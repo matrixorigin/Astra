@@ -30,7 +30,7 @@ use crate::tool_sandbox::{
     IsolatedOutput, IsolationConfig, SandboxMode, SandboxPolicy, ToolTier, effective_tier,
     execute_isolated, filter_environment,
 };
-use crate::turn::file_edit_journal::{EditType, FileEditJournal};
+use astra_turn_core::file_edit_journal::{EditType, FileEditJournal};
 
 const MO_CONNECT_TIMEOUT_SECS: u32 = 5;
 
@@ -619,10 +619,10 @@ fn extract_tool_name(args: &Value) -> Option<String> {
 
 fn effective_runtime_config(
     workspace: Option<&astra_services::session_workspace::WorkspaceMetadata>,
-) -> Result<crate::runtime_config::RuntimeConfig, String> {
+) -> Result<astra_config::runtime_config::RuntimeConfig, String> {
     match workspace.and_then(|workspace| workspace.tuned_config_json.as_deref()) {
         Some(json) => serde_json::from_str(json).map_err(|error| error.to_string()),
-        None => Ok(crate::runtime_config::RuntimeConfig::load()),
+        None => Ok(astra_config::runtime_config::RuntimeConfig::load()),
     }
 }
 
@@ -690,9 +690,9 @@ fn persist_config_override(
     let base_config = effective_runtime_config(Some(&workspace))?;
     let mut value = serde_json::to_value(&base_config).map_err(|e| e.to_string())?;
     let old_value = replace_json_path(&mut value, path, new_value.clone())?;
-    let candidate_config: crate::runtime_config::RuntimeConfig =
+    let candidate_config: astra_config::runtime_config::RuntimeConfig =
         serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-    let baseline_json = serde_json::to_value(crate::runtime_config::RuntimeConfig::load())
+    let baseline_json = serde_json::to_value(astra_config::runtime_config::RuntimeConfig::load())
         .map_err(|e| e.to_string())?;
     workspace.tuned_config_json = if value == baseline_json {
         None
@@ -1038,7 +1038,7 @@ pub struct ServerToolExecutor {
     resource_governor:
         Option<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>>,
     /// Optional edge connection pool for routing to remote edge agents.
-    edge_connection_pool: Option<super::edge_connection_pool::EdgeConnectionPool>,
+    edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     /// Optional observability session for self-mod and rollback-backed session state.
     observability_session:
         Option<Arc<std::sync::RwLock<crate::observability_integration::ObservabilitySession>>>,
@@ -1246,7 +1246,7 @@ impl ServerToolExecutor {
     /// Set the edge connection pool for remote tool routing.
     pub fn set_edge_connection_pool(
         &mut self,
-        pool: super::edge_connection_pool::EdgeConnectionPool,
+        pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
     ) {
         self.edge_connection_pool = Some(pool);
     }
@@ -1694,7 +1694,7 @@ impl ServerToolExecutor {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if !allow_destructive
-            && let Some(kind) = crate::turn::safety_middleware::check_sql_safety(sql)
+            && let Some(kind) = astra_turn_core::safety_middleware::check_sql_safety(sql)
         {
             return astra_tools::ToolResult::error(format!(
                 "Error: {kind} statements are blocked by default. Pass \"allow_destructive\": true to confirm execution."

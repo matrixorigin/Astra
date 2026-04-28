@@ -2846,7 +2846,7 @@ pub(super) fn apply_pending_adaptive_state(state: &mut ReplState) {
     // Restore tuned RuntimeConfig (merge on top of freshly loaded defaults)
     if let Some(json) = &adaptive.tuned_config_json {
         if let Ok(saved_config) =
-            serde_json::from_str::<astra_runtime::runtime_config::RuntimeConfig>(json)
+            serde_json::from_str::<astra_config::runtime_config::RuntimeConfig>(json)
         {
             let current = std::mem::take(&mut guard.config);
             guard.config = current.merge(saved_config);

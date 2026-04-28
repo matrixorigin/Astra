@@ -7,7 +7,7 @@ use astra_services::self_surface::{
     ToolHealthView, VerificationEventView, VerificationSurface,
 };
 
-use crate::str_preview::truncate_str;
+use astra_text_utils::str_preview::truncate_str;
 use crate::turn::agentic_headless_round::HeadlessStderrStyle;
 
 use super::agentic_adaptive_tuning::{

@@ -22,7 +22,7 @@ use astra_learning::auto_tuning::{FeedbackSignal, SignalType};
 use astra_pipeline::ToolHealthEntry;
 use astra_runtime::observability_integration::{ObservabilityHub, ObservabilitySession};
 use astra_runtime::self_model::SelfModel;
-use astra_runtime::turn::tool_health::ToolHealthTracker;
+use astra_turn_core::tool_health::ToolHealthTracker;
 use astra_runtime::user_profile::Scenario;
 use astra_turn_core::parallel_tool_exec::ToolExecutorFn;
 use astra_turn_core::streaming_tool_exec::{StreamingSpeculationMetrics, StreamingToolExecutor};

@@ -1,5 +1,5 @@
 use super::*;
-use astra_runtime::str_preview::truncate_str;
+use astra_text_utils::str_preview::truncate_str;
 
 /// Check if a path is a UNC path (Windows network path that could leak NTLM credentials).
 fn is_unc_path(path: &str) -> bool {

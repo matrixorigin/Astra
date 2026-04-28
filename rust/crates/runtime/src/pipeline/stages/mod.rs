@@ -1,2 +1,2 @@
-pub mod evaluate;
-pub mod reflect;
+pub use astra_pipeline::stages::evaluate;
+pub use astra_pipeline::stages::reflect;

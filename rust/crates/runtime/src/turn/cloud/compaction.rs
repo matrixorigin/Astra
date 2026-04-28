@@ -551,7 +551,7 @@ pub async fn compact_with_summary(
     tier: CompactionTier,
     keep_recent_turns: usize,
     compact_config: &CompactConfig,
-    llm_client: Option<&dyn super::summary::SummaryLlmClient>,
+    llm_client: Option<&dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
 ) -> CompactResult {
     // Always run structural compaction first
     let mut result =
@@ -561,7 +561,7 @@ pub async fn compact_with_summary(
     if compact_config.should_summarize(tier)
         && let Some(client) = llm_client
     {
-        match super::summary::generate_compact_summary(messages, client).await {
+        match astra_turn_core::cloud_summary::generate_compact_summary(messages, client).await {
             Some(summary) => {
                 // Prepend summary as a user message
                 let summary_msg = serde_json::json!({
@@ -865,7 +865,7 @@ mod tests {
 
     #[tokio::test]
     async fn compact_with_summary_disabled_no_summary_injected() {
-        use crate::turn::cloud::summary::test_support::MockSummaryClient;
+        use astra_turn_core::cloud_summary::test_support::MockSummaryClient;
         let client = MockSummaryClient::success("should not appear");
         let msgs = vec![tool(&"a".repeat(5000)), tool(&"b".repeat(100))];
         let cfg = CompactConfig {
@@ -894,7 +894,7 @@ mod tests {
 
     #[tokio::test]
     async fn compact_with_summary_enabled_injects_summary() {
-        use crate::turn::cloud::summary::test_support::MockSummaryClient;
+        use astra_turn_core::cloud_summary::test_support::MockSummaryClient;
         let client = MockSummaryClient::success("## Task\nFix the bug");
         let msgs: Vec<Value> = (0..5)
             .flat_map(|i| {

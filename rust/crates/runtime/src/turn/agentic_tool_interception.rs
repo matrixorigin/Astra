@@ -5,7 +5,7 @@ use astra_services::SessionArtifactStore;
 use astra_services::session_journal::{SURGICAL_REMOVAL_TOOL_NAME, ToolCallRecord};
 use serde_json::Value;
 
-use crate::turn::sse_stream_host::EdgeToolExecResult;
+use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 
 use super::agentic_loop_host::{AgenticLoopState, DELEGATE_TOOL_NAME, HostTurnResult};
 
@@ -23,7 +23,7 @@ pub(crate) async fn prepare_intercepted_tool_round(
     valid_tool_names: &HashSet<String>,
 ) -> PreparedToolRound {
     let tool_calls =
-        super::headless_tool_assembly::ensure_tool_call_ids(effective_tool_calls).into_owned();
+        astra_turn_core::headless_tool_assembly::ensure_tool_call_ids(effective_tool_calls).into_owned();
     let (mut pre_resolved_results, post_send_tool_calls) =
         intercept_send_message_calls(state, &tool_calls, valid_tool_names).await;
     let SkillInterceptionResult {
@@ -163,13 +163,13 @@ async fn intercept_send_message_calls(
     let mut msg_results = Vec::new();
     let mut remaining = Vec::new();
     for tc in tool_calls {
-        if crate::messaging::send_tool::is_send_message_call(tc)
-            && valid_tool_names.contains(crate::messaging::send_tool::SEND_MESSAGE_TOOL_NAME)
+        if astra_messaging::send_tool::is_send_message_call(tc)
+            && valid_tool_names.contains(astra_messaging::send_tool::SEND_MESSAGE_TOOL_NAME)
         {
-            if let Some((call_id, args)) = crate::messaging::send_tool::parse_send_message_call(tc)
+            if let Some((call_id, args)) = astra_messaging::send_tool::parse_send_message_call(tc)
             {
                 let send_result =
-                    crate::messaging::send_tool::execute_send_message(mailbox, &args).await;
+                    astra_messaging::send_tool::execute_send_message(mailbox, &args).await;
                 if send_result.tracked_message.is_some()
                     || !send_result.display.starts_with("Error:")
                 {
@@ -184,7 +184,7 @@ async fn intercept_send_message_calls(
                         if state.messaging.ack_sweep_task.is_none() {
                             if let Some(ref mailbox) = state.messaging.mailbox {
                                 state.messaging.ack_sweep_task =
-                                    Some(crate::messaging::ack_tracker::start_sweep_task(
+                                    Some(astra_messaging::ack_tracker::start_sweep_task(
                                         Arc::clone(tracker),
                                         mailbox.router(),
                                         state.messaging.dead_letter_queue.clone(),
@@ -658,15 +658,15 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::messaging::in_process::InProcessTransport;
-    use crate::messaging::router::AgentMailboxRouter;
-    use crate::messaging::types::AgentAddress;
+    use astra_messaging::in_process::InProcessTransport;
+    use astra_messaging::router::AgentMailboxRouter;
+    use astra_messaging::types::AgentAddress;
     use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
     use crate::turn::agentic_loop_host::tests::make_state;
 
     async fn setup_mailboxes() -> (
-        crate::messaging::router::AgentMailbox,
-        crate::messaging::router::AgentMailbox,
+        astra_messaging::router::AgentMailbox,
+        astra_messaging::router::AgentMailbox,
     ) {
         let transport = Arc::new(InProcessTransport::new());
         let tracker = Arc::new(DelegationTracker::new());

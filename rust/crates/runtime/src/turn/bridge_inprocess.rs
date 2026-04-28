@@ -30,7 +30,7 @@
 ///   Rust API (`forward()` on [`InProcessChatTurnBridge`]) injects context into headers:
 ///     x-mo-user-id, x-mo-session-id, x-mo-turn-chain-id, x-mo-user-query-event-id, ...
 ///   This bridge reads those headers, calls the LLM, streams SSE back, persists events, and
-///   for each tool round blocks on [`super::edge_ledger`] until `POST /tools/result` (or timeout).
+///   for each tool round blocks on [`astra_turn_core::edge_ledger`] until `POST /tools/result` (or timeout).
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -58,12 +58,12 @@ use crate::{
     TurnObserverWorker, TurnReflectionLessonWriter, TurnReflectionStateStore,
     TurnSessionActivityWriter, TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
     build_explain_event, build_stream_error_event, prompts,
-    turn::edge_ledger::ensure_tool_call_ids,
-    turn::persist::{build_tool_call_event_payload, build_tool_result_event_payload},
-    turn::sse_blocks::SseBlankLineUtf8Buf,
-    turn::tool_call_shape::tool_call_name,
-    turn::tool_schema_prune::prune_tool_schemas,
 };
+use astra_turn_core::edge_ledger::ensure_tool_call_ids;
+use astra_turn_core::persist::{build_tool_call_event_payload, build_tool_result_event_payload};
+use astra_turn_core::sse_blocks::SseBlankLineUtf8Buf;
+use astra_turn_core::tool_call_shape::tool_call_name;
+use astra_turn_core::tool_schema_prune::prune_tool_schemas;
 
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
 const ROOT_TURN_JOURNAL_HEADER: &str = "x-mo-root-turn-journal";
@@ -429,7 +429,7 @@ use super::bridge_observability::{
 // ── LLM streaming — delegated to turn::bridge_llm_stream ─────────────────────
 use super::bridge_llm_stream::call_llm_stream;
 use super::bridge_llm_stream::rate_limit_cooldown;
-use crate::bridge::rate_limit_cooldown::RateLimitAction;
+use astra_turn_core::bridge_rate_limit_cooldown::RateLimitAction;
 
 #[cfg(test)]
 async fn await_with_client_disconnect<T, F>(
@@ -592,7 +592,7 @@ fn filter_round_edge_tools(edge_tools: &[Value], restricted_tools: &HashSet<Stri
 
 #[cfg(test)]
 fn record_turn_guard_tool_results(
-    turn_guard: &mut crate::turn::turn_guard::TurnGuard,
+    turn_guard: &mut astra_turn_core::turn_guard::TurnGuard,
     persist_tool_results: &[Value],
 ) {
     for tool_result in persist_tool_results {
@@ -611,15 +611,15 @@ fn record_turn_guard_tool_results(
 }
 
 fn turn_complete_event(messages: &[Value], assistant_text: &str, tool_calls: &[Value]) -> Value {
-    let mut event = crate::turn::complete::build_turn_complete_event(
+    let mut event = astra_turn_core::complete::build_turn_complete_event(
         !tool_calls.is_empty(),
         false,
-        &crate::turn::stall::DivergenceStatus::Healthy,
+        &astra_turn_core::stall::DivergenceStatus::Healthy,
         None,
         Some(assistant_text),
     );
     if let Some(user_message) = latest_user_message_text(messages)
-        && let Some(suggestion) = crate::turn::followup_suggestion::suggest_followup(
+        && let Some(suggestion) = astra_turn_core::followup_suggestion::suggest_followup(
             user_message,
             assistant_text,
             &tool_names_from_tool_calls(tool_calls),
@@ -657,7 +657,7 @@ pub struct InProcessChatTurnBridge {
     pub edge_callback_ledger: Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
     /// Session-scoped structured feedback store — accumulates correction rules
     /// and injects them into subsequent turn system prompts.
-    pub feedback_store: Arc<crate::pipeline::feedback_store::FeedbackStore>,
+    pub feedback_store: Arc<astra_pipeline::feedback_store::FeedbackStore>,
     /// Cached Memoria client — created once, reused across turns.
     pub memoria_client: Option<crate::turn::cloud::memoria_compact::HttpMemoriaClient>,
     /// Shared session facts for facts-first compaction. Updated by the agentic loop
@@ -676,7 +676,7 @@ impl InProcessChatTurnBridge {
             shared_pool: None,
             turn_learning_writer: None,
             edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            feedback_store: Arc::new(crate::pipeline::feedback_store::FeedbackStore::new()),
+            feedback_store: Arc::new(astra_pipeline::feedback_store::FeedbackStore::new()),
             memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env(),
             session_facts: Arc::new(std::sync::Mutex::new(Default::default())),
             persist_tracker: None,
@@ -745,7 +745,7 @@ impl InProcessChatTurnBridge {
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|turn| *turn > 0);
         #[cfg(feature = "bridge-e2e-hooks")]
-        let bridge_e2e_authorized = crate::turn::bridge_e2e_hooks::authorized(headers);
+        let bridge_e2e_authorized = astra_turn_core::bridge_e2e_hooks::authorized(headers);
         #[cfg(not(feature = "bridge-e2e-hooks"))]
         let bridge_e2e_authorized = false;
         let turn_chain_id =
@@ -826,7 +826,7 @@ impl InProcessChatTurnBridge {
 
         #[cfg(feature = "bridge-e2e-hooks")]
         let bridge_e2e_for_stream: Option<Vec<Value>> =
-            if crate::turn::bridge_e2e_hooks::authorized(headers) {
+            if astra_turn_core::bridge_e2e_hooks::authorized(headers) {
                 payload
                     .get("test_llm_rounds")
                     .and_then(|v| v.as_array())
@@ -838,8 +838,8 @@ impl InProcessChatTurnBridge {
         let bridge_e2e_for_stream: Option<Vec<Value>> = None;
         #[cfg(feature = "bridge-e2e-hooks")]
         let bridge_e2e_stream_blocks_for_stream: Option<Vec<String>> =
-            if crate::turn::bridge_e2e_hooks::authorized(headers) {
-                let blocks = crate::turn::bridge_e2e_hooks::parse_stream_blocks(
+            if astra_turn_core::bridge_e2e_hooks::authorized(headers) {
+                let blocks = astra_turn_core::bridge_e2e_hooks::parse_stream_blocks(
                     payload
                         .get("test_llm_stream_blocks")
                         .unwrap_or(&Value::Null),
@@ -1204,9 +1204,9 @@ impl InProcessChatTurnBridge {
             // the user's interest immediately rather than exploring the codebase.
             // This wires the Rust-side detect_store_signal into the live pipeline.
             let memory_signal_hint = if let Some(category) =
-                crate::prompts::memory_lifecycle::detect_store_signal(user_content_for_signal)
+                astra_prompts::memory_lifecycle::detect_store_signal(user_content_for_signal)
             {
-                let ns = crate::prompts::memory_lifecycle::suggest_namespace(category);
+                let ns = astra_prompts::memory_lifecycle::suggest_namespace(category);
                 format!(
                     "\n\n⚡ MEMORY SIGNAL DETECTED: category=\"{category}\", namespace=\"{ns}\". \
                      Store the user's intent with memory_store BEFORE doing anything else."
@@ -1245,7 +1245,7 @@ impl InProcessChatTurnBridge {
                 // Store heuristic-extracted feedback only on correction/frustration signals
                 // and only when we have a valid session_id (avoid cross-session leakage)
                 if !session_id.is_empty() && is_correction {
-                    if let Some(fb) = crate::pipeline::feedback_extraction::heuristic_extract(
+                    if let Some(fb) = astra_pipeline::feedback_extraction::heuristic_extract(
                         user_content_for_signal,
                         &signal.signal_type,
                         signal.confidence,
@@ -1315,7 +1315,7 @@ impl InProcessChatTurnBridge {
             };
 
             // ── Round budget directive: encourage synthesis after several rounds ──
-            let tool_cfg = crate::runtime_config::RuntimeConfig::load().tool_selection;
+            let tool_cfg = astra_config::runtime_config::RuntimeConfig::load().tool_selection;
             let (tool_round_guidance, guidance_signals) = prompts::tool_round_guidance_trace_with(
                 &messages,
                 round_index,
@@ -1336,8 +1336,8 @@ impl InProcessChatTurnBridge {
                         skill_hint.clone(),
                         prompts::PromptTokenBucket::UserPreferences,
                     )
-                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
-                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
+                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                             active_output_skills: true,
                             ..Default::default()
                         },
@@ -1351,8 +1351,8 @@ impl InProcessChatTurnBridge {
                         learned_context_hint.clone(),
                         prompts::PromptTokenBucket::UserPreferences,
                     )
-                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
-                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
+                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                             learned_runtime_context: true,
                             ..Default::default()
                         },
@@ -1366,8 +1366,8 @@ impl InProcessChatTurnBridge {
                         memory_signal_hint.clone(),
                         prompts::PromptTokenBucket::Environment,
                     )
-                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
-                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
+                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                             memory_signal_detected: true,
                             ..Default::default()
                         },
@@ -1381,8 +1381,8 @@ impl InProcessChatTurnBridge {
                         implicit_feedback_hint.clone(),
                         prompts::PromptTokenBucket::Environment,
                     )
-                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
-                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
+                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                             implicit_feedback: true,
                             ..Default::default()
                         },
@@ -1396,8 +1396,8 @@ impl InProcessChatTurnBridge {
                         feedback_rules_hint.clone(),
                         prompts::PromptTokenBucket::Environment,
                     )
-                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
-                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
+                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                             learned_feedback_rules: true,
                             ..Default::default()
                         },
@@ -1411,8 +1411,8 @@ impl InProcessChatTurnBridge {
                         self_awareness_hint.clone(),
                         prompts::PromptTokenBucket::Environment,
                     )
-                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
-                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
+                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                             self_awareness: true,
                             ..Default::default()
                         },
@@ -1426,8 +1426,8 @@ impl InProcessChatTurnBridge {
                         memoria_insights_hint.clone(),
                         prompts::PromptTokenBucket::Environment,
                     )
-                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
-                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
+                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                             memoria_insights: true,
                             ..Default::default()
                         },
@@ -1449,8 +1449,8 @@ impl InProcessChatTurnBridge {
                         session_anchor.clone(),
                         prompts::PromptTokenBucket::Environment,
                     )
-                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
-                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
+                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                             session_anchor: true,
                             ..Default::default()
                         },
@@ -1464,7 +1464,7 @@ impl InProcessChatTurnBridge {
                         tool_round_guidance.clone(),
                         prompts::PromptTokenBucket::Environment,
                     )
-                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
+                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
                         guidance_signals,
                         ..Default::default()
                     }),
@@ -1537,8 +1537,8 @@ impl InProcessChatTurnBridge {
 
                 // Build summary client for LLM-based compaction
                 let compact_config = crate::prompts::CompactConfig::from_env();
-                let summary_client = crate::turn::cloud::summary::HttpSummaryClient::new(
-                    crate::turn::cloud::summary::LlmConnParams {
+                let summary_client = astra_turn_core::cloud_summary::HttpSummaryClient::new(
+                    astra_turn_core::cloud_summary::LlmConnParams {
                         model_name: model_name.clone(),
                         api_key: api_key.clone(),
                         base_url: base_url.clone(),
@@ -1554,7 +1554,7 @@ impl InProcessChatTurnBridge {
                     &memoria_params,
                     memoria_client.as_ref().map(|c| c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient),
                     Some(&compact_config),
-                    Some(&summary_client as &dyn crate::turn::cloud::summary::SummaryLlmClient),
+                    Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
                 )
                 .await;
 
@@ -1616,7 +1616,7 @@ impl InProcessChatTurnBridge {
             // usage. Keeps the field (as empty string) for thinking-model API
             // compat; only the most recent assistant reasoning is preserved.
             // Heavy checkpoints and persisted events retain full reasoning.
-            super::edge_ledger::strip_stale_reasoning(&mut llm_messages, &provider, &model_name);
+            astra_turn_core::edge_ledger::strip_stale_reasoning(&mut llm_messages, &provider, &model_name);
 
             // Cloud loop: every tool round waits on §5.5 ledger (`POST /tools/result`) then continues LLM.
             let merged_tool_results: Vec<Value> = tool_results.clone();
@@ -1634,7 +1634,7 @@ impl InProcessChatTurnBridge {
             let llm_started = Instant::now();
             let budget = crate::prompts::budget_for_model(Some(&model_name));
             let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
-            let max_rounds = crate::turn::routing::max_tool_rounds();
+            let max_rounds = astra_turn_core::routing::max_tool_rounds();
             let _round_limit: i64 = if use_e2e_llm {
                 bridge_e2e
                     .as_ref()
@@ -1645,7 +1645,7 @@ impl InProcessChatTurnBridge {
             };
 
             let mut last_measured_prompt: Option<u64> = None;
-            let mut cache_detector = crate::turn::cloud::cache_diagnostics::CacheBreakDetector::new();
+            let mut cache_detector = astra_turn_core::cloud_cache_diagnostics::CacheBreakDetector::new();
 
 
             // Single LLM call per HTTP request (no multi-round tool loop).
@@ -1719,7 +1719,7 @@ impl InProcessChatTurnBridge {
                     #[cfg(feature = "bridge-e2e-hooks")]
                     {
                         let (t, r, tc, u_delta) =
-                            crate::turn::bridge_e2e_hooks::parse_llm_round(round_val);
+                            astra_turn_core::bridge_e2e_hooks::parse_llm_round(round_val);
                         loop_text = t;
                         loop_reasoning = r;
                         loop_tool_calls = tc;
@@ -1736,7 +1736,7 @@ impl InProcessChatTurnBridge {
                     apply_anthropic_cache_metadata(&mut llm_messages, &cache_cfg, &session_id);
 
                     // Emit system prompt breakdown so CLI can record precise per-component trace.
-                    let skill_injections: Vec<crate::turn::context_assembly_trace::SkillInjection> =
+                    let skill_injections: Vec<astra_turn_core::context_assembly_trace::SkillInjection> =
                         edge_profile
                             .get("active_skills")
                             .and_then(Value::as_array)
@@ -1748,7 +1748,7 @@ impl InProcessChatTurnBridge {
                                     // Total tokens for the skill hint section, split evenly
                                     let hint_tokens = prompts::estimate_str_tokens(&skill_hint) as u32;
                                     let per = hint_tokens / names.len().max(1) as u32;
-                                    names.iter().map(|name| crate::turn::context_assembly_trace::SkillInjection {
+                                    names.iter().map(|name| astra_turn_core::context_assembly_trace::SkillInjection {
                                         skill_name: name.to_string(),
                                         skill_version: None,
                                         tokens: per,
@@ -1757,9 +1757,9 @@ impl InProcessChatTurnBridge {
                                 }
                             })
                             .unwrap_or_default();
-                    let memory_injections: Vec<crate::turn::context_assembly_trace::MemoryInjection> =
+                    let memory_injections: Vec<astra_turn_core::context_assembly_trace::MemoryInjection> =
                         memory_preview.iter().enumerate().map(|(i, line)| {
-                            crate::turn::context_assembly_trace::MemoryInjection {
+                            astra_turn_core::context_assembly_trace::MemoryInjection {
                                 memory_id: format!("prefetch-{i}"),
                                 memory_type: "hybrid_retrieval".into(),
                                 tokens: prompts::estimate_str_tokens(line) as u32,
@@ -1848,8 +1848,8 @@ impl InProcessChatTurnBridge {
                     session_facts: session_facts_shared.lock().ok().map(|f| f.clone()),
                             };
                             let compact_config = crate::prompts::CompactConfig::from_env();
-                            let summary_client = crate::turn::cloud::summary::HttpSummaryClient::new(
-                                crate::turn::cloud::summary::LlmConnParams {
+                            let summary_client = astra_turn_core::cloud_summary::HttpSummaryClient::new(
+                                astra_turn_core::cloud_summary::LlmConnParams {
                                     model_name: model_name.clone(),
                                     api_key: api_key.clone(),
                                     base_url: base_url.clone(),
@@ -1872,7 +1872,7 @@ impl InProcessChatTurnBridge {
                                 &aggressive_params,
                                 memoria_client.as_ref().map(|c| c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient),
                                 Some(&compact_config),
-                                Some(&summary_client as &dyn crate::turn::cloud::summary::SummaryLlmClient),
+                                Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
                             )
                             .await;
 
@@ -1944,7 +1944,7 @@ impl InProcessChatTurnBridge {
                                         }),
                                     );
                                     let kind = classify_llm_error(&e2);
-                                    let dump = crate::turn::llm_request_dump::build_llm_request_dump(
+                                    let dump = astra_turn_core::llm_request_dump::build_llm_request_dump(
                                         &session_id, agent_id.as_deref(), &model_name, &provider,
                                         &e2, &llm_messages, &pruned_tools,
                                         capture_round_ix, Some(max_output_tokens / 2),
@@ -2013,7 +2013,7 @@ impl InProcessChatTurnBridge {
                                 }),
                             );
                             let kind = classify_llm_error(&e);
-                            let dump = crate::turn::llm_request_dump::build_llm_request_dump(
+                            let dump = astra_turn_core::llm_request_dump::build_llm_request_dump(
                                 &session_id, agent_id.as_deref(), &model_name, &provider,
                                 &e, &llm_messages, &pruned_tools,
                                 capture_round_ix, Some(max_output_tokens),
@@ -2666,7 +2666,7 @@ impl InProcessChatTurnBridge {
                         Some(v) => serde_json::to_string(v).unwrap_or_default(),
                         None => String::new(),
                     };
-                    let fp = crate::turn::cloud::cache_diagnostics::CacheFingerprint::new(
+                    let fp = astra_turn_core::cloud_cache_diagnostics::CacheFingerprint::new(
                         &sys_prompt_str,
                         &round_tools_fingerprint_str,
                         &model_name,
@@ -2944,7 +2944,7 @@ impl InProcessChatTurnBridge {
 
             // Hook side effects: decision audit, skill selection, implicit feedback, reflection
             {
-                let mut hook_payload = crate::turn::tail_persist::build_turn_hook_args(
+                let mut hook_payload = astra_turn_core::tail_persist::build_turn_hook_args(
                     &user_id,
                     &session_id,
                     &messages,
@@ -3388,7 +3388,7 @@ pub mod bridge_inprocess_test_helpers {
     use serde_json::Value;
 
     pub fn prune_tool_schemas_pub(tools: &[Value], tier: CompactionTier) -> Vec<Value> {
-        crate::turn::tool_schema_prune::prune_tool_schemas(tools, tier)
+        astra_turn_core::tool_schema_prune::prune_tool_schemas(tools, tier)
     }
 }
 
@@ -3396,7 +3396,7 @@ pub mod bridge_inprocess_test_helpers {
 mod tests {
     use super::*;
     use crate::turn::bridge_sse_helpers::apply_forward_llm_sse_event;
-    use crate::turn::turn_guard::TurnGuard;
+    use astra_turn_core::turn_guard::TurnGuard;
     use astra_services::{
         SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionArtifact,
     };
@@ -3614,7 +3614,7 @@ mod tests {
                 "total_catalog_size": 2
             }
         });
-        let mut hook_payload = crate::turn::tail_persist::build_turn_hook_args(
+        let mut hook_payload = astra_turn_core::tail_persist::build_turn_hook_args(
             "user-1",
             "session-1",
             &request_messages,
@@ -3680,7 +3680,7 @@ mod tests {
                 "extra": {"ranked_pool": 100}
             }
         });
-        let mut hook_payload = crate::turn::tail_persist::build_turn_hook_args(
+        let mut hook_payload = astra_turn_core::tail_persist::build_turn_hook_args(
             "user-1",
             "session-1",
             &[],
@@ -4090,8 +4090,8 @@ mod tests {
                 prompts::PromptTokenBucket::UserPreferences,
             )
             .with_trace_signals(
-                crate::turn::context_assembly_trace::PromptTraceSignals {
-                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                astra_turn_core::context_assembly_trace::PromptTraceSignals {
+                    context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                         active_output_skills: !active_skill_names.is_empty(),
                         ..Default::default()
                     },
@@ -4103,8 +4103,8 @@ mod tests {
                 prompts::PromptTokenBucket::UserPreferences,
             )
             .with_trace_signals(
-                crate::turn::context_assembly_trace::PromptTraceSignals {
-                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                astra_turn_core::context_assembly_trace::PromptTraceSignals {
+                    context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                         learned_runtime_context: !learned_context_text.is_empty(),
                         ..Default::default()
                     },
@@ -4116,8 +4116,8 @@ mod tests {
                 prompts::PromptTokenBucket::Environment,
             )
             .with_trace_signals(
-                crate::turn::context_assembly_trace::PromptTraceSignals {
-                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                astra_turn_core::context_assembly_trace::PromptTraceSignals {
+                    context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                         memory_signal_detected: !memory_signal_hint.is_empty(),
                         ..Default::default()
                     },
@@ -4129,8 +4129,8 @@ mod tests {
                 prompts::PromptTokenBucket::Environment,
             )
             .with_trace_signals(
-                crate::turn::context_assembly_trace::PromptTraceSignals {
-                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                astra_turn_core::context_assembly_trace::PromptTraceSignals {
+                    context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                         implicit_feedback: !implicit_feedback_hint.is_empty(),
                         ..Default::default()
                     },
@@ -4142,8 +4142,8 @@ mod tests {
                 prompts::PromptTokenBucket::Environment,
             )
             .with_trace_signals(
-                crate::turn::context_assembly_trace::PromptTraceSignals {
-                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                astra_turn_core::context_assembly_trace::PromptTraceSignals {
+                    context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                         learned_feedback_rules: !feedback_rules_hint.is_empty(),
                         ..Default::default()
                     },
@@ -4155,8 +4155,8 @@ mod tests {
                 prompts::PromptTokenBucket::Environment,
             )
             .with_trace_signals(
-                crate::turn::context_assembly_trace::PromptTraceSignals {
-                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                astra_turn_core::context_assembly_trace::PromptTraceSignals {
+                    context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                         self_awareness: !self_awareness_hint.is_empty(),
                         ..Default::default()
                     },
@@ -4168,8 +4168,8 @@ mod tests {
                 prompts::PromptTokenBucket::Environment,
             )
             .with_trace_signals(
-                crate::turn::context_assembly_trace::PromptTraceSignals {
-                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                astra_turn_core::context_assembly_trace::PromptTraceSignals {
+                    context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                         session_anchor: !session_anchor.is_empty(),
                         ..Default::default()
                     },
@@ -4181,8 +4181,8 @@ mod tests {
                 prompts::PromptTokenBucket::Environment,
             )
             .with_trace_signals(
-                crate::turn::context_assembly_trace::PromptTraceSignals {
-                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                astra_turn_core::context_assembly_trace::PromptTraceSignals {
+                    context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                         memoria_insights: true,
                         ..Default::default()
                     },
@@ -4221,7 +4221,7 @@ mod tests {
     #[test]
     fn build_system_prompt_trace_guidance_signals_only() {
         use crate::prompts::{CacheScope, PromptSection, PromptTokenBucket};
-        use crate::turn::context_assembly_trace::{PromptGuidanceSignals, PromptTraceSignals};
+        use astra_turn_core::context_assembly_trace::{PromptGuidanceSignals, PromptTraceSignals};
 
         let section = PromptSection {
             text: "round budget warning".to_string(),
@@ -4816,7 +4816,7 @@ mod tests {
 
     #[test]
     fn multi_turn_sse_cache_tokens_accumulate_in_accum() {
-        use super::super::chat_turn_sse_dispatch::{
+        use astra_turn_core::chat_turn_sse_dispatch::{
             ChatTurnSseAccum, dispatch_chat_turn_sse_event_block,
         };
 

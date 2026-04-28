@@ -185,14 +185,14 @@ impl Default for LoopDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
-    use crate::pipeline::step_recorder::StepRecorder;
-    use crate::semantic_dedup::SemanticDedup;
+    use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
+    use astra_pipeline::step_recorder::StepRecorder;
+    use astra_text_utils::semantic_dedup::SemanticDedup;
     use crate::turn::agentic_headless_round::HeadlessStderrStyle;
     use crate::turn::agentic_loop_host::HostTurnResult;
-    use crate::turn::chat_turn_heuristics::TaskExecutionProfile;
-    use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
-    use crate::turn::turn_guard::TurnGuard;
+    use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
+    use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
+    use astra_turn_core::turn_guard::TurnGuard;
     use async_trait::async_trait;
     use serde_json::json;
     use std::collections::HashMap;
@@ -291,7 +291,7 @@ mod tests {
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
             call_counts: HashMap::new(),
-            max_identical_tool_calls: crate::runtime_config::RuntimeConfig::load()
+            max_identical_tool_calls: astra_config::runtime_config::RuntimeConfig::load()
                 .tool_selection
                 .effective_max_identical_calls(),
             max_tools_per_turn: 15,

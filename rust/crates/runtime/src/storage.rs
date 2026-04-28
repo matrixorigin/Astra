@@ -4,11 +4,11 @@ use std::time::Duration;
 
 use sqlx::{MySql, query};
 
-use crate::turn::contracts::{
+use astra_turn_core::contracts::{
     TurnCoreEventRecord, TurnDecisionAuditRecord, TurnImplicitFeedbackRecord,
     TurnSkillSelectionRecord, TurnSkillSelectorMetricRecord, TurnToolEventRecord,
 };
-use crate::turn::hook_plans::SnapshotLinkPlan;
+use astra_turn_core::hook_plans::SnapshotLinkPlan;
 
 fn metadata_tool_name(metadata: Option<&serde_json::Value>) -> Option<String> {
     metadata

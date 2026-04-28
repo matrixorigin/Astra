@@ -8,16 +8,16 @@ use astra_services::session_journal::ToolCallRecord;
 use astra_thin_client::ThinClient;
 use serde_json::Value;
 
-use super::headless_tool_assembly::{
+use astra_turn_core::headless_tool_assembly::{
     EdgeToolRoundRow, begin_headless_tool_round_opening_ext, openai_tool_roundtrip_values,
 };
 use super::headless_tool_pipeline::{HeadlessToolExecutionCtx, HeadlessToolExecutionPipeline};
-use super::headless_tool_postprocess::HeadlessStepDeadline;
-use super::tool_result_sanitize::tool_result_content_for_model;
-use super::turn_guard::TurnGuard;
-use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
-use crate::pipeline::step_recorder::StepRecorder;
-use crate::semantic_dedup::SemanticDedup;
+use astra_turn_core::headless_tool_postprocess::HeadlessStepDeadline;
+use astra_turn_core::tool_result_sanitize::tool_result_content_for_model;
+use astra_turn_core::turn_guard::TurnGuard;
+use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
+use astra_pipeline::step_recorder::StepRecorder;
+use astra_text_utils::semantic_dedup::SemanticDedup;
 
 // Re-export headless types from turn-core (canonical definitions live there).
 pub use astra_turn_core::headless_types::{
@@ -58,7 +58,7 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     pub tool_call_records: &'a mut Vec<ToolCallRecord>,
     pub tool_event_hooks: &'a crate::skills::hooks::ToolEventHookRegistry,
     pub term: &'a mut dyn HeadlessRoundTerminal,
-    pub mailbox: Option<&'a mut crate::messaging::router::AgentMailbox>,
+    pub mailbox: Option<&'a mut astra_messaging::router::AgentMailbox>,
     pub permission_context: Option<&'a PermissionSyncHandle>,
     pub progress_emitter: Option<&'a crate::orchestration::AgentProgressEmitter>,
     /// Tool results resolved by upstream interception layers (skill, send_message)
@@ -78,7 +78,7 @@ struct HeadlessPreparedRound<'a> {
     effective_permission_timeout: Duration,
     tool_calls: std::borrow::Cow<'a, [Value]>,
     pre_resolved_ids: HashSet<String>,
-    indices: Vec<super::headless_tool_assembly::HeadlessRoundToolIdx>,
+    indices: Vec<astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx>,
     step_deadline: HeadlessStepDeadline,
     consumed_edge: Vec<bool>,
 }
@@ -111,8 +111,8 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
     tool_results.clear();
 
     let force_reasoning =
-        !reasoning_content.is_empty() || super::edge_ledger::history_has_reasoning(messages);
-    let tool_calls = super::headless_tool_assembly::ensure_tool_call_ids(tool_calls);
+        !reasoning_content.is_empty() || astra_turn_core::edge_ledger::history_has_reasoning(messages);
+    let tool_calls = astra_turn_core::headless_tool_assembly::ensure_tool_call_ids(tool_calls);
 
     let opening = begin_headless_tool_round_opening_ext(
         &tool_calls,
@@ -290,7 +290,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
     }
 }
 
-use super::headless_tool_assembly::HeadlessRoundToolIdx;
+use astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx;
 
 pub(crate) enum ToolBatch {
     Concurrent(Vec<HeadlessRoundToolIdx>),
@@ -301,7 +301,7 @@ pub(crate) fn partition_tool_batches(
     indices: &[HeadlessRoundToolIdx],
     tool_calls: &[Value],
 ) -> Vec<ToolBatch> {
-    use super::headless_tool_assembly::READ_ONLY_TOOLS;
+    use astra_turn_core::headless_tool_assembly::READ_ONLY_TOOLS;
 
     let mut batches = Vec::new();
     let mut concurrent_buf: Vec<HeadlessRoundToolIdx> = Vec::new();

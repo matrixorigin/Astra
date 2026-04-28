@@ -230,7 +230,7 @@ async fn chain_variable_substitution_end_to_end() {
 #[tokio::test]
 async fn chain_skip_condition_end_to_end() {
     use astra_runtime::tool_registry::ToolChain;
-    use astra_runtime::tool_registry::chain::ChainStep;
+    use astra_turn_core::tool_registry_chain::ChainStep;
 
     let dir = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(dir.path());

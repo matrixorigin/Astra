@@ -30,7 +30,7 @@ pub use astra_server_types::team_orchestrator_types::{
 };
 use astra_server_types::warn_persist;
 
-use super::worktree_isolation::{MergeResult, RepoLock, WorktreeManager};
+use astra_server_types::worktree_isolation::{MergeResult, RepoLock, WorktreeManager};
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -84,7 +84,7 @@ impl TeamExecutionOrchestrator {
             run_engine,
             profile_registry,
             config,
-            repo_lock: super::worktree_isolation::new_repo_lock(),
+            repo_lock: astra_server_types::worktree_isolation::new_repo_lock(),
             conflict_resolver: None,
         }
     }
@@ -1202,7 +1202,7 @@ mod tests {
                 source_agent_id: "o".to_string(),
                 progress: None,
             },
-            repo_lock: super::super::worktree_isolation::new_repo_lock(),
+            repo_lock: astra_server_types::worktree_isolation::new_repo_lock(),
             conflict_resolver: None,
         };
 

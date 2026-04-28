@@ -32,15 +32,15 @@ fn sync_liquid_tactical_runtime(
     if let Some(ref mut collector) = state.step_signal_collector {
         collector.reset(turn_token_budget);
     } else {
-        state.step_signal_collector = Some(crate::liquid::step_signals::StepSignalCollector::new(
-            crate::liquid::step_signals::StepSignalConfig::default(),
+        state.step_signal_collector = Some(astra_turn_core::liquid_step_signals::StepSignalCollector::new(
+            astra_turn_core::liquid_step_signals::StepSignalConfig::default(),
             turn_token_budget,
         ));
     }
 
     if state.tactical_adapter.is_none() {
-        state.tactical_adapter = Some(crate::liquid::tactical::TacticalAdapter::new(
-            crate::liquid::tactical::DampenerConfig::default(),
+        state.tactical_adapter = Some(astra_turn_core::liquid_tactical::TacticalAdapter::new(
+            astra_turn_core::liquid_tactical::DampenerConfig::default(),
         ));
     }
 }
@@ -71,27 +71,27 @@ fn looks_like_debug_query(message: &str) -> bool {
 
 fn fallback_scenario_from_routing(
     message: &str,
-    task_profile: crate::turn::chat_turn_heuristics::TaskExecutionProfile,
+    task_profile: astra_turn_core::chat_turn_heuristics::TaskExecutionProfile,
     task_type: crate::pipeline::routing::TaskType,
-) -> Option<crate::user_profile::Scenario> {
+) -> Option<astra_config::user_profile::Scenario> {
     if !task_profile.mutates_workspace && looks_like_code_review_query(message) {
-        return Some(crate::user_profile::Scenario::CodeReview);
+        return Some(astra_config::user_profile::Scenario::CodeReview);
     }
     if !task_profile.mutates_workspace && looks_like_debug_query(message) {
-        return Some(crate::user_profile::Scenario::Debugging);
+        return Some(astra_config::user_profile::Scenario::Debugging);
     }
 
     match task_type {
         crate::pipeline::routing::TaskType::Code | crate::pipeline::routing::TaskType::Mutate
             if task_profile.mutates_workspace =>
         {
-            Some(crate::user_profile::Scenario::Implementation)
+            Some(astra_config::user_profile::Scenario::Implementation)
         }
         crate::pipeline::routing::TaskType::Code
         | crate::pipeline::routing::TaskType::Reasoning
         | crate::pipeline::routing::TaskType::Fetch
         | crate::pipeline::routing::TaskType::Mutate => {
-            Some(crate::user_profile::Scenario::Exploration)
+            Some(astra_config::user_profile::Scenario::Exploration)
         }
         _ => None,
     }
@@ -99,7 +99,7 @@ fn fallback_scenario_from_routing(
 
 pub(crate) fn apply_tactical_actions(
     state: &mut AgenticLoopState,
-    step_actions: &[crate::liquid::tactical::TacticalAction],
+    step_actions: &[astra_turn_core::liquid_tactical::TacticalAction],
 ) -> Vec<String> {
     let session = state.telemetry.observability_session.clone();
     let mut session_guard = session.as_ref().and_then(|s| s.write().ok());
@@ -107,7 +107,7 @@ pub(crate) fn apply_tactical_actions(
 
     for action in step_actions {
         match action {
-            crate::liquid::tactical::TacticalAction::IncreaseVerification { reason } => {
+            astra_turn_core::liquid_tactical::TacticalAction::IncreaseVerification { reason } => {
                 let mut suffix = String::new();
                 if let Some(guard) = session_guard.as_mut() {
                     let old = guard.config.verification.strictness;
@@ -119,14 +119,14 @@ pub(crate) fn apply_tactical_actions(
                 }
                 hint_parts.push(format!("⚠️ {reason}{suffix}"));
             }
-            crate::liquid::tactical::TacticalAction::SuggestToolSwitch { from_tool, reason } => {
+            astra_turn_core::liquid_tactical::TacticalAction::SuggestToolSwitch { from_tool, reason } => {
                 state.turn_guard.health.force_deprioritize(from_tool);
                 hint_parts.push(format!(
                     "💡 Consider switching from '{}': {} (deprioritized for follow-up selection)",
                     from_tool, reason
                 ));
             }
-            crate::liquid::tactical::TacticalAction::TokenBudgetWarning { used, budget } => {
+            astra_turn_core::liquid_tactical::TacticalAction::TokenBudgetWarning { used, budget } => {
                 let baseline = state
                     .tool_budget_override
                     .or_else(|| {
@@ -161,7 +161,7 @@ pub(crate) fn apply_tactical_actions(
                     suffix
                 ));
             }
-            crate::liquid::tactical::TacticalAction::ThrottleHint { reason } => {
+            astra_turn_core::liquid_tactical::TacticalAction::ThrottleHint { reason } => {
                 let mut suffix = String::new();
                 if let Some(guard) = session_guard.as_mut() {
                     let old = guard.config.token_budget.max_turn_input_tokens;
@@ -174,7 +174,7 @@ pub(crate) fn apply_tactical_actions(
                 }
                 hint_parts.push(format!("🐢 {reason}{suffix}"));
             }
-            crate::liquid::tactical::TacticalAction::NoOp => {}
+            astra_turn_core::liquid_tactical::TacticalAction::NoOp => {}
         }
     }
 
@@ -196,8 +196,8 @@ pub(crate) fn apply_tactical_actions(
 
 fn carry_forward_tactical_runtime_mutations(
     state: &AgenticLoopState,
-    previous_config: &crate::runtime_config::RuntimeConfig,
-    next_config: &mut crate::runtime_config::RuntimeConfig,
+    previous_config: &astra_config::runtime_config::RuntimeConfig,
+    next_config: &mut astra_config::runtime_config::RuntimeConfig,
 ) {
     next_config.verification.strictness = next_config
         .verification
@@ -251,7 +251,7 @@ pub(crate) fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
         return;
     }
 
-    let mut detector = crate::user_profile::ScenarioDetector::new();
+    let mut detector = astra_config::user_profile::ScenarioDetector::new();
     for query in &session_guard.recent_queries {
         detector.observe_query(query);
     }
@@ -286,7 +286,7 @@ pub(crate) fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
     let old_scenario = session_guard.profile.current_scenario;
 
     let mut profile =
-        crate::execution_profile::ExecutionProfile::from_base(session_guard.config.clone());
+        astra_config::execution_profile::ExecutionProfile::from_base(session_guard.config.clone());
 
     if let Some((scenario, confidence)) = detector.detect() {
         profile.apply_scenario(scenario);
@@ -639,16 +639,16 @@ pub(crate) fn apply_per_turn_adaptation(state: &mut AgenticLoopState, turn_token
 }
 
 fn runtime_promotion_recommendation(
-    recommendation: crate::evolution::types::ProposalPromotionRecommendation,
+    recommendation: astra_evolution::types::ProposalPromotionRecommendation,
 ) -> RuntimePromotionRecommendation {
     match recommendation {
-        crate::evolution::types::ProposalPromotionRecommendation::Promote => {
+        astra_evolution::types::ProposalPromotionRecommendation::Promote => {
             RuntimePromotionRecommendation::Promote
         }
-        crate::evolution::types::ProposalPromotionRecommendation::Canary => {
+        astra_evolution::types::ProposalPromotionRecommendation::Canary => {
             RuntimePromotionRecommendation::Canary
         }
-        crate::evolution::types::ProposalPromotionRecommendation::Hold => {
+        astra_evolution::types::ProposalPromotionRecommendation::Hold => {
             RuntimePromotionRecommendation::Hold
         }
     }
@@ -668,7 +668,7 @@ fn record_runtime_promotion_event(state: &mut AgenticLoopState, event: RuntimePr
 fn record_evolution_proposal_event(
     state: &mut AgenticLoopState,
     outcome: RuntimePromotionOutcome,
-    proposal: &crate::evolution::types::EvolutionProposal,
+    proposal: &astra_evolution::types::EvolutionProposal,
 ) {
     let Some(verdict) = proposal.promotion_verdict.as_ref() else {
         return;
@@ -699,7 +699,7 @@ pub(crate) async fn snapshot_evolution_promotion_ids(
 ) -> (
     HashSet<String>,
     HashSet<String>,
-    HashMap<String, crate::evolution::types::EvolutionProposal>,
+    HashMap<String, astra_evolution::types::EvolutionProposal>,
     HashSet<String>,
 ) {
     let pending = evo
@@ -734,7 +734,7 @@ pub(crate) async fn record_new_evolution_promotion_events(
     evo: &crate::evolution::service::EvolutionService,
     pending_before: &HashSet<String>,
     applied_before: &HashSet<String>,
-    canary_before: &HashMap<String, crate::evolution::types::EvolutionProposal>,
+    canary_before: &HashMap<String, astra_evolution::types::EvolutionProposal>,
     resolved_before: &HashSet<String>,
 ) {
     for proposal in evo.pending().await {
@@ -764,10 +764,10 @@ pub(crate) async fn record_new_evolution_promotion_events(
             continue;
         }
         let outcome = match proposal.status {
-            crate::evolution::types::ApprovalStatus::CanaryPromoted => {
+            astra_evolution::types::ApprovalStatus::CanaryPromoted => {
                 RuntimePromotionOutcome::CanaryPromoted
             }
-            crate::evolution::types::ApprovalStatus::CanaryRolledBack => {
+            astra_evolution::types::ApprovalStatus::CanaryRolledBack => {
                 RuntimePromotionOutcome::CanaryRolledBack
             }
             _ => continue,
@@ -804,7 +804,7 @@ pub(crate) fn record_loop_completion_feedback(
     state: &mut AgenticLoopState,
     result: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
 ) {
-    use crate::auto_tuning::{FeedbackSignal, SignalType};
+    use astra_learning::auto_tuning::{FeedbackSignal, SignalType};
 
     let hub = match &state.telemetry.observability_hub {
         Some(h) => h,
@@ -986,7 +986,7 @@ pub(crate) fn record_loop_completion_feedback(
             .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
         if has_prior_assistant && !state.message.is_empty() {
             let lower = state.message.to_lowercase();
-            let is_correction = crate::evolution::signal_collector::CORRECTION_KEYWORDS
+            let is_correction = astra_evolution::signal_collector::CORRECTION_KEYWORDS
                 .iter()
                 .any(|kw| lower.contains(kw));
             if !is_correction {
@@ -1123,7 +1123,7 @@ pub(crate) fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
     }
 
     // Persist feedback state after each tuning cycle
-    if let Err(e) = crate::auto_tuning::save_feedback("default", hub.tuning()) {
+    if let Err(e) = astra_learning::auto_tuning::save_feedback("default", hub.tuning()) {
         tracing::warn!(
             target: "astra_runtime::auto_tuning",
             err = %e,
@@ -1156,8 +1156,8 @@ fn write_session_journal_event(
 mod tests {
     use super::fallback_scenario_from_routing;
     use crate::pipeline::routing::TaskType;
-    use crate::turn::chat_turn_heuristics::infer_task_execution_profile;
-    use crate::user_profile::Scenario;
+    use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
+    use astra_config::user_profile::Scenario;
 
     #[test]
     fn review_like_analysis_query_prefers_code_review_over_implementation_fallback() {

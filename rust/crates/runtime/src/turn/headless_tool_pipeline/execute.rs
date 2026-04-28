@@ -1,19 +1,19 @@
 use std::time::Instant;
 
 use super::super::agentic_headless_round::HeadlessStderrStyle;
-use super::super::headless_tool_assembly::READ_ONLY_TOOLS;
-use super::super::headless_tool_postprocess::{
+use astra_turn_core::headless_tool_assembly::READ_ONLY_TOOLS;
+use astra_turn_core::headless_tool_postprocess::{
     HeadlessOutputEnrichSignal, append_headless_result_quality_feedback,
     enrich_headless_tool_output_for_errors_and_limits,
 };
-use super::super::headless_tool_stderr_lines::{
+use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_resource_limit_blocked, headless_stderr_resource_limit_in_output,
 };
-use super::super::hydrate_reflect::hydrate_reflect_placeholder_if_needed;
+use astra_turn_core::hydrate_reflect::hydrate_reflect_placeholder_if_needed;
 use super::*;
 use crate::turn::agentic_loop_tool_support::edge_tool_status_exit_code;
-use crate::turn::edge_prompt_context::make_args_preview;
-use crate::turn::tool_result_semantics::is_tool_error;
+use astra_turn_core::edge_prompt_context::make_args_preview;
+use astra_turn_core::tool_result_semantics::is_tool_error;
 
 /// The sentinel error prefix emitted by `take_edge_output_for_tool_call_with_duration`
 /// when no edge agent matched the tool call.
@@ -142,7 +142,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         // Record outcome under the canonical `(tool, args)` signature so
         // later turns can consult prior attempts before repeating work.
-        let outcome_sig = crate::turn::tool_result_semantics::tool_dedup_signature(
+        let outcome_sig = astra_turn_core::tool_result_semantics::tool_dedup_signature(
             &execution.name,
             &execution.args,
         );

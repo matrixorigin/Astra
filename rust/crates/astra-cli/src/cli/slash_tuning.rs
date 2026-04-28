@@ -11,11 +11,11 @@
 // /tuning help            - Show help
 
 use super::*;
-use astra_runtime::auto_tuning::{
+use astra_learning::auto_tuning::{
     AlertSeverity, AutoTuningEngine, EvolutionAction, EvolutionRule, EvolutionTrigger,
     FeedbackSignal, RollbackCondition, RuleExecution, Sentiment, SignalType,
 };
-use astra_runtime::runtime_config::RuntimeConfig;
+use astra_config::runtime_config::RuntimeConfig;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;

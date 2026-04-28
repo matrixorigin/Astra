@@ -18,7 +18,7 @@ use axum::http::StatusCode;
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex as TokioMutex, RwLock, mpsc};
 
-use super::ws_progress_callback::ProgressEvent;
+use astra_server_types::ws_progress_callback::ProgressEvent;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -36,7 +36,7 @@ use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
 use crate::evolution::service::EvolutionService;
 use crate::observability_integration::ObservabilityHub;
-use crate::pipeline::step_recorder::StepRecorder;
+use astra_pipeline::step_recorder::StepRecorder;
 use crate::turn::agentic_loop_host::{
     AgenticLoopOutcome, AgenticLoopState, CancellationState, ContextTracePersistenceContext,
     EvaluationPersistenceContext, MessagingState, RequestConstraints, SkillState, StopHookState,
@@ -383,7 +383,7 @@ fn build_server_skill_executor(
     request_constraints: RequestConstraints,
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
     session_id: &str,
-    edge_connection_pool: Option<&super::edge_connection_pool::EdgeConnectionPool>,
+    edge_connection_pool: Option<&astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
 ) -> Option<Arc<dyn crate::skills::traits::SkillExecutor>> {
     use super::server_skill_subrun::ServerSkillSubRunExecutor;
@@ -413,7 +413,7 @@ fn build_server_skill_executor(
 }
 
 pub(crate) fn has_turn_verdict_warning(
-    verdict_events: &[crate::turn::agentic_verdict_audit::AgenticVerdictAuditEvent],
+    verdict_events: &[astra_turn_core::agentic_verdict_audit::AgenticVerdictAuditEvent],
 ) -> bool {
     verdict_events.iter().any(|event| {
         event.severity.eq_ignore_ascii_case("warning")
@@ -518,7 +518,7 @@ fn build_runtime_evaluation_service(
 
 fn seed_restricted_tools_from_blocked_patterns(
     loop_state: &mut AgenticLoopState,
-    pattern_library: &crate::pipeline::pattern::PatternLibrary,
+    pattern_library: &astra_pipeline::pattern::PatternLibrary,
 ) {
     for name in pattern_library.blocked_tool_names() {
         loop_state.restricted_tools.insert(name);
@@ -1169,7 +1169,7 @@ fn extract_prev_assistant_text(messages: &[serde_json::Value]) -> Option<String>
 fn build_run_turn_complete_event_with_interruption(
     total_tool_calls: u32,
     final_text: &str,
-    interruption: Option<&crate::turn::interruption::InterruptionRecord>,
+    interruption: Option<&astra_turn_core::interruption::InterruptionRecord>,
 ) -> Value {
     let execution_state = interruption.map(|record| {
         serde_json::json!({
@@ -1188,7 +1188,7 @@ fn build_run_turn_complete_event_with_interruption(
     Value::Object(astra_turn_core::complete::build_turn_complete_event(
         total_tool_calls > 0,
         interruption.is_some(),
-        &crate::turn::stall::DivergenceStatus::Healthy,
+        &astra_turn_core::stall::DivergenceStatus::Healthy,
         execution_state,
         (!final_text.is_empty()).then_some(final_text),
     ))
@@ -1355,7 +1355,7 @@ pub struct AgenticRunLifecycleService {
     resource_governor:
         Option<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>>,
     /// Live edge WebSocket connection pool (Phase 6).
-    edge_connection_pool: Option<super::edge_connection_pool::EdgeConnectionPool>,
+    edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     /// Optional database skill provider for runtime skill resolution.
     skill_service: Option<Arc<dyn SkillService>>,
     /// Lazily initialized server skill registry + resolver bundle.
@@ -1430,7 +1430,7 @@ impl AgenticRunLifecycleService {
 
     pub fn with_edge_connection_pool(
         mut self,
-        pool: super::edge_connection_pool::EdgeConnectionPool,
+        pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
     ) -> Self {
         self.edge_connection_pool = Some(pool);
         self
@@ -1830,10 +1830,10 @@ impl AgenticRunLifecycleService {
         workspace_override: Option<&std::path::Path>,
         cancel_token: Option<Arc<CancellationToken>>,
     ) -> AgenticLoopState {
-        use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
-        use crate::semantic_dedup::SemanticDedup;
-        use crate::turn::chat_turn_heuristics::infer_task_execution_profile;
-        use crate::turn::stop_hooks_yaml::{
+        use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
+        use astra_text_utils::semantic_dedup::SemanticDedup;
+        use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
+        use astra_turn_core::stop_hooks_yaml::{
             detect_turn_hook_sets, is_plan_subtask_from_chat_context, project_root_for_stop_hooks,
         };
 
@@ -1852,7 +1852,7 @@ impl AgenticRunLifecycleService {
             request_constraints.allowed_skills.as_ref(),
         )
         .expect("request allow_skills should be validated before state build");
-        use crate::turn::turn_guard::TurnGuard;
+        use astra_turn_core::turn_guard::TurnGuard;
 
         let user_message = json!({
             "role": "user",
@@ -1921,7 +1921,7 @@ impl AgenticRunLifecycleService {
             cancel_token,
         );
 
-        let resolved_tool_policy = crate::runtime_config::RuntimeConfig::load()
+        let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_selection
             .resolve_for_model(request.model.as_deref());
 
@@ -1974,7 +1974,7 @@ impl AgenticRunLifecycleService {
                 executor: skill_executor,
                 request_constraints,
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
+                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
                 search: skill_search,
                 tool_event_hooks,
                 session_event_hooks,
@@ -2026,7 +2026,7 @@ impl AgenticRunLifecycleService {
             interruption: None,
             session_facts: Default::default(),
             continuity: runtime_continuity.unwrap_or_default(),
-            compact_strategy: crate::turn::microcompact::CompactStrategy::from_provider_hint(
+            compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
                 request.model.as_deref().unwrap_or(""),
             ),
             approval_overrides: None,
@@ -2068,9 +2068,9 @@ impl AgenticRunLifecycleService {
         session_id: &str,
     ) -> Result<
         Option<astra_turn_types::continuity::ContinuityState>,
-        crate::pipeline::step_restore::RestoreError,
+        astra_pipeline::step_restore::RestoreError,
     > {
-        match crate::pipeline::step_restore::restore_session_with_continuity_validator(
+        match astra_pipeline::step_restore::restore_session_with_continuity_validator(
             session_id,
             |value| {
                 astra_turn_types::continuity::try_from_checkpoint_value(value)
@@ -2086,8 +2086,8 @@ impl AgenticRunLifecycleService {
                 }
             }
             Ok(None) => {}
-            Err(crate::pipeline::step_restore::RestoreError::IoError(error)) => {
-                return Err(crate::pipeline::step_restore::RestoreError::IoError(error));
+            Err(astra_pipeline::step_restore::RestoreError::IoError(error)) => {
+                return Err(astra_pipeline::step_restore::RestoreError::IoError(error));
             }
             Err(error) => {
                 tracing::warn!(
@@ -2433,7 +2433,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             // ── Phase E: Wire WebSocket approval gate ───────────────
             let (approval_tx, approval_rx) = mpsc::unbounded_channel();
-            let approval_gate = super::ws_approval_gate::WebSocketApprovalGate::new(
+            let approval_gate = astra_turn_core::ws_approval_gate::WebSocketApprovalGate::new(
                 user_id.clone(),
                 self.edge_callback_ledger.clone(),
                 approval_tx,
@@ -2446,7 +2446,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             if request.interactive_client {
                 let (user_prompt_tx, user_prompt_rx) = mpsc::unbounded_channel();
-                let user_prompt_gate = super::ws_user_prompt_gate::WebSocketUserPromptGate::new(
+                let user_prompt_gate = astra_turn_core::ws_user_prompt_gate::WebSocketUserPromptGate::new(
                     user_id.clone(),
                     self.edge_callback_ledger.clone(),
                     user_prompt_tx,
@@ -2461,7 +2461,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             // ── Phase F.3: Wire WebSocket progress callback ─────────
             let (progress_tx, progress_rx) = mpsc::unbounded_channel();
             let progress_cb =
-                super::ws_progress_callback::WebSocketProgressCallback::new(progress_tx);
+                astra_server_types::ws_progress_callback::WebSocketProgressCallback::new(progress_tx);
             executor.set_progress_callback(std::sync::Arc::new(progress_cb));
             self.progress_channels
                 .lock()
@@ -3406,7 +3406,7 @@ pub struct ServerSubRunExecutor {
     encryptor: Arc<FernetTokenEncryptor>,
     shared_pool: Option<SharedPool>,
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
-    edge_connection_pool: Option<super::edge_connection_pool::EdgeConnectionPool>,
+    edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     skill_service: Option<Arc<dyn SkillService>>,
     skill_resolver_cache: std::sync::OnceLock<ServerSkillResolverBundle>,
 }
@@ -3435,7 +3435,7 @@ impl ServerSubRunExecutor {
 
     pub fn with_edge_connection_pool(
         mut self,
-        pool: super::edge_connection_pool::EdgeConnectionPool,
+        pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
     ) -> Self {
         self.edge_connection_pool = Some(pool);
         self
@@ -3479,17 +3479,17 @@ impl SubRunExecutor for ServerSubRunExecutor {
         &self,
         config: SubRunConfig,
     ) -> Result<astra_services::coordination::AgentResult, String> {
-        use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
-        use crate::semantic_dedup::SemanticDedup;
-        use crate::turn::chat_turn_heuristics::infer_task_execution_profile;
-        use crate::turn::stop_hooks_yaml::{
+        use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
+        use astra_text_utils::semantic_dedup::SemanticDedup;
+        use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
+        use astra_turn_core::stop_hooks_yaml::{
             detect_turn_hook_sets, is_plan_subtask_from_delegation_context,
             project_root_from_delegation_context,
         };
-        use crate::turn::turn_guard::TurnGuard;
+        use astra_turn_core::turn_guard::TurnGuard;
 
         // Build edge profile from agent's system prompt and metadata.
-        let compact_strategy = crate::turn::microcompact::CompactStrategy::from_provider_hint(
+        let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
             config.agent_profile.model_override.as_deref().unwrap_or(""),
         );
         let mut edge_profile = Map::new();
@@ -3563,7 +3563,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
 
         // Sub-agent / delegation path: model comes from the agent profile
         // override, not a request field.
-        let resolved_tool_policy = crate::runtime_config::RuntimeConfig::load()
+        let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_selection
             .resolve_for_model(config.agent_profile.model_override.as_deref());
 
@@ -3612,7 +3612,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 resolver: skill_resolver,
                 request_constraints: config.request_constraints.clone(),
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
+                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
                 search: skill_search_from_context(&config.context),
                 tool_event_hooks,
                 session_event_hooks,
@@ -3927,10 +3927,10 @@ mod tests {
 
     #[test]
     fn build_run_turn_complete_event_marks_interrupted_turns() {
-        let interruption = crate::turn::interruption::InterruptionRecord::new(
-            crate::turn::interruption::InterruptionKind::BudgetExhausted,
-            crate::turn::interruption::ResumeAction::ContinueImmediately,
-            crate::turn::interruption::InterruptionStateSummary {
+        let interruption = astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+            astra_turn_core::interruption::InterruptionStateSummary {
                 has_checkpoint: true,
                 tool_calls_completed: 7,
                 turns_completed: 15,
@@ -4443,7 +4443,7 @@ mod tests {
         state.telemetry.first_budget_pressure = 0.27;
         state.stall.events.push(("repetition_stall".into(), 1));
         state.stall.verdict_events.push(
-            crate::turn::agentic_verdict_audit::AgenticVerdictAuditEvent {
+            astra_turn_core::agentic_verdict_audit::AgenticVerdictAuditEvent {
                 turn: 1,
                 severity: "warning".into(),
                 injections: vec!["stall detected".into()],
@@ -4493,7 +4493,7 @@ mod tests {
         let svc = test_service();
         let request = test_request("inspect blocked tools");
         let mut state = svc.build_initial_state(&request, "session-1", "run-1", None, None);
-        let mut pattern_library = crate::pipeline::pattern::PatternLibrary::new();
+        let mut pattern_library = astra_pipeline::pattern::PatternLibrary::new();
 
         // One success so the pattern exists, then Block adds 5 failures.
         // Total: success=1, failure=5, rate=5/6=0.833 > 0.8 → blocked.
@@ -4507,7 +4507,7 @@ mod tests {
         );
         pattern_library.apply_evolution_action(
             "some_custom_tool",
-            crate::evolution::types::PatternAction::Block,
+            astra_evolution::types::PatternAction::Block,
         );
 
         seed_restricted_tools_from_blocked_patterns(&mut state, &pattern_library);
@@ -4564,10 +4564,10 @@ mod tests {
         let request = test_request("partial");
         let mut state = svc.build_initial_state(&request, "session-1", "run-1", None, None);
         state.final_text = "[Round budget hard-limit reached]".to_string();
-        state.interruption = Some(crate::turn::interruption::InterruptionRecord::new(
-            crate::turn::interruption::InterruptionKind::BudgetExhausted,
-            crate::turn::interruption::ResumeAction::ContinueImmediately,
-            crate::turn::interruption::InterruptionStateSummary {
+        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+            astra_turn_core::interruption::InterruptionStateSummary {
                 has_checkpoint: true,
                 tool_calls_completed: 5,
                 turns_completed: 15,

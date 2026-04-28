@@ -6,7 +6,5 @@
 
 pub mod promotion_gate;
 pub mod service;
-pub mod signal_collector;
-pub mod store;
-pub mod types;
-pub mod evolver;
+pub use astra_evolution::store;
+pub use astra_evolution::types;

@@ -26,7 +26,7 @@ pub fn build_agentic_tool_selection_context<'a>(
     outcome_bias: HashMap<String, f64>,
     _follow_up_tool_round: bool,
     tool_budget_override: Option<u32>,
-    previous_confidence_fallback: Option<crate::turn::confidence_contract::ConfidenceFallback>,
+    previous_confidence_fallback: Option<astra_turn_core::confidence_contract::ConfidenceFallback>,
 ) -> SelectionContext<'a> {
     let turn_count = history_pair_count as u32 + 1;
     let base = tool_budget_override

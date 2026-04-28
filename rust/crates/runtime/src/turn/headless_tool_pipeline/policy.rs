@@ -1,17 +1,17 @@
 use astra_core::agent_warn;
 
 use super::super::agentic_headless_round::HeadlessStderrStyle;
-use super::super::headless_tool_assembly::{
+use astra_turn_core::headless_tool_assembly::{
     READ_ONLY_TOOLS, headless_idempotency_hit_openai_pair,
     headless_openai_duplicate_within_turn_pair, headless_unknown_local_tool_openai_pair,
     openai_tool_roundtrip_values, unknown_local_tool_error_message,
 };
-use super::super::headless_tool_body_preview::emit_headless_tool_body_preview;
-use super::super::headless_tool_journal::{
+use astra_turn_core::headless_tool_body_preview::emit_headless_tool_body_preview;
+use astra_turn_core::headless_tool_journal::{
     journal_record_blocked_tool, journal_record_cross_turn_cache_hit,
     journal_record_duplicate_within_turn, journal_record_unknown_tool,
 };
-use super::super::headless_tool_stderr_lines::{
+use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_cache_hit_line, headless_stderr_unknown_tool_detail,
     headless_stderr_unknown_tool_header,
 };
@@ -19,8 +19,8 @@ use super::super::permission_gate::{
     PermissionCheckResult, check_tool_permission, permission_denied_error_result,
 };
 use super::*;
-use crate::turn::edge_prompt_context::make_args_preview;
-use crate::turn::tool_result_semantics::tool_dedup_signature;
+use astra_turn_core::edge_prompt_context::make_args_preview;
+use astra_turn_core::tool_result_semantics::tool_dedup_signature;
 
 const OUTCOME_MEMORY_FAILURE_BLOCK_WINDOW: usize = 2;
 const OUTCOME_MEMORY_FAILURE_BLOCK_MAX_AGE_SECS: u64 = 60 * 60;
@@ -31,7 +31,7 @@ const REASON_REPEATED_CACHE_HIT_SUPPRESSED: &str = "repeated_cache_hit_suppresse
 
 fn emit_blocked_tool_result(
     blocked: HeadlessBlockedTool<'_>,
-    step_recorder: &mut crate::pipeline::step_recorder::StepRecorder,
+    step_recorder: &mut astra_pipeline::step_recorder::StepRecorder,
     quiet: bool,
     term: &mut dyn HeadlessRoundTerminal,
     messages: &mut Vec<Value>,
@@ -61,7 +61,7 @@ fn emit_blocked_tool_result(
 }
 
 fn trace_short_circuit_tool_skip(
-    step_recorder: &mut crate::pipeline::step_recorder::StepRecorder,
+    step_recorder: &mut astra_pipeline::step_recorder::StepRecorder,
     tool_id: &str,
     tool_name: &str,
     reason: &str,
@@ -637,7 +637,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 }
 
 fn should_block_from_outcome_memory(
-    health: &crate::turn::tool_health::ToolHealthTracker,
+    health: &astra_turn_core::tool_health::ToolHealthTracker,
     call_sig: &str,
 ) -> Option<usize> {
     let history = health.outcome_history(call_sig)?;

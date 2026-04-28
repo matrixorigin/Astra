@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 
-use super::meta::ToolMeta;
+use astra_turn_core::tool_registry_meta::ToolMeta;
 
 /// Sort tool schemas alphabetically by `function.name` for prompt-cache stability.
 pub(super) fn sort_schemas_by_name(schemas: &mut [Value]) {

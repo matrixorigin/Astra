@@ -2138,11 +2138,11 @@ fn execute_config_command(cmd: ConfigCmd) -> Result<(), String> {
 }
 
 fn config_show_policy(model: Option<&str>, json: bool) -> Result<(), String> {
-    let cfg = astra_runtime::runtime_config::RuntimeConfig::load();
+    let cfg = astra_config::runtime_config::RuntimeConfig::load();
     let policy = cfg.tool_selection.resolve_for_model(model);
     let trust_mode = match cfg.safety.resolved_trust_mode() {
-        astra_runtime::runtime_config::TrustModeSerde::Strict => "strict",
-        astra_runtime::runtime_config::TrustModeSerde::Trusted => "trusted",
+        astra_config::runtime_config::TrustModeSerde::Strict => "strict",
+        astra_config::runtime_config::TrustModeSerde::Trusted => "trusted",
     };
     let rejected = cfg.tool_selection.rejected_model_match_patterns();
     println!(
@@ -2163,7 +2163,7 @@ fn config_show_policy(model: Option<&str>, json: bool) -> Result<(), String> {
 /// non-empty, they're surfaced so users can spot misconfigs.
 fn format_policy_output(
     model: Option<&str>,
-    policy: &astra_runtime::runtime_config::EffectiveToolPolicy,
+    policy: &astra_config::runtime_config::EffectiveToolPolicy,
     trust_mode: &str,
     rejected_patterns: &[String],
     json: bool,
@@ -2875,7 +2875,7 @@ mod arg_render_tests {
 #[cfg(test)]
 mod show_policy_tests {
     use super::*;
-    use astra_runtime::runtime_config::EffectiveToolPolicy;
+    use astra_config::runtime_config::EffectiveToolPolicy;
 
     fn fake_policy() -> EffectiveToolPolicy {
         EffectiveToolPolicy {
@@ -2954,7 +2954,7 @@ mod show_policy_tests {
         // wiring works — not just the string formatter. Opus's built-in
         // profile is 4 / 20 / 4 / 3 (see
         // `ToolSelectionConfig::builtin_model_profiles`).
-        let cfg = astra_runtime::runtime_config::RuntimeConfig::load();
+        let cfg = astra_config::runtime_config::RuntimeConfig::load();
         let policy = cfg.tool_selection.resolve_for_model(Some("opus"));
         let human = format_policy_output(Some("opus"), &policy, "strict", &[], false);
         assert!(human.contains("= 4"), "expected 4s for opus: {human}");

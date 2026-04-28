@@ -15,7 +15,7 @@ use astra_runtime::pipeline::{
     learning::PipelineLearningWriter,
     routing::{DomainHint, TaskType},
 };
-use astra_runtime::turn::approval_fingerprint::{ApprovalFingerprint, DenialAction, DenialTracker};
+use astra_turn_core::approval_fingerprint::{ApprovalFingerprint, DenialAction, DenialTracker};
 use astra_runtime::turn::implicit_feedback::{
     detect_implicit_feedback_signal, implicit_feedback_context_injection, implicit_feedback_rating,
 };

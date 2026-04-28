@@ -17,13 +17,13 @@ use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
 
-use crate::auto_tuning::{FeedbackSignal, SignalType};
-use crate::runtime_config::RuntimeConfig;
-use crate::str_preview::truncate_str;
-use crate::turn::context_assembly_trace::TokenBudgetTrace;
-use crate::turn::goal_tracker::{GoalProgress, Milestone};
-use crate::turn::tool_health::ToolHealthTracker;
-use crate::user_profile::Scenario;
+use astra_learning::auto_tuning::{FeedbackSignal, SignalType};
+use astra_config::runtime_config::RuntimeConfig;
+use astra_text_utils::str_preview::truncate_str;
+use astra_turn_core::context_assembly_trace::TokenBudgetTrace;
+use astra_turn_core::goal_tracker::{GoalProgress, Milestone};
+use astra_turn_core::tool_health::ToolHealthTracker;
+use astra_config::user_profile::Scenario;
 
 // ─── Core Self-Model ────────────────────────────────────────────────────────
 
@@ -1170,7 +1170,7 @@ fn signal_type_display(st: &SignalType) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_config::RuntimeConfig;
+    use astra_config::runtime_config::RuntimeConfig;
 
     #[test]
     fn snapshot_minimal() {
@@ -1339,7 +1339,7 @@ mod tests {
         let mut health = ToolHealthTracker::new();
         health.record_outcome(
             r#"bash:{"command":"pwd"}"#,
-            crate::turn::tool_health::ToolOutcome {
+            astra_turn_core::tool_health::ToolOutcome {
                 success: true,
                 latency_ms: 9,
                 result_hash: 11,
@@ -1349,7 +1349,7 @@ mod tests {
         );
         health.record_outcome(
             r#"grep:{"pattern":"TODO"}"#,
-            crate::turn::tool_health::ToolOutcome {
+            astra_turn_core::tool_health::ToolOutcome {
                 success: false,
                 latency_ms: 12,
                 result_hash: 22,

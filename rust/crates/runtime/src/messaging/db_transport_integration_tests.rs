@@ -18,7 +18,7 @@ mod tests {
         DatabaseTransport, ensure_schema, mark_direct_failed_by_identity,
     };
     use crate::messaging::transport::MessageTransport;
-    use crate::messaging::types::*;
+    use astra_messaging::types::*;
     use sqlx::Row;
 
     fn addr(run: &str, agent: &str) -> AgentAddress {

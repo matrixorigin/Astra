@@ -14,16 +14,16 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::{Value, json};
 
-    use crate::messaging::in_process::InProcessTransport;
-    use crate::messaging::router::AgentMailboxRouter;
-    use crate::messaging::types::*;
+    use astra_messaging::in_process::InProcessTransport;
+    use astra_messaging::router::AgentMailboxRouter;
+    use astra_messaging::types::*;
     use crate::orchestration::permission_sync::{
         InheritedPermissions, PermissionMode, PermissionRequest, PermissionRequestMessaging,
         PermissionResponse, PermissionResponseMessaging, PermissionSyncContext,
     };
-    use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
-    use crate::pipeline::step_recorder::StepRecorder;
-    use crate::semantic_dedup::SemanticDedup;
+    use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
+    use astra_pipeline::step_recorder::StepRecorder;
+    use astra_text_utils::semantic_dedup::SemanticDedup;
     use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
     use crate::turn::agentic_headless_round::{
         HeadlessStderrStyle, HeadlessToolRoundCtx, NoopHeadlessTerminal,
@@ -32,10 +32,10 @@ mod tests {
     use crate::turn::agentic_loop_host::{
         AgenticLoopHost, AgenticLoopState, HostTurnResult, run_agentic_loop_with_host,
     };
-    use crate::turn::chat_turn_heuristics::TaskExecutionProfile;
-    use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
-    use crate::turn::sse_stream_host::EdgeToolExecResult;
-    use crate::turn::turn_guard::TurnGuard;
+    use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
+    use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
+    use astra_turn_core::sse_stream_host::EdgeToolExecResult;
+    use astra_turn_core::turn_guard::TurnGuard;
 
     // ── Mock Host ───────────────────────────────────────────────────────────
 
@@ -170,7 +170,7 @@ mod tests {
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.95),
             call_counts: HashMap::new(),
-            max_identical_tool_calls: crate::runtime_config::RuntimeConfig::load()
+            max_identical_tool_calls: astra_config::runtime_config::RuntimeConfig::load()
                 .tool_selection
                 .effective_max_identical_calls(),
             max_tools_per_turn: 15,
@@ -232,8 +232,8 @@ mod tests {
 
     async fn setup_two_agents() -> (
         Arc<AgentMailboxRouter>,
-        crate::messaging::router::AgentMailbox,
-        crate::messaging::router::AgentMailbox,
+        astra_messaging::router::AgentMailbox,
+        astra_messaging::router::AgentMailbox,
         Arc<DelegationTracker>,
     ) {
         let transport = Arc::new(InProcessTransport::new());

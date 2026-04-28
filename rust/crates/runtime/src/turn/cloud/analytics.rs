@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use super::compaction::{CompactBoundary, CompactTrigger};
 use crate::prompts::CompactionTier;
-use crate::str_preview::truncate_str;
+use astra_text_utils::str_preview::truncate_str;
 
 // ---------------------------------------------------------------------------
 // Event Types

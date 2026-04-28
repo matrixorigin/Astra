@@ -763,13 +763,13 @@ pub fn build_turn_skill_selector_metric_record(
     turn_number: i64,
     shortlist: Option<&astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace>,
     chosen_skills: &[String],
-) -> Option<crate::turn::contracts::TurnSkillSelectorMetricRecord> {
+) -> Option<astra_turn_core::contracts::TurnSkillSelectorMetricRecord> {
     let shortlist = shortlist?;
     let computed = astra_turn_core::skill_selector_metrics::compute_skill_selector_metric(
         shortlist,
         chosen_skills,
     )?;
-    Some(crate::turn::contracts::TurnSkillSelectorMetricRecord {
+    Some(astra_turn_core::contracts::TurnSkillSelectorMetricRecord {
         event_id: uuid::Uuid::now_v7().to_string(),
         session_id: session_id.to_string(),
         user_id: user_id.to_string(),
@@ -1944,7 +1944,7 @@ fn execute_skill<'a>(
                                             std::env::current_dir().unwrap_or_default()
                                         });
                                     let verifier =
-                                        crate::skills::verify::SkillVerifier::new(work_dir);
+                                        astra_skills::verify::SkillVerifier::new(work_dir);
                                     let mut manifest = SkillManifest::default();
                                     // success_criteria is already Vec<serde_json::Value>
                                     manifest.success_criteria = skill.success_criteria.clone();

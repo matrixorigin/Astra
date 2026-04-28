@@ -3,9 +3,6 @@
 //! Re-exports from the `astra-messaging` crate, plus integration tests
 //! that depend on runtime types (DelegationTracker, PermissionSync, etc.).
 
-pub mod in_process;
-pub mod router;
-pub mod types;
 
 #[cfg(test)]
 mod db_transport_integration_tests;
@@ -28,7 +25,4 @@ pub use astra_messaging::{
     MessagingEventHandler, MessagingMetrics, MetricsSnapshot, PendingAckTracker, PermissionOutcome,
     RequestType, SendResult, StderrEventHandler, SubRunInfo,
 };
-pub mod ack_tracker;
-pub mod dead_letter;
-pub mod metrics;
-pub mod send_tool;
+pub use astra_messaging::{metrics, db_transport, transport, in_process, router, types};

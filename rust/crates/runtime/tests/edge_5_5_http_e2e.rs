@@ -1,5 +1,5 @@
 //! End-to-end: §5.5 HTTP handlers write into the same ledger the bridge consumes, keys match
-//! [`astra_runtime::turn::edge_ledger`], and `take_ledger_entry` removes rows.
+//! [`astra_turn_core::edge_ledger`], and `take_ledger_entry` removes rows.
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -37,8 +37,8 @@ use astra_core::{
 };
 
 use super::run_engine::RunEngine;
-use crate::messaging::router::AgentMailboxRouter;
-use crate::prompts::team_prompts;
+use astra_messaging::router::AgentMailboxRouter;
+use astra_prompts::team_prompts;
 
 fn normalize_context_allowlist_entry(entry: &str, key: &str) -> Result<String, String> {
     let normalized = entry.trim().to_ascii_lowercase();
@@ -103,7 +103,7 @@ pub struct SubRunConfig {
     /// Mid-execution checkpoint gate — abort early if contract criteria are violated.
     pub checkpoint_gate: Option<Arc<dyn CheckpointGate>>,
     /// Optional mailbox for inter-agent messaging during the sub-run.
-    pub mailbox: Option<crate::messaging::router::AgentMailbox>,
+    pub mailbox: Option<astra_messaging::router::AgentMailbox>,
     /// Cancellation token — when cancelled, the sub-run should stop gracefully.
     pub cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
 }
@@ -1382,7 +1382,7 @@ impl DelegationEngine {
 
                     if retry_config.mailbox.is_none() {
                         if let Some(router) = &self.mailbox_router {
-                            let addr = crate::messaging::types::AgentAddress {
+                            let addr = astra_messaging::types::AgentAddress {
                                 run_id: retry_run_id.clone(),
                                 agent_id: retry_config.agent_profile.agent_id.clone(),
                             };
@@ -1556,7 +1556,7 @@ impl DelegationEngine {
         // Validate first
         self.validate(&request, source_agent_id).await?;
         let child_recursion_depth =
-            crate::turn::agentic_recursion_guard::checked_child_recursion_depth_u32(request.depth)?;
+            astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth_u32(request.depth)?;
 
         let session_id = request
             .context
@@ -1611,7 +1611,7 @@ impl DelegationEngine {
         // registered this run_id (e.g., CLI layer or tests that pre-register
         // a parent mailbox to receive messages).
         let parent_mailbox = if let Some(router) = &self.mailbox_router {
-            let parent_addr = crate::messaging::types::AgentAddress {
+            let parent_addr = astra_messaging::types::AgentAddress {
                 run_id: request.parent_run_id.clone(),
                 agent_id: source_agent_id.to_string(),
             };
@@ -1884,7 +1884,7 @@ impl DelegationEngine {
 
             // Register with mailbox router and obtain a mailbox handle (if router available).
             let mailbox = if let Some(router) = &self.mailbox_router {
-                let addr = crate::messaging::types::AgentAddress {
+                let addr = astra_messaging::types::AgentAddress {
                     run_id: sub_run_id.clone(),
                     agent_id: agent_id.clone(),
                 };
@@ -2330,7 +2330,7 @@ impl DelegationEngine {
             });
 
             let mailbox = if let Some(router) = &self.mailbox_router {
-                let addr = crate::messaging::types::AgentAddress {
+                let addr = astra_messaging::types::AgentAddress {
                     run_id: sub_run_id.clone(),
                     agent_id: agent_id.clone(),
                 };
@@ -2619,7 +2619,7 @@ impl DelegationEngine {
                 .await?;
 
             let prod_mailbox = if let Some(router) = &self.mailbox_router {
-                let addr = crate::messaging::types::AgentAddress {
+                let addr = astra_messaging::types::AgentAddress {
                     run_id: prod_run_id.clone(),
                     agent_id: producer_id.to_string(),
                 };
@@ -2835,7 +2835,7 @@ impl DelegationEngine {
                 .await?;
 
             let rev_mailbox = if let Some(router) = &self.mailbox_router {
-                let addr = crate::messaging::types::AgentAddress {
+                let addr = astra_messaging::types::AgentAddress {
                     run_id: rev_run_id.clone(),
                     agent_id: reviewer_id.to_string(),
                 };
@@ -3060,7 +3060,7 @@ impl DelegationEngine {
             let pause_flag = self.tracker.register_pause_flag(&run_id).await;
 
             let fork_mailbox = if let Some(router) = &self.mailbox_router {
-                let addr = crate::messaging::types::AgentAddress {
+                let addr = astra_messaging::types::AgentAddress {
                     run_id: run_id.clone(),
                     agent_id: agent_id.to_string(),
                 };

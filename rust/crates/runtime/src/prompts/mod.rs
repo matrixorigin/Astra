@@ -5,10 +5,7 @@
 //! scattering string literals through the codebase.
 
 mod context;
-pub mod memory_lifecycle;
-pub mod memory_proto;
 mod system;
-pub mod team_prompts;
 
 pub use context::{
     CacheAwareEstimate, CompactConfig, CompactionTier, ContextBudget, DEFAULT_SYSTEM_PROMPT_TOKENS,
@@ -33,6 +30,9 @@ pub use astra_prompts::skills::{
     SystemSkill, build_skill_dev_prefix, build_skill_instructions, builtin_concise_skill,
     builtin_markdown_skill, builtin_system_skills,
 };
+
+pub use astra_prompts::memory_proto;
+pub use astra_prompts::memory_lifecycle;
 
 #[cfg(test)]
 mod tests {

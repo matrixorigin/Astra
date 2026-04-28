@@ -405,7 +405,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             );
         // Resolve per-model workflow-guard policy up front; `effective_model`
         // is moved into the SubRunHost below.
-        let resolved_tool_policy = astra_runtime::runtime_config::RuntimeConfig::load()
+        let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_selection
             .resolve_for_model(effective_model.as_deref());
 

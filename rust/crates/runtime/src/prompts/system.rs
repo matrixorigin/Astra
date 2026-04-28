@@ -1,7 +1,7 @@
 /// Agent persona / base identity.
 pub const SYSTEM_PROMPT_BASE: &str = "You are an expert software engineer. You write clean, correct code and use tools precisely to solve tasks.";
 
-use crate::output_style::OutputStyle;
+use astra_text_utils::output_style::OutputStyle;
 
 /// Confidence threshold below which the system prompt includes an advisory
 /// telling the LLM to ask for clarification rather than guessing with wrong tools.
@@ -834,7 +834,7 @@ pub fn apply_overrides(sections: &mut [PromptSection], overrides: &PromptOverrid
 
 // ── System Prompt Tracing ─────────────────────────────────────────────────────
 
-use crate::turn::context_assembly_trace::{
+use astra_turn_core::context_assembly_trace::{
     MemoryInjection, PromptContextSignals, PromptGuidanceSignals, PromptTraceSignals,
     SkillInjection, SystemPromptBreakdown,
 };
@@ -2580,7 +2580,7 @@ mod tests {
 
     #[test]
     fn prompt_with_output_style_includes_style_content() {
-        use crate::output_style::{OutputStyle, StyleSource};
+        use astra_text_utils::output_style::{OutputStyle, StyleSource};
 
         let style = OutputStyle {
             name: "test".to_string(),
@@ -2612,7 +2612,7 @@ mod tests {
 
     #[test]
     fn sections_with_output_style_includes_style_content() {
-        use crate::output_style::{OutputStyle, StyleSource};
+        use astra_text_utils::output_style::{OutputStyle, StyleSource};
 
         let style = OutputStyle {
             name: "concise".to_string(),
@@ -2699,7 +2699,7 @@ mod tests {
 
     #[test]
     fn build_system_prompt_trace_includes_skills_and_memories() {
-        use crate::turn::context_assembly_trace::{MemoryInjection, SkillInjection};
+        use astra_turn_core::context_assembly_trace::{MemoryInjection, SkillInjection};
 
         let sections = build_system_prompt_sections(&["bash", "grep"], "", 0.8, None);
         let skills = vec![SkillInjection {

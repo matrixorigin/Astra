@@ -24,7 +24,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::bridge::rate_limit_cooldown::RateLimitAction;
+use astra_turn_core::bridge_rate_limit_cooldown::RateLimitAction;
 use crate::turn::agentic_headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopState, HostReflectionRequest, HostReflectionResult, HostTurnResult,
@@ -32,7 +32,7 @@ use crate::turn::agentic_loop_host::{
 };
 use crate::turn::agentic_loop_tool_support::edge_tool_status_exit_code;
 use crate::turn::bridge_llm_stream::rate_limit_cooldown;
-use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
+use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use crate::turn::llm_client::{
     LlmCallResult, LlmCancel, cached_system_prompt, call_llm_and_collect_with_request_overrides,
     call_llm_nonstream_fallback_with_request_overrides, llm_connect_timeout, llm_fallback_timeout,
@@ -42,8 +42,8 @@ use crate::turn::prompt_cache::{
     PromptCacheConfig, annotate_tool_schemas_for_caching, apply_anthropic_cache_metadata,
     build_system_message_with_dynamic_sections,
 };
-use crate::turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, prune_tool_schemas};
-use crate::turn::turn_guard::merge_deprioritized_tools_into_restricted;
+use astra_turn_core::tool_schema_prune::{filter_tool_schemas_by_excluded_names, prune_tool_schemas};
+use astra_turn_core::turn_guard::merge_deprioritized_tools_into_restricted;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_core::SharedPool;
 use astra_services::LlmTokenServiceConfig;
@@ -252,11 +252,11 @@ struct RequestAwareSummaryClient {
 }
 
 #[async_trait]
-impl crate::turn::cloud::summary::SummaryLlmClient for RequestAwareSummaryClient {
+impl astra_turn_core::cloud_summary::SummaryLlmClient for RequestAwareSummaryClient {
     async fn summarize(
         &self,
         messages: &[Value],
-    ) -> Result<crate::turn::cloud::summary::SummaryResponse, String> {
+    ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, String> {
         let client = request_aware_summary_http_client()?;
 
         match call_llm_nonstream_fallback_with_request_overrides(
@@ -275,12 +275,12 @@ impl crate::turn::cloud::summary::SummaryLlmClient for RequestAwareSummaryClient
         )
         .await
         {
-            Ok(result) => Ok(crate::turn::cloud::summary::SummaryResponse {
+            Ok(result) => Ok(astra_turn_core::cloud_summary::SummaryResponse {
                 text: result.full_text,
                 is_ptl_error: false,
             }),
             Err(error) if error.kind == astra_core::ErrorKind::ContextWindow => {
-                Ok(crate::turn::cloud::summary::SummaryResponse {
+                Ok(astra_turn_core::cloud_summary::SummaryResponse {
                     text: String::new(),
                     is_ptl_error: true,
                 })
@@ -446,7 +446,7 @@ fn build_captured_llm_request(
     system_msgs: &[Value],
     tools: &[Value],
     messages: &[Value],
-    breakdown: &crate::turn::context_assembly_trace::SystemPromptBreakdown,
+    breakdown: &astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
 ) -> CapturedLlmRequest {
     let _ = breakdown; // retained in case future assertions want it
     // Identify primary + dynamic system slots.
@@ -1073,7 +1073,7 @@ impl ServerAgenticLoopHost {
         }
 
         let (full_text, reasoning, tool_calls, usage) =
-            crate::turn::bridge_e2e_hooks::parse_llm_round(round);
+            astra_turn_core::bridge_e2e_hooks::parse_llm_round(round);
 
         if !reasoning.is_empty() {
             self.push_reasoning_events(&reasoning);
@@ -1446,7 +1446,7 @@ impl ServerAgenticLoopHost {
     ) -> (
         Vec<Value>,
         String,
-        crate::turn::context_assembly_trace::SystemPromptBreakdown,
+        astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
     ) {
         let tool_names: Vec<&str> = tools
             .iter()
@@ -1521,9 +1521,9 @@ impl ServerAgenticLoopHost {
 
         // Memory signal detection
         let memory_signal_hint = if let Some(category) =
-            crate::prompts::memory_lifecycle::detect_store_signal(user_content)
+            astra_prompts::memory_lifecycle::detect_store_signal(user_content)
         {
-            let ns = crate::prompts::memory_lifecycle::suggest_namespace(category);
+            let ns = astra_prompts::memory_lifecycle::suggest_namespace(category);
             format!(
                 "\n\n⚡ MEMORY SIGNAL DETECTED: category=\"{category}\", namespace=\"{ns}\". \
                  Store the user's intent with memory_store BEFORE doing anything else."
@@ -1541,7 +1541,7 @@ impl ServerAgenticLoopHost {
             .map(|s| format!("\n\n{s}"))
             .unwrap_or_default();
 
-        let tool_cfg = crate::runtime_config::RuntimeConfig::load().tool_selection;
+        let tool_cfg = astra_config::runtime_config::RuntimeConfig::load().tool_selection;
         let (tool_round_guidance, guidance_signals) =
             crate::prompts::tool_round_guidance_trace_with(
                 &state.messages,
@@ -1564,9 +1564,9 @@ impl ServerAgenticLoopHost {
                     crate::prompts::PromptTokenBucket::UserPreferences,
                 )
                 .with_trace_signals(
-                    crate::turn::context_assembly_trace::PromptTraceSignals {
+                    astra_turn_core::context_assembly_trace::PromptTraceSignals {
                         context_signals:
-                            crate::turn::context_assembly_trace::PromptContextSignals {
+                            astra_turn_core::context_assembly_trace::PromptContextSignals {
                                 active_output_skills: true,
                                 ..Default::default()
                             },
@@ -1582,9 +1582,9 @@ impl ServerAgenticLoopHost {
                     crate::prompts::PromptTokenBucket::UserPreferences,
                 )
                 .with_trace_signals(
-                    crate::turn::context_assembly_trace::PromptTraceSignals {
+                    astra_turn_core::context_assembly_trace::PromptTraceSignals {
                         context_signals:
-                            crate::turn::context_assembly_trace::PromptContextSignals {
+                            astra_turn_core::context_assembly_trace::PromptContextSignals {
                                 learned_runtime_context: true,
                                 ..Default::default()
                             },
@@ -1600,9 +1600,9 @@ impl ServerAgenticLoopHost {
                     crate::prompts::PromptTokenBucket::Environment,
                 )
                 .with_trace_signals(
-                    crate::turn::context_assembly_trace::PromptTraceSignals {
+                    astra_turn_core::context_assembly_trace::PromptTraceSignals {
                         context_signals:
-                            crate::turn::context_assembly_trace::PromptContextSignals {
+                            astra_turn_core::context_assembly_trace::PromptContextSignals {
                                 effort_hint: state.skills.effort.is_some(),
                                 agent_type_hint: state.skills.agent_type.is_some(),
                                 ..Default::default()
@@ -1619,9 +1619,9 @@ impl ServerAgenticLoopHost {
                     crate::prompts::PromptTokenBucket::Environment,
                 )
                 .with_trace_signals(
-                    crate::turn::context_assembly_trace::PromptTraceSignals {
+                    astra_turn_core::context_assembly_trace::PromptTraceSignals {
                         context_signals:
-                            crate::turn::context_assembly_trace::PromptContextSignals {
+                            astra_turn_core::context_assembly_trace::PromptContextSignals {
                                 memory_signal_detected: true,
                                 ..Default::default()
                             },
@@ -1637,9 +1637,9 @@ impl ServerAgenticLoopHost {
                     crate::prompts::PromptTokenBucket::Environment,
                 )
                 .with_trace_signals(
-                    crate::turn::context_assembly_trace::PromptTraceSignals {
+                    astra_turn_core::context_assembly_trace::PromptTraceSignals {
                         context_signals:
-                            crate::turn::context_assembly_trace::PromptContextSignals {
+                            astra_turn_core::context_assembly_trace::PromptContextSignals {
                                 system_prompt_override: true,
                                 ..Default::default()
                             },
@@ -1670,7 +1670,7 @@ impl ServerAgenticLoopHost {
                     crate::prompts::PromptTokenBucket::Environment,
                 )
                 .with_trace_signals(
-                    crate::turn::context_assembly_trace::PromptTraceSignals {
+                    astra_turn_core::context_assembly_trace::PromptTraceSignals {
                         guidance_signals,
                         ..Default::default()
                     },
@@ -1707,7 +1707,7 @@ impl ServerAgenticLoopHost {
 
     fn emit_context_meta(
         &mut self,
-        breakdown: &crate::turn::context_assembly_trace::SystemPromptBreakdown,
+        breakdown: &astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
     ) {
         self.emit_event(json!({
             "type": "context_meta",
@@ -1848,9 +1848,9 @@ impl ServerAgenticLoopHost {
             format!("\n\n# Project Profile\n{}", profile_parts.join("\n"))
         };
         let memory_signal_hint = if let Some(category) =
-            crate::prompts::memory_lifecycle::detect_store_signal(user_content)
+            astra_prompts::memory_lifecycle::detect_store_signal(user_content)
         {
-            let ns = crate::prompts::memory_lifecycle::suggest_namespace(category);
+            let ns = astra_prompts::memory_lifecycle::suggest_namespace(category);
             format!(
                 "\n\n⚡ MEMORY SIGNAL DETECTED: category=\"{category}\", namespace=\"{ns}\". \
                  Store the user's intent with memory_store BEFORE doing anything else."
@@ -1858,7 +1858,7 @@ impl ServerAgenticLoopHost {
         } else {
             String::new()
         };
-        let tool_cfg = crate::runtime_config::RuntimeConfig::load().tool_selection;
+        let tool_cfg = astra_config::runtime_config::RuntimeConfig::load().tool_selection;
         let round_budget_hint = crate::prompts::round_budget_directive_with(
             0,
             tool_cfg.effective_round_budget_warning(),
@@ -1970,18 +1970,18 @@ impl ServerAgenticLoopHost {
                 .as_ref()
                 .map(|c| c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient),
             Some(&compact_config),
-            Some(&summary_client as &dyn crate::turn::cloud::summary::SummaryLlmClient),
+            Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
         )
         .await;
 
         llm_messages.extend(compact_result.messages);
         // Strip old reasoning to reduce input tokens (see edge_ledger::strip_stale_reasoning).
-        crate::turn::edge_ledger::strip_stale_reasoning(&mut llm_messages, provider, model_name);
+        astra_turn_core::edge_ledger::strip_stale_reasoning(&mut llm_messages, provider, model_name);
 
         // Post-compaction: re-inject invoked skill instructions (truncated)
         // so the LLM retains skill context after history summarization.
         if !state.skills.invoked.is_empty() {
-            let mut builder = crate::turn::cloud::attachments::AttachmentBuilder::new();
+            let mut builder = astra_turn_core::cloud_attachments::AttachmentBuilder::new();
             let mut skills: Vec<_> = state.skills.invoked.values().collect();
             skills.sort_by_key(|b| std::cmp::Reverse(b.invoked_at_turn));
             for skill in skills {
@@ -1995,7 +1995,7 @@ impl ServerAgenticLoopHost {
         // retains awareness of code it was working with before compaction.
         if !state.recent_file_reads.is_empty() {
             let cwd = self.edge_profile.get("cwd").and_then(|v| v.as_str());
-            let file_messages = crate::turn::cloud::attachments::restore_recent_files(
+            let file_messages = astra_turn_core::cloud_attachments::restore_recent_files(
                 &state.recent_file_reads,
                 cwd,
             );
@@ -2938,9 +2938,9 @@ mod tests {
     use super::*;
     use crate::turn::agentic_loop_host::ASK_USER_TOOL_NAME;
     use crate::turn::agentic_loop_host::run_agentic_loop_with_host;
-    use crate::turn::cloud::summary::SummaryLlmClient;
-    use crate::turn::edge_ledger::{approval_callback_key, tool_callback_key};
-    use crate::turn::sse_stream_host::EdgeToolExecResult;
+    use astra_turn_core::cloud_summary::SummaryLlmClient;
+    use astra_turn_core::edge_ledger::{approval_callback_key, tool_callback_key};
+    use astra_turn_core::sse_stream_host::EdgeToolExecResult;
     #[cfg(feature = "bridge-e2e-hooks")]
     use astra_services::SessionArtifactStore;
 
@@ -3821,11 +3821,11 @@ mod tests {
     }
 
     fn create_test_state() -> AgenticLoopState {
-        use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
-        use crate::pipeline::step_recorder::StepRecorder;
-        use crate::semantic_dedup::SemanticDedup;
-        use crate::turn::chat_turn_heuristics::TaskExecutionProfile;
-        use crate::turn::turn_guard::TurnGuard;
+        use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
+        use astra_pipeline::step_recorder::StepRecorder;
+        use astra_text_utils::semantic_dedup::SemanticDedup;
+        use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
+        use astra_turn_core::turn_guard::TurnGuard;
 
         AgenticLoopState {
             messages: Vec::new(),
@@ -3855,7 +3855,7 @@ mod tests {
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
             call_counts: HashMap::new(),
-            max_identical_tool_calls: crate::runtime_config::RuntimeConfig::load()
+            max_identical_tool_calls: astra_config::runtime_config::RuntimeConfig::load()
                 .tool_selection
                 .effective_max_identical_calls(),
             max_tools_per_turn: 15,
@@ -4999,7 +4999,7 @@ mod tests {
             cache_enabled: true,
             is_anthropic: true,
         };
-        let breakdown = crate::turn::context_assembly_trace::SystemPromptBreakdown::default();
+        let breakdown = astra_turn_core::context_assembly_trace::SystemPromptBreakdown::default();
         let captured = super::build_captured_llm_request(
             0,
             "anthropic".to_string(),

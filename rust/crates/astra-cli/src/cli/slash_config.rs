@@ -7,7 +7,7 @@
 //! - `/config export [path]` — Export configuration to file
 //! - `/config diff` — Show difference from defaults
 
-use astra_runtime::runtime_config::RuntimeConfig;
+use astra_config::runtime_config::RuntimeConfig;
 use crossterm::style::Stylize;
 use std::path::PathBuf;
 

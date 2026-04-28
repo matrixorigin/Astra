@@ -2,7 +2,7 @@
 //!
 //! These tools allow agents to share knowledge with siblings in the same session.
 
-use astra_runtime::orchestration::context_cache::SharedContextCache;
+use astra_turn_core::orchestration_context_cache::SharedContextCache;
 use serde_json::{Value, json};
 use std::sync::Arc;
 

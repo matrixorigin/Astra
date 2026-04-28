@@ -121,7 +121,7 @@ pub(crate) struct ReplState {
     pub skill_dev: Option<SkillDevState>,
     pub active_system_skills: Vec<prompts::SystemSkill>,
     /// Runtime configuration loaded from config files + env vars (M3).
-    pub runtime_config: astra_runtime::runtime_config::RuntimeConfig,
+    pub runtime_config: astra_config::runtime_config::RuntimeConfig,
     pub context_budget: prompts::ContextBudget,
     pub journal: Option<session_journal::JournalWriter>,
     /// Tools used in the last turn — fed into selection for recency boost.
@@ -301,11 +301,11 @@ pub(crate) struct ReplState {
 
     // ── User Profile (M5) ──
     /// User profile manager for preferences and scenario detection.
-    pub user_profile_manager: std::sync::Arc<astra_runtime::user_profile::UserProfileManager>,
+    pub user_profile_manager: std::sync::Arc<astra_config::user_profile::UserProfileManager>,
 
     // ── Auto-Tuning (M6) ──
     /// Auto-tuning engine for adaptive learning.
-    pub auto_tuning_engine: std::sync::Arc<astra_runtime::auto_tuning::AutoTuningEngine>,
+    pub auto_tuning_engine: std::sync::Arc<astra_learning::auto_tuning::AutoTuningEngine>,
 
     // ── Evolution ──
     /// Shared evolution service for multi-axis self-evolution.
@@ -366,7 +366,7 @@ impl Default for ReplState {
             active_system_skills: Vec::new(),
             // Load RuntimeConfig from config files + env vars, then create
             // ContextBudget using the loaded config (M3 wiring).
-            runtime_config: { astra_runtime::runtime_config::RuntimeConfig::load() },
+            runtime_config: { astra_config::runtime_config::RuntimeConfig::load() },
             // Temporary: will be replaced with from_runtime_config when model is known
             context_budget: prompts::ContextBudget::default(),
             journal: None,
@@ -450,13 +450,13 @@ impl Default for ReplState {
             pending_goal_progress: None,
             user_profile_manager: {
                 let store =
-                    std::sync::Arc::new(astra_runtime::user_profile::UserProfileStore::new());
-                std::sync::Arc::new(astra_runtime::user_profile::UserProfileManager::new(store))
+                    std::sync::Arc::new(astra_config::user_profile::UserProfileStore::new());
+                std::sync::Arc::new(astra_config::user_profile::UserProfileManager::new(store))
             },
             auto_tuning_engine: {
-                let engine = astra_runtime::auto_tuning::AutoTuningEngine::new();
+                let engine = astra_learning::auto_tuning::AutoTuningEngine::new();
                 // Add default evolution rules
-                for rule in astra_runtime::auto_tuning::default_rules() {
+                for rule in astra_learning::auto_tuning::default_rules() {
                     engine.add_rule(rule);
                 }
                 std::sync::Arc::new(engine)

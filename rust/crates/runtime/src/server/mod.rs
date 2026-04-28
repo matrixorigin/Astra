@@ -27,7 +27,6 @@ pub mod conflict_resolver;
 pub mod delegation_engine;
 mod delegation_handlers;
 mod edge_callback_handlers;
-pub mod edge_connection_pool;
 mod edge_status_handler;
 mod edge_ws_handler;
 pub(crate) mod header_utils;
@@ -96,7 +95,7 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     // reach the safety guards. Defaults to Strict; only flipped if the
     // operator explicitly sets `[safety] trust_mode = "trusted"` in
     // runtime.toml.
-    crate::apply_safety_config_from_runtime_config(&crate::runtime_config::RuntimeConfig::load());
+    crate::apply_safety_config_from_runtime_config(&astra_config::runtime_config::RuntimeConfig::load());
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let settings = AppSettings::from_env()?;
@@ -237,6 +236,8 @@ fn spawn_data_cleanup(
     })
 }
 
+pub use astra_server_types::edge_connection_pool;
+
 #[cfg(test)]
 mod tests {
     /// U1: build_app must set a DefaultBodyLimit to prevent OOM from
@@ -246,6 +247,7 @@ mod tests {
     #[test]
     fn build_app_has_body_size_limit() {
         let source = include_str!("mod.rs");
+
         let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
         let prod_code = &source[..test_start];
         assert!(
@@ -258,6 +260,7 @@ mod tests {
     #[test]
     fn shutdown_drains_background_tasks() {
         let source = include_str!("mod.rs");
+
         let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
         let prod_code = &source[..test_start];
         assert!(
@@ -266,8 +269,3 @@ mod tests {
         );
     }
 }
-pub mod worktree_isolation;
-pub mod ws_progress_callback;
-pub mod edge_ws_protocol;
-pub mod ws_approval_gate;
-pub mod ws_user_prompt_gate;

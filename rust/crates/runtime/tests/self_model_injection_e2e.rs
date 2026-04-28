@@ -7,7 +7,7 @@ use astra_pipeline::ToolHealthEntry;
 use astra_runtime::auto_tuning::{FeedbackSignal, SignalType};
 use astra_runtime::observability_integration::ObservabilitySession;
 use astra_runtime::self_model::SelfModel;
-use astra_runtime::turn::tool_health::ToolHealthTracker;
+use astra_turn_core::tool_health::ToolHealthTracker;
 use astra_runtime::user_profile::Scenario;
 
 fn make_entry(name: &str, total_calls: usize, total_failures: usize) -> ToolHealthEntry {

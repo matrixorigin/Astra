@@ -78,7 +78,7 @@ pub(crate) fn build_memory_section(merged_lines: &[String]) -> Option<String> {
         return None;
     }
     let refs: Vec<&str> = merged_lines.iter().map(|s| s.as_str()).collect();
-    let formatted = crate::prompts::memory_proto::format_for_llm(&refs);
+    let formatted = astra_prompts::memory_proto::format_for_llm(&refs);
     if !formatted.is_empty() {
         Some(format!("## User Memories\n{formatted}"))
     } else {

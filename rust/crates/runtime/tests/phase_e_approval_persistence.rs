@@ -11,7 +11,7 @@
 //! in `slash_session`, so they stay valid even if the checkpoint wire format
 //! evolves (they go through `to_json` / `merge_from_json`).
 
-use astra_runtime::turn::approval_fingerprint::{ApprovalFingerprint, FingerprintedOverrides};
+use astra_turn_core::approval_fingerprint::{ApprovalFingerprint, FingerprintedOverrides};
 use serde_json::{Value, json};
 
 /// Helper: simulate one session restart — serialize `current`, merge into a

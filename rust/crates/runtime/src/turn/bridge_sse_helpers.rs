@@ -8,7 +8,7 @@
 use axum::body::Bytes;
 use serde_json::{Map, Value, json};
 
-use crate::turn::sse_data_lines::{
+use astra_turn_core::sse_data_lines::{
     drain_sse_data_lines, finish_sse_data_buffer, validate_sse_event_block_json,
     validated_json_events_from_sse_block,
 };

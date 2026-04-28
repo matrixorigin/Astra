@@ -4,18 +4,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use super::evolver;
+use astra_evolution::evolver;
 use super::promotion_gate::{ProposalPromotionContext, evaluate_proposal_promotion};
-use super::signal_collector::SignalCollector;
-use super::store::EvolutionStore;
-use super::types::{
+use astra_evolution::signal_collector::SignalCollector;
+use astra_evolution::store::EvolutionStore;
+use astra_evolution::types::{
     ApprovalStatus, EvolutionAxis, EvolutionProposal, EvolutionSignal, PersistedActiveCanary,
     ProposalPromotionRecommendation, ProposalPromotionVerdict, ToolResultContext, TurnSummary,
 };
 
 use crate::liquid::reflection::ReflectionEngine;
-use crate::pipeline::calibration::ProgressiveCalibrator;
-use crate::pipeline::pattern::PatternLibrary;
+use astra_pipeline::calibration::ProgressiveCalibrator;
+use astra_pipeline::pattern::PatternLibrary;
 
 const MAX_APPLIED_LOG: usize = 100;
 const MAX_RECENT_CALIBRATION_DEDUP: usize = 32;
@@ -936,11 +936,11 @@ fn calibration_dedup_key(proposal: &EvolutionProposal) -> Option<String> {
     ))
 }
 
-fn calibration_axis_identity(axis: &super::types::CalibrationAxis) -> String {
+fn calibration_axis_identity(axis: &astra_evolution::types::CalibrationAxis) -> String {
     match axis {
-        super::types::CalibrationAxis::Intent(intent) => format!("intent:{intent}"),
-        super::types::CalibrationAxis::Domain(domain) => format!("domain:{domain:?}"),
-        super::types::CalibrationAxis::Task(task) => format!("task:{task:?}"),
+        astra_evolution::types::CalibrationAxis::Intent(intent) => format!("intent:{intent}"),
+        astra_evolution::types::CalibrationAxis::Domain(domain) => format!("domain:{domain:?}"),
+        astra_evolution::types::CalibrationAxis::Task(task) => format!("task:{task:?}"),
     }
 }
 
@@ -990,12 +990,12 @@ pub fn new_shared() -> Arc<EvolutionService> {
 mod tests {
     use super::*;
     use crate::evolution::store::StoredStatus;
-    use crate::evolution::types::{
+    use astra_evolution::types::{
         ApprovalStatus, CalibrationAxis, EvolutionAxis, PatternAction,
         ProposalPromotionRecommendation,
     };
     use crate::liquid::reflection::ReflectionContext;
-    use crate::pipeline::calibration::ProgressiveCalibrator;
+    use astra_pipeline::calibration::ProgressiveCalibrator;
     use crate::pipeline::routing::{DomainHint, TaskType};
 
     fn tool_failure_signal(tool: &str, skill: Option<&str>) -> EvolutionSignal {
@@ -1028,7 +1028,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_drift_auto_applies() {
-        use crate::pipeline::pattern::PatternLibrary;
+        use astra_pipeline::pattern::PatternLibrary;
 
         let lib = Arc::new(std::sync::Mutex::new(PatternLibrary::default()));
         {
@@ -1081,7 +1081,7 @@ mod tests {
 
     #[tokio::test]
     async fn approve_moves_to_applied() {
-        use crate::pipeline::pattern::PatternLibrary;
+        use astra_pipeline::pattern::PatternLibrary;
 
         let lib = Arc::new(std::sync::Mutex::new(PatternLibrary::default()));
         {
@@ -1193,7 +1193,7 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_flush_separates_fast_and_llm() {
-        use crate::pipeline::pattern::PatternLibrary;
+        use astra_pipeline::pattern::PatternLibrary;
 
         let lib = Arc::new(std::sync::Mutex::new(PatternLibrary::default()));
         {
@@ -1324,7 +1324,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_detects_drift_from_pattern_library() {
-        use crate::pipeline::pattern::PatternLibrary;
+        use astra_pipeline::pattern::PatternLibrary;
 
         let lib = Arc::new(std::sync::Mutex::new(PatternLibrary::default()));
         // Need historical rate >> recent rate to trigger drift and meet
@@ -1379,7 +1379,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_applies_auto_pattern_proposals_to_pattern_library() {
-        use crate::pipeline::pattern::PatternLibrary;
+        use astra_pipeline::pattern::PatternLibrary;
 
         let lib = Arc::new(std::sync::Mutex::new(PatternLibrary::default()));
         {
@@ -1521,7 +1521,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_high_confidence_pattern_auto_applies() {
-        use crate::pipeline::pattern::PatternLibrary;
+        use astra_pipeline::pattern::PatternLibrary;
 
         let lib = Arc::new(std::sync::Mutex::new(PatternLibrary::default()));
         {

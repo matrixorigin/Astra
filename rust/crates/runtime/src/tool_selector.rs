@@ -36,12 +36,12 @@
 //! The next edge case should be handled by **improving the LLM prompt**, not
 //! by adding a field to ConversationState.
 
-use crate::pipeline::calibration::ProgressiveCalibrator;
-use crate::pipeline::entity::{EntityGraph, extract_entities};
-use crate::pipeline::pattern::PatternLibrary;
+use astra_pipeline::calibration::ProgressiveCalibrator;
+use astra_pipeline::entity::{EntityGraph, extract_entities};
+use astra_pipeline::pattern::PatternLibrary;
 use crate::pipeline::routing::{DomainHint, RoutingEngine, TaskType, domain_hint_to_label};
 use crate::tool_registry::{self, TOOL_CATALOG, ToolQualityTracker, ToolRegistry};
-use crate::turn::routing_metrics::ConfidenceCalibrator;
+use astra_turn_core::routing_metrics::ConfidenceCalibrator;
 use astra_thin_client::ThinClient;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -93,7 +93,7 @@ pub struct SelectionContext<'a> {
     /// Fallback action from the previous turn's confidence diagnosis.
     /// When `Some(Broaden)`, the selector should relax budget constraints
     /// and include more candidate tools.
-    pub previous_confidence_fallback: Option<crate::turn::confidence_contract::ConfidenceFallback>,
+    pub previous_confidence_fallback: Option<astra_turn_core::confidence_contract::ConfidenceFallback>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -689,10 +689,10 @@ impl ToolSelector for TfIdfSelector {
         // If the previous turn diagnosed low confidence, reduce budget pressure
         // to broaden the tool set for this turn.
         let effective_pressure = match ctx.previous_confidence_fallback {
-            Some(crate::turn::confidence_contract::ConfidenceFallback::Broaden) => {
+            Some(astra_turn_core::confidence_contract::ConfidenceFallback::Broaden) => {
                 (ctx.budget_pressure * 0.3).min(0.3) // cap pressure at 0.3
             }
-            Some(crate::turn::confidence_contract::ConfidenceFallback::EscalateToLlm) => {
+            Some(astra_turn_core::confidence_contract::ConfidenceFallback::EscalateToLlm) => {
                 0.0 // remove all pressure to maximize tool availability
             }
             _ => ctx.budget_pressure,
@@ -1578,7 +1578,7 @@ mod tests {
     #[test]
     fn learned_context_filters_low_confidence_entity_hints() {
         let mut graph = EntityGraph::new();
-        graph.merge(&[crate::pipeline::entity::EntityKnowledge {
+        graph.merge(&[astra_pipeline::entity::EntityKnowledge {
             name: "stale-org".into(),
             aliases: vec![],
             domain: Some(DomainHint::GitHub),

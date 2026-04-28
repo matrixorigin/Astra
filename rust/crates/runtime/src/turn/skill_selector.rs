@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::skills::quality::SkillQualityTracker;
-use crate::text_tokenize::tokenize;
+use astra_text_utils::text_tokenize::tokenize;
 
 const EMBEDDING_POOL: usize = 100;
 /// Lexical recall ceiling before unified shortlist trim.

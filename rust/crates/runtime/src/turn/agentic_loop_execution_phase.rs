@@ -9,11 +9,11 @@ use super::agentic_loop_lifecycle::{
     TurnIterationPrep, current_agentic_step, interruption_state_summary, session_turn_number,
     tool_record_is_workspace_mutation,
 };
-use super::agentic_turn_ingest::{
+use astra_turn_core::agentic_turn_ingest::{
     AgenticIngestIterationControl, AgenticTurnIngestMut, agentic_turn_stream_snapshot_with_kind,
     ingest_agentic_turn_stream, map_ingest_outcome_to_iteration_control,
 };
-use super::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
+use astra_turn_core::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
 
 /// Record an `llm_round` event for an early-exit path (no tool calls).
 fn record_early_exit_llm_round(
@@ -157,7 +157,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     }
 
     // Load runtime config once per round for all mid-loop guards below.
-    let tool_cfg = &crate::runtime_config::RuntimeConfig::load().tool_selection;
+    let tool_cfg = &astra_config::runtime_config::RuntimeConfig::load().tool_selection;
     let parallel_batching_force_threshold =
         tool_cfg.effective_parallel_batching_force_streak() as usize;
     let round_budget_hard_limit = tool_cfg.effective_round_budget_limit();
@@ -553,7 +553,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             // limit, context overflow) take priority — only fill when still empty.
             if state.interruption.is_none() {
                 if let Some((kind, action)) =
-                    super::interruption::interruption_from_error_kind(e.kind)
+                    astra_turn_core::interruption::interruption_from_error_kind(e.kind)
                 {
                     state.interruption = Some(InterruptionRecord::new(
                         kind,
@@ -607,7 +607,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
 
             if state.hooks.stop_hook_runs == 0
                 && let Some(prompt) =
-                    crate::turn::stop_hooks::build_stop_hook_prompt(&state.hooks.stop_hooks)
+                    astra_turn_core::stop_hooks::build_stop_hook_prompt(&state.hooks.stop_hooks)
             {
                 state.hooks.stop_hook_runs = 1;
                 if !prep.quiet {
@@ -1716,7 +1716,7 @@ fn update_turn_trace_collector(state: &mut AgenticLoopState, turn_result: &HostT
         }
         if let Some(ref breakdown_json) = turn_result.accum.system_prompt_breakdown
             && let Ok(breakdown) = serde_json::from_value::<
-                crate::turn::context_assembly_trace::SystemPromptBreakdown,
+                astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
             >(breakdown_json.clone())
         {
             collector.record_system_prompt(breakdown);
@@ -1892,7 +1892,7 @@ fn record_tool_selection(
         // Compute diagnosis from available signals.
         let query_tokens = state.message.split_whitespace().count();
         let dynamic_tools = turn_result.edge_tool_round.len();
-        let diagnosis = crate::turn::confidence_contract::ConfidenceDiagnosis::diagnose(
+        let diagnosis = astra_turn_core::confidence_contract::ConfidenceDiagnosis::diagnose(
             conf,
             dynamic_tools,     // signal_count proxy
             dynamic_tools > 0, // task_type_known proxy
@@ -1943,18 +1943,18 @@ fn record_tool_selection(
             .map(|r| r.tool.clone())
             .collect();
         if !selected_tools.is_empty() {
-            let explanation = crate::turn::decision_explainer::DecisionExplanation {
+            let explanation = astra_turn_core::decision_explainer::DecisionExplanation {
                 id: format!(
                     "tool-sel-{}-{}",
                     state.current_session_id.as_deref().unwrap_or("?"),
                     turn_index
                 ),
                 timestamp: std::time::SystemTime::now(),
-                decision_type: crate::turn::decision_explainer::DecisionType::ToolSelection {
+                decision_type: astra_turn_core::decision_explainer::DecisionType::ToolSelection {
                     selected_tools: selected_tools.clone(),
                     total_available: state.telemetry.all_tools_used.len() as u32,
                 },
-                inputs: vec![crate::turn::decision_explainer::ExplainableInput {
+                inputs: vec![astra_turn_core::decision_explainer::ExplainableInput {
                     name: "user_query".to_string(),
                     value: state.message.clone(),
                     influence: 1.0,
@@ -2149,7 +2149,7 @@ mod tests {
     fn execution_retry_blocks_plan_only_finish_for_mutating_task() {
         let mut state = make_state();
         state.task_profile =
-            crate::turn::chat_turn_heuristics::infer_task_execution_profile("修复这个问题");
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("修复这个问题");
         state.message = "修复这个问题".into();
         state.final_text = "需要我直接执行这些修改吗？".into();
         state.total_tool_calls = 2;
@@ -2171,7 +2171,7 @@ mod tests {
         // retry here would just waste a turn.
         let mut state = make_state();
         state.task_profile =
-            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
         state.message = "fix the bug".into();
         state.final_text = "I reviewed the code and the bug does not exist.".into();
 
@@ -2184,7 +2184,7 @@ mod tests {
         // committed → still retry to push for execution.
         let mut state = make_state();
         state.task_profile =
-            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
         state.message = "fix the bug".into();
         state.final_text = "Here is the plan: change foo to bar.".into();
         state.total_tool_calls = 1;
@@ -2202,7 +2202,7 @@ mod tests {
     fn execution_retry_skips_reviewed_no_bug_conclusion_after_read_only_inspection() {
         let mut state = make_state();
         state.task_profile =
-            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
         state.message = "fix the bug".into();
         state.final_text = "I reviewed the code path and the bug does not exist.".into();
         state.total_tool_calls = 2;
@@ -2311,7 +2311,7 @@ mod tests {
     fn execution_retry_does_not_fire_for_read_only_review() {
         let mut state = make_state();
         state.task_profile =
-            crate::turn::chat_turn_heuristics::infer_task_execution_profile("review local changes");
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("review local changes");
         state.message = "review local changes".into();
         state.final_text = "I found one issue.".into();
         state.total_tool_calls = 1;
@@ -2329,7 +2329,7 @@ mod tests {
     fn execution_retry_does_not_fire_after_concrete_edit() {
         let mut state = make_state();
         state.task_profile =
-            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
         state.message = "fix the bug".into();
         state.final_text = "Done.".into();
         state.total_tool_calls = 2;
@@ -2376,7 +2376,7 @@ mod tests {
     #[test]
     fn browser_verification_retry_overrides_concrete_edit_short_circuit() {
         let mut state = make_state();
-        state.task_profile = crate::turn::chat_turn_heuristics::infer_task_execution_profile(
+        state.task_profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
             "fix the game bug and verify it in browser",
         );
         state.message = "fix the game bug and verify it in browser".into();
@@ -2509,7 +2509,7 @@ mod tests {
         let mut state = make_state();
         state.message = "fix the bug in foo".into();
         state.task_profile =
-            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug in foo");
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug in foo");
         assert!(
             state.task_profile.mutates_workspace,
             "test precondition: profile must be mutating"
@@ -2543,7 +2543,7 @@ mod tests {
             make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD + 2);
         // Flip profile to read-only exploration — escalation must not engage.
         state.task_profile =
-            crate::turn::chat_turn_heuristics::infer_task_execution_profile("review the diff");
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("review the diff");
         assert!(!state.task_profile.mutates_workspace);
         assert!(!should_escalate_execution(&state));
     }
@@ -2601,7 +2601,7 @@ mod tests {
         let mut state = make_state();
         state.message = "fix the bug".into();
         state.task_profile =
-            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
         // 20 failed reads — don't count toward threshold (they weren't real
         // progress; retrying reads is already flagged elsewhere).
         for _ in 0..20 {
@@ -2620,7 +2620,7 @@ mod tests {
         let mut state = make_state();
         state.message = "fix the bug".into();
         state.task_profile =
-            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
         for _ in 0..(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD + 2) {
             state.stall.tool_call_records.push(ToolCallRecord {
                 name: "bash".into(),
@@ -2648,7 +2648,7 @@ mod tests {
         let mut state = make_state();
         state.message = "fix the bug".into();
         state.task_profile =
-            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
         state.final_text = "I will proceed with the edits now.".into();
         state.total_tool_calls = 10;
 
@@ -2666,7 +2666,7 @@ mod tests {
         let mut state = make_state();
         state.message = "fix the bug".into();
         state.task_profile =
-            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
         state.final_text = "I'll continue investigating.".into();
         state.total_tool_calls = 10;
         // Without the parallel-batching flag, this state would trigger retry.

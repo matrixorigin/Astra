@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use astra_services::session_journal::ToolCallRecord;
 use serde_json::Value;
 
-use crate::str_preview::truncate_str;
+use astra_text_utils::str_preview::truncate_str;
 use crate::turn::agentic_headless_round::HeadlessStderrStyle;
 
 use super::agentic_loop_host::{
@@ -21,11 +21,11 @@ pub(crate) struct DelegationInterceptionResult {
 }
 
 pub(crate) fn tool_call_name(tool_call: &Value) -> Option<&str> {
-    super::tool_call_shape::tool_call_name(tool_call)
+    astra_turn_core::tool_call_shape::tool_call_name(tool_call)
 }
 
 pub(crate) fn tool_call_arguments_value(tool_call: &Value) -> Value {
-    super::tool_call_shape::tool_call_arguments_value(tool_call)
+    astra_turn_core::tool_call_shape::tool_call_arguments_value(tool_call)
 }
 
 pub(crate) fn is_delegation_call(tool_call: &Value) -> bool {
@@ -193,14 +193,14 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             let rc = &turn_result.accum.reasoning_content;
             if !rc.is_empty() {
                 assistant_msg["reasoning_content"] = Value::String(rc.clone());
-            } else if super::edge_ledger::history_has_reasoning(&state.messages) {
+            } else if astra_turn_core::edge_ledger::history_has_reasoning(&state.messages) {
                 assistant_msg["reasoning_content"] = Value::String(String::new());
             }
             state.messages.push(assistant_msg);
         }
         for result in &delegation_results {
             let summary_for_model =
-                crate::turn::tool_result_sanitize::tool_result_content_for_model(
+                astra_turn_core::tool_result_sanitize::tool_result_content_for_model(
                     DELEGATE_TOOL_NAME,
                     &result.summary,
                 );
@@ -238,7 +238,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
 
     if !delegation_results.is_empty()
         && state.hooks.teammate_idle_hook_runs == 0
-        && let Some(prompt) = crate::turn::stop_hooks::build_teammate_idle_hook_prompt(
+        && let Some(prompt) = astra_turn_core::stop_hooks::build_teammate_idle_hook_prompt(
             &state.hooks.teammate_idle_hooks,
         )
     {
@@ -313,7 +313,7 @@ pub(crate) fn parse_delegation_request(
         context.insert("adaptive_coordination".to_string(), policy);
     }
     merge_forward_headers_into_delegation_context(&mut context);
-    crate::turn::agentic_recursion_guard::checked_child_recursion_depth(recursion_depth)?;
+    astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth(recursion_depth)?;
 
     Ok(astra_services::coordination::DelegationRequest {
         delegation_id: uuid::Uuid::new_v4().to_string(),
@@ -337,7 +337,7 @@ pub(crate) fn merge_forward_headers_into_delegation_context(
 
 #[derive(Debug, Clone)]
 pub(crate) struct DelegationAdaptiveContext {
-    pub(crate) scenario: Option<crate::user_profile::Scenario>,
+    pub(crate) scenario: Option<astra_config::user_profile::Scenario>,
     pub(crate) preferred_pattern: Option<String>,
 }
 
@@ -385,10 +385,10 @@ pub(crate) fn select_default_coordination_pattern(
     let should_adapt = matches!(
         scenario,
         Some(
-            crate::user_profile::Scenario::CodeReview
-                | crate::user_profile::Scenario::Exploration
-                | crate::user_profile::Scenario::Debugging
-                | crate::user_profile::Scenario::Testing
+            astra_config::user_profile::Scenario::CodeReview
+                | astra_config::user_profile::Scenario::Exploration
+                | astra_config::user_profile::Scenario::Debugging
+                | astra_config::user_profile::Scenario::Testing
         )
     ) || task_requests_review;
 
@@ -412,26 +412,26 @@ pub(crate) fn select_default_coordination_pattern(
     let hints = astra_services::coordination::CoordinationHints {
         agent_ids: agents,
         task: task.to_string(),
-        needs_review: matches!(scenario, Some(crate::user_profile::Scenario::CodeReview)),
+        needs_review: matches!(scenario, Some(astra_config::user_profile::Scenario::CodeReview)),
         has_dependencies: !matches!(
             scenario,
             Some(
-                crate::user_profile::Scenario::Exploration
-                    | crate::user_profile::Scenario::CodeReview
-                    | crate::user_profile::Scenario::Testing
+                astra_config::user_profile::Scenario::Exploration
+                    | astra_config::user_profile::Scenario::CodeReview
+                    | astra_config::user_profile::Scenario::Testing
             )
         ),
         timeout_sec: args.get("timeout").and_then(Value::as_u64).unwrap_or(0),
     };
     let pattern = astra_services::coordination::suggest_pattern(&hints);
     let selected_pattern = coordination_pattern_name(&pattern);
-    let reason = if matches!(scenario, Some(crate::user_profile::Scenario::CodeReview)) {
+    let reason = if matches!(scenario, Some(astra_config::user_profile::Scenario::CodeReview)) {
         "code_review_scenario_prefers_review_loop"
-    } else if matches!(scenario, Some(crate::user_profile::Scenario::Exploration)) {
+    } else if matches!(scenario, Some(astra_config::user_profile::Scenario::Exploration)) {
         "exploration_scenario_prefers_parallel_scouting"
-    } else if matches!(scenario, Some(crate::user_profile::Scenario::Debugging)) {
+    } else if matches!(scenario, Some(astra_config::user_profile::Scenario::Debugging)) {
         "debugging_scenario_prefers_sequential_with_stop"
-    } else if matches!(scenario, Some(crate::user_profile::Scenario::Testing)) {
+    } else if matches!(scenario, Some(astra_config::user_profile::Scenario::Testing)) {
         "testing_scenario_prefers_parallel_execution"
     } else if task_requests_review {
         "task_keywords_request_review"
@@ -1143,7 +1143,7 @@ mod tests {
             &tool_call,
             "run-1",
             "sess-1",
-            crate::turn::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
+            astra_turn_core::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
             &astra_core::SkillSearchSettings::default(),
             None,
         );
@@ -1165,7 +1165,7 @@ mod tests {
             }
         });
         let adaptive_context = DelegationAdaptiveContext {
-            scenario: Some(crate::user_profile::Scenario::Exploration),
+            scenario: Some(astra_config::user_profile::Scenario::Exploration),
             preferred_pattern: None,
         };
 
@@ -1199,7 +1199,7 @@ mod tests {
             }
         });
         let adaptive_context = DelegationAdaptiveContext {
-            scenario: Some(crate::user_profile::Scenario::CodeReview),
+            scenario: Some(astra_config::user_profile::Scenario::CodeReview),
             preferred_pattern: None,
         };
 
@@ -1282,7 +1282,7 @@ mod tests {
     fn select_default_uses_history_when_available() {
         let args = json!({"agents": ["coder", "reviewer"]});
         let adaptive_context = DelegationAdaptiveContext {
-            scenario: Some(crate::user_profile::Scenario::CodeReview),
+            scenario: Some(astra_config::user_profile::Scenario::CodeReview),
             preferred_pattern: Some("fan_out".to_string()),
         };
         let (pattern, policy) =
@@ -1302,7 +1302,7 @@ mod tests {
     fn select_default_uses_pipeline_history_when_available() {
         let args = json!({"agents": ["plan", "verify"]});
         let adaptive_context = DelegationAdaptiveContext {
-            scenario: Some(crate::user_profile::Scenario::Testing),
+            scenario: Some(astra_config::user_profile::Scenario::Testing),
             preferred_pattern: Some("pipeline".to_string()),
         };
         let (pattern, policy) = select_default_coordination_pattern(
@@ -1326,7 +1326,7 @@ mod tests {
     fn select_default_debugging_scenario() {
         let args = json!({"agents": ["coder"]});
         let adaptive_context = DelegationAdaptiveContext {
-            scenario: Some(crate::user_profile::Scenario::Debugging),
+            scenario: Some(astra_config::user_profile::Scenario::Debugging),
             preferred_pattern: None,
         };
         let (_pattern, policy) =
@@ -1343,7 +1343,7 @@ mod tests {
     fn select_default_testing_scenario() {
         let args = json!({"agents": ["coder", "tester"]});
         let adaptive_context = DelegationAdaptiveContext {
-            scenario: Some(crate::user_profile::Scenario::Testing),
+            scenario: Some(astra_config::user_profile::Scenario::Testing),
             preferred_pattern: None,
         };
         let (_pattern, policy) =
@@ -1680,7 +1680,7 @@ mod tests {
         state.delegation_engine = Some(make_test_delegation_engine());
 
         let turn_result = HostTurnResult {
-            accum: crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum {
+            accum: astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum {
                 has_tool_calls: true,
                 tool_calls: vec![json!({
                     "id": "call_delegate",
@@ -1690,7 +1690,7 @@ mod tests {
                         "arguments": "{\"task\":\"write tests\",\"agents\":[\"coder\"]}"
                     }
                 })],
-                ..crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum::default()
+                ..astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum::default()
             },
             ttft_ms: Some(10),
             edge_tool_round: Vec::new(),
@@ -1723,7 +1723,7 @@ mod tests {
         state.delegation_engine = Some(Arc::new(make_partition_engine("main", &["coder"])));
 
         let turn_result = HostTurnResult {
-            accum: crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum {
+            accum: astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum {
                 has_tool_calls: true,
                 tool_calls: vec![json!({
                     "id": "call_delegate",
@@ -1733,7 +1733,7 @@ mod tests {
                         "arguments": "{\"task\":\"write tests\",\"agents\":[\"coder\"]}"
                     }
                 })],
-                ..crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum::default()
+                ..astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum::default()
             },
             ttft_ms: Some(10),
             edge_tool_round: Vec::new(),

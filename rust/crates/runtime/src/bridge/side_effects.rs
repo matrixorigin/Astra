@@ -59,7 +59,7 @@ pub fn run_bridge_hook_side_effects(
         // Pipeline learning: extract turn outcome and update EntityGraph/PatternLibrary/Calibrator
         if let Some(writer) = turn_learning_writer
             && let Some(outcome) =
-                crate::pipeline::learning::build_learning_outcome_from_payload(&payload)
+                astra_turn_core::pipeline_learning::build_learning_outcome_from_payload(&payload)
             && let Err(error) = writer.record_outcome(outcome).await
         {
             record_persist_failure("pipeline_learning", &error);
@@ -114,7 +114,7 @@ fn build_hook_db_persist_from_payload(
     let mut tool_pre_state_snapshot_databases = std::collections::HashMap::new();
     let mut tool_execution_outcomes: std::collections::HashMap<
         String,
-        crate::turn::action_compensation::ExecutionOutcomeClassification,
+        astra_turn_core::action_compensation::ExecutionOutcomeClassification,
     > = std::collections::HashMap::new();
     for tool_result in tool_results {
         let Some(tool_call_id) = tool_result
@@ -133,7 +133,7 @@ fn build_hook_db_persist_from_payload(
             .or_else(|| tool_result.get("error"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        let is_err = crate::turn::tool_result_semantics::is_tool_error(result_text)
+        let is_err = astra_turn_core::tool_result_semantics::is_tool_error(result_text)
             || tool_result.get("ok").and_then(serde_json::Value::as_bool) == Some(false);
         let error_text = tool_result
             .get("error")
@@ -149,7 +149,7 @@ fn build_hook_db_persist_from_payload(
             == Some("rejected")
             || error_text.starts_with("blocked_tool:")
             || result_text.starts_with("blocked_tool:");
-        let classification = crate::turn::action_compensation::classify_execution_outcome(
+        let classification = astra_turn_core::action_compensation::classify_execution_outcome(
             result_text,
             is_err,
             duration_ms,
@@ -277,7 +277,7 @@ fn build_hook_db_persist_from_payload(
         })
         .collect::<Vec<_>>();
     let mutation_objective_score =
-        crate::pipeline::learning::build_learning_outcome_from_payload(payload)
+        astra_turn_core::pipeline_learning::build_learning_outcome_from_payload(payload)
             .and_then(|outcome| serde_json::to_value(outcome.mutation_objective_score()).ok());
     let turn_number = valid_turn_number(hook_payload.get("turn_count"));
     let decision_audit = Some(TurnDecisionAuditRecord {
@@ -1961,10 +1961,10 @@ mod inprocess_hook_contract_tests {
         use std::sync::{Arc, Mutex as StdMutex};
 
         let cal = Arc::new(StdMutex::new(
-            crate::pipeline::calibration::ProgressiveCalibrator::new(0.70),
+            astra_pipeline::calibration::ProgressiveCalibrator::new(0.70),
         ));
         let writer: Arc<dyn crate::TurnLearningWriter> = Arc::new(
-            crate::pipeline::learning::PipelineLearningWriter::new()
+            astra_turn_core::pipeline_learning::PipelineLearningWriter::new()
                 .with_progressive_calibrator(cal.clone()),
         );
 
@@ -2065,10 +2065,10 @@ mod inprocess_hook_contract_tests {
         use std::sync::{Arc, Mutex as StdMutex};
 
         let cal = Arc::new(StdMutex::new(
-            crate::pipeline::calibration::ProgressiveCalibrator::new(0.70),
+            astra_pipeline::calibration::ProgressiveCalibrator::new(0.70),
         ));
         let writer: Arc<dyn crate::TurnLearningWriter> = Arc::new(
-            crate::pipeline::learning::PipelineLearningWriter::new()
+            astra_turn_core::pipeline_learning::PipelineLearningWriter::new()
                 .with_progressive_calibrator(cal.clone()),
         );
 
@@ -2190,10 +2190,10 @@ mod inprocess_hook_contract_tests {
         use std::sync::{Arc, Mutex as StdMutex};
 
         let cal = Arc::new(StdMutex::new(
-            crate::pipeline::calibration::ProgressiveCalibrator::new(0.70),
+            astra_pipeline::calibration::ProgressiveCalibrator::new(0.70),
         ));
         let writer: Arc<dyn crate::TurnLearningWriter> = Arc::new(
-            crate::pipeline::learning::PipelineLearningWriter::new()
+            astra_turn_core::pipeline_learning::PipelineLearningWriter::new()
                 .with_progressive_calibrator(cal.clone()),
         );
 

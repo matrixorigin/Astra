@@ -951,7 +951,7 @@ pub(crate) fn worktree_remove(project_root: &Path, args: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_runtime::str_preview::prefix_chars;
+    use astra_text_utils::str_preview::prefix_chars;
     use serde_json::json;
     use tempfile::TempDir;
 

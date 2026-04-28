@@ -284,7 +284,7 @@ impl ContextBudget {
     /// - compact_threshold, keep_recent_turns come from RuntimeConfig.compression
     /// - memory_budget_chars comes from RuntimeConfig.memory.max_memory_tokens
     pub fn from_runtime_config(
-        config: &crate::runtime_config::RuntimeConfig,
+        config: &astra_config::runtime_config::RuntimeConfig,
         model: Option<&str>,
     ) -> Self {
         // Get model-specific limits
@@ -1424,7 +1424,7 @@ mod tests {
 
     #[test]
     fn from_runtime_config_applies_compression_settings() {
-        let mut config = crate::runtime_config::RuntimeConfig::default();
+        let mut config = astra_config::runtime_config::RuntimeConfig::default();
         config.compression.compression_threshold = 0.6;
         config.compression.preserve_recent_turns = 4;
         config.memory.max_memory_tokens = 5000;
@@ -1444,7 +1444,7 @@ mod tests {
 
     #[test]
     fn from_runtime_config_defaults() {
-        let config = crate::runtime_config::RuntimeConfig::default();
+        let config = astra_config::runtime_config::RuntimeConfig::default();
         let b = ContextBudget::from_runtime_config(&config, None);
 
         // Should use default values

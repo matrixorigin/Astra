@@ -16,12 +16,12 @@ use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::bridge::rate_limit_cooldown::{
+use astra_turn_core::bridge_rate_limit_cooldown::{
     PerModelCooldown, RateLimitAction, is_overload_status, is_rate_limit_status,
     parse_retry_after_ms,
 };
 use crate::turn::bridge_sse_helpers::render_sse;
-use crate::turn::edge_ledger::ensure_tool_call_ids;
+use astra_turn_core::edge_ledger::ensure_tool_call_ids;
 use crate::turn::llm_client::{
     LlmCallResult, LlmCancel, apply_provider_auth, build_provider_request_body,
     consolidate_system_messages, llm_request_url_for_provider, provider_uses_bedrock_converse,
@@ -681,13 +681,13 @@ pub(crate) async fn call_llm_stream(
 
                 // Degraded tool-call fallback: recover <invoke> or <tool_call> blocks.
                 if tool_calls.is_empty() {
-                    if let Some(parsed) = crate::turn::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text) {
+                    if let Some(parsed) = astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text) {
                         astra_core::agent_warn!(
                             "llm",
                             "recovered {} tool call(s) from degraded text in content (inprocess)",
                             parsed.len()
                         );
-                        full_text = crate::turn::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
+                        full_text = astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
                         tool_calls = parsed;
                     }
                 }

@@ -90,7 +90,7 @@ pub(crate) async fn stream_chat_sse(
     // Capture the model id up front for later `resolve_for_model` calls —
     // `p.model` (Option<&str>) gets consumed into `host.model` below.
     let model_id_for_policy = p.model;
-    let resolved_tool_policy = astra_runtime::runtime_config::RuntimeConfig::load()
+    let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
         .tool_selection
         .resolve_for_model(model_id_for_policy);
 

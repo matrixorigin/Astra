@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::turn::sse_stream_host::EdgeToolExecResult;
+use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 
 use super::agentic_loop_host::AgenticLoopState;
 

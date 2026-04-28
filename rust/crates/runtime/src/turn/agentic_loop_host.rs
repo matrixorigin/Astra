@@ -58,15 +58,15 @@ use astra_services::{DatabaseEvaluationService, DatabaseEventService};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint};
-use crate::pipeline::step_recorder::StepRecorder;
-use crate::semantic_dedup::SemanticDedup;
+use astra_pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint};
+use astra_pipeline::step_recorder::StepRecorder;
+use astra_text_utils::semantic_dedup::SemanticDedup;
 use crate::tool_registry::SelectionReport;
-use crate::turn::agentic_verdict_audit::AgenticVerdictAuditEvent;
-use crate::turn::chat_turn_heuristics::TaskExecutionProfile;
-use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
-use crate::turn::sse_stream_host::EdgeToolExecResult;
-use crate::turn::turn_guard::TurnGuard;
+use astra_turn_core::agentic_verdict_audit::AgenticVerdictAuditEvent;
+use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
+use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
+use astra_turn_core::sse_stream_host::EdgeToolExecResult;
+use astra_turn_core::turn_guard::TurnGuard;
 use astra_turn_core::headless_types::HeadlessStderrStyle;
 use tokio_util::sync::CancellationToken;
 
@@ -264,7 +264,7 @@ pub struct SkillState {
     /// Used to boost high-performing skills in selection priority.
     pub quality_tracker: crate::skills::quality::SkillQualityTracker,
     /// Skill auto-improvement tracker — detects user corrections and proposes SKILL.md rewrites.
-    pub improvement_tracker: crate::skills::improvement::ImprovementTracker,
+    pub improvement_tracker: astra_skills::improvement::ImprovementTracker,
     /// Skills pinned by the user — always included in budget (never truncated).
     pub pinned: std::collections::HashSet<String>,
     /// Canonical skill names surfaced via `discover_skills` this session.
@@ -471,15 +471,15 @@ pub struct MessagingState {
     /// Optional mailbox for receiving messages from other agents.
     /// When set, incoming messages are drained at each turn start and
     /// progress updates are sent to the parent at turn end.
-    pub mailbox: Option<crate::messaging::router::AgentMailbox>,
+    pub mailbox: Option<astra_messaging::router::AgentMailbox>,
     /// Tracks messages that require acknowledgment and handles retries.
-    pub ack_tracker: Option<std::sync::Arc<crate::messaging::ack_tracker::PendingAckTracker>>,
+    pub ack_tracker: Option<std::sync::Arc<astra_messaging::ack_tracker::PendingAckTracker>>,
     /// Background retry/dead-letter sweep for ack-tracked messages.
-    pub ack_sweep_task: Option<crate::messaging::ack_tracker::AckSweepHandle>,
+    pub ack_sweep_task: Option<astra_messaging::ack_tracker::AckSweepHandle>,
     /// Dead letter queue for permanently failed messages.
-    pub dead_letter_queue: Option<std::sync::Arc<crate::messaging::dead_letter::DeadLetterQueue>>,
+    pub dead_letter_queue: Option<std::sync::Arc<astra_messaging::dead_letter::DeadLetterQueue>>,
     /// Unified messaging metrics (optional, shared across agents in a delegation).
-    pub metrics: Option<std::sync::Arc<crate::messaging::metrics::MessagingMetrics>>,
+    pub metrics: Option<std::sync::Arc<astra_messaging::metrics::MessagingMetrics>>,
     /// Optional progress emitter for broadcasting turn events to UI/subscribers.
     /// When set, the loop emits `TurnCompleted` events after each turn.
     pub progress_emitter: Option<crate::orchestration::AgentProgressEmitter>,
@@ -491,11 +491,11 @@ pub struct StopHookState {
     /// Verification commands run before the loop is allowed to complete.
     /// For plan subtasks, populated from declarative `when: task_completed` hooks.
     /// If any hook fails, its output is injected and the loop continues.
-    pub stop_hooks: Vec<crate::turn::stop_hooks::StopHook>,
+    pub stop_hooks: Vec<astra_turn_core::stop_hooks::StopHook>,
     /// How many times stop hooks have fired (prevents infinite hook loops).
     pub stop_hook_runs: u32,
     /// Hooks with `when: teammate_idle` — injected once after a `delegate` round returns.
-    pub teammate_idle_hooks: Vec<crate::turn::stop_hooks::StopHook>,
+    pub teammate_idle_hooks: Vec<astra_turn_core::stop_hooks::StopHook>,
     /// How many times teammate-idle hooks have fired (at most once per loop).
     pub teammate_idle_hook_runs: u32,
     /// Edge/chat project root (`git_root` or `cwd`) for enriching `delegate` sub-run context
@@ -526,7 +526,7 @@ pub struct ErrorRecoveryState {
     /// Reset when a turn succeeds or a different error category appears.
     pub consecutive_same_error: u32,
     /// The error category from the last turn (for streak detection).
-    pub last_error_category: Option<crate::turn::error_recovery::ErrorCategory>,
+    pub last_error_category: Option<astra_turn_core::error_recovery::ErrorCategory>,
 }
 
 // ─── Loop state ──────────────────────────────────────────────────────────────
@@ -718,9 +718,9 @@ pub struct AgenticLoopState {
 
     // ── Liquid (within-turn tactical adaptation) ──
     /// Optional tactical adapter for step-level adaptation within a turn.
-    pub tactical_adapter: Option<crate::liquid::tactical::TacticalAdapter>,
+    pub tactical_adapter: Option<astra_turn_core::liquid_tactical::TacticalAdapter>,
     /// Optional step signal collector for within-turn outcome tracking.
-    pub step_signal_collector: Option<crate::liquid::step_signals::StepSignalCollector>,
+    pub step_signal_collector: Option<astra_turn_core::liquid_step_signals::StepSignalCollector>,
 
     // ── Tool selection budget override ──
     /// Scenario-driven override for the tool selection token budget.
@@ -733,7 +733,7 @@ pub struct AgenticLoopState {
     /// Accumulated LLM-routed evolution signals awaiting reflection.
     /// Filled during tuning cycles; drained when threshold is met and
     /// reflection prompt is injected.
-    pub pending_reflection_signals: Vec<crate::evolution::types::EvolutionSignal>,
+    pub pending_reflection_signals: Vec<astra_evolution::types::EvolutionSignal>,
     /// Recent tactical adaptations applied while the current reflection window
     /// was accumulating. Drained into the next auto-reflection context.
     pub recent_tactical_actions: Vec<String>,
@@ -747,7 +747,7 @@ pub struct AgenticLoopState {
     /// Structured interruption record populated by early-exit paths.
     /// When set, the session journal and checkpoint include machine-readable
     /// interruption context for structured resumption.
-    pub interruption: Option<super::interruption::InterruptionRecord>,
+    pub interruption: Option<astra_turn_core::interruption::InterruptionRecord>,
 
     // ── Session Facts (L1a ground truth) ──
     /// System-tracked session state updated every turn from tool call records.
@@ -765,13 +765,13 @@ pub struct AgenticLoopState {
     // ── Approval checkpoint persistence ──
     /// Approval overrides synchronized from CLI's PermissionManager before each turn.
     /// Written to HeavyCheckpoint so approval decisions survive session restarts.
-    pub approval_overrides: Option<super::approval_fingerprint::FingerprintedOverrides>,
+    pub approval_overrides: Option<astra_turn_core::approval_fingerprint::FingerprintedOverrides>,
 
     // ── Confidence tracking ──
     /// Tracks selector confidence trends across turns to detect floor loops.
-    pub confidence_trend: super::confidence_contract::ConfidenceTrendTracker,
+    pub confidence_trend: astra_turn_core::confidence_contract::ConfidenceTrendTracker,
     /// Last diagnosis computed after tool selection (for telemetry and fallback).
-    pub last_confidence_diagnosis: Option<super::confidence_contract::ConfidenceDiagnosis>,
+    pub last_confidence_diagnosis: Option<astra_turn_core::confidence_contract::ConfidenceDiagnosis>,
 
     // ── Turn observability (Phase 1) ──
     /// In-memory collector for fine-grained turn events (llm_round, tool timing).
@@ -1052,11 +1052,11 @@ pub fn make_test_loop_state() -> AgenticLoopState {
 
 /// **Test-only.** Like [`make_test_loop_state`], but resolves workflow-guard
 /// thresholds (`max_identical_tool_calls`, `max_tools_per_turn`) through
-/// [`crate::runtime_config::ToolSelectionConfig::resolve_for_model`], so a
+/// [`astra_config::runtime_config::ToolSelectionConfig::resolve_for_model`], so a
 /// request carrying a specific model id sees that model's profile.
 #[cfg(feature = "bridge-e2e-hooks")]
 pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
-    let policy = crate::runtime_config::RuntimeConfig::load()
+    let policy = astra_config::runtime_config::RuntimeConfig::load()
         .tool_selection
         .resolve_for_model(model);
     AgenticLoopState {
@@ -1095,7 +1095,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         telemetry: Default::default(),
         skills: SkillState {
             quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-            improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
+            improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
             ..Default::default()
         },
         hooks: Default::default(),
@@ -1435,10 +1435,10 @@ pub(crate) mod tests {
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.95),
             call_counts: HashMap::new(),
-            max_identical_tool_calls: crate::runtime_config::RuntimeConfig::load()
+            max_identical_tool_calls: astra_config::runtime_config::RuntimeConfig::load()
                 .tool_selection
                 .effective_max_identical_calls(),
-            max_tools_per_turn: crate::runtime_config::RuntimeConfig::load()
+            max_tools_per_turn: astra_config::runtime_config::RuntimeConfig::load()
                 .tool_selection
                 .effective_max_tools_per_turn(),
             repeated_cache_hit_suppression: 3,
@@ -1447,7 +1447,7 @@ pub(crate) mod tests {
             telemetry: Default::default(),
             skills: SkillState {
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
+                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
                 ..Default::default()
             },
             hooks: Default::default(),
@@ -1672,17 +1672,17 @@ pub(crate) mod tests {
             .filter(|event| {
                 matches!(
                     event.event_type,
-                    crate::pipeline::StepEventType::StepCompleted
-                        | crate::pipeline::StepEventType::StepIncomplete
-                        | crate::pipeline::StepEventType::StepFailed
-                        | crate::pipeline::StepEventType::StepRetried
+                    astra_pipeline::step_protocol::StepEventType::StepCompleted
+                        | astra_pipeline::step_protocol::StepEventType::StepIncomplete
+                        | astra_pipeline::step_protocol::StepEventType::StepFailed
+                        | astra_pipeline::step_protocol::StepEventType::StepRetried
                 )
             })
             .collect();
         assert_eq!(terminal_events.len(), 1, "{terminal_events:?}");
         assert_eq!(
             terminal_events[0].event_type,
-            crate::pipeline::StepEventType::StepCompleted
+            astra_pipeline::step_protocol::StepEventType::StepCompleted
         );
     }
 
@@ -1701,10 +1701,10 @@ pub(crate) mod tests {
         for event in state.step_recorder.events() {
             if matches!(
                 event.event_type,
-                crate::pipeline::StepEventType::StepCompleted
-                    | crate::pipeline::StepEventType::StepIncomplete
-                    | crate::pipeline::StepEventType::StepFailed
-                    | crate::pipeline::StepEventType::StepRetried
+                astra_pipeline::step_protocol::StepEventType::StepCompleted
+                    | astra_pipeline::step_protocol::StepEventType::StepIncomplete
+                    | astra_pipeline::step_protocol::StepEventType::StepFailed
+                    | astra_pipeline::step_protocol::StepEventType::StepRetried
             ) {
                 *terminal_counts
                     .entry(event.step_id.clone())
@@ -1745,7 +1745,7 @@ pub(crate) mod tests {
             .events()
             .iter()
             .find(|event| {
-                event.event_type == crate::pipeline::StepEventType::ToolCallCompleted
+                event.event_type == astra_pipeline::step_protocol::StepEventType::ToolCallCompleted
                     && event
                         .payload
                         .as_ref()
@@ -1874,7 +1874,7 @@ pub(crate) mod tests {
         ])
         .with_valid_tools(&["read_file", "write_file"]);
         let mut state = make_state();
-        state.task_profile = crate::turn::chat_turn_heuristics::infer_task_execution_profile(
+        state.task_profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
             "systematically refactor and implement a complex subsystem",
         );
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
@@ -1911,7 +1911,7 @@ pub(crate) mod tests {
         ])
         .with_valid_tools(&["read_file"]);
         let mut state = make_state();
-        state.task_profile = crate::turn::chat_turn_heuristics::infer_task_execution_profile(
+        state.task_profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
             "explore the codebase and investigate the root cause",
         );
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
@@ -1956,7 +1956,7 @@ pub(crate) mod tests {
         ])
         .with_valid_tools(&["read_file", "write_file"]);
         let mut state = make_state();
-        state.task_profile = crate::turn::chat_turn_heuristics::infer_task_execution_profile(
+        state.task_profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
             "systematically refactor and implement a complex subsystem",
         );
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
@@ -1968,7 +1968,7 @@ pub(crate) mod tests {
         state.max_turns = 2;
         state.remaining_turns = 2;
         state.stall.verdict_events.push(
-            crate::turn::agentic_verdict_audit::AgenticVerdictAuditEvent {
+            astra_turn_core::agentic_verdict_audit::AgenticVerdictAuditEvent {
                 turn: 1,
                 severity: "warning".into(),
                 injections: vec!["stall detected".into()],
@@ -2025,7 +2025,7 @@ pub(crate) mod tests {
         ])
         .with_valid_tools(&["read_file", "glob"]);
         let mut state = make_state();
-        state.task_profile = crate::turn::chat_turn_heuristics::infer_task_execution_profile(
+        state.task_profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
             "explore the codebase and investigate the root cause",
         );
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
@@ -2078,7 +2078,7 @@ pub(crate) mod tests {
         ])
         .with_valid_tools(&["read_file", "write_file"]);
         let mut state = make_state();
-        state.task_profile = crate::turn::chat_turn_heuristics::infer_task_execution_profile(
+        state.task_profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
             "systematically refactor and implement a complex subsystem",
         );
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
@@ -3748,7 +3748,7 @@ pub(crate) mod tests {
 
     #[test]
     fn post_compact_skill_reinjection() {
-        use crate::turn::cloud::attachments::AttachmentBuilder;
+        use astra_turn_core::cloud_attachments::AttachmentBuilder;
         use crate::turn::skill_tool::InvokedSkill;
 
         let mut state = make_state();
@@ -4843,19 +4843,19 @@ print(json.dumps({'context': 'user said: ' + msg}))
         // Add a rule that fires on low success rate — it should NOT fire because
         // we just recorded a success.
         hub.tuning()
-            .add_rule(crate::auto_tuning::EvolutionRule::new(
+            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
                 "test-low-success",
-                crate::auto_tuning::EvolutionTrigger::LowSuccessRate {
+                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
                     threshold: 0.5,
                     window_secs: 3600,
                     min_samples: 1,
                 },
-                crate::auto_tuning::EvolutionAction::Alert {
+                astra_learning::auto_tuning::EvolutionAction::Alert {
                     message: "low success".into(),
-                    severity: crate::auto_tuning::AlertSeverity::Warning,
+                    severity: astra_learning::auto_tuning::AlertSeverity::Warning,
                 },
             ));
-        let config = crate::runtime_config::RuntimeConfig::default();
+        let config = astra_config::runtime_config::RuntimeConfig::default();
         let triggered = hub.tuning().evaluate(&config);
         assert!(
             triggered.is_empty(),
@@ -4878,7 +4878,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         );
 
         // Full cycle: evaluate + execute.
-        let mut config2 = crate::runtime_config::RuntimeConfig::default();
+        let mut config2 = astra_config::runtime_config::RuntimeConfig::default();
         let executions = hub.run_tuning_cycle(&mut config2);
         assert!(
             !executions.is_empty(),
@@ -4898,19 +4898,19 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         // TaskFailure lowers success rate. With 0 successes and 1 failure, rate = 0.0.
         hub.tuning()
-            .add_rule(crate::auto_tuning::EvolutionRule::new(
+            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
                 "low-success",
-                crate::auto_tuning::EvolutionTrigger::LowSuccessRate {
+                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
                     threshold: 0.5,
                     window_secs: 3600,
                     min_samples: 1,
                 },
-                crate::auto_tuning::EvolutionAction::Alert {
+                astra_learning::auto_tuning::EvolutionAction::Alert {
                     message: "low success".into(),
-                    severity: crate::auto_tuning::AlertSeverity::Warning,
+                    severity: astra_learning::auto_tuning::AlertSeverity::Warning,
                 },
             ));
-        let config = crate::runtime_config::RuntimeConfig::default();
+        let config = astra_config::runtime_config::RuntimeConfig::default();
         let triggered = hub.tuning().evaluate(&config);
         assert!(
             !triggered.is_empty(),
@@ -4929,19 +4929,19 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         // Interruption is recorded as a signal — verify via accumulation.
         hub.tuning()
-            .add_rule(crate::auto_tuning::EvolutionRule::new(
+            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
                 "interrupt-detect",
-                crate::auto_tuning::EvolutionTrigger::SignalAccumulation {
+                astra_learning::auto_tuning::EvolutionTrigger::SignalAccumulation {
                     signal_type: "interruption".into(),
                     count: 1,
                     window_secs: 3600,
                 },
-                crate::auto_tuning::EvolutionAction::Alert {
+                astra_learning::auto_tuning::EvolutionAction::Alert {
                     message: "interrupted".into(),
-                    severity: crate::auto_tuning::AlertSeverity::Info,
+                    severity: astra_learning::auto_tuning::AlertSeverity::Info,
                 },
             ));
-        let config = crate::runtime_config::RuntimeConfig::default();
+        let config = astra_config::runtime_config::RuntimeConfig::default();
         let triggered = hub.tuning().evaluate(&config);
         assert!(
             !triggered.is_empty(),
@@ -4961,19 +4961,19 @@ print(json.dumps({'context': 'user said: ' + msg}))
         record_loop_completion_feedback(&mut state, &result);
 
         hub.tuning()
-            .add_rule(crate::auto_tuning::EvolutionRule::new(
+            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
                 "high-tokens",
-                crate::auto_tuning::EvolutionTrigger::HighTokenUsage {
+                astra_learning::auto_tuning::EvolutionTrigger::HighTokenUsage {
                     threshold_tokens: 50_000,
                     window_secs: 3600,
                     min_samples: 1,
                 },
-                crate::auto_tuning::EvolutionAction::Alert {
+                astra_learning::auto_tuning::EvolutionAction::Alert {
                     message: "high tokens".into(),
-                    severity: crate::auto_tuning::AlertSeverity::Warning,
+                    severity: astra_learning::auto_tuning::AlertSeverity::Warning,
                 },
             ));
-        let config = crate::runtime_config::RuntimeConfig::default();
+        let config = astra_config::runtime_config::RuntimeConfig::default();
         let triggered = hub.tuning().evaluate(&config);
         assert!(!triggered.is_empty(), "high token usage rule should fire");
     }
@@ -4991,19 +4991,19 @@ print(json.dumps({'context': 'user said: ' + msg}))
         record_loop_completion_feedback(&mut state, &result);
 
         hub.tuning()
-            .add_rule(crate::auto_tuning::EvolutionRule::new(
+            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
                 "churn-detect",
-                crate::auto_tuning::EvolutionTrigger::SignalAccumulation {
+                astra_learning::auto_tuning::EvolutionTrigger::SignalAccumulation {
                     signal_type: "tool_churn".into(),
                     count: 1,
                     window_secs: 3600,
                 },
-                crate::auto_tuning::EvolutionAction::Alert {
+                astra_learning::auto_tuning::EvolutionAction::Alert {
                     message: "churn".into(),
-                    severity: crate::auto_tuning::AlertSeverity::Info,
+                    severity: astra_learning::auto_tuning::AlertSeverity::Info,
                 },
             ));
-        let config = crate::runtime_config::RuntimeConfig::default();
+        let config = astra_config::runtime_config::RuntimeConfig::default();
         let triggered = hub.tuning().evaluate(&config);
         assert!(
             !triggered.is_empty(),
@@ -5046,19 +5046,19 @@ print(json.dumps({'context': 'user said: ' + msg}))
         record_loop_completion_feedback(&mut state, &result);
 
         hub.tuning()
-            .add_rule(crate::auto_tuning::EvolutionRule::new(
+            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
                 "churn-detect",
-                crate::auto_tuning::EvolutionTrigger::SignalAccumulation {
+                astra_learning::auto_tuning::EvolutionTrigger::SignalAccumulation {
                     signal_type: "tool_churn".into(),
                     count: 1,
                     window_secs: 3600,
                 },
-                crate::auto_tuning::EvolutionAction::Alert {
+                astra_learning::auto_tuning::EvolutionAction::Alert {
                     message: "churn".into(),
-                    severity: crate::auto_tuning::AlertSeverity::Info,
+                    severity: astra_learning::auto_tuning::AlertSeverity::Info,
                 },
             ));
-        let config = crate::runtime_config::RuntimeConfig::default();
+        let config = astra_config::runtime_config::RuntimeConfig::default();
         let triggered = hub.tuning().evaluate(&config);
         assert!(
             triggered.is_empty(),
@@ -5104,19 +5104,19 @@ print(json.dumps({'context': 'user said: ' + msg}))
         // We have TaskSuccess (completed) + TaskSuccess (good-skill) + TaskFailure (bad-skill)
         // = 2 successes / 3 total = 0.67 success rate.
         hub.tuning()
-            .add_rule(crate::auto_tuning::EvolutionRule::new(
+            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
                 "low-success",
-                crate::auto_tuning::EvolutionTrigger::LowSuccessRate {
+                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
                     threshold: 0.8, // 0.67 < 0.8, so this should trigger
                     window_secs: 3600,
                     min_samples: 1,
                 },
-                crate::auto_tuning::EvolutionAction::Alert {
+                astra_learning::auto_tuning::EvolutionAction::Alert {
                     message: "skill failure".into(),
-                    severity: crate::auto_tuning::AlertSeverity::Warning,
+                    severity: astra_learning::auto_tuning::AlertSeverity::Warning,
                 },
             ));
-        let config = crate::runtime_config::RuntimeConfig::default();
+        let config = astra_config::runtime_config::RuntimeConfig::default();
         let triggered = hub.tuning().evaluate(&config);
         assert!(
             !triggered.is_empty(),
@@ -5133,16 +5133,16 @@ print(json.dumps({'context': 'user said: ' + msg}))
         state.telemetry.observability_session = Some(session.clone());
 
         hub.tuning().add_rule(
-            crate::auto_tuning::EvolutionRule::new(
+            astra_learning::auto_tuning::EvolutionRule::new(
                 "test-alert",
-                crate::auto_tuning::EvolutionTrigger::LowSuccessRate {
+                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
                     threshold: 0.5,
                     window_secs: 3600,
                     min_samples: 1,
                 },
-                crate::auto_tuning::EvolutionAction::Alert {
+                astra_learning::auto_tuning::EvolutionAction::Alert {
                     message: "low success detected".into(),
-                    severity: crate::auto_tuning::AlertSeverity::Warning,
+                    severity: astra_learning::auto_tuning::AlertSeverity::Warning,
                 },
             )
             .with_cooldown(std::time::Duration::from_secs(0)),
@@ -5150,8 +5150,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         // Record failures to satisfy the rule trigger.
         for _ in 0..3 {
-            hub.record_feedback(crate::auto_tuning::FeedbackSignal::new(
-                crate::auto_tuning::SignalType::TaskFailure {
+            hub.record_feedback(astra_learning::auto_tuning::FeedbackSignal::new(
+                astra_learning::auto_tuning::SignalType::TaskFailure {
                     reason: "test".into(),
                 },
             ));
@@ -5216,7 +5216,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let guard = session.read().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             guard.profile.current_scenario,
-            Some(crate::user_profile::Scenario::Debugging)
+            Some(astra_config::user_profile::Scenario::Debugging)
         );
         assert!(state.max_turn_input_tokens >= 100_000);
     }
@@ -5306,7 +5306,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let guard = session.read().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             guard.profile.current_scenario,
-            Some(crate::user_profile::Scenario::Debugging),
+            Some(astra_config::user_profile::Scenario::Debugging),
             "scenario detection must resume on the turn after the cancellation flag is consumed"
         );
     }
@@ -5338,11 +5338,11 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let mut state = make_state();
         state.telemetry.observability_hub = Some(hub);
         state.telemetry.observability_session = Some(session.clone());
-        state.tactical_adapter = Some(crate::liquid::tactical::TacticalAdapter::new(
-            crate::liquid::tactical::DampenerConfig::default(),
+        state.tactical_adapter = Some(astra_turn_core::liquid_tactical::TacticalAdapter::new(
+            astra_turn_core::liquid_tactical::DampenerConfig::default(),
         ));
-        state.step_signal_collector = Some(crate::liquid::step_signals::StepSignalCollector::new(
-            crate::liquid::step_signals::StepSignalConfig::default(),
+        state.step_signal_collector = Some(astra_turn_core::liquid_step_signals::StepSignalCollector::new(
+            astra_turn_core::liquid_step_signals::StepSignalConfig::default(),
             64_000,
         ));
 
@@ -5550,7 +5550,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         // CodeReview scenario should set memory_top_k=7 and verification_strictness=0.7
         assert_eq!(
             guard.profile.current_scenario,
-            Some(crate::user_profile::Scenario::CodeReview)
+            Some(astra_config::user_profile::Scenario::CodeReview)
         );
         assert_eq!(guard.config.memory.retrieval_top_k, 7);
         assert!(
@@ -5650,7 +5650,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         // After cooldown expires, scenario should be allowed to change
         assert_ne!(
             guard.profile.current_scenario,
-            Some(crate::user_profile::Scenario::Debugging),
+            Some(astra_config::user_profile::Scenario::Debugging),
             "scenario should change after cooldown expires"
         );
     }
@@ -5817,14 +5817,14 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         // Add a rule that increases token budget
         hub.tuning()
-            .add_rule(crate::auto_tuning::EvolutionRule::new(
+            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
                 "test-increase-budget",
-                crate::auto_tuning::EvolutionTrigger::LowSuccessRate {
+                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
                     threshold: 1.0, // always fires
                     window_secs: 3600,
                     min_samples: 0,
                 },
-                crate::auto_tuning::EvolutionAction::AdjustConfig {
+                astra_learning::auto_tuning::EvolutionAction::AdjustConfig {
                     path: "token_budget.max_turn_input_tokens".into(),
                     delta: 10_000.0,
                     min: None,
@@ -5986,14 +5986,14 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         // Add a rule that increases token budget
         hub.tuning()
-            .add_rule(crate::auto_tuning::EvolutionRule::new(
+            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
                 "increase-budget",
-                crate::auto_tuning::EvolutionTrigger::LowSuccessRate {
+                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
                     threshold: 1.0,
                     window_secs: 3600,
                     min_samples: 0,
                 },
-                crate::auto_tuning::EvolutionAction::AdjustConfig {
+                astra_learning::auto_tuning::EvolutionAction::AdjustConfig {
                     path: "token_budget.max_turn_input_tokens".into(),
                     delta: 20_000.0,
                     min: None,
@@ -6059,7 +6059,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         ];
 
         let mut scenario_changes = 0u32;
-        let mut last_scenario: Option<crate::user_profile::Scenario> = None;
+        let mut last_scenario: Option<astra_config::user_profile::Scenario> = None;
 
         for turn in 1..=100u32 {
             let query = if turn % 2 == 1 {
@@ -6245,7 +6245,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
     #[test]
     fn stress_all_8_default_rules_fire() {
-        use crate::auto_tuning::{FeedbackSignal, SignalType, default_rules};
+        use astra_learning::auto_tuning::{FeedbackSignal, SignalType, default_rules};
 
         let hub = make_hub();
         // Load default evolution rules so the tuning engine has something to evaluate
@@ -6374,19 +6374,19 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let result = Ok(AgenticLoopOutcome::Completed);
         record_loop_completion_feedback(&mut state, &result);
 
-        let config = crate::runtime_config::RuntimeConfig::default();
+        let config = astra_config::runtime_config::RuntimeConfig::default();
         // Add a rule that triggers on high retry rate.
         hub.tuning()
-            .add_rule(crate::auto_tuning::EvolutionRule::new(
+            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
                 "retry-trigger",
-                crate::auto_tuning::EvolutionTrigger::HighRetryRate {
+                astra_learning::auto_tuning::EvolutionTrigger::HighRetryRate {
                     threshold: 0.3,
                     window_secs: 3600,
                     min_samples: 1,
                 },
-                crate::auto_tuning::EvolutionAction::Alert {
+                astra_learning::auto_tuning::EvolutionAction::Alert {
                     message: "retries detected".into(),
-                    severity: crate::auto_tuning::AlertSeverity::Warning,
+                    severity: astra_learning::auto_tuning::AlertSeverity::Warning,
                 },
             ));
         let triggered = hub.tuning().evaluate(&config);
@@ -6410,18 +6410,18 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         // Verify Acceptance signal was recorded — check success rate.
         // Acceptance + TaskSuccess = 2 successes, both positive.
-        let config = crate::runtime_config::RuntimeConfig::default();
+        let config = astra_config::runtime_config::RuntimeConfig::default();
         hub.tuning()
-            .add_rule(crate::auto_tuning::EvolutionRule::new(
+            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
                 "high-success-check",
-                crate::auto_tuning::EvolutionTrigger::LowSuccessRate {
+                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
                     threshold: 0.5,
                     window_secs: 3600,
                     min_samples: 1,
                 },
-                crate::auto_tuning::EvolutionAction::Alert {
+                astra_learning::auto_tuning::EvolutionAction::Alert {
                     message: "acceptance".into(),
-                    severity: crate::auto_tuning::AlertSeverity::Info,
+                    severity: astra_learning::auto_tuning::AlertSeverity::Info,
                 },
             ));
         let triggered = hub.tuning().evaluate(&config);
@@ -6446,18 +6446,18 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         // Only TaskSuccess should be recorded (no Acceptance because "wrong" is a correction keyword).
         // We can verify by checking there's only 1 signal.
-        let config = crate::runtime_config::RuntimeConfig::default();
+        let config = astra_config::runtime_config::RuntimeConfig::default();
         hub.tuning()
-            .add_rule(crate::auto_tuning::EvolutionRule::new(
+            .add_rule(astra_learning::auto_tuning::EvolutionRule::new(
                 "success-check",
-                crate::auto_tuning::EvolutionTrigger::LowSuccessRate {
+                astra_learning::auto_tuning::EvolutionTrigger::LowSuccessRate {
                     threshold: 1.1, // impossible to reach — we're just counting signals
                     window_secs: 3600,
                     min_samples: 1,
                 },
-                crate::auto_tuning::EvolutionAction::Alert {
+                astra_learning::auto_tuning::EvolutionAction::Alert {
                     message: "check".into(),
-                    severity: crate::auto_tuning::AlertSeverity::Info,
+                    severity: astra_learning::auto_tuning::AlertSeverity::Info,
                 },
             ));
         // This would trigger if there's any signal below the impossible threshold.
@@ -6479,8 +6479,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
     #[test]
     fn tactical_adapter_wiring_produces_hints_on_error_streak() {
-        use crate::liquid::step_signals::{StepSignalCollector, StepSignalConfig};
-        use crate::liquid::tactical::{DampenerConfig, TacticalAction, TacticalAdapter};
+        use astra_turn_core::liquid_step_signals::{StepSignalCollector, StepSignalConfig};
+        use astra_turn_core::liquid_tactical::{DampenerConfig, TacticalAction, TacticalAdapter};
 
         let mut state = make_state();
         state.max_turn_input_tokens = 100_000;
@@ -6553,7 +6553,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let mut step_actions: Vec<TacticalAction> = Vec::new();
 
         for rec in &new_records {
-            let outcome = crate::liquid::step_signals::StepOutcome {
+            let outcome = astra_turn_core::liquid_step_signals::StepOutcome {
                 tool_name: rec.name.clone(),
                 ok: rec.ok,
                 latency_ms: rec.ms,
@@ -6591,7 +6591,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
     #[test]
     fn tactical_actions_apply_bounded_runtime_mutations() {
-        use crate::liquid::tactical::TacticalAction;
+        use astra_turn_core::liquid_tactical::TacticalAction;
 
         let session = make_session();
         let mut state = make_state();
@@ -6644,7 +6644,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
     #[test]
     fn tactical_budget_mutations_survive_next_adaptive_profile_application() {
-        use crate::liquid::tactical::TacticalAction;
+        use astra_turn_core::liquid_tactical::TacticalAction;
 
         let hub = make_hub();
         let session = make_session();
@@ -6707,8 +6707,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
     #[test]
     fn tactical_adapter_reset_clears_turn_state() {
-        use crate::liquid::step_signals::{StepSignalCollector, StepSignalConfig};
-        use crate::liquid::tactical::TacticalAdapter;
+        use astra_turn_core::liquid_step_signals::{StepSignalCollector, StepSignalConfig};
+        use astra_turn_core::liquid_tactical::TacticalAdapter;
 
         let mut state = make_state();
         state.max_turn_input_tokens = 50_000;
@@ -6717,12 +6717,12 @@ print(json.dumps({'context': 'user said: ' + msg}))
             50_000,
         ));
         state.tactical_adapter = Some(TacticalAdapter::new(
-            crate::liquid::tactical::DampenerConfig::default(),
+            astra_turn_core::liquid_tactical::DampenerConfig::default(),
         ));
 
         // Record some outcomes
         if let Some(ref mut collector) = state.step_signal_collector {
-            collector.record(crate::liquid::step_signals::StepOutcome {
+            collector.record(astra_turn_core::liquid_step_signals::StepOutcome {
                 tool_name: "test".into(),
                 ok: false,
                 latency_ms: 100,
@@ -6742,7 +6742,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         // After reset, recording a single OK outcome should produce no triggers
         let triggers = if let Some(ref mut collector) = state.step_signal_collector {
-            collector.record(crate::liquid::step_signals::StepOutcome {
+            collector.record(astra_turn_core::liquid_step_signals::StepOutcome {
                 tool_name: "test".into(),
                 ok: true,
                 latency_ms: 50,
@@ -6757,7 +6757,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             triggers.is_empty()
                 || triggers
                     .iter()
-                    .all(|t| matches!(t, crate::liquid::step_signals::AdaptationTrigger::Nominal)),
+                    .all(|t| matches!(t, astra_turn_core::liquid_step_signals::AdaptationTrigger::Nominal)),
             "After reset, a single OK call should not trigger error-based adaptation"
         );
     }
@@ -6801,7 +6801,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         // Add fewer signals than threshold.
         state.pending_reflection_signals.push(
-            crate::evolution::types::EvolutionSignal::RepeatedStall {
+            astra_evolution::types::EvolutionSignal::RepeatedStall {
                 tool_chain: vec!["test".into()],
                 stall_count: 5,
                 turn_id: "t1".into(),
@@ -6840,7 +6840,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         // Pre-load signals at threshold.
         for i in 0..AUTO_REFLECTION_SIGNAL_THRESHOLD {
             state.pending_reflection_signals.push(
-                crate::evolution::types::EvolutionSignal::RepeatedStall {
+                astra_evolution::types::EvolutionSignal::RepeatedStall {
                     tool_chain: vec![format!("tool_{i}")],
                     stall_count: 3,
                     turn_id: format!("t{i}"),
@@ -6900,7 +6900,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         for i in 0..AUTO_REFLECTION_SIGNAL_THRESHOLD {
             state.pending_reflection_signals.push(
-                crate::evolution::types::EvolutionSignal::RepeatedStall {
+                astra_evolution::types::EvolutionSignal::RepeatedStall {
                     tool_chain: vec![format!("tool_{i}")],
                     stall_count: 3,
                     turn_id: format!("t{i}"),
@@ -7045,7 +7045,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         state.evolution_service = Some(evo.clone());
 
         // Feed a signal that passes needs_llm (ToolFailure with skill_context).
-        evo.add_signal(crate::evolution::types::EvolutionSignal::ToolFailure {
+        evo.add_signal(astra_evolution::types::EvolutionSignal::ToolFailure {
             tool_name: "bash".into(),
             error_snippet: "permission denied".into(),
             failure_category: None,
@@ -7057,7 +7057,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         // Pre-load enough on state so that pre-loaded + flushed >= threshold.
         for i in 0..(AUTO_REFLECTION_SIGNAL_THRESHOLD - 1) {
             state.pending_reflection_signals.push(
-                crate::evolution::types::EvolutionSignal::ToolFailure {
+                astra_evolution::types::EvolutionSignal::ToolFailure {
                     tool_name: format!("tool_{i}"),
                     error_snippet: "err".into(),
                     failure_category: None,
@@ -7090,7 +7090,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         for i in 0..AUTO_REFLECTION_SIGNAL_THRESHOLD {
             state.pending_reflection_signals.push(
-                crate::evolution::types::EvolutionSignal::RepeatedStall {
+                astra_evolution::types::EvolutionSignal::RepeatedStall {
                     tool_chain: vec![format!("tool_{i}")],
                     stall_count: 3,
                     turn_id: format!("t{i}"),
@@ -7121,7 +7121,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         for i in 0..AUTO_REFLECTION_SIGNAL_THRESHOLD {
             state.pending_reflection_signals.push(
-                crate::evolution::types::EvolutionSignal::RepeatedStall {
+                astra_evolution::types::EvolutionSignal::RepeatedStall {
                     tool_chain: vec![format!("tool_{i}")],
                     stall_count: 3,
                     turn_id: format!("t{i}"),
@@ -7409,7 +7409,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         for i in 0..AUTO_REFLECTION_SIGNAL_THRESHOLD {
             state.pending_reflection_signals.push(
-                crate::evolution::types::EvolutionSignal::RepeatedStall {
+                astra_evolution::types::EvolutionSignal::RepeatedStall {
                     tool_chain: vec![format!("tool_{i}")],
                     stall_count: 3,
                     turn_id: format!("t{i}"),
@@ -7477,7 +7477,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             .evolution_service
             .as_ref()
             .unwrap()
-            .add_signal(crate::evolution::types::EvolutionSignal::ToolFailure {
+            .add_signal(astra_evolution::types::EvolutionSignal::ToolFailure {
                 tool_name: "bash".into(),
                 error_snippet: "Permission denied".into(),
                 failure_category: None,

@@ -866,7 +866,7 @@ async fn handle_tool_approval(
     approved: bool,
     reason: Option<String>,
 ) {
-    use crate::turn::edge_ledger::approval_callback_key;
+    use astra_turn_core::edge_ledger::approval_callback_key;
 
     let key = approval_callback_key(&conn.user.user_id, request_id);
     let value = serde_json::json!({
@@ -886,7 +886,7 @@ async fn handle_user_prompt_response(
     answer: String,
     was_custom: bool,
 ) {
-    use crate::turn::edge_ledger::user_prompt_callback_key;
+    use astra_turn_core::edge_ledger::user_prompt_callback_key;
 
     let key = user_prompt_callback_key(&conn.user.user_id, request_id);
     let value = serde_json::json!({

@@ -21,9 +21,9 @@ mod tests {
     };
     use astra_services::runs::InMemoryRunStateStore;
 
-    use crate::messaging::in_process::InProcessTransport;
-    use crate::messaging::router::AgentMailboxRouter;
-    use crate::messaging::types::*;
+    use astra_messaging::in_process::InProcessTransport;
+    use astra_messaging::router::AgentMailboxRouter;
+    use astra_messaging::types::*;
     use crate::server::delegation_engine::{
         DelegationEngine, DelegationTracker, SubRunConfig, SubRunExecutor,
     };
@@ -812,7 +812,7 @@ mod tests {
         let store = Arc::new(InMemoryRunStateStore::new());
         let _run_engine = Arc::new(RunEngine::new(store));
         let tracker = Arc::new(DelegationTracker::new());
-        let transport = Arc::new(crate::messaging::in_process::InProcessTransport::new());
+        let transport = Arc::new(astra_messaging::in_process::InProcessTransport::new());
         let router = Arc::new(AgentMailboxRouter::new(transport, tracker));
 
         // First registration succeeds.
@@ -841,7 +841,7 @@ mod tests {
         let store = Arc::new(InMemoryRunStateStore::new());
         let _run_engine = Arc::new(RunEngine::new(store));
         let tracker = Arc::new(DelegationTracker::new());
-        let transport = Arc::new(crate::messaging::in_process::InProcessTransport::new());
+        let transport = Arc::new(astra_messaging::in_process::InProcessTransport::new());
         let router = Arc::new(AgentMailboxRouter::new(transport, tracker));
 
         let addr1 = AgentAddress::new("run-1", "agent-1");

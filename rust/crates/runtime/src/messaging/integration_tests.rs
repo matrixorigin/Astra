@@ -7,10 +7,10 @@
 mod tests {
     use std::sync::Arc;
 
-    use crate::messaging::in_process::InProcessTransport;
-    use crate::messaging::router::{AgentMailbox, AgentMailboxRouter};
-    use crate::messaging::send_tool;
-    use crate::messaging::types::*;
+    use astra_messaging::in_process::InProcessTransport;
+    use astra_messaging::router::{AgentMailbox, AgentMailboxRouter};
+    use astra_messaging::send_tool;
+    use astra_messaging::types::*;
     use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
 
     fn tracker() -> Arc<DelegationTracker> {
@@ -532,7 +532,7 @@ mod tests {
 
     #[tokio::test]
     async fn ack_tracker_end_to_end_with_mailbox() {
-        use crate::messaging::ack_tracker::{AckConfig, PendingAckTracker};
+        use astra_messaging::ack_tracker::{AckConfig, PendingAckTracker};
 
         let (_router, mut parent, mut children, _dt) = setup_delegation(1, "del-ack-e2e").await;
 
@@ -577,8 +577,8 @@ mod tests {
 
     #[tokio::test]
     async fn ack_sweep_task_retries_and_dead_letters_while_idle() {
-        use crate::messaging::ack_tracker::{AckConfig, PendingAckTracker, start_sweep_task};
-        use crate::messaging::dead_letter::DeadLetterQueue;
+        use astra_messaging::ack_tracker::{AckConfig, PendingAckTracker, start_sweep_task};
+        use astra_messaging::dead_letter::DeadLetterQueue;
 
         let (_router, parent, children, _dt) = setup_delegation(1, "del-ack-sweep").await;
 
@@ -634,7 +634,7 @@ mod tests {
         let dead_letters = dlq.list().await;
         assert_eq!(dead_letters[0].message.id, msg.id);
         match &dead_letters[0].reason {
-            crate::messaging::dead_letter::DeadLetterReason::AckTimeout { attempts } => {
+            astra_messaging::dead_letter::DeadLetterReason::AckTimeout { attempts } => {
                 assert_eq!(*attempts, 2);
             }
             other => panic!("expected AckTimeout, got: {other:?}"),
@@ -645,8 +645,8 @@ mod tests {
 
     #[tokio::test]
     async fn ack_timeout_stores_in_dlq() {
-        use crate::messaging::ack_tracker::{AckConfig, AckOutcome, PendingAckTracker};
-        use crate::messaging::dead_letter::DeadLetterQueue;
+        use astra_messaging::ack_tracker::{AckConfig, AckOutcome, PendingAckTracker};
+        use astra_messaging::dead_letter::DeadLetterQueue;
         use std::time::Duration;
 
         let (_router, _parent, children, _dt) = setup_delegation(2, "del-dlq-timeout").await;
@@ -687,7 +687,7 @@ mod tests {
             {
                 dlq.store(
                     Arc::clone(message),
-                    crate::messaging::dead_letter::DeadLetterReason::AckTimeout {
+                    astra_messaging::dead_letter::DeadLetterReason::AckTimeout {
                         attempts: *attempts,
                     },
                     *attempts,
@@ -703,8 +703,8 @@ mod tests {
 
     #[tokio::test]
     async fn nack_stores_in_dlq() {
-        use crate::messaging::ack_tracker::{AckOutcome, PendingAckTracker};
-        use crate::messaging::dead_letter::DeadLetterQueue;
+        use astra_messaging::ack_tracker::{AckOutcome, PendingAckTracker};
+        use astra_messaging::dead_letter::DeadLetterQueue;
 
         let (_router, _parent, children, _dt) = setup_delegation(2, "del-dlq-nack").await;
 
@@ -739,7 +739,7 @@ mod tests {
             {
                 dlq.store(
                     Arc::clone(message),
-                    crate::messaging::dead_letter::DeadLetterReason::Rejected {
+                    astra_messaging::dead_letter::DeadLetterReason::Rejected {
                         reason: reason.clone(),
                     },
                     1,
@@ -751,7 +751,7 @@ mod tests {
         assert_eq!(dlq.count().await, 1);
         let entries = dlq.list().await;
         match &entries[0].reason {
-            crate::messaging::dead_letter::DeadLetterReason::Rejected { reason } => {
+            astra_messaging::dead_letter::DeadLetterReason::Rejected { reason } => {
                 assert_eq!(reason.as_deref(), Some("invalid format"));
             }
             _ => panic!("expected Rejected reason"),
@@ -760,8 +760,8 @@ mod tests {
 
     #[tokio::test]
     async fn dlq_take_for_retry_removes_entries() {
-        use crate::messaging::ack_tracker::{AckConfig, AckOutcome, PendingAckTracker};
-        use crate::messaging::dead_letter::DeadLetterQueue;
+        use astra_messaging::ack_tracker::{AckConfig, AckOutcome, PendingAckTracker};
+        use astra_messaging::dead_letter::DeadLetterQueue;
         use std::time::Duration;
 
         let (_router, _parent, children, _dt) = setup_delegation(2, "del-dlq-retry").await;
@@ -798,7 +798,7 @@ mod tests {
             {
                 dlq.store(
                     Arc::clone(message),
-                    crate::messaging::dead_letter::DeadLetterReason::AckTimeout {
+                    astra_messaging::dead_letter::DeadLetterReason::AckTimeout {
                         attempts: *attempts,
                     },
                     *attempts,
@@ -825,7 +825,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_track_send_receive_ack_flow() {
-        use crate::messaging::metrics::MessagingMetrics;
+        use astra_messaging::metrics::MessagingMetrics;
         use std::sync::atomic::Ordering;
         use std::time::Duration;
 
@@ -870,7 +870,7 @@ mod tests {
 
     #[tokio::test]
     async fn event_dispatcher_receives_messaging_events() {
-        use crate::messaging::metrics::{EventDispatcher, MessagingEvent, MessagingEventHandler};
+        use astra_messaging::metrics::{EventDispatcher, MessagingEvent, MessagingEventHandler};
         use std::sync::atomic::{AtomicU32, Ordering};
 
         struct Counter {
@@ -1139,8 +1139,8 @@ mod tests {
     /// Verifies: system stability under mixed operations.
     #[tokio::test]
     async fn stress_mixed_operations() {
-        use crate::messaging::ack_tracker::PendingAckTracker;
-        use crate::messaging::dead_letter::DeadLetterQueue;
+        use astra_messaging::ack_tracker::PendingAckTracker;
+        use astra_messaging::dead_letter::DeadLetterQueue;
 
         const NUM_AGENTS: usize = 5;
         const OPS_PER_AGENT: usize = 50;
@@ -1221,7 +1221,7 @@ mod tests {
                             dlq_clone
                                 .store(
                                     msg,
-                                    crate::messaging::dead_letter::DeadLetterReason::AckTimeout {
+                                    astra_messaging::dead_letter::DeadLetterReason::AckTimeout {
                                         attempts: 3,
                                     },
                                     3,

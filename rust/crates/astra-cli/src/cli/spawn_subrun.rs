@@ -116,7 +116,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 
         // Resolve per-model workflow-guard policy once; used for both the
         // `SubRunHost::tool_cache` and the `AgenticLoopState` below.
-        let resolved_tool_policy = astra_runtime::runtime_config::RuntimeConfig::load()
+        let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_selection
             .resolve_for_model(Some(&config.model));
 

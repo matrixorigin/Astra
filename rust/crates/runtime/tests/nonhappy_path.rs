@@ -45,7 +45,7 @@ mod circuit_breaker_integration {
 }
 
 mod stall_detection {
-    use astra_runtime::turn::stall::{SERVER_STALL_WINDOW, detect_server_stall};
+    use astra_turn_core::stall::{SERVER_STALL_WINDOW, detect_server_stall};
     use std::collections::BTreeSet;
 
     /// Proves stall detector catches repetitive tool calls
@@ -77,7 +77,7 @@ mod stall_detection {
 }
 
 mod turn_limits {
-    use astra_runtime::turn::routing::MAX_TOOL_ROUNDS;
+    use astra_turn_core::routing::MAX_TOOL_ROUNDS;
 
     /// Proves MAX_TOOL_ROUNDS is set to a reasonable value.
     /// The env override can only DECREASE the limit, not bypass it.
@@ -91,7 +91,7 @@ mod turn_limits {
 // ── Turn Guard Integration ──────────────────────────────────────────────────
 
 mod turn_guard_integration {
-    use astra_runtime::turn::turn_guard::{TurnGuard, VerdictSeverity};
+    use astra_turn_core::turn_guard::{TurnGuard, VerdictSeverity};
     use serde_json::json;
 
     fn tool_call(name: &str, args: &str) -> serde_json::Value {
@@ -232,7 +232,7 @@ mod turn_guard_integration {
     #[test]
     fn cross_session_min_calls_protection() {
         use astra_runtime::pipeline::persistence::ToolHealthEntry;
-        use astra_runtime::turn::tool_health::ToolHealthTracker;
+        use astra_turn_core::tool_health::ToolHealthTracker;
 
         // Tool A: 3 calls, 100% failure → NOT deprioritized (too few calls, need >=8)
         // Tool B: 10 calls, 80% failure → deprioritized (enough data + above 70% threshold)
@@ -290,8 +290,8 @@ mod turn_guard_integration {
 
 mod multi_file_edit_regression {
     use astra_runtime::tool_registry::SelectionReport;
-    use astra_runtime::turn::tool_schema_prune::pin_invoked_tool_schemas;
-    use astra_runtime::turn::turn_guard::{TurnGuard, VerdictSeverity};
+    use astra_turn_core::tool_schema_prune::pin_invoked_tool_schemas;
+    use astra_turn_core::turn_guard::{TurnGuard, VerdictSeverity};
     use serde_json::{Value, json};
 
     fn tool_schema(name: &str) -> Value {
@@ -626,7 +626,7 @@ mod result_quality_integration {
 // ── Error Recovery Integration ──────────────────────────────────────────────
 
 mod error_recovery_integration {
-    use astra_runtime::turn::error_recovery::*;
+    use astra_turn_core::error_recovery::*;
 
     #[test]
     fn full_recovery_flow() {
@@ -690,8 +690,8 @@ mod chat_stream_turnguard_e2e {
     use astra_runtime::pipeline::persistence::ToolHealthEntry;
     use astra_runtime::tool_selector::ToolSelector;
     use astra_runtime::turn::result_quality::ResultQuality;
-    use astra_runtime::turn::tool_health::ToolHealthTracker;
-    use astra_runtime::turn::turn_guard::{TurnGuard, TurnVerdict, VerdictSeverity};
+    use astra_turn_core::tool_health::ToolHealthTracker;
+    use astra_turn_core::turn_guard::{TurnGuard, TurnVerdict, VerdictSeverity};
     use serde_json::json;
     use std::collections::HashSet;
 
@@ -1247,7 +1247,7 @@ mod chat_stream_turnguard_e2e {
     #[test]
     fn cross_session_health_preserved() {
         use astra_runtime::pipeline::persistence::ToolHealthEntry;
-        use astra_runtime::turn::tool_health::ToolHealthTracker;
+        use astra_turn_core::tool_health::ToolHealthTracker;
 
         let entries = vec![ToolHealthEntry {
             name: "flaky_tool".to_string(),

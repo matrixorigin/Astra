@@ -8,12 +8,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-use crate::messaging::router::AgentMailbox;
+use astra_messaging::router::AgentMailbox;
 use crate::orchestration::permission_sync::{
     PermissionMode, PermissionRequest, PermissionResponse, PermissionSyncContext, PermissionUpdate,
 };
-use crate::turn::action_compensation::explicit_approval_reason;
-use crate::turn::tool_argument_hints::{
+use astra_turn_core::action_compensation::explicit_approval_reason;
+use astra_turn_core::tool_argument_hints::{
     normalize_llm_function_arguments, permission_prompt_primary_detail,
 };
 
@@ -380,9 +380,9 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_actions_request_parent_even_when_tool_is_allowed() {
-        use crate::messaging::in_process::InProcessTransport;
-        use crate::messaging::router::AgentMailboxRouter;
-        use crate::messaging::types::AgentAddress;
+        use astra_messaging::in_process::InProcessTransport;
+        use astra_messaging::router::AgentMailboxRouter;
+        use astra_messaging::types::AgentAddress;
         use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
 
         let transport = Arc::new(InProcessTransport::new());
@@ -460,9 +460,9 @@ mod tests {
 
     #[tokio::test]
     async fn requests_parent_and_applies_updates() {
-        use crate::messaging::in_process::InProcessTransport;
-        use crate::messaging::router::AgentMailboxRouter;
-        use crate::messaging::types::AgentAddress;
+        use astra_messaging::in_process::InProcessTransport;
+        use astra_messaging::router::AgentMailboxRouter;
+        use astra_messaging::types::AgentAddress;
         use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
 
         let transport = Arc::new(InProcessTransport::new());
@@ -547,9 +547,9 @@ mod tests {
 
     #[tokio::test]
     async fn denied_rules_do_not_request_parent() {
-        use crate::messaging::in_process::InProcessTransport;
-        use crate::messaging::router::AgentMailboxRouter;
-        use crate::messaging::types::AgentAddress;
+        use astra_messaging::in_process::InProcessTransport;
+        use astra_messaging::router::AgentMailboxRouter;
+        use astra_messaging::types::AgentAddress;
         use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
 
         let transport = Arc::new(InProcessTransport::new());

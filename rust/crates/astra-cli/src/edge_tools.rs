@@ -1231,7 +1231,7 @@ impl ToolExecutor {
         chain: &astra_runtime::tool_registry::ToolChain,
         input: Value,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + '_>> {
-        use astra_runtime::tool_registry::chain::{ChainContext, resolve_args};
+        use astra_turn_core::tool_registry_chain::{ChainContext, resolve_args};
 
         if let Err(error) = crate::tool_safety_guard::ToolSafetyGuard::check_chain(chain) {
             let chain_name = chain.name.clone();

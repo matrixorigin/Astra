@@ -101,5 +101,3 @@ pub fn default_unified_registry() -> &'static std::sync::Arc<UnifiedSkillRegistr
 }
 
 pub use astra_skills::has_inline_shell;
-pub mod improvement;
-pub mod verify;

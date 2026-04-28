@@ -12,10 +12,10 @@ use astra_runtime::liquid::reflection::{
     summarize_recent_adaptation_impacts, summarize_recent_adaptation_verification_impacts,
     summarize_recent_performance_deltas,
 };
-use astra_runtime::runtime_config::RuntimeConfig;
+use astra_config::runtime_config::RuntimeConfig;
 use astra_runtime::self_model::ConstraintSet;
 use astra_runtime::tool_registry::ToolRegistry;
-use astra_runtime::user_profile::Scenario;
+use astra_config::user_profile::Scenario;
 use astra_services::self_surface::{
     EventPreview as SurfaceEventPreview, EvolutionRecord, GoalSurface,
     HealthSurface as SurfaceHealthSurface, LocalSelfSurfaceService, PersistentSelfSnapshot,

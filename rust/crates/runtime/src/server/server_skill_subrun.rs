@@ -20,16 +20,16 @@ use astra_services::LlmTokenServiceConfig;
 
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
-use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
-use crate::pipeline::step_recorder::StepRecorder;
-use crate::semantic_dedup::SemanticDedup;
+use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
+use astra_pipeline::step_recorder::StepRecorder;
+use astra_text_utils::semantic_dedup::SemanticDedup;
 use crate::skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
 use crate::turn::agentic_loop_host::{
     AgenticLoopHost as _, AgenticLoopState, CancellationState, RequestConstraints, SkillState,
     StopHookState, TurnInteractionPolicy, run_agentic_loop_with_host,
 };
-use crate::turn::chat_turn_heuristics::infer_task_execution_profile;
-use crate::turn::turn_guard::TurnGuard;
+use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
+use astra_turn_core::turn_guard::TurnGuard;
 
 use super::server_loop_host::ServerAgenticLoopHostBuilder;
 
@@ -67,7 +67,7 @@ pub struct ServerSkillSubRunExecutor {
     /// Session ID for the parent run.
     session_id: String,
     /// Edge connection pool for routing tool calls to connected edges.
-    edge_connection_pool: Option<super::edge_connection_pool::EdgeConnectionPool>,
+    edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
 }
 
 impl ServerSkillSubRunExecutor {
@@ -146,7 +146,7 @@ impl ServerSkillSubRunExecutor {
 
     pub fn with_edge_connection_pool(
         mut self,
-        pool: super::edge_connection_pool::EdgeConnectionPool,
+        pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
     ) -> Self {
         self.edge_connection_pool = Some(pool);
         self
@@ -194,14 +194,14 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         agent_type: Option<&str>,
     ) -> Result<SubRunResult, String> {
         let child_recursion_depth =
-            crate::turn::agentic_recursion_guard::checked_child_recursion_depth(
+            astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth(
                 parent_recursion_depth,
             )?;
 
         let effective_model = model
             .map(String::from)
             .or_else(|| self.default_model.clone());
-        let compact_strategy = crate::turn::microcompact::CompactStrategy::from_provider_hint(
+        let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
             effective_model.as_deref().unwrap_or(""),
         );
 
@@ -218,7 +218,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
 
         // Resolve per-model workflow-guard policy before `effective_model` is
         // consumed by `.with_model(...)` below.
-        let resolved_tool_policy = crate::runtime_config::RuntimeConfig::load()
+        let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_selection
             .resolve_for_model(effective_model.as_deref());
 
@@ -315,7 +315,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             widen_selection_pending: false,
             step_recorder,
             idempotency_cache: InMemoryIdempotencyCache::new(),
-            semantic_dedup: SemanticDedup::new(crate::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD),
+            semantic_dedup: SemanticDedup::new(astra_text_utils::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD),
             call_counts: HashMap::new(),
             max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
             max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
@@ -329,7 +329,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 resolver: self.skill_resolver.clone(),
                 request_constraints: self.request_constraints.clone(),
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
+                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
                 tool_event_hooks,
                 session_event_hooks,
                 // Skill-level effort/agent_type from manifest

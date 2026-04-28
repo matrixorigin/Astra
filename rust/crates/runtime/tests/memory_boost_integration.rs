@@ -7,7 +7,7 @@
 
 use astra_runtime::tool_registry::ToolRegistry;
 use astra_runtime::tool_selector::{SelectionContext, TfIdfSelector, ToolSelector};
-use astra_runtime::turn::retrieval::{extract_boost_terms_from_pairs, extract_entity_boost_terms};
+use astra_turn_core::retrieval::{extract_boost_terms_from_pairs, extract_entity_boost_terms};
 use serde_json::{Map, Value};
 
 fn github_history_message(content: &str) -> Map<String, Value> {

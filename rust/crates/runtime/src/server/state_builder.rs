@@ -357,10 +357,10 @@ pub async fn build_server_state(
 /// [`crate::matrix_cloud_runtime::MatrixCloudRuntime`] without duplicate pools.
 pub(super) struct PipelineLearningStack {
     pub writer: Arc<dyn TurnLearningWriter>,
-    pub entity_graph: Arc<Mutex<crate::pipeline::entity::EntityGraph>>,
-    pub pattern_library: Arc<Mutex<crate::pipeline::pattern::PatternLibrary>>,
-    pub calibrator: Arc<Mutex<crate::pipeline::calibration::ProgressiveCalibrator>>,
-    pub active_canary: Option<crate::evolution::types::PersistedActiveCanary>,
+    pub entity_graph: Arc<Mutex<astra_pipeline::entity::EntityGraph>>,
+    pub pattern_library: Arc<Mutex<astra_pipeline::pattern::PatternLibrary>>,
+    pub calibrator: Arc<Mutex<astra_pipeline::calibration::ProgressiveCalibrator>>,
+    pub active_canary: Option<astra_evolution::types::PersistedActiveCanary>,
     /// Profile name used for cross-session persistence.
     pub profile: Option<String>,
 }
@@ -369,7 +369,7 @@ impl PipelineLearningStack {
     /// Persist current learning state to disk if a profile was configured.
     pub fn save_with_active_canary(
         &self,
-        active_canary: Option<crate::evolution::types::PersistedActiveCanary>,
+        active_canary: Option<astra_evolution::types::PersistedActiveCanary>,
     ) {
         if let Some(ref profile) = self.profile {
             let _ = crate::pipeline::persistence::save_learning_state_with_health_and_canary(
@@ -393,13 +393,14 @@ impl PipelineLearningStack {
 /// patterns (including recent block/deprioritize signals) are not erased by the
 /// bootstrap priors.
 pub(super) fn build_pipeline_learning_stack(profile: Option<&str>) -> PipelineLearningStack {
-    use crate::pipeline::{
+    use astra_pipeline::{
         calibration::ProgressiveCalibrator,
         defaults::{default_calibration, default_entities, default_patterns},
         entity::EntityGraph,
-        learning::PipelineLearningWriter,
+
         pattern::PatternLibrary,
     };
+    use astra_turn_core::pipeline_learning::PipelineLearningWriter;
 
     let entity_graph = Arc::new(Mutex::new(EntityGraph::new()));
     let pattern_library = Arc::new(Mutex::new(PatternLibrary::new()));
@@ -456,10 +457,10 @@ pub(super) fn build_pipeline_learning_stack(profile: Option<&str>) -> PipelineLe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evolution::types::PatternAction;
-    use crate::pipeline::defaults::default_patterns;
+    use astra_evolution::types::PatternAction;
+    use astra_pipeline::defaults::default_patterns;
     use crate::pipeline::routing::{DomainHint, TaskType};
-    use crate::turn::contracts::TurnLearningOutcome;
+    use astra_turn_core::contracts::TurnLearningOutcome;
 
     #[tokio::test]
     async fn build_pipeline_learning_writer_creates_functional_writer() {
@@ -519,7 +520,7 @@ mod tests {
     #[test]
     fn persisted_patterns_overlay_defaults_without_losing_blocked_state() {
         let tools = vec!["grep".to_string()];
-        let mut persisted = crate::pipeline::pattern::PatternLibrary::new();
+        let mut persisted = astra_pipeline::pattern::PatternLibrary::new();
         persisted.record_outcome(
             &tools,
             TaskType::Code,
@@ -530,7 +531,7 @@ mod tests {
         );
         persisted.apply_evolution_action("grep", PatternAction::Block);
 
-        let mut layered = crate::pipeline::pattern::PatternLibrary::new();
+        let mut layered = astra_pipeline::pattern::PatternLibrary::new();
         layered.merge(&default_patterns());
         layered.overlay(&persisted.export());
 

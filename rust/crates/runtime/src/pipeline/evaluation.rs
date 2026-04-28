@@ -6,7 +6,7 @@
 pub use astra_turn_core::evaluation::*;
 
 pub fn current_evaluation_thresholds() -> EvaluationThresholds {
-    let cfg = crate::runtime_config::RuntimeConfig::load();
+    let cfg = astra_config::runtime_config::RuntimeConfig::load();
     EvaluationThresholds {
         sequential_read_churn: cfg
             .tool_selection

@@ -21,13 +21,13 @@ use astra_services::session_workspace::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::auto_tuning::{AutoTuningEngine, DelegationOutcomeTracker, FeedbackSignal, SignalType};
-use crate::pipeline::pattern::PatternLibrary;
-use crate::runtime_config::RuntimeConfig;
-use crate::turn::context_assembly_trace::ContextAssemblyTrace;
-use crate::turn::decision_explainer::{DecisionExplanation, DriftDetector, FocusDriftAnalysis};
-use crate::turn::goal_tracker::{GoalProgress, GoalTracker};
-use crate::user_profile::{Scenario, UserProfile, UserProfileManager, UserProfileStore};
+use astra_learning::auto_tuning::{AutoTuningEngine, DelegationOutcomeTracker, FeedbackSignal, SignalType};
+use astra_pipeline::pattern::PatternLibrary;
+use astra_config::runtime_config::RuntimeConfig;
+use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
+use astra_turn_core::decision_explainer::{DecisionExplanation, DriftDetector, FocusDriftAnalysis};
+use astra_turn_core::goal_tracker::{GoalProgress, GoalTracker};
+use astra_config::user_profile::{Scenario, UserProfile, UserProfileManager, UserProfileStore};
 
 // ─── Session Context ────────────────────────────────────────────────────────
 
@@ -439,7 +439,7 @@ impl ObservabilitySession {
 
         // Feed user sentiment to goal tracker
         if let Some(ref mut tracker) = self.goal_tracker {
-            if let Some(signal) = crate::turn::goal_tracker::detect_user_sentiment(query) {
+            if let Some(signal) = astra_turn_core::goal_tracker::detect_user_sentiment(query) {
                 tracker.record(self.turn_number, signal);
             }
         }
@@ -648,7 +648,7 @@ impl ObservabilitySession {
     pub fn record_tool_result(&mut self, tool_name: &str, output: &str, exit_code: Option<i32>) {
         if let Some(ref mut tracker) = self.goal_tracker {
             if let Some(signal) =
-                crate::turn::goal_tracker::detect_signal(tool_name, output, exit_code)
+                astra_turn_core::goal_tracker::detect_signal(tool_name, output, exit_code)
             {
                 tracker.record(self.turn_number, signal);
             }
@@ -1571,10 +1571,10 @@ mod tests {
             assert!(guard.context_traces.is_empty());
         }
 
-        let trace = crate::turn::context_assembly_trace::ContextAssemblyTrace {
+        let trace = astra_turn_core::context_assembly_trace::ContextAssemblyTrace {
             turn_id: "turn-0".into(),
             session_id: "s1".into(),
-            token_budget: crate::turn::context_assembly_trace::TokenBudgetTrace {
+            token_budget: astra_turn_core::context_assembly_trace::TokenBudgetTrace {
                 max_tokens: 128_000,
                 system_prompt_tokens: 14_000,
                 history_tokens: 5_000,
@@ -1608,7 +1608,7 @@ mod tests {
         let session = hub.start_session("u1", "s1");
 
         for i in 0..3 {
-            let trace = crate::turn::context_assembly_trace::ContextAssemblyTrace {
+            let trace = astra_turn_core::context_assembly_trace::ContextAssemblyTrace {
                 turn_id: format!("turn-{i}"),
                 session_id: "s1".into(),
                 ..Default::default()
@@ -1628,7 +1628,7 @@ mod tests {
         let session = hub.start_session("u1", "s1");
 
         for i in 0..60 {
-            let trace = crate::turn::context_assembly_trace::ContextAssemblyTrace {
+            let trace = astra_turn_core::context_assembly_trace::ContextAssemblyTrace {
                 turn_id: format!("turn-{i}"),
                 session_id: "s1".into(),
                 ..Default::default()

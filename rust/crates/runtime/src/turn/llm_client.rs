@@ -29,15 +29,15 @@ use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::sse_blocks::SseBlankLineUtf8Buf;
-use super::sse_data_lines::{
+use astra_turn_core::sse_blocks::SseBlankLineUtf8Buf;
+use astra_turn_core::sse_data_lines::{
     json_events_from_sse_event_block, validate_sse_event_block_json,
     validated_drain_sse_data_lines, validated_finish_sse_data_buffer,
 };
-use crate::bridge::rate_limit_cooldown::{
+use astra_turn_core::bridge_rate_limit_cooldown::{
     RateLimitAction, is_overload_status, is_rate_limit_status, parse_retry_after_ms,
 };
-use crate::output_style::current_output_style;
+use astra_text_utils::output_style::current_output_style;
 use crate::prompts;
 
 /// Redact common provider secret patterns from a string before logging.
@@ -343,7 +343,7 @@ pub(crate) fn stream_idle_timeout() -> std::time::Duration {
     if let Some(d) = TEST_STREAM_IDLE_TIMEOUT.with(|c| *c.borrow()) {
         return d;
     }
-    crate::turn::sse_stream_host::stream_idle_timeout()
+    astra_turn_core::sse_stream_host::stream_idle_timeout()
 }
 
 /// Per-chunk idle watchdog (post-progress): once at least one SSE chunk has been
@@ -353,7 +353,7 @@ pub(crate) fn stream_idle_timeout_after_progress() -> std::time::Duration {
     if let Some(d) = TEST_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS.with(|c| *c.borrow()) {
         return d;
     }
-    crate::turn::sse_stream_host::stream_idle_timeout_after_progress()
+    astra_turn_core::sse_stream_host::stream_idle_timeout_after_progress()
 }
 
 #[cfg(test)]
@@ -1904,13 +1904,13 @@ async fn collect_llm_stream(
     // Degraded tool-call fallback: some models emit <invoke> XML or <tool_call>
     // tags in content instead of structured tool_calls. Recover them.
     if tool_calls.is_empty() {
-        if let Some(parsed) = super::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text) {
+        if let Some(parsed) = astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text) {
             astra_core::agent_warn!(
                 "llm",
                 "recovered {} tool call(s) from degraded text in content (stream)",
                 parsed.len()
             );
-            full_text = super::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
+            full_text = astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
             tool_calls = parsed;
         }
     }
@@ -2258,13 +2258,13 @@ fn parse_openai_compatible_nonstream_response(
 
     // Degraded tool-call fallback: same recovery for non-stream responses.
     if tool_calls.is_empty() {
-        if let Some(parsed) = super::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text) {
+        if let Some(parsed) = astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text) {
             astra_core::agent_warn!(
                 "llm",
                 "recovered {} tool call(s) from degraded text in content (non-stream)",
                 parsed.len()
             );
-            full_text = super::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
+            full_text = astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
             tool_calls = parsed;
         }
     }

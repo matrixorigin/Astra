@@ -23,15 +23,15 @@ use super::agentic_loop_host::{
     record_edge_tool_observability,
 };
 use super::agentic_loop_lifecycle::{TurnIterationPrep, current_agentic_step, session_turn_number};
-use super::agentic_post_tool_policy::{
+use astra_turn_core::agentic_post_tool_policy::{
     AgenticPostToolIterationControl, AgenticPostToolPolicyRequest, apply_agentic_post_tool_policy,
     map_post_tool_policy_outcome,
 };
 use super::agentic_tool_interception::{PreparedToolRound, prepare_intercepted_tool_round};
-use super::agentic_turn_flow::{
+use astra_turn_core::agentic_turn_flow::{
     agentic_round_stall_preflight_with_tool_calls, append_explain_turn_batch,
 };
-use super::tool_result_semantics::tool_dedup_signature;
+use astra_turn_core::tool_result_semantics::tool_dedup_signature;
 
 pub(crate) enum TurnToolPhaseControl {
     ContinueLoop,
@@ -761,9 +761,9 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 ),
             );
         }
-        state.interruption = Some(super::interruption::InterruptionRecord::new(
-            super::interruption::InterruptionKind::TokenBudgetExceeded,
-            super::interruption::ResumeAction::ContinueImmediately,
+        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::TokenBudgetExceeded,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
             super::agentic_loop_lifecycle::interruption_state_summary(
                 state,
                 Some("LLM ignored wrapup instruction and attempted tool calls".to_string()),
@@ -999,13 +999,13 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 continue;
             }
             let result_text = tool_record_result_text(rec);
-            let classification = crate::turn::action_compensation::classify_execution_outcome(
+            let classification = astra_turn_core::action_compensation::classify_execution_outcome(
                 result_text,
                 !rec.ok,
                 rec.ms,
                 tool_record_was_rejected(rec),
             );
-            let ctx = crate::evolution::types::ToolResultContext {
+            let ctx = astra_evolution::types::ToolResultContext {
                 tool_name: &rec.name,
                 tool_args: rec.args_preview.as_deref().unwrap_or(""),
                 result: result_text,
@@ -1023,7 +1023,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             let n = sigs.len();
             if n >= 3 && sigs[n - 1] == sigs[n - 2] && sigs[n - 2] == sigs[n - 3] {
                 let chain: Vec<String> = sigs[n - 1].iter().cloned().collect();
-                evo.add_signal(crate::evolution::types::EvolutionSignal::RepeatedStall {
+                evo.add_signal(astra_evolution::types::EvolutionSignal::RepeatedStall {
                     tool_chain: chain,
                     stall_count: 3,
                     turn_id: turn_id.to_string(),
@@ -1042,7 +1042,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         }
         for (tool, count) in &fail_counts {
             if *count >= 3 {
-                evo.add_signal(crate::evolution::types::EvolutionSignal::RepeatedStall {
+                evo.add_signal(astra_evolution::types::EvolutionSignal::RepeatedStall {
                     tool_chain: vec![(*tool).to_string()],
                     stall_count: *count,
                     turn_id: turn_id.to_string(),
@@ -1054,10 +1054,10 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
 
     if state.step_signal_collector.is_some() || state.tactical_adapter.is_some() {
         let new_records = &state.stall.tool_call_records[evo_records_before..];
-        let mut step_actions: Vec<crate::liquid::tactical::TacticalAction> = Vec::new();
+        let mut step_actions: Vec<astra_turn_core::liquid_tactical::TacticalAction> = Vec::new();
 
         for rec in new_records {
-            let outcome = crate::liquid::step_signals::StepOutcome {
+            let outcome = astra_turn_core::liquid_step_signals::StepOutcome {
                 tool_name: rec.name.clone(),
                 ok: rec.ok,
                 latency_ms: rec.ms,
@@ -1074,7 +1074,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             {
                 let actions = adapter.evaluate(&triggers);
                 for action in actions {
-                    if !matches!(action, crate::liquid::tactical::TacticalAction::NoOp) {
+                    if !matches!(action, astra_turn_core::liquid_tactical::TacticalAction::NoOp) {
                         step_actions.push(action);
                     }
                 }
@@ -1275,7 +1275,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             // carry a structured record for resumption.
             if state.interruption.is_none() {
                 use super::agentic_loop_lifecycle::interruption_state_summary;
-                use super::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
+                use astra_turn_core::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
                 state.interruption = Some(InterruptionRecord::new(
                     InterruptionKind::CriticalVerdict,
                     ResumeAction::ContinueImmediately,

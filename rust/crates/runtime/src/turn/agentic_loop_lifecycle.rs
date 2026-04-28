@@ -10,10 +10,10 @@ use super::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, delegate_tool_schema,
     try_write_heavy_checkpoint,
 };
-use super::interruption::{
+use astra_turn_core::interruption::{
     InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
 };
-use super::stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG;
+use astra_turn_core::stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG;
 use crate::orchestration::permission_sync::PermissionResponseMessaging;
 
 #[derive(Clone, Copy)]
@@ -285,7 +285,7 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     }
 
     if state.messaging.mailbox.is_some() {
-        host.inject_tool_schema(crate::messaging::send_tool::send_message_tool_schema());
+        host.inject_tool_schema(astra_messaging::send_tool::send_message_tool_schema());
     }
 
     if let Some(resolver) = &state.skills.resolver {
@@ -590,7 +590,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 let from_label = &msg.from.agent_id;
 
                 match &msg.payload {
-                    crate::messaging::types::MessagePayload::Ack { message_id } => {
+                    astra_messaging::types::MessagePayload::Ack { message_id } => {
                         if let Some(ref tracker) = state.messaging.ack_tracker {
                             tracker.acknowledge(message_id).await;
                         }
@@ -602,9 +602,9 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                         ));
                         continue;
                     }
-                    crate::messaging::types::MessagePayload::Nack { message_id, reason } => {
+                    astra_messaging::types::MessagePayload::Nack { message_id, reason } => {
                         if let Some(ref tracker) = state.messaging.ack_tracker
-                            && let Some(crate::messaging::ack_tracker::AckOutcome::Rejected {
+                            && let Some(astra_messaging::ack_tracker::AckOutcome::Rejected {
                                 message,
                                 ..
                             }) = tracker.reject(message_id, reason.clone()).await
@@ -617,7 +617,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                             if let Some(ref dlq) = state.messaging.dead_letter_queue {
                                 dlq.store(
                                     Arc::clone(&message),
-                                    crate::messaging::dead_letter::DeadLetterReason::Rejected {
+                                    astra_messaging::dead_letter::DeadLetterReason::Rejected {
                                         reason: reason.clone(),
                                     },
                                     1,
@@ -669,26 +669,26 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 }
 
                 match &msg.payload {
-                    crate::messaging::types::MessagePayload::Text { content, .. } => {
+                    astra_messaging::types::MessagePayload::Text { content, .. } => {
                         parts.push(format!("[{from_label}]: {content}"));
                     }
-                    crate::messaging::types::MessagePayload::Progress {
+                    astra_messaging::types::MessagePayload::Progress {
                         status, detail, ..
                     } => {
                         let extra = detail.as_deref().unwrap_or("");
                         parts.push(format!("[{from_label} progress]: {status} {extra}"));
                     }
-                    crate::messaging::types::MessagePayload::Request { request_type, .. } => {
+                    astra_messaging::types::MessagePayload::Request { request_type, .. } => {
                         parts.push(format!("[{from_label} request]: {request_type:?}"));
                     }
-                    crate::messaging::types::MessagePayload::Response { accepted, .. } => {
+                    astra_messaging::types::MessagePayload::Response { accepted, .. } => {
                         parts.push(format!("[{from_label} response]: accepted={accepted}"));
                     }
-                    crate::messaging::types::MessagePayload::Signal(sig) => {
+                    astra_messaging::types::MessagePayload::Signal(sig) => {
                         parts.push(format!("[{from_label} signal]: {sig:?}"));
                     }
-                    crate::messaging::types::MessagePayload::Ack { .. } => {}
-                    crate::messaging::types::MessagePayload::Nack { .. } => {}
+                    astra_messaging::types::MessagePayload::Ack { .. } => {}
+                    astra_messaging::types::MessagePayload::Nack { .. } => {}
                 }
             }
             if !parts.is_empty() {
@@ -790,7 +790,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 .collect();
             if !recent_events.is_empty() {
                 let error_tools: Vec<&str> = state.turn_guard.health.deprioritized_tools();
-                let reflection = super::stall::build_stall_reflection(
+                let reflection = astra_turn_core::stall::build_stall_reflection(
                     &state.stall.turn_sigs,
                     &error_tools,
                     state.stall.nudge_count as usize,
@@ -837,7 +837,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         // Use state-aware variant when SessionFacts has active files (pin list).
         let strategy = state.compact_strategy;
         let mc = if !state.session_facts.active_files.is_empty() {
-            super::microcompact::compact_tool_results_state_aware(
+            astra_turn_core::microcompact::compact_tool_results_state_aware(
                 &mut state.messages,
                 pressure,
                 &state.session_facts,
@@ -845,7 +845,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 strategy,
             )
         } else {
-            super::microcompact::compact_tool_results_adaptive(
+            astra_turn_core::microcompact::compact_tool_results_adaptive(
                 &mut state.messages,
                 pressure,
                 strategy,

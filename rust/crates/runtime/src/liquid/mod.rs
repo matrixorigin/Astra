@@ -6,5 +6,3 @@
 //! errors, adjusting tool selection hints after failures).
 
 pub mod reflection;
-pub mod step_signals;
-pub mod tactical;

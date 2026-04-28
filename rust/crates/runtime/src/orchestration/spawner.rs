@@ -1,11 +1,11 @@
 //! Dynamic agent spawner — runtime agent creation and lifecycle management.
 
 use crate::messaging::SubRunInfo;
-use crate::messaging::router::AgentMailboxRouter;
-use crate::messaging::types::AgentAddress;
-use crate::orchestration::context_cache::SharedContextCache;
-use crate::orchestration::progress::{AgentProgressEvent, ProgressBroadcaster, ProgressEventType};
-use crate::orchestration::spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
+use astra_messaging::router::AgentMailboxRouter;
+use astra_messaging::types::AgentAddress;
+use astra_turn_core::orchestration_context_cache::SharedContextCache;
+use astra_turn_core::orchestration_progress::{AgentProgressEvent, ProgressBroadcaster, ProgressEventType};
+use astra_turn_core::orchestration_spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -126,15 +126,15 @@ pub struct SpawnRunConfig {
     /// Working directory for the agent.
     pub working_dir: PathBuf,
     /// Optional mailbox for inter-agent messaging.
-    pub mailbox: Option<crate::messaging::router::AgentMailbox>,
+    pub mailbox: Option<astra_messaging::router::AgentMailbox>,
     /// Optional progress emitter for broadcasting turn completion events.
-    pub progress_emitter: Option<super::progress::AgentProgressEmitter>,
+    pub progress_emitter: Option<astra_turn_core::orchestration_progress::AgentProgressEmitter>,
     /// Optional shared context cache for cross-agent knowledge sharing.
     pub context_cache: Option<Arc<SharedContextCache>>,
     /// Inherited permissions from parent agent.
     pub inherited_permissions: Option<super::permission_sync::InheritedPermissions>,
     /// Parent agent address for permission requests (if this is a child agent).
-    pub parent_address: Option<crate::messaging::types::AgentAddress>,
+    pub parent_address: Option<astra_messaging::types::AgentAddress>,
     /// Permission context for runtime permission management.
     /// Created from inherited_permissions or as a fresh root context.
     pub permission_context:
@@ -217,7 +217,7 @@ pub struct DynamicAgentSpawner {
     /// Optional session ID for persisting agent state to journal.
     session_id: Option<String>,
     /// Agent type registry (builtins + user-defined).
-    agent_registry: super::team_config::AgentRegistry,
+    agent_registry: astra_turn_core::orchestration_team_config::AgentRegistry,
     /// Completed agents archive for history queries.
     completed_agents: Arc<RwLock<Vec<SpawnedAgentState>>>,
     /// JoinSet tracking all in-flight background agent tasks for graceful shutdown drain.
@@ -235,7 +235,7 @@ impl DynamicAgentSpawner {
             context_cache: Arc::new(SharedContextCache::default()),
             executor: None,
             session_id: None,
-            agent_registry: super::team_config::AgentRegistry::builtins_only(),
+            agent_registry: astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
         }
@@ -255,7 +255,7 @@ impl DynamicAgentSpawner {
             context_cache: Arc::new(SharedContextCache::default()),
             executor: None,
             session_id: None,
-            agent_registry: super::team_config::AgentRegistry::builtins_only(),
+            agent_registry: astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
         }
@@ -273,7 +273,7 @@ impl DynamicAgentSpawner {
             context_cache,
             executor: None,
             session_id: None,
-            agent_registry: super::team_config::AgentRegistry::builtins_only(),
+            agent_registry: astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
         }
@@ -292,13 +292,13 @@ impl DynamicAgentSpawner {
     }
 
     /// Set a custom agent registry (builtins + user-defined types).
-    pub fn with_agent_registry(mut self, registry: super::team_config::AgentRegistry) -> Self {
+    pub fn with_agent_registry(mut self, registry: astra_turn_core::orchestration_team_config::AgentRegistry) -> Self {
         self.agent_registry = registry;
         self
     }
 
     /// Get a reference to the agent registry.
-    pub fn agent_registry(&self) -> &super::team_config::AgentRegistry {
+    pub fn agent_registry(&self) -> &astra_turn_core::orchestration_team_config::AgentRegistry {
         &self.agent_registry
     }
 
@@ -331,7 +331,7 @@ impl DynamicAgentSpawner {
             .get(&input.agent_type)
             .ok_or_else(|| SpawnError::UnknownAgentType(input.agent_type.clone()))?;
         let child_recursion_depth =
-            crate::turn::agentic_recursion_guard::checked_child_recursion_depth(
+            astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth(
                 context.recursion_depth,
             )
             .map_err(SpawnError::DepthLimitExceeded)?;
@@ -435,7 +435,7 @@ impl DynamicAgentSpawner {
         );
 
         // 7. Build parent address for permission requests
-        let parent_address = crate::messaging::types::AgentAddress::new(
+        let parent_address = astra_messaging::types::AgentAddress::new(
             &context.parent_run_id,
             &context.parent_agent_id,
         );
@@ -1033,9 +1033,9 @@ fn create_agent_worktree(parent_dir: &std::path::Path, run_id: &str) -> Result<P
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::messaging::in_process::InProcessTransport;
-    use crate::messaging::router::AgentMailboxRouter;
-    use crate::messaging::types::{AgentMessage, MessagePayload, MessageTarget};
+    use astra_messaging::in_process::InProcessTransport;
+    use astra_messaging::router::AgentMailboxRouter;
+    use astra_messaging::types::{AgentMessage, MessagePayload, MessageTarget};
     use crate::server::delegation_engine::DelegationTracker;
     use tokio::time::{Duration, sleep};
 
@@ -1133,7 +1133,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_cache_shared_across_spawns() {
-        use crate::orchestration::context_cache::SharedContextCache;
+        use astra_turn_core::orchestration_context_cache::SharedContextCache;
 
         // Create a shared context cache
         let cache = Arc::new(SharedContextCache::default());
@@ -1411,7 +1411,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
-            recursion_depth: crate::turn::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
+            recursion_depth: astra_turn_core::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
             inherited_permissions: None,
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),

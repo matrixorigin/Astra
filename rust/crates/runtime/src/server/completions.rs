@@ -135,7 +135,7 @@ pub(super) async fn completions_handler(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        let truncated = crate::str_preview::truncate_str(&text, 500);
+        let truncated = astra_text_utils::str_preview::truncate_str(&text, 500);
         return Err(error_response(
             StatusCode::BAD_GATEWAY,
             format!("Upstream LLM HTTP {status}: {truncated}"),

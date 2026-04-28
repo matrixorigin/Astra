@@ -7,7 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use astra_runtime::str_preview::truncate_str;
+use astra_text_utils::str_preview::truncate_str;
 use serde_json::Value;
 
 use super::{

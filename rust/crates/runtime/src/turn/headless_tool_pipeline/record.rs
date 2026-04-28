@@ -3,23 +3,23 @@ use std::time::Duration;
 use astra_services::SessionArtifactStore;
 
 use super::super::agentic_headless_round::HeadlessStderrStyle;
-use super::super::headless_tool_assembly::{
+use astra_turn_core::headless_tool_assembly::{
     READ_ONLY_TOOLS, openai_tool_roundtrip_values_with_result_fields,
 };
-use super::super::headless_tool_body_preview::emit_headless_tool_body_preview;
-use super::super::headless_tool_journal::journal_record_executed_tool_call;
-use super::super::headless_tool_postprocess::{
+use astra_turn_core::headless_tool_body_preview::emit_headless_tool_body_preview;
+use astra_turn_core::headless_tool_journal::journal_record_executed_tool_call;
+use astra_turn_core::headless_tool_postprocess::{
     HeadlessCacheableRecordCtx, format_headless_tool_duration,
     record_headless_cacheable_success_and_semantic_hint, try_write_light_headless_step_checkpoint,
 };
-use super::super::headless_tool_status_display::{tool_call_detail, tool_result_summary};
-use super::super::headless_tool_stderr_lines::{
+use astra_turn_core::headless_tool_status_display::{tool_call_detail, tool_result_summary};
+use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_error_preview_line, headless_stderr_tool_error_detail_line,
     headless_stderr_tool_error_line, headless_stderr_tool_ok_line,
 };
 use super::*;
-use crate::turn::edge_prompt_context::make_args_preview;
-use crate::turn::tool_result_sanitize::tool_result_content_for_model;
+use astra_turn_core::edge_prompt_context::make_args_preview;
+use astra_turn_core::tool_result_sanitize::tool_result_content_for_model;
 
 fn emit_tool_display_feedback(
     quiet: bool,
@@ -79,7 +79,7 @@ fn maybe_persist_model_tool_result(
         let session_dir = astra_services::local_session_artifact_store()
             .session_dir(sid)
             .expect("validated session_id must resolve tool-result session dir");
-        match super::super::tool_result_storage::maybe_persist_tool_result(
+        match astra_turn_core::tool_result_storage::maybe_persist_tool_result(
             &session_dir,
             id,
             name,

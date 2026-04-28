@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use super::meta::{IntentType, Scope, TOOL_CATALOG, ToolMeta};
-use super::report::ToolQualityTracker;
-use super::state::ConversationState;
-use crate::text_tokenize::tokenize;
-use crate::turn::routing_metrics::{ConfidenceCalibrator, DisambiguationAction};
+use astra_turn_core::tool_registry_meta::{IntentType, Scope, TOOL_CATALOG, ToolMeta};
+use astra_turn_core::tool_registry_report::ToolQualityTracker;
+use astra_turn_core::tool_registry_state::ConversationState;
+use astra_text_utils::text_tokenize::tokenize;
+use astra_turn_core::routing_metrics::{ConfidenceCalibrator, DisambiguationAction};
 
 /// Pre-computed inverse document frequency for each term across all tools.
 /// Terms that appear in fewer tools get higher IDF (more discriminative).
@@ -106,7 +106,7 @@ pub fn tfidf_score(query_terms: &[String], tool_idx: usize) -> f64 {
 /// This is COMPLEMENTARY to TF-IDF — triggers capture multilingual synonyms
 /// and phrase patterns that TF-IDF might miss (e.g., "关注" → github tools).
 pub fn trigger_match_score(tool: &ToolMeta, query_lower: &str, query_chars: &[char]) -> f64 {
-    use super::state::word_boundary_match;
+    use astra_turn_core::tool_registry_state::word_boundary_match;
 
     let mut best_score = 0.0;
     let query_words: Vec<&str> = query_lower
@@ -222,7 +222,7 @@ fn file_context_tool_boost(tool_name: &str, file_context: &[String]) -> f64 {
 }
 
 fn explicit_lsp_signal(query_lower: &str, query_chars: &[char]) -> bool {
-    use super::state::word_boundary_match;
+    use astra_turn_core::tool_registry_state::word_boundary_match;
 
     const LSP_SIGNALS: &[&str] = &[
         "lsp",
@@ -643,7 +643,7 @@ pub fn pre_filter_dynamic_with_file_context(
 /// Pre-filter including outcome-memory bias. When `outcome_bias` is non-empty,
 /// each catalog tool gets an additive score adjustment (±0.10) derived from
 /// recent per-signature success/failure evidence (see
-/// [`crate::turn::tool_health::ToolHealthTracker::outcome_bias_by_tool`]).
+/// [`astra_turn_core::tool_health::ToolHealthTracker::outcome_bias_by_tool`]).
 #[allow(clippy::too_many_arguments)]
 pub fn pre_filter_dynamic_with_outcome_bias(
     state: &ConversationState,
@@ -916,7 +916,7 @@ fn ensure_intent_diversity(
     all_scored: &[(usize, f64)],
     state: &ConversationState,
 ) {
-    use super::meta::IntentType;
+    use astra_turn_core::tool_registry_meta::IntentType;
 
     let intent_requirements: &[(bool, IntentType)] = &[
         (state.is_github, IntentType::GitHub),

@@ -635,7 +635,7 @@ pub(crate) fn print_markdown_width(text: &str, width: Option<usize>) {
     print!("{}", fmt);
 }
 
-pub(crate) use astra_runtime::str_preview::{prefix_chars, truncate_str};
+pub(crate) use astra_text_utils::str_preview::{prefix_chars, truncate_str};
 
 pub(super) fn urlencoding(s: &str) -> String {
     s.chars()

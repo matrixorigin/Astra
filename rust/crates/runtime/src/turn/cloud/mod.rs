@@ -1,13 +1,6 @@
 pub mod analytics;
-pub mod attachments;
-pub mod cache_diagnostics;
 pub mod compaction;
 pub mod memoria_compact;
 pub mod session_end_governance;
 pub mod session_facts;
-pub mod session_memory_extract;
 pub mod session_memory_protocol;
-pub mod summary;
-pub mod history;
-pub mod iteration;
-pub mod prefilter;

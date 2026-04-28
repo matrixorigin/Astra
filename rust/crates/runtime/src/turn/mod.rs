@@ -1,5 +1,3 @@
-pub mod action_compensation;
-pub mod activity;
 pub mod agentic_adaptive_tuning;
 pub mod agentic_auto_reflection;
 pub mod agentic_delegate_interception;
@@ -13,36 +11,16 @@ pub mod agentic_loop_tool_support;
 pub mod agentic_prepare_payload;
 pub mod agentic_stage_bridge;
 pub mod agentic_tool_interception;
-pub mod approval_fingerprint;
-#[cfg(feature = "bridge-e2e-hooks")]
-pub mod bridge_e2e_hooks;
 pub mod bridge_inprocess;
 pub mod bridge_llm_stream;
 pub mod bridge_observability;
 pub mod bridge_sse_helpers;
-pub mod cache;
 pub mod chat_turn_budget_pressure;
 pub mod chat_turn_selection_context;
-pub mod chat_turn_sse_dispatch;
 pub mod cloud;
 pub mod compaction_replay;
-pub mod complete;
-pub mod confidence_contract;
 pub mod context_compression;
-pub mod contracts;
-pub mod counter;
-pub mod edge_ledger;
-pub mod edge_prompt_context;
-pub mod error_recovery;
-pub mod execution_state;
-pub mod explain;
-pub mod firewall;
-pub mod goal_tracker;
-pub mod headless_tool_assembly;
 pub mod headless_tool_pipeline;
-pub mod history;
-pub mod history_apply;
-pub mod hook_plans;
 /// Re-exported from astra-turn-types
 pub mod implicit_feedback {
     pub use astra_turn_types::{
@@ -50,83 +28,27 @@ pub mod implicit_feedback {
         implicit_feedback_context_injection, implicit_feedback_rating,
     };
 }
-pub mod interruption;
 pub(crate) mod llm_client;
 pub(crate) mod llm_exchange_capture;
-pub mod llm_request_dump;
 pub mod loop_dispatcher;
 pub mod memory_prefetch;
-pub mod microcompact;
-pub mod observer;
-pub mod parallel_tool_exec;
 pub mod permission_gate;
-pub mod persist;
-pub mod persist_inputs;
 pub mod prompt_cache;
-pub mod quality;
-pub mod refresh;
-pub mod response_guard;
 /// Re-exported from astra-turn-types
 pub mod result_quality {
     pub use astra_turn_types::{ResultQuality, classify_result, quality_feedback};
 }
-pub mod retrieval;
-pub mod routing;
-pub mod routing_metrics;
-pub mod safety_middleware;
 pub(crate) mod services;
-pub mod session_cache;
 pub mod skill_selector;
 pub mod skill_tool;
-pub mod snapshot;
-pub mod sse_data_lines;
-pub mod stall;
-pub mod state;
-pub mod stop_hooks;
-pub mod stream_events;
-pub mod streaming_tool_exec;
-pub mod tail_persist;
-pub mod task;
-pub mod tool_args_repair;
-pub(crate) mod tool_call_shape;
-pub mod tool_health;
-pub mod tool_result_sanitize;
-pub mod tool_result_semantics;
-pub mod tool_schema_prune;
-pub mod tool_selection;
-pub mod turn_guard;
 pub mod turn_trace_collector;
-pub mod unconsumed;
-pub mod view;
-pub mod xml_tool_call_fallback;
-pub mod agentic_post_tool_policy;
-pub mod agentic_turn_flow;
-pub mod agentic_turn_ingest;
-pub mod headless_tool_body_preview;
-pub mod headless_tool_journal;
-pub mod headless_tool_postprocess;
-pub mod headless_tool_status_display;
-pub mod headless_tool_stderr_lines;
-pub mod hydrate_reflect;
-pub mod sse_blocks;
-pub mod tool_result_storage;
-pub mod cloud_tool_delivery;
-pub mod agentic_verdict_audit;
-pub mod chat_turn_heuristics;
-pub mod context_assembly_trace;
-pub mod decision_explainer;
-pub mod file_edit_journal;
-pub mod sse_stream_host;
-pub mod stop_hooks_yaml;
-pub mod tool_argument_hints;
-pub mod agentic_recursion_guard;
-pub mod followup_suggestion;
-pub mod agentic_turn_telemetry;
-pub mod boost_domain_hints;
-pub mod chat_turn_api_error;
-pub mod chat_turn_edge_profile;
-pub mod chat_turn_explain_wire;
-pub mod chat_turn_payload;
-pub mod chat_turn_step_plan;
-pub mod prepare_turn_explain_text;
-pub mod chat_history_openai;
+
+// Re-export from astra-turn-core for public API compatibility
+pub use astra_turn_core::{
+    agentic_turn_telemetry, boost_domain_hints, chat_history_openai, chat_turn_api_error,
+    chat_turn_edge_profile, chat_turn_explain_wire, chat_turn_heuristics, chat_turn_payload,
+    chat_turn_step_plan, edge_prompt_context, prepare_turn_explain_text, stop_hooks_yaml,
+    tool_health, tool_schema_prune, turn_guard,
+    chat_turn_sse_dispatch, parallel_tool_exec, sse_stream_host, streaming_tool_exec,
+    cloud_tool_delivery, edge_ledger, agentic_recursion_guard,
+};

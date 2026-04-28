@@ -11,7 +11,7 @@
 //! - `/profile help`: Show help
 
 use super::*;
-use astra_runtime::user_profile::{
+use astra_config::user_profile::{
     CodeCommentStyle, EmojiUsage, Formality, ResponseLength, Scenario, UserProfile,
     UserProfileManager, Verbosity,
 };

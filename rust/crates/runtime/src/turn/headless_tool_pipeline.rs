@@ -6,14 +6,14 @@ use astra_thin_client::ThinClient;
 use serde_json::{Map, Value};
 
 use super::agentic_headless_round::{HeadlessRoundTerminal, PermissionSyncHandle};
-use super::headless_tool_assembly::{
+use astra_turn_core::headless_tool_assembly::{
     EdgeToolRoundRow, HeadlessResolvedToolSlot, HeadlessRoundToolIdx, resolve_headless_tool_slot,
     take_edge_output_for_tool_call_with_duration,
 };
-use crate::pipeline::step_protocol::{IdempotencyKey, InMemoryIdempotencyCache};
-use crate::pipeline::step_recorder::StepRecorder;
-use crate::semantic_dedup::SemanticDedup;
-use crate::turn::turn_guard::TurnGuard;
+use astra_pipeline::step_protocol::{IdempotencyKey, InMemoryIdempotencyCache};
+use astra_pipeline::step_recorder::StepRecorder;
+use astra_text_utils::semantic_dedup::SemanticDedup;
+use astra_turn_core::turn_guard::TurnGuard;
 
 mod execute;
 mod policy;
@@ -97,7 +97,7 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     pub tool_call_records: &'a mut Vec<ToolCallRecord>,
     pub tool_event_hooks: &'a crate::skills::hooks::ToolEventHookRegistry,
     pub term: &'a mut dyn HeadlessRoundTerminal,
-    pub mailbox: Option<&'a mut crate::messaging::router::AgentMailbox>,
+    pub mailbox: Option<&'a mut astra_messaging::router::AgentMailbox>,
     pub permission_context: Option<&'a PermissionSyncHandle>,
     pub progress_emitter: Option<&'a crate::orchestration::AgentProgressEmitter>,
     pub effective_permission_timeout: Duration,
@@ -274,7 +274,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         // Phase 3: post-process + record serially (fast, needs &mut self).
         for (execution, idem_key) in executions {
-            let is_err = crate::turn::tool_result_semantics::is_tool_error(&execution.result_str);
+            let is_err = astra_turn_core::tool_result_semantics::is_tool_error(&execution.result_str);
             let executed_ms = if execution.is_edge_tool && execution.edge_duration_ms > 0 {
                 execution.edge_duration_ms
             } else {
@@ -299,10 +299,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    use crate::pipeline::step_protocol::CachedToolResult;
+    use astra_pipeline::step_protocol::CachedToolResult;
     use crate::skills::hooks::{HookAction, ToolEventHook, ToolEventHookRegistry, ToolEventKind};
     use crate::turn::agentic_headless_round::NoopHeadlessTerminal;
-    use crate::turn::sse_stream_host::EdgeToolExecResult;
+    use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 
     fn init_git_repo(dir: &Path) {
         std::process::Command::new("git")
@@ -360,7 +360,7 @@ mod tests {
 
     fn tool_trace_events(
         harness: &PipelineHarness,
-    ) -> Vec<(crate::pipeline::step_protocol::StepEventType, Option<Value>)> {
+    ) -> Vec<(astra_pipeline::step_protocol::StepEventType, Option<Value>)> {
         harness
             .step_recorder
             .events()
@@ -368,10 +368,10 @@ mod tests {
             .filter(|event| {
                 matches!(
                     event.event_type,
-                    crate::pipeline::step_protocol::StepEventType::ToolCallStarted
-                        | crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
-                        | crate::pipeline::step_protocol::StepEventType::ToolCallCompleted
-                        | crate::pipeline::step_protocol::StepEventType::ToolCallFailed
+                    astra_pipeline::step_protocol::StepEventType::ToolCallStarted
+                        | astra_pipeline::step_protocol::StepEventType::ToolCallSkipped
+                        | astra_pipeline::step_protocol::StepEventType::ToolCallCompleted
+                        | astra_pipeline::step_protocol::StepEventType::ToolCallFailed
                 )
             })
             .map(|event| (event.event_type.clone(), event.payload.clone()))
@@ -551,11 +551,11 @@ mod tests {
         );
         assert!(matches!(
             tool_events[0].0,
-            crate::pipeline::step_protocol::StepEventType::ToolCallStarted
+            astra_pipeline::step_protocol::StepEventType::ToolCallStarted
         ));
         assert!(matches!(
             tool_events[1].0,
-            crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+            astra_pipeline::step_protocol::StepEventType::ToolCallSkipped
         ));
         assert_eq!(
             tool_events[1]
@@ -595,11 +595,11 @@ mod tests {
         );
         assert!(matches!(
             tool_events[0].0,
-            crate::pipeline::step_protocol::StepEventType::ToolCallStarted
+            astra_pipeline::step_protocol::StepEventType::ToolCallStarted
         ));
         assert!(matches!(
             tool_events[1].0,
-            crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+            astra_pipeline::step_protocol::StepEventType::ToolCallSkipped
         ));
         assert_eq!(
             tool_events[1]
@@ -638,11 +638,11 @@ mod tests {
         );
         assert!(matches!(
             tool_events[0].0,
-            crate::pipeline::step_protocol::StepEventType::ToolCallStarted
+            astra_pipeline::step_protocol::StepEventType::ToolCallStarted
         ));
         assert!(matches!(
             tool_events[1].0,
-            crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+            astra_pipeline::step_protocol::StepEventType::ToolCallSkipped
         ));
         assert_eq!(
             tool_events[1]
@@ -708,11 +708,11 @@ mod tests {
         );
         assert!(matches!(
             tool_events[0].0,
-            crate::pipeline::step_protocol::StepEventType::ToolCallStarted
+            astra_pipeline::step_protocol::StepEventType::ToolCallStarted
         ));
         assert!(matches!(
             tool_events[1].0,
-            crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+            astra_pipeline::step_protocol::StepEventType::ToolCallSkipped
         ));
         assert_eq!(
             tool_events[1]
@@ -739,7 +739,7 @@ mod tests {
         );
         assert!(matches!(
             tool_events[0].0,
-            crate::pipeline::step_protocol::StepEventType::ToolCallStarted
+            astra_pipeline::step_protocol::StepEventType::ToolCallStarted
         ));
         let started_payload = tool_events[0].1.as_ref().expect("started payload");
         assert_eq!(
@@ -760,7 +760,7 @@ mod tests {
 
         assert!(matches!(
             tool_events[1].0,
-            crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+            astra_pipeline::step_protocol::StepEventType::ToolCallSkipped
         ));
         let skipped_payload = tool_events[1].1.as_ref().expect("skipped payload");
         assert_eq!(
@@ -1113,11 +1113,11 @@ mod tests {
         );
         assert!(matches!(
             tool_events[0].0,
-            crate::pipeline::step_protocol::StepEventType::ToolCallStarted
+            astra_pipeline::step_protocol::StepEventType::ToolCallStarted
         ));
         assert!(matches!(
             tool_events[1].0,
-            crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+            astra_pipeline::step_protocol::StepEventType::ToolCallSkipped
         ));
         assert_eq!(
             tool_events[1]
@@ -1238,11 +1238,11 @@ mod tests {
         );
         assert!(matches!(
             tool_events[0].0,
-            crate::pipeline::step_protocol::StepEventType::ToolCallStarted
+            astra_pipeline::step_protocol::StepEventType::ToolCallStarted
         ));
         assert!(matches!(
             tool_events[1].0,
-            crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+            astra_pipeline::step_protocol::StepEventType::ToolCallSkipped
         ));
         assert_eq!(
             tool_events[1]
@@ -1423,7 +1423,7 @@ mod tests {
 
         // Simulate what the server loop does between turns.
         assert!(!pipeline.ctx.restricted_tools.contains("outline"));
-        crate::turn::turn_guard::merge_deprioritized_tools_into_restricted(
+        astra_turn_core::turn_guard::merge_deprioritized_tools_into_restricted(
             pipeline.ctx.turn_guard,
             pipeline.ctx.restricted_tools,
         );
@@ -1614,7 +1614,7 @@ mod tests {
         };
         let executed = pipeline.execute_execution(permitted).await;
 
-        let sig = crate::turn::tool_result_semantics::tool_dedup_signature(
+        let sig = astra_turn_core::tool_result_semantics::tool_dedup_signature(
             &executed.execution.name,
             &executed.execution.args,
         );
@@ -1647,7 +1647,7 @@ mod tests {
             "id": "call-grep-0",
             "function": { "name": "grep", "arguments": "{\"pattern\":\"headless\"}" }
         }));
-        let sig = crate::turn::tool_result_semantics::tool_dedup_signature(
+        let sig = astra_turn_core::tool_result_semantics::tool_dedup_signature(
             "grep",
             &json!({"pattern":"headless"}),
         );
@@ -1657,7 +1657,7 @@ mod tests {
             .unwrap_or(0);
         harness.turn_guard.health.record_outcome(
             &sig,
-            crate::turn::tool_health::ToolOutcome {
+            astra_turn_core::tool_health::ToolOutcome {
                 success: false,
                 latency_ms: 10,
                 result_hash: 1,
@@ -1667,7 +1667,7 @@ mod tests {
         );
         harness.turn_guard.health.record_outcome(
             &sig,
-            crate::turn::tool_health::ToolOutcome {
+            astra_turn_core::tool_health::ToolOutcome {
                 success: false,
                 latency_ms: 12,
                 result_hash: 2,
@@ -1697,11 +1697,11 @@ mod tests {
         );
         assert!(matches!(
             tool_events[0].0,
-            crate::pipeline::step_protocol::StepEventType::ToolCallStarted
+            astra_pipeline::step_protocol::StepEventType::ToolCallStarted
         ));
         assert!(matches!(
             tool_events[1].0,
-            crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+            astra_pipeline::step_protocol::StepEventType::ToolCallSkipped
         ));
         assert_eq!(
             tool_events[1]
@@ -1726,7 +1726,7 @@ mod tests {
             "id": "call-edit-0",
             "function": { "name": "str_replace", "arguments": serde_json::to_string(&args).unwrap() }
         }));
-        let sig = crate::turn::tool_result_semantics::tool_dedup_signature("str_replace", &args);
+        let sig = astra_turn_core::tool_result_semantics::tool_dedup_signature("str_replace", &args);
         let now_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1734,7 +1734,7 @@ mod tests {
         for result_hash in [11, 12] {
             harness.turn_guard.health.record_outcome(
                 &sig,
-                crate::turn::tool_health::ToolOutcome {
+                astra_turn_core::tool_health::ToolOutcome {
                     success: false,
                     latency_ms: 10,
                     result_hash,
@@ -1762,7 +1762,7 @@ mod tests {
             .find(|(kind, _)| {
                 matches!(
                     kind,
-                    crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+                    astra_pipeline::step_protocol::StepEventType::ToolCallSkipped
                 )
             })
             .expect("expected skipped trace event");
@@ -1791,7 +1791,7 @@ mod tests {
             "id": "call-grep-0",
             "function": { "name": "grep", "arguments": "{\"pattern\":\"headless\"}" }
         }));
-        let sig = crate::turn::tool_result_semantics::tool_dedup_signature(
+        let sig = astra_turn_core::tool_result_semantics::tool_dedup_signature(
             "grep",
             &json!({"pattern":"headless"}),
         );
@@ -1801,7 +1801,7 @@ mod tests {
             .unwrap_or(0);
         harness.turn_guard.health.record_outcome(
             &sig,
-            crate::turn::tool_health::ToolOutcome {
+            astra_turn_core::tool_health::ToolOutcome {
                 success: false,
                 latency_ms: 10,
                 result_hash: 1,
@@ -1811,7 +1811,7 @@ mod tests {
         );
         harness.turn_guard.health.record_outcome(
             &sig,
-            crate::turn::tool_health::ToolOutcome {
+            astra_turn_core::tool_health::ToolOutcome {
                 success: true,
                 latency_ms: 8,
                 result_hash: 2,
@@ -1865,7 +1865,7 @@ mod tests {
 
     #[test]
     fn cross_session_restored_outcome_memory_blocks_repeated_failure() {
-        let sig = crate::turn::tool_result_semantics::tool_dedup_signature(
+        let sig = astra_turn_core::tool_result_semantics::tool_dedup_signature(
             "grep",
             &json!({"pattern":"headless"}),
         );
@@ -1879,7 +1879,7 @@ mod tests {
         session_one_guard.health.record_failure("grep");
         session_one_guard.health.record_outcome(
             &sig,
-            crate::turn::tool_health::ToolOutcome {
+            astra_turn_core::tool_health::ToolOutcome {
                 success: false,
                 latency_ms: 10,
                 result_hash: 1,
@@ -1889,7 +1889,7 @@ mod tests {
         );
         session_one_guard.health.record_outcome(
             &sig,
-            crate::turn::tool_health::ToolOutcome {
+            astra_turn_core::tool_health::ToolOutcome {
                 success: false,
                 latency_ms: 12,
                 result_hash: 2,
@@ -1902,7 +1902,7 @@ mod tests {
         assert_eq!(exported.len(), 1);
         assert_eq!(exported[0].recent_outcomes.len(), 1);
 
-        let restored = crate::turn::tool_health::ToolHealthTracker::from_entries(&exported);
+        let restored = astra_turn_core::tool_health::ToolHealthTracker::from_entries(&exported);
         let mut harness = PipelineHarness::new();
         harness.turn_guard = TurnGuard::with_health(restored);
         harness.tool_calls.push(json!({
@@ -1924,7 +1924,7 @@ mod tests {
     #[tokio::test]
     async fn restored_outcome_memory_reduces_recovery_executions_vs_blind_retry() {
         async fn run_recovery_turn(
-            restored: Option<crate::turn::tool_health::ToolHealthTracker>,
+            restored: Option<astra_turn_core::tool_health::ToolHealthTracker>,
         ) -> (u32, usize, usize) {
             let mut harness = PipelineHarness::new();
             harness.valid_tool_names.insert("outline".to_string());
@@ -2001,7 +2001,7 @@ mod tests {
 
         let mut prior_guard = TurnGuard::new();
         let outline_sig =
-            crate::turn::tool_result_semantics::tool_dedup_signature("outline", &json!({}));
+            astra_turn_core::tool_result_semantics::tool_dedup_signature("outline", &json!({}));
         let now_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -2010,7 +2010,7 @@ mod tests {
         prior_guard.health.record_failure("outline");
         prior_guard.health.record_outcome(
             &outline_sig,
-            crate::turn::tool_health::ToolOutcome {
+            astra_turn_core::tool_health::ToolOutcome {
                 success: false,
                 latency_ms: 10,
                 result_hash: 1,
@@ -2020,7 +2020,7 @@ mod tests {
         );
         prior_guard.health.record_outcome(
             &outline_sig,
-            crate::turn::tool_health::ToolOutcome {
+            astra_turn_core::tool_health::ToolOutcome {
                 success: false,
                 latency_ms: 11,
                 result_hash: 2,
@@ -2029,7 +2029,7 @@ mod tests {
             },
         );
         let restored =
-            crate::turn::tool_health::ToolHealthTracker::from_entries(&prior_guard.health.export());
+            astra_turn_core::tool_health::ToolHealthTracker::from_entries(&prior_guard.health.export());
         let memory_guided = run_recovery_turn(Some(restored)).await;
 
         assert_eq!(blind_retry.2, 1, "blind retry still reaches grep success");
@@ -2137,11 +2137,11 @@ mod tests {
         );
         assert!(matches!(
             tool_events[0].0,
-            crate::pipeline::step_protocol::StepEventType::ToolCallStarted
+            astra_pipeline::step_protocol::StepEventType::ToolCallStarted
         ));
         assert!(matches!(
             tool_events[1].0,
-            crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+            astra_pipeline::step_protocol::StepEventType::ToolCallSkipped
         ));
         assert_eq!(
             tool_events[1]

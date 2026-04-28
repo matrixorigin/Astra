@@ -18,9 +18,9 @@ mod tests {
     };
     use astra_services::runs::InMemoryRunStateStore;
 
-    use crate::messaging::in_process::InProcessTransport;
-    use crate::messaging::router::AgentMailboxRouter;
-    use crate::messaging::types::*;
+    use astra_messaging::in_process::InProcessTransport;
+    use astra_messaging::router::AgentMailboxRouter;
+    use astra_messaging::types::*;
     use crate::server::delegation_engine::{
         DelegationEngine, DelegationTracker, SubRunConfig, SubRunExecutor,
     };

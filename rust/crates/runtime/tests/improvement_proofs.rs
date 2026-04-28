@@ -505,7 +505,7 @@ mod memory_awareness {
 
         // Simple query: "fix bug" — doesn't need much context
         let simple_query = "fix bug";
-        let adaptive_simple = astra_runtime::turn::retrieval::adaptive_budget_chars(simple_query);
+        let adaptive_simple = astra_turn_core::retrieval::adaptive_budget_chars(simple_query);
         assert!(
             adaptive_simple < fixed_budget,
             "Simple query should use LESS budget: {} vs fixed {}. Saves {}%",
@@ -516,7 +516,7 @@ mod memory_awareness {
 
         // Complex code query: needs more context
         let complex_query = "impl AsyncTrait for MyService { fn handle(&self, req: Request) -> Result<Response, Error> { /* need to see similar patterns */ }";
-        let adaptive_complex = astra_runtime::turn::retrieval::adaptive_budget_chars(complex_query);
+        let adaptive_complex = astra_turn_core::retrieval::adaptive_budget_chars(complex_query);
         assert!(
             adaptive_complex > fixed_budget,
             "Complex code query should use MORE budget: {} vs fixed {}. Gets {}% more context",
@@ -541,7 +541,7 @@ mod memory_awareness {
 
 mod skill_accuracy {
     use astra_runtime::tool_registry::{SelectionFeedback, SelectionReport, ToolQualityTracker};
-    use astra_runtime::turn::routing_metrics::{
+    use astra_turn_core::routing_metrics::{
         ConfidenceCalibrator, DisambiguationAction, disambiguate_intents,
     };
 
@@ -1010,7 +1010,7 @@ mod selection_feedback_loop {
         ConversationState, IntentType, SelectionFeedback, TOOL_CATALOG, ToolQualityTracker,
         pre_filter_dynamic, pre_filter_dynamic_with_quality,
     };
-    use astra_runtime::turn::routing_metrics::DisambiguationAction;
+    use astra_turn_core::routing_metrics::DisambiguationAction;
 
     /// PROOF: Quality tracker boost_factor actually changes tool ranking.
     /// Old: all tools scored equally regardless of history.
@@ -1173,10 +1173,10 @@ mod selection_feedback_loop {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod non_happy_path {
-    use astra_runtime::turn::stall::{
+    use astra_turn_core::stall::{
         DivergenceStatus, build_stall_reflection, detect_divergence, detect_server_stall,
     };
-    use astra_runtime::turn::tool_health::ToolHealthTracker;
+    use astra_turn_core::tool_health::ToolHealthTracker;
     use std::collections::BTreeSet;
 
     fn make_sigs(rounds: &[&[&str]]) -> Vec<BTreeSet<String>> {
@@ -2332,7 +2332,7 @@ fn schema_pruning_strips_optional_params() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod semantic_dedup_proofs {
-    use astra_runtime::semantic_dedup::{SemanticDedup, output_similarity, semantic_call_key};
+    use astra_text_utils::semantic_dedup::{SemanticDedup, output_similarity, semantic_call_key};
     use serde_json::json;
 
     #[test]
@@ -2468,7 +2468,7 @@ mod semantic_dedup_proofs {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod error_recovery_proofs {
-    use astra_runtime::turn::error_recovery::*;
+    use astra_turn_core::error_recovery::*;
 
     #[test]
     fn error_classification_handles_real_world_messages() {
@@ -2599,7 +2599,7 @@ mod error_recovery_proofs {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod stall_enforcement_proofs {
-    use astra_runtime::turn::stall::*;
+    use astra_turn_core::stall::*;
     use std::collections::HashSet;
 
     #[test]
@@ -4272,7 +4272,7 @@ mod runtime_limits_proofs {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod idempotency_cache_proofs {
-    use astra_runtime::pipeline::step_protocol::{
+    use astra_pipeline::step_protocol::{
         CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache, epoch_ms,
     };
     use serde_json::json;
@@ -4418,7 +4418,7 @@ mod idempotency_cache_proofs {
 
 mod file_event_store_proofs {
     use astra_runtime::pipeline::step_checkpoint::*;
-    use astra_runtime::pipeline::step_protocol::*;
+    use astra_pipeline::step_protocol::*;
     use serde_json::json;
 
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4544,7 +4544,7 @@ mod file_event_store_proofs {
 
     #[test]
     fn recorder_with_persistence_writes_events_to_disk() {
-        use astra_runtime::pipeline::step_recorder::StepRecorder;
+        use astra_pipeline::step_recorder::StepRecorder;
 
         let sid = test_session();
         {
@@ -4571,8 +4571,8 @@ mod file_event_store_proofs {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod scheduling_contract_proofs {
-    use astra_runtime::pipeline::step_protocol::*;
-    use astra_runtime::pipeline::step_recorder::StepRecorder;
+    use astra_pipeline::step_protocol::*;
+    use astra_pipeline::step_recorder::StepRecorder;
 
     #[test]
     fn recorder_perceive_populates_step_payload() {
@@ -4692,8 +4692,8 @@ mod scheduling_contract_proofs {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod slot_integration_proofs {
-    use astra_runtime::pipeline::step_protocol::*;
-    use astra_runtime::pipeline::step_recorder::StepRecorder;
+    use astra_pipeline::step_protocol::*;
+    use astra_pipeline::step_recorder::StepRecorder;
 
     #[test]
     fn begin_tool_with_key_populates_idempotency_key() {
@@ -4888,12 +4888,12 @@ mod hardening_proofs {
     use astra_runtime::pipeline::persistence::{
         LearningSnapshot, ToolHealthEntry, load_snapshot_from, save_snapshot_to,
     };
-    use astra_runtime::turn::response_guard::{
+    use astra_turn_core::response_guard::{
         QualityReport, check_response_quality, find_hallucinated_tools, find_malformed_args,
         is_prompt_leaked, is_repetition_loop,
     };
-    use astra_runtime::turn::tool_health::ToolHealthTracker;
-    use astra_runtime::turn::turn_guard::TurnGuard;
+    use astra_turn_core::tool_health::ToolHealthTracker;
+    use astra_turn_core::turn_guard::TurnGuard;
 
     // ── Response Guard ──
 
@@ -5602,7 +5602,7 @@ mod token_efficiency_deep {
 // ─── Step Protocol: Crash Recovery ───────────────────────────────────────────
 
 mod crash_recovery_proofs {
-    use astra_runtime::pipeline::step_protocol::*;
+    use astra_pipeline::step_protocol::*;
     use astra_runtime::pipeline::step_restore::*;
 
     // ── Version validation ──
@@ -5879,7 +5879,7 @@ mod crash_recovery_proofs {
 
     #[test]
     fn recorder_complete_tool_with_result_includes_output_in_event() {
-        use astra_runtime::pipeline::step_recorder::StepRecorder;
+        use astra_pipeline::step_recorder::StepRecorder;
 
         let mut rec = StepRecorder::new("test-session", "task-1");
         rec.begin_turn(1);
@@ -5908,7 +5908,7 @@ mod crash_recovery_proofs {
 
     #[test]
     fn recorder_complete_tool_backward_compatible() {
-        use astra_runtime::pipeline::step_recorder::StepRecorder;
+        use astra_pipeline::step_recorder::StepRecorder;
 
         // Original complete_tool() should still work without output
         let mut rec = StepRecorder::new("test-session", "task-1");
@@ -5959,7 +5959,7 @@ mod crash_recovery_proofs {
 
 // ─── Protocol hygiene proofs ────────────────────────────────────────────────
 mod protocol_hygiene_proofs {
-    use astra_runtime::pipeline::step_protocol::*;
+    use astra_pipeline::step_protocol::*;
 
     /// StepEventDag was deleted — production binary uses FileBackedEventStore only.
     /// Verify FileBackedEventStore implements the full StepEventStore trait,
@@ -6048,7 +6048,7 @@ mod protocol_hygiene_proofs {
 // ─── Scheduling contract proofs ─────────────────────────────────────────────
 mod scheduling_wiring_proofs {
     use astra_core::RuntimeLimits;
-    use astra_runtime::pipeline::step_protocol::SchedulingContract;
+    use astra_pipeline::step_protocol::SchedulingContract;
 
     /// Default contract has sane values.
     #[test]
@@ -6169,8 +6169,8 @@ mod scheduling_wiring_proofs {
 //         double-count prevention, health scoring accuracy.
 // =============================================================================
 mod turnguard_step_integration_proofs {
-    use astra_runtime::turn::tool_health::ToolHealthTracker;
-    use astra_runtime::turn::turn_guard::TurnGuard;
+    use astra_turn_core::tool_health::ToolHealthTracker;
+    use astra_turn_core::turn_guard::TurnGuard;
 
     // --- ToolHealth record_timeout ---
 
@@ -6394,7 +6394,7 @@ mod turnguard_step_integration_proofs {
 
     #[test]
     fn cache_duplication_triggers_warning_at_threshold() {
-        use astra_runtime::turn::turn_guard::VerdictSeverity;
+        use astra_turn_core::turn_guard::VerdictSeverity;
         let mut guard = TurnGuard::new();
         // 3 cache hits on the same tool → wasteful
         guard.record_cache_hit("read_file");
@@ -6453,7 +6453,7 @@ mod turnguard_step_integration_proofs {
 
     #[test]
     fn timeout_only_errors_do_not_escalate_to_critical() {
-        use astra_runtime::turn::turn_guard::VerdictSeverity;
+        use astra_turn_core::turn_guard::VerdictSeverity;
         let mut guard = TurnGuard::new();
         // 5 timeouts would trigger Critical if counted as regular errors (>= 5 errors)
         for _ in 0..5 {
@@ -6470,7 +6470,7 @@ mod turnguard_step_integration_proofs {
 
     #[test]
     fn mixed_timeout_and_bug_errors_escalate_normally() {
-        use astra_runtime::turn::turn_guard::VerdictSeverity;
+        use astra_turn_core::turn_guard::VerdictSeverity;
         let mut guard = TurnGuard::new();
         // 3 real failures (not timeouts)
         guard.record_tool_result("bash", "error: command not found");
@@ -6490,7 +6490,7 @@ mod turnguard_step_integration_proofs {
 
     #[test]
     fn evaluate_combines_all_new_signals() {
-        use astra_runtime::turn::turn_guard::VerdictSeverity;
+        use astra_turn_core::turn_guard::VerdictSeverity;
         let mut guard = TurnGuard::new();
 
         // Scenario: timeout-dominant tool + cache waste + real error
@@ -6519,7 +6519,7 @@ mod turnguard_step_integration_proofs {
 //         StepCheckpoint::Heavy carries full conversation state for recovery.
 // =============================================================================
 mod checkpoint_cloud_persistence_proofs {
-    use astra_runtime::pipeline::step_protocol::{
+    use astra_pipeline::step_protocol::{
         ExecutionCursor, HeavyCheckpoint, LightCheckpoint, StepAction, StepCheckpoint,
     };
 
@@ -6806,7 +6806,7 @@ mod checkpoint_cloud_persistence_proofs {
 // ══════════════════════════════════════════════════════════════════════════
 
 mod health_summary_auditability_proofs {
-    use astra_runtime::turn::tool_health::ToolHealthTracker;
+    use astra_turn_core::tool_health::ToolHealthTracker;
 
     #[test]
     fn summary_includes_timeouts_and_cache_hits() {
@@ -7069,7 +7069,7 @@ mod learning_sync_cloud_proofs {
 
 mod health_dashboard_proofs {
     use astra_runtime::pipeline::persistence::ToolHealthEntry;
-    use astra_runtime::turn::tool_health::ToolHealthTracker;
+    use astra_turn_core::tool_health::ToolHealthTracker;
 
     #[test]
     fn from_entries_roundtrip_preserves_health_data() {
@@ -7481,7 +7481,7 @@ mod timestamp_merge_proofs {
 
     #[test]
     fn last_updated_epoch_set_on_health_export() {
-        use astra_runtime::turn::tool_health::ToolHealthTracker;
+        use astra_turn_core::tool_health::ToolHealthTracker;
 
         let mut tracker = ToolHealthTracker::new();
         tracker.record_success("bash");
@@ -7522,8 +7522,8 @@ mod timestamp_merge_proofs {
 // =============================================================================
 mod turnguard_e2e_proofs {
     use astra_runtime::pipeline::persistence::ToolHealthEntry;
-    use astra_runtime::turn::tool_health::ToolHealthTracker;
-    use astra_runtime::turn::turn_guard::{TurnGuard, VerdictSeverity};
+    use astra_turn_core::tool_health::ToolHealthTracker;
+    use astra_turn_core::turn_guard::{TurnGuard, VerdictSeverity};
     use serde_json::json;
 
     fn tc(name: &str, args: &str) -> serde_json::Value {
@@ -8030,7 +8030,7 @@ mod turnguard_e2e_proofs {
     // escalation regardless of category.
     #[test]
     fn mixed_error_categories_accumulate_for_escalation() {
-        use astra_runtime::turn::error_recovery::ErrorCategory;
+        use astra_turn_core::error_recovery::ErrorCategory;
         let mut guard = TurnGuard::new();
 
         // Record enough non-auth errors to trigger Warning (need 8+ actionable)
@@ -8103,10 +8103,10 @@ mod turnguard_e2e_proofs {
         guard.nudge_count = 4;
         guard
             .errors
-            .record_error(astra_runtime::turn::error_recovery::ErrorCategory::Unknown);
+            .record_error(astra_turn_core::error_recovery::ErrorCategory::Unknown);
         guard
             .errors
-            .record_error(astra_runtime::turn::error_recovery::ErrorCategory::Unknown);
+            .record_error(astra_turn_core::error_recovery::ErrorCategory::Unknown);
 
         let verdict = guard.evaluate();
         assert!(
@@ -8117,7 +8117,7 @@ mod turnguard_e2e_proofs {
         // Now at 4 nudges + 3 errors → first Critical → restricted (progressive degradation)
         guard
             .errors
-            .record_error(astra_runtime::turn::error_recovery::ErrorCategory::Unknown);
+            .record_error(astra_turn_core::error_recovery::ErrorCategory::Unknown);
         let verdict = guard.evaluate();
         assert_eq!(verdict.severity, VerdictSeverity::Critical);
         assert!(

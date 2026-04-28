@@ -228,7 +228,7 @@ pub(super) async fn chat_stream_handler(
             .context
             .as_ref()
             .map_or(false, |c| c.contains_key("test_llm_rounds"));
-        if crate::turn::bridge_e2e_hooks::authorized(&headers) && !has_test_rounds {
+        if astra_turn_core::bridge_e2e_hooks::authorized(&headers) && !has_test_rounds {
             let payload = chat_stream_bridge_fallback_payload(&chat_data);
             let body = match serde_json::to_vec(&payload).map(Bytes::from) {
                 Ok(body) => body,

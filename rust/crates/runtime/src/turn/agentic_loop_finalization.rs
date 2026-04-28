@@ -1,5 +1,5 @@
-use crate::pipeline::step_checkpoint;
-use crate::pipeline::step_protocol::StepCheckpoint;
+use astra_pipeline::step_checkpoint;
+use astra_pipeline::step_protocol::StepCheckpoint;
 use crate::{EventCreateRequestData, EventService};
 use astra_services::SessionArtifactStore;
 
@@ -39,7 +39,7 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
     if budget_pressure > state.telemetry.first_budget_pressure {
         state.telemetry.first_budget_pressure = budget_pressure;
     }
-    collector.record_token_budget(crate::turn::context_assembly_trace::TokenBudgetTrace {
+    collector.record_token_budget(astra_turn_core::context_assembly_trace::TokenBudgetTrace {
         max_tokens: max as u32,
         total_used: measured as u32,
         budget_pressure,
@@ -695,7 +695,7 @@ fn update_session_facts_from_turn(state: &mut super::agentic_loop_host::AgenticL
                 .session_path(sid, "session-memory.md")
             {
                 if let Err(e) =
-                    crate::turn::cloud::session_memory_extract::write_session_memory_file(
+                    astra_turn_core::cloud_session_memory_extract::write_session_memory_file(
                         &path,
                         &l1_content,
                     )
@@ -880,7 +880,7 @@ mod tests {
         let mut state = make_state();
         state.message = "修复这个 bug".to_string();
         state.task_profile =
-            crate::turn::chat_turn_heuristics::infer_task_execution_profile("修复这个 bug");
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("修复这个 bug");
         assert!(
             state.task_profile.mutates_workspace,
             "test precondition: profile must be mutating"
@@ -930,7 +930,7 @@ mod tests {
         let mut state = make_state();
         state.message = "fix the bug".to_string();
         state.task_profile =
-            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
         assert!(state.task_profile.mutates_workspace);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
@@ -960,7 +960,7 @@ mod tests {
         let mut state = make_state();
         state.message = "修复这个 bug".to_string();
         state.task_profile =
-            crate::turn::chat_turn_heuristics::infer_task_execution_profile("修复这个 bug");
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("修复这个 bug");
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok(), "loop must terminate: {:?}", outcome);
@@ -1179,7 +1179,7 @@ mod tests {
 
         for i in 0..AUTO_REFLECTION_SIGNAL_THRESHOLD {
             state.pending_reflection_signals.push(
-                crate::evolution::types::EvolutionSignal::RepeatedStall {
+                astra_evolution::types::EvolutionSignal::RepeatedStall {
                     tool_chain: vec![format!("tool_{i}")],
                     stall_count: 3,
                     turn_id: format!("t{i}"),
@@ -1495,7 +1495,7 @@ mod tests {
             "turn-1".to_string(),
             "s1".to_string(),
         );
-        second.set_history_retained(&[crate::turn::context_assembly_trace::TurnRetention {
+        second.set_history_retained(&[astra_turn_core::context_assembly_trace::TurnRetention {
             turn_index: 0,
             role: "assistant".to_string(),
             tokens: 123,

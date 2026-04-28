@@ -2,7 +2,7 @@
 //!
 //! Entries are keyed `{user_id}:tool:{request_id}` / `{user_id}:approval:{request_id}`.
 //! [`InProcessChatTurnBridge`](crate::turn::bridge_inprocess::InProcessChatTurnBridge) and
-//! [`crate::turn::cloud_tool_delivery`] poll and `remove` keys until `turn_timeout_s` (user id from
+//! [`astra_turn_core::cloud_tool_delivery`] poll and `remove` keys until `turn_timeout_s` (user id from
 //! `x-mo-user-id` on the chat turn).
 
 use axum::extract::Extension;
@@ -16,7 +16,7 @@ use astra_services::session_journal::{
 use astra_thin_client::ASTRA_EDGE_ID_HEADER;
 use serde::Deserialize;
 
-use crate::turn::edge_ledger::{LEDGER_MAX_ENTRIES, approval_callback_key, tool_callback_key};
+use astra_turn_core::edge_ledger::{LEDGER_MAX_ENTRIES, approval_callback_key, tool_callback_key};
 
 fn edge_id_from_headers(headers: &HeaderMap) -> String {
     headers
@@ -330,7 +330,7 @@ mod edge_callback_insert_tests {
     //! previous `contains_key` short-circuit.
 
     use super::{LedgerInsertError, insert_approval_ledger_entry, insert_ledger_entry};
-    use crate::turn::edge_ledger::LEDGER_MAX_ENTRIES;
+    use astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES;
     use serde_json::json;
     use std::collections::HashMap;
 
