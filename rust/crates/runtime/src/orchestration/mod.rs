@@ -3,7 +3,6 @@
 //! This module provides the ability for LLMs to dynamically spawn sub-agents
 //! at runtime without pre-defined team configurations.
 
-pub mod permission_sync;
 mod spawner;
 
 pub use astra_turn_core::orchestration_context_cache::{
@@ -25,3 +24,4 @@ pub use spawner::{
     SpawnedAgentMetrics, SpawnedAgentState,
 };
 pub use astra_turn_core::orchestration_team_config::{AgentRegistry, AgentTypeConfig};
+pub use astra_turn_core::permission_sync;

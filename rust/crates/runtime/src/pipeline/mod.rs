@@ -12,12 +12,12 @@
 //! 5. **Structured reflection** — not just "nudge", but causal analysis + strategy change.
 
 pub mod evaluation;
-pub mod learning;
-pub mod learning_quality_gate;
-pub mod persistence;
 
 
 // Re-export from astra-pipeline for public API compatibility
 pub use astra_pipeline::{step_protocol, step_recorder};
 pub use astra_pipeline::{calibration, engine, entity, event, feedback_extraction, feedback_store, pattern, state, step_checkpoint, step_restore};
 pub use astra_turn_core::routing_engine as routing;
+pub use astra_evolution::persistence;
+pub use astra_turn_core::learning_quality_gate;
+pub use astra_turn_core::pipeline_learning as learning;

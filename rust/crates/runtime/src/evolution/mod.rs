@@ -4,7 +4,7 @@
 //! generates evolution proposals across four axes (skill, pattern, calibration, entity),
 //! and applies approved changes back into the system.
 
-pub mod promotion_gate;
 pub mod service;
 pub use astra_evolution::store;
 pub use astra_evolution::types;
+pub use astra_evolution::promotion_gate;
