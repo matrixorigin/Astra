@@ -78,6 +78,7 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
         git_worktree_journal: None,
         session_state_journal: None,
         task_manager: None,
+        runtime_continuity: None,
         turn_index: 0,
         evolution_service: None,
     })
@@ -163,6 +164,7 @@ async fn stream_chat_sse_simple_text_response() {
         git_worktree_journal: None,
         session_state_journal: None,
         task_manager: None,
+        runtime_continuity: None,
         turn_index: 0,
         evolution_service: None,
     })
@@ -251,6 +253,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         git_worktree_journal: None,
         session_state_journal: None,
         task_manager: None,
+        runtime_continuity: None,
         turn_index: 0,
         evolution_service: None,
     })
@@ -345,6 +348,7 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             git_worktree_journal: None,
             session_state_journal: None,
             task_manager: None,
+            runtime_continuity: None,
             turn_index: 0,
             evolution_service: None,
         })
@@ -431,6 +435,7 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         git_worktree_journal: None,
         session_state_journal: None,
         task_manager: None,
+        runtime_continuity: None,
         turn_index: 0,
         evolution_service: None,
     })
@@ -545,6 +550,7 @@ async fn stream_chat_sse_api_error_propagated() {
         git_worktree_journal: None,
         session_state_journal: None,
         task_manager: None,
+        runtime_continuity: None,
         turn_index: 0,
         evolution_service: None,
     })
@@ -633,6 +639,7 @@ async fn stream_chat_sse_with_tool_call_loop() {
         git_worktree_journal: None,
         session_state_journal: None,
         task_manager: None,
+        runtime_continuity: None,
         turn_index: 0,
         evolution_service: None,
     })
@@ -744,6 +751,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         git_worktree_journal: None,
         session_state_journal: None,
         task_manager: None,
+        runtime_continuity: None,
         turn_index: 0,
         evolution_service: None,
     })
@@ -898,6 +906,7 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
         git_worktree_journal: None,
         session_state_journal: None,
         task_manager: None,
+        runtime_continuity: None,
         turn_index: 0,
         evolution_service: None,
     })

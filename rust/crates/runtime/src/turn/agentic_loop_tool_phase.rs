@@ -112,7 +112,7 @@ fn advance_runtime_todo_before_tool_round(state: &mut AgenticLoopState) {
             .continuity
             .todos
             .active_or_next()
-            .is_some_and(|item| item.status == astra_turn_core::continuity::TodoStatus::Pending)
+            .is_some_and(|item| item.status == astra_turn_types::continuity::TodoStatus::Pending)
     {
         state.continuity.todos.begin_next_ready();
         state.continuity.sync_facts(state.session_facts.clone());
@@ -153,7 +153,7 @@ fn update_runtime_todo_from_tool_records(
             .todos
             .mark_blocked(&active_id, reason.clone());
         state.continuity.verification.set(
-            astra_turn_core::continuity::VerificationStatus::Failed,
+            astra_turn_types::continuity::VerificationStatus::Failed,
             reason,
             turn,
         );
@@ -168,7 +168,7 @@ fn update_runtime_todo_from_tool_records(
             .todos
             .add_evidence(&active_id, evidence.clone());
         state.continuity.verification.set(
-            astra_turn_core::continuity::VerificationStatus::Passed,
+            astra_turn_types::continuity::VerificationStatus::Passed,
             evidence,
             turn,
         );
@@ -1522,7 +1522,7 @@ mod tests {
         let active = state.continuity.todos.active_or_next().unwrap();
         assert_eq!(
             active.status,
-            astra_turn_core::continuity::TodoStatus::InProgress
+            astra_turn_types::continuity::TodoStatus::InProgress
         );
         assert_eq!(
             state
@@ -1546,12 +1546,12 @@ mod tests {
         let active = state.continuity.todos.active_or_next().unwrap();
         assert_eq!(
             active.status,
-            astra_turn_core::continuity::TodoStatus::InProgress
+            astra_turn_types::continuity::TodoStatus::InProgress
         );
         assert_eq!(active.evidence, vec!["bash ok".to_string()]);
         assert_eq!(
             state.continuity.verification.last_status,
-            Some(astra_turn_core::continuity::VerificationStatus::Passed)
+            Some(astra_turn_types::continuity::VerificationStatus::Passed)
         );
 
         update_runtime_todo_from_tool_records(&mut state, &[tool_record("cargo", false)]);
@@ -1564,7 +1564,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             blocked.status,
-            astra_turn_core::continuity::TodoStatus::Blocked
+            astra_turn_types::continuity::TodoStatus::Blocked
         );
         assert!(
             blocked
@@ -1575,7 +1575,7 @@ mod tests {
         );
         assert_eq!(
             state.continuity.verification.last_status,
-            Some(astra_turn_core::continuity::VerificationStatus::Failed)
+            Some(astra_turn_types::continuity::VerificationStatus::Failed)
         );
     }
 

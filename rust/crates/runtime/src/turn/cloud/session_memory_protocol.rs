@@ -4,7 +4,7 @@
 
 use serde_json::Value;
 
-use astra_turn_core::continuity::{
+use astra_turn_types::continuity::{
     AttentionManifest, ContinuityState, GoalState, TodoItem, TodoState, TodoStatus,
     narrative_task_contradicts_facts, redact_sensitive,
 };
@@ -1115,10 +1115,10 @@ mod tests {
 
     #[test]
     fn continuity_first_injection_puts_attention_before_facts_and_narrative() {
-        use astra_turn_core::cloud_session_facts::{FileEntry, SessionFacts};
-        use astra_turn_core::continuity::{
+        use astra_turn_types::continuity::{
             ContinuityState, TodoItem, TodoState, TodoStatus, VerificationState, VerificationStatus,
         };
+        use astra_turn_types::session_facts::{FileEntry, SessionFacts};
 
         let facts = SessionFacts {
             turn: 7,
@@ -1132,7 +1132,7 @@ mod tests {
         let mut verification = VerificationState::default();
         verification.set(VerificationStatus::Failed, "cargo test failed", 7);
         let continuity = ContinuityState {
-            goal: astra_turn_core::continuity::GoalState {
+            goal: astra_turn_types::continuity::GoalState {
                 text: "Implement runtime-owned continuity".to_string(),
                 source_turn: Some(1),
             },

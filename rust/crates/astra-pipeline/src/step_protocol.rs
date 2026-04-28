@@ -265,7 +265,7 @@ impl std::error::Error for ProtocolError {}
 /// Distinct from `ProtocolError` because schema drift of embedded serialized
 /// payloads (e.g. `continuity_state`) is an application-level concern the
 /// runtime injects as a validator closure — pipeline does not own that schema.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
     /// Base protocol validation failed (delegated from `validate()`).
     Protocol(String),
@@ -1102,8 +1102,12 @@ impl StepCheckpoint {
     ///   - `self` is a `Heavy` checkpoint, AND
     ///   - `continuity_state` is `Some(_)`.
     ///
+    /// Light checkpoints do not carry embedded continuity state; for `Light`
+    /// variants this method still runs base protocol validation, then treats the
+    /// injected schema validator as a no-op.
+    ///
     /// This keeps `astra-pipeline` free of any knowledge about the continuity
-    /// schema (which lives in `astra-turn-core`), while still giving restore
+    /// schema (which lives in `astra-turn-types`), while still giving restore
     /// paths a single choke-point to reject malformed blobs at checkpoint
     /// validation time rather than discovering drift later during use.
     pub fn validate_with<F>(&self, validator: F) -> Result<(), ValidationError>
@@ -1124,7 +1128,7 @@ impl HeavyCheckpoint {
     ///
     /// The validator closure is **only** invoked when `continuity_state` is
     /// `Some(_)`. This keeps `astra-pipeline` free of any knowledge about the
-    /// continuity schema (which lives in `astra-turn-core`), while still giving
+    /// continuity schema (which lives in `astra-turn-types`), while still giving
     /// restore paths a single choke-point to reject malformed blobs at
     /// checkpoint validation time rather than discovering drift later during
     /// use.

@@ -13,6 +13,7 @@ astra-logging.workspace = true
 astra-services.workspace = true
 astra-runtime.workspace = true
 astra-turn-core.workspace = true
+astra-turn-types.workspace = true
 astra-text-utils.workspace = true
 astra-tools.workspace = true
 astra-thin-client.workspace = true

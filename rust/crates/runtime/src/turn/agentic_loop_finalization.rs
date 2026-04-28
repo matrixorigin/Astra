@@ -624,7 +624,7 @@ fn update_session_facts_from_turn(state: &mut super::agentic_loop_host::AgenticL
         event.error = Some("turn had errors".to_string());
     }
 
-    state.session_facts.update_from_journal_event(&event);
+    crate::turn::cloud::session_facts::update_from_journal_event(&mut state.session_facts, &event);
 
     // Sync blocked tools from state
     state
@@ -671,7 +671,7 @@ fn complete_active_runtime_todo_if_finalized(
     let Some(active) = state.continuity.todos.active_or_next().cloned() else {
         return;
     };
-    if active.status != astra_turn_core::continuity::TodoStatus::InProgress {
+    if active.status != astra_turn_types::continuity::TodoStatus::InProgress {
         return;
     }
     // If the round produced a final answer without any tool evidence
@@ -716,7 +716,7 @@ mod tests {
     // direct assertion.
 
     fn seed_active_todo(state: &mut super::super::agentic_loop_host::AgenticLoopState) {
-        use astra_turn_core::continuity::{TodoItem, TodoStatus};
+        use astra_turn_types::continuity::{TodoItem, TodoStatus};
         state.continuity.todos.add_item(TodoItem {
             id: "runtime-goal".to_string(),
             title: "answer the user".to_string(),
@@ -731,7 +731,7 @@ mod tests {
 
     #[test]
     fn complete_active_runtime_todo_closes_with_synthetic_evidence_when_no_tool_invocation() {
-        use astra_turn_core::continuity::TodoStatus;
+        use astra_turn_types::continuity::TodoStatus;
         let mut state = make_state();
         state.final_text = "Here is your answer.".to_string();
         seed_active_todo(&mut state);
@@ -761,7 +761,7 @@ mod tests {
 
     #[test]
     fn complete_active_runtime_todo_does_not_close_when_final_text_empty() {
-        use astra_turn_core::continuity::TodoStatus;
+        use astra_turn_types::continuity::TodoStatus;
         let mut state = make_state();
         state.final_text = String::new();
         seed_active_todo(&mut state);
@@ -789,7 +789,7 @@ mod tests {
 
     #[test]
     fn complete_active_runtime_todo_does_not_close_when_error_occurred() {
-        use astra_turn_core::continuity::TodoStatus;
+        use astra_turn_types::continuity::TodoStatus;
         let mut state = make_state();
         state.final_text = "partial output before failure".to_string();
         seed_active_todo(&mut state);
@@ -1602,7 +1602,7 @@ mod tests {
             .iter()
             .find(|item| item.id == active_id)
             .unwrap();
-        assert_eq!(item.status, astra_turn_core::continuity::TodoStatus::Done);
+        assert_eq!(item.status, astra_turn_types::continuity::TodoStatus::Done);
         assert_eq!(
             state
                 .session_facts

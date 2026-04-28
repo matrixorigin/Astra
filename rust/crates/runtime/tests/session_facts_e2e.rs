@@ -202,7 +202,7 @@ async fn e2e_full_session_lifecycle() {
         make_event(10, vec![make_tc("bash", true, None)], 2000, None),
     ];
     for event in &turns {
-        facts.update_from_journal_event(event);
+        astra_runtime::turn::cloud::session_facts::update_from_journal_event(&mut facts, event);
     }
     facts.set_plan_state(Some(PlanFact {
         goal: "Add OAuth support".to_string(),
@@ -779,7 +779,7 @@ fn unhappy_old_journal_without_file_path() {
     event.turn = Some(1);
     event.tokens_in = Some(1000);
     event.tool_calls = Some(vec![tc]);
-    facts.update_from_journal_event(&event);
+    astra_runtime::turn::cloud::session_facts::update_from_journal_event(&mut facts, &event);
 
     assert_eq!(facts.active_files.len(), 1);
     assert_eq!(facts.active_files[0].path, "src/lib.rs");
@@ -842,7 +842,7 @@ fn e2e_rapid_facts_updates_no_data_loss() {
             None
         };
         let event = make_event(i, tcs, 1000, error);
-        facts.update_from_journal_event(&event);
+        astra_runtime::turn::cloud::session_facts::update_from_journal_event(&mut facts, &event);
     }
 
     assert_eq!(facts.turn, 50);

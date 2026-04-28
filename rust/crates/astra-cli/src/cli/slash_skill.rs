@@ -1779,6 +1779,7 @@ Follow these steps:
                 git_worktree_journal: Some(state.git_worktree_journal.clone()),
                 session_state_journal: Some(state.session_state_journal.clone()),
                 task_manager: Some(state.task_manager.clone()),
+                runtime_continuity: state.runtime_continuity.as_ref(),
                 turn_index: state.turn,
                 evolution_service: None,
             })

@@ -24,7 +24,8 @@ use std::collections::HashMap;
 use crate::step_checkpoint::{FileBackedEventStore, read_latest_heavy_checkpoint};
 use crate::step_protocol::{
     CachedToolResult, HeavyCheckpoint, IdempotencyKey, InMemoryIdempotencyCache, PROTOCOL_VERSION,
-    SlotState, StepEvent, StepEventType, VersionPolicy, check_protocol_version_with_policy,
+    SlotState, StepEvent, StepEventType, ValidationError, VersionPolicy,
+    check_protocol_version_with_policy,
 };
 
 /// Restored session state — everything needed to resume execution.
@@ -110,8 +111,34 @@ pub fn restore_session_with_policy(
     session_id: &str,
     policy: VersionPolicy,
 ) -> Result<Option<RestoredSession>, RestoreError> {
+    restore_session_with_policy_inner(
+        session_id,
+        policy,
+        None::<fn(&serde_json::Value) -> Result<(), String>>,
+    )
+}
+
+/// Restore with an injected validator for the embedded `continuity_state` blob.
+pub fn restore_session_with_continuity_validator<F>(
+    session_id: &str,
+    validator: F,
+) -> Result<Option<RestoredSession>, RestoreError>
+where
+    F: FnOnce(&serde_json::Value) -> Result<(), String>,
+{
+    restore_session_with_policy_inner(session_id, VersionPolicy::Compatible, Some(validator))
+}
+
+fn restore_session_with_policy_inner<F>(
+    session_id: &str,
+    policy: VersionPolicy,
+    validator: Option<F>,
+) -> Result<Option<RestoredSession>, RestoreError>
+where
+    F: FnOnce(&serde_json::Value) -> Result<(), String>,
+{
     // Step 1: Load latest heavy checkpoint
-    let heavy = match read_latest_heavy_checkpoint(session_id) {
+    let mut heavy = match read_latest_heavy_checkpoint(session_id) {
         Ok(Some(h)) => h,
         Ok(None) => return Ok(None),
         Err(e) => return Err(RestoreError::IoError(e.to_string())),
@@ -119,6 +146,7 @@ pub fn restore_session_with_policy(
 
     // Step 2: Validate protocol version (no migration)
     validate_checkpoint_version(&heavy, policy)?;
+    validate_restored_continuity_state(&mut heavy, validator)?;
 
     // Step 3: Extract resume turn and warm cache
     build_restored_session(session_id, heavy)
@@ -170,6 +198,30 @@ fn validate_checkpoint_version(
             checkpoint_version: cp_version,
             current_version: PROTOCOL_VERSION,
         }),
+    }
+}
+
+fn validate_restored_continuity_state<F>(
+    heavy: &mut HeavyCheckpoint,
+    validator: Option<F>,
+) -> Result<(), RestoreError>
+where
+    F: FnOnce(&serde_json::Value) -> Result<(), String>,
+{
+    let Some(validator) = validator else {
+        return Ok(());
+    };
+    match heavy.validate_with(validator) {
+        Ok(()) => Ok(()),
+        Err(ValidationError::ContinuityStateSchema(error)) => {
+            tracing::warn!(
+                error = %error,
+                "dropping invalid continuity_state from restored checkpoint"
+            );
+            heavy.continuity_state = None;
+            Ok(())
+        }
+        Err(ValidationError::Protocol(error)) => Err(RestoreError::InvalidCheckpoint(error)),
     }
 }
 
@@ -451,6 +503,26 @@ mod tests {
         heavy.light.protocol_version = 2000; // major 2, current is major 1
         let result = validate_checkpoint_version(&heavy, VersionPolicy::Compatible);
         assert!(matches!(result, Err(RestoreError::VersionMismatch { .. })));
+    }
+
+    #[test]
+    fn restore_continuity_validator_drops_bad_embedded_state() {
+        let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
+        heavy.continuity_state = Some(serde_json::json!({"todos": "not-an-object"}));
+
+        validate_restored_continuity_state(
+            &mut heavy,
+            Some(|value: &serde_json::Value| {
+                value
+                    .get("todos")
+                    .and_then(|todos| todos.as_object())
+                    .ok_or_else(|| "todos must be object".to_string())?;
+                Ok(())
+            }),
+        )
+        .unwrap();
+
+        assert!(heavy.continuity_state.is_none());
     }
 
     // ── Resume turn extraction ──

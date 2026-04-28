@@ -57,6 +57,7 @@ mod tests {
             step_recorder_summary: None,
             tool_health_export: Vec::new(),
             last_heavy_checkpoint: None,
+            runtime_continuity: Default::default(),
             ttft_ms: None,
             context_ms: None,
             selector_strategy: None,

@@ -66,13 +66,13 @@ fn inject_runtime_attention_manifest(state: &mut AgenticLoopState) {
         || !state.continuity.user_corrections.is_empty()
         || state.continuity.verification.last_status.is_some()
     {
-        astra_turn_core::continuity::append_attention_manifest_message(
+        astra_turn_types::continuity::append_attention_manifest_message(
             &mut state.messages,
             &state.continuity,
             4_000,
         );
     } else {
-        astra_turn_core::continuity::strip_attention_manifest_messages(&mut state.messages);
+        astra_turn_types::continuity::strip_attention_manifest_messages(&mut state.messages);
     }
 }
 
@@ -2004,7 +2004,7 @@ mod tests {
 
     use super::*;
     use crate::observability_integration::ObservabilityHub;
-    use crate::turn::agentic_loop_host::tests::make_state;
+    use crate::turn::agentic_loop_host::tests::{MockHost, make_state, text_result};
 
     #[test]
     fn observe_turn_end_without_tools_records_outer_session_turn() {
@@ -2060,7 +2060,7 @@ mod tests {
         state
             .session_facts
             .active_files
-            .push(astra_turn_core::cloud_session_facts::FileEntry {
+            .push(astra_turn_types::session_facts::FileEntry {
                 path: "rust/crates/runtime/src/turn/agentic_loop_execution_phase.rs".to_string(),
                 last_action: "write".to_string(),
                 turn: 2,
@@ -2080,6 +2080,48 @@ mod tests {
             "active_files:\n- rust/crates/runtime/src/turn/agentic_loop_execution_phase.rs"
         ));
         assert!(!manifests[0].contains("stale"));
+    }
+
+    #[tokio::test]
+    async fn execute_turn_strips_stale_manifest_and_injects_fresh_manifest_before_host_call() {
+        let mut state = make_state();
+        state.message = "Continue the checkpoint restore refactor and add tests".into();
+        state.messages.push(serde_json::json!({
+            "role": "user",
+            "content": "[attention:v1]\ngoal: stale compacted summary\ncurrent_todo: stale"
+        }));
+        state
+            .session_facts
+            .active_files
+            .push(astra_turn_types::session_facts::FileEntry {
+                path: "rust/crates/astra-pipeline/src/step_restore.rs".to_string(),
+                last_action: "edit".to_string(),
+                turn: 4,
+            });
+        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))]);
+
+        let _ = execute_turn_and_ingest_phase(
+            &mut host,
+            &mut state,
+            0,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let captured = host.executed_messages.first().expect("host was called");
+        let manifests: Vec<&str> = captured
+            .iter()
+            .filter_map(|message| message.get("content").and_then(|content| content.as_str()))
+            .filter(|content| content.starts_with("[attention:v1]"))
+            .collect();
+        assert_eq!(manifests.len(), 1);
+        assert!(manifests[0].contains("checkpoint restore refactor"));
+        assert!(manifests[0].contains("rust/crates/astra-pipeline/src/step_restore.rs"));
+        assert!(!manifests[0].contains("stale compacted summary"));
     }
 
     #[test]
