@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::sync::Mutex as TokioMutex;
 
 use astra_core::SharedPool;
@@ -21,8 +21,8 @@ use astra_services::LlmTokenServiceConfig;
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
 use crate::turn::agentic_loop_host::{
-    run_agentic_loop_with_host, AgenticLoopHost as _, AgenticLoopState, CancellationState,
-    RequestConstraints, SkillState, StopHookState, TurnInteractionPolicy,
+    AgenticLoopHost as _, AgenticLoopState, CancellationState, RequestConstraints, SkillState,
+    StopHookState, TurnInteractionPolicy, run_agentic_loop_with_host,
 };
 use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
 use astra_pipeline::step_recorder::StepRecorder;

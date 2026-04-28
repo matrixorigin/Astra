@@ -1708,17 +1708,17 @@ impl ServerAgenticLoopHost {
                 vec![]
             } else {
                 let hint_tokens = crate::prompts::estimate_str_tokens(&skill_hint) as u32;
-            // Observability guard: when the estimator returns 0 but we DO have
-            // active skills, downstream context_meta would show
-            // `skills_injected = N with tokens=0 each`, which is indistinguishable
-            // from "nothing was injected". Emit a debug trace so operators can
-            // tell the two cases apart.
-            if hint_tokens == 0 && !active_skill_names.is_empty() {
-                tracing::debug!(
-                    active_skill_count = active_skill_names.len(),
-                    "skill hint token estimate is 0; context_meta breakdown will show 0 tokens per skill"
-                );
-            }
+                // Observability guard: when the estimator returns 0 but we DO have
+                // active skills, downstream context_meta would show
+                // `skills_injected = N with tokens=0 each`, which is indistinguishable
+                // from "nothing was injected". Emit a debug trace so operators can
+                // tell the two cases apart.
+                if hint_tokens == 0 && !active_skill_names.is_empty() {
+                    tracing::debug!(
+                        active_skill_count = active_skill_names.len(),
+                        "skill hint token estimate is 0; context_meta breakdown will show 0 tokens per skill"
+                    );
+                }
                 // Safe: `active_skill_names` is non-empty in this branch.
                 // `.max(1)` is an observability sentinel: if integer division
                 // truncates to 0 (hint shorter than skill count, or estimator
@@ -3068,7 +3068,9 @@ mod tests {
         // Use `find` (first occurrence) — rfind would find the test module itself
         // if a nested `mod tests {` were ever added. First occurrence is always
         // the production `mod tests {` opener.
-        let tests_start = source.find("\n#[cfg(test)]\nmod tests {").expect("cfg(test) + mod tests marker");
+        let tests_start = source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("cfg(test) + mod tests marker");
         let production = &source[..tests_start];
         for context in [
             "server_loop_host context window dump persist failed",
@@ -3106,7 +3108,9 @@ mod tests {
     #[test]
     fn post_compaction_reinjects_invoked_skills() {
         let source = include_str!("server_loop_host.rs");
-        let tests_start = source.find("\n#[cfg(test)]\nmod tests {").expect("cfg(test) + mod tests marker");
+        let tests_start = source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("cfg(test) + mod tests marker");
         let production = &source[..tests_start];
         assert!(
             production.contains("state.skills.invoked"),
@@ -3129,7 +3133,9 @@ mod tests {
     #[test]
     fn llm_error_paths_publish_remote_llm_capture_artifacts() {
         let source = include_str!("server_loop_host.rs");
-        let tests_start = source.find("\n#[cfg(test)]\nmod tests {").expect("cfg(test) + mod tests marker");
+        let tests_start = source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("cfg(test) + mod tests marker");
         let production = &source[..tests_start];
         for context in [
             "server_loop_host context window capture",
@@ -3169,7 +3175,9 @@ mod tests {
     #[test]
     fn server_loop_error_captures_use_structured_error_response() {
         let source = include_str!("server_loop_host.rs");
-        let tests_start = source.find("\n#[cfg(test)]\nmod tests {").expect("cfg(test) + mod tests marker");
+        let tests_start = source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("cfg(test) + mod tests marker");
         let production = &source[..tests_start];
         assert!(
             production.contains("llm_capture_error_response(e)"),
@@ -3188,7 +3196,9 @@ mod tests {
     #[test]
     fn server_loop_uses_shared_rate_limit_cooldown_singleton() {
         let source = include_str!("server_loop_host.rs");
-        let tests_start = source.find("\n#[cfg(test)]\nmod tests {").expect("cfg(test) + mod tests marker");
+        let tests_start = source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("cfg(test) + mod tests marker");
         let production = &source[..tests_start];
         assert!(
             production.contains("use crate::turn::bridge_llm_stream::rate_limit_cooldown;"),
