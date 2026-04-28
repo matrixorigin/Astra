@@ -179,17 +179,6 @@ impl MatrixCloudRuntime {
     pub fn edge_agent_id(&self) -> &str {
         &self.edge_agent_id
     }
-
-    /// Task mirror backing [`crate::sync_adapters::TaskAdapter`] (pull merge + export source).
-    pub fn task_sync_mirror(&self) -> Arc<Mutex<BTreeMap<String, TaskRecord>>> {
-        Arc::clone(&self.task_mirror)
-    }
-
-    /// Dirty task IDs for lease-filtered task sync export.
-    pub fn task_sync_dirty(&self) -> Arc<Mutex<HashSet<String>>> {
-        Arc::clone(&self.task_dirty)
-    }
-
     pub fn shared_pool(&self) -> &SharedPool {
         &self.shared_pool
     }

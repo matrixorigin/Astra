@@ -596,22 +596,6 @@ impl SyncOrchestrator {
         self.adapters.insert(domain, adapter);
         self.policies.insert(domain, policy);
     }
-
-    /// Check cloud health and update availability flag.
-    pub async fn check_health(&mut self) -> bool {
-        let prev = self.cloud_available;
-        self.cloud_available = self.transport.health_check().await;
-        if prev != self.cloud_available {
-            tracing::info!(
-                target: "astra_services::sync_engine",
-                user_id = %self.user_id,
-                cloud_available = self.cloud_available,
-                "cloud transport health changed"
-            );
-        }
-        self.cloud_available
-    }
-
     /// Pull all domains that have PullTrigger::SessionStart.
     pub async fn pull_all(&mut self) -> Vec<DomainSyncResult> {
         let mut results = Vec::new();

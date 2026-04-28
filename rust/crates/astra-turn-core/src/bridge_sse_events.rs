@@ -53,26 +53,6 @@ impl StreamEventCursor {
             || self.turn_chain_id.is_some()
             || self.user_query_event_id.is_some()
     }
-
-    pub fn matches_scope(&self, other: &Self) -> bool {
-        self.has_replay_scope()
-            && scope_field_matches(self.session_id.as_deref(), other.session_id.as_deref())
-            && scope_field_matches(
-                self.turn_chain_id.as_deref(),
-                other.turn_chain_id.as_deref(),
-            )
-            && scope_field_matches(
-                self.user_query_event_id.as_deref(),
-                other.user_query_event_id.as_deref(),
-            )
-    }
-}
-
-fn scope_field_matches(expected: Option<&str>, actual: Option<&str>) -> bool {
-    match expected {
-        Some(expected) => actual == Some(expected),
-        None => true,
-    }
 }
 
 fn scoped_cursor_value(value: Option<&str>) -> Option<String> {

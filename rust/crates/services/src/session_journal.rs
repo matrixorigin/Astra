@@ -243,12 +243,6 @@ pub mod state_delta {
                 .filter(|e| e.version > since_version)
                 .collect()
         }
-
-        /// Get all changes.
-        pub fn all_changes(&self) -> &[StateChange] {
-            &self.entries
-        }
-
         /// Get current state snapshot.
         pub fn snapshot(&self) -> &HashMap<String, serde_json::Value> {
             &self.current_state
@@ -263,12 +257,6 @@ pub mod state_delta {
         pub fn change_count(&self) -> usize {
             self.entries.len()
         }
-
-        /// Clear all change entries (after sync).
-        pub fn clear_changes(&mut self) {
-            self.entries.clear();
-        }
-
         /// Compact by keeping only latest change per key.
         pub fn compact(&mut self) {
             let mut latest: HashMap<String, StateChange> = HashMap::new();
@@ -1407,17 +1395,6 @@ pub enum SessionEndState {
 }
 
 impl SessionEndState {
-    #[must_use]
-    pub fn is_recoverable(&self) -> bool {
-        matches!(
-            self,
-            Self::Zombie
-                | Self::Interrupted {
-                    resumable: true,
-                    ..
-                }
-        )
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1689,14 +1666,6 @@ pub struct SessionListMeta {
 }
 
 impl SessionListMeta {
-    /// Check if this session is stale (older than `max_age`).
-    pub fn is_stale(&self, max_age: std::time::Duration) -> bool {
-        let cutoff = std::time::SystemTime::now()
-            .checked_sub(max_age)
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        self.last_modified < cutoff
-    }
-
     /// Get the age of this session (time since last modified).
     pub fn age(&self) -> std::time::Duration {
         self.last_modified

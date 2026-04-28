@@ -190,11 +190,6 @@ impl CompactionEvent {
             sm_fallback_reason: None,
         }
     }
-
-    /// Convert to JSON value for event storage.
-    pub fn to_metadata(&self) -> Value {
-        serde_json::to_value(self).unwrap_or_default()
-    }
 }
 
 // ---------------------------------------------------------------------------

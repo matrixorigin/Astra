@@ -4,7 +4,7 @@
 //! using YAML files that extend or override built-in agent types.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -189,19 +189,6 @@ impl AgentRegistry {
     pub fn is_custom(&self, agent_type: &str) -> bool {
         self.custom_names.contains(agent_type)
     }
-
-    /// Get the search paths used for team config discovery.
-    pub fn config_paths(project_root: Option<&Path>) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        if let Some(root) = project_root {
-            paths.push(root.join(".astra").join("teams"));
-        }
-        if let Some(home) = dirs::home_dir() {
-            paths.push(home.join(".astra").join("teams"));
-        }
-        paths
-    }
-
     /// Register a custom agent type at runtime (non-persistent).
     pub fn register(&mut self, def: AgentTypeDefinition) {
         self.agents.retain(|a| a.agent_type != def.agent_type);

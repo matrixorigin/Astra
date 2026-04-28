@@ -1194,12 +1194,6 @@ impl DelegationEngine {
     pub fn set_gate(&mut self, gate: Arc<dyn VerificationGate>) {
         self.gate = Some(gate);
     }
-
-    /// Remove the current verification gate (sub-runs will bypass verification).
-    pub fn clear_gate(&mut self) {
-        self.gate = None;
-    }
-
     /// Create a new engine sharing the same components but with a different gate.
     ///
     /// All `Arc`-wrapped internals (registry, run_engine, tracker, executor) are

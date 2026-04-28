@@ -431,15 +431,6 @@ impl AppState {
         self.turn_hook_db_writer = turn_hook_db_writer;
         self
     }
-
-    pub fn with_turn_reflection_state_store(
-        mut self,
-        turn_reflection_state_store: Arc<dyn TurnReflectionStateStore>,
-    ) -> Self {
-        self.turn_reflection_state_store = turn_reflection_state_store;
-        self
-    }
-
     pub fn with_turn_reflection_lesson_writer(
         mut self,
         turn_reflection_lesson_writer: Arc<dyn TurnReflectionLessonWriter>,
@@ -553,15 +544,6 @@ impl AppState {
         self.chat_turn_bridge_secret = chat_turn_bridge_secret.into();
         self
     }
-
-    pub fn with_chat_turn_bridge_cache(
-        mut self,
-        chat_turn_bridge_cache: Arc<tokio::sync::Mutex<SessionCache>>,
-    ) -> Self {
-        self.chat_turn_bridge_cache = chat_turn_bridge_cache;
-        self
-    }
-
     pub fn with_turn_learning_writer(mut self, writer: Arc<dyn TurnLearningWriter>) -> Self {
         self.turn_learning_writer = Some(writer);
         self

@@ -131,16 +131,6 @@ impl DeadLetterQueue {
         let mut entries = self.entries.write().await;
         entries.drain(..).collect()
     }
-
-    /// Purge dead letters older than the given duration.
-    pub async fn purge_older_than(&self, max_age: std::time::Duration) -> usize {
-        let cutoff = Instant::now() - max_age;
-        let mut entries = self.entries.write().await;
-        let before = entries.len();
-        entries.retain(|dl| dl.failed_at >= cutoff);
-        before - entries.len()
-    }
-
     /// Purge all dead letters.
     pub async fn purge_all(&self) -> usize {
         let mut entries = self.entries.write().await;

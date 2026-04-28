@@ -133,11 +133,6 @@ impl ExecutionProfile {
     pub fn merge_boosts(&mut self, boost_terms: Vec<String>) {
         self.boost_terms = boost_terms;
     }
-
-    /// Whether this profile has an active experiment enrollment.
-    pub fn is_in_experiment(&self) -> bool {
-        self.experiment_id.is_some()
-    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

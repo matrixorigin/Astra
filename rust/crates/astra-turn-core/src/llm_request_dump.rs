@@ -6,13 +6,10 @@
 //! 2. **Cloud event**: `event_type = "llm_request_dump"` in `agent_events`
 //!    — queryable via `/events/session/{session_id}` for support staff.
 
-use std::sync::Arc;
 
 use astra_services::{SessionArtifactJsonRecord, SessionArtifactJsonStore, SessionArtifactStore};
 use serde_json::{Value, json};
-use uuid::Uuid;
 
-use crate::contracts::{TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter};
 
 const ERROR_PREVIEW_MAX_CHARS: usize = 200;
 
@@ -87,41 +84,6 @@ impl LlmRequestDump {
         std::fs::write(&path, content).ok()?;
         Some(path.display().to_string())
     }
-
-    /// Persist as an auxiliary event to the cloud DB (fire-and-forget).
-    pub fn persist_cloud(
-        &self,
-        user_id: &str,
-        causal_chain_id: &str,
-        writer: Arc<dyn TurnAuxiliaryEventWriter>,
-    ) {
-        let event = TurnAuxiliaryEventRecord {
-            event_id: Uuid::now_v7().to_string(),
-            user_id: user_id.to_string(),
-            session_id: self.session_id.clone(),
-            agent_id: self.agent_id.clone(),
-            event_type: "llm_request_dump".to_string(),
-            content: serde_json::to_string(&self.to_json()).unwrap_or_default(),
-            parent_event_id: None,
-            parent_event_ids: Vec::new(),
-            causal_chain_id: causal_chain_id.to_string(),
-            metadata: Some(json!({
-                "model": self.model,
-                "provider": self.provider,
-                "round": self.round,
-                "message_count": self.messages.len(),
-                "tool_count": self.tools.len(),
-                "error_preview": truncate_chars(&self.error, ERROR_PREVIEW_MAX_CHARS),
-            })),
-            reasoning_content: None,
-        };
-        tokio::spawn(async move {
-            if let Err(e) = writer.persist_events(vec![event]).await {
-                eprintln!("[llm_error_dump] cloud persist failed: {e}");
-            }
-        });
-    }
-
     pub async fn persist_remote(
         &self,
         user_id: &str,

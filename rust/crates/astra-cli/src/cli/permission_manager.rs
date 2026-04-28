@@ -249,18 +249,6 @@ impl PermissionSettings {
         let json = serde_json::to_string_pretty(self)?;
         fs::write(path, json)
     }
-
-    /// Save to the user-level settings file (`~/.astra/permissions.json`).
-    pub fn save_user(&self) -> io::Result<()> {
-        let home = dirs::home_dir()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME directory not found"))?;
-        let dir = home.join(".astra");
-        fs::create_dir_all(&dir)?;
-        let path = dir.join("permissions.json");
-        let json = serde_json::to_string_pretty(self)?;
-        fs::write(path, json)
-    }
-
     #[allow(dead_code)] // Used in tests and by with_project
     fn parsed_allow_rules(&self) -> Vec<PermissionRule> {
         self.allow

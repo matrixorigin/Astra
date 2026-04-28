@@ -95,34 +95,10 @@ impl PlanPhase {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Completed { .. } | Self::Failed { .. })
     }
-
-    /// Whether plan-only chat is active — tools should be omitted from payloads.
-    /// True for `PlanOnlyChat` and `Refining` phases.
-    pub fn should_omit_tools(&self) -> bool {
-        matches!(self, Self::PlanOnlyChat | Self::Refining { .. })
-    }
-
     /// Get the plan-only chat flag (backward compat with `chat_plan_only`).
     pub fn chat_plan_only(&self) -> bool {
         matches!(self, Self::PlanOnlyChat)
     }
-
-    /// Get the plan mode state reference, if in refining phase.
-    pub fn plan_mode_state(&self) -> Option<&PlanModeState> {
-        match self {
-            Self::Refining { state } => Some(state),
-            _ => None,
-        }
-    }
-
-    /// Get mutable plan mode state reference.
-    pub fn plan_mode_state_mut(&mut self) -> Option<&mut PlanModeState> {
-        match self {
-            Self::Refining { state } => Some(state),
-            _ => None,
-        }
-    }
-
     /// Get the executing plan (backward compat with `executing_plan`).
     pub fn executing_plan(&self) -> Option<&TaskPlan> {
         match self {
@@ -131,16 +107,6 @@ impl PlanPhase {
             _ => None,
         }
     }
-
-    /// Get mutable executing plan.
-    pub fn executing_plan_mut(&mut self) -> Option<&mut TaskPlan> {
-        match self {
-            Self::Executing { state } => Some(&mut state.plan),
-            Self::Paused { state, .. } => Some(&mut state.plan),
-            _ => None,
-        }
-    }
-
     /// Get the execution state.
     pub fn execution_state(&self) -> Option<&PlanExecutionState> {
         match self {
@@ -148,15 +114,6 @@ impl PlanPhase {
             _ => None,
         }
     }
-
-    /// Get mutable execution state.
-    pub fn execution_state_mut(&mut self) -> Option<&mut PlanExecutionState> {
-        match self {
-            Self::Executing { state } | Self::Paused { state, .. } => Some(state),
-            _ => None,
-        }
-    }
-
     /// Get the current plan subtask ID being executed.
     pub fn current_subtask_id(&self) -> Option<&str> {
         match self {
@@ -166,15 +123,6 @@ impl PlanPhase {
             _ => None,
         }
     }
-
-    /// Get the executing plan goal.
-    pub fn executing_goal(&self) -> Option<&str> {
-        match self {
-            Self::Executing { state } | Self::Paused { state, .. } => state.goal.as_deref(),
-            _ => None,
-        }
-    }
-
     /// Validate and apply a transition.
     ///
     /// Returns `Err` if the transition is not valid from the current phase.

@@ -154,12 +154,6 @@ impl McpLifecycleManager {
             sessions: std::sync::Mutex::new(HashMap::new()),
         }
     }
-
-    /// Load from project root.
-    pub fn from_project(project_root: &Path) -> Self {
-        Self::new(McpProjectConfig::load_from_project(project_root))
-    }
-
     /// Start MCP connections for an agent.
     /// Returns the list of tool names discovered.
     pub fn start_agent_session(

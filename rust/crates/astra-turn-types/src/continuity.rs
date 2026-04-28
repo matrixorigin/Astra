@@ -77,12 +77,6 @@ impl ContinuityState {
             ..Default::default()
         }
     }
-
-    pub fn with_facts(mut self, facts: SessionFacts) -> Self {
-        self.facts = facts;
-        self
-    }
-
     pub fn sync_facts(&mut self, facts: SessionFacts) {
         let plan_state = self.todos.to_plan_fact(&self.goal.text);
         self.facts = facts;

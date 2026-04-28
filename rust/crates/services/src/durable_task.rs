@@ -2354,29 +2354,6 @@ impl MatrixOneDurableTaskLifecycle {
             output_sink: None,
         }
     }
-
-    /// Create with database-level snapshots for finer granularity.
-    pub fn with_database(
-        pool: sqlx::Pool<sqlx::MySql>,
-        work_dir: std::path::PathBuf,
-        database: impl Into<String>,
-    ) -> Self {
-        let database = database.into();
-        let branch_ops: Arc<dyn TaskBranchOps> =
-            Arc::new(TaskBranchService::new(pool.clone(), database));
-        Self {
-            pool,
-            branch_ops,
-            work_dir,
-            llm_judge: None,
-            event_sender: None,
-            session_id: String::new(),
-            user_id: String::new(),
-            learning_bridge: None,
-            output_sink: None,
-        }
-    }
-
     pub fn from_shared(shared: &astra_core::SharedPool, work_dir: std::path::PathBuf) -> Self {
         Self::new(shared.get().clone(), work_dir)
     }

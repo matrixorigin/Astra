@@ -88,21 +88,6 @@ impl SpawnAgentOutput {
             messaging_address: None,
         }
     }
-
-    pub fn with_address(self, address: Option<String>) -> Self {
-        match self {
-            Self::Launched {
-                agent_id,
-                description,
-                ..
-            } => Self::Launched {
-                agent_id,
-                description,
-                messaging_address: address,
-            },
-            other => other,
-        }
-    }
 }
 
 /// Generate the JSON schema for spawn_agent tool.

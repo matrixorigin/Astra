@@ -209,13 +209,6 @@ impl CachedProjectContext {
             _ => false,
         }
     }
-
-    /// Refresh the context if stale, otherwise return the cached version.
-    pub fn refresh_if_stale(&mut self, root: &Path, ttl: Duration) {
-        if !self.is_valid(root, ttl) {
-            *self = Self::scan(root);
-        }
-    }
 }
 
 // ─── Debounced Sync ─────────────────────────────────────────────────────────

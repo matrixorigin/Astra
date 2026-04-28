@@ -258,12 +258,6 @@ impl PendingAckTracker {
     pub async fn failed_outcomes(&self) -> Vec<AckOutcome> {
         self.failed.read().await.clone()
     }
-
-    /// Clear the failed outcomes list.
-    pub async fn clear_failed(&self) {
-        self.failed.write().await.clear();
-    }
-
     /// Configured interval for sweeping timed-out acknowledgments.
     pub fn sweep_interval(&self) -> Duration {
         self.config.sweep_interval

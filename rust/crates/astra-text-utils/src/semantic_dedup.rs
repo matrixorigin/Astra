@@ -427,12 +427,6 @@ impl SemanticDedup {
             ));
         }
     }
-
-    /// Number of entries tracked (for diagnostics).
-    pub fn param_cache_size(&self) -> usize {
-        self.param_cache.len()
-    }
-
     pub fn output_log_size(&self) -> usize {
         self.output_log.len()
     }

@@ -32,11 +32,6 @@ impl LocalSkillProvider {
             search_paths: paths,
         }
     }
-
-    /// Add an additional search path.
-    pub fn add_path(&mut self, path: PathBuf) {
-        self.search_paths.push(path);
-    }
 }
 
 #[async_trait]

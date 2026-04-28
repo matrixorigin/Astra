@@ -648,14 +648,6 @@ impl TeamExecutionOrchestrator {
             .pause_delegation(delegation_id)
             .await
     }
-
-    /// Resume all agents in a paused team delegation.
-    pub async fn resume_team(&self, delegation_id: &str) -> usize {
-        self.delegation_tracker
-            .resume_delegation(delegation_id)
-            .await
-    }
-
     /// Check if a delegation is currently paused.
     pub async fn is_paused(&self, delegation_id: &str) -> bool {
         let sub_runs = self.delegation_tracker.get_sub_runs(delegation_id).await;

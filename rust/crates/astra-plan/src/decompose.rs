@@ -2366,14 +2366,6 @@ impl PlanModeState {
         let path = plans_dir.join(format!("{plan_id}.json"));
         self.save_to_file(&path)
     }
-
-    /// Save this plan to the plans directory with a generated ID.
-    pub fn save_to_plans_dir(&mut self) -> Result<String, String> {
-        let plan_id = Self::generate_plan_id(&self.goal);
-        self.save_to_plans_dir_with_id(&plan_id)?;
-        Ok(plan_id)
-    }
-
     /// Load a plan from the plans directory by ID.
     /// Returns typed `PlanLoadError` for proper HTTP status mapping.
     pub fn load_from_plans_dir(plan_id: &str) -> Result<Self, PlanLoadError> {

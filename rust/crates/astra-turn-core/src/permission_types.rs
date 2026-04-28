@@ -184,15 +184,6 @@ impl InheritedPermissions {
             ..Default::default()
         }
     }
-
-    /// Create inherited permissions with deny mode (all write/execute denied).
-    pub fn deny_all() -> Self {
-        Self {
-            mode: PermissionMode::Deny,
-            ..Default::default()
-        }
-    }
-
     /// Check if a tool is explicitly allowed by inherited rules.
     pub fn is_allowed(&self, tool_name: &str, command: Option<&str>) -> bool {
         self.allow_rules

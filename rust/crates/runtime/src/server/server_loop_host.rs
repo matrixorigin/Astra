@@ -707,12 +707,6 @@ impl ServerAgenticLoopHostBuilder {
         self.full_llm_capture = full_llm_capture;
         self
     }
-
-    pub fn with_event_tx(mut self, tx: tokio::sync::mpsc::Sender<Value>) -> Self {
-        self.event_tx = Some(tx);
-        self
-    }
-
     #[cfg(feature = "bridge-e2e-hooks")]
     pub fn with_test_llm_rounds(mut self, rounds: Vec<Value>) -> Self {
         self.test_llm_rounds_wired = true;

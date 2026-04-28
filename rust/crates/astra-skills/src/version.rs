@@ -27,11 +27,6 @@ impl Version {
             pre: None,
         }
     }
-
-    pub fn with_pre(mut self, pre: impl Into<String>) -> Self {
-        self.pre = Some(pre.into());
-        self
-    }
 }
 
 impl Default for Version {

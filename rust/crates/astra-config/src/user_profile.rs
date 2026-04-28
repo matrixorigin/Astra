@@ -864,17 +864,6 @@ impl UserProfileStore {
             .get(user_id)
             .cloned()
     }
-
-    /// List all user IDs.
-    pub fn list_users(&self) -> Vec<String> {
-        self.profiles
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .keys()
-            .cloned()
-            .collect()
-    }
-
     /// Delete a profile.
     pub fn delete(&self, user_id: &str) -> bool {
         let removed = self
