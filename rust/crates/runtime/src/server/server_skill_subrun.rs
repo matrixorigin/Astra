@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use tokio::sync::Mutex as TokioMutex;
 
 use astra_core::SharedPool;
@@ -21,8 +21,8 @@ use astra_services::LlmTokenServiceConfig;
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
 use crate::turn::agentic_loop_host::{
-    AgenticLoopHost as _, AgenticLoopState, CancellationState, RequestConstraints, SkillState,
-    StopHookState, TurnInteractionPolicy, run_agentic_loop_with_host,
+    run_agentic_loop_with_host, AgenticLoopHost as _, AgenticLoopState, CancellationState,
+    RequestConstraints, SkillState, StopHookState, TurnInteractionPolicy,
 };
 use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
 use astra_pipeline::step_recorder::StepRecorder;
@@ -503,6 +503,12 @@ mod tests {
             mock_encryptor(),
             "test-session".to_string(),
         );
+        // NOTE: empty `allowed_tools` here is intentional and SAFE because
+        // `execute_skill_subrun` checks recursion depth FIRST (see
+        // `checked_child_recursion_depth` call at ~L197, before any tool
+        // validation). If someone reorders those checks, this test will
+        // start returning a tool-validation error instead of the depth
+        // error we're asserting on — update the test setup accordingly.
         let allowed_tools: Vec<String> = Vec::new();
 
         let err = executor

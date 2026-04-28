@@ -1076,6 +1076,9 @@ pub async fn partition_and_execute_skills(
                         .replace('"', "&quot;")
                         .replace('\'', "&apos;");
                     format!("{}\n\n<skill-loaded name=\"{}\"/>", skill_output, safe_name)
+                    // Contract: skill body MUST precede the <skill-loaded> marker.
+                    // Locked by web_agent_e2e.rs::skill_resolve_round_trip_carries_instructions_to_next_turn
+                    // (body_idx < marker_idx assertion). Do NOT reorder without updating that test.
                 } else {
                     skill_output
                 };

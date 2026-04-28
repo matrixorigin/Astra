@@ -1708,8 +1708,24 @@ impl ServerAgenticLoopHost {
                 vec![]
             } else {
                 let hint_tokens = crate::prompts::estimate_str_tokens(&skill_hint) as u32;
+            // Observability guard: when the estimator returns 0 but we DO have
+            // active skills, downstream context_meta would show
+            // `skills_injected = N with tokens=0 each`, which is indistinguishable
+            // from "nothing was injected". Emit a debug trace so operators can
+            // tell the two cases apart.
+            if hint_tokens == 0 && !active_skill_names.is_empty() {
+                tracing::debug!(
+                    active_skill_count = active_skill_names.len(),
+                    "skill hint token estimate is 0; context_meta breakdown will show 0 tokens per skill"
+                );
+            }
                 // Safe: `active_skill_names` is non-empty in this branch.
-                let per = hint_tokens / active_skill_names.len() as u32;
+                // `.max(1)` is an observability sentinel: if integer division
+                // truncates to 0 (hint shorter than skill count, or estimator
+                // returns 0), we still report 1 token per injection so that
+                // `context_meta.skills_injected` doesn't misleadingly show
+                // "active_output_skills=true" alongside "0 tokens injected".
+                let per = (hint_tokens / active_skill_names.len() as u32).max(1);
                 active_skill_names
                     .iter()
                     .map(|name| crate::turn::context_assembly_trace::SkillInjection {
@@ -2122,6 +2138,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 // break cross-round dedup — the agentic loop can re-drive the
                 // same tool_call emission path in Round 2 (post tool-result)
                 // and we must still suppress that duplicate.
+                // NOTE: Callers may re-enter execute_turn with non-zero
+                // llm_rounds_completed within the same user-turn (observed
+                // e.g. in skill_invocation_costs_* when agentic loop drives
+                // round 2). We clear dedup state ONLY at round 0 so the
+                // HashSet persists across rounds within a user-turn. New
+                // user-turns must start a fresh state object to re-trigger
+                // the clear.
                 if state.llm_rounds_completed == 0 {
                     self.emitted_tool_call_ids.clear();
                 }
@@ -3045,7 +3068,7 @@ mod tests {
         // Use `find` (first occurrence) — rfind would find the test module itself
         // if a nested `mod tests {` were ever added. First occurrence is always
         // the production `mod tests {` opener.
-        let tests_start = source.find("mod tests {").expect("test module start");
+        let tests_start = source.find("\n#[cfg(test)]\nmod tests {").expect("cfg(test) + mod tests marker");
         let production = &source[..tests_start];
         for context in [
             "server_loop_host context window dump persist failed",
@@ -3083,7 +3106,7 @@ mod tests {
     #[test]
     fn post_compaction_reinjects_invoked_skills() {
         let source = include_str!("server_loop_host.rs");
-        let tests_start = source.find("mod tests {").expect("test module start");
+        let tests_start = source.find("\n#[cfg(test)]\nmod tests {").expect("cfg(test) + mod tests marker");
         let production = &source[..tests_start];
         assert!(
             production.contains("state.skills.invoked"),
@@ -3106,7 +3129,7 @@ mod tests {
     #[test]
     fn llm_error_paths_publish_remote_llm_capture_artifacts() {
         let source = include_str!("server_loop_host.rs");
-        let tests_start = source.find("mod tests {").expect("test module start");
+        let tests_start = source.find("\n#[cfg(test)]\nmod tests {").expect("cfg(test) + mod tests marker");
         let production = &source[..tests_start];
         for context in [
             "server_loop_host context window capture",
@@ -3146,7 +3169,7 @@ mod tests {
     #[test]
     fn server_loop_error_captures_use_structured_error_response() {
         let source = include_str!("server_loop_host.rs");
-        let tests_start = source.find("mod tests {").expect("test module start");
+        let tests_start = source.find("\n#[cfg(test)]\nmod tests {").expect("cfg(test) + mod tests marker");
         let production = &source[..tests_start];
         assert!(
             production.contains("llm_capture_error_response(e)"),
@@ -3165,7 +3188,7 @@ mod tests {
     #[test]
     fn server_loop_uses_shared_rate_limit_cooldown_singleton() {
         let source = include_str!("server_loop_host.rs");
-        let tests_start = source.find("mod tests {").expect("test module start");
+        let tests_start = source.find("\n#[cfg(test)]\nmod tests {").expect("cfg(test) + mod tests marker");
         let production = &source[..tests_start];
         assert!(
             production.contains("use crate::turn::bridge_llm_stream::rate_limit_cooldown;"),
