@@ -1192,25 +1192,13 @@ pub(super) async fn finish_step_run_handler(
         .map_err(map_plan_load_err)?;
 
     // Look up the finalized row to return it and journal progress with the
-    // right subtask context. Bounded at DEFAULT_RUNS_LIMIT was a bug — a
-    // plan with more attempts than the limit would 404 on success. Scan
-    // ordered-by-started_at-DESC which is the natural "most recent first"
-    // sort, and accept up to 1000 rows; finalize_step_run filters by plan_id
-    // so this list is still plan-scoped.
-    let runs = state
+    // right subtask context. Direct SELECT by (run_id, plan_id) — O(1) vs
+    // the previous list_step_runs + find which was O(N) over all plan runs.
+    let finalized = state
         .plan_repo
-        .list_step_runs(&plan_id, None, 1000)
+        .get_step_run(&plan_id, &run_id)
         .await
         .map_err(map_plan_load_err)?;
-    let finalized = runs
-        .into_iter()
-        .find(|r| r.run_id == run_id)
-        .ok_or_else(|| {
-            error_response(
-                StatusCode::NOT_FOUND,
-                format!("step run {run_id} not found after finalize"),
-            )
-        })?;
 
     let subtask_title = plan_state
         .plan

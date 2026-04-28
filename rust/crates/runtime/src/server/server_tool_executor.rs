@@ -3703,6 +3703,7 @@ mod tests {
     use std::sync::{Mutex as StdMutex, MutexGuard, OnceLock};
 
     use super::*;
+    use astra_plan::PlanRepository;
     use astra_tools::{AskUserDecision, AskUserGate, AskUserResponse};
     use async_trait::async_trait;
     use serde_json::json;
@@ -4999,6 +5000,13 @@ esac
                 .finalize_step_run(plan_id, run_id, status, error, artifact_ref)
                 .await
         }
+        async fn get_step_run(
+            &self,
+            plan_id: &str,
+            run_id: &str,
+        ) -> Result<astra_plan::PlanStepRun, astra_plan::PlanLoadError> {
+            self.inner.get_step_run(plan_id, run_id).await
+        }
         async fn list_step_runs(
             &self,
             plan_id: &str,
@@ -5125,6 +5133,198 @@ esac
             "invalidation must force a fresh active_plan_for_session lookup \
              — active count before={before}, after={}",
             active.load(Ordering::Relaxed)
+        );
+    }
+
+    // ── Plan-mode write guard E2E ───────────────────────────────────────────
+
+    /// In-memory plan repo that supports active_plan_id toggling for the
+    /// write-guard test. Stores one plan and one active_plan_id slot.
+    struct InMemoryPlanRepo {
+        active_plan: tokio::sync::RwLock<Option<String>>,
+        plan_state: tokio::sync::RwLock<Option<(String, astra_plan::PlanModeState)>>,
+    }
+
+    impl InMemoryPlanRepo {
+        fn new() -> Self {
+            Self {
+                active_plan: tokio::sync::RwLock::new(None),
+                plan_state: tokio::sync::RwLock::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl astra_plan::PlanRepository for InMemoryPlanRepo {
+        async fn save(
+            &self,
+            plan_id: &str,
+            state: &mut astra_plan::PlanModeState,
+            _expected_version: Option<u64>,
+        ) -> Result<(), astra_plan::PlanLoadError> {
+            state.version += 1;
+            *self.plan_state.write().await = Some((plan_id.to_string(), state.clone()));
+            Ok(())
+        }
+        async fn load(
+            &self,
+            plan_id: &str,
+        ) -> Result<astra_plan::PlanModeState, astra_plan::PlanLoadError> {
+            let guard = self.plan_state.read().await;
+            match &*guard {
+                Some((id, s)) if id == plan_id => Ok(s.clone()),
+                _ => Err(astra_plan::PlanLoadError::NotFound(plan_id.into())),
+            }
+        }
+        async fn load_owned(
+            &self,
+            plan_id: &str,
+            _user_id: &str,
+        ) -> Result<astra_plan::PlanModeState, astra_plan::PlanLoadError> {
+            self.load(plan_id).await
+        }
+        async fn list_for_user(
+            &self,
+            _user_id: &str,
+            _filter: astra_plan::PlanListFilter<'_>,
+        ) -> Result<Vec<astra_plan::SavedPlanInfo>, astra_plan::PlanLoadError> {
+            Ok(vec![])
+        }
+        async fn delete(&self, _plan_id: &str) -> Result<(), astra_plan::PlanLoadError> {
+            Ok(())
+        }
+        async fn set_active_plan(
+            &self,
+            _session_id: &str,
+            plan_id: Option<&str>,
+        ) -> Result<(), astra_plan::PlanLoadError> {
+            *self.active_plan.write().await = plan_id.map(str::to_string);
+            Ok(())
+        }
+        async fn active_plan_for_session(
+            &self,
+            _session_id: &str,
+        ) -> Result<Option<String>, astra_plan::PlanLoadError> {
+            Ok(self.active_plan.read().await.clone())
+        }
+        async fn record_step_run(
+            &self,
+            _input: astra_plan::NewStepRun<'_>,
+        ) -> Result<String, astra_plan::PlanLoadError> {
+            Ok(uuid::Uuid::new_v4().to_string())
+        }
+        async fn record_completed_step_run(
+            &self,
+            _input: astra_plan::NewStepRun<'_>,
+            _error: Option<&str>,
+            _artifact_ref: Option<&str>,
+        ) -> Result<String, astra_plan::PlanLoadError> {
+            Ok(uuid::Uuid::new_v4().to_string())
+        }
+        async fn finalize_step_run(
+            &self,
+            _plan_id: &str,
+            _run_id: &str,
+            _status: astra_services::task_orchestrator::TaskStatus,
+            _error: Option<&str>,
+            _artifact_ref: Option<&str>,
+        ) -> Result<(), astra_plan::PlanLoadError> {
+            Ok(())
+        }
+        // NOTE: this mock does not persist step_run rows; tests that exercise
+        // `finish_step_run_handler` or otherwise depend on reading a run back
+        // must use the real `CloudPlanRepository` (or another repo that
+        // actually stores runs) instead of `InMemoryPlanRepo`.
+        async fn get_step_run(
+            &self,
+            _plan_id: &str,
+            run_id: &str,
+        ) -> Result<astra_plan::PlanStepRun, astra_plan::PlanLoadError> {
+            Err(astra_plan::PlanLoadError::NotFound(run_id.into()))
+        }
+        async fn list_step_runs(
+            &self,
+            _plan_id: &str,
+            _subtask_id: Option<&str>,
+            _limit: i32,
+        ) -> Result<Vec<astra_plan::PlanStepRun>, astra_plan::PlanLoadError> {
+            Ok(vec![])
+        }
+        async fn abort_open_step_runs(
+            &self,
+            _plan_id: &str,
+            _subtask_ids: &[String],
+        ) -> Result<u64, astra_plan::PlanLoadError> {
+            Ok(0)
+        }
+    }
+
+    /// Core plan-mode write guard contract: bash is blocked while a plan is
+    /// in authoring phase, and unblocked after exit_plan_mode(approved=true).
+    #[tokio::test]
+    async fn plan_mode_write_guard_blocks_bash_during_authoring_unblocks_after_exit() {
+        let repo = Arc::new(InMemoryPlanRepo::new());
+
+        // Seed a plan in authoring state (has subtasks, all pending, none done).
+        let mut state = astra_plan::PlanModeState::new_with_owner(
+            "test plan".into(),
+            astra_plan::ProjectContext::default(),
+            "test-user".into(),
+        );
+        state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "s1".into(),
+                title: "step 1".into(),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        repo.save("plan-guard-test", &mut state, None)
+            .await
+            .unwrap();
+        // Pin the plan as active for the session.
+        repo.set_active_plan("test-session", Some("plan-guard-test"))
+            .await
+            .unwrap();
+
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
+
+        // ── Phase 1: bash must be blocked ────────────────────────────────
+        let result = exec
+            .execute("bash", &json!({"command": "echo hello"}))
+            .await;
+        assert!(
+            result.contains("blocked while plan mode is active"),
+            "bash must be blocked during authoring, got: {result}"
+        );
+
+        // write_file also blocked.
+        let result = exec
+            .execute("write_file", &json!({"path": "x.txt", "content": "x"}))
+            .await;
+        assert!(
+            result.contains("blocked while plan mode is active"),
+            "write_file must be blocked during authoring, got: {result}"
+        );
+
+        // ── Phase 2: exit_plan_mode(approved=true) unblocks ──────────────
+        let exit_result = exec
+            .execute("exit_plan_mode", &json!({"approved": true}))
+            .await;
+        assert!(
+            exit_result.contains("unlocked"),
+            "exit_plan_mode must confirm write tools are unlocked, got: {exit_result}"
+        );
+
+        // bash now succeeds (or at least isn't blocked by the guard).
+        let result = exec
+            .execute("bash", &json!({"command": "echo hello"}))
+            .await;
+        assert!(
+            !result.contains("blocked while plan mode is active"),
+            "bash must NOT be blocked after exit_plan_mode, got: {result}"
         );
     }
 }

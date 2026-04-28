@@ -160,6 +160,11 @@ pub trait PlanRepository: Send + Sync {
         artifact_ref: Option<&str>,
     ) -> Result<(), PlanLoadError>;
 
+    /// Fetch a single step-run by `(run_id, plan_id)`. Returns `NotFound` if
+    /// the row doesn't exist or belongs to a different plan.
+    async fn get_step_run(&self, plan_id: &str, run_id: &str)
+    -> Result<PlanStepRun, PlanLoadError>;
+
     /// List step runs for a plan (optionally one subtask), newest first.
     async fn list_step_runs(
         &self,
@@ -682,6 +687,42 @@ impl PlanRepository for CloudPlanRepository {
         Ok(())
     }
 
+    async fn get_step_run(
+        &self,
+        plan_id: &str,
+        run_id: &str,
+    ) -> Result<PlanStepRun, PlanLoadError> {
+        let row = sqlx::query(
+            "SELECT run_id, plan_id, subtask_id, attempt, status, session_id, \
+                    started_at, finished_at, request_id, error, artifact_ref \
+             FROM plan_step_runs \
+             WHERE run_id = ? AND plan_id = ?",
+        )
+        .bind(run_id)
+        .bind(plan_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let Some(r) = row else {
+            return Err(PlanLoadError::NotFound(format!(
+                "step_run {run_id} not found in plan {plan_id}"
+            )));
+        };
+        Ok(PlanStepRun {
+            run_id: r.try_get("run_id").map_err(map_sqlx)?,
+            plan_id: r.try_get("plan_id").map_err(map_sqlx)?,
+            subtask_id: r.try_get("subtask_id").map_err(map_sqlx)?,
+            attempt: r.try_get("attempt").map_err(map_sqlx)?,
+            status: TaskStatus::parse_status(&r.try_get::<String, _>("status").map_err(map_sqlx)?),
+            session_id: r.try_get("session_id").map_err(map_sqlx)?,
+            started_at: r.try_get("started_at").map_err(map_sqlx)?,
+            finished_at: r.try_get("finished_at").map_err(map_sqlx)?,
+            request_id: r.try_get("request_id").map_err(map_sqlx)?,
+            error: r.try_get("error").map_err(map_sqlx)?,
+            artifact_ref: r.try_get("artifact_ref").map_err(map_sqlx)?,
+        })
+    }
+
     async fn list_step_runs(
         &self,
         plan_id: &str,
@@ -878,6 +919,16 @@ impl PlanRepository for LocalCachePlanRepository {
         _artifact_ref: Option<&str>,
     ) -> Result<(), PlanLoadError> {
         Ok(())
+    }
+
+    async fn get_step_run(
+        &self,
+        _plan_id: &str,
+        run_id: &str,
+    ) -> Result<PlanStepRun, PlanLoadError> {
+        Err(PlanLoadError::NotFound(format!(
+            "step_run {run_id} (local cache has no step_runs)"
+        )))
     }
 
     async fn list_step_runs(

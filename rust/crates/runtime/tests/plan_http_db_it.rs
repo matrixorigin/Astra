@@ -1166,3 +1166,84 @@ async fn rewind_cancels_open_step_runs_for_reset_subtasks() {
 
     cleanup_plan(&pool, &plan_id).await;
 }
+
+#[tokio::test]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+async fn execute_plan_handler_rejects_empty_session_id_with_400() {
+    let (app, pool) = setup_app().await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-exec-nosess", &["s1"]).await;
+
+    let (_, get_body) = request_json(app.clone(), "GET", &format!("/plans/{plan_id}"), None).await;
+    let v = get_body["version"].as_u64().unwrap();
+
+    // Empty session_id must be rejected.
+    let (status, body) = request_json(
+        app.clone(),
+        "POST",
+        &format!("/plans/{plan_id}/execute"),
+        Some(json!({
+            "session_id": "",
+            "step_by_step": true,
+            "expected_version": v
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "empty session_id must be rejected: {body}"
+    );
+
+    // Whitespace-only also rejected.
+    let (status, _) = request_json(
+        app.clone(),
+        "POST",
+        &format!("/plans/{plan_id}/execute"),
+        Some(json!({
+            "session_id": "   ",
+            "step_by_step": false,
+            "expected_version": v
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    cleanup_plan(&pool, &plan_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+async fn start_step_run_rejects_unknown_subtask_id_with_400() {
+    let (app, pool) = setup_app().await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-run-nosub", &["s1"]).await;
+    let session_id = format!("sit-nosub-{}", Uuid::new_v4().simple());
+    ensure_session(&pool, &session_id).await;
+
+    let (status, body) = request_json(
+        app.clone(),
+        "POST",
+        &format!("/plans/{plan_id}/step-runs"),
+        Some(json!({
+            "subtask_id": "does-not-exist",
+            "session_id": session_id,
+            "request_id": "req-1",
+            "attempt": 1
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unknown subtask_id must be rejected: {body}"
+    );
+
+    // No row persisted.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plan_step_runs WHERE plan_id = ?")
+        .bind(&plan_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+
+    cleanup_plan(&pool, &plan_id).await;
+}
