@@ -656,8 +656,10 @@ pub struct SnapshotContext {
 ///
 /// Always returns `None` for snapshots, making the data dimension
 /// absent from any `CompositeSnapshot`.
+#[cfg(test)]
 pub struct NoopDataSnapshotProvider;
 
+#[cfg(test)]
 impl DataSnapshotProvider for NoopDataSnapshotProvider {
     fn create_snapshot(
         &self,

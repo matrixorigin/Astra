@@ -433,18 +433,6 @@ async fn multi_round_three_tool_calls_then_final_answer() {
 // Test 5: Tool result timeout — irrelevant in single-call mode
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
-#[ignore = "timeout scenario not applicable in single-call mode"]
-async fn tool_result_timeout_when_edge_never_responds() {}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Test 5b: Approval timeout — irrelevant in single-call mode
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#[tokio::test]
-#[ignore = "approval timeout not applicable in single-call mode"]
-async fn approval_timeout_when_edge_never_posts_approval() {}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Test 6: SSE event ordering — session_info before content, turn_complete last
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -533,7 +533,6 @@ pub(super) fn build_router(state: AppState) -> Router {
             get(marketplace::search_marketplace_handler),
         )
         // Streaming (deprecated)
-        .route("/streaming/chat", post(streaming::stream_chat_handler))
         // Evaluation
         .route(
             "/evaluation/quality/trend",

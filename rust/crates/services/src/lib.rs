@@ -23,7 +23,6 @@ pub mod models;
 pub mod multi_agent;
 pub mod mutation_scoreboard;
 pub mod pagination;
-pub mod protocol;
 pub mod reflect;
 pub mod replay;
 pub mod resource_governor;
@@ -44,7 +43,6 @@ pub mod skills;
 pub mod snapshot_sql;
 pub mod state_sync;
 pub mod storage;
-pub mod streaming;
 pub mod sync_engine;
 pub mod task_orchestrator;
 pub mod team_persistence;
@@ -97,7 +95,7 @@ pub use decisions::{
 };
 pub use durable_task::OutputSink;
 pub use durable_task::{
-    CloudJudgePersistContext, CloudLlmConfig, CloudLlmJudge, ContractAmendment, ContractStatus,
+    CloudLlmConfig, CloudLlmJudge, ContractAmendment, ContractStatus,
     CriterionLearningResult, DiffSummary, DurableSubtask, DurableTaskLifecycle, LlmJudge,
     LocalDurableTaskLifecycle, MatrixOneDurableTaskLifecycle, NoopBranchOps,
     NoopTaskLearningBridge, SubtaskDeliverySummary, SubtaskExecutionContext, SubtaskOutcomeSignal,
@@ -156,13 +154,6 @@ pub use pagination::{
     MAX_MARKETPLACE_SEARCH_OFFSET, clamp_admin_audit_limit, clamp_api_list_pagination,
     clamp_marketplace_search_offset,
 };
-pub use protocol::{
-    ApplyDeltaRequest, ApplyDeltaResponse, ApplyOptions, Checkpoint, CheckpointOptions,
-    CheckpointTriggers, Conflict, ConflictResolution, DeltaBatch, DeltaEngine, DeltaError, DeltaOp,
-    DeltaOpType, DeltaRange, FallbackThresholds, GetChangesRequest, GetChangesResponse,
-    GetStateRequest, IncrementalSyncProtocol, StateRef, StateRefType, StateSnapshot, SyncMetrics,
-    SyncType, Tombstone, VersionVector, endpoints, grpc_methods, should_fallback_to_full_sync,
-};
 pub use reflect::{
     DatabaseReflectService, Diagnosis, ErrorClass, ReflectReport, ReflectService,
     UnconfiguredReflectService,
@@ -191,11 +182,7 @@ pub use session_artifact_store::{
     SessionArtifactJsonStore, SessionArtifactStore, SessionArtifactStoreError,
     StoredSessionArtifact, local_session_artifact_store,
 };
-pub use session_fork::{
-    CrossBranchLearning, DataBranchOptions, ExploreError, ExploreOptions, ExploreResult,
-    ForkSessionOptions, ForkSessionResult, TuneConfig, TuneExperimentResult, TuneSweepResult,
-    create_exploration_branches, fork_local_session,
-};
+pub use session_fork::{ForkSessionOptions, ForkSessionResult, fork_local_session};
 pub use skill_config::{
     DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,
 };
@@ -213,7 +200,6 @@ pub use storage::{
     log_session_audit, resolve_active_skill_versions, session_record_from_row,
     update_turn_skill_selection_version,
 };
-pub use streaming::{StreamingService, UnconfiguredStreamingService};
 pub use sync_engine::{
     CloudTransport, DomainAdapter, DomainSyncResult, MergeResult, NoopTransport, PayloadFormat,
     PullResult, PullTrigger, PushResult, PushTrigger, SyncDomain, SyncEnvelope, SyncError,

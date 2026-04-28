@@ -136,34 +136,6 @@ pub struct RestoredCheckpoint {
     pub contract_state_json: Option<String>,
 }
 
-/// Tool health entry mirrored from the runtime crate for breakpoint restore.
-/// Avoids a circular dependency (runtime depends on services).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BreakpointToolHealthEntry {
-    pub name: String,
-    pub total_calls: usize,
-    pub total_failures: usize,
-    pub failure_rate: f64,
-    #[serde(default)]
-    pub last_updated_epoch: u64,
-}
-
-/// Result of restoring to a specific breakpoint.
-#[derive(Debug, Clone)]
-pub struct RestoredBreakpoint {
-    /// The base restored session.
-    pub session: RestoredSession,
-    /// Breakpoint metadata.
-    pub breakpoint_id: String,
-    /// Tool health entries from the breakpoint.
-    pub tool_health_entries: Vec<BreakpointToolHealthEntry>,
-    /// Correction history JSON (to restore TurnGuard state).
-    pub correction_history_json: Option<String>,
-    /// Composite snapshot at the breakpoint, if one was recorded.
-    /// Callers can use this to selectively restore data/memory/git dimensions.
-    pub composite_snapshot: Option<astra_core::composite_snapshot::CompositeSnapshot>,
-}
-
 /// Result of restoring from a composite snapshot.
 #[derive(Debug, Clone)]
 pub struct RestoredCompositeState {

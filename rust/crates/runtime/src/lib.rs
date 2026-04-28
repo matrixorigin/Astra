@@ -46,7 +46,6 @@ pub mod replay;
 pub mod sandbox;
 pub mod skill_config;
 pub mod skills;
-pub mod streaming;
 pub mod triggers;
 pub(crate) mod workflows;
 
@@ -190,7 +189,6 @@ pub use astra_services::{
         DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,
     },
     skills::{DatabaseSkillService, SkillRecord, SkillService, UnconfiguredSkillService},
-    streaming::{StreamingService, UnconfiguredStreamingService},
     task_orchestrator::{
         MatrixOneTaskService, TaskCreateRequest, TaskRecord, TaskService, TaskStatus,
         UnconfiguredTaskService,

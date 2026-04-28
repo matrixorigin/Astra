@@ -46,7 +46,6 @@ pub struct AppState {
     pub(crate) marketplace_stats_service: Arc<dyn MarketplaceStatsService>,
     pub(crate) replay_service: Arc<dyn ReplayService>,
     pub(crate) session_audit_service: Arc<dyn SessionAuditService>,
-    pub(crate) streaming_service: Arc<dyn StreamingService>,
     pub(crate) skill_service: Arc<dyn SkillService>,
     pub(crate) skill_config_service: Arc<dyn SkillConfigService>,
     pub(crate) llm_trusted_domain_service:
@@ -143,7 +142,6 @@ impl AppState {
             marketplace_stats_service: Arc::new(NoopMarketplaceStatsService),
             replay_service: Arc::new(UnconfiguredReplayService),
             session_audit_service: Arc::new(UnconfiguredSessionAuditService),
-            streaming_service: Arc::new(UnconfiguredStreamingService),
             skill_service: Arc::new(UnconfiguredSkillService),
             skill_config_service: Arc::new(UnconfiguredSkillConfigService),
             llm_trusted_domain_service: Arc::new(
@@ -343,11 +341,6 @@ impl AppState {
         session_audit_service: Arc<dyn SessionAuditService>,
     ) -> Self {
         self.session_audit_service = session_audit_service;
-        self
-    }
-
-    pub fn with_streaming_service(mut self, streaming_service: Arc<dyn StreamingService>) -> Self {
-        self.streaming_service = streaming_service;
         self
     }
 

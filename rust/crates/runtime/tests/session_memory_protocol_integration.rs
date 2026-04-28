@@ -179,7 +179,7 @@ fn sample_session_memory(task: &str) -> String {
 // ── L1 Store → Retrieve Round-Trip ──────────────────────────────────────────
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 async fn l1_store_and_retrieve_via_memoria() {
     let tm = require_memoria!();
     let marker = format!("REST-API-{}", &tm.session_id()[..12]);
@@ -204,7 +204,7 @@ async fn l1_store_and_retrieve_via_memoria() {
 // ── L1 Correct (Update) ────────────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 async fn l1_correct_updates_in_place() {
     let tm = require_memoria!();
     let marker_v1 = format!("v1-{}", &tm.session_id()[..12]);
@@ -242,7 +242,7 @@ async fn l1_correct_updates_in_place() {
 // ── Compaction with L1 (Zero-LLM Path) ─────────────────────────────────────
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 async fn compaction_uses_l1_when_available() {
     let tm = require_memoria!();
 
@@ -315,7 +315,7 @@ async fn compaction_uses_l1_when_available() {
 // ── First User Message Preserved Through Compaction ─────────────────────────
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 async fn first_user_message_survives_compaction() {
     let tm = require_memoria!();
 
@@ -376,7 +376,7 @@ async fn first_user_message_survives_compaction() {
 // ── L1 Parsed from Memoria Matches Protocol ─────────────────────────────────
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 async fn l1_round_trip_preserves_structure() {
     let tm = require_memoria!();
     let marker = format!("roundtrip-{}", &tm.session_id()[..12]);
@@ -415,7 +415,7 @@ async fn l1_round_trip_preserves_structure() {
 // ── Anchor Derived from Retrieved L1 ────────────────────────────────────────
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 async fn anchor_from_retrieved_l1() {
     let tm = require_memoria!();
     let marker = format!("anchor-{}", &tm.session_id()[..12]);
@@ -442,7 +442,7 @@ async fn anchor_from_retrieved_l1() {
 // ── Session Isolation ───────────────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 async fn different_sessions_are_isolated() {
     let tm = require_memoria!();
     let sid_a = &*unique_session_id();
@@ -491,7 +491,7 @@ async fn different_sessions_are_isolated() {
 ///   Phase 2: 20 more turns → second compaction → update L1
 ///   Verify: original task, key decisions, and file context survive both compactions.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 async fn multi_compaction_preserves_goal_and_decisions() {
     let tm = require_memoria!();
     let marker = format!("multi-{}", &tm.session_id()[..12]);
@@ -677,7 +677,7 @@ async fn multi_compaction_preserves_goal_and_decisions() {
 /// Simulates a session where tool results dominate token usage (realistic agent behavior).
 /// Tool results are 80%+ of tokens. Compaction must not lose the task buried among them.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 async fn tool_heavy_session_preserves_task() {
     let tm = require_memoria!();
     let marker = format!("tools-{}", &tm.session_id()[..12]);
@@ -883,7 +883,7 @@ fn anchor_does_not_break_cached_prefix() {
 
 /// Measures exact token overhead of enabling Memoria vs pure compaction.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 async fn measure_memoria_token_overhead() {
     let tm = require_memoria!();
 
@@ -1013,7 +1013,7 @@ async fn measure_memoria_token_overhead() {
 /// 3. Run compaction on a new conversation that references the same session
 /// 4. Verify the L1 content is retrieved and injected
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 async fn full_loop_l1_write_then_compaction_reads() {
     let tm = require_memoria!();
     let marker = format!("fullloop-{}", &tm.session_id()[..12]);
@@ -1107,7 +1107,7 @@ async fn full_loop_l1_write_then_compaction_reads() {
 // ── L2 Fallback: Memoria unavailable → LLM summary still works ─────────────
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 async fn l2_fallback_when_memoria_unavailable() {
     // No require_memoria! — we intentionally pass None as client
     let mut messages: Vec<Value> = vec![system("You are helpful."), user("Build a rate limiter")];
@@ -1159,7 +1159,7 @@ async fn l2_fallback_when_memoria_unavailable() {
 // ── Cross-Session Bootstrap: new session retrieves old session's memories ───
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 async fn cross_session_retrieves_other_sessions_memories() {
     let tm = require_memoria!();
 

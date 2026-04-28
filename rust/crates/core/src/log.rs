@@ -89,20 +89,6 @@ macro_rules! log_persist {
     };
 }
 
-/// Structured tool event log with key=value fields.
-#[macro_export]
-macro_rules! agent_tool_event {
-    ($component:expr, $event:expr, $($key:ident = $val:expr),+ $(,)?) => {
-        $crate::tracing::warn!(
-            target: "astra.agent",
-            component = $component,
-            kind = "TOOL_EVENT",
-            event_kind = %$event,
-            $($key = ?$val),+,
-            "tool event"
-        );
-    };
-}
 
 /// Structured escalation event log.
 #[macro_export]
@@ -138,16 +124,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tool_event_macro_formats_kv() {
-        agent_tool_event!(
-            "runtime",
-            "tool_error",
-            tool = "bash",
-            category = "Transient",
-            attempt = 1usize
-        );
-    }
+
 
     #[test]
     fn escalation_macro_formats_kv() {

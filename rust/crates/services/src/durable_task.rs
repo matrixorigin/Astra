@@ -189,13 +189,6 @@ impl CloudLlmJudge {
         }
     }
 
-    /// Set the persistence context before running a batch of evaluations.
-    pub fn set_persist_context(&self, ctx: CloudJudgePersistContext) {
-        if let Ok(mut guard) = self.persist_context.lock() {
-            *guard = ctx;
-        }
-    }
-
     /// Persist an evaluation result to the cloud database.
     async fn persist_result(
         &self,
