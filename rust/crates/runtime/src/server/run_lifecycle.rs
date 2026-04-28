@@ -387,7 +387,7 @@ fn build_server_skill_executor(
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
 ) -> Option<Arc<dyn crate::skills::traits::SkillExecutor>> {
     use super::server_skill_subrun::ServerSkillSubRunExecutor;
-    use crate::skills::executor::isolated::{IsolatedSkillExecutor, SkillExecutionRouter};
+    use astra_skills::executor::isolated::{IsolatedSkillExecutor, SkillExecutionRouter};
 
     let mut subrun_executor = ServerSkillSubRunExecutor::new(
         matrixone.clone(),

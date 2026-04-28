@@ -24,8 +24,8 @@
 //! # Fork (isolated) execution
 //!
 //! Skills with [`ExecutionContext::Fork`](crate::skills::manifest::ExecutionContext::Fork)
-//! run in a nested agentic loop via [`crate::skills::executor::IsolatedSkillExecutor`] and a
-//! host-provided [`crate::skills::executor::SkillSubRunExecutor`] (e.g. CLI fork sub-run host).
+//! run in a nested agentic loop via [`astra_skills::executor::IsolatedSkillExecutor`] and a
+//! host-provided [`astra_skills::executor::SkillSubRunExecutor`] (e.g. CLI fork sub-run host).
 //! Recursive fork is disabled in sub-runs (`skill_executor: None`); nested `skill` calls are
 //! still resolved and executed **inline** so composition can proceed.
 

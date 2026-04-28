@@ -23,7 +23,7 @@ use crate::MatrixOneSettings;
 use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
-use crate::skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
+use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
 use crate::turn::agentic_loop_host::{
     AgenticLoopHost as _, AgenticLoopState, CancellationState, RequestConstraints, SkillState,
     StopHookState, TurnInteractionPolicy, run_agentic_loop_with_host,
