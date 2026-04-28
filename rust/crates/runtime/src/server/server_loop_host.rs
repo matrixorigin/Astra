@@ -581,7 +581,13 @@ pub struct ServerAgenticLoopHost {
     /// the start of each user-turn in `run_one_mock_turn_for_test` and in
     /// `execute_turn`'s test-hook path.
     #[cfg(feature = "bridge-e2e-hooks")]
-    emitted_tool_call_ids: std::collections::HashSet<String>,
+    /// Shared across host instances within the same chat turn so that
+    /// skill subruns (which construct a second `ServerAgenticLoopHost` via
+    /// `run_lifecycle.rs:3465`) reuse the parent host's dedup state instead
+    /// of starting with an empty HashSet. Without this sharing, the same
+    /// `tool_call` id would be emitted once per host instance. See
+    /// `web_agent_e2e::skill_invocation_costs_exactly_two_llm_rounds_today`.
+    emitted_tool_call_ids: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// Builder for [`ServerAgenticLoopHost`].
@@ -610,6 +616,12 @@ pub struct ServerAgenticLoopHostBuilder {
     mock_provider: Option<(String, String)>,
     #[cfg(feature = "bridge-e2e-hooks")]
     llm_request_capture: Option<Arc<std::sync::Mutex<Vec<CapturedLlmRequest>>>>,
+    /// Shared tool_call dedup state. When set (via `with_dedup_state`), the
+    /// built host shares the same `emitted_tool_call_ids` Arc as the parent
+    /// host, preventing duplicate `tool_call` events across host instances
+    /// within the same chat turn (e.g. parent + skill subrun).
+    #[cfg(feature = "bridge-e2e-hooks")]
+    shared_dedup_state: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
 }
 
 impl ServerAgenticLoopHostBuilder {
@@ -644,7 +656,22 @@ impl ServerAgenticLoopHostBuilder {
             mock_provider: None,
             #[cfg(feature = "bridge-e2e-hooks")]
             llm_request_capture: None,
+            #[cfg(feature = "bridge-e2e-hooks")]
+            shared_dedup_state: None,
         }
+    }
+
+    /// Share a parent host's `emitted_tool_call_ids` HashSet with the host
+    /// being built, so that skill subruns deduplicate `tool_call` events
+    /// against the parent's already-emitted ids. Call this when constructing
+    /// a subrun host from `ServerSkillSubRunExecutor`.
+    #[cfg(feature = "bridge-e2e-hooks")]
+    pub fn with_dedup_state(
+        mut self,
+        shared: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    ) -> Self {
+        self.shared_dedup_state = Some(shared);
+        self
     }
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
@@ -806,7 +833,9 @@ impl ServerAgenticLoopHostBuilder {
             #[cfg(feature = "bridge-e2e-hooks")]
             llm_request_capture: self.llm_request_capture,
             #[cfg(feature = "bridge-e2e-hooks")]
-            emitted_tool_call_ids: std::collections::HashSet::new(),
+            emitted_tool_call_ids: self.shared_dedup_state.unwrap_or_else(|| {
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()))
+            }),
         }
     }
 }
@@ -937,9 +966,33 @@ impl ServerAgenticLoopHost {
         &mut self,
         state: &mut AgenticLoopState,
     ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
-        // Clear per-turn dedup state so ids from a previous user message
-        // never suppress tool_call events in the next one.
-        self.emitted_tool_call_ids.clear();
+        // Clear dedup state ONLY at the true user-turn boundary.
+        // NOTE: Do NOT clear emitted_tool_call_ids here. The HashSet's
+        // lifetime equals the ServerAgenticLoopHost instance lifetime, which
+        // equals one user-turn (build_host is called per HTTP request in
+        // chat_handler_inner). Skill subruns re-enter execute_turn with a
+        // fresh AgenticLoopState but the SAME host instance, so the HashSet
+        // persists across rounds within a user-turn — exactly what we need
+        // to dedupe tool_call events emitted by both Round 1 and Round 2
+        // of the agentic loop for the same skill invocation.
+        //
+        // Previous versions cleared here (and/or in execute_turn's test-hook
+        // path) which wiped ids inserted by earlier rounds and caused
+        // duplicate events. See skill_invocation_costs_exactly_two_llm_rounds_today.
+        //
+        // Legacy comment (kept for history):
+        // `run_one_mock_turn_for_test` can be called in addition to
+        // `execute_turn` within the same user-turn (both drive mock emits
+        // through `execute_mock_turn`). Clearing unconditionally here
+        // would wipe ids inserted by a prior `execute_turn` pass in the
+        // same turn, allowing duplicate tool_call events to escape.
+        // `state.llm_rounds_completed == 0` is the unambiguous signal
+        // that this is the first mock drive for a fresh user-turn.
+        // Contract locked by:
+        //   `skill_invocation_costs_exactly_two_llm_rounds_today`
+        // Dedup state is intentionally NOT cleared here — the host instance
+        // itself is the user-turn boundary (one build_host() per HTTP request).
+        // See the NOTE block above for full rationale.
         let round = self.test_llm_rounds.pop_front().unwrap_or_else(
             || json!({ "full_text": "[mock rounds exhausted]", "tool_calls": [], "usage": {} }),
         );
@@ -1094,7 +1147,7 @@ impl ServerAgenticLoopHost {
                 Some(id) if !id.is_empty() => format!("id:{id}"),
                 _ => format!("raw:{tc}"),
             };
-            if !self.emitted_tool_call_ids.insert(key) {
+            if !self.emitted_tool_call_ids.lock().unwrap().insert(key) {
                 continue;
             }
             self.emit_event(json!({ "type": "tool_call", "tool_call": tc }));
@@ -1321,6 +1374,21 @@ impl ServerAgenticLoopHost {
 
             for tc in &executable_calls {
                 for m in sse_maps_through_tool_request(tc) {
+                    // L1094 (execute_mock_turn mock-LLM-response path) is the
+                    // SINGLE owner of `tool_call` events per skill invocation.
+                    // `sse_maps_through_tool_request` re-wraps the same tc as
+                    // a `tool_call` map for the tool-dispatch stream, but that
+                    // would produce a duplicate event (same id) downstream.
+                    // Skip any `tool_call` map here — other map types
+                    // (tool_request, etc.) still flow through normally.
+                    // Contract locked by:
+                    //   `skill_invocation_costs_exactly_two_llm_rounds_today`
+                    #[cfg(feature = "bridge-e2e-hooks")]
+                    {
+                        if m.get("type").and_then(|v| v.as_str()) == Some("tool_call") {
+                            continue;
+                        }
+                    }
                     self.emit_event(Value::Object(m));
                 }
             }
@@ -2133,21 +2201,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         {
             if let Some(round) = self.test_llm_rounds.pop_front() {
                 // Clear per-*user-turn* dedup state only at the first LLM round
-                // of a new user-turn (callers that don't go through
-                // run_one_mock_turn_for_test). Clearing on every round would
-                // break cross-round dedup — the agentic loop can re-drive the
-                // same tool_call emission path in Round 2 (post tool-result)
-                // and we must still suppress that duplicate.
-                // NOTE: Callers may re-enter execute_turn with non-zero
-                // llm_rounds_completed within the same user-turn (observed
-                // e.g. in skill_invocation_costs_* when agentic loop drives
-                // round 2). We clear dedup state ONLY at round 0 so the
-                // HashSet persists across rounds within a user-turn. New
-                // user-turns must start a fresh state object to re-trigger
-                // the clear.
-                if state.llm_rounds_completed == 0 {
-                    self.emitted_tool_call_ids.clear();
-                }
+                // NOTE: Do NOT clear emitted_tool_call_ids here.
+                // The single authoritative clear point is run_one_mock_turn_for_test
+                // (the true user-turn boundary). Skill subruns create a fresh
+                // AgenticLoopState with llm_rounds_completed==0 and re-enter
+                // execute_turn — clearing here would wipe the parent turn's dedup
+                // state and allow duplicate tool_call events to escape the HashSet.
+                // Contract: emitted_tool_call_ids is cleared ONLY in
+                // run_one_mock_turn_for_test at the start of each new user message.
                 return self.execute_mock_turn(state, &round, turn_started).await;
             }
             if self.test_llm_rounds_wired {

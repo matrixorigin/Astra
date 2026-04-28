@@ -68,6 +68,12 @@ pub struct ServerSkillSubRunExecutor {
     session_id: String,
     /// Edge connection pool for routing tool calls to connected edges.
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
+    /// Shared tool_call dedup state from the parent host. When set, the sub-run
+    /// host will observe the same emitted_tool_call_ids HashSet as the parent,
+    /// preventing duplicate `tool_call` events across host instances within the
+    /// same chat turn. Plumbed only under `bridge-e2e-hooks` (test observability).
+    #[cfg(feature = "bridge-e2e-hooks")]
+    dedup_state: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
 }
 
 impl ServerSkillSubRunExecutor {
@@ -90,7 +96,21 @@ impl ServerSkillSubRunExecutor {
             request_constraints: Default::default(),
             session_id,
             edge_connection_pool: None,
+            #[cfg(feature = "bridge-e2e-hooks")]
+            dedup_state: None,
         }
+    }
+
+    /// Share the parent host's `emitted_tool_call_ids` HashSet so that sub-run
+    /// hosts dedupe `tool_call` events against the parent's already-emitted
+    /// ids. See `ServerAgenticLoopHostBuilder::with_dedup_state`.
+    #[cfg(feature = "bridge-e2e-hooks")]
+    pub fn with_dedup_state(
+        mut self,
+        shared: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    ) -> Self {
+        self.dedup_state = Some(shared);
+        self
     }
 
     pub fn with_pool(mut self, pool: Option<SharedPool>) -> Self {
@@ -237,6 +257,17 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
 
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
+        }
+
+        // Wire shared dedup state from the parent host so that tool_call events
+        // emitted by this sub-run host are deduplicated against the parent's
+        // already-emitted ids. Without this, the same `tool_call` id would be
+        // emitted once per host instance within the same chat turn.
+        // See `ServerAgenticLoopHostBuilder::with_dedup_state` and
+        // `ServerSkillSubRunExecutor::with_dedup_state`.
+        #[cfg(feature = "bridge-e2e-hooks")]
+        if let Some(dedup) = &self.dedup_state {
+            builder = builder.with_dedup_state(dedup.clone());
         }
 
         let mut host = builder.build();

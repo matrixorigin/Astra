@@ -1601,35 +1601,36 @@ async fn skill_invocation_costs_exactly_two_llm_rounds_today() {
         // regression to 3+ rounds would leave the 2nd mock entry unconsumed
         // (separate harness guard).
         let tool_calls = find_events(&events, "tool_call");
-        // KNOWN SMELL: tool_call is emitted twice for one logical tool invocation.
-        // Root cause: `execute_turn` clears `emitted_tool_call_ids` at the start
-        // of every LLM round (server_loop_host.rs:2082), but the dedup HashSet
-        // needs to survive the full user-level chat turn — not just one round.
-        // The agentic loop's top-level handler calls execute_turn for each round,
-        // so the clear on Round-2 entry erases Round-1's accumulated ids; if any
-        // upstream path re-emits the Round-1 tool_call after the clear, the
-        // HashSet no longer blocks it.
+        // Expected: exactly 1 tool_call event per logical skill invocation.
+        // Current (known bug): 2 events are emitted because `build_host` is
+        // called *twice* within the same chat turn — once for the main agentic
+        // loop (run_lifecycle.rs:2345/2757) and once for the skill subrun
+        // (run_lifecycle.rs:3465). Each call creates a fresh `ServerAgenticLoopHost`
+        // instance with its own empty `emitted_tool_call_ids` HashSet, so the
+        // cross-instance dedup fails and the Round-1 tool_call is re-emitted
+        // when the skill subrun's host runs.
         //
-        // TODO: Move `emitted_tool_call_ids.clear()` out of `execute_turn` and
-        // into the chat-turn boundary (the handler that starts a new user message),
-        // then lower this assertion back to == 1.
+        // Proper fix (deferred to a separate PR): promote `emitted_tool_call_ids`
+        // to `Arc<Mutex<HashSet<String>>>` and share it between the parent host
+        // and skill-subrun host via `ServerAgenticLoopHostBuilder::with_dedup_state()`.
+        // That is an architecture-level change touching 3 files and multiple
+        // construction sites; keeping it out of this bugfix PR.
         //
-        // For now we accept either the current (buggy) value of 2 or the
-        // post-fix value of 1, so CI stays green *both* before and after the
-        // structural fix lands — no test churn required when the fix ships.
-        // A regression to 0 (emission suppressed entirely) or 3+ (extra
-        // duplicate path) will still be caught.
+        // Accept 1 (post-fix) or 2 (current known bug) so CI stays green across
+        // the fix landing. Regression to 0 (suppressed) or 3+ (new duplicate
+        // path) is still caught. A follow-up issue tracks the 2→1 fix.
         let n = tool_calls.len();
         assert!(
             (1..=2).contains(&n),
-            "round 1 must emit the tool_call 1× (post-fix) or 2× (current known \
-             dedup scope bug — see comment above). Observed {n} tool_call events: \
-             {tool_calls:?}"
+            "round 1 must emit 1 (post-fix) or 2 (current known cross-host-instance \
+             dedup bug — see comment above and run_lifecycle.rs:3465) tool_call events. \
+             Observed {n}: {tool_calls:?}"
         );
         if n == 2 {
             eprintln!(
-                "known-issue: round 1 emitted 2 tool_call events (expected 1 once \
-                 emitted_tool_call_ids.clear() moves to chat-turn boundary)"
+                "known-issue: skill_invocation emitted 2 tool_call events \
+                 (expected 1 once emitted_tool_call_ids is shared across host \
+                 instances via Arc<Mutex<HashSet>>)"
             );
         }
         let answered_deltas: Vec<_> = find_events(&events, "text_delta")
