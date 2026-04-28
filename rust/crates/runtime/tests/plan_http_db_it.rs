@@ -899,6 +899,177 @@ async fn exit_plan_mode_records_lifecycle_decision() {
     cleanup_plan(&pool, &plan_id).await;
 }
 
+// ── Round-3 input-validation regressions ────────────────────────────────────
+
+/// `start_step_run_handler` used to accept any client-provided `attempt`
+/// including 0, negative, or near-i32::MAX. Those values silently land in
+/// `plan_step_runs.attempt`, poison `max(attempt) + 1` redo logic, or wrap
+/// on overflow. Handler must reject with 400 before the INSERT.
+#[tokio::test]
+#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+async fn start_step_run_rejects_attempt_out_of_range() {
+    let (app, pool) = setup_app().await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-attempt-range", &["s1"]).await;
+    let session_id = format!("sit-attempt-{}", Uuid::new_v4().simple());
+    ensure_session(&pool, &session_id).await;
+
+    for bad in [0, -1, -999, i32::MIN, i32::MAX] {
+        let (status, body) = request_json(
+            app.clone(),
+            "POST",
+            &format!("/plans/{plan_id}/step-runs"),
+            Some(json!({
+                "subtask_id": "s1",
+                "session_id": session_id,
+                "request_id": "req-1",
+                "attempt": bad
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "attempt={bad} must be rejected, got {status} body={body}"
+        );
+    }
+
+    // And no row was inserted for any of those attempts.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plan_step_runs WHERE plan_id = ?")
+        .bind(&plan_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "no step_runs must persist for rejected attempts");
+
+    cleanup_plan(&pool, &plan_id).await;
+}
+
+/// Same rule applies to the one-shot completed-step-run endpoint.
+#[tokio::test]
+#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+async fn post_completed_step_run_rejects_attempt_out_of_range() {
+    let (app, pool) = setup_app().await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-cattempt", &["s1"]).await;
+    let session_id = format!("sit-cattempt-{}", Uuid::new_v4().simple());
+    ensure_session(&pool, &session_id).await;
+
+    for bad in [0, -1] {
+        let (status, body) = request_json(
+            app.clone(),
+            "POST",
+            &format!("/plans/{plan_id}/step-runs/completed"),
+            Some(json!({
+                "subtask_id": "s1",
+                "session_id": session_id,
+                "request_id": "req-1",
+                "attempt": bad,
+                "status": "completed"
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "attempt={bad} must be rejected, got {status} body={body}"
+        );
+    }
+
+    cleanup_plan(&pool, &plan_id).await;
+}
+
+/// `rewind.reason`, `finish.error`, and `finish.artifact_ref` have no
+/// backpressure: a malicious client can stuff a 10MB string into the journal
+/// or the `plan_step_runs.error` column. Handlers must cap them.
+#[tokio::test]
+#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+async fn rewind_rejects_oversized_reason_string() {
+    let (app, pool) = setup_app().await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-rewind-big", &["a", "b"]).await;
+
+    // 20k > the 5k cap we'll install.
+    let huge = "A".repeat(20_000);
+    let (status, body) = request_json(
+        app.clone(),
+        "POST",
+        &format!("/plans/{plan_id}/rewind"),
+        Some(json!({ "anchor": "2", "reason": huge })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "huge reason must be rejected: {body}"
+    );
+
+    cleanup_plan(&pool, &plan_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+async fn finish_step_run_rejects_oversized_error_and_artifact_ref() {
+    let (app, pool) = setup_app().await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-finish-big", &["s1"]).await;
+    let session_id = format!("sit-finish-big-{}", Uuid::new_v4().simple());
+    ensure_session(&pool, &session_id).await;
+
+    // Start a run legitimately.
+    let (_, body) = request_json(
+        app.clone(),
+        "POST",
+        &format!("/plans/{plan_id}/step-runs"),
+        Some(json!({
+            "subtask_id": "s1",
+            "session_id": session_id,
+            "request_id": "req-1",
+            "attempt": 1
+        })),
+    )
+    .await;
+    let run_id = body["run_id"].as_str().unwrap().to_string();
+
+    let huge_err = "E".repeat(20_000);
+    let (status, body) = request_json(
+        app.clone(),
+        "POST",
+        &format!("/plans/{plan_id}/step-runs/{run_id}/finish"),
+        Some(json!({ "status": "failed", "error": huge_err })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "huge error must be rejected: {body}"
+    );
+
+    let huge_art = "/".to_string() + &"a".repeat(2000);
+    let (status, body) = request_json(
+        app.clone(),
+        "POST",
+        &format!("/plans/{plan_id}/step-runs/{run_id}/finish"),
+        Some(json!({ "status": "failed", "artifact_ref": huge_art })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "huge artifact_ref must be rejected: {body}"
+    );
+
+    // Run must still be open (nothing finalized).
+    let row = sqlx::query("SELECT finished_at FROM plan_step_runs WHERE run_id = ?")
+        .bind(&run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let finished: Option<chrono::DateTime<chrono::Utc>> = row.try_get("finished_at").unwrap();
+    assert!(
+        finished.is_none(),
+        "rejected finalize must not persist finished_at"
+    );
+
+    cleanup_plan(&pool, &plan_id).await;
+}
+
 /// Regression for round-2 review finding: rewind was resetting subtasks to
 /// Pending but leaving open `plan_step_runs` rows with `finished_at IS NULL`.
 /// The orphaned audit rows would skew attempt counters and make stall

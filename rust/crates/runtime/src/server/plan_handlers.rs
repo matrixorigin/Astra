@@ -33,6 +33,44 @@ const MAX_INSTRUCTION_LENGTH: usize = 10_000;
 const MAX_PLAN_MD_LENGTH: usize = 200_000;
 const DEFAULT_RUNS_LIMIT: i32 = 100;
 
+/// Upper bound on attempt counters. One million attempts per subtask is
+/// already unreachable in practice; this rejects arbitrary i32 values (0,
+/// negative, near-MAX) that would otherwise poison `max(attempt)+1` redo
+/// logic or wrap on overflow.
+const MAX_ATTEMPT: i32 = 1_000_000;
+
+/// Cap on free-form client text stored in journal/state so a hostile caller
+/// can't bloat `plan_json` or the journal with multi-MB payloads.
+const MAX_REASON_LENGTH: usize = 5_000;
+const MAX_ERROR_LENGTH: usize = 10_000;
+const MAX_ARTIFACT_REF_LENGTH: usize = 1_000;
+
+fn validate_attempt(attempt: i32) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if !(1..=MAX_ATTEMPT).contains(&attempt) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("attempt must be between 1 and {MAX_ATTEMPT}, got {attempt}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_optional_len(
+    value: Option<&str>,
+    max: usize,
+    field: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if let Some(v) = value
+        && v.len() > max
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("{field} exceeds {max} characters"),
+        ));
+    }
+    Ok(())
+}
+
 // ─── Request / Response types ────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -756,6 +794,9 @@ pub(super) async fn rewind_plan_handler(
             "anchor is required",
         ));
     }
+    // Cap `reason` so a hostile caller can't bloat the journal / plan_json
+    // with multi-MB strings on every rewind.
+    validate_optional_len(req.reason.as_deref(), MAX_REASON_LENGTH, "reason")?;
     let anchor_parsed = if let Ok(n) = anchor.parse::<usize>() {
         PlanRewindAnchor::OneBased(n)
     } else {
@@ -940,6 +981,10 @@ pub(super) async fn start_step_run_handler(
 ) -> Result<(StatusCode, Json<StartStepRunResponse>), (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
 
+    // Validate client-provided fields before any DB work so a bad request
+    // fails fast and cannot corrupt state.
+    validate_attempt(req.attempt)?;
+
     let plan_state = state
         .plan_repo
         .load_owned(&plan_id, &user.user_id)
@@ -1017,6 +1062,14 @@ pub(super) async fn post_completed_step_run_handler(
     Json(req): Json<CompletedStepRunRequest>,
 ) -> Result<(StatusCode, Json<StartStepRunResponse>), (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+
+    validate_attempt(req.attempt)?;
+    validate_optional_len(req.error.as_deref(), MAX_ERROR_LENGTH, "error")?;
+    validate_optional_len(
+        req.artifact_ref.as_deref(),
+        MAX_ARTIFACT_REF_LENGTH,
+        "artifact_ref",
+    )?;
 
     if req.session_id.trim().is_empty() || req.request_id.trim().is_empty() {
         return Err(error_response(
@@ -1111,6 +1164,13 @@ pub(super) async fn finish_step_run_handler(
     Json(req): Json<FinishStepRunRequest>,
 ) -> Result<Json<PlanStepRun>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+
+    validate_optional_len(req.error.as_deref(), MAX_ERROR_LENGTH, "error")?;
+    validate_optional_len(
+        req.artifact_ref.as_deref(),
+        MAX_ARTIFACT_REF_LENGTH,
+        "artifact_ref",
+    )?;
 
     // Ownership check so unrelated users can't finalize someone else's runs.
     let plan_state = state

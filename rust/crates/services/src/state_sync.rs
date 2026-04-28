@@ -272,6 +272,66 @@ const MAX_PLAN_TEMPLATE_SYNC_ROWS: i64 = 500;
 const MAX_PLAN_SYNC_ROWS: i64 = 200;
 const MAX_PLAN_STEP_RUN_SYNC_ROWS: i64 = 2000;
 
+/// Upper bounds on untrusted step-run fields pushed from edges. Rejects
+/// nonsensical clock values and oversized audit strings before they reach
+/// the DB, matching the caps enforced by the HTTP plan handlers.
+///
+/// `STEP_RUN_CLOCK_SKEW_YEARS` accepts ±10 years from the cloud's current
+/// time — a legitimate offline CLI session lasting more than a decade is
+/// unrealistic, while clocks off by centuries (1970 default, 2099 default)
+/// are a clear sign of a misconfigured device.
+const STEP_RUN_CLOCK_SKEW_YEARS: i64 = 10;
+const STEP_RUN_MAX_ERROR_LEN: usize = 10_000;
+const STEP_RUN_MAX_ARTIFACT_REF_LEN: usize = 1_000;
+
+fn validate_step_run_timestamps(
+    started_at: chrono::DateTime<chrono::Utc>,
+    finished_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), String> {
+    let now = chrono::Utc::now();
+    let window = chrono::Duration::days(365 * STEP_RUN_CLOCK_SKEW_YEARS);
+    if started_at < now - window || started_at > now + window {
+        return Err(format!(
+            "started_at={started_at} outside ±{STEP_RUN_CLOCK_SKEW_YEARS}y skew window; \
+             reject suspected-bad-clock edge"
+        ));
+    }
+    if let Some(finished) = finished_at {
+        if finished < started_at {
+            return Err(format!(
+                "finished_at={finished} is before started_at={started_at}; \
+                 causally impossible"
+            ));
+        }
+        if finished < now - window || finished > now + window {
+            return Err(format!(
+                "finished_at={finished} outside ±{STEP_RUN_CLOCK_SKEW_YEARS}y skew window"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_step_run_strings(run: &PlanStepRunSyncRow) -> Result<(), String> {
+    if let Some(ref e) = run.error
+        && e.len() > STEP_RUN_MAX_ERROR_LEN
+    {
+        return Err(format!(
+            "step_run.error exceeds {STEP_RUN_MAX_ERROR_LEN} chars ({} got)",
+            e.len()
+        ));
+    }
+    if let Some(ref a) = run.artifact_ref
+        && a.len() > STEP_RUN_MAX_ARTIFACT_REF_LEN
+    {
+        return Err(format!(
+            "step_run.artifact_ref exceeds {STEP_RUN_MAX_ARTIFACT_REF_LEN} chars ({} got)",
+            a.len()
+        ));
+    }
+    Ok(())
+}
+
 /// One row from `plans`, serialized for edge↔cloud sync. Plans carry the
 /// full serialized `PlanModeState` in `plan_json` so edge can hydrate an
 /// identical view without needing every column in the table.
@@ -1520,6 +1580,34 @@ impl StateSyncService for MatrixOneSyncService {
                     skipped_runs += 1;
                     continue;
                 }
+            }
+
+            // Bounds-check the untrusted edge-supplied fields. A malformed
+            // run is skipped (not an error for the whole pack) so one bad
+            // row doesn't discard a batch of otherwise-valid attempts.
+            if let Err(reason) = validate_step_run_timestamps(run.started_at, run.finished_at) {
+                tracing::warn!(
+                    target: "astra_services::state_sync",
+                    user_id = %user_id,
+                    plan_id = %run.plan_id,
+                    run_id = %run.run_id,
+                    reason = %reason,
+                    "push_plans_pack skipping run with bad timestamps"
+                );
+                skipped_runs += 1;
+                continue;
+            }
+            if let Err(reason) = validate_step_run_strings(run) {
+                tracing::warn!(
+                    target: "astra_services::state_sync",
+                    user_id = %user_id,
+                    plan_id = %run.plan_id,
+                    run_id = %run.run_id,
+                    reason = %reason,
+                    "push_plans_pack skipping run with oversized fields"
+                );
+                skipped_runs += 1;
+                continue;
             }
 
             // INSERT IGNORE so edge can replay a pack safely without failing

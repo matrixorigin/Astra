@@ -599,3 +599,253 @@ async fn pull_plans_pack_returns_user_scoped_plans_and_runs() {
     cleanup(&pool, &plan_id).await;
     cleanup(&pool, &other_plan).await;
 }
+
+// ── Round-3 edge-input validation regressions ───────────────────────────────
+
+/// A step-run with `finished_at < started_at` is causally impossible. The
+/// sync endpoint must reject it rather than silently store a nonsensical
+/// audit row that breaks time-ordered queries.
+#[tokio::test]
+#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+async fn push_plans_pack_rejects_step_run_with_inverted_timestamps() {
+    let pool = setup_pool().await;
+    let svc = MatrixOneSyncService::new(pool.clone());
+    let user = format!("u-inv-{}", Uuid::new_v4().simple());
+    let plan_id = format!("pit-inv-{}", Uuid::new_v4().simple());
+    let session_id = format!("sit-inv-{}", Uuid::new_v4().simple());
+    cleanup(&pool, &plan_id).await;
+
+    let plan = row_for(&user, &plan_id, 1, "inv");
+    let mut run = step_for(
+        &plan_id,
+        &format!("run-{}", Uuid::new_v4().simple()),
+        &session_id,
+        1,
+    );
+    run.started_at = chrono::Utc::now();
+    run.finished_at = Some(run.started_at - chrono::Duration::hours(1)); // earlier than start
+
+    let pack = serde_json::json!({
+        "plans": [plan],
+        "step_runs": [run],
+    })
+    .to_string();
+
+    let res = svc.push_plans_pack(&user, &pack).await;
+    // Either the whole push rejects (preferred) or the run is skipped, but
+    // the row must NOT land in the DB.
+    let count: i64 = scalar_i64(
+        &pool,
+        "SELECT COUNT(*) FROM plan_step_runs WHERE plan_id = ?",
+        &plan_id,
+    )
+    .await;
+    assert_eq!(
+        count, 0,
+        "inverted-timestamp run must not persist; svc result={res:?}"
+    );
+
+    cleanup(&pool, &plan_id).await;
+}
+
+/// Edge clients with wildly wrong clocks must not poison the cloud audit
+/// chain. Any `started_at` more than ±10 years from now is obviously bogus
+/// and must be rejected.
+#[tokio::test]
+#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+async fn push_plans_pack_rejects_step_run_with_out_of_range_timestamps() {
+    let pool = setup_pool().await;
+    let svc = MatrixOneSyncService::new(pool.clone());
+    let user = format!("u-oor-{}", Uuid::new_v4().simple());
+    let plan_id = format!("pit-oor-{}", Uuid::new_v4().simple());
+    let session_id = format!("sit-oor-{}", Uuid::new_v4().simple());
+    cleanup(&pool, &plan_id).await;
+
+    let plan = row_for(&user, &plan_id, 1, "oor");
+
+    // Year 2099 — clearly skewed edge clock.
+    let far_future: chrono::DateTime<chrono::Utc> = "2099-01-01T00:00:00Z".parse().unwrap();
+    let mut run = step_for(
+        &plan_id,
+        &format!("run-{}", Uuid::new_v4().simple()),
+        &session_id,
+        1,
+    );
+    run.started_at = far_future;
+    run.finished_at = Some(far_future + chrono::Duration::seconds(1));
+
+    let pack = serde_json::json!({
+        "plans": [plan],
+        "step_runs": [run],
+    })
+    .to_string();
+    let _ = svc.push_plans_pack(&user, &pack).await;
+    let count: i64 = scalar_i64(
+        &pool,
+        "SELECT COUNT(*) FROM plan_step_runs WHERE plan_id = ?",
+        &plan_id,
+    )
+    .await;
+    assert_eq!(count, 0, "far-future run must not persist");
+
+    cleanup(&pool, &plan_id).await;
+}
+
+/// Regression for migration hazard: if a prod DB already has duplicate
+/// `(plan_id, subtask_id, attempt)` rows from before the UNIQUE constraint,
+/// `ALTER TABLE ... ADD UNIQUE` fails with MySQL 1062 and blocks startup.
+/// Migration 7 DELETEs duplicates (keeping smallest run_id) before
+/// migration 8 adds the UNIQUE.
+///
+/// The test simulates a pre-upgrade DB by dropping the UNIQUE index,
+/// injecting two rows with the same (plan_id, subtask_id, attempt), then
+/// directly calling the dedupe SQL and verifying only one row survives and
+/// the ADD UNIQUE succeeds afterwards.
+#[tokio::test]
+#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+async fn migration_dedupe_removes_duplicate_attempt_tuples() {
+    let pool = setup_pool().await;
+    let plan_id = format!("pit-mig-{}", Uuid::new_v4().simple());
+    let user = format!("u-mig-{}", Uuid::new_v4().simple());
+    cleanup(&pool, &plan_id).await;
+
+    // Drop the UNIQUE so we can inject duplicates that mimic a pre-v8 DB.
+    // May or may not be present depending on the DB's migration state;
+    // swallow the "doesn't exist" error (1091) either way.
+    let _ = sqlx::query("ALTER TABLE plan_step_runs DROP INDEX uq_step_runs_subtask_attempt")
+        .execute(&pool)
+        .await;
+
+    // Seed a plan so step_run FKs point somewhere meaningful.
+    sqlx::query(
+        "INSERT INTO plans \
+             (plan_id, user_id, goal, phase, version, plan_json, progress_pct, \
+              subtask_count, created_by, created_at, updated_at) \
+         VALUES (?, ?, 'mig', 'planning', 1, '{}', 0, 0, ?, NOW(6), NOW(6))",
+    )
+    .bind(&plan_id)
+    .bind(&user)
+    .bind(&user)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Two rows share the same (plan_id, subtask_id=s1, attempt=1). Without
+    // the UNIQUE (dropped above) both INSERTs succeed.
+    let run_keep = format!("aaa-{}", Uuid::new_v4().simple());
+    let run_drop = format!("zzz-{}", Uuid::new_v4().simple());
+    for rid in [&run_keep, &run_drop] {
+        sqlx::query(
+            "INSERT INTO plan_step_runs \
+                 (run_id, plan_id, subtask_id, attempt, status, session_id, \
+                  started_at, request_id) \
+             VALUES (?, ?, 's1', 1, 'completed', 'sess', NOW(6), 'req')",
+        )
+        .bind(rid)
+        .bind(&plan_id)
+        .execute(&pool)
+        .await
+        .expect("duplicate seed must succeed while UNIQUE is absent");
+    }
+
+    // Verify the seed actually landed both rows.
+    let before: i64 = scalar_i64(
+        &pool,
+        "SELECT COUNT(*) FROM plan_step_runs WHERE plan_id = ?",
+        &plan_id,
+    )
+    .await;
+    assert_eq!(before, 2, "expected two dup rows before dedupe");
+
+    // Re-run ensure_core_schema — migrations 7 (dedupe) and 8 (add UNIQUE)
+    // must run in that order. schema_migrations already has them marked as
+    // applied from the first call, so we mark them unapplied to force re-run.
+    sqlx::query("DELETE FROM schema_migrations WHERE version IN (7, 8)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let settings = require_db_it_env();
+    ensure_core_schema(&settings)
+        .await
+        .expect("migrations must succeed even with pre-existing duplicates");
+
+    // Exactly one row survives — the smallest run_id lexicographically,
+    // which is `run_keep` (prefix "aaa-").
+    let after: i64 = scalar_i64(
+        &pool,
+        "SELECT COUNT(*) FROM plan_step_runs WHERE plan_id = ?",
+        &plan_id,
+    )
+    .await;
+    assert_eq!(after, 1, "dedupe must leave one row per attempt tuple");
+
+    let kept: String =
+        sqlx::query_scalar("SELECT run_id FROM plan_step_runs WHERE plan_id = ? LIMIT 1")
+            .bind(&plan_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        kept, run_keep,
+        "dedupe must keep the smallest run_id, got {kept}"
+    );
+
+    // And migration 8 recorded its success row (SELECT from
+    // schema_migrations) so the next boot won't try to re-run the ALTER.
+    let applied: i64 = scalar_i64(
+        &pool,
+        "SELECT COUNT(*) FROM schema_migrations WHERE version = ?",
+        "8",
+    )
+    .await;
+    assert_eq!(applied, 1, "migration 8 must be recorded as applied");
+
+    // `record_step_run` uniqueness is exercised end-to-end by the repo-level
+    // test `record_step_run_rejects_duplicate_plan_subtask_attempt_tuple`,
+    // so we don't re-probe MatrixOne's UNIQUE enforcement here — this test
+    // owns the dedupe + migration invariant only.
+
+    cleanup(&pool, &plan_id).await;
+}
+
+/// `error` and `artifact_ref` are TEXT/VARCHAR columns — unbounded client
+/// strings are an edge-side DoS vector. The sync endpoint caps them.
+#[tokio::test]
+#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+async fn push_plans_pack_rejects_step_run_with_oversized_error_string() {
+    let pool = setup_pool().await;
+    let svc = MatrixOneSyncService::new(pool.clone());
+    let user = format!("u-big-{}", Uuid::new_v4().simple());
+    let plan_id = format!("pit-big-{}", Uuid::new_v4().simple());
+    let session_id = format!("sit-big-{}", Uuid::new_v4().simple());
+    cleanup(&pool, &plan_id).await;
+
+    let plan = row_for(&user, &plan_id, 1, "big");
+    let mut run = step_for(
+        &plan_id,
+        &format!("run-{}", Uuid::new_v4().simple()),
+        &session_id,
+        1,
+    );
+    run.error = Some("E".repeat(50_000));
+
+    let pack = serde_json::json!({
+        "plans": [plan],
+        "step_runs": [run],
+    })
+    .to_string();
+    let _ = svc.push_plans_pack(&user, &pack).await;
+    let count: i64 = scalar_i64(
+        &pool,
+        "SELECT COUNT(*) FROM plan_step_runs WHERE plan_id = ?",
+        &plan_id,
+    )
+    .await;
+    assert_eq!(
+        count, 0,
+        "run with 50k error string must be rejected (audit bloat DoS)"
+    );
+
+    cleanup(&pool, &plan_id).await;
+}

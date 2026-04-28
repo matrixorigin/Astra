@@ -1416,23 +1416,26 @@ async fn run_migration(
         return Ok(());
     }
 
-    // Idempotent migrations: ALTER ADD COLUMN on a table whose CREATE already
-    // includes that column (fresh DB) returns MySQL error 1060 "Duplicate
-    // column name"; ADD INDEX on an existing index returns 1061. DROP INDEX
-    // on a non-existent index returns 1091 — happens when a fresh DB created
-    // the table with the new index name directly, so there's nothing to drop.
-    // Treat all three as "already in desired state" and record the migration
-    // so we don't retry on next boot.
+    // Idempotent migrations need tolerance for vendor-specific error codes
+    // when the target is already in the desired state:
+    //   * 1060 — ALTER ADD COLUMN on an existing column (fresh DB where
+    //     CREATE TABLE already installed it).
+    //   * 1061 — ALTER ADD INDEX on an existing index (same reason).
+    //   * 1091 — MySQL's "Can't DROP; check column/key exists".
+    //   * 20101 — MatrixOne's internal error for the same DROP-missing case.
+    //   * 1062 — duplicate key value on an index being added; handled by
+    //     explicit dedupe migrations, not here.
     //
-    // MySQL's SQLSTATE is a generic "HY000" for these — the real signal is the
-    // numeric error code, which we read via downcast to `MySqlDatabaseError`.
+    // MySQL's SQLSTATE is a generic "HY000" for these; the real signal is
+    // the numeric error code, which we read via downcast to the driver's
+    // `MySqlDatabaseError`.
     match query(sql).execute(pool).await {
         Ok(_) => {}
         Err(sqlx::Error::Database(db_err)) => {
             let number = db_err
                 .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
                 .map(|e| e.number());
-            if matches!(number, Some(1060) | Some(1061) | Some(1091)) {
+            if matches!(number, Some(1060) | Some(1061) | Some(1091) | Some(20101)) {
                 // Already present (or already absent for DROP) — fresh DB
                 // created the schema via CREATE TABLE. Record and continue.
             } else {
@@ -1501,10 +1504,17 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
     // `redo_step` calls would each compute `next_attempt = max+1` from a
     // stale read and both insert the same tuple; the UNIQUE index makes
     // exactly one INSERT win so `record_step_run` can surface a Conflict.
-    // Migration 6 drops the previous non-unique index, 7 installs the
-    // UNIQUE replacement. The 1091 (drop non-existent) and 1061 (add
-    // duplicate) tolerances in `run_migration` keep fresh DBs happy where
-    // the CREATE TABLE already installed the uniqueness directly.
+    //
+    // Migrations 6-8 are sequenced for safety on DBs that already
+    // accumulated duplicates under the prior non-unique index:
+    //   6: drop the old non-unique index (1091/20101 tolerance covers the
+    //      fresh-DB case where CREATE TABLE never installed it).
+    //   7: DELETE duplicate rows, keeping the lexicographically smallest
+    //      run_id per (plan_id, subtask_id, attempt). Idempotent — on a
+    //      DB with no dupes this is a no-op DELETE.
+    //   8: ADD UNIQUE. With 7 finished no 1062 can occur; the 1061
+    //      tolerance handles fresh DBs whose CREATE TABLE already installed
+    //      the unique key.
     run_migration(
         pool,
         6,
@@ -1516,6 +1526,23 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
     run_migration(
         pool,
         7,
+        "dedupe plan_step_runs on (plan_id, subtask_id, attempt) keeping oldest run_id",
+        // MatrixOne silently no-ops the MySQL `DELETE t FROM t JOIN ...`
+        // form, so we use a NOT IN subquery. Plain MySQL also forbids
+        // SELECT from the same target table in a direct subquery, which we
+        // dodge by wrapping the GROUP BY in a derived table.
+        "DELETE FROM plan_step_runs WHERE run_id NOT IN ( \
+             SELECT keep_id FROM ( \
+                 SELECT MIN(run_id) AS keep_id FROM plan_step_runs \
+                 GROUP BY plan_id, subtask_id, attempt \
+             ) keep \
+         )",
+    )
+    .await?;
+
+    run_migration(
+        pool,
+        8,
         "add UNIQUE (plan_id, subtask_id, attempt) on plan_step_runs",
         "ALTER TABLE plan_step_runs \
          ADD UNIQUE KEY uq_step_runs_subtask_attempt (plan_id, subtask_id, attempt)",
