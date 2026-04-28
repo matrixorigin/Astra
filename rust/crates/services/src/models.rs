@@ -818,16 +818,15 @@ pub async fn validate_connectivity(
         return None;
     }
 
-    // Disable env-proxy for connectivity probes. Matches the policy established in
-    // commit 3e3d6fa8 ("centralize env proxy in LLM client"): connectivity probes
-    // target provider endpoints directly and must not be rerouted through
-    // HTTP(S)_PROXY / ALL_PROXY env vars, which can silently break probes in
-    // corporate environments and leak internal endpoints in others.
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .no_proxy()
-        .build()
-    {
+    // Connectivity probes reach external provider endpoints (Anthropic, Bedrock,
+    // OpenAI-compatible base_urls) — same class of traffic as the LLM client.
+    // They are NOT "internal connections" in the sense of 3e3d6fa8, so they
+    // share the LLM client's proxy policy via the single authoritative
+    // implementation in `astra_core::net::apply_env_proxy`.
+    let probe_builder = astra_core::net::apply_env_proxy(
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
+    );
+    let client = match probe_builder.build() {
         Ok(c) => c,
         Err(e) => return Some(format!("Client error: {}", e)),
     };

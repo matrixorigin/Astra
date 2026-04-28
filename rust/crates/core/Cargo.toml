@@ -7,6 +7,7 @@ edition.workspace = true
 axum.workspace = true
 chrono.workspace = true
 dotenvy.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
@@ -14,6 +15,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+temp-env = "0.3"
 
 [features]
 dev-defaults = []

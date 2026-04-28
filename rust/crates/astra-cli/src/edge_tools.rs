@@ -443,11 +443,16 @@ impl ToolExecutor {
             // TODO: Consider using a zeroize-capable wrapper for tokens to prevent
             // memory-resident secrets from lingering after drop.
             github_token: astra_tools::github::resolve_github_token(),
-            github_client: Client::builder()
-                .timeout(Duration::from_secs(15))
-                .user_agent(format!("astra/{}", env!("CARGO_PKG_VERSION")))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            // GitHub API is external traffic (api.github.com), so it honours
+            // HTTPS_PROXY/ALL_PROXY via the authoritative helper in astra_core::net.
+            // See core/src/net.rs for the workspace proxy policy (3e3d6fa8).
+            github_client: astra_core::net::apply_env_proxy(
+                Client::builder()
+                    .timeout(Duration::from_secs(15))
+                    .user_agent(format!("astra/{}", env!("CARGO_PKG_VERSION"))),
+            )
+            .build()
+            .unwrap_or_else(|_| Client::new()),
             sandbox_policy: std::sync::RwLock::new(Some(sandbox)),
             preferred_repos: std::sync::Mutex::new(preferred_repos),
             budget_pressure: std::sync::Mutex::new(0.0),
@@ -1670,4 +1675,44 @@ mod tests {
     mod utf16_tests;
     mod web_search_tests;
     mod worktree_tests;
+
+    /// Regression test for 3e3d6fa8 proxy policy:
+    /// `github_client` targets api.github.com (external traffic), so it must
+    /// honour HTTPS_PROXY/ALL_PROXY via `astra_core::net::apply_env_proxy`.
+    /// Before the fix, this builder silently inherited reqwest's default env
+    /// handling without NO_PROXY / socks5 / tracing parity with the LLM client.
+    ///
+    /// We can't introspect reqwest's internal proxy config, so we assert the
+    /// observable contract: (a) the builder constructs successfully under a
+    /// variety of proxy envs (NO_PROXY, malformed, socks5 via ALL_PROXY), and
+    /// (b) `ToolExecutor::new` never panics when those envs are set — which
+    /// was the actual risk if a caller forgot to call `apply_env_proxy` and
+    /// reqwest rejected a malformed env URL at build time.
+    #[test]
+    fn github_client_honours_proxy_env_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // valid https proxy
+        temp_env::with_var("HTTPS_PROXY", Some("http://proxy.example:8080"), || {
+            let _ = ToolExecutor::new(dir.path());
+        });
+        // socks5 via ALL_PROXY (parity with LLM client regression)
+        temp_env::with_var("ALL_PROXY", Some("socks5://127.0.0.1:1080"), || {
+            let _ = ToolExecutor::new(dir.path());
+        });
+        // malformed must not panic (apply_env_proxy swallows parse errors)
+        temp_env::with_var("HTTPS_PROXY", Some("not a url"), || {
+            let _ = ToolExecutor::new(dir.path());
+        });
+        // NO_PROXY honoured
+        temp_env::with_vars(
+            [
+                ("HTTPS_PROXY", Some("http://proxy.example:8080")),
+                ("NO_PROXY", Some("api.github.com")),
+            ],
+            || {
+                let _ = ToolExecutor::new(dir.path());
+            },
+        );
+    }
 }
