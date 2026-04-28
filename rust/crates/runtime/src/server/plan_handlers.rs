@@ -771,7 +771,25 @@ pub(super) async fn rewind_plan_handler(
 
     let idx = resolve_rewind_start_index(&plan_state.plan, &anchor_parsed)
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, e))?;
+
+    // Capture the IDs of the subtasks that are about to be reset — any
+    // in-flight step_runs for them need to be cancelled so the audit trail
+    // doesn't carry phantom "in_progress" rows once the plan resumes.
+    let affected_subtask_ids: Vec<String> = plan_state
+        .plan
+        .subtasks
+        .iter()
+        .skip(idx)
+        .map(|s| s.id.clone())
+        .collect();
+
     let reset_count = rewind_plan_from_subtask(&mut plan_state.plan, idx);
+
+    let aborted_runs = state
+        .plan_repo
+        .abort_open_step_runs(&plan_id, &affected_subtask_ids)
+        .await
+        .map_err(map_plan_load_err)?;
 
     plan_state
         .timeline
@@ -800,6 +818,7 @@ pub(super) async fn rewind_plan_handler(
                 "anchor": anchor,
                 "from_idx": idx,
                 "reset_count": reset_count,
+                "aborted_runs": aborted_runs,
                 "reason": req.reason,
                 "version": plan_state.version,
             })),
@@ -850,6 +869,17 @@ pub(super) async fn redo_step_handler(
     let title = plan_state.plan.subtasks[idx].title.clone();
     let resolved_subtask_id = plan_state.plan.subtasks[idx].id.clone();
 
+    // Cancel any open step_run for this subtask first — otherwise the
+    // attempt counter below would skip ahead of a still-running row that
+    // later finalizes and creates an attempt-number overlap. Must run
+    // before `list_step_runs` to keep the max-attempt read consistent with
+    // the state we just rolled back to.
+    let aborted_runs = state
+        .plan_repo
+        .abort_open_step_runs(&plan_id, std::slice::from_ref(&resolved_subtask_id))
+        .await
+        .map_err(map_plan_load_err)?;
+
     // Compute the next attempt number by counting prior runs for this subtask.
     // The LocalCachePlanRepository returns an empty vec so attempt starts at 1
     // there — that's fine for offline/test paths.
@@ -886,6 +916,7 @@ pub(super) async fn redo_step_handler(
                 "subtask_id": resolved_subtask_id,
                 "title": title,
                 "attempt": next_attempt,
+                "aborted_runs": aborted_runs,
                 "version": plan_state.version,
             })),
         ),

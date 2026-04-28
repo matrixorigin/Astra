@@ -869,7 +869,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             error        TEXT NULL,
             artifact_ref VARCHAR(255) NULL,
             INDEX idx_step_runs_plan_started (plan_id, started_at DESC),
-            INDEX idx_step_runs_subtask_attempt (plan_id, subtask_id, attempt),
+            UNIQUE KEY uq_step_runs_subtask_attempt (plan_id, subtask_id, attempt),
             INDEX idx_step_runs_session (session_id, started_at DESC)
         )",
     )
@@ -1494,6 +1494,31 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
         "add index on agent_sessions.active_plan_id for cascade clears",
         "ALTER TABLE agent_sessions \
          ADD INDEX idx_agent_sessions_active_plan_id (active_plan_id)",
+    )
+    .await?;
+
+    // Enforce uniqueness on (plan_id, subtask_id, attempt). Two concurrent
+    // `redo_step` calls would each compute `next_attempt = max+1` from a
+    // stale read and both insert the same tuple; the UNIQUE index makes
+    // exactly one INSERT win so `record_step_run` can surface a Conflict.
+    // Migration 6 drops the previous non-unique index, 7 installs the
+    // UNIQUE replacement. The 1091 (drop non-existent) and 1061 (add
+    // duplicate) tolerances in `run_migration` keep fresh DBs happy where
+    // the CREATE TABLE already installed the uniqueness directly.
+    run_migration(
+        pool,
+        6,
+        "drop non-unique idx_step_runs_subtask_attempt before upgrading to UNIQUE",
+        "ALTER TABLE plan_step_runs DROP INDEX idx_step_runs_subtask_attempt",
+    )
+    .await?;
+
+    run_migration(
+        pool,
+        7,
+        "add UNIQUE (plan_id, subtask_id, attempt) on plan_step_runs",
+        "ALTER TABLE plan_step_runs \
+         ADD UNIQUE KEY uq_step_runs_subtask_attempt (plan_id, subtask_id, attempt)",
     )
     .await?;
 

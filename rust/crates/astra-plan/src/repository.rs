@@ -167,6 +167,23 @@ pub trait PlanRepository: Send + Sync {
         subtask_id: Option<&str>,
         limit: i32,
     ) -> Result<Vec<PlanStepRun>, PlanLoadError>;
+
+    /// Finalize every open (`finished_at IS NULL`) step-run for the given
+    /// subtasks in one statement, marking them as `cancelled`.
+    ///
+    /// Called by `rewind` and `redo_step` handlers so resetting a subtask's
+    /// in-process state also closes its open audit row — otherwise the run
+    /// sits `in_progress` forever and the attempt counter in a later redo
+    /// sees stale max-attempt values. Returns the number of rows closed.
+    ///
+    /// Already-finalized rows are never touched (the UPDATE filters on
+    /// `finished_at IS NULL`), keeping the table append-only-with-
+    /// terminal-edit semantics.
+    async fn abort_open_step_runs(
+        &self,
+        plan_id: &str,
+        subtask_ids: &[String],
+    ) -> Result<u64, PlanLoadError>;
 }
 
 /// Filter for [`PlanRepository::list_for_user`].
@@ -213,6 +230,28 @@ fn infer_phase_for_persist(state: &PlanModeState) -> &'static str {
 
 fn map_sqlx(err: sqlx::Error) -> PlanLoadError {
     PlanLoadError::Internal(format!("sql error: {err}"))
+}
+
+/// Translate the MySQL duplicate-key error (1062) raised by the unique
+/// `(plan_id, subtask_id, attempt)` index on `plan_step_runs` into
+/// [`PlanLoadError::Conflict`]. This happens when two concurrent redos
+/// compute the same `next_attempt` and race to INSERT — exactly one must win.
+fn map_step_run_insert_error(
+    err: sqlx::Error,
+    _plan_id: &str,
+    _subtask_id: &str,
+    attempt: i32,
+) -> PlanLoadError {
+    if let sqlx::Error::Database(db_err) = &err
+        && let Some(my) = db_err.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+        && my.number() == 1062
+    {
+        return PlanLoadError::Conflict {
+            expected: attempt as u64,
+            actual: attempt as u64,
+        };
+    }
+    map_sqlx(err)
 }
 
 #[async_trait]
@@ -550,7 +589,7 @@ impl PlanRepository for CloudPlanRepository {
 
     async fn record_step_run(&self, input: NewStepRun<'_>) -> Result<String, PlanLoadError> {
         let run_id = Uuid::new_v4().to_string();
-        sqlx::query(
+        let res = sqlx::query(
             "INSERT INTO plan_step_runs \
                  (run_id, plan_id, subtask_id, attempt, status, session_id, \
                   started_at, request_id) \
@@ -564,9 +603,16 @@ impl PlanRepository for CloudPlanRepository {
         .bind(input.session_id)
         .bind(input.request_id)
         .execute(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
-        Ok(run_id)
+        .await;
+        match res {
+            Ok(_) => Ok(run_id),
+            Err(e) => Err(map_step_run_insert_error(
+                e,
+                input.plan_id,
+                input.subtask_id,
+                input.attempt,
+            )),
+        }
     }
 
     async fn record_completed_step_run(
@@ -576,7 +622,7 @@ impl PlanRepository for CloudPlanRepository {
         artifact_ref: Option<&str>,
     ) -> Result<String, PlanLoadError> {
         let run_id = Uuid::new_v4().to_string();
-        sqlx::query(
+        let res = sqlx::query(
             "INSERT INTO plan_step_runs \
                  (run_id, plan_id, subtask_id, attempt, status, session_id, \
                   started_at, finished_at, request_id, error, artifact_ref) \
@@ -592,9 +638,16 @@ impl PlanRepository for CloudPlanRepository {
         .bind(error)
         .bind(artifact_ref)
         .execute(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
-        Ok(run_id)
+        .await;
+        match res {
+            Ok(_) => Ok(run_id),
+            Err(e) => Err(map_step_run_insert_error(
+                e,
+                input.plan_id,
+                input.subtask_id,
+                input.attempt,
+            )),
+        }
     }
 
     async fn finalize_step_run(
@@ -638,13 +691,17 @@ impl PlanRepository for CloudPlanRepository {
         PlanModeState::validate_plan_id(plan_id)?;
         let limit = limit.clamp(1, 1000);
 
+        // Stable order: newest started_at first, `run_id` ASC as the
+        // tiebreaker. Without this, two runs inserted in the same microsecond
+        // (same NOW(6) under load) come back in an arbitrary order, so a
+        // client paging by limit could see duplicates or skips.
         let rows = if let Some(sid) = subtask_id {
             sqlx::query(
                 "SELECT run_id, plan_id, subtask_id, attempt, status, session_id, \
                         started_at, finished_at, request_id, error, artifact_ref \
                  FROM plan_step_runs \
                  WHERE plan_id = ? AND subtask_id = ? \
-                 ORDER BY started_at DESC LIMIT ?",
+                 ORDER BY started_at DESC, run_id ASC LIMIT ?",
             )
             .bind(plan_id)
             .bind(sid)
@@ -657,7 +714,7 @@ impl PlanRepository for CloudPlanRepository {
                         started_at, finished_at, request_id, error, artifact_ref \
                  FROM plan_step_runs \
                  WHERE plan_id = ? \
-                 ORDER BY started_at DESC LIMIT ?",
+                 ORDER BY started_at DESC, run_id ASC LIMIT ?",
             )
             .bind(plan_id)
             .bind(limit)
@@ -685,6 +742,38 @@ impl PlanRepository for CloudPlanRepository {
             });
         }
         Ok(out)
+    }
+
+    async fn abort_open_step_runs(
+        &self,
+        plan_id: &str,
+        subtask_ids: &[String],
+    ) -> Result<u64, PlanLoadError> {
+        PlanModeState::validate_plan_id(plan_id)?;
+        if subtask_ids.is_empty() {
+            return Ok(0);
+        }
+
+        // Build an `IN (?, ?, ...)` clause sized to the input. All values are
+        // bound via `.bind()` — only the placeholder count is string-
+        // formatted, so no injection surface.
+        let placeholders = std::iter::repeat_n("?", subtask_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE plan_step_runs \
+             SET status = ?, finished_at = NOW(6) \
+             WHERE plan_id = ? AND finished_at IS NULL \
+               AND subtask_id IN ({placeholders})"
+        );
+        let mut q = sqlx::query(&sql)
+            .bind(TaskStatus::Cancelled.as_str())
+            .bind(plan_id);
+        for sid in subtask_ids {
+            q = q.bind(sid);
+        }
+        let result = q.execute(&self.pool).await.map_err(map_sqlx)?;
+        Ok(result.rows_affected())
     }
 }
 
@@ -798,6 +887,15 @@ impl PlanRepository for LocalCachePlanRepository {
         _limit: i32,
     ) -> Result<Vec<PlanStepRun>, PlanLoadError> {
         Ok(Vec::new())
+    }
+
+    async fn abort_open_step_runs(
+        &self,
+        _plan_id: &str,
+        _subtask_ids: &[String],
+    ) -> Result<u64, PlanLoadError> {
+        // Local cache doesn't track step_runs, so nothing to abort.
+        Ok(0)
     }
 }
 

@@ -5007,6 +5007,13 @@ esac
         ) -> Result<Vec<astra_plan::PlanStepRun>, astra_plan::PlanLoadError> {
             self.inner.list_step_runs(plan_id, subtask_id, limit).await
         }
+        async fn abort_open_step_runs(
+            &self,
+            plan_id: &str,
+            subtask_ids: &[String],
+        ) -> Result<u64, astra_plan::PlanLoadError> {
+            self.inner.abort_open_step_runs(plan_id, subtask_ids).await
+        }
     }
 
     #[tokio::test]

@@ -1046,3 +1046,295 @@ async fn session_hint_round_trips_through_load() {
     cleanup_plans(&pool, &plan_id).await;
     cleanup_sessions(&pool, "sit-hint-").await;
 }
+
+// ── Deep-review regressions (round 2) ────────────────────────────────────────
+
+/// Rewind / redo must not leave step_runs stuck as `in_progress` when the
+/// subtask itself is reset to pending — otherwise the audit chain says "still
+/// running" forever and future `list_step_runs` attempt counting breaks.
+#[tokio::test]
+#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+async fn abort_open_step_runs_closes_unfinished_attempts_for_subtask() {
+    let (repo, pool) = setup_repo().await;
+    let user = format!("u-abort-{}", Uuid::new_v4().simple());
+    let sess = format!("sit-abort-{}", Uuid::new_v4().simple());
+    let plan_id = format!("pit-abort-{}", Uuid::new_v4().simple());
+    cleanup_plans(&pool, &plan_id).await;
+    cleanup_sessions(&pool, "sit-abort-").await;
+    ensure_session(&pool, &sess, &user).await;
+
+    let mut state = make_state_with_subtasks(&user, "abort", &["a", "b"]);
+    repo.save(&plan_id, &mut state, None).await.unwrap();
+
+    // Open one in-flight run per subtask, plus one already-finalized on `a`.
+    let run_a_open = repo
+        .record_step_run(NewStepRun {
+            plan_id: &plan_id,
+            subtask_id: "a",
+            attempt: 1,
+            status: TaskStatus::InProgress,
+            session_id: &sess,
+            request_id: "req-a",
+        })
+        .await
+        .unwrap();
+    let run_a_done = repo
+        .record_completed_step_run(
+            NewStepRun {
+                plan_id: &plan_id,
+                subtask_id: "a",
+                attempt: 2,
+                status: TaskStatus::Completed,
+                session_id: &sess,
+                request_id: "req-a-2",
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let run_b_open = repo
+        .record_step_run(NewStepRun {
+            plan_id: &plan_id,
+            subtask_id: "b",
+            attempt: 1,
+            status: TaskStatus::InProgress,
+            session_id: &sess,
+            request_id: "req-b",
+        })
+        .await
+        .unwrap();
+
+    // Abort only "a"'s open runs. Must finalize `run_a_open` (cancelled) but
+    // leave `run_b_open` untouched and `run_a_done` untouched.
+    let aborted = repo
+        .abort_open_step_runs(&plan_id, &["a".to_string()])
+        .await
+        .expect("abort_open_step_runs");
+    assert_eq!(aborted, 1, "exactly one open run on `a` must be aborted");
+
+    let rows_a = repo.list_step_runs(&plan_id, Some("a"), 10).await.unwrap();
+    let open_a = rows_a
+        .iter()
+        .find(|r| r.run_id == run_a_open)
+        .expect("run_a_open present");
+    assert!(
+        open_a.finished_at.is_some(),
+        "aborted run must have finished_at set"
+    );
+    assert_eq!(
+        open_a.status,
+        TaskStatus::Cancelled,
+        "aborted run must land in Cancelled status"
+    );
+    let done_a = rows_a
+        .iter()
+        .find(|r| r.run_id == run_a_done)
+        .expect("run_a_done present");
+    assert_eq!(
+        done_a.status,
+        TaskStatus::Completed,
+        "already-finalized run must not be re-touched"
+    );
+
+    let rows_b = repo.list_step_runs(&plan_id, Some("b"), 10).await.unwrap();
+    let open_b = rows_b
+        .iter()
+        .find(|r| r.run_id == run_b_open)
+        .expect("run_b still open");
+    assert!(
+        open_b.finished_at.is_none(),
+        "b's open run must be untouched when aborting only `a`"
+    );
+
+    cleanup_plans(&pool, &plan_id).await;
+    cleanup_sessions(&pool, "sit-abort-").await;
+}
+
+/// Two simultaneous `record_step_run` calls with the same (plan_id,
+/// subtask_id, attempt) must not both succeed — the tuple is a unique audit
+/// key. Prevents a race in `redo_step` where two concurrent calls compute the
+/// same `next_attempt` and both insert.
+#[tokio::test]
+#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+async fn record_step_run_rejects_duplicate_plan_subtask_attempt_tuple() {
+    let (repo, pool) = setup_repo().await;
+    let user = format!("u-dup-{}", Uuid::new_v4().simple());
+    let sess = format!("sit-dup-{}", Uuid::new_v4().simple());
+    let plan_id = format!("pit-dup-{}", Uuid::new_v4().simple());
+    cleanup_plans(&pool, &plan_id).await;
+    cleanup_sessions(&pool, "sit-dup-").await;
+    ensure_session(&pool, &sess, &user).await;
+
+    let mut state = make_state_with_subtasks(&user, "dup", &["x"]);
+    repo.save(&plan_id, &mut state, None).await.unwrap();
+
+    // First insert wins.
+    repo.record_step_run(NewStepRun {
+        plan_id: &plan_id,
+        subtask_id: "x",
+        attempt: 1,
+        status: TaskStatus::InProgress,
+        session_id: &sess,
+        request_id: "req-1",
+    })
+    .await
+    .expect("first insert ok");
+
+    // Second insert with identical (plan_id, subtask_id, attempt) must error.
+    let err = repo
+        .record_step_run(NewStepRun {
+            plan_id: &plan_id,
+            subtask_id: "x",
+            attempt: 1,
+            status: TaskStatus::InProgress,
+            session_id: &sess,
+            request_id: "req-2",
+        })
+        .await
+        .expect_err("duplicate attempt tuple must be rejected");
+    // Error variant should be Conflict (unique constraint violated).
+    assert!(
+        matches!(err, PlanLoadError::Conflict { .. }),
+        "expected Conflict, got {err:?}"
+    );
+
+    // Verify via raw SELECT that there is exactly one row.
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM plan_step_runs WHERE plan_id = ? AND attempt = ?")
+            .bind(&plan_id)
+            .bind(1_i32)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 1, "only the first attempt=1 row must persist");
+
+    cleanup_plans(&pool, &plan_id).await;
+    cleanup_sessions(&pool, "sit-dup-").await;
+}
+
+/// Pagination stability: with identical `started_at` values, `list_step_runs`
+/// must return rows in a deterministic order so a client scrolling by limit
+/// never sees duplicates or skipped rows. Tiebreaker is `run_id` ascending.
+#[tokio::test]
+#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+async fn list_step_runs_order_is_stable_on_identical_started_at() {
+    let (repo, pool) = setup_repo().await;
+    let user = format!("u-stab-{}", Uuid::new_v4().simple());
+    let sess = format!("sit-stab-{}", Uuid::new_v4().simple());
+    let plan_id = format!("pit-stab-{}", Uuid::new_v4().simple());
+    cleanup_plans(&pool, &plan_id).await;
+    cleanup_sessions(&pool, "sit-stab-").await;
+    ensure_session(&pool, &sess, &user).await;
+
+    let mut state = make_state_with_subtasks(&user, "stab", &["x"]);
+    repo.save(&plan_id, &mut state, None).await.unwrap();
+
+    // Record several runs with DIFFERENT attempt numbers (the unique index
+    // forbids duplicate tuples) but clamp started_at to the same value via a
+    // raw UPDATE afterwards. This simulates the real-world case where
+    // NOW(6) produces identical microsecond-precision timestamps under load.
+    let mut run_ids = Vec::new();
+    for attempt in 1..=5 {
+        let rid = repo
+            .record_step_run(NewStepRun {
+                plan_id: &plan_id,
+                subtask_id: "x",
+                attempt,
+                status: TaskStatus::InProgress,
+                session_id: &sess,
+                request_id: "req",
+            })
+            .await
+            .unwrap();
+        run_ids.push(rid);
+    }
+    sqlx::query(
+        "UPDATE plan_step_runs SET started_at = '2026-01-01 00:00:00.000000' WHERE plan_id = ?",
+    )
+    .bind(&plan_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // List three times; expect identical ordering each call.
+    let first = repo.list_step_runs(&plan_id, Some("x"), 10).await.unwrap();
+    let second = repo.list_step_runs(&plan_id, Some("x"), 10).await.unwrap();
+    let third = repo.list_step_runs(&plan_id, Some("x"), 10).await.unwrap();
+    let first_ids: Vec<_> = first.iter().map(|r| r.run_id.clone()).collect();
+    let second_ids: Vec<_> = second.iter().map(|r| r.run_id.clone()).collect();
+    let third_ids: Vec<_> = third.iter().map(|r| r.run_id.clone()).collect();
+    assert_eq!(first_ids, second_ids, "order must be stable across calls");
+    assert_eq!(first_ids, third_ids, "order must be stable across calls");
+
+    // And the tiebreaker must be `run_id` ASC when started_at ties (so a
+    // caller can page by (started_at, run_id) without seeing dup/skip).
+    let mut sorted_by_runid = first_ids.clone();
+    sorted_by_runid.sort();
+    assert_eq!(
+        first_ids, sorted_by_runid,
+        "tiebreaker on identical started_at must be run_id ASC; got {:?}",
+        first_ids
+    );
+
+    cleanup_plans(&pool, &plan_id).await;
+    cleanup_sessions(&pool, "sit-stab-").await;
+}
+
+/// `record_completed_step_run` must also respect the (plan_id, subtask_id,
+/// attempt) uniqueness — otherwise the happy-path shortcut bypasses the new
+/// guard.
+#[tokio::test]
+#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+async fn record_completed_step_run_rejects_duplicate_attempt_tuple() {
+    let (repo, pool) = setup_repo().await;
+    let user = format!("u-cdup-{}", Uuid::new_v4().simple());
+    let sess = format!("sit-cdup-{}", Uuid::new_v4().simple());
+    let plan_id = format!("pit-cdup-{}", Uuid::new_v4().simple());
+    cleanup_plans(&pool, &plan_id).await;
+    cleanup_sessions(&pool, "sit-cdup-").await;
+    ensure_session(&pool, &sess, &user).await;
+
+    let mut state = make_state_with_subtasks(&user, "cdup", &["y"]);
+    repo.save(&plan_id, &mut state, None).await.unwrap();
+
+    // First completed-shortcut wins.
+    repo.record_completed_step_run(
+        NewStepRun {
+            plan_id: &plan_id,
+            subtask_id: "y",
+            attempt: 1,
+            status: TaskStatus::Completed,
+            session_id: &sess,
+            request_id: "req-1",
+        },
+        None,
+        None,
+    )
+    .await
+    .expect("first completed insert ok");
+
+    // Same tuple again via the shortcut path must reject.
+    let err = repo
+        .record_completed_step_run(
+            NewStepRun {
+                plan_id: &plan_id,
+                subtask_id: "y",
+                attempt: 1,
+                status: TaskStatus::Completed,
+                session_id: &sess,
+                request_id: "req-2",
+            },
+            None,
+            None,
+        )
+        .await
+        .expect_err("duplicate attempt tuple must be rejected on shortcut too");
+    assert!(
+        matches!(err, PlanLoadError::Conflict { .. }),
+        "expected Conflict, got {err:?}"
+    );
+
+    cleanup_plans(&pool, &plan_id).await;
+    cleanup_sessions(&pool, "sit-cdup-").await;
+}

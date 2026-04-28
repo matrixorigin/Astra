@@ -898,3 +898,100 @@ async fn exit_plan_mode_records_lifecycle_decision() {
 
     cleanup_plan(&pool, &plan_id).await;
 }
+
+/// Regression for round-2 review finding: rewind was resetting subtasks to
+/// Pending but leaving open `plan_step_runs` rows with `finished_at IS NULL`.
+/// The orphaned audit rows would skew attempt counters and make stall
+/// detectors think the subtask was still executing. Handler must now cancel
+/// any open runs for the reset suffix.
+#[tokio::test]
+#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+async fn rewind_cancels_open_step_runs_for_reset_subtasks() {
+    let (app, pool) = setup_app().await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-rewind-abort", &["a", "b", "c"]).await;
+    let session_id = format!("sit-rewind-abort-{}", Uuid::new_v4().simple());
+    ensure_session(&pool, &session_id).await;
+
+    // Start open runs on b and c (they are the ones rewind will touch).
+    // Leave a with a completed run so we can verify it stays intact.
+    let (_s, body_a) = request_json(
+        app.clone(),
+        "POST",
+        &format!("/plans/{plan_id}/step-runs"),
+        Some(json!({ "subtask_id": "a", "session_id": session_id, "request_id": "req-a", "attempt": 1 })),
+    )
+    .await;
+    let run_a = body_a["run_id"].as_str().unwrap().to_string();
+    let _ = request_json(
+        app.clone(),
+        "POST",
+        &format!("/plans/{plan_id}/step-runs/{run_a}/finish"),
+        Some(json!({ "status": "completed" })),
+    )
+    .await;
+
+    let (_, body_b) = request_json(
+        app.clone(),
+        "POST",
+        &format!("/plans/{plan_id}/step-runs"),
+        Some(json!({ "subtask_id": "b", "session_id": session_id, "request_id": "req-b", "attempt": 1 })),
+    )
+    .await;
+    let run_b = body_b["run_id"].as_str().unwrap().to_string();
+    let (_, body_c) = request_json(
+        app.clone(),
+        "POST",
+        &format!("/plans/{plan_id}/step-runs"),
+        Some(json!({ "subtask_id": "c", "session_id": session_id, "request_id": "req-c", "attempt": 1 })),
+    )
+    .await;
+    let run_c = body_c["run_id"].as_str().unwrap().to_string();
+
+    // Rewind from anchor=2 → reset suffix (b, c); a stays completed.
+    let (s, body) = request_json(
+        app.clone(),
+        "POST",
+        &format!("/plans/{plan_id}/rewind"),
+        Some(json!({ "anchor": "2", "reason": "restart b+c" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+
+    // b and c's runs must be cancelled (finalized).
+    let row_b = sqlx::query("SELECT status, finished_at FROM plan_step_runs WHERE run_id = ?")
+        .bind(&run_b)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let b_status: String = row_b.try_get("status").unwrap();
+    let b_finished: Option<chrono::DateTime<chrono::Utc>> = row_b.try_get("finished_at").unwrap();
+    assert_eq!(
+        b_status, "cancelled",
+        "b's open run must be cancelled by rewind"
+    );
+    assert!(b_finished.is_some(), "b's open run must gain finished_at");
+
+    let row_c = sqlx::query("SELECT status, finished_at FROM plan_step_runs WHERE run_id = ?")
+        .bind(&run_c)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let c_status: String = row_c.try_get("status").unwrap();
+    let c_finished: Option<chrono::DateTime<chrono::Utc>> = row_c.try_get("finished_at").unwrap();
+    assert_eq!(
+        c_status, "cancelled",
+        "c's open run must be cancelled by rewind"
+    );
+    assert!(c_finished.is_some(), "c's open run must gain finished_at");
+
+    // a's already-finalized run must not be re-touched.
+    let row_a = sqlx::query("SELECT status FROM plan_step_runs WHERE run_id = ?")
+        .bind(&run_a)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let a_status: String = row_a.try_get("status").unwrap();
+    assert_eq!(a_status, "completed", "a's run must stay completed");
+
+    cleanup_plan(&pool, &plan_id).await;
+}
