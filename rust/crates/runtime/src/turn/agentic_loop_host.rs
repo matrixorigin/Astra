@@ -646,6 +646,11 @@ pub struct AgenticLoopState {
     /// patterns where compaction runs but the next call still fails.
     pub compaction_effectiveness: super::compaction_replay::CompactionEffectivenessTracker,
 
+    /// Measured token cost of the tool schemas injected into the LLM request.
+    /// Passed to `estimate_tokens_precise` so pressure estimates include the
+    /// schema overhead the API will count. 0 = unknown (legacy / sub-runs).
+    pub pinned_tool_schema_tokens: u64,
+
     // ── Per-turn token budget ──
     /// Maximum LLM input tokens before the loop forces a graceful wind-down.
     /// 0 = unlimited (legacy).  Set from `RuntimeLimits::max_turn_input_tokens`.
@@ -1108,6 +1113,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         last_measured_prompt_tokens: None,
         consecutive_context_window_errors: 0,
         compaction_effectiveness: Default::default(),
+        pinned_tool_schema_tokens: 0,
         max_turn_input_tokens: 0,
         budget_wrapup_injected: false,
         skill_produced_output: false,
@@ -1455,6 +1461,7 @@ pub(crate) mod tests {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
+            pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
             skill_produced_output: false,

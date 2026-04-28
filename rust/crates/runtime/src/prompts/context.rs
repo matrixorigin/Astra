@@ -25,7 +25,14 @@ pub fn estimate_str_tokens(s: &str) -> usize {
     // CJK: ~1.5 tokens per char (3*n/2).
     let cjk_tokens = (cjk_chars * 3).div_ceil(2);
     // JSON-like content: ~2 bytes/token. Regular text: ~4 bytes/token.
-    let first = s.as_bytes().first().copied().unwrap_or(0);
+    // Trim leading whitespace before peeking — tool results often have
+    // newlines or spaces before the opening brace.
+    let first = s
+        .as_bytes()
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .copied()
+        .unwrap_or(0);
     let ascii_divisor = if first == b'{' || first == b'[' { 2 } else { 4 };
     cjk_tokens + ascii_bytes / ascii_divisor
 }
@@ -86,17 +93,21 @@ fn estimate_single_message_tokens(m: &serde_json::Value) -> usize {
         .and_then(|v| v.as_str())
         .map(estimate_str_tokens)
         .unwrap_or(0);
+    // Each tool_call carries structural overhead: id, type, function.name.
+    const TOOL_CALL_STRUCTURAL_OVERHEAD: usize = 15;
     let tool_call_tokens = m
         .get("tool_calls")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
                 .map(|tc| {
-                    tc.get("function")
+                    let args_tokens = tc
+                        .get("function")
                         .and_then(|f| f.get("arguments"))
                         .and_then(|a| a.as_str())
                         .map(estimate_str_tokens)
-                        .unwrap_or(0)
+                        .unwrap_or(0);
+                    args_tokens + TOOL_CALL_STRUCTURAL_OVERHEAD
                 })
                 .sum::<usize>()
         })
@@ -560,10 +571,10 @@ mod tests {
     fn cache_aware_with_tool_calls() {
         let messages = vec![
             msg("system prompt"),
-            tool_msg(&"x".repeat(120)), // 30 tokens + 4 = 34
+            tool_msg(&"x".repeat(120)), // 30 args + 15 structural + 4 msg = 49
         ];
         let est = estimate_tokens_cache_aware(&messages, 0);
-        assert_eq!(est.volatile_tokens, 34);
+        assert_eq!(est.volatile_tokens, 49);
     }
 
     // ---------------------------------------------------------------
@@ -770,13 +781,24 @@ mod tests {
     #[test]
     fn estimate_tokens_with_tool_calls_unchanged() {
         let messages = vec![tool_msg(&"y".repeat(200))];
-        // 200/4 = 50 + 4 overhead + 3000 fixed = 3054
-        assert_eq!(estimate_tokens(&messages), 3054);
+        // 200/4 = 50 args + 15 structural overhead + 4 msg overhead + 3000 fixed = 3069
+        assert_eq!(estimate_tokens(&messages), 3069);
     }
 
     #[test]
     fn estimate_tokens_empty() {
         assert_eq!(estimate_tokens(&[]), 3000);
+    }
+
+    #[test]
+    fn estimate_tokens_precise_includes_schema_tokens() {
+        let msgs = vec![msg(&"x".repeat(400))];
+        let without_schema = estimate_tokens_precise(&msgs, 0, 0);
+        let with_schema = estimate_tokens_precise(&msgs, 50_000, 0);
+        assert!(
+            with_schema > without_schema + 40_000,
+            "schema_token_total must be included: without={without_schema}, with={with_schema}",
+        );
     }
 
     // ---------------------------------------------------------------
@@ -870,6 +892,54 @@ mod tests {
         // Code with comments in Chinese
         let t = estimate_str_tokens("fn main() { // 主函数入口 }");
         assert!(t > 0, "code + CJK comment should estimate > 0");
+    }
+
+    // ── Bug fixes: JSON detection + tool call overhead ──
+
+    #[test]
+    fn estimate_str_tokens_whitespace_prefixed_json_detected() {
+        // JSON with leading whitespace should still use the JSON divisor (2),
+        // not the ASCII divisor (4). Without trimming, the first byte is ' '
+        // and the function falls back to divisor=4, underestimating by 2×.
+        let json_str = r#"  {"key": "value", "nested": {"a": 1, "b": 2}}"#;
+        let trimmed = json_str.trim();
+        let with_ws = estimate_str_tokens(json_str);
+        let without_ws = estimate_str_tokens(trimmed);
+        // Both should use the JSON divisor — the difference should be only
+        // from the 2 leading space bytes, not a 2× factor.
+        let ratio = without_ws as f64 / with_ws as f64;
+        assert!(
+            ratio < 1.3,
+            "whitespace-prefixed JSON should estimate similarly to trimmed: \
+             with_ws={with_ws}, without_ws={without_ws}, ratio={ratio:.2}",
+        );
+    }
+
+    #[test]
+    fn estimate_single_message_tokens_includes_tool_call_overhead() {
+        // A message with 3 tool calls should count structural overhead
+        // (id, type, function name) — not just the arguments string.
+        let msg_with_calls = json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"a.rs\"}"}},
+                {"id": "call_2", "type": "function", "function": {"name": "grep", "arguments": "{\"pattern\": \"TODO\"}"}},
+                {"id": "call_3", "type": "function", "function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}
+            ]
+        });
+        let msg_no_calls = json!({
+            "role": "assistant",
+            "content": "{\"path\": \"a.rs\"}{\"pattern\": \"TODO\"}{\"command\": \"ls\"}"
+        });
+        let with_calls = estimate_single_message_tokens(&msg_with_calls);
+        let just_args = estimate_single_message_tokens(&msg_no_calls);
+        // The tool-call message should be higher because of id/type/name overhead.
+        assert!(
+            with_calls > just_args,
+            "tool_calls overhead (id, type, name) must be counted: \
+             with_calls={with_calls}, just_args={just_args}",
+        );
     }
 
     // ── Phase 6.2: Token budget exhaustion boundary ──

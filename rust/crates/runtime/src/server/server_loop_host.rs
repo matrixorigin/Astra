@@ -3790,6 +3790,7 @@ mod tests {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
+            pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
             skill_produced_output: false,
