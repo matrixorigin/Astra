@@ -511,6 +511,7 @@ pub(crate) async fn stream_chat_sse(
             forced_exploration_family_phase2: false,
             exploration_family_corrective_family: None,
             nudge_count: 0,
+            circuit_breaker: Default::default(),
             guardrail_tuner: astra_runtime::guardrail_tuning::GuardrailTuner::default(),
             guardrail_tuner_records_cursor: 0,
         },

@@ -77,14 +77,20 @@ mod stall_detection {
 }
 
 mod turn_limits {
-    use astra_turn_core::routing::MAX_TOOL_ROUNDS;
+    use astra_turn_core::loop_circuit_breaker::BreakerConfig;
 
-    /// Proves MAX_TOOL_ROUNDS is set to a reasonable value.
-    /// The env override can only DECREASE the limit, not bypass it.
+    /// Proves the circuit breaker's absolute_max_rounds default is a reasonable
+    /// infrastructure ceiling. This replaces the old MAX_TOOL_ROUNDS constant
+    /// (deprecated compat shim) — the circuit breaker config is now the
+    /// single source of truth for the hard round cap.
     #[test]
-    fn max_rounds_is_bounded() {
-        const { assert!(MAX_TOOL_ROUNDS > 0) };
-        const { assert!(MAX_TOOL_ROUNDS <= 100) }; // matches MAX_TOOL_ROUNDS_DEFAULT
+    fn absolute_max_rounds_default_is_bounded() {
+        let cap = BreakerConfig::default().absolute_max_rounds;
+        assert!(cap > 0, "absolute_max_rounds must be positive, got {cap}");
+        assert!(
+            cap <= 200,
+            "absolute_max_rounds default should be <= 200 (infrastructure ceiling), got {cap}"
+        );
     }
 }
 

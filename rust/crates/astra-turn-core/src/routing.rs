@@ -1,14 +1,19 @@
 use serde_json::{Map, Value, json};
 
-/// Maximum tool execution rounds per turn. Reads from `MO_MAX_TOOL_ROUNDS` env
-/// var at process start, defaulting to 15.
+/// Maximum tool execution rounds per turn — DEPRECATED.
+///
+/// The per-turn round limit is now handled by `LoopCircuitBreaker::absolute_max_rounds`.
+/// This function returns the circuit breaker's default (200) for backward compatibility.
+#[deprecated(
+    note = "Use LoopCircuitBreaker. This returns a compat constant, not the active policy limit."
+)]
 pub fn max_tool_rounds() -> i64 {
-    astra_core::RuntimeLimits::global().max_tool_rounds
+    astra_core::MAX_TOOL_ROUNDS_DEFAULT
 }
 
-/// Compile-time constant for tests that need `const` assertions.
-/// Runtime value from `max_tool_rounds()` may differ if env var is set.
-pub const MAX_TOOL_ROUNDS: i64 = 15;
+/// Compile-time constant — DEPRECATED. Use `BreakerConfig::absolute_max_rounds` instead.
+#[deprecated(note = "Use circuit_breaker_absolute_max_rounds config. This is a compat shim.")]
+pub const MAX_TOOL_ROUNDS: i64 = 200;
 
 pub fn detect_correction(query: &str) -> bool {
     let pattern = regex::Regex::new(

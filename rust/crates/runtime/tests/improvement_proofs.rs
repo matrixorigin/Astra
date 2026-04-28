@@ -4225,7 +4225,7 @@ mod runtime_limits_proofs {
         // Now centralized with env-var override capability.
         let d = RuntimeLimits::default();
         assert_eq!(d.max_turns, 150, "was MAX_TURNS in chat_stream.rs");
-        assert_eq!(d.max_tool_rounds, 100, "was MAX_TOOL_ROUNDS in routing.rs");
+        // max_tool_rounds removed — now handled by LoopCircuitBreaker
         assert!(
             (d.turn_timeout_s - 300.0).abs() < f64::EPSILON,
             "was TURN_TIMEOUT_S in bridge_inprocess.rs"
@@ -4254,7 +4254,6 @@ mod runtime_limits_proofs {
         let limits = RuntimeLimits::global();
         // Just verify it doesn't panic and returns valid values
         assert!(limits.max_turns > 0);
-        assert!(limits.max_tool_rounds > 0);
         assert!(limits.turn_timeout_s > 0.0);
         assert!(limits.global_output_limit > 0);
     }

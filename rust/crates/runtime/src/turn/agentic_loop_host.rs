@@ -453,6 +453,9 @@ pub struct StallTrackingState {
     /// How many stall correction nudges have been injected this loop.
     /// Limits nudge frequency (at most one per stall type per session).
     pub nudge_count: u32,
+    /// Anomaly-based circuit breaker for the agentic loop.
+    /// Replaces the old countdown-based round budget phase1/phase2 logic.
+    pub circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker,
     /// Rolling-stats guardrail auto-tuner for the auto-reflection signal
     /// threshold. Observes per-turn outcomes and adjusts the threshold by
     /// ±1 (bounded to `[MIN, MAX]`) so Astra reacts faster when failures

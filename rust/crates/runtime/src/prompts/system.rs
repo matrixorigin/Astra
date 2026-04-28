@@ -1112,41 +1112,23 @@ const TASK_TYPE_KEYWORDS: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Round budget directive injected into the dynamic system prompt.
+/// Round budget directive — REMOVED.
 ///
-/// When `round_index` >= `ROUND_BUDGET_THRESHOLD`, nudges the LLM to synthesize
-/// what it has gathered so far rather than continuing sequential tool exploration.
-/// This is a **generic** mechanism — not task-specific.
+/// The old countdown-based budget pressure ("⚡ Round Budget Warning") has been
+/// replaced by the anomaly-based `LoopCircuitBreaker` in `astra-turn-core`.
+/// Agents run unlimited by default; intervention fires only on stall/regression.
 ///
-/// These constants are defaults; callers should prefer
-/// `ToolSelectionConfig::effective_round_budget_warning/limit` for runtime overrides.
+/// These constants are retained temporarily for test compatibility but the
+/// directive itself always returns empty.
 pub const ROUND_BUDGET_THRESHOLD: u32 = 8;
 pub const ROUND_BUDGET_HARD_LIMIT: u32 = 15;
 
-pub fn round_budget_directive(round_index: u32) -> String {
-    round_budget_directive_with(round_index, ROUND_BUDGET_THRESHOLD, ROUND_BUDGET_HARD_LIMIT)
+pub fn round_budget_directive(_round_index: u32) -> String {
+    String::new()
 }
 
-pub fn round_budget_directive_with(round_index: u32, warning: u32, limit: u32) -> String {
-    if round_index >= limit {
-        format!(
-            "\n\n## ⚠ Round Budget Exceeded (round {round_index}/{limit})\n\
-             You MUST produce your final answer NOW. Do NOT call any more tools.\n\
-             Synthesize everything you have gathered so far into a complete response.\n\
-             If some information is missing, state what you could not verify.\n"
-        )
-    } else if round_index >= warning {
-        let remaining = limit - round_index;
-        format!(
-            "\n\n## ⚡ Round Budget Warning (round {round_index}/{limit})\n\
-             You have used {round_index} tool rounds. {remaining} remaining before the hard limit.\n\
-             - If you have enough information, produce your final answer NOW.\n\
-             - If you still need data, batch ALL remaining tool calls into ONE parallel turn.\n\
-             - Do NOT make one-tool-at-a-time sequential calls.\n"
-        )
-    } else {
-        String::new()
-    }
+pub fn round_budget_directive_with(_round_index: u32, _warning: u32, _limit: u32) -> String {
+    String::new()
 }
 
 /// Threshold for the parallel-batching nudge: how many consecutive trailing
@@ -1260,26 +1242,11 @@ fn trailing_tool_result_count(messages: &[serde_json::Value]) -> usize {
 }
 
 pub fn synthesize_or_batch_directive(
-    messages: &[serde_json::Value],
-    round_index: u32,
-    warning: u32,
+    _messages: &[serde_json::Value],
+    _round_index: u32,
+    _warning: u32,
 ) -> String {
-    if round_index < warning {
-        return String::new();
-    }
-
-    let trailing_tool_count = trailing_tool_result_count(messages);
-    if trailing_tool_count == 0 {
-        return String::new();
-    }
-
-    format!(
-        "\n\n## Synthesize Or Batch Now\n\
-         The last round ended with {trailing_tool_count} tool result(s) and no assistant synthesis yet.\n\
-         - If you already have enough information, produce your final answer NOW.\n\
-         - If you still need more data, make at most ONE more tool round and batch all remaining independent calls together.\n\
-         - Do NOT continue one-tool-at-a-time exploration.\n"
-    )
+    String::new()
 }
 
 /// Combined late-round guidance block used by bridge/server dynamic prompt
@@ -1306,27 +1273,26 @@ pub fn tool_round_guidance(messages: &[serde_json::Value], round_index: u32) -> 
 pub fn tool_round_guidance_trace_with(
     messages: &[serde_json::Value],
     round_index: u32,
-    warning: u32,
-    limit: u32,
+    _warning: u32,
+    _limit: u32,
 ) -> (String, PromptGuidanceSignals) {
-    let round_budget_warning = round_index >= warning;
     let trailing_tool_count = trailing_tool_result_count(messages);
-    let synthesize_or_batch = round_index >= warning && trailing_tool_count > 0;
     let parallel_feedback = trailing_tool_count > 1;
     let single_tool_streak = trailing_single_tool_round_streak(messages);
     let parallel_batching_nudge = single_tool_streak >= PARALLEL_BATCHING_NUDGE_THRESHOLD;
 
+    // Only emit parallel-batching nudge and positive feedback.
+    // Round budget pressure is gone — circuit breaker handles stalls.
+    let _ = round_index;
     (
         format!(
-            "{}{}{}{}",
-            round_budget_directive_with(round_index, warning, limit),
-            synthesize_or_batch_directive(messages, round_index, warning),
+            "{}{}",
             parallel_batching_nudge_directive(messages),
             parallel_execution_feedback(messages)
         ),
         PromptGuidanceSignals {
-            round_budget_warning,
-            synthesize_or_batch,
+            round_budget_warning: false,
+            synthesize_or_batch: false,
             parallel_feedback,
             parallel_batching_nudge,
         },
@@ -2773,18 +2739,16 @@ mod tests {
         ];
 
         let guidance = tool_round_guidance(&messages, ROUND_BUDGET_THRESHOLD);
+        // Round budget and synthesize directives are neutered (circuit breaker).
         assert!(
-            guidance.contains("Round Budget Warning"),
-            "guidance should include the round-budget warning"
+            !guidance.contains("Round Budget Warning"),
+            "round budget directive should be empty"
         );
         assert!(
-            guidance.contains("Synthesize Or Batch Now"),
-            "guidance should include the late-round synthesis nudge"
+            !guidance.contains("Synthesize Or Batch Now"),
+            "synthesize directive should be empty"
         );
-        assert!(
-            guidance.contains("2 tool result(s)"),
-            "guidance should mention trailing tool results"
-        );
+        // Parallel feedback still works.
         assert!(
             guidance.contains("2 tools executed in parallel"),
             "guidance should preserve parallel batching feedback"
@@ -2812,8 +2776,9 @@ mod tests {
         ];
 
         let breakdown = build_system_prompt_trace(&sections, vec![], vec![]);
-        assert!(breakdown.guidance_signals.round_budget_warning);
-        assert!(breakdown.guidance_signals.synthesize_or_batch);
+        // Budget signals are always false now (circuit breaker replaces them).
+        assert!(!breakdown.guidance_signals.round_budget_warning);
+        assert!(!breakdown.guidance_signals.synthesize_or_batch);
         assert!(breakdown.guidance_signals.parallel_feedback);
     }
 
@@ -2831,11 +2796,13 @@ mod tests {
             ROUND_BUDGET_HARD_LIMIT,
         );
 
-        assert!(guidance.contains("Round Budget Warning"));
-        assert!(guidance.contains("Synthesize Or Batch Now"));
+        // Budget directives neutered.
+        assert!(!guidance.contains("Round Budget Warning"));
+        assert!(!guidance.contains("Synthesize Or Batch Now"));
+        // Parallel feedback still works.
         assert!(guidance.contains("2 tools executed in parallel"));
-        assert!(signals.round_budget_warning);
-        assert!(signals.synthesize_or_batch);
+        assert!(!signals.round_budget_warning);
+        assert!(!signals.synthesize_or_batch);
         assert!(signals.parallel_feedback);
     }
 
@@ -2861,9 +2828,10 @@ mod tests {
             ROUND_BUDGET_HARD_LIMIT,
         );
 
-        assert!(guidance.contains("Synthesize Or Batch Now"));
+        // Budget directives neutered; parallel feedback still works.
+        assert!(!guidance.contains("Synthesize Or Batch Now"));
         assert!(guidance.contains("2 tools executed in parallel"));
-        assert!(signals.synthesize_or_batch);
+        assert!(!signals.synthesize_or_batch);
         assert!(signals.parallel_feedback);
     }
 
@@ -2894,9 +2862,10 @@ mod tests {
             ROUND_BUDGET_HARD_LIMIT,
         );
 
-        assert!(guidance.contains("Synthesize Or Batch Now"));
+        // Budget directives neutered; parallel feedback still works.
+        assert!(!guidance.contains("Synthesize Or Batch Now"));
         assert!(guidance.contains("2 tools executed in parallel"));
-        assert!(signals.synthesize_or_batch);
+        assert!(!signals.synthesize_or_batch);
         assert!(signals.parallel_feedback);
     }
 
@@ -3019,17 +2988,16 @@ mod tests {
 
     #[test]
     fn round_budget_defaults_hard_limit_at_15() {
-        // Round 15 should trigger the hard stop.
+        // Directive is always empty now (circuit breaker replaces countdown).
         let at_limit = round_budget_directive(15);
         assert!(
-            at_limit.contains("Round Budget Exceeded"),
-            "round 15 should trigger hard stop"
+            at_limit.is_empty(),
+            "round budget directive should always be empty"
         );
-        // Round 14 should only be a warning, not hard stop.
         let before_limit = round_budget_directive(14);
         assert!(
-            !before_limit.contains("Round Budget Exceeded"),
-            "round 14 should not trigger hard stop"
+            before_limit.is_empty(),
+            "round budget directive should always be empty"
         );
     }
 

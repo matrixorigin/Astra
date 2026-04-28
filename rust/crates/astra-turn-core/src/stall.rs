@@ -24,6 +24,16 @@ pub const SERVER_STALL_WINDOW: usize = 3;
 /// Call sites append the actual budget number, e.g. `format!("{} (budget: {} turns)", MSG, n)`.
 pub const CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG: &str = "Turn budget exhausted. To increase, set MO_MAX_TURNS (interactive) or MO_PLAN_SUBTASK_MAX_TURNS (plan subtasks).";
 
+/// User-visible error when the legacy in-process bridge exhausts the tool-round budget.
+pub fn cli_agentic_tool_round_budget_abort_msg(current_limit: usize) -> String {
+    format!(
+        "Tool-round budget exhausted (limit: {}). The circuit breaker terminated this turn \
+         due to detected stall or regression. To increase the ceiling, set \
+         `circuit_breaker_absolute_max_rounds` in your runtime config.",
+        current_limit,
+    )
+}
+
 /// Tools considered "exploration" — low-value if used repeatedly without
 /// a "productive" tool call in between.
 const EXPLORATION_TOOLS: &[&str] = &[
@@ -814,6 +824,16 @@ mod tests {
             .iter()
             .map(|tools| tools.iter().map(|t| format!("{}:{{}}", t)).collect())
             .collect()
+    }
+
+    #[test]
+    fn tool_round_abort_message_points_to_tool_round_limit() {
+        assert_eq!(
+            cli_agentic_tool_round_budget_abort_msg(30),
+            "Tool-round budget exhausted (limit: 30). The circuit breaker terminated this turn \
+             due to detected stall or regression. To increase the ceiling, set \
+             `circuit_breaker_absolute_max_rounds` in your runtime config."
+        );
     }
 
     // ── Stall detection ──

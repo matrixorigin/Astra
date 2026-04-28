@@ -3999,9 +3999,10 @@ mod tests {
             !primary_text.contains("Synthesize Or Batch Now"),
             "stable primary message must not contain late-round dynamic guidance"
         );
+        // Synthesize directive is neutered; parallel feedback still works.
         assert!(
-            dynamic_text.contains("Synthesize Or Batch Now"),
-            "dynamic message should include the late-round synthesis nudge"
+            !dynamic_text.contains("Synthesize Or Batch Now"),
+            "synthesize directive is neutered (circuit breaker replaces it)"
         );
         assert!(
             dynamic_text.contains("2 tools executed in parallel"),

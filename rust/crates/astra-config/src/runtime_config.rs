@@ -382,15 +382,35 @@ pub struct ToolSelectionConfig {
     #[serde(default)]
     pub max_tools_per_turn: u32,
 
-    /// Round index at which the LLM receives a "wrap up" warning.
-    /// 0 = use default (3). Set higher for complex multi-file tasks.
+    /// Round budget warning — DEPRECATED, always ignored.
+    /// Retained for config file backward compatibility (deserialization won't fail).
     #[serde(default)]
     pub round_budget_warning: u32,
 
-    /// Round index at which the LLM is forced to stop calling tools.
-    /// 0 = use default (6). Set higher for complex multi-file tasks.
+    /// Round budget limit — DEPRECATED, always ignored.
+    /// Retained for config file backward compatibility (deserialization won't fail).
     #[serde(default)]
     pub round_budget_limit: u32,
+
+    /// Circuit breaker: consecutive stall rounds (no new patterns, no mutations)
+    /// before tripping. 0 = use default (3).
+    #[serde(default)]
+    pub circuit_breaker_stall_threshold: u32,
+
+    /// Circuit breaker: consecutive identical tool-signature rounds before
+    /// tripping. 0 = use default (3).
+    #[serde(default)]
+    pub circuit_breaker_repetition_threshold: u32,
+
+    /// Circuit breaker: rounds of patience in half-open state after injecting
+    /// a correction. 0 = use default (2).
+    #[serde(default)]
+    pub circuit_breaker_half_open_patience: u32,
+
+    /// Circuit breaker: absolute maximum rounds per turn (infrastructure guard).
+    /// 0 = use default (200). This is a pure bug-catcher, not a policy knob.
+    #[serde(default)]
+    pub circuit_breaker_absolute_max_rounds: u32,
 
     /// Mid-loop guard: number of consecutive single-tool rounds tolerated
     /// before the runtime injects a parallel-batching corrective. 0 = use
@@ -640,23 +660,36 @@ impl ToolSelectionConfig {
         }
     }
 
-    /// Resolved round budget warning threshold (0 → default of 8).
+    /// DEPRECATED — always returns a high value so callers that still check
+    /// this never trigger budget pressure.
     pub fn effective_round_budget_warning(&self) -> u32 {
-        if self.round_budget_warning > 0 {
-            self.round_budget_warning
-        } else {
-            8
-        }
+        200
     }
 
-    /// Resolved round budget hard limit (0 → default of 45).
+    /// DEPRECATED — always returns a high value so callers that still check
+    /// this never trigger the old phase1/phase2 logic.
     pub fn effective_round_budget_limit(&self) -> u32 {
-        if self.round_budget_limit > 0 {
-            self.round_budget_limit
-                .max(self.effective_round_budget_warning() + 1)
-        } else {
-            45
-        }
+        200
+    }
+
+    /// Resolved circuit breaker stall threshold (0 → default 3, floor 2).
+    pub fn effective_circuit_breaker_stall_threshold(&self) -> u32 {
+        resolve_threshold(self.circuit_breaker_stall_threshold, 3, 2)
+    }
+
+    /// Resolved circuit breaker repetition threshold (0 → default 3, floor 2).
+    pub fn effective_circuit_breaker_repetition_threshold(&self) -> u32 {
+        resolve_threshold(self.circuit_breaker_repetition_threshold, 3, 2)
+    }
+
+    /// Resolved circuit breaker half-open patience (0 → default 2, floor 1).
+    pub fn effective_circuit_breaker_half_open_patience(&self) -> u32 {
+        resolve_threshold(self.circuit_breaker_half_open_patience, 2, 1)
+    }
+
+    /// Resolved circuit breaker absolute max rounds (0 → default 200, floor 20).
+    pub fn effective_circuit_breaker_absolute_max_rounds(&self) -> u32 {
+        resolve_threshold(self.circuit_breaker_absolute_max_rounds, 200, 20)
     }
 
     /// Resolved parallel-batching force streak threshold (0 → default of 5).
@@ -822,6 +855,10 @@ impl Default for ToolSelectionConfig {
             max_tools_per_turn: 0,
             round_budget_warning: 0,
             round_budget_limit: 0,
+            circuit_breaker_stall_threshold: 0,
+            circuit_breaker_repetition_threshold: 0,
+            circuit_breaker_half_open_patience: 0,
+            circuit_breaker_absolute_max_rounds: 0,
             parallel_batching_force_streak: 0,
             redundant_reads_midloop_threshold: 0,
             sequential_read_churn_eval_threshold: 0,
@@ -1349,6 +1386,10 @@ impl RuntimeConfig {
             max_tools_per_turn,
             round_budget_warning,
             round_budget_limit,
+            circuit_breaker_stall_threshold,
+            circuit_breaker_repetition_threshold,
+            circuit_breaker_half_open_patience,
+            circuit_breaker_absolute_max_rounds,
             parallel_batching_force_streak,
             redundant_reads_midloop_threshold,
             sequential_read_churn_eval_threshold,
@@ -1412,6 +1453,26 @@ impl RuntimeConfig {
         merge_if_non_default(
             &mut self.tool_selection.round_budget_limit,
             round_budget_limit,
+            0,
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.circuit_breaker_stall_threshold,
+            circuit_breaker_stall_threshold,
+            0,
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.circuit_breaker_repetition_threshold,
+            circuit_breaker_repetition_threshold,
+            0,
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.circuit_breaker_half_open_patience,
+            circuit_breaker_half_open_patience,
+            0,
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.circuit_breaker_absolute_max_rounds,
+            circuit_breaker_absolute_max_rounds,
             0,
         );
         merge_if_non_default(
@@ -1917,6 +1978,10 @@ mod tests {
                 max_tools_per_turn: 0,
                 round_budget_warning: 0,
                 round_budget_limit: 0,
+                circuit_breaker_stall_threshold: 0,
+                circuit_breaker_repetition_threshold: 0,
+                circuit_breaker_half_open_patience: 0,
+                circuit_breaker_absolute_max_rounds: 0,
                 parallel_batching_force_streak: 0,
                 redundant_reads_midloop_threshold: 0,
                 sequential_read_churn_eval_threshold: 0,
@@ -2050,41 +2115,44 @@ mod tests {
 
     #[test]
     fn round_budget_defaults() {
+        // Deprecated: always returns 200 (effectively disabled).
         let cfg = ToolSelectionConfig::default();
-        assert_eq!(cfg.effective_round_budget_warning(), 8);
-        assert_eq!(cfg.effective_round_budget_limit(), 45);
+        assert_eq!(cfg.effective_round_budget_warning(), 200);
+        assert_eq!(cfg.effective_round_budget_limit(), 200);
     }
 
     #[test]
     fn round_budget_custom_values() {
+        // Deprecated: custom values are ignored, always returns 200.
         let cfg = ToolSelectionConfig {
             round_budget_warning: 5,
             round_budget_limit: 10,
             ..Default::default()
         };
-        assert_eq!(cfg.effective_round_budget_warning(), 5);
-        assert_eq!(cfg.effective_round_budget_limit(), 10);
+        assert_eq!(cfg.effective_round_budget_warning(), 200);
+        assert_eq!(cfg.effective_round_budget_limit(), 200);
     }
 
     #[test]
     fn round_budget_limit_enforces_above_warning() {
-        // limit set below warning → clamped to warning + 1
+        // Deprecated: always returns 200 regardless of config.
         let cfg = ToolSelectionConfig {
             round_budget_warning: 8,
             round_budget_limit: 5,
             ..Default::default()
         };
-        assert_eq!(cfg.effective_round_budget_limit(), 9);
+        assert_eq!(cfg.effective_round_budget_limit(), 200);
     }
 
     #[test]
     fn round_budget_limit_zero_uses_default_regardless_of_warning() {
+        // Deprecated: always returns 200.
         let cfg = ToolSelectionConfig {
             round_budget_warning: 5,
             round_budget_limit: 0,
             ..Default::default()
         };
-        assert_eq!(cfg.effective_round_budget_limit(), 45);
+        assert_eq!(cfg.effective_round_budget_limit(), 200);
     }
 
     #[test]

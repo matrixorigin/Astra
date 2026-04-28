@@ -4454,12 +4454,12 @@ async fn context_meta_exposes_late_round_guidance_signals() {
     assert_eq!(
         late_round_context["system_prompt_breakdown"]["guidance_signals"]["round_budget_warning"]
             .as_bool(),
-        Some(true)
+        Some(false)
     );
     assert_eq!(
         late_round_context["system_prompt_breakdown"]["guidance_signals"]["synthesize_or_batch"]
             .as_bool(),
-        Some(true)
+        Some(false)
     );
     assert!(
         late_round_context["system_prompt_breakdown"]["guidance_signals"]["parallel_feedback"]

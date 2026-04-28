@@ -160,7 +160,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     let tool_cfg = &astra_config::runtime_config::RuntimeConfig::load().tool_selection;
     let parallel_batching_force_threshold =
         tool_cfg.effective_parallel_batching_force_streak() as usize;
-    let round_budget_hard_limit = tool_cfg.effective_round_budget_limit();
     let redundant_reads_threshold = tool_cfg.effective_redundant_reads_midloop_threshold() as usize;
     let cache_waste_threshold = tool_cfg.effective_cache_waste_midloop_threshold() as usize;
     let exploration_family_threshold =
@@ -195,34 +194,80 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
 
-    // Round-budget convergence guard — phase 1. When the loop has completed
-    // at or above the effective hard limit but the model is still calling
-    // tools, inject a final-finalize corrective with explicit anti-
-    // hallucination wording. Phase 2 (after this round) escalates to a hard
-    // abort if the model ignores phase 1.
-    if should_inject_round_budget_phase1(state, round_budget_hard_limit) {
-        state.stall.forced_round_budget_phase1 = true;
-        state.messages.push(serde_json::json!({
-            "role": "user",
-            "content": round_budget_phase1_message(state.llm_rounds_completed, &state.message),
-        }));
-        tracing::warn!(
-            target: "astra::loop_guard",
-            tier = "round_budget_phase1",
-            round = state.llm_rounds_completed,
-            hard_limit = round_budget_hard_limit,
-            "loop guard fired"
-        );
-        if !prep.quiet {
-            host.emit_headless_line(
-                HeadlessStderrStyle::Yellow,
-                format!(
-                    "↻ Round budget exhausted at round {}; forcing text-only finalization…",
-                    state.llm_rounds_completed
-                ),
-            );
+    // ── Circuit breaker observation ──────────────────────────────────────
+    // Feed the previous round's signal to the circuit breaker. On the first
+    // round (no previous tool calls), this is skipped. The breaker decides
+    // whether to inject a correction or abort based on anomaly detection.
+    if state.llm_rounds_completed > 0 {
+        let signal = build_circuit_breaker_signal(state);
+        let action = state.stall.circuit_breaker.observe(signal);
+        match action {
+            astra_turn_core::loop_circuit_breaker::BreakerAction::InjectCorrection => {
+                state.stall.forced_round_budget_phase1 = true;
+                state.stall.circuit_breaker.correction_injected();
+                state.messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": round_budget_phase1_message(state.llm_rounds_completed, &state.message),
+                }));
+                tracing::warn!(
+                    target: "astra::loop_guard",
+                    tier = "circuit_breaker_correction",
+                    round = state.llm_rounds_completed,
+                    "circuit breaker tripped — injecting correction"
+                );
+                if !prep.quiet {
+                    host.emit_headless_line(
+                        HeadlessStderrStyle::Yellow,
+                        format!(
+                            "↻ Circuit breaker tripped at round {} (stall/regression detected); forcing finalization…",
+                            state.llm_rounds_completed
+                        ),
+                    );
+                }
+            }
+            astra_turn_core::loop_circuit_breaker::BreakerAction::Abort => {
+                state.stall.forced_round_budget_phase2 = true;
+                let abort_msg = format!(
+                    "[Circuit breaker abort at round {}. The agent did not recover \
+                     after correction — stall or regression persists. Any progress \
+                     and tool results from earlier rounds are preserved above.]",
+                    state.llm_rounds_completed,
+                );
+                if state.final_text.trim().is_empty() {
+                    state.final_text = abort_msg.clone();
+                } else {
+                    state.final_text.push_str("\n\n");
+                    state.final_text.push_str(&abort_msg);
+                }
+                state.final_text_streamed = false;
+                state.interruption = Some(InterruptionRecord::new(
+                    InterruptionKind::BudgetExhausted,
+                    ResumeAction::ContinueImmediately,
+                    interruption_state_summary(state, Some(abort_msg)),
+                ));
+                tracing::warn!(
+                    target: "astra::loop_guard",
+                    tier = "circuit_breaker_abort",
+                    round = state.llm_rounds_completed,
+                    "circuit breaker abort — agent did not recover"
+                );
+                if !prep.quiet {
+                    host.emit_headless_line(
+                        HeadlessStderrStyle::Yellow,
+                        format!(
+                            "⛔ Circuit breaker abort at round {}; agent did not recover after correction.",
+                            state.llm_rounds_completed
+                        ),
+                    );
+                }
+                state.step_recorder.end_turn(false);
+                finalize_and_render(host, state).await;
+                return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
+            }
+            astra_turn_core::loop_circuit_breaker::BreakerAction::Continue => {}
         }
     }
+
     if !state.stall.forced_round_budget_phase1
         && let Some((family, blocked_tools)) = exploration_family_phase2_candidate(state)
     {
@@ -661,24 +706,17 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         AgenticIngestIterationControl::ProceedWithToolCalls => {}
     }
 
-    // Round-budget convergence guard — phase 2. Phase 1 already injected the
-    // text-only corrective on this iteration's pre-LLM block. If the model
-    // STILL emitted tool calls (i.e. we reached `ProceedWithToolCalls` with
-    // the phase-1 flag set), we escalate to a hard abort: refuse to execute
-    // the new tool calls and end the loop with a partial-progress notice.
-    // This mirrors Claude Code's `error_max_turns` exit but reaches it only
-    // after a corrective grace round, avoiding overkill on weaker models.
-    // Phase-2 only fires inside `ProceedWithToolCalls`: the model emitted tool
-    // calls after the phase-1 corrective, so this flag is inherently true here.
-    // Using a named variable rather than a literal makes the contract self-
-    // documenting and prevents accidental copy-paste to a broader scope.
-    if should_abort_for_round_budget_phase2(state, round_budget_hard_limit) {
+    // Circuit breaker post-LLM check: if the correction was injected (phase1)
+    // but the model still emitted tool calls, escalate to abort. We do NOT
+    // call observe() again — the breaker observes exactly once per completed
+    // round (in the pre-LLM block). Here we just check: correction was given,
+    // model ignored it → abort.
+    if state.stall.forced_round_budget_phase1 && !state.stall.forced_round_budget_phase2 {
         state.stall.forced_round_budget_phase2 = true;
         let abort_msg = format!(
-            "[Round budget hard-limit reached at round {}. The runtime injected a \
-             finalization corrective on the previous round but the model continued \
-             to call tools, so the turn was aborted before executing them. Any \
-             progress and tool results from earlier rounds are preserved above.]",
+            "[Circuit breaker abort at round {}. The runtime injected a \
+             finalization corrective but the model continued to call tools. \
+             Any progress from earlier rounds is preserved above.]",
             state.llm_rounds_completed,
         );
         if state.final_text.trim().is_empty() {
@@ -691,19 +729,19 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         state.interruption = Some(InterruptionRecord::new(
             InterruptionKind::BudgetExhausted,
             ResumeAction::ContinueImmediately,
-            interruption_state_summary(state, Some(abort_msg.clone())),
+            interruption_state_summary(state, Some(abort_msg)),
         ));
         tracing::warn!(
             target: "astra::loop_guard",
-            tier = "round_budget_phase2",
+            tier = "circuit_breaker_phase2_abort",
             round = state.llm_rounds_completed,
-            "loop guard fired (hard abort)"
+            "circuit breaker phase2 abort (model ignored correction)"
         );
         if !prep.quiet {
             host.emit_headless_line(
                 HeadlessStderrStyle::Yellow,
                 format!(
-                    "⛔ Phase-1 corrective ignored at round {}; aborting turn.",
+                    "⛔ Correction ignored at round {}; aborting turn.",
                     state.llm_rounds_completed
                 ),
             );
@@ -712,7 +750,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         finalize_and_render(host, state).await;
         return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
     }
-
     emit_subrun_text_preview(host, state, prep.quiet);
     if let Some(control) = handle_token_budget(host, state, turn_index, prep, &turn_result).await {
         return Ok(control);
@@ -1308,44 +1345,31 @@ pub(crate) fn is_round_budget_phase1(m: &serde_json::Value) -> bool {
         .is_some_and(|s| s.starts_with(ROUND_BUDGET_PHASE1_MARKER))
 }
 
-/// Whether to inject phase-1 corrective on the upcoming round. Caller passes
-/// the effective hard limit so test/runtime/ToolSelectionConfig overrides
-/// flow through.
-pub(crate) fn should_inject_round_budget_phase1(state: &AgenticLoopState, hard_limit: u32) -> bool {
-    if state.stall.forced_round_budget_phase1 {
-        return false;
-    }
-    // One corrective injection per turn: if another guard already fired
-    // this round, skip phase-1 to avoid double-injecting. In practice
-    // phase-1 fires at round >= hard_limit (typically 15) while other
-    // guards fire earlier, so overlap is rare — this is defensive.
-    if state.stall.forced_execution_escalation
-        || state.stall.forced_parallel_batching
-        || state.stall.forced_redundant_reads_corrective
-        || state.stall.forced_cache_waste_corrective
-        || state.stall.forced_exploration_family_corrective
-    {
-        return false;
-    }
-    state.llm_rounds_completed >= hard_limit
-}
-
-/// Whether to abort the loop with phase-2 hard stop. Triggers when phase-1
-/// already fired AND the most-recent assistant turn still attempted at least
-/// one tool call AND `llm_rounds_completed >= hard_limit` (sanity guard
-/// prevents mis-set flags from aborting at a low round count). The caller
-/// passes `last_round_had_tool_calls` to distinguish model compliance
-/// (text-only) from model ignoring the corrective (tool calls).
-pub(crate) fn should_abort_for_round_budget_phase2(
+/// Build a `RoundSignal` from the current loop state for the circuit breaker.
+/// Uses the latest `turn_sigs` entry and checks `tool_call_records` for mutations.
+fn build_circuit_breaker_signal(
     state: &AgenticLoopState,
-    hard_limit: u32,
-) -> bool {
-    if state.stall.forced_round_budget_phase2 {
-        return false;
+) -> astra_turn_core::loop_circuit_breaker::RoundSignal {
+    use astra_turn_core::loop_circuit_breaker::RoundSignal;
+
+    let tool_signatures = state.stall.turn_sigs.last().cloned().unwrap_or_default();
+
+    // Check if the most recent round produced any workspace mutation.
+    let produced_mutation = state
+        .stall
+        .tool_call_records
+        .iter()
+        .rev()
+        .take(state.max_tools_per_turn as usize)
+        .any(|r| tool_record_is_workspace_mutation(r));
+
+    let tool_count = tool_signatures.len();
+
+    RoundSignal {
+        tool_signatures,
+        produced_mutation,
+        tool_count,
     }
-    // Phase-2 fires when phase-1 corrective was injected but the model
-    // continued to call tools (ignored the corrective).
-    state.stall.forced_round_budget_phase1 && state.llm_rounds_completed >= hard_limit
 }
 
 pub(crate) fn round_budget_phase1_message(round_index: u32, original_query: &str) -> String {
@@ -2904,143 +2928,11 @@ mod tests {
         ));
     }
 
-    // ─── Round-budget convergence guard (two-phase) ──────────────────────
-
-    #[test]
-    fn round_budget_phase1_fires_at_or_above_hard_limit() {
-        let mut state = make_state();
-        state.message = "investigate complex bug".into();
-
-        // Just below the limit: silent.
-        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_HARD_LIMIT - 1;
-        assert!(!should_inject_round_budget_phase1(
-            &state,
-            crate::prompts::ROUND_BUDGET_HARD_LIMIT
-        ));
-
-        // At the hard limit: phase-1 fires.
-        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_HARD_LIMIT;
-        assert!(should_inject_round_budget_phase1(
-            &state,
-            crate::prompts::ROUND_BUDGET_HARD_LIMIT
-        ));
-
-        // Above the limit: still fires (until one-shot flag prevents it).
-        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_HARD_LIMIT + 5;
-        assert!(should_inject_round_budget_phase1(
-            &state,
-            crate::prompts::ROUND_BUDGET_HARD_LIMIT
-        ));
-    }
-
-    #[test]
-    fn round_budget_phase1_is_one_shot_per_turn() {
-        let mut state = make_state();
-        state.message = "investigate".into();
-        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_HARD_LIMIT + 2;
-        assert!(should_inject_round_budget_phase1(
-            &state,
-            crate::prompts::ROUND_BUDGET_HARD_LIMIT
-        ));
-        // Once flag is set, a second injection is suppressed even if the
-        // round count has grown further.
-        state.stall.forced_round_budget_phase1 = true;
-        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_HARD_LIMIT + 10;
-        assert!(!should_inject_round_budget_phase1(
-            &state,
-            crate::prompts::ROUND_BUDGET_HARD_LIMIT
-        ));
-    }
-
-    #[test]
-    fn round_budget_phase1_suppressed_when_other_corrective_already_fired() {
-        let hard_limit = crate::prompts::ROUND_BUDGET_HARD_LIMIT;
-
-        // Escalation suppresses phase-1.
-        let mut state = make_state();
-        state.llm_rounds_completed = hard_limit;
-        state.stall.forced_execution_escalation = true;
-        assert!(
-            !should_inject_round_budget_phase1(&state, hard_limit),
-            "phase-1 must not fire when escalation already active"
-        );
-
-        // Parallel-batching suppresses phase-1.
-        let mut state = make_state();
-        state.llm_rounds_completed = hard_limit;
-        state.stall.forced_parallel_batching = true;
-        assert!(
-            !should_inject_round_budget_phase1(&state, hard_limit),
-            "phase-1 must not fire when parallel-batching already active"
-        );
-
-        // Redundant-reads suppresses phase-1.
-        let mut state = make_state();
-        state.llm_rounds_completed = hard_limit;
-        state.stall.forced_redundant_reads_corrective = true;
-        assert!(
-            !should_inject_round_budget_phase1(&state, hard_limit),
-            "phase-1 must not fire when redundant-reads already active"
-        );
-    }
-
-    #[test]
-    fn round_budget_phase1_marker_recognized_by_corrective_filter() {
-        let msg = serde_json::json!({
-            "role": "user",
-            "content": round_budget_phase1_message(15, "investigate"),
-        });
-        assert!(is_round_budget_phase1(&msg));
-        assert!(is_execution_corrective_message(&msg));
-        // Anti-hallucination wording must be present — this is the whole
-        // reason phase-1 exists, not just round budgeting.
-        let body = msg.get("content").and_then(|c| c.as_str()).unwrap();
-        assert!(
-            body.contains("Do NOT fabricate"),
-            "phase-1 corrective must include explicit anti-hallucination directive; got: {body}"
-        );
-        assert!(
-            body.contains("could NOT verify") || body.contains("not verify"),
-            "phase-1 corrective must instruct enumerating gaps"
-        );
-    }
-
-    #[test]
-    fn round_budget_phase2_fires_only_after_phase1_with_subsequent_tool_calls() {
-        let mut state = make_state();
-        let hard_limit = crate::prompts::ROUND_BUDGET_HARD_LIMIT;
-        // Set rounds completed to meet the hard_limit so the sanity guard
-        // passes — phase-2 only makes sense when the budget is genuinely
-        // exhausted.
-        state.llm_rounds_completed = hard_limit;
-
-        // Without phase-1 set, phase-2 must not abort even if last round had
-        // tool calls — the model never received the corrective.
-        state.stall.forced_round_budget_phase1 = false;
-        assert!(!should_abort_for_round_budget_phase2(&state, hard_limit));
-
-        // With phase-1 set: phase-2 fires because the model continued past
-        // the hard limit after receiving the corrective.
-        state.stall.forced_round_budget_phase1 = true;
-        assert!(should_abort_for_round_budget_phase2(&state, hard_limit));
-
-        // Sanity guard: even with phase-1 set, if llm_rounds_completed is
-        // below the hard limit, phase-2 must NOT fire.
-        state.llm_rounds_completed = hard_limit - 1;
-        assert!(!should_abort_for_round_budget_phase2(&state, hard_limit));
-    }
-
-    #[test]
-    fn round_budget_phase2_is_one_shot_per_turn() {
-        let mut state = make_state();
-        let hard_limit = crate::prompts::ROUND_BUDGET_HARD_LIMIT;
-        state.llm_rounds_completed = hard_limit;
-        state.stall.forced_round_budget_phase1 = true;
-        state.stall.forced_round_budget_phase2 = true;
-        // Even with phase-1 set, once phase-2 has already fired we must not
-        // re-trigger.
-        assert!(!should_abort_for_round_budget_phase2(&state, hard_limit));
-    }
+    // ─── Round-budget convergence guard — REMOVED ─────────────────────────
+    // The old countdown-based phase1/phase2 tests have been replaced by
+    // unit tests in `astra_turn_core::loop_circuit_breaker::tests`.
+    // The circuit breaker is integration-tested via the full agentic loop
+    // E2E tests.
 
     fn push_redundant_sed_read(state: &mut AgenticLoopState, round: u32) {
         // Same file, same range, no intervening mutation — counts as one

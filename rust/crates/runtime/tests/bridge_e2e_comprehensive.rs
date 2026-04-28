@@ -8745,7 +8745,7 @@ async fn b1_think_before_act_directive_in_system_prompt() {
     );
 }
 
-/// B2: round_budget_directive returns empty for early rounds (0, 1, 2).
+/// B2: round_budget_directive always returns empty (budget pressure removed).
 #[tokio::test]
 async fn b2_round_budget_no_directive_early_rounds() {
     for round in 0..astra_runtime::prompts::ROUND_BUDGET_THRESHOLD {
@@ -8757,78 +8757,47 @@ async fn b2_round_budget_no_directive_early_rounds() {
     }
 }
 
-/// B2: round_budget_directive returns warning for rounds at threshold.
+/// B2: round_budget_directive returns empty even at threshold (neutered).
 #[tokio::test]
 async fn b2_round_budget_warning_at_threshold() {
     let threshold = astra_runtime::prompts::ROUND_BUDGET_THRESHOLD;
     let directive = astra_runtime::prompts::round_budget_directive(threshold);
     assert!(
-        directive.contains("Round Budget Warning"),
-        "round {threshold} should have budget warning"
-    );
-    assert!(
-        directive.contains("batch ALL remaining tool calls"),
-        "warning should encourage batching"
-    );
-    assert!(
-        !directive.contains("MUST produce your final answer"),
-        "threshold round should be warning, not hard limit"
+        directive.is_empty(),
+        "round budget directive should always be empty (circuit breaker replaces it)"
     );
 }
 
-/// B2: round_budget_directive returns hard stop at hard limit.
+/// B2: round_budget_directive returns empty even at hard limit (neutered).
 #[tokio::test]
 async fn b2_round_budget_hard_limit() {
     let hard = astra_runtime::prompts::ROUND_BUDGET_HARD_LIMIT;
     let directive = astra_runtime::prompts::round_budget_directive(hard);
     assert!(
-        directive.contains("Round Budget Exceeded"),
-        "hard limit should say 'Exceeded'"
-    );
-    assert!(
-        directive.contains("MUST produce your final answer NOW"),
-        "hard limit should demand final answer"
-    );
-    assert!(
-        directive.contains("Do NOT call any more tools"),
-        "hard limit should prohibit further tool calls"
+        directive.is_empty(),
+        "round budget directive should always be empty (circuit breaker replaces it)"
     );
 }
 
-/// B2: round_budget_directive past hard limit still triggers hard stop.
+/// B2: round_budget_directive returns empty past hard limit (neutered).
 #[tokio::test]
 async fn b2_round_budget_past_hard_limit() {
     let past = astra_runtime::prompts::ROUND_BUDGET_HARD_LIMIT + 5;
     let directive = astra_runtime::prompts::round_budget_directive(past);
     assert!(
-        directive.contains("Round Budget Exceeded"),
-        "past hard limit should still say 'Exceeded'"
+        directive.is_empty(),
+        "round budget directive should always be empty (circuit breaker replaces it)"
     );
 }
 
-/// B2: round_budget_directive_with respects custom thresholds.
+/// B2: round_budget_directive_with always returns empty (neutered).
 #[tokio::test]
 async fn b2_round_budget_custom_thresholds() {
     use astra_runtime::prompts::round_budget_directive_with;
 
-    // Below custom warning → empty
     assert!(round_budget_directive_with(4, 5, 10).is_empty());
-
-    // At custom warning → warning with correct remaining count
-    let w = round_budget_directive_with(5, 5, 10);
-    assert!(
-        w.contains("Round Budget Warning"),
-        "should warn at custom threshold"
-    );
-    assert!(w.contains("5 remaining"), "should show correct remaining");
-
-    // At custom limit → exceeded
-    let e = round_budget_directive_with(10, 5, 10);
-    assert!(
-        e.contains("Round Budget Exceeded"),
-        "should exceed at custom limit"
-    );
-    assert!(e.contains("round 10/10"), "should show custom limit");
+    assert!(round_budget_directive_with(5, 5, 10).is_empty());
+    assert!(round_budget_directive_with(10, 5, 10).is_empty());
 }
 
 /// B2: Bridge reads round_index from payload and injects directive into dynamic prompt.
@@ -8917,14 +8886,11 @@ async fn b2_round_index_defaults_to_zero() {
 #[tokio::test]
 async fn b2_round_budget_warning_shows_remaining() {
     let threshold = astra_runtime::prompts::ROUND_BUDGET_THRESHOLD;
-    let hard = astra_runtime::prompts::ROUND_BUDGET_HARD_LIMIT;
-    let remaining = hard - threshold;
-
+    // Directive is always empty now (circuit breaker replaces countdown).
     let directive = astra_runtime::prompts::round_budget_directive(threshold);
-    let expected = format!("{remaining} remaining");
     assert!(
-        directive.contains(&expected),
-        "warning should show '{expected}' remaining, got: {directive}"
+        directive.is_empty(),
+        "round budget directive should always be empty"
     );
 }
 

@@ -1563,9 +1563,10 @@ mod tests {
 
     #[tokio::test]
     async fn round_budget_guidance_injected_at_threshold() {
-        // Simulate enough tool rounds to exceed ROUND_BUDGET_THRESHOLD (8).
-        // Use varied tool names to avoid the stall detector's duplicate-call
-        // force-stop interfering with the test.
+        // With the circuit breaker refactor, round budget directives are no
+        // longer injected. The parallel-batching nudge may still fire if the
+        // model produces single-tool rounds. This test verifies the loop
+        // completes normally without budget pressure.
         let tool_names = [
             "read_file",
             "grep",
@@ -1596,19 +1597,18 @@ mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
 
-        // After ROUND_BUDGET_THRESHOLD rounds, a user message with
-        // "Round Budget" or "Synthesize" should appear.
-        let guidance_found = state.messages.iter().any(|m| {
+        // Round budget directives are no longer injected (circuit breaker
+        // handles stalls). Verify no "Round Budget" messages appear.
+        let budget_found = state.messages.iter().any(|m| {
             m.get("role").and_then(|r| r.as_str()) == Some("user")
                 && m.get("content")
                     .and_then(|c| c.as_str())
-                    .map(|s| s.contains("Round Budget") || s.contains("Synthesize"))
+                    .map(|s| s.contains("Round Budget"))
                     .unwrap_or(false)
         });
         assert!(
-            guidance_found,
-            "round budget guidance must be injected after {} rounds",
-            crate::prompts::ROUND_BUDGET_THRESHOLD,
+            !budget_found,
+            "round budget directives should no longer be injected (circuit breaker replaces them)",
         );
     }
 

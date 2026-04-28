@@ -116,6 +116,7 @@ pub mod bridge_sse_events;
 pub mod complete;
 pub mod edge_prompt_context;
 pub mod hydrate_reflect;
+pub mod loop_circuit_breaker;
 pub mod stall;
 pub mod tool_registry_state;
 
