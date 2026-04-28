@@ -3901,6 +3901,7 @@ mod tests {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            continuity: Default::default(),
             compact_strategy: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),

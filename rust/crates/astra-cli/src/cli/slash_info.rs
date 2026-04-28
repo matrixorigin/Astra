@@ -1276,6 +1276,7 @@ pub(super) async fn handle_info_command(
                 git_worktree_journal: None,
                 session_state_journal: None,
                 task_manager: None,
+                runtime_continuity: None,
                 turn_index: 0,
                 evolution_service: state.evolution_service.clone(),
             })

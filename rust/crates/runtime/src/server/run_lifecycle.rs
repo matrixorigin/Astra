@@ -1899,6 +1899,7 @@ impl AgenticRunLifecycleService {
             .as_ref()
             .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
             .unwrap_or_default();
+        let runtime_continuity = Self::continuity_from_chat_context(&request.context);
 
         // Build the server-side skill fork executor so skills with
         // execution_context: Fork can run in isolated sub-agent loops.
@@ -2024,6 +2025,7 @@ impl AgenticRunLifecycleService {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            continuity: runtime_continuity.unwrap_or_default(),
             compact_strategy: crate::turn::microcompact::CompactStrategy::from_provider_hint(
                 request.model.as_deref().unwrap_or(""),
             ),
@@ -2034,6 +2036,104 @@ impl AgenticRunLifecycleService {
             bridge_turn_chain_id: None,
             bridge_user_query_event_id: None,
             turn_event_buffer: None,
+        }
+    }
+
+    fn parse_runtime_continuity_value(
+        value: &Value,
+        source: &'static str,
+    ) -> Option<astra_turn_types::continuity::ContinuityState> {
+        astra_turn_types::continuity::try_from_checkpoint_value(value)
+            .map_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    source,
+                    "dropping invalid continuity_state"
+                );
+            })
+            .ok()
+    }
+
+    fn continuity_from_chat_context(
+        context: &Option<Map<String, Value>>,
+    ) -> Option<astra_turn_types::continuity::ContinuityState> {
+        context
+            .as_ref()
+            .and_then(|ctx| ctx.get("continuity_state"))
+            .and_then(|value| Self::parse_runtime_continuity_value(value, "chat request context"))
+    }
+
+    async fn restore_continuity_from_session_checkpoint(
+        &self,
+        session_id: &str,
+    ) -> Result<
+        Option<astra_turn_types::continuity::ContinuityState>,
+        crate::pipeline::step_restore::RestoreError,
+    > {
+        match crate::pipeline::step_restore::restore_session_with_continuity_validator(
+            session_id,
+            |value| {
+                astra_turn_types::continuity::try_from_checkpoint_value(value)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            },
+        ) {
+            Ok(Some(restored)) => {
+                // RestoredSession.continuity_state is now Option<ContinuityState>
+                // (parsed during restore), so no re-parse needed here.
+                if restored.continuity_state.is_some() {
+                    return Ok(restored.continuity_state);
+                }
+            }
+            Ok(None) => {}
+            Err(crate::pipeline::step_restore::RestoreError::IoError(error)) => {
+                return Err(crate::pipeline::step_restore::RestoreError::IoError(error));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    session_id,
+                    "skipping invalid local step checkpoint during server continuity restore"
+                );
+            }
+        }
+
+        let Some(shared_pool) = self.shared_pool.as_ref() else {
+            return Ok(None);
+        };
+        match astra_services::session_restore::pull_step_checkpoint_from_cloud(
+            shared_pool.get(),
+            session_id,
+        )
+        .await
+        {
+            Ok(Some(state_json)) => {
+                match astra_services::session_restore::parse_cloud_heavy_checkpoint_state(
+                    &state_json,
+                ) {
+                    // continuity_state is already a parsed ContinuityState (Option<ContinuityState>)
+                    // after the CloudHeavyCheckpointState strong-type migration — no re-parse needed.
+                    Ok(Some(heavy)) => Ok(heavy.continuity_state),
+                    Ok(None) => Ok(None),
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            session_id,
+                            "skipping cloud step checkpoint during server continuity restore"
+                        );
+                        Ok(None)
+                    }
+                }
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    session_id,
+                    "cloud step checkpoint unavailable during server continuity restore"
+                );
+                Ok(None)
+            }
         }
     }
 
@@ -2268,6 +2368,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             server_workspace.as_deref(),
             Some(llm_cancel_token.clone()),
         );
+        if request.session_id.is_some()
+            && loop_state.continuity == astra_turn_types::continuity::ContinuityState::default()
+        {
+            match self
+                .restore_continuity_from_session_checkpoint(&session_id)
+                .await
+            {
+                Ok(Some(restored)) => loop_state.continuity = restored,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        session_id,
+                        "server continuity restore unavailable; continuing without checkpoint continuity"
+                    );
+                }
+            }
+        }
         loop_state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
         self.configure_loop_state_runtime_controls(
             &mut loop_state,
@@ -2644,6 +2762,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             server_workspace.as_deref(),
             Some(llm_cancel_token.clone()),
         );
+        if request.session_id.is_some()
+            && state.continuity == astra_turn_types::continuity::ContinuityState::default()
+        {
+            match self
+                .restore_continuity_from_session_checkpoint(&session_id)
+                .await
+            {
+                Ok(Some(restored)) => state.continuity = restored,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        session_id,
+                        "server continuity restore unavailable; continuing without checkpoint continuity"
+                    );
+                }
+            }
+        }
         state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
 
         let plan_resume_hint = if let Some(shared) = &self.shared_pool {
@@ -3534,6 +3670,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            continuity: Default::default(),
             compact_strategy,
             approval_overrides: None,
             confidence_trend: Default::default(),
@@ -4970,6 +5107,40 @@ mod tests {
         assert_eq!(state.agentic_turn_budget, expected_budget);
         assert_eq!(state.message, "write a test");
         assert!(state.cancellation.token.is_none());
+    }
+
+    #[test]
+    fn build_initial_state_restores_continuity_from_request_context() {
+        let svc = test_service();
+        let mut continuity = astra_turn_types::continuity::ContinuityState::default();
+        continuity.ensure_tracked_goal("continue server-side restored work");
+        let mut req = test_request("continue");
+        let mut context = Map::new();
+        context.insert(
+            "continuity_state".to_string(),
+            serde_json::to_value(&continuity).unwrap(),
+        );
+        req.context = Some(context);
+
+        let state = svc.build_initial_state(&req, "sess-1", "run-1", None, None);
+
+        assert_eq!(state.continuity, continuity);
+    }
+
+    #[test]
+    fn build_initial_state_soft_drops_invalid_continuity_context() {
+        let svc = test_service();
+        let mut req = test_request("continue");
+        let mut context = Map::new();
+        context.insert("continuity_state".to_string(), serde_json::json!({}));
+        req.context = Some(context);
+
+        let state = svc.build_initial_state(&req, "sess-1", "run-1", None, None);
+
+        assert_eq!(
+            state.continuity,
+            astra_turn_types::continuity::ContinuityState::default()
+        );
     }
 
     #[test]

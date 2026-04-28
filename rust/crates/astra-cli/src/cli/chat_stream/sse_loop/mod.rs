@@ -619,6 +619,7 @@ pub(crate) async fn stream_chat_sse(
         server_tool_executor: None,
         interruption: None,
         session_facts: Default::default(),
+        continuity: p.runtime_continuity.cloned().unwrap_or_default(),
         compact_strategy:
             astra_runtime::turn::microcompact::CompactStrategy::from_provider_and_model(
                 p.provider, p.model,
@@ -710,6 +711,7 @@ pub(crate) async fn stream_chat_sse(
         step_recorder: &state.step_recorder,
         turn_guard: &state.turn_guard,
         last_heavy_checkpoint: state.stall.last_heavy_checkpoint,
+        runtime_continuity: state.continuity,
         ttft_ms: state.telemetry.first_ttft_ms,
         context_ms: state.telemetry.first_context_assembly_ms,
         selector_strategy: state.telemetry.first_selector_strategy,

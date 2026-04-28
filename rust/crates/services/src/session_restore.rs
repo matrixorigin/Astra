@@ -15,6 +15,7 @@
 //! for data that may have been created on a different device.
 
 use astra_core::is_duplicate_key_error;
+use astra_turn_types::continuity::ContinuityState;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -73,6 +74,9 @@ pub struct RestoredSession {
     /// Serialized compaction-state payload restored from a heavy checkpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_state: Option<serde_json::Value>,
+    /// Validated runtime-owned continuity state restored from a heavy checkpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity_state: Option<astra_turn_types::continuity::ContinuityState>,
     /// Active plan being executed (JSON-serialized TaskPlan).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executing_plan_json: Option<String>,
@@ -114,6 +118,9 @@ pub struct CloudHeavyCheckpointState {
     pub approval_overrides: Option<serde_json::Value>,
     pub interruption: Option<serde_json::Value>,
     pub compaction_state: Option<serde_json::Value>,
+    /// Already-validated and deserialized continuity state. Avoids double-parse
+    /// (validate_restored_continuity_state → downstream restore).
+    pub continuity_state: Option<ContinuityState>,
 }
 
 /// A restored checkpoint entry (lightweight, for listing).
@@ -450,6 +457,9 @@ impl HybridRestoreService {
                     compaction_state: heavy_state
                         .as_ref()
                         .and_then(|heavy| heavy.compaction_state.clone()),
+                    continuity_state: heavy_state
+                        .as_ref()
+                        .and_then(|heavy| heavy.continuity_state.clone()),
                     executing_plan_json: metadata_state.executing_plan_json,
                     plan_goal: metadata_state.plan_goal,
                     plan_config_json: metadata_state.plan_config_json,
@@ -657,10 +667,10 @@ impl HybridRestoreService {
             None => return Ok(None),
         };
 
-        let state_json = pull_step_checkpoint_from_cloud(pool, session_id).await?;
-        Ok(state_json
-            .as_deref()
-            .and_then(parse_cloud_heavy_checkpoint_state))
+        let Some(state_json) = pull_step_checkpoint_from_cloud(pool, session_id).await? else {
+            return Ok(None);
+        };
+        parse_cloud_heavy_checkpoint_state(&state_json)
     }
 
     /// List checkpoints from MatrixOne.
@@ -984,6 +994,7 @@ fn cloud_heavy_payload(root: &serde_json::Value) -> Option<&serde_json::Value> {
         || root.get("approval_overrides").is_some()
         || root.get("interruption").is_some()
         || root.get("compaction_state").is_some()
+        || root.get("continuity_state").is_some()
     {
         return Some(root);
     }
@@ -993,10 +1004,28 @@ fn cloud_heavy_payload(root: &serde_json::Value) -> Option<&serde_json::Value> {
 /// Parse cloud step-checkpoint JSON into the heavy-state fields needed for restore.
 /// Accepts both the current externally tagged `{"Heavy": ...}` shape and legacy
 /// rows that stored the heavy payload unwrapped.
-pub fn parse_cloud_heavy_checkpoint_state(state_json: &str) -> Option<CloudHeavyCheckpointState> {
-    let root = serde_json::from_str::<serde_json::Value>(state_json).ok()?;
-    let heavy = cloud_heavy_payload(&root)?;
-    Some(CloudHeavyCheckpointState {
+pub fn parse_cloud_heavy_checkpoint_state(
+    state_json: &str,
+) -> Result<Option<CloudHeavyCheckpointState>, String> {
+    let root = match serde_json::from_str::<serde_json::Value>(state_json) {
+        Ok(root) => root,
+        Err(_) => return Ok(None),
+    };
+    let Some(heavy) = cloud_heavy_payload(&root) else {
+        return Ok(None);
+    };
+    let continuity_state = heavy
+        .get("continuity_state")
+        .cloned()
+        .filter(|v| !v.is_null());
+    let continuity_state = match validate_restored_continuity_state(continuity_state) {
+        Ok(continuity_state) => continuity_state,
+        Err(error) => {
+            tracing::debug!(error = %error, "dropping invalid continuity_state from cloud checkpoint");
+            None
+        }
+    };
+    Ok(Some(CloudHeavyCheckpointState {
         messages: heavy
             .get("messages")
             .and_then(|v| v.as_array())
@@ -1019,7 +1048,26 @@ pub fn parse_cloud_heavy_checkpoint_state(state_json: &str) -> Option<CloudHeavy
             .get("compaction_state")
             .cloned()
             .filter(|v| !v.is_null()),
-    })
+        continuity_state,
+    }))
+}
+
+fn validate_restored_continuity_state(
+    continuity_state: Option<serde_json::Value>,
+) -> Result<Option<ContinuityState>, String> {
+    let Some(value) = continuity_state else {
+        return Ok(None);
+    };
+    astra_turn_types::continuity::try_from_checkpoint_value(&value)
+        .map(Some)
+        .map_err(|e| {
+            let error = e.to_string();
+            tracing::warn!(
+                error = %error,
+                "continuity_state blob rejected at cloud restore"
+            );
+            error
+        })
 }
 
 #[async_trait]
@@ -2984,6 +3032,29 @@ mod tests {
         let approval_overrides = serde_json::json!({"rules": []});
         let interruption = serde_json::json!({"kind":"rate_limited"});
         let compaction_state = serde_json::json!({"attempt_count": 2});
+        let continuity_state = serde_json::json!({
+            "goal": {"text": "continue durable todo"},
+            "todos": {"items": []},
+            "facts": {
+                "active_files": [],
+                "recent_tool_calls": [],
+                "plan_state": null,
+                "blocked_tools": [],
+                "error_state": {
+                    "total_errors": 0,
+                    "last_error": null,
+                    "last_error_turn": null
+                },
+                "turn": 0,
+                "estimated_tokens": 0
+            },
+            "user_corrections": [],
+            "verification": {
+                "last_status": null,
+                "last_evidence": null,
+                "last_turn": null
+            }
+        });
         let expected = CloudHeavyCheckpointState {
             messages: messages.clone(),
             blocked_tools: vec!["bash".into()],
@@ -2991,6 +3062,10 @@ mod tests {
             approval_overrides: Some(approval_overrides.clone()),
             interruption: Some(interruption.clone()),
             compaction_state: Some(compaction_state.clone()),
+            continuity_state: astra_turn_types::continuity::try_from_checkpoint_value(
+                &continuity_state,
+            )
+            .ok(),
         };
         let tagged = serde_json::json!({
             "Heavy": {
@@ -3000,7 +3075,8 @@ mod tests {
                 "recent_tools": ["rg"],
                 "approval_overrides": approval_overrides,
                 "interruption": interruption,
-                "compaction_state": compaction_state
+                "compaction_state": compaction_state,
+                "continuity_state": continuity_state
             }
         })
         .to_string();
@@ -3010,15 +3086,47 @@ mod tests {
             "recent_tools": expected.recent_tools.clone(),
             "approval_overrides": expected.approval_overrides.clone(),
             "interruption": expected.interruption.clone(),
-            "compaction_state": expected.compaction_state.clone()
+            "compaction_state": expected.compaction_state.clone(),
+            "continuity_state": expected.continuity_state.clone()
         })
         .to_string();
 
         assert_eq!(
             parse_cloud_heavy_checkpoint_state(&tagged),
-            Some(expected.clone())
+            Ok(Some(expected.clone()))
         );
-        assert_eq!(parse_cloud_heavy_checkpoint_state(&legacy), Some(expected));
+        assert_eq!(
+            parse_cloud_heavy_checkpoint_state(&legacy),
+            Ok(Some(expected))
+        );
+    }
+
+    #[test]
+    fn parse_cloud_heavy_checkpoint_state_drops_bad_continuity_state() {
+        let tagged = serde_json::json!({
+            "Heavy": {
+                "messages": [{"role": "user", "content": "hi"}],
+                "continuity_state": {
+                    "goal": {"text": "x"},
+                    "todos": "not-an-object",
+                    "facts": {},
+                    "user_corrections": [],
+                    "verification": {}
+                }
+            }
+        })
+        .to_string();
+
+        let restored = parse_cloud_heavy_checkpoint_state(&tagged)
+            .unwrap()
+            .expect("heavy payload should still restore");
+        assert_eq!(restored.messages.len(), 1);
+        assert!(restored.continuity_state.is_none());
+    }
+
+    #[test]
+    fn parse_cloud_heavy_checkpoint_state_keeps_corrupt_json_as_absent() {
+        assert_eq!(parse_cloud_heavy_checkpoint_state("{not-json"), Ok(None));
     }
 
     #[test]

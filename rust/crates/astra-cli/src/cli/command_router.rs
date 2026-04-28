@@ -2722,6 +2722,7 @@ mod exit_code_tests {
             step_recorder_summary: None,
             tool_health_export: vec![],
             last_heavy_checkpoint: None,
+            runtime_continuity: Default::default(),
             ttft_ms: None,
             context_ms: None,
             selector_strategy: None,

@@ -3,8 +3,10 @@
 //! This crate provides foundational types used during turn execution,
 //! extracted from the monolithic runtime crate for better modularity.
 
+pub mod continuity;
 mod implicit_feedback;
 mod result_quality;
+pub mod session_facts;
 
 pub use implicit_feedback::{
     ImplicitSignal, StructuredFeedback, detect_implicit_feedback_signal,

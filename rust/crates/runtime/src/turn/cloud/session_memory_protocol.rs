@@ -4,6 +4,11 @@
 
 use serde_json::Value;
 
+use astra_turn_types::continuity::{
+    AttentionManifest, ContinuityState, GoalState, TodoItem, TodoState, TodoStatus,
+    narrative_task_contradicts_facts, redact_sensitive,
+};
+
 use super::session_facts::SessionFacts;
 
 // ── L0: Session Anchor ──────────────────────────────────────────────────────
@@ -402,34 +407,101 @@ pub fn build_facts_first_injection(
     let mut out = String::from("[session-memory]\n");
 
     // ── Layer 1: System Facts (ground truth, ~150t) ──
-    out.push_str(&facts.to_injection());
-
-    // Track which narrative sections to skip due to cross-validation
-    let mut skip_task = false;
-
-    // ── Layer 2: Cross-validation (detect contradictions BEFORE injecting narrative) ──
-    if facts.error_state.total_errors > 0 && facts.error_state.last_error.is_some() {
-        if let Some(plan) = &facts.plan_state {
-            if plan.completed == plan.total && plan.total > 0 {
-                skip_task = true;
-                out.push_str(
-                    "⚠️ Plan complete but unresolved errors — narrative Task section omitted\n",
-                );
-            }
+    if facts_have_attention_value(facts) {
+        let attention =
+            AttentionManifest::from_state(&continuity_from_facts(facts), 4_000).into_string();
+        out.push_str(&attention);
+        if !out.ends_with('\n') {
+            out.push('\n');
         }
     }
+    out.push_str(&facts.to_injection());
+    append_validated_narrative(&mut out, facts, narrative);
+
+    out
+}
+
+/// Build continuity-first injection: runtime-owned attention/todo state first,
+/// then SessionFacts, then LLM narrative only as validated supplement.
+pub fn build_continuity_first_injection(
+    continuity: &ContinuityState,
+    narrative: Option<&SessionMemory>,
+) -> String {
+    let mut out = String::from("[session-memory]\n");
+    let attention = AttentionManifest::from_state(continuity, 4_000).into_string();
+    out.push_str(&attention);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&continuity.facts.to_injection());
+    append_validated_narrative(&mut out, &continuity.facts, narrative);
+    out
+}
+
+fn facts_have_attention_value(facts: &SessionFacts) -> bool {
+    facts.plan_state.is_some()
+        || !facts.active_files.is_empty()
+        || facts.error_state.total_errors > 0
+        || !facts.blocked_tools.is_empty()
+}
+
+fn continuity_from_facts(facts: &SessionFacts) -> ContinuityState {
+    let goal = facts
+        .plan_state
+        .as_ref()
+        .map(|plan| plan.goal.clone())
+        .unwrap_or_default();
+    let todos = facts
+        .plan_state
+        .as_ref()
+        .and_then(|plan| {
+            plan.current_subtask.as_ref().map(|subtask| TodoState {
+                items: vec![TodoItem {
+                    id: "session-plan-current".to_string(),
+                    title: subtask.clone(),
+                    description: subtask.clone(),
+                    status: TodoStatus::InProgress,
+                    evidence: Vec::new(),
+                    blocked_reason: None,
+                }],
+            })
+        })
+        .unwrap_or_default();
+
+    ContinuityState {
+        goal: GoalState {
+            text: goal,
+            source_turn: None,
+        },
+        todos,
+        facts: facts.clone(),
+        user_corrections: Vec::new(),
+        verification: Default::default(),
+    }
+}
+
+fn append_validated_narrative(
+    out: &mut String,
+    facts: &SessionFacts,
+    narrative: Option<&SessionMemory>,
+) {
+    let skip_task = narrative_task_contradicts_facts(facts);
 
     // ── Layer 3: LLM Narrative (supplement, ≤500t) ──
     if let Some(n) = narrative {
         if !skip_task {
             if let Some(task) = n.section("Task Specification") {
                 out.push_str("# Task\n");
-                out.push_str(&truncate_to_token_budget(task.trim(), 200));
+                out.push_str(&truncate_to_token_budget(
+                    redact_sensitive(task.trim()).as_str(),
+                    200,
+                ));
                 out.push('\n');
             }
         }
         if let Some(corrections) = n.section("User Corrections") {
-            let trimmed = corrections.trim();
+            let redacted = redact_sensitive(corrections.trim());
+            let trimmed = redacted.trim();
             if !trimmed.is_empty() {
                 out.push_str("# User Corrections\n");
                 out.push_str(&truncate_to_token_budget(trimmed, 150));
@@ -445,7 +517,7 @@ pub fn build_facts_first_injection(
             if !last_three.is_empty() {
                 out.push_str("# Learnings\n");
                 for line in &last_three {
-                    out.push_str(line.trim());
+                    out.push_str(&redact_sensitive(line.trim()));
                     out.push('\n');
                 }
             }
@@ -457,13 +529,11 @@ pub fn build_facts_first_injection(
                 .collect();
             if let Some(recent) = entries.last() {
                 out.push_str("# Last Decision\n");
-                out.push_str(recent.trim());
+                out.push_str(&redact_sensitive(recent.trim()));
                 out.push('\n');
             }
         }
     }
-
-    out
 }
 
 /// Extract text content from a message, handling both string and Anthropic content blocks.
@@ -984,6 +1054,32 @@ mod tests {
     }
 
     #[test]
+    fn facts_first_injection_includes_attention_manifest_from_plan_facts() {
+        use super::super::session_facts::{PlanFact, SessionFacts};
+        let facts = SessionFacts {
+            plan_state: Some(PlanFact {
+                goal: "Implement runtime continuity".to_string(),
+                completed: 1,
+                total: 3,
+                current_subtask: Some("wire attention into compaction".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        let injection = build_facts_first_injection(&facts, None);
+        let attention_pos = injection.find("[attention:v1]").unwrap();
+        let facts_pos = injection.find("# System State").unwrap();
+        assert!(attention_pos < facts_pos);
+        assert!(injection.contains("goal: Implement runtime continuity"));
+        assert!(
+            injection.contains(
+                "current_todo: session-plan-current [in_progress]: wire attention into compaction"
+            ),
+            "{injection}"
+        );
+    }
+
+    #[test]
     fn injection_cross_validation_skips_task_on_contradiction() {
         use super::super::session_facts::{ErrorFact, PlanFact, SessionFacts};
         let mut facts = SessionFacts::default();
@@ -1008,10 +1104,81 @@ mod tests {
             !injection.contains("# Task"),
             "contradicted Task should be skipped"
         );
-        assert!(injection.contains("⚠️"), "should have warning");
+        assert!(
+            !injection.contains("⚠️"),
+            "contradicted narrative should be omitted without prompt warning noise"
+        );
         // But User Corrections should still be present
         assert!(injection.contains("# User Corrections"));
         assert!(injection.contains("RS256"));
+    }
+
+    #[test]
+    fn continuity_first_injection_puts_attention_before_facts_and_narrative() {
+        use astra_turn_types::continuity::{
+            ContinuityState, TodoItem, TodoState, TodoStatus, VerificationState, VerificationStatus,
+        };
+        use astra_turn_types::session_facts::{FileEntry, SessionFacts};
+
+        let facts = SessionFacts {
+            turn: 7,
+            active_files: vec![FileEntry {
+                path: "rust/crates/runtime/src/turn/agentic_loop_execution_phase.rs".to_string(),
+                last_action: "write".to_string(),
+                turn: 7,
+            }],
+            ..Default::default()
+        };
+        let mut verification = VerificationState::default();
+        verification.set(VerificationStatus::Failed, "cargo test failed", 7);
+        let continuity = ContinuityState {
+            goal: astra_turn_types::continuity::GoalState {
+                text: "Implement runtime-owned continuity".to_string(),
+                source_turn: Some(1),
+            },
+            todos: TodoState {
+                items: vec![TodoItem {
+                    id: "attention-injection".to_string(),
+                    title: "Inject attention manifest".to_string(),
+                    description: "turn start injection".to_string(),
+                    status: TodoStatus::InProgress,
+                    evidence: vec![],
+                    blocked_reason: None,
+                }],
+            },
+            facts,
+            user_corrections: Vec::new(),
+            verification,
+        };
+        let narrative = narrative_with_sections(&[("Task Specification", "LLM narrative")]);
+
+        let injection = build_continuity_first_injection(&continuity, Some(&narrative));
+        let attention_pos = injection.find("[attention:v1]").unwrap();
+        let facts_pos = injection.find("# System State").unwrap();
+        let task_pos = injection.find("# Task").unwrap();
+        assert!(attention_pos < facts_pos);
+        assert!(facts_pos < task_pos);
+        assert!(injection.contains("current_todo: attention-injection [in_progress]"));
+        assert!(injection.contains("- failed t7: cargo test failed"));
+    }
+
+    #[test]
+    fn facts_first_narrative_sections_are_redacted() {
+        use super::super::session_facts::SessionFacts;
+        let facts = SessionFacts::default();
+        let narrative = narrative_with_sections(&[
+            ("Task Specification", "Use token=ghp_secret"),
+            ("User Corrections", "password:hunter2"),
+            ("Decisions", "- Use api_key=abc123"),
+        ]);
+
+        let injection = build_facts_first_injection(&facts, Some(&narrative));
+        assert!(injection.contains("token=[REDACTED]"));
+        assert!(injection.contains("password:[REDACTED]"));
+        assert!(injection.contains("api_key=[REDACTED]"));
+        assert!(!injection.contains("hunter2"));
+        assert!(!injection.contains("abc123"));
+        assert!(!injection.contains("ghp_secret"));
     }
 
     #[test]

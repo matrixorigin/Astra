@@ -1776,6 +1776,7 @@ async fn plan_executor_task(
                     git_worktree_journal: Some(ctx.git_worktree_journal.clone()),
                     session_state_journal: Some(ctx.session_state_journal.clone()),
                     task_manager: Some(ctx.task_manager.clone()),
+                    runtime_continuity: None,
                     turn_index: ctx.turn,
                     evolution_service: ctx.evolution_service.clone(),
                 })
@@ -2743,6 +2744,7 @@ mod tests {
             step_recorder_summary: None,
             tool_health_export: Vec::new(),
             last_heavy_checkpoint: None,
+            runtime_continuity: Default::default(),
             ttft_ms: None,
             context_ms: None,
             selector_strategy: None,
@@ -3762,6 +3764,7 @@ All acceptance checks pass:
             step_recorder_summary: None,
             tool_health_export: Vec::new(),
             last_heavy_checkpoint: None,
+            runtime_continuity: Default::default(),
             ttft_ms: Some(1500),
             context_ms: Some(220),
             selector_strategy: Some("tfidf".into()),

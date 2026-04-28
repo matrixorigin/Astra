@@ -148,6 +148,8 @@ dependencies = [
  "astra-text-utils",
  "astra-thin-client",
  "astra-tools",
+ "astra-turn-core",
+ "astra-turn-types",
  "async-trait",
  "axum 0.8.9",
  "base64",
@@ -451,6 +453,7 @@ version = "0.1.0"
 dependencies = [
  "astra-core",
  "astra-logging",
+ "astra-turn-types",
  "async-trait",
  "axum 0.8.9",
  "base64",
@@ -618,6 +621,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

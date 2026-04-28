@@ -754,6 +754,11 @@ pub struct AgenticLoopState {
     /// Used for facts-first anchor, injection, compaction, and microcompact pin list.
     pub session_facts: crate::turn::cloud::session_facts::SessionFacts,
 
+    // ── Runtime-owned continuity (goal/todo/attention) ──
+    /// Deterministic continuity state used to reconstruct attention every LLM round
+    /// without relying on model-invoked task tools.
+    pub continuity: astra_turn_types::continuity::ContinuityState,
+
     /// Provider-aware compaction strategy for microcompact placeholders.
     pub compact_strategy: astra_turn_core::microcompact::CompactStrategy,
 
@@ -1130,6 +1135,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         server_tool_executor: None,
         interruption: None,
         session_facts: Default::default(),
+        continuity: Default::default(),
         compact_strategy: Default::default(),
         approval_overrides: None,
         confidence_trend: Default::default(),
@@ -1161,6 +1167,7 @@ pub(crate) mod tests {
         reflection_error: Option<String>,
         pub(crate) last_reflection_prompt: Option<String>,
         pub(crate) rendered_final_text: Vec<String>,
+        pub(crate) executed_messages: Vec<Vec<Value>>,
     }
 
     impl MockHost {
@@ -1176,6 +1183,7 @@ pub(crate) mod tests {
                 reflection_error: None,
                 last_reflection_prompt: None,
                 rendered_final_text: Vec::new(),
+                executed_messages: Vec::new(),
             }
         }
 
@@ -1203,7 +1211,7 @@ pub(crate) mod tests {
     impl AgenticLoopHost for MockHost {
         async fn execute_turn(
             &mut self,
-            _state: &mut AgenticLoopState,
+            state: &mut AgenticLoopState,
         ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
             if self.turn_results.is_empty() {
                 return Err(astra_core::ClassifiedError::new(
@@ -1211,6 +1219,7 @@ pub(crate) mod tests {
                     "no more turns",
                 ));
             }
+            self.executed_messages.push(state.messages.clone());
             let result = self.turn_results.remove(0);
             self.current_turn += 1;
             Ok(result)
@@ -1478,6 +1487,7 @@ pub(crate) mod tests {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            continuity: Default::default(),
             compact_strategy: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),

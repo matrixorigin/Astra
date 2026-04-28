@@ -154,6 +154,8 @@ pub(crate) struct ChatTurnParams<'a> {
         Option<std::sync::Arc<std::sync::Mutex<crate::edge_tools::SessionStateRollbackJournal>>>,
     /// Session-scoped task manager so task mutations survive across turns.
     pub(crate) task_manager: Option<std::sync::Arc<crate::edge_tools::TaskManager>>,
+    /// Runtime-owned continuity restored from a checkpoint or prior REPL turn.
+    pub(crate) runtime_continuity: Option<&'a astra_turn_types::continuity::ContinuityState>,
     /// Current REPL turn number — used to tag journal entries for undo.
     pub(crate) turn_index: u32,
     /// Shared evolution service for multi-axis self-evolution.
@@ -236,6 +238,7 @@ impl<'a> ChatTurnParams<'a> {
             git_worktree_journal: None,
             session_state_journal: None,
             task_manager: None,
+            runtime_continuity: None,
             turn_index: 0,
             evolution_service: None,
         }

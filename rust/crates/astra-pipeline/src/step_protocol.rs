@@ -260,6 +260,38 @@ impl std::fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
+/// Schema-level validation errors raised by `HeavyCheckpoint::validate_with`.
+///
+/// Distinct from `ProtocolError` because schema drift of embedded serialized
+/// payloads (e.g. `continuity_state`) is an application-level concern the
+/// runtime injects as a validator closure — pipeline does not own that schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationError {
+    /// Base protocol validation failed (delegated from `validate()`).
+    Protocol(String),
+    /// Embedded `continuity_state` blob failed injected schema validator.
+    ContinuityStateSchema(String),
+}
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Protocol(msg) => write!(f, "Protocol validation failed: {msg}"),
+            Self::ContinuityStateSchema(msg) => {
+                write!(f, "continuity_state schema validation failed: {msg}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
+impl From<ProtocolError> for ValidationError {
+    fn from(e: ProtocolError) -> Self {
+        Self::Protocol(e.to_string())
+    }
+}
+
 // ─── Step: Layered Structure ─────────────────────────────────────────────────
 
 /// Scheduling contract — immutable policy governing a step's execution.
@@ -856,6 +888,11 @@ pub struct HeavyCheckpoint {
     /// last_was_insufficient — enabling enriched resume guidance and tier selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_state: Option<serde_json::Value>,
+    /// Serialized runtime-owned continuity state (goal/todo/facts/attention).
+    /// Restored before the next model call so "continue" does not depend on
+    /// LLM narrative memory or explicit task-tool usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity_state: Option<serde_json::Value>,
 }
 /// Summary of a completed delegation sub-run, stored in HeavyCheckpoint for recovery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -974,6 +1011,7 @@ impl StepCheckpoint {
             approval_overrides: None,
             consecutive_context_window_errors: 0,
             compaction_state: None,
+            continuity_state: None,
         }))
     }
 
@@ -1055,6 +1093,60 @@ impl StepCheckpoint {
     /// Is this a heavy (full recovery) checkpoint?
     pub fn is_heavy(&self) -> bool {
         matches!(self, Self::Heavy(_))
+    }
+
+    /// Extended validation with an injected schema validator for the
+    /// embedded `continuity_state` blob.
+    ///
+    /// The validator closure is **only** invoked when:
+    ///   - `self` is a `Heavy` checkpoint, AND
+    ///   - `continuity_state` is `Some(_)`.
+    ///
+    /// Light checkpoints do not carry embedded continuity state; for `Light`
+    /// variants this method still runs base protocol validation, then treats the
+    /// injected schema validator as a no-op.
+    ///
+    /// This keeps `astra-pipeline` free of any knowledge about the continuity
+    /// schema (which lives in `astra-turn-types`), while still giving restore
+    /// paths a single choke-point to reject malformed blobs at checkpoint
+    /// validation time rather than discovering drift later during use.
+    pub fn validate_with<F>(&self, validator: F) -> Result<(), ValidationError>
+    where
+        F: FnOnce(&serde_json::Value) -> Result<(), String>,
+    {
+        self.validate()?;
+        if let Self::Heavy(h) = self {
+            h.validate_continuity_with(validator)?;
+        }
+        Ok(())
+    }
+}
+
+impl HeavyCheckpoint {
+    /// Schema-level validator for `HeavyCheckpoint` that invokes the provided
+    /// closure on `continuity_state` when present.
+    ///
+    /// The validator closure is **only** invoked when `continuity_state` is
+    /// `Some(_)`. This keeps `astra-pipeline` free of any knowledge about the
+    /// continuity schema (which lives in `astra-turn-types`), while still giving
+    /// restore paths a single choke-point to reject malformed blobs at
+    /// checkpoint validation time rather than discovering drift later during
+    /// use.
+    pub fn validate_with<F>(&self, validator: F) -> Result<(), ValidationError>
+    where
+        F: FnOnce(&serde_json::Value) -> Result<(), String>,
+    {
+        self.validate_continuity_with(validator)
+    }
+
+    fn validate_continuity_with<F>(&self, validator: F) -> Result<(), ValidationError>
+    where
+        F: FnOnce(&serde_json::Value) -> Result<(), String>,
+    {
+        if let Some(cs) = &self.continuity_state {
+            validator(cs).map_err(ValidationError::ContinuityStateSchema)?;
+        }
+        Ok(())
     }
 }
 
@@ -2992,6 +3084,7 @@ mod tests {
             approval_overrides: None,
             consecutive_context_window_errors: 0,
             compaction_state: None,
+            continuity_state: None,
         }));
         let err = cp.validate().unwrap_err();
         assert!(matches!(err, ProtocolError::CheckpointCorrupt(_)));
@@ -3026,6 +3119,7 @@ mod tests {
             approval_overrides: None,
             consecutive_context_window_errors: 0,
             compaction_state: None,
+            continuity_state: None,
         }));
         assert!(cp.validate().is_ok());
     }
@@ -3318,5 +3412,69 @@ mod tests {
         )
         .with_timeout_ms(120_000);
         assert_eq!(step.descriptor.scheduling.timeout_ms, 120_000);
+    }
+
+    fn make_heavy_with_continuity(cs: Option<serde_json::Value>) -> HeavyCheckpoint {
+        HeavyCheckpoint {
+            light: LightCheckpoint {
+                protocol_version: PROTOCOL_VERSION,
+                cursor: ExecutionCursor::default(),
+                step_id: "s".into(),
+                task_id: "t".into(),
+                agent_id: "a".into(),
+                progress: 0.0,
+                total_tokens: 0,
+                created_at: 0,
+            },
+            messages: vec![],
+            budget_remaining_tokens: 0,
+            budget_remaining_rounds: 0,
+            blocked_tools: vec![],
+            recent_tools: vec![],
+            learning_snapshot_id: None,
+            memory_context: None,
+            delegation_id: None,
+            delegation_pattern: None,
+            delegation_sub_run_summaries: vec![],
+            interruption: None,
+            approval_overrides: None,
+            consecutive_context_window_errors: 0,
+            compaction_state: None,
+            continuity_state: cs,
+        }
+    }
+
+    #[test]
+    fn heavy_checkpoint_rejects_malformed_continuity_state_via_validator() {
+        let cp = make_heavy_with_continuity(Some(serde_json::json!({"todos": "not-an-object"})));
+        let result = cp.validate_with(|v| {
+            v.get("todos")
+                .and_then(|t| t.as_object())
+                .ok_or_else(|| "todos must be object".to_string())?;
+            Ok(())
+        });
+        assert!(matches!(
+            result,
+            Err(ValidationError::ContinuityStateSchema(_))
+        ));
+    }
+
+    #[test]
+    fn heavy_checkpoint_accepts_valid_continuity_state_via_validator() {
+        let cp = make_heavy_with_continuity(Some(serde_json::json!({"todos": {}})));
+        let result = cp.validate_with(|v| {
+            v.get("todos")
+                .and_then(|t| t.as_object())
+                .ok_or_else(|| "todos must be object".to_string())?;
+            Ok(())
+        });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn heavy_checkpoint_validate_with_passes_when_no_continuity_state() {
+        let cp = make_heavy_with_continuity(None);
+        let result = cp.validate_with(|_| Err("should not be called".to_string()));
+        assert!(result.is_ok());
     }
 }

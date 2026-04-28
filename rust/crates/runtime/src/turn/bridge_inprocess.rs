@@ -3204,7 +3204,10 @@ impl InProcessChatTurnBridge {
                     event.turn = Some(cloud_loop_turns as u32);
                     event.tokens_in = usage.get("prompt_tokens").and_then(Value::as_i64).map(|t| t as u64);
                     event.tool_calls = Some(tool_call_records.clone());
-                    facts.update_from_journal_event(&event);
+                    crate::turn::cloud::session_facts::update_from_journal_event(
+                        &mut facts,
+                        &event,
+                    );
                 }
 
                 let l1_content = crate::turn::cloud::session_memory_protocol::build_l1_from_messages(

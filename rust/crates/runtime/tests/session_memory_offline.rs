@@ -16,6 +16,7 @@ use astra_runtime::turn::cloud::memoria_compact::{
 };
 use astra_runtime::turn::cloud::session_end_governance::run_session_end_governance;
 use astra_runtime::turn::cloud::session_facts::SessionFacts;
+use astra_runtime::turn::cloud::session_facts::update_from_journal_event;
 use astra_runtime::turn::cloud::session_memory_protocol::{
     SessionMemory, build_l1_from_messages, persist_l1,
 };
@@ -195,17 +196,18 @@ async fn full_session_memory_lifecycle_glues_modules() {
 
     // Phase 1: 3-turn conversation → build SessionFacts from journal events.
     let mut facts = SessionFacts::default();
-    facts.update_from_journal_event(&turn_event(
-        1,
-        vec![tc("read_file", true, Some("src/auth.rs"))],
-        2_000,
-    ));
-    facts.update_from_journal_event(&turn_event(
-        2,
-        vec![tc("str_replace", true, Some("src/auth.rs"))],
-        2_200,
-    ));
-    facts.update_from_journal_event(&turn_event(3, vec![tc("run_tests", false, None)], 1_800));
+    update_from_journal_event(
+        &mut facts,
+        &turn_event(1, vec![tc("read_file", true, Some("src/auth.rs"))], 2_000),
+    );
+    update_from_journal_event(
+        &mut facts,
+        &turn_event(2, vec![tc("str_replace", true, Some("src/auth.rs"))], 2_200),
+    );
+    update_from_journal_event(
+        &mut facts,
+        &turn_event(3, vec![tc("run_tests", false, None)], 1_800),
+    );
     assert_eq!(facts.turn, 3);
     assert_eq!(facts.active_files.len(), 1, "single file touched twice");
     assert!(facts.recent_tool_calls.iter().any(|t| !t.ok));

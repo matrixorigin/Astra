@@ -261,6 +261,9 @@ pub(crate) struct ReplState {
     /// Resume guidance message from a previously interrupted checkpoint.
     /// One-shot: consumed and cleared after the first turn that uses it.
     pub resume_guidance: Option<String>,
+    /// Runtime-owned continuity restored from checkpoint or updated by the last turn.
+    /// This is the live source for the next agentic loop, not just prompt guidance.
+    pub runtime_continuity: Option<astra_turn_types::continuity::ContinuityState>,
 
     /// Pre-computed plan-resume digest (P3.3).
     ///
@@ -435,6 +438,7 @@ impl Default for ReplState {
             pending_idle_agent_messages: Vec::new(),
             redo_stack: Vec::new(),
             resume_guidance: None,
+            runtime_continuity: None,
             pending_plan_resume_digest: None,
             drift_compressed_turns: Vec::new(),
             drift_user_corrections: Vec::new(),

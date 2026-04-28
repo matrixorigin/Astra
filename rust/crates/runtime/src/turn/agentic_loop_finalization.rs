@@ -327,6 +327,7 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     };
     // Persist compaction effectiveness state for enriched resume guidance.
     heavy.compaction_state = Some(state.compaction_effectiveness.to_json());
+    heavy.continuity_state = serde_json::to_value(&state.continuity).ok();
     let cp = StepCheckpoint::Heavy(Box::new(heavy));
     if let Err(e) = step_checkpoint::write_step_checkpoint(sid, ckpt_num, &cp) {
         astra_core::agent_warn!(
@@ -623,12 +624,62 @@ fn update_session_facts_from_turn(state: &mut super::agentic_loop_host::AgenticL
         event.error = Some("turn had errors".to_string());
     }
 
-    state.session_facts.update_from_journal_event(&event);
+    crate::turn::cloud::session_facts::update_from_journal_event(&mut state.session_facts, &event);
 
     // Sync blocked tools from state
     state
         .session_facts
         .set_blocked_tools(state.restricted_tools.iter().cloned().collect());
+    // Sync facts → continuity once, then let the todo-completion hook mutate
+    // todos on `state.continuity` only.
+    //
+    // INVARIANT (enforced by debug_assert below):
+    //   `complete_active_runtime_todo_if_finalized` must mutate neither
+    //   `state.session_facts` nor `state.continuity.facts`. It only touches
+    //   `state.continuity.todos`. This keeps the three snapshots
+    //   (`session_facts`, `continuity.facts`, `facts_before`) trivially
+    //   equal after the hook, so no clone-back is required.
+    //
+    // If a future hook revision needs to mutate facts, update BOTH sides
+    // explicitly (mutate `continuity.facts` and mirror to `session_facts`)
+    // and loosen/replace this assertion — do not reintroduce a silent
+    // clone-back that would mask divergence.
+    let facts_before = state.session_facts.clone();
+    state.continuity.sync_facts(facts_before.clone());
+    // Snapshot `continuity.facts` AFTER sync and BEFORE the hook, so the
+    // post-hook assertion genuinely verifies the hook did not touch
+    // `continuity.facts` (asserting against `facts_before` would be
+    // tautological — we just wrote that value in).
+    #[cfg(debug_assertions)]
+    let continuity_facts_snapshot = state.continuity.facts.clone();
+    complete_active_runtime_todo_if_finalized(state, had_error);
+    debug_assert_eq!(
+        state.session_facts, facts_before,
+        "complete_active_runtime_todo_if_finalized must not mutate session_facts"
+    );
+    #[cfg(debug_assertions)]
+    debug_assert_eq!(
+        state.continuity.facts, continuity_facts_snapshot,
+        "complete_active_runtime_todo_if_finalized must not mutate continuity.facts"
+    );
+    // After the hook may have advanced todos (e.g. marking the active todo
+    // done), re-derive plan_state from the updated todos and write it into
+    // both session_facts and continuity.facts.
+    //
+    // This is a *targeted* update, not a clone-back of the whole facts map:
+    // the hook is contractually forbidden from mutating any other field
+    // (asserted above), so `plan_state` is the single derived field we must
+    // refresh. The `.clone()` below is required because `set_plan_state`
+    // consumes its argument and we need to write the same value into both
+    // session_facts and continuity.facts.
+    let post_hook_plan_state = state
+        .continuity
+        .todos
+        .to_plan_fact(&state.continuity.goal.text);
+    state
+        .session_facts
+        .set_plan_state(post_hook_plan_state.clone());
+    state.continuity.facts.set_plan_state(post_hook_plan_state);
 
     // P4: Error-triggered L1 persist — when an error occurred this turn,
     // write L1 to local session memory file immediately so user corrections
@@ -656,6 +707,39 @@ fn update_session_facts_from_turn(state: &mut super::agentic_loop_host::AgenticL
     }
 }
 
+fn complete_active_runtime_todo_if_finalized(
+    state: &mut super::agentic_loop_host::AgenticLoopState,
+    had_error: bool,
+) {
+    // INVARIANT: this function must only mutate `state.continuity` (todos,
+    // verification). It must NOT write to `state.session_facts` — the caller
+    // clones facts back from continuity after return, so any direct writes
+    // to session_facts would be silently overwritten.
+    if had_error || state.final_text.trim().is_empty() {
+        return;
+    }
+    let Some(active) = state.continuity.todos.active_or_next().cloned() else {
+        return;
+    };
+    if active.status != astra_turn_types::continuity::TodoStatus::InProgress {
+        return;
+    }
+    // If the round produced a final answer without any tool evidence
+    // (e.g. pure Q&A), seed a weak evidence entry so the todo can close.
+    // Otherwise the manifest keeps advertising `in_progress` forever and
+    // misleads future rounds.
+    if active.evidence.is_empty() {
+        state
+            .continuity
+            .todos
+            .add_evidence(&active.id, "answered without tool invocation");
+    }
+    state.continuity.todos.mark_done(
+        &active.id,
+        "final response completed after verified tool evidence",
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use crate::turn::agentic_loop_host::tests::{
@@ -663,6 +747,123 @@ mod tests {
     };
 
     use super::*;
+
+    // ── Direct unit tests for complete_active_runtime_todo_if_finalized ──
+    //
+    // These lock the three gating conditions of the "no-tool-turn todo
+    // closure" policy introduced in commit 3072457:
+    //   1. `had_error == true` MUST prevent closure (avoid falsely marking
+    //      failed rounds as done).
+    //   2. empty `final_text` MUST prevent closure (the round did not
+    //      actually produce an answer).
+    //   3. an in-progress active todo with NO evidence MUST be closed with
+    //      a synthetic "answered without tool invocation" evidence, so the
+    //      attention manifest does not keep advertising `in_progress`.
+    //
+    // Previously this function was only covered indirectly via the agentic
+    // loop E2E tests. A regression that silently re-enabled the old behavior
+    // (never closing no-tool-turn todos) would not have been caught by any
+    // direct assertion.
+
+    fn seed_active_todo(state: &mut super::super::agentic_loop_host::AgenticLoopState) {
+        use astra_turn_types::continuity::{TodoItem, TodoStatus};
+        state.continuity.todos.add_item(TodoItem {
+            id: "runtime-goal".to_string(),
+            title: "answer the user".to_string(),
+            description: String::new(),
+            status: TodoStatus::Pending,
+            evidence: Vec::new(),
+            blocked_reason: None,
+        });
+        // Transition to InProgress — mirrors the real tool_phase behavior.
+        state.continuity.todos.begin_next_ready();
+    }
+
+    #[test]
+    fn complete_active_runtime_todo_closes_with_synthetic_evidence_when_no_tool_invocation() {
+        use astra_turn_types::continuity::TodoStatus;
+        let mut state = make_state();
+        state.final_text = "Here is your answer.".to_string();
+        seed_active_todo(&mut state);
+
+        complete_active_runtime_todo_if_finalized(&mut state, /*had_error=*/ false);
+
+        let item = state
+            .continuity
+            .todos
+            .items
+            .iter()
+            .find(|i| i.id == "runtime-goal")
+            .expect("seeded todo must exist");
+        assert_eq!(
+            item.status,
+            TodoStatus::Done,
+            "pure Q&A round must close the active todo so the manifest stops showing in_progress"
+        );
+        assert!(
+            item.evidence
+                .iter()
+                .any(|e| e.contains("answered without tool invocation")),
+            "must seed a synthetic evidence when no tool was invoked; got: {:?}",
+            item.evidence
+        );
+    }
+
+    #[test]
+    fn complete_active_runtime_todo_does_not_close_when_final_text_empty() {
+        use astra_turn_types::continuity::TodoStatus;
+        let mut state = make_state();
+        state.final_text = String::new();
+        seed_active_todo(&mut state);
+
+        complete_active_runtime_todo_if_finalized(&mut state, /*had_error=*/ false);
+
+        let item = state
+            .continuity
+            .todos
+            .items
+            .iter()
+            .find(|i| i.id == "runtime-goal")
+            .expect("seeded todo must exist");
+        assert_eq!(
+            item.status,
+            TodoStatus::InProgress,
+            "a round with no final_text must NOT close the todo — nothing was actually answered"
+        );
+        assert!(
+            item.evidence.is_empty(),
+            "no synthetic evidence when final_text is empty; got: {:?}",
+            item.evidence
+        );
+    }
+
+    #[test]
+    fn complete_active_runtime_todo_does_not_close_when_error_occurred() {
+        use astra_turn_types::continuity::TodoStatus;
+        let mut state = make_state();
+        state.final_text = "partial output before failure".to_string();
+        seed_active_todo(&mut state);
+
+        complete_active_runtime_todo_if_finalized(&mut state, /*had_error=*/ true);
+
+        let item = state
+            .continuity
+            .todos
+            .items
+            .iter()
+            .find(|i| i.id == "runtime-goal")
+            .expect("seeded todo must exist");
+        assert_eq!(
+            item.status,
+            TodoStatus::InProgress,
+            "a round that errored must NOT be marked done — prevents falsely closing failed rounds"
+        );
+        assert!(
+            item.evidence.is_empty(),
+            "no synthetic evidence when had_error=true; got: {:?}",
+            item.evidence
+        );
+    }
 
     // E2E: full execution-retry guard lifecycle through the production loop.
     // Round 1: model defers ("需要我直接执行这些修改吗？") on a mutating-profile
@@ -1365,6 +1566,14 @@ mod tests {
         assert_eq!(state.session_facts.active_files[1].last_action, "write");
         assert_eq!(state.session_facts.estimated_tokens, 5000);
         assert_eq!(state.session_facts.recent_tool_calls.len(), 2);
+        assert_eq!(
+            state.continuity.facts.active_files,
+            state.session_facts.active_files
+        );
+        assert_eq!(
+            state.continuity.facts.recent_tool_calls,
+            state.session_facts.recent_tool_calls
+        );
     }
 
     #[tokio::test]
@@ -1412,6 +1621,46 @@ mod tests {
         );
         assert!(l1.contains("[session-memory:v1]"));
         assert!(l1.contains("fix the bug"));
+    }
+
+    #[tokio::test]
+    async fn finalization_marks_active_runtime_todo_done_after_evidence() {
+        let mut state = make_state();
+        state
+            .continuity
+            .ensure_tracked_goal("Implement runtime continuity and validate completion evidence");
+        state.continuity.todos.begin_next_ready();
+        let active_id = state
+            .continuity
+            .todos
+            .active_or_next()
+            .map(|item| item.id.clone())
+            .unwrap();
+        state
+            .continuity
+            .todos
+            .add_evidence(&active_id, "cargo test ok");
+        state.final_text = "Done.".to_string();
+        state.total_prompt = 100;
+
+        finalize_turn_trace(&mut state).await;
+
+        let item = state
+            .continuity
+            .todos
+            .items
+            .iter()
+            .find(|item| item.id == active_id)
+            .unwrap();
+        assert_eq!(item.status, astra_turn_types::continuity::TodoStatus::Done);
+        assert_eq!(
+            state
+                .session_facts
+                .plan_state
+                .as_ref()
+                .map(|plan| (plan.completed, plan.total)),
+            Some((1, 1))
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════

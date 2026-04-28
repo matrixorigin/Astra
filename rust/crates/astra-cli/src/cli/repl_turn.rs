@@ -967,6 +967,7 @@ async fn maybe_auto_compact(
         git_worktree_journal: Some(state.git_worktree_journal.clone()),
         session_state_journal: Some(state.session_state_journal.clone()),
         task_manager: Some(state.task_manager.clone()),
+        runtime_continuity: None,
         turn_index: state.turn,
         evolution_service: state.evolution_service.clone(),
     })
@@ -1245,6 +1246,7 @@ async fn run_chat_turn(
             git_worktree_journal: Some(state.git_worktree_journal.clone()),
             session_state_journal: Some(state.session_state_journal.clone()),
             task_manager: Some(state.task_manager.clone()),
+            runtime_continuity: state.runtime_continuity.as_ref(),
             turn_index: state.turn,
             evolution_service: state.evolution_service.clone(),
         }) => TurnAttempt::Completed(Box::new(result)),
@@ -1877,6 +1879,7 @@ fn apply_turn_success_sync(
         &state.cached_pricing,
     );
     state.total_session_cost += turn_cost;
+    state.runtime_continuity = Some(result.runtime_continuity.clone());
     state.last_response = Some(result.full_text.clone());
     state.continuation_anchor = build_continuation_anchor(state, line, &result);
     state.pending_followup_suggestion =
@@ -2962,6 +2965,7 @@ fn build_manual_heavy_step_checkpoint(
         approval_overrides: None,
         consecutive_context_window_errors: 0,
         compaction_state: None,
+        continuity_state: None,
     };
     StepCheckpoint::Heavy(Box::new(heavy))
 }
@@ -4395,6 +4399,7 @@ mod tests {
             step_recorder_summary: None,
             tool_health_export: Vec::new(),
             last_heavy_checkpoint: None,
+            runtime_continuity: Default::default(),
             ttft_ms: None,
             context_ms: None,
             selector_strategy: None,

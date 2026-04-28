@@ -1201,7 +1201,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_create",
-                "description": "Create a structured task for tracking complex multi-step work. Use proactively when: (1) task requires 3+ distinct steps, (2) plan mode is active, (3) user provides multiple tasks. Skip for single trivial tasks. Successful mutations record a bounded task-state rollback handle.",
+                "description": "Create an explicit scratchpad task when the user asks for visible task tracking. Runtime continuity/todo state is tracked automatically; do not use this tool as the authoritative source for multi-turn memory or resume. Successful mutations record a bounded task-state rollback handle.",
                 "parameters": {
                     "type": "object",
                     "properties": {

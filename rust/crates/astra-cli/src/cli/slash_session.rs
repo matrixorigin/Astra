@@ -4522,6 +4522,7 @@ fn reset_state_for_session_restore(state: &mut ReplState) {
     state.last_delivery_report = None;
     state.redo_stack.clear();
     state.resume_guidance = None;
+    state.runtime_continuity = None;
     state.pending_goal_progress = None;
     state.pending_adaptive_state = None;
     state.pinned_skills.clear();
@@ -4633,6 +4634,26 @@ fn build_step_resume_guidance(
             compaction_ctx.as_ref(),
         )
     })
+}
+
+fn build_continuity_resume_guidance_from_state(
+    continuity: &astra_turn_types::continuity::ContinuityState,
+) -> String {
+    let manifest = astra_turn_types::continuity::AttentionManifest::from_state(&continuity, 4_000);
+    format!(
+        "[Recovered runtime continuity]\nRestore this runtime-owned attention state before continuing. It is ground truth over narrative summaries.\n\n{}",
+        manifest.as_str()
+    )
+}
+
+fn restore_runtime_continuity_guidance(
+    state: &mut ReplState,
+    continuity_state: Option<&astra_turn_types::continuity::ContinuityState>,
+) -> Option<String> {
+    let continuity = continuity_state?.clone();
+    let guidance = build_continuity_resume_guidance_from_state(&continuity);
+    state.runtime_continuity = Some(continuity);
+    Some(guidance)
 }
 
 fn history_pairs_from_messages(messages: &[serde_json::Value]) -> Vec<(String, String)> {
@@ -4754,9 +4775,31 @@ async fn apply_restored_session(
 
     apply_restored_workspace_state(state, &restored.session_id);
 
-    if let Ok(Some(step_restored)) =
-        astra_runtime::pipeline::step_restore::restore_session(&restored.session_id)
-    {
+    let step_restored =
+        match astra_runtime::pipeline::step_restore::restore_session_with_continuity_validator(
+            &restored.session_id,
+            |value| {
+                astra_turn_types::continuity::try_from_checkpoint_value(value)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            },
+        ) {
+            Ok(restored) => restored,
+            Err(astra_runtime::pipeline::step_restore::RestoreError::IoError(error)) => {
+                return Err(format!(
+                    "Failed to read local step checkpoint for {}: {}",
+                    restored.session_id, error
+                ));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "skipping invalid local step checkpoint during resume"
+                );
+                None
+            }
+        };
+    if let Some(step_restored) = step_restored {
         let summary = astra_runtime::pipeline::step_restore::restore_summary(&step_restored);
         for tool in &step_restored.blocked_tools {
             if !state.tool_health_entries.iter().any(|e| e.name == *tool) {
@@ -4772,6 +4815,10 @@ async fn apply_restored_session(
             step_restored.interruption.as_ref(),
             step_restored.compaction_state.as_ref(),
         );
+        let step_guidance = combine_resume_guidance(
+            step_guidance,
+            restore_runtime_continuity_guidance(state, step_restored.continuity_state.as_ref()),
+        );
         state.resume_guidance = combine_resume_guidance(
             step_guidance,
             build_session_memory_resume_guidance(&restored.session_id),
@@ -4784,11 +4831,25 @@ async fn apply_restored_session(
         astra_runtime::pipeline::step_checkpoint::read_latest_heavy_checkpoint(&restored.session_id)
     {
         apply_heavy_checkpoint_fallback(state, &heavy);
-        state.resume_guidance = combine_resume_guidance(
+        let heavy_continuity = heavy.continuity_state.as_ref().and_then(|v| {
+            astra_turn_types::continuity::try_from_checkpoint_value(v)
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        error = %error,
+                        "heavy checkpoint continuity_state parse failed"
+                    );
+                })
+                .ok()
+        });
+        let step_guidance = combine_resume_guidance(
             build_step_resume_guidance(
                 heavy.interruption.as_ref(),
                 heavy.compaction_state.as_ref(),
             ),
+            restore_runtime_continuity_guidance(state, heavy_continuity.as_ref()),
+        );
+        state.resume_guidance = combine_resume_guidance(
+            step_guidance,
             build_session_memory_resume_guidance(&restored.session_id),
         );
     } else if !restored.conversation_messages.is_empty()
@@ -4796,13 +4857,18 @@ async fn apply_restored_session(
         || restored.approval_overrides.is_some()
         || restored.interruption.is_some()
         || restored.compaction_state.is_some()
+        || restored.continuity_state.is_some()
     {
         apply_restored_cloud_heavy_state(state, &restored);
-        state.resume_guidance = combine_resume_guidance(
+        let step_guidance = combine_resume_guidance(
             build_step_resume_guidance(
                 restored.interruption.as_ref(),
                 restored.compaction_state.as_ref(),
             ),
+            restore_runtime_continuity_guidance(state, restored.continuity_state.as_ref()),
+        );
+        state.resume_guidance = combine_resume_guidance(
+            step_guidance,
             build_session_memory_resume_guidance(&restored.session_id),
         );
         eprintln!("  {} Restored step checkpoint from cloud", "☁".cyan());
@@ -4818,7 +4884,7 @@ async fn apply_restored_session(
                 match astra_services::session_restore::parse_cloud_heavy_checkpoint_state(
                     &state_json,
                 ) {
-                    Some(heavy) => {
+                    Ok(Some(heavy)) => {
                         apply_heavy_state_fallback(
                             state,
                             &heavy.blocked_tools,
@@ -4826,19 +4892,32 @@ async fn apply_restored_session(
                             &heavy.messages,
                             heavy.approval_overrides.as_ref(),
                         );
-                        state.resume_guidance = combine_resume_guidance(
+                        let step_guidance = combine_resume_guidance(
                             build_step_resume_guidance(
                                 heavy.interruption.as_ref(),
                                 heavy.compaction_state.as_ref(),
                             ),
+                            restore_runtime_continuity_guidance(
+                                state,
+                                heavy.continuity_state.as_ref(),
+                            ),
+                        );
+                        state.resume_guidance = combine_resume_guidance(
+                            step_guidance,
                             build_session_memory_resume_guidance(&restored.session_id),
                         );
                         eprintln!("  {} Restored step checkpoint from cloud", "☁".cyan());
                     }
-                    None => {
+                    Ok(None) => {
                         eprintln!(
                             "  {} Cloud checkpoint corrupted, skipping",
                             theme::icon_warn()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "skipping cloud step checkpoint with invalid continuity_state"
                         );
                     }
                 }
@@ -5474,6 +5553,33 @@ mod resume_tests {
         std::fs::create_dir_all(&sessions).unwrap();
         let guard = JournalDirGuard::new(&sessions);
         (tmp, guard)
+    }
+
+    #[test]
+    fn restore_runtime_continuity_guidance_sets_repl_state() {
+        let mut continuity = astra_turn_types::continuity::ContinuityState::default();
+        continuity.ensure_tracked_goal("continue the checkpoint restore implementation");
+        let value = serde_json::to_value(&continuity).unwrap();
+        let mut state = ReplState::default();
+
+        let cs = astra_turn_types::continuity::try_from_checkpoint_value(&value).unwrap();
+        let guidance =
+            restore_runtime_continuity_guidance(&mut state, Some(&cs)).expect("guidance");
+
+        assert!(guidance.contains("[Recovered runtime continuity]"));
+        assert_eq!(state.runtime_continuity, Some(continuity));
+    }
+
+    #[test]
+    fn restore_runtime_continuity_guidance_soft_drops_invalid_state() {
+        let mut state = ReplState::default();
+        let invalid = serde_json::json!({});
+
+        let cs = astra_turn_types::continuity::try_from_checkpoint_value(&invalid).ok();
+        let guidance = restore_runtime_continuity_guidance(&mut state, cs.as_ref());
+
+        assert!(guidance.is_none());
+        assert!(state.runtime_continuity.is_none());
     }
 
     fn write_local_resumable_session(session_id: &str, turn_count: u32) {

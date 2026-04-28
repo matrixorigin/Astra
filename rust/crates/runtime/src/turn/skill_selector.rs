@@ -335,6 +335,7 @@ struct ExactSignals {
 struct LexicalCandidate {
     idx: usize,
     score: f64,
+    exact_match: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -615,6 +616,7 @@ fn lexical_candidates(
             LexicalCandidate {
                 idx,
                 score: lexical_score(&query_tokens, entry, quality_tracker, &exact),
+                exact_match: exact.name_hit || exact.alias_hit || exact.trigger_hit,
             }
         })
         .collect::<Vec<_>>();
@@ -1090,15 +1092,28 @@ pub fn select_skill_indices(
     let surface_cap = cfg.effective_surface_cap();
     let embedding_configured = embed_service_from_env().is_some();
     let rerank_enabled = rerank_service_from_env().is_some();
+    let lexical = lexical_candidates(all_skills, user_message, quality_tracker);
+    let lexical_no_signal = lexical
+        .first()
+        .map(|c| c.score <= LEXICAL_MIN_TOP_SCORE)
+        .unwrap_or(true);
+    let lexical_has_exact_top_hit = lexical.first().map(|c| c.exact_match).unwrap_or(false);
 
     // Strategy (see y.md):
+    //   0) explicit lexical exact-hit → trust lexical immediately. A direct skill
+    //      name / alias / trigger mention is stronger than online semantic search
+    //      and avoids env/service coupling for obvious invokes.
     //   1) embedding configured → embedding_top100; if top1 sim ≤ threshold → empty.
     //      If cheap LLM rerank also configured → cheap_llm_top10 over the pool.
     //   2) Otherwise → lexical_top20; if top1 score ≤ threshold → empty.
     //   3) Final unified trim: if non-empty, truncate to x = max(5, min(20, ⌈2% × catalog⌉)).
     //   Never pad with arbitrary skills.
     let mut tier: &'static str = "lexical";
-    let (skill_list, ranked_pool_len): (Vec<usize>, usize) = if embedding_configured {
+    let (skill_list, ranked_pool_len): (Vec<usize>, usize) = if lexical_has_exact_top_hit {
+        let pool: Vec<usize> = lexical.iter().take(LEXICAL_POOL).map(|c| c.idx).collect();
+        let pool_len = pool.len();
+        (pool, pool_len)
+    } else if embedding_configured {
         let embedding_ranks = embedding_rank_map(all_skills, user_message).unwrap_or_else(|e| {
             warn!(
                 target: "astra::skill_selector",
@@ -1131,12 +1146,7 @@ pub fn select_skill_indices(
             (pool.iter().map(|c| c.idx).collect(), pool_len)
         }
     } else {
-        let lexical = lexical_candidates(all_skills, user_message, quality_tracker);
-        let no_signal = lexical
-            .first()
-            .map(|c| c.score <= LEXICAL_MIN_TOP_SCORE)
-            .unwrap_or(true);
-        if no_signal {
+        if lexical_no_signal {
             let telemetry = astra_turn_core::skill_selector_metrics::SkillSelectorTelemetry {
                 selector_tier: Some("lexical".to_string()),
                 elapsed_ms: Some(started.elapsed().as_millis() as i64),
@@ -1294,6 +1304,58 @@ pub fn discover_skill_indices(
 mod tests {
     use super::*;
     use crate::skills::manifest::SkillSourceKind;
+    use std::sync::{LazyLock, Mutex};
+
+    static SELECTOR_ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// RAII guard that acquires SELECTOR_ENV_MUTEX *and* mutates process env.
+    ///
+    /// The mutex guard is held inside `Self` so the lock is released only on
+    /// Drop, after the env has been restored. This makes it impossible to call
+    /// `set_var` / `remove_var` in selector tests without serializing through
+    /// the mutex, which is the invariant that keeps concurrent test threads
+    /// from observing torn env state (see `embed_service_from_env`).
+    struct SelectorEnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+        // Lock is dropped *after* `saved` restore in Drop order (fields drop
+        // top-to-bottom, so we keep `_lock` last here on purpose). Held across
+        // the whole guard lifetime.
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl SelectorEnvGuard {
+        fn set(vars: &[(&'static str, &'static str)]) -> Self {
+            let lock = SELECTOR_ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let saved = vars
+                .iter()
+                .map(|(key, _)| (*key, std::env::var(key).ok()))
+                .collect::<Vec<_>>();
+            for (key, value) in vars {
+                unsafe {
+                    std::env::set_var(key, value);
+                }
+            }
+            Self { saved, _lock: lock }
+        }
+    }
+
+    impl Drop for SelectorEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => unsafe {
+                        std::env::set_var(key, value);
+                    },
+                    None => unsafe {
+                        std::env::remove_var(key);
+                    },
+                }
+            }
+            // `_lock` drops here, releasing SELECTOR_ENV_MUTEX after restore.
+        }
+    }
 
     fn skill(name: &str, description: &str) -> SkillToolInfo {
         SkillToolInfo {
@@ -1330,6 +1392,33 @@ mod tests {
             &SkillSearchSettings::default(),
         );
         assert_eq!(ranked.first().copied(), Some(0));
+    }
+
+    #[test]
+    fn lexical_exact_hit_beats_unavailable_embedding_selector() {
+        let _env = SelectorEnvGuard::set(&[
+            ("MEMORIA_EMBEDDING_BASE_URL", "http://127.0.0.1:9"),
+            ("MEMORIA_EMBEDDING_API_KEY", "test"),
+            ("MEMORIA_EMBEDDING_MODEL", "bge-m3"),
+        ]);
+        let skills = vec![
+            SkillToolInfo {
+                name: "deploy".into(),
+                description: "Deploy workloads".into(),
+                aliases: vec!["ship-it".into()],
+                source: SkillSourceKind::Local,
+                ..Default::default()
+            },
+            skill("debug", "Debug issues"),
+        ];
+        let (ranked, telemetry) = select_skill_indices(
+            &skills,
+            "请帮我 deploy 一下",
+            None,
+            &SkillSearchSettings::default(),
+        );
+        assert_eq!(ranked.first().copied(), Some(0));
+        assert_eq!(telemetry.selector_tier.as_deref(), Some("lexical"));
     }
 
     #[test]
