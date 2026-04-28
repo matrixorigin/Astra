@@ -917,7 +917,7 @@ fn list_heavy_checkpoints(session_dir: &Path) -> Vec<PathBuf> {
 // ── Breakpoints ─────────────────────────────────────────────────────────────
 
 fn show_breakpoints(session_id: &str) {
-    match astra_runtime::pipeline::step_checkpoint::read_breakpoint_index(session_id) {
+    match astra_pipeline::step_checkpoint::read_breakpoint_index(session_id) {
         Ok(index) => {
             if index.breakpoints.is_empty() {
                 eprintln!("  {}", "(no breakpoints)".dim());
@@ -941,7 +941,7 @@ fn show_breakpoints(session_id: &str) {
 }
 
 fn show_composite_snapshots(session_id: &str) {
-    let index = astra_runtime::pipeline::step_checkpoint::read_composite_snapshot_index(session_id)
+    let index = astra_pipeline::step_checkpoint::read_composite_snapshot_index(session_id)
         .unwrap_or_default();
 
     if index.snapshots.is_empty() {

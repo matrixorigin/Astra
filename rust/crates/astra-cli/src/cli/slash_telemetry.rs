@@ -404,7 +404,7 @@ fn show_decisions(
         };
 
         // Format decision type nicely
-        use astra_runtime::turn::decision_explainer::DecisionType;
+        use astra_turn_core::decision_explainer::DecisionType;
         let type_label = match &decision.decision_type {
             DecisionType::ToolSelection {
                 selected_tools,
@@ -1602,7 +1602,7 @@ fn show_session_analysis(
         std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
     >,
 ) {
-    use astra_runtime::turn::context_assembly_trace::TraceAggregation;
+    use astra_turn_core::context_assembly_trace::TraceAggregation;
 
     let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
     let traces = &session_guard.context_traces;
@@ -1671,13 +1671,13 @@ fn show_session_analysis(
 
         type ComponentExtractor = (
             &'static str,
-            Box<dyn Fn(&astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace) -> f64>,
+            Box<dyn Fn(&astra_turn_core::context_assembly_trace::ContextAssemblyTrace) -> f64>,
         );
         let component_extractors: Vec<ComponentExtractor> = vec![
             (
                 "system_prompt",
                 Box::new(
-                    |t: &astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace| {
+                    |t: &astra_turn_core::context_assembly_trace::ContextAssemblyTrace| {
                         let total = t.token_budget.total_used.max(1) as f64;
                         t.token_budget.system_prompt_tokens as f64 / total * 100.0
                     },
@@ -1686,7 +1686,7 @@ fn show_session_analysis(
             (
                 "history",
                 Box::new(
-                    |t: &astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace| {
+                    |t: &astra_turn_core::context_assembly_trace::ContextAssemblyTrace| {
                         let total = t.token_budget.total_used.max(1) as f64;
                         t.token_budget.history_tokens as f64 / total * 100.0
                     },
@@ -1695,7 +1695,7 @@ fn show_session_analysis(
             (
                 "memory",
                 Box::new(
-                    |t: &astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace| {
+                    |t: &astra_turn_core::context_assembly_trace::ContextAssemblyTrace| {
                         let total = t.token_budget.total_used.max(1) as f64;
                         t.token_budget.memory_tokens as f64 / total * 100.0
                     },
@@ -1704,7 +1704,7 @@ fn show_session_analysis(
             (
                 "tools",
                 Box::new(
-                    |t: &astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace| {
+                    |t: &astra_turn_core::context_assembly_trace::ContextAssemblyTrace| {
                         let total = t.token_budget.total_used.max(1) as f64;
                         t.token_budget.tool_schema_tokens as f64 / total * 100.0
                     },
@@ -1713,7 +1713,7 @@ fn show_session_analysis(
             (
                 "user_msg",
                 Box::new(
-                    |t: &astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace| {
+                    |t: &astra_turn_core::context_assembly_trace::ContextAssemblyTrace| {
                         let total = t.token_budget.total_used.max(1) as f64;
                         t.token_budget.user_message_tokens as f64 / total * 100.0
                     },
@@ -1977,9 +1977,9 @@ fn resolve_turn_index(arg: &str, len: usize) -> Option<usize> {
 }
 
 fn format_rejection_reason(
-    reason: &astra_runtime::turn::context_assembly_trace::RejectionReason,
+    reason: &astra_turn_core::context_assembly_trace::RejectionReason,
 ) -> String {
-    use astra_runtime::turn::context_assembly_trace::RejectionReason;
+    use astra_turn_core::context_assembly_trace::RejectionReason;
     match reason {
         RejectionReason::BelowThreshold { threshold, score } => {
             format!("score {score:.2} < threshold {threshold:.2}")
@@ -1998,9 +1998,9 @@ fn format_rejection_reason(
 }
 
 fn format_compression_method(
-    method: &astra_runtime::turn::context_assembly_trace::CompressionMethod,
+    method: &astra_turn_core::context_assembly_trace::CompressionMethod,
 ) -> &'static str {
-    use astra_runtime::turn::context_assembly_trace::CompressionMethod;
+    use astra_turn_core::context_assembly_trace::CompressionMethod;
     match method {
         CompressionMethod::ToolResultTruncation => "ToolResultTrunc",
         CompressionMethod::DuplicateReadElimination => "DuplicateReadElim",
@@ -2011,9 +2011,9 @@ fn format_compression_method(
 }
 
 fn format_trace_decision_type(
-    dt: &astra_runtime::turn::context_assembly_trace::DecisionType,
+    dt: &astra_turn_core::context_assembly_trace::DecisionType,
 ) -> String {
-    use astra_runtime::turn::context_assembly_trace::DecisionType;
+    use astra_turn_core::context_assembly_trace::DecisionType;
     match dt {
         DecisionType::ToolSelection { tools } => {
             format!("ToolSelection ({})", tools.len())

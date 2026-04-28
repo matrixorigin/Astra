@@ -17,11 +17,11 @@ pub(super) fn create_tool_selector_quiet(
 /// Shared pipeline learning modules — kept accessible for cross-session persistence.
 pub(super) struct PipelineModules {
     pub entity_graph:
-        std::sync::Arc<std::sync::Mutex<astra_runtime::pipeline::entity::EntityGraph>>,
+        std::sync::Arc<std::sync::Mutex<astra_pipeline::entity::EntityGraph>>,
     pub pattern_library:
-        std::sync::Arc<std::sync::Mutex<astra_runtime::pipeline::pattern::PatternLibrary>>,
+        std::sync::Arc<std::sync::Mutex<astra_pipeline::pattern::PatternLibrary>>,
     pub calibrator: std::sync::Arc<
-        std::sync::Mutex<astra_runtime::pipeline::calibration::ProgressiveCalibrator>,
+        std::sync::Mutex<astra_pipeline::calibration::ProgressiveCalibrator>,
     >,
     /// Unified skill registry (single source of truth for all skill resolution).
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
@@ -36,7 +36,7 @@ pub(super) fn create_tool_selector_with_quality(
     profile: Option<&str>,
     quality_tracker: Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
     confidence_calibrator: Option<
-        std::sync::Arc<astra_runtime::turn::routing_metrics::ConfidenceCalibrator>,
+        std::sync::Arc<astra_turn_core::routing_metrics::ConfidenceCalibrator>,
     >,
 ) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
     create_tool_selector_with_quality_internal(
@@ -53,11 +53,11 @@ fn create_tool_selector_with_quality_internal(
     profile: Option<&str>,
     quality_tracker: Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
     confidence_calibrator: Option<
-        std::sync::Arc<astra_runtime::turn::routing_metrics::ConfidenceCalibrator>,
+        std::sync::Arc<astra_turn_core::routing_metrics::ConfidenceCalibrator>,
     >,
     _announce_skills: bool,
 ) -> (Box<dyn tool_selector::ToolSelector>, PipelineModules) {
-    use astra_runtime::pipeline::{
+    use astra_pipeline::{
         calibration::ProgressiveCalibrator, entity::EntityGraph, pattern::PatternLibrary,
     };
 
@@ -89,10 +89,10 @@ fn create_tool_selector_with_quality_internal(
     // Initialize unified skill registry with providers (priority: Local > Bundled)
     let mut unified_skill_registry = astra_runtime::skills::UnifiedSkillRegistry::new();
     unified_skill_registry.add_provider(Box::new(
-        astra_runtime::skills::LocalSkillProvider::standard(),
+        astra_skills::providers::LocalSkillProvider::standard(),
     ));
     unified_skill_registry.add_provider(Box::new(
-        astra_runtime::skills::BundledSkillProvider::with_defaults(),
+        astra_skills::providers::BundledSkillProvider::with_defaults(),
     ));
     let unified_skill_registry = std::sync::Arc::new(unified_skill_registry);
     // Discover skills eagerly so the `skill` tool schema is populated from the first turn.
@@ -189,7 +189,7 @@ fn create_tool_selector_with_quality_internal(
     // Start file-system watcher for skill hot-reload
     let skill_watcher = astra_runtime::skills::watcher::start_watching(
         unified_skill_registry.clone(),
-        astra_runtime::skills::loader::skill_search_paths(),
+        astra_skills::loader::skill_search_paths(),
     );
 
     let creds = load_credentials();

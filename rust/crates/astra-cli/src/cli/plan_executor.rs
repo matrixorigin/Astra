@@ -545,7 +545,7 @@ fn has_any_unresolved_verification_failure(
 /// generic "try something different" message. Returns `None` when no
 /// tool crosses the `min_calls` bar.
 fn high_failure_tool_evidence(
-    entries: &[astra_runtime::pipeline::persistence::ToolHealthEntry],
+    entries: &[astra_evolution::persistence::ToolHealthEntry],
     top_k: usize,
 ) -> Option<String> {
     const MIN_CALLS: usize = 2;
@@ -978,7 +978,7 @@ impl PlanExecutorHandle {
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use astra_runtime::pipeline::persistence::ToolHealthEntry;
+use astra_evolution::persistence::ToolHealthEntry;
 use astra_runtime::plan_decompose;
 use astra_runtime::tool_selector::ToolSelector;
 use astra_services::session_journal;
@@ -1108,9 +1108,9 @@ pub(super) struct BackgroundPlanContext {
     pub unified_skill_registry: Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     pub skill_search: astra_core::SkillSearchSettings,
     pub delegation_engine: Option<Arc<astra_runtime::server::delegation_engine::DelegationEngine>>,
-    pub messaging_metrics: Option<Arc<astra_runtime::messaging::MessagingMetrics>>,
+    pub messaging_metrics: Option<Arc<astra_messaging::MessagingMetrics>>,
     pub agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
-    pub root_mailbox: Option<astra_runtime::messaging::router::AgentMailbox>,
+    pub root_mailbox: Option<astra_messaging::router::AgentMailbox>,
     pub root_agent_id: String,
     pub durable_task_state: Option<durable_bridge::DurableTaskState>,
     pub workspace_root: PathBuf,
@@ -1119,7 +1119,7 @@ pub(super) struct BackgroundPlanContext {
         Arc<std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>>,
     >,
     pub file_journal:
-        Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
+        Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>>,
     /// Session-scoped file-state cache — shared across subtask turns so
     /// read-before-write tracking persists.
     pub file_state: crate::edge_tools::SharedFileState,
@@ -1136,9 +1136,9 @@ pub(super) struct BackgroundPlanContext {
     // ─── Cloud + Learning Integration ────────────────────────────────────
     pub ingestion_user_id: Option<String>,
     pub matrix_runtime: Option<Arc<astra_runtime::MatrixCloudRuntime>>,
-    pub entity_graph: Option<Arc<Mutex<astra_runtime::pipeline::entity::EntityGraph>>>,
-    pub pattern_library: Option<Arc<Mutex<astra_runtime::pipeline::pattern::PatternLibrary>>>,
-    pub calibrator: Option<Arc<Mutex<astra_runtime::pipeline::calibration::ProgressiveCalibrator>>>,
+    pub entity_graph: Option<Arc<Mutex<astra_pipeline::entity::EntityGraph>>>,
+    pub pattern_library: Option<Arc<Mutex<astra_pipeline::pattern::PatternLibrary>>>,
+    pub calibrator: Option<Arc<Mutex<astra_pipeline::calibration::ProgressiveCalibrator>>>,
 
     // ─── Execution Config ────────────────────────────────────────────────
     pub plan_execution_config: Option<plan_decompose::PlanExecutionConfig>,
@@ -1220,7 +1220,7 @@ async fn plan_executor_task(
         let pl = ctx.pattern_library.as_ref()?;
         let cal = ctx.calibrator.as_ref()?;
         let mut bridge =
-            astra_runtime::pipeline::task_learning::PipelineTaskLearningBridge::from_shared(
+            astra_pipeline::task_learning::PipelineTaskLearningBridge::from_shared(
                 eg.clone(),
                 pl.clone(),
                 cal.clone(),
@@ -1731,7 +1731,7 @@ async fn plan_executor_task(
             });
 
             // Execute the subtask via stream_chat_sse
-            let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+            let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
             let turn_result: Result<StreamResult, crate::TurnFailure> =
                 stream_chat_sse(ChatTurnParams {
                     api: &ctx.api,
@@ -2283,10 +2283,10 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    use astra_runtime::pipeline::calibration::ProgressiveCalibrator;
-    use astra_runtime::pipeline::entity::EntityGraph;
-    use astra_runtime::pipeline::pattern::PatternLibrary;
-    use astra_runtime::pipeline::routing::{DomainHint, TaskType};
+    use astra_pipeline::calibration::ProgressiveCalibrator;
+    use astra_pipeline::entity::EntityGraph;
+    use astra_pipeline::pattern::PatternLibrary;
+    use astra_turn_core::routing_engine::{DomainHint, TaskType};
     use astra_runtime::tool_selector::SelectionContext;
 
     fn test_background_plan_context(
@@ -2296,10 +2296,10 @@ mod tests {
     ) -> BackgroundPlanContext {
         let mut reg = astra_runtime::skills::UnifiedSkillRegistry::new();
         reg.add_provider(Box::new(
-            astra_runtime::skills::LocalSkillProvider::standard(),
+            astra_skills::providers::LocalSkillProvider::standard(),
         ));
         reg.add_provider(Box::new(
-            astra_runtime::skills::BundledSkillProvider::with_defaults(),
+            astra_skills::providers::BundledSkillProvider::with_defaults(),
         ));
         BackgroundPlanContext {
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
@@ -2326,7 +2326,7 @@ mod tests {
             observability_hub: None,
             observability_session: None,
             file_journal: Arc::new(std::sync::Mutex::new(
-                astra_runtime::turn::file_edit_journal::FileEditJournal::default(),
+                astra_turn_core::file_edit_journal::FileEditJournal::default(),
             )),
             file_state: std::sync::Arc::new(
                 std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -2573,7 +2573,7 @@ mod tests {
 
     #[test]
     fn high_failure_tool_evidence_surfaces_repeat_offenders() {
-        use astra_runtime::pipeline::persistence::ToolHealthEntry;
+        use astra_evolution::persistence::ToolHealthEntry;
         let entries = vec![
             ToolHealthEntry {
                 name: "flaky_tool".into(),
@@ -2617,7 +2617,7 @@ mod tests {
 
     #[test]
     fn high_failure_tool_evidence_returns_none_when_no_signal() {
-        use astra_runtime::pipeline::persistence::ToolHealthEntry;
+        use astra_evolution::persistence::ToolHealthEntry;
         let entries = vec![ToolHealthEntry {
             name: "steady".into(),
             total_calls: 5,

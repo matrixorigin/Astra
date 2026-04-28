@@ -374,7 +374,7 @@ pub struct ToolExecutor {
     /// File edit journal — records before-state of every file write for undo.
     /// Wrapped in Arc so the REPL session can share the journal across turns.
     pub file_journal:
-        std::sync::Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
+        std::sync::Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>>,
     /// MatrixOne snapshot journal — records captured pre-state snapshots so the
     /// executor can perform a bounded restore without reconstructing tool history.
     pub database_snapshot_journal:
@@ -466,7 +466,7 @@ impl ToolExecutor {
             passive_lsp: passive_lsp::PassiveLspManager::new(),
             mcp_manager: None,
             file_journal: std::sync::Arc::new(std::sync::Mutex::new(
-                astra_runtime::turn::file_edit_journal::FileEditJournal::default(),
+                astra_turn_core::file_edit_journal::FileEditJournal::default(),
             )),
             database_snapshot_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 mo_tools::DatabaseSnapshotRollbackJournal::default(),
@@ -576,7 +576,7 @@ impl ToolExecutor {
     pub fn with_shared_file_journal(
         mut self,
         journal: std::sync::Arc<
-            std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>,
+            std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>,
         >,
     ) -> Self {
         self.file_journal = journal;
@@ -1564,7 +1564,7 @@ impl ToolExecutor {
             None
         } else {
             Some(
-                astra_runtime::turn::tool_health::ToolHealthTracker::from_entries(
+                astra_turn_core::tool_health::ToolHealthTracker::from_entries(
                     &session.last_tool_health_export,
                 ),
             )

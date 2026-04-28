@@ -2,7 +2,7 @@
 use super::*;
 
 pub(super) async fn handle_health_command(arg: &str, state: &ReplState) {
-    use astra_runtime::turn::tool_health::ToolHealthTracker;
+    use astra_turn_core::tool_health::ToolHealthTracker;
 
     let detail = arg.trim() == "detail";
 

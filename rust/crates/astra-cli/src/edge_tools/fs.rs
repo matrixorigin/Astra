@@ -6,12 +6,12 @@ fn is_unc_path(path: &str) -> bool {
     path.starts_with("\\\\") || path.starts_with("//")
 }
 
-fn edit_type_label(edit_type: astra_runtime::turn::file_edit_journal::EditType) -> &'static str {
+fn edit_type_label(edit_type: astra_turn_core::file_edit_journal::EditType) -> &'static str {
     match edit_type {
-        astra_runtime::turn::file_edit_journal::EditType::Create => "create",
-        astra_runtime::turn::file_edit_journal::EditType::Overwrite => "overwrite",
-        astra_runtime::turn::file_edit_journal::EditType::Patch => "patch",
-        astra_runtime::turn::file_edit_journal::EditType::Delete => "delete",
+        astra_turn_core::file_edit_journal::EditType::Create => "create",
+        astra_turn_core::file_edit_journal::EditType::Overwrite => "overwrite",
+        astra_turn_core::file_edit_journal::EditType::Patch => "patch",
+        astra_turn_core::file_edit_journal::EditType::Delete => "delete",
     }
 }
 
@@ -2492,7 +2492,7 @@ fn unified_diff(old_content: &str, new_content: &str, path: &std::path::Path) ->
 }
 
 fn append_str_replace_cli_unified_diff(out: &mut String, before: &str, after: &str, path: &Path) {
-    use astra_runtime::turn::tool_result_sanitize::{STR_REPLACE_DIFF_END, STR_REPLACE_DIFF_START};
+    use astra_turn_core::tool_result_sanitize::{STR_REPLACE_DIFF_END, STR_REPLACE_DIFF_START};
     out.push_str(STR_REPLACE_DIFF_START);
     out.push_str(&cap_cli_unified_diff(unified_diff_raw(before, after, path)));
     out.push_str(STR_REPLACE_DIFF_END);

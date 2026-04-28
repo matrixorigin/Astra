@@ -265,7 +265,7 @@ pub(super) async fn handle_task_command(
 
                 // Create fresh auto-approve permission manager for background
                 let mut perm_manager = PermissionManager::with_project(true, &workspace_root);
-                let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+                let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
                 // Create a fresh tool selector for the background task
                 let (selector, _modules) = create_tool_selector_quiet(&api_clone, None);

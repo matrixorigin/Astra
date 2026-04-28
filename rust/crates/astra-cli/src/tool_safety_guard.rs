@@ -1,20 +1,20 @@
 use astra_runtime::tool_registry::ToolChain;
-use astra_runtime::turn::cloud_approval_policy::{
+use astra_turn_core::cloud_approval_policy::{
     CloudGatedToolKind, bash_command_is_read_only, cloud_gated_tool_kind,
 };
-use astra_runtime::turn::safety_middleware::{
+use astra_turn_core::safety_middleware::{
     SafetyMiddlewareDecision, evaluate_tool_safety_request,
 };
-use astra_runtime::turn::stall::{
+use astra_turn_core::stall::{
     SERVER_STALL_WINDOW, detect_server_stall, record_server_tool_signatures,
 };
 use serde_json::{Value, json};
 
 pub(crate) const MAX_RUN_CHAIN_STEPS: usize = 16;
 pub(crate) const MAX_RUN_CHAIN_MUTATING_STEPS: usize = 8;
-pub(crate) use astra_runtime::turn::safety_middleware::check_sql_safety;
+pub(crate) use astra_turn_core::safety_middleware::check_sql_safety;
 #[cfg(test)]
-pub(crate) use astra_runtime::turn::safety_middleware::strip_sql_comments;
+pub(crate) use astra_turn_core::safety_middleware::strip_sql_comments;
 
 pub(crate) struct ToolSafetyGuard;
 

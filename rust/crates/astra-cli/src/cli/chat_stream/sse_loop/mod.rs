@@ -49,8 +49,8 @@ use cli_loop_host::CliAgenticLoopHost;
 use serde_json::json;
 
 async fn finalize_root_mailbox(
-    slot: Option<&mut Option<astra_runtime::messaging::router::AgentMailbox>>,
-    mailbox: &mut Option<astra_runtime::messaging::router::AgentMailbox>,
+    slot: Option<&mut Option<astra_messaging::router::AgentMailbox>>,
+    mailbox: &mut Option<astra_messaging::router::AgentMailbox>,
 ) {
     if let Some(slot) = slot {
         *slot = mailbox.take();
@@ -285,7 +285,7 @@ pub(crate) async fn stream_chat_sse(
         root_ctx
             .router
             .register(
-                astra_runtime::messaging::types::AgentAddress::new(run_id, &root_ctx.agent_id),
+                astra_messaging::types::AgentAddress::new(run_id, &root_ctx.agent_id),
                 None,
             )
             .await
@@ -374,7 +374,7 @@ pub(crate) async fn stream_chat_sse(
         .unwrap_or(false);
     let hook_sets = if bare_mode {
         // Bare mode: skip all hooks
-        astra_runtime::turn::stop_hooks_yaml::TurnHookSets::default()
+        astra_turn_core::stop_hooks_yaml::TurnHookSets::default()
     } else {
         detect_turn_hook_sets(&project_root, task_profile, p.is_plan_subtask)
     };
@@ -395,7 +395,7 @@ pub(crate) async fn stream_chat_sse(
     };
 
     // Build skill executor — fork sub-runs inherit the resolver for nesting.
-    let skill_executor: Option<Arc<dyn astra_runtime::skills::SkillExecutor>> = {
+    let skill_executor: Option<Arc<dyn astra_skills::SkillExecutor>> = {
         let mut subrun_exec = crate::skill_subrun::CliSkillSubRunExecutor::new(
             p.api.clone(),
             p.token.to_string(),
@@ -410,13 +410,13 @@ pub(crate) async fn stream_chat_sse(
             subrun_exec = subrun_exec.with_active_session_id(session_id.to_string());
         }
         let subrun_exec = Arc::new(subrun_exec);
-        let isolated = Arc::new(astra_runtime::skills::executor::IsolatedSkillExecutor::new(
+        let isolated = Arc::new(astra_skills::executor::IsolatedSkillExecutor::new(
             subrun_exec,
         ));
-        let router = Arc::new(astra_runtime::skills::executor::SkillExecutionRouter::new(
+        let router = Arc::new(astra_skills::executor::SkillExecutionRouter::new(
             Some(isolated),
         ));
-        Some(router as Arc<dyn astra_runtime::skills::SkillExecutor>)
+        Some(router as Arc<dyn astra_skills::SkillExecutor>)
     };
 
     // Pre-compute project-level cross-session context (knowledge backflow P2).
@@ -543,19 +543,19 @@ pub(crate) async fn stream_chat_sse(
             resolver: skill_resolver,
             executor: skill_executor,
             quality_tracker: p.skill_quality_tracker.clone(),
-            improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(),
+            improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
             pinned: std::collections::HashSet::new(),
             discovered: discovered_skills,
             search: p.skill_search.clone(),
             tool_event_hooks: if bare_mode {
                 Default::default()
             } else {
-                astra_runtime::skills::hooks::load_tool_event_hooks(&project_root)
+                astra_skills::hooks::load_tool_event_hooks(&project_root)
             },
             session_event_hooks: if bare_mode {
                 Default::default()
             } else {
-                astra_runtime::skills::hooks::load_session_event_hooks(&project_root)
+                astra_skills::hooks::load_session_event_hooks(&project_root)
             },
             listing_message: None,
             invoked: std::collections::HashMap::new(),
@@ -621,7 +621,7 @@ pub(crate) async fn stream_chat_sse(
         session_facts: Default::default(),
         continuity: p.runtime_continuity.cloned().unwrap_or_default(),
         compact_strategy:
-            astra_runtime::turn::microcompact::CompactStrategy::from_provider_and_model(
+            astra_turn_core::microcompact::CompactStrategy::from_provider_and_model(
                 p.provider, p.model,
             ),
         approval_overrides: initial_approval_overrides,
@@ -739,9 +739,9 @@ mod tests {
     use super::extend_restricted_with_blocked_tools;
     use astra_runtime::evolution::types::PatternAction;
     use astra_runtime::observability_integration::ObservabilityHub;
-    use astra_runtime::pipeline::pattern::PatternLibrary;
-    use astra_runtime::pipeline::routing::TaskType;
-    use astra_runtime::turn::chat_turn_heuristics::infer_task_execution_profile;
+    use astra_pipeline::pattern::PatternLibrary;
+    use astra_turn_core::routing_engine::TaskType;
+    use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
     use std::collections::HashSet;
     use std::path::Path;
     use std::sync::{Arc, Mutex};

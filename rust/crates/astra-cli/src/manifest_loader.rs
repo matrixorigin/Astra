@@ -4,7 +4,7 @@
 //! tables, settings, secrets, and resources declarations.
 //!
 //! Uses legacy `SkillInstruction`/`SkillMetadata` types pending migration to
-//! `astra_runtime::skills::manifest` types.
+//! `astra_skills::manifest` types.
 
 #![allow(deprecated)]
 //!

@@ -36,7 +36,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use astra_runtime::messaging::{
+use astra_messaging::{
     AgentMessage, MessagingMetrics,
     router::AgentMailboxRouter,
     types::{AgentAddress, MessagePayload, MessageTarget},
@@ -415,7 +415,7 @@ pub async fn handle_send_message_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_runtime::messaging::{AgentMailboxRouter, InProcessTransport, types::AgentAddress};
+    use astra_messaging::{AgentMailboxRouter, InProcessTransport, types::AgentAddress};
     use astra_runtime::server::delegation_engine::DelegationTracker;
     use std::sync::Arc;
 

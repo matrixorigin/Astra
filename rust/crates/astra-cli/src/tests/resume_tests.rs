@@ -365,9 +365,9 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
     ws.total_tokens_out = 20;
     astra_services::session_workspace::write_workspace(&ws).unwrap();
 
-    let light = astra_runtime::pipeline::step_protocol::LightCheckpoint {
-        protocol_version: astra_runtime::pipeline::step_protocol::PROTOCOL_VERSION,
-        cursor: astra_runtime::pipeline::step_protocol::ExecutionCursor::default(),
+    let light = astra_pipeline::step_protocol::LightCheckpoint {
+        protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
+        cursor: astra_pipeline::step_protocol::ExecutionCursor::default(),
         step_id: "resume-step".to_string(),
         task_id: "task-1".to_string(),
         agent_id: sid.clone(),
@@ -378,7 +378,7 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
             .unwrap()
             .as_millis() as u64,
     };
-    let heavy = astra_runtime::pipeline::step_protocol::HeavyCheckpoint {
+    let heavy = astra_pipeline::step_protocol::HeavyCheckpoint {
         light,
         messages: vec![
             serde_json::json!({"role": "user", "content": "continue the parser refactor"}),
@@ -399,10 +399,10 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
         compaction_state: None,
         continuity_state: None,
     };
-    astra_runtime::pipeline::step_checkpoint::write_step_checkpoint(
+    astra_pipeline::step_checkpoint::write_step_checkpoint(
         &sid,
         1,
-        &astra_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),
+        &astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),
     )
     .unwrap();
 
@@ -986,7 +986,7 @@ total_tokens_out: 500
 
 #[test]
 fn merge_learning_valid_snapshot() {
-    use astra_runtime::pipeline::{calibration, entity, pattern};
+    use astra_pipeline::{calibration, entity, pattern};
 
     let json = serde_json::json!({
         "version": 1,
@@ -1041,7 +1041,7 @@ fn merge_learning_valid_snapshot() {
 
 #[test]
 fn merge_learning_invalid_json_does_not_panic() {
-    use astra_runtime::pipeline::{calibration, entity, pattern};
+    use astra_pipeline::{calibration, entity, pattern};
 
     let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
     let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
@@ -1059,7 +1059,7 @@ fn merge_learning_invalid_json_does_not_panic() {
 
 #[test]
 fn merge_learning_empty_snapshot() {
-    use astra_runtime::pipeline::{calibration, entity, pattern};
+    use astra_pipeline::{calibration, entity, pattern};
 
     let json = serde_json::json!({
         "version": 1,
@@ -1083,7 +1083,7 @@ fn merge_learning_empty_snapshot() {
 
 #[test]
 fn merge_learning_idempotent() {
-    use astra_runtime::pipeline::{calibration, entity, pattern};
+    use astra_pipeline::{calibration, entity, pattern};
 
     let json = serde_json::json!({
         "version": 1,
@@ -1119,7 +1119,7 @@ fn merge_learning_idempotent() {
 
 #[test]
 fn merge_learning_multiple_entities_and_patterns() {
-    use astra_runtime::pipeline::{calibration, entity, pattern};
+    use astra_pipeline::{calibration, entity, pattern};
 
     let json = serde_json::json!({
         "version": 1,

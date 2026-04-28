@@ -2031,7 +2031,7 @@ fn parse_continuation_anchor(anchor: &str) -> ContinuationAnchorParts {
 }
 
 fn print_context_breakdown(
-    trace: &astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace,
+    trace: &astra_turn_core::context_assembly_trace::ContextAssemblyTrace,
 ) {
     eprintln!(
         "\n{}",
@@ -2566,7 +2566,7 @@ mod tests {
         let mut state = ReplState::default();
         state.session_id = Some("s".into());
         state.skill_improvement_tracker.propose(
-            astra_runtime::skills::improvement::ImprovementProposal {
+            astra_skills::improvement::ImprovementProposal {
                 skill_name: "git-flow".into(),
                 skill_path: std::path::PathBuf::from("/tmp/git-flow"),
                 improvements: vec![],

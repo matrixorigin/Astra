@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use astra_runtime::messaging::router::AgentMailboxRouter;
+use astra_messaging::router::AgentMailboxRouter;
 use astra_runtime::orchestration::{
     DynamicAgentSpawner, InheritedPermissions, SpawnAgentInput, SpawnContext, spawn_agent_schema,
 };

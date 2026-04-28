@@ -116,7 +116,7 @@ pub(crate) async fn complete_repl_startup(
         .join("astra")
         .join("skill_quality.json");
     state.skill_quality_tracker =
-        astra_runtime::skills::quality::SkillQualityTracker::load(&skill_quality_path);
+        astra_skills::quality::SkillQualityTracker::load(&skill_quality_path);
 
     // Load pinned skills from previous sessions
     let pinned_skills_path = dirs::config_dir()
@@ -135,7 +135,7 @@ pub(crate) async fn complete_repl_startup(
     // Seed from prior session snapshot (if any) so boost factors don't reset.
     let profile_name_for_quality = profile.unwrap_or("default");
     let persisted_quality =
-        astra_runtime::pipeline::persistence::load_tool_quality(profile_name_for_quality);
+        astra_evolution::persistence::load_tool_quality(profile_name_for_quality);
     let quality_tracker = {
         let mut tracker = tool_registry::ToolQualityTracker::new();
         if !persisted_quality.is_empty() {
@@ -155,7 +155,7 @@ pub(crate) async fn complete_repl_startup(
     state.tool_quality_tracker = Some(quality_tracker_for_save);
     // Session-scoped confidence calibrator: thresholds adapt to correction rates
     let confidence_calibrator =
-        std::sync::Arc::new(astra_runtime::turn::routing_metrics::ConfidenceCalibrator::default());
+        std::sync::Arc::new(astra_turn_core::routing_metrics::ConfidenceCalibrator::default());
     let (selector, pipeline_modules) = create_tool_selector_with_quality(
         api,
         profile,
@@ -167,7 +167,7 @@ pub(crate) async fn complete_repl_startup(
     // Load cross-session learning state (entity graph, patterns, calibration, tool health)
     let profile_name = profile.unwrap_or("default");
     let (cross_session_health_entries, cloud_pull_result, pref_keys_after_pull) = {
-        let loaded = astra_runtime::pipeline::persistence::load_learning_state(
+        let loaded = astra_evolution::persistence::load_learning_state(
             profile_name,
             &pipeline_modules.entity_graph,
             &pipeline_modules.pattern_library,
@@ -181,9 +181,9 @@ pub(crate) async fn complete_repl_startup(
             );
         }
         let mut cross_session_health_entries =
-            astra_runtime::pipeline::persistence::load_tool_health(profile_name);
+            astra_evolution::persistence::load_tool_health(profile_name);
         state.synced_tool_health_entries =
-            astra_runtime::pipeline::persistence::load_synced_tool_health(profile_name);
+            astra_evolution::persistence::load_synced_tool_health(profile_name);
         if !cross_session_health_entries.is_empty() {
             eprintln!(
                 "{}",
@@ -204,7 +204,7 @@ pub(crate) async fn complete_repl_startup(
         state.cloud_learning_version = cloud_pull_result.version;
         if !cloud_pull_result.tool_health.is_empty() {
             let (merged, cloud_wins, cloud_only) =
-                astra_runtime::pipeline::persistence::merge_tool_health(
+                astra_evolution::persistence::merge_tool_health(
                     &cross_session_health_entries,
                     &cloud_pull_result.tool_health,
                 );

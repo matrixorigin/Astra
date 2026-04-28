@@ -105,18 +105,18 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Session-scoped skill surfacing policy for this REPL / plan execution.
     pub(crate) skill_search: &'a astra_core::SkillSearchSettings,
     /// Session-scoped skill quality tracker for learning loop.
-    pub(crate) skill_quality_tracker: &'a mut astra_runtime::skills::quality::SkillQualityTracker,
+    pub(crate) skill_quality_tracker: &'a mut astra_skills::quality::SkillQualityTracker,
     /// Session-scoped discover cache so surfaced skills survive across user turns.
     pub(crate) discovered_skills: Option<&'a mut HashSet<String>>,
     /// Shared messaging metrics for inter-agent communication observability.
-    pub(crate) messaging_metrics: Option<Arc<astra_runtime::messaging::MessagingMetrics>>,
+    pub(crate) messaging_metrics: Option<Arc<astra_messaging::MessagingMetrics>>,
     /// Optional agent spawner for dynamic sub-agent creation via spawn_agent tool.
     pub(crate) agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     /// Optional logical root agent ID for this top-level turn when agent spawning is enabled.
     pub(crate) root_agent_id: Option<&'a str>,
     /// Optional persistent top-level mailbox slot for cross-turn reply handling.
     pub(crate) root_mailbox_slot:
-        Option<&'a mut Option<astra_runtime::messaging::router::AgentMailbox>>,
+        Option<&'a mut Option<astra_messaging::router::AgentMailbox>>,
     /// Optional observability hub for M1-M6 integration (profiles, experiments, auto-tuning).
     pub(crate) observability_hub:
         Option<Arc<astra_runtime::observability_integration::ObservabilityHub>>,
@@ -126,7 +126,7 @@ pub(crate) struct ChatTurnParams<'a> {
     >,
     /// Session-scoped file edit journal — shared with ToolExecutors for undo support.
     pub(crate) file_journal: Option<
-        std::sync::Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
+        std::sync::Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>>,
     >,
     /// Session-scoped file-state cache — shared with ToolExecutors so
     /// read-before-write tracking survives across plan subtask turns.
@@ -193,7 +193,7 @@ impl<'a> ChatTurnParams<'a> {
         token: &'a str,
         session_id: Option<&'a str>,
         perm_manager: &'a mut PermissionManager,
-        skill_quality_tracker: &'a mut astra_runtime::skills::quality::SkillQualityTracker,
+        skill_quality_tracker: &'a mut astra_skills::quality::SkillQualityTracker,
     ) -> ChatTurnParams<'a> {
         ChatTurnParams {
             api: ctx.api,

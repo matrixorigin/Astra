@@ -39,10 +39,8 @@ pub use astra_skills::providers::{bundled, local, mcp};
 // Runtime-specific modules that depend on astra-services or other runtime types.
 pub mod executor;
 pub mod handlers;
-pub mod improvement;
 pub mod providers;
 pub mod registry;
-pub mod verify;
 pub mod watcher;
 
 // Re-export HTTP handlers at the module root for backward compatibility
@@ -103,3 +101,5 @@ pub fn default_unified_registry() -> &'static std::sync::Arc<UnifiedSkillRegistr
 }
 
 pub use astra_skills::has_inline_shell;
+pub mod improvement;
+pub mod verify;

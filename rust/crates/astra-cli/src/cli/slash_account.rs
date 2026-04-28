@@ -133,17 +133,17 @@ mod tests {
 
         let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
         let mut state = super::ReplState::default();
-        let router = std::sync::Arc::new(astra_runtime::messaging::AgentMailboxRouter::new(
-            std::sync::Arc::new(astra_runtime::messaging::InProcessTransport::new()),
+        let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
+            std::sync::Arc::new(astra_messaging::InProcessTransport::new()),
             std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new()),
         ));
-        let root_addr = astra_runtime::messaging::AgentAddress::new("run-root", "root");
+        let root_addr = astra_messaging::AgentAddress::new("run-root", "root");
         state.root_mailbox = Some(router.register(root_addr.clone(), None).await.unwrap());
         state.pending_idle_agent_messages.push(std::sync::Arc::new(
-            astra_runtime::messaging::AgentMessage::new(
-                astra_runtime::messaging::AgentAddress::new("run-worker", "worker"),
-                astra_runtime::messaging::MessageTarget::Direct { address: root_addr },
-                astra_runtime::messaging::MessagePayload::Text {
+            astra_messaging::AgentMessage::new(
+                astra_messaging::AgentAddress::new("run-worker", "worker"),
+                astra_messaging::MessageTarget::Direct { address: root_addr },
+                astra_messaging::MessagePayload::Text {
                     content: "stale".to_string(),
                     summary: None,
                 },
@@ -181,25 +181,25 @@ mod tests {
         ));
         state.agent_spawner = Some(std::sync::Arc::new(
             astra_runtime::orchestration::DynamicAgentSpawner::new(std::sync::Arc::new(
-                astra_runtime::messaging::AgentMailboxRouter::new(
-                    std::sync::Arc::new(astra_runtime::messaging::InProcessTransport::new()),
+                astra_messaging::AgentMailboxRouter::new(
+                    std::sync::Arc::new(astra_messaging::InProcessTransport::new()),
                     std::sync::Arc::new(
                         astra_runtime::server::delegation_engine::DelegationTracker::new(),
                     ),
                 ),
             )),
         ));
-        let router = std::sync::Arc::new(astra_runtime::messaging::AgentMailboxRouter::new(
-            std::sync::Arc::new(astra_runtime::messaging::InProcessTransport::new()),
+        let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
+            std::sync::Arc::new(astra_messaging::InProcessTransport::new()),
             std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new()),
         ));
-        let root_addr = astra_runtime::messaging::AgentAddress::new("run-root", "root");
+        let root_addr = astra_messaging::AgentAddress::new("run-root", "root");
         state.root_mailbox = Some(router.register(root_addr.clone(), None).await.unwrap());
         state.pending_idle_agent_messages.push(std::sync::Arc::new(
-            astra_runtime::messaging::AgentMessage::new(
-                astra_runtime::messaging::AgentAddress::new("run-worker", "worker"),
-                astra_runtime::messaging::MessageTarget::Direct { address: root_addr },
-                astra_runtime::messaging::MessagePayload::Text {
+            astra_messaging::AgentMessage::new(
+                astra_messaging::AgentAddress::new("run-worker", "worker"),
+                astra_messaging::MessageTarget::Direct { address: root_addr },
+                astra_messaging::MessagePayload::Text {
                     content: "queued".to_string(),
                     summary: None,
                 },
@@ -248,8 +248,8 @@ mod tests {
         ));
         state.agent_spawner = Some(std::sync::Arc::new(
             astra_runtime::orchestration::DynamicAgentSpawner::new(std::sync::Arc::new(
-                astra_runtime::messaging::AgentMailboxRouter::new(
-                    std::sync::Arc::new(astra_runtime::messaging::InProcessTransport::new()),
+                astra_messaging::AgentMailboxRouter::new(
+                    std::sync::Arc::new(astra_messaging::InProcessTransport::new()),
                     std::sync::Arc::new(
                         astra_runtime::server::delegation_engine::DelegationTracker::new(),
                     ),

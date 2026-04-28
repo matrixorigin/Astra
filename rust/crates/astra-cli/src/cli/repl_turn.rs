@@ -1084,7 +1084,7 @@ async fn apply_auto_compact_result(
 
     // ─── Observability: record history compression decision ───────────────
     if let Some(session) = &state.observability_session {
-        use astra_runtime::turn::decision_explainer::{
+        use astra_turn_core::decision_explainer::{
             DecisionExplanation, DecisionType, ExplainableInput,
         };
         let compacted_turns: Vec<u32> = (0..(total - kept_indices.len()) as u32).collect();
@@ -1510,13 +1510,13 @@ fn commit_turn_journal_workspace_and_sidecars(
                     .unwrap_or(0);
                 // Extract metadata from the checkpoint for column storage
                 let (tier, turn, title, tools_json): (String, u32, String, String) = match step_cp {
-                    astra_runtime::pipeline::step_protocol::StepCheckpoint::Light(l) => (
+                    astra_pipeline::step_protocol::StepCheckpoint::Light(l) => (
                         "light".to_string(),
                         0u32,
                         format!("step:{}", l.step_id),
                         "[]".to_string(),
                     ),
-                    astra_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(h) => {
+                    astra_pipeline::step_protocol::StepCheckpoint::Heavy(h) => {
                         let tools = serde_json::to_string(&h.recent_tools)
                             .unwrap_or_else(|_| "[]".to_string());
                         (
@@ -1717,7 +1717,7 @@ fn merge_interruption_metadata(
 
 /// Routing + turn quality for journal fields and `ToolSelector::record_outcome`.
 pub(super) struct ReplTurnLearningSnapshot {
-    pub routing: astra_runtime::pipeline::routing::RoutingDecision,
+    pub routing: astra_turn_core::routing_engine::RoutingDecision,
     pub eval: astra_runtime::pipeline::evaluation::TurnEvaluation,
 }
 
@@ -1731,7 +1731,7 @@ pub(super) fn analyze_repl_turn_learning(
         TurnEvaluationTelemetry, current_evaluation_thresholds,
         evaluate_tool_call_records_with_thresholds_and_telemetry,
     };
-    use astra_runtime::pipeline::routing::RoutingEngine;
+    use astra_turn_core::routing_engine::RoutingEngine;
     let routing = RoutingEngine::analyze(line, turn, recent_tools, &[], vec![]);
 
     let has_verdict_warning = result.verdict_events.iter().any(|v| {
@@ -1789,7 +1789,7 @@ fn record_selector_turn_outcome(
     snap: &ReplTurnLearningSnapshot,
     prev_assistant_text: Option<&str>,
 ) {
-    let signal = astra_runtime::turn::implicit_feedback::detect_implicit_feedback_signal(
+    let signal = astra_turn_types::detect_implicit_feedback_signal(
         line,
         prev_assistant_text,
     );
@@ -1909,7 +1909,7 @@ fn apply_turn_success_sync(
     let routing_domain = learning_snap
         .routing
         .domain_hint
-        .map(|d| astra_runtime::pipeline::routing::domain_hint_to_label(d).to_string());
+        .map(|d| astra_turn_core::routing_engine::domain_hint_to_label(d).to_string());
     let entity_skipped = learning_snap.eval.success
         && !result.tools_used.is_empty()
         && learning_snap.routing.domain_hint.is_none();
@@ -2165,7 +2165,7 @@ pub(crate) async fn try_llm_skill_improvement(
         .filter(|m| {
             matches!(
                 m.source,
-                astra_runtime::skills::manifest::SkillSourceKind::Local
+                astra_skills::manifest::SkillSourceKind::Local
             )
         })
         .collect();
@@ -2174,19 +2174,19 @@ pub(crate) async fn try_llm_skill_improvement(
         return Ok(true);
     }
 
-    let recent: Vec<astra_runtime::skills::improvement::RecentMessage> = state
+    let recent: Vec<astra_skills::improvement::RecentMessage> = state
         .history
         .iter()
         .rev()
-        .take(astra_runtime::skills::improvement::TURN_BATCH_SIZE as usize)
+        .take(astra_skills::improvement::TURN_BATCH_SIZE as usize)
         .rev()
         .flat_map(|(user, assistant)| {
             vec![
-                astra_runtime::skills::improvement::RecentMessage {
+                astra_skills::improvement::RecentMessage {
                     role: "user".into(),
                     content: user.clone(),
                 },
-                astra_runtime::skills::improvement::RecentMessage {
+                astra_skills::improvement::RecentMessage {
                     role: "assistant".into(),
                     content: assistant.clone(),
                 },
@@ -2225,13 +2225,13 @@ pub(crate) async fn try_llm_skill_improvement(
 
     // Step 1: analysis — detect structured improvements.
     let (analysis_system, analysis_user) =
-        astra_runtime::skills::improvement::build_analysis_prompt(
+        astra_skills::improvement::build_analysis_prompt(
             &target.name,
             &current_content,
             &recent,
         );
     let analysis_resp = llm.complete(&analysis_system, &analysis_user).await?;
-    let improvements = astra_runtime::skills::improvement::parse_improvements(&analysis_resp);
+    let improvements = astra_skills::improvement::parse_improvements(&analysis_resp);
     if improvements.is_empty() {
         state.skill_improvement_tracker.mark_analyzed(state.turn);
         return Ok(true);
@@ -2239,17 +2239,17 @@ pub(crate) async fn try_llm_skill_improvement(
 
     // Step 2: rewrite — apply improvements into a new SKILL.md.
     let rewrite_prompt =
-        astra_runtime::skills::improvement::build_rewrite_prompt(&current_content, &improvements);
+        astra_skills::improvement::build_rewrite_prompt(&current_content, &improvements);
     let rewrite_system =
         "You are editing a skill definition file. Output only the <updated_file> block.";
     let rewrite_resp = llm.complete(rewrite_system, &rewrite_prompt).await?;
-    let new_content = astra_runtime::skills::improvement::extract_updated_content(&rewrite_resp)
+    let new_content = astra_skills::improvement::extract_updated_content(&rewrite_resp)
         .ok_or_else(|| "LLM response missing <updated_file> block".to_string())?;
 
-    astra_runtime::skills::improvement::apply_improvement(&skill_md, &new_content)
+    astra_skills::improvement::apply_improvement(&skill_md, &new_content)
         .map_err(|e| format!("failed to write {}: {}", skill_md.display(), e))?;
 
-    let proposal = astra_runtime::skills::improvement::ImprovementProposal {
+    let proposal = astra_skills::improvement::ImprovementProposal {
         skill_name: target.name.clone(),
         skill_path: skill_md.clone(),
         improvements: improvements.clone(),
@@ -2347,7 +2347,7 @@ fn check_skill_improvement_inner(state: &mut ReplState) {
         .filter(|m| {
             matches!(
                 m.source,
-                astra_runtime::skills::manifest::SkillSourceKind::Local
+                astra_skills::manifest::SkillSourceKind::Local
             )
         })
         .collect();
@@ -2358,19 +2358,19 @@ fn check_skill_improvement_inner(state: &mut ReplState) {
     }
 
     // Build recent messages for analysis
-    let recent: Vec<astra_runtime::skills::improvement::RecentMessage> = state
+    let recent: Vec<astra_skills::improvement::RecentMessage> = state
         .history
         .iter()
         .rev()
-        .take(astra_runtime::skills::improvement::TURN_BATCH_SIZE as usize)
+        .take(astra_skills::improvement::TURN_BATCH_SIZE as usize)
         .rev()
         .flat_map(|(user, assistant)| {
             vec![
-                astra_runtime::skills::improvement::RecentMessage {
+                astra_skills::improvement::RecentMessage {
                     role: "user".into(),
                     content: user.clone(),
                 },
-                astra_runtime::skills::improvement::RecentMessage {
+                astra_skills::improvement::RecentMessage {
                     role: "assistant".into(),
                     content: assistant.clone(),
                 },
@@ -2446,11 +2446,11 @@ fn check_skill_improvement_inner(state: &mut ReplState) {
         return;
     }
 
-    let improvements: Vec<astra_runtime::skills::improvement::SkillImprovement> = corrections
+    let improvements: Vec<astra_skills::improvement::SkillImprovement> = corrections
         .iter()
         .map(|c| {
             let snippet: String = c.chars().take(240).collect();
-            astra_runtime::skills::improvement::SkillImprovement {
+            astra_skills::improvement::SkillImprovement {
                 section: "Recent user feedback".into(),
                 change: format!("User correction: {}", snippet),
                 reason: "Detected correction pattern in user message".into(),
@@ -2458,7 +2458,7 @@ fn check_skill_improvement_inner(state: &mut ReplState) {
         })
         .collect();
 
-    let proposal = astra_runtime::skills::improvement::ImprovementProposal {
+    let proposal = astra_skills::improvement::ImprovementProposal {
         skill_name: target.name.clone(),
         skill_path: skill_md.clone(),
         improvements: improvements.clone(),
@@ -2503,7 +2503,7 @@ fn check_skill_improvement_inner(state: &mut ReplState) {
     // Trim oldest feedback sections if we'd exceed the cap after appending.
     let trimmed_existing = trim_feedback_sections(&existing, MAX_FEEDBACK_SECTIONS - 1);
     let new_content = format!("{}{}", trimmed_existing.trim_end(), appended);
-    if let Err(e) = astra_runtime::skills::improvement::apply_improvement(&skill_md, &new_content) {
+    if let Err(e) = astra_skills::improvement::apply_improvement(&skill_md, &new_content) {
         eprintln!(
             "  {}",
             format!(
@@ -2899,7 +2899,7 @@ fn sync_context_trace_to_workspace(
 
 /// Next numeric id for `step_checkpoints/<NNNNNN>-*.json`.
 fn next_step_checkpoint_number(sid: &str) -> Result<u32, String> {
-    let existing = astra_runtime::pipeline::step_checkpoint::list_checkpoints(sid)
+    let existing = astra_pipeline::step_checkpoint::list_checkpoints(sid)
         .map_err(|e| format!("list step checkpoints: {e}"))?;
     Ok(existing
         .iter()
@@ -2913,8 +2913,8 @@ fn next_step_checkpoint_number(sid: &str) -> Result<u32, String> {
 fn build_manual_heavy_step_checkpoint(
     state: &ReplState,
     sid: &str,
-) -> astra_runtime::pipeline::step_protocol::StepCheckpoint {
-    use astra_runtime::pipeline::step_protocol::{
+) -> astra_pipeline::step_protocol::StepCheckpoint {
+    use astra_pipeline::step_protocol::{
         ExecutionCursor, HeavyCheckpoint, LightCheckpoint, PROTOCOL_VERSION, StepCheckpoint,
         epoch_ms,
     };
@@ -2977,9 +2977,9 @@ fn persist_manual_heavy_and_composite(
     turn: u32,
     title: &str,
     next_step: u32,
-    step_cp: &astra_runtime::pipeline::step_protocol::StepCheckpoint,
+    step_cp: &astra_pipeline::step_protocol::StepCheckpoint,
 ) -> Result<std::path::PathBuf, String> {
-    use astra_runtime::pipeline::step_checkpoint::{
+    use astra_pipeline::step_checkpoint::{
         read_composite_snapshot_index, write_composite_snapshot_index, write_step_checkpoint,
     };
 
@@ -3083,7 +3083,7 @@ fn spawn_manual_checkpoint_cloud_uploads(
     next_step: u32,
     turn: u32,
     title: &str,
-    step_cp: &astra_runtime::pipeline::step_protocol::StepCheckpoint,
+    step_cp: &astra_pipeline::step_protocol::StepCheckpoint,
 ) {
     let Some(ref mc) = state.matrix_runtime else {
         return;
@@ -3212,8 +3212,8 @@ fn classify_turn_error(error: &str) -> astra_core::ErrorKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_runtime::pipeline::step_checkpoint::read_composite_snapshot_index;
-    use astra_runtime::pipeline::step_protocol::StepCheckpoint;
+    use astra_pipeline::step_checkpoint::read_composite_snapshot_index;
+    use astra_pipeline::step_protocol::StepCheckpoint;
 
     fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
         let tmp = tempfile::tempdir().unwrap();
@@ -3568,12 +3568,12 @@ mod tests {
         let mut obs =
             astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-trace");
         obs.context_traces
-            .push(astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace {
+            .push(astra_turn_core::context_assembly_trace::ContextAssemblyTrace {
                 turn_id: "turn-3".into(),
-                tools: astra_runtime::turn::context_assembly_trace::ToolSelectionTrace {
+                tools: astra_turn_core::context_assembly_trace::ToolSelectionTrace {
                     selection_strategy: "code-intel".into(),
                     selection_confidence: 0.92,
-                    tools_selected: vec![astra_runtime::turn::context_assembly_trace::ToolSelected {
+                    tools_selected: vec![astra_turn_core::context_assembly_trace::ToolSelected {
                         tool_name: "lsp".into(),
                         score: 1.0,
                         tokens: 0,
@@ -3581,26 +3581,26 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-                memory: astra_runtime::turn::context_assembly_trace::MemoryRetrievalTrace {
+                memory: astra_turn_core::context_assembly_trace::MemoryRetrievalTrace {
                     query: "resume trace persistence".into(),
-                    memories_selected: vec![astra_runtime::turn::context_assembly_trace::MemorySelection {
+                    memories_selected: vec![astra_turn_core::context_assembly_trace::MemorySelection {
                         memory_id: "m1".into(),
                         memory_type: "semantic".into(),
                         content_preview: "trace".into(),
                         relevance_score: 0.8,
                         tokens: 10,
-                        source: astra_runtime::turn::context_assembly_trace::MemorySource::Memoria,
+                        source: astra_turn_core::context_assembly_trace::MemorySource::Memoria,
                     }],
                     ..Default::default()
                 },
-                history: astra_runtime::turn::context_assembly_trace::HistorySelectionTrace {
-                    turns_compressed: vec![astra_runtime::turn::context_assembly_trace::TurnCompression {
+                history: astra_turn_core::context_assembly_trace::HistorySelectionTrace {
+                    turns_compressed: vec![astra_turn_core::context_assembly_trace::TurnCompression {
                         turn_index: 1,
                         role: "assistant".into(),
                         original_tokens: 100,
                         compressed_tokens: 50,
                         compression_method:
-                            astra_runtime::turn::context_assembly_trace::CompressionMethod::ReactiveCompact,
+                            astra_turn_core::context_assembly_trace::CompressionMethod::ReactiveCompact,
                         information_lost: Vec::new(),
                     }],
                     compression_ratio: 0.5,
@@ -3608,15 +3608,15 @@ mod tests {
                     tokens_after: 50,
                     ..Default::default()
                 },
-                token_budget: astra_runtime::turn::context_assembly_trace::TokenBudgetTrace {
+                token_budget: astra_turn_core::context_assembly_trace::TokenBudgetTrace {
                     max_tokens: 16_000,
                     total_used: 8_200,
                     budget_pressure: 0.76,
                     ..Default::default()
                 },
-                explanations: vec![astra_runtime::turn::context_assembly_trace::DecisionExplanation {
+                explanations: vec![astra_turn_core::context_assembly_trace::DecisionExplanation {
                     decision_type:
-                        astra_runtime::turn::context_assembly_trace::DecisionType::StrategyChoice {
+                        astra_turn_core::context_assembly_trace::DecisionType::StrategyChoice {
                             strategy: "code-intel".into(),
                         },
                     reasoning: "Need symbol-aware context.".into(),
@@ -5331,7 +5331,7 @@ mod tests {
         // 2. Build a registry backed by a LocalSkillProvider pointing at tmp.
         let mut registry = astra_runtime::skills::UnifiedSkillRegistry::new();
         registry.add_provider(Box::new(
-            astra_runtime::skills::LocalSkillProvider::with_paths(vec![tmp.path().to_path_buf()]),
+            astra_skills::providers::LocalSkillProvider::with_paths(vec![tmp.path().to_path_buf()]),
         ));
         registry.discover_all().await.unwrap();
         // Pre-load so skill_dir is populated on the cached LoadedSkill.
@@ -5346,7 +5346,7 @@ mod tests {
                 "no, that's wrong — please do it differently next time".to_string(),
                 "(previous assistant response)".to_string(),
             )],
-            turn: astra_runtime::skills::improvement::TURN_BATCH_SIZE + 1,
+            turn: astra_skills::improvement::TURN_BATCH_SIZE + 1,
             recent_tools: vec!["my-skill".to_string()],
             ..Default::default()
         };
@@ -5402,7 +5402,7 @@ mod tests {
 
         let mut registry = astra_runtime::skills::UnifiedSkillRegistry::new();
         registry.add_provider(Box::new(
-            astra_runtime::skills::LocalSkillProvider::with_paths(vec![tmp.path().to_path_buf()]),
+            astra_skills::providers::LocalSkillProvider::with_paths(vec![tmp.path().to_path_buf()]),
         ));
         registry.discover_all().await.unwrap();
         registry.load("my-skill").await.unwrap();
@@ -5413,7 +5413,7 @@ mod tests {
                 "hello, please add a feature".to_string(),
                 "sure thing".to_string(),
             )],
-            turn: astra_runtime::skills::improvement::TURN_BATCH_SIZE + 1,
+            turn: astra_skills::improvement::TURN_BATCH_SIZE + 1,
             ..Default::default()
         };
 
@@ -5513,7 +5513,7 @@ mod tests {
 
         let mut registry = astra_runtime::skills::UnifiedSkillRegistry::new();
         registry.add_provider(Box::new(
-            astra_runtime::skills::LocalSkillProvider::with_paths(vec![tmp.path().to_path_buf()]),
+            astra_skills::providers::LocalSkillProvider::with_paths(vec![tmp.path().to_path_buf()]),
         ));
         registry.discover_all().await.unwrap();
         registry.load("my-skill").await.unwrap();
@@ -5524,7 +5524,7 @@ mod tests {
                 "no, don't greet twice — skip the greeting on follow-ups".to_string(),
                 "Hello again!".to_string(),
             )],
-            turn: astra_runtime::skills::improvement::TURN_BATCH_SIZE + 1,
+            turn: astra_skills::improvement::TURN_BATCH_SIZE + 1,
             recent_tools: vec!["my-skill".to_string()],
             ..Default::default()
         };
@@ -5584,7 +5584,7 @@ mod tests {
 
         let mut registry = astra_runtime::skills::UnifiedSkillRegistry::new();
         registry.add_provider(Box::new(
-            astra_runtime::skills::LocalSkillProvider::with_paths(vec![tmp.path().to_path_buf()]),
+            astra_skills::providers::LocalSkillProvider::with_paths(vec![tmp.path().to_path_buf()]),
         ));
         registry.discover_all().await.unwrap();
         registry.load("my-skill").await.unwrap();
@@ -5592,7 +5592,7 @@ mod tests {
         let mut state = ReplState {
             unified_skill_registry: std::sync::Arc::new(registry),
             history: vec![("no, that's wrong".to_string(), "sorry".to_string())],
-            turn: astra_runtime::skills::improvement::TURN_BATCH_SIZE + 1,
+            turn: astra_skills::improvement::TURN_BATCH_SIZE + 1,
             recent_tools: vec!["my-skill".to_string()],
             ..Default::default()
         };
@@ -5626,7 +5626,7 @@ mod tests {
 
         let mut registry = astra_runtime::skills::UnifiedSkillRegistry::new();
         registry.add_provider(Box::new(
-            astra_runtime::skills::LocalSkillProvider::with_paths(vec![tmp.path().to_path_buf()]),
+            astra_skills::providers::LocalSkillProvider::with_paths(vec![tmp.path().to_path_buf()]),
         ));
         registry.discover_all().await.unwrap();
         registry.load("my-skill").await.unwrap();
@@ -5637,7 +5637,7 @@ mod tests {
                 "no, that's wrong, do it differently".to_string(),
                 "sorry".to_string(),
             )],
-            turn: astra_runtime::skills::improvement::TURN_BATCH_SIZE + 1,
+            turn: astra_skills::improvement::TURN_BATCH_SIZE + 1,
             recent_tools: vec!["my-skill".to_string()],
             ..Default::default()
         };

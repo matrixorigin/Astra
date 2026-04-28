@@ -187,7 +187,7 @@ fn retained_history_messages(messages: &[Value]) -> &[Value] {
 
 fn build_retained_history_turns(
     messages: &[Value],
-) -> Vec<astra_runtime::turn::context_assembly_trace::TurnRetention> {
+) -> Vec<astra_turn_core::context_assembly_trace::TurnRetention> {
     let mut turns = Vec::new();
 
     for message in messages {
@@ -200,7 +200,7 @@ fn build_retained_history_turns(
         let has_tool_calls = message_has_tool_calls(message);
 
         if turns.is_empty() || role == "user" {
-            turns.push(astra_runtime::turn::context_assembly_trace::TurnRetention {
+            turns.push(astra_turn_core::context_assembly_trace::TurnRetention {
                 turn_index: turns.len() as u32,
                 role,
                 tokens,
@@ -289,7 +289,7 @@ struct PrepareChatTurnRequest<'a> {
     /// After the selector picks tools, any allowed tools it missed are force-injected.
     skill_allowed_tools: Option<Vec<String>>,
     previous_confidence_fallback:
-        Option<astra_runtime::turn::confidence_contract::ConfidenceFallback>,
+        Option<astra_turn_core::confidence_contract::ConfidenceFallback>,
     /// Current agentic loop round (0-based). Sent to bridge for round budget directives.
     round_index: u32,
     /// Authoritative visible-turn number from the outer loop.
@@ -382,7 +382,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     let semantic_query = semantic_query_from_message(ctx.message);
     let semantic_query_str = semantic_query.as_ref();
-    let mut boost_terms = astra_runtime::turn::retrieval::extract_boost_terms_from_pairs(
+    let mut boost_terms = astra_turn_core::retrieval::extract_boost_terms_from_pairs(
         ctx.history,
         semantic_query_str,
     );
@@ -407,7 +407,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             let ranked = if memory_contents.is_empty() {
                 Vec::new()
             } else {
-                astra_runtime::turn::retrieval::rank_memory_results(
+                astra_turn_core::retrieval::rank_memory_results(
                     semantic_query_str,
                     &memory_contents,
                 )
@@ -427,7 +427,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                         ctx.executor.add_preferred_repo(&repo);
                     }
                 }
-                astra_runtime::turn::retrieval::append_boost_terms_from_ranked_memory(
+                astra_turn_core::retrieval::append_boost_terms_from_ranked_memory(
                     &mut boost_terms,
                     semantic_query_str,
                     &ranked,
@@ -599,7 +599,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let mut turn_schemas = turn_schemas;
     let mut selection_report = selection_report;
     if let Some(ref allowed) = ctx.skill_allowed_tools {
-        astra_runtime::turn::tool_schema_prune::inject_skill_allowed_tools(
+        astra_turn_core::tool_schema_prune::inject_skill_allowed_tools(
             &mut turn_schemas,
             &mut selection_report,
             allowed,
@@ -930,7 +930,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub current_session_id: Option<&'a str>,
     pub tool_results: &'a [Value],
     pub all_schemas: &'a [Value],
-    pub turn_guard: &'a astra_runtime::turn::turn_guard::TurnGuard,
+    pub turn_guard: &'a astra_turn_core::turn_guard::TurnGuard,
     pub restricted_tools: &'a mut HashSet<String>,
     pub step_recorder: &'a mut StepRecorder,
     pub file_context: &'a [String],
@@ -971,7 +971,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub tool_cache: &'a mut crate::stream_render::EdgeToolCache,
     /// Fallback from previous turn's confidence diagnosis for broadening.
     pub previous_confidence_fallback:
-        Option<astra_runtime::turn::confidence_contract::ConfidenceFallback>,
+        Option<astra_turn_core::confidence_contract::ConfidenceFallback>,
     /// Current agentic loop round (0-based). Sent to bridge for round budget directives.
     pub round_index: u32,
     pub session_turn: u32,
@@ -1232,7 +1232,7 @@ pub(crate) async fn fetch_chat_turn_sse(
 #[cfg(test)]
 mod tests {
     use astra_runtime::turn::agentic_loop_host::{ASK_USER_TOOL_NAME, TurnInteractionMode};
-    use astra_runtime::turn::chat_history_openai::merge_skill_names_track;
+    use astra_turn_core::chat_history_openai::merge_skill_names_track;
     use serde_json::json;
 
     fn schema(name: &str) -> serde_json::Value {
@@ -1402,7 +1402,7 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
 
     #[test]
     fn context_meta_sse_event_sets_system_prompt_tokens() {
-        use astra_runtime::turn::chat_turn_sse_dispatch::{
+        use astra_turn_core::chat_turn_sse_dispatch::{
             ChatTurnSseAccum, dispatch_chat_turn_sse_event_block,
         };
         let mut accum = ChatTurnSseAccum::default();
@@ -1413,10 +1413,10 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
 
     #[test]
     fn context_meta_sse_event_parses_full_breakdown() {
-        use astra_runtime::turn::chat_turn_sse_dispatch::{
+        use astra_turn_core::chat_turn_sse_dispatch::{
             ChatTurnSseAccum, dispatch_chat_turn_sse_event_block,
         };
-        use astra_runtime::turn::context_assembly_trace::SystemPromptBreakdown;
+        use astra_turn_core::context_assembly_trace::SystemPromptBreakdown;
 
         let mut accum = ChatTurnSseAccum::default();
         let sse = concat!(
@@ -1484,7 +1484,7 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
     #[test]
     fn skill_allowed_tools_injected_into_selection() {
         use astra_runtime::tool_registry::SelectionReport;
-        use astra_runtime::turn::tool_schema_prune::inject_skill_allowed_tools;
+        use astra_turn_core::tool_schema_prune::inject_skill_allowed_tools;
 
         let all_schemas = [
             schema("bash"),

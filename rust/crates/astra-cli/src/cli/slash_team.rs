@@ -951,8 +951,8 @@ pub(super) async fn handle_team_command(
             let run_engine = Arc::new(astra_runtime::server::run_engine::RunEngine::new(run_store));
             let tracker =
                 Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
-            let transport = Arc::new(astra_runtime::messaging::InProcessTransport::new());
-            let mailbox_router = Arc::new(astra_runtime::messaging::AgentMailboxRouter::new(
+            let transport = Arc::new(astra_messaging::InProcessTransport::new());
+            let mailbox_router = Arc::new(astra_messaging::AgentMailboxRouter::new(
                 transport,
                 tracker.clone(),
             ));

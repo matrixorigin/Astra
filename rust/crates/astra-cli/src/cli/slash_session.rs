@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use astra_core::{DriftCause, EvidenceType};
-use astra_runtime::turn::decision_explainer::{DriftDetector, FocusDriftAnalysis};
+use astra_turn_core::decision_explainer::{DriftDetector, FocusDriftAnalysis};
 use astra_services::session_restore::{
     HybridRestoreService, RestoredSession, SessionRestoreService,
 };
@@ -4613,7 +4613,7 @@ fn build_step_resume_guidance(
 ) -> Option<String> {
     let compaction_ctx =
         compaction_state.map(
-            |cs| astra_runtime::turn::interruption::CompactionResumeContext {
+            |cs| astra_turn_core::interruption::CompactionResumeContext {
                 compaction_attempts: cs
                     .get("attempt_count")
                     .and_then(|v| v.as_u64())
@@ -4629,7 +4629,7 @@ fn build_step_resume_guidance(
             },
         );
     interruption.and_then(|irj| {
-        astra_runtime::turn::interruption::build_resume_guidance_with_context(
+        astra_turn_core::interruption::build_resume_guidance_with_context(
             irj,
             compaction_ctx.as_ref(),
         )
@@ -4678,8 +4678,8 @@ fn history_pairs_from_messages(messages: &[serde_json::Value]) -> Vec<(String, S
 /// cloud preference seeding in `cloud_sync.rs`).
 fn blocked_tool_health_entry(
     name: String,
-) -> astra_runtime::pipeline::persistence::ToolHealthEntry {
-    astra_runtime::pipeline::persistence::ToolHealthEntry {
+) -> astra_evolution::persistence::ToolHealthEntry {
+    astra_evolution::persistence::ToolHealthEntry {
         name,
         total_calls: 0,
         total_failures: 0,
@@ -4719,7 +4719,7 @@ fn apply_heavy_state_fallback(
 
 fn apply_heavy_checkpoint_fallback(
     state: &mut ReplState,
-    heavy: &astra_runtime::pipeline::step_protocol::HeavyCheckpoint,
+    heavy: &astra_pipeline::step_protocol::HeavyCheckpoint,
 ) {
     apply_heavy_state_fallback(
         state,
@@ -4776,7 +4776,7 @@ async fn apply_restored_session(
     apply_restored_workspace_state(state, &restored.session_id);
 
     let step_restored =
-        match astra_runtime::pipeline::step_restore::restore_session_with_continuity_validator(
+        match astra_pipeline::step_restore::restore_session_with_continuity_validator(
             &restored.session_id,
             |value| {
                 astra_turn_types::continuity::try_from_checkpoint_value(value)
@@ -4785,7 +4785,7 @@ async fn apply_restored_session(
             },
         ) {
             Ok(restored) => restored,
-            Err(astra_runtime::pipeline::step_restore::RestoreError::IoError(error)) => {
+            Err(astra_pipeline::step_restore::RestoreError::IoError(error)) => {
                 return Err(format!(
                     "Failed to read local step checkpoint for {}: {}",
                     restored.session_id, error
@@ -4800,7 +4800,7 @@ async fn apply_restored_session(
             }
         };
     if let Some(step_restored) = step_restored {
-        let summary = astra_runtime::pipeline::step_restore::restore_summary(&step_restored);
+        let summary = astra_pipeline::step_restore::restore_summary(&step_restored);
         for tool in &step_restored.blocked_tools {
             if !state.tool_health_entries.iter().any(|e| e.name == *tool) {
                 state
@@ -4828,7 +4828,7 @@ async fn apply_restored_session(
         }
         eprintln!("  {} {}", "↻".cyan(), summary.dim());
     } else if let Ok(Some(heavy)) =
-        astra_runtime::pipeline::step_checkpoint::read_latest_heavy_checkpoint(&restored.session_id)
+        astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&restored.session_id)
     {
         apply_heavy_checkpoint_fallback(state, &heavy);
         let heavy_continuity = heavy.continuity_state.as_ref().and_then(|v| {
@@ -5647,7 +5647,7 @@ mod resume_tests {
 
     #[test]
     fn apply_heavy_checkpoint_fallback_restores_history_and_approval_overrides() {
-        use astra_runtime::turn::approval_fingerprint::{
+        use astra_turn_core::approval_fingerprint::{
             ApprovalFingerprint, FingerprintedOverrides,
         };
 
@@ -5659,13 +5659,13 @@ mod resume_tests {
         );
         let approval_json = overrides.to_json().expect("non-empty overrides");
 
-        let mut heavy = match astra_runtime::pipeline::step_protocol::StepCheckpoint::heavy(
+        let mut heavy = match astra_pipeline::step_protocol::StepCheckpoint::heavy(
             "step-1".into(),
             "task-1".into(),
             "agent-1".into(),
             Default::default(),
         ) {
-            astra_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(heavy) => *heavy,
+            astra_pipeline::step_protocol::StepCheckpoint::Heavy(heavy) => *heavy,
             _ => unreachable!("heavy checkpoint constructor should yield Heavy"),
         };
         heavy.messages = vec![

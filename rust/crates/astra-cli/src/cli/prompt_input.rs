@@ -11,7 +11,7 @@ use super::{
 
 enum PromptWaitOutcome {
     Readline(Result<String, ReadlineError>, Option<String>),
-    IdleAgentMessage(Option<std::sync::Arc<astra_runtime::messaging::AgentMessage>>),
+    IdleAgentMessage(Option<std::sync::Arc<astra_messaging::AgentMessage>>),
     Shutdown(ShutdownSignal),
 }
 

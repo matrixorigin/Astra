@@ -4,8 +4,8 @@ use astra_runtime::tool_sandbox::{
     CommandRisk, GitSafetyViolation, analyze_command_risks, is_dangerous_file_path,
     validate_git_command,
 };
-use astra_runtime::turn::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind};
-use astra_runtime::turn::tool_argument_hints::{
+use astra_turn_core::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind};
+use astra_turn_core::tool_argument_hints::{
     command_hint_from_args, path_hint_from_args, permission_prompt_primary_detail,
 };
 use astra_runtime::{compensation_prompt_note, explicit_approval_reason};
@@ -70,8 +70,8 @@ pub(super) fn format_denied_message(reason: &str) -> String {
 fn content_aware_fingerprint(
     name: &str,
     args: &serde_json::Value,
-) -> astra_runtime::turn::approval_fingerprint::ApprovalFingerprint {
-    use astra_runtime::turn::approval_fingerprint::ApprovalFingerprint;
+) -> astra_turn_core::approval_fingerprint::ApprovalFingerprint {
+    use astra_turn_core::approval_fingerprint::ApprovalFingerprint;
 
     match cloud_gated_tool_kind(name) {
         Some(CloudGatedToolKind::Execute) => {
@@ -277,8 +277,8 @@ impl PermissionSettings {
 
 pub(super) struct PermissionManager {
     mode: PermissionMode,
-    session_overrides: astra_runtime::turn::approval_fingerprint::FingerprintedOverrides,
-    denial_tracker: astra_runtime::turn::approval_fingerprint::DenialTracker,
+    session_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides,
+    denial_tracker: astra_turn_core::approval_fingerprint::DenialTracker,
     /// Persistent rules loaded from project settings file.
     settings: PermissionSettings,
     /// Project root for settings persistence.
@@ -377,8 +377,8 @@ impl PermissionManager {
         Self {
             mode,
             session_overrides:
-                astra_runtime::turn::approval_fingerprint::FingerprintedOverrides::default(),
-            denial_tracker: astra_runtime::turn::approval_fingerprint::DenialTracker::default(),
+                astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
+            denial_tracker: astra_turn_core::approval_fingerprint::DenialTracker::default(),
             recent_rejections: std::collections::VecDeque::new(),
             settings: PermissionSettings::default(),
             project_root: None,
@@ -413,8 +413,8 @@ impl PermissionManager {
         Self {
             mode,
             session_overrides:
-                astra_runtime::turn::approval_fingerprint::FingerprintedOverrides::default(),
-            denial_tracker: astra_runtime::turn::approval_fingerprint::DenialTracker::default(),
+                astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
+            denial_tracker: astra_turn_core::approval_fingerprint::DenialTracker::default(),
             recent_rejections: std::collections::VecDeque::new(),
             settings,
             project_root: Some(project_root.to_path_buf()),
@@ -450,8 +450,8 @@ impl PermissionManager {
         Self {
             mode,
             session_overrides:
-                astra_runtime::turn::approval_fingerprint::FingerprintedOverrides::default(),
-            denial_tracker: astra_runtime::turn::approval_fingerprint::DenialTracker::default(),
+                astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
+            denial_tracker: astra_turn_core::approval_fingerprint::DenialTracker::default(),
             recent_rejections: std::collections::VecDeque::new(),
             settings,
             project_root: Some(project_root.to_path_buf()),
@@ -594,14 +594,14 @@ impl PermissionManager {
         }
         let fp = match (cloud_gated_tool_kind(tool), detail) {
             (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
-                astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::shell(
+                astra_turn_core::approval_fingerprint::ApprovalFingerprint::shell(
                     tool, cmd, false,
                 )
             }
             (Some(CloudGatedToolKind::Write), d) => {
-                astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
+                astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
             }
-            _ => astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool),
+            _ => astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(tool),
         };
         if let Some(allowed) = self.session_overrides.check(&fp) {
             return if allowed {
@@ -611,11 +611,11 @@ impl PermissionManager {
             };
         }
         match self.denial_tracker.should_prompt(&fp) {
-            astra_runtime::turn::approval_fingerprint::DenialAction::SkipTool => {
+            astra_turn_core::approval_fingerprint::DenialAction::SkipTool => {
                 return ApprovalDecision::Deny;
             }
-            astra_runtime::turn::approval_fingerprint::DenialAction::FallbackToUser => {}
-            astra_runtime::turn::approval_fingerprint::DenialAction::Continue => {}
+            astra_turn_core::approval_fingerprint::DenialAction::FallbackToUser => {}
+            astra_turn_core::approval_fingerprint::DenialAction::Continue => {}
         }
 
         eprintln!(
@@ -827,14 +827,14 @@ impl PermissionManager {
 
         let fp = match (cloud_gated_tool_kind(tool), detail) {
             (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
-                astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::shell(
+                astra_turn_core::approval_fingerprint::ApprovalFingerprint::shell(
                     tool, cmd, false,
                 )
             }
             (Some(CloudGatedToolKind::Write), d) => {
-                astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
+                astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
             }
-            _ => astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool),
+            _ => astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(tool),
         };
         if let Some(allowed) = self.session_overrides.check(&fp) {
             return Some(if allowed {
@@ -844,11 +844,11 @@ impl PermissionManager {
             });
         }
         match self.denial_tracker.should_prompt(&fp) {
-            astra_runtime::turn::approval_fingerprint::DenialAction::SkipTool => {
+            astra_turn_core::approval_fingerprint::DenialAction::SkipTool => {
                 Some(ApprovalDecision::Deny)
             }
-            astra_runtime::turn::approval_fingerprint::DenialAction::FallbackToUser => None,
-            astra_runtime::turn::approval_fingerprint::DenialAction::Continue => None,
+            astra_turn_core::approval_fingerprint::DenialAction::FallbackToUser => None,
+            astra_turn_core::approval_fingerprint::DenialAction::Continue => None,
         }
     }
 
@@ -1138,16 +1138,16 @@ impl PermissionManager {
             'a' => {
                 let fp = match (cloud_gated_tool_kind(tool), detail) {
                     (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
-                        astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::shell(
+                        astra_turn_core::approval_fingerprint::ApprovalFingerprint::shell(
                             tool, cmd, false,
                         )
                     }
                     (Some(CloudGatedToolKind::Write), d) => {
-                        astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::file_op(
+                        astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(
                             tool, d,
                         )
                     }
-                    _ => astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool),
+                    _ => astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(tool),
                 };
                 self.session_overrides.insert(fp, true);
                 eprintln!("{}", format!("  ✓ {tool}: allowed for this session").dim());
@@ -1165,16 +1165,16 @@ impl PermissionManager {
             's' => {
                 let fp = match (cloud_gated_tool_kind(tool), detail) {
                     (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
-                        astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::shell(
+                        astra_turn_core::approval_fingerprint::ApprovalFingerprint::shell(
                             tool, cmd, false,
                         )
                     }
                     (Some(CloudGatedToolKind::Write), d) => {
-                        astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::file_op(
+                        astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(
                             tool, d,
                         )
                     }
-                    _ => astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool),
+                    _ => astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(tool),
                 };
                 self.session_overrides.insert(fp.clone(), false);
                 self.denial_tracker.record(&fp, false);
@@ -1367,17 +1367,17 @@ impl PermissionManager {
         // Check denial limits before prompting.
         let fp = content_aware_fingerprint(name, args);
         match self.denial_tracker.should_prompt(&fp) {
-            astra_runtime::turn::approval_fingerprint::DenialAction::SkipTool => {
+            astra_turn_core::approval_fingerprint::DenialAction::SkipTool => {
                 eprintln!(
                     "  {}",
                     format!("  ✗ {name}: auto-denied (repeated denials)").dim()
                 );
                 return false;
             }
-            astra_runtime::turn::approval_fingerprint::DenialAction::FallbackToUser => {
+            astra_turn_core::approval_fingerprint::DenialAction::FallbackToUser => {
                 // Still show the prompt but could add escalation context
             }
-            astra_runtime::turn::approval_fingerprint::DenialAction::Continue => {}
+            astra_turn_core::approval_fingerprint::DenialAction::Continue => {}
         }
         match Self::prompt_approval(ApprovalPromptKind::LocalStandard) {
             'y' => true,
@@ -1635,15 +1635,15 @@ impl PermissionManager {
                 // Check denial limits before prompting.
                 let fp = content_aware_fingerprint(name, args);
                 match self.denial_tracker.should_prompt(&fp) {
-                    astra_runtime::turn::approval_fingerprint::DenialAction::SkipTool => {
+                    astra_turn_core::approval_fingerprint::DenialAction::SkipTool => {
                         return PermissionDecision::Deny(format!(
                             "{name}: auto-denied (repeated denials)"
                         ));
                     }
-                    astra_runtime::turn::approval_fingerprint::DenialAction::FallbackToUser => {
+                    astra_turn_core::approval_fingerprint::DenialAction::FallbackToUser => {
                         // Still show the prompt but add escalation context
                     }
-                    astra_runtime::turn::approval_fingerprint::DenialAction::Continue => {}
+                    astra_turn_core::approval_fingerprint::DenialAction::Continue => {}
                 }
                 let (header, detail) = Self::format_tool_display(name, args);
                 PermissionDecision::NeedApproval {
@@ -1665,7 +1665,7 @@ impl PermissionManager {
     ) {
         let fp = match args {
             Some(a) => content_aware_fingerprint(name, a),
-            None => astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name),
+            None => astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(name),
         };
         self.session_overrides.insert(fp.clone(), allowed);
         if !allowed {
@@ -1725,7 +1725,7 @@ impl PermissionManager {
     /// Export session overrides as a `FingerprintedOverrides` clone for checkpoint persistence.
     pub(super) fn export_session_overrides(
         &self,
-    ) -> Option<astra_runtime::turn::approval_fingerprint::FingerprintedOverrides> {
+    ) -> Option<astra_turn_core::approval_fingerprint::FingerprintedOverrides> {
         if self.session_overrides.is_empty() {
             None
         } else {
@@ -1834,7 +1834,7 @@ fn is_rm_catastrophic_target(lower: &str) -> bool {
 }
 
 fn is_read_only_allowlisted(lower_cmd: &str) -> bool {
-    use astra_runtime::turn::cloud_approval_policy::bash_command_is_read_only;
+    use astra_turn_core::cloud_approval_policy::bash_command_is_read_only;
 
     let cmd = lower_cmd.trim();
     if cmd.is_empty() {
@@ -1863,8 +1863,8 @@ fn is_read_only_allowlisted(lower_cmd: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn bare_fp(tool: &str) -> astra_runtime::turn::approval_fingerprint::ApprovalFingerprint {
-        astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool)
+    fn bare_fp(tool: &str) -> astra_turn_core::approval_fingerprint::ApprovalFingerprint {
+        astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(tool)
     }
 
     // ── classify ──────────────────────────────────────────────────────────────

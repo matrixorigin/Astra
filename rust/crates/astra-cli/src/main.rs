@@ -209,7 +209,7 @@ mod tool_call_groups;
 mod tool_safety_guard;
 
 use agent_runtime::initialize_multi_agent_runtime;
-use astra_runtime::turn::chat_turn_heuristics::{
+use astra_turn_core::chat_turn_heuristics::{
     is_session_not_found_error, looks_like_live_query_with_context,
 };
 use auth_flow::{clear_profile_last_session, do_login, do_register};
@@ -889,7 +889,7 @@ async fn run_chat_repl(
             .as_ref()
             .and_then(|t| t.lock().ok().map(|g| g.export()))
             .unwrap_or_default();
-        if let Err(e) = astra_runtime::pipeline::persistence::save_learning_state_full(
+        if let Err(e) = astra_evolution::persistence::save_learning_state_full(
             profile_name,
             &pipeline_modules.entity_graph,
             &pipeline_modules.pattern_library,
@@ -935,7 +935,7 @@ async fn run_chat_repl(
                 expected_version = pull_result.version;
                 // Merge tool health from cloud pull
                 if !pull_result.tool_health.is_empty() {
-                    let (merged, _, _) = astra_runtime::pipeline::persistence::merge_tool_health(
+                    let (merged, _, _) = astra_evolution::persistence::merge_tool_health(
                         &state.tool_health_entries,
                         &pull_result.tool_health,
                     );
@@ -1452,7 +1452,7 @@ mod tests {
         let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
         let selector = tool_selector::TfIdfSelector::new(registry);
         let mut pm = PermissionManager::new(true);
-        let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+        let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
         let skill_search = astra_core::SkillSearchSettings::default();
         let result = stream_chat_sse(ChatTurnParams {
             api: &api,
@@ -1525,7 +1525,7 @@ mod tests {
         let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
         let selector = tool_selector::TfIdfSelector::new(registry);
         let mut pm = PermissionManager::new(true);
-        let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+        let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
         let skill_search = astra_core::SkillSearchSettings::default();
         let result = stream_chat_sse(ChatTurnParams {
             api: &api,
@@ -1614,7 +1614,7 @@ mod tests {
         let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
         let selector = tool_selector::TfIdfSelector::new(registry);
         let mut pm = PermissionManager::new(true); // auto-approve
-        let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+        let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
         let skill_search = astra_core::SkillSearchSettings::default();
         let result = stream_chat_sse(ChatTurnParams {
             api: &api,
@@ -1857,7 +1857,7 @@ mod tests {
         ));
         let mut state = ReplState {
             tool_health_entries: vec![
-                astra_runtime::pipeline::persistence::ToolHealthEntry {
+                astra_evolution::persistence::ToolHealthEntry {
                     name: "bash".into(),
                     total_calls: 15,
                     total_failures: 3,
@@ -1865,7 +1865,7 @@ mod tests {
                     last_updated_epoch: 0,
                     recent_outcomes: vec![],
                 },
-                astra_runtime::pipeline::persistence::ToolHealthEntry {
+                astra_evolution::persistence::ToolHealthEntry {
                     name: "grep".into(),
                     total_calls: 8,
                     total_failures: 0,
@@ -1889,7 +1889,7 @@ mod tests {
             edge_tools::all_tool_schemas(),
         ));
         let mut state = ReplState {
-            tool_health_entries: vec![astra_runtime::pipeline::persistence::ToolHealthEntry {
+            tool_health_entries: vec![astra_evolution::persistence::ToolHealthEntry {
                 name: "bash".into(),
                 total_calls: 10,
                 total_failures: 5,
@@ -2496,7 +2496,7 @@ total_tokens_out: 500
 
     #[test]
     fn merge_learning_valid_snapshot() {
-        use astra_runtime::pipeline::{calibration, entity, pattern};
+        use astra_pipeline::{calibration, entity, pattern};
 
         let json = serde_json::json!({
             "version": 1,
@@ -2551,7 +2551,7 @@ total_tokens_out: 500
 
     #[test]
     fn merge_learning_invalid_json_does_not_panic() {
-        use astra_runtime::pipeline::{calibration, entity, pattern};
+        use astra_pipeline::{calibration, entity, pattern};
 
         let eg = std::sync::Arc::new(std::sync::Mutex::new(entity::EntityGraph::new()));
         let pl = std::sync::Arc::new(std::sync::Mutex::new(pattern::PatternLibrary::new()));
@@ -2569,7 +2569,7 @@ total_tokens_out: 500
 
     #[test]
     fn merge_learning_empty_snapshot() {
-        use astra_runtime::pipeline::{calibration, entity, pattern};
+        use astra_pipeline::{calibration, entity, pattern};
 
         let json = serde_json::json!({
             "version": 1,
@@ -2593,7 +2593,7 @@ total_tokens_out: 500
 
     #[test]
     fn merge_learning_idempotent() {
-        use astra_runtime::pipeline::{calibration, entity, pattern};
+        use astra_pipeline::{calibration, entity, pattern};
 
         let json = serde_json::json!({
             "version": 1,
@@ -2629,7 +2629,7 @@ total_tokens_out: 500
 
     #[test]
     fn merge_learning_multiple_entities_and_patterns() {
-        use astra_runtime::pipeline::{calibration, entity, pattern};
+        use astra_pipeline::{calibration, entity, pattern};
 
         let json = serde_json::json!({
             "version": 1,
@@ -3207,13 +3207,13 @@ total_tokens_out: 500
             std::env::remove_var("MATRIXONE_HOST");
         }
         let eg = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_runtime::pipeline::entity::EntityGraph::new(),
+            astra_pipeline::entity::EntityGraph::new(),
         ));
         let pl = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_runtime::pipeline::pattern::PatternLibrary::new(),
+            astra_pipeline::pattern::PatternLibrary::new(),
         ));
         let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_runtime::pipeline::calibration::ProgressiveCalibrator::new(0.15),
+            astra_pipeline::calibration::ProgressiveCalibrator::new(0.15),
         ));
         let result = try_cloud_pull("default", &eg, &pl, &cal).await;
         assert!(
@@ -3236,13 +3236,13 @@ total_tokens_out: 500
             std::env::remove_var("MATRIXONE_HOST");
         }
         let eg = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_runtime::pipeline::entity::EntityGraph::new(),
+            astra_pipeline::entity::EntityGraph::new(),
         ));
         let pl = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_runtime::pipeline::pattern::PatternLibrary::new(),
+            astra_pipeline::pattern::PatternLibrary::new(),
         ));
         let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_runtime::pipeline::calibration::ProgressiveCalibrator::new(0.15),
+            astra_pipeline::calibration::ProgressiveCalibrator::new(0.15),
         ));
         // Should not panic (was the original bug)
         // Use versioned API (None = new snapshot or unconditional push)
@@ -3255,18 +3255,18 @@ total_tokens_out: 500
             std::env::remove_var("MATRIXONE_HOST");
         }
         let eg = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_runtime::pipeline::entity::EntityGraph::new(),
+            astra_pipeline::entity::EntityGraph::new(),
         ));
         let pl = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_runtime::pipeline::pattern::PatternLibrary::new(),
+            astra_pipeline::pattern::PatternLibrary::new(),
         ));
         let cal = std::sync::Arc::new(std::sync::Mutex::new(
-            astra_runtime::pipeline::calibration::ProgressiveCalibrator::new(0.15),
+            astra_pipeline::calibration::ProgressiveCalibrator::new(0.15),
         ));
         let mut synced = Vec::new();
         eg.lock().unwrap().learn(
             "rust",
-            astra_runtime::pipeline::routing::DomainHint::Code,
+            astra_turn_core::routing_engine::DomainHint::Code,
             &[],
             None,
         );

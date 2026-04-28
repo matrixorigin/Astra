@@ -142,9 +142,13 @@ name = "astra-cli"
 version = "0.1.0"
 dependencies = [
  "astra-core",
+ "astra-evolution",
  "astra-logging",
+ "astra-messaging",
+ "astra-pipeline",
  "astra-runtime",
  "astra-services",
+ "astra-skills",
  "astra-text-utils",
  "astra-thin-client",
  "astra-tools",

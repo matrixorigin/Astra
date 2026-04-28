@@ -1,16 +1,16 @@
 use super::*;
-use astra_runtime::turn::chat_turn_sse_dispatch::{
+use astra_turn_core::chat_turn_sse_dispatch::{
     ChatTurnSseAccum, EdgeApprovalRequest, SseRenderEffect, dispatch_chat_turn_sse_event_block,
 };
-use astra_runtime::turn::headless_tool_assembly::READ_ONLY_TOOLS;
-use astra_runtime::turn::sse_edge_stderr_lines::{
+use astra_turn_core::headless_tool_assembly::READ_ONLY_TOOLS;
+use astra_turn_core::sse_edge_stderr_lines::{
     edge_sse_post_approval_fail_line, edge_sse_post_tool_result_fail_line,
 };
-use astra_runtime::turn::sse_stream_host::{
+use astra_turn_core::sse_stream_host::{
     EdgeApprovalResult, EdgeToolExecResult, NoopSseStreamHost, SseStreamHost, ToolBatchRequest,
     consume_sse_stream_cancellable, is_tool_concurrency_safe, stream_idle_timeout,
 };
-use astra_runtime::turn::tool_result_semantics::{
+use astra_turn_core::tool_result_semantics::{
     cloud_tool_result_status_label, tool_dedup_signature, tool_error_triggers_rollback,
 };
 use astra_services::session_journal::{JournalEvent, JournalWriter};
@@ -39,7 +39,7 @@ use super::effects::{
     ThinkingSpinnerKind, ToolRegionState, ToolStdoutLineAnim, thinking_viewport_rows,
 };
 
-pub use astra_runtime::turn::chat_turn_sse_dispatch::ChatTurnEdgePending;
+pub use astra_turn_core::chat_turn_sse_dispatch::ChatTurnEdgePending;
 
 // Re-export effects types for callers
 pub(crate) use super::effects::{ChatPrepPhaseLabel, ChatTurnPrepLineGuard};
@@ -273,7 +273,7 @@ struct CliSseStreamHost<'a> {
     /// and journal/observability events still fire exactly once in the
     /// batch phase.
     streaming_tool_exec:
-        Option<std::sync::Arc<astra_runtime::turn::streaming_tool_exec::StreamingToolExecutor>>,
+        Option<std::sync::Arc<astra_turn_core::streaming_tool_exec::StreamingToolExecutor>>,
     /// Optional ObservabilityHub for streaming-speculation metric reporting.
     observability_hub:
         Option<std::sync::Arc<astra_runtime::observability_integration::ObservabilityHub>>,
@@ -659,7 +659,7 @@ impl<'a> CliSseStreamHost<'a> {
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .is_some_and(
-                    astra_runtime::turn::cloud_approval_policy::bash_command_is_read_only,
+                    astra_turn_core::cloud_approval_policy::bash_command_is_read_only,
                 );
         }
         is_tool_concurrency_safe(tool)
@@ -687,7 +687,7 @@ impl<'a> CliSseStreamHost<'a> {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|command| !command.is_empty())?;
-        if astra_runtime::turn::cloud_approval_policy::bash_command_is_read_only(command) {
+        if astra_turn_core::cloud_approval_policy::bash_command_is_read_only(command) {
             return None;
         }
         Some(message.to_string())
@@ -1004,10 +1004,10 @@ impl<'a> CliSseStreamHost<'a> {
     fn tool_error_triggers_turn_rollback(tool: &str, args: &Value) -> bool {
         if tool == "bash" {
             let command = args.get("command").and_then(Value::as_str).unwrap_or("");
-            return !astra_runtime::turn::cloud_approval_policy::bash_command_is_read_only(command);
+            return !astra_turn_core::cloud_approval_policy::bash_command_is_read_only(command);
         }
         // Non-bash tools: only cloud-gated (mutation) tools trigger rollback.
-        astra_runtime::turn::cloud_approval_policy::cloud_gated_tool_kind(tool).is_some()
+        astra_turn_core::cloud_approval_policy::cloud_gated_tool_kind(tool).is_some()
     }
 
     fn batch_transaction_boundary_violation(tool: &str, args: &Value) -> Option<String> {
@@ -2600,7 +2600,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // genuinely spans every batch and every concurrent session in this
         // process — previously each batch constructed its own `Semaphore::new(10)`,
         // which allowed 10·N concurrent tools when N batches overlapped.
-        let sem = astra_runtime::turn::parallel_tool_exec::shared_tool_semaphore();
+        let sem = astra_turn_core::parallel_tool_exec::shared_tool_semaphore();
         // D-9: harvest speculative results from mid-stream execution.
         // Matching request_ids skip the normal dispatch and reuse the
         // speculative output. Journal/observability still fire exactly
@@ -2630,19 +2630,19 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         // decision short-circuits execution with a synthesized
                         // error output so the model sees the reason.
                         let mut effective_args = args.clone();
-                        if astra_runtime::turn::tool_hooks::global_has_hooks().await {
-                            let pre_ctx = astra_runtime::turn::tool_hooks::ToolHookContext::pre(
+                        if astra_turn_core::tool_hooks::global_has_hooks().await {
+                            let pre_ctx = astra_turn_core::tool_hooks::ToolHookContext::pre(
                                 &tool,
                                 args.clone(),
                             )
                             .with_call_id(&request_id);
-                            match astra_runtime::turn::tool_hooks::global_run_pre(&pre_ctx).await {
-                                astra_runtime::turn::tool_hooks::PreHookOutcome::Proceed {
+                            match astra_turn_core::tool_hooks::global_run_pre(&pre_ctx).await {
+                                astra_turn_core::tool_hooks::PreHookOutcome::Proceed {
                                     final_input,
                                 } => {
                                     effective_args = final_input;
                                 }
-                                astra_runtime::turn::tool_hooks::PreHookOutcome::Blocked {
+                                astra_turn_core::tool_hooks::PreHookOutcome::Blocked {
                                     hook_id,
                                     reason,
                                 } => {
@@ -2667,15 +2667,15 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         )
                         .await;
                         // ── Post-tool hooks (rewrite output if any hook requests it) ──
-                        if astra_runtime::turn::tool_hooks::global_has_hooks().await {
-                            let post_ctx = astra_runtime::turn::tool_hooks::ToolHookContext::post(
+                        if astra_turn_core::tool_hooks::global_has_hooks().await {
+                            let post_ctx = astra_turn_core::tool_hooks::ToolHookContext::post(
                                 &tool,
                                 effective_args.clone(),
                                 outcome.output.clone(),
                             )
                             .with_call_id(&request_id);
                             let post =
-                                astra_runtime::turn::tool_hooks::global_run_post(&post_ctx).await;
+                                astra_turn_core::tool_hooks::global_run_post(&post_ctx).await;
                             if post.final_output != outcome.output {
                                 return (
                                     crate::edge_tools::ToolExecutionOutcome {
@@ -2832,7 +2832,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         if call_id.is_empty() {
             return;
         }
-        if !astra_runtime::turn::streaming_tool_exec::should_speculate(&tool_name, None) {
+        if !astra_turn_core::streaming_tool_exec::should_speculate(&tool_name, None) {
             return;
         }
         tracing::debug!(
@@ -2856,11 +2856,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
 /// `parallel_tool_exec`.
 fn build_streaming_tool_exec(
     executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
-) -> Option<std::sync::Arc<astra_runtime::turn::streaming_tool_exec::StreamingToolExecutor>> {
-    if !astra_runtime::turn::streaming_tool_exec::streaming_tool_exec_enabled() {
+) -> Option<std::sync::Arc<astra_turn_core::streaming_tool_exec::StreamingToolExecutor>> {
+    if !astra_turn_core::streaming_tool_exec::streaming_tool_exec_enabled() {
         return None;
     }
-    let fn_exec: astra_runtime::turn::parallel_tool_exec::ToolExecutorFn =
+    let fn_exec: astra_turn_core::parallel_tool_exec::ToolExecutorFn =
         std::sync::Arc::new(move |tc: Value| {
             let executor = std::sync::Arc::clone(&executor);
             Box::pin(async move {
@@ -2890,7 +2890,7 @@ fn build_streaming_tool_exec(
             })
         });
     Some(std::sync::Arc::new(
-        astra_runtime::turn::streaming_tool_exec::StreamingToolExecutor::new(fn_exec),
+        astra_turn_core::streaming_tool_exec::StreamingToolExecutor::new(fn_exec),
     ))
 }
 
@@ -5989,7 +5989,7 @@ pub(super) async fn consume_turn_sse(
     // do this when tool calls are present — if there are no tool calls, the text
     // might legitimately discuss <invoke> (e.g. code reviews).
     if result.has_tool_calls || !result.edge_tool_round.is_empty() {
-        result.full_text = astra_runtime::turn::xml_tool_call_fallback::strip_degraded_tool_calls(
+        result.full_text = astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(
             &result.full_text,
         );
     }

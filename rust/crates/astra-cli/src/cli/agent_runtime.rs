@@ -40,8 +40,8 @@ pub(crate) async fn initialize_multi_agent_runtime(
     let run_store = std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
     let tracker =
         std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
-    let transport = std::sync::Arc::new(astra_runtime::messaging::InProcessTransport::new());
-    let mailbox_router = std::sync::Arc::new(astra_runtime::messaging::AgentMailboxRouter::new(
+    let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
+    let mailbox_router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
         transport,
         tracker.clone(),
     ));

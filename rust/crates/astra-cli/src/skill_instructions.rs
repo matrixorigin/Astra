@@ -76,7 +76,7 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 }
 
 /// Skill instruction parsed from SKILL.md file.
-#[deprecated(note = "Use astra_runtime::skills::manifest::SkillManifest + LoadedSkill instead")]
+#[deprecated(note = "Use astra_skills::manifest::SkillManifest + LoadedSkill instead")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillInstruction {
     /// Unique skill identifier (from frontmatter or filename).
@@ -140,7 +140,7 @@ fn default_true() -> bool {
 
 /// Metadata-only view of a skill (Level 1 loading).
 /// Used for discovery and selection without loading full instructions.
-#[deprecated(note = "Use astra_runtime::skills::manifest::SkillManifest instead")]
+#[deprecated(note = "Use astra_skills::manifest::SkillManifest instead")]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SkillMetadata {
     pub name: String,
@@ -510,7 +510,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 /// A skill entry that supports progressive loading.
-#[deprecated(note = "Use astra_runtime::skills::manifest::LoadedSkill instead")]
+#[deprecated(note = "Use astra_skills::manifest::LoadedSkill instead")]
 #[derive(Debug, Clone)]
 pub struct ProgressiveSkill {
     /// Level 1: Metadata (always loaded).
@@ -1327,9 +1327,9 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
     fn resolve(
         &self,
         name: &str,
-    ) -> Result<astra_runtime::turn::skill_tool::ResolvedSkill, astra_runtime::skills::SkillError>
+    ) -> Result<astra_runtime::turn::skill_tool::ResolvedSkill, astra_skills::SkillError>
     {
-        use astra_runtime::skills::SkillError;
+        use astra_skills::SkillError;
 
         // Fast path: read-lock to check if instructions are already loaded.
         // This avoids taking a write lock (and blocking all readers) for the
@@ -1353,10 +1353,10 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
                         None
                     },
                     allowed_tools: instruction.allowed_tools.clone(),
-                    execution_context: astra_runtime::skills::manifest::ExecutionContext::Inline,
-                    hooks: astra_runtime::skills::hooks::SkillHooks::default(),
+                    execution_context: astra_skills::manifest::ExecutionContext::Inline,
+                    hooks: astra_skills::hooks::SkillHooks::default(),
                     skill_dir: None,
-                    source: astra_runtime::skills::manifest::SkillSourceKind::Local,
+                    source: astra_skills::manifest::SkillSourceKind::Local,
                     success_criteria: Vec::new(),
                     composition: None,
                     input_schema: None,
@@ -1367,7 +1367,7 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
                     aliases: Vec::new(),
                     effort: None,
                     agent_type: None,
-                    trust_tier: astra_runtime::skills::manifest::TrustTier::Bundled,
+                    trust_tier: astra_skills::manifest::TrustTier::Bundled,
                 });
             }
         }
@@ -1402,10 +1402,10 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
                 None
             },
             allowed_tools: instruction.allowed_tools.clone(),
-            execution_context: astra_runtime::skills::manifest::ExecutionContext::Inline,
-            hooks: astra_runtime::skills::hooks::SkillHooks::default(),
+            execution_context: astra_skills::manifest::ExecutionContext::Inline,
+            hooks: astra_skills::hooks::SkillHooks::default(),
             skill_dir: None,
-            source: astra_runtime::skills::manifest::SkillSourceKind::Local,
+            source: astra_skills::manifest::SkillSourceKind::Local,
             success_criteria: Vec::new(),
             composition: None,
             input_schema: None,
@@ -1417,7 +1417,7 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
 
             effort: None,
             agent_type: None,
-            trust_tier: astra_runtime::skills::manifest::TrustTier::Bundled,
+            trust_tier: astra_skills::manifest::TrustTier::Bundled,
         })
     }
 
@@ -1434,7 +1434,7 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
                 name: s.name().to_string(),
                 description: s.description().to_string(),
                 when_to_use: s.metadata.when_to_use.clone(),
-                source: astra_runtime::skills::manifest::SkillSourceKind::Local,
+                source: astra_skills::manifest::SkillSourceKind::Local,
                 aliases: Vec::new(),
                 category: None,
                 tags: Vec::new(),

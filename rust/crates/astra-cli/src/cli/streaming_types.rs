@@ -4,7 +4,7 @@
 //! These types bridge the agentic runtime with the CLI display logic.
 
 /// Re-export of the verdict audit event type for convenience.
-pub(crate) type VerdictEvent = astra_runtime::turn::agentic_verdict_audit::AgenticVerdictAuditEvent;
+pub(crate) type VerdictEvent = astra_turn_core::agentic_verdict_audit::AgenticVerdictAuditEvent;
 
 /// Partial data rescued from `AgenticLoopState` when a turn fails.
 /// Enables enriched error logging, failure learning, and post-mortem analysis.
@@ -18,9 +18,9 @@ pub(crate) struct PartialTurnData {
     pub completion_tokens: u64,
     pub tool_calls_count: u32,
     #[allow(dead_code)]
-    pub tool_health_export: Vec<astra_runtime::pipeline::persistence::ToolHealthEntry>,
+    pub tool_health_export: Vec<astra_evolution::persistence::ToolHealthEntry>,
     pub session_id: Option<String>,
-    pub last_heavy_checkpoint: Option<astra_runtime::pipeline::step_protocol::StepCheckpoint>,
+    pub last_heavy_checkpoint: Option<astra_pipeline::step_protocol::StepCheckpoint>,
     /// Partial text the model generated before the turn was interrupted.
     /// Preserved in conversation history so the next turn has context.
     pub partial_text: String,
@@ -90,12 +90,12 @@ pub(crate) struct StreamResult {
     pub(crate) verdict_events: Vec<VerdictEvent>,
     /// Step Protocol recorder summary for debugging and audit.
     pub(crate) step_recorder_summary:
-        Option<astra_runtime::pipeline::step_recorder::RecorderSummary>,
+        Option<astra_pipeline::step_recorder::RecorderSummary>,
     /// Exported tool health entries from this turn's TurnGuard (for cross-session persistence).
-    pub(crate) tool_health_export: Vec<astra_runtime::pipeline::persistence::ToolHealthEntry>,
+    pub(crate) tool_health_export: Vec<astra_evolution::persistence::ToolHealthEntry>,
     /// Last heavy checkpoint built during the agentic loop (for cloud persistence).
     pub(crate) last_heavy_checkpoint:
-        Option<astra_runtime::pipeline::step_protocol::StepCheckpoint>,
+        Option<astra_pipeline::step_protocol::StepCheckpoint>,
     /// Live runtime-owned continuity after the turn. Saved back into REPL state
     /// so multi-turn sessions do not fall back to prompt-only continuity.
     pub(crate) runtime_continuity: astra_turn_types::continuity::ContinuityState,

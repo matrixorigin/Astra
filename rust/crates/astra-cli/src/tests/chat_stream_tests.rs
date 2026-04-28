@@ -32,7 +32,7 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
     let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let selector = tool_selector::TfIdfSelector::new(registry);
     let mut pm = PermissionManager::new(true);
-    let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let skill_search = astra_core::SkillSearchSettings::default();
 
     let result = stream_chat_sse(ChatTurnParams {
@@ -119,7 +119,7 @@ async fn stream_chat_sse_simple_text_response() {
     let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let selector = tool_selector::TfIdfSelector::new(registry);
     let mut pm = PermissionManager::new(true);
-    let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let skill_search = astra_core::SkillSearchSettings::default();
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
@@ -207,7 +207,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
     let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let selector = tool_selector::TfIdfSelector::new(registry);
     let mut pm = PermissionManager::new(true);
-    let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let skill_search = astra_core::SkillSearchSettings::default();
 
     let result = stream_chat_sse(ChatTurnParams {
@@ -282,10 +282,10 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
     let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let selector = tool_selector::TfIdfSelector::new(registry);
-    let transport = std::sync::Arc::new(astra_runtime::messaging::InProcessTransport::new());
+    let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
     let tracker =
         std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
-    let router = std::sync::Arc::new(astra_runtime::messaging::AgentMailboxRouter::new(
+    let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
         transport, tracker,
     ));
     let spawner = std::sync::Arc::new(astra_runtime::orchestration::DynamicAgentSpawner::new(
@@ -294,7 +294,7 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
     let mut root_mailbox = Some(
         router
             .register(
-                astra_runtime::messaging::AgentAddress::new("persisted-run", "main"),
+                astra_messaging::AgentAddress::new("persisted-run", "main"),
                 None,
             )
             .await
@@ -304,7 +304,7 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
 
     for session_id in [None, Some("sess-override")] {
         let mut pm = PermissionManager::new(true);
-        let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+        let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
         let result = stream_chat_sse(ChatTurnParams {
             api: &api,
             token: "fake-token",
@@ -379,10 +379,10 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
     let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let selector = tool_selector::TfIdfSelector::new(registry);
-    let transport = std::sync::Arc::new(astra_runtime::messaging::InProcessTransport::new());
+    let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
     let tracker =
         std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
-    let router = std::sync::Arc::new(astra_runtime::messaging::AgentMailboxRouter::new(
+    let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
         transport, tracker,
     ));
     let spawner = std::sync::Arc::new(astra_runtime::orchestration::DynamicAgentSpawner::new(
@@ -390,7 +390,7 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
     ));
     let skill_search = astra_core::SkillSearchSettings::default();
     let mut pm = PermissionManager::new(true);
-    let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
@@ -451,21 +451,21 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
 
 #[tokio::test]
 async fn drain_root_mailbox_into_idle_queue_collects_pending_messages() {
-    let transport = std::sync::Arc::new(astra_runtime::messaging::InProcessTransport::new());
+    let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
     let tracker =
         std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
-    let router = std::sync::Arc::new(astra_runtime::messaging::AgentMailboxRouter::new(
+    let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
         transport, tracker,
     ));
-    let root_addr = astra_runtime::messaging::AgentAddress::new("root-run", "main");
-    let worker_addr = astra_runtime::messaging::AgentAddress::new("worker-run", "worker");
+    let root_addr = astra_messaging::AgentAddress::new("root-run", "main");
+    let worker_addr = astra_messaging::AgentAddress::new("worker-run", "worker");
     let root_mailbox = router.register(root_addr.clone(), None).await.unwrap();
     let worker_mailbox = router.register(worker_addr.clone(), None).await.unwrap();
     worker_mailbox
-        .send(astra_runtime::messaging::AgentMessage::new(
+        .send(astra_messaging::AgentMessage::new(
             worker_addr,
-            astra_runtime::messaging::MessageTarget::Direct { address: root_addr },
-            astra_runtime::messaging::MessagePayload::Text {
+            astra_messaging::MessageTarget::Direct { address: root_addr },
+            astra_messaging::MessagePayload::Text {
                 content: "done".to_string(),
                 summary: Some("worker finished".to_string()),
             },
@@ -505,7 +505,7 @@ async fn stream_chat_sse_api_error_propagated() {
     let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let selector = tool_selector::TfIdfSelector::new(registry);
     let mut pm = PermissionManager::new(true);
-    let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let skill_search = astra_core::SkillSearchSettings::default();
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
@@ -594,7 +594,7 @@ async fn stream_chat_sse_with_tool_call_loop() {
     let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let selector = tool_selector::TfIdfSelector::new(registry);
     let mut pm = PermissionManager::new(true); // auto-approve
-    let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let skill_search = astra_core::SkillSearchSettings::default();
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
@@ -706,7 +706,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
     let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let selector = tool_selector::TfIdfSelector::new(registry);
     let mut pm = PermissionManager::new(true);
-    let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let skill_search = astra_core::SkillSearchSettings::default();
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
@@ -861,7 +861,7 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
     let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let selector = tool_selector::TfIdfSelector::new(registry);
     let mut pm = PermissionManager::new(true);
-    let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let skill_search = astra_core::SkillSearchSettings::default();
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,

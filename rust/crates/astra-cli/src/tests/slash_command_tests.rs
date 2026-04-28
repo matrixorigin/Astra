@@ -206,7 +206,7 @@ async fn slash_health_with_entries_does_not_crash() {
     ));
     let mut state = ReplState {
         tool_health_entries: vec![
-            astra_runtime::pipeline::persistence::ToolHealthEntry {
+            astra_evolution::persistence::ToolHealthEntry {
                 name: "bash".into(),
                 total_calls: 15,
                 total_failures: 3,
@@ -214,7 +214,7 @@ async fn slash_health_with_entries_does_not_crash() {
                 last_updated_epoch: 0,
                 recent_outcomes: vec![],
             },
-            astra_runtime::pipeline::persistence::ToolHealthEntry {
+            astra_evolution::persistence::ToolHealthEntry {
                 name: "grep".into(),
                 total_calls: 8,
                 total_failures: 0,
@@ -238,7 +238,7 @@ async fn slash_health_detail_mode() {
         edge_tools::all_tool_schemas(),
     ));
     let mut state = ReplState {
-        tool_health_entries: vec![astra_runtime::pipeline::persistence::ToolHealthEntry {
+        tool_health_entries: vec![astra_evolution::persistence::ToolHealthEntry {
             name: "bash".into(),
             total_calls: 10,
             total_failures: 5,

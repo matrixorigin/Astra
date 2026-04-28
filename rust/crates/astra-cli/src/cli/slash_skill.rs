@@ -141,15 +141,15 @@ pub(super) async fn handle_skill_command(
             let all = registry.all_manifests();
             let local = all
                 .iter()
-                .filter(|m| m.source == astra_runtime::skills::SkillSourceKind::Local)
+                .filter(|m| m.source == astra_skills::SkillSourceKind::Local)
                 .count();
             let bundled = all
                 .iter()
-                .filter(|m| m.source == astra_runtime::skills::SkillSourceKind::Bundled)
+                .filter(|m| m.source == astra_skills::SkillSourceKind::Bundled)
                 .count();
             let mcp = all
                 .iter()
-                .filter(|m| m.source == astra_runtime::skills::SkillSourceKind::Mcp)
+                .filter(|m| m.source == astra_skills::SkillSourceKind::Mcp)
                 .count();
 
             eprintln!(
@@ -332,15 +332,15 @@ pub(super) async fn handle_skill_command(
             }
             let local_count = manifests
                 .iter()
-                .filter(|m| m.source == astra_runtime::skills::SkillSourceKind::Local)
+                .filter(|m| m.source == astra_skills::SkillSourceKind::Local)
                 .count();
             let bundled_count = manifests
                 .iter()
-                .filter(|m| m.source == astra_runtime::skills::SkillSourceKind::Bundled)
+                .filter(|m| m.source == astra_skills::SkillSourceKind::Bundled)
                 .count();
             let mcp_count = manifests
                 .iter()
-                .filter(|m| m.source == astra_runtime::skills::SkillSourceKind::Mcp)
+                .filter(|m| m.source == astra_skills::SkillSourceKind::Mcp)
                 .count();
             let mut parts = vec![
                 format!("{} local", local_count),
@@ -765,13 +765,13 @@ Follow these steps:
 
                     if ok
                         && let Ok((manifest, _body)) =
-                            astra_runtime::skills::loader::parse_skill_md(&src)
+                            astra_skills::loader::parse_skill_md(&src)
                     {
                         if let Some(ref hooks) = manifest.hooks {
                             if !hooks.pre_invoke.is_empty() {
                                 eprintln!("  {} pre_invoke hooks…", "Running".dim());
                                 for action in &hooks.pre_invoke {
-                                    if let astra_runtime::skills::hooks::HookAction::Shell {
+                                    if let astra_skills::hooks::HookAction::Shell {
                                         command,
                                     } = action
                                     {
@@ -1006,7 +1006,7 @@ Follow these steps:
                 );
                 eprintln!("{}", "\u{2500}".repeat(72).dim());
                 for m in &manifests {
-                    use astra_runtime::skills::SkillSourceKind::*;
+                    use astra_skills::SkillSourceKind::*;
                     let (disk_col, check_col): (String, String) = match m.source {
                         Mcp | Database | Plugin => {
                             ("—".dim().to_string(), "(remote)".dim().to_string())
@@ -1939,11 +1939,11 @@ fn print_skill_directory_raw(name: &str, skill_dir: &std::path::Path) -> Result<
 
 // ── List filtering helpers ──────────────────────────────────────────────
 
-fn source_label(source: &astra_runtime::skills::SkillSourceKind) -> &'static str {
+fn source_label(source: &astra_skills::SkillSourceKind) -> &'static str {
     match source {
-        astra_runtime::skills::SkillSourceKind::Local => "local",
-        astra_runtime::skills::SkillSourceKind::Bundled => "bundled",
-        astra_runtime::skills::SkillSourceKind::Mcp => "mcp",
+        astra_skills::SkillSourceKind::Local => "local",
+        astra_skills::SkillSourceKind::Bundled => "bundled",
+        astra_skills::SkillSourceKind::Mcp => "mcp",
         _ => "other",
     }
 }
@@ -1984,7 +1984,7 @@ fn parse_list_filters(arg: &str) -> (Option<String>, Option<String>, Option<Stri
 
 /// Check if a skill manifest matches the given filters.
 fn matches_skill_filter(
-    m: &astra_runtime::skills::SkillManifest,
+    m: &astra_skills::SkillManifest,
     search: &Option<String>,
     source_filter: &Option<String>,
     category_filter: &Option<String>,
@@ -2024,7 +2024,7 @@ fn matches_skill_filter(
 
 /// Score a skill's relevance to a search query.
 /// Higher score = more relevant. Returns 0 if no match.
-fn skill_relevance_score(m: &astra_runtime::skills::SkillManifest, query: &str) -> u32 {
+fn skill_relevance_score(m: &astra_skills::SkillManifest, query: &str) -> u32 {
     let mut score = 0u32;
     let words: Vec<&str> = query.split_whitespace().collect();
 
@@ -2520,7 +2520,7 @@ mod tests {
 
     #[test]
     fn matches_filter_no_filters() {
-        let m = astra_runtime::skills::SkillManifest {
+        let m = astra_skills::SkillManifest {
             name: "test-skill".into(),
             description: "A test skill".into(),
             ..Default::default()
@@ -2530,7 +2530,7 @@ mod tests {
 
     #[test]
     fn matches_filter_by_name() {
-        let m = astra_runtime::skills::SkillManifest {
+        let m = astra_skills::SkillManifest {
             name: "pr-review".into(),
             description: "Review pull requests".into(),
             ..Default::default()
@@ -2544,9 +2544,9 @@ mod tests {
 
     #[test]
     fn matches_filter_by_source() {
-        let m = astra_runtime::skills::SkillManifest {
+        let m = astra_skills::SkillManifest {
             name: "debug".into(),
-            source: astra_runtime::skills::SkillSourceKind::Bundled,
+            source: astra_skills::SkillSourceKind::Bundled,
             ..Default::default()
         };
         let src = Some("bundled".to_string());
@@ -2558,7 +2558,7 @@ mod tests {
 
     #[test]
     fn matches_filter_by_tag() {
-        let m = astra_runtime::skills::SkillManifest {
+        let m = astra_skills::SkillManifest {
             name: "security-scan".into(),
             tags: vec!["security".into(), "audit".into()],
             ..Default::default()
@@ -2569,7 +2569,7 @@ mod tests {
 
     #[test]
     fn relevance_score_exact_name_highest() {
-        let m = astra_runtime::skills::SkillManifest {
+        let m = astra_skills::SkillManifest {
             name: "debug".into(),
             description: "Debug issues".into(),
             ..Default::default()
@@ -2581,7 +2581,7 @@ mod tests {
 
     #[test]
     fn relevance_score_zero_for_no_match() {
-        let m = astra_runtime::skills::SkillManifest {
+        let m = astra_skills::SkillManifest {
             name: "debug".into(),
             description: "Debug issues".into(),
             ..Default::default()
@@ -2591,7 +2591,7 @@ mod tests {
 
     #[test]
     fn relevance_score_tag_match() {
-        let m = astra_runtime::skills::SkillManifest {
+        let m = astra_skills::SkillManifest {
             name: "security-scan".into(),
             tags: vec!["security".into(), "vulnerability".into()],
             ..Default::default()
@@ -2601,7 +2601,7 @@ mod tests {
 
     #[test]
     fn relevance_score_multi_word_query() {
-        let m = astra_runtime::skills::SkillManifest {
+        let m = astra_skills::SkillManifest {
             name: "pr-review".into(),
             description: "Review pull requests for code quality".into(),
             ..Default::default()
@@ -3030,7 +3030,7 @@ mod tests {
             // our tempdir, so test the underlying parse_skill_md directly
             let content = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
             let (manifest, _body) =
-                astra_runtime::skills::loader::parse_skill_md(&content).unwrap();
+                astra_skills::loader::parse_skill_md(&content).unwrap();
             assert_eq!(manifest.version.to_string(), "1.2.3");
         }
 
@@ -3129,7 +3129,7 @@ mod tests {
 
         #[test]
         fn version_comparison_detects_upgrade_needed() {
-            use astra_runtime::skills::version::Version;
+            use astra_skills::version::Version;
             let local: Version = "1.0.0".parse().unwrap();
             let remote: Version = "1.1.0".parse().unwrap();
             assert!(remote > local);
@@ -3143,7 +3143,7 @@ mod tests {
 
         #[test]
         fn version_comparison_handles_prerelease() {
-            use astra_runtime::skills::version::Version;
+            use astra_skills::version::Version;
             let release: Version = "2.0.0".parse().unwrap();
             let pre: Version = "2.0.0-beta".parse().unwrap();
             assert!(release > pre, "release should be greater than pre-release");
@@ -3165,7 +3165,7 @@ mod tests {
 /// Upload local quality metrics to the marketplace API (opt-in).
 async fn upload_quality_report(
     api: &astra_thin_client::ThinClient,
-    tracker: &astra_runtime::skills::SkillQualityTracker,
+    tracker: &astra_skills::quality::SkillQualityTracker,
     token: Option<&str>,
 ) {
     let entries = tracker.all_entries();
@@ -3220,7 +3220,7 @@ async fn upload_quality_report(
 /// Upload quality on REPL exit if opt-in enabled via ASTRA_QUALITY_UPLOAD=true.
 pub(super) async fn maybe_upload_quality_on_exit(
     api: &astra_thin_client::ThinClient,
-    tracker: &astra_runtime::skills::SkillQualityTracker,
+    tracker: &astra_skills::quality::SkillQualityTracker,
     token: Option<&str>,
 ) {
     if std::env::var("ASTRA_QUALITY_UPLOAD")
@@ -3251,7 +3251,7 @@ async fn install_skill_from_marketplace(
 
     let tok = token.unwrap_or("");
     let mut installed_names: Vec<String> = Vec::new();
-    let constraint = astra_runtime::skills::version::VersionConstraint::default(); // Any
+    let constraint = astra_skills::version::VersionConstraint::default(); // Any
 
     install_skill_recursive(name, &constraint, api, tok, state, &mut installed_names, 0).await;
 
@@ -3271,7 +3271,7 @@ const MAX_DEP_INSTALL_DEPTH: u32 = 5;
 /// Recursively install a skill and its dependencies, checking version constraints.
 fn install_skill_recursive<'a>(
     name: &'a str,
-    constraint: &'a astra_runtime::skills::version::VersionConstraint,
+    constraint: &'a astra_skills::version::VersionConstraint,
     api: &'a astra_thin_client::ThinClient,
     tok: &'a str,
     state: &'a mut ReplState,
@@ -3380,7 +3380,7 @@ fn install_skill_recursive<'a>(
 
             let skill_deps: Vec<_> = deps
                 .into_iter()
-                .filter(|d| d.dep_type == astra_runtime::skills::version::DependencyType::Skill)
+                .filter(|d| d.dep_type == astra_skills::version::DependencyType::Skill)
                 .collect();
 
             if !skill_deps.is_empty() {
@@ -3437,7 +3437,7 @@ async fn install_single_skill(
                     .join(".astra")
                     .join("skills");
 
-                match astra_runtime::skills::pack::unpack_skill_from_bytes(&bytes, &install_dir) {
+                match astra_skills::pack::unpack_skill_from_bytes(&bytes, &install_dir) {
                     Ok((installed, manifest)) => {
                         eprintln!(
                             "  {} Installed {} v{} to {}",
@@ -3613,7 +3613,7 @@ async fn publish_skill_to_marketplace(
 
     // Try bundle publish if we have a local directory
     if let Some(ref dir) = skill_dir {
-        match astra_runtime::skills::pack::pack_skill_to_bytes(dir) {
+        match astra_skills::pack::pack_skill_to_bytes(dir) {
             Ok((bundle_bytes, bundle_manifest)) => {
                 let encoded = base64::Engine::encode(
                     &base64::engine::general_purpose::STANDARD,
@@ -3823,7 +3823,7 @@ fn pack_skill_bundle(name: &str) {
     // Output to current directory
     let output_dir = std::env::current_dir().unwrap_or_default();
 
-    match astra_runtime::skills::pack::pack_skill(&skill_dir, &output_dir) {
+    match astra_skills::pack::pack_skill(&skill_dir, &output_dir) {
         Ok((path, manifest)) => {
             let size = std::fs::metadata(&path)
                 .map(|m| format_bytes(m.len()))
@@ -3871,7 +3871,7 @@ async fn unpack_skill_bundle(path_str: &str, state: &mut ReplState) {
         .join(".astra")
         .join("skills");
 
-    match astra_runtime::skills::pack::unpack_skill(bundle_path, &install_dir) {
+    match astra_skills::pack::unpack_skill(bundle_path, &install_dir) {
         Ok((installed, manifest)) => {
             eprintln!(
                 "  {} Unpacked {} v{} to {}",
@@ -3906,7 +3906,7 @@ fn inspect_skill_bundle(path_str: &str) {
         return;
     }
 
-    match astra_runtime::skills::pack::inspect_bundle(bundle_path) {
+    match astra_skills::pack::inspect_bundle(bundle_path) {
         Ok(manifest) => {
             eprintln!("  {}", "Bundle contents:".bold());
             eprintln!("    Name:        {}", manifest.name.cyan());
@@ -3945,13 +3945,13 @@ fn format_bytes(bytes: u64) -> String {
 /// Read the local installed version of a skill from its SKILL.md frontmatter.
 fn read_local_skill_version(
     skill_name: &str,
-) -> Option<(std::path::PathBuf, astra_runtime::skills::version::Version)> {
+) -> Option<(std::path::PathBuf, astra_skills::version::Version)> {
     let search_paths = crate::skill_instructions::skill_search_paths();
     for base in &search_paths {
         let skill_md = base.join(skill_name).join("SKILL.md");
         if skill_md.exists() {
             if let Ok(content) = std::fs::read_to_string(&skill_md) {
-                if let Ok((manifest, _)) = astra_runtime::skills::loader::parse_skill_md(&content) {
+                if let Ok((manifest, _)) = astra_skills::loader::parse_skill_md(&content) {
                     return Some((base.join(skill_name), manifest.version));
                 }
             }
@@ -3984,7 +3984,7 @@ async fn fetch_marketplace_version(
                     .filter_map(|result| {
                         result
                             .version
-                            .parse::<astra_runtime::skills::version::Version>()
+                            .parse::<astra_skills::version::Version>()
                             .ok()
                             .map(|version| (version, result.version.clone()))
                     })
@@ -4044,7 +4044,7 @@ async fn check_skill_updates(name: &str, api: &astra_thin_client::ThinClient, to
 
         match (local, remote) {
             (Some((_path, local_ver)), Some(remote_str)) => {
-                match remote_str.parse::<astra_runtime::skills::version::Version>() {
+                match remote_str.parse::<astra_skills::version::Version>() {
                     Ok(remote_ver) => {
                         if remote_ver > local_ver {
                             eprintln!(
@@ -4159,7 +4159,7 @@ async fn upgrade_skill(
         }
     };
 
-    let remote_ver = match remote_str.parse::<astra_runtime::skills::version::Version>() {
+    let remote_ver = match remote_str.parse::<astra_skills::version::Version>() {
         Ok(v) => v,
         Err(_) => {
             eprintln!(
@@ -4264,7 +4264,7 @@ async fn upgrade_all_skills(api: &astra_thin_client::ThinClient, tok: &str, stat
             None => continue,
         };
 
-        let remote_ver = match remote_str.parse::<astra_runtime::skills::version::Version>() {
+        let remote_ver = match remote_str.parse::<astra_skills::version::Version>() {
             Ok(v) => v,
             Err(_) => continue,
         };

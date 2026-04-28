@@ -23,7 +23,7 @@ pub(crate) fn build_learning_bridge(
     let pl = state.pattern_library.as_ref()?;
     let cal = state.calibrator.as_ref()?;
     let mut bridge =
-        astra_runtime::pipeline::task_learning::PipelineTaskLearningBridge::from_shared(
+        astra_pipeline::task_learning::PipelineTaskLearningBridge::from_shared(
             eg.clone(),
             pl.clone(),
             cal.clone(),

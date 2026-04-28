@@ -12,7 +12,7 @@
 
 use super::*;
 use astra_runtime::orchestration::{AgentStatus, DynamicAgentSpawner, PermissionSummary};
-use astra_runtime::turn::delegation_tree::{AgentTreeNode, render_agent_forest};
+use astra_turn_core::delegation_tree::{AgentTreeNode, render_agent_forest};
 use astra_services::session_journal::{self, JournalEventType};
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -1869,7 +1869,7 @@ fn delegation_final_preview(entry: &DelegationHistoryEntry) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_runtime::messaging::{AgentMailboxRouter, InProcessTransport};
+    use astra_messaging::{AgentMailboxRouter, InProcessTransport};
     use astra_runtime::orchestration::{
         SpawnAgentInput, SpawnContext, SpawnedAgentInfo, SpawnedAgentMetrics,
     };

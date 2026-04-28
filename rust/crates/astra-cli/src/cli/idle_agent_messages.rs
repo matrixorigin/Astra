@@ -12,8 +12,8 @@ pub(crate) fn drain_root_mailbox_into_idle_queue(state: &mut ReplState) {
     }
 }
 
-fn format_idle_agent_message_payload(payload: &astra_runtime::messaging::MessagePayload) -> String {
-    use astra_runtime::messaging::{AgentSignal, MessagePayload, RequestType};
+fn format_idle_agent_message_payload(payload: &astra_messaging::MessagePayload) -> String {
+    use astra_messaging::{AgentSignal, MessagePayload, RequestType};
 
     match payload {
         MessagePayload::Text { content, summary } => {

@@ -1,4 +1,4 @@
-use astra_runtime::turn::explain_report_lines::{
+use astra_turn_core::explain_report_lines::{
     EXPLAIN_REPORT_HEADER, REPORT_SEPARATOR_LINE, VERDICT_REPORT_HEADER,
     explain_auxiliary_llm_call_line, explain_auxiliary_llm_header_line,
     explain_content_preview_line, explain_l0_profile_line, explain_l1_retrieval_line,

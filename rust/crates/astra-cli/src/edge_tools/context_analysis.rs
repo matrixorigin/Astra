@@ -110,7 +110,7 @@ fn resolve_turn_idx(turn: i64, len: usize) -> Option<usize> {
 
 /// Detailed per-turn context breakdown with proportional analysis.
 fn analyze_turn(
-    trace: &astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace,
+    trace: &astra_turn_core::context_assembly_trace::ContextAssemblyTrace,
     idx: usize,
     total_turns: usize,
     fuzzy_events: &[astra_runtime::observability_integration::FuzzyMatchEvent],
@@ -317,13 +317,13 @@ fn analyze_turn(
 
 /// Multi-turn session analysis with trends and aggregation.
 fn analyze_session(
-    traces: &[astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace],
+    traces: &[astra_turn_core::context_assembly_trace::ContextAssemblyTrace],
     timings: &[astra_runtime::observability_integration::TurnTiming],
     fuzzy_events: &[astra_runtime::observability_integration::FuzzyMatchEvent],
 ) -> Value {
     use std::collections::BTreeMap;
 
-    use astra_runtime::turn::context_assembly_trace::TraceAggregation;
+    use astra_turn_core::context_assembly_trace::TraceAggregation;
 
     let agg = TraceAggregation::from_traces(traces);
     let n = traces.len();
@@ -462,9 +462,9 @@ fn analyze_session(
 
 /// Compare two turns side-by-side.
 fn compare_turns(
-    a: &astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace,
+    a: &astra_turn_core::context_assembly_trace::ContextAssemblyTrace,
     a_idx: usize,
-    b: &astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace,
+    b: &astra_turn_core::context_assembly_trace::ContextAssemblyTrace,
     b_idx: usize,
 ) -> Value {
     let ta = &a.token_budget;

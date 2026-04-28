@@ -11,7 +11,7 @@
 //! - **Conflict resolution**: Optimistic locking with version numbers; conflicts trigger re-pull
 
 use astra_core::resolve_database_name_or;
-use astra_runtime::pipeline::persistence::{
+use astra_evolution::persistence::{
     DeltaSnapshot, LearningSnapshot, ToolHealthEntry, clear_dirty_learning_in_modules,
     export_dirty_learning_from_modules, export_from_modules_with_health, export_tool_health_delta,
     has_dirty_learning_data, merge_into_modules, merge_tool_health, save_synced_tool_health,
@@ -55,9 +55,9 @@ pub(super) async fn try_connect_matrixone() -> Option<sqlx::Pool<sqlx::MySql>> {
 /// Merge a JSON learning snapshot into live pipeline modules.
 pub(super) fn merge_learning_snapshot(
     json: &str,
-    entity_graph: &Arc<Mutex<astra_runtime::pipeline::entity::EntityGraph>>,
-    pattern_library: &Arc<Mutex<astra_runtime::pipeline::pattern::PatternLibrary>>,
-    calibrator: &Arc<Mutex<astra_runtime::pipeline::calibration::ProgressiveCalibrator>>,
+    entity_graph: &Arc<Mutex<astra_pipeline::entity::EntityGraph>>,
+    pattern_library: &Arc<Mutex<astra_pipeline::pattern::PatternLibrary>>,
+    calibrator: &Arc<Mutex<astra_pipeline::calibration::ProgressiveCalibrator>>,
 ) {
     if json.trim().is_empty() {
         return;
@@ -89,9 +89,9 @@ pub(super) fn merge_learning_snapshot(
 /// Returns tool health entries and cloud version for optimistic locking.
 pub(super) async fn try_cloud_pull(
     profile_name: &str,
-    entity_graph: &Arc<Mutex<astra_runtime::pipeline::entity::EntityGraph>>,
-    pattern_library: &Arc<Mutex<astra_runtime::pipeline::pattern::PatternLibrary>>,
-    calibrator: &Arc<Mutex<astra_runtime::pipeline::calibration::ProgressiveCalibrator>>,
+    entity_graph: &Arc<Mutex<astra_pipeline::entity::EntityGraph>>,
+    pattern_library: &Arc<Mutex<astra_pipeline::pattern::PatternLibrary>>,
+    calibrator: &Arc<Mutex<astra_pipeline::calibration::ProgressiveCalibrator>>,
 ) -> CloudPullResult {
     let pool = match try_connect_matrixone().await {
         Some(p) => p,
@@ -149,9 +149,9 @@ pub(super) async fn try_cloud_pull(
 /// On conflict, the caller should pull fresh data and retry.
 pub(super) async fn try_cloud_push_versioned(
     profile_name: &str,
-    entity_graph: &Arc<Mutex<astra_runtime::pipeline::entity::EntityGraph>>,
-    pattern_library: &Arc<Mutex<astra_runtime::pipeline::pattern::PatternLibrary>>,
-    calibrator: &Arc<Mutex<astra_runtime::pipeline::calibration::ProgressiveCalibrator>>,
+    entity_graph: &Arc<Mutex<astra_pipeline::entity::EntityGraph>>,
+    pattern_library: &Arc<Mutex<astra_pipeline::pattern::PatternLibrary>>,
+    calibrator: &Arc<Mutex<astra_pipeline::calibration::ProgressiveCalibrator>>,
     tool_health: &[ToolHealthEntry],
     expected_version: Option<i64>,
 ) -> Option<i64> {
@@ -214,9 +214,9 @@ pub(super) async fn try_cloud_push_versioned(
 /// Returns the new cloud version if successful, None otherwise.
 pub(super) async fn try_cloud_push_delta(
     profile_name: &str,
-    entity_graph: &Arc<Mutex<astra_runtime::pipeline::entity::EntityGraph>>,
-    pattern_library: &Arc<Mutex<astra_runtime::pipeline::pattern::PatternLibrary>>,
-    calibrator: &Arc<Mutex<astra_runtime::pipeline::calibration::ProgressiveCalibrator>>,
+    entity_graph: &Arc<Mutex<astra_pipeline::entity::EntityGraph>>,
+    pattern_library: &Arc<Mutex<astra_pipeline::pattern::PatternLibrary>>,
+    calibrator: &Arc<Mutex<astra_pipeline::calibration::ProgressiveCalibrator>>,
     tool_health_entries: &[ToolHealthEntry],
     synced_tool_health_entries: &mut Vec<ToolHealthEntry>,
     expected_version: Option<i64>,

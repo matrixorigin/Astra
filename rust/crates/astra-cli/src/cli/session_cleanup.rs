@@ -85,7 +85,7 @@ pub(super) fn session_end_extract_learnings(
     }
 
     // Need LLM params and at least a few turns of history
-    let params = astra_runtime::turn::cloud::summary::LlmConnParams::from_env()?;
+    let params = astra_turn_core::cloud_summary::LlmConnParams::from_env()?;
     if history.len() < 3 {
         return None;
     }
@@ -122,20 +122,20 @@ pub(super) fn session_end_extract_learnings(
         .join("\n");
 
     Some(tokio::spawn(async move {
-        use astra_runtime::turn::cloud::session_memory_extract::{
+        use astra_turn_core::cloud_session_memory_extract::{
             build_learnings_extraction_prompt, parse_learnings_response,
         };
 
         let prompt = build_learnings_extraction_prompt(&session_summary, &recent_messages);
 
         // Call LLM
-        let client = astra_runtime::turn::cloud::summary::HttpSummaryClient::new(
-            astra_runtime::turn::cloud::summary::LlmConnParams {
+        let client = astra_turn_core::cloud_summary::HttpSummaryClient::new(
+            astra_turn_core::cloud_summary::LlmConnParams {
                 max_output_tokens: 2048,
                 ..params
             },
         );
-        use astra_runtime::turn::cloud::summary::SummaryLlmClient;
+        use astra_turn_core::cloud_summary::SummaryLlmClient;
         match client.summarize(&prompt).await {
             Ok(resp) => {
                 if let Some(learnings) = parse_learnings_response(&resp.text) {

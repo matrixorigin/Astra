@@ -77,12 +77,12 @@ pub(super) async fn handle_state_command(
                             eprintln!(
                                 "    {} {} ({} edit{})",
                                 match edit_type {
-                                    astra_runtime::turn::file_edit_journal::EditType::Overwrite =>
+                                    astra_turn_core::file_edit_journal::EditType::Overwrite =>
                                         "📝",
-                                    astra_runtime::turn::file_edit_journal::EditType::Create =>
+                                    astra_turn_core::file_edit_journal::EditType::Create =>
                                         "🆕",
-                                    astra_runtime::turn::file_edit_journal::EditType::Patch => "✏️",
-                                    astra_runtime::turn::file_edit_journal::EditType::Delete =>
+                                    astra_turn_core::file_edit_journal::EditType::Patch => "✏️",
+                                    astra_turn_core::file_edit_journal::EditType::Delete =>
                                         "🗑️",
                                 },
                                 path.display(),
@@ -859,7 +859,7 @@ pub(super) fn render_reflect_diff(state: &super::repl_state::ReplState) -> Strin
     let sep = "─".repeat(38);
     let _ = writeln!(out, "\n  ─── reflect diff {sep}");
 
-    let synced: HashMap<&str, &astra_runtime::pipeline::persistence::ToolHealthEntry> = state
+    let synced: HashMap<&str, &astra_evolution::persistence::ToolHealthEntry> = state
         .synced_tool_health_entries
         .iter()
         .map(|e| (e.name.as_str(), e))
@@ -1254,7 +1254,7 @@ mod tests {
 
     #[test]
     fn render_reflect_diff_surfaces_new_and_drifting_tools() {
-        use astra_runtime::pipeline::persistence::ToolHealthEntry;
+        use astra_evolution::persistence::ToolHealthEntry;
         let mut state = super::super::repl_state::ReplState::default();
         // Baseline had "grep" at 10 calls / 10% fail.
         state.synced_tool_health_entries = vec![ToolHealthEntry {

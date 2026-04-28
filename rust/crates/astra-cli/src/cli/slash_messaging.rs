@@ -167,16 +167,16 @@ fn show_dlq(state: &ReplState) {
                 eprintln!("  {}", "Recent entries:".white().bold());
                 for dl in recent {
                     let reason_str = match &dl.reason {
-                        astra_runtime::messaging::DeadLetterReason::AckTimeout { attempts } => {
+                        astra_messaging::DeadLetterReason::AckTimeout { attempts } => {
                             format!("ack timeout ({attempts} attempts)")
                         }
-                        astra_runtime::messaging::DeadLetterReason::Rejected { reason } => {
+                        astra_messaging::DeadLetterReason::Rejected { reason } => {
                             format!("rejected: {}", reason.as_deref().unwrap_or("no reason"))
                         }
-                        astra_runtime::messaging::DeadLetterReason::TransportFailure { error } => {
+                        astra_messaging::DeadLetterReason::TransportFailure { error } => {
                             format!("transport: {error}")
                         }
-                        astra_runtime::messaging::DeadLetterReason::Expired => "expired".into(),
+                        astra_messaging::DeadLetterReason::Expired => "expired".into(),
                     };
                     let short_id = if dl.message.id.len() >= 8 {
                         &dl.message.id[..8]

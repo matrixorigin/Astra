@@ -1,7 +1,7 @@
 use super::*;
 use astra_runtime::observability_integration::TurnTiming;
 use astra_runtime::observability_integration::{FuzzyMatchEvent, FuzzyMatchOutcome};
-use astra_runtime::turn::context_assembly_trace::*;
+use astra_turn_core::context_assembly_trace::*;
 use serde_json::json;
 
 // ─── Helper: create a sample trace ──────────────────────────────────────────
