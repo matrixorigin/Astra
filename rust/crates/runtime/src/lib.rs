@@ -47,7 +47,6 @@ pub mod sandbox;
 pub mod skill_config;
 pub mod skills;
 pub mod streaming;
-pub mod tool_sandbox;
 pub mod triggers;
 pub(crate) mod workflows;
 
@@ -71,14 +70,15 @@ pub mod evaluation;
 pub mod evolution;
 pub mod guardrail_tuning;
 pub mod introspection;
-pub mod liquid;
 pub mod matrix_cloud_runtime;
 pub mod memoria_insights;
 pub mod observability_integration;
 pub mod pipeline;
-pub mod plan;
 pub use astra_sync_adapters as sync_adapters;
-pub use crate::plan as plan_decompose;
+pub use astra_sandbox as tool_sandbox;
+pub use astra_plan as plan;
+pub use astra_plan as plan_decompose;
+pub mod liquid { pub use astra_evolution::reflection; }
 pub mod prompts;
 pub mod self_model;
 pub mod server;

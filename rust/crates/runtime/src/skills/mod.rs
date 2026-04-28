@@ -39,7 +39,6 @@ pub use astra_skills::providers::{bundled, local, mcp};
 
 // Runtime-specific modules that depend on astra-services or other runtime types.
 pub mod handlers;
-pub mod providers;
 pub mod registry;
 pub mod watcher;
 
