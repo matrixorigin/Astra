@@ -24,6 +24,35 @@ pub struct ContinuityState {
     pub verification: VerificationState,
 }
 
+/// Error surfaced when a persisted `continuity_state` JSON blob fails schema
+/// validation. Callers (restore / resume paths) should treat this as a soft
+/// failure: log, drop the blob, and continue with a fresh `ContinuityState`
+/// rather than panic.
+///
+/// The underlying `serde_json::Error` is preserved so callers can distinguish
+/// missing fields, type mismatches, and invalid enum variants via
+/// `source.classify()` if they need tiered degradation.
+#[derive(Debug, thiserror::Error)]
+#[error("continuity_state schema validation failed: {source}")]
+pub struct ContinuityStateSchemaError {
+    #[from]
+    pub source: serde_json::Error,
+}
+
+/// Deserialize a persisted `continuity_state` JSON value into a typed
+/// `ContinuityState`, returning a structured error instead of panicking when
+/// the on-disk shape has drifted from the current schema.
+///
+/// This is the single validation choke-point for checkpoint restore. As of
+/// this change the only external caller is `astra-cli`'s
+/// `build_continuity_resume_guidance`; keep future `from_value::<ContinuityState>`
+/// consumers funneled through here so schema checks stay consistent.
+pub fn try_from_checkpoint_value(
+    value: &serde_json::Value,
+) -> Result<ContinuityState, ContinuityStateSchemaError> {
+    serde_json::from_value::<ContinuityState>(value.clone()).map_err(Into::into)
+}
+
 impl ContinuityState {
     pub fn new(goal: impl Into<String>) -> Self {
         Self {
@@ -815,5 +844,67 @@ mod tests {
                 .unwrap()
                 .contains("runtime-todo")
         );
+    }
+
+    #[test]
+    fn try_from_checkpoint_value_round_trips_valid_state() {
+        let mut state = ContinuityState::new("ship feature X");
+        state.ensure_tracked_goal("ship feature X");
+        let value = serde_json::to_value(&state).unwrap();
+        let restored = try_from_checkpoint_value(&value).expect("valid blob must parse");
+        assert_eq!(restored.goal.text, state.goal.text);
+        assert_eq!(restored.todos.items.len(), state.todos.items.len());
+    }
+
+    #[test]
+    fn try_from_checkpoint_value_rejects_malformed_blob() {
+        // Shape drift: `todos` must be an object, not a string.
+        let bad = serde_json::json!({
+            "goal": { "text": "x" },
+            "todos": "not-an-object",
+            "facts": {},
+            "user_corrections": [],
+            "verification": {}
+        });
+        let err = try_from_checkpoint_value(&bad).unwrap_err();
+        assert!(err.to_string().contains("continuity_state schema"));
+    }
+
+    #[test]
+    fn try_from_checkpoint_value_rejects_empty_object_with_missing_field() {
+        // `{}` currently fails because top-level fields are not `#[serde(default)]`.
+        // This test locks the current contract: an empty / truncated blob is a
+        // schema error, not a soft success. If we later opt into
+        // `#[serde(default)]` for forward-compat with legacy checkpoints, flip
+        // this test to assert `Ok(_)` — the failure here will flag the behavior
+        // change loudly instead of regressing restore semantics silently.
+        let empty = serde_json::json!({});
+        let err = try_from_checkpoint_value(&empty).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("continuity_state schema"), "msg: {msg}");
+        assert!(msg.contains("missing field"), "msg: {msg}");
+    }
+
+    #[test]
+    fn try_from_checkpoint_value_rejects_invalid_enum_variant() {
+        // Enum drift: TodoItemState has a closed set of variants. An unknown
+        // variant name must surface as a schema error, not be silently coerced.
+        let bad = serde_json::json!({
+            "goal": { "text": "x" },
+            "todos": {
+                "items": [{
+                    "id": "t1",
+                    "description": "d",
+                    "state": "banana",
+                    "evidence": [],
+                    "blocker": null
+                }]
+            },
+            "facts": {},
+            "user_corrections": [],
+            "verification": {}
+        });
+        let err = try_from_checkpoint_value(&bad).unwrap_err();
+        assert!(err.to_string().contains("continuity_state schema"));
     }
 }

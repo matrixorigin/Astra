@@ -4639,9 +4639,14 @@ fn build_continuity_resume_guidance(
     continuity_state: Option<&serde_json::Value>,
 ) -> Option<String> {
     let value = continuity_state?;
-    let continuity =
-        serde_json::from_value::<astra_turn_core::continuity::ContinuityState>(value.clone())
-            .ok()?;
+    let continuity = astra_turn_core::continuity::try_from_checkpoint_value(value)
+        .map_err(|e| {
+            tracing::warn!(
+                error = %e,
+                "dropped persisted continuity_state: schema mismatch"
+            );
+        })
+        .ok()?;
     let manifest = astra_turn_core::continuity::AttentionManifest::from_state(&continuity, 4_000);
     Some(format!(
         "[Recovered runtime continuity]\nRestore this runtime-owned attention state before continuing. It is ground truth over narrative summaries.\n\n{}",
