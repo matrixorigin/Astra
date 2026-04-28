@@ -113,7 +113,7 @@ pub use astra_turn_core::recent_arg_hints;
 pub fn apply_safety_config_from_runtime_config(cfg: &astra_config::RuntimeConfig) {
     use astra_config::TrustModeSerde;
     use astra_turn_core::safety_middleware::{TrustMode, set_global_trust_mode};
-    let mode = match cfg.safety.trust_mode {
+    let mode = match cfg.safety.resolved_trust_mode() {
         TrustModeSerde::Strict => TrustMode::Strict,
         TrustModeSerde::Trusted => TrustMode::Trusted,
     };

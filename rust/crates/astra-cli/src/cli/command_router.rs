@@ -2140,7 +2140,7 @@ fn execute_config_command(cmd: ConfigCmd) -> Result<(), String> {
 fn config_show_policy(model: Option<&str>, json: bool) -> Result<(), String> {
     let cfg = astra_runtime::runtime_config::RuntimeConfig::load();
     let policy = cfg.tool_selection.resolve_for_model(model);
-    let trust_mode = match cfg.safety.trust_mode {
+    let trust_mode = match cfg.safety.resolved_trust_mode() {
         astra_runtime::runtime_config::TrustModeSerde::Strict => "strict",
         astra_runtime::runtime_config::TrustModeSerde::Trusted => "trusted",
     };

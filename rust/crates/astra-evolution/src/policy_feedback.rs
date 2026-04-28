@@ -91,6 +91,16 @@ pub struct PolicyTuningProposal {
     pub reason: String,
 }
 
+impl PolicyTuningProposal {
+    /// The fields that define *what* this proposal wants to change
+    /// (target model + target value), stripped of noise-carrying fields
+    /// like `reason`. Two proposals with the same decision key are
+    /// semantically the same action — see [`propose_with_hysteresis`].
+    pub fn decision_key(&self) -> (&str, Option<u32>) {
+        (self.model_match.as_str(), self.new_max_identical_tool_calls)
+    }
+}
+
 /// Decide whether to tighten / loosen / hold a model's policy given one
 /// window of observations.
 ///
@@ -98,42 +108,6 @@ pub struct PolicyTuningProposal {
 /// is warranted (stats land inside the hysteresis band).
 #[must_use]
 pub fn propose_policy_tuning(stats: &ModelGuardStats) -> Option<PolicyTuningProposal> {
-    propose_policy_tuning_inner(stats)
-}
-
-/// Apply hysteresis: only return a proposal when the current window plus
-/// the last `N-1` windows in `history` all propose the same change.
-///
-/// `history` should contain the most recent N-1 proposals (oldest first or
-/// newest first — order doesn't matter; equality is by value). Consumers
-/// typically maintain a bounded ring buffer of past proposals.
-///
-/// This keeps the per-window function pure while giving callers a simple
-/// way to resist noise. Setting `n = 1` is equivalent to calling
-/// [`propose_policy_tuning`] directly.
-#[must_use]
-pub fn propose_with_hysteresis(
-    stats: &ModelGuardStats,
-    history: &[PolicyTuningProposal],
-    n: usize,
-) -> Option<PolicyTuningProposal> {
-    let current = propose_policy_tuning_inner(stats)?;
-
-    if n <= 1 {
-        return Some(current);
-    }
-
-    // Need at least `n - 1` prior proposals that all match `current`.
-    if history.len() < n - 1 {
-        return None;
-    }
-    if history.iter().take(n - 1).any(|p| p != &current) {
-        return None;
-    }
-    Some(current)
-}
-
-fn propose_policy_tuning_inner(stats: &ModelGuardStats) -> Option<PolicyTuningProposal> {
     if stats.guard_hits < MIN_GUARD_HITS_FOR_PROPOSAL {
         return None;
     }
@@ -183,6 +157,50 @@ fn propose_policy_tuning_inner(stats: &ModelGuardStats) -> Option<PolicyTuningPr
         // Hysteresis band — no change.
         None
     }
+}
+
+/// Apply hysteresis: only return a proposal when the current window plus
+/// the last `N-1` windows in `history` all propose the **same decision**.
+///
+/// "Same decision" means [`PolicyTuningProposal::decision_key`] matches
+/// (model + target value). The human-readable `reason` string — which
+/// embeds window-specific numbers — is intentionally *not* part of the
+/// comparison; otherwise two consecutive "tighten opus 4 → 3" proposals
+/// with different sample sizes would look unequal and the streak would
+/// never close.
+///
+/// `history` should contain the most recent N-1 proposals. Order within
+/// the slice doesn't matter (all entries must agree with `current`).
+/// Consumers typically maintain a bounded ring buffer.
+///
+/// Setting `n = 1` is equivalent to calling [`propose_policy_tuning`]
+/// directly — no history required.
+#[must_use]
+pub fn propose_with_hysteresis(
+    stats: &ModelGuardStats,
+    history: &[PolicyTuningProposal],
+    n: usize,
+) -> Option<PolicyTuningProposal> {
+    let current = propose_policy_tuning(stats)?;
+
+    if n <= 1 {
+        return Some(current);
+    }
+
+    // Need at least `n - 1` prior proposals that all match `current`'s
+    // decision key (not the whole struct — see fn doc).
+    if history.len() < n - 1 {
+        return None;
+    }
+    let current_key = current.decision_key();
+    if history
+        .iter()
+        .take(n - 1)
+        .any(|p| p.decision_key() != current_key)
+    {
+        return None;
+    }
+    Some(current)
 }
 
 #[cfg(test)]
@@ -394,6 +412,70 @@ mod tests {
             propose_with_hysteresis(&window, &[], 1),
             single,
             "n=1 collapses to the single-window decision"
+        );
+    }
+
+    /// Hysteresis must commit when the **decision** agrees across windows
+    /// even if the underlying counts/rates differ.
+    ///
+    /// Regression guard for a bug where `PolicyTuningProposal`'s derived
+    /// `PartialEq` compared the `reason` string (which embeds guard_hits
+    /// and rate), making same-decision windows with different numbers
+    /// look unequal — the N-window agreement check was effectively
+    /// vacuous in production.
+    #[test]
+    fn hysteresis_agrees_on_decision_not_on_exact_reason_string() {
+        // Three windows, all proposing "tighten opus from 4 → 3" but with
+        // different sample sizes and rates. Reasons differ; decisions match.
+        let w_current = stats("opus", 120, 115, 4); // rate ≈ 95.83%
+        let p_prior1 = propose_policy_tuning(&stats("opus", 100, 95, 4)).unwrap(); // 95.0%
+        let p_prior2 = propose_policy_tuning(&stats("opus", 150, 138, 4)).unwrap(); // 92.0%
+
+        // Sanity: the three proposals would fail derived PartialEq (different reasons).
+        let p_current_as_proposal = propose_policy_tuning(&w_current).unwrap();
+        assert_ne!(
+            p_current_as_proposal, p_prior1,
+            "test premise: reason strings should differ"
+        );
+
+        // Yet hysteresis should treat them as a matching streak and commit.
+        let history = vec![p_prior1, p_prior2];
+        let out = propose_with_hysteresis(&w_current, &history, 3);
+        assert!(
+            out.is_some(),
+            "three tighten-opus-4-to-3 windows should commit, got None"
+        );
+        let out = out.unwrap();
+        assert_eq!(out.model_match, "opus");
+        assert_eq!(out.new_max_identical_tool_calls, Some(3));
+    }
+
+    /// Decision-level disagreement (direction differs) still breaks the
+    /// streak. Guards against "fix over-fired" — i.e. we don't just strip
+    /// the reason, we actually compare the semantic fields.
+    #[test]
+    fn hysteresis_decision_mismatch_blocks_commit() {
+        let w_current = stats("opus", 100, 95, 4); // tighten
+        let p_different_direction = propose_policy_tuning(&stats("opus", 100, 60, 4)).unwrap(); // loosen
+        let history = vec![p_different_direction];
+        // n=2 so history of 1 is enough if it matched.
+        assert_eq!(
+            propose_with_hysteresis(&w_current, &history, 2),
+            None,
+            "opposite-direction prior must still break the streak"
+        );
+    }
+
+    /// Different target models should never satisfy each other's streak.
+    #[test]
+    fn hysteresis_model_match_must_agree() {
+        let w_current = stats("opus", 100, 95, 4);
+        let p_other_model = propose_policy_tuning(&stats("haiku", 100, 95, 4)).unwrap();
+        let history = vec![p_other_model];
+        assert_eq!(
+            propose_with_hysteresis(&w_current, &history, 2),
+            None,
+            "a prior proposal for a different model must not count"
         );
     }
 }

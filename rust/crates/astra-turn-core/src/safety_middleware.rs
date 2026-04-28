@@ -465,9 +465,28 @@ pub fn current_trust_mode() -> TrustMode {
     }
 }
 
-/// Override the global trust mode. Intended to be called once at startup
-/// from a trusted configuration source (e.g. `RuntimeConfig::load()` +
-/// explicit user opt-in). Calling from untrusted input is a bug.
+/// Override the global trust mode. Intended to be called **once at
+/// startup** from a trusted configuration source (e.g. `RuntimeConfig::load()`
+/// after reading the operator's `~/.astra/config/runtime.toml`).
+///
+/// # When NOT to call this
+///
+/// - **Never from a request/tool-arg path.** `TrustMode::Trusted` is a
+///   trust delegation from the operator, not a property of the LLM's
+///   output. Letting the model flip this is a sandbox escape.
+/// - **Never from library code reached by a server handler.** Because the
+///   value is process-global, one request mutating it affects every
+///   concurrent request. For per-request or per-tenant trust, call
+///   [`check_shell_command_safety_with_mode`] directly and pass the mode
+///   in explicitly — don't flip the global.
+///
+/// # Future: per-tenant servers
+///
+/// If/when a multi-tenant server mode lands, migrate callers off this
+/// global and onto a context object threaded through
+/// `evaluate_tool_safety_request`. This API intentionally stays `pub` (not
+/// `pub(crate)`) so the migration can be staged, but prefer
+/// `_with_mode` for any new call sites.
 pub fn set_global_trust_mode(mode: TrustMode) {
     let value = match mode {
         TrustMode::Strict => TRUST_MODE_STRICT,

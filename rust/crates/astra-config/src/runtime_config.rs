@@ -76,19 +76,41 @@ pub struct RuntimeConfig {
 ///
 /// Kept deliberately small — this struct is a contract between config files
 /// and the runtime. The `trust_mode` field maps 1:1 to
-/// `astra_turn_core::safety_middleware::TrustMode` (kept as a `String` here
-/// to avoid a cross-crate dep).
+/// `astra_turn_core::safety_middleware::TrustMode`.
+///
+/// `trust_mode` is `Option<TrustModeSerde>` so config layering can
+/// distinguish three cases:
+/// - `None` — layer didn't mention safety; defer to earlier layers / default.
+/// - `Some(Strict)` — layer explicitly wants Strict; overrides an earlier
+///   `Some(Trusted)` so a project-level config can re-tighten a local opt-in.
+/// - `Some(Trusted)` — layer explicitly opts in to relaxed checks.
+///
+/// Callers that just want the effective mode should use
+/// [`SafetyConfig::resolved_trust_mode`].
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SafetyConfig {
-    /// Trust level for shell-obfuscation checks.
+    /// Raw trust-mode field from TOML. Use [`Self::resolved_trust_mode`]
+    /// to read the effective value with the default applied.
     ///
-    /// - `"strict"` (default) — all rules fire. Safe for any environment.
+    /// - `"strict"` — all rules fire. Safe for any environment.
     /// - `"trusted"` — opt-in developer-local relaxation of high-false-positive
     ///   rules (command substitution). Prompt-injection defenses still apply.
     ///
     /// Unknown values fail to parse (no silent fallback).
-    #[serde(default = "default_trust_mode")]
-    pub trust_mode: TrustModeSerde,
+    #[serde(default)]
+    pub trust_mode: Option<TrustModeSerde>,
+}
+
+impl SafetyConfig {
+    /// Effective trust mode, applying the Strict default when unset.
+    ///
+    /// This is what the runtime and CLI should consult — the `Option` is
+    /// only load-bearing for config merging (see the merge semantics in
+    /// [`RuntimeConfig::merge`]).
+    #[must_use]
+    pub fn resolved_trust_mode(&self) -> TrustModeSerde {
+        self.trust_mode.clone().unwrap_or_default()
+    }
 }
 
 /// Serializable trust-mode string. Matches the snake-case variants of
@@ -99,20 +121,6 @@ pub enum TrustModeSerde {
     #[default]
     Strict,
     Trusted,
-}
-
-fn default_trust_mode() -> TrustModeSerde {
-    TrustModeSerde::Strict
-}
-
-// String comparison helpers for tests (the canonical comparison is by enum).
-impl PartialEq<&str> for TrustModeSerde {
-    fn eq(&self, other: &&str) -> bool {
-        match self {
-            TrustModeSerde::Strict => *other == "strict",
-            TrustModeSerde::Trusted => *other == "trusted",
-        }
-    }
 }
 
 fn default_config_version() -> String {
@@ -705,20 +713,45 @@ fn resolve_threshold(value: u32, default: u32, floor: u32) -> u32 {
     if value > 0 { value.max(floor) } else { default }
 }
 
+/// Minimum pattern length for a non-empty [`ModelPolicyProfile::model_match`].
+///
+/// Shorter patterns are almost always a misconfig (`"4"` would match any
+/// model containing a `4`, `"us"` would match every Bedrock id, etc.).
+/// Rejected patterns are silently ignored at resolve time — callers should
+/// surface them via `astra config show-policy` / validation, not runtime.
+const MIN_MODEL_MATCH_LEN: usize = 3;
+
 /// Case-insensitive substring match for [`ModelPolicyProfile::model_match`].
-/// Empty pattern matches any model (fallback profile).
+///
+/// Rules:
+/// - Empty pattern → matches any model (explicit fallback-profile sentinel).
+/// - Pattern shorter than [`MIN_MODEL_MATCH_LEN`] (non-empty) → never
+///   matches; treated as a misconfig. See the constant's docs for rationale.
+/// - Otherwise → case-insensitive substring match.
 fn model_profile_matches(pattern: &str, model_lower: &str) -> bool {
     if pattern.is_empty() {
         return true;
+    }
+    if pattern.chars().count() < MIN_MODEL_MATCH_LEN {
+        return false;
     }
     model_lower.contains(&pattern.to_ascii_lowercase())
 }
 
 /// Apply a profile's non-zero fields over a base policy.
+///
+/// Each field has a floor to defend against user typos:
+/// - `max_identical_tool_calls` floor 2 — a value of 1 would make every
+///   second tool call a dedup hit. Matches the haiku built-in's lower bound.
+/// - `max_tools_per_turn` floor 5 — prevents pathological starvation.
+/// - `repeated_cache_hit_suppression` floor 1 — 0 would effectively disable
+///   the guard.
+/// - `max_consecutive_empty_name` floor 1 — 0 would abort on the very first
+///   empty-name call.
 fn apply_profile(base: EffectiveToolPolicy, profile: &ModelPolicyProfile) -> EffectiveToolPolicy {
     EffectiveToolPolicy {
         max_identical_tool_calls: if profile.max_identical_tool_calls > 0 {
-            profile.max_identical_tool_calls
+            profile.max_identical_tool_calls.max(2)
         } else {
             base.max_identical_tool_calls
         },
@@ -728,14 +761,11 @@ fn apply_profile(base: EffectiveToolPolicy, profile: &ModelPolicyProfile) -> Eff
             base.max_tools_per_turn
         },
         repeated_cache_hit_suppression: if profile.repeated_cache_hit_suppression > 0 {
-            // Floor of 1: zero would disable suppression entirely, which is
-            // almost certainly a misconfig rather than intent.
             profile.repeated_cache_hit_suppression.max(1)
         } else {
             base.repeated_cache_hit_suppression
         },
         max_consecutive_empty_name: if profile.max_consecutive_empty_name > 0 {
-            // Floor of 1: 0 would abort immediately on the first empty-name call.
             profile.max_consecutive_empty_name.max(1)
         } else {
             base.max_consecutive_empty_name
@@ -1639,11 +1669,11 @@ impl RuntimeConfig {
             default_tuning_cycle_interval(),
         );
 
-        // SafetyConfig: whole-struct replace when the other side has an
-        // explicit Trusted setting. Strict (default) doesn't override, so
-        // layering a "Trusted" project config over a "Strict" user config
-        // yields Trusted (explicit opt-in always wins).
-        if matches!(safety.trust_mode, TrustModeSerde::Trusted) {
+        // SafetyConfig: last layer with an explicit trust_mode wins.
+        // Unset (None) preserves the earlier layer's value. This makes the
+        // merge symmetric — a project config can both opt *in* to Trusted
+        // AND opt *back out* to Strict on top of a Trusted user config.
+        if safety.trust_mode.is_some() {
             self.safety = safety;
         }
 
@@ -2275,6 +2305,90 @@ selector_model = "qwen-flash"
     }
 
     #[test]
+    fn resolve_for_model_rejects_too_short_pattern_as_footgun() {
+        // `model_match = "4"` would match any model containing a "4"
+        // (claude-opus-4-7, gpt-4, etc.) — almost certainly a misconfig
+        // rather than intent. Require ≥ 3 chars. Empty string stays the
+        // explicit fallback-profile sentinel and is unaffected.
+        let mut cfg = ToolSelectionConfig::default();
+        cfg.model_profiles.push(ModelPolicyProfile {
+            model_match: "4".to_string(),
+            max_identical_tool_calls: 99,
+            ..Default::default()
+        });
+        // Should NOT match — too-short pattern ignored.
+        let policy = cfg.resolve_for_model(Some("claude-opus-4-7"));
+        assert_ne!(
+            policy.max_identical_tool_calls, 99,
+            "single-char pattern must not match — it's a footgun"
+        );
+        // Built-in opus profile should still win.
+        assert_eq!(policy.max_identical_tool_calls, 4);
+    }
+
+    #[test]
+    fn resolve_for_model_rejects_two_char_pattern() {
+        // Boundary: "op" is still too short (most pathological match cases
+        // — "o", "4", "us" — are 1–2 chars).
+        let mut cfg = ToolSelectionConfig::default();
+        cfg.model_profiles.push(ModelPolicyProfile {
+            model_match: "op".to_string(),
+            max_identical_tool_calls: 99,
+            ..Default::default()
+        });
+        let policy = cfg.resolve_for_model(Some("claude-opus-4-7"));
+        assert_ne!(policy.max_identical_tool_calls, 99);
+    }
+
+    #[test]
+    fn resolve_for_model_accepts_three_char_pattern() {
+        // Boundary: 3 chars is the minimum allowed — "gpt", "opus" minus
+        // one, etc. Honoring this lets users target narrower model families.
+        let mut cfg = ToolSelectionConfig::default();
+        cfg.model_profiles.push(ModelPolicyProfile {
+            model_match: "4-7".to_string(),
+            max_identical_tool_calls: 7,
+            ..Default::default()
+        });
+        let policy = cfg.resolve_for_model(Some("claude-opus-4-7"));
+        assert_eq!(policy.max_identical_tool_calls, 7);
+    }
+
+    #[test]
+    fn resolve_for_model_floor_applied_to_max_identical_tool_calls() {
+        // A user profile with max_identical_tool_calls = 1 would turn every
+        // tool call after the first into a "duplicate" — indistinguishable
+        // from "disable tool use entirely after N=1". That's almost
+        // certainly a misconfig; clamp to the lowest value any built-in
+        // profile uses (2, matching haiku).
+        let mut cfg = ToolSelectionConfig::default();
+        cfg.model_profiles.push(ModelPolicyProfile {
+            model_match: "custom".to_string(),
+            max_identical_tool_calls: 1,
+            ..Default::default()
+        });
+        let policy = cfg.resolve_for_model(Some("custom-model"));
+        assert_eq!(
+            policy.max_identical_tool_calls, 2,
+            "max_identical_tool_calls=1 should be clamped to floor 2"
+        );
+    }
+
+    #[test]
+    fn resolve_for_model_empty_pattern_still_works_as_fallback() {
+        // Regression guard: after tightening the min-length check, the
+        // empty-string fallback-profile pattern must still match any model.
+        let mut cfg = ToolSelectionConfig::default();
+        cfg.model_profiles.push(ModelPolicyProfile {
+            model_match: String::new(),
+            max_identical_tool_calls: 9,
+            ..Default::default()
+        });
+        let policy = cfg.resolve_for_model(Some("anything"));
+        assert_eq!(policy.max_identical_tool_calls, 9);
+    }
+
+    #[test]
     fn model_profiles_round_trip_through_toml() {
         let mut cfg = RuntimeConfig::default();
         cfg.tool_selection.model_profiles.push(ModelPolicyProfile {
@@ -2298,7 +2412,20 @@ selector_model = "qwen-flash"
         // TrustMode::Strict is the safe default. Shipping with Trusted would
         // turn a fail-closed guard into fail-open — never do that implicitly.
         let cfg = RuntimeConfig::default();
-        assert_eq!(cfg.safety.trust_mode, "strict");
+        // The resolved value is what every caller reads.
+        assert_eq!(cfg.safety.resolved_trust_mode(), TrustModeSerde::Strict);
+    }
+
+    #[test]
+    fn safety_config_default_has_no_explicit_trust_mode() {
+        // `resolved_trust_mode()` defaults to Strict, but the raw field
+        // distinguishes "unset" from "explicit strict" — this matters for
+        // merge semantics (see the merge tests).
+        let cfg = RuntimeConfig::default();
+        assert!(
+            cfg.safety.trust_mode.is_none(),
+            "default must be None so layered configs can explicitly set Strict too"
+        );
     }
 
     #[test]
@@ -2309,12 +2436,25 @@ selector_model = "qwen-flash"
             trust_mode = "trusted"
         "#;
         let parsed: RuntimeConfig = toml::from_str(toml).unwrap();
-        assert_eq!(parsed.safety.trust_mode, "trusted");
+        assert_eq!(parsed.safety.resolved_trust_mode(), TrustModeSerde::Trusted);
+        assert_eq!(parsed.safety.trust_mode, Some(TrustModeSerde::Trusted));
+    }
+
+    #[test]
+    fn safety_trust_mode_explicit_strict_parses_as_some() {
+        // "strict" in the TOML must round-trip as Some(Strict), not None —
+        // so a later merge can use the explicit intent.
+        let toml = r#"
+            version = "1.0"
+            [safety]
+            trust_mode = "strict"
+        "#;
+        let parsed: RuntimeConfig = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.safety.trust_mode, Some(TrustModeSerde::Strict));
     }
 
     #[test]
     fn safety_trust_mode_rejects_unknown_values_by_serde() {
-        // Guard against typos silently becoming Strict — fail loudly.
         let toml = r#"
             version = "1.0"
             [safety]
@@ -2322,6 +2462,48 @@ selector_model = "qwen-flash"
         "#;
         let result: Result<RuntimeConfig, _> = toml::from_str(toml);
         assert!(result.is_err(), "unknown trust_mode should fail to parse");
+    }
+
+    #[test]
+    fn safety_merge_project_trusted_overrides_user_strict() {
+        // Layered: user = unset (Strict), project = explicit Trusted.
+        // Later layer wins (standard config convention).
+        let user = RuntimeConfig::default();
+        let mut project = RuntimeConfig::default();
+        project.safety.trust_mode = Some(TrustModeSerde::Trusted);
+
+        let merged = user.merge(project);
+        assert_eq!(merged.safety.resolved_trust_mode(), TrustModeSerde::Trusted);
+    }
+
+    #[test]
+    fn safety_merge_project_strict_overrides_user_trusted() {
+        // The formerly-broken direction: user set Trusted, project explicitly
+        // wants Strict. Project must win — a checked-in project config
+        // should be able to re-tighten a locally-loose user setting.
+        let mut user = RuntimeConfig::default();
+        user.safety.trust_mode = Some(TrustModeSerde::Trusted);
+
+        let mut project = RuntimeConfig::default();
+        project.safety.trust_mode = Some(TrustModeSerde::Strict);
+
+        let merged = user.merge(project);
+        assert_eq!(
+            merged.safety.resolved_trust_mode(),
+            TrustModeSerde::Strict,
+            "explicit Strict in later layer must override earlier Trusted"
+        );
+    }
+
+    #[test]
+    fn safety_merge_project_unset_preserves_user_trusted() {
+        // Project doesn't mention safety → user's explicit Trusted sticks.
+        let mut user = RuntimeConfig::default();
+        user.safety.trust_mode = Some(TrustModeSerde::Trusted);
+        let project = RuntimeConfig::default(); // unset
+
+        let merged = user.merge(project);
+        assert_eq!(merged.safety.resolved_trust_mode(), TrustModeSerde::Trusted);
     }
 
     #[test]
