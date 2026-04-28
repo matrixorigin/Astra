@@ -662,6 +662,24 @@ fn update_session_facts_from_turn(state: &mut super::agentic_loop_host::AgenticL
         state.continuity.facts, continuity_facts_snapshot,
         "complete_active_runtime_todo_if_finalized must not mutate continuity.facts"
     );
+    // After the hook may have advanced todos (e.g. marking the active todo
+    // done), re-derive plan_state from the updated todos and write it into
+    // both session_facts and continuity.facts.
+    //
+    // This is a *targeted* update, not a clone-back of the whole facts map:
+    // the hook is contractually forbidden from mutating any other field
+    // (asserted above), so `plan_state` is the single derived field we must
+    // refresh. The `.clone()` below is required because `set_plan_state`
+    // consumes its argument and we need to write the same value into both
+    // session_facts and continuity.facts.
+    let post_hook_plan_state = state
+        .continuity
+        .todos
+        .to_plan_fact(&state.continuity.goal.text);
+    state
+        .session_facts
+        .set_plan_state(post_hook_plan_state.clone());
+    state.continuity.facts.set_plan_state(post_hook_plan_state);
 
     // P4: Error-triggered L1 persist — when an error occurred this turn,
     // write L1 to local session memory file immediately so user corrections
