@@ -31,7 +31,6 @@ mod edge_status_handler;
 mod edge_ws_handler;
 pub(crate) mod header_utils;
 mod http_helpers;
-mod http_types;
 mod learning_handlers;
 mod llm_trusted_domains_handlers;
 mod meta_handlers;
@@ -54,7 +53,8 @@ mod team_handlers;
 pub mod team_orchestrator;
 mod ws_handler;
 
-use self::{bridge_prep::prepare_chat_turn_bridge_body, http_helpers::*, http_types::*};
+use self::{bridge_prep::prepare_chat_turn_bridge_body, http_helpers::*};
+use astra_server_types::*;
 use astra_server_types::{ChatRouteResponse, classify_chat_route};
 mod completions;
 
