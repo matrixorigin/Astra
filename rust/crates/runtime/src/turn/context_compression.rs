@@ -14,6 +14,7 @@ use crate::turn::headless_tool_assembly::READ_ONLY_TOOLS;
 pub use astra_turn_core::compression_types::{
     CompressionLayer, CompressionResult, PipelineOutcome, TokenBudget,
 };
+use astra_turn_core::context_assembly_trace::CompressionMethod;
 
 use crate::runtime_config::CompressionConfig;
 use serde_json::Value;
@@ -75,9 +76,14 @@ impl CompressionPipeline {
 
             layer_results.push((layer.name().to_string(), result));
 
-            if !running_budget.is_over_budget()
-                && running_budget.pressure() < layer.trigger_pressure()
-            {
+            // Early-break on budget satisfaction only.
+            //
+            // Previous logic broke when `pressure() < layer.trigger_pressure()`,
+            // which could skip a later, more-aggressive layer whose threshold
+            // is *lower* than the current layer's. Fix: only stop once we are
+            // actually under budget; otherwise keep giving later layers a
+            // chance.
+            if !running_budget.is_over_budget() {
                 break;
             }
         }
@@ -195,6 +201,10 @@ impl CompressionLayer for ToolResultTruncation {
         "tool_result_truncation"
     }
 
+    fn method(&self) -> CompressionMethod {
+        CompressionMethod::ToolResultTruncation
+    }
+
     fn trigger_pressure(&self) -> f64 {
         self.trigger
     }
@@ -273,22 +283,48 @@ impl DuplicateReadElimination {
     }
 }
 
-/// Tool names recognized as file-read operations.
-const FILE_READ_TOOLS: &[&str] = &["read_file"];
+/// Tool names recognized as read operations whose duplicate results
+/// can be safely stubbed. Expanded beyond `read_file` to cover
+/// common read-only tools that produce large, repeatable output.
+const FILE_READ_TOOLS: &[&str] = &[
+    "read_file",
+    "list_dir",
+    "grep",
+    "glob",
+    "symbols",
+    "git_log",
+    "git_show",
+    "git_diff",
+    "git_blame",
+    "git_file_history",
+];
 
-/// Extract the file path from a tool call's arguments JSON.
+/// Extract a deduplication key from a tool call's arguments JSON.
+///
+/// For file-oriented tools this is the `path`/`file_path` argument.
+/// For search tools (grep, glob) we combine path + pattern so that
+/// different searches of the same directory are not conflated.
 fn extract_path_from_args(args: &str) -> Option<String> {
     serde_json::from_str::<Value>(args).ok().and_then(|v| {
-        v.get("path")
+        let base = v
+            .get("path")
             .or_else(|| v.get("file_path"))
-            .and_then(|p| p.as_str())
-            .map(|s| s.to_string())
+            .and_then(|p| p.as_str())?;
+        if let Some(pattern) = v.get("pattern").and_then(|p| p.as_str()) {
+            Some(format!("{base}::{pattern}"))
+        } else {
+            Some(base.to_string())
+        }
     })
 }
 
 impl CompressionLayer for DuplicateReadElimination {
     fn name(&self) -> &str {
         "duplicate_read_elimination"
+    }
+
+    fn method(&self) -> CompressionMethod {
+        CompressionMethod::DuplicateReadElimination
     }
 
     fn trigger_pressure(&self) -> f64 {
@@ -411,6 +447,10 @@ impl CompressionLayer for TieredCompaction {
         "tiered_compaction"
     }
 
+    fn method(&self) -> CompressionMethod {
+        CompressionMethod::TieredCompaction
+    }
+
     fn trigger_pressure(&self) -> f64 {
         self.trigger
     }
@@ -507,6 +547,10 @@ impl ReactiveCompact {
 impl CompressionLayer for ReactiveCompact {
     fn name(&self) -> &str {
         "reactive_compact"
+    }
+
+    fn method(&self) -> CompressionMethod {
+        CompressionMethod::ReactiveCompact
     }
 
     fn trigger_pressure(&self) -> f64 {
@@ -1139,6 +1183,41 @@ mod tests {
         // No duplicates, no stubbing
         assert_eq!(result.estimated_tokens_freed, 0);
         assert_eq!(msgs[2]["content"].as_str().unwrap(), &"x".repeat(500));
+    }
+
+    #[test]
+    fn duplicate_read_recognizes_grep_and_git_log() {
+        // DuplicateReadElimination should stub duplicates for grep/git_log
+        // (read-only tools), not only read_file.
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "task"}),
+            // grep call 1
+            json!({
+                "role": "assistant", "content": "searching.",
+                "tool_calls": [{"id": "c1", "function": {"name": "grep", "arguments": "{\"pattern\": \"TODO\", \"path\": \"src/\"}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "match1\nmatch2\n".repeat(100)}),
+            // grep call 2 — same path and pattern
+            json!({
+                "role": "assistant", "content": "re-checking.",
+                "tool_calls": [{"id": "c2", "function": {"name": "grep", "arguments": "{\"pattern\": \"TODO\", \"path\": \"src/\"}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "c2", "content": "match3\nmatch4\n".repeat(100)}),
+        ];
+        let b = budget(80_000, 60_000);
+        let result = DuplicateReadElimination::new(0.0).compress(&mut msgs, &b);
+        assert!(
+            result.estimated_tokens_freed > 0,
+            "grep duplicates should be eliminated, freed={}",
+            result.estimated_tokens_freed
+        );
+        assert!(
+            msgs[3]["content"]
+                .as_str()
+                .unwrap()
+                .contains("duplicate read")
+        );
     }
 
     // ── Layer 3: TieredCompaction ──────────────────────────────────────

@@ -814,10 +814,20 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         }
 
         // Compute context pressure from a fresh estimate that includes
-        // per-message overhead and fixed overhead (system prompt + schemas),
-        // not the stale `last_measured_prompt_tokens` from the previous round.
+        // per-message overhead, calibrated system-prompt overhead, and
+        // (when available) measured tool-schema tokens — not the stale
+        // `last_measured_prompt_tokens` from the previous round.
+        //
+        // Using `estimate_tokens_precise` with the calibrated 14 000-token
+        // system-prompt default (vs. the legacy 3 000-token `FIXED_OVERHEAD`)
+        // keeps the 0.75 / 0.90 microcompact gates from firing too late and
+        // matches the pre-request accounting used by `/chat` budget pressure.
         let pressure = if state.max_turn_input_tokens > 0 {
-            let fresh_estimate = crate::prompts::estimate_tokens(&state.messages) as u64;
+            let fresh_estimate = crate::prompts::estimate_tokens_precise(
+                &state.messages,
+                state.pinned_tool_schema_tokens as usize,
+                0,
+            ) as u64;
             fresh_estimate as f64 / state.max_turn_input_tokens as f64
         } else {
             0.0

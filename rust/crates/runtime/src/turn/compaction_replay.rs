@@ -133,13 +133,21 @@ pub(crate) fn try_compact_for_retry_tiered(
     }
 
     // Build a budget that reflects the overflow.
-    let measured = last_measured_tokens.unwrap_or_else(|| {
-        messages
-            .iter()
-            .filter_map(|m| m.get("content").and_then(|v| v.as_str()))
-            .map(|s| crate::prompts::estimate_str_tokens(s) as u64)
-            .sum()
-    });
+    //
+    // Fallback estimation when `last_measured_tokens` is unknown: we must
+    // account for *all* token sources the LLM will count, not just plain
+    // string `content`. In particular:
+    //   * tool_call arguments (often very large),
+    //   * tool_result messages (array or string content),
+    //   * multimodal / array-form content.
+    //
+    // Using `prompts::estimate_tokens` (which walks content + tool_calls and
+    // adds per-message + fixed overhead) keeps this in sync with the
+    // pre-request pressure estimate in `agentic_loop_lifecycle` so a
+    // CompactAndRetry triggered precisely by large tool_calls is not
+    // silently skipped.
+    let measured =
+        last_measured_tokens.unwrap_or_else(|| crate::prompts::estimate_tokens(messages) as u64);
 
     let max_tokens = if model_context_limit > 0 {
         model_context_limit
@@ -384,6 +392,45 @@ mod tests {
         assert_eq!(json["cumulative_tokens_freed"], 5000);
         assert_eq!(json["attempt_count"], 1);
         assert_eq!(json["last_was_insufficient"], true);
+    }
+
+    #[test]
+    fn fallback_estimate_counts_tool_calls_arguments() {
+        // Regression: assistant messages carrying only tool_calls (no string content)
+        // must contribute to the fallback token estimate. Otherwise a conversation
+        // dominated by large tool-call arguments silently stays under budget and
+        // compaction is skipped exactly when it is most needed.
+        let big_args = "x".repeat(80_000); // ~20k tokens of arguments
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "go"}),
+        ];
+        // Add many assistant messages whose *only* payload is tool_calls arguments.
+        for i in 0..10 {
+            msgs.push(json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("call_{i}"),
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": &big_args},
+                }],
+            }));
+            msgs.push(json!({
+                "role": "tool",
+                "tool_call_id": format!("call_{i}"),
+                "content": "ok",
+            }));
+        }
+
+        // Model limit 100k, real cost is ~200k+ tokens from tool_calls alone.
+        // Fallback (no measured_tokens) MUST detect overflow.
+        let result = try_compact_for_retry(&mut msgs, None, 100_000);
+        assert!(
+            result.is_some(),
+            "fallback estimate ignored tool_calls arguments \
+             and wrongly reported under-budget"
+        );
     }
 
     #[test]

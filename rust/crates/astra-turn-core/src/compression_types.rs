@@ -4,6 +4,7 @@
 //! downstream modules like `compaction_replay` can depend on them
 //! without pulling in the full runtime.
 
+use crate::context_assembly_trace::CompressionMethod;
 use serde_json::Value;
 
 /// Token budget for a single turn.
@@ -66,6 +67,11 @@ pub struct PipelineOutcome {
 pub trait CompressionLayer: Send + Sync {
     /// Human-readable name for logging / audit.
     fn name(&self) -> &str;
+
+    /// Strongly-typed telemetry identity for this layer. Each impl must
+    /// declare its own `CompressionMethod` variant so telemetry aggregation
+    /// cannot silently drift when a layer name string is changed.
+    fn method(&self) -> CompressionMethod;
 
     /// Minimum budget pressure (0.0–1.0) required for this layer to fire.
     /// The pipeline skips layers whose threshold exceeds the current

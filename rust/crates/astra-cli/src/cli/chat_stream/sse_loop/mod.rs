@@ -225,6 +225,7 @@ pub(crate) async fn stream_chat_sse(
         schemas
     };
     let registry = ToolRegistry::new(all_schemas.clone());
+    let pinned_schema_tokens = registry.total_pinned_token_cost() as u64;
     let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
 
     // --allowed-tools: if set, restrict to only the specified tools
@@ -599,6 +600,7 @@ pub(crate) async fn stream_chat_sse(
         last_measured_prompt_tokens: None,
         consecutive_context_window_errors: 0,
         compaction_effectiveness: Default::default(),
+        pinned_tool_schema_tokens: pinned_schema_tokens,
         max_turn_input_tokens: RuntimeLimits::global().max_turn_input_tokens,
         budget_wrapup_injected: false,
         skill_produced_output: false,

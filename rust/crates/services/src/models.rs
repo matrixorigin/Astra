@@ -818,8 +818,14 @@ pub async fn validate_connectivity(
         return None;
     }
 
+    // Disable env-proxy for connectivity probes. Matches the policy established in
+    // commit 3e3d6fa8 ("centralize env proxy in LLM client"): connectivity probes
+    // target provider endpoints directly and must not be rerouted through
+    // HTTP(S)_PROXY / ALL_PROXY env vars, which can silently break probes in
+    // corporate environments and leak internal endpoints in others.
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
+        .no_proxy()
         .build()
     {
         Ok(c) => c,
