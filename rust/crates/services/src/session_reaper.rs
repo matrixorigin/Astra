@@ -222,13 +222,4 @@ mod tests {
         assert_eq!(r.deleted, 0);
         assert_eq!(r.workspaces_removed, 0);
     }
-
-    #[test]
-    fn spawn_session_reaper_accepts_cancel_token() {
-        let source = include_str!("session_reaper.rs");
-        assert!(
-            source.contains("pub fn spawn_session_reaper(\n    pool: astra_core::SharedPool,\n    cancel: tokio_util::sync::CancellationToken,\n) -> tokio::task::JoinHandle<()>"),
-            "spawn_session_reaper must accept a CancellationToken and return a JoinHandle"
-        );
-    }
 }

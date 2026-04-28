@@ -620,21 +620,6 @@ pub(crate) fn terminal_width_usize() -> usize {
         .max(20)
 }
 
-/// Render markdown with explicit wrap width so it matches [`StreamRenderState`] line accounting.
-#[allow(dead_code)]
-pub(crate) fn print_markdown_width(text: &str, width: Option<usize>) {
-    let w = width.unwrap_or_else(terminal_width_usize).max(20);
-    let mut skin = termimad::MadSkin::default();
-    // Use crossterm colors so they match our existing palette
-    use termimad::FmtText;
-    use termimad::crossterm::style::Color;
-    skin.bold.set_fg(Color::Cyan);
-    skin.italic.set_fg(Color::Yellow);
-    skin.inline_code.set_fg(Color::Green);
-    let fmt = FmtText::from(&skin, text, Some(w));
-    print!("{}", fmt);
-}
-
 pub(crate) use astra_text_utils::str_preview::{prefix_chars, truncate_str};
 
 pub(super) fn urlencoding(s: &str) -> String {

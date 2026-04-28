@@ -133,16 +133,6 @@ impl StreamingMarkdown {
         self.stable_end = 0;
         self.full_text.clear();
     }
-
-    /// Clear ALL rendered output (stable + unstable).
-    /// Only used when output must be fully removed.
-    #[allow(dead_code)]
-    pub(super) fn clear_all(&mut self) {
-        self.unstable_region.clear();
-        self.stable_region.clear();
-        self.stable_end = 0;
-        self.full_text.clear();
-    }
 }
 
 /// Split rendered markdown into terminal lines (stripping trailing newline).

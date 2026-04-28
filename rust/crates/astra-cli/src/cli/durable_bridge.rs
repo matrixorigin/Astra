@@ -157,31 +157,6 @@ pub fn subtask_retries_exhausted(durable: &DurableTaskState, subtask_id: &str) -
 }
 
 /// Extract the latest verification results for a subtask as a JSON value
-/// suitable for journaling. Returns `None` if the subtask has no results.
-#[allow(dead_code)]
-pub fn subtask_verification_json(
-    durable: &DurableTaskState,
-    subtask_id: &str,
-) -> Option<serde_json::Value> {
-    let sub = durable
-        .contract
-        .subtasks
-        .iter()
-        .find(|s| s.id == subtask_id)?;
-    match &sub.stage {
-        SubtaskStage::Verified => Some(serde_json::json!({
-            "stage": "verified",
-            "retry_count": sub.retry_count,
-        })),
-        SubtaskStage::VerificationFailed { results } => Some(serde_json::json!({
-            "stage": "verification_failed",
-            "retry_count": sub.retry_count,
-            "criteria": results,
-        })),
-        _ => None,
-    }
-}
-
 /// Call when a subtask transitions Pending → Executing (snapshot).
 pub async fn on_subtask_begin(durable: &DurableTaskState, subtask_id: &str) {
     if let Err(e) = durable
@@ -701,74 +676,6 @@ pub(super) fn save_delivery_report_json(report: &TaskDeliveryReport) {
 
 // ─── Post-delivery user feedback ─────────────────────────────────────────────
 
-/// Prompt the user for a 1–5 rating and feed it back into the learning pipeline.
-///
-/// Returns the raw rating (1–5) if the user provided one, or `None` if skipped.
-#[allow(dead_code)]
-pub async fn collect_user_feedback(
-    durable: &DurableTaskState,
-    learning_bridge: Option<&std::sync::Arc<dyn astra_services::TaskLearningBridge>>,
-) -> Option<u8> {
-    let report = durable.last_report.as_ref()?;
-
-    eprintln!();
-    eprint!("  {} ", "Rate this delivery (1-5, Enter to skip):".bold());
-    std::io::Write::flush(&mut std::io::stderr()).ok();
-
-    let mut input = String::new();
-    if std::io::stdin().read_line(&mut input).is_err() {
-        return None;
-    }
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let rating: u8 = match trimmed.parse() {
-        Ok(r) if (1..=5).contains(&r) => r,
-        _ => {
-            eprintln!("  {}", "Skipped (expected 1-5).".dim());
-            return None;
-        }
-    };
-
-    let stars = "★".repeat(rating as usize);
-    let empty = "☆".repeat(5 - rating as usize);
-    eprintln!("  {} {}{}", "📊".cyan(), stars.yellow(), empty.dim());
-
-    // Convert 1-5 → 0-100 scale for learning pipeline
-    let rating_100 = (rating as u16 * 20).min(100) as u8;
-
-    if let Some(bridge) = learning_bridge {
-        let all_tools: Vec<String> = durable
-            .contract
-            .subtasks
-            .iter()
-            .flat_map(|s| s.tools_used.iter().cloned())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        let outcome = astra_services::durable_task::build_outcome_signal(
-            &durable.contract,
-            report,
-            all_tools,
-            Some(rating_100),
-            durable.contract.domain_hint.clone(),
-            durable.contract.task_type.clone(),
-        );
-        let _ = bridge.learn_from_task_outcome(&outcome).await;
-    }
-
-    Some(rating)
-}
-
-// ─── Lifecycle factory ───────────────────────────────────────────────────────
-
-/// Create a [`LocalDurableTaskLifecycle`] with optional cloud event streaming.
-///
-/// Uses the session directory as the persistence root and the cwd as the work_dir
-/// for the embedded [`VerificationRunner`]. When an `IngestionSender` is provided,
-/// verification events are streamed to the cloud asynchronously (local-first with
-/// cloud event streaming).
 /// Convenience wrapper without cloud event streaming (used in tests).
 #[cfg(test)]
 pub fn create_local_lifecycle(

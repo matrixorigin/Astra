@@ -532,7 +532,6 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/marketplace/search",
             get(marketplace::search_marketplace_handler),
         )
-        // Streaming (deprecated)
         // Evaluation
         .route(
             "/evaluation/quality/trend",

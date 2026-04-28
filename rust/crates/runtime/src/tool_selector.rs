@@ -185,15 +185,6 @@ impl Default for SelectionResult {
     }
 }
 
-/// Deprecated: skill metadata was used for proactive skill selection via the
-/// tool selector. Skill activation is now handled by the `skill` tool in the
-/// agentic loop. This type will be removed.
-#[derive(Debug, Clone)]
-pub struct SkillCatalogEntry {
-    pub name: String,
-    pub description: String,
-}
-
 /// Strategy for selecting tools from the catalog.
 #[async_trait]
 pub trait ToolSelector: Send + Sync {
@@ -209,11 +200,6 @@ pub trait ToolSelector: Send + Sync {
 
     fn learned_context(&self, _query: &str, _recent_tools: &[String]) -> LearnedContext {
         LearnedContext::default()
-    }
-
-    /// Deprecated: proactive skill selection is retired. Always returns true.
-    fn selected_skills_empty(&self) -> bool {
-        true
     }
 
     /// Access the underlying tool registry for schema/cost queries.
@@ -910,14 +896,6 @@ impl LlmToolSelector {
         self
     }
 
-    /// Deprecated: skill activation is now handled by the `skill` tool. No-op.
-    pub fn with_skills(self, _skills: Vec<SkillCatalogEntry>) -> Self {
-        self
-    }
-
-    /// Deprecated: skill activation is now handled by the `skill` tool. No-op.
-    pub fn update_skills(&mut self, _skills: &[SkillCatalogEntry]) {}
-
     /// Make a lightweight SSE call and collect the full response text.
     /// Returns (text, tokens_in, tokens_out).
     async fn call_llm(&self, messages: Vec<Value>) -> Result<(String, u64, u64), String> {
@@ -1007,10 +985,6 @@ impl ToolSelector for LlmToolSelector {
     async fn select(&self, ctx: &SelectionContext<'_>) -> SelectionResult {
         self.select_with_learned_context(ctx, &LearnedContext::default())
             .await
-    }
-
-    fn selected_skills_empty(&self) -> bool {
-        true
     }
 
     async fn select_with_learned_context(

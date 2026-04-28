@@ -287,21 +287,17 @@ pub use astra_turn_core::{
     counter::count_persisted_turn_events,
     execution_state::normalize_execution_state,
     explain::build_explain_event,
-    firewall::build_firewall_verification_plan,
     history::{
         RecoveredEventRow, append_recovered_events, find_tool_call_safe_split,
         merge_tool_results_into_history,
     },
-    history_apply::apply_turn_inputs_to_history,
     hook_plans::{SnapshotLinkPlan, build_snapshot_link_plan},
     observer::{build_observer_messages, should_run_observer},
     persist::{
         LlmResponsePersistPlan, PersistEventPayload, build_llm_response_persist_plan,
         build_tool_call_event_payload, build_tool_result_event_payload,
     },
-    persist_inputs::{build_routing_decision_event_payload, collect_skill_version_names},
     quality::build_tool_result_quality_event_payload,
-    refresh::{extract_first_user_query, plan_memory_refresh},
     response_guard::{is_prompt_leaked, is_repetition_loop},
     retrieval::{
         RETRIEVAL_BUDGET_CHARS, enhanced_extraction, format_retrieved_events, rule_based_extraction,
@@ -309,9 +305,6 @@ pub use astra_turn_core::{
     routing::{
         MAX_TOOL_ROUNDS, build_routing_metadata, build_skipped_routing_metadata, detect_correction,
     },
-    routing_metrics::{RoutingMetricsPlan, build_routing_metrics_plan},
-    session_cache::apply_turn_to_session_entry,
-    snapshot::{build_session_history_snapshot, should_persist_session_history_snapshot},
     stall::{
         DIVERGENCE_CORRECTION, DivergenceStatus, SERVER_STALL_WINDOW, canonical_tool_args,
         detect_divergence, detect_server_stall, record_server_tool_signatures,
@@ -322,13 +315,10 @@ pub use astra_turn_core::{
         build_approval_required_event, build_edge_tool_call_event, build_firewall_warning_event,
         build_runtime_error_event, build_stream_error_event, build_tool_request_event,
     },
-    tail_persist::{
-        build_cached_assistant_message, build_persist_thread_args, build_turn_hook_args,
-    },
+    tail_persist::build_turn_hook_args,
     task::classify_task,
     tool_args_repair::try_repair_tool_args,
     tool_selection::{plan_tool_subset_for_result_turn, resolve_preferred_tool_status},
-    unconsumed::{build_unconsumed_tool_messages, latest_assistant_tool_call_ids},
     view::{
         RetrievalPlan, build_recent_retrieval_tail, compose_retrieval_view,
         extract_latest_user_query, plan_retrieval_inputs,

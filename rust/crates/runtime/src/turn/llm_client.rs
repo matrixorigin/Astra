@@ -268,11 +268,6 @@ fn llm_result_details_json(result: &LlmCallResult) -> Option<String> {
     .ok()
 }
 
-#[allow(dead_code)] // May be used for per-request timeout in the future
-fn turn_timeout_s() -> f64 {
-    astra_core::RuntimeLimits::global().turn_timeout_s
-}
-
 /// Cooperative cancellation for [`call_llm_and_collect`] / [`collect_llm_stream`].
 #[derive(Clone, Copy)]
 pub(crate) enum LlmCancel<'a> {

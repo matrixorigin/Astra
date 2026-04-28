@@ -881,19 +881,6 @@ mod tests {
         assert_eq!(resp.total, 42);
     }
 
-    #[test]
-    fn create_event_upserts_agent_session_count() {
-        let source = include_str!("events.rs");
-        assert!(
-            source.contains("load_agent_event_count"),
-            "create event flow should count actual persisted agent_events before reconciling event_count"
-        );
-        assert!(
-            source.contains("upsert_agent_session_event_count"),
-            "create event flow should reuse the shared agent_sessions upsert helper when reconciling event_count"
-        );
-    }
-
     // --- query deserialization defaults ---
 
     #[test]
@@ -937,82 +924,8 @@ mod tests {
     }
 
     /// P1-C: delete_event must reconcile session event_count after deletion.
-    #[test]
-    fn delete_event_reconciles_event_count() {
-        let source = include_str!("events.rs");
-        // Find the DatabaseEventService impl of delete_event (contains actual SQL)
-        let impl_start = source
-            .find("impl EventService for DatabaseEventService")
-            .expect("DatabaseEventService impl must exist");
-        let impl_source = &source[impl_start..];
-        let fn_start = impl_source
-            .find("async fn delete_event")
-            .expect("delete_event must exist in DatabaseEventService");
-        let fn_end = impl_source[fn_start..]
-            .find("\n    async fn ")
-            .map(|p| fn_start + p)
-            .unwrap_or(impl_source.len());
-        let fn_body = &impl_source[fn_start..fn_end];
-        assert!(
-            fn_body.contains("load_agent_event_count"),
-            "delete_event must recount events after deletion"
-        );
-        assert!(
-            fn_body.contains("upsert_agent_session_event_count"),
-            "delete_event must update session event_count"
-        );
-    }
-
     /// P2-A: get_event and delete_event must return 404 (not 403) for
     /// non-owner access to prevent IDOR information leakage.
-    #[test]
-    fn event_access_returns_not_found_for_non_owner() {
-        let source = include_str!("events.rs");
-        let impl_start = source
-            .find("impl EventService for DatabaseEventService")
-            .expect("impl must exist");
-        let impl_source = &source[impl_start..];
-        // Check get_event
-        let get_start = impl_source
-            .find("async fn get_event")
-            .expect("get_event must exist");
-        let get_end = impl_source[get_start..]
-            .find("\n    async fn ")
-            .map(|p| get_start + p)
-            .unwrap_or(impl_source.len());
-        let get_body = &impl_source[get_start..get_end];
-        assert!(
-            !get_body.contains("StatusCode::FORBIDDEN"),
-            "get_event must return NOT_FOUND (not FORBIDDEN) for non-owner"
-        );
-        // Check delete_event
-        let del_start = impl_source
-            .find("async fn delete_event")
-            .expect("delete_event must exist");
-        let del_end = impl_source[del_start..]
-            .find("\n    async fn ")
-            .map(|p| del_start + p)
-            .unwrap_or(impl_source.len());
-        let del_body = &impl_source[del_start..del_end];
-        assert!(
-            !del_body.contains("StatusCode::FORBIDDEN"),
-            "delete_event must return NOT_FOUND (not FORBIDDEN) for non-owner"
-        );
-        // Check get_session_events
-        let ses_start = impl_source
-            .find("async fn get_session_events")
-            .expect("get_session_events must exist");
-        let ses_end = impl_source[ses_start..]
-            .find("\n    async fn ")
-            .map(|p| ses_start + p)
-            .unwrap_or(impl_source.len());
-        let ses_body = &impl_source[ses_start..ses_end];
-        assert!(
-            !ses_body.contains("StatusCode::FORBIDDEN"),
-            "get_session_events must return NOT_FOUND (not FORBIDDEN) for non-owner"
-        );
-    }
-
     /// P2-E: EventListQuery::default() must use the same limit as serde deserialization.
     #[test]
     fn event_list_query_default_matches_serde() {

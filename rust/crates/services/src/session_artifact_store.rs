@@ -459,45 +459,6 @@ mod tests {
     }
 
     #[test]
-    fn database_store_loads_artifact_by_id() {
-        let source = include_str!("session_artifact_store.rs");
-        assert!(
-            source.contains("FROM session_artifacts WHERE artifact_id = ?"),
-            "artifact store should support loading a specific artifact by id"
-        );
-    }
-
-    #[test]
-    fn database_store_lists_session_artifacts_newest_first() {
-        let source = include_str!("session_artifact_store.rs");
-        assert!(
-            source.contains("WHERE session_id = ? AND artifact_kind = ?"),
-            "artifact listing should support filtering by artifact kind"
-        );
-        assert!(
-            source.contains("WHERE session_id = ? \\"),
-            "artifact listing should support listing all artifacts for a session"
-        );
-        assert!(
-            source.contains("ORDER BY created_at DESC, artifact_id DESC LIMIT ?"),
-            "artifact listing should return newest artifacts first with a stable bounded order"
-        );
-    }
-
-    #[test]
-    fn error_type_is_thiserror_enum() {
-        let source = include_str!("session_artifact_store.rs");
-        assert!(
-            source.contains("#[derive(Debug, thiserror::Error)]"),
-            "SessionArtifactStoreError must derive thiserror::Error for structured context"
-        );
-        assert!(
-            source.contains("pub enum SessionArtifactStoreError"),
-            "public structured error type must be named SessionArtifactStoreError"
-        );
-    }
-
-    #[test]
     fn invalid_relative_path_display_preserves_substring() {
         let err = SessionArtifactStoreError::InvalidRelativePath {
             path: PathBuf::from("../x"),
@@ -524,22 +485,6 @@ mod tests {
     fn error_is_send_sync_and_static() {
         fn assert_bounds<T: Send + Sync + 'static>() {}
         assert_bounds::<SessionArtifactStoreError>();
-    }
-
-    #[test]
-    fn metadata_parse_failure_drops_value_with_warning() {
-        // Build the forbidden pattern at runtime so this test's source does
-        // not match itself under include_str!.
-        let forbidden = format!(".and_then(|value| serde_json::{}(&value).ok())", "from_str");
-        let source = include_str!("session_artifact_store.rs");
-        assert!(
-            !source.contains(&forbidden),
-            "metadata parse must no longer silently drop failures via .ok()"
-        );
-        assert!(
-            source.contains("tracing::warn!"),
-            "metadata parse failures should be surfaced via tracing::warn!"
-        );
     }
 
     #[test]

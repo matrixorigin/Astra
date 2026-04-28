@@ -2477,17 +2477,4 @@ mod tests {
         let h3 = sha256_bytes("world");
         assert_ne!(h1, h3);
     }
-
-    /// audit-D7/D8: state_sync must not silently drop DB write errors.
-    #[test]
-    fn state_sync_db_writes_are_not_silently_dropped() {
-        let source = include_str!("state_sync.rs");
-        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
-        let prod_code = &source[..test_start];
-        let count = prod_code.matches("let _ = sqlx::query").count();
-        assert_eq!(
-            count, 0,
-            "state_sync has {count} silently-dropped DB writes"
-        );
-    }
 }

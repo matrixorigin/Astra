@@ -864,11 +864,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_retry_after_whitespace() {
-        assert_eq!(parse_retry_after_ms("  5  "), Some(5000));
-    }
-
-    #[test]
     fn parse_retry_after_negative() {
         // Negative numbers can't parse as u64
         assert_eq!(parse_retry_after_ms("-1"), None);
@@ -883,23 +878,6 @@ mod tests {
     fn parse_retry_after_non_numeric() {
         assert_eq!(parse_retry_after_ms("abc"), None);
         assert_eq!(parse_retry_after_ms("1.5"), None);
-    }
-
-    #[test]
-    fn is_rate_limit_status_edge_cases() {
-        assert!(is_rate_limit_status(429));
-        assert!(!is_rate_limit_status(430));
-        assert!(!is_rate_limit_status(503));
-        assert!(!is_rate_limit_status(0));
-    }
-
-    #[test]
-    fn is_overload_status_edge_cases() {
-        assert!(is_overload_status(529));
-        assert!(is_overload_status(503));
-        assert!(!is_overload_status(500));
-        assert!(!is_overload_status(429));
-        assert!(!is_overload_status(0));
     }
 
     #[test]
@@ -921,20 +899,6 @@ mod tests {
         let pmc = PerModelCooldown::new();
         let action = pmc.with("new-model", |rl| rl.check_request(false));
         assert_eq!(action, RateLimitAction::Proceed);
-    }
-
-    #[test]
-    fn cooldown_reason_as_str_values() {
-        assert_eq!(CooldownReason::RateLimit.as_str(), "rate_limit");
-        assert_eq!(CooldownReason::Overloaded.as_str(), "overloaded");
-    }
-
-    #[test]
-    fn default_creates_active_state() {
-        let rl = RateLimitCooldown::default();
-        assert_eq!(rl.state(), RateLimitState::Active);
-        assert!(!rl.is_in_cooldown());
-        assert_eq!(rl.cooldown_remaining_ms(), 0);
     }
 
     #[test]

@@ -1,44 +1,6 @@
 use astra_core::ConfidenceInterval;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RoutingMetricsPlan {
-    pub confidence: ConfidenceInterval,
-    pub threshold: f64,
-    pub record_fallback: bool,
-    pub record_cache_hit: bool,
-    pub record_correction: bool,
-    pub efficiency_ratio: Option<f64>,
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn build_routing_metrics_plan(
-    confidence: ConfidenceInterval,
-    threshold: f64,
-    matched_by: &str,
-    tier: i64,
-    has_tier1: bool,
-    forced: Option<&str>,
-    intent: &str,
-    estimated_tokens: i64,
-    full_question_tokens: i64,
-) -> RoutingMetricsPlan {
-    RoutingMetricsPlan {
-        confidence,
-        threshold,
-        record_fallback: matched_by == "fallback",
-        record_cache_hit: tier == 0 && !has_tier1,
-        record_correction: forced == Some("question"),
-        efficiency_ratio: if !intent.is_empty() && intent != "question" && full_question_tokens > 0
-        {
-            Some(1.0 - estimated_tokens as f64 / full_question_tokens as f64)
-        } else {
-            None
-        },
-    }
-}
 
 fn correction_rate_interval(total: u64, corrections: u64) -> ConfidenceInterval {
     if total == 0 {
@@ -49,8 +11,7 @@ fn correction_rate_interval(total: u64, corrections: u64) -> ConfidenceInterval 
     ConfidenceInterval::symmetric(rate, margin)
 }
 
-// ─── Confidence Calibration ─────────────────────────────────────────────────
-
+#[derive(Debug)]
 /// Tracks historical routing accuracy per intent type for dynamic threshold adjustment.
 /// Over time, intents that are frequently corrected get lower confidence thresholds,
 /// meaning the system is more cautious and more likely to use fallback routing.
@@ -232,65 +193,6 @@ pub fn disambiguate_intents(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── RoutingMetricsPlan (existing) ──
-
-    #[test]
-    fn metrics_plan_basic() {
-        let plan = build_routing_metrics_plan(
-            0.85.into(),
-            0.70,
-            "both",
-            0,
-            false,
-            None,
-            "command",
-            5000,
-            10000,
-        );
-        assert_eq!(plan.confidence.point, 0.85);
-        assert!(!plan.record_fallback);
-        assert!(plan.record_cache_hit);
-        assert!(!plan.record_correction);
-        assert!((plan.efficiency_ratio.unwrap() - 0.5).abs() < 0.01);
-    }
-
-    #[test]
-    fn metrics_plan_fallback() {
-        let plan = build_routing_metrics_plan(
-            0.5.into(),
-            0.70,
-            "fallback",
-            1,
-            false,
-            None,
-            "question",
-            5000,
-            10000,
-        );
-        assert!(plan.record_fallback);
-        assert!(!plan.record_cache_hit);
-        // intent "question" → no efficiency_ratio
-        assert!(plan.efficiency_ratio.is_none());
-    }
-
-    #[test]
-    fn metrics_plan_correction() {
-        let plan = build_routing_metrics_plan(
-            0.8.into(),
-            0.70,
-            "regex",
-            0,
-            true,
-            Some("question"),
-            "command",
-            3000,
-            10000,
-        );
-        assert!(plan.record_correction);
-        // has_tier1 = true, so cache_hit = false
-        assert!(!plan.record_cache_hit);
-    }
 
     // ── ConfidenceCalibrator ──
 

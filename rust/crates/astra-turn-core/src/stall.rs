@@ -1,6 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use astra_core::RuntimeLimits;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -24,15 +23,6 @@ pub const SERVER_STALL_WINDOW: usize = 3;
 /// User-visible error prefix when the agentic loop exhausts the per-request remaining-turn budget.
 /// Call sites append the actual budget number, e.g. `format!("{} (budget: {} turns)", MSG, n)`.
 pub const CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG: &str = "Turn budget exhausted. To increase, set MO_MAX_TURNS (interactive) or MO_PLAN_SUBTASK_MAX_TURNS (plan subtasks).";
-
-/// User-visible error when the legacy in-process bridge exhausts the tool-round budget.
-pub fn cli_agentic_tool_round_budget_abort_msg(current_limit: usize) -> String {
-    format!(
-        "Tool-round budget exhausted. To increase, set MO_MAX_TOOL_ROUNDS to a larger value (current limit: {}, default: {}).",
-        current_limit,
-        RuntimeLimits::default().max_tool_rounds
-    )
-}
 
 /// Tools considered "exploration" — low-value if used repeatedly without
 /// a "productive" tool call in between.
@@ -180,7 +170,6 @@ pub fn round_tool_call_sig_and_names(tool_calls: &[Value]) -> (BTreeSet<String>,
 /// True when the last `window` rounds have **identical** tool-call signatures
 /// (name + args). This is the CLI-loop equivalent of [`detect_server_stall`].
 ///
-/// The older `detect_cli_tool_name_stall` variant looked only at tool-name
 /// sets, which misfired for legitimate patterns like three consecutive
 /// `read_file` calls with different paths. The signature-based version is
 /// the general fix: progress comes from *arguments changing*, not from
@@ -190,26 +179,6 @@ pub fn detect_cli_tool_sig_stall(
     window: usize,
 ) -> Result<bool, StallDetectionError> {
     detect_server_stall(turn_sigs, window)
-}
-
-/// Deprecated: retained for backward compatibility. Prefer
-/// [`detect_cli_tool_sig_stall`] which keys on full signatures (name+args).
-/// Set-of-names equality misfires when the same tool is called with
-/// different arguments across rounds.
-#[deprecated(
-    note = "use detect_cli_tool_sig_stall — name-only equality is prone to false positives"
-)]
-pub fn detect_cli_tool_name_stall(
-    turn_tool_names: &[HashSet<String>],
-    window: usize,
-) -> Result<bool, StallDetectionError> {
-    if window == 0 {
-        return Err(StallDetectionError::InvalidWindowOrBudget(0));
-    }
-    Ok(turn_tool_names.len() >= window
-        && turn_tool_names[turn_tool_names.len() - window..]
-            .windows(2)
-            .all(|w| w[0] == w[1]))
 }
 
 // ─── Divergence detection ───────────────────────────────────────────────────
@@ -847,14 +816,6 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn tool_round_abort_message_points_to_tool_round_limit() {
-        assert_eq!(
-            cli_agentic_tool_round_budget_abort_msg(30),
-            "Tool-round budget exhausted. To increase, set MO_MAX_TOOL_ROUNDS to a larger value (current limit: 30, default: 100)."
-        );
-    }
-
     // ── Stall detection ──
 
     #[test]
@@ -907,21 +868,6 @@ mod tests {
                 .any(|s| s.contains("read_file") && s.contains("a.rs"))
         );
         assert!(names.contains("read_file"));
-    }
-
-    #[test]
-    fn cli_tool_name_stall_three_identical_name_rounds() {
-        let one: HashSet<String> = HashSet::from_iter([String::from("read_file")]);
-        let v = vec![one.clone(), one.clone(), one];
-        assert!(detect_cli_tool_name_stall(&v, SERVER_STALL_WINDOW).unwrap());
-    }
-
-    #[test]
-    fn cli_tool_name_stall_not_triggered_when_middle_round_differs() {
-        let rf: HashSet<String> = HashSet::from_iter([String::from("read_file")]);
-        let bash: HashSet<String> = HashSet::from_iter([String::from("bash")]);
-        let v = vec![rf.clone(), bash, rf];
-        assert!(!detect_cli_tool_name_stall(&v, SERVER_STALL_WINDOW).unwrap());
     }
 
     // ── assess_progress (general progress-aware stall) ──
@@ -1923,35 +1869,6 @@ mod tests {
             .collect();
         let sigs = vec![round_a.clone(), round_b, round_a];
         assert!(!detect_server_stall(&sigs, 3).unwrap());
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  detect_cli_tool_name_stall — additional cases
-    // ══════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn cli_name_stall_empty_input() {
-        assert!(!detect_cli_tool_name_stall(&[], 3).unwrap());
-    }
-
-    #[test]
-    fn cli_name_stall_single_entry() {
-        let one: HashSet<String> = HashSet::from_iter([String::from("bash")]);
-        assert!(!detect_cli_tool_name_stall(&[one], 3).unwrap());
-    }
-
-    #[test]
-    fn cli_name_stall_multi_tool_identical_sets() {
-        let set: HashSet<String> =
-            HashSet::from_iter(["bash".to_string(), "read_file".to_string()]);
-        let v = vec![set.clone(), set.clone(), set];
-        assert!(detect_cli_tool_name_stall(&v, 3).unwrap());
-    }
-
-    #[test]
-    fn cli_name_stall_window_of_one() {
-        let one: HashSet<String> = HashSet::from_iter([String::from("bash")]);
-        assert!(detect_cli_tool_name_stall(&[one], 1).unwrap());
     }
 
     // ══════════════════════════════════════════════════════════════════════

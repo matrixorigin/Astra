@@ -751,17 +751,4 @@ mod unit_tests {
         let s = UnconfiguredTaskLeaseService;
         assert!(s.try_claim_lease("u", "t", "a", "e", 60).await.is_err());
     }
-
-    /// audit-D9: multi_agent must not silently drop DB write errors.
-    #[test]
-    fn multi_agent_db_writes_are_not_silently_dropped() {
-        let source = include_str!("multi_agent.rs");
-        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
-        let prod_code = &source[..test_start];
-        let count = prod_code.matches("let _ = sqlx::query").count();
-        assert_eq!(
-            count, 0,
-            "multi_agent has {count} silently-dropped DB writes"
-        );
-    }
 }

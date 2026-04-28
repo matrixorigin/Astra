@@ -344,28 +344,6 @@ impl PermissionManager {
         self.mode = mode;
     }
 
-    /// Label + stable fingerprint of loaded rules (for `edge_profile` / cloud audit).
-    #[allow(dead_code)]
-    pub(super) fn edge_audit_summary(&self) -> (String, String) {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        self.mode.hash(&mut h);
-        for rule in &self.cached_allow {
-            rule.hash(&mut h);
-        }
-        for rule in &self.cached_deny {
-            rule.hash(&mut h);
-        }
-        for rule in &self.cached_user_allow {
-            rule.hash(&mut h);
-        }
-        for rule in &self.cached_user_deny {
-            rule.hash(&mut h);
-        }
-        (self.mode.to_string(), format!("{:016x}", h.finish()))
-    }
-
     /// Create without loading project settings. Used in tests and internal auto-approved operations.
     #[cfg(test)]
     pub(super) fn new(auto_approve: bool) -> Self {
