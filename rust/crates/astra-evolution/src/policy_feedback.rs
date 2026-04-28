@@ -478,4 +478,39 @@ mod tests {
             "a prior proposal for a different model must not count"
         );
     }
+
+    /// Compile-time tripwire: when a new field is added to
+    /// [`PolicyTuningProposal`], the exhaustive destructure below stops
+    /// compiling. At that moment, *stop and decide* for the new field:
+    ///
+    ///   - is it part of the **decision** (what we want to change)? →
+    ///     include it in [`PolicyTuningProposal::decision_key`], then
+    ///     update this test's destructure + decision_key() assertion.
+    ///   - is it **noise** (window-specific numbers, audit text)? →
+    ///     leave `decision_key` alone, just update this destructure.
+    ///
+    /// The original 🔴 bug was exactly this category of mistake — adding
+    /// the `reason` field later would have re-introduced it. Lock it in.
+    #[test]
+    fn decision_key_exhaustively_covers_decision_fields() {
+        let proposal =
+            propose_policy_tuning(&stats("opus", 100, 95, 4)).expect("tighten-opus proposal");
+
+        // Exhaustive destructure — compile error when fields are added.
+        // Every field must be listed explicitly (no `..`).
+        let PolicyTuningProposal {
+            // Decision fields — MUST appear in decision_key().
+            model_match,
+            new_max_identical_tool_calls,
+            // Noise fields — MUST NOT appear in decision_key().
+            reason: _,
+        } = &proposal;
+
+        assert_eq!(
+            proposal.decision_key(),
+            (model_match.as_str(), *new_max_identical_tool_calls),
+            "decision_key must exactly mirror the decision fields; if you \
+             added a field, update decision_key + this test together"
+        );
+    }
 }

@@ -109,13 +109,19 @@ impl SafetyConfig {
     /// [`RuntimeConfig::merge`]).
     #[must_use]
     pub fn resolved_trust_mode(&self) -> TrustModeSerde {
-        self.trust_mode.clone().unwrap_or_default()
+        self.trust_mode.unwrap_or_default()
     }
 }
 
 /// Serializable trust-mode string. Matches the snake-case variants of
 /// `astra_turn_core::safety_middleware::TrustMode`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+///
+/// `Copy` + `Hash` + `Ord` are free for a unit-variant enum and let this
+/// value be used as a map key, passed by value on hot paths, and sorted
+/// without a custom impl. No invariants depend on the absence of these.
+#[derive(
+    Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustModeSerde {
     #[default]
@@ -525,15 +531,19 @@ pub struct EffectiveToolPolicy {
 }
 
 impl ToolSelectionConfig {
-    /// Resolved max identical tool calls (0 → default of 3).
+    /// Resolved max identical tool calls (0 → default of 3, floor of 2).
     ///
     /// Default raised from 2 → 3 on 2026-04-27: the prior limit fired on the
     /// common "read → re-check after an edit" flow, which is legitimate rather
     /// than a loop. Per-model profiles can tighten or loosen this further —
     /// see [`ToolSelectionConfig::resolve_for_model`].
+    ///
+    /// The floor of 2 is symmetric with the per-profile floor in
+    /// `apply_profile`. A value of 1 would turn every second identical call
+    /// into a dedup hit — almost always a misconfig.
     pub fn effective_max_identical_calls(&self) -> u32 {
         if self.max_identical_tool_calls > 0 {
-            self.max_identical_tool_calls
+            self.max_identical_tool_calls.max(2)
         } else {
             3
         }
@@ -717,8 +727,9 @@ fn resolve_threshold(value: u32, default: u32, floor: u32) -> u32 {
 ///
 /// Shorter patterns are almost always a misconfig (`"4"` would match any
 /// model containing a `4`, `"us"` would match every Bedrock id, etc.).
-/// Rejected patterns are silently ignored at resolve time — callers should
-/// surface them via `astra config show-policy` / validation, not runtime.
+/// Rejected patterns are silently ignored at resolve time — use
+/// [`ToolSelectionConfig::rejected_model_match_patterns`] to surface them
+/// (e.g. `astra config show-policy` prints a warning block for each).
 const MIN_MODEL_MATCH_LEN: usize = 3;
 
 /// Case-insensitive substring match for [`ModelPolicyProfile::model_match`].
@@ -736,6 +747,25 @@ fn model_profile_matches(pattern: &str, model_lower: &str) -> bool {
         return false;
     }
     model_lower.contains(&pattern.to_ascii_lowercase())
+}
+
+impl ToolSelectionConfig {
+    /// Return every `model_match` pattern in `model_profiles` that is too
+    /// short to be considered at resolve time (see [`MIN_MODEL_MATCH_LEN`]).
+    ///
+    /// These patterns match nothing — intended to surface them through
+    /// user-facing tooling (e.g. `astra config show-policy`) so the user
+    /// can notice the misconfig. The empty-string fallback pattern is
+    /// intentionally accepted and not reported.
+    pub fn rejected_model_match_patterns(&self) -> Vec<String> {
+        self.model_profiles
+            .iter()
+            .filter(|p| {
+                !p.model_match.is_empty() && p.model_match.chars().count() < MIN_MODEL_MATCH_LEN
+            })
+            .map(|p| p.model_match.clone())
+            .collect()
+    }
 }
 
 /// Apply a profile's non-zero fields over a base policy.
@@ -1735,8 +1765,43 @@ mod tests {
         config.max_identical_tool_calls = 5;
         assert_eq!(config.effective_max_identical_calls(), 5);
 
+        // Floor applied: 1 would make every second identical call a dedup
+        // hit (see `apply_profile` for the matching per-model floor).
         config.max_identical_tool_calls = 1;
-        assert_eq!(config.effective_max_identical_calls(), 1);
+        assert_eq!(
+            config.effective_max_identical_calls(),
+            2,
+            "global max_identical_tool_calls = 1 must clamp to floor 2, \
+             mirroring the per-model floor in `apply_profile`"
+        );
+    }
+
+    /// The symmetry regression — this asserts the global and per-profile
+    /// floors behave the same when both set `max_identical_tool_calls = 1`.
+    /// Before the fix, `apply_profile` clamped to 2 but the global path
+    /// returned 1 verbatim.
+    #[test]
+    fn global_and_profile_floors_for_max_identical_calls_agree() {
+        let cfg = ToolSelectionConfig {
+            max_identical_tool_calls: 1,
+            ..Default::default()
+        };
+        let global = cfg.effective_max_identical_calls();
+
+        let mut cfg2 = ToolSelectionConfig::default();
+        cfg2.model_profiles.push(ModelPolicyProfile {
+            model_match: "custom".to_string(),
+            max_identical_tool_calls: 1,
+            ..Default::default()
+        });
+        let via_profile = cfg2
+            .resolve_for_model(Some("custom-model"))
+            .max_identical_tool_calls;
+
+        assert_eq!(
+            global, via_profile,
+            "floor must be symmetric between global and per-profile paths"
+        );
     }
 
     #[test]
@@ -2389,6 +2454,36 @@ selector_model = "qwen-flash"
     }
 
     #[test]
+    fn rejected_model_match_patterns_lists_short_patterns_preserves_order() {
+        // Intent: `show-policy` can read this list verbatim and tell the
+        // user "these patterns are being ignored".
+        let mut cfg = ToolSelectionConfig::default();
+        for p in ["4", "op", "opus", "", "us"] {
+            cfg.model_profiles.push(ModelPolicyProfile {
+                model_match: p.to_string(),
+                ..Default::default()
+            });
+        }
+        let rejected = cfg.rejected_model_match_patterns();
+        // Short non-empty patterns surfaced, in declaration order.
+        // "opus" (valid) and "" (explicit fallback) must be filtered out.
+        assert_eq!(
+            rejected,
+            vec!["4".to_string(), "op".to_string(), "us".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejected_model_match_patterns_empty_when_all_valid() {
+        let mut cfg = ToolSelectionConfig::default();
+        cfg.model_profiles.push(ModelPolicyProfile {
+            model_match: "gpt-5".to_string(),
+            ..Default::default()
+        });
+        assert!(cfg.rejected_model_match_patterns().is_empty());
+    }
+
+    #[test]
     fn model_profiles_round_trip_through_toml() {
         let mut cfg = RuntimeConfig::default();
         cfg.tool_selection.model_profiles.push(ModelPolicyProfile {
@@ -2426,6 +2521,16 @@ selector_model = "qwen-flash"
             cfg.safety.trust_mode.is_none(),
             "default must be None so layered configs can explicitly set Strict too"
         );
+    }
+
+    /// `TrustModeSerde` is a unit-variant enum — making it `Copy` avoids
+    /// `.clone()` on the read path and is a typical shape for small
+    /// config enums. This is a compile-time assertion; if `Copy` is
+    /// dropped, `fn requires<T: Copy>() {}` stops compiling.
+    #[test]
+    fn trust_mode_serde_is_copy() {
+        fn requires_copy<T: Copy>() {}
+        requires_copy::<TrustModeSerde>();
     }
 
     #[test]
