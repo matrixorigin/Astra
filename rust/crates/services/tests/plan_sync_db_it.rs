@@ -2,7 +2,7 @@
 //! [`astra_services::MatrixOneSyncService`].
 //!
 //! ```text
-//! ASTRA_PLAN_DB_IT=1 cargo test -p astra-services --test plan_sync_db_it -- --ignored
+//! ASTRA_DB_IT=1 cargo test -p astra-services --test plan_sync_db_it -- --ignored
 //! ```
 //!
 //! Shares the same env conventions as `services_db_integration.rs`.
@@ -17,9 +17,9 @@ use uuid::Uuid;
 
 fn require_db_it_env() -> MatrixOneSettings {
     assert_eq!(
-        std::env::var("ASTRA_PLAN_DB_IT").as_deref(),
+        std::env::var("ASTRA_DB_IT").as_deref(),
         Ok("1"),
-        "set ASTRA_PLAN_DB_IT=1 for ignored plan_sync_db_it tests"
+        "set ASTRA_DB_IT=1 for ignored plan_sync_db_it tests"
     );
     dotenvy::dotenv().ok();
     MatrixOneSettings {
@@ -98,7 +98,7 @@ async fn scalar_i64(pool: &sqlx::Pool<sqlx::MySql>, sql: &str, bind: &str) -> i6
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn push_plans_pack_upserts_plans_and_steps() {
     let pool = setup_pool().await;
     let svc = MatrixOneSyncService::new(pool.clone());
@@ -137,7 +137,7 @@ async fn push_plans_pack_upserts_plans_and_steps() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn push_plans_pack_rejects_stale_version_optimistically() {
     let pool = setup_pool().await;
     let svc = MatrixOneSyncService::new(pool.clone());
@@ -213,7 +213,7 @@ async fn push_plans_pack_rejects_stale_version_optimistically() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn push_plans_pack_drops_cross_user_plans() {
     let pool = setup_pool().await;
     let svc = MatrixOneSyncService::new(pool.clone());
@@ -258,7 +258,7 @@ async fn push_plans_pack_drops_cross_user_plans() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn push_plans_pack_step_runs_are_idempotent_on_replay() {
     let pool = setup_pool().await;
     let svc = MatrixOneSyncService::new(pool.clone());
@@ -319,7 +319,7 @@ async fn push_plans_pack_step_runs_are_idempotent_on_replay() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn push_plans_pack_rejects_orphan_step_runs() {
     let pool = setup_pool().await;
     let svc = MatrixOneSyncService::new(pool.clone());
@@ -348,7 +348,7 @@ async fn push_plans_pack_rejects_orphan_step_runs() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn push_plans_pack_scales_to_fifty_plans_without_n_plus_one() {
     // The original impl did `SELECT version FROM plans WHERE plan_id = ?`
     // per-plan inside a loop plus `SELECT user_id FROM plans WHERE plan_id = ?`
@@ -463,7 +463,7 @@ async fn push_plans_pack_scales_to_fifty_plans_without_n_plus_one() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn push_plans_pack_preserves_edge_step_run_timestamps() {
     // Regression for the NOW(6) timestamp bug: when an edge executes offline
     // and later syncs, the cloud must record the ACTUAL execution timeline
@@ -545,7 +545,7 @@ async fn push_plans_pack_preserves_edge_step_run_timestamps() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn pull_plans_pack_returns_user_scoped_plans_and_runs() {
     let pool = setup_pool().await;
     let svc = MatrixOneSyncService::new(pool.clone());
@@ -606,7 +606,7 @@ async fn pull_plans_pack_returns_user_scoped_plans_and_runs() {
 /// sync endpoint must reject it rather than silently store a nonsensical
 /// audit row that breaks time-ordered queries.
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn push_plans_pack_rejects_step_run_with_inverted_timestamps() {
     let pool = setup_pool().await;
     let svc = MatrixOneSyncService::new(pool.clone());
@@ -652,7 +652,7 @@ async fn push_plans_pack_rejects_step_run_with_inverted_timestamps() {
 /// chain. Any `started_at` more than ±10 years from now is obviously bogus
 /// and must be rejected.
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn push_plans_pack_rejects_step_run_with_out_of_range_timestamps() {
     let pool = setup_pool().await;
     let svc = MatrixOneSyncService::new(pool.clone());
@@ -702,7 +702,7 @@ async fn push_plans_pack_rejects_step_run_with_out_of_range_timestamps() {
 /// directly calling the dedupe SQL and verifying only one row survives and
 /// the ADD UNIQUE succeeds afterwards.
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn migration_dedupe_removes_duplicate_attempt_tuples() {
     let pool = setup_pool().await;
     let plan_id = format!("pit-mig-{}", Uuid::new_v4().simple());
@@ -812,7 +812,7 @@ async fn migration_dedupe_removes_duplicate_attempt_tuples() {
 /// `error` and `artifact_ref` are TEXT/VARCHAR columns — unbounded client
 /// strings are an edge-side DoS vector. The sync endpoint caps them.
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn push_plans_pack_rejects_step_run_with_oversized_error_string() {
     let pool = setup_pool().await;
     let svc = MatrixOneSyncService::new(pool.clone());

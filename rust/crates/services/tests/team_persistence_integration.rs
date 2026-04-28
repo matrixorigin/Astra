@@ -1,7 +1,7 @@
 //! MySQL / MatrixOne integration tests for [`astra_services::team_persistence`].
 //!
 //! ```text
-//! ASTRA_MULTI_AGENT_IT=1 cargo test -p astra-services team_persistence_integration -- --ignored
+//! ASTRA_DB_IT=1 cargo test -p astra-services team_persistence_integration -- --ignored
 //! ```
 //!
 //! Uses `MATRIXONE_*` env vars (after `dotenvy`) with the same defaults as local dev.
@@ -18,9 +18,9 @@ use uuid::Uuid;
 
 fn require_it_env() -> MatrixOneSettings {
     assert_eq!(
-        std::env::var("ASTRA_MULTI_AGENT_IT").as_deref(),
+        std::env::var("ASTRA_DB_IT").as_deref(),
         Ok("1"),
-        "set ASTRA_MULTI_AGENT_IT=1 for ignored integration tests"
+        "set ASTRA_DB_IT=1 for ignored integration tests"
     );
     dotenvy::dotenv().ok();
     MatrixOneSettings {
@@ -98,7 +98,7 @@ fn test_team(suffix: &str, coord: TeamCoordination) -> TeamDefinition {
 // ─── CRUD Tests ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore = "ASTRA_MULTI_AGENT_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn team_crud_roundtrip() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
@@ -154,7 +154,7 @@ async fn team_crud_roundtrip() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_MULTI_AGENT_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn save_team_rejects_primary_key_collision_with_different_logical_team() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
@@ -201,7 +201,7 @@ async fn save_team_rejects_primary_key_collision_with_different_logical_team() {
 // ─── Execution History Tests ────────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore = "ASTRA_MULTI_AGENT_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn execution_history_lifecycle() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
@@ -254,7 +254,7 @@ async fn execution_history_lifecycle() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_MULTI_AGENT_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn execution_history_respects_limit() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
@@ -293,7 +293,7 @@ async fn execution_history_respects_limit() {
 // ─── Coordination Variant Serialization ─────────────────────────────────────
 
 #[tokio::test]
-#[ignore = "ASTRA_MULTI_AGENT_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn coordination_variants_roundtrip() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
@@ -345,7 +345,7 @@ async fn coordination_variants_roundtrip() {
 // ─── Budget/Max-Parallel Roundtrip ──────────────────────────────────────────
 
 #[tokio::test]
-#[ignore = "ASTRA_MULTI_AGENT_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn budget_and_max_parallel_roundtrip() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
@@ -394,7 +394,7 @@ async fn budget_and_max_parallel_roundtrip() {
 // ─── Builtins Seeding ───────────────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore = "ASTRA_MULTI_AGENT_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn ensure_builtins_idempotent() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();

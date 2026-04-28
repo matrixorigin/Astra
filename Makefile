@@ -462,36 +462,37 @@ test-runtime-bridge-hooks:
 	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --features bridge-e2e-hooks
 
 # Ignored tests: opt-in via env vars (see `make test-online`). Enable with:
-#   ASTRA_SYSTEM_MATRIX_E2E=1   -> system_matrix_http_e2e (--ignored)
-#   ASTRA_MULTI_AGENT_IT=1      -> astra-services multi_agent_integration + team_persistence (--ignored)
-#   ASTRA_SERVICES_DB_IT=1      -> astra-services services_db_integration (--ignored): list clamps,
-#                                 skills index, cross-session audit stats/lists, durable_task resume history
-# Optional serial Matrix E2E: ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS=1 -> --test-threads=1
+#   ASTRA_DB_IT=1   -> all online/Matrix ignored integration tests (--ignored)
+
+# Optional serial Matrix E2E: ASTRA_DB_IT_TEST_THREADS=1 -> --test-threads=1
 .PHONY: test-ignored-integration
 test-ignored-integration:
-	@if [ "$${ASTRA_SYSTEM_MATRIX_E2E:-}" != "1" ] && [ "$${ASTRA_MULTI_AGENT_IT:-}" != "1" ] && [ "$${ASTRA_SERVICES_DB_IT:-}" != "1" ]; then \
-		echo "Note: no online/Matrix ignored suites selected. Use \`make test-online\` or set ASTRA_SYSTEM_MATRIX_E2E=1 / ASTRA_MULTI_AGENT_IT=1 / ASTRA_SERVICES_DB_IT=1."; \
+	@if [ "$${ASTRA_DB_IT:-}" != "1" ]; then \
+		echo "Note: no online/Matrix ignored suites selected. Use \`make test-online\` or set ASTRA_DB_IT=1."; \
 	fi
-	@if [ "$${ASTRA_SYSTEM_MATRIX_E2E:-}" = "1" ]; then \
+	@if [ "$${ASTRA_DB_IT:-}" = "1" ]; then \
 		EXTRA_THREADS=""; \
-		if [ "$${ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS:-}" = "1" ]; then \
+		if [ "$${ASTRA_DB_IT_TEST_THREADS:-}" = "1" ]; then \
 			EXTRA_THREADS="--test-threads=1"; \
-			echo "system_matrix_http_e2e: serial mode (ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS=1)"; \
+			echo "system_matrix_http_e2e: serial mode (ASTRA_DB_IT_TEST_THREADS=1)"; \
 		else \
 			echo "Running system_matrix_http_e2e (ignored; parallel default; live DB + AppSettings::from_env)..."; \
 		fi; \
 		$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --features bridge-e2e-hooks \
 			--test system_matrix_http_e2e -- --ignored $$EXTRA_THREADS --nocapture; \
-	fi
-	@if [ "$${ASTRA_MULTI_AGENT_IT:-}" = "1" ]; then \
+		\
 		echo "Running multi_agent_integration (ignored; live MatrixOne)..."; \
 		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-services --test multi_agent_integration -- --ignored; \
 		echo "Running team_persistence_integration (ignored; live MatrixOne)..."; \
 		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-services --test team_persistence_integration -- --ignored; \
-	fi
-	@if [ "$${ASTRA_SERVICES_DB_IT:-}" = "1" ]; then \
 		echo "Running services_db_integration (ignored; live MatrixOne)..."; \
 		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-services --test services_db_integration -- --ignored; \
+		echo "Running plan_sync_db_it (ignored; live MatrixOne)..."; \
+		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-services --test plan_sync_db_it -- --ignored; \
+		echo "Running plan_repository_db_it (ignored; live MatrixOne)..."; \
+		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-plan --test plan_repository_db_it -- --ignored; \
+		echo "Running plan_http_db_it (ignored; live MatrixOne)..."; \
+		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test plan_http_db_it -- --ignored; \
 	fi
 
 # Online (MatrixOne): opt-in #[ignore] integration binaries (see test-ignored-integration).
@@ -517,7 +518,7 @@ test-online:
 	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 		$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) -- --ignored; \
 	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
-		ASTRA_SYSTEM_MATRIX_E2E=1 ASTRA_MULTI_AGENT_IT=1 ASTRA_SERVICES_DB_IT=1 \
+		ASTRA_DB_IT=1 \
 		$(MAKE) test-ignored-integration
 	@if [ "$${ASTRA_SDK_ONLINE_E2E:-}" = "1" ]; then \
 		$(MAKE) test-sdk-online; \

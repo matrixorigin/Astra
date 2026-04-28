@@ -10,7 +10,7 @@
 //!   - Asserts both the JSON response body **and** actual rows in MatrixOne
 //!
 //! ```text
-//! ASTRA_PLAN_DB_IT=1 cargo test -p astra-runtime --test plan_http_db_it -- --ignored
+//! ASTRA_DB_IT=1 cargo test -p astra-runtime --test plan_http_db_it -- --ignored
 //! ```
 
 use std::sync::Arc;
@@ -43,9 +43,9 @@ impl HealthChecker for HealthyStub {
 
 fn require_db_it_env() -> MatrixOneSettings {
     assert_eq!(
-        std::env::var("ASTRA_PLAN_DB_IT").as_deref(),
+        std::env::var("ASTRA_DB_IT").as_deref(),
         Ok("1"),
-        "set ASTRA_PLAN_DB_IT=1 for ignored plan_http_db_it tests"
+        "set ASTRA_DB_IT=1 for ignored plan_http_db_it tests"
     );
     dotenvy::dotenv().ok();
     MatrixOneSettings {
@@ -194,7 +194,7 @@ async fn seed_plan_with_subtasks(app: &Router, goal: &str, subtasks: &[&str]) ->
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn post_plans_creates_row_owned_by_authenticated_user() {
     let (app, pool) = setup_app().await;
 
@@ -221,7 +221,7 @@ async fn post_plans_creates_row_owned_by_authenticated_user() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn get_plan_invalid_id_returns_400_not_500() {
     let (app, _pool) = setup_app().await;
     let (status, body) = request_json(app, "GET", "/plans/..%2Fetc%2Fpasswd", None).await;
@@ -233,7 +233,7 @@ async fn get_plan_invalid_id_returns_400_not_500() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn get_plan_unknown_id_returns_404() {
     let (app, _pool) = setup_app().await;
     let (status, _) = request_json(app, "GET", "/plans/doesnotexist-xyz", None).await;
@@ -241,7 +241,7 @@ async fn get_plan_unknown_id_returns_404() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn put_plan_with_stale_expected_version_returns_409() {
     let (app, pool) = setup_app().await;
     let (plan_id, version) = seed_plan_with_subtasks(&app, "http-ver-conflict", &["a", "b"]).await;
@@ -278,7 +278,7 @@ async fn put_plan_with_stale_expected_version_returns_409() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn rewind_resets_suffix_and_records_timeline_event() {
     let (app, pool) = setup_app().await;
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-rewind", &["a", "b", "c"]).await;
@@ -349,7 +349,7 @@ async fn rewind_resets_suffix_and_records_timeline_event() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn redo_step_resets_single_subtask_only() {
     let (app, pool) = setup_app().await;
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-redo", &["a", "b"]).await;
@@ -397,7 +397,7 @@ async fn redo_step_resets_single_subtask_only() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn start_and_finish_step_run_round_trips_through_plan_step_runs_table() {
     let (app, pool) = setup_app().await;
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-runs", &["s1", "s2"]).await;
@@ -480,7 +480,7 @@ async fn start_and_finish_step_run_round_trips_through_plan_step_runs_table() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn execute_pins_active_plan_id_on_session() {
     let (app, pool) = setup_app().await;
     let (plan_id, v0) = seed_plan_with_subtasks(&app, "http-exec", &["s1"]).await;
@@ -527,7 +527,7 @@ async fn execute_pins_active_plan_id_on_session() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn delete_plan_clears_active_plan_id_on_any_session() {
     let (app, pool) = setup_app().await;
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-del", &["s1"]).await;
@@ -566,7 +566,7 @@ async fn delete_plan_clears_active_plan_id_on_any_session() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn post_completed_step_run_persists_finalized_row_in_one_call() {
     // The CLI executor's happy path (subtask completed) only ever needs to
     // record a terminal-state attempt. The start+finish pair costs 2 HTTP
@@ -623,7 +623,7 @@ async fn post_completed_step_run_persists_finalized_row_in_one_call() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn post_completed_step_run_rejects_in_progress_status() {
     // The one-shot endpoint is for terminal states only — an attempt that
     // ended in_progress shouldn't exist. The handler must 400 so callers
@@ -656,7 +656,7 @@ async fn post_completed_step_run_rejects_in_progress_status() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn end_to_end_thin_client_posts_step_run_pair_and_persists_row() {
     // This test mirrors what the CLI executor does at the completed path:
     // it uses the real `ThinClient` against a real HTTP server to post a
@@ -749,7 +749,7 @@ async fn end_to_end_thin_client_posts_step_run_pair_and_persists_row() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn exit_plan_mode_approved_clears_session_active_plan_id() {
     // Regression: exit_plan_mode_handler previously only flipped the phase
     // hint in the response body — it did NOT clear agent_sessions.active_plan_id.
@@ -815,7 +815,7 @@ async fn exit_plan_mode_approved_clears_session_active_plan_id() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn exit_plan_mode_rejected_leaves_active_plan_id_pinned() {
     // Control: rejecting keeps the plan pinned so the next authoring pass
     // still benefits from the write guard.
@@ -861,7 +861,7 @@ async fn exit_plan_mode_rejected_leaves_active_plan_id_pinned() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn exit_plan_mode_records_lifecycle_decision() {
     let (app, pool) = setup_app().await;
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-exit", &["s1"]).await;
@@ -906,7 +906,7 @@ async fn exit_plan_mode_records_lifecycle_decision() {
 /// `plan_step_runs.attempt`, poison `max(attempt) + 1` redo logic, or wrap
 /// on overflow. Handler must reject with 400 before the INSERT.
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn start_step_run_rejects_attempt_out_of_range() {
     let (app, pool) = setup_app().await;
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-attempt-range", &["s1"]).await;
@@ -946,7 +946,7 @@ async fn start_step_run_rejects_attempt_out_of_range() {
 
 /// Same rule applies to the one-shot completed-step-run endpoint.
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn post_completed_step_run_rejects_attempt_out_of_range() {
     let (app, pool) = setup_app().await;
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-cattempt", &["s1"]).await;
@@ -981,7 +981,7 @@ async fn post_completed_step_run_rejects_attempt_out_of_range() {
 /// backpressure: a malicious client can stuff a 10MB string into the journal
 /// or the `plan_step_runs.error` column. Handlers must cap them.
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn rewind_rejects_oversized_reason_string() {
     let (app, pool) = setup_app().await;
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-rewind-big", &["a", "b"]).await;
@@ -1005,7 +1005,7 @@ async fn rewind_rejects_oversized_reason_string() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn finish_step_run_rejects_oversized_error_and_artifact_ref() {
     let (app, pool) = setup_app().await;
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-finish-big", &["s1"]).await;
@@ -1076,7 +1076,7 @@ async fn finish_step_run_rejects_oversized_error_and_artifact_ref() {
 /// detectors think the subtask was still executing. Handler must now cancel
 /// any open runs for the reset suffix.
 #[tokio::test]
-#[ignore = "ASTRA_PLAN_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
 async fn rewind_cancels_open_step_runs_for_reset_subtasks() {
     let (app, pool) = setup_app().await;
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-rewind-abort", &["a", "b", "c"]).await;
