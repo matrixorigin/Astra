@@ -671,10 +671,18 @@ fn complete_active_runtime_todo_if_finalized(
     let Some(active) = state.continuity.todos.active_or_next().cloned() else {
         return;
     };
-    if active.status != astra_turn_core::continuity::TodoStatus::InProgress
-        || active.evidence.is_empty()
-    {
+    if active.status != astra_turn_core::continuity::TodoStatus::InProgress {
         return;
+    }
+    // If the round produced a final answer without any tool evidence
+    // (e.g. pure Q&A), seed a weak evidence entry so the todo can close.
+    // Otherwise the manifest keeps advertising `in_progress` forever and
+    // misleads future rounds.
+    if active.evidence.is_empty() {
+        state
+            .continuity
+            .todos
+            .add_evidence(&active.id, "answered without tool invocation");
     }
     state.continuity.todos.mark_done(
         &active.id,

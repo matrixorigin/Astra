@@ -50,22 +50,26 @@ impl ContinuityState {
 
     pub fn ensure_goal(&mut self, goal: impl Into<String>) {
         if self.goal.text.trim().is_empty() {
-            self.goal.text = goal.into();
+            // Redact on intake so any secret accidentally included in the
+            // user's first turn never gets persisted into checkpoints via
+            // ContinuityState.goal.text.
+            self.goal.text = redact_sensitive(&goal.into());
         }
     }
 
     pub fn ensure_tracked_goal(&mut self, goal: impl Into<String>) -> Option<&TodoItem> {
         let goal = goal.into();
-        self.ensure_goal(goal.clone());
-        if !should_track_request(&goal) || self.todos.has_items() {
+        let redacted_goal = redact_sensitive(&goal);
+        self.ensure_goal(redacted_goal.clone());
+        if !should_track_request(&redacted_goal) || self.todos.has_items() {
             return self.todos.active_or_next();
         }
 
-        let title = first_sentence(&goal);
+        let title = first_sentence(&redacted_goal);
         self.todos.add_item(TodoItem {
             id: "runtime-goal".to_string(),
             title: truncate_clean(&title, 120),
-            description: truncate_clean(&goal, 320),
+            description: truncate_clean(&redacted_goal, 320),
             status: TodoStatus::Pending,
             evidence: Vec::new(),
             blocked_reason: None,
@@ -710,6 +714,40 @@ mod tests {
         assert_eq!(active.id, "runtime-goal");
         assert_eq!(active.status, TodoStatus::Pending);
         assert_eq!(state.todos.items.len(), 1);
+    }
+
+    #[test]
+    fn ensure_goal_does_not_overwrite_existing_goal_on_followup_turn() {
+        // Regression: attention manifest injection runs every round with
+        // `state.message`. A terse follow-up ("继续") must not overwrite the
+        // original tracked goal.
+        let mut state = ContinuityState::default();
+        state.ensure_tracked_goal("Implement runtime continuity and add tests");
+        let original_goal = state.goal.text.clone();
+        assert!(!original_goal.is_empty());
+
+        state.ensure_goal("继续");
+        state.ensure_tracked_goal("继续");
+
+        assert_eq!(state.goal.text, original_goal);
+        assert_eq!(state.todos.items.len(), 1);
+        assert_eq!(state.todos.items[0].id, "runtime-goal");
+    }
+
+    #[test]
+    fn ensure_goal_redacts_secret_like_value_on_intake() {
+        // Defense-in-depth: if the user's first turn contains a bearer token
+        // or API key, it must be scrubbed before being persisted into
+        // checkpoints via ContinuityState.goal.text.
+        let mut state = ContinuityState::default();
+        state.ensure_goal(
+            "deploy with Authorization: Bearer sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        );
+        assert!(
+            !state.goal.text.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+            "goal text must not retain raw secret: {}",
+            state.goal.text
+        );
     }
 
     #[test]
