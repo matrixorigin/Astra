@@ -46,16 +46,6 @@ pub struct PlanMetrics {
 }
 
 impl PlanMetrics {
-    /// Record a plan edit.
-    pub fn record_edit(&mut self) {
-        self.edit_count += 1;
-    }
-
-    /// Record a new version.
-    pub fn record_version(&mut self) {
-        self.version_count += 1;
-    }
-
     /// Record token usage from a turn.
     pub fn record_tokens(&mut self, prompt: u64, completion: u64) {
         self.total_prompt_tokens += prompt;
