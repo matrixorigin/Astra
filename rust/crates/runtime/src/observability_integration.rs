@@ -1303,19 +1303,6 @@ pub fn on_turn_end(hub: &ObservabilityHub, session: &mut ObservabilitySession, t
     }
 }
 
-/// Hook called on task completion.
-pub fn on_task_complete(
-    hub: &ObservabilityHub,
-    session_id: &str,
-    success: bool,
-    reason: Option<&str>,
-) {
-    if success {
-        hub.record_success(session_id);
-    } else {
-        hub.record_failure(session_id, reason.unwrap_or("unknown"));
-    }
-}
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 

@@ -96,7 +96,6 @@ pub mod orchestration_types;
 pub mod permission_sync;
 pub mod permission_types;
 pub mod persist;
-pub mod progress_display;
 pub mod quality;
 pub mod routing_metrics;
 pub mod tool_registry_chain;
@@ -130,7 +129,6 @@ pub mod agentic_turn_telemetry;
 pub mod chat_turn_edge_profile;
 pub mod cloud_compact_prompt;
 pub mod cloud_summary;
-pub mod session_replay_harness;
 pub mod sse_data_lines;
 
 // Phase 18: contracts, session cache, trace collector

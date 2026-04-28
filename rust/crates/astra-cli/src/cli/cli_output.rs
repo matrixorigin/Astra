@@ -172,10 +172,6 @@ pub fn cli_bullet(text: &str) {
 pub fn cli_numbered(index: usize, text: &str) {
     eprintln!("  {}. {}", format!("{:>2}", index).dim(), text);
 }
-/// Complete a progress line with success.
-pub fn cli_progress_done() {
-    eprintln!(" {}", theme::icon_ok());
-}
 // ─────────────────────────────────────────────────────────────────────────────
 // Layered Error Formatting — "Did you mean?" suggestions + actionable hints
 // ─────────────────────────────────────────────────────────────────────────────
