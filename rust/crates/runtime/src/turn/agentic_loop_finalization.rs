@@ -698,6 +698,123 @@ mod tests {
 
     use super::*;
 
+    // ── Direct unit tests for complete_active_runtime_todo_if_finalized ──
+    //
+    // These lock the three gating conditions of the "no-tool-turn todo
+    // closure" policy introduced in commit 3072457:
+    //   1. `had_error == true` MUST prevent closure (avoid falsely marking
+    //      failed rounds as done).
+    //   2. empty `final_text` MUST prevent closure (the round did not
+    //      actually produce an answer).
+    //   3. an in-progress active todo with NO evidence MUST be closed with
+    //      a synthetic "answered without tool invocation" evidence, so the
+    //      attention manifest does not keep advertising `in_progress`.
+    //
+    // Previously this function was only covered indirectly via the agentic
+    // loop E2E tests. A regression that silently re-enabled the old behavior
+    // (never closing no-tool-turn todos) would not have been caught by any
+    // direct assertion.
+
+    fn seed_active_todo(state: &mut super::super::agentic_loop_host::AgenticLoopState) {
+        use astra_turn_core::continuity::{TodoItem, TodoStatus};
+        state.continuity.todos.add_item(TodoItem {
+            id: "runtime-goal".to_string(),
+            title: "answer the user".to_string(),
+            description: String::new(),
+            status: TodoStatus::Pending,
+            evidence: Vec::new(),
+            blocked_reason: None,
+        });
+        // Transition to InProgress — mirrors the real tool_phase behavior.
+        state.continuity.todos.begin_next_ready();
+    }
+
+    #[test]
+    fn complete_active_runtime_todo_closes_with_synthetic_evidence_when_no_tool_invocation() {
+        use astra_turn_core::continuity::TodoStatus;
+        let mut state = make_state();
+        state.final_text = "Here is your answer.".to_string();
+        seed_active_todo(&mut state);
+
+        complete_active_runtime_todo_if_finalized(&mut state, /*had_error=*/ false);
+
+        let item = state
+            .continuity
+            .todos
+            .items
+            .iter()
+            .find(|i| i.id == "runtime-goal")
+            .expect("seeded todo must exist");
+        assert_eq!(
+            item.status,
+            TodoStatus::Done,
+            "pure Q&A round must close the active todo so the manifest stops showing in_progress"
+        );
+        assert!(
+            item.evidence
+                .iter()
+                .any(|e| e.contains("answered without tool invocation")),
+            "must seed a synthetic evidence when no tool was invoked; got: {:?}",
+            item.evidence
+        );
+    }
+
+    #[test]
+    fn complete_active_runtime_todo_does_not_close_when_final_text_empty() {
+        use astra_turn_core::continuity::TodoStatus;
+        let mut state = make_state();
+        state.final_text = String::new();
+        seed_active_todo(&mut state);
+
+        complete_active_runtime_todo_if_finalized(&mut state, /*had_error=*/ false);
+
+        let item = state
+            .continuity
+            .todos
+            .items
+            .iter()
+            .find(|i| i.id == "runtime-goal")
+            .expect("seeded todo must exist");
+        assert_eq!(
+            item.status,
+            TodoStatus::InProgress,
+            "a round with no final_text must NOT close the todo — nothing was actually answered"
+        );
+        assert!(
+            item.evidence.is_empty(),
+            "no synthetic evidence when final_text is empty; got: {:?}",
+            item.evidence
+        );
+    }
+
+    #[test]
+    fn complete_active_runtime_todo_does_not_close_when_error_occurred() {
+        use astra_turn_core::continuity::TodoStatus;
+        let mut state = make_state();
+        state.final_text = "partial output before failure".to_string();
+        seed_active_todo(&mut state);
+
+        complete_active_runtime_todo_if_finalized(&mut state, /*had_error=*/ true);
+
+        let item = state
+            .continuity
+            .todos
+            .items
+            .iter()
+            .find(|i| i.id == "runtime-goal")
+            .expect("seeded todo must exist");
+        assert_eq!(
+            item.status,
+            TodoStatus::InProgress,
+            "a round that errored must NOT be marked done — prevents falsely closing failed rounds"
+        );
+        assert!(
+            item.evidence.is_empty(),
+            "no synthetic evidence when had_error=true; got: {:?}",
+            item.evidence
+        );
+    }
+
     // E2E: full execution-retry guard lifecycle through the production loop.
     // Round 1: model defers ("需要我直接执行这些修改吗？") on a mutating-profile
     // task → guard fires, corrective user message is injected into
