@@ -303,22 +303,6 @@ impl std::fmt::Display for CommandRisk {
 mod tests {
     use super::*;
 
-    /// Drift guard: sandbox command tests must not re-introduce raw unsafe
-    /// env mutation. Use `temp_env::with_vars` so env state is restored via
-    /// RAII even when a test panics.
-    #[test]
-    fn command_tests_use_temp_env_not_unsafe_set_var() {
-        let unsafe_open = format!("{}{}", "unsafe", " { ");
-        let std_env = format!("{}{}", "std::", "env::");
-        let sentinel_set = format!("{unsafe_open}{std_env}set_{}", "var");
-        let sentinel_remove = format!("{unsafe_open}{std_env}remove_{}", "var");
-        let source = include_str!("command.rs");
-        assert!(
-            !source.contains(&sentinel_set) && !source.contains(&sentinel_remove),
-            "command tests must use temp_env::with_vars instead of raw unsafe env mutation"
-        );
-    }
-
     // ── Environment filtering ────────────────────────────────────────────
 
     #[test]

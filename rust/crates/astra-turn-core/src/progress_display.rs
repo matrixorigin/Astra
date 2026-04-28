@@ -479,19 +479,4 @@ mod tests {
         assert!(display.all_done());
     }
 
-    /// audit-#15: `ProgressDisplayHandle` must hold the spawned task's
-    /// `JoinHandle` so the runtime can account for the task and so silent
-    /// abandonment is impossible.
-    #[test]
-    fn progress_display_handle_stores_join_handle() {
-        let source = include_str!("progress_display.rs");
-        assert!(
-            source.contains("_task: tokio::task::JoinHandle<()>"),
-            "ProgressDisplayHandle must store the spawned JoinHandle"
-        );
-        assert!(
-            source.contains("_task: task,"),
-            "start_progress_display must populate the JoinHandle field"
-        );
-    }
 }

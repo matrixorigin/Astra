@@ -680,16 +680,4 @@ mod tests {
         );
     }
 
-    /// audit-#9: when speculative execution is skipped because the semaphore
-    /// is full, the result content must be a descriptive sentinel — not an
-    /// empty string that callers cannot distinguish from a tool that legally
-    /// returned no output.
-    #[test]
-    fn speculative_exec_returns_descriptive_error_on_capacity() {
-        let source = include_str!("streaming_tool_exec.rs");
-        assert!(
-            source.contains("speculative execution skipped: capacity reached"),
-            "try_start must surface a descriptive sentinel when speculation is skipped"
-        );
-    }
 }

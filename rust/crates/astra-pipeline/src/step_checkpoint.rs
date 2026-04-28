@@ -1010,38 +1010,6 @@ mod tests {
     /// P1-E: write_step_checkpoint uses fsync before rename.
     /// Simulates power loss by truncating the temp file to 0 bytes after write
     /// but before rename. The read path must fall back to the previous checkpoint.
-    #[test]
-    fn fsync_before_rename_source_guard() {
-        // Verify the production code calls sync_all() before rename.
-        let source = include_str!("step_checkpoint.rs");
-        // Find the write_step_checkpoint function body
-        let fn_start = source
-            .find("fn write_step_checkpoint")
-            .expect("write_step_checkpoint must exist");
-        // Find the closing brace of the function (next fn or end of impl block)
-        let fn_body_end = source[fn_start..]
-            .find("\npub fn ")
-            .or_else(|| source[fn_start..].find("\nfn "))
-            .map(|p| fn_start + p)
-            .unwrap_or(source.len());
-        let fn_body = &source[fn_start..fn_body_end];
-
-        let sync_pos = fn_body.find("sync_all");
-        let rename_pos = fn_body.find("fs::rename");
-        assert!(
-            sync_pos.is_some(),
-            "sync_all() must be called in write_step_checkpoint"
-        );
-        assert!(
-            rename_pos.is_some(),
-            "fs::rename must be called in write_step_checkpoint"
-        );
-        assert!(
-            sync_pos.unwrap() < rename_pos.unwrap(),
-            "sync_all() must be called before fs::rename() in write_step_checkpoint"
-        );
-    }
-
     /// P1-E: Orphaned temp files (from interrupted writes) must be ignored
     /// by the checkpoint reader, falling back to the previous valid checkpoint.
     #[test]

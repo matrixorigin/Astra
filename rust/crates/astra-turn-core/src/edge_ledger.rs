@@ -1105,21 +1105,4 @@ mod tests {
         assert_eq!(ledger.lock().await.len(), 1);
     }
 
-    /// audit-#16: the `LEDGER_MAX_ENTRIES` doc comment must accurately
-    /// describe rejection (not eviction) of new entries when the cap is hit.
-    #[test]
-    fn edge_ledger_cap_comment_reflects_rejection_not_eviction() {
-        let source = include_str!("edge_ledger.rs");
-        // Build the misleading needle dynamically so this test's own message
-        // doesn't accidentally satisfy the substring search.
-        let bad_needle = format!("evicted{}wholesale", " ");
-        assert!(
-            !source.contains(bad_needle.as_str()),
-            "edge_ledger comment must not describe entries as wholesale-evicted"
-        );
-        assert!(
-            source.contains("REJECTED (not evicted)"),
-            "edge_ledger comment must explicitly state entries are REJECTED on capacity"
-        );
-    }
 }

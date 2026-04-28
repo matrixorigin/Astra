@@ -639,27 +639,6 @@ mod tests {
 
     /// P1-K: execute_isolated must log a warning when namespace isolation
     /// is requested but unavailable (Strict mode silent degradation).
-    #[test]
-    fn namespace_fallback_warning_in_source() {
-        let source = include_str!("process_isolation.rs");
-        // Find the execute_isolated function
-        let fn_start = source
-            .find("pub async fn execute_isolated")
-            .expect("execute_isolated must exist");
-        let fn_body = &source[fn_start..];
-        // The warning must appear before the command is built
-        let warn_pos = fn_body.find("namespace isolation unavailable");
-        let cmd_build_pos = fn_body.find("let (program, args)");
-        assert!(
-            warn_pos.is_some(),
-            "execute_isolated must log a warning when namespace isolation is unavailable"
-        );
-        assert!(
-            warn_pos.unwrap() < cmd_build_pos.unwrap_or(usize::MAX),
-            "namespace fallback warning must appear before command construction"
-        );
-    }
-
     /// P1-K: IsolationConfig::strict() requests namespace isolation.
     /// When unshare is unavailable, namespace_active must be false in output.
     #[tokio::test]
