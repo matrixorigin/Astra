@@ -162,19 +162,6 @@ impl TerminalRegion {
         }
         let _ = io::stdout().flush();
     }
-
-    /// Append a single line.
-    #[allow(dead_code)]
-    pub(super) fn append_line(&mut self, line: String) {
-        println!("{line}");
-        let _ = io::stdout().flush();
-        let rows = self.calc_physical_rows(&line);
-        self.lines.push(LineEntry {
-            content: line,
-            physical_rows: rows,
-        });
-    }
-
     /// Clear the entire region from the terminal.
     pub(super) fn clear(&mut self) {
         // Refresh width in case terminal was resized
@@ -190,28 +177,6 @@ impl TerminalRegion {
             .ok();
             let _ = io::stdout().flush();
             self.lines.clear();
-        }
-    }
-
-    /// Remove the last `n` logical lines from the region.
-    #[allow(dead_code)]
-    pub(super) fn pop_lines(&mut self, n: usize) {
-        self.refresh_term_width();
-        let n = n.min(self.lines.len());
-        if n > 0 {
-            let rows_to_remove: usize = self.lines[self.lines.len() - n..]
-                .iter()
-                .map(|e| e.physical_rows)
-                .sum();
-            execute!(
-                io::stdout(),
-                cursor::MoveUp(rows_to_remove as u16),
-                cursor::MoveToColumn(0),
-                terminal::Clear(terminal::ClearType::FromCursorDown)
-            )
-            .ok();
-            let _ = io::stdout().flush();
-            self.lines.truncate(self.lines.len() - n);
         }
     }
 }

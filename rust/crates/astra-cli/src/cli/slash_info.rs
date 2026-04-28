@@ -117,20 +117,6 @@ fn run_git_lines(project_root: &std::path::Path, args: &[&str]) -> Vec<String> {
         _ => Vec::new(),
     }
 }
-
-fn run_git_stdout(project_root: &std::path::Path, args: &[&str]) -> String {
-    match SysCommand::new("git")
-        .args(args)
-        .current_dir(project_root)
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n")
-        }
-        _ => String::new(),
-    }
-}
-
 fn lsp_backend_label(name: &str) -> &str {
     match name {
         "rust" => "Rust",

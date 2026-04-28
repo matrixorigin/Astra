@@ -129,21 +129,6 @@ fn emit_plan_lifecycle_event(
         let _ = journal.append(&event);
     }
 }
-
-/// Format a duration in milliseconds as a compact human-readable string.
-fn format_duration_ms(ms: u64) -> String {
-    if ms >= 60_000 {
-        let m = ms / 60_000;
-        let s = (ms % 60_000) / 1000;
-        format!("{m}m{s}s")
-    } else if ms >= 1000 {
-        let s = ms as f64 / 1000.0;
-        format!("{s:.1}s")
-    } else {
-        format!("{ms}ms")
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlanMonitorOutcome {
     /// Normal drain — more updates may follow.

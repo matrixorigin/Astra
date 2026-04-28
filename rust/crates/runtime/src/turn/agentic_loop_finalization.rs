@@ -261,27 +261,6 @@ fn persist_remote_composite_snapshot_index_blocking(
     }
 }
 
-async fn persist_remote_composite_snapshot_index_if_present(
-    state: &AgenticLoopState,
-    session_id: &str,
-    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
-    source: &str,
-) {
-    let Some(persistence) = state.telemetry.context_trace_persistence.clone() else {
-        return;
-    };
-    if let Err(error) = astra_services::session_restore::persist_remote_composite_snapshot_index(
-        session_id,
-        &persistence.user_id,
-        index,
-        &persistence.artifact_store,
-    )
-    .await
-    .map(|_| ())
-    {
-        astra_core::agent_warn!("checkpoint", "Failed to {source} for {session_id}: {error}");
-    }
-}
 
 /// Best-effort heavy checkpoint write.
 ///
@@ -371,95 +350,6 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     state.stall.last_heavy_checkpoint = Some(cp);
 }
 
-/// Build a full composite snapshot asynchronously (with data provider).
-///
-/// Call this at strategic points (breakpoints, plan boundaries, user request)
-/// where the async data snapshot is worth the cost.
-#[allow(dead_code)]
-pub(crate) async fn build_full_composite_snapshot(
-    state: &mut AgenticLoopState,
-) -> Option<astra_core::composite_snapshot::CompositeSnapshot> {
-    let sid = state.current_session_id.as_ref()?;
-    let turn = session_turn_number(state);
-    let ckpt_num = state.step_recorder.summary().checkpoints;
-
-    let mut builder =
-        astra_core::composite_snapshot::CompositeSnapshotBuilder::new(sid.clone(), turn)
-            .label(format!("full-snapshot-t{turn}"))
-            .session_state(format!("{:06}-heavy.json", ckpt_num))
-            .workspace_state(sid.clone());
-
-    {
-        let epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        builder = builder.memory_snapshot(astra_core::composite_snapshot::MemorySnapshotRef {
-            profile: "default".to_string(),
-            epoch,
-            path: None,
-        });
-    }
-
-    if let Ok(output) = tokio::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .await
-        && output.status.success()
-    {
-        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if sha.len() >= 7 {
-            builder = builder.git_commit(sha);
-        }
-    }
-
-    if let Some(provider) = &state.data_snapshot_provider {
-        let context = astra_core::composite_snapshot::SnapshotContext {
-            session_id: sid.clone(),
-            turn,
-            label: Some(format!("turn-{turn}")),
-            task_type: None,
-            databases: None,
-        };
-        match provider.create_snapshot(&context).await {
-            Ok(Some(ds)) => {
-                builder = builder.data_snapshot(ds);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                astra_core::agent_warn!("snapshot", "Data snapshot failed: {e}");
-            }
-        }
-    }
-
-    let mut snapshot = builder.build();
-
-    let mut index = step_checkpoint::read_composite_snapshot_index(sid).unwrap_or_default();
-    if let Err(e) = index.append(&mut snapshot) {
-        astra_core::agent_warn!(
-            "checkpoint",
-            "Failed to append composite snapshot version: {e}"
-        );
-        return Some(snapshot);
-    }
-    if let Err(e) = step_checkpoint::write_composite_snapshot_index(sid, &index) {
-        astra_core::agent_warn!(
-            "checkpoint",
-            "Failed to write composite snapshot index: {e}"
-        );
-    } else {
-        persist_remote_composite_snapshot_index_if_present(
-            state,
-            sid,
-            &index,
-            "persist remote composite snapshot index",
-        )
-        .await;
-    }
-
-    state.last_composite_snapshot = Some(snapshot.clone());
-    Some(snapshot)
-}
 
 /// Run the multi-turn agentic loop using the provided host.
 ///

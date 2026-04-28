@@ -5210,15 +5210,6 @@ impl StreamRenderState {
             }
         }
     }
-
-    /// Clear tool status region (for intermediate turns before next SSE stream).
-    #[allow(dead_code)]
-    fn clear_tool_region(&mut self) {
-        self.stop_tool_stdout_anim();
-        let mut g = self.tool_ui.lock().unwrap_or_else(|e| e.into_inner());
-        g.region.clear();
-        g.lines.clear();
-    }
 }
 
 fn pluralize_with_count(count: usize, singular: &str, plural: &str) -> String {

@@ -33,11 +33,6 @@ fn apply_system_prompt(message: &str, system_prompt: Option<&str>) -> String {
         None => message.to_string(),
     }
 }
-
-fn forwarded_args(args: &ForwardArgs) -> String {
-    args.args.join(" ")
-}
-
 fn join_words(words: &[String]) -> String {
     words.join(" ")
 }
