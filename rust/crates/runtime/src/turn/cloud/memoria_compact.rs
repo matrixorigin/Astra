@@ -105,7 +105,7 @@ pub struct MemoriaCompactParams {
     /// Optional session facts for facts-first compaction (L1a ground truth).
     /// When present, `build_facts_first_injection()` is used as the primary
     /// memory context, with Memoria narrative as supplement.
-    pub session_facts: Option<super::session_facts::SessionFacts>,
+    pub session_facts: Option<astra_turn_types::session_facts::SessionFacts>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1499,7 +1499,7 @@ mod tests {
 
     #[tokio::test]
     async fn compact_facts_first_uses_session_facts() {
-        use super::super::session_facts::{ErrorFact, FileEntry, SessionFacts};
+        use astra_turn_types::session_facts::{ErrorFact, FileEntry, SessionFacts};
         let msgs = vec![
             user("implement OAuth"),
             assistant("I'll help with OAuth"),
@@ -1593,7 +1593,7 @@ mod tests {
 
     #[tokio::test]
     async fn compact_facts_first_works_without_narrative() {
-        use super::super::session_facts::{FileEntry, SessionFacts};
+        use astra_turn_types::session_facts::{FileEntry, SessionFacts};
         let msgs = vec![user("hello"), assistant("hi")];
         let config = MemoriaCompactConfig {
             min_tokens_for_retrieval: 100,

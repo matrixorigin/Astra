@@ -7,7 +7,7 @@
 //!
 //! See `docs/design/session-memory-protocol.md` Section 6.2.
 
-use super::session_facts::SessionFacts;
+use astra_turn_types::session_facts::SessionFacts;
 use super::session_memory_protocol::SessionMemory;
 
 /// Knowledge extracted from a session for cross-session persistence.
@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn extract_knowledge_includes_error_patterns() {
-        use super::super::session_facts::ErrorFact;
+        use astra_turn_types::session_facts::ErrorFact;
         let mut facts = SessionFacts::default();
         facts.error_state = ErrorFact {
             total_errors: 3,

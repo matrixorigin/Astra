@@ -8,7 +8,6 @@ pub mod agentic_loop_host;
 pub mod agentic_loop_lifecycle;
 pub mod agentic_loop_tool_phase;
 pub mod agentic_loop_tool_support;
-pub mod agentic_prepare_payload;
 pub mod agentic_stage_bridge;
 pub mod agentic_tool_interception;
 pub mod bridge_inprocess;
@@ -50,5 +49,5 @@ pub use astra_turn_core::{
     chat_turn_step_plan, edge_prompt_context, prepare_turn_explain_text, stop_hooks_yaml,
     tool_health, tool_schema_prune, turn_guard,
     chat_turn_sse_dispatch, parallel_tool_exec, sse_stream_host, streaming_tool_exec,
-    cloud_tool_delivery, edge_ledger, agentic_recursion_guard,
+    cloud_tool_delivery, edge_ledger, agentic_recursion_guard, agentic_prepare_payload,
 };

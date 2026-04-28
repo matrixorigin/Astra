@@ -1015,7 +1015,7 @@ mod tests {
         state
             .session_facts
             .active_files
-            .push(crate::turn::cloud::session_facts::FileEntry {
+            .push(astra_turn_types::session_facts::FileEntry {
                 path: "src/main.rs".to_string(),
                 last_action: "write".to_string(),
                 turn: 1,

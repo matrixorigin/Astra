@@ -662,7 +662,7 @@ pub struct InProcessChatTurnBridge {
     pub memoria_client: Option<crate::turn::cloud::memoria_compact::HttpMemoriaClient>,
     /// Shared session facts for facts-first compaction. Updated by the agentic loop
     /// at each turn end; read by the bridge during compaction.
-    pub session_facts: Arc<std::sync::Mutex<crate::turn::cloud::session_facts::SessionFacts>>,
+    pub session_facts: Arc<std::sync::Mutex<astra_turn_types::session_facts::SessionFacts>>,
     /// Shutdown-aware tracker for fire-and-forget SSE persist tasks (HIGH #4).
     /// When `None` the bridge falls back to raw `tokio::spawn` (dev / test mode).
     pub persist_tracker: Option<Arc<dyn crate::matrix_cloud_runtime::BridgePersistTracker>>,
@@ -3204,7 +3204,7 @@ impl InProcessChatTurnBridge {
                     event.turn = Some(cloud_loop_turns as u32);
                     event.tokens_in = usage.get("prompt_tokens").and_then(Value::as_i64).map(|t| t as u64);
                     event.tool_calls = Some(tool_call_records.clone());
-                    crate::turn::cloud::session_facts::update_from_journal_event(
+                    astra_turn_core::cloud_session_facts::update_from_journal_event(
                         &mut facts,
                         &event,
                     );

@@ -752,7 +752,7 @@ pub struct AgenticLoopState {
     // ── Session Facts (L1a ground truth) ──
     /// System-tracked session state updated every turn from tool call records.
     /// Used for facts-first anchor, injection, compaction, and microcompact pin list.
-    pub session_facts: crate::turn::cloud::session_facts::SessionFacts,
+    pub session_facts: astra_turn_types::session_facts::SessionFacts,
 
     // ── Runtime-owned continuity (goal/todo/attention) ──
     /// Deterministic continuity state used to reconstruct attention every LLM round

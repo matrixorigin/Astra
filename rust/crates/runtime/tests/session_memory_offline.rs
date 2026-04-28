@@ -15,8 +15,8 @@ use astra_runtime::turn::cloud::memoria_compact::{
     SessionMemoryFileCombine, compact_with_memoria,
 };
 use astra_runtime::turn::cloud::session_end_governance::run_session_end_governance;
-use astra_runtime::turn::cloud::session_facts::SessionFacts;
-use astra_runtime::turn::cloud::session_facts::update_from_journal_event;
+use astra_turn_types::session_facts::SessionFacts;
+use astra_turn_core::cloud_session_facts::update_from_journal_event;
 use astra_runtime::turn::cloud::session_memory_protocol::{
     SessionMemory, build_l1_from_messages, persist_l1,
 };

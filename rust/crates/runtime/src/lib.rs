@@ -356,7 +356,6 @@ pub use turn::{
             read_session_memory_file, resolve_resume_session_memory_file,
             resolve_session_memory_file_options, sanitize_path_for_claude_projects,
         },
-        session_facts::{ErrorFact, FileEntry, PlanFact, SessionFacts, ToolFact},
     },
     implicit_feedback::{
         ImplicitSignal, detect_implicit_feedback_signal, implicit_feedback_rating,
@@ -371,3 +370,5 @@ pub use astra_text_utils::text_tokenize;
 pub use astra_config::user_profile;
 pub use astra_learning::auto_tuning;
 pub use astra_config::runtime_config;
+pub use astra_turn_types::session_facts::{ErrorFact, FileEntry, PlanFact, SessionFacts, ToolFact};
+pub use astra_turn_core::cloud_session_facts::update_from_journal_event;

@@ -13,10 +13,8 @@
 
 pub use astra_turn_core::tool_registry_meta::{IntentType, Scope, TOOL_CATALOG, ToolMeta};
 
-pub mod plugin;
 mod registry;
 pub mod scoring;
-mod selection_edge_hints;
 pub mod tool_pool;
 
 pub use astra_turn_core::tool_registry_chain::{ChainContext, ChainStep, ToolChain};
@@ -28,7 +26,7 @@ pub use scoring::{
     pre_filter_dynamic_with_memory, pre_filter_dynamic_with_outcome_bias,
     pre_filter_dynamic_with_pressure, pre_filter_dynamic_with_quality, tfidf_score,
 };
-pub use selection_edge_hints::{
+pub use astra_turn_core::tool_registry_selection_edge_hints::{
     apply_selector_hints_to_edge_profile, top_unpinned_tool_names_from_report,
 };
 pub use astra_turn_core::tool_registry_state::ConversationState;
@@ -37,6 +35,7 @@ pub use astra_turn_core::tool_registry_state::ConversationState;
 
 pub use astra_turn_core::tool_registry_state as state;
 pub use astra_turn_core::tool_registry_chain as chain;
+pub use astra_turn_core::tool_registry_plugin as plugin;
 pub use astra_turn_core::tool_registry_report as report;
 
 #[cfg(test)]

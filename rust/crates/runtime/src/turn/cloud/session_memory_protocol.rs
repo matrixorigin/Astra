@@ -9,7 +9,7 @@ use astra_turn_types::continuity::{
     narrative_task_contradicts_facts, redact_sensitive,
 };
 
-use super::session_facts::SessionFacts;
+use astra_turn_types::session_facts::SessionFacts;
 
 // ── L0: Session Anchor ──────────────────────────────────────────────────────
 
@@ -907,7 +907,7 @@ mod tests {
 
     #[test]
     fn facts_anchor_with_plan_state() {
-        use super::super::session_facts::{PlanFact, SessionFacts};
+        use astra_turn_types::session_facts::{PlanFact, SessionFacts};
         let mut facts = SessionFacts::default();
         facts.plan_state = Some(PlanFact {
             goal: "Implement OAuth".to_string(),
@@ -930,7 +930,7 @@ mod tests {
 
     #[test]
     fn facts_anchor_with_active_file_no_plan() {
-        use super::super::session_facts::{FileEntry, SessionFacts};
+        use astra_turn_types::session_facts::{FileEntry, SessionFacts};
         let mut facts = SessionFacts::default();
         facts.active_files.push(FileEntry {
             path: "src/auth.rs".to_string(),
@@ -943,7 +943,7 @@ mod tests {
 
     #[test]
     fn facts_anchor_empty_facts_shows_starting() {
-        use super::super::session_facts::SessionFacts;
+        use astra_turn_types::session_facts::SessionFacts;
         let facts = SessionFacts::default();
         let anchor = extract_anchor_from_facts("Build something", &facts, None);
         assert!(anchor.contains("State: starting"));
@@ -951,7 +951,7 @@ mod tests {
 
     #[test]
     fn facts_anchor_includes_last_error() {
-        use super::super::session_facts::{ErrorFact, SessionFacts};
+        use astra_turn_types::session_facts::{ErrorFact, SessionFacts};
         let mut facts = SessionFacts::default();
         facts.error_state = ErrorFact {
             total_errors: 2,
@@ -965,7 +965,7 @@ mod tests {
 
     #[test]
     fn facts_anchor_includes_blocked_tools() {
-        use super::super::session_facts::SessionFacts;
+        use astra_turn_types::session_facts::SessionFacts;
         let mut facts = SessionFacts::default();
         facts.blocked_tools = vec!["web_fetch".to_string(), "rm".to_string()];
         let anchor = extract_anchor_from_facts("Do stuff", &facts, None);
@@ -974,7 +974,7 @@ mod tests {
 
     #[test]
     fn facts_anchor_prefers_narrative_task_spec() {
-        use super::super::session_facts::SessionFacts;
+        use astra_turn_types::session_facts::SessionFacts;
         let facts = SessionFacts::default();
         let l1 = SessionMemory::parse(sample_l1()).unwrap();
         let anchor = extract_anchor_from_facts("raw user msg ignored", &facts, Some(&l1));
@@ -995,7 +995,7 @@ mod tests {
 
     #[test]
     fn injection_facts_before_narrative() {
-        use super::super::session_facts::{FileEntry, SessionFacts};
+        use astra_turn_types::session_facts::{FileEntry, SessionFacts};
         let mut facts = SessionFacts::default();
         facts.turn = 5;
         facts.estimated_tokens = 20000;
@@ -1017,7 +1017,7 @@ mod tests {
 
     #[test]
     fn injection_includes_narrative_sections() {
-        use super::super::session_facts::SessionFacts;
+        use astra_turn_types::session_facts::SessionFacts;
         let facts = SessionFacts::default();
         let narrative = narrative_with_sections(&[
             ("Task Specification", "Implement OAuth"),
@@ -1038,7 +1038,7 @@ mod tests {
 
     #[test]
     fn injection_without_narrative() {
-        use super::super::session_facts::{FileEntry, SessionFacts};
+        use astra_turn_types::session_facts::{FileEntry, SessionFacts};
         let mut facts = SessionFacts::default();
         facts.turn = 3;
         facts.estimated_tokens = 10000;
@@ -1055,7 +1055,7 @@ mod tests {
 
     #[test]
     fn facts_first_injection_includes_attention_manifest_from_plan_facts() {
-        use super::super::session_facts::{PlanFact, SessionFacts};
+        use astra_turn_types::session_facts::{PlanFact, SessionFacts};
         let facts = SessionFacts {
             plan_state: Some(PlanFact {
                 goal: "Implement runtime continuity".to_string(),
@@ -1081,7 +1081,7 @@ mod tests {
 
     #[test]
     fn injection_cross_validation_skips_task_on_contradiction() {
-        use super::super::session_facts::{ErrorFact, PlanFact, SessionFacts};
+        use astra_turn_types::session_facts::{ErrorFact, PlanFact, SessionFacts};
         let mut facts = SessionFacts::default();
         facts.plan_state = Some(PlanFact {
             goal: "Build API".to_string(),
@@ -1164,7 +1164,7 @@ mod tests {
 
     #[test]
     fn facts_first_narrative_sections_are_redacted() {
-        use super::super::session_facts::SessionFacts;
+        use astra_turn_types::session_facts::SessionFacts;
         let facts = SessionFacts::default();
         let narrative = narrative_with_sections(&[
             ("Task Specification", "Use token=ghp_secret"),
@@ -1183,7 +1183,7 @@ mod tests {
 
     #[test]
     fn injection_no_cross_validation_when_no_errors() {
-        use super::super::session_facts::{PlanFact, SessionFacts};
+        use astra_turn_types::session_facts::{PlanFact, SessionFacts};
         let mut facts = SessionFacts::default();
         facts.plan_state = Some(PlanFact {
             goal: "Build API".to_string(),
@@ -1200,7 +1200,7 @@ mod tests {
 
     #[test]
     fn injection_learnings_last_three_only() {
-        use super::super::session_facts::SessionFacts;
+        use astra_turn_types::session_facts::SessionFacts;
         let facts = SessionFacts::default();
         let narrative = narrative_with_sections(&[(
             "Learnings",
