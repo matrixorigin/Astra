@@ -270,17 +270,6 @@ pub struct MatchedEdgeToolOutput {
     pub tool_result_fields: Option<serde_json::Map<String, Value>>,
 }
 
-/// Take output for a server-emitted `tool_call` by matching dedup signature against the edge round.
-pub fn take_edge_output_for_tool_call<T: EdgeToolRoundRow>(
-    name: &str,
-    args: &Value,
-    round: &[T],
-    consumed: &mut [bool],
-    by_sig: &HashMap<String, String>,
-) -> String {
-    take_edge_output_for_tool_call_with_duration(name, args, round, consumed, by_sig).output
-}
-
 pub fn take_edge_output_for_tool_call_with_duration<T: EdgeToolRoundRow>(
     name: &str,
     args: &Value,

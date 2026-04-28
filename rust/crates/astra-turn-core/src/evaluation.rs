@@ -1236,11 +1236,6 @@ pub fn eval_signal_to_json_with_thresholds(
         }),
     }
 }
-
-pub fn eval_signals_to_json(signals: &[EvalSignal]) -> Vec<serde_json::Value> {
-    eval_signals_to_json_with_thresholds(signals, EvaluationThresholds::default())
-}
-
 pub fn eval_signals_to_json_with_thresholds(
     signals: &[EvalSignal],
     thresholds: EvaluationThresholds,

@@ -5,11 +5,10 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::Arc;
 use std::time::Instant;
 
 use crate::agent_progress_ui::{AgentColor, AgentProgress, AgentStatus, MultiAgentProgress};
-use crate::orchestration_progress::{AgentProgressEvent, ProgressBroadcaster, ProgressEventType};
+use crate::orchestration_progress::{AgentProgressEvent, ProgressEventType};
 
 /// Terminal progress display mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,53 +343,6 @@ impl ProgressDisplayHandle {
         let _ = self.stop_tx.send(());
     }
 }
-
-/// Start a background task that subscribes to progress events and displays them.
-///
-/// Returns a handle that can be used to stop the display.
-pub fn start_progress_display(
-    broadcaster: Arc<ProgressBroadcaster>,
-    mode: ProgressDisplayMode,
-) -> ProgressDisplayHandle {
-    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
-
-    let task = tokio::spawn(async move {
-        let mut display = ProgressDisplay::new(mode);
-        let mut rx = broadcaster.subscribe();
-
-        loop {
-            tokio::select! {
-                _ = &mut stop_rx => {
-                    display.clear();
-                    break;
-                }
-                event = rx.recv() => {
-                    match event {
-                        Ok(e) => {
-                            display.handle_event(e);
-                            display.display();
-                            if display.all_done() {
-                                break;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            // Dropped events - continue
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    ProgressDisplayHandle {
-        stop_tx,
-        _task: task,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

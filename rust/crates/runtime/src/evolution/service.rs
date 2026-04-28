@@ -980,12 +980,6 @@ fn sort_proposals(mut proposals: Vec<EvolutionProposal>) -> Vec<EvolutionProposa
     });
     proposals
 }
-
-/// Wrap in Arc for shared ownership across async tasks.
-pub fn new_shared() -> Arc<EvolutionService> {
-    Arc::new(EvolutionService::new())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

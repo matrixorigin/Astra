@@ -172,31 +172,10 @@ pub fn cli_bullet(text: &str) {
 pub fn cli_numbered(index: usize, text: &str) {
     eprintln!("  {}. {}", format!("{:>2}", index).dim(), text);
 }
-
-/// Print a progress indicator line that can be updated.
-///
-/// Returns the text for use with `cli_progress_done`.
-pub fn cli_progress(message: &str) {
-    use std::io::Write;
-    eprint!("  {} {}...", theme::icon_info(), message.dim());
-    let _ = std::io::stderr().flush();
-}
-
 /// Complete a progress line with success.
 pub fn cli_progress_done() {
     eprintln!(" {}", theme::icon_ok());
 }
-
-/// Complete a progress line with failure.
-pub fn cli_progress_fail() {
-    eprintln!(" {}", theme::icon_err());
-}
-
-/// Print an empty line for visual separation.
-pub fn cli_blank() {
-    eprintln!();
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Layered Error Formatting — "Did you mean?" suggestions + actionable hints
 // ─────────────────────────────────────────────────────────────────────────────
@@ -311,98 +290,6 @@ pub fn format_invalid_value_error(field: &str, value: &str, valid_options: &[&st
         );
     }
 }
-
-/// Format a permission denied error with context.
-///
-/// # Example output
-/// ```text
-///   ✗ Permission denied: Bash(rm -rf /)
-///     This operation was blocked by safety rules.
-///     Try: /allow to adjust permission mode
-/// ```
-pub fn format_permission_error(operation: &str, reason: Option<&str>) {
-    eprintln!(
-        "  {} Permission denied: {}",
-        theme::icon_err(),
-        operation.red()
-    );
-
-    if let Some(r) = reason {
-        eprintln!("    {}", r.dim());
-    }
-
-    eprintln!(
-        "    {} {}",
-        "Try:".dim(),
-        "/allow to adjust permission mode".cyan()
-    );
-}
-
-/// Format a connection/API error with troubleshooting steps.
-///
-/// # Example output
-/// ```text
-///   ✗ API request failed: connection refused
-///     • Check your internet connection
-///     • Verify API endpoint in /config
-///     • Try: /diagnostics to troubleshoot
-/// ```
-pub fn format_api_error(error: &str, endpoint: Option<&str>) {
-    eprintln!(
-        "  {} API request failed: {}",
-        theme::icon_err(),
-        error.red()
-    );
-
-    if let Some(ep) = endpoint {
-        eprintln!("    {} {}", "Endpoint:".dim(), ep);
-    }
-
-    eprintln!("    {} Check your internet connection", "•".dim());
-    eprintln!(
-        "    {} {}",
-        "Try:".dim(),
-        "/diagnostics to troubleshoot".cyan()
-    );
-}
-
-/// Format a configuration error with fix suggestions.
-///
-/// # Example output
-/// ```text
-///   ✗ Configuration error in settings.json
-///     Invalid JSON at line 15: unexpected token
-///     Try: /config reset to restore defaults
-/// ```
-pub fn format_config_error(file: &str, detail: &str) {
-    eprintln!(
-        "  {} Configuration error in {}",
-        theme::icon_err(),
-        file.red()
-    );
-    eprintln!("    {}", detail.dim());
-    eprintln!(
-        "    {} {}",
-        "Try:".dim(),
-        "/config reset to restore defaults".cyan()
-    );
-}
-
-/// Format a generic error with optional context and suggestion.
-///
-/// Use this for errors that don't fit other categories.
-pub fn format_error_with_hint(message: &str, context: Option<&str>, hint: Option<&str>) {
-    eprintln!("  {} {}", theme::icon_err(), message.red());
-
-    if let Some(ctx) = context {
-        eprintln!("    {}", ctx.dim());
-    }
-
-    if let Some(h) = hint {
-        eprintln!("    {} {}", "Try:".dim(), h.cyan());
-    }
-}
-
 /// Suggest models from a list (for /model command validation).
 pub fn suggest_models(input: &str, available: &[String]) -> Vec<String> {
     let refs: Vec<&str> = available.iter().map(|s| s.as_str()).collect();
@@ -411,16 +298,6 @@ pub fn suggest_models(input: &str, available: &[String]) -> Vec<String> {
         .map(|s| s.to_string())
         .collect()
 }
-
-/// Suggest sessions from a list.
-pub fn suggest_sessions(input: &str, available: &[String]) -> Vec<String> {
-    let refs: Vec<&str> = available.iter().map(|s| s.as_str()).collect();
-    find_suggestions(input, &refs, 3)
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect()
-}
-
 /// Suggest skills from a list.
 pub fn suggest_skills(input: &str, available: &[String]) -> Vec<String> {
     let refs: Vec<&str> = available.iter().map(|s| s.as_str()).collect();

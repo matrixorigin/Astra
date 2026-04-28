@@ -113,14 +113,6 @@ pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
         },
     ]
 }
-
-/// Get the definition for a specific agent type.
-pub fn get_agent_type_definition(agent_type: &str) -> Option<AgentTypeDefinition> {
-    get_builtin_agent_types()
-        .into_iter()
-        .find(|def| def.agent_type == agent_type)
-}
-
 const EXPLORE_PROMPT: &str = r#"
 You are an exploration agent focused on understanding codebases quickly.
 - Search and navigate code to answer questions

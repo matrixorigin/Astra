@@ -24,7 +24,6 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use astra_messaging::router::AgentMailboxRouter;
 use astra_runtime::orchestration::{
     DynamicAgentSpawner, InheritedPermissions, SpawnAgentInput, SpawnContext, spawn_agent_schema,
 };
@@ -116,29 +115,6 @@ pub async fn handle_spawn_agent_tool(args: &Value, ctx: Option<&SpawnAgentContex
 pub fn get_spawn_agent_schema() -> Value {
     spawn_agent_schema()
 }
-
-// ─── Helper Functions ──────────────────────────────────────────────────────
-
-/// Create a SpawnAgentContext from commonly available components.
-pub fn create_spawn_context(
-    run_id: String,
-    agent_id: String,
-    working_dir: PathBuf,
-    router: Arc<AgentMailboxRouter>,
-    inherited_permissions: InheritedPermissions,
-) -> SpawnAgentContext {
-    let spawner = Arc::new(DynamicAgentSpawner::new(router));
-    SpawnAgentContext {
-        run_id,
-        agent_id,
-        recursion_depth: 0,
-        working_dir,
-        spawner,
-        inherited_permissions,
-        active_skills: Vec::new(),
-    }
-}
-
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

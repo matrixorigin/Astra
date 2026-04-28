@@ -681,28 +681,6 @@ pub fn create_local_lifecycle(
 ) -> Arc<dyn DurableTaskLifecycle> {
     create_local_lifecycle_full(session_dir, work_dir, None, None, None, None, None, None)
 }
-
-/// Like [`create_local_lifecycle`] but also wires cloud event streaming.
-#[allow(dead_code)] // Public API — callers without cloud judge use this shorthand
-pub fn create_local_lifecycle_with_sender(
-    session_dir: &std::path::Path,
-    work_dir: &std::path::Path,
-    sender: Option<astra_services::event_ingestion::IngestionSender>,
-    session_id: Option<&str>,
-    user_id: Option<&str>,
-) -> Arc<dyn DurableTaskLifecycle> {
-    create_local_lifecycle_full(
-        session_dir,
-        work_dir,
-        sender,
-        session_id,
-        user_id,
-        None,
-        None,
-        None,
-    )
-}
-
 /// Full lifecycle creation with optional cloud LLM judge.
 ///
 /// When `cloud_judge` is provided, it's used for semantic (LlmJudge) verification

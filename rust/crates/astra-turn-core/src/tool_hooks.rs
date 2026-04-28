@@ -333,12 +333,6 @@ pub async fn global_run_pre(ctx: &ToolHookContext) -> PreHookOutcome {
 pub async fn global_run_post(ctx: &ToolHookContext) -> PostHookOutcome {
     global_registry().run_post(ctx).await
 }
-
-/// Convenience — run the post-tool-failure chain on the global registry.
-pub async fn global_run_post_failure(ctx: &ToolHookContext) -> std::collections::HashSet<String> {
-    global_registry().run_post_failure(ctx).await
-}
-
 /// Returns `true` if any hook is currently registered on the global
 /// registry. Tool dispatch sites can use this to skip the
 /// `run_pre`/`run_post` call entirely when no hooks exist — a zero-cost

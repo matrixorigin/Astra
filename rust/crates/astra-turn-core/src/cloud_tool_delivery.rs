@@ -262,26 +262,6 @@ fn approval_kind_str(approval_kind: ApprovalKind) -> &'static str {
     }
 }
 
-fn append_approval_required_journal_event(
-    session_id: &str,
-    turn: u32,
-    request_id: &str,
-    tool_name: &str,
-    approval_kind: ApprovalKind,
-    detail: Option<&str>,
-) -> Result<(), String> {
-    let writer = JournalWriter::new(session_id).map_err(|error| error.to_string())?;
-    writer
-        .append(&JournalEvent::approval_required(
-            Some(session_id),
-            Some(turn),
-            request_id,
-            tool_name,
-            approval_kind_str(approval_kind),
-            detail,
-        ))
-        .map_err(|error| error.to_string())
-}
 
 fn append_approval_timeout_journal_event(
     session_id: &str,
@@ -341,36 +321,6 @@ async fn persist_approval_aux_event(
         }])
         .await
 }
-
-pub async fn record_approval_required_audit(
-    context: &ApprovalAuditContext,
-    request_id: &str,
-    tool_name: &str,
-    approval_kind: ApprovalKind,
-    detail: Option<&str>,
-) -> Result<(), String> {
-    append_approval_required_journal_event(
-        &context.session_id,
-        context.turn,
-        request_id,
-        tool_name,
-        approval_kind,
-        detail,
-    )?;
-    persist_approval_aux_event(
-        context,
-        "approval_required",
-        request_id,
-        tool_name,
-        approval_kind,
-        detail,
-        None,
-        None,
-        None,
-    )
-    .await
-}
-
 fn journal_decision_to_cloud_result(
     decision: astra_services::session_journal::ApprovalJournalDecision,
 ) -> (CloudApprovalResult, Option<String>, Option<String>) {
@@ -682,19 +632,6 @@ pub fn local_tool_execution_delivery(
 pub fn cloud_tool_requires_approval_for_delivery(tool_call: &Value) -> bool {
     cloud_tool_requires_approval(tool_call)
 }
-
-pub fn tool_path_hint_for_delivery(tool_call: &Value) -> Option<String> {
-    tool_path_hint(tool_call)
-}
-
-pub fn tool_approval_detail_for_delivery(tool_call: &Value) -> Option<String> {
-    tool_approval_detail(tool_call)
-}
-
-pub fn tool_approval_kind_for_delivery(tool_call: &Value) -> ApprovalKind {
-    tool_approval_kind(tool_call)
-}
-
 #[derive(Debug, Clone)]
 pub struct ApprovalBatchItem {
     pub tool_call: Value,
