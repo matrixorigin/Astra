@@ -534,12 +534,31 @@ async fn adding_user_message_keeps_system_prefix_hash_stable() {
 //   * Usage events carry the per-round prompt/completion token counts
 //     independently (no leakage between rounds)
 fn round_with_tool_calls(text: &str, tool_names: &[&str]) -> Value {
+    // Derive a per-round id tag from the tool-name list so different rounds
+    // calling this helper get distinct ids. Rounds that legitimately reuse
+    // a tool_call id (e.g. both calling `bash`) are intentionally fine —
+    // `execute_mock_turn`'s per-round dedup scope ensures both are emitted.
+    // The dedicated `round` tag below keeps fixtures readable and avoids
+    // accidental collisions when a test wants distinct ids.
+    round_with_tool_calls_tagged(text, tool_names, text)
+}
+
+fn round_with_tool_calls_tagged(text: &str, tool_names: &[&str], round_tag: &str) -> Value {
+    let round_slug: String = round_tag
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    let round_slug = if round_slug.is_empty() {
+        "r".to_string()
+    } else {
+        round_slug
+    };
     let tool_calls: Vec<Value> = tool_names
         .iter()
         .enumerate()
         .map(|(i, n)| {
             json!({
-                "id": format!("tc_{n}_{i}"),
+                "id": format!("tc_{round_slug}_{n}_{i}"),
                 "type": "function",
                 "function": {"name": *n, "arguments": "{}"}
             })

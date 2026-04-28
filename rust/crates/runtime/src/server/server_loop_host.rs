@@ -1135,20 +1135,48 @@ impl ServerAgenticLoopHost {
         if !full_text.is_empty() {
             self.emit_event(json!({ "type": "text_delta", "content": &full_text }));
         }
-        // Emit tool_call events with id-level dedupe across ALL execute_mock_turn
-        // invocations within the same user-turn. `self.emitted_tool_call_ids` is
-        // cleared at the start of each user-turn (run_one_mock_turn_for_test /
-        // execute_turn test-hook path). This prevents duplicate events when the
-        // agentic loop calls execute_mock_turn more than once per chat turn
-        // (e.g. skill round-trips). Contract locked by:
+        // Tool_call dedup — two distinct concerns, two distinct scopes:
+        //
+        //   1. Per-round local set (`round_seen`): the ONLY structure used to
+        //      filter/suppress duplicate emits. Scope is this one
+        //      `execute_mock_turn` invocation. Protects against duplicated
+        //      tool_call deltas within a single SSE stream. Fresh HashSet
+        //      every invocation, so LLMs are free to reuse the same tool_call
+        //      id across rounds (e.g. `call_bash_0` in round 2 AND round 3);
+        //      the second one will be emitted just like the first.
+        //
+        //   2. Cross-host shared set (`self.emitted_tool_call_ids`,
+        //      Arc<Mutex<HashSet>>): a WRITE-ONLY log of ids that this host
+        //      (and any host sharing the Arc via `with_shared_dedup_state`)
+        //      has ever emitted during the user-turn. It is NOT consulted to
+        //      suppress per-round new ids. Its purpose is to let sub-run or
+        //      sibling hosts observe what has been emitted elsewhere — the
+        //      consumers of that signal live outside this loop.
+        //
+        // Prior behavior (pre-fix) used the Arc set as a filter, which caused
+        // a regression: round 3's legitimate re-use of a round-2 tool_call id
+        // was silently swallowed. The HashSet's turn-scoped semantics made
+        // any cross-round id repeat disappear, breaking
+        // `interleaved_tool_and_text_rounds_preserve_event_order_and_history`.
+        //
+        // Contract locked by:
         //   `skill_invocation_costs_exactly_two_llm_rounds_today`
+        //   `interleaved_tool_and_text_rounds_preserve_event_order_and_history`
+        let mut round_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for tc in &tool_calls {
             let key = match tc.get("id").and_then(Value::as_str) {
                 Some(id) if !id.is_empty() => format!("id:{id}"),
                 _ => format!("raw:{tc}"),
             };
-            if !self.emitted_tool_call_ids.lock().unwrap().insert(key) {
+            // Per-round dedup (same SSE stream): skip if already seen in THIS round.
+            if !round_seen.insert(key.clone()) {
                 continue;
+            }
+            // Record to the cross-host log, but do NOT use it to filter:
+            // per-round new ids always emit. Lock span is kept minimal.
+            {
+                let mut shared = self.emitted_tool_call_ids.lock().unwrap();
+                shared.insert(key);
             }
             self.emit_event(json!({ "type": "tool_call", "tool_call": tc }));
         }
@@ -3493,8 +3521,8 @@ mod tests {
         );
 
         assert!(
-            plain.contains("Synthesize Or Batch Now"),
-            "plain prompt should include the late-round synthesis nudge"
+            !plain.contains("Synthesize Or Batch Now"),
+            "synthesize directive is neutered (circuit breaker replaces it)"
         );
         assert!(
             plain.contains("2 tools executed in parallel"),
@@ -3517,11 +3545,11 @@ mod tests {
             "late-round guidance must stay out of the stable cached prefix"
         );
         assert!(
-            dynamic_text.contains("Synthesize Or Batch Now"),
-            "late-round guidance should live in the dynamic prompt message"
+            !dynamic_text.contains("Synthesize Or Batch Now"),
+            "synthesize directive is neutered (circuit breaker replaces it)"
         );
-        assert!(breakdown.guidance_signals.round_budget_warning);
-        assert!(breakdown.guidance_signals.synthesize_or_batch);
+        assert!(!breakdown.guidance_signals.round_budget_warning);
+        assert!(!breakdown.guidance_signals.synthesize_or_batch);
         assert!(breakdown.guidance_signals.parallel_feedback);
     }
 
