@@ -3183,14 +3183,6 @@ pub(super) fn create_manual_repl_checkpoint(
     })
 }
 
-/// Classify a turn error message into an [`ErrorKind`] for post-mortem analysis.
-///
-/// Delegates to [`astra_core::classify_tool_output`] — kept as a thin wrapper
-/// for backward compatibility with callers that haven't migrated yet.
-#[allow(dead_code)]
-fn classify_turn_error(error: &str) -> astra_core::ErrorKind {
-    astra_core::classify_tool_output(error)
-}
 
 #[cfg(test)]
 mod tests {
@@ -5191,107 +5183,6 @@ mod tests {
         assert!(kept.len() <= 4);
         assert!(kept.contains(&9), "must keep latest turn");
     }
-
-    #[test]
-    fn classify_turn_error_timeout() {
-        use astra_core::ErrorKind;
-        // "Request timed out after 30s" → ToolTimeout (local command timeout pattern)
-        assert_eq!(
-            classify_turn_error("Request timed out after 30s"),
-            ErrorKind::ToolTimeout
-        );
-        // "connection timeout" → Network (contains "connection")
-        assert_eq!(
-            classify_turn_error("connection timeout"),
-            ErrorKind::Network
-        );
-        // "TIMEOUT waiting for LLM" → Network (generic timeout)
-        assert_eq!(
-            classify_turn_error("TIMEOUT waiting for LLM"),
-            ErrorKind::Network
-        );
-    }
-
-    #[test]
-    fn classify_turn_error_rate_limit() {
-        use astra_core::ErrorKind;
-        // "Rate limit" → Network (transient, contains "rate limit")
-        assert_eq!(
-            classify_turn_error("Rate limit exceeded"),
-            ErrorKind::Network
-        );
-        assert_eq!(
-            classify_turn_error("HTTP 429: too many requests"),
-            ErrorKind::Network
-        );
-    }
-
-    #[test]
-    fn classify_turn_error_network() {
-        use astra_core::ErrorKind;
-        assert_eq!(
-            classify_turn_error("Connection refused"),
-            ErrorKind::Network
-        );
-        assert_eq!(
-            classify_turn_error("DNS resolution failed"),
-            ErrorKind::Network
-        );
-        assert_eq!(
-            classify_turn_error("network unreachable"),
-            ErrorKind::Network
-        );
-    }
-
-    #[test]
-    fn classify_turn_error_auth() {
-        use astra_core::ErrorKind;
-        assert_eq!(
-            classify_turn_error("HTTP 401 Unauthorized"),
-            ErrorKind::Auth
-        );
-        assert_eq!(classify_turn_error("403 Forbidden"), ErrorKind::Auth);
-        assert_eq!(
-            classify_turn_error("Authentication failed"),
-            ErrorKind::Auth
-        );
-    }
-
-    #[test]
-    fn classify_turn_error_server() {
-        use astra_core::ErrorKind;
-        // 500/502/503 → Network (transient)
-        assert_eq!(
-            classify_turn_error("Internal Server Error 500"),
-            ErrorKind::Network
-        );
-        assert_eq!(classify_turn_error("502 Bad Gateway"), ErrorKind::Network);
-        assert_eq!(
-            classify_turn_error("503 Service Unavailable"),
-            ErrorKind::Network
-        );
-    }
-
-    #[test]
-    fn classify_turn_error_unknown() {
-        use astra_core::ErrorKind;
-        assert_eq!(
-            classify_turn_error("something weird happened"),
-            ErrorKind::Unknown
-        );
-        assert_eq!(classify_turn_error(""), ErrorKind::Unknown);
-    }
-
-    #[test]
-    fn classify_turn_error_priority_timeout_over_network() {
-        use astra_core::ErrorKind;
-        // "connection timeout" → Network (both patterns match, Network wins)
-        assert_eq!(
-            classify_turn_error("connection timeout"),
-            ErrorKind::Network
-        );
-    }
-
     // ─── E2E: skill improvement closed loop ─────────────────────────────
     // Seeds a tempdir filesystem skill, injects a user correction into
     // ReplState.history, and calls `check_skill_improvement_inner` to verify:

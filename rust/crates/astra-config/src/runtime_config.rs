@@ -371,14 +371,6 @@ pub struct ToolSelectionConfig {
     #[serde(default)]
     pub tool_budget_tokens: u32,
 
-    /// Legacy: model name for the removed CLI LLM-based tool selector.
-    ///
-    /// The `astra-cli` REPL and background plan executor use the TF-IDF tool selector only
-    /// (no extra LLM call before the task model). This field is still parsed from TOML for
-    /// backward compatibility but has **no effect** on tool selection today.
-    #[serde(default)]
-    pub selector_model: Option<String>,
-
     /// Max times the same (tool, args) can execute across a session.
     /// 0 = use default (2). Prevents infinite loops from ignored dedup hints.
     #[serde(default)]
@@ -826,7 +818,6 @@ impl Default for ToolSelectionConfig {
             use_learned_patterns: default_true(),
             max_tool_schema_tokens: default_max_tool_schema_tokens(),
             tool_budget_tokens: 0,
-            selector_model: None,
             max_identical_tool_calls: 0,
             max_tools_per_turn: 0,
             round_budget_warning: 0,
@@ -1354,7 +1345,6 @@ impl RuntimeConfig {
             use_learned_patterns,
             max_tool_schema_tokens,
             tool_budget_tokens,
-            selector_model,
             max_identical_tool_calls,
             max_tools_per_turn,
             round_budget_warning,
@@ -1404,9 +1394,6 @@ impl RuntimeConfig {
             tool_budget_tokens,
             0,
         );
-        if selector_model.is_some() {
-            self.tool_selection.selector_model = selector_model;
-        }
         merge_if_non_default(
             &mut self.tool_selection.max_identical_tool_calls,
             max_identical_tool_calls,
@@ -1926,7 +1913,6 @@ mod tests {
                 use_learned_patterns: false,
                 max_tool_schema_tokens: 22000,
                 tool_budget_tokens: 0,
-                selector_model: None,
                 max_identical_tool_calls: 0,
                 max_tools_per_turn: 0,
                 round_budget_warning: 0,
@@ -2060,49 +2046,6 @@ mod tests {
         assert_eq!(merged.adaptive_tuning.scenario_cooldown_turns, 10);
         assert_eq!(merged.adaptive_tuning.budget_cooldown_turns, 6);
         assert_eq!(merged.adaptive_tuning.tuning_cycle_interval, 8);
-    }
-
-    #[test]
-    fn selector_model_from_toml() {
-        let toml = r#"
-[tool_selection]
-selector_model = "qwen3.5-flash"
-"#;
-        let cfg: RuntimeConfig = toml::from_str(toml).unwrap();
-        assert_eq!(
-            cfg.tool_selection.selector_model.as_deref(),
-            Some("qwen3.5-flash")
-        );
-    }
-
-    #[test]
-    fn selector_model_merge_override() {
-        let base = RuntimeConfig::default();
-        assert!(base.tool_selection.selector_model.is_none());
-
-        let override_toml = r#"
-[tool_selection]
-selector_model = "qwen-flash"
-"#;
-        let overrides: RuntimeConfig = toml::from_str(override_toml).unwrap();
-        let merged = base.merge(overrides);
-        assert_eq!(
-            merged.tool_selection.selector_model.as_deref(),
-            Some("qwen-flash")
-        );
-    }
-
-    #[test]
-    fn selector_model_none_does_not_clobber() {
-        let mut base = RuntimeConfig::default();
-        base.tool_selection.selector_model = Some("qwen3.5-flash".into());
-
-        let empty: RuntimeConfig = toml::from_str("").unwrap();
-        let merged = base.merge(empty);
-        assert_eq!(
-            merged.tool_selection.selector_model.as_deref(),
-            Some("qwen3.5-flash")
-        );
     }
 
     #[test]

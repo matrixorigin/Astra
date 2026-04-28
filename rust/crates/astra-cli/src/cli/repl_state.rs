@@ -2,14 +2,12 @@
 //!
 //! This module defines `ReplState`, the central struct that holds all session state
 //! for the CLI REPL. It also includes helper types like `ExplainMode` and `SkillDevState`.
-#![allow(deprecated)]
 
 use crate::PermissionManager;
 use crate::durable_bridge;
 use crate::mcp_client;
 use crate::plan_executor;
 use crate::prompts;
-use crate::skill_instructions;
 use crate::slash_team;
 use astra_runtime::plan_decompose;
 use astra_runtime::tool_registry;
@@ -56,7 +54,6 @@ pub(crate) struct PersistedAdaptiveState {
 // NOTE: ReplState is per-session and NOT shared across sessions. In future
 // server/multi-session mode, ensure each session gets its own ReplState
 // instance to prevent cross-session data leakage (permissions, history, tokens).
-#[allow(deprecated)]
 pub(crate) struct ReplState {
     pub session_id: Option<String>,
     /// Project-scoped recoverable session detected at startup.
@@ -194,7 +191,6 @@ pub(crate) struct ReplState {
     pub mcp_manager: std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
     /// Skill classification cache for LLM-based skill detection.
     #[allow(dead_code)]
-    pub skill_classification_cache: skill_instructions::SkillClassificationCache,
     /// Active durable-task contract for plan execution verification.
     pub durable_task_state: Option<durable_bridge::DurableTaskState>,
     /// Last delivery report — kept after plan completion so `/report` works post-plan.
@@ -309,7 +305,6 @@ pub(crate) struct ReplState {
         Option<std::sync::Arc<astra_runtime::evolution::service::EvolutionService>>,
 }
 
-#[allow(deprecated)]
 impl Default for ReplState {
     fn default() -> Self {
         Self {
@@ -403,7 +398,6 @@ impl Default for ReplState {
             mcp_manager: std::sync::Arc::new(tokio::sync::RwLock::new(
                 mcp_client::McpClientManager::new(),
             )),
-            skill_classification_cache: skill_instructions::SkillClassificationCache::default(),
             durable_task_state: None,
             last_delivery_report: None,
             plan_execution_corrections: Vec::new(),

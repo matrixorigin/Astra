@@ -623,7 +623,6 @@ pub struct ExecutionCursor {
 }
 
 /// Per-tool execution slot — independent state machine.
-/// Replace old (tool_index + ToolCompletion) with explicit slot lifecycle.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExecutionSlot {
     /// Slot index (0-based, stable after creation)
@@ -782,48 +781,8 @@ impl ExecutionCursor {
             .count()
     }
 
-    // ── Backward-compat aliases (v2 → v3 migration) ──
-
-    /// Alias for v2 callers: advance_tool → advance_slot
-    pub fn advance_tool(&mut self, index: usize, status: ToolCompletionStatus) {
-        let state = match status {
-            ToolCompletionStatus::Pending => SlotState::Pending,
-            ToolCompletionStatus::Running => SlotState::Running,
-            ToolCompletionStatus::Completed => SlotState::Completed,
-            ToolCompletionStatus::Failed => SlotState::Failed,
-            ToolCompletionStatus::Skipped => SlotState::Skipped,
-        };
-        self.advance_slot(index, state);
-    }
-
-    /// Alias: all_tools_done → all_slots_done
-    pub fn all_tools_done(&self) -> bool {
-        self.all_slots_done()
-    }
-
-    /// Alias: completed_tool_count → completed_slot_count
-    pub fn completed_tool_count(&self) -> usize {
-        self.completed_slot_count()
-    }
-
-    /// Alias: pending_tool_count → pending_slot_count
-    pub fn pending_tool_count(&self) -> usize {
-        self.pending_slot_count()
-    }
 }
 
-/// v2 backward-compat type alias
-pub type ToolCompletion = ExecutionSlot;
-
-/// v2 backward-compat status enum (maps to SlotState)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ToolCompletionStatus {
-    Pending,
-    Running,
-    Completed,
-    Failed,
-    Skipped,
-}
 
 // ─── Checkpoint (Tiered: Light / Heavy) ──────────────────────────────────────
 
@@ -2011,16 +1970,6 @@ mod tests {
         assert!(cursor.all_slots_done());
     }
 
-    #[test]
-    fn cursor_backward_compat_advance_tool() {
-        let mut cursor = ExecutionCursor::for_act(2);
-        // v2 API still works via backward-compat aliases
-        cursor.advance_tool(0, ToolCompletionStatus::Completed);
-        cursor.advance_tool(1, ToolCompletionStatus::Failed);
-        assert!(cursor.all_tools_done()); // alias for all_slots_done
-        assert_eq!(cursor.completed_tool_count(), 1);
-        assert_eq!(cursor.pending_tool_count(), 0);
-    }
 
     // ── Wait Trigger ──
 

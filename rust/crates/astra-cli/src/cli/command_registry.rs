@@ -838,10 +838,6 @@ pub fn commands_by_group(group: CommandGroup) -> impl Iterator<Item = &'static C
     COMMANDS.iter().filter(move |m| m.group == group)
 }
 
-/// Get all commands as (name, description) tuples for backward compatibility.
-pub fn command_tuples() -> Vec<(&'static str, &'static str)> {
-    COMMANDS.iter().map(|m| (m.name, m.description)).collect()
-}
 
 /// Fuzzy completion candidates: returns matches scored by quality (best first).
 /// Falls back gracefully — prefix > contains > subsequence.
@@ -1029,14 +1025,6 @@ mod tests {
         command_usage::reset_for_tests();
     }
 
-    #[test]
-    fn command_tuples_compatibility() {
-        let tuples = command_tuples();
-        assert!(
-            tuples.iter().any(|(cmd, _)| *cmd == "/help"),
-            "tuples should contain /help"
-        );
-    }
 
     #[test]
     fn get_arg_hint_from_registry() {
