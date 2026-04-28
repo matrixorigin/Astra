@@ -547,7 +547,11 @@ fn first_sentence(text: &str) -> String {
 }
 
 fn none_if_empty(text: &str) -> &str {
-    if text.trim().is_empty() { "none" } else { text }
+    if text.trim().is_empty() {
+        "none"
+    } else {
+        text
+    }
 }
 
 fn truncate_clean(text: &str, max_chars: usize) -> String {
@@ -793,11 +797,9 @@ mod tests {
         let active = state.todos.begin_next_ready().unwrap();
         assert_eq!(active.status, TodoStatus::InProgress);
 
-        assert!(
-            state
-                .todos
-                .mark_blocked("runtime-goal", "cargo test failed with token=secret-value")
-        );
+        assert!(state
+            .todos
+            .mark_blocked("runtime-goal", "cargo test failed with token=secret-value"));
         let item = state
             .todos
             .items
@@ -834,16 +836,14 @@ mod tests {
                 .count(),
             1
         );
-        assert!(
-            messages
-                .last()
-                .unwrap()
-                .get("content")
-                .unwrap()
-                .as_str()
-                .unwrap()
-                .contains("runtime-todo")
-        );
+        assert!(messages
+            .last()
+            .unwrap()
+            .get("content")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains("runtime-todo"));
     }
 
     #[test]
@@ -906,5 +906,43 @@ mod tests {
         });
         let err = try_from_checkpoint_value(&bad).unwrap_err();
         assert!(err.to_string().contains("continuity_state schema"));
+    }
+
+    // --- MAX_SECRET_VALUE_CHARS cap tests ---
+    //
+    // Documents redact_sensitive's behavior for long tokens. The cap only
+    // applies to tokens that are neither secret-assignments (`key=value`)
+    // nor look_like_secret_value (ghp_/sk-/xoxb- prefix or >=32 char pure
+    // alphanumeric). For those, the leading MAX_SECRET_VALUE_CHARS chars
+    // are preserved. Pure alphanumeric long tokens are redacted outright
+    // as secrets before the cap applies.
+
+    #[test]
+    fn redact_sensitive_caps_long_non_secret_token_at_max_chars() {
+        // 200-char token with '/' chars so it does NOT match
+        // looks_like_secret_value (which requires all alnum/_-.).
+        // Expect: truncated to MAX_SECRET_VALUE_CHARS (160), not [REDACTED].
+        let long = "a/".repeat(100); // 200 chars, contains '/'
+        let out = redact_sensitive(&long);
+        assert_eq!(out.chars().count(), MAX_SECRET_VALUE_CHARS);
+        assert!(!out.contains("[REDACTED]"));
+        assert!(out.starts_with("a/a/"));
+    }
+
+    #[test]
+    fn redact_sensitive_preserves_short_non_secret_text() {
+        // Plain prose stays verbatim (whitespace normalized by split+join).
+        let input = "normal message without secrets";
+        assert_eq!(redact_sensitive(input), "normal message without secrets");
+    }
+
+    #[test]
+    fn redact_sensitive_redacts_long_alphanumeric_token_as_secret_not_capped() {
+        // 160-char pure alphanumeric token triggers looks_like_secret_value
+        // (>=32 chars, all alnum/_-.) and is redacted BEFORE the cap applies.
+        // This locks the precedence: secret detection > length cap.
+        let token = "a".repeat(160);
+        let out = redact_sensitive(&token);
+        assert_eq!(out, "[REDACTED]");
     }
 }
