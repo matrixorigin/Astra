@@ -825,6 +825,33 @@ fn persist_manual_compression(
 
 fn supports_server_tool_name(tool: &str) -> bool {
     astra_tools::schemas::SERVER_EXECUTOR_TOOL_NAMES.contains(&tool)
+        || matches!(tool, "enter_plan_mode" | "exit_plan_mode")
+}
+
+/// Tools that mutate the world outside the session. Blocked while plan mode
+/// is active (`PlanPhase` = PlanOnlyChat|Planning|Refining) to mirror Claude
+/// Code's `prepareContextForPlanMode` behaviour: the model must call
+/// ExitPlanMode before writing anything.
+///
+/// Read-only tools (grep, glob, read_file, git_status/diff/log, web_search,
+/// task_*, memory_retrieve, …) stay available so the agent can continue
+/// exploring while authoring a plan.
+fn is_plan_mode_blocked_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "bash"
+            | "write_file"
+            | "str_replace"
+            | "multi_edit"
+            | "delete_file"
+            | "rollback_file_edits"
+            | "mo_query"
+            | "rollback_database_snapshots"
+            | "git_commit"
+            | "git_stash"
+            | "git_revert_commit"
+            | "github_create_issue"
+    )
 }
 
 fn mo_current_account() -> &'static str {
@@ -1025,6 +1052,32 @@ pub struct ServerToolExecutor {
     default_executor: DefaultToolExecutor,
     /// Optional remote workspace artifact store for publishing workspace metadata.
     workspace_artifact_store: Option<astra_services::DatabaseSessionArtifactStore>,
+    /// Plan repository for plan-mode gating and Enter/ExitPlanMode tools.
+    /// `None` leaves plan-mode unconditionally off (back-compat for tests /
+    /// constructor call sites that haven't been updated).
+    plan_repo: Option<Arc<dyn astra_plan::PlanRepository>>,
+    /// Cache for `plan_mode_authoring_active()` so a typical session with
+    /// 20-50 tool calls doesn't incur 40-100 DB round-trips. Invalidated
+    /// explicitly on `enter_plan_mode` / `exit_plan_mode`. Holds the latest
+    /// (authoring-bool, rendered-resume-hint) pair so both the write guard
+    /// and the system-prompt injector read from the same snapshot.
+    plan_mode_cache: Arc<tokio::sync::RwLock<PlanModeSnapshot>>,
+    /// Shared handle to the loop host's plan-resume hint. Tools that change
+    /// plan-mode state write through this so the next turn's system prompt
+    /// reflects current state instead of the loop-start snapshot.
+    plan_resume_hint_handle: Option<Arc<std::sync::RwLock<Option<String>>>>,
+}
+
+/// Snapshot used by the plan-mode write guard and the system-prompt
+/// injector. Populated on first access per plan-mode state change; cleared
+/// by the enter/exit tools so the next call sees fresh DB state.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PlanModeSnapshot {
+    /// Whether the session currently has an active plan still in authoring.
+    pub authoring_active: Option<bool>,
+    /// Rendered system-prompt section to inject on the next turn (`None`
+    /// when there's no active plan or it's already executing).
+    pub resume_hint: Option<String>,
 }
 
 impl ServerToolExecutor {
@@ -1114,7 +1167,24 @@ impl ServerToolExecutor {
             self_mod_deprioritized_tools: Mutex::new(deprioritized_tools),
             self_mod_mutation_counter: Mutex::new((0, 0)),
             workspace_artifact_store: None,
+            plan_repo: None,
+            plan_mode_cache: Arc::new(tokio::sync::RwLock::new(PlanModeSnapshot::default())),
+            plan_resume_hint_handle: None,
         }
+    }
+
+    /// Inject the plan repository so plan-mode tools and the write-tool guard
+    /// can check `active_plan_id` and flip plan phase.
+    pub fn set_plan_repository(&mut self, repo: Arc<dyn astra_plan::PlanRepository>) {
+        self.plan_repo = Some(repo);
+    }
+
+    /// Inject the host's plan-resume hint handle so tool-driven plan-mode
+    /// changes (enter_plan_mode / exit_plan_mode) can refresh the system
+    /// prompt injection mid-run. `None` (the default) leaves the host's
+    /// hint untouched — useful for test executors without a host.
+    pub fn set_plan_resume_hint_handle(&mut self, handle: Arc<std::sync::RwLock<Option<String>>>) {
+        self.plan_resume_hint_handle = Some(handle);
     }
 
     /// Set the approval gate for interactive tool execution.
@@ -1236,6 +1306,22 @@ impl ServerToolExecutor {
         name: &str,
         args: &Value,
     ) -> astra_tools::ToolResult {
+        // ── Plan-mode write guard ────────────────────────────────────
+        // If the session has an active plan still in authoring phase,
+        // short-circuit world-mutating tools with a structured error that
+        // names ExitPlanMode as the escape hatch. Read-only tools (explore,
+        // status, tasks, memory) still pass through so the agent can keep
+        // investigating while authoring.
+        if is_plan_mode_blocked_tool(name) && self.plan_mode_authoring_active().await {
+            return astra_tools::ToolResult::error(format!(
+                "Tool '{name}' is blocked while plan mode is active. \
+                 The agent must call `exit_plan_mode` with an approved plan \
+                 before any write operation. This mirrors Claude Code's plan \
+                 mode: the plan is authored with read-only tools, approved by \
+                 the user, then execution proceeds with writes unlocked."
+            ));
+        }
+
         // ── Approval gate check ──────────────────────────────────────
         if let Some(gate) = &self.approval_gate {
             if gate.requires_approval(name) {
@@ -1296,6 +1382,11 @@ impl ServerToolExecutor {
                 }
             }
             "ask_user" => self.server_ask_user(args).await,
+            // ── Plan-mode lifecycle tools ──────────────────────────────
+            "enter_plan_mode" => {
+                astra_tools::ToolResult::text(self.tool_enter_plan_mode(args).await)
+            }
+            "exit_plan_mode" => astra_tools::ToolResult::text(self.tool_exit_plan_mode(args).await),
             // ── File operations ─────────────────────────────────────────
             // Write operations use server-specific journal recording.
             // Read-only operations delegate to DefaultToolExecutor.
@@ -2833,6 +2924,233 @@ impl ServerToolExecutor {
     }
 
     // ────────────────────────────────────────────────────────────────────────
+    // Plan-mode gating and tools
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// Returns true when this session has an active plan that is still being
+    /// authored (`planning` / `refining` / plan-only chat). Returns false when
+    /// there is no plan, the plan is executing/completed/failed, or when no
+    /// plan repository has been wired.
+    ///
+    /// Cached per-executor: the first call hits the repo (1 SELECT on
+    /// `agent_sessions.active_plan_id` + 1 SELECT on `plans.plan_json`); every
+    /// subsequent call within the same plan-mode state returns instantly.
+    /// The cache is invalidated by `enter_plan_mode` / `exit_plan_mode`, which
+    /// are the only two events that change the result.
+    async fn plan_mode_authoring_active(&self) -> bool {
+        if let Some(cached) = self.plan_mode_cache.read().await.authoring_active {
+            return cached;
+        }
+        let (authoring, hint) = self.recompute_plan_mode_snapshot().await;
+        let mut w = self.plan_mode_cache.write().await;
+        w.authoring_active = Some(authoring);
+        w.resume_hint = hint;
+        authoring
+    }
+
+    /// Fresh DB query for the authoring gate + resume hint. Callers should
+    /// normally go through the cache; this is exposed so the cache-warming
+    /// path is obvious and testable.
+    async fn recompute_plan_mode_snapshot(&self) -> (bool, Option<String>) {
+        let Some(repo) = &self.plan_repo else {
+            return (false, None);
+        };
+        let Ok(Some(plan_id)) = repo.active_plan_for_session(&self.session_id).await else {
+            return (false, None);
+        };
+        match repo.load(&plan_id).await {
+            Ok(state) => {
+                // Phase is inferred from plan contents; we mirror the same
+                // logic plan_handlers uses so the gate stays consistent.
+                let has_subtasks = !state.plan.subtasks.is_empty();
+                let any_in_progress =
+                    state.plan.subtasks.iter().any(|s| {
+                        s.status == astra_services::task_orchestrator::TaskStatus::InProgress
+                    });
+                let items_done = state.plan.items_done() > 0;
+                let progress_complete = state.plan.progress_pct() == 100;
+                // Authoring = no execution activity yet. Once anything is
+                // in-progress or completed, writes are unlocked. A plan row
+                // with no subtasks yet (brand-new, pre-decomposition) also
+                // counts as authoring.
+                let authoring =
+                    !has_subtasks || (!any_in_progress && !items_done && !progress_complete);
+                let hint = astra_plan::plan_resume_system_prompt_section(&state);
+                (authoring, hint)
+            }
+            Err(_) => (false, None),
+        }
+    }
+
+    /// Clear the plan-mode cache so the next authoring check re-reads from
+    /// the repo, AND push a fresh hint to the host's plan_resume_hint slot
+    /// so the next system-prompt build reflects the new state. Called by
+    /// the enter/exit tools whenever they change `active_plan_id`.
+    async fn invalidate_plan_mode_cache(&self) {
+        {
+            let mut w = self.plan_mode_cache.write().await;
+            *w = PlanModeSnapshot::default();
+        }
+        // Recompute the hint and push it to the host handle so the very next
+        // turn sees the updated prompt — without this, the host keeps the
+        // stale "A plan is currently in-flight" text even after exit_plan_mode.
+        if let Some(handle) = &self.plan_resume_hint_handle {
+            let (_, hint) = self.recompute_plan_mode_snapshot().await;
+            if let Ok(mut slot) = handle.write() {
+                *slot = hint.clone();
+            }
+            // Also warm the cache with the freshly-computed values so the
+            // next authoring check in the same turn doesn't re-query.
+            let (authoring, _) = self.recompute_plan_mode_snapshot().await;
+            let mut w = self.plan_mode_cache.write().await;
+            w.authoring_active = Some(authoring);
+            w.resume_hint = hint;
+        }
+    }
+
+    /// `enter_plan_mode` tool — mark the current session as authoring a plan
+    /// so subsequent write tools are gated. Creates a new plan row owned by
+    /// the session's user if `plan_id` isn't supplied.
+    async fn tool_enter_plan_mode(&self, args: &Value) -> String {
+        let Some(repo) = self.plan_repo.clone() else {
+            return "Error: plan repository not configured on this executor".to_string();
+        };
+        let goal = args
+            .get("goal")
+            .and_then(Value::as_str)
+            .unwrap_or("(pending)")
+            .trim()
+            .to_string();
+        if goal.is_empty() {
+            return "Error: goal must be non-empty".to_string();
+        }
+
+        let plan_id = args
+            .get("plan_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| astra_plan::PlanModeState::generate_plan_id(&goal));
+
+        // Create-or-link: if a plan with this id already exists we re-link
+        // it to this session (passing the observed version so a concurrent
+        // editor cannot be silently overwritten); otherwise we create a
+        // fresh one with no expected_version.
+        let (mut state, expected_version) = match repo.load(&plan_id).await {
+            Ok(mut s) => {
+                let v = s.version;
+                s.session_hint = Some(self.session_id.clone());
+                (s, Some(v))
+            }
+            Err(astra_plan::PlanLoadError::NotFound(_)) => {
+                let mut s = astra_plan::PlanModeState::new_with_owner(
+                    goal.clone(),
+                    astra_plan::ProjectContext::default(),
+                    self.user_id.clone(),
+                );
+                s.session_hint = Some(self.session_id.clone());
+                (s, None)
+            }
+            Err(e) => return format!("Error: load plan: {e}"),
+        };
+
+        if let Err(e) = repo.save(&plan_id, &mut state, expected_version).await {
+            return format!("Error: save plan: {e}");
+        }
+        if let Err(e) = repo.set_active_plan(&self.session_id, Some(&plan_id)).await {
+            return format!("Error: link plan to session: {e}");
+        }
+
+        // Invalidate so the next write tool and the next system-prompt build
+        // both observe the freshly-linked plan instead of reading a stale
+        // "no active plan" cache entry populated before the tool fired.
+        self.invalidate_plan_mode_cache().await;
+
+        // Journal the entry so session audit surfaces show it.
+        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(&self.session_id) {
+            let _ = writer.append(
+                &astra_services::session_journal::JournalEvent::plan_lifecycle(
+                    Some(&self.session_id),
+                    "plan_mode_entered",
+                    Some(serde_json::json!({
+                        "plan_id": plan_id,
+                        "goal": goal,
+                    })),
+                ),
+            );
+        }
+
+        format!(
+            "Entered plan mode. plan_id={} goal=\"{}\". Write tools are now blocked — \
+             author the plan, then call `exit_plan_mode` with `approved=true` when ready.",
+            plan_id, goal
+        )
+    }
+
+    /// `exit_plan_mode` tool — flip the current session out of authoring so
+    /// write tools unlock. Does NOT start execution; the caller still needs
+    /// `POST /plans/{id}/execute` (or the next turn can proceed with writes
+    /// directly — approved plans are advisory, not a hard requirement for
+    /// subsequent bash/file ops).
+    async fn tool_exit_plan_mode(&self, args: &Value) -> String {
+        let Some(repo) = self.plan_repo.clone() else {
+            return "Error: plan repository not configured on this executor".to_string();
+        };
+        let approved = args
+            .get("approved")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
+        let active = match repo.active_plan_for_session(&self.session_id).await {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                return "Note: session has no active plan; nothing to exit.".to_string();
+            }
+            Err(e) => return format!("Error: lookup active plan: {e}"),
+        };
+
+        // We unlock writes by clearing `active_plan_id`. The `plans` row
+        // stays around so the approved plan can drive execution via
+        // /plans/{id}/execute. Rejecting keeps the plan linked for another
+        // authoring pass.
+        if approved {
+            if let Err(e) = repo.set_active_plan(&self.session_id, None).await {
+                return format!("Error: clear active plan: {e}");
+            }
+        }
+
+        // Always invalidate on exit — even a rejection mutates nothing but
+        // clients often immediately retry in-plan editing afterward, and
+        // a stale cache is cheap to avoid.
+        self.invalidate_plan_mode_cache().await;
+
+        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(&self.session_id) {
+            let _ = writer.append(
+                &astra_services::session_journal::JournalEvent::plan_lifecycle(
+                    Some(&self.session_id),
+                    if approved {
+                        "plan_approved"
+                    } else {
+                        "plan_rejected"
+                    },
+                    Some(serde_json::json!({ "plan_id": active })),
+                ),
+            );
+        }
+
+        if approved {
+            format!(
+                "Exited plan mode. plan_id={} is approved; write tools unlocked. \
+                 Use `/plans/{}/execute` to start step-by-step execution.",
+                active, active
+            )
+        } else {
+            format!(
+                "Plan {} left open for another authoring pass. Write tools remain blocked.",
+                active
+            )
+        }
+    }
+
     // File operations (sandboxed to workspace_root)
     // ────────────────────────────────────────────────────────────────────────
 
@@ -4593,5 +4911,213 @@ esac
     async fn workspace_root_returns_correct_path() {
         let (exec, dir) = test_executor();
         assert_eq!(exec.workspace_root(), dir.path());
+    }
+
+    // ── plan_mode_authoring_active caching ─────────────────────────────
+
+    /// Counting wrapper over [`astra_plan::PlanRepository`] used by the
+    /// cache tests. Records how many times each trait method was called.
+    struct QueryCountingPlanRepo {
+        inner: Arc<dyn astra_plan::PlanRepository>,
+        active_calls: Arc<AtomicU32>,
+        load_calls: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl astra_plan::PlanRepository for QueryCountingPlanRepo {
+        async fn save(
+            &self,
+            plan_id: &str,
+            state: &mut astra_plan::PlanModeState,
+            expected_version: Option<u64>,
+        ) -> Result<(), astra_plan::PlanLoadError> {
+            self.inner.save(plan_id, state, expected_version).await
+        }
+        async fn load(
+            &self,
+            plan_id: &str,
+        ) -> Result<astra_plan::PlanModeState, astra_plan::PlanLoadError> {
+            self.load_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.load(plan_id).await
+        }
+        async fn load_owned(
+            &self,
+            plan_id: &str,
+            user_id: &str,
+        ) -> Result<astra_plan::PlanModeState, astra_plan::PlanLoadError> {
+            self.inner.load_owned(plan_id, user_id).await
+        }
+        async fn list_for_user(
+            &self,
+            user_id: &str,
+            filter: astra_plan::PlanListFilter<'_>,
+        ) -> Result<Vec<astra_plan::SavedPlanInfo>, astra_plan::PlanLoadError> {
+            self.inner.list_for_user(user_id, filter).await
+        }
+        async fn delete(&self, plan_id: &str) -> Result<(), astra_plan::PlanLoadError> {
+            self.inner.delete(plan_id).await
+        }
+        async fn set_active_plan(
+            &self,
+            session_id: &str,
+            plan_id: Option<&str>,
+        ) -> Result<(), astra_plan::PlanLoadError> {
+            self.inner.set_active_plan(session_id, plan_id).await
+        }
+        async fn active_plan_for_session(
+            &self,
+            session_id: &str,
+        ) -> Result<Option<String>, astra_plan::PlanLoadError> {
+            self.active_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.active_plan_for_session(session_id).await
+        }
+        async fn record_step_run(
+            &self,
+            input: astra_plan::NewStepRun<'_>,
+        ) -> Result<String, astra_plan::PlanLoadError> {
+            self.inner.record_step_run(input).await
+        }
+        async fn record_completed_step_run(
+            &self,
+            input: astra_plan::NewStepRun<'_>,
+            error: Option<&str>,
+            artifact_ref: Option<&str>,
+        ) -> Result<String, astra_plan::PlanLoadError> {
+            self.inner
+                .record_completed_step_run(input, error, artifact_ref)
+                .await
+        }
+        async fn finalize_step_run(
+            &self,
+            plan_id: &str,
+            run_id: &str,
+            status: astra_services::task_orchestrator::TaskStatus,
+            error: Option<&str>,
+            artifact_ref: Option<&str>,
+        ) -> Result<(), astra_plan::PlanLoadError> {
+            self.inner
+                .finalize_step_run(plan_id, run_id, status, error, artifact_ref)
+                .await
+        }
+        async fn list_step_runs(
+            &self,
+            plan_id: &str,
+            subtask_id: Option<&str>,
+            limit: i32,
+        ) -> Result<Vec<astra_plan::PlanStepRun>, astra_plan::PlanLoadError> {
+            self.inner.list_step_runs(plan_id, subtask_id, limit).await
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_mode_authoring_active_caches_first_lookup() {
+        // First call pays for 1 active_plan_for_session + 0 load (no plan).
+        // Second call must hit the cache and issue zero additional DB queries.
+        // Without the cache, every tool call would duplicate both lookups.
+        let active = Arc::new(AtomicU32::new(0));
+        let load = Arc::new(AtomicU32::new(0));
+        let inner: Arc<dyn astra_plan::PlanRepository> =
+            Arc::new(astra_plan::LocalCachePlanRepository::new());
+        let wrapper = Arc::new(QueryCountingPlanRepo {
+            inner,
+            active_calls: active.clone(),
+            load_calls: load.clone(),
+        });
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(wrapper);
+
+        // No plan → authoring=false, cached.
+        assert!(!exec.plan_mode_authoring_active().await);
+        let active_after_first = active.load(Ordering::Relaxed);
+        let load_after_first = load.load(Ordering::Relaxed);
+        assert_eq!(
+            active_after_first, 1,
+            "first call must hit the repo exactly once"
+        );
+
+        for _ in 0..20 {
+            assert!(!exec.plan_mode_authoring_active().await);
+        }
+        assert_eq!(
+            active.load(Ordering::Relaxed),
+            active_after_first,
+            "20 additional calls must NOT issue more active_plan_for_session queries \
+             — cache hit rate must be 100% between plan-mode state changes"
+        );
+        assert_eq!(
+            load.load(Ordering::Relaxed),
+            load_after_first,
+            "load() count must not budge on cache hits either"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_tool_clears_shared_plan_resume_hint() {
+        // Regression for the mid-run staleness: the host's plan_resume_hint
+        // slot was populated at loop-start and never refreshed, so a tool
+        // call that exited plan mode left "A plan is currently in-flight"
+        // in the system prompt for the rest of the run. The executor now
+        // shares the slot and pushes updates through on enter/exit.
+        let inner: Arc<dyn astra_plan::PlanRepository> =
+            Arc::new(astra_plan::LocalCachePlanRepository::new());
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(inner);
+
+        let hint_slot: Arc<std::sync::RwLock<Option<String>>> = Arc::new(std::sync::RwLock::new(
+            Some("## Active Plan\n[plan-resume] goal=\"x\" · open=1 · done=0/1".into()),
+        ));
+        exec.set_plan_resume_hint_handle(Arc::clone(&hint_slot));
+
+        // Before invalidation: hint is whatever the host was built with
+        // (simulating loop-start snapshot).
+        assert!(hint_slot.read().unwrap().is_some());
+
+        // Simulate exit_plan_mode's follow-up: invalidate_plan_mode_cache is
+        // what the tool calls after clearing active_plan_id. The slot must
+        // now reflect fresh DB state (no active plan → None).
+        exec.invalidate_plan_mode_cache().await;
+
+        assert_eq!(
+            hint_slot.read().unwrap().clone(),
+            None,
+            "after exit_plan_mode invalidation, the shared slot must be None — \
+             otherwise the next turn's system prompt still claims a plan is in flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_mode_cache_invalidated_by_enter_exit_tools() {
+        // After a tool mutates plan-mode state, the next authoring check must
+        // re-read the repo. Without invalidation, the cache would keep
+        // returning the stale pre-enter/exit answer and the write guard
+        // would misbehave for the rest of the run.
+        let active = Arc::new(AtomicU32::new(0));
+        let load = Arc::new(AtomicU32::new(0));
+        let inner: Arc<dyn astra_plan::PlanRepository> =
+            Arc::new(astra_plan::LocalCachePlanRepository::new());
+        let wrapper = Arc::new(QueryCountingPlanRepo {
+            inner,
+            active_calls: active.clone(),
+            load_calls: load.clone(),
+        });
+        let (mut exec, _dir) = test_executor();
+        exec.set_plan_repository(wrapper);
+
+        // Prime the cache: no plan yet → authoring=false.
+        assert!(!exec.plan_mode_authoring_active().await);
+        let before = active.load(Ordering::Relaxed);
+
+        // Simulate an enter_plan_mode: cache must be invalidated.
+        exec.invalidate_plan_mode_cache().await;
+
+        // Next authoring check re-queries (LocalCache still returns no plan,
+        // but the call must have happened).
+        assert!(!exec.plan_mode_authoring_active().await);
+        assert!(
+            active.load(Ordering::Relaxed) > before,
+            "invalidation must force a fresh active_plan_for_session lookup \
+             — active count before={before}, after={}",
+            active.load(Ordering::Relaxed)
+        );
     }
 }

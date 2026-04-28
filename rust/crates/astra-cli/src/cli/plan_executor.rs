@@ -990,6 +990,100 @@ use super::chat_stream::ChatTurnParams;
 use super::durable_bridge;
 use super::permission_manager::PermissionManager;
 
+/// Post a start + finish pair to `/plans/{plan_id}/step-runs` so the cloud
+/// `plan_step_runs` table carries an audit row for this attempt.
+///
+/// Called by the CLI executor immediately after a subtask completes. The
+/// helper is fire-and-forget from the executor's point of view: a network
+/// or server failure logs a warning but does not abort the run.
+///
+/// Returns `Some(run_id)` on successful round-trip; `None` if either the
+/// start or finish call failed, or when the caller lacks a cloud `plan_id`.
+///
+/// # Parameters
+/// * `api` — thin client with auth header already baked.
+/// * `plan_id` — cloud plan_id; `None` short-circuits to a no-op.
+/// * `subtask_id` + `attempt` — identify the attempt row.
+/// * `session_id` + `request_id` — trace-correlation keys written to the row.
+/// * `status` — terminal status for the attempt (`completed` / `failed` / `cancelled`).
+/// * `error` — human-readable error, only used when status != Completed.
+///
+/// On the happy path (terminal status) this makes a single POST to
+/// `/step-runs/completed`. For attempts that must start `in_progress` and
+/// finalize later the caller should use the start + finish pair directly;
+/// this helper is the terminal-only shortcut the CLI uses on subtask-done.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn record_cloud_step_run(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    plan_id: Option<&str>,
+    subtask_id: &str,
+    attempt: i32,
+    session_id: &str,
+    request_id: &str,
+    status: TaskStatus,
+    error: Option<&str>,
+) -> Option<String> {
+    let pid = plan_id?;
+    if pid.is_empty() || session_id.is_empty() || request_id.is_empty() {
+        return None;
+    }
+    // One-shot /step-runs/completed requires a terminal status. If a caller
+    // passes a non-terminal status fall back to start + finish so the
+    // intermediate in_progress state is still observable.
+    if status.is_terminal() {
+        let body = serde_json::json!({
+            "subtask_id": subtask_id,
+            "session_id": session_id,
+            "request_id": request_id,
+            "attempt": attempt,
+            "status": status.as_str(),
+            "error": error,
+        });
+        match api.post_plan_step_run_completed(token, pid, &body).await {
+            Ok(resp) => serde_json::from_str::<serde_json::Value>(&resp)
+                .ok()
+                .and_then(|v| v.get("run_id").and_then(|r| r.as_str()).map(str::to_string)),
+            Err(e) => {
+                tracing::warn!(
+                    target: "astra_cli::plan_executor",
+                    plan_id = pid,
+                    subtask_id,
+                    error = %e,
+                    "one-shot step-run POST failed; skipping cloud attempt persistence",
+                );
+                None
+            }
+        }
+    } else {
+        // Non-terminal: start + finish pair. The finish is only reachable
+        // through callers that hold on to the run_id, so this path is rare
+        // in today's CLI — included for future pause/resume semantics.
+        let start_body = serde_json::json!({
+            "subtask_id": subtask_id,
+            "session_id": session_id,
+            "request_id": request_id,
+            "attempt": attempt,
+        });
+        let start_resp = match api.post_plan_step_run_start(token, pid, &start_body).await {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::warn!(
+                    target: "astra_cli::plan_executor",
+                    plan_id = pid,
+                    subtask_id,
+                    error = %e,
+                    "step-run start POST failed; skipping cloud attempt persistence",
+                );
+                return None;
+            }
+        };
+        serde_json::from_str::<serde_json::Value>(&start_resp)
+            .ok()
+            .and_then(|v| v.get("run_id").and_then(|r| r.as_str()).map(str::to_string))
+    }
+}
+
 /// Owned state extracted from ReplState for the background plan executor task.
 ///
 /// All fields are owned (no lifetimes) so the struct is `Send + 'static`.
@@ -1002,6 +1096,10 @@ pub(super) struct BackgroundPlanContext {
     pub model: Option<String>,
     pub plan: TaskPlan,
     pub plan_goal: Option<String>,
+    /// Cloud plan_id the executor should post step-run rows to. `None` when
+    /// the plan was created CLI-locally and has no cloud counterpart yet
+    /// — the executor still runs, just without `plan_step_runs` persistence.
+    pub plan_id: Option<String>,
     pub plan_corrections: Vec<String>,
     pub history: Vec<(String, String)>,
     pub session_id: Option<String>,
@@ -1895,6 +1993,29 @@ async fn plan_executor_task(
                                 done,
                             );
                             emit_event(&update_tx, &ctx, event);
+                            // Mirror the attempt to cloud plan_step_runs when
+                            // we have a plan_id + session_id + request_id.
+                            // Fire-and-forget — executor keeps running on failure.
+                            let request_id = result
+                                .run_id
+                                .clone()
+                                .or_else(|| result.session_id.clone())
+                                .unwrap_or_else(|| format!("turn-{}", ctx.turn));
+                            let session_for_run = ctx.session_id.clone().unwrap_or_default();
+                            if !session_for_run.is_empty() {
+                                let _ = record_cloud_step_run(
+                                    &ctx.api,
+                                    &ctx.token,
+                                    ctx.plan_id.as_deref(),
+                                    next_id,
+                                    ctx.turn.max(1) as i32,
+                                    &session_for_run,
+                                    &request_id,
+                                    TaskStatus::Completed,
+                                    None,
+                                )
+                                .await;
+                            }
                             let _ = update_tx.send(PlanUpdate::SubtaskStatusSync {
                                 id: next_id.clone(),
                                 status: TaskStatus::Completed,
@@ -2186,6 +2307,7 @@ mod tests {
             model: None,
             plan: TaskPlan::default(),
             plan_goal: None,
+            plan_id: None,
             plan_corrections: vec![],
             history: vec![],
             session_id: None,
@@ -3873,5 +3995,88 @@ All acceptance checks pass:
             }
             other => panic!("expected PlanPaused, got {:?}", other),
         }
+    }
+
+    // ── record_cloud_step_run contract ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn record_cloud_step_run_noop_when_plan_id_is_none() {
+        // No plan_id → returns None immediately, never touches the network.
+        // We point the client at a closed port; if the helper tried to dial
+        // it the call would error out (which it must NOT do — None is the
+        // contract for "no cloud plan linked").
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let run_id = record_cloud_step_run(
+            &api,
+            "tok",
+            None,
+            "subtask-1",
+            1,
+            "sess-abc",
+            "req-1",
+            TaskStatus::Completed,
+            None,
+        )
+        .await;
+        assert!(run_id.is_none(), "no plan_id must short-circuit to None");
+    }
+
+    #[tokio::test]
+    async fn record_cloud_step_run_noop_when_session_or_request_missing() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        // Empty session_id.
+        assert!(
+            record_cloud_step_run(
+                &api,
+                "tok",
+                Some("plan-1"),
+                "st",
+                1,
+                "",
+                "req",
+                TaskStatus::Completed,
+                None
+            )
+            .await
+            .is_none()
+        );
+        // Empty request_id.
+        assert!(
+            record_cloud_step_run(
+                &api,
+                "tok",
+                Some("plan-1"),
+                "st",
+                1,
+                "sess",
+                "",
+                TaskStatus::Completed,
+                None
+            )
+            .await
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn record_cloud_step_run_returns_none_on_network_error() {
+        // Closed-port client → start POST fails → helper returns None without panicking.
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let run_id = record_cloud_step_run(
+            &api,
+            "tok",
+            Some("plan-1"),
+            "st",
+            1,
+            "sess",
+            "req",
+            TaskStatus::Completed,
+            None,
+        )
+        .await;
+        assert!(
+            run_id.is_none(),
+            "network failure must not panic; helper is fire-and-forget"
+        );
     }
 }

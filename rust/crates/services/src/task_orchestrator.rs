@@ -90,6 +90,19 @@ pub struct SubtaskPlan {
     pub acceptance_checks: Vec<VerifierKind>,
 }
 
+impl SubtaskPlan {
+    /// Reset this subtask so it will be re-executed on the next run.
+    ///
+    /// Distinct from rewind (which resets this subtask and every subtask after it):
+    /// `reset_for_redo` clears **only** the runtime status of this one subtask back to
+    /// `Pending`. The authoring fields (`title`, `description`, `depends_on`, `files`,
+    /// `effort`, `acceptance_checks`) are preserved verbatim so a redo re-runs the
+    /// exact same work definition that was originally approved.
+    pub fn reset_for_redo(&mut self) {
+        self.status = TaskStatus::Pending;
+    }
+}
+
 /// Decomposed plan for a complex task.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskPlan {

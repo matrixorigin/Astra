@@ -323,11 +323,17 @@ dependencies = [
 name = "astra-plan"
 version = "0.1.0"
 dependencies = [
+ "astra-core",
  "astra-services",
+ "async-trait",
+ "chrono",
+ "dotenvy",
  "serde",
  "serde_json",
  "sqlx",
  "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

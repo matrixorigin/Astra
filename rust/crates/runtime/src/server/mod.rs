@@ -39,6 +39,7 @@ mod http_types;
 mod learning_handlers;
 mod llm_trusted_domains_handlers;
 mod meta_handlers;
+mod plan_handlers;
 mod platform_handlers;
 mod reflect_handlers;
 mod request_trace;

@@ -79,6 +79,8 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "memory_purge",
     "memory_correct",
     "memory_profile",
+    "enter_plan_mode",
+    "exit_plan_mode",
 ];
 
 fn filter_tool_schemas_by_name(allowed_names: &[&str]) -> Vec<Value> {
@@ -1900,6 +1902,43 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "include_findings": {
                             "type": "boolean",
                             "description": "If true, also returns structured findings from completed agents."
+                        }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "enter_plan_mode",
+                "description": "Enter plan authoring mode for an ambitious task. Creates or re-links a plan to the current session; subsequent write tools (bash, write_file, str_replace, multi_edit, delete_file, git_commit, mo_query, …) are blocked until `exit_plan_mode` is called with an approved plan. Read-only exploration tools (read_file, grep, glob, git_status, task_*, memory_*) stay available so you can keep investigating while drafting. Use this before multi-file refactors, new feature implementations, architectural changes, or any task where you'd want user sign-off on the approach before writing code.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "goal": {
+                            "type": "string",
+                            "description": "One-sentence description of what the plan should accomplish. Becomes the plan's goal string."
+                        },
+                        "plan_id": {
+                            "type": "string",
+                            "description": "Optional existing plan to re-link to this session (for resume flows). Omit to create a fresh plan."
+                        }
+                    },
+                    "required": ["goal"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "exit_plan_mode",
+                "description": "Exit plan authoring mode. Passing `approved=true` (default) unlocks write tools for the current session; the approved plan remains linked and can drive execution via /plans/{id}/execute. Passing `approved=false` keeps the plan pending for another authoring pass and leaves write tools blocked. Emits a `plan_approved`/`plan_rejected` journal event for session audit.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "approved": {
+                            "type": "boolean",
+                            "description": "Whether the plan is approved for execution. Default true."
                         }
                     }
                 }

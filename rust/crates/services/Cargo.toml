@@ -10,7 +10,7 @@ async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
 bcrypt.workspace = true
-chrono.workspace = true
+chrono = { workspace = true, features = ["serde"] }
 fernet.workspace = true
 flate2.workspace = true
 jsonwebtoken.workspace = true
@@ -20,7 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 sha2.workspace = true
-sqlx.workspace = true
+sqlx = { workspace = true, features = ["chrono"] }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -35,7 +35,7 @@ astra-core = { workspace = true, features = ["dev-defaults"] }
 filetime = "0.2"
 serde_json.workspace = true
 serial_test = "3"
-sqlx.workspace = true
+sqlx = { workspace = true, features = ["chrono"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 uuid.workspace = true

@@ -1530,6 +1530,64 @@ fn is_recovery_activity_event(event_type: &JournalEventType) -> bool {
     )
 }
 
+/// Terminal plan-lifecycle actions — a `plan_lifecycle` event with one of
+/// these `action` values marks the plan as no longer mid-flight.
+const PLAN_TERMINAL_ACTIONS: &[&str] = &[
+    "plan_completed",
+    "plan_abandoned",
+    "plan_failed",
+    "plan_deleted",
+    "plan_rejected",
+];
+
+/// Return `Some(plan_id)` if the tail contains a `plan_lifecycle`
+/// `execution_started` event that has no later terminal-action event for the
+/// same plan_id. That means the plan is still mid-flight and the session must
+/// not be classified as cleanly `Completed`.
+fn mid_flight_plan_id(tail_lines: &[String]) -> Option<String> {
+    // Walk chronologically (oldest → newest). Track the most recent started
+    // plan_id; clear it whenever a matching terminal event fires.
+    let mut active: Option<String> = None;
+    for line in tail_lines {
+        let Some(entry) = parse_journal_tail_entry(line) else {
+            continue;
+        };
+        if !matches!(entry.event_type, JournalEventType::PlanLifecycle) {
+            continue;
+        }
+        let Some(meta) = entry.metadata.as_ref() else {
+            continue;
+        };
+        let action = meta
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .or_else(|| meta.get("action").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let plan_id = meta
+            .get("detail")
+            .and_then(|d| d.get("plan_id"))
+            .and_then(|v| v.as_str())
+            .or_else(|| meta.get("plan_id").and_then(|v| v.as_str()))
+            .map(str::to_string);
+        match action {
+            "execution_started" => {
+                active = plan_id;
+            }
+            a if PLAN_TERMINAL_ACTIONS.contains(&a) => {
+                if active.as_deref() == plan_id.as_deref() {
+                    active = None;
+                } else if active.is_some() && plan_id.is_none() {
+                    // Terminal event without a plan_id still clears the most
+                    // recent active plan — errs on the side of "not stale".
+                    active = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    active
+}
+
 /// Classify the latest session segment as completed, interrupted, or zombie.
 ///
 /// Uses a bounded reverse tail read instead of loading the full JSONL file.
@@ -1545,12 +1603,28 @@ pub fn classify_session_end_state(session_id: &str) -> std::io::Result<SessionEn
     let tail_lines = read_journal_tail_lines(&path, RECOVERY_TAIL_LINE_LIMIT)?;
     let mut saw_activity_after_start = false;
 
+    // Gate "Completed" results on plan state: if a plan is still mid-flight
+    // (execution_started with no matching terminal event), treat the session
+    // as Interrupted(plan_mid_flight) so find_stale_sessions / the reaper
+    // notices. Computed up-front so the early returns below can consult it.
+    let mid_flight = mid_flight_plan_id(&tail_lines);
+    let completed_or_mid_flight = || {
+        if mid_flight.is_some() {
+            SessionEndState::Interrupted {
+                kind: "plan_mid_flight".to_string(),
+                resumable: true,
+            }
+        } else {
+            SessionEndState::Completed
+        }
+    };
+
     for line in tail_lines.iter().rev() {
         let Some(entry) = parse_journal_tail_entry(line) else {
             continue;
         };
         match entry.event_type {
-            JournalEventType::SessionEnd => return Ok(SessionEndState::Completed),
+            JournalEventType::SessionEnd => return Ok(completed_or_mid_flight()),
             JournalEventType::InterruptionRecorded => {
                 return Ok(SessionEndState::Interrupted {
                     kind: interruption_kind(&entry),
@@ -1561,7 +1635,7 @@ pub fn classify_session_end_state(session_id: &str) -> std::io::Result<SessionEn
                 return Ok(if saw_activity_after_start {
                     SessionEndState::Zombie
                 } else {
-                    SessionEndState::Completed
+                    completed_or_mid_flight()
                 });
             }
             _ if is_recovery_activity_event(&entry.event_type) => {
@@ -1574,7 +1648,7 @@ pub fn classify_session_end_state(session_id: &str) -> std::io::Result<SessionEn
     Ok(if saw_activity_after_start {
         SessionEndState::Zombie
     } else {
-        SessionEndState::Completed
+        completed_or_mid_flight()
     })
 }
 
@@ -5509,6 +5583,133 @@ mod tests {
                 kind: "auth_failure".to_string(),
                 resumable: false,
             }
+        );
+    }
+
+    #[test]
+    fn classify_session_end_state_flags_mid_flight_plan_as_interrupted_even_when_session_end_exists()
+     {
+        // Scenario: the agent started plan execution, emitted subtask progress
+        // for two steps, and then the session terminated without a
+        // `plan_completed`/`plan_abandoned` event. Even though a `session_end`
+        // was written, the plan is still mid-flight — treating this as
+        // SessionEndState::Completed would hide a stale plan from the reaper.
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = format!("test-plan-stale-{}", uuid::Uuid::new_v4());
+        let writer = JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
+            .unwrap();
+        writer
+            .append(&JournalEvent::plan_lifecycle(
+                Some(&sid),
+                "execution_started",
+                Some(serde_json::json!({ "plan_id": "p-abc", "subtask_count": 3 })),
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::plan_progress(
+                Some(&sid),
+                1,
+                "s1",
+                "first step",
+                "completed",
+                33,
+                3,
+                1,
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::session_end(Some(&sid), 1))
+            .unwrap();
+
+        let state = classify_session_end_state(&sid).unwrap();
+        match state {
+            SessionEndState::Interrupted { kind, resumable } => {
+                assert_eq!(
+                    kind, "plan_mid_flight",
+                    "unterminated plan must be classified as plan_mid_flight"
+                );
+                assert!(
+                    resumable,
+                    "mid-flight plans are resumable (the user can pick up execution)"
+                );
+            }
+            other => panic!(
+                "expected Interrupted(plan_mid_flight), got {other:?}; \
+                 an unterminated plan with a session_end must still surface as stale"
+            ),
+        }
+    }
+
+    #[test]
+    fn classify_session_end_state_completed_when_plan_also_completed() {
+        // Control: plan started AND completed before session_end → Completed.
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = format!("test-plan-ok-{}", uuid::Uuid::new_v4());
+        let writer = JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
+            .unwrap();
+        writer
+            .append(&JournalEvent::plan_lifecycle(
+                Some(&sid),
+                "execution_started",
+                Some(serde_json::json!({ "plan_id": "p-ok" })),
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::plan_lifecycle(
+                Some(&sid),
+                "plan_completed",
+                Some(serde_json::json!({ "plan_id": "p-ok" })),
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::session_end(Some(&sid), 1))
+            .unwrap();
+
+        assert_eq!(
+            classify_session_end_state(&sid).unwrap(),
+            SessionEndState::Completed,
+            "a properly terminated plan must not be flagged as stale"
+        );
+    }
+
+    #[test]
+    fn classify_session_end_state_completed_when_plan_abandoned() {
+        // Control: plan abandoned explicitly before session_end → Completed.
+        // (The user chose to stop; not the same as "forgot to finish".)
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = format!("test-plan-abandon-{}", uuid::Uuid::new_v4());
+        let writer = JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
+            .unwrap();
+        writer
+            .append(&JournalEvent::plan_lifecycle(
+                Some(&sid),
+                "execution_started",
+                Some(serde_json::json!({ "plan_id": "p-ab" })),
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::plan_lifecycle(
+                Some(&sid),
+                "plan_abandoned",
+                Some(serde_json::json!({ "plan_id": "p-ab" })),
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::session_end(Some(&sid), 1))
+            .unwrap();
+
+        assert_eq!(
+            classify_session_end_state(&sid).unwrap(),
+            SessionEndState::Completed
         );
     }
 

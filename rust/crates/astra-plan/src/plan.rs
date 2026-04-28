@@ -540,8 +540,10 @@ pub enum PlanCommand {
     Correct { guidance: String },
     /// Clear stacked corrections.
     ClearCorrections,
-    /// Rewind to a specific subtask.
+    /// Rewind to a specific subtask — resets this subtask and every subtask after it to Pending.
     Rewind { anchor: String },
+    /// Re-do a single subtask — resets only the named subtask to Pending.
+    RedoStep { subtask_id: String },
     /// Enable plan-only chat mode.
     EnablePlanOnly,
     /// Disable plan-only chat mode.
@@ -687,17 +689,22 @@ impl PlanCommand {
             }
         }
 
-        // Rewind
-        for prefix in [
-            "rewind ",
-            "restart from ",
-            "redo from ",
-            "restart ",
-            "redo ",
-        ] {
+        // Rewind (suffix reset): "rewind N", "restart from X", "redo from X", "restart X"
+        for prefix in ["rewind ", "restart from ", "redo from ", "restart "] {
             if let Some(rest) = strip_prefix_ci_local(trimmed, prefix).filter(|r| !r.is_empty()) {
                 return Some(PlanCommand::Rewind {
                     anchor: rest.to_string(),
+                });
+            }
+        }
+
+        // RedoStep (single subtask): "redo X" or "redo-step X" — distinct from
+        // "redo from X" (which is a rewind). Checked after the rewind prefixes so
+        // "redo from X" matches there first.
+        for prefix in ["redo-step ", "redo "] {
+            if let Some(rest) = strip_prefix_ci_local(trimmed, prefix).filter(|r| !r.is_empty()) {
+                return Some(PlanCommand::RedoStep {
+                    subtask_id: rest.to_string(),
                 });
             }
         }
@@ -1064,6 +1071,32 @@ mod tests {
                 anchor: "setup".to_string()
             })
         );
+        // "redo from X" is still a rewind (suffix reset), not a single-step redo.
+        assert_eq!(
+            PlanCommand::parse("redo from setup"),
+            Some(PlanCommand::Rewind {
+                anchor: "setup".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn plan_command_parse_redo_step() {
+        // Single-subtask redo — disjoint from rewind.
+        assert_eq!(
+            PlanCommand::parse("redo setup"),
+            Some(PlanCommand::RedoStep {
+                subtask_id: "setup".to_string()
+            })
+        );
+        assert_eq!(
+            PlanCommand::parse("redo-step st-2"),
+            Some(PlanCommand::RedoStep {
+                subtask_id: "st-2".to_string()
+            })
+        );
+        // Bare "redo" with nothing after it is not a command.
+        assert_eq!(PlanCommand::parse("redo"), None);
     }
 
     #[test]

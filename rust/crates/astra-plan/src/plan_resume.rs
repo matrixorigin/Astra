@@ -61,6 +61,38 @@ pub fn plan_resume_digest(state: &PlanModeState) -> Option<String> {
     Some(out)
 }
 
+/// Build a system-prompt section that reminds the LLM a plan is still open.
+///
+/// Returns `None` when the plan has nothing worth surfacing (no goal **and**
+/// no subtasks — same guard as [`plan_resume_digest`]).
+///
+/// The output is multi-line markdown intended to be appended to the dynamic
+/// portion of the system prompt on every turn while a session has an active
+/// plan. It includes the one-line digest plus an instruction paragraph that
+/// steers the model back toward plan execution semantics.
+///
+/// Example:
+///
+/// ```text
+/// ## Active Plan
+/// [plan-resume] goal="Fix auth bug" · in_progress="Add unit test" · open=3 · done=1/5
+///
+/// A plan is currently in-flight for this session. Treat the next turn as a
+/// continuation — resume from the in-progress subtask, respect the approved
+/// plan structure, and call `exit_plan_mode` only if the plan needs to be
+/// abandoned before completion.
+/// ```
+pub fn plan_resume_system_prompt_section(state: &PlanModeState) -> Option<String> {
+    let digest = plan_resume_digest(state)?;
+    Some(format!(
+        "\n\n## Active Plan\n{digest}\n\n\
+         A plan is currently in-flight for this session. Treat the next turn as a \
+         continuation — resume from the in-progress subtask, respect the approved \
+         plan structure, and call `exit_plan_mode` only if the plan needs to be \
+         abandoned before completion."
+    ))
+}
+
 /// Returns `true` when the user line signals intent to resume a paused plan.
 ///
 /// Matches are intentionally narrow to avoid false positives on unrelated
@@ -190,6 +222,46 @@ mod tests {
     #[test]
     fn resume_signal_matches_explicit_tag() {
         assert!(message_signals_resume("please @resume-plan now"));
+    }
+
+    #[test]
+    fn resume_system_prompt_section_returns_none_for_empty_state() {
+        let st = make_state("", vec![]);
+        assert!(plan_resume_system_prompt_section(&st).is_none());
+    }
+
+    #[test]
+    fn resume_system_prompt_section_contains_digest_and_continuation_cue() {
+        let st = make_state(
+            "Ship auth overhaul",
+            vec![
+                subtask("t1", "schema migration", TaskStatus::Completed),
+                subtask("t2", "middleware refactor", TaskStatus::InProgress),
+                subtask("t3", "tests", TaskStatus::Pending),
+            ],
+        );
+        let section = plan_resume_system_prompt_section(&st).expect("section");
+        // Includes the digest line and the continuation instruction.
+        assert!(
+            section.contains("[plan-resume]"),
+            "section missing digest: {section}"
+        );
+        assert!(
+            section.contains("goal=\"Ship auth overhaul\""),
+            "section missing goal: {section}"
+        );
+        assert!(
+            section.contains("in_progress=\"middleware refactor\""),
+            "section missing in_progress subtask: {section}"
+        );
+        assert!(
+            section.contains("Active Plan"),
+            "section missing header: {section}"
+        );
+        assert!(
+            section.contains("exit_plan_mode"),
+            "section must mention the exit-plan-mode escape hatch"
+        );
     }
 
     #[test]

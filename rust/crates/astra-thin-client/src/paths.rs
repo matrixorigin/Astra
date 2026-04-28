@@ -272,6 +272,59 @@ pub fn session_audit_errors(session_id: &str) -> String {
     format!("/sessions/{session_id}/audit/errors")
 }
 
+// ── Plan lifecycle endpoints (cloud-authoritative) ──────────────────────────
+
+/// `POST /plans` / `GET /plans`
+pub const PLANS: &str = "/plans";
+
+#[inline]
+pub fn plan(id: &str) -> String {
+    format!("/plans/{id}")
+}
+
+#[inline]
+pub fn plan_status(id: &str) -> String {
+    format!("/plans/{id}/status")
+}
+
+#[inline]
+pub fn plan_execute(id: &str) -> String {
+    format!("/plans/{id}/execute")
+}
+
+#[inline]
+pub fn plan_exit_mode(id: &str) -> String {
+    format!("/plans/{id}/exit-plan-mode")
+}
+
+#[inline]
+pub fn plan_rewind(id: &str) -> String {
+    format!("/plans/{id}/rewind")
+}
+
+#[inline]
+pub fn plan_redo_step(id: &str) -> String {
+    format!("/plans/{id}/redo-step")
+}
+
+/// `POST /plans/{id}/step-runs` (create) and `GET /plans/{id}/step-runs` (list).
+/// Same path, different methods — read + write share the prefix for API
+/// consumer intuition.
+#[inline]
+pub fn plan_step_runs(id: &str) -> String {
+    format!("/plans/{id}/step-runs")
+}
+
+#[inline]
+pub fn plan_step_run_completed(id: &str) -> String {
+    format!("/plans/{id}/step-runs/completed")
+}
+
+#[inline]
+pub fn plan_step_run_finish(plan_id: &str, run_id: &str) -> String {
+    format!("/plans/{plan_id}/step-runs/{run_id}/finish")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

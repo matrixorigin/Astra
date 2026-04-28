@@ -662,6 +662,53 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/admin/resources/limits/{user_id}",
             axum::routing::put(resource_handlers::set_resource_limits_handler),
         )
+        // ── Plan lifecycle (authoring + execution + resume) ──────────────
+        .route(
+            "/plans",
+            post(plan_handlers::create_plan_handler).get(plan_handlers::list_plans_handler),
+        )
+        .route(
+            "/plans/{plan_id}",
+            get(plan_handlers::get_plan_handler)
+                .put(plan_handlers::update_plan_handler)
+                .delete(plan_handlers::delete_plan_handler),
+        )
+        .route(
+            "/plans/{plan_id}/status",
+            get(plan_handlers::plan_status_handler),
+        )
+        .route(
+            "/plans/{plan_id}/execute",
+            post(plan_handlers::execute_plan_handler),
+        )
+        .route(
+            "/plans/{plan_id}/exit-plan-mode",
+            post(plan_handlers::exit_plan_mode_handler),
+        )
+        .route(
+            "/plans/{plan_id}/rewind",
+            post(plan_handlers::rewind_plan_handler),
+        )
+        .route(
+            "/plans/{plan_id}/redo-step",
+            post(plan_handlers::redo_step_handler),
+        )
+        // Unified `/step-runs` prefix: GET lists, POST starts, POST /completed
+        // one-shots, POST /{run_id}/finish finalizes. The earlier `/runs`
+        // read path was confusing (read vs write used different nouns) and
+        // is gone.
+        .route(
+            "/plans/{plan_id}/step-runs",
+            get(plan_handlers::list_step_runs_handler).post(plan_handlers::start_step_run_handler),
+        )
+        .route(
+            "/plans/{plan_id}/step-runs/completed",
+            post(plan_handlers::post_completed_step_run_handler),
+        )
+        .route(
+            "/plans/{plan_id}/step-runs/{run_id}/finish",
+            post(plan_handlers::finish_step_run_handler),
+        )
         .with_state(state)
 }
 

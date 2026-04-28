@@ -74,6 +74,7 @@ fn take_plan_context(
         model: state.model.clone(),
         plan,
         plan_goal: state.executing_plan_goal.clone(),
+        plan_id: state.executing_plan_id.clone(),
         plan_corrections: std::mem::take(&mut state.plan_execution_corrections),
         history: state.history.clone(),
         session_id: state.session_id.clone(),

@@ -2069,6 +2069,37 @@ async fn handle_plan_command(
             }
         }
 
+        PlanCommand::RedoStep { subtask_id } => {
+            if let Some(ref mut plan) = state.executing_plan {
+                let anchor = plan::PlanRewindAnchor::IdPrefix(subtask_id.clone());
+                match plan::resolve_rewind_start_index(plan, &anchor) {
+                    Ok(idx) => {
+                        plan.subtasks[idx].reset_for_redo();
+                        let title = plan.subtasks[idx].title.clone();
+                        eprintln!(
+                            "  {} Reset subtask '{}' ({}) for redo",
+                            theme::icon_ok(),
+                            title.cyan(),
+                            subtask_id.cyan(),
+                        );
+                    }
+                    Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
+                }
+            } else if plan_execution_ui_active(state) {
+                eprintln!(
+                    "  {} Redo targets the live executor after a pause. Pause the run first ({} or Ctrl+C).",
+                    theme::icon_warn(),
+                    "pause".cyan()
+                );
+            } else if state.plan_mode.is_some() {
+                eprintln!(
+                    "  {} {}",
+                    theme::icon_warn(),
+                    "Redo is only available during execution".yellow()
+                );
+            }
+        }
+
         PlanCommand::EnablePlanOnly => {
             state.chat_plan_only = true;
             eprintln!(

@@ -269,6 +269,55 @@ pub struct PlanTemplateSyncRow {
 
 const MAX_PREFERENCE_SYNC_ROWS: i64 = 128;
 const MAX_PLAN_TEMPLATE_SYNC_ROWS: i64 = 500;
+const MAX_PLAN_SYNC_ROWS: i64 = 200;
+const MAX_PLAN_STEP_RUN_SYNC_ROWS: i64 = 2000;
+
+/// One row from `plans`, serialized for edge↔cloud sync. Plans carry the
+/// full serialized `PlanModeState` in `plan_json` so edge can hydrate an
+/// identical view without needing every column in the table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanSyncRow {
+    pub plan_id: String,
+    pub user_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub goal: String,
+    pub phase: String,
+    pub version: i64,
+    pub plan_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_md: Option<String>,
+    pub progress_pct: i32,
+    /// Denormalized subtask count, maintained by `PlanRepository::save`.
+    /// Let the list endpoint render a card without parsing `plan_json`.
+    pub subtask_count: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+}
+
+/// One row from `plan_step_runs`. The run history is the audit chain that
+/// makes plan execution traceable across sessions.
+///
+/// `started_at` / `finished_at` are the edge's actual execution timestamps
+/// — when a CLI executes offline and later syncs, the cloud must preserve
+/// the original timeline, not overwrite with sync-time `NOW()`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanStepRunSyncRow {
+    pub run_id: String,
+    pub plan_id: String,
+    pub subtask_id: String,
+    pub attempt: i32,
+    pub status: String,
+    pub session_id: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_ref: Option<String>,
+}
 
 /// Delta snapshot containing only changed data since last sync.
 ///
@@ -408,6 +457,17 @@ pub trait StateSyncService: Send + Sync {
     /// JSON array of [`PlanTemplateSyncRow`] for the user plus global rows (`user_id IS NULL`).
     async fn pull_plan_templates_pack(&self, user_id: &str) -> Result<String, String>;
 
+    /// JSON array of [`PlanSyncRow`] for the user's owned plans (newest first).
+    /// Returns `{"plans": [...], "step_runs": [...]}` — the `plans` table rows
+    /// and matching `plan_step_runs` history so edge can replay attempt chains
+    /// offline. One envelope simplifies atomic edge-side hydration.
+    async fn pull_plans_pack(&self, user_id: &str) -> Result<String, String>;
+
+    /// Accept a JSON envelope `{"plans": [...], "step_runs": [...]}` produced
+    /// by edge while offline. Upserts plans (optimistic version check) and
+    /// appends previously-unseen step-runs (idempotent by `run_id`).
+    async fn push_plans_pack(&self, user_id: &str, pack_json: &str) -> Result<String, String>;
+
     /// JSON array of [`crate::task_orchestrator::TaskRecord`] for the user (`agent_tasks`).
     async fn pull_tasks_pack(&self, user_id: &str) -> Result<String, String>;
 
@@ -489,6 +549,14 @@ impl StateSyncService for LocalOnlySyncService {
 
     async fn pull_plan_templates_pack(&self, _user_id: &str) -> Result<String, String> {
         Ok("[]".to_string())
+    }
+
+    async fn pull_plans_pack(&self, _user_id: &str) -> Result<String, String> {
+        Ok(r#"{"plans":[],"step_runs":[]}"#.to_string())
+    }
+
+    async fn push_plans_pack(&self, _user_id: &str, _pack_json: &str) -> Result<String, String> {
+        Ok(r#"{"applied":0,"skipped":0}"#.to_string())
     }
 
     async fn pull_tasks_pack(&self, _user_id: &str) -> Result<String, String> {
@@ -1157,6 +1225,348 @@ impl StateSyncService for MatrixOneSyncService {
             });
         }
         serde_json::to_string(&items).map_err(|e| format!("pull_plan_templates_pack json: {e}"))
+    }
+
+    async fn pull_plans_pack(&self, user_id: &str) -> Result<String, String> {
+        use sqlx::Row;
+
+        // 1. Plans owned by this user, newest first.
+        let plan_rows = sqlx::query(
+            "SELECT plan_id, user_id, session_id, goal, phase, version, plan_json, \
+                    plan_md, progress_pct, subtask_count, created_by \
+             FROM plans \
+             WHERE user_id = ? \
+             ORDER BY updated_at DESC \
+             LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(MAX_PLAN_SYNC_ROWS)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("pull_plans_pack plans: {e}"))?;
+
+        let mut plans: Vec<PlanSyncRow> = Vec::with_capacity(plan_rows.len());
+        let mut plan_ids: Vec<String> = Vec::with_capacity(plan_rows.len());
+        for row in plan_rows {
+            let plan_id: String = row
+                .try_get("plan_id")
+                .map_err(|e| format!("pull_plans_pack plan_id: {e}"))?;
+            plan_ids.push(plan_id.clone());
+            plans.push(PlanSyncRow {
+                plan_id,
+                user_id: row
+                    .try_get("user_id")
+                    .map_err(|e| format!("pull_plans_pack user_id: {e}"))?,
+                session_id: row
+                    .try_get("session_id")
+                    .map_err(|e| format!("pull_plans_pack session_id: {e}"))?,
+                goal: row
+                    .try_get("goal")
+                    .map_err(|e| format!("pull_plans_pack goal: {e}"))?,
+                phase: row
+                    .try_get("phase")
+                    .map_err(|e| format!("pull_plans_pack phase: {e}"))?,
+                version: row
+                    .try_get("version")
+                    .map_err(|e| format!("pull_plans_pack version: {e}"))?,
+                plan_json: row
+                    .try_get("plan_json")
+                    .map_err(|e| format!("pull_plans_pack plan_json: {e}"))?,
+                plan_md: row
+                    .try_get("plan_md")
+                    .map_err(|e| format!("pull_plans_pack plan_md: {e}"))?,
+                progress_pct: row
+                    .try_get("progress_pct")
+                    .map_err(|e| format!("pull_plans_pack progress_pct: {e}"))?,
+                subtask_count: row
+                    .try_get("subtask_count")
+                    .map_err(|e| format!("pull_plans_pack subtask_count: {e}"))?,
+                created_by: row
+                    .try_get("created_by")
+                    .map_err(|e| format!("pull_plans_pack created_by: {e}"))?,
+            });
+        }
+
+        // 2. Step-run history for those plans (bounded so we don't ship
+        //    unbounded history on every pull).
+        let mut step_runs: Vec<PlanStepRunSyncRow> = Vec::new();
+        if !plan_ids.is_empty() {
+            let placeholders = (0..plan_ids.len())
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT run_id, plan_id, subtask_id, attempt, status, session_id, \
+                        started_at, finished_at, request_id, error, artifact_ref \
+                 FROM plan_step_runs \
+                 WHERE plan_id IN ({placeholders}) \
+                 ORDER BY started_at DESC \
+                 LIMIT ?"
+            );
+            let mut q = sqlx::query(&sql);
+            for id in &plan_ids {
+                q = q.bind(id);
+            }
+            q = q.bind(MAX_PLAN_STEP_RUN_SYNC_ROWS);
+            let rows = q
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| format!("pull_plans_pack step_runs: {e}"))?;
+            step_runs.reserve(rows.len());
+            for row in rows {
+                step_runs.push(PlanStepRunSyncRow {
+                    run_id: row
+                        .try_get("run_id")
+                        .map_err(|e| format!("pull_plans_pack run_id: {e}"))?,
+                    plan_id: row
+                        .try_get("plan_id")
+                        .map_err(|e| format!("pull_plans_pack run_plan_id: {e}"))?,
+                    subtask_id: row
+                        .try_get("subtask_id")
+                        .map_err(|e| format!("pull_plans_pack subtask_id: {e}"))?,
+                    attempt: row
+                        .try_get("attempt")
+                        .map_err(|e| format!("pull_plans_pack attempt: {e}"))?,
+                    status: row
+                        .try_get("status")
+                        .map_err(|e| format!("pull_plans_pack status: {e}"))?,
+                    session_id: row
+                        .try_get("session_id")
+                        .map_err(|e| format!("pull_plans_pack step session_id: {e}"))?,
+                    started_at: row
+                        .try_get("started_at")
+                        .map_err(|e| format!("pull_plans_pack started_at: {e}"))?,
+                    finished_at: row
+                        .try_get("finished_at")
+                        .map_err(|e| format!("pull_plans_pack finished_at: {e}"))?,
+                    request_id: row
+                        .try_get("request_id")
+                        .map_err(|e| format!("pull_plans_pack request_id: {e}"))?,
+                    error: row
+                        .try_get("error")
+                        .map_err(|e| format!("pull_plans_pack error: {e}"))?,
+                    artifact_ref: row
+                        .try_get("artifact_ref")
+                        .map_err(|e| format!("pull_plans_pack artifact_ref: {e}"))?,
+                });
+            }
+        }
+
+        serde_json::to_string(&serde_json::json!({
+            "plans": plans,
+            "step_runs": step_runs,
+        }))
+        .map_err(|e| format!("pull_plans_pack json: {e}"))
+    }
+
+    async fn push_plans_pack(&self, user_id: &str, pack_json: &str) -> Result<String, String> {
+        #[derive(Deserialize)]
+        struct Pack {
+            #[serde(default)]
+            plans: Vec<PlanSyncRow>,
+            #[serde(default)]
+            step_runs: Vec<PlanStepRunSyncRow>,
+        }
+        let pack: Pack =
+            serde_json::from_str(pack_json).map_err(|e| format!("push_plans_pack parse: {e}"))?;
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| format!("push_plans_pack begin: {e}"))?;
+
+        // Partition incoming plans into user-owned (to process) and cross-user
+        // (to reject up-front). Cross-user drops never hit the DB.
+        let mut skipped_plans = 0usize;
+        let owned_plans: Vec<&PlanSyncRow> = pack
+            .plans
+            .iter()
+            .filter(|p| {
+                if p.user_id == user_id {
+                    true
+                } else {
+                    skipped_plans += 1;
+                    false
+                }
+            })
+            .collect();
+
+        // Batch prefetch stored versions for the plans we intend to touch —
+        // one SELECT with an IN() list instead of one per plan. Empty input
+        // skips the round-trip entirely.
+        let mut stored_versions: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::with_capacity(owned_plans.len());
+        if !owned_plans.is_empty() {
+            let placeholders = std::iter::repeat_n("?", owned_plans.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql =
+                format!("SELECT plan_id, version FROM plans WHERE plan_id IN ({placeholders})");
+            let mut q = sqlx::query(&sql);
+            for plan in &owned_plans {
+                q = q.bind(&plan.plan_id);
+            }
+            let rows = q
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| format!("push_plans_pack batch select versions: {e}"))?;
+            for row in rows {
+                let id: String = row
+                    .try_get("plan_id")
+                    .map_err(|e| format!("push_plans_pack version row plan_id: {e}"))?;
+                let v: i64 = row
+                    .try_get("version")
+                    .map_err(|e| format!("push_plans_pack version row version: {e}"))?;
+                stored_versions.insert(id, v);
+            }
+        }
+
+        let mut applied_plans = 0usize;
+        for plan in &owned_plans {
+            // Optimistic concurrency: only accept if the incoming version is
+            // strictly newer than the stored version. Ties and regressions are
+            // skipped so a stale edge pack can't clobber cloud updates.
+            if let Some(&stored) = stored_versions.get(&plan.plan_id)
+                && stored >= plan.version
+            {
+                skipped_plans += 1;
+                continue;
+            }
+
+            sqlx::query(
+                "INSERT INTO plans \
+                     (plan_id, user_id, session_id, goal, phase, version, \
+                      plan_json, plan_md, progress_pct, subtask_count, created_by, \
+                      created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6)) \
+                 ON DUPLICATE KEY UPDATE \
+                     session_id = VALUES(session_id), \
+                     goal = VALUES(goal), \
+                     phase = VALUES(phase), \
+                     version = VALUES(version), \
+                     plan_json = VALUES(plan_json), \
+                     plan_md = VALUES(plan_md), \
+                     progress_pct = VALUES(progress_pct), \
+                     subtask_count = VALUES(subtask_count), \
+                     updated_at = NOW(6)",
+            )
+            .bind(&plan.plan_id)
+            .bind(&plan.user_id)
+            .bind(plan.session_id.as_deref())
+            .bind(&plan.goal)
+            .bind(&plan.phase)
+            .bind(plan.version)
+            .bind(&plan.plan_json)
+            .bind(plan.plan_md.as_deref())
+            .bind(plan.progress_pct)
+            .bind(plan.subtask_count)
+            .bind(plan.created_by.as_deref())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("push_plans_pack upsert plan: {e}"))?;
+            applied_plans += 1;
+        }
+
+        // Batch prefetch owners for every distinct plan_id referenced by the
+        // step_runs we might apply. One IN() query instead of N, and owners
+        // we just UPSERTed in this tx are already visible through the row
+        // cache. Include the plans we just applied so the owner lookup
+        // doesn't miss newly-inserted plans.
+        let mut run_plan_ids: std::collections::HashSet<&str> =
+            pack.step_runs.iter().map(|r| r.plan_id.as_str()).collect();
+        // Plans inserted earlier in the tx are visible to this SELECT (same
+        // connection, same transaction), so no special-casing needed — but
+        // we still read from the DB so step_runs referencing a completely
+        // fresh plan_id that only appears in this pack are resolved via the
+        // UPSERTed row.
+        let mut owners: std::collections::HashMap<String, String> =
+            std::collections::HashMap::with_capacity(run_plan_ids.len());
+        if !run_plan_ids.is_empty() {
+            let placeholders = std::iter::repeat_n("?", run_plan_ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql =
+                format!("SELECT plan_id, user_id FROM plans WHERE plan_id IN ({placeholders})");
+            let mut q = sqlx::query(&sql);
+            // Hash iteration order is random; capture the order so we can
+            // bind in the same order as the placeholders.
+            let ordered: Vec<&str> = run_plan_ids.drain().collect();
+            for id in &ordered {
+                q = q.bind(*id);
+            }
+            let rows = q
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| format!("push_plans_pack batch select owners: {e}"))?;
+            for row in rows {
+                let id: String = row
+                    .try_get("plan_id")
+                    .map_err(|e| format!("push_plans_pack owner row plan_id: {e}"))?;
+                let uid: String = row
+                    .try_get("user_id")
+                    .map_err(|e| format!("push_plans_pack owner row user_id: {e}"))?;
+                owners.insert(id, uid);
+            }
+        }
+
+        let mut applied_runs = 0usize;
+        let mut skipped_runs = 0usize;
+        for run in &pack.step_runs {
+            // Verify the plan exists and is owned — rejects orphan + cross-user runs.
+            match owners.get(&run.plan_id) {
+                Some(owner_id) if owner_id == user_id => { /* ok */ }
+                _ => {
+                    skipped_runs += 1;
+                    continue;
+                }
+            }
+
+            // INSERT IGNORE so edge can replay a pack safely without failing
+            // on previously-persisted run ids (append-only semantics).
+            //
+            // started_at / finished_at come from the edge's actual execution
+            // timestamps, NOT the sync-time NOW(). Offline executions must
+            // preserve their real timeline or the audit chain collapses into
+            // the moment of sync.
+            let res = sqlx::query(
+                "INSERT IGNORE INTO plan_step_runs \
+                     (run_id, plan_id, subtask_id, attempt, status, session_id, \
+                      started_at, finished_at, request_id, error, artifact_ref) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&run.run_id)
+            .bind(&run.plan_id)
+            .bind(&run.subtask_id)
+            .bind(run.attempt)
+            .bind(&run.status)
+            .bind(&run.session_id)
+            .bind(run.started_at)
+            .bind(run.finished_at)
+            .bind(&run.request_id)
+            .bind(run.error.as_deref())
+            .bind(run.artifact_ref.as_deref())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("push_plans_pack insert run: {e}"))?;
+            if res.rows_affected() == 0 {
+                skipped_runs += 1;
+            } else {
+                applied_runs += 1;
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| format!("push_plans_pack commit: {e}"))?;
+
+        serde_json::to_string(&serde_json::json!({
+            "plans_applied": applied_plans,
+            "plans_skipped": skipped_plans,
+            "step_runs_applied": applied_runs,
+            "step_runs_skipped": skipped_runs,
+        }))
+        .map_err(|e| format!("push_plans_pack result json: {e}"))
     }
 
     async fn pull_tasks_pack(&self, user_id: &str) -> Result<String, String> {

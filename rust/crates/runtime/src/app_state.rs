@@ -105,6 +105,10 @@ pub struct AppState {
     /// Shared HTTP client for upstream LLM proxy requests (completions handler).
     /// Reuses connection pool and TLS state across requests.
     pub(crate) http_client: reqwest::Client,
+    /// Cloud-authoritative repository for plan state and step-run history.
+    /// Defaults to [`astra_plan::LocalCachePlanRepository`]; production wires
+    /// [`astra_plan::CloudPlanRepository`] backed by the MatrixOne pool.
+    pub(crate) plan_repo: Arc<dyn astra_plan::PlanRepository>,
 }
 
 impl AppState {
@@ -205,7 +209,16 @@ impl AppState {
                 .timeout(std::time::Duration::from_secs(120))
                 .build()
                 .expect("failed to build shared HTTP client"),
+            plan_repo: Arc::new(astra_plan::LocalCachePlanRepository::new()),
         }
+    }
+
+    /// Inject the plan repository — production wires
+    /// [`astra_plan::CloudPlanRepository`]; tests typically keep the default
+    /// [`astra_plan::LocalCachePlanRepository`].
+    pub fn with_plan_repository(mut self, repo: Arc<dyn astra_plan::PlanRepository>) -> Self {
+        self.plan_repo = repo;
+        self
     }
 
     pub fn with_memoria_config(

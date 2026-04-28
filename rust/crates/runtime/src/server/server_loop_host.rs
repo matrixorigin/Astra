@@ -527,6 +527,11 @@ pub struct ServerAgenticLoopHost {
     interactive_client: bool,
     /// `true` when this session explicitly requests full LLM request/response capture.
     full_llm_capture: bool,
+    /// System-prompt section reminding the LLM that a plan is in-flight.
+    /// Shared mutable so mid-run tool executions (enter_plan_mode /
+    /// exit_plan_mode) can refresh it. `None` means no active plan; reads
+    /// are cheap (one RwLock read) so `build_system_prompt` stays sync.
+    plan_resume_hint: Arc<std::sync::RwLock<Option<String>>>,
 
     // ── Tool execution ──
     #[allow(dead_code)] // used in Step 3: wire edge tool delivery via ledger
@@ -588,6 +593,7 @@ pub struct ServerAgenticLoopHostBuilder {
     interactive_client: bool,
     full_llm_capture: bool,
     event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
+    plan_resume_hint: Option<String>,
     #[cfg(feature = "bridge-e2e-hooks")]
     test_llm_rounds: Vec<Value>,
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -621,6 +627,7 @@ impl ServerAgenticLoopHostBuilder {
             interactive_client: false,
             full_llm_capture: false,
             event_tx: None,
+            plan_resume_hint: None,
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds: Vec::new(),
             #[cfg(feature = "bridge-e2e-hooks")]
@@ -634,6 +641,14 @@ impl ServerAgenticLoopHostBuilder {
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.shared_pool = Some(pool);
+        self
+    }
+
+    /// Inject a pre-computed system-prompt section that reminds the LLM a
+    /// plan is active for this session. Populated by the lifecycle service
+    /// before the loop starts so the first and subsequent turns both see it.
+    pub fn with_plan_resume_hint(mut self, hint: Option<String>) -> Self {
+        self.plan_resume_hint = hint;
         self
     }
 
@@ -779,6 +794,7 @@ impl ServerAgenticLoopHostBuilder {
             client_cancel_flag: None,
             client_cancel_token: None,
             progress_rx,
+            plan_resume_hint: Arc::new(std::sync::RwLock::new(self.plan_resume_hint)),
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds: std::collections::VecDeque::from(self.test_llm_rounds),
             #[cfg(feature = "bridge-e2e-hooks")]
@@ -792,6 +808,14 @@ impl ServerAgenticLoopHostBuilder {
 }
 
 impl ServerAgenticLoopHost {
+    /// Handle to the shared plan-resume hint slot. Mid-run callers
+    /// (tool executions that mutate plan-mode state) clone this handle and
+    /// swap in a fresh hint so the next turn's system prompt reflects the
+    /// new plan state instead of the snapshot baked at loop start.
+    pub(crate) fn plan_resume_hint_handle(&self) -> Arc<std::sync::RwLock<Option<String>>> {
+        Arc::clone(&self.plan_resume_hint)
+    }
+
     fn turn_interaction_mode(&self) -> TurnInteractionMode {
         if self.interactive_client {
             TurnInteractionMode::Prompt
@@ -1624,6 +1648,21 @@ impl ServerAgenticLoopHost {
                 ),
             );
         }
+        // Plan-resume reminder: injected when the session has an active plan.
+        // The hint is an `Arc<RwLock<Option<String>>>` so mid-run tool calls
+        // (enter_plan_mode / exit_plan_mode) can refresh it without
+        // re-building the host. Reading at prompt-build time ensures the
+        // next turn's system prompt reflects the current plan-mode state,
+        // not the state at loop start.
+        let plan_resume_hint = self.plan_resume_hint.read().ok().and_then(|g| g.clone());
+        if let Some(hint) = plan_resume_hint {
+            if !hint.is_empty() {
+                dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+                    hint,
+                    crate::prompts::PromptTokenBucket::Environment,
+                ));
+            }
+        }
         if !tool_round_guidance.is_empty() {
             dynamic_sections.push(
                 crate::prompts::PromptSection::dynamic(
@@ -1825,8 +1864,14 @@ impl ServerAgenticLoopHost {
             tool_cfg.effective_round_budget_warning(),
             tool_cfg.effective_round_budget_limit(),
         );
+        let plan_resume = self
+            .plan_resume_hint
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_default();
         let full_dynamic = format!(
-            "{profile_desc}{skill_hint}{learned_context_hint}{memory_signal_hint}{round_budget_hint}"
+            "{profile_desc}{skill_hint}{learned_context_hint}{memory_signal_hint}{round_budget_hint}{plan_resume}"
         );
 
         cached_system_prompt(
@@ -3169,6 +3214,55 @@ mod tests {
         assert!(
             prompt.contains("Learned Runtime Context"),
             "prompt should include learned context section"
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_includes_plan_resume_hint_when_set() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_plan_resume_hint(Some(
+            "\n\n## Active Plan\n[plan-resume] goal=\"Ship feature X\" · open=3 · done=1/5\n\n\
+             A plan is currently in-flight for this session."
+                .to_string(),
+        ))
+        .build();
+
+        let prompt = host.build_system_prompt("any user turn", &host.edge_tools);
+        assert!(
+            prompt.contains("[plan-resume]"),
+            "system prompt must surface the plan-resume digest when a plan is active"
+        );
+        assert!(
+            prompt.contains("Active Plan"),
+            "system prompt must include the Active Plan header"
+        );
+        assert!(
+            prompt.contains("Ship feature X"),
+            "system prompt must carry the plan's goal"
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_omits_plan_resume_hint_when_none() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .build();
+
+        let prompt = host.build_system_prompt("any user turn", &host.edge_tools);
+        assert!(
+            !prompt.contains("[plan-resume]"),
+            "system prompt must NOT mention plan-resume when no plan is active"
         );
     }
 

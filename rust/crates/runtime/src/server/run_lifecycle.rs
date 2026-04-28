@@ -1777,6 +1777,7 @@ impl AgenticRunLifecycleService {
         request: &ChatRequestData,
         edge_tools: Vec<Value>,
         edge_profile: Map<String, Value>,
+        plan_resume_hint: Option<String>,
     ) -> super::server_loop_host::ServerAgenticLoopHost {
         let mut builder = ServerAgenticLoopHostBuilder::new(
             self.matrixone.clone(),
@@ -1790,7 +1791,8 @@ impl AgenticRunLifecycleService {
         .with_edge_tools(edge_tools)
         .with_edge_profile(edge_profile)
         .with_edge_callback_ledger(self.edge_callback_ledger.clone())
-        .with_interactive_client(request.interactive_client);
+        .with_interactive_client(request.interactive_client)
+        .with_plan_resume_hint(plan_resume_hint);
 
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
@@ -2242,7 +2244,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             None
         };
-        let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
+        // Look up the plan-resume hint up-front so the system prompt on every
+        // turn reminds the LLM a plan is in flight. Missing pool → None, missing
+        // active plan → None, transient errors → None (best-effort).
+        let plan_resume_hint = if let Some(shared) = &self.shared_pool {
+            let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
+            astra_plan::plan_resume_hint_for_session(&repo, &session_id).await
+        } else {
+            None
+        };
+        let mut host = self.build_host(
+            &user_id,
+            &session_id,
+            &request,
+            edge_tools,
+            edge_profile,
+            plan_resume_hint,
+        );
         let mut loop_state = self.build_initial_state(
             &request,
             &session_id,
@@ -2280,6 +2298,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
             }
+            // Wire the plan repository so enter/exit_plan_mode tools work and
+            // the write-tool guard can check `active_plan_id`.
+            if let Some(shared) = &self.shared_pool {
+                executor.set_plan_repository(std::sync::Arc::new(
+                    astra_plan::CloudPlanRepository::new(shared.get().clone()),
+                ));
+            }
+            // Share the host's plan-resume hint slot so tool-triggered
+            // plan-mode changes refresh the system prompt mid-run.
+            executor.set_plan_resume_hint_handle(host.plan_resume_hint_handle());
             if let Some(observability_session) = loop_state.telemetry.observability_session.clone()
             {
                 executor.set_observability_session(observability_session);
@@ -2618,7 +2646,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         );
         state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
 
-        let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
+        let plan_resume_hint = if let Some(shared) = &self.shared_pool {
+            let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
+            astra_plan::plan_resume_hint_for_session(&repo, &session_id).await
+        } else {
+            None
+        };
+        let mut host = self.build_host(
+            &user_id,
+            &session_id,
+            &request,
+            edge_tools,
+            edge_profile,
+            plan_resume_hint,
+        );
         host.set_event_tx(event_tx.clone());
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
 
@@ -2674,6 +2715,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .with_cancel_token(state.cancellation.token.clone());
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
+            }
+            if let Some(shared) = &self.shared_pool {
+                executor.set_plan_repository(std::sync::Arc::new(
+                    astra_plan::CloudPlanRepository::new(shared.get().clone()),
+                ));
             }
             if let Some(observability_session) = state.telemetry.observability_session.clone() {
                 executor.set_observability_session(observability_session);
@@ -3521,6 +3567,12 @@ impl SubRunExecutor for ServerSubRunExecutor {
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
             }
+            if let Some(shared) = self.shared_pool.as_ref() {
+                executor.set_plan_repository(std::sync::Arc::new(
+                    astra_plan::CloudPlanRepository::new(shared.get().clone()),
+                ));
+            }
+            executor.set_plan_resume_hint_handle(host.plan_resume_hint_handle());
             if let Some(obs) = loop_state.telemetry.observability_session.clone() {
                 executor.set_observability_session(obs);
             }

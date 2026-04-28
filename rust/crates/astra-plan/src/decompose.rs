@@ -1627,6 +1627,10 @@ pub enum PlanLoadError {
     NotFound(String),
     /// Plan file exists but is corrupted or unreadable.
     Corrupt(String),
+    /// Optimistic-concurrency conflict — caller's `expected_version` did not
+    /// match the version actually stored. Typed separately from Internal so
+    /// HTTP handlers can map it to 409 without string matching.
+    Conflict { expected: u64, actual: u64 },
     /// I/O or other unexpected error.
     Internal(String),
 }
@@ -1637,6 +1641,9 @@ impl std::fmt::Display for PlanLoadError {
             Self::InvalidId(msg) => write!(f, "invalid plan ID: {msg}"),
             Self::NotFound(msg) => write!(f, "plan not found: {msg}"),
             Self::Corrupt(msg) => write!(f, "plan corrupted: {msg}"),
+            Self::Conflict { expected, actual } => {
+                write!(f, "version conflict: expected {expected}, stored {actual}")
+            }
             Self::Internal(msg) => write!(f, "plan error: {msg}"),
         }
     }
@@ -1675,6 +1682,14 @@ pub struct PlanModeState {
     /// User who created this plan (for ownership filtering).
     #[serde(default)]
     pub created_by: Option<String>,
+    /// Most-recent session that touched this plan. Populated by
+    /// [`crate::PlanRepository`] on load from the `plans.session_id` column;
+    /// used as a routing hint for journal emission and CLI resume. Not the
+    /// canonical audit — that lives in `plan_step_runs.session_id` per
+    /// attempt. Skipped during serialization so it always reflects the
+    /// current routing hint rather than a stale value from disk.
+    #[serde(skip)]
+    pub session_hint: Option<String>,
     /// Wall-clock origin for CLI "Assembling plan · Ns" (plan> session; not serialized).
     #[serde(skip)]
     pub assemble_wall_start: Option<Instant>,
@@ -1698,6 +1713,7 @@ impl PlanModeState {
             timeline: ExecutionTimeline::default(),
             version: 1,
             created_by: None,
+            session_hint: None,
             assemble_wall_start: Some(Instant::now()),
             _background_execution: false,
         }
@@ -3770,6 +3786,20 @@ pub enum TimelineEventKind {
         commit_hash: String,
         message: String,
     },
+    /// Plan was rewound — subtask at `from_idx` and every subtask after it
+    /// reset to pending. `reset_count` is the number that actually flipped.
+    SubtaskRewound {
+        anchor: String,
+        from_idx: usize,
+        reset_count: usize,
+        reason: Option<String>,
+    },
+    /// A single subtask was reset for re-execution (distinct from a rewind).
+    SubtaskRedone {
+        subtask_id: String,
+        title: String,
+        attempt: u32,
+    },
 }
 
 /// A single event in the execution timeline.
@@ -3824,6 +3854,8 @@ impl TimelineEvent {
             }
             TimelineEventKind::Discovery { .. } => "⚠",
             TimelineEventKind::GitCommit { .. } => "📦",
+            TimelineEventKind::SubtaskRewound { .. } => "⏮",
+            TimelineEventKind::SubtaskRedone { .. } => "🔁",
         };
 
         let desc = match &self.event {
@@ -3866,6 +3898,18 @@ impl TimelineEvent {
                 &commit_hash[..7.min(commit_hash.len())],
                 message
             ),
+            TimelineEventKind::SubtaskRewound {
+                anchor,
+                reset_count,
+                reason,
+                ..
+            } => match reason {
+                Some(r) => format!("Rewound to {} ({} reset): {}", anchor, reset_count, r),
+                None => format!("Rewound to {} ({} reset)", anchor, reset_count),
+            },
+            TimelineEventKind::SubtaskRedone { title, attempt, .. } => {
+                format!("Redo #{}: {}", attempt, title)
+            }
         };
 
         format!("{}  {} {}", self.time_display, icon, desc)

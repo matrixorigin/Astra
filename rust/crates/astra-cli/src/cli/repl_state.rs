@@ -154,6 +154,10 @@ pub(crate) struct ReplState {
     pub plan_execution_config: Option<plan_decompose::PlanExecutionConfig>,
     /// Goal text for the executing plan (for summary generation).
     pub executing_plan_goal: Option<String>,
+    /// Cloud `plan_id` this execution is mirroring to, for posting
+    /// `plan_step_runs` rows to the server. `None` keeps execution purely
+    /// local (no step-run persistence).
+    pub executing_plan_id: Option<String>,
     /// Number of parallel execution rounds completed (for summary).
     pub plan_execution_rounds: usize,
     /// ID of the currently-executing plan subtask (set during plan execution,
@@ -382,6 +386,7 @@ impl Default for ReplState {
             executing_plan: None,
             plan_execution_config: None,
             executing_plan_goal: None,
+            executing_plan_id: None,
             plan_execution_rounds: 0,
             current_plan_subtask_id: None,
             last_turn_interrupted: false,

@@ -1489,6 +1489,150 @@ impl ThinClient {
         let resp = req.send().await?;
         Self::json_or_error(resp).await
     }
+
+    // ── Plan lifecycle ─────────────────────────────────────────────────────
+
+    /// `POST /plans/{plan_id}/step-runs` — record the start of a subtask
+    /// attempt. Returns the `run_id` the server assigned so the caller can
+    /// pair a later finish call.
+    pub async fn post_plan_step_run_start(
+        &self,
+        token: &str,
+        plan_id: &str,
+        body: &Value,
+    ) -> Result<String, ThinClientError> {
+        let url = self.url(&paths::plan_step_runs(plan_id))?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(Self::bearer_headers(token)?)
+            .json(body)
+            .send()
+            .await?;
+        Self::text_or_api(resp).await
+    }
+
+    /// `POST /plans/{plan_id}/step-runs/completed` — one-shot record of an
+    /// attempt that already reached a terminal state. Saves one HTTP round-trip
+    /// vs. the start + finish pair on the CLI's happy path.
+    pub async fn post_plan_step_run_completed(
+        &self,
+        token: &str,
+        plan_id: &str,
+        body: &Value,
+    ) -> Result<String, ThinClientError> {
+        let url = self.url(&paths::plan_step_run_completed(plan_id))?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(Self::bearer_headers(token)?)
+            .json(body)
+            .send()
+            .await?;
+        Self::text_or_api(resp).await
+    }
+
+    /// `POST /plans/{plan_id}/step-runs/{run_id}/finish` — finalize an attempt.
+    pub async fn post_plan_step_run_finish(
+        &self,
+        token: &str,
+        plan_id: &str,
+        run_id: &str,
+        body: &Value,
+    ) -> Result<String, ThinClientError> {
+        let url = self.url(&paths::plan_step_run_finish(plan_id, run_id))?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(Self::bearer_headers(token)?)
+            .json(body)
+            .send()
+            .await?;
+        Self::text_or_api(resp).await
+    }
+
+    /// `GET /plans/{plan_id}/step-runs` — list attempt history for audit UIs.
+    pub async fn get_plan_step_runs_text(
+        &self,
+        token: &str,
+        plan_id: &str,
+        subtask_id: Option<&str>,
+        limit: Option<i32>,
+    ) -> Result<String, ThinClientError> {
+        let mut path = paths::plan_step_runs(plan_id);
+        let mut sep = '?';
+        if let Some(sid) = subtask_id {
+            path.push(sep);
+            path.push_str("subtask_id=");
+            path.push_str(sid);
+            sep = '&';
+        }
+        if let Some(l) = limit {
+            path.push(sep);
+            path.push_str("limit=");
+            path.push_str(&l.to_string());
+        }
+        let url = self.url(&path)?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(Self::bearer_headers(token)?)
+            .send()
+            .await?;
+        Self::text_or_api(resp).await
+    }
+
+    /// `POST /plans/{plan_id}/rewind` — suffix reset from an anchor.
+    pub async fn post_plan_rewind(
+        &self,
+        token: &str,
+        plan_id: &str,
+        body: &Value,
+    ) -> Result<String, ThinClientError> {
+        let url = self.url(&paths::plan_rewind(plan_id))?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(Self::bearer_headers(token)?)
+            .json(body)
+            .send()
+            .await?;
+        Self::text_or_api(resp).await
+    }
+
+    /// `POST /plans/{plan_id}/redo-step` — single-subtask reset.
+    pub async fn post_plan_redo_step(
+        &self,
+        token: &str,
+        plan_id: &str,
+        body: &Value,
+    ) -> Result<String, ThinClientError> {
+        let url = self.url(&paths::plan_redo_step(plan_id))?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(Self::bearer_headers(token)?)
+            .json(body)
+            .send()
+            .await?;
+        Self::text_or_api(resp).await
+    }
+
+    /// `GET /plans?session_id=…` — list plans scoped to a session (resume).
+    pub async fn get_plans_for_session_text(
+        &self,
+        token: &str,
+        session_id: &str,
+    ) -> Result<String, ThinClientError> {
+        let url = self.url(&format!("/plans?session_id={session_id}"))?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(Self::bearer_headers(token)?)
+            .send()
+            .await?;
+        Self::text_or_api(resp).await
+    }
 }
 
 fn attachment_filename(headers: &HeaderMap) -> Option<String> {

@@ -39,6 +39,9 @@ pub async fn build_server_state(
         Arc::new(MatrixOneHealthChecker::new(settings.matrixone.clone())),
     )
     .with_shared_pool(shared_pool.clone())
+    .with_plan_repository(Arc::new(astra_plan::CloudPlanRepository::new(
+        shared_pool.get().clone(),
+    )))
     .with_auth_service(auth_service)
     .with_session_service(Arc::new(
         DatabaseSessionService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),

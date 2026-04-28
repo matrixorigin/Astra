@@ -826,6 +826,54 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .execute(&pool)
     .await?;
 
+    // ── Plans: cloud-authoritative plan state (user-owned, session-linked) ──
+    // `subtask_count` is denormalized so list endpoints don't need to parse
+    // `plan_json` just to render a card. Maintained by `PlanRepository::save`.
+    query(
+        "CREATE TABLE IF NOT EXISTS plans (
+            plan_id       VARCHAR(64) PRIMARY KEY,
+            user_id       VARCHAR(64) NOT NULL,
+            session_id    VARCHAR(64) NULL,
+            goal          TEXT NOT NULL,
+            phase         VARCHAR(32) NOT NULL,
+            version       BIGINT NOT NULL DEFAULT 0,
+            plan_json     LONGTEXT NOT NULL,
+            plan_md       LONGTEXT NULL,
+            progress_pct  INT NOT NULL DEFAULT 0,
+            subtask_count INT NOT NULL DEFAULT 0,
+            created_by    VARCHAR(64) NULL,
+            created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_plans_user_updated (user_id, updated_at),
+            INDEX idx_plans_session (session_id),
+            INDEX idx_plans_user_phase (user_id, phase)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Plan step runs: append-only attempt chain for every subtask ──
+    query(
+        "CREATE TABLE IF NOT EXISTS plan_step_runs (
+            run_id       VARCHAR(64) PRIMARY KEY,
+            plan_id      VARCHAR(64) NOT NULL,
+            subtask_id   VARCHAR(64) NOT NULL,
+            attempt      INT NOT NULL,
+            status       VARCHAR(16) NOT NULL,
+            session_id   VARCHAR(64) NOT NULL,
+            started_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            finished_at  DATETIME(6) NULL,
+            request_id   VARCHAR(64) NOT NULL,
+            error        TEXT NULL,
+            artifact_ref VARCHAR(255) NULL,
+            INDEX idx_step_runs_plan_started (plan_id, started_at),
+            INDEX idx_step_runs_subtask_attempt (plan_id, subtask_id, attempt),
+            INDEX idx_step_runs_session (session_id, started_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     query(
         "CREATE TABLE IF NOT EXISTS session_checkpoints (
             checkpoint_id VARCHAR(64) PRIMARY KEY,
@@ -1366,7 +1414,29 @@ async fn run_migration(
         return Ok(());
     }
 
-    query(sql).execute(pool).await?;
+    // Idempotent migrations: ALTER ADD COLUMN on a table whose CREATE already
+    // includes that column (fresh DB) returns MySQL error 1060 "Duplicate
+    // column name"; ADD INDEX on an existing index returns 1061. Treat both
+    // as "column/index already present" and still record the migration so we
+    // don't try again on the next boot.
+    //
+    // MySQL's SQLSTATE is a generic "HY000" for these — the real signal is the
+    // numeric error code, which we read via downcast to `MySqlDatabaseError`.
+    match query(sql).execute(pool).await {
+        Ok(_) => {}
+        Err(sqlx::Error::Database(db_err)) => {
+            let number = db_err
+                .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+                .map(|e| e.number());
+            if matches!(number, Some(1060) | Some(1061)) {
+                // Already present — fresh DB created the column/index via
+                // the CREATE TABLE path. Record and continue.
+            } else {
+                return Err(sqlx::Error::Database(db_err));
+            }
+        }
+        Err(e) => return Err(e),
+    }
 
     query("INSERT IGNORE INTO schema_migrations (version, description) VALUES (?, ?)")
         .bind(version)
@@ -1391,6 +1461,22 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
         2,
         "add covering index on skills_registry for listing queries",
         "SELECT 1", // index already in CREATE TABLE above; marker only
+    )
+    .await?;
+
+    run_migration(
+        pool,
+        3,
+        "add active_plan_id to agent_sessions for plan-mode linkage",
+        "ALTER TABLE agent_sessions ADD COLUMN active_plan_id VARCHAR(64) NULL",
+    )
+    .await?;
+
+    run_migration(
+        pool,
+        4,
+        "add subtask_count to plans for denormalized list rendering",
+        "ALTER TABLE plans ADD COLUMN subtask_count INT NOT NULL DEFAULT 0",
     )
     .await?;
 
