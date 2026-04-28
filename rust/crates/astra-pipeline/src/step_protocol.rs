@@ -1503,6 +1503,18 @@ impl InMemoryIdempotencyCache {
         self.cache.insert(key.cache_key(), result);
     }
 
+    /// Remove cached results for a tool. Used after workspace mutations to
+    /// prevent stale read-only results from bypassing tool-level freshness checks.
+    pub fn evict_tool(&mut self, tool_name: &str) {
+        self.cache.retain(|_, result| result.tool_name != tool_name);
+    }
+
+    /// Remove cached results for any of the provided tools.
+    pub fn evict_tools(&mut self, tool_names: &[&str]) {
+        self.cache
+            .retain(|_, result| !tool_names.contains(&result.tool_name.as_str()));
+    }
+
     /// Remove all entries for a step (cleanup after step completes).
     /// Uses delimiter ":" to avoid prefix collisions (e.g., "s1" vs "s10").
     pub fn evict_step(&mut self, step_id: &str) {
@@ -2374,6 +2386,37 @@ mod tests {
         let key_a = IdempotencyKey::semantic("tool", &args_a);
         let key_b = IdempotencyKey::semantic("tool", &args_b);
         assert_eq!(key_a.content_hash, key_b.content_hash);
+    }
+
+    #[test]
+    fn in_memory_cache_evicts_by_tool_name() {
+        let mut cache = InMemoryIdempotencyCache::new();
+        let read_key = IdempotencyKey::semantic("read_file", &serde_json::json!({"path": "a.rs"}));
+        let grep_key = IdempotencyKey::semantic("grep", &serde_json::json!({"pattern": "foo"}));
+
+        cache.record(
+            &read_key,
+            CachedToolResult {
+                tool_name: "read_file".into(),
+                output: "old file".into(),
+                is_error: false,
+                cached_at: 0,
+            },
+        );
+        cache.record(
+            &grep_key,
+            CachedToolResult {
+                tool_name: "grep".into(),
+                output: "old grep".into(),
+                is_error: false,
+                cached_at: 0,
+            },
+        );
+
+        cache.evict_tool("read_file");
+
+        assert!(cache.check(&read_key).is_none());
+        assert!(cache.check(&grep_key).is_some());
     }
 
     // ── Execution Slot with Cached Result ──

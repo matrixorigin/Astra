@@ -37,6 +37,7 @@ const READ_ONLY_COMMANDS: &[&str] = &[
     "tail",
     "wc",
     "stat",
+    "sed -n",
     "ls",
     "ll",
     "tree",
@@ -105,6 +106,7 @@ const READ_ONLY_COMMANDS: &[&str] = &[
     "expr",
     "seq",
     "sleep",
+    "cd",
     // Rust/Cargo read-only
     "cargo check",
     "cargo clippy",
@@ -164,6 +166,8 @@ const WRITE_INDICATORS: &[&str] = &[
     "chmod ",
     "chown ",
     "ln ",
+    "sed -i",
+    "perl -pi",
     // Package managers (install/modify)
     "npm install",
     "npm i ",
@@ -187,12 +191,7 @@ const WRITE_INDICATORS: &[&str] = &[
 ];
 
 fn effective_bash_command(command: &str) -> &str {
-    let cmd = command.trim();
-    if cmd.starts_with("cd ") && cmd.contains("&&") {
-        cmd.split("&&").nth(1).map(str::trim).unwrap_or(cmd)
-    } else {
-        cmd
-    }
+    command.trim()
 }
 
 fn strip_benign_fd_redirects(command: &str) -> String {
@@ -227,6 +226,22 @@ fn bash_segment_is_read_only(command: &str) -> bool {
     !cmd.is_empty() && !has_write_indicators(cmd) && matches_read_only_prefix(cmd)
 }
 
+fn has_shell_injection_vector(command: &str) -> bool {
+    // Deliberately deny-by-default at string level. This rejects harmless quoted
+    // literals such as `grep ';' file`, but keeps approval classification from
+    // needing to prove shell quoting correctness.
+    command.contains("$(") || command.contains('`') || command.contains(';')
+}
+
+fn split_compound_segments(command: &str) -> impl Iterator<Item = &str> {
+    command
+        .split('\n')
+        .flat_map(|chunk| chunk.split("&&"))
+        .flat_map(|chunk| chunk.split("||"))
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+}
+
 /// Check if a bash command is read-only (safe for concurrent execution).
 ///
 /// Returns `true` if the command appears to only read data without side effects.
@@ -234,9 +249,10 @@ fn bash_segment_is_read_only(command: &str) -> bool {
 ///
 /// # Algorithm
 /// 1. Normalize harmless fd forwarding (`2>&1`, `1>&2`, `/dev/null`)
-/// 2. Split read-only pipelines (`cargo check | head -50`) into segments
-/// 3. Reject any segment with write indicators; otherwise match read-only prefixes
-/// 4. Default to false (require approval) for unknown commands
+/// 2. Reject shell expansion/sequencing forms that can hide arbitrary commands
+/// 3. Split read-only compounds/pipelines (`cargo check | head -50`) into segments
+/// 4. Reject any segment with write indicators; otherwise match read-only prefixes
+/// 5. Default to false (require approval) for unknown commands
 pub fn bash_command_is_read_only(command: &str) -> bool {
     let cmd = effective_bash_command(command);
 
@@ -247,23 +263,28 @@ pub fn bash_command_is_read_only(command: &str) -> bool {
 
     let normalized = strip_benign_fd_redirects(cmd);
     let normalized = normalized.trim();
-    if normalized.is_empty() {
+    if normalized.is_empty() || has_shell_injection_vector(normalized) {
         return false;
     }
 
-    if normalized.contains('|') {
-        let segments: Vec<&str> = normalized
-            .split('|')
-            .map(str::trim)
-            .filter(|segment| !segment.is_empty())
-            .collect();
-        return !segments.is_empty()
-            && segments
-                .iter()
-                .all(|segment| bash_segment_is_read_only(segment));
-    }
-
-    bash_segment_is_read_only(normalized)
+    let mut saw_segment = false;
+    split_compound_segments(normalized).all(|segment| {
+        saw_segment = true;
+        if segment.contains('|') {
+            let mut saw_pipe_segment = false;
+            segment
+                .split('|')
+                .map(str::trim)
+                .filter(|segment| !segment.is_empty())
+                .all(|pipe_segment| {
+                    saw_pipe_segment = true;
+                    bash_segment_is_read_only(pipe_segment)
+                })
+                && saw_pipe_segment
+        } else {
+            bash_segment_is_read_only(segment)
+        }
+    }) && saw_segment
 }
 
 /// Kind of side effect for tools gated before edge execution.
@@ -420,6 +441,7 @@ mod tests {
         assert!(bash_command_is_read_only("cat file.txt"));
         assert!(bash_command_is_read_only("head -n 10 file.txt"));
         assert!(bash_command_is_read_only("tail -f log.txt"));
+        assert!(bash_command_is_read_only("sed -n '565,572p' file.rs"));
         assert!(bash_command_is_read_only("wc -l file.txt"));
         assert!(bash_command_is_read_only("pwd"));
         assert!(bash_command_is_read_only("whoami"));
@@ -450,6 +472,10 @@ mod tests {
         // cd-prefixed commands
         assert!(bash_command_is_read_only("cd project && ls"));
         assert!(bash_command_is_read_only("cd /tmp && cat file.txt"));
+        assert!(bash_command_is_read_only(
+            "cd /repo && sed -n '1,20p' a.rs && echo '---' && sed -n '30,40p' b.rs"
+        ));
+        assert!(bash_command_is_read_only("cd /tmp"));
     }
 
     #[test]
@@ -460,6 +486,10 @@ mod tests {
         assert!(!bash_command_is_read_only("cp a.txt b.txt"));
         assert!(!bash_command_is_read_only("mkdir dir"));
         assert!(!bash_command_is_read_only("touch file.txt"));
+        assert!(!bash_command_is_read_only("sed -i 's/a/b/' file.rs"));
+        assert!(!bash_command_is_read_only("cd $(malicious)"));
+        assert!(!bash_command_is_read_only("ls `malicious`"));
+        assert!(!bash_command_is_read_only("ls ; ls"));
 
         // Git write operations
         assert!(!bash_command_is_read_only("git add ."));

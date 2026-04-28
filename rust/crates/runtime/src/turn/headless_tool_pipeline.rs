@@ -782,6 +782,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_mutation_invalidates_cached_read_only_results() {
+        let cases = [
+            (
+                "write_file",
+                json!({ "path": "a.txt", "content": "new content" }),
+                false,
+                true,
+            ),
+            (
+                "str_replace",
+                json!({ "path": "a.txt", "old_str": "old", "new_str": "new" }),
+                false,
+                true,
+            ),
+            (
+                "git_commit",
+                json!({ "message": "save changes" }),
+                false,
+                true,
+            ),
+            ("git_checkout_file", json!({ "path": "a.txt" }), false, true),
+            (
+                "bash",
+                json!({ "command": "printf new > a.txt" }),
+                false,
+                true,
+            ),
+            (
+                "write_file",
+                json!({ "path": "a.txt", "content": "new content" }),
+                true,
+                false,
+            ),
+        ];
+
+        for (tool_name, args, is_err, should_evict) in cases {
+            let mut harness = PipelineHarness::new();
+            begin_recorded_turn(&mut harness, 1);
+            let read_args = json!({ "path": "a.txt" });
+            let read_key = IdempotencyKey::semantic("read_file", &read_args);
+            harness.idempotency_cache.record(
+                &read_key,
+                CachedToolResult {
+                    tool_name: "read_file".into(),
+                    output: "old content".into(),
+                    is_error: false,
+                    cached_at: 0,
+                },
+            );
+
+            let mut pipeline = harness.pipeline();
+            pipeline
+                .record_execution(ExecutedExecution {
+                    execution: HeadlessResolvedExecution {
+                        id: format!("call-{tool_name}"),
+                        name: tool_name.into(),
+                        args: args.clone(),
+                        result_str: "mutation succeeded".into(),
+                        tool_result_fields: None,
+                        edge_duration_ms: 1,
+                        is_edge_tool: true,
+                        early_exit_ms: 0,
+                    },
+                    idem_key: IdempotencyKey::semantic(tool_name, &args),
+                    is_err,
+                    executed_ms: 1,
+                })
+                .await;
+            drop(pipeline);
+
+            assert_eq!(
+                harness.idempotency_cache.check(&read_key).is_none(),
+                should_evict,
+                "{tool_name} with is_err={is_err} eviction mismatch"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn execute_and_record_pipeline_appends_one_tool_result() {
         let mut harness = PipelineHarness::new();
         let mut pipeline = harness.pipeline();

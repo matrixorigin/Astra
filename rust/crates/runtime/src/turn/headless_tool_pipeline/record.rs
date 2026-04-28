@@ -160,6 +160,15 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             try_write_light_headless_step_checkpoint(sid, self.ctx.step_recorder);
         }
 
+        if !is_err
+            && crate::turn::tool_side_effects::tool_call_invalidates_read_cache(
+                &execution.name,
+                Some(&execution.args),
+            )
+        {
+            self.ctx.idempotency_cache.evict_tools(READ_ONLY_TOOLS);
+        }
+
         if !is_err && READ_ONLY_TOOLS.contains(&execution.name.as_str()) {
             record_headless_cacheable_success_and_semantic_hint(
                 &execution.name,

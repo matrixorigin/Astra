@@ -1800,13 +1800,9 @@ fn is_read_only_allowlisted(lower_cmd: &str) -> bool {
     }
 
     // Reject code-injection vectors unconditionally — these can hide arbitrary
-    // commands inside otherwise-read-only wrappers.
-    if cmd.contains("$(")
-        || cmd.contains('`')
-        || cmd.contains("&&")
-        || cmd.contains("||")
-        || cmd.contains(';')
-    {
+    // commands inside otherwise-read-only wrappers. `&&`/`||` are delegated to
+    // the runtime read-only classifier; `;` is intentionally blocked here.
+    if cmd.contains("$(") || cmd.contains('`') || cmd.contains(';') {
         return false;
     }
 
@@ -2007,6 +2003,12 @@ mod tests {
             PermissionManager::execute_decision("bash", &rg),
             ExecuteDecision::AllowSilent
         );
+
+        let sed = serde_json::json!({"command": "sed -n '565,572p' file.rs"});
+        assert_eq!(
+            PermissionManager::execute_decision("bash", &sed),
+            ExecuteDecision::AllowSilent
+        );
     }
 
     #[test]
@@ -2021,6 +2023,20 @@ mod tests {
         let redirected = serde_json::json!({"command": "git status > out.txt"});
         assert_eq!(
             PermissionManager::execute_decision("bash", &redirected),
+            ExecuteDecision::Ask
+        );
+
+        let sed_chain = serde_json::json!({
+            "command": "cd /repo && sed -n '1,20p' a.rs && echo '---' && sed -n '30,40p' b.rs"
+        });
+        assert_eq!(
+            PermissionManager::execute_decision("bash", &sed_chain),
+            ExecuteDecision::AllowSilent
+        );
+
+        let sed_in_place = serde_json::json!({"command": "sed -i 's/a/b/' file.rs"});
+        assert_eq!(
+            PermissionManager::execute_decision("bash", &sed_in_place),
             ExecuteDecision::Ask
         );
     }
@@ -3221,8 +3237,13 @@ mod tests {
         assert!(is_read_only_allowlisted("git diff --cached"));
         assert!(is_read_only_allowlisted("ls -la"));
         assert!(is_read_only_allowlisted("cat README.md"));
+        assert!(is_read_only_allowlisted("sed -n '1,20p' src/lib.rs"));
         assert!(!is_read_only_allowlisted(""));
         assert!(!is_read_only_allowlisted("rm -rf /"));
+        assert!(!is_read_only_allowlisted("sed -i 's/a/b/' src/lib.rs"));
+        assert!(!is_read_only_allowlisted("cd $(malicious)"));
+        assert!(!is_read_only_allowlisted("ls `malicious`"));
+        assert!(!is_read_only_allowlisted("ls ; ls"));
     }
 
     #[test]
@@ -3231,6 +3252,9 @@ mod tests {
         assert!(is_read_only_allowlisted("cargo check 2>&1 | head -50"));
         assert!(is_read_only_allowlisted("git diff | head -100"));
         assert!(is_read_only_allowlisted("ls -la | grep foo"));
+        assert!(is_read_only_allowlisted(
+            "cd /repo && sed -n '1,20p' a.rs && echo '---' && sed -n '30,40p' b.rs"
+        ));
         // Dangerous pipes must still be rejected.
         assert!(!is_read_only_allowlisted("echo foo | sudo tee /etc/passwd"));
     }

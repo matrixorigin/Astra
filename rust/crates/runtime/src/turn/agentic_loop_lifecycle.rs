@@ -91,13 +91,13 @@ fn used_budget_extensions(state: &AgenticLoopState) -> u32 {
         .min(u32::MAX as usize) as u32
 }
 
-fn bash_command_looks_mutating(command: &str) -> bool {
-    crate::bash_intent::bash_command_looks_mutating(command)
+pub(crate) fn extract_tool_args(args: Option<&str>) -> Option<Value> {
+    let args = args?;
+    serde_json::from_str::<Value>(args).ok()
 }
 
 pub(crate) fn extract_bash_command(args: Option<&str>) -> Option<String> {
-    let args = args?;
-    let value = serde_json::from_str::<Value>(args).ok()?;
+    let value = extract_tool_args(args)?;
     let command = value.get("command").and_then(Value::as_str)?;
     Some(command.to_string())
 }
@@ -105,15 +105,9 @@ pub(crate) fn extract_bash_command(args: Option<&str>) -> Option<String> {
 pub(crate) fn tool_record_is_workspace_mutation(
     record: &astra_services::session_journal::ToolCallRecord,
 ) -> bool {
-    match record.name.as_str() {
-        "write_file" | "edit_file" | "apply_patch" | "create_file" | "delete_file"
-        | "rename_file" | "move_file" | "replace_text" | "insert_text" | "append_file"
-        | "str_replace" => true,
-        "bash" => extract_bash_command(record.args_full.as_deref())
-            .or_else(|| extract_bash_command(record.args_preview.as_deref()))
-            .is_some_and(|command| bash_command_looks_mutating(&command)),
-        _ => false,
-    }
+    let args = extract_tool_args(record.args_full.as_deref())
+        .or_else(|| extract_tool_args(record.args_preview.as_deref()));
+    crate::turn::tool_side_effects::tool_call_invalidates_read_cache(&record.name, args.as_ref())
 }
 
 fn recent_turns_are_repetitive(state: &AgenticLoopState) -> bool {

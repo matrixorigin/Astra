@@ -40,6 +40,7 @@ pub mod result_quality {
 pub(crate) mod services;
 pub mod skill_selector;
 pub mod skill_tool;
+pub(crate) mod tool_side_effects;
 pub mod turn_trace_collector;
 
 // Re-export from astra-turn-core for public API compatibility

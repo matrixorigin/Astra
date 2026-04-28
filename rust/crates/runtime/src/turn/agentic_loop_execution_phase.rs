@@ -1353,17 +1353,41 @@ fn build_circuit_breaker_signal(
     use astra_turn_core::loop_circuit_breaker::RoundSignal;
 
     let tool_signatures = state.stall.turn_sigs.last().cloned().unwrap_or_default();
+    let tool_count = tool_signatures.len();
+    if state.llm_rounds_completed == 0 {
+        return RoundSignal {
+            tool_signatures,
+            produced_mutation: false,
+            tool_count,
+        };
+    }
 
-    // Check if the most recent round produced any workspace mutation.
-    let produced_mutation = state
+    // Check only the most recently completed round. The previous implementation
+    // scanned the last `max_tools_per_turn` records, so a single mutation could
+    // mask many later read-only rounds and delay stall detection.
+    let latest_round = state.llm_rounds_completed - 1;
+    let latest_round_records: Vec<_> = state
         .stall
         .tool_call_records
         .iter()
-        .rev()
-        .take(state.max_tools_per_turn as usize)
-        .any(|r| tool_record_is_workspace_mutation(r));
-
-    let tool_count = tool_signatures.len();
+        .filter(|record| record.round == Some(latest_round))
+        .collect();
+    let produced_mutation = if !latest_round_records.is_empty() {
+        latest_round_records
+            .iter()
+            .any(|record| tool_record_is_workspace_mutation(record))
+    } else {
+        // Legacy records may not carry round metadata; fall back to the old
+        // bounded scan only when the batch is fully legacy. Partial round
+        // metadata is treated as authoritative for per-round classification.
+        state
+            .stall
+            .tool_call_records
+            .iter()
+            .rev()
+            .take(state.max_tools_per_turn as usize)
+            .any(tool_record_is_workspace_mutation)
+    };
 
     RoundSignal {
         tool_signatures,
@@ -2526,6 +2550,55 @@ mod tests {
 
         assert!(!tool_record_is_workspace_mutation(&read_only));
         assert!(tool_record_is_workspace_mutation(&mutating));
+    }
+
+    #[test]
+    fn circuit_breaker_signal_uses_latest_round_for_mutation_detection() {
+        let mut state = make_state();
+        state.llm_rounds_completed = 6;
+        state.stall.turn_sigs.push(
+            ["read_file:{\"path\":\"a.rs\"}".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "str_replace".into(),
+            ok: true,
+            round: Some(2),
+            ..Default::default()
+        });
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "read_file".into(),
+            ok: true,
+            round: Some(5),
+            ..Default::default()
+        });
+
+        let signal = build_circuit_breaker_signal(&state);
+
+        assert!(
+            !signal.produced_mutation,
+            "an old str_replace must not mask a later read-only round"
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_signal_ignores_round_zero_records_before_any_round_completes() {
+        let mut state = make_state();
+        state.llm_rounds_completed = 0;
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "str_replace".into(),
+            ok: true,
+            round: Some(0),
+            ..Default::default()
+        });
+
+        let signal = build_circuit_breaker_signal(&state);
+
+        assert!(
+            !signal.produced_mutation,
+            "round 0 records are not latest completed work before any round completes"
+        );
     }
 
     // ─── Mid-loop execution escalation tests ──────────────────────────────
