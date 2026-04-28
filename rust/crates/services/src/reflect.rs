@@ -1,5 +1,5 @@
 use astra_core::{
-    ErrorResponse, MatrixOneSettings, SharedPool, composite_snapshot::CompositeSnapshotIndex,
+    ErrorResponse, MatrixOneSettings, SharedPool,
     connect_matrixone, error_response, internal_error,
 };
 use async_trait::async_trait;
@@ -7,7 +7,6 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, query};
 
-use crate::SessionArtifactStore;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -358,139 +357,6 @@ fn build_evidence_graph(
 
     Some(EvidenceGraph { nodes, edges })
 }
-
-/// Build analysis context for a specific turn from local data.
-///
-/// Loads checkpoint + journal data for a turn and builds a structured
-/// context string suitable for LLM consumption. This is a data preparation
-/// function — it does not call the LLM.
-pub fn build_turn_analysis_context(session_id: &str, turn: u32) -> Result<String, String> {
-    let events = crate::session_journal::read_journal(session_id)
-        .map_err(|e| format!("Failed to read journal: {e}"))?;
-
-    let turn_events: Vec<_> = events.iter().filter(|e| e.turn == Some(turn)).collect();
-
-    if turn_events.is_empty() {
-        return Err(format!("No events found for turn {turn}"));
-    }
-
-    let mut context = String::new();
-    context.push_str(&format!("## Turn {turn} Analysis Context\n\n"));
-
-    for evt in &turn_events {
-        context.push_str(&format!("### Event: {:?}\n", evt.event_type));
-        if let Some(ref input) = evt.user_input {
-            context.push_str(&format!("User input: {input}\n"));
-        }
-        if let Some(ref output) = evt.assistant_output {
-            context.push_str(&format!(
-                "Assistant output (truncated): {}...\n",
-                output.chars().take(200).collect::<String>()
-            ));
-        }
-        if let Some(ref error) = evt.error {
-            context.push_str(&format!("Error: {error}\n"));
-        }
-        if let Some(ref tools) = evt.tools_used {
-            context.push_str(&format!("Tools used: {}\n", tools.join(", ")));
-        }
-        if let Some(ref tool_calls) = evt.tool_calls {
-            context.push_str(&format!("Tool calls: {} total\n", tool_calls.len()));
-            for tc in tool_calls {
-                context.push_str(&format!("  - {} (ok={}, {}ms)\n", tc.name, tc.ok, tc.ms));
-            }
-        }
-        context.push('\n');
-    }
-
-    Ok(context)
-}
-
-/// Build a unified session diagnostic report from local journal data.
-pub fn build_session_diagnostic(session_id: &str) -> Result<SessionDiagnosticReport, String> {
-    let events = crate::session_journal::read_journal(session_id)
-        .map_err(|e| format!("Failed to read journal: {e}"))?;
-
-    let data_completeness = assess_data_completeness(session_id, None);
-
-    let total_turns = events
-        .iter()
-        .filter(|e| e.event_type == crate::session_journal::JournalEventType::Turn)
-        .count() as u32;
-    let error_count = events
-        .iter()
-        .filter(|e| e.event_type == crate::session_journal::JournalEventType::TurnError)
-        .count() as u32;
-    let stall_count = events
-        .iter()
-        .filter(|e| e.event_type == crate::session_journal::JournalEventType::StallDetected)
-        .count() as u32;
-    let verdict_count = events
-        .iter()
-        .filter(|e| e.event_type == crate::session_journal::JournalEventType::TurnGuardVerdict)
-        .count() as u32;
-
-    let error_summary: Vec<String> = events
-        .iter()
-        .filter_map(|e| e.error.as_ref())
-        .take(10)
-        .cloned()
-        .collect();
-
-    let mut recommendations = Vec::new();
-    if error_count > total_turns / 4 && total_turns > 0 {
-        recommendations.push("High error rate (>25%). Review tool selection strategy.".to_string());
-    }
-    if stall_count > 0 {
-        recommendations.push(format!(
-            "{stall_count} stall events detected. Consider reviewing task decomposition."
-        ));
-    }
-    if data_completeness.confidence < 0.8 {
-        recommendations.push(
-            "Data completeness is low. Some events may be missing from cloud DB.".to_string(),
-        );
-    }
-
-    // Composite snapshot info
-    let snapshot_dir = crate::local_session_artifact_store()
-        .session_path(session_id, "step_checkpoints/composite_snapshots.json")
-        .expect("validated session_id must resolve reflect snapshot path");
-    let (composite_snapshot_count, latest_snapshot_dimensions) = if snapshot_dir.exists() {
-        match std::fs::read_to_string(&snapshot_dir) {
-            Ok(content) => match serde_json::from_str::<CompositeSnapshotIndex>(&content) {
-                Ok(index) => {
-                    let count = index.snapshots.len() as u32;
-                    let dims = index
-                        .snapshots
-                        .last()
-                        .map(|s| s.dimensions().into_iter().map(String::from).collect())
-                        .unwrap_or_default();
-                    (count, dims)
-                }
-                Err(_) => (0, Vec::new()),
-            },
-            Err(_) => (0, Vec::new()),
-        }
-    } else {
-        (0, Vec::new())
-    };
-
-    Ok(SessionDiagnosticReport {
-        session_id: session_id.to_string(),
-        data_completeness,
-        total_turns,
-        error_count,
-        stall_count,
-        verdict_count,
-        deprioritized_tools: Vec::new(),
-        error_summary,
-        recommendations,
-        composite_snapshot_count,
-        latest_snapshot_dimensions,
-    })
-}
-
 /// Request for LLM-powered single-turn analysis.
 #[derive(Debug, Clone)]
 pub struct TurnAnalysisRequest {

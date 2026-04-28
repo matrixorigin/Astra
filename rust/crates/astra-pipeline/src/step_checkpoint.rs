@@ -260,26 +260,6 @@ fn prune_light_checkpoints(dir: &Path) -> std::io::Result<()> {
 
     Ok(())
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Breakpoint Index I/O
-// ═══════════════════════════════════════════════════════════════════════════════
-
-pub fn write_breakpoint_index(
-    session_id: &str,
-    index: &crate::step_protocol::BreakpointIndex,
-) -> std::io::Result<()> {
-    let dir = checkpoint_dir_for(session_id);
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("breakpoints.json");
-    let json = serde_json::to_string_pretty(index)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let tmp = dir.join(".breakpoints.json.tmp");
-    std::fs::write(&tmp, &json)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
-}
-
 pub fn read_breakpoint_index(
     session_id: &str,
 ) -> std::io::Result<crate::step_protocol::BreakpointIndex> {
