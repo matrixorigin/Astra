@@ -1158,8 +1158,10 @@ pub const PARALLEL_BATCHING_NUDGE_THRESHOLD: usize = 4;
 
 /// Walk the conversation tail backwards and count how many consecutive
 /// most-recent rounds each ran exactly one tool. A "round" here is a contiguous
-/// run of `tool` messages produced after one assistant turn; trailing runtime
-/// system messages (which we inject as nudges/feedback) are skipped.
+/// run of `tool` messages produced after one assistant turn; trailing
+/// runtime-injected scaffolding messages (system nudges/feedback *and* the
+/// `[attention:v1]` user-role manifest) are skipped via
+/// [`is_trailing_runtime_scaffolding_message`].
 ///
 /// Returns the streak length. The streak terminates as soon as we hit a round
 /// with a different tool count (zero or ≥2) or run out of history.
@@ -1168,8 +1170,8 @@ pub fn trailing_single_tool_round_streak(messages: &[serde_json::Value]) -> usiz
     let mut streak = 0_usize;
 
     loop {
-        // Skip any runtime-injected system messages between rounds.
-        while idx > 0 && is_trailing_runtime_system_message(&messages[idx - 1]) {
+        // Skip any runtime-injected scaffolding messages between rounds.
+        while idx > 0 && is_trailing_runtime_scaffolding_message(&messages[idx - 1]) {
             idx -= 1;
         }
         // Count contiguous trailing tool messages = this round's tool result count.
@@ -1213,18 +1215,46 @@ pub fn parallel_batching_nudge_directive(messages: &[serde_json::Value]) -> Stri
     )
 }
 
+/// Returns `true` for messages that the runtime injects at the tail of the
+/// conversation and that must NOT be counted as part of the user/assistant
+/// tool-round cadence.
 ///
-/// This is generic and history-based: it looks only at the current round index
-/// plus whether the visible conversation ends with tool results.
-fn is_trailing_runtime_system_message(message: &serde_json::Value) -> bool {
-    message.get("role").and_then(|r| r.as_str()) == Some("system")
+/// The detection is purely shape-based (role + optional content marker) so
+/// it stays correct regardless of how deep the runtime injects scaffolding.
+///
+/// Two shapes are recognized:
+///   * `role == "system"` — unconditional. The runtime never emits user-typed
+///     system turns; every `system` message on the tail is runtime-injected
+///     (nudges, feedback, guidance). If that invariant ever changes, this
+///     branch must be tightened with a content marker analogous to the one
+///     used for `user` below.
+///   * `role == "user"` with content matching [`is_attention_manifest_content`] —
+///     the `[attention:v1]` manifest we inject as a user-role message.
+fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool {
+    let role = message.get("role").and_then(|r| r.as_str());
+    if role == Some("system") {
+        return true;
+    }
+    role == Some("user")
+        && message
+            .get("content")
+            .and_then(|content| content.as_str())
+            .is_some_and(is_attention_manifest_content)
+}
+
+/// Returns true when `content` begins with the attention-manifest prefix
+/// followed by a newline. Allocation-free — safe to call in hot loops over
+/// full message history.
+fn is_attention_manifest_content(content: &str) -> bool {
+    let prefix = astra_turn_types::continuity::ATTENTION_PREFIX;
+    content.starts_with(prefix) && content.as_bytes().get(prefix.len()) == Some(&b'\n')
 }
 
 fn trailing_tool_result_count(messages: &[serde_json::Value]) -> usize {
     messages
         .iter()
         .rev()
-        .skip_while(|message| is_trailing_runtime_system_message(message))
+        .skip_while(|message| is_trailing_runtime_scaffolding_message(message))
         .take_while(|message| message.get("role").and_then(|r| r.as_str()) == Some("tool"))
         .count()
 }
@@ -1371,6 +1401,28 @@ pub const STALL_NUDGE: &str = "You appear to be repeating the same tool calls. \
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── is_attention_manifest_content ─────────────────────────────
+
+    #[test]
+    fn attention_manifest_content_requires_prefix_and_newline() {
+        let prefix = astra_turn_types::continuity::ATTENTION_PREFIX;
+        // Exact prefix without newline — not a manifest (truncated / malformed).
+        assert!(!is_attention_manifest_content(prefix));
+        // Prefix followed by newline and body — valid manifest.
+        assert!(is_attention_manifest_content(&format!("{}\nfoo", prefix)));
+        // Prefix followed by newline only — still a valid manifest shell.
+        assert!(is_attention_manifest_content(&format!("{}\n", prefix)));
+        // Empty content — not a manifest.
+        assert!(!is_attention_manifest_content(""));
+        // Prefix followed by a non-newline byte — not a manifest (guards
+        // against accidental matches like `[attention:v1]extra`).
+        assert!(!is_attention_manifest_content(&format!("{}X", prefix)));
+        // Random user content that merely mentions the marker — not a manifest.
+        assert!(!is_attention_manifest_content(
+            "what does [attention:v1] mean?"
+        ));
+    }
 
     // ── detect_task_type ──────────────────────────────────────────
 
@@ -2799,6 +2851,39 @@ mod tests {
             serde_json::json!({
                 "role": "system",
                 "content": "## Already Fetched (do NOT re-read/re-grep these)\nFiles: README.md"
+            }),
+        ];
+
+        let (guidance, signals) = tool_round_guidance_trace_with(
+            &messages,
+            ROUND_BUDGET_THRESHOLD,
+            ROUND_BUDGET_THRESHOLD,
+            ROUND_BUDGET_HARD_LIMIT,
+        );
+
+        assert!(guidance.contains("Synthesize Or Batch Now"));
+        assert!(guidance.contains("2 tools executed in parallel"));
+        assert!(signals.synthesize_or_batch);
+        assert!(signals.parallel_feedback);
+    }
+
+    #[test]
+    fn tool_round_guidance_ignores_trailing_runtime_attention_manifest() {
+        let messages = vec![
+            serde_json::json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_1"}]}),
+            serde_json::json!({"role": "tool", "content": "Cargo.toml"}),
+            serde_json::json!({"role": "tool", "content": "README.md"}),
+            serde_json::json!({
+                "role": "system",
+                "content": "[working-set:v1]\ngoal: inspect the project files"
+            }),
+            serde_json::json!({
+                "role": "system",
+                "content": "## Already Fetched (do NOT re-read/re-grep these)\nFiles: README.md"
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": "[attention:v1]\ngoal: inspect the project files"
             }),
         ];
 

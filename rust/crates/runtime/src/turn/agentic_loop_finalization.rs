@@ -630,19 +630,38 @@ fn update_session_facts_from_turn(state: &mut super::agentic_loop_host::AgenticL
     state
         .session_facts
         .set_blocked_tools(state.restricted_tools.iter().cloned().collect());
-    // Sync facts → continuity once, let the todo-completion hook mutate todos
-    // only, then write facts back.
-    // INVARIANT: `complete_active_runtime_todo_if_finalized` must not write to
-    // `state.session_facts`. If it did, the clone-back below would overwrite
-    // those writes with the stale copy inside `continuity.facts`.
+    // Sync facts → continuity once, then let the todo-completion hook mutate
+    // todos on `state.continuity` only.
+    //
+    // INVARIANT (enforced by debug_assert below):
+    //   `complete_active_runtime_todo_if_finalized` must mutate neither
+    //   `state.session_facts` nor `state.continuity.facts`. It only touches
+    //   `state.continuity.todos`. This keeps the three snapshots
+    //   (`session_facts`, `continuity.facts`, `facts_before`) trivially
+    //   equal after the hook, so no clone-back is required.
+    //
+    // If a future hook revision needs to mutate facts, update BOTH sides
+    // explicitly (mutate `continuity.facts` and mirror to `session_facts`)
+    // and loosen/replace this assertion — do not reintroduce a silent
+    // clone-back that would mask divergence.
     let facts_before = state.session_facts.clone();
     state.continuity.sync_facts(facts_before.clone());
+    // Snapshot `continuity.facts` AFTER sync and BEFORE the hook, so the
+    // post-hook assertion genuinely verifies the hook did not touch
+    // `continuity.facts` (asserting against `facts_before` would be
+    // tautological — we just wrote that value in).
+    #[cfg(debug_assertions)]
+    let continuity_facts_snapshot = state.continuity.facts.clone();
     complete_active_runtime_todo_if_finalized(state, had_error);
     debug_assert_eq!(
         state.session_facts, facts_before,
         "complete_active_runtime_todo_if_finalized must not mutate session_facts"
     );
-    state.session_facts = state.continuity.facts.clone();
+    #[cfg(debug_assertions)]
+    debug_assert_eq!(
+        state.continuity.facts, continuity_facts_snapshot,
+        "complete_active_runtime_todo_if_finalized must not mutate continuity.facts"
+    );
 
     // P4: Error-triggered L1 persist — when an error occurred this turn,
     // write L1 to local session memory file immediately so user corrections

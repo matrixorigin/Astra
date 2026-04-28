@@ -9,7 +9,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::session_facts::{FileEntry, PlanFact, SessionFacts};
 
-const ATTENTION_PREFIX: &str = "[attention:v1]";
+/// Marker tag that prefixes runtime-injected attention-manifest user messages.
+///
+/// Exposed so other crates (e.g. prompt scaffolding) can detect these injected
+/// messages without hard-coding the literal in multiple places.
+///
+/// NOTE: changing this value is a breaking change for persisted message
+/// history — existing sessions store manifests with the current prefix and
+/// downstream detectors (e.g. `is_attention_manifest_content` in
+/// `runtime::prompts::system`) match on it verbatim. Bump the version suffix
+/// (`v1` → `v2`) and keep back-compat recognition if a migration is needed.
+pub const ATTENTION_PREFIX: &str = "[attention:v1]";
 const DEFAULT_ATTENTION_CHAR_CAP: usize = 4_000;
 const MAX_MANIFEST_FILES: usize = 12;
 const MAX_MANIFEST_CORRECTIONS: usize = 5;
