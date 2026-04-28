@@ -273,9 +273,6 @@ pub use astra_turn_core::{
     cloud_cache_diagnostics::{
         CacheBreakCause, CacheBreakDetector, CacheBreakEvent, CacheFingerprint, diff_fingerprints,
     },
-    cloud_history::compact_cloud_loop_history,
-    cloud_iteration::{CloudLoopIterationPlan, plan_cloud_loop_iteration},
-    cloud_prefilter::{CloudSkillCandidatePlan, plan_cloud_skill_candidates},
     cloud_session_memory_extract::{
         SESSION_MEMORY_TEMPLATE, SessionMemoryExtractConfig, SessionMemoryState,
         build_extraction_prompt, build_learnings_extraction_prompt, extract_learnings_for_backflow,

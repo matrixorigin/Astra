@@ -15,7 +15,6 @@ pub mod entity;
 pub mod event;
 pub mod feedback_extraction;
 pub mod feedback_store;
-pub mod mo_persistence;
 pub mod pattern;
 pub mod routing;
 pub mod scheduling;
@@ -26,10 +25,10 @@ pub mod step_protocol;
 pub mod step_recorder;
 pub mod step_restore;
 pub mod task_learning;
-pub mod tool_health_types;
 
 pub use pattern::PatternAction;
 pub use routing::{CalibrationAxis, DomainHint, TaskType, ToolFilter, domain_hint_to_label};
+pub mod tool_health_types;
 pub use tool_health_types::{
     TOOL_OUTCOME_RING_CAPACITY, ToolHealthEntry, ToolOutcome, ToolOutcomeCacheEntry,
 };
