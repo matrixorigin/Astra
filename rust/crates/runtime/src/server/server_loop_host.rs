@@ -3042,7 +3042,10 @@ mod tests {
     #[test]
     fn llm_request_dump_failures_are_not_silently_ignored() {
         let source = include_str!("server_loop_host.rs");
-        let tests_start = source.rfind("mod tests {").expect("test module start");
+        // Use `find` (first occurrence) — rfind would find the test module itself
+        // if a nested `mod tests {` were ever added. First occurrence is always
+        // the production `mod tests {` opener.
+        let tests_start = source.find("mod tests {").expect("test module start");
         let production = &source[..tests_start];
         for context in [
             "server_loop_host context window dump persist failed",
@@ -3080,7 +3083,7 @@ mod tests {
     #[test]
     fn post_compaction_reinjects_invoked_skills() {
         let source = include_str!("server_loop_host.rs");
-        let tests_start = source.rfind("mod tests {").expect("test module start");
+        let tests_start = source.find("mod tests {").expect("test module start");
         let production = &source[..tests_start];
         assert!(
             production.contains("state.skills.invoked"),
@@ -3103,7 +3106,7 @@ mod tests {
     #[test]
     fn llm_error_paths_publish_remote_llm_capture_artifacts() {
         let source = include_str!("server_loop_host.rs");
-        let tests_start = source.rfind("mod tests {").expect("test module start");
+        let tests_start = source.find("mod tests {").expect("test module start");
         let production = &source[..tests_start];
         for context in [
             "server_loop_host context window capture",
@@ -3143,7 +3146,7 @@ mod tests {
     #[test]
     fn server_loop_error_captures_use_structured_error_response() {
         let source = include_str!("server_loop_host.rs");
-        let tests_start = source.rfind("mod tests {").expect("test module start");
+        let tests_start = source.find("mod tests {").expect("test module start");
         let production = &source[..tests_start];
         assert!(
             production.contains("llm_capture_error_response(e)"),
@@ -3162,7 +3165,7 @@ mod tests {
     #[test]
     fn server_loop_uses_shared_rate_limit_cooldown_singleton() {
         let source = include_str!("server_loop_host.rs");
-        let tests_start = source.rfind("mod tests {").expect("test module start");
+        let tests_start = source.find("mod tests {").expect("test module start");
         let production = &source[..tests_start];
         assert!(
             production.contains("use crate::turn::bridge_llm_stream::rate_limit_cooldown;"),
