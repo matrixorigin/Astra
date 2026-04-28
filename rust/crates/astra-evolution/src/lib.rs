@@ -6,7 +6,6 @@
 
 pub mod evolver;
 pub mod persistence;
-pub mod policy_feedback;
 pub mod promotion_gate;
 pub mod promotion_signals;
 pub mod reflection;
@@ -16,7 +15,6 @@ pub mod types;
 
 // Re-export key types at crate root
 pub use evolver::{generate_fast_proposals, needs_llm};
-pub use policy_feedback::{ModelGuardStats, PolicyTuningProposal, propose_policy_tuning};
 pub use signal_collector::SignalCollector;
 pub use store::EvolutionStore;
 pub use types::*;

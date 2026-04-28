@@ -274,15 +274,6 @@ pub fn internal_error(error: impl ToString) -> (StatusCode, Json<ErrorResponse>)
     error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
 
-pub fn internal_error_coded(
-    error: impl ToString,
-    error_code: impl Into<String>,
-) -> (StatusCode, Json<ErrorResponse>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse::new(error.to_string()).with_error_code(error_code)),
-    )
-}
 
 /// MySQL/MatrixOne duplicate-key errors may surface as vendor code 1062,
 /// SQLSTATE 23000, or wrapped message-only errors.

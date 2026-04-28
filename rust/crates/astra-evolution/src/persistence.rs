@@ -717,24 +717,6 @@ pub fn export_dirty_learning_from_modules(
     }
 }
 
-/// Clear dirty flags from all modules after successful sync.
-pub fn clear_dirty_in_modules(
-    entity_graph: &Arc<Mutex<EntityGraph>>,
-    pattern_library: &Arc<Mutex<PatternLibrary>>,
-    calibrator: &Arc<Mutex<ProgressiveCalibrator>>,
-    tool_health: &mut astra_turn_core::tool_health::ToolHealthTracker,
-) {
-    if let Ok(mut graph) = entity_graph.lock() {
-        graph.clear_dirty();
-    }
-    if let Ok(mut library) = pattern_library.lock() {
-        library.clear_dirty();
-    }
-    if let Ok(mut cal) = calibrator.lock() {
-        cal.clear_dirty();
-    }
-    tool_health.clear_dirty();
-}
 
 /// Clear dirty flags from learning modules after successful sync.
 pub fn clear_dirty_learning_in_modules(

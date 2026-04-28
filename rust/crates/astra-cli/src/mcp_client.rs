@@ -1532,13 +1532,7 @@ impl McpClientManager {
     }
 }
 
-/// Thread-safe MCP client manager.
-pub type SharedMcpClientManager = Arc<RwLock<McpClientManager>>;
 
-/// Create a new shared MCP client manager.
-pub fn new_shared_manager() -> SharedMcpClientManager {
-    Arc::new(RwLock::new(McpClientManager::new()))
-}
 
 /// Connect to an MCP server with exponential backoff retry.
 async fn connect_to_server(
