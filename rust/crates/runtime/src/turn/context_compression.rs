@@ -301,21 +301,37 @@ const FILE_READ_TOOLS: &[&str] = &[
 
 /// Extract a deduplication key from a tool call's arguments JSON.
 ///
-/// For file-oriented tools this is the `path`/`file_path` argument.
-/// For search tools (grep, glob) we combine path + pattern so that
-/// different searches of the same directory are not conflated.
+/// Strategy:
+///   1. File-oriented tools (`path` / `file_path`): key = path (+ pattern when present).
+///   2. Path-less tools (`git_log {n, query}`, `git_show {commit}`, `git_diff {ref}`,
+///      `symbols {query, kind}`, etc.): key = canonicalized full args JSON.
+///      Two identical calls dedupe; calls that differ in any arg do not.
+///
+/// The canonicalization step (parse → re-serialize via `serde_json`) normalizes
+/// whitespace so formatting differences between identical calls are ignored.
 fn extract_path_from_args(args: &str) -> Option<String> {
-    serde_json::from_str::<Value>(args).ok().and_then(|v| {
-        let base = v
-            .get("path")
-            .or_else(|| v.get("file_path"))
-            .and_then(|p| p.as_str())?;
-        if let Some(pattern) = v.get("pattern").and_then(|p| p.as_str()) {
-            Some(format!("{base}::{pattern}"))
-        } else {
-            Some(base.to_string())
+    let v: Value = serde_json::from_str(args).ok()?;
+    let base = v
+        .get("path")
+        .or_else(|| v.get("file_path"))
+        .and_then(|p| p.as_str());
+
+    match base {
+        Some(p) => {
+            if let Some(pattern) = v.get("pattern").and_then(|p| p.as_str()) {
+                Some(format!("{p}::{pattern}"))
+            } else {
+                Some(p.to_string())
+            }
         }
-    })
+        None => {
+            // No path → use full args as dedup identity. Prefix with a sentinel
+            // so a path-less key can never collide with a real path key.
+            serde_json::to_string(&v)
+                .ok()
+                .map(|s| format!("::args::{s}"))
+        }
+    }
 }
 
 impl CompressionLayer for DuplicateReadElimination {
@@ -1160,63 +1176,170 @@ mod tests {
         );
         assert!(
             msgs[7]["content"].as_str().unwrap().contains("v3"),
-            "read 3 should be preserved"
+            "read 3 (newest) should be preserved verbatim"
+        );
+        assert!(
+            result.estimated_tokens_freed > 0,
+            "three-read dedup should report freed > 0, got {}",
+            result.estimated_tokens_freed
+        );
+    }
+
+    #[test]
+    fn duplicate_read_skips_tool_results_without_call_id() {
+        // Defensive invariant: a tool-result message missing `tool_call_id`
+        // (malformed / truncated history) must NEVER be stubbed. The layer
+        // must fall through and leave such messages untouched, because we
+        // cannot prove which tool_call they answer.
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "task"}),
+            // Well-formed read 1.
+            json!({
+                "role": "assistant", "content": "r1.",
+                "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{\"path\": \"a.rs\"}"}}]
+            }),
+            // Malformed tool message — no tool_call_id. Must be left alone.
+            json!({"role": "tool", "content": "orphan payload ".repeat(200)}),
+            // Well-formed read 2 (same path — would normally trigger dedup
+            // against read 1, but the malformed message in between must not
+            // participate).
+            json!({
+                "role": "assistant", "content": "r2.",
+                "tool_calls": [{"id": "c2", "function": {"name": "read_file", "arguments": "{\"path\": \"a.rs\"}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "c2", "content": "v2 ".repeat(200)}),
+        ];
+        let orphan_before = msgs[3]["content"].as_str().unwrap().to_string();
+        let b = budget(80_000, 60_000);
+        DuplicateReadElimination::new(0.0).compress(&mut msgs, &b);
+        assert_eq!(
+            msgs[3]["content"].as_str().unwrap(),
+            orphan_before,
+            "malformed tool message (no tool_call_id) must NEVER be stubbed"
+        );
+    }
+
+    #[test]
+    fn duplicate_read_recognizes_grep_and_git_log() {
+        // Covers the multi-tool dedup story: grep calls with identical
+        // (path, pattern) dedupe, and git_log calls with identical args
+        // dedupe (via the path-less fallback). Both flavors in one session.
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "task"}),
+            // grep #1
+            json!({
+                "role": "assistant", "content": "g.",
+                "tool_calls": [{"id": "a1", "function": {"name": "grep", "arguments": "{\"path\": \"src\", \"pattern\": \"fn foo\"}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "a1", "content": "match1\n".repeat(200)}),
+            // git_log #1
+            json!({
+                "role": "assistant", "content": "l.",
+                "tool_calls": [{"id": "a2", "function": {"name": "git_log", "arguments": "{\"n\": 5}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "a2", "content": "commit\n".repeat(200)}),
+            // grep #2 — same path+pattern as #1, must dedupe earlier
+            json!({
+                "role": "assistant", "content": "g2.",
+                "tool_calls": [{"id": "a3", "function": {"name": "grep", "arguments": "{\"path\": \"src\", \"pattern\": \"fn foo\"}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "a3", "content": "match2\n".repeat(200)}),
+            // git_log #2 — same args as #1, must dedupe earlier
+            json!({
+                "role": "assistant", "content": "l2.",
+                "tool_calls": [{"id": "a4", "function": {"name": "git_log", "arguments": "{\"n\": 5}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "a4", "content": "commit2\n".repeat(200)}),
+        ];
+        let b = budget(80_000, 60_000);
+        let result = DuplicateReadElimination::new(0.0).compress(&mut msgs, &b);
+        assert!(
+            msgs[3]["content"]
+                .as_str()
+                .unwrap()
+                .contains("duplicate read"),
+            "earlier grep should be stubbed"
+        );
+        assert!(
+            msgs[5]["content"]
+                .as_str()
+                .unwrap()
+                .contains("duplicate read"),
+            "earlier git_log should be stubbed"
+        );
+        assert!(
+            msgs[7]["content"].as_str().unwrap().contains("match2"),
+            "latest grep must be preserved"
+        );
+        assert!(
+            msgs[9]["content"].as_str().unwrap().contains("commit2"),
+            "latest git_log must be preserved"
         );
         assert!(result.estimated_tokens_freed > 0);
     }
 
     #[test]
-    fn duplicate_read_skips_tool_results_without_call_id() {
+    fn duplicate_read_recognizes_path_less_git_log() {
+        // git_log calls without a `path` arg should still dedupe when the
+        // full argument set is identical. Two calls with `{n: 10}`, same
+        // args, must stub the earlier one.
         let mut msgs = vec![
             json!({"role": "system", "content": "sys"}),
             json!({"role": "user", "content": "task"}),
-            // Tool result with no tool_call_id — should be skipped
-            json!({"role": "tool", "content": "x".repeat(500)}),
             json!({
-                "role": "assistant", "content": "reading.",
-                "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{\"path\": \"a.rs\"}"}}]
+                "role": "assistant", "content": "log.",
+                "tool_calls": [{"id": "g1", "function": {"name": "git_log", "arguments": "{\"n\": 10}"}}]
             }),
-            json!({"role": "tool", "tool_call_id": "c1", "content": "y".repeat(500)}),
-        ];
-        let b = budget(80_000, 60_000);
-        let result = DuplicateReadElimination::new(0.0).compress(&mut msgs, &b);
-        // No duplicates, no stubbing
-        assert_eq!(result.estimated_tokens_freed, 0);
-        assert_eq!(msgs[2]["content"].as_str().unwrap(), &"x".repeat(500));
-    }
-
-    #[test]
-    fn duplicate_read_recognizes_grep_and_git_log() {
-        // DuplicateReadElimination should stub duplicates for grep/git_log
-        // (read-only tools), not only read_file.
-        let mut msgs = vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "task"}),
-            // grep call 1
+            json!({"role": "tool", "tool_call_id": "g1", "content": "commit1\ncommit2\n".repeat(200)}),
             json!({
-                "role": "assistant", "content": "searching.",
-                "tool_calls": [{"id": "c1", "function": {"name": "grep", "arguments": "{\"pattern\": \"TODO\", \"path\": \"src/\"}"}}]
+                "role": "assistant", "content": "log again.",
+                "tool_calls": [{"id": "g2", "function": {"name": "git_log", "arguments": "{\"n\": 10}"}}]
             }),
-            json!({"role": "tool", "tool_call_id": "c1", "content": "match1\nmatch2\n".repeat(100)}),
-            // grep call 2 — same path and pattern
-            json!({
-                "role": "assistant", "content": "re-checking.",
-                "tool_calls": [{"id": "c2", "function": {"name": "grep", "arguments": "{\"pattern\": \"TODO\", \"path\": \"src/\"}"}}]
-            }),
-            json!({"role": "tool", "tool_call_id": "c2", "content": "match3\nmatch4\n".repeat(100)}),
+            json!({"role": "tool", "tool_call_id": "g2", "content": "commit3\ncommit4\n".repeat(200)}),
         ];
         let b = budget(80_000, 60_000);
         let result = DuplicateReadElimination::new(0.0).compress(&mut msgs, &b);
         assert!(
             result.estimated_tokens_freed > 0,
-            "grep duplicates should be eliminated, freed={}",
+            "path-less git_log duplicates should dedupe, freed={}",
             result.estimated_tokens_freed
         );
         assert!(
             msgs[3]["content"]
                 .as_str()
                 .unwrap()
-                .contains("duplicate read")
+                .contains("duplicate read"),
+            "earlier git_log result should be stubbed"
+        );
+    }
+
+    #[test]
+    fn duplicate_read_does_not_dedupe_different_path_less_args() {
+        // git_log {n: 10} and git_log {n: 20} are different calls and must
+        // NOT be conflated.
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "task"}),
+            json!({
+                "role": "assistant", "content": "a.",
+                "tool_calls": [{"id": "g1", "function": {"name": "git_log", "arguments": "{\"n\": 10}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "g1", "content": "r1\n".repeat(200)}),
+            json!({
+                "role": "assistant", "content": "b.",
+                "tool_calls": [{"id": "g2", "function": {"name": "git_log", "arguments": "{\"n\": 20}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "g2", "content": "r2\n".repeat(200)}),
+        ];
+        let b = budget(80_000, 60_000);
+        let before = msgs[3]["content"].as_str().unwrap().to_string();
+        DuplicateReadElimination::new(0.0).compress(&mut msgs, &b);
+        assert_eq!(
+            msgs[3]["content"].as_str().unwrap(),
+            before,
+            "different git_log args must not be deduped"
         );
     }
 
