@@ -4635,6 +4635,20 @@ fn build_step_resume_guidance(
     })
 }
 
+fn build_continuity_resume_guidance(
+    continuity_state: Option<&serde_json::Value>,
+) -> Option<String> {
+    let value = continuity_state?;
+    let continuity =
+        serde_json::from_value::<astra_turn_core::continuity::ContinuityState>(value.clone())
+            .ok()?;
+    let manifest = astra_turn_core::continuity::AttentionManifest::from_state(&continuity, 4_000);
+    Some(format!(
+        "[Recovered runtime continuity]\nRestore this runtime-owned attention state before continuing. It is ground truth over narrative summaries.\n\n{}",
+        manifest.as_str()
+    ))
+}
+
 fn history_pairs_from_messages(messages: &[serde_json::Value]) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     let mut last_user = String::new();
@@ -4772,6 +4786,10 @@ async fn apply_restored_session(
             step_restored.interruption.as_ref(),
             step_restored.compaction_state.as_ref(),
         );
+        let step_guidance = combine_resume_guidance(
+            step_guidance,
+            build_continuity_resume_guidance(step_restored.continuity_state.as_ref()),
+        );
         state.resume_guidance = combine_resume_guidance(
             step_guidance,
             build_session_memory_resume_guidance(&restored.session_id),
@@ -4784,11 +4802,15 @@ async fn apply_restored_session(
         astra_runtime::pipeline::step_checkpoint::read_latest_heavy_checkpoint(&restored.session_id)
     {
         apply_heavy_checkpoint_fallback(state, &heavy);
-        state.resume_guidance = combine_resume_guidance(
+        let step_guidance = combine_resume_guidance(
             build_step_resume_guidance(
                 heavy.interruption.as_ref(),
                 heavy.compaction_state.as_ref(),
             ),
+            build_continuity_resume_guidance(heavy.continuity_state.as_ref()),
+        );
+        state.resume_guidance = combine_resume_guidance(
+            step_guidance,
             build_session_memory_resume_guidance(&restored.session_id),
         );
     } else if !restored.conversation_messages.is_empty()
@@ -4796,13 +4818,18 @@ async fn apply_restored_session(
         || restored.approval_overrides.is_some()
         || restored.interruption.is_some()
         || restored.compaction_state.is_some()
+        || restored.continuity_state.is_some()
     {
         apply_restored_cloud_heavy_state(state, &restored);
-        state.resume_guidance = combine_resume_guidance(
+        let step_guidance = combine_resume_guidance(
             build_step_resume_guidance(
                 restored.interruption.as_ref(),
                 restored.compaction_state.as_ref(),
             ),
+            build_continuity_resume_guidance(restored.continuity_state.as_ref()),
+        );
+        state.resume_guidance = combine_resume_guidance(
+            step_guidance,
             build_session_memory_resume_guidance(&restored.session_id),
         );
         eprintln!("  {} Restored step checkpoint from cloud", "☁".cyan());
@@ -4826,11 +4853,15 @@ async fn apply_restored_session(
                             &heavy.messages,
                             heavy.approval_overrides.as_ref(),
                         );
-                        state.resume_guidance = combine_resume_guidance(
+                        let step_guidance = combine_resume_guidance(
                             build_step_resume_guidance(
                                 heavy.interruption.as_ref(),
                                 heavy.compaction_state.as_ref(),
                             ),
+                            build_continuity_resume_guidance(heavy.continuity_state.as_ref()),
+                        );
+                        state.resume_guidance = combine_resume_guidance(
+                            step_guidance,
                             build_session_memory_resume_guidance(&restored.session_id),
                         );
                         eprintln!("  {} Restored step checkpoint from cloud", "☁".cyan());

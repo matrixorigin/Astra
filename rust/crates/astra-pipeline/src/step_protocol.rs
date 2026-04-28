@@ -856,6 +856,11 @@ pub struct HeavyCheckpoint {
     /// last_was_insufficient — enabling enriched resume guidance and tier selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_state: Option<serde_json::Value>,
+    /// Serialized runtime-owned continuity state (goal/todo/facts/attention).
+    /// Restored before the next model call so "continue" does not depend on
+    /// LLM narrative memory or explicit task-tool usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity_state: Option<serde_json::Value>,
 }
 /// Summary of a completed delegation sub-run, stored in HeavyCheckpoint for recovery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -974,6 +979,7 @@ impl StepCheckpoint {
             approval_overrides: None,
             consecutive_context_window_errors: 0,
             compaction_state: None,
+            continuity_state: None,
         }))
     }
 
@@ -2992,6 +2998,7 @@ mod tests {
             approval_overrides: None,
             consecutive_context_window_errors: 0,
             compaction_state: None,
+            continuity_state: None,
         }));
         let err = cp.validate().unwrap_err();
         assert!(matches!(err, ProtocolError::CheckpointCorrupt(_)));
@@ -3026,6 +3033,7 @@ mod tests {
             approval_overrides: None,
             consecutive_context_window_errors: 0,
             compaction_state: None,
+            continuity_state: None,
         }));
         assert!(cp.validate().is_ok());
     }

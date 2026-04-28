@@ -754,6 +754,11 @@ pub struct AgenticLoopState {
     /// Used for facts-first anchor, injection, compaction, and microcompact pin list.
     pub session_facts: crate::turn::cloud::session_facts::SessionFacts,
 
+    // ── Runtime-owned continuity (goal/todo/attention) ──
+    /// Deterministic continuity state used to reconstruct attention every LLM round
+    /// without relying on model-invoked task tools.
+    pub continuity: astra_turn_core::continuity::ContinuityState,
+
     /// Provider-aware compaction strategy for microcompact placeholders.
     pub compact_strategy: astra_turn_core::microcompact::CompactStrategy,
 
@@ -1130,6 +1135,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         server_tool_executor: None,
         interruption: None,
         session_facts: Default::default(),
+        continuity: Default::default(),
         compact_strategy: Default::default(),
         approval_overrides: None,
         confidence_trend: Default::default(),
@@ -1478,6 +1484,7 @@ pub(crate) mod tests {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            continuity: Default::default(),
             compact_strategy: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),

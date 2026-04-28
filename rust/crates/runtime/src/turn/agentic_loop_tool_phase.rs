@@ -106,6 +106,77 @@ fn tool_record_was_rejected(rec: &astra_services::session_journal::ToolCallRecor
         .unwrap_or(false)
 }
 
+fn advance_runtime_todo_before_tool_round(state: &mut AgenticLoopState) {
+    if state.continuity.todos.has_items()
+        && state
+            .continuity
+            .todos
+            .active_or_next()
+            .is_some_and(|item| item.status == astra_turn_core::continuity::TodoStatus::Pending)
+    {
+        state.continuity.todos.begin_next_ready();
+        state.continuity.sync_facts(state.session_facts.clone());
+        state.session_facts = state.continuity.facts.clone();
+    }
+}
+
+fn update_runtime_todo_from_tool_records(
+    state: &mut AgenticLoopState,
+    new_records: &[astra_services::session_journal::ToolCallRecord],
+) {
+    let Some(active_id) = state
+        .continuity
+        .todos
+        .active_or_next()
+        .map(|item| item.id.clone())
+    else {
+        return;
+    };
+    let meaningful: Vec<&astra_services::session_journal::ToolCallRecord> = new_records
+        .iter()
+        .filter(|record| !record.is_synthetic_placeholder())
+        .collect();
+    if meaningful.is_empty() {
+        return;
+    }
+
+    let turn = session_turn_number(state);
+    if let Some(failed) = meaningful.iter().find(|record| !record.ok) {
+        let reason = tool_record_result_text(failed);
+        let reason = if reason.trim().is_empty() {
+            format!("{} failed", failed.name)
+        } else {
+            format!("{} failed: {reason}", failed.name)
+        };
+        state
+            .continuity
+            .todos
+            .mark_blocked(&active_id, reason.clone());
+        state.continuity.verification.set(
+            astra_turn_core::continuity::VerificationStatus::Failed,
+            reason,
+            turn,
+        );
+    } else {
+        let evidence = meaningful
+            .iter()
+            .map(|record| format!("{} ok", record.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        state
+            .continuity
+            .todos
+            .add_evidence(&active_id, evidence.clone());
+        state.continuity.verification.set(
+            astra_turn_core::continuity::VerificationStatus::Passed,
+            evidence,
+            turn,
+        );
+    }
+    state.continuity.sync_facts(state.session_facts.clone());
+    state.session_facts = state.continuity.facts.clone();
+}
+
 const EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK: &str = "turn_rollback";
 
 struct ServerRollbackBoundary {
@@ -766,6 +837,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
 
     let evo_records_before = state.stall.tool_call_records.len();
     let tool_results_before = state.tool_results.len();
+    advance_runtime_todo_before_tool_round(state);
     {
         let mut term_adapter = HostTerminalAdapter(host);
         let headless_quiet = prep.quiet || state.skill_produced_output;
@@ -852,6 +924,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         }
         new_records.to_vec()
     };
+    update_runtime_todo_from_tool_records(state, &round_tool_calls);
 
     let agentic_step = current_agentic_step(state);
     let run_id = state.current_run_id.clone();
@@ -1434,6 +1507,75 @@ mod tests {
         assert_eq!(
             build_runtime_session_quality_assessment("sess-9", 0.63, usize::MAX).step_count,
             i32::MAX
+        );
+    }
+
+    #[test]
+    fn runtime_todo_policy_marks_pending_item_in_progress_before_tool_round() {
+        let mut state = make_state();
+        state
+            .continuity
+            .ensure_tracked_goal("Implement runtime todo policy and validate tool evidence");
+
+        advance_runtime_todo_before_tool_round(&mut state);
+
+        let active = state.continuity.todos.active_or_next().unwrap();
+        assert_eq!(
+            active.status,
+            astra_turn_core::continuity::TodoStatus::InProgress
+        );
+        assert_eq!(
+            state
+                .session_facts
+                .plan_state
+                .as_ref()
+                .and_then(|plan| plan.current_subtask.as_deref()),
+            Some("runtime-goal: Implement runtime todo policy and validate tool evidence")
+        );
+    }
+
+    #[test]
+    fn runtime_todo_policy_records_success_and_failure_evidence() {
+        let mut state = make_state();
+        state
+            .continuity
+            .ensure_tracked_goal("Implement runtime todo policy and validate tool evidence");
+        advance_runtime_todo_before_tool_round(&mut state);
+
+        update_runtime_todo_from_tool_records(&mut state, &[tool_record("bash", true)]);
+        let active = state.continuity.todos.active_or_next().unwrap();
+        assert_eq!(
+            active.status,
+            astra_turn_core::continuity::TodoStatus::InProgress
+        );
+        assert_eq!(active.evidence, vec!["bash ok".to_string()]);
+        assert_eq!(
+            state.continuity.verification.last_status,
+            Some(astra_turn_core::continuity::VerificationStatus::Passed)
+        );
+
+        update_runtime_todo_from_tool_records(&mut state, &[tool_record("cargo", false)]);
+        let blocked = state
+            .continuity
+            .todos
+            .items
+            .iter()
+            .find(|item| item.id == "runtime-goal")
+            .unwrap();
+        assert_eq!(
+            blocked.status,
+            astra_turn_core::continuity::TodoStatus::Blocked
+        );
+        assert!(
+            blocked
+                .blocked_reason
+                .as_deref()
+                .unwrap()
+                .contains("cargo failed")
+        );
+        assert_eq!(
+            state.continuity.verification.last_status,
+            Some(astra_turn_core::continuity::VerificationStatus::Failed)
         );
     }
 

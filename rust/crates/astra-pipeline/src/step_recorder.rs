@@ -788,6 +788,7 @@ impl StepRecorder {
             approval_overrides,
             consecutive_context_window_errors,
             compaction_state: None, // Set by caller after construction
+            continuity_state: None, // Set by caller after construction
         })
     }
 

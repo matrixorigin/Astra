@@ -10,7 +10,7 @@ use std::fmt::Write;
 // ── Types ────────────────────────────────────────────────────────────────────
 
 /// Ground truth session state. Never hallucinated.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionFacts {
     /// Files touched this session, most recent last. Capped at 20.
     pub active_files: Vec<FileEntry>,
@@ -28,7 +28,7 @@ pub struct SessionFacts {
     pub estimated_tokens: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileEntry {
     pub path: String,
     /// "read", "write", or "create"; "write" covers all non-create mutations, including deletes.
@@ -36,14 +36,14 @@ pub struct FileEntry {
     pub turn: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolFact {
     pub name: String,
     pub ok: bool,
     pub turn: u32,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanFact {
     pub goal: String,
     pub completed: u32,
@@ -51,7 +51,7 @@ pub struct PlanFact {
     pub current_subtask: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ErrorFact {
     pub total_errors: u32,
     pub last_error: Option<String>,

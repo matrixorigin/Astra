@@ -61,6 +61,8 @@ pub struct RestoredSession {
     pub consecutive_context_window_errors: u32,
     /// Serialized CompactionEffectivenessTracker state for enriched resume guidance.
     pub compaction_state: Option<serde_json::Value>,
+    /// Serialized runtime-owned continuity state restored from checkpoint.
+    pub continuity_state: Option<serde_json::Value>,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum RestoreError {
@@ -145,6 +147,7 @@ fn build_restored_session(
         approval_overrides: heavy.approval_overrides,
         consecutive_context_window_errors: heavy.consecutive_context_window_errors,
         compaction_state: heavy.compaction_state,
+        continuity_state: heavy.continuity_state,
     }))
 }
 
@@ -294,6 +297,9 @@ pub fn restore_summary(restored: &RestoredSession) -> String {
     if restored.compaction_state.is_some() {
         s.push_str(", compaction_state=yes");
     }
+    if restored.continuity_state.is_some() {
+        s.push_str(", continuity_state=yes");
+    }
     s
 }
 
@@ -401,6 +407,7 @@ mod tests {
             approval_overrides: None,
             consecutive_context_window_errors: 0,
             compaction_state: None,
+            continuity_state: None,
         }
     }
 
@@ -508,6 +515,7 @@ mod tests {
             approval_overrides: None,
             consecutive_context_window_errors: 0,
             compaction_state: None,
+            continuity_state: None,
         };
 
         let summary = restore_summary(&restored);

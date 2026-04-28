@@ -111,6 +111,7 @@ impl MatrixOneCheckpointWriter {
                     approval_overrides: None,
                     consecutive_context_window_errors: 0,
                     compaction_state: None,
+                    continuity_state: None,
                 };
                 StepCheckpoint::Heavy(Box::new(heavy))
             }
@@ -602,6 +603,7 @@ mod tests {
             approval_overrides: None,
             consecutive_context_window_errors: 0,
             compaction_state: None,
+            continuity_state: None,
         };
         let cp = StepCheckpoint::Heavy(Box::new(heavy));
         let json = serde_json::to_string(&cp).unwrap();

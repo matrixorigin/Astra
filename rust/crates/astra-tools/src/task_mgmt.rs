@@ -1,7 +1,8 @@
-//! Session-local task management for the CLI.
+//! Explicit scratchpad task management for the CLI.
 //!
-//! Tasks are in-memory only — they survive across tool calls but not across
-//! CLI restarts. Each task can contain subtasks with dependency tracking.
+//! Runtime-owned continuity state is the authoritative source for agent progress.
+//! These tools are only an explicit user/model scratchpad and must not be relied
+//! on for multi-turn continuity or resume.
 
 #![allow(dead_code)]
 use serde_json::{Value, json};
@@ -10,7 +11,7 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
 };
 
-/// A task tracked within the current CLI session.
+/// A scratchpad task tracked within the current CLI session.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionTask {
     pub id: String,
@@ -32,7 +33,7 @@ pub struct SessionSubtask {
     pub depends_on: Vec<String>,
 }
 
-/// In-memory task store for the current session.
+/// In-memory scratchpad store for the current session.
 pub struct TaskManager {
     tasks: Mutex<Vec<SessionTask>>,
     id_counter: AtomicU32,

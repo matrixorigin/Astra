@@ -73,6 +73,9 @@ pub struct RestoredSession {
     /// Serialized compaction-state payload restored from a heavy checkpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_state: Option<serde_json::Value>,
+    /// Serialized runtime-owned continuity state restored from a heavy checkpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity_state: Option<serde_json::Value>,
     /// Active plan being executed (JSON-serialized TaskPlan).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executing_plan_json: Option<String>,
@@ -114,6 +117,7 @@ pub struct CloudHeavyCheckpointState {
     pub approval_overrides: Option<serde_json::Value>,
     pub interruption: Option<serde_json::Value>,
     pub compaction_state: Option<serde_json::Value>,
+    pub continuity_state: Option<serde_json::Value>,
 }
 
 /// A restored checkpoint entry (lightweight, for listing).
@@ -450,6 +454,9 @@ impl HybridRestoreService {
                     compaction_state: heavy_state
                         .as_ref()
                         .and_then(|heavy| heavy.compaction_state.clone()),
+                    continuity_state: heavy_state
+                        .as_ref()
+                        .and_then(|heavy| heavy.continuity_state.clone()),
                     executing_plan_json: metadata_state.executing_plan_json,
                     plan_goal: metadata_state.plan_goal,
                     plan_config_json: metadata_state.plan_config_json,
@@ -984,6 +991,7 @@ fn cloud_heavy_payload(root: &serde_json::Value) -> Option<&serde_json::Value> {
         || root.get("approval_overrides").is_some()
         || root.get("interruption").is_some()
         || root.get("compaction_state").is_some()
+        || root.get("continuity_state").is_some()
     {
         return Some(root);
     }
@@ -1017,6 +1025,10 @@ pub fn parse_cloud_heavy_checkpoint_state(state_json: &str) -> Option<CloudHeavy
         interruption: heavy.get("interruption").cloned().filter(|v| !v.is_null()),
         compaction_state: heavy
             .get("compaction_state")
+            .cloned()
+            .filter(|v| !v.is_null()),
+        continuity_state: heavy
+            .get("continuity_state")
             .cloned()
             .filter(|v| !v.is_null()),
     })
@@ -2984,6 +2996,10 @@ mod tests {
         let approval_overrides = serde_json::json!({"rules": []});
         let interruption = serde_json::json!({"kind":"rate_limited"});
         let compaction_state = serde_json::json!({"attempt_count": 2});
+        let continuity_state = serde_json::json!({
+            "goal": {"text": "continue durable todo"},
+            "todos": {"items": []}
+        });
         let expected = CloudHeavyCheckpointState {
             messages: messages.clone(),
             blocked_tools: vec!["bash".into()],
@@ -2991,6 +3007,7 @@ mod tests {
             approval_overrides: Some(approval_overrides.clone()),
             interruption: Some(interruption.clone()),
             compaction_state: Some(compaction_state.clone()),
+            continuity_state: Some(continuity_state.clone()),
         };
         let tagged = serde_json::json!({
             "Heavy": {
@@ -3000,7 +3017,8 @@ mod tests {
                 "recent_tools": ["rg"],
                 "approval_overrides": approval_overrides,
                 "interruption": interruption,
-                "compaction_state": compaction_state
+                "compaction_state": compaction_state,
+                "continuity_state": continuity_state
             }
         })
         .to_string();
@@ -3010,7 +3028,8 @@ mod tests {
             "recent_tools": expected.recent_tools.clone(),
             "approval_overrides": expected.approval_overrides.clone(),
             "interruption": expected.interruption.clone(),
-            "compaction_state": expected.compaction_state.clone()
+            "compaction_state": expected.compaction_state.clone(),
+            "continuity_state": expected.continuity_state.clone()
         })
         .to_string();
 

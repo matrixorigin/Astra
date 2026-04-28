@@ -327,6 +327,7 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     };
     // Persist compaction effectiveness state for enriched resume guidance.
     heavy.compaction_state = Some(state.compaction_effectiveness.to_json());
+    heavy.continuity_state = serde_json::to_value(&state.continuity).ok();
     let cp = StepCheckpoint::Heavy(Box::new(heavy));
     if let Err(e) = step_checkpoint::write_step_checkpoint(sid, ckpt_num, &cp) {
         astra_core::agent_warn!(
@@ -629,6 +630,10 @@ fn update_session_facts_from_turn(state: &mut super::agentic_loop_host::AgenticL
     state
         .session_facts
         .set_blocked_tools(state.restricted_tools.iter().cloned().collect());
+    state.continuity.sync_facts(state.session_facts.clone());
+    complete_active_runtime_todo_if_finalized(state, had_error);
+    state.continuity.sync_facts(state.session_facts.clone());
+    state.session_facts = state.continuity.facts.clone();
 
     // P4: Error-triggered L1 persist — when an error occurred this turn,
     // write L1 to local session memory file immediately so user corrections
@@ -654,6 +659,27 @@ fn update_session_facts_from_turn(state: &mut super::agentic_loop_host::AgenticL
             }
         }
     }
+}
+
+fn complete_active_runtime_todo_if_finalized(
+    state: &mut super::agentic_loop_host::AgenticLoopState,
+    had_error: bool,
+) {
+    if had_error || state.final_text.trim().is_empty() {
+        return;
+    }
+    let Some(active) = state.continuity.todos.active_or_next().cloned() else {
+        return;
+    };
+    if active.status != astra_turn_core::continuity::TodoStatus::InProgress
+        || active.evidence.is_empty()
+    {
+        return;
+    }
+    state.continuity.todos.mark_done(
+        &active.id,
+        "final response completed after verified tool evidence",
+    );
 }
 
 #[cfg(test)]
@@ -1365,6 +1391,14 @@ mod tests {
         assert_eq!(state.session_facts.active_files[1].last_action, "write");
         assert_eq!(state.session_facts.estimated_tokens, 5000);
         assert_eq!(state.session_facts.recent_tool_calls.len(), 2);
+        assert_eq!(
+            state.continuity.facts.active_files,
+            state.session_facts.active_files
+        );
+        assert_eq!(
+            state.continuity.facts.recent_tool_calls,
+            state.session_facts.recent_tool_calls
+        );
     }
 
     #[tokio::test]
@@ -1412,6 +1446,46 @@ mod tests {
         );
         assert!(l1.contains("[session-memory:v1]"));
         assert!(l1.contains("fix the bug"));
+    }
+
+    #[tokio::test]
+    async fn finalization_marks_active_runtime_todo_done_after_evidence() {
+        let mut state = make_state();
+        state
+            .continuity
+            .ensure_tracked_goal("Implement runtime continuity and validate completion evidence");
+        state.continuity.todos.begin_next_ready();
+        let active_id = state
+            .continuity
+            .todos
+            .active_or_next()
+            .map(|item| item.id.clone())
+            .unwrap();
+        state
+            .continuity
+            .todos
+            .add_evidence(&active_id, "cargo test ok");
+        state.final_text = "Done.".to_string();
+        state.total_prompt = 100;
+
+        finalize_turn_trace(&mut state).await;
+
+        let item = state
+            .continuity
+            .todos
+            .items
+            .iter()
+            .find(|item| item.id == active_id)
+            .unwrap();
+        assert_eq!(item.status, astra_turn_core::continuity::TodoStatus::Done);
+        assert_eq!(
+            state
+                .session_facts
+                .plan_state
+                .as_ref()
+                .map(|plan| (plan.completed, plan.total)),
+            Some((1, 1))
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════

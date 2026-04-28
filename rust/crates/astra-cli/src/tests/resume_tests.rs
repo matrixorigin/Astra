@@ -397,6 +397,7 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
         approval_overrides: None,
         consecutive_context_window_errors: 0,
         compaction_state: None,
+        continuity_state: None,
     };
     astra_runtime::pipeline::step_checkpoint::write_step_checkpoint(
         &sid,

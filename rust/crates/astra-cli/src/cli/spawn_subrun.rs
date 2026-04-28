@@ -294,6 +294,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            continuity: Default::default(),
             compact_strategy,
             approval_overrides: None,
             confidence_trend: Default::default(),

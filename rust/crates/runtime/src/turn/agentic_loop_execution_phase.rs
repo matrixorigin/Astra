@@ -53,6 +53,29 @@ pub(crate) enum TurnExecutionControl {
     Return(AgenticLoopOutcome),
 }
 
+fn inject_runtime_attention_manifest(state: &mut AgenticLoopState) {
+    let current_goal = state.message.clone();
+    state.continuity.ensure_goal(current_goal.clone());
+    state.continuity.ensure_tracked_goal(current_goal);
+    state.continuity.sync_facts(state.session_facts.clone());
+    state.session_facts = state.continuity.facts.clone();
+
+    if state.continuity.todos.has_items()
+        || !state.continuity.facts.active_files.is_empty()
+        || state.continuity.facts.error_state.total_errors > 0
+        || !state.continuity.user_corrections.is_empty()
+        || state.continuity.verification.last_status.is_some()
+    {
+        astra_turn_core::continuity::append_attention_manifest_message(
+            &mut state.messages,
+            &state.continuity,
+            4_000,
+        );
+    } else {
+        astra_turn_core::continuity::strip_attention_manifest_messages(&mut state.messages);
+    }
+}
+
 pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -62,6 +85,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     if let Some(ref emitter) = state.messaging.progress_emitter {
         emitter.llm_call_started(turn_index as u32);
     }
+
+    inject_runtime_attention_manifest(state);
 
     // Inject round budget guidance so the model knows to batch or synthesize.
     // Use llm_rounds_completed (actual LLM call count) not turn_index (step
@@ -1998,6 +2023,63 @@ mod tests {
         let guard = session.read().unwrap();
         assert_eq!(guard.turn_timings.len(), 1);
         assert_eq!(guard.turn_timings[0].turn, 6);
+    }
+
+    #[test]
+    fn runtime_attention_manifest_creates_todo_without_task_tool_call() {
+        let mut state = make_state();
+        state.message =
+            "Implement runtime continuity and validate that active todo survives compaction".into();
+        state.messages.push(serde_json::json!({
+            "role": "user",
+            "content": state.message,
+        }));
+
+        inject_runtime_attention_manifest(&mut state);
+
+        assert_eq!(state.continuity.todos.items.len(), 1);
+        assert_eq!(state.continuity.todos.items[0].id, "runtime-goal");
+        let manifest = state
+            .messages
+            .last()
+            .and_then(|message| message.get("content"))
+            .and_then(|content| content.as_str())
+            .unwrap();
+        assert!(manifest.starts_with("[attention:v1]\n"));
+        assert!(manifest.contains("current_todo: runtime-goal [pending]"));
+    }
+
+    #[test]
+    fn runtime_attention_manifest_replaces_stale_manifest_and_keeps_active_facts() {
+        let mut state = make_state();
+        state.message = "Fix the runtime continuity bug and add tests".into();
+        state.messages.push(serde_json::json!({
+            "role": "user",
+            "content": "[attention:v1]\ngoal: stale",
+        }));
+        state
+            .session_facts
+            .active_files
+            .push(astra_turn_core::cloud_session_facts::FileEntry {
+                path: "rust/crates/runtime/src/turn/agentic_loop_execution_phase.rs".to_string(),
+                last_action: "write".to_string(),
+                turn: 2,
+            });
+
+        inject_runtime_attention_manifest(&mut state);
+        inject_runtime_attention_manifest(&mut state);
+
+        let manifests: Vec<&str> = state
+            .messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(|content| content.as_str()))
+            .filter(|content| content.starts_with("[attention:v1]"))
+            .collect();
+        assert_eq!(manifests.len(), 1);
+        assert!(manifests[0].contains(
+            "active_files:\n- rust/crates/runtime/src/turn/agentic_loop_execution_phase.rs"
+        ));
+        assert!(!manifests[0].contains("stale"));
     }
 
     #[test]
