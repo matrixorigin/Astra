@@ -2030,9 +2030,7 @@ fn parse_continuation_anchor(anchor: &str) -> ContinuationAnchorParts {
     ContinuationAnchorParts { task, direction }
 }
 
-fn print_context_breakdown(
-    trace: &astra_turn_core::context_assembly_trace::ContextAssemblyTrace,
-) {
+fn print_context_breakdown(trace: &astra_turn_core::context_assembly_trace::ContextAssemblyTrace) {
     eprintln!(
         "\n{}",
         format!(
@@ -2565,13 +2563,13 @@ mod tests {
     fn render_whoami_surfaces_pending_improvement_proposal() {
         let mut state = ReplState::default();
         state.session_id = Some("s".into());
-        state.skill_improvement_tracker.propose(
-            astra_skills::improvement::ImprovementProposal {
+        state
+            .skill_improvement_tracker
+            .propose(astra_skills::improvement::ImprovementProposal {
                 skill_name: "git-flow".into(),
                 skill_path: std::path::PathBuf::from("/tmp/git-flow"),
                 improvements: vec![],
-            },
-        );
+            });
         let out = super::render_whoami(&state);
         assert!(out.contains("pending_improve: git-flow"), "got: {out}");
     }

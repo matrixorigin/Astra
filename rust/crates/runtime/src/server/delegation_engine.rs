@@ -1556,7 +1556,9 @@ impl DelegationEngine {
         // Validate first
         self.validate(&request, source_agent_id).await?;
         let child_recursion_depth =
-            astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth_u32(request.depth)?;
+            astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth_u32(
+                request.depth,
+            )?;
 
         let session_id = request
             .context

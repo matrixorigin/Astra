@@ -1,6 +1,6 @@
+use crate::{EventCreateRequestData, EventService};
 use astra_pipeline::step_checkpoint;
 use astra_pipeline::step_protocol::StepCheckpoint;
-use crate::{EventCreateRequestData, EventService};
 use astra_services::SessionArtifactStore;
 
 use super::agentic_adaptive_tuning::{
@@ -624,7 +624,10 @@ fn update_session_facts_from_turn(state: &mut super::agentic_loop_host::AgenticL
         event.error = Some("turn had errors".to_string());
     }
 
-    astra_turn_core::cloud_session_facts::update_from_journal_event(&mut state.session_facts, &event);
+    astra_turn_core::cloud_session_facts::update_from_journal_event(
+        &mut state.session_facts,
+        &event,
+    );
 
     // Sync blocked tools from state
     state

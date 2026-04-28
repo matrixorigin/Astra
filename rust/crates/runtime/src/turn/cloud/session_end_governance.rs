@@ -7,8 +7,8 @@
 //!
 //! See `docs/design/session-memory-protocol.md` Section 6.2.
 
-use astra_turn_types::session_facts::SessionFacts;
 use super::session_memory_protocol::SessionMemory;
+use astra_turn_types::session_facts::SessionFacts;
 
 /// Knowledge extracted from a session for cross-session persistence.
 #[derive(Debug, Clone)]

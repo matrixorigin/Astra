@@ -23,11 +23,11 @@ use super::agentic_loop_host::{
     record_edge_tool_observability,
 };
 use super::agentic_loop_lifecycle::{TurnIterationPrep, current_agentic_step, session_turn_number};
+use super::agentic_tool_interception::{PreparedToolRound, prepare_intercepted_tool_round};
 use astra_turn_core::agentic_post_tool_policy::{
     AgenticPostToolIterationControl, AgenticPostToolPolicyRequest, apply_agentic_post_tool_policy,
     map_post_tool_policy_outcome,
 };
-use super::agentic_tool_interception::{PreparedToolRound, prepare_intercepted_tool_round};
 use astra_turn_core::agentic_turn_flow::{
     agentic_round_stall_preflight_with_tool_calls, append_explain_turn_batch,
 };
@@ -1074,7 +1074,10 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             {
                 let actions = adapter.evaluate(&triggers);
                 for action in actions {
-                    if !matches!(action, astra_turn_core::liquid_tactical::TacticalAction::NoOp) {
+                    if !matches!(
+                        action,
+                        astra_turn_core::liquid_tactical::TacticalAction::NoOp
+                    ) {
                         step_actions.push(action);
                     }
                 }
@@ -1275,7 +1278,9 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             // carry a structured record for resumption.
             if state.interruption.is_none() {
                 use super::agentic_loop_lifecycle::interruption_state_summary;
-                use astra_turn_core::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
+                use astra_turn_core::interruption::{
+                    InterruptionKind, InterruptionRecord, ResumeAction,
+                };
                 state.interruption = Some(InterruptionRecord::new(
                     InterruptionKind::CriticalVerdict,
                     ResumeAction::ContinueImmediately,

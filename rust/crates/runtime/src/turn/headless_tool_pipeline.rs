@@ -6,13 +6,13 @@ use astra_thin_client::ThinClient;
 use serde_json::{Map, Value};
 
 use super::agentic_headless_round::{HeadlessRoundTerminal, PermissionSyncHandle};
+use astra_pipeline::step_protocol::{IdempotencyKey, InMemoryIdempotencyCache};
+use astra_pipeline::step_recorder::StepRecorder;
+use astra_text_utils::semantic_dedup::SemanticDedup;
 use astra_turn_core::headless_tool_assembly::{
     EdgeToolRoundRow, HeadlessResolvedToolSlot, HeadlessRoundToolIdx, resolve_headless_tool_slot,
     take_edge_output_for_tool_call_with_duration,
 };
-use astra_pipeline::step_protocol::{IdempotencyKey, InMemoryIdempotencyCache};
-use astra_pipeline::step_recorder::StepRecorder;
-use astra_text_utils::semantic_dedup::SemanticDedup;
 use astra_turn_core::turn_guard::TurnGuard;
 
 mod execute;
@@ -274,7 +274,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         // Phase 3: post-process + record serially (fast, needs &mut self).
         for (execution, idem_key) in executions {
-            let is_err = astra_turn_core::tool_result_semantics::is_tool_error(&execution.result_str);
+            let is_err =
+                astra_turn_core::tool_result_semantics::is_tool_error(&execution.result_str);
             let executed_ms = if execution.is_edge_tool && execution.edge_duration_ms > 0 {
                 execution.edge_duration_ms
             } else {
@@ -299,9 +300,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    use astra_pipeline::step_protocol::CachedToolResult;
     use crate::skills::hooks::{HookAction, ToolEventHook, ToolEventHookRegistry, ToolEventKind};
     use crate::turn::agentic_headless_round::NoopHeadlessTerminal;
+    use astra_pipeline::step_protocol::CachedToolResult;
     use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 
     fn init_git_repo(dir: &Path) {
@@ -1726,7 +1727,8 @@ mod tests {
             "id": "call-edit-0",
             "function": { "name": "str_replace", "arguments": serde_json::to_string(&args).unwrap() }
         }));
-        let sig = astra_turn_core::tool_result_semantics::tool_dedup_signature("str_replace", &args);
+        let sig =
+            astra_turn_core::tool_result_semantics::tool_dedup_signature("str_replace", &args);
         let now_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -2028,8 +2030,9 @@ mod tests {
                 failure_category: None,
             },
         );
-        let restored =
-            astra_turn_core::tool_health::ToolHealthTracker::from_entries(&prior_guard.health.export());
+        let restored = astra_turn_core::tool_health::ToolHealthTracker::from_entries(
+            &prior_guard.health.export(),
+        );
         let memory_guided = run_recovery_turn(Some(restored)).await;
 
         assert_eq!(blind_retry.2, 1, "blind retry still reaches grep success");

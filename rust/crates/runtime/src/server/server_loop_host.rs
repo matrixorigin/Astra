@@ -24,7 +24,6 @@ use serde_json::{Map, Value, json};
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
-use astra_turn_core::bridge_rate_limit_cooldown::RateLimitAction;
 use crate::turn::agentic_headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopState, HostReflectionRequest, HostReflectionResult, HostTurnResult,
@@ -32,7 +31,6 @@ use crate::turn::agentic_loop_host::{
 };
 use crate::turn::agentic_loop_tool_support::edge_tool_status_exit_code;
 use crate::turn::bridge_llm_stream::rate_limit_cooldown;
-use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use crate::turn::llm_client::{
     LlmCallResult, LlmCancel, cached_system_prompt, call_llm_and_collect_with_request_overrides,
     call_llm_nonstream_fallback_with_request_overrides, llm_connect_timeout, llm_fallback_timeout,
@@ -42,11 +40,15 @@ use crate::turn::prompt_cache::{
     PromptCacheConfig, annotate_tool_schemas_for_caching, apply_anthropic_cache_metadata,
     build_system_message_with_dynamic_sections,
 };
-use astra_turn_core::tool_schema_prune::{filter_tool_schemas_by_excluded_names, prune_tool_schemas};
-use astra_turn_core::turn_guard::merge_deprioritized_tools_into_restricted;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_core::SharedPool;
 use astra_services::LlmTokenServiceConfig;
+use astra_turn_core::bridge_rate_limit_cooldown::RateLimitAction;
+use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
+use astra_turn_core::tool_schema_prune::{
+    filter_tool_schemas_by_excluded_names, prune_tool_schemas,
+};
+use astra_turn_core::turn_guard::merge_deprioritized_tools_into_restricted;
 
 fn request_aware_summary_http_client() -> Result<reqwest::Client, String> {
     static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
@@ -1976,7 +1978,11 @@ impl ServerAgenticLoopHost {
 
         llm_messages.extend(compact_result.messages);
         // Strip old reasoning to reduce input tokens (see edge_ledger::strip_stale_reasoning).
-        astra_turn_core::edge_ledger::strip_stale_reasoning(&mut llm_messages, provider, model_name);
+        astra_turn_core::edge_ledger::strip_stale_reasoning(
+            &mut llm_messages,
+            provider,
+            model_name,
+        );
 
         // Post-compaction: re-inject invoked skill instructions (truncated)
         // so the LLM retains skill context after history summarization.
@@ -2938,11 +2944,11 @@ mod tests {
     use super::*;
     use crate::turn::agentic_loop_host::ASK_USER_TOOL_NAME;
     use crate::turn::agentic_loop_host::run_agentic_loop_with_host;
+    #[cfg(feature = "bridge-e2e-hooks")]
+    use astra_services::SessionArtifactStore;
     use astra_turn_core::cloud_summary::SummaryLlmClient;
     use astra_turn_core::edge_ledger::{approval_callback_key, tool_callback_key};
     use astra_turn_core::sse_stream_host::EdgeToolExecResult;
-    #[cfg(feature = "bridge-e2e-hooks")]
-    use astra_services::SessionArtifactStore;
 
     fn mock_matrixone() -> MatrixOneSettings {
         MatrixOneSettings {

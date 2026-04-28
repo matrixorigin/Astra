@@ -1789,10 +1789,7 @@ fn record_selector_turn_outcome(
     snap: &ReplTurnLearningSnapshot,
     prev_assistant_text: Option<&str>,
 ) {
-    let signal = astra_turn_types::detect_implicit_feedback_signal(
-        line,
-        prev_assistant_text,
-    );
+    let signal = astra_turn_types::detect_implicit_feedback_signal(line, prev_assistant_text);
     let was_corrected = matches!(signal.signal_type.as_str(), "correction" | "frustration");
     selector.record_outcome(
         line,
@@ -2162,12 +2159,7 @@ pub(crate) async fn try_llm_skill_improvement(
     let manifests = registry.all_manifests();
     let filesystem_skills: Vec<_> = manifests
         .iter()
-        .filter(|m| {
-            matches!(
-                m.source,
-                astra_skills::manifest::SkillSourceKind::Local
-            )
-        })
+        .filter(|m| matches!(m.source, astra_skills::manifest::SkillSourceKind::Local))
         .collect();
     if filesystem_skills.is_empty() {
         state.skill_improvement_tracker.mark_analyzed(state.turn);
@@ -2225,11 +2217,7 @@ pub(crate) async fn try_llm_skill_improvement(
 
     // Step 1: analysis — detect structured improvements.
     let (analysis_system, analysis_user) =
-        astra_skills::improvement::build_analysis_prompt(
-            &target.name,
-            &current_content,
-            &recent,
-        );
+        astra_skills::improvement::build_analysis_prompt(&target.name, &current_content, &recent);
     let analysis_resp = llm.complete(&analysis_system, &analysis_user).await?;
     let improvements = astra_skills::improvement::parse_improvements(&analysis_resp);
     if improvements.is_empty() {
@@ -2344,12 +2332,7 @@ fn check_skill_improvement_inner(state: &mut ReplState) {
     let manifests = registry.all_manifests();
     let filesystem_skills: Vec<_> = manifests
         .iter()
-        .filter(|m| {
-            matches!(
-                m.source,
-                astra_skills::manifest::SkillSourceKind::Local
-            )
-        })
+        .filter(|m| matches!(m.source, astra_skills::manifest::SkillSourceKind::Local))
         .collect();
 
     if filesystem_skills.is_empty() {

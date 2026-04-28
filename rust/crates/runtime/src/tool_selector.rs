@@ -36,13 +36,13 @@
 //! The next edge case should be handled by **improving the LLM prompt**, not
 //! by adding a field to ConversationState.
 
+use crate::pipeline::routing::{DomainHint, RoutingEngine, TaskType, domain_hint_to_label};
+use crate::tool_registry::{self, TOOL_CATALOG, ToolQualityTracker, ToolRegistry};
 use astra_pipeline::calibration::ProgressiveCalibrator;
 use astra_pipeline::entity::{EntityGraph, extract_entities};
 use astra_pipeline::pattern::PatternLibrary;
-use crate::pipeline::routing::{DomainHint, RoutingEngine, TaskType, domain_hint_to_label};
-use crate::tool_registry::{self, TOOL_CATALOG, ToolQualityTracker, ToolRegistry};
-use astra_turn_core::routing_metrics::ConfidenceCalibrator;
 use astra_thin_client::ThinClient;
+use astra_turn_core::routing_metrics::ConfidenceCalibrator;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
@@ -93,7 +93,8 @@ pub struct SelectionContext<'a> {
     /// Fallback action from the previous turn's confidence diagnosis.
     /// When `Some(Broaden)`, the selector should relax budget constraints
     /// and include more candidate tools.
-    pub previous_confidence_fallback: Option<astra_turn_core::confidence_contract::ConfidenceFallback>,
+    pub previous_confidence_fallback:
+        Option<astra_turn_core::confidence_contract::ConfidenceFallback>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

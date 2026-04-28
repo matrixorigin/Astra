@@ -288,8 +288,7 @@ struct PrepareChatTurnRequest<'a> {
     /// Skill-scoped tool allowlist — tools the active skill declared as needed.
     /// After the selector picks tools, any allowed tools it missed are force-injected.
     skill_allowed_tools: Option<Vec<String>>,
-    previous_confidence_fallback:
-        Option<astra_turn_core::confidence_contract::ConfidenceFallback>,
+    previous_confidence_fallback: Option<astra_turn_core::confidence_contract::ConfidenceFallback>,
     /// Current agentic loop round (0-based). Sent to bridge for round budget directives.
     round_index: u32,
     /// Authoritative visible-turn number from the outer loop.
@@ -382,10 +381,8 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     let semantic_query = semantic_query_from_message(ctx.message);
     let semantic_query_str = semantic_query.as_ref();
-    let mut boost_terms = astra_turn_core::retrieval::extract_boost_terms_from_pairs(
-        ctx.history,
-        semantic_query_str,
-    );
+    let mut boost_terms =
+        astra_turn_core::retrieval::extract_boost_terms_from_pairs(ctx.history, semantic_query_str);
     let mut memoria_insights_text: Option<String> = None;
     {
         if should_skip_memory_boost(ctx.message, ctx.history) {

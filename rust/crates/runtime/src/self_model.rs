@@ -17,13 +17,13 @@ use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
 
-use astra_learning::auto_tuning::{FeedbackSignal, SignalType};
 use astra_config::runtime_config::RuntimeConfig;
+use astra_config::user_profile::Scenario;
+use astra_learning::auto_tuning::{FeedbackSignal, SignalType};
 use astra_text_utils::str_preview::truncate_str;
 use astra_turn_core::context_assembly_trace::TokenBudgetTrace;
 use astra_turn_core::goal_tracker::{GoalProgress, Milestone};
 use astra_turn_core::tool_health::ToolHealthTracker;
-use astra_config::user_profile::Scenario;
 
 // ─── Core Self-Model ────────────────────────────────────────────────────────
 

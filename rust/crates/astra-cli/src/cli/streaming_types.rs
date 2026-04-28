@@ -89,13 +89,11 @@ pub(crate) struct StreamResult {
     /// nudge_count, total_errors, deprioritized_count). Only non-Healthy verdicts.
     pub(crate) verdict_events: Vec<VerdictEvent>,
     /// Step Protocol recorder summary for debugging and audit.
-    pub(crate) step_recorder_summary:
-        Option<astra_pipeline::step_recorder::RecorderSummary>,
+    pub(crate) step_recorder_summary: Option<astra_pipeline::step_recorder::RecorderSummary>,
     /// Exported tool health entries from this turn's TurnGuard (for cross-session persistence).
     pub(crate) tool_health_export: Vec<astra_evolution::persistence::ToolHealthEntry>,
     /// Last heavy checkpoint built during the agentic loop (for cloud persistence).
-    pub(crate) last_heavy_checkpoint:
-        Option<astra_pipeline::step_protocol::StepCheckpoint>,
+    pub(crate) last_heavy_checkpoint: Option<astra_pipeline::step_protocol::StepCheckpoint>,
     /// Live runtime-owned continuity after the turn. Saved back into REPL state
     /// so multi-turn sessions do not fall back to prompt-only continuity.
     pub(crate) runtime_continuity: astra_turn_types::continuity::ContinuityState,

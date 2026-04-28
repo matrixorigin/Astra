@@ -22,12 +22,11 @@ pub(crate) fn build_learning_bridge(
     let eg = state.entity_graph.as_ref()?;
     let pl = state.pattern_library.as_ref()?;
     let cal = state.calibrator.as_ref()?;
-    let mut bridge =
-        astra_pipeline::task_learning::PipelineTaskLearningBridge::from_shared(
-            eg.clone(),
-            pl.clone(),
-            cal.clone(),
-        );
+    let mut bridge = astra_pipeline::task_learning::PipelineTaskLearningBridge::from_shared(
+        eg.clone(),
+        pl.clone(),
+        cal.clone(),
+    );
     if let Some(mc) = &state.matrix_runtime {
         let pool = mc.shared_pool().get().clone();
         let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");

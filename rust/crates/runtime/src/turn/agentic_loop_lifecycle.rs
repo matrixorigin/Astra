@@ -10,11 +10,11 @@ use super::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, delegate_tool_schema,
     try_write_heavy_checkpoint,
 };
+use crate::orchestration::permission_sync::PermissionResponseMessaging;
 use astra_turn_core::interruption::{
     InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
 };
 use astra_turn_core::stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG;
-use crate::orchestration::permission_sync::PermissionResponseMessaging;
 
 #[derive(Clone, Copy)]
 pub(crate) struct TurnIterationPrep {
@@ -672,9 +672,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     astra_messaging::types::MessagePayload::Text { content, .. } => {
                         parts.push(format!("[{from_label}]: {content}"));
                     }
-                    astra_messaging::types::MessagePayload::Progress {
-                        status, detail, ..
-                    } => {
+                    astra_messaging::types::MessagePayload::Progress { status, detail, .. } => {
                         let extra = detail.as_deref().unwrap_or("");
                         parts.push(format!("[{from_label} progress]: {status} {extra}"));
                     }

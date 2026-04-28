@@ -396,7 +396,6 @@ pub(super) fn build_pipeline_learning_stack(profile: Option<&str>) -> PipelineLe
         calibration::ProgressiveCalibrator,
         defaults::{default_calibration, default_entities, default_patterns},
         entity::EntityGraph,
-
         pattern::PatternLibrary,
     };
     use astra_turn_core::pipeline_learning::PipelineLearningWriter;
@@ -456,9 +455,9 @@ pub(super) fn build_pipeline_learning_stack(profile: Option<&str>) -> PipelineLe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::routing::{DomainHint, TaskType};
     use astra_evolution::types::PatternAction;
     use astra_pipeline::defaults::default_patterns;
-    use crate::pipeline::routing::{DomainHint, TaskType};
     use astra_turn_core::contracts::TurnLearningOutcome;
 
     #[tokio::test]

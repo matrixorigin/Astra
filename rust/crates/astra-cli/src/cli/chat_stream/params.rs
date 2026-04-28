@@ -115,8 +115,7 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Optional logical root agent ID for this top-level turn when agent spawning is enabled.
     pub(crate) root_agent_id: Option<&'a str>,
     /// Optional persistent top-level mailbox slot for cross-turn reply handling.
-    pub(crate) root_mailbox_slot:
-        Option<&'a mut Option<astra_messaging::router::AgentMailbox>>,
+    pub(crate) root_mailbox_slot: Option<&'a mut Option<astra_messaging::router::AgentMailbox>>,
     /// Optional observability hub for M1-M6 integration (profiles, experiments, auto-tuning).
     pub(crate) observability_hub:
         Option<Arc<astra_runtime::observability_integration::ObservabilityHub>>,

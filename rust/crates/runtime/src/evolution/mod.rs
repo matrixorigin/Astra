@@ -5,6 +5,6 @@
 //! and applies approved changes back into the system.
 
 pub mod service;
+pub use astra_evolution::promotion_gate;
 pub use astra_evolution::store;
 pub use astra_evolution::types;
-pub use astra_evolution::promotion_gate;

@@ -763,17 +763,14 @@ Follow these steps:
                         eprintln!("  {} {} chars", "Instruction body:".dim(), body.len());
                     }
 
-                    if ok
-                        && let Ok((manifest, _body)) =
-                            astra_skills::loader::parse_skill_md(&src)
+                    if ok && let Ok((manifest, _body)) = astra_skills::loader::parse_skill_md(&src)
                     {
                         if let Some(ref hooks) = manifest.hooks {
                             if !hooks.pre_invoke.is_empty() {
                                 eprintln!("  {} pre_invoke hooks…", "Running".dim());
                                 for action in &hooks.pre_invoke {
-                                    if let astra_skills::hooks::HookAction::Shell {
-                                        command,
-                                    } = action
+                                    if let astra_skills::hooks::HookAction::Shell { command } =
+                                        action
                                     {
                                         eprintln!("  {} {command}", "$".dim());
                                         match std::process::Command::new("sh")
@@ -3029,8 +3026,7 @@ mod tests {
             // read_local_skill_version searches skill_search_paths() which won't find
             // our tempdir, so test the underlying parse_skill_md directly
             let content = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
-            let (manifest, _body) =
-                astra_skills::loader::parse_skill_md(&content).unwrap();
+            let (manifest, _body) = astra_skills::loader::parse_skill_md(&content).unwrap();
             assert_eq!(manifest.version.to_string(), "1.2.3");
         }
 

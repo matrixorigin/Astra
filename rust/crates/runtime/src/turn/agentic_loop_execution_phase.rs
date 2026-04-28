@@ -2310,8 +2310,9 @@ mod tests {
     #[test]
     fn execution_retry_does_not_fire_for_read_only_review() {
         let mut state = make_state();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("review local changes");
+        state.task_profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
+            "review local changes",
+        );
         state.message = "review local changes".into();
         state.final_text = "I found one issue.".into();
         state.total_tool_calls = 1;
@@ -2508,8 +2509,9 @@ mod tests {
     fn make_mutating_state_with_reads(n: usize) -> AgenticLoopState {
         let mut state = make_state();
         state.message = "fix the bug in foo".into();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug in foo");
+        state.task_profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
+            "fix the bug in foo",
+        );
         assert!(
             state.task_profile.mutates_workspace,
             "test precondition: profile must be mutating"

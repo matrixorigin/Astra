@@ -10,11 +10,11 @@
 //! 3. **TieredCompaction** — drop middle messages, keep system + first user + recent.
 //! 4. **ReactiveCompact** — emergency: keep system + first user + last 4.
 
-use astra_turn_core::headless_tool_assembly::READ_ONLY_TOOLS;
 pub use astra_turn_core::compression_types::{
     CompressionLayer, CompressionResult, PipelineOutcome, TokenBudget,
 };
 use astra_turn_core::context_assembly_trace::CompressionMethod;
+use astra_turn_core::headless_tool_assembly::READ_ONLY_TOOLS;
 
 use astra_config::runtime_config::CompressionConfig;
 use serde_json::Value;

@@ -4,12 +4,12 @@ use astra_runtime::tool_sandbox::{
     CommandRisk, GitSafetyViolation, analyze_command_risks, is_dangerous_file_path,
     validate_git_command,
 };
+use astra_runtime::{compensation_prompt_note, explicit_approval_reason};
+use astra_thin_client::ApprovalKind;
 use astra_turn_core::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind};
 use astra_turn_core::tool_argument_hints::{
     command_hint_from_args, path_hint_from_args, permission_prompt_primary_detail,
 };
-use astra_runtime::{compensation_prompt_note, explicit_approval_reason};
-use astra_thin_client::ApprovalKind;
 
 /// Classify a permission-denial reason and emit a short, actionable
 /// **safe-alternative** hint the agent can act on. The runtime never
@@ -594,9 +594,7 @@ impl PermissionManager {
         }
         let fp = match (cloud_gated_tool_kind(tool), detail) {
             (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
-                astra_turn_core::approval_fingerprint::ApprovalFingerprint::shell(
-                    tool, cmd, false,
-                )
+                astra_turn_core::approval_fingerprint::ApprovalFingerprint::shell(tool, cmd, false)
             }
             (Some(CloudGatedToolKind::Write), d) => {
                 astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
@@ -827,9 +825,7 @@ impl PermissionManager {
 
         let fp = match (cloud_gated_tool_kind(tool), detail) {
             (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
-                astra_turn_core::approval_fingerprint::ApprovalFingerprint::shell(
-                    tool, cmd, false,
-                )
+                astra_turn_core::approval_fingerprint::ApprovalFingerprint::shell(tool, cmd, false)
             }
             (Some(CloudGatedToolKind::Write), d) => {
                 astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
@@ -1143,9 +1139,7 @@ impl PermissionManager {
                         )
                     }
                     (Some(CloudGatedToolKind::Write), d) => {
-                        astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(
-                            tool, d,
-                        )
+                        astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
                     }
                     _ => astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(tool),
                 };
@@ -1170,9 +1164,7 @@ impl PermissionManager {
                         )
                     }
                     (Some(CloudGatedToolKind::Write), d) => {
-                        astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(
-                            tool, d,
-                        )
+                        astra_turn_core::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
                     }
                     _ => astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(tool),
                 };

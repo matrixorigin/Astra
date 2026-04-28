@@ -1327,8 +1327,7 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
     fn resolve(
         &self,
         name: &str,
-    ) -> Result<astra_runtime::turn::skill_tool::ResolvedSkill, astra_skills::SkillError>
-    {
+    ) -> Result<astra_runtime::turn::skill_tool::ResolvedSkill, astra_skills::SkillError> {
         use astra_skills::SkillError;
 
         // Fast path: read-lock to check if instructions are already loaded.

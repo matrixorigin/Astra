@@ -7,8 +7,8 @@ use astra_services::self_surface::{
     ToolHealthView, VerificationEventView, VerificationSurface,
 };
 
-use astra_text_utils::str_preview::truncate_str;
 use crate::turn::agentic_headless_round::HeadlessStderrStyle;
+use astra_text_utils::str_preview::truncate_str;
 
 use super::agentic_adaptive_tuning::{
     MAX_RECENT_TACTICAL_ACTIONS, record_new_evolution_promotion_events,

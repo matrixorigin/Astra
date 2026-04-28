@@ -200,7 +200,8 @@ impl AppState {
             resource_governor: std::sync::Arc::new(
                 astra_services::resource_governor::InMemoryResourceGovernor::new(),
             ),
-            edge_connection_pool: astra_server_types::edge_connection_pool::EdgeConnectionPool::new(),
+            edge_connection_pool: astra_server_types::edge_connection_pool::EdgeConnectionPool::new(
+            ),
             http_client: reqwest::Client::builder()
                 .no_proxy()
                 .connect_timeout(std::time::Duration::from_secs(30))

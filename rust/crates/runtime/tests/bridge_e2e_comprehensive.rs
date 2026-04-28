@@ -1096,16 +1096,13 @@ async fn multi_turn_session_accumulates_state() {
 // Test: Text-only turn — no tool calls, persist events correct
 // ══════════════════════════════════════════════════════════════════════════════
 
-
 // ══════════════════════════════════════════════════════════════════════════════
 // Test: Batch tool calls — 5 tools in one response
 // ══════════════════════════════════════════════════════════════════════════════
 
-
 // ══════════════════════════════════════════════════════════════════════════════
 // Test: SSE event ordering — session_info first, turn_complete last
 // ══════════════════════════════════════════════════════════════════════════════
-
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Test: Error — missing test_llm_rounds with e2e hooks returns error event
@@ -4422,8 +4419,6 @@ async fn session_event_ids_unique_across_turns() {
 // AREA 4: Explain/Trace Events
 // ══════════════════════════════════════════════════════════════════════════════
 
-
-
 /// explain event with no tool calls → tools_selected=0, no tool_selection
 #[tokio::test]
 async fn explain_event_text_only_no_tools() {
@@ -5588,7 +5583,6 @@ async fn gap_tool_call_missing_id_gets_uuid() {
         "missing id got UUID assigned in tool_call_id: {assigned_id}"
     );
 }
-
 
 /// Mixed tool call IDs: some valid, some missing → only missing ones get UUIDs
 #[tokio::test]
@@ -8458,7 +8452,6 @@ async fn a4_empty_active_skills_no_impact() {
     let turn_completes = events_of_type(&events, "turn_complete");
     assert_eq!(turn_completes.len(), 1, "works with empty active_skills");
 }
-
 
 #[tokio::test]
 async fn a5_persist_tool_call_with_full_args() {

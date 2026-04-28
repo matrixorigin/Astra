@@ -89,7 +89,6 @@ macro_rules! log_persist {
     };
 }
 
-
 /// Structured escalation event log.
 #[macro_export]
 macro_rules! agent_escalation {
@@ -123,8 +122,6 @@ mod tests {
             error = "timeout"
         );
     }
-
-
 
     #[test]
     fn escalation_macro_formats_kv() {

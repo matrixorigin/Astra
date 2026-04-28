@@ -1118,8 +1118,7 @@ pub(super) struct BackgroundPlanContext {
     pub observability_session: Option<
         Arc<std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>>,
     >,
-    pub file_journal:
-        Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>>,
+    pub file_journal: Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>>,
     /// Session-scoped file-state cache — shared across subtask turns so
     /// read-before-write tracking persists.
     pub file_state: crate::edge_tools::SharedFileState,
@@ -1219,12 +1218,11 @@ async fn plan_executor_task(
         let eg = ctx.entity_graph.as_ref()?;
         let pl = ctx.pattern_library.as_ref()?;
         let cal = ctx.calibrator.as_ref()?;
-        let mut bridge =
-            astra_pipeline::task_learning::PipelineTaskLearningBridge::from_shared(
-                eg.clone(),
-                pl.clone(),
-                cal.clone(),
-            );
+        let mut bridge = astra_pipeline::task_learning::PipelineTaskLearningBridge::from_shared(
+            eg.clone(),
+            pl.clone(),
+            cal.clone(),
+        );
         if let Some(mc) = &ctx.matrix_runtime {
             let pool = mc.shared_pool().get().clone();
             let user_id = ctx.ingestion_user_id.as_deref().unwrap_or("anonymous");
@@ -2286,8 +2284,8 @@ mod tests {
     use astra_pipeline::calibration::ProgressiveCalibrator;
     use astra_pipeline::entity::EntityGraph;
     use astra_pipeline::pattern::PatternLibrary;
-    use astra_turn_core::routing_engine::{DomainHint, TaskType};
     use astra_runtime::tool_selector::SelectionContext;
+    use astra_turn_core::routing_engine::{DomainHint, TaskType};
 
     fn test_background_plan_context(
         entity_graph: Option<Arc<Mutex<EntityGraph>>>,

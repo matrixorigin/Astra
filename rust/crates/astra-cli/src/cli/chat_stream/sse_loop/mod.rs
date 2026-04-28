@@ -413,9 +413,9 @@ pub(crate) async fn stream_chat_sse(
         let isolated = Arc::new(astra_skills::executor::IsolatedSkillExecutor::new(
             subrun_exec,
         ));
-        let router = Arc::new(astra_skills::executor::SkillExecutionRouter::new(
-            Some(isolated),
-        ));
+        let router = Arc::new(astra_skills::executor::SkillExecutionRouter::new(Some(
+            isolated,
+        )));
         Some(router as Arc<dyn astra_skills::SkillExecutor>)
     };
 
@@ -620,10 +620,9 @@ pub(crate) async fn stream_chat_sse(
         interruption: None,
         session_facts: Default::default(),
         continuity: p.runtime_continuity.cloned().unwrap_or_default(),
-        compact_strategy:
-            astra_turn_core::microcompact::CompactStrategy::from_provider_and_model(
-                p.provider, p.model,
-            ),
+        compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_provider_and_model(
+            p.provider, p.model,
+        ),
         approval_overrides: initial_approval_overrides,
         confidence_trend: Default::default(),
         last_confidence_diagnosis: None,
@@ -737,11 +736,11 @@ pub(crate) async fn stream_chat_sse(
 mod tests {
     use super::detect_turn_hook_sets;
     use super::extend_restricted_with_blocked_tools;
+    use astra_pipeline::pattern::PatternLibrary;
     use astra_runtime::evolution::types::PatternAction;
     use astra_runtime::observability_integration::ObservabilityHub;
-    use astra_pipeline::pattern::PatternLibrary;
-    use astra_turn_core::routing_engine::TaskType;
     use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
+    use astra_turn_core::routing_engine::TaskType;
     use std::collections::HashSet;
     use std::path::Path;
     use std::sync::{Arc, Mutex};

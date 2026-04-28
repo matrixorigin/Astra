@@ -3396,10 +3396,10 @@ pub mod bridge_inprocess_test_helpers {
 mod tests {
     use super::*;
     use crate::turn::bridge_sse_helpers::apply_forward_llm_sse_event;
-    use astra_turn_core::turn_guard::TurnGuard;
     use astra_services::{
         SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionArtifact,
     };
+    use astra_turn_core::turn_guard::TurnGuard;
     use async_trait::async_trait;
     use http_body_util::BodyExt;
     use std::sync::Mutex;
@@ -4091,10 +4091,11 @@ mod tests {
             )
             .with_trace_signals(
                 astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                    context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                        active_output_skills: !active_skill_names.is_empty(),
-                        ..Default::default()
-                    },
+                    context_signals:
+                        astra_turn_core::context_assembly_trace::PromptContextSignals {
+                            active_output_skills: !active_skill_names.is_empty(),
+                            ..Default::default()
+                        },
                     ..Default::default()
                 },
             ),
@@ -4104,10 +4105,11 @@ mod tests {
             )
             .with_trace_signals(
                 astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                    context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                        learned_runtime_context: !learned_context_text.is_empty(),
-                        ..Default::default()
-                    },
+                    context_signals:
+                        astra_turn_core::context_assembly_trace::PromptContextSignals {
+                            learned_runtime_context: !learned_context_text.is_empty(),
+                            ..Default::default()
+                        },
                     ..Default::default()
                 },
             ),
@@ -4117,10 +4119,11 @@ mod tests {
             )
             .with_trace_signals(
                 astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                    context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                        memory_signal_detected: !memory_signal_hint.is_empty(),
-                        ..Default::default()
-                    },
+                    context_signals:
+                        astra_turn_core::context_assembly_trace::PromptContextSignals {
+                            memory_signal_detected: !memory_signal_hint.is_empty(),
+                            ..Default::default()
+                        },
                     ..Default::default()
                 },
             ),
@@ -4130,10 +4133,11 @@ mod tests {
             )
             .with_trace_signals(
                 astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                    context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                        implicit_feedback: !implicit_feedback_hint.is_empty(),
-                        ..Default::default()
-                    },
+                    context_signals:
+                        astra_turn_core::context_assembly_trace::PromptContextSignals {
+                            implicit_feedback: !implicit_feedback_hint.is_empty(),
+                            ..Default::default()
+                        },
                     ..Default::default()
                 },
             ),
@@ -4143,10 +4147,11 @@ mod tests {
             )
             .with_trace_signals(
                 astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                    context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                        learned_feedback_rules: !feedback_rules_hint.is_empty(),
-                        ..Default::default()
-                    },
+                    context_signals:
+                        astra_turn_core::context_assembly_trace::PromptContextSignals {
+                            learned_feedback_rules: !feedback_rules_hint.is_empty(),
+                            ..Default::default()
+                        },
                     ..Default::default()
                 },
             ),
@@ -4156,10 +4161,11 @@ mod tests {
             )
             .with_trace_signals(
                 astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                    context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                        self_awareness: !self_awareness_hint.is_empty(),
-                        ..Default::default()
-                    },
+                    context_signals:
+                        astra_turn_core::context_assembly_trace::PromptContextSignals {
+                            self_awareness: !self_awareness_hint.is_empty(),
+                            ..Default::default()
+                        },
                     ..Default::default()
                 },
             ),
@@ -4169,10 +4175,11 @@ mod tests {
             )
             .with_trace_signals(
                 astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                    context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                        session_anchor: !session_anchor.is_empty(),
-                        ..Default::default()
-                    },
+                    context_signals:
+                        astra_turn_core::context_assembly_trace::PromptContextSignals {
+                            session_anchor: !session_anchor.is_empty(),
+                            ..Default::default()
+                        },
                     ..Default::default()
                 },
             ),
@@ -4182,10 +4189,11 @@ mod tests {
             )
             .with_trace_signals(
                 astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                    context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                        memoria_insights: true,
-                        ..Default::default()
-                    },
+                    context_signals:
+                        astra_turn_core::context_assembly_trace::PromptContextSignals {
+                            memoria_insights: true,
+                            ..Default::default()
+                        },
                     ..Default::default()
                 },
             ),

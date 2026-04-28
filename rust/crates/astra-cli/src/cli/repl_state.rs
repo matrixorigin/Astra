@@ -174,13 +174,10 @@ pub(crate) struct ReplState {
     pub pattern_library:
         Option<std::sync::Arc<std::sync::Mutex<astra_pipeline::pattern::PatternLibrary>>>,
     /// Shared entity graph (learning feedback loop + post-login cloud pull).
-    pub entity_graph:
-        Option<std::sync::Arc<std::sync::Mutex<astra_pipeline::entity::EntityGraph>>>,
+    pub entity_graph: Option<std::sync::Arc<std::sync::Mutex<astra_pipeline::entity::EntityGraph>>>,
     /// Shared calibrator (learning feedback loop + post-login cloud pull).
     pub calibrator: Option<
-        std::sync::Arc<
-            std::sync::Mutex<astra_pipeline::calibration::ProgressiveCalibrator>,
-        >,
+        std::sync::Arc<std::sync::Mutex<astra_pipeline::calibration::ProgressiveCalibrator>>,
     >,
     /// Unified skill registry (single source of truth for all skill resolution).
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
@@ -244,8 +241,7 @@ pub(crate) struct ReplState {
     /// Shared messaging metrics (populated when delegation is active).
     pub messaging_metrics: Option<std::sync::Arc<astra_messaging::MessagingMetrics>>,
     /// Shared dead letter queue (populated when delegation is active).
-    pub dead_letter_queue:
-        Option<std::sync::Arc<astra_messaging::dead_letter::DeadLetterQueue>>,
+    pub dead_letter_queue: Option<std::sync::Arc<astra_messaging::dead_letter::DeadLetterQueue>>,
     /// Dynamic agent spawner for runtime agent creation.
     pub agent_spawner: Option<std::sync::Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     /// Persistent top-level mailbox so spawned agents can reply across turns.
@@ -401,8 +397,7 @@ impl Default for ReplState {
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
             skill_quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
             skill_search: astra_core::SkillSearchSettings::default(),
-            skill_improvement_tracker: astra_skills::improvement::ImprovementTracker::new(
-            ),
+            skill_improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
             pinned_skills: std::collections::HashSet::new(),
             discovered_skills: std::collections::HashSet::new(),
             mcp_manager: std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -427,9 +422,7 @@ impl Default for ReplState {
             plan_thinking_pane: None,
             project_instructions: None,
             // Create shared messaging infrastructure eagerly so /messaging always has data
-            messaging_metrics: Some(std::sync::Arc::new(
-                astra_messaging::MessagingMetrics::new(),
-            )),
+            messaging_metrics: Some(std::sync::Arc::new(astra_messaging::MessagingMetrics::new())),
             dead_letter_queue: Some(std::sync::Arc::new(
                 astra_messaging::dead_letter::DeadLetterQueue::new(),
             )),

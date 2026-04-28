@@ -32,10 +32,12 @@ fn sync_liquid_tactical_runtime(
     if let Some(ref mut collector) = state.step_signal_collector {
         collector.reset(turn_token_budget);
     } else {
-        state.step_signal_collector = Some(astra_turn_core::liquid_step_signals::StepSignalCollector::new(
-            astra_turn_core::liquid_step_signals::StepSignalConfig::default(),
-            turn_token_budget,
-        ));
+        state.step_signal_collector = Some(
+            astra_turn_core::liquid_step_signals::StepSignalCollector::new(
+                astra_turn_core::liquid_step_signals::StepSignalConfig::default(),
+                turn_token_budget,
+            ),
+        );
     }
 
     if state.tactical_adapter.is_none() {
@@ -119,14 +121,20 @@ pub(crate) fn apply_tactical_actions(
                 }
                 hint_parts.push(format!("⚠️ {reason}{suffix}"));
             }
-            astra_turn_core::liquid_tactical::TacticalAction::SuggestToolSwitch { from_tool, reason } => {
+            astra_turn_core::liquid_tactical::TacticalAction::SuggestToolSwitch {
+                from_tool,
+                reason,
+            } => {
                 state.turn_guard.health.force_deprioritize(from_tool);
                 hint_parts.push(format!(
                     "💡 Consider switching from '{}': {} (deprioritized for follow-up selection)",
                     from_tool, reason
                 ));
             }
-            astra_turn_core::liquid_tactical::TacticalAction::TokenBudgetWarning { used, budget } => {
+            astra_turn_core::liquid_tactical::TacticalAction::TokenBudgetWarning {
+                used,
+                budget,
+            } => {
                 let baseline = state
                     .tool_budget_override
                     .or_else(|| {
@@ -1156,8 +1164,8 @@ fn write_session_journal_event(
 mod tests {
     use super::fallback_scenario_from_routing;
     use crate::pipeline::routing::TaskType;
-    use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
     use astra_config::user_profile::Scenario;
+    use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
 
     #[test]
     fn review_like_analysis_query_prefers_code_review_over_implementation_fallback() {

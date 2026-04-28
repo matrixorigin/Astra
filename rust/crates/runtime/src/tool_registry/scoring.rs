@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use astra_text_utils::text_tokenize::tokenize;
+use astra_turn_core::routing_metrics::{ConfidenceCalibrator, DisambiguationAction};
 use astra_turn_core::tool_registry_meta::{IntentType, Scope, TOOL_CATALOG, ToolMeta};
 use astra_turn_core::tool_registry_report::ToolQualityTracker;
 use astra_turn_core::tool_registry_state::ConversationState;
-use astra_text_utils::text_tokenize::tokenize;
-use astra_turn_core::routing_metrics::{ConfidenceCalibrator, DisambiguationAction};
 
 /// Pre-computed inverse document frequency for each term across all tools.
 /// Terms that appear in fewer tools get higher IDF (more discriminative).

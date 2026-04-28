@@ -1,11 +1,11 @@
 use std::io::Write;
 
 use astra_core::{DriftCause, EvidenceType};
-use astra_turn_core::decision_explainer::{DriftDetector, FocusDriftAnalysis};
 use astra_services::session_restore::{
     HybridRestoreService, RestoredSession, SessionRestoreService,
 };
 use astra_services::{ForkSessionOptions, fork_local_session, session_journal, session_workspace};
+use astra_turn_core::decision_explainer::{DriftDetector, FocusDriftAnalysis};
 use chrono::{DateTime, Utc};
 
 use super::*;
@@ -4676,9 +4676,7 @@ fn history_pairs_from_messages(messages: &[serde_json::Value]) -> Vec<(String, S
 
 /// Baseline row for a blocked tool when we have no persisted health metrics yet (same defaults as
 /// cloud preference seeding in `cloud_sync.rs`).
-fn blocked_tool_health_entry(
-    name: String,
-) -> astra_evolution::persistence::ToolHealthEntry {
+fn blocked_tool_health_entry(name: String) -> astra_evolution::persistence::ToolHealthEntry {
     astra_evolution::persistence::ToolHealthEntry {
         name,
         total_calls: 0,
@@ -5647,9 +5645,7 @@ mod resume_tests {
 
     #[test]
     fn apply_heavy_checkpoint_fallback_restores_history_and_approval_overrides() {
-        use astra_turn_core::approval_fingerprint::{
-            ApprovalFingerprint, FingerprintedOverrides,
-        };
+        use astra_turn_core::approval_fingerprint::{ApprovalFingerprint, FingerprintedOverrides};
 
         let mut state = ReplState::default();
         let mut overrides = FingerprintedOverrides::default();

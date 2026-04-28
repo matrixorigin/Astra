@@ -2,9 +2,7 @@ use astra_runtime::tool_registry::ToolChain;
 use astra_turn_core::cloud_approval_policy::{
     CloudGatedToolKind, bash_command_is_read_only, cloud_gated_tool_kind,
 };
-use astra_turn_core::safety_middleware::{
-    SafetyMiddlewareDecision, evaluate_tool_safety_request,
-};
+use astra_turn_core::safety_middleware::{SafetyMiddlewareDecision, evaluate_tool_safety_request};
 use astra_turn_core::stall::{
     SERVER_STALL_WINDOW, detect_server_stall, record_server_tool_signatures,
 };

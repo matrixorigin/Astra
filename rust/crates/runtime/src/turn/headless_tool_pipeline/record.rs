@@ -3,6 +3,8 @@ use std::time::Duration;
 use astra_services::SessionArtifactStore;
 
 use super::super::agentic_headless_round::HeadlessStderrStyle;
+use super::*;
+use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::headless_tool_assembly::{
     READ_ONLY_TOOLS, openai_tool_roundtrip_values_with_result_fields,
 };
@@ -17,8 +19,6 @@ use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_error_preview_line, headless_stderr_tool_error_detail_line,
     headless_stderr_tool_error_line, headless_stderr_tool_ok_line,
 };
-use super::*;
-use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::tool_result_sanitize::tool_result_content_for_model;
 
 fn emit_tool_display_feedback(

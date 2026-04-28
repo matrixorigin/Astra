@@ -1,6 +1,11 @@
 use astra_core::agent_warn;
 
 use super::super::agentic_headless_round::HeadlessStderrStyle;
+use super::super::permission_gate::{
+    PermissionCheckResult, check_tool_permission, permission_denied_error_result,
+};
+use super::*;
+use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::headless_tool_assembly::{
     READ_ONLY_TOOLS, headless_idempotency_hit_openai_pair,
     headless_openai_duplicate_within_turn_pair, headless_unknown_local_tool_openai_pair,
@@ -15,11 +20,6 @@ use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_cache_hit_line, headless_stderr_unknown_tool_detail,
     headless_stderr_unknown_tool_header,
 };
-use super::super::permission_gate::{
-    PermissionCheckResult, check_tool_permission, permission_denied_error_result,
-};
-use super::*;
-use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::tool_result_semantics::tool_dedup_signature;
 
 const OUTCOME_MEMORY_FAILURE_BLOCK_WINDOW: usize = 2;

@@ -23,7 +23,8 @@ pub(crate) async fn prepare_intercepted_tool_round(
     valid_tool_names: &HashSet<String>,
 ) -> PreparedToolRound {
     let tool_calls =
-        astra_turn_core::headless_tool_assembly::ensure_tool_call_ids(effective_tool_calls).into_owned();
+        astra_turn_core::headless_tool_assembly::ensure_tool_call_ids(effective_tool_calls)
+            .into_owned();
     let (mut pre_resolved_results, post_send_tool_calls) =
         intercept_send_message_calls(state, &tool_calls, valid_tool_names).await;
     let SkillInterceptionResult {
@@ -166,8 +167,7 @@ async fn intercept_send_message_calls(
         if astra_messaging::send_tool::is_send_message_call(tc)
             && valid_tool_names.contains(astra_messaging::send_tool::SEND_MESSAGE_TOOL_NAME)
         {
-            if let Some((call_id, args)) = astra_messaging::send_tool::parse_send_message_call(tc)
-            {
+            if let Some((call_id, args)) = astra_messaging::send_tool::parse_send_message_call(tc) {
                 let send_result =
                     astra_messaging::send_tool::execute_send_message(mailbox, &args).await;
                 if send_result.tracked_message.is_some()
@@ -658,11 +658,11 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
+    use crate::turn::agentic_loop_host::tests::make_state;
     use astra_messaging::in_process::InProcessTransport;
     use astra_messaging::router::AgentMailboxRouter;
     use astra_messaging::types::AgentAddress;
-    use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
-    use crate::turn::agentic_loop_host::tests::make_state;
 
     async fn setup_mailboxes() -> (
         astra_messaging::router::AgentMailbox,

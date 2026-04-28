@@ -1,6 +1,9 @@
 use std::time::Instant;
 
 use super::super::agentic_headless_round::HeadlessStderrStyle;
+use super::*;
+use crate::turn::agentic_loop_tool_support::edge_tool_status_exit_code;
+use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::headless_tool_assembly::READ_ONLY_TOOLS;
 use astra_turn_core::headless_tool_postprocess::{
     HeadlessOutputEnrichSignal, append_headless_result_quality_feedback,
@@ -10,9 +13,6 @@ use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_resource_limit_blocked, headless_stderr_resource_limit_in_output,
 };
 use astra_turn_core::hydrate_reflect::hydrate_reflect_placeholder_if_needed;
-use super::*;
-use crate::turn::agentic_loop_tool_support::edge_tool_status_exit_code;
-use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::tool_result_semantics::is_tool_error;
 
 /// The sentinel error prefix emitted by `take_edge_output_for_tool_call_with_duration`

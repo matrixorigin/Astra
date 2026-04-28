@@ -58,16 +58,16 @@ use astra_services::{DatabaseEvaluationService, DatabaseEventService};
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::tool_registry::SelectionReport;
 use astra_pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
-use crate::tool_registry::SelectionReport;
 use astra_turn_core::agentic_verdict_audit::AgenticVerdictAuditEvent;
 use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
+use astra_turn_core::headless_types::HeadlessStderrStyle;
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use astra_turn_core::turn_guard::TurnGuard;
-use astra_turn_core::headless_types::HeadlessStderrStyle;
 use tokio_util::sync::CancellationToken;
 
 // ─── Host turn result ────────────────────────────────────────────────────────
@@ -771,7 +771,8 @@ pub struct AgenticLoopState {
     /// Tracks selector confidence trends across turns to detect floor loops.
     pub confidence_trend: astra_turn_core::confidence_contract::ConfidenceTrendTracker,
     /// Last diagnosis computed after tool selection (for telemetry and fallback).
-    pub last_confidence_diagnosis: Option<astra_turn_core::confidence_contract::ConfidenceDiagnosis>,
+    pub last_confidence_diagnosis:
+        Option<astra_turn_core::confidence_contract::ConfidenceDiagnosis>,
 
     // ── Turn observability (Phase 1) ──
     /// In-memory collector for fine-grained turn events (llm_round, tool timing).
@@ -3748,8 +3749,8 @@ pub(crate) mod tests {
 
     #[test]
     fn post_compact_skill_reinjection() {
-        use astra_turn_core::cloud_attachments::AttachmentBuilder;
         use crate::turn::skill_tool::InvokedSkill;
+        use astra_turn_core::cloud_attachments::AttachmentBuilder;
 
         let mut state = make_state();
         state.skills.invoked.insert(
@@ -5341,10 +5342,12 @@ print(json.dumps({'context': 'user said: ' + msg}))
         state.tactical_adapter = Some(astra_turn_core::liquid_tactical::TacticalAdapter::new(
             astra_turn_core::liquid_tactical::DampenerConfig::default(),
         ));
-        state.step_signal_collector = Some(astra_turn_core::liquid_step_signals::StepSignalCollector::new(
-            astra_turn_core::liquid_step_signals::StepSignalConfig::default(),
-            64_000,
-        ));
+        state.step_signal_collector = Some(
+            astra_turn_core::liquid_step_signals::StepSignalCollector::new(
+                astra_turn_core::liquid_step_signals::StepSignalConfig::default(),
+                64_000,
+            ),
+        );
 
         {
             let mut guard = session.write().unwrap();
@@ -6755,9 +6758,10 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         assert!(
             triggers.is_empty()
-                || triggers
-                    .iter()
-                    .all(|t| matches!(t, astra_turn_core::liquid_step_signals::AdaptationTrigger::Nominal)),
+                || triggers.iter().all(|t| matches!(
+                    t,
+                    astra_turn_core::liquid_step_signals::AdaptationTrigger::Nominal
+                )),
             "After reset, a single OK call should not trigger error-based adaptation"
         );
     }

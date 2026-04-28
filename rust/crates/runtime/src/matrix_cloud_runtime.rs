@@ -18,14 +18,13 @@ use astra_services::{
     state_sync::{MatrixOneSyncService, PlanTemplateSyncRow},
 };
 
-use astra_evolution::persistence::ToolHealthEntry;
-use astra_pipeline::{
-    calibration::ProgressiveCalibrator, entity::EntityGraph, pattern::PatternLibrary,
-
-};
 use crate::sync_adapters::{
     EventAdapter, LearningAdapter, MatrixOneTransport, PreferenceAdapter, TaskAdapter,
     TemplateAdapter,
+};
+use astra_evolution::persistence::ToolHealthEntry;
+use astra_pipeline::{
+    calibration::ProgressiveCalibrator, entity::EntityGraph, pattern::PatternLibrary,
 };
 
 /// Max time to wait for the ingestion worker to finish during shutdown.

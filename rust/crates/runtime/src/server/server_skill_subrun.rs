@@ -20,14 +20,14 @@ use astra_services::LlmTokenServiceConfig;
 
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
-use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
-use astra_pipeline::step_recorder::StepRecorder;
-use astra_text_utils::semantic_dedup::SemanticDedup;
-use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
 use crate::turn::agentic_loop_host::{
     AgenticLoopHost as _, AgenticLoopState, CancellationState, RequestConstraints, SkillState,
     StopHookState, TurnInteractionPolicy, run_agentic_loop_with_host,
 };
+use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
+use astra_pipeline::step_recorder::StepRecorder;
+use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
+use astra_text_utils::semantic_dedup::SemanticDedup;
 use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
 use astra_turn_core::turn_guard::TurnGuard;
 
@@ -315,7 +315,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             widen_selection_pending: false,
             step_recorder,
             idempotency_cache: InMemoryIdempotencyCache::new(),
-            semantic_dedup: SemanticDedup::new(astra_text_utils::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD),
+            semantic_dedup: SemanticDedup::new(
+                astra_text_utils::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
+            ),
             call_counts: HashMap::new(),
             max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
             max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,

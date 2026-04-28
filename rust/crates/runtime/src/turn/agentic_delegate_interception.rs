@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use astra_services::session_journal::ToolCallRecord;
 use serde_json::Value;
 
-use astra_text_utils::str_preview::truncate_str;
 use crate::turn::agentic_headless_round::HeadlessStderrStyle;
+use astra_text_utils::str_preview::truncate_str;
 
 use super::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopState, HostTurnResult, RequestConstraints,
@@ -412,7 +412,10 @@ pub(crate) fn select_default_coordination_pattern(
     let hints = astra_services::coordination::CoordinationHints {
         agent_ids: agents,
         task: task.to_string(),
-        needs_review: matches!(scenario, Some(astra_config::user_profile::Scenario::CodeReview)),
+        needs_review: matches!(
+            scenario,
+            Some(astra_config::user_profile::Scenario::CodeReview)
+        ),
         has_dependencies: !matches!(
             scenario,
             Some(
@@ -425,13 +428,25 @@ pub(crate) fn select_default_coordination_pattern(
     };
     let pattern = astra_services::coordination::suggest_pattern(&hints);
     let selected_pattern = coordination_pattern_name(&pattern);
-    let reason = if matches!(scenario, Some(astra_config::user_profile::Scenario::CodeReview)) {
+    let reason = if matches!(
+        scenario,
+        Some(astra_config::user_profile::Scenario::CodeReview)
+    ) {
         "code_review_scenario_prefers_review_loop"
-    } else if matches!(scenario, Some(astra_config::user_profile::Scenario::Exploration)) {
+    } else if matches!(
+        scenario,
+        Some(astra_config::user_profile::Scenario::Exploration)
+    ) {
         "exploration_scenario_prefers_parallel_scouting"
-    } else if matches!(scenario, Some(astra_config::user_profile::Scenario::Debugging)) {
+    } else if matches!(
+        scenario,
+        Some(astra_config::user_profile::Scenario::Debugging)
+    ) {
         "debugging_scenario_prefers_sequential_with_stop"
-    } else if matches!(scenario, Some(astra_config::user_profile::Scenario::Testing)) {
+    } else if matches!(
+        scenario,
+        Some(astra_config::user_profile::Scenario::Testing)
+    ) {
         "testing_scenario_prefers_parallel_execution"
     } else if task_requests_review {
         "task_keywords_request_review"

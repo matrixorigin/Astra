@@ -4,9 +4,9 @@
 //! authenticate, and then receive tool execution requests from the server.
 //! Results are sent back over the same WebSocket.
 
+use super::*;
 use astra_server_types::edge_connection_pool::EdgeToolResult;
 use astra_server_types::edge_ws_protocol::*;
-use super::*;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;

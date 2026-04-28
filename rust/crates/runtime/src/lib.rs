@@ -73,11 +73,13 @@ pub mod matrix_cloud_runtime;
 pub mod memoria_insights;
 pub mod observability_integration;
 pub mod pipeline;
-pub use astra_sync_adapters as sync_adapters;
-pub use astra_sandbox as tool_sandbox;
 pub use astra_plan as plan;
 pub use astra_plan as plan_decompose;
-pub mod liquid { pub use astra_evolution::reflection; }
+pub use astra_sandbox as tool_sandbox;
+pub use astra_sync_adapters as sync_adapters;
+pub mod liquid {
+    pub use astra_evolution::reflection;
+}
 pub mod prompts;
 pub mod self_model;
 pub mod server;
@@ -266,22 +268,19 @@ pub use astra_turn_core::{
     activity::{SessionActivityUpdatePlan, build_session_activity_update_plan},
     cache::SessionCache,
     cloud_attachments::{
-        AttachmentBuilder, FileAttachment, PlanAttachment, PostCompactAttachments,
-        SkillAttachment,
+        AttachmentBuilder, FileAttachment, PlanAttachment, PostCompactAttachments, SkillAttachment,
     },
     cloud_cache_diagnostics::{
-        CacheBreakCause, CacheBreakDetector, CacheBreakEvent, CacheFingerprint,
-        diff_fingerprints,
+        CacheBreakCause, CacheBreakDetector, CacheBreakEvent, CacheFingerprint, diff_fingerprints,
     },
     cloud_history::compact_cloud_loop_history,
     cloud_iteration::{CloudLoopIterationPlan, plan_cloud_loop_iteration},
     cloud_prefilter::{CloudSkillCandidatePlan, plan_cloud_skill_candidates},
     cloud_session_memory_extract::{
         SESSION_MEMORY_TEMPLATE, SessionMemoryExtractConfig, SessionMemoryState,
-        build_extraction_prompt, build_learnings_extraction_prompt,
-        extract_learnings_for_backflow, extract_section, parse_learnings_response,
-        should_extract as should_extract_session_memory, should_extract_with_error_trigger,
-        truncate_for_prompt, write_session_memory_file,
+        build_extraction_prompt, build_learnings_extraction_prompt, extract_learnings_for_backflow,
+        extract_section, parse_learnings_response, should_extract as should_extract_session_memory,
+        should_extract_with_error_trigger, truncate_for_prompt, write_session_memory_file,
     },
     cloud_summary::{HttpSummaryClient, LlmConnParams, SummaryLlmClient, SummaryResponse},
     complete::build_turn_complete_event,
@@ -360,13 +359,13 @@ pub use turn::{
     },
 };
 
+pub use astra_config::runtime_config;
+pub use astra_config::user_profile;
+pub use astra_learning::auto_tuning;
+pub use astra_text_utils::semantic_dedup;
+pub use astra_text_utils::text_tokenize;
+pub use astra_turn_core::cloud_session_facts::update_from_journal_event;
+pub use astra_turn_types::session_facts::{ErrorFact, FileEntry, PlanFact, SessionFacts, ToolFact};
 pub use matrix_cloud_runtime::{
     MatrixCloudRuntime, build_sync_orchestrator_with_adapters, matrix_settings_from_env,
 };
-pub use astra_text_utils::semantic_dedup;
-pub use astra_text_utils::text_tokenize;
-pub use astra_config::user_profile;
-pub use astra_learning::auto_tuning;
-pub use astra_config::runtime_config;
-pub use astra_turn_types::session_facts::{ErrorFact, FileEntry, PlanFact, SessionFacts, ToolFact};
-pub use astra_turn_core::cloud_session_facts::update_from_journal_event;

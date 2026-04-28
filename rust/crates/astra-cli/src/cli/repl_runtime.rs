@@ -16,13 +16,10 @@ pub(super) fn create_tool_selector_quiet(
 
 /// Shared pipeline learning modules — kept accessible for cross-session persistence.
 pub(super) struct PipelineModules {
-    pub entity_graph:
-        std::sync::Arc<std::sync::Mutex<astra_pipeline::entity::EntityGraph>>,
-    pub pattern_library:
-        std::sync::Arc<std::sync::Mutex<astra_pipeline::pattern::PatternLibrary>>,
-    pub calibrator: std::sync::Arc<
-        std::sync::Mutex<astra_pipeline::calibration::ProgressiveCalibrator>,
-    >,
+    pub entity_graph: std::sync::Arc<std::sync::Mutex<astra_pipeline::entity::EntityGraph>>,
+    pub pattern_library: std::sync::Arc<std::sync::Mutex<astra_pipeline::pattern::PatternLibrary>>,
+    pub calibrator:
+        std::sync::Arc<std::sync::Mutex<astra_pipeline::calibration::ProgressiveCalibrator>>,
     /// Unified skill registry (single source of truth for all skill resolution).
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// MCP client manager for external tool servers.

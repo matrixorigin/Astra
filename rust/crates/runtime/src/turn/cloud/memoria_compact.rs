@@ -27,9 +27,9 @@ use serde_json::{Value, json};
 use super::compaction::{
     CompactBoundary, CompactResult, CompactTrigger, compact_tiered_with_result,
 };
-use astra_turn_core::cloud_summary::SummaryLlmClient;
 use crate::prompts::{CompactConfig, CompactionTier};
 use astra_text_utils::str_preview::truncate_str;
+use astra_turn_core::cloud_summary::SummaryLlmClient;
 
 // ---------------------------------------------------------------------------
 // Configuration

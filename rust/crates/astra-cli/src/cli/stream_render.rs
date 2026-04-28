@@ -1,4 +1,6 @@
 use super::*;
+use astra_services::session_journal::{JournalEvent, JournalWriter};
+use astra_tools::git_gix::{git_worktree_is_clean, head_short};
 use astra_turn_core::chat_turn_sse_dispatch::{
     ChatTurnSseAccum, EdgeApprovalRequest, SseRenderEffect, dispatch_chat_turn_sse_event_block,
 };
@@ -13,8 +15,6 @@ use astra_turn_core::sse_stream_host::{
 use astra_turn_core::tool_result_semantics::{
     cloud_tool_result_status_label, tool_dedup_signature, tool_error_triggers_rollback,
 };
-use astra_services::session_journal::{JournalEvent, JournalWriter};
-use astra_tools::git_gix::{git_worktree_is_clean, head_short};
 use crossterm::style::Stylize;
 use futures_util::FutureExt;
 use futures_util::StreamExt;
@@ -658,9 +658,7 @@ impl<'a> CliSseStreamHost<'a> {
                 .get("command")
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .is_some_and(
-                    astra_turn_core::cloud_approval_policy::bash_command_is_read_only,
-                );
+                .is_some_and(astra_turn_core::cloud_approval_policy::bash_command_is_read_only);
         }
         is_tool_concurrency_safe(tool)
             || matches!(
@@ -5989,9 +5987,8 @@ pub(super) async fn consume_turn_sse(
     // do this when tool calls are present — if there are no tool calls, the text
     // might legitimately discuss <invoke> (e.g. code reviews).
     if result.has_tool_calls || !result.edge_tool_round.is_empty() {
-        result.full_text = astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(
-            &result.full_text,
-        );
+        result.full_text =
+            astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&result.full_text);
     }
     super::streaming_md::strip_leading_narration(&mut result.full_text);
 

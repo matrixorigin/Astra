@@ -18,34 +18,36 @@ pub mod scoring;
 pub mod tool_pool;
 
 pub use astra_turn_core::tool_registry_chain::{ChainContext, ChainStep, ToolChain};
-pub use plugin::{PluginRegistry, PluginToolEntry};
-pub use registry::ToolRegistry;
-pub use astra_turn_core::tool_registry_report::{SelectionFeedback, SelectionReport, ToolQualityTracker};
-pub use scoring::{
-    DEFAULT_TOOL_BUDGET_TOKENS, pre_filter_dynamic, pre_filter_dynamic_calibrated,
-    pre_filter_dynamic_with_memory, pre_filter_dynamic_with_outcome_bias,
-    pre_filter_dynamic_with_pressure, pre_filter_dynamic_with_quality, tfidf_score,
+pub use astra_turn_core::tool_registry_report::{
+    SelectionFeedback, SelectionReport, ToolQualityTracker,
 };
 pub use astra_turn_core::tool_registry_selection_edge_hints::{
     apply_selector_hints_to_edge_profile, top_unpinned_tool_names_from_report,
 };
 pub use astra_turn_core::tool_registry_state::ConversationState;
+pub use plugin::{PluginRegistry, PluginToolEntry};
+pub use registry::ToolRegistry;
+pub use scoring::{
+    DEFAULT_TOOL_BUDGET_TOKENS, pre_filter_dynamic, pre_filter_dynamic_calibrated,
+    pre_filter_dynamic_with_memory, pre_filter_dynamic_with_outcome_bias,
+    pre_filter_dynamic_with_pressure, pre_filter_dynamic_with_quality, tfidf_score,
+};
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
-pub use astra_turn_core::tool_registry_state as state;
 pub use astra_turn_core::tool_registry_chain as chain;
 pub use astra_turn_core::tool_registry_plugin as plugin;
 pub use astra_turn_core::tool_registry_report as report;
+pub use astra_turn_core::tool_registry_state as state;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use astra_text_utils::text_tokenize::tokenize;
+    use astra_turn_core::tool_registry_state::word_boundary_match;
     use scoring::tfidf_score;
     use serde_json::Value;
     use serde_json::json;
-    use astra_turn_core::tool_registry_state::word_boundary_match;
     fn mock_schemas() -> Vec<Value> {
         // Build schemas matching TOOL_CATALOG names
         TOOL_CATALOG

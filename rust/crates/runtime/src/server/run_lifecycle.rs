@@ -36,7 +36,6 @@ use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
 use crate::evolution::service::EvolutionService;
 use crate::observability_integration::ObservabilityHub;
-use astra_pipeline::step_recorder::StepRecorder;
 use crate::turn::agentic_loop_host::{
     AgenticLoopOutcome, AgenticLoopState, CancellationState, ContextTracePersistenceContext,
     EvaluationPersistenceContext, MessagingState, RequestConstraints, SkillState, StopHookState,
@@ -46,6 +45,7 @@ use crate::{
     DatabaseEvaluationService, DatabaseEventService, DatabaseTurnCoreEventWriter,
     EventCreateRequestData, EventService,
 };
+use astra_pipeline::step_recorder::StepRecorder;
 use astra_turn_core::contracts::{
     TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan, TurnDecisionAuditRecord,
     TurnHookDbPersistPlan, TurnHookDbWriter, TurnLearningOutcome, TurnLearningWriter,
@@ -2446,11 +2446,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             if request.interactive_client {
                 let (user_prompt_tx, user_prompt_rx) = mpsc::unbounded_channel();
-                let user_prompt_gate = astra_turn_core::ws_user_prompt_gate::WebSocketUserPromptGate::new(
-                    user_id.clone(),
-                    self.edge_callback_ledger.clone(),
-                    user_prompt_tx,
-                );
+                let user_prompt_gate =
+                    astra_turn_core::ws_user_prompt_gate::WebSocketUserPromptGate::new(
+                        user_id.clone(),
+                        self.edge_callback_ledger.clone(),
+                        user_prompt_tx,
+                    );
                 executor.set_ask_user_gate(std::sync::Arc::new(user_prompt_gate));
                 self.user_prompt_channels
                     .lock()
@@ -2461,7 +2462,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             // ── Phase F.3: Wire WebSocket progress callback ─────────
             let (progress_tx, progress_rx) = mpsc::unbounded_channel();
             let progress_cb =
-                astra_server_types::ws_progress_callback::WebSocketProgressCallback::new(progress_tx);
+                astra_server_types::ws_progress_callback::WebSocketProgressCallback::new(
+                    progress_tx,
+                );
             executor.set_progress_callback(std::sync::Arc::new(progress_cb));
             self.progress_channels
                 .lock()

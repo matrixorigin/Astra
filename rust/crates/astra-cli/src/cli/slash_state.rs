@@ -77,13 +77,10 @@ pub(super) async fn handle_state_command(
                             eprintln!(
                                 "    {} {} ({} edit{})",
                                 match edit_type {
-                                    astra_turn_core::file_edit_journal::EditType::Overwrite =>
-                                        "📝",
-                                    astra_turn_core::file_edit_journal::EditType::Create =>
-                                        "🆕",
+                                    astra_turn_core::file_edit_journal::EditType::Overwrite => "📝",
+                                    astra_turn_core::file_edit_journal::EditType::Create => "🆕",
                                     astra_turn_core::file_edit_journal::EditType::Patch => "✏️",
-                                    astra_turn_core::file_edit_journal::EditType::Delete =>
-                                        "🗑️",
+                                    astra_turn_core::file_edit_journal::EditType::Delete => "🗑️",
                                 },
                                 path.display(),
                                 count,

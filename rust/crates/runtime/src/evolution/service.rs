@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use astra_evolution::evolver;
 use super::promotion_gate::{ProposalPromotionContext, evaluate_proposal_promotion};
+use astra_evolution::evolver;
 use astra_evolution::signal_collector::SignalCollector;
 use astra_evolution::store::EvolutionStore;
 use astra_evolution::types::{
@@ -990,13 +990,13 @@ pub fn new_shared() -> Arc<EvolutionService> {
 mod tests {
     use super::*;
     use crate::evolution::store::StoredStatus;
+    use crate::liquid::reflection::ReflectionContext;
+    use crate::pipeline::routing::{DomainHint, TaskType};
     use astra_evolution::types::{
         ApprovalStatus, CalibrationAxis, EvolutionAxis, PatternAction,
         ProposalPromotionRecommendation,
     };
-    use crate::liquid::reflection::ReflectionContext;
     use astra_pipeline::calibration::ProgressiveCalibrator;
-    use crate::pipeline::routing::{DomainHint, TaskType};
 
     fn tool_failure_signal(tool: &str, skill: Option<&str>) -> EvolutionSignal {
         EvolutionSignal::ToolFailure {

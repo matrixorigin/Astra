@@ -203,11 +203,10 @@ pub(crate) async fn complete_repl_startup(
         .await;
         state.cloud_learning_version = cloud_pull_result.version;
         if !cloud_pull_result.tool_health.is_empty() {
-            let (merged, cloud_wins, cloud_only) =
-                astra_evolution::persistence::merge_tool_health(
-                    &cross_session_health_entries,
-                    &cloud_pull_result.tool_health,
-                );
+            let (merged, cloud_wins, cloud_only) = astra_evolution::persistence::merge_tool_health(
+                &cross_session_health_entries,
+                &cloud_pull_result.tool_health,
+            );
             cross_session_health_entries = merged;
             if cloud_wins > 0 || cloud_only > 0 {
                 let mut parts = Vec::new();

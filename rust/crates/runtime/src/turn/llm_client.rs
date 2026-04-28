@@ -29,16 +29,16 @@ use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
+use crate::prompts;
+use astra_text_utils::output_style::current_output_style;
+use astra_turn_core::bridge_rate_limit_cooldown::{
+    RateLimitAction, is_overload_status, is_rate_limit_status, parse_retry_after_ms,
+};
 use astra_turn_core::sse_blocks::SseBlankLineUtf8Buf;
 use astra_turn_core::sse_data_lines::{
     json_events_from_sse_event_block, validate_sse_event_block_json,
     validated_drain_sse_data_lines, validated_finish_sse_data_buffer,
 };
-use astra_turn_core::bridge_rate_limit_cooldown::{
-    RateLimitAction, is_overload_status, is_rate_limit_status, parse_retry_after_ms,
-};
-use astra_text_utils::output_style::current_output_style;
-use crate::prompts;
 
 /// Redact common provider secret patterns from a string before logging.
 ///
@@ -1904,13 +1904,16 @@ async fn collect_llm_stream(
     // Degraded tool-call fallback: some models emit <invoke> XML or <tool_call>
     // tags in content instead of structured tool_calls. Recover them.
     if tool_calls.is_empty() {
-        if let Some(parsed) = astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text) {
+        if let Some(parsed) =
+            astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text)
+        {
             astra_core::agent_warn!(
                 "llm",
                 "recovered {} tool call(s) from degraded text in content (stream)",
                 parsed.len()
             );
-            full_text = astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
+            full_text =
+                astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
             tool_calls = parsed;
         }
     }
@@ -2258,13 +2261,16 @@ fn parse_openai_compatible_nonstream_response(
 
     // Degraded tool-call fallback: same recovery for non-stream responses.
     if tool_calls.is_empty() {
-        if let Some(parsed) = astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text) {
+        if let Some(parsed) =
+            astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text)
+        {
             astra_core::agent_warn!(
                 "llm",
                 "recovered {} tool call(s) from degraded text in content (non-stream)",
                 parsed.len()
             );
-            full_text = astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
+            full_text =
+                astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
             tool_calls = parsed;
         }
     }

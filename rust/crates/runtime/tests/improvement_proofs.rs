@@ -4417,8 +4417,8 @@ mod idempotency_cache_proofs {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod file_event_store_proofs {
-    use astra_runtime::pipeline::step_checkpoint::*;
     use astra_pipeline::step_protocol::*;
+    use astra_runtime::pipeline::step_checkpoint::*;
     use serde_json::json;
 
     use std::sync::atomic::{AtomicU64, Ordering};

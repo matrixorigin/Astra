@@ -6,16 +6,16 @@ use crate::cli_args::{
     SelfReflectArgs,
 };
 use crate::cli_utils::resumable_last_session_id;
+use astra_config::runtime_config::RuntimeConfig;
+use astra_config::user_profile::Scenario;
 use astra_runtime::liquid::reflection::{
     GoalSummary as ReflectionGoalSummary, HealthSummary as ReflectionHealthSummary,
     ReflectionEventSummary, VerificationSummary as ReflectionVerificationSummary,
     summarize_recent_adaptation_impacts, summarize_recent_adaptation_verification_impacts,
     summarize_recent_performance_deltas,
 };
-use astra_config::runtime_config::RuntimeConfig;
 use astra_runtime::self_model::ConstraintSet;
 use astra_runtime::tool_registry::ToolRegistry;
-use astra_config::user_profile::Scenario;
 use astra_services::self_surface::{
     EventPreview as SurfaceEventPreview, EvolutionRecord, GoalSurface,
     HealthSurface as SurfaceHealthSurface, LocalSelfSurfaceService, PersistentSelfSnapshot,

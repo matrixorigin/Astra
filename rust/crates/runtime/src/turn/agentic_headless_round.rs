@@ -8,16 +8,16 @@ use astra_services::session_journal::ToolCallRecord;
 use astra_thin_client::ThinClient;
 use serde_json::Value;
 
-use astra_turn_core::headless_tool_assembly::{
-    EdgeToolRoundRow, begin_headless_tool_round_opening_ext, openai_tool_roundtrip_values,
-};
 use super::headless_tool_pipeline::{HeadlessToolExecutionCtx, HeadlessToolExecutionPipeline};
-use astra_turn_core::headless_tool_postprocess::HeadlessStepDeadline;
-use astra_turn_core::tool_result_sanitize::tool_result_content_for_model;
-use astra_turn_core::turn_guard::TurnGuard;
 use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
+use astra_turn_core::headless_tool_assembly::{
+    EdgeToolRoundRow, begin_headless_tool_round_opening_ext, openai_tool_roundtrip_values,
+};
+use astra_turn_core::headless_tool_postprocess::HeadlessStepDeadline;
+use astra_turn_core::tool_result_sanitize::tool_result_content_for_model;
+use astra_turn_core::turn_guard::TurnGuard;
 
 // Re-export headless types from turn-core (canonical definitions live there).
 pub use astra_turn_core::headless_types::{
@@ -110,8 +110,8 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
 
     tool_results.clear();
 
-    let force_reasoning =
-        !reasoning_content.is_empty() || astra_turn_core::edge_ledger::history_has_reasoning(messages);
+    let force_reasoning = !reasoning_content.is_empty()
+        || astra_turn_core::edge_ledger::history_has_reasoning(messages);
     let tool_calls = astra_turn_core::headless_tool_assembly::ensure_tool_call_ids(tool_calls);
 
     let opening = begin_headless_tool_round_opening_ext(

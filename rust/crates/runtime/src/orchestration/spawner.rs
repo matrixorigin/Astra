@@ -4,7 +4,9 @@ use crate::messaging::SubRunInfo;
 use astra_messaging::router::AgentMailboxRouter;
 use astra_messaging::types::AgentAddress;
 use astra_turn_core::orchestration_context_cache::SharedContextCache;
-use astra_turn_core::orchestration_progress::{AgentProgressEvent, ProgressBroadcaster, ProgressEventType};
+use astra_turn_core::orchestration_progress::{
+    AgentProgressEvent, ProgressBroadcaster, ProgressEventType,
+};
 use astra_turn_core::orchestration_spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
 
 use std::collections::HashMap;
@@ -235,7 +237,8 @@ impl DynamicAgentSpawner {
             context_cache: Arc::new(SharedContextCache::default()),
             executor: None,
             session_id: None,
-            agent_registry: astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
+            agent_registry:
+                astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
         }
@@ -255,7 +258,8 @@ impl DynamicAgentSpawner {
             context_cache: Arc::new(SharedContextCache::default()),
             executor: None,
             session_id: None,
-            agent_registry: astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
+            agent_registry:
+                astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
         }
@@ -273,7 +277,8 @@ impl DynamicAgentSpawner {
             context_cache,
             executor: None,
             session_id: None,
-            agent_registry: astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
+            agent_registry:
+                astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
         }
@@ -292,7 +297,10 @@ impl DynamicAgentSpawner {
     }
 
     /// Set a custom agent registry (builtins + user-defined types).
-    pub fn with_agent_registry(mut self, registry: astra_turn_core::orchestration_team_config::AgentRegistry) -> Self {
+    pub fn with_agent_registry(
+        mut self,
+        registry: astra_turn_core::orchestration_team_config::AgentRegistry,
+    ) -> Self {
         self.agent_registry = registry;
         self
     }
@@ -1033,10 +1041,10 @@ fn create_agent_worktree(parent_dir: &std::path::Path, run_id: &str) -> Result<P
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::delegation_engine::DelegationTracker;
     use astra_messaging::in_process::InProcessTransport;
     use astra_messaging::router::AgentMailboxRouter;
     use astra_messaging::types::{AgentMessage, MessagePayload, MessageTarget};
-    use crate::server::delegation_engine::DelegationTracker;
     use tokio::time::{Duration, sleep};
 
     fn mock_router() -> Arc<AgentMailboxRouter> {
