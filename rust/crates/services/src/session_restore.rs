@@ -15,6 +15,7 @@
 //! for data that may have been created on a different device.
 
 use astra_core::is_duplicate_key_error;
+use astra_turn_types::continuity::ContinuityState;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -73,9 +74,9 @@ pub struct RestoredSession {
     /// Serialized compaction-state payload restored from a heavy checkpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_state: Option<serde_json::Value>,
-    /// Serialized runtime-owned continuity state restored from a heavy checkpoint.
+    /// Validated runtime-owned continuity state restored from a heavy checkpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub continuity_state: Option<serde_json::Value>,
+    pub continuity_state: Option<astra_turn_types::continuity::ContinuityState>,
     /// Active plan being executed (JSON-serialized TaskPlan).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executing_plan_json: Option<String>,
@@ -117,7 +118,9 @@ pub struct CloudHeavyCheckpointState {
     pub approval_overrides: Option<serde_json::Value>,
     pub interruption: Option<serde_json::Value>,
     pub compaction_state: Option<serde_json::Value>,
-    pub continuity_state: Option<serde_json::Value>,
+    /// Already-validated and deserialized continuity state. Avoids double-parse
+    /// (validate_restored_continuity_state → downstream restore).
+    pub continuity_state: Option<ContinuityState>,
 }
 
 /// A restored checkpoint entry (lightweight, for listing).
@@ -1018,10 +1021,7 @@ pub fn parse_cloud_heavy_checkpoint_state(
     let continuity_state = match validate_restored_continuity_state(continuity_state) {
         Ok(continuity_state) => continuity_state,
         Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "dropping invalid continuity_state from cloud checkpoint"
-            );
+            tracing::debug!(error = %error, "dropping invalid continuity_state from cloud checkpoint");
             None
         }
     };
@@ -1054,13 +1054,20 @@ pub fn parse_cloud_heavy_checkpoint_state(
 
 fn validate_restored_continuity_state(
     continuity_state: Option<serde_json::Value>,
-) -> Result<Option<serde_json::Value>, String> {
+) -> Result<Option<ContinuityState>, String> {
     let Some(value) = continuity_state else {
         return Ok(None);
     };
     astra_turn_types::continuity::try_from_checkpoint_value(&value)
-        .map(|_| Some(value.clone()))
-        .map_err(|e| e.to_string())
+        .map(Some)
+        .map_err(|e| {
+            let error = e.to_string();
+            tracing::warn!(
+                error = %error,
+                "continuity_state blob rejected at cloud restore"
+            );
+            error
+        })
 }
 
 #[async_trait]
@@ -3055,7 +3062,10 @@ mod tests {
             approval_overrides: Some(approval_overrides.clone()),
             interruption: Some(interruption.clone()),
             compaction_state: Some(compaction_state.clone()),
-            continuity_state: Some(continuity_state.clone()),
+            continuity_state: astra_turn_types::continuity::try_from_checkpoint_value(
+                &continuity_state,
+            )
+            .ok(),
         };
         let tagged = serde_json::json!({
             "Heavy": {

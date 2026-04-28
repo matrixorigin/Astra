@@ -4646,30 +4646,11 @@ fn build_continuity_resume_guidance_from_state(
     )
 }
 
-fn parse_runtime_continuity_from_checkpoint(
-    continuity_state: Option<&serde_json::Value>,
-    source: &'static str,
-) -> Option<astra_turn_types::continuity::ContinuityState> {
-    let Some(value) = continuity_state else {
-        return None;
-    };
-    astra_turn_types::continuity::try_from_checkpoint_value(value)
-        .map_err(|error| {
-            tracing::warn!(
-                error = %error,
-                source,
-                "dropping invalid continuity_state"
-            );
-        })
-        .ok()
-}
-
 fn restore_runtime_continuity_guidance(
     state: &mut ReplState,
-    continuity_state: Option<&serde_json::Value>,
-    source: &'static str,
+    continuity_state: Option<&astra_turn_types::continuity::ContinuityState>,
 ) -> Option<String> {
-    let continuity = parse_runtime_continuity_from_checkpoint(continuity_state, source)?;
+    let continuity = continuity_state?.clone();
     let guidance = build_continuity_resume_guidance_from_state(&continuity);
     state.runtime_continuity = Some(continuity);
     Some(guidance)
@@ -4836,11 +4817,7 @@ async fn apply_restored_session(
         );
         let step_guidance = combine_resume_guidance(
             step_guidance,
-            restore_runtime_continuity_guidance(
-                state,
-                step_restored.continuity_state.as_ref(),
-                "local step checkpoint",
-            ),
+            restore_runtime_continuity_guidance(state, step_restored.continuity_state.as_ref()),
         );
         state.resume_guidance = combine_resume_guidance(
             step_guidance,
@@ -4854,16 +4831,22 @@ async fn apply_restored_session(
         astra_runtime::pipeline::step_checkpoint::read_latest_heavy_checkpoint(&restored.session_id)
     {
         apply_heavy_checkpoint_fallback(state, &heavy);
+        let heavy_continuity = heavy.continuity_state.as_ref().and_then(|v| {
+            astra_turn_types::continuity::try_from_checkpoint_value(v)
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        error = %error,
+                        "heavy checkpoint continuity_state parse failed"
+                    );
+                })
+                .ok()
+        });
         let step_guidance = combine_resume_guidance(
             build_step_resume_guidance(
                 heavy.interruption.as_ref(),
                 heavy.compaction_state.as_ref(),
             ),
-            restore_runtime_continuity_guidance(
-                state,
-                heavy.continuity_state.as_ref(),
-                "local heavy checkpoint",
-            ),
+            restore_runtime_continuity_guidance(state, heavy_continuity.as_ref()),
         );
         state.resume_guidance = combine_resume_guidance(
             step_guidance,
@@ -4882,11 +4865,7 @@ async fn apply_restored_session(
                 restored.interruption.as_ref(),
                 restored.compaction_state.as_ref(),
             ),
-            restore_runtime_continuity_guidance(
-                state,
-                restored.continuity_state.as_ref(),
-                "restored cloud checkpoint",
-            ),
+            restore_runtime_continuity_guidance(state, restored.continuity_state.as_ref()),
         );
         state.resume_guidance = combine_resume_guidance(
             step_guidance,
@@ -4921,7 +4900,6 @@ async fn apply_restored_session(
                             restore_runtime_continuity_guidance(
                                 state,
                                 heavy.continuity_state.as_ref(),
-                                "pulled cloud checkpoint",
                             ),
                         );
                         state.resume_guidance = combine_resume_guidance(
@@ -5584,9 +5562,9 @@ mod resume_tests {
         let value = serde_json::to_value(&continuity).unwrap();
         let mut state = ReplState::default();
 
+        let cs = astra_turn_types::continuity::try_from_checkpoint_value(&value).unwrap();
         let guidance =
-            restore_runtime_continuity_guidance(&mut state, Some(&value), "test checkpoint")
-                .expect("guidance");
+            restore_runtime_continuity_guidance(&mut state, Some(&cs)).expect("guidance");
 
         assert!(guidance.contains("[Recovered runtime continuity]"));
         assert_eq!(state.runtime_continuity, Some(continuity));
@@ -5597,8 +5575,8 @@ mod resume_tests {
         let mut state = ReplState::default();
         let invalid = serde_json::json!({});
 
-        let guidance =
-            restore_runtime_continuity_guidance(&mut state, Some(&invalid), "test checkpoint");
+        let cs = astra_turn_types::continuity::try_from_checkpoint_value(&invalid).ok();
+        let guidance = restore_runtime_continuity_guidance(&mut state, cs.as_ref());
 
         assert!(guidance.is_none());
         assert!(state.runtime_continuity.is_none());

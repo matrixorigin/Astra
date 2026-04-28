@@ -24,8 +24,7 @@ use std::collections::HashMap;
 use crate::step_checkpoint::{FileBackedEventStore, read_latest_heavy_checkpoint};
 use crate::step_protocol::{
     CachedToolResult, HeavyCheckpoint, IdempotencyKey, InMemoryIdempotencyCache, PROTOCOL_VERSION,
-    SlotState, StepEvent, StepEventType, ValidationError, VersionPolicy,
-    check_protocol_version_with_policy,
+    SlotState, StepEvent, StepEventType, VersionPolicy, check_protocol_version_with_policy,
 };
 
 /// Restored session state — everything needed to resume execution.
@@ -62,8 +61,8 @@ pub struct RestoredSession {
     pub consecutive_context_window_errors: u32,
     /// Serialized CompactionEffectivenessTracker state for enriched resume guidance.
     pub compaction_state: Option<serde_json::Value>,
-    /// Serialized runtime-owned continuity state restored from checkpoint.
-    pub continuity_state: Option<serde_json::Value>,
+    /// Validated runtime-owned continuity state restored from checkpoint.
+    pub continuity_state: Option<astra_turn_types::continuity::ContinuityState>,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum RestoreError {
@@ -119,6 +118,11 @@ pub fn restore_session_with_policy(
 }
 
 /// Restore with an injected validator for the embedded `continuity_state` blob.
+///
+/// Validator rejection is authoritative: a rejected blob is dropped even if the
+/// current parser would accept it. Validator acceptance is not authoritative:
+/// `try_from_checkpoint_value` remains the final typed parse gate before a
+/// continuity blob is restored.
 pub fn restore_session_with_continuity_validator<F>(
     session_id: &str,
     validator: F,
@@ -138,7 +142,7 @@ where
     F: FnOnce(&serde_json::Value) -> Result<(), String>,
 {
     // Step 1: Load latest heavy checkpoint
-    let mut heavy = match read_latest_heavy_checkpoint(session_id) {
+    let heavy = match read_latest_heavy_checkpoint(session_id) {
         Ok(Some(h)) => h,
         Ok(None) => return Ok(None),
         Err(e) => return Err(RestoreError::IoError(e.to_string())),
@@ -146,16 +150,17 @@ where
 
     // Step 2: Validate protocol version (no migration)
     validate_checkpoint_version(&heavy, policy)?;
-    validate_restored_continuity_state(&mut heavy, validator)?;
+    let continuity_state = validate_and_parse_continuity_state(&heavy, validator)?;
 
     // Step 3: Extract resume turn and warm cache
-    build_restored_session(session_id, heavy)
+    build_restored_session(session_id, heavy, continuity_state)
 }
 
 /// Shared: build RestoredSession from a validated checkpoint.
 fn build_restored_session(
     session_id: &str,
     heavy: HeavyCheckpoint,
+    continuity_state: Option<astra_turn_types::continuity::ContinuityState>,
 ) -> Result<Option<RestoredSession>, RestoreError> {
     let resume_turn = extract_resume_turn(&heavy);
     let (cache, completed_results) = warm_cache_from_events(session_id);
@@ -175,7 +180,7 @@ fn build_restored_session(
         approval_overrides: heavy.approval_overrides,
         consecutive_context_window_errors: heavy.consecutive_context_window_errors,
         compaction_state: heavy.compaction_state,
-        continuity_state: heavy.continuity_state,
+        continuity_state,
     }))
 }
 
@@ -201,28 +206,42 @@ fn validate_checkpoint_version(
     }
 }
 
-fn validate_restored_continuity_state<F>(
-    heavy: &mut HeavyCheckpoint,
+/// Validate the embedded `continuity_state` blob and return the parsed
+/// `ContinuityState` on success.
+///
+/// When a `validator` is supplied it runs first as a pre-check; rejection is
+/// authoritative (blob is dropped with a warning). Acceptance is *not* —
+/// `try_from_checkpoint_value` is the final parse gate and may still reject
+/// the blob if the validator was more lenient than the schema deserializer.
+fn validate_and_parse_continuity_state<F>(
+    heavy: &HeavyCheckpoint,
     validator: Option<F>,
-) -> Result<(), RestoreError>
+) -> Result<Option<astra_turn_types::continuity::ContinuityState>, RestoreError>
 where
     F: FnOnce(&serde_json::Value) -> Result<(), String>,
 {
-    let Some(validator) = validator else {
-        return Ok(());
+    let Some(value) = &heavy.continuity_state else {
+        return Ok(None);
     };
-    match heavy.validate_with(validator) {
-        Ok(()) => Ok(()),
-        Err(ValidationError::ContinuityStateSchema(error)) => {
-            tracing::warn!(
-                error = %error,
-                "dropping invalid continuity_state from restored checkpoint"
-            );
-            heavy.continuity_state = None;
-            Ok(())
-        }
-        Err(ValidationError::Protocol(error)) => Err(RestoreError::InvalidCheckpoint(error)),
+    if let Some(validator) = validator
+        && let Err(error) = validator(value)
+    {
+        tracing::warn!(
+            error = %error,
+            "dropping invalid continuity_state from restored checkpoint"
+        );
+        return Ok(None);
     }
+    Ok(
+        astra_turn_types::continuity::try_from_checkpoint_value(value)
+            .inspect_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    "continuity_state blob failed try_from_checkpoint_value after validator passed"
+                );
+            })
+            .ok(),
+    )
 }
 
 /// Extract the turn number to resume from (based on cursor progress).
@@ -510,8 +529,8 @@ mod tests {
         let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
         heavy.continuity_state = Some(serde_json::json!({"todos": "not-an-object"}));
 
-        validate_restored_continuity_state(
-            &mut heavy,
+        let result = validate_and_parse_continuity_state(
+            &heavy,
             Some(|value: &serde_json::Value| {
                 value
                     .get("todos")
@@ -522,7 +541,69 @@ mod tests {
         )
         .unwrap();
 
-        assert!(heavy.continuity_state.is_none());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn restore_continuity_validator_err_is_authoritative_even_if_parser_would_accept() {
+        // Validator applies a business rule stricter than schema: rejects
+        // any blob where goal text is empty. The parser would accept it.
+        let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
+        let valid_blob = serde_json::json!({
+            "goal": {"text": ""},
+            "todos": {"items": []},
+            "facts": {
+                "active_files": [], "recent_tool_calls": [],
+                "plan_state": null, "blocked_tools": [],
+                "error_state": {"total_errors": 0, "last_error": null, "last_error_turn": null},
+                "turn": 0, "estimated_tokens": 0
+            },
+            "user_corrections": [],
+            "verification": {"last_status": null, "last_evidence": null, "last_turn": null}
+        });
+        heavy.continuity_state = Some(valid_blob);
+
+        let result = validate_and_parse_continuity_state(
+            &heavy,
+            Some(|_: &serde_json::Value| Err("business rule: goal must not be empty".to_string())),
+        )
+        .unwrap();
+
+        assert!(
+            result.is_none(),
+            "validator rejection must be authoritative"
+        );
+    }
+
+    #[test]
+    fn restore_continuity_lenient_validator_does_not_override_parser_rejection() {
+        // Validator passes (only checks top-level key exists), but
+        // try_from_checkpoint_value rejects because `todos` is a string.
+        let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
+        heavy.continuity_state = Some(serde_json::json!({
+            "goal": {"text": "x"},
+            "todos": "not-an-object",
+            "facts": {},
+            "user_corrections": [],
+            "verification": {}
+        }));
+
+        let result = validate_and_parse_continuity_state(
+            &heavy,
+            Some(|value: &serde_json::Value| {
+                // Lenient: only checks goal exists
+                value
+                    .get("goal")
+                    .ok_or_else(|| "missing goal".to_string())?;
+                Ok(())
+            }),
+        )
+        .unwrap();
+
+        assert!(
+            result.is_none(),
+            "parser rejection must win even when validator passed"
+        );
     }
 
     // ── Resume turn extraction ──

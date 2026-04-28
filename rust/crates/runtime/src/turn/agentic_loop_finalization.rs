@@ -630,9 +630,18 @@ fn update_session_facts_from_turn(state: &mut super::agentic_loop_host::AgenticL
     state
         .session_facts
         .set_blocked_tools(state.restricted_tools.iter().cloned().collect());
-    state.continuity.sync_facts(state.session_facts.clone());
+    // Sync facts → continuity once, let the todo-completion hook mutate todos
+    // only, then write facts back.
+    // INVARIANT: `complete_active_runtime_todo_if_finalized` must not write to
+    // `state.session_facts`. If it did, the clone-back below would overwrite
+    // those writes with the stale copy inside `continuity.facts`.
+    let facts_before = state.session_facts.clone();
+    state.continuity.sync_facts(facts_before.clone());
     complete_active_runtime_todo_if_finalized(state, had_error);
-    state.continuity.sync_facts(state.session_facts.clone());
+    debug_assert_eq!(
+        state.session_facts, facts_before,
+        "complete_active_runtime_todo_if_finalized must not mutate session_facts"
+    );
     state.session_facts = state.continuity.facts.clone();
 
     // P4: Error-triggered L1 persist — when an error occurred this turn,
@@ -665,6 +674,10 @@ fn complete_active_runtime_todo_if_finalized(
     state: &mut super::agentic_loop_host::AgenticLoopState,
     had_error: bool,
 ) {
+    // INVARIANT: this function must only mutate `state.continuity` (todos,
+    // verification). It must NOT write to `state.session_facts` — the caller
+    // clones facts back from continuity after return, so any direct writes
+    // to session_facts would be silently overwritten.
     if had_error || state.final_text.trim().is_empty() {
         return;
     }

@@ -2077,11 +2077,10 @@ impl AgenticRunLifecycleService {
             },
         ) {
             Ok(Some(restored)) => {
-                if let Some(value) = restored.continuity_state.as_ref() {
-                    return Ok(Self::parse_runtime_continuity_value(
-                        value,
-                        "local step checkpoint",
-                    ));
+                // RestoredSession.continuity_state is now Option<ContinuityState>
+                // (parsed during restore), so no re-parse needed here.
+                if restored.continuity_state.is_some() {
+                    return Ok(restored.continuity_state);
                 }
             }
             Ok(None) => {}
@@ -2110,9 +2109,9 @@ impl AgenticRunLifecycleService {
                 match astra_services::session_restore::parse_cloud_heavy_checkpoint_state(
                     &state_json,
                 ) {
-                    Ok(Some(heavy)) => Ok(heavy.continuity_state.as_ref().and_then(|value| {
-                        Self::parse_runtime_continuity_value(value, "cloud step checkpoint")
-                    })),
+                    // continuity_state is already a parsed ContinuityState (Option<ContinuityState>)
+                    // after the CloudHeavyCheckpointState strong-type migration — no re-parse needed.
+                    Ok(Some(heavy)) => Ok(heavy.continuity_state),
                     Ok(None) => Ok(None),
                     Err(error) => {
                         tracing::warn!(

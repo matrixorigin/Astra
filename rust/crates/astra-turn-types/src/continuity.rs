@@ -85,14 +85,17 @@ impl ContinuityState {
         if self.goal.text.trim().is_empty() {
             // Redact on intake so any secret accidentally included in the
             // user's first turn never gets persisted into checkpoints via
-            // ContinuityState.goal.text.
-            self.goal.text = redact_sensitive(&goal.into());
+            // ContinuityState.goal.text. Use the length-preserving variant:
+            // goals are displayed/truncated by their consumers (attention
+            // manifest uses truncate_clean(..,300)); we should not silently
+            // cap a long benign goal at MAX_SECRET_VALUE_CHARS (160).
+            self.goal.text = redact_sensitive_preserve_length(&goal.into());
         }
     }
 
     pub fn ensure_tracked_goal(&mut self, goal: impl Into<String>) -> Option<&TodoItem> {
         let goal = goal.into();
-        let redacted_goal = redact_sensitive(&goal);
+        let redacted_goal = redact_sensitive_preserve_length(&goal);
         if !should_track_request(&redacted_goal) {
             return self.todos.active_or_next();
         }
@@ -574,12 +577,33 @@ fn truncate_clean(text: &str, max_chars: usize) -> String {
 
 pub fn redact_sensitive(text: &str) -> String {
     text.split_whitespace()
-        .map(redact_token)
+        .map(|t| redact_token_inner(t, RedactMode::CapNonSecret))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-fn redact_token(token: &str) -> String {
+/// Redact secrets but preserve the full length of non-secret tokens.
+///
+/// Use this for fields whose semantic content matters more than length
+/// (e.g. `ContinuityState.goal.text`) and whose downstream callers apply
+/// their own `truncate_clean`. The `MAX_SECRET_VALUE_CHARS` cap in
+/// [`redact_sensitive`] is designed for attention-manifest injection,
+/// where it guards against unbounded blobs; applying it to goals causes
+/// silent truncation of long-but-benign user intents.
+pub fn redact_sensitive_preserve_length(text: &str) -> String {
+    text.split_whitespace()
+        .map(|t| redact_token_inner(t, RedactMode::PreserveLength))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[derive(Clone, Copy)]
+enum RedactMode {
+    CapNonSecret,
+    PreserveLength,
+}
+
+fn redact_token_inner(token: &str, mode: RedactMode) -> String {
     let lower = token.to_ascii_lowercase();
     if lower.starts_with("bearer ") {
         return "Bearer [REDACTED]".to_string();
@@ -591,7 +615,10 @@ fn redact_token(token: &str) -> String {
             .unwrap_or("");
         return format!("{prefix}[REDACTED]");
     }
-    token.chars().take(MAX_SECRET_VALUE_CHARS).collect()
+    match mode {
+        RedactMode::CapNonSecret => token.chars().take(MAX_SECRET_VALUE_CHARS).collect(),
+        RedactMode::PreserveLength => token.to_string(),
+    }
 }
 
 fn is_secret_assignment(lower: &str) -> bool {
@@ -985,6 +1012,61 @@ mod tests {
     // as secrets before the cap applies.
 
     #[test]
+    fn ensure_goal_preserves_long_benign_goal_beyond_max_secret_chars() {
+        // Regression: ensure_goal previously used redact_sensitive which caps
+        // non-secret tokens at MAX_SECRET_VALUE_CHARS (160). Long benign goals
+        // like detailed user intents must not be silently truncated at intake.
+        let mut state = ContinuityState::default();
+        // Use many short words so no single token trips the secret heuristic.
+        let long_goal = "please ".repeat(60) + "finish the refactor"; // >300 chars
+        assert!(long_goal.chars().count() > MAX_SECRET_VALUE_CHARS);
+        state.ensure_goal(long_goal.clone());
+        assert_eq!(state.goal.text, long_goal.trim());
+        assert!(state.goal.text.chars().count() > MAX_SECRET_VALUE_CHARS);
+    }
+
+    #[test]
+    fn ensure_goal_still_redacts_secrets_in_long_goal() {
+        // Embed an actual prefixed secret value into a long goal and verify
+        // it is redacted. Without a real secret in the input, the negative
+        // assertion below would be vacuously true.
+        let mut state = ContinuityState::default();
+        let long_prefix = "please finish the refactor ".repeat(8); // ~216 chars
+        let goal = format!("{long_prefix}with token sk-supersecretvalue now");
+        state.ensure_goal(goal);
+        assert!(
+            state.goal.text.contains("[REDACTED]"),
+            "secret token must be redacted; got: {}",
+            state.goal.text
+        );
+        assert!(
+            !state.goal.text.contains("sk-supersecretvalue"),
+            "raw secret must not leak; got: {}",
+            state.goal.text
+        );
+    }
+
+    #[test]
+    /// Guard: redact_token was renamed to redact_token_inner with an explicit
+    /// mode; ensure redact_sensitive still caps long non-secret tokens at
+    /// exactly MAX_SECRET_VALUE_CHARS. Use a token containing '/' so it does
+    /// NOT match looks_like_secret_value (which would redact outright instead
+    /// of capping) and we actually exercise the cap branch.
+    fn redact_token_rename_does_not_regress_cap_behavior() {
+        let long_token = "a/".repeat(MAX_SECRET_VALUE_CHARS); // 2*MAX chars, non-secret
+        let result = redact_sensitive(&long_token);
+        assert_eq!(
+            result.chars().count(),
+            MAX_SECRET_VALUE_CHARS,
+            "redact_sensitive must cap long non-secret tokens at exactly MAX_SECRET_VALUE_CHARS"
+        );
+        assert!(
+            !result.contains("[REDACTED]"),
+            "non-secret token must be capped, not redacted; got: {result}"
+        );
+    }
+
+    #[test]
     fn redact_sensitive_caps_long_non_secret_token_at_max_chars() {
         // 200-char token with '/' chars so it does NOT match
         // looks_like_secret_value (which requires all alnum/_-.).
@@ -1015,7 +1097,8 @@ mod tests {
 
     #[test]
     fn redact_sensitive_handles_unicode_context_around_prefixed_secret() {
-        let input = format!("你好世界 {}", format!("sk-{}", "密".repeat(4)));
+        let secret = format!("sk-{}", "密".repeat(4));
+        let input = format!("你好世界 {secret}");
         let out = redact_sensitive(&input);
         assert_eq!(out, "你好世界 [REDACTED]");
     }
