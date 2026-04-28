@@ -399,9 +399,11 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             ended_at DATETIME(6) NULL,
             last_active_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            active_plan_id VARCHAR(64) NULL,
             INDEX idx_agent_sessions_user_status_updated (user_id, status, updated_at),
             INDEX idx_agent_sessions_user_last_active (user_id, last_active_at),
-            INDEX idx_agent_sessions_agent_status (agent_id, status)
+            INDEX idx_agent_sessions_agent_status (agent_id, status),
+            INDEX idx_agent_sessions_active_plan_id (active_plan_id)
         )",
     )
     .execute(&pool)
@@ -844,7 +846,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             created_by    VARCHAR(64) NULL,
             created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_plans_user_updated (user_id, updated_at),
+            INDEX idx_plans_user_updated (user_id, updated_at DESC),
             INDEX idx_plans_session (session_id),
             INDEX idx_plans_user_phase (user_id, phase)
         )",
@@ -866,9 +868,9 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             request_id   VARCHAR(64) NOT NULL,
             error        TEXT NULL,
             artifact_ref VARCHAR(255) NULL,
-            INDEX idx_step_runs_plan_started (plan_id, started_at),
+            INDEX idx_step_runs_plan_started (plan_id, started_at DESC),
             INDEX idx_step_runs_subtask_attempt (plan_id, subtask_id, attempt),
-            INDEX idx_step_runs_session (session_id, started_at)
+            INDEX idx_step_runs_session (session_id, started_at DESC)
         )",
     )
     .execute(&pool)
@@ -1416,9 +1418,11 @@ async fn run_migration(
 
     // Idempotent migrations: ALTER ADD COLUMN on a table whose CREATE already
     // includes that column (fresh DB) returns MySQL error 1060 "Duplicate
-    // column name"; ADD INDEX on an existing index returns 1061. Treat both
-    // as "column/index already present" and still record the migration so we
-    // don't try again on the next boot.
+    // column name"; ADD INDEX on an existing index returns 1061. DROP INDEX
+    // on a non-existent index returns 1091 — happens when a fresh DB created
+    // the table with the new index name directly, so there's nothing to drop.
+    // Treat all three as "already in desired state" and record the migration
+    // so we don't retry on next boot.
     //
     // MySQL's SQLSTATE is a generic "HY000" for these — the real signal is the
     // numeric error code, which we read via downcast to `MySqlDatabaseError`.
@@ -1428,9 +1432,9 @@ async fn run_migration(
             let number = db_err
                 .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
                 .map(|e| e.number());
-            if matches!(number, Some(1060) | Some(1061)) {
-                // Already present — fresh DB created the column/index via
-                // the CREATE TABLE path. Record and continue.
+            if matches!(number, Some(1060) | Some(1061) | Some(1091)) {
+                // Already present (or already absent for DROP) — fresh DB
+                // created the schema via CREATE TABLE. Record and continue.
             } else {
                 return Err(sqlx::Error::Database(db_err));
             }
@@ -1477,6 +1481,19 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
         4,
         "add subtask_count to plans for denormalized list rendering",
         "ALTER TABLE plans ADD COLUMN subtask_count INT NOT NULL DEFAULT 0",
+    )
+    .await?;
+
+    // Index on active_plan_id covers the cascade clear in `delete_plan` and
+    // `set_active_plan` (`UPDATE agent_sessions SET active_plan_id = NULL
+    // WHERE active_plan_id = ?`). Without it, every plan deletion triggers a
+    // full table scan of `agent_sessions`.
+    run_migration(
+        pool,
+        5,
+        "add index on agent_sessions.active_plan_id for cascade clears",
+        "ALTER TABLE agent_sessions \
+         ADD INDEX idx_agent_sessions_active_plan_id (active_plan_id)",
     )
     .await?;
 
