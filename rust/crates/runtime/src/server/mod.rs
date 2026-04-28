@@ -19,8 +19,6 @@ use uuid::Uuid;
 use super::*;
 
 mod admin_handlers;
-pub mod agent_mailbox;
-pub mod agent_mcp;
 mod audit_handlers;
 mod auth_handlers;
 mod bridge_prep;
@@ -32,7 +30,6 @@ mod edge_callback_handlers;
 pub mod edge_connection_pool;
 mod edge_status_handler;
 mod edge_ws_handler;
-pub mod edge_ws_protocol;
 pub(crate) mod header_utils;
 mod http_helpers;
 mod http_types;
@@ -56,20 +53,10 @@ mod state_builder;
 mod task_handlers;
 mod team_handlers;
 pub mod team_orchestrator;
-pub mod worktree_isolation;
-pub mod ws_approval_gate;
 mod ws_handler;
-pub mod ws_progress_callback;
-pub mod ws_user_prompt_gate;
 
-use self::{
-    bridge_prep::prepare_chat_turn_bridge_body,
-    chat_route::{ChatRouteResponse, classify_chat_route},
-    http_helpers::*,
-    http_types::*,
-};
-
-mod chat_route;
+use self::{bridge_prep::prepare_chat_turn_bridge_body, http_helpers::*, http_types::*};
+use astra_server_types::{ChatRouteResponse, classify_chat_route};
 mod completions;
 
 pub use request_trace::RequestTrace;
@@ -279,3 +266,8 @@ mod tests {
         );
     }
 }
+pub mod worktree_isolation;
+pub mod ws_progress_callback;
+pub mod edge_ws_protocol;
+pub mod ws_approval_gate;
+pub mod ws_user_prompt_gate;

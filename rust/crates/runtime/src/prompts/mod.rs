@@ -5,11 +5,8 @@
 //! scattering string literals through the codebase.
 
 mod context;
-mod extraction;
 pub mod memory_lifecycle;
-pub mod memory_ns;
 pub mod memory_proto;
-mod skills;
 mod system;
 pub mod team_prompts;
 
@@ -17,11 +14,6 @@ pub use context::{
     CacheAwareEstimate, CompactConfig, CompactionTier, ContextBudget, DEFAULT_SYSTEM_PROMPT_TOKENS,
     budget_for_model, capped_output_tokens, compaction_tier_calibrated, estimate_str_tokens,
     estimate_tokens, estimate_tokens_cache_aware, estimate_tokens_precise,
-};
-pub use extraction::{COMPACT_SUMMARY_REQUEST, MEMORY_EXTRACTOR_PROMPT, parse_extracted_facts};
-pub use skills::{
-    SystemSkill, build_skill_dev_prefix, build_skill_instructions, builtin_concise_skill,
-    builtin_markdown_skill, builtin_system_skills,
 };
 pub use system::{
     CacheScope, LOW_CONFIDENCE_THRESHOLD, PARALLEL_BATCHING_NUDGE_THRESHOLD, PromptSection,
@@ -33,6 +25,13 @@ pub use system::{
     sections_to_string, self_awareness_prompt_section, synthesize_or_batch_directive,
     tool_round_guidance, tool_round_guidance_trace_with, tool_round_guidance_with,
     trailing_single_tool_round_streak,
+};
+pub use astra_prompts::extraction::{
+    COMPACT_SUMMARY_REQUEST, MEMORY_EXTRACTOR_PROMPT, parse_extracted_facts,
+};
+pub use astra_prompts::skills::{
+    SystemSkill, build_skill_dev_prefix, build_skill_instructions, builtin_concise_skill,
+    builtin_markdown_skill, builtin_system_skills,
 };
 
 #[cfg(test)]

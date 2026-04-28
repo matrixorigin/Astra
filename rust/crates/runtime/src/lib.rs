@@ -38,7 +38,6 @@ pub mod data_versioning;
 pub(crate) mod decisions;
 pub(crate) mod events;
 pub mod jobs;
-pub(crate) mod lock_ext;
 pub mod marketplace;
 pub mod messaging;
 pub(crate) mod models;
