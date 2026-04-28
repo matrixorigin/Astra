@@ -819,13 +819,6 @@ impl VerificationRunner {
             output_sink: None,
         }
     }
-
-    /// Set an output sink that receives live command output lines.
-    pub fn with_output_sink(mut self, sink: OutputSink) -> Self {
-        self.output_sink = Some(sink);
-        self
-    }
-
     /// Verify all criteria for a subtask.
     pub async fn verify_subtask(&self, subtask: &DurableSubtask) -> SubtaskVerificationReport {
         self.verify_subtask_filtered(subtask, false).await

@@ -87,17 +87,6 @@ impl RenderPolicy {
     pub fn suppress_headless(self) -> bool {
         matches!(self, Self::FinalOnly | Self::Silent)
     }
-
-    /// True when thinking spinner and preview should still be shown.
-    pub fn show_thinking(self) -> bool {
-        !self.is_silent()
-    }
-
-    /// True when the thinking viewport receives reasoning-delta content
-    /// instead of the main text area (plan decompose mode).
-    pub fn reasoning_to_viewport(self) -> bool {
-        matches!(self, Self::PlanDecompose)
-    }
 }
 
 /// Cross-turn tool output cache for the CLI edge tool execution path.

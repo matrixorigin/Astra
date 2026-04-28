@@ -1215,20 +1215,6 @@ impl DelegationEngine {
             mailbox_router: self.mailbox_router.clone(),
         }
     }
-
-    /// Clone sharing all Arc components but with the gate cleared.
-    /// Used between subtasks to prevent a previous subtask's gate from leaking.
-    pub fn clone_without_gate(&self) -> Self {
-        Self {
-            registry: self.registry.clone(),
-            run_engine: self.run_engine.clone(),
-            tracker: self.tracker.clone(),
-            executor: self.executor.clone(),
-            gate: None,
-            mailbox_router: self.mailbox_router.clone(),
-        }
-    }
-
     /// Validate a delegation request without executing it.
     pub async fn validate(
         &self,

@@ -226,50 +226,6 @@ impl MemoriaClient {
             }
         }
     }
-
-    /// Fire-and-forget: send "useful" feedback for retrieved memory IDs.
-    pub fn feedback_useful(&self, memory_ids: Vec<String>) {
-        if memory_ids.is_empty() || self.is_circuit_open() {
-            return;
-        }
-        let base = std::env::var("MEMORIA_BASE_URL")
-            .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
-        let key = match std::env::var("MEMORIA_API_KEY")
-            .ok()
-            .or_else(|| std::env::var("MEMORIA_MASTER_KEY").ok())
-        {
-            Some(k) => k,
-            None => return,
-        };
-        tokio::spawn(async move {
-            let client = match reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .no_proxy()
-                .build()
-            {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-            let url = format!("{base}/v1/memories/feedback");
-            for mid in memory_ids {
-                if client
-                    .post(&url)
-                    .header("Authorization", format!("Bearer {key}"))
-                    .json(&json!({
-                        "memory_id": mid,
-                        "signal": "useful",
-                        "context": "boost_search retrieval"
-                    }))
-                    .send()
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-    }
-
     fn build_direct_request(base: &str, op: &str, args: &Value) -> (String, Value) {
         // Helper: propagate session_id and user_id when present in args
         // so Memoria can scope operations to the correct user.

@@ -742,20 +742,6 @@ impl CompositeSnapshotBuilder {
         self.refs.push(SnapshotRef::DataSnapshot(ds));
         self
     }
-
-    /// Attempt to add a data snapshot via the provider.
-    /// If the provider returns `None`, the data dimension is simply absent.
-    pub async fn with_data_provider(
-        mut self,
-        provider: &dyn DataSnapshotProvider,
-        context: &SnapshotContext,
-    ) -> Result<Self, String> {
-        if let Some(ds) = provider.create_snapshot(context).await? {
-            self.refs.push(SnapshotRef::DataSnapshot(ds));
-        }
-        Ok(self)
-    }
-
     /// Build the final `CompositeSnapshot`.
     pub fn build(self) -> CompositeSnapshot {
         let snapshot_id = format!(

@@ -751,14 +751,6 @@ impl McpConnection {
     pub fn tools(&self) -> &[Tool] {
         &self.tools
     }
-
-    /// Refresh the tool list from the server.
-    pub async fn refresh_tools(&mut self) -> Result<&[Tool], ServiceError> {
-        self.tools = self.peer.list_all_tools().await?;
-        self.tools_changed.store(false, Ordering::Release);
-        Ok(&self.tools)
-    }
-
     /// Check if the server signalled a tool list change and refresh if so.
     ///
     /// Returns `true` if tools were refreshed, `false` if no change detected.
@@ -776,23 +768,10 @@ impl McpConnection {
     pub fn has_pending_tool_change(&self) -> bool {
         self.tools_changed.load(Ordering::Acquire)
     }
-
-    /// Whether the server has signalled a prompt list change that hasn't been
-    /// consumed yet.
-    pub fn has_pending_prompt_change(&self) -> bool {
-        self.prompts_changed.load(Ordering::Acquire)
-    }
-
     /// Consume the prompts_changed flag (returns previous value).
     pub fn consume_prompt_change(&self) -> bool {
         self.prompts_changed.swap(false, Ordering::AcqRel)
     }
-
-    /// Whether the server has signalled a resource list/update change.
-    pub fn has_pending_resource_change(&self) -> bool {
-        self.resources_changed.load(Ordering::Acquire)
-    }
-
     /// Consume the resources_changed flag (returns previous value).
     pub fn consume_resource_change(&self) -> bool {
         self.resources_changed.swap(false, Ordering::AcqRel)
@@ -840,20 +819,6 @@ impl McpConnection {
     pub fn has_tool(&self, name: &str) -> bool {
         self.tools.iter().any(|t| t.name == name)
     }
-
-    /// Check whether WebSocket bridge tasks are still running.
-    ///
-    /// Returns `true` for non-WebSocket connections (stdio/SSE) since they
-    /// don't rely on bridge tasks. For WebSocket connections, returns `false`
-    /// if either bridge task has finished (error/panic/clean exit), which
-    /// means data flow is degraded or stopped.
-    pub fn ws_bridge_alive(&self) -> bool {
-        match &self.ws_bridge_handles {
-            None => true, // stdio/SSE — no bridge tasks needed
-            Some((read_h, write_h)) => !read_h.is_finished() && !write_h.is_finished(),
-        }
-    }
-
     /// List all resources from this server.
     pub async fn list_resources(&self) -> Result<Vec<Resource>, ServiceError> {
         self.peer.list_all_resources().await
@@ -1265,64 +1230,6 @@ impl McpClientManager {
             .await
             .map_err(McpError::Service)
     }
-
-    /// Call a tool with automatic reconnect on transport failure.
-    /// On first failure, reconnects to the server and retries the call once.
-    pub async fn call_tool_with_reconnect(
-        &mut self,
-        tool_name: &str,
-        arguments: serde_json::Value,
-    ) -> Result<CallToolResult, McpError> {
-        // First attempt
-        let server_name = self
-            .find_tool(tool_name)
-            .map(|(name, _)| name.to_string())
-            .ok_or_else(|| McpError::ToolNotFound(tool_name.to_string()))?;
-
-        let first_result = {
-            let conn = self
-                .connections
-                .get(&server_name)
-                .ok_or_else(|| McpError::ServerNotConnected(server_name.clone()))?;
-            conn.call_tool(tool_name, arguments.clone()).await
-        };
-
-        match first_result {
-            Ok(result) => Ok(result),
-            Err(e) => {
-                eprintln!(
-                    "  ↻ MCP tool '{}' failed on '{}': {e}, attempting reconnect…",
-                    tool_name, server_name
-                );
-
-                // Try to reconnect
-                match self.reconnect(&server_name).await {
-                    Ok(tool_count) => {
-                        eprintln!(
-                            "  ✓ Reconnected to '{}' ({} tools), retrying…",
-                            server_name, tool_count
-                        );
-                    }
-                    Err(reconn_err) => {
-                        return Err(McpError::ConnectionLost(
-                            server_name,
-                            format!("original error: {e}; reconnect failed: {reconn_err}"),
-                        ));
-                    }
-                }
-
-                // Retry the tool call
-                let conn = self
-                    .connections
-                    .get(&server_name)
-                    .ok_or_else(|| McpError::ServerNotConnected(server_name.clone()))?;
-                conn.call_tool(tool_name, arguments)
-                    .await
-                    .map_err(McpError::Service)
-            }
-        }
-    }
-
     /// Request argument completions from a specific server.
     pub async fn complete(
         &self,
@@ -1407,63 +1314,6 @@ impl McpClientManager {
             }
         }
     }
-
-    /// Reconnect a server and re-discover skills. Primary reconnect entry point.
-    pub async fn reconnect_and_rediscover_skills(
-        &mut self,
-        name: &str,
-        skill_registry: &astra_runtime::skills::UnifiedSkillRegistry,
-    ) -> Result<usize, McpError> {
-        let config = match self.connections.get(name) {
-            Some(conn) => conn.config.clone(),
-            None => return Err(McpError::ServerNotConnected(name.to_string())),
-        };
-
-        // Clean up old skills first
-        if let Err(e) = skill_registry.remove_mcp_server_skills(name).await {
-            astra_core::agent_warn!(
-                "mcp",
-                "failed to remove skills for server '{}' during reconnect: {e}",
-                name
-            );
-        }
-        self.connections.remove(name);
-        self.states
-            .insert(name.to_string(), ConnectionState::Reconnecting);
-
-        // Reconnect with retry
-        let connection =
-            match connect_to_server(config, self.sampling.clone(), self.roots.clone()).await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    self.states
-                        .insert(name.to_string(), ConnectionState::Failed);
-                    return Err(e);
-                }
-            };
-        self.states
-            .insert(name.to_string(), ConnectionState::Connected);
-        let conn = Arc::new(connection);
-        self.connections.insert(name.to_string(), Arc::clone(&conn));
-
-        // Re-discover skills
-        let skill_resources = conn.discover_skill_resources().await;
-        let mut registered = 0;
-        for (_skill_name, content) in &skill_resources {
-            match skill_registry.register_mcp_skill(name, content).await {
-                Ok(_) => registered += 1,
-                Err(e) => {
-                    eprintln!(
-                        "  {} {}",
-                        theme::icon_warn(),
-                        format!("Failed to register MCP skill from {name}: {e}").dim()
-                    );
-                }
-            }
-        }
-        Ok(registered)
-    }
-
     /// Check all connections for tool list change notifications and refresh
     /// any that have pending changes. Returns the names of servers that were refreshed.
     pub async fn refresh_changed_tools(&mut self) -> Vec<String> {

@@ -898,24 +898,6 @@ impl ToolExecutor {
         self.aggregate_output_bytes
             .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
     }
-
-    /// Configure security sandbox for tool execution.
-    #[allow(dead_code)] // Public builder API for library consumers
-    pub fn with_sandbox(self, policy: SandboxPolicy) -> Self {
-        if let Ok(mut guard) = self.sandbox_policy.write() {
-            *guard = Some(policy);
-        }
-        self
-    }
-
-    #[allow(dead_code)] // Public builder API for library consumers
-    pub fn with_github_token(mut self, token: impl Into<String>) -> Self {
-        let token = token.into();
-        let token = token.trim().to_string();
-        self.github_token = if token.is_empty() { None } else { Some(token) };
-        self
-    }
-
     fn finalize_tool_output(&self, output: String, name: &str) -> String {
         let output = normalize_empty_output(output, name);
         let output = truncate_output(output, global_output_limit());

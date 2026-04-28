@@ -1250,15 +1250,6 @@ impl ServerToolExecutor {
     ) {
         self.edge_connection_pool = Some(pool);
     }
-
-    /// Set the resource governor for usage tracking.
-    pub fn set_resource_governor(
-        &mut self,
-        governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>,
-    ) {
-        self.resource_governor = Some(governor);
-    }
-
     /// Set the observability session for rollback-backed session-state tools.
     pub fn set_observability_session(
         &mut self,

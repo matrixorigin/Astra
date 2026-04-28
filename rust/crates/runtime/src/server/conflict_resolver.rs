@@ -22,12 +22,6 @@ impl LlmConflictResolver {
             max_file_size: 100_000, // ~100KB default
         }
     }
-
-    pub fn with_max_file_size(mut self, size: usize) -> Self {
-        self.max_file_size = size;
-        self
-    }
-
     /// Build the prompt for a single file conflict.
     fn build_prompt(
         task_context: &str,

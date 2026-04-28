@@ -963,54 +963,6 @@ impl SyncOrchestrator {
             adapter.set_envelope(envelope);
         }
     }
-
-    /// Record an external sync event in the log.
-    pub fn log_external_event(
-        &mut self,
-        domain: SyncDomain,
-        op: SyncOperation,
-        success: bool,
-        duration_ms: u64,
-        bytes: u64,
-        error: Option<&str>,
-    ) {
-        if self.event_log.len() >= 100 {
-            self.event_log.remove(0);
-        }
-        self.event_log.push(SyncEvent {
-            domain,
-            operation: op,
-            success,
-            duration_ms,
-            bytes_transferred: bytes,
-            version_before: None,
-            version_after: None,
-            error: error.map(|s| s.to_string()),
-            timestamp: epoch_secs(),
-        });
-        if !success {
-            tracing::warn!(
-                target: "astra_services::sync_engine",
-                user_id = %self.user_id,
-                domain = %domain,
-                ?op,
-                duration_ms,
-                err = error.unwrap_or(""),
-                "external sync event failed"
-            );
-        } else {
-            tracing::debug!(
-                target: "astra_services::sync_engine",
-                user_id = %self.user_id,
-                domain = %domain,
-                ?op,
-                duration_ms,
-                bytes,
-                "external sync event ok"
-            );
-        }
-    }
-
     fn log_event(
         &mut self,
         domain: SyncDomain,

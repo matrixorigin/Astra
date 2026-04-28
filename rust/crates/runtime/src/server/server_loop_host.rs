@@ -906,12 +906,6 @@ impl ServerAgenticLoopHost {
         }
         std::mem::take(&mut self.emitted_events)
     }
-
-    /// Returns `true` when no CLI edge agent is connected (tools are server-side).
-    pub fn edge_tools_empty(&self) -> bool {
-        self.server_side_tools
-    }
-
     /// Attach an incremental SSE channel. Events will be pushed through
     /// this sender as they are emitted, enabling streaming to the client.
     /// When the channel closes (client disconnect), `cancel_flag` and

@@ -54,12 +54,6 @@ impl ThinkingPreviewPane {
     pub fn set_output_bytes(&mut self, bytes: usize) {
         self.output_bytes = bytes;
     }
-
-    /// Set estimated cost in USD (from usage SSE + pricing data).
-    pub fn set_estimated_cost(&mut self, cost: f64) {
-        self.estimated_cost = Some(cost);
-    }
-
     /// Push a chunk of reasoning content and redraw.
     pub fn push_chunk(&mut self, chunk: &str) {
         self.buffer.push_str(chunk);

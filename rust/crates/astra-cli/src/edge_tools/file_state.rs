@@ -439,26 +439,6 @@ impl ToolExecutor {
             .and_then(|s| s.get(&key).map(|fs| fs.ranged_read_count))
             .unwrap_or(0)
     }
-
-    /// Check if a file was previously partially read (outline or line range) and
-    /// hasn't been modified since. Used to auto-expand subsequent ranged reads
-    /// to the full file, eliminating fragmented multi-range read patterns.
-    pub(super) fn was_partially_read_unchanged(&self, path: &Path) -> bool {
-        let current_ts = Self::file_mtime_ms(path);
-        if current_ts == 0 {
-            return false;
-        }
-        let key = self.file_state_key(path);
-        self.file_state
-            .lock()
-            .ok()
-            .and_then(|s| {
-                s.get(&key)
-                    .map(|fs| fs.from_read && fs.is_partial && fs.timestamp_ms == current_ts)
-            })
-            .unwrap_or(false)
-    }
-
     /// Try to retrieve cached file content. Returns `Some(content)` if:
     /// - The file was previously read or written with content caching
     /// - The content was small enough to be cached

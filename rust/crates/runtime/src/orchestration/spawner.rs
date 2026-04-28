@@ -295,16 +295,6 @@ impl DynamicAgentSpawner {
         self.session_id = Some(session_id);
         self
     }
-
-    /// Set a custom agent registry (builtins + user-defined types).
-    pub fn with_agent_registry(
-        mut self,
-        registry: astra_turn_core::orchestration_team_config::AgentRegistry,
-    ) -> Self {
-        self.agent_registry = registry;
-        self
-    }
-
     /// Get a reference to the agent registry.
     pub fn agent_registry(&self) -> &astra_turn_core::orchestration_team_config::AgentRegistry {
         &self.agent_registry
@@ -905,43 +895,6 @@ impl DynamicAgentSpawner {
     /// Get a reference to the progress broadcaster.
     pub fn progress_broadcaster(&self) -> Arc<ProgressBroadcaster> {
         Arc::clone(&self.progress_broadcaster)
-    }
-
-    /// Query historical agent records from the session journal.
-    ///
-    /// Returns agent metadata from `AgentTerminated` events recorded in this session's journal.
-    pub fn get_journal_agent_history(&self) -> Vec<AgentHistoryRecord> {
-        let Some(ref sid) = self.session_id else {
-            return Vec::new();
-        };
-        let events = match astra_services::session_journal::read_journal(sid) {
-            Ok(e) => e,
-            Err(e) => {
-                astra_core::agent_warn!("spawner", "journal read failed: {e}");
-                return Vec::new();
-            }
-        };
-        events
-            .into_iter()
-            .filter(|e| {
-                e.event_type == astra_services::session_journal::JournalEventType::AgentTerminated
-            })
-            .filter_map(|e| {
-                let m = e.metadata.as_ref()?;
-                Some(AgentHistoryRecord {
-                    agent_id: m.get("agent_id")?.as_str()?.to_string(),
-                    run_id: m.get("run_id")?.as_str()?.to_string(),
-                    agent_type: m.get("agent_type")?.as_str()?.to_string(),
-                    status: m.get("status")?.as_str()?.to_string(),
-                    turns_completed: m.get("turns_completed")?.as_u64()? as u32,
-                    tool_calls: m.get("tool_calls")?.as_u64()? as u32,
-                    prompt_tokens: m.get("prompt_tokens")?.as_u64()?,
-                    completion_tokens: m.get("completion_tokens")?.as_u64()?,
-                    duration_ms: m.get("duration_ms")?.as_u64()?,
-                    timestamp: e.ts,
-                })
-            })
-            .collect()
     }
 }
 

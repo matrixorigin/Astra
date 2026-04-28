@@ -58,9 +58,6 @@ pub struct AgentTypeDefinition {
 }
 
 impl AgentTypeDefinition {
-    pub fn is_tool_allowed(&self, tool_name: &str) -> bool {
-        self.allowed_tools.contains("*") || self.allowed_tools.contains(tool_name)
-    }
 }
 
 /// Get all built-in agent type definitions.

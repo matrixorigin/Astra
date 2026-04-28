@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use super::scoring::{
-    DEFAULT_TOOL_BUDGET_TOKENS, pre_filter_dynamic, pre_filter_dynamic_calibrated,
+    DEFAULT_TOOL_BUDGET_TOKENS, pre_filter_dynamic,
     pre_filter_dynamic_with_memory, pre_filter_dynamic_with_outcome_bias,
     pre_filter_dynamic_with_quality,
 };
@@ -267,73 +267,6 @@ impl ToolRegistry {
 
         (schemas, report)
     }
-
-    /// Full-featured selection with quality tracking AND confidence calibration.
-    #[allow(clippy::too_many_arguments)]
-    pub fn select_calibrated(
-        &self,
-        query: &str,
-        turn_count: u32,
-        budget: u32,
-        recent_tools: &[String],
-        quality_tracker: Option<&ToolQualityTracker>,
-        calibrator: Option<&ConfidenceCalibrator>,
-        boost_terms: &[String],
-    ) -> (Vec<Value>, SelectionReport) {
-        // Build the effective query: original + memory-derived boost terms
-        let effective_query = if boost_terms.is_empty() {
-            query.to_string()
-        } else {
-            format!("{} {}", query, boost_terms.join(" "))
-        };
-        let state = ConversationState::from_message_with_context(
-            &effective_query,
-            turn_count,
-            recent_tools,
-        );
-
-        if state.is_conversational
-            && !state.is_fetch
-            && !state.is_mutate
-            && !state.is_analytical
-            && !state.references_history
-        {
-            let schemas = self.pinned_only();
-            let names = Self::selected_names(&schemas);
-            let report = SelectionReport {
-                tools_selected: names,
-                selected_count: schemas.len() as u32,
-                budget_used: 0,
-                budget_total: budget,
-            };
-            return (schemas, report);
-        }
-
-        let ranked =
-            pre_filter_dynamic_calibrated(&state, &effective_query, quality_tracker, calibrator);
-        let schemas = self.budget_select_measured(&ranked, budget);
-        let names = Self::selected_names(&schemas);
-
-        let budget_used: u32 = names
-            .iter()
-            .filter(|n| {
-                !TOOL_CATALOG
-                    .iter()
-                    .any(|t| t.pinned && t.name == n.as_str())
-            })
-            .map(|n| self.token_cost(n))
-            .sum();
-
-        let report = SelectionReport {
-            selected_count: schemas.len() as u32,
-            tools_selected: names,
-            budget_used,
-            budget_total: budget,
-        };
-
-        (schemas, report)
-    }
-
     /// Pipeline-integrated selection using a pre-computed RoutingDecision.
     ///
     /// This is the new preferred entry point for tool selection. It uses

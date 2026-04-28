@@ -2545,13 +2545,6 @@ impl JournalEvent {
         self.entity_learn_skipped_no_domain = entity_learn_skipped_no_domain;
         self
     }
-
-    /// Attach selection trace for post-hoc tool selection analysis.
-    pub fn with_selection_trace(mut self, trace: SelectionTrace) -> Self {
-        self.selection_trace = Some(trace);
-        self
-    }
-
     /// Stall detection event.
     pub fn stall_detected(
         session_id: Option<&str>,
@@ -3078,13 +3071,6 @@ impl JournalEvent {
         evt.metadata = Some(metadata);
         evt
     }
-
-    /// Builder to attach a context assembly trace to an existing turn event.
-    pub fn with_context_assembly_trace(mut self, trace: serde_json::Value) -> Self {
-        self.context_assembly_trace = Some(trace);
-        self
-    }
-
     /// Focus drift detected — emitted when drift analysis finds significant drift.
     pub fn drift_detected(
         session_id: Option<&str>,

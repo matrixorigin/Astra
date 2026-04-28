@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::github::GitHubClient;
 use crate::task_mgmt::TaskManager;
 use crate::{
-    FileEditJournal, GitRollbackJournal, ToolApprovalGate, ToolContext, ToolExecutor,
+    ToolApprovalGate, ToolContext, ToolExecutor,
     ToolProgressCallback, ToolResult,
 };
 
@@ -59,8 +59,6 @@ pub struct DefaultToolExecutor {
     ctx: ToolContext,
     approval_gate: Option<Arc<dyn ToolApprovalGate>>,
     progress_callback: Option<Arc<dyn ToolProgressCallback>>,
-    file_journal: Option<Arc<std::sync::Mutex<dyn FileEditJournal>>>,
-    git_journal: Option<Arc<std::sync::Mutex<dyn GitRollbackJournal>>>,
     github_client: Option<GitHubClient>,
     task_manager: Arc<TaskManager>,
 }
@@ -71,43 +69,14 @@ impl DefaultToolExecutor {
             ctx,
             approval_gate: None,
             progress_callback: None,
-            file_journal: None,
-            git_journal: None,
             github_client: None,
             task_manager: Arc::new(TaskManager::new()),
         }
     }
-
-    pub fn with_approval_gate(mut self, gate: Arc<dyn ToolApprovalGate>) -> Self {
-        self.approval_gate = Some(gate);
-        self
-    }
-
-    pub fn with_progress_callback(mut self, cb: Arc<dyn ToolProgressCallback>) -> Self {
-        self.progress_callback = Some(cb);
-        self
-    }
-
-    pub fn with_file_journal(mut self, j: Arc<std::sync::Mutex<dyn FileEditJournal>>) -> Self {
-        self.file_journal = Some(j);
-        self
-    }
-
-    pub fn with_git_journal(mut self, j: Arc<std::sync::Mutex<dyn GitRollbackJournal>>) -> Self {
-        self.git_journal = Some(j);
-        self
-    }
-
     pub fn with_github_client(mut self, client: GitHubClient) -> Self {
         self.github_client = Some(client);
         self
     }
-
-    pub fn with_task_manager(mut self, mgr: Arc<TaskManager>) -> Self {
-        self.task_manager = mgr;
-        self
-    }
-
     pub fn with_cancel_token(mut self, token: Option<Arc<CancellationToken>>) -> Self {
         self.ctx.cancel_token = token;
         self
@@ -121,11 +90,6 @@ impl DefaultToolExecutor {
     /// Workspace root path (alias for `context().workspace_root`).
     pub fn workspace_root(&self) -> &Path {
         &self.ctx.workspace_root
-    }
-
-    /// Project root path (alias for `context().project_root`).
-    pub fn project_root_path(&self) -> &Path {
-        &self.ctx.project_root
     }
 }
 

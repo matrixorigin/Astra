@@ -491,19 +491,6 @@ impl PermissionSyncContext {
             self.apply_update(update);
         }
     }
-
-    /// Export current session rules as updates (for propagation to children).
-    pub fn export_session_rules(&self) -> Vec<PermissionUpdate> {
-        let mut updates = Vec::new();
-        for rule in &self.session_allow {
-            updates.push(PermissionUpdate::allow(rule.clone()));
-        }
-        for rule in &self.session_deny {
-            updates.push(PermissionUpdate::deny(rule.clone()));
-        }
-        updates
-    }
-
     /// Create inherited permissions for a child agent.
     pub fn for_child(&self, is_background: bool) -> InheritedPermissions {
         let mut inherited = self.inherited.clone();
@@ -540,11 +527,6 @@ impl PermissionSyncContext {
             .permission_requests_approved
             .saturating_add(1);
     }
-
-    pub fn record_blocked_tool(&mut self, tool_name: &str) {
-        self.record_blocked_tool_with_reason(tool_name, None);
-    }
-
     pub fn record_blocked_tool_with_reason(&mut self, tool_name: &str, reason: Option<&str>) {
         self.telemetry.tools_blocked = self.telemetry.tools_blocked.saturating_add(1);
         self.telemetry

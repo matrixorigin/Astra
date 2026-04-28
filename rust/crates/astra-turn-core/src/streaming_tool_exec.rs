@@ -304,12 +304,6 @@ impl StreamingToolExecutor {
 
         (done, needed)
     }
-
-    /// Number of currently in-flight speculative executions.
-    pub async fn inflight_count(&self) -> usize {
-        self.inflight.lock().await.len()
-    }
-
     /// Take a metrics snapshot. Does not reset counters.
     pub async fn snapshot(&self) -> StreamingSpeculationMetrics {
         let inflight = self.inflight.lock().await.len() as u64;

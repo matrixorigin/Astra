@@ -59,10 +59,6 @@ impl StopHookCache {
     pub fn should_skip(&self, key: &str) -> bool {
         self.entries.get(key).is_some_and(|r| r.passed)
     }
-
-    pub fn invalidate_all(&mut self) {
-        self.entries.clear();
-    }
 }
 
 /// Topological sort of hooks into layers. Hooks in the same layer can execute
