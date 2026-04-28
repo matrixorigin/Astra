@@ -489,6 +489,43 @@ mod tests {
         assert!(executor.cancel_token.is_some());
     }
 
+    /// Server-side symmetric to `cli_skill_subrun_rejects_when_recursion_depth_limit_reached`:
+    /// the fork sub-run executor must refuse to spawn once the agent recursion
+    /// cap is reached. Without this guard, a fork-context skill could recurse
+    /// into itself indefinitely. The CLI has had this test; the server did not
+    /// — so this closes an asymmetric coverage gap where a misbehaving
+    /// resolver on the server path could recurse without a fast-fail at the
+    /// depth boundary.
+    #[tokio::test]
+    async fn server_skill_subrun_rejects_when_recursion_depth_limit_reached() {
+        let executor = ServerSkillSubRunExecutor::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "test-session".to_string(),
+        );
+        let allowed_tools: Vec<String> = Vec::new();
+
+        let err = executor
+            .execute_skill_subrun(
+                "depth-test",
+                "Do work",
+                "task",
+                None,
+                None,
+                &allowed_tools,
+                crate::turn::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.contains("recursion depth") && err.contains("reached maximum"),
+            "error must cite depth limit; got: {err}"
+        );
+    }
+
     /// audit-#8: turn-count math must not underflow when `remaining_turns`
     /// briefly exceeds the cap (race conditions, future refactors, etc.).
     #[test]

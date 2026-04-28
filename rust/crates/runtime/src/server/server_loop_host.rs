@@ -576,6 +576,12 @@ pub struct ServerAgenticLoopHost {
     /// Per-turn captured payloads for assertion in tests.
     #[cfg(feature = "bridge-e2e-hooks")]
     llm_request_capture: Option<Arc<std::sync::Mutex<Vec<CapturedLlmRequest>>>>,
+    /// Per-turn set of already-emitted tool_call id-keys (dedup across multiple
+    /// `execute_mock_turn` invocations within the same chat turn). Cleared at
+    /// the start of each user-turn in `run_one_mock_turn_for_test` and in
+    /// `execute_turn`'s test-hook path.
+    #[cfg(feature = "bridge-e2e-hooks")]
+    emitted_tool_call_ids: std::collections::HashSet<String>,
 }
 
 /// Builder for [`ServerAgenticLoopHost`].
@@ -799,6 +805,8 @@ impl ServerAgenticLoopHostBuilder {
             mock_provider: self.mock_provider,
             #[cfg(feature = "bridge-e2e-hooks")]
             llm_request_capture: self.llm_request_capture,
+            #[cfg(feature = "bridge-e2e-hooks")]
+            emitted_tool_call_ids: std::collections::HashSet::new(),
         }
     }
 }
@@ -929,6 +937,9 @@ impl ServerAgenticLoopHost {
         &mut self,
         state: &mut AgenticLoopState,
     ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
+        // Clear per-turn dedup state so ids from a previous user message
+        // never suppress tool_call events in the next one.
+        self.emitted_tool_call_ids.clear();
         let round = self.test_llm_rounds.pop_front().unwrap_or_else(
             || json!({ "full_text": "[mock rounds exhausted]", "tool_calls": [], "usage": {} }),
         );
@@ -1071,7 +1082,21 @@ impl ServerAgenticLoopHost {
         if !full_text.is_empty() {
             self.emit_event(json!({ "type": "text_delta", "content": &full_text }));
         }
+        // Emit tool_call events with id-level dedupe across ALL execute_mock_turn
+        // invocations within the same user-turn. `self.emitted_tool_call_ids` is
+        // cleared at the start of each user-turn (run_one_mock_turn_for_test /
+        // execute_turn test-hook path). This prevents duplicate events when the
+        // agentic loop calls execute_mock_turn more than once per chat turn
+        // (e.g. skill round-trips). Contract locked by:
+        //   `skill_invocation_costs_exactly_two_llm_rounds_today`
         for tc in &tool_calls {
+            let key = match tc.get("id").and_then(Value::as_str) {
+                Some(id) if !id.is_empty() => format!("id:{id}"),
+                _ => format!("raw:{tc}"),
+            };
+            if !self.emitted_tool_call_ids.insert(key) {
+                continue;
+            }
             self.emit_event(json!({ "type": "tool_call", "tool_call": tc }));
         }
         let prompt = usage
@@ -1678,7 +1703,25 @@ impl ServerAgenticLoopHost {
             task_type,
             cache_cfg,
         );
-        let breakdown = crate::prompts::build_system_prompt_trace(&sections, vec![], vec![]);
+        let skill_injections: Vec<crate::turn::context_assembly_trace::SkillInjection> =
+            if active_skill_names.is_empty() {
+                vec![]
+            } else {
+                let hint_tokens = crate::prompts::estimate_str_tokens(&skill_hint) as u32;
+                // Safe: `active_skill_names` is non-empty in this branch.
+                let per = hint_tokens / active_skill_names.len() as u32;
+                active_skill_names
+                    .iter()
+                    .map(|name| crate::turn::context_assembly_trace::SkillInjection {
+                        skill_name: (*name).to_string(),
+                        skill_version: None,
+                        tokens: per,
+                        selection_reason: "active_output_skill".into(),
+                    })
+                    .collect()
+            };
+        let breakdown =
+            crate::prompts::build_system_prompt_trace(&sections, skill_injections, vec![]);
         let mut system_messages = vec![sys_msg];
         if let Some(dm) = dynamic_msg {
             system_messages.push(dm);
@@ -2073,6 +2116,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         #[cfg(feature = "bridge-e2e-hooks")]
         {
             if let Some(round) = self.test_llm_rounds.pop_front() {
+                // Clear per-*user-turn* dedup state only at the first LLM round
+                // of a new user-turn (callers that don't go through
+                // run_one_mock_turn_for_test). Clearing on every round would
+                // break cross-round dedup — the agentic loop can re-drive the
+                // same tool_call emission path in Round 2 (post tool-result)
+                // and we must still suppress that duplicate.
+                if state.llm_rounds_completed == 0 {
+                    self.emitted_tool_call_ids.clear();
+                }
                 return self.execute_mock_turn(state, &round, turn_started).await;
             }
             if self.test_llm_rounds_wired {
@@ -3008,6 +3060,44 @@ mod tests {
                 "{context} should handle dump.persist_remote failures explicitly"
             );
         }
+    }
+
+    /// Pin: after compaction, the server loop MUST re-inject invoked-skill
+    /// instructions via `AttachmentBuilder::add_skill`. Without this, skills
+    /// that were loaded before compaction lose their full content once history
+    /// is summarized, and the model would have to re-invoke them — costing an
+    /// extra round trip per skill.
+    ///
+    /// The mechanism hinges on:
+    ///   1. `state.skills.invoked` tracking every skill the model has called
+    ///      (see `InvokedSkill` at `turn/skill_tool.rs:147`).
+    ///   2. The compaction path iterating that map and feeding each entry into
+    ///      `AttachmentBuilder::add_skill` so `to_messages()` restores the
+    ///      skill content as user messages appended after the compact summary.
+    ///
+    /// A silent refactor that drops either piece would break cross-turn skill
+    /// persistence with no runtime error. This test pins both anchors.
+    #[test]
+    fn post_compaction_reinjects_invoked_skills() {
+        let source = include_str!("server_loop_host.rs");
+        let tests_start = source.rfind("mod tests {").expect("test module start");
+        let production = &source[..tests_start];
+        assert!(
+            production.contains("state.skills.invoked"),
+            "production code must consult state.skills.invoked to decide re-injection"
+        );
+        assert!(
+            production.contains("builder.add_skill(&skill.name, &skill.content)"),
+            "production code must feed invoked skills into AttachmentBuilder::add_skill \
+             so full instructions survive compaction"
+        );
+        // Ordering guard: most-recently invoked skill first (so the oldest
+        // content sits closest to the model's current turn after to_messages
+        // reverses). If this sort key flips, cross-turn ordering will break.
+        assert!(
+            production.contains("std::cmp::Reverse(b.invoked_at_turn)"),
+            "invoked skills must be sorted most-recent-first before re-injection"
+        );
     }
 
     #[test]
