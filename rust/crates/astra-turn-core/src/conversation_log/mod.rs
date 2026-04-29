@@ -359,6 +359,7 @@ pub trait CslStore: Send + Sync {
     /// [`DbCslStore`](db_store::DbCslStore) with `entry_type` column) should
     /// override this to avoid the deserialization cost.
     async fn snapshot_seqs(&self, session_id: &str) -> Result<Vec<u64>, CslStoreError> {
+        validate_session_id(session_id)?;
         let entries = self.load_after(session_id, 0).await?;
         Ok(entries
             .iter()
@@ -1104,5 +1105,39 @@ mod tests {
             Some(None),
             "JSON null must deserialize to Some(None)"
         );
+    }
+
+    #[test]
+    fn validate_session_id_rejects_invalid() {
+        for bad in [
+            "",
+            "../etc/passwd",
+            "foo/bar",
+            "a\\b",
+            "..",
+            "has\0nul",
+            "has\nnewline",
+            "has\ttab",
+            "has\x7Fdel",
+        ] {
+            match validate_session_id(bad) {
+                Err(CslStoreError::InvalidSessionId(_)) => {}
+                other => panic!("{bad:?}: expected InvalidSessionId, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_session_id_accepts_valid() {
+        for good in [
+            "abc123",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "session_with-dashes.and.dots",
+        ] {
+            assert!(
+                validate_session_id(good).is_ok(),
+                "{good:?} should be accepted"
+            );
+        }
     }
 }
