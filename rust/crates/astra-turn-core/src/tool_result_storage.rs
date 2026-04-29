@@ -89,9 +89,10 @@ pub fn maybe_persist_tool_result(
 
     let dir = session_dir.join(TOOL_RESULTS_SUBDIR);
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!(
-            "[tool_result_storage] failed to create dir {}: {e}",
-            dir.display()
+        tracing::warn!(
+            dir = %dir.display(),
+            error = %e,
+            "tool_result_storage: failed to create dir"
         );
         return None;
     }
@@ -101,9 +102,10 @@ pub fn maybe_persist_tool_result(
     let file_path = dir.join(format!("{safe_id}.txt"));
 
     if let Err(e) = std::fs::write(&file_path, content) {
-        eprintln!(
-            "[tool_result_storage] failed to write {}: {e}",
-            file_path.display()
+        tracing::warn!(
+            path = %file_path.display(),
+            error = %e,
+            "tool_result_storage: failed to write"
         );
         return None;
     }
@@ -126,9 +128,10 @@ pub fn maybe_persist_tool_result_unconditional(
 ) -> bool {
     let dir = session_dir.join(TOOL_RESULTS_SUBDIR);
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!(
-            "[tool_result_storage] failed to create dir {}: {e}",
-            dir.display()
+        tracing::warn!(
+            dir = %dir.display(),
+            error = %e,
+            "tool_result_storage: failed to create dir"
         );
         return false;
     }
@@ -137,9 +140,10 @@ pub fn maybe_persist_tool_result_unconditional(
     let file_path = dir.join(format!("{safe_id}.txt"));
 
     if let Err(e) = std::fs::write(&file_path, content) {
-        eprintln!(
-            "[tool_result_storage] failed to write {}: {e}",
-            file_path.display()
+        tracing::warn!(
+            path = %file_path.display(),
+            error = %e,
+            "tool_result_storage: failed to write"
         );
         return false;
     }

@@ -1703,6 +1703,41 @@ mod tests {
         );
     }
 
+    /// The "last tool failed" heuristic uses REQUEST order (the order the
+    /// model emitted tool_calls), not completion order. The parallel executor
+    /// reassembles results by original_index, so the slice passed to
+    /// update_runtime_todo_from_tool_records always reflects request order.
+    /// This test verifies: if the last tool in request order succeeded but
+    /// an earlier tool failed, the todo is NOT blocked.
+    #[test]
+    fn mixed_batch_last_tool_heuristic_uses_request_order() {
+        let mut state = make_state();
+        state.continuity.ensure_tracked_goal(
+            "Validate request-order semantics for last-tool blocking heuristic",
+        );
+        advance_runtime_todo_before_tool_round(&mut state);
+
+        // Request order: [read_file(FAIL), grep(OK), bash(OK)]
+        // Last tool in request order is bash(OK) → non-blocking
+        update_runtime_todo_from_tool_records(
+            &mut state,
+            &[
+                tool_record("read_file", false),
+                tool_record("grep", true),
+                tool_record("bash", true),
+            ],
+        );
+
+        let item = state.continuity.todos.active_or_next().unwrap();
+        assert_eq!(
+            item.status,
+            astra_turn_types::continuity::TodoStatus::InProgress,
+            "todo must NOT be blocked when last tool in request order succeeded"
+        );
+        // Evidence from successful tools must still be recorded
+        assert!(item.evidence.contains(&"grep ok, bash ok".to_string()));
+    }
+
     fn tool_record(name: &str, ok: bool) -> ToolCallRecord {
         ToolCallRecord {
             name: name.to_string(),
