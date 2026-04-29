@@ -1265,6 +1265,13 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     },
 ];
 
+/// Returns `true` when `name` matches a pinned tool in [`TOOL_CATALOG`].
+/// Pinned tools are essential to agent operation and must never be blocked
+/// by cross-session learning or pattern-library heuristics.
+pub fn is_pinned_tool(name: &str) -> bool {
+    TOOL_CATALOG.iter().any(|t| t.pinned && t.name == name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1430,5 +1437,14 @@ mod tests {
             .find(|t| t.name == "memory_store")
             .unwrap();
         assert!(!ms.pinned, "memory_store should be selected dynamically");
+    }
+
+    #[test]
+    fn is_pinned_tool_matches_catalog() {
+        assert!(is_pinned_tool("bash"));
+        assert!(is_pinned_tool("read_file"));
+        assert!(is_pinned_tool("str_replace"));
+        assert!(!is_pinned_tool("memory_store"));
+        assert!(!is_pinned_tool("nonexistent_tool"));
     }
 }

@@ -249,9 +249,11 @@ pub struct SkillState {
     pub effort: Option<crate::skills::manifest::EffortLevel>,
     /// Agent type hint from the most recently activated skill.
     pub agent_type: Option<String>,
-    /// Tool allow-list from the most recently activated skill.
-    /// When non-empty, only these tools (plus `skill` itself) should be available.
-    /// The host converts this allow-list to additions in `restricted_tools`.
+    /// Tool allow-list from the most recently activated skill (additive only).
+    /// When set, the host ensures these tools are present in the model's tool
+    /// schemas (via `inject_skill_allowed_tools`), but never restricts other
+    /// tools. This aligns with Claude Code's semantics where `allowed_tools`
+    /// is a visibility hint, not a security boundary.
     pub allowed_tools: Option<HashSet<String>>,
     /// Request-scoped tool/skill constraints supplied by the external caller.
     /// Nested runs inherit these constraints unchanged.
@@ -3308,10 +3310,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn restricted_tools_not_accumulated_across_turns() {
-        // This tests the invariant that restricted_tools doesn't permanently
-        // grow from skill allowed_tools. After the loop, restricted_tools
-        // should not contain skill-scoped restrictions.
+    async fn skill_allowed_tools_never_pollutes_restricted_tools() {
+        // Skill allowed_tools is additive (ensures tool schema visibility),
+        // never restrictive. The runtime must not add anything to restricted_tools
+        // based on skill allowed_tools.
         let resolver = StubSkillResolver::new().with_allowed_tools(vec!["bash".into()]);
         let turns = vec![
             skill_tool_call_result("call_1", r#"{"skill_name": "test-skill"}"#, 100, 50),
@@ -3325,17 +3327,16 @@ pub(crate) mod tests {
             .push(json!({"role": "user", "content": "use skill"}));
         state.skills.resolver = Some(Arc::new(resolver));
 
-        // Pre-condition: restricted_tools is empty
         assert!(state.restricted_tools.is_empty());
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        // Post-condition: restricted_tools should NOT contain "grep" or "edit"
-        // permanently (skill restrictions are transient, applied only in CLI host)
-        // Note: the runtime loop itself doesn't apply restrictions — that's the
-        // host's job in execute_turn(). This test verifies the runtime doesn't
-        // pollute restricted_tools.
-        // The skill_allowed_tools field IS set (for the host to use):
+        // restricted_tools must stay empty — skill allowed_tools is additive only
+        assert!(
+            state.restricted_tools.is_empty(),
+            "skill allowed_tools must not pollute restricted_tools"
+        );
+        // The allowed_tools field is still set for schema injection
         let allowed = state.skills.allowed_tools.as_ref().unwrap();
         assert!(allowed.contains("bash"));
     }

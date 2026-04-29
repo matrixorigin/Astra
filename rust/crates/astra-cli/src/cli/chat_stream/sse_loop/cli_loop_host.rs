@@ -136,29 +136,12 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // If a skill activation overrode the model, use that; otherwise fall back to host default.
         let effective_model = state.skills.model_override.as_deref().or(self.model);
 
-        // Skill-scoped restrictions: computed fresh each turn from skill_allowed_tools
-        // and applied transiently (removed after the turn) so they don't accumulate
-        // in the permanent restricted_tools set.
-        let skill_scoped_restrictions: HashSet<String> =
-            if let Some(ref allowed) = state.skills.allowed_tools {
-                self.valid_tool_names
-                    .iter()
-                    .filter(|name| {
-                        !allowed.contains(*name)
-                            && *name != astra_runtime::turn::skill_tool::SKILL_TOOL_NAME
-                            && *name != astra_runtime::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME
-                    })
-                    .cloned()
-                    .collect()
-            } else {
-                HashSet::new()
-            };
+        // Skill allowed_tools is additive — it ensures skill-referenced tools
+        // are visible to the model via schema injection, but never restricts
+        // other tools. Only interaction-scoped restrictions apply here.
         let interaction_mode = self.turn_interaction_mode();
         let interaction_scoped_restrictions =
             interaction_scoped_tool_restrictions(interaction_mode);
-        state
-            .restricted_tools
-            .extend(skill_scoped_restrictions.iter().cloned());
         state
             .restricted_tools
             .extend(interaction_scoped_restrictions.iter().cloned());
@@ -277,11 +260,6 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         })
         .await;
 
-        // Remove skill-scoped restrictions so they don't accumulate permanently.
-        // They'll be re-computed fresh on the next turn if skill_allowed_tools is still set.
-        for name in &skill_scoped_restrictions {
-            state.restricted_tools.remove(name);
-        }
         for name in &interaction_scoped_restrictions {
             state.restricted_tools.remove(name);
         }

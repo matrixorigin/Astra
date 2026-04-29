@@ -1110,9 +1110,11 @@ pub async fn partition_and_execute_skills(
 /// instruction sets:
 /// - `model_override`: None = "no opinion" (keep previous), Some = overwrite.
 /// - `effort` / `agent_type`: same semantics — None preserves, Some overwrites.
-/// - `allowed_tools`: intersection of all non-empty allow-lists. If any
-///   skill restricts tools, only tools allowed by ALL skills survive.
-///   An unrestricted skill (empty list) doesn't widen a prior restriction.
+/// - `allowed_tools`: union of all allow-lists. This field is an *additive*
+///   schema-visibility hint, not a restriction: it ensures every
+///   skill-referenced tool is visible to the model. When multiple skills
+///   activate in one turn, we must surface the union of their referenced
+///   tools — intersecting would silently hide tools one skill depends on.
 fn merge_activations(prev: Option<SkillActivation>, new: SkillActivation) -> SkillActivation {
     let Some(mut merged) = prev else {
         return new;
@@ -1132,25 +1134,18 @@ fn merge_activations(prev: Option<SkillActivation>, new: SkillActivation) -> Ski
         merged.agent_type = new.agent_type;
     }
 
-    // Tools: intersect non-empty allow-lists.
-    match (
-        merged.allowed_tools.is_empty(),
-        new.allowed_tools.is_empty(),
-    ) {
-        (true, true) => {} // Both unrestricted — stay unrestricted.
-        (true, false) => {
-            // Previous was unrestricted, new restricts — adopt new restrictions.
-            merged.allowed_tools = new.allowed_tools;
-        }
-        (false, true) => {} // New is unrestricted — keep previous restrictions.
-        (false, false) => {
-            // Both restrict — intersect.
-            let new_set: std::collections::HashSet<&str> =
-                new.allowed_tools.iter().map(|s| s.as_str()).collect();
-            merged
-                .allowed_tools
-                .retain(|t| new_set.contains(t.as_str()));
-        }
+    // Tools: union of allow-lists (additive schema-visibility hint).
+    // Every tool either skill references must remain visible to the model.
+    if !new.allowed_tools.is_empty() {
+        let existing: std::collections::HashSet<&str> =
+            merged.allowed_tools.iter().map(|s| s.as_str()).collect();
+        let additions: Vec<String> = new
+            .allowed_tools
+            .iter()
+            .filter(|t| !existing.contains(t.as_str()))
+            .cloned()
+            .collect();
+        merged.allowed_tools.extend(additions);
     }
 
     // Sandbox: stricter policy wins (higher SandboxMode ordinal = more restrictive).
@@ -2036,13 +2031,6 @@ fn execute_skill<'a>(
 
                 if !task_hint.is_empty() {
                     output.push_str(&format!("\n\n---\n\n**Task context:** {}", task_hint));
-                }
-
-                if !skill.allowed_tools.is_empty() {
-                    output.push_str(&format!(
-                        "\n\n**Allowed tools for this skill:** {}",
-                        skill.allowed_tools.join(", ")
-                    ));
                 }
 
                 // Run post-invocation hooks (skipped for MCP)
@@ -3916,12 +3904,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_skill_shows_allowed_tools() {
-        struct ToolRestrictedResolver;
-        impl SkillResolver for ToolRestrictedResolver {
+    async fn execute_skill_returns_activation_with_allowed_tools() {
+        struct ToolListResolver;
+        impl SkillResolver for ToolListResolver {
             fn resolve(&self, _name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
-                    name: "restricted".into(),
+                    name: "review".into(),
                     instructions: "Do the thing.".into(),
                     model: None,
                     max_tokens: None,
@@ -3950,19 +3938,20 @@ mod tests {
         }
 
         let r = execute_skill(
-            &ToolRestrictedResolver,
+            &ToolListResolver,
             None,
-            "restricted",
+            "review",
             "",
             None,
             &SkillContext::default(),
         )
         .await;
+        // allowed_tools must NOT appear as restrictive text in the prompt
         assert!(
-            r.output
-                .contains("**Allowed tools for this skill:** bash, read_file")
+            !r.output.contains("Allowed tools"),
+            "skill output must not contain restrictive 'Allowed tools' hint"
         );
-        // allowed_tools set → activation returned
+        // activation carries allowed_tools for additive schema injection
         let act = r.activation.unwrap();
         assert_eq!(act.allowed_tools, vec!["bash", "read_file"]);
         assert!(act.model_override.is_none());
@@ -4385,7 +4374,11 @@ mod tests {
     }
 
     #[test]
-    fn merge_activations_tools_intersect() {
+    fn merge_activations_tools_union_dedups_and_preserves_order() {
+        // Under additive schema-visibility semantics, merging two allow-lists
+        // must return the UNION so no skill's tool hint is silently dropped.
+        // Insertion order (prev first, then new additions) is preserved;
+        // duplicates are deduped.
         let prev = SkillActivation {
             model_override: None,
             allowed_tools: vec!["bash".into(), "grep".into(), "read_file".into()],
@@ -4401,23 +4394,25 @@ mod tests {
             sandbox_policy: None,
         };
         let merged = super::merge_activations(Some(prev), new);
-        let mut tools = merged.allowed_tools;
-        tools.sort();
-        assert_eq!(tools, vec!["bash", "read_file"]);
+        assert_eq!(
+            merged.allowed_tools,
+            vec!["bash", "grep", "read_file", "edit"],
+            "union must preserve prev order and append only novel entries"
+        );
     }
 
     #[test]
-    fn merge_activations_unrestricted_plus_restricted() {
+    fn merge_activations_unrestricted_plus_restricted_yields_union() {
         let prev = SkillActivation {
             model_override: None,
-            allowed_tools: vec![], // unrestricted
+            allowed_tools: vec![], // empty hint
             effort: None,
             agent_type: None,
             sandbox_policy: None,
         };
         let new = SkillActivation {
             model_override: None,
-            allowed_tools: vec!["bash".into()], // restricted
+            allowed_tools: vec!["bash".into()],
             effort: None,
             agent_type: None,
             sandbox_policy: None,
@@ -4427,17 +4422,18 @@ mod tests {
     }
 
     #[test]
-    fn merge_activations_restricted_plus_unrestricted_keeps_restriction() {
+    fn merge_activations_restricted_plus_unrestricted_keeps_previous_hint() {
+        // Empty `new.allowed_tools` must not erase prev's visibility hint.
         let prev = SkillActivation {
             model_override: None,
-            allowed_tools: vec!["bash".into()], // restricted
+            allowed_tools: vec!["bash".into()],
             effort: None,
             agent_type: None,
             sandbox_policy: None,
         };
         let new = SkillActivation {
             model_override: None,
-            allowed_tools: vec![], // unrestricted
+            allowed_tools: vec![],
             effort: None,
             agent_type: None,
             sandbox_policy: None,
@@ -4447,7 +4443,9 @@ mod tests {
     }
 
     #[test]
-    fn merge_activations_disjoint_tools_produce_empty() {
+    fn merge_activations_disjoint_tools_produce_union() {
+        // Regression guard: the old intersection logic would return empty
+        // here, silently hiding both skills' tools. Union preserves both.
         let prev = SkillActivation {
             model_override: None,
             allowed_tools: vec!["bash".into()],
@@ -4463,7 +4461,7 @@ mod tests {
             sandbox_policy: None,
         };
         let merged = super::merge_activations(Some(prev), new);
-        assert!(merged.allowed_tools.is_empty());
+        assert_eq!(merged.allowed_tools, vec!["bash", "edit"]);
     }
 
     #[test]

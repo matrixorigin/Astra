@@ -77,7 +77,11 @@ fn extend_restricted_with_blocked_tools(
         && let Some(pattern_library) = hub.pattern_library()
         && let Ok(lib) = pattern_library.lock()
     {
-        restricted.extend(lib.blocked_tool_names());
+        for name in lib.blocked_tool_names() {
+            if !astra_turn_core::tool_registry_meta::is_pinned_tool(&name) {
+                restricted.insert(name);
+            }
+        }
     }
 }
 

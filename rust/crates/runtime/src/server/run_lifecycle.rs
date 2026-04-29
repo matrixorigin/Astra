@@ -521,7 +521,9 @@ fn seed_restricted_tools_from_blocked_patterns(
     pattern_library: &astra_pipeline::pattern::PatternLibrary,
 ) {
     for name in pattern_library.blocked_tool_names() {
-        loop_state.restricted_tools.insert(name);
+        if !astra_turn_core::tool_registry_meta::is_pinned_tool(&name) {
+            loop_state.restricted_tools.insert(name);
+        }
     }
 }
 
