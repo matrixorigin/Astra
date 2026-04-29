@@ -1180,32 +1180,28 @@ impl ServerAgenticLoopHost {
             }
             self.emit_event(json!({ "type": "tool_call", "tool_call": tc }));
         }
-        let prompt = usage
-            .get("prompt_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(10);
-        let completion = usage
-            .get("completion_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(5);
-        // Accept both the flat naming (mock-friendly) and the Anthropic
-        // `*_input_tokens` variants so fixtures can model either provider.
-        let cache_read = usage
-            .get("cache_read_tokens")
-            .or_else(|| usage.get("cache_read_input_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let cache_creation = usage
-            .get("cache_creation_tokens")
-            .or_else(|| usage.get("cache_creation_input_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        // Mock fixtures use upstream OpenAI-native keys (`prompt_tokens` /
+        // `completion_tokens` / `prompt_tokens_details.cached_tokens`), plus
+        // direct Anthropic-style aliases. Normalize through the shared
+        // [`TokenUsage`] extractor so the emitted SSE uses canonical keys
+        // regardless of fixture provenance.
+        let extracted = crate::turn::token_usage::extract_usage(
+            crate::turn::token_usage::UsageDialect::OpenAi,
+            &usage,
+        );
+        let u = extracted.unwrap_or(crate::turn::token_usage::TokenUsage {
+            input_tokens: 10,
+            cached_input_tokens: 0,
+            cache_creation_tokens: 0,
+            output_tokens: 5,
+        });
         self.emit_event(json!({
             "type": "usage",
-            "prompt_tokens": prompt,
-            "completion_tokens": completion,
-            "cache_read_tokens": cache_read,
-            "cache_creation_tokens": cache_creation,
+            "input_tokens": u.input_tokens,
+            "cached_input_tokens": u.cached_input_tokens,
+            "cache_creation_tokens": u.cache_creation_tokens,
+            "output_tokens": u.output_tokens,
+            "total_tokens": u.total_tokens(),
         }));
 
         let edge_tool_round =
@@ -1220,10 +1216,10 @@ impl ServerAgenticLoopHost {
             reasoning_content: reasoning,
             tool_calls: tool_calls.clone(),
             has_tool_calls: !tool_calls.is_empty(),
-            prompt_tokens: prompt,
-            completion_tokens: completion,
-            cache_read_tokens: cache_read,
-            cache_creation_tokens: cache_creation,
+            prompt_tokens: u.input_tokens,
+            completion_tokens: u.output_tokens,
+            cache_read_tokens: u.cached_input_tokens,
+            cache_creation_tokens: u.cache_creation_tokens,
             has_usage: true,
             system_prompt_tokens: Some(system_prompt_breakdown.total_tokens),
             system_prompt_breakdown: serde_json::to_value(&system_prompt_breakdown).ok(),
@@ -1258,10 +1254,11 @@ impl ServerAgenticLoopHost {
                     "reasoning": accum.reasoning_content.clone(),
                     "tool_calls": tool_calls.clone(),
                     "usage": {
-                        "prompt_tokens": prompt,
-                        "completion_tokens": completion,
-                        "cache_read_tokens": cache_read,
-                        "cache_creation_tokens": cache_creation,
+                        "input_tokens": u.input_tokens,
+                        "cached_input_tokens": u.cached_input_tokens,
+                        "cache_creation_tokens": u.cache_creation_tokens,
+                        "output_tokens": u.output_tokens,
+                        "total_tokens": u.total_tokens(),
                     },
                 }),
                 Some(crate::turn::llm_exchange_capture::CaptureTrace {

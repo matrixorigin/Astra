@@ -3203,7 +3203,7 @@ impl InProcessChatTurnBridge {
                         astra_services::session_journal::JournalEventType::Turn, None,
                     );
                     event.turn = Some(cloud_loop_turns as u32);
-                    event.tokens_in = usage.get("prompt_tokens").and_then(Value::as_i64).map(|t| t as u64);
+                    event.tokens_in = usage.get("input_tokens").and_then(Value::as_u64);
                     event.tool_calls = Some(tool_call_records.clone());
                     astra_turn_core::cloud_session_facts::update_from_journal_event(
                         &mut facts,
@@ -3213,7 +3213,7 @@ impl InProcessChatTurnBridge {
 
                 let l1_content = crate::turn::cloud::session_memory_protocol::build_l1_from_messages(
                     &messages, cloud_loop_turns as usize,
-                    usage.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0) as usize,
+                    usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as usize,
                 );
                 let l1_sid = session_id.clone();
                 let l1_client = memoria_client_shared.clone();

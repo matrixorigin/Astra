@@ -259,13 +259,12 @@ pub enum StreamEvent {
         error: Option<String>,
     },
     Usage {
-        prompt_tokens: Option<u64>,
-        completion_tokens: Option<u64>,
-        tool_call_count: Option<u64>,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        cached_input_tokens: Option<u64>,
         cache_creation_tokens: Option<u64>,
-        cache_read_tokens: Option<u64>,
-        cache_creation_input_tokens: Option<u64>,
-        cache_read_input_tokens: Option<u64>,
+        total_tokens: Option<u64>,
+        tool_call_count: Option<u64>,
         raw: Value,
     },
     TurnComplete {
@@ -428,15 +427,12 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
             error: optional_str(&obj, "error"),
         },
         "usage" => StreamEvent::Usage {
-            prompt_tokens: obj.get("prompt_tokens").and_then(|v| v.as_u64()),
-            completion_tokens: obj.get("completion_tokens").and_then(|v| v.as_u64()),
-            tool_call_count: obj.get("tool_call_count").and_then(|v| v.as_u64()),
+            input_tokens: obj.get("input_tokens").and_then(|v| v.as_u64()),
+            output_tokens: obj.get("output_tokens").and_then(|v| v.as_u64()),
+            cached_input_tokens: obj.get("cached_input_tokens").and_then(|v| v.as_u64()),
             cache_creation_tokens: obj.get("cache_creation_tokens").and_then(|v| v.as_u64()),
-            cache_read_tokens: obj.get("cache_read_tokens").and_then(|v| v.as_u64()),
-            cache_creation_input_tokens: obj
-                .get("cache_creation_input_tokens")
-                .and_then(|v| v.as_u64()),
-            cache_read_input_tokens: obj.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
+            total_tokens: obj.get("total_tokens").and_then(|v| v.as_u64()),
+            tool_call_count: obj.get("tool_call_count").and_then(|v| v.as_u64()),
             raw,
         },
         "turn_complete" => StreamEvent::TurnComplete {
@@ -837,27 +833,29 @@ mod tests {
     fn classify_usage() {
         let value = serde_json::json!({
             "type": "usage",
-            "prompt_tokens": 10,
-            "completion_tokens": 4,
-            "tool_call_count": 2,
+            "input_tokens": 10,
+            "output_tokens": 4,
+            "cached_input_tokens": 1,
             "cache_creation_tokens": 3,
-            "cache_read_tokens": 1
+            "total_tokens": 18,
+            "tool_call_count": 2,
         });
         match classify_stream_event(value).unwrap() {
             StreamEvent::Usage {
-                prompt_tokens,
-                completion_tokens,
-                tool_call_count,
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
                 cache_creation_tokens,
-                cache_read_tokens,
+                total_tokens,
+                tool_call_count,
                 raw,
-                ..
             } => {
-                assert_eq!(prompt_tokens, Some(10));
-                assert_eq!(completion_tokens, Some(4));
-                assert_eq!(tool_call_count, Some(2));
+                assert_eq!(input_tokens, Some(10));
+                assert_eq!(output_tokens, Some(4));
+                assert_eq!(cached_input_tokens, Some(1));
                 assert_eq!(cache_creation_tokens, Some(3));
-                assert_eq!(cache_read_tokens, Some(1));
+                assert_eq!(total_tokens, Some(18));
+                assert_eq!(tool_call_count, Some(2));
                 assert_eq!(raw["type"], "usage");
             }
             other => panic!("unexpected {other:?}"),

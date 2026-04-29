@@ -1778,7 +1778,7 @@ mod tests {
                 "text_delta",
                 &format!(",\"content\":{}", serde_json::json!(xml_text))
             ),
-            sse_event("usage", ",\"prompt_tokens\":100,\"completion_tokens\":50"),
+            sse_event("usage", ",\"input_tokens\":100,\"output_tokens\":50"),
         );
         let chunks = chunks_from_sse(&events);
         let mut stream = stream::iter(chunks);

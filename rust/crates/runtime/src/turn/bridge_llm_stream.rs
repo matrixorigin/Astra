@@ -1463,12 +1463,21 @@ mod tests {
             .await
             .expect("bind bedrock split listener");
         let addr = listener.local_addr().expect("local_addr");
+        // Signal the caller as soon as we have a bound address — no sleep needed.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<String>();
         tokio::spawn(async move {
+            // Notify the test that the server is ready before entering the accept loop.
+            let _ = ready_tx.send(format!("http://{addr}"));
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
                 tokio::spawn(async move {
+                    // TCP_NODELAY disables Nagle's algorithm so that each flush()
+                    // produces an independent TCP segment. This guarantees the two
+                    // chunked-transfer chunks reach the client in separate reads
+                    // without relying on any timing / sleep.
+                    let _ = socket.set_nodelay(true);
                     let mut buf = vec![0_u8; 8192];
                     let _ = socket.read(&mut buf).await.unwrap_or(0);
                     let start = build_bedrock_frame("messageStart", br#"{"role":"assistant"}"#);
@@ -1476,8 +1485,7 @@ mod tests {
                         "contentBlockDelta",
                         br#"{"contentBlockIndex":0,"delta":{"text":"hi"}}"#,
                     );
-                    let stop =
-                        build_bedrock_frame("messageStop", br#"{"stopReason":"end_turn"}"#);
+                    let stop = build_bedrock_frame("messageStop", br#"{"stopReason":"end_turn"}"#);
                     let meta = build_bedrock_frame(
                         "metadata",
                         br#"{"usage":{"inputTokens":42,"outputTokens":7,"totalTokens":49}}"#,
@@ -1500,11 +1508,9 @@ mod tests {
                         .await;
                     let _ = socket.write_all(&part1).await;
                     let _ = socket.write_all(b"\r\n").await;
-                    // Force a flush boundary so the client observes the
-                    // close of the first chunk and tries to exit before
-                    // seeing the metadata chunk.
+                    // flush() with TCP_NODELAY forces chunk1 out as a separate
+                    // TCP segment before chunk2 is written — no sleep required.
                     let _ = socket.flush().await;
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     let _ = socket
                         .write_all(format!("{:x}\r\n", meta.len()).as_bytes())
                         .await;
@@ -1515,8 +1521,9 @@ mod tests {
                 });
             }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-        format!("http://{addr}")
+        // Block until the server has bound and is ready to accept — deterministic,
+        // no arbitrary sleep.
+        ready_rx.await.expect("bedrock split meta server ready")
     }
 
     #[tokio::test]

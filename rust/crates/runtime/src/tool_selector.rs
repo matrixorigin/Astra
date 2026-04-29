@@ -941,36 +941,33 @@ impl LlmToolSelector {
                     {
                         text.push_str(delta);
                     }
-                    // Usage in final chunk
+                    // Raw upstream OpenAI shape (non-bridge path): usage is
+                    // nested with OpenAI-native keys.
                     if let Some(usage) = chunk.get("usage") {
                         tin = usage
                             .get("prompt_tokens")
                             .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
+                            .unwrap_or(tin);
                         tout = usage
                             .get("completion_tokens")
                             .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
+                            .unwrap_or(tout);
                     }
-                    // InProcess bridge format
+                    // InProcess bridge format — events use canonical keys
+                    // (see `turn::token_usage::TokenUsage`).
                     if let Some(t) = chunk.get("type").and_then(Value::as_str) {
                         if t == "text_delta"
                             && let Some(d) = chunk.get("content").and_then(Value::as_str)
                         {
                             text.push_str(d);
                         }
-                        if t == "_inprocess_summary"
-                            && let Some(ft) = chunk.get("full_text").and_then(Value::as_str)
-                        {
-                            tin = chunk
-                                .get("prompt_tokens")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
-                            tout = chunk
-                                .get("completion_tokens")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
-                            return Ok((ft.to_string(), tin, tout));
+                        if t == "usage" {
+                            if let Some(v) = chunk.get("input_tokens").and_then(|v| v.as_u64()) {
+                                tin = v;
+                            }
+                            if let Some(v) = chunk.get("output_tokens").and_then(|v| v.as_u64()) {
+                                tout = v;
+                            }
                         }
                     }
                 }
