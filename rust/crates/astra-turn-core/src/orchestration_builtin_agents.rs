@@ -57,8 +57,7 @@ pub struct AgentTypeDefinition {
     pub read_only: bool,
 }
 
-impl AgentTypeDefinition {
-}
+impl AgentTypeDefinition {}
 
 /// Get all built-in agent type definitions.
 pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {

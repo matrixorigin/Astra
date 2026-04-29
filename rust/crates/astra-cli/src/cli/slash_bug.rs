@@ -209,4 +209,3 @@ fn build_bug_report(state: &ReplState) -> String {
 
     lines.join("\n")
 }
-

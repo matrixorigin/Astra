@@ -673,5 +673,4 @@ mod tests {
             "Drop must drain in-flight speculative tasks"
         );
     }
-
 }

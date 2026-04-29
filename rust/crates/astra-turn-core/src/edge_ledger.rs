@@ -1104,5 +1104,4 @@ mod tests {
         assert_eq!(removed, 0, "fresh entry should not be evicted");
         assert_eq!(ledger.lock().await.len(), 1);
     }
-
 }

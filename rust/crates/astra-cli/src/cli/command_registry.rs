@@ -838,7 +838,6 @@ pub fn commands_by_group(group: CommandGroup) -> impl Iterator<Item = &'static C
     COMMANDS.iter().filter(move |m| m.group == group)
 }
 
-
 /// Fuzzy completion candidates: returns matches scored by quality (best first).
 /// Falls back gracefully — prefix > contains > subsequence.
 pub fn fuzzy_completion_candidates(
@@ -1024,7 +1023,6 @@ mod tests {
         command_usage::clear_test_dir();
         command_usage::reset_for_tests();
     }
-
 
     #[test]
     fn get_arg_hint_from_registry() {

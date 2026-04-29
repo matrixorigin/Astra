@@ -6009,7 +6009,6 @@ pub(super) async fn consume_turn_sse(
     result
 }
 
-
 /// Used by `main` test module and stream_render unit tests; production path is [`consume_turn_sse`].
 #[allow(dead_code)]
 pub(super) fn dispatch_turn_event_block(
@@ -6263,7 +6262,6 @@ mod tests {
     }
 
     // ── Regression: intermediate draft text must not leak ─────────────
-
 
     #[test]
     fn final_text_cleanup_strips_reflect_tags() {

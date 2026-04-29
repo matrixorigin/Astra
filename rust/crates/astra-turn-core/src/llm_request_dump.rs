@@ -6,10 +6,8 @@
 //! 2. **Cloud event**: `event_type = "llm_request_dump"` in `agent_events`
 //!    — queryable via `/events/session/{session_id}` for support staff.
 
-
 use astra_services::{SessionArtifactJsonRecord, SessionArtifactJsonStore, SessionArtifactStore};
 use serde_json::{Value, json};
-
 
 const ERROR_PREVIEW_MAX_CHARS: usize = 200;
 

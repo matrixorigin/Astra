@@ -274,7 +274,6 @@ pub fn internal_error(error: impl ToString) -> (StatusCode, Json<ErrorResponse>)
     error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
 
-
 /// MySQL/MatrixOne duplicate-key errors may surface as vendor code 1062,
 /// SQLSTATE 23000, or wrapped message-only errors.
 pub fn is_duplicate_key_error(err: &sqlx::Error) -> bool {

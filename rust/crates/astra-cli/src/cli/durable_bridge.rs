@@ -8,9 +8,9 @@ use crate::cli_utils::{prefix_chars, truncate_str};
 
 use astra_services::task_orchestrator::TaskOutcome;
 use astra_services::{
-    ContractAmendment, ContractGenerator, DurableTaskLifecycle,
-    LocalDurableTaskLifecycle, MatrixOneDurableTaskLifecycle, SubtaskStage,
-    SubtaskVerificationReport, TaskContract, TaskDeliveryReport, VerifierKind,
+    ContractAmendment, ContractGenerator, DurableTaskLifecycle, LocalDurableTaskLifecycle,
+    MatrixOneDurableTaskLifecycle, SubtaskStage, SubtaskVerificationReport, TaskContract,
+    TaskDeliveryReport, VerifierKind,
 };
 use crossterm::style::Stylize;
 use std::sync::Arc;
@@ -2064,5 +2064,4 @@ mod tests {
             "error should mention proxy: {err}"
         );
     }
-
 }

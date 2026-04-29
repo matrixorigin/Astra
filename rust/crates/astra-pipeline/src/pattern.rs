@@ -845,8 +845,6 @@ impl PatternLibrary {
     }
 
     // ─── Active Exploration ──────────────────────────────────────────────────
-
-
 }
 // ─── Drift & Exploration Types ───────────────────────────────────────────────
 
@@ -2147,7 +2145,6 @@ mod tests {
     }
 
     // ── Active Exploration Tests ──
-
 
     #[test]
     fn recent_outcomes_window_caps_at_drift_window() {

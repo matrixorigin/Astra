@@ -717,7 +717,6 @@ pub fn export_dirty_learning_from_modules(
     }
 }
 
-
 /// Clear dirty flags from learning modules after successful sync.
 pub fn clear_dirty_learning_in_modules(
     entity_graph: &Arc<Mutex<EntityGraph>>,

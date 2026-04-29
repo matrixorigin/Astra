@@ -117,7 +117,6 @@ pub fn add_stream_event_metadata(
     }
 }
 
-
 pub fn find_sse_frame_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(2).position(|window| window == b"\n\n")
 }
@@ -462,5 +461,4 @@ mod tests {
         assert!(!parsed.contains_key("session_id"));
         assert!(!parsed.contains_key("protocol_version"));
     }
-
 }

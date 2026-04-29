@@ -1394,8 +1394,7 @@ pub enum SessionEndState {
     Zombie,
 }
 
-impl SessionEndState {
-}
+impl SessionEndState {}
 
 #[derive(Debug, Deserialize)]
 struct JournalTailEntry {

@@ -179,7 +179,6 @@ impl From<&SkillInstruction> for SkillMetadata {
     }
 }
 
-
 /// Parse SKILL.md content into a SkillInstruction.
 ///
 /// Extracts YAML frontmatter (between `---` markers) and Markdown body.
@@ -210,4 +209,3 @@ pub fn parse_skill_md(content: &str) -> Result<SkillInstruction, String> {
 
     Ok(instruction)
 }
-

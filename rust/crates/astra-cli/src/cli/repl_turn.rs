@@ -3183,7 +3183,6 @@ pub(super) fn create_manual_repl_checkpoint(
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

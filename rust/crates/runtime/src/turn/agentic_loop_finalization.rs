@@ -261,7 +261,6 @@ fn persist_remote_composite_snapshot_index_blocking(
     }
 }
 
-
 /// Best-effort heavy checkpoint write.
 ///
 /// Several early-exit paths in the agentic loop (text-only responses, stop-hook
@@ -349,7 +348,6 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     state.last_composite_snapshot = Some(snapshot);
     state.stall.last_heavy_checkpoint = Some(cp);
 }
-
 
 /// Run the multi-turn agentic loop using the provided host.
 ///

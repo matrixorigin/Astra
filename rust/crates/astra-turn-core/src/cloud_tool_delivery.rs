@@ -262,7 +262,6 @@ fn approval_kind_str(approval_kind: ApprovalKind) -> &'static str {
     }
 }
 
-
 fn append_approval_timeout_journal_event(
     session_id: &str,
     turn: u32,

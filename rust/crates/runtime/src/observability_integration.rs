@@ -1303,7 +1303,6 @@ pub fn on_turn_end(hub: &ObservabilityHub, session: &mut ObservabilitySession, t
     }
 }
 
-
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

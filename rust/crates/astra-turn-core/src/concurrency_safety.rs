@@ -350,5 +350,4 @@ mod tests {
         assert_eq!(global_classify(name), ConcurrencySafety::ReadOnly);
         assert!(super::super::parallel_tool_exec::is_read_only_tool(name));
     }
-
 }

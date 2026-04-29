@@ -780,9 +780,7 @@ impl ExecutionCursor {
             .filter(|s| s.state == SlotState::Failed)
             .count()
     }
-
 }
-
 
 // ─── Checkpoint (Tiered: Light / Heavy) ──────────────────────────────────────
 
@@ -1969,7 +1967,6 @@ mod tests {
         cursor.advance_slot(1, SlotState::Failed);
         assert!(cursor.all_slots_done());
     }
-
 
     // ── Wait Trigger ──
 

@@ -14,10 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::github::GitHubClient;
 use crate::task_mgmt::TaskManager;
-use crate::{
-    ToolApprovalGate, ToolContext, ToolExecutor,
-    ToolProgressCallback, ToolResult,
-};
+use crate::{ToolApprovalGate, ToolContext, ToolExecutor, ToolProgressCallback, ToolResult};
 
 // ─── Helper ─────────────────────────────────────────────────────────────────
 

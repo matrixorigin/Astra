@@ -198,7 +198,6 @@ pub struct SubtaskMetrics {
     pub retries: u32,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

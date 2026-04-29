@@ -1382,8 +1382,6 @@ impl McpClientManager {
     }
 }
 
-
-
 /// Connect to an MCP server with exponential backoff retry.
 async fn connect_to_server(
     config: McpServerConfig,
