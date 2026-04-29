@@ -376,6 +376,8 @@ pub enum CslStoreError {
     Serde(#[from] serde_json::Error),
     #[error("materialize error: {0}")]
     Materialize(#[from] MaterializeError),
+    #[error("invalid session_id: {0}")]
+    InvalidSessionId(String),
     #[error("{0}")]
     Other(String),
 }

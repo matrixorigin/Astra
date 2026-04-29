@@ -14,10 +14,9 @@ fn validate_session_id(session_id: &str) -> Result<(), CslStoreError> {
         || session_id.contains('/')
         || session_id.contains('\\')
         || session_id.contains("..")
+        || session_id.bytes().any(|b| b < 0x20)
     {
-        return Err(CslStoreError::Other(
-            "invalid session_id: must not contain path separators or '..'".to_string(),
-        ));
+        return Err(CslStoreError::InvalidSessionId(session_id.to_string()));
     }
     Ok(())
 }
@@ -1281,13 +1280,26 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp);
 
-        for bad_id in ["../etc/passwd", "foo/bar", "a\\b", "..", ""] {
+        for bad_id in [
+            "../etc/passwd",
+            "foo/bar",
+            "a\\b",
+            "..",
+            "",
+            "has\0nul",
+            "has\nnewline",
+            "has\ttab",
+        ] {
             let result = CslManager::new(
                 Arc::clone(&store),
                 bad_id.to_string(),
                 CslManagerConfig::default(),
             );
-            assert!(result.is_err(), "session_id '{bad_id}' should be rejected");
+            match result {
+                Err(CslStoreError::InvalidSessionId(_)) => {}
+                Err(other) => panic!("'{bad_id}': expected InvalidSessionId, got {other}"),
+                Ok(_) => panic!("session_id '{bad_id}' should be rejected"),
+            }
         }
     }
 

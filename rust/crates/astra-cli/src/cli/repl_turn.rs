@@ -1525,12 +1525,17 @@ fn apply_turn_success_sync(
                     astra_services::session_journal::local_sessions_dir(),
                 ),
             );
-            state.csl_manager = astra_turn_core::conversation_log::manager::CslManager::new(
+            state.csl_manager = match astra_turn_core::conversation_log::manager::CslManager::new(
                 store,
                 session_id.to_string(),
                 Default::default(),
-            )
-            .ok();
+            ) {
+                Ok(mgr) => Some(mgr),
+                Err(e) => {
+                    astra_core::agent_warn!("csl", "manager init failed: {e}");
+                    None
+                }
+            };
         }
 
         // Initialize observability session if hub is available and session not yet created
@@ -1990,13 +1995,18 @@ fn extract_csl_fields_from_result(result: &StreamResult) -> CslCheckpointFields 
             compaction_tracker: Some(heavy.compaction_state.clone()),
         }
     } else {
+        // No HeavyCheckpoint: all fields fall back to prev_state.
+        // interruption from StreamResult is NOT authoritative here —
+        // it's only populated by the agentic loop which also writes
+        // a HeavyCheckpoint, so if there's no checkpoint, interruption
+        // should be preserved from the previous CSL state too.
         CslCheckpointFields {
             blocked_tools: None,
             approval_overrides: None,
             budget_remaining_tokens: None,
             budget_remaining_rounds: None,
             consecutive_ctx_errors: None,
-            interruption: Some(result.interruption.clone()),
+            interruption: None,
             delegation: None,
             compaction_tracker: None,
         }
@@ -5939,7 +5949,7 @@ mod tests {
             budget_remaining_tokens: Some(0),
             budget_remaining_rounds: Some(0),
             consecutive_ctx_errors: Some(0),
-            interruption: None,
+            interruption: Some(None),
             delegation: Some(None),
             compaction_tracker: Some(None),
         };
@@ -5953,11 +5963,42 @@ mod tests {
             result.approval_overrides.is_none(),
             "should be explicitly cleared"
         );
+        assert!(
+            result.interruption.is_none(),
+            "should be explicitly cleared"
+        );
         assert!(result.delegation.is_none(), "should be explicitly cleared");
         assert!(
             result.compaction_tracker.is_none(),
             "should be explicitly cleared"
         );
         assert_eq!(result.budget_remaining_tokens, 0);
+    }
+
+    #[test]
+    fn no_checkpoint_preserves_interruption_from_prev_state() {
+        let state = &ReplState::default();
+        let prev = astra_turn_core::conversation_log::SessionStateCompact {
+            interruption: Some(serde_json::json!({"kind": "budget_exhausted"})),
+            ..Default::default()
+        };
+
+        let cp = CslCheckpointFields {
+            blocked_tools: None,
+            approval_overrides: None,
+            budget_remaining_tokens: None,
+            budget_remaining_rounds: None,
+            consecutive_ctx_errors: None,
+            interruption: None,
+            delegation: None,
+            compaction_tracker: None,
+        };
+
+        let result = build_full_session_state_compact(state, cp, &prev);
+        assert_eq!(
+            result.interruption,
+            Some(serde_json::json!({"kind": "budget_exhausted"})),
+            "no-checkpoint path must preserve interruption from prev_state"
+        );
     }
 }

@@ -30,10 +30,9 @@ impl FileCslStore {
             || session_id.contains('/')
             || session_id.contains('\\')
             || session_id.contains("..")
+            || session_id.bytes().any(|b| b < 0x20)
         {
-            return Err(CslStoreError::Other(
-                "invalid session_id: must not contain path separators or '..'".to_string(),
-            ));
+            return Err(CslStoreError::InvalidSessionId(session_id.to_string()));
         }
         Ok(())
     }
