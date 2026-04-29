@@ -353,7 +353,11 @@ pub trait CslStore: Send + Sync {
 
     /// Return seq numbers of all Snapshot entries, in ascending order.
     /// Used by GC to find which snapshots to retain without deserializing payloads.
-    /// Default: falls back to `load_after(0)` + filter (deserializes everything).
+    ///
+    /// The default implementation falls back to `load_after(0)` + filter, which
+    /// deserializes every entry. Store backends with indexed metadata (e.g.
+    /// [`DbCslStore`](db_store::DbCslStore) with `entry_type` column) should
+    /// override this to avoid the deserialization cost.
     async fn snapshot_seqs(&self, session_id: &str) -> Result<Vec<u64>, CslStoreError> {
         let entries = self.load_after(session_id, 0).await?;
         Ok(entries

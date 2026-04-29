@@ -1525,11 +1525,12 @@ fn apply_turn_success_sync(
                     astra_services::session_journal::local_sessions_dir(),
                 ),
             );
-            state.csl_manager = Some(astra_turn_core::conversation_log::manager::CslManager::new(
+            state.csl_manager = astra_turn_core::conversation_log::manager::CslManager::new(
                 store,
                 session_id.to_string(),
                 Default::default(),
-            ));
+            )
+            .ok();
         }
 
         // Initialize observability session if hub is available and session not yet created
@@ -1949,16 +1950,19 @@ pub(crate) async fn try_llm_skill_improvement(
     Ok(true)
 }
 
+/// Fields extracted from HeavyCheckpoint for CSL persistence.
+/// `None` on any field means "no data available, preserve previous CSL value".
+/// For nullable fields (approval_overrides, delegation, compaction_tracker,
+/// interruption): `Some(None)` = explicitly cleared, `Some(Some(v))` = new value.
 struct CslCheckpointFields {
-    blocked_tools: Vec<String>,
-    approval_overrides: Option<serde_json::Value>,
-    /// `None` when no HeavyCheckpoint exists — preserves previous CSL value.
+    blocked_tools: Option<Vec<String>>,
+    approval_overrides: Option<Option<serde_json::Value>>,
     budget_remaining_tokens: Option<u64>,
     budget_remaining_rounds: Option<u32>,
     consecutive_ctx_errors: Option<u32>,
-    interruption: Option<serde_json::Value>,
-    delegation: Option<astra_turn_core::conversation_log::DelegationCompact>,
-    compaction_tracker: Option<serde_json::Value>,
+    interruption: Option<Option<serde_json::Value>>,
+    delegation: Option<Option<astra_turn_core::conversation_log::DelegationCompact>>,
+    compaction_tracker: Option<Option<serde_json::Value>>,
 }
 
 fn extract_csl_fields_from_result(result: &StreamResult) -> CslCheckpointFields {
@@ -1976,29 +1980,32 @@ fn extract_csl_fields_from_result(result: &StreamResult) -> CslCheckpointFields 
             _ => None,
         };
         CslCheckpointFields {
-            blocked_tools: heavy.blocked_tools.clone(),
-            approval_overrides: heavy.approval_overrides.clone(),
+            blocked_tools: Some(heavy.blocked_tools.clone()),
+            approval_overrides: Some(heavy.approval_overrides.clone()),
             budget_remaining_tokens: Some(heavy.budget_remaining_tokens),
             budget_remaining_rounds: Some(heavy.budget_remaining_rounds),
             consecutive_ctx_errors: Some(heavy.consecutive_context_window_errors),
-            interruption: heavy.interruption.clone(),
-            delegation,
-            compaction_tracker: heavy.compaction_state.clone(),
+            interruption: Some(heavy.interruption.clone()),
+            delegation: Some(delegation),
+            compaction_tracker: Some(heavy.compaction_state.clone()),
         }
     } else {
         CslCheckpointFields {
-            blocked_tools: Vec::new(),
+            blocked_tools: None,
             approval_overrides: None,
             budget_remaining_tokens: None,
             budget_remaining_rounds: None,
             consecutive_ctx_errors: None,
-            interruption: result.interruption.clone(),
+            interruption: Some(result.interruption.clone()),
             delegation: None,
             compaction_tracker: None,
         }
     }
 }
 
+/// Build a full `SessionStateCompact` from REPL state, checkpoint fields, and
+/// the previous CSL state. Fields from `cp` that are `None` fall back to
+/// `prev_state`, so the no-checkpoint path preserves previously persisted values.
 fn build_full_session_state_compact(
     state: &ReplState,
     cp: CslCheckpointFields,
@@ -2007,8 +2014,12 @@ fn build_full_session_state_compact(
     astra_turn_core::conversation_log::SessionStateCompact {
         recent_tools: state.recent_tools.clone(),
         continuity: state.runtime_continuity.clone(),
-        blocked_tools: cp.blocked_tools,
-        approval_overrides: cp.approval_overrides,
+        blocked_tools: cp
+            .blocked_tools
+            .unwrap_or_else(|| prev_state.blocked_tools.clone()),
+        approval_overrides: cp
+            .approval_overrides
+            .unwrap_or_else(|| prev_state.approval_overrides.clone()),
         budget_remaining_tokens: cp
             .budget_remaining_tokens
             .unwrap_or(prev_state.budget_remaining_tokens),
@@ -2018,9 +2029,15 @@ fn build_full_session_state_compact(
         consecutive_ctx_errors: cp
             .consecutive_ctx_errors
             .unwrap_or(prev_state.consecutive_ctx_errors),
-        interruption: cp.interruption,
-        delegation: cp.delegation,
-        compaction_tracker: cp.compaction_tracker,
+        interruption: cp
+            .interruption
+            .unwrap_or_else(|| prev_state.interruption.clone()),
+        delegation: cp
+            .delegation
+            .unwrap_or_else(|| prev_state.delegation.clone()),
+        compaction_tracker: cp
+            .compaction_tracker
+            .unwrap_or_else(|| prev_state.compaction_tracker.clone()),
     }
 }
 
@@ -5510,7 +5527,8 @@ mod tests {
         let store = std::sync::Arc::new(FileCslStore::new(
             astra_services::session_journal::local_sessions_dir(),
         ));
-        let mut mgr = CslManager::new(store.clone(), session_id.clone(), Default::default());
+        let mut mgr =
+            CslManager::new(store.clone(), session_id.clone(), Default::default()).unwrap();
 
         let full_messages = vec![
             serde_json::json!({"role": "user", "content": "hello"}),
@@ -5551,7 +5569,8 @@ mod tests {
         let store = std::sync::Arc::new(FileCslStore::new(
             astra_services::session_journal::local_sessions_dir(),
         ));
-        let mut mgr = CslManager::new(store.clone(), session_id.clone(), Default::default());
+        let mut mgr =
+            CslManager::new(store.clone(), session_id.clone(), Default::default()).unwrap();
 
         let t1_msgs = vec![
             serde_json::json!({"role": "user", "content": "q1"}),
@@ -5606,7 +5625,8 @@ mod tests {
         let store = std::sync::Arc::new(FileCslStore::new(
             astra_services::session_journal::local_sessions_dir(),
         ));
-        let mut mgr = CslManager::new(store.clone(), session_id.clone(), Default::default());
+        let mut mgr =
+            CslManager::new(store.clone(), session_id.clone(), Default::default()).unwrap();
 
         for t in 1..=5u32 {
             let full: Vec<serde_json::Value> = (1..=t)
@@ -5649,7 +5669,8 @@ mod tests {
         let store = std::sync::Arc::new(FileCslStore::new(
             astra_services::session_journal::local_sessions_dir(),
         ));
-        let mut mgr = CslManager::new(store.clone(), session_id.clone(), Default::default());
+        let mut mgr =
+            CslManager::new(store.clone(), session_id.clone(), Default::default()).unwrap();
 
         for t in 1..=3u32 {
             let mut session_state = SessionStateCompact::default();
@@ -5669,7 +5690,7 @@ mod tests {
         let saved_seq = mgr.last_seq();
 
         // Resume from CSL in fresh manager
-        let mut mgr2 = CslManager::new(store, session_id.clone(), Default::default());
+        let mut mgr2 = CslManager::new(store, session_id.clone(), Default::default()).unwrap();
         let mat = mgr2.load().await.unwrap().expect("should have entries");
 
         assert_eq!(mat.messages.len(), 6, "3 turns × 2 messages");
@@ -5696,7 +5717,8 @@ mod tests {
         let store = std::sync::Arc::new(FileCslStore::new(
             astra_services::session_journal::local_sessions_dir(),
         ));
-        let mut mgr = CslManager::new(store.clone(), session_id.clone(), Default::default());
+        let mut mgr =
+            CslManager::new(store.clone(), session_id.clone(), Default::default()).unwrap();
 
         for t in 1..=2u32 {
             let full: Vec<serde_json::Value> = (1..=t)
@@ -5721,5 +5743,221 @@ mod tests {
         let mat = materialize(&entries).unwrap();
         assert_eq!(mat.messages.len(), 1, "fresh snapshot should have 1 msg");
         assert_eq!(mat.messages[0]["content"], "after-undo");
+    }
+
+    // ── No-checkpoint path: must preserve prev_state fields ─────────
+
+    #[test]
+    fn no_checkpoint_preserves_blocked_tools_from_prev_state() {
+        let state = &ReplState {
+            recent_tools: vec!["read_file".into()],
+            ..Default::default()
+        };
+        let prev = astra_turn_core::conversation_log::SessionStateCompact {
+            blocked_tools: vec!["bash".into(), "write".into()],
+            ..Default::default()
+        };
+
+        // Simulate no-checkpoint path: all Option fields are None,
+        // blocked_tools would currently be Vec::new() — the bug.
+        let cp = CslCheckpointFields {
+            blocked_tools: None,
+            approval_overrides: None,
+            budget_remaining_tokens: None,
+            budget_remaining_rounds: None,
+            consecutive_ctx_errors: None,
+            interruption: None,
+            delegation: None,
+            compaction_tracker: None,
+        };
+
+        let result = build_full_session_state_compact(state, cp, &prev);
+        assert_eq!(
+            result.blocked_tools,
+            vec!["bash", "write"],
+            "no-checkpoint path must preserve blocked_tools from prev_state"
+        );
+    }
+
+    #[test]
+    fn no_checkpoint_preserves_approval_overrides_from_prev_state() {
+        let state = &ReplState::default();
+        let prev = astra_turn_core::conversation_log::SessionStateCompact {
+            approval_overrides: Some(serde_json::json!({"tool": "bash", "approved": true})),
+            ..Default::default()
+        };
+
+        let cp = CslCheckpointFields {
+            blocked_tools: None,
+            approval_overrides: None,
+            budget_remaining_tokens: None,
+            budget_remaining_rounds: None,
+            consecutive_ctx_errors: None,
+            interruption: None,
+            delegation: None,
+            compaction_tracker: None,
+        };
+
+        let result = build_full_session_state_compact(state, cp, &prev);
+        assert_eq!(
+            result.approval_overrides,
+            Some(serde_json::json!({"tool": "bash", "approved": true})),
+            "no-checkpoint path must preserve approval_overrides from prev_state"
+        );
+    }
+
+    #[test]
+    fn no_checkpoint_preserves_delegation_from_prev_state() {
+        let state = &ReplState::default();
+        let delegation = astra_turn_core::conversation_log::DelegationCompact {
+            id: "d1".into(),
+            pattern: "review".into(),
+            completed_sub_runs: vec![],
+        };
+        let prev = astra_turn_core::conversation_log::SessionStateCompact {
+            delegation: Some(delegation.clone()),
+            ..Default::default()
+        };
+
+        let cp = CslCheckpointFields {
+            blocked_tools: None,
+            approval_overrides: None,
+            budget_remaining_tokens: None,
+            budget_remaining_rounds: None,
+            consecutive_ctx_errors: None,
+            interruption: None,
+            delegation: None,
+            compaction_tracker: None,
+        };
+
+        let result = build_full_session_state_compact(state, cp, &prev);
+        assert_eq!(
+            result.delegation,
+            Some(delegation),
+            "no-checkpoint path must preserve delegation from prev_state"
+        );
+    }
+
+    #[test]
+    fn no_checkpoint_preserves_compaction_tracker_from_prev_state() {
+        let state = &ReplState::default();
+        let prev = astra_turn_core::conversation_log::SessionStateCompact {
+            compaction_tracker: Some(serde_json::json!({"version": 3})),
+            ..Default::default()
+        };
+
+        let cp = CslCheckpointFields {
+            blocked_tools: None,
+            approval_overrides: None,
+            budget_remaining_tokens: None,
+            budget_remaining_rounds: None,
+            consecutive_ctx_errors: None,
+            interruption: None,
+            delegation: None,
+            compaction_tracker: None,
+        };
+
+        let result = build_full_session_state_compact(state, cp, &prev);
+        assert_eq!(
+            result.compaction_tracker,
+            Some(serde_json::json!({"version": 3})),
+            "no-checkpoint path must preserve compaction_tracker from prev_state"
+        );
+    }
+
+    #[test]
+    fn checkpoint_path_overrides_prev_state() {
+        let state = &ReplState {
+            recent_tools: vec!["exec".into()],
+            ..Default::default()
+        };
+        let prev = astra_turn_core::conversation_log::SessionStateCompact {
+            blocked_tools: vec!["old_bash".into()],
+            approval_overrides: Some(serde_json::json!({"old": true})),
+            delegation: Some(astra_turn_core::conversation_log::DelegationCompact {
+                id: "old_d".into(),
+                pattern: "old_p".into(),
+                completed_sub_runs: vec![],
+            }),
+            compaction_tracker: Some(serde_json::json!({"old": 1})),
+            budget_remaining_tokens: 99_999,
+            budget_remaining_rounds: 99,
+            consecutive_ctx_errors: 99,
+            ..Default::default()
+        };
+
+        let cp = CslCheckpointFields {
+            blocked_tools: Some(vec!["new_bash".into()]),
+            approval_overrides: Some(Some(serde_json::json!({"new": true}))),
+            budget_remaining_tokens: Some(50_000),
+            budget_remaining_rounds: Some(5),
+            consecutive_ctx_errors: Some(1),
+            interruption: None,
+            delegation: Some(Some(astra_turn_core::conversation_log::DelegationCompact {
+                id: "new_d".into(),
+                pattern: "new_p".into(),
+                completed_sub_runs: vec![],
+            })),
+            compaction_tracker: Some(Some(serde_json::json!({"new": 2}))),
+        };
+
+        let result = build_full_session_state_compact(state, cp, &prev);
+        assert_eq!(result.blocked_tools, vec!["new_bash"]);
+        assert_eq!(
+            result.approval_overrides,
+            Some(serde_json::json!({"new": true}))
+        );
+        assert_eq!(result.budget_remaining_tokens, 50_000);
+        assert_eq!(result.budget_remaining_rounds, 5);
+        assert_eq!(result.consecutive_ctx_errors, 1);
+        assert_eq!(result.delegation.unwrap().id, "new_d");
+        assert_eq!(
+            result.compaction_tracker,
+            Some(serde_json::json!({"new": 2}))
+        );
+    }
+
+    #[test]
+    fn checkpoint_explicitly_clears_fields() {
+        let state = &ReplState::default();
+        let prev = astra_turn_core::conversation_log::SessionStateCompact {
+            blocked_tools: vec!["bash".into()],
+            approval_overrides: Some(serde_json::json!({"tool": "bash"})),
+            delegation: Some(astra_turn_core::conversation_log::DelegationCompact {
+                id: "d1".into(),
+                pattern: "p1".into(),
+                completed_sub_runs: vec![],
+            }),
+            compaction_tracker: Some(serde_json::json!({"v": 1})),
+            ..Default::default()
+        };
+
+        // Checkpoint says "explicitly empty/cleared"
+        let cp = CslCheckpointFields {
+            blocked_tools: Some(vec![]),
+            approval_overrides: Some(None),
+            budget_remaining_tokens: Some(0),
+            budget_remaining_rounds: Some(0),
+            consecutive_ctx_errors: Some(0),
+            interruption: None,
+            delegation: Some(None),
+            compaction_tracker: Some(None),
+        };
+
+        let result = build_full_session_state_compact(state, cp, &prev);
+        assert!(
+            result.blocked_tools.is_empty(),
+            "should be explicitly cleared"
+        );
+        assert!(
+            result.approval_overrides.is_none(),
+            "should be explicitly cleared"
+        );
+        assert!(result.delegation.is_none(), "should be explicitly cleared");
+        assert!(
+            result.compaction_tracker.is_none(),
+            "should be explicitly cleared"
+        );
+        assert_eq!(result.budget_remaining_tokens, 0);
     }
 }

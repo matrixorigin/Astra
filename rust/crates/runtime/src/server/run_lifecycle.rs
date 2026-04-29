@@ -1522,11 +1522,17 @@ impl AgenticRunLifecycleService {
         loop_state: &mut AgenticLoopState,
     ) -> Option<astra_turn_core::conversation_log::manager::CslManager> {
         let store = self.build_csl_store()?;
-        let mut mgr = astra_turn_core::conversation_log::manager::CslManager::new(
+        let mut mgr = match astra_turn_core::conversation_log::manager::CslManager::new(
             store,
             session_id.to_string(),
             Default::default(),
-        );
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "CSL manager creation failed");
+                return None;
+            }
+        };
         mgr.set_trace_id(run_id.to_string());
 
         match mgr.load().await {

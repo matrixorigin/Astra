@@ -9,6 +9,19 @@ use super::{
     SessionStatePatch, materialize,
 };
 
+fn validate_session_id(session_id: &str) -> Result<(), CslStoreError> {
+    if session_id.is_empty()
+        || session_id.contains('/')
+        || session_id.contains('\\')
+        || session_id.contains("..")
+    {
+        return Err(CslStoreError::Other(
+            "invalid session_id: must not contain path separators or '..'".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct CslManagerConfig {
     pub snapshot_interval: u32,
@@ -36,8 +49,13 @@ pub struct CslManager {
 }
 
 impl CslManager {
-    pub fn new(store: Arc<dyn CslStore>, session_id: String, config: CslManagerConfig) -> Self {
-        Self {
+    pub fn new(
+        store: Arc<dyn CslStore>,
+        session_id: String,
+        config: CslManagerConfig,
+    ) -> Result<Self, CslStoreError> {
+        validate_session_id(&session_id)?;
+        Ok(Self {
             store,
             session_id,
             config,
@@ -46,7 +64,7 @@ impl CslManager {
             turn_start_message_count: 0,
             trace_id: None,
             last_session_state: SessionStateCompact::default(),
-        }
+        })
     }
 
     pub fn set_trace_id(&mut self, id: String) {
@@ -172,12 +190,14 @@ impl CslManager {
     }
 
     /// Fork this session at `fork_after_turn`, creating a new session.
-    /// Returns a fresh `CslManager` for the child.
+    /// Returns a fresh `CslManager` for the child and the materialized state
+    /// (if non-empty), so the caller doesn't need to call `load()` again.
     pub async fn fork(
         &self,
         new_session_id: &str,
         fork_after_turn: u32,
-    ) -> Result<CslManager, CslStoreError> {
+    ) -> Result<(CslManager, Option<MaterializedState>), CslStoreError> {
+        validate_session_id(new_session_id)?;
         self.store
             .fork(&self.session_id, new_session_id, fork_after_turn)
             .await?;
@@ -186,13 +206,10 @@ impl CslManager {
             Arc::clone(&self.store),
             new_session_id.to_string(),
             self.config.clone(),
-        );
+        )?;
         child.trace_id = self.trace_id.clone();
-        // Load the child's CSL to discover actual seq/turn/message_count.
-        // If the store wrote nothing (empty parent), last_seq stays 0 and the
-        // next persist_turn will correctly write a fresh Snapshot.
-        child.load().await?;
-        Ok(child)
+        let mat = child.load().await?;
+        Ok((child, mat))
     }
 
     /// Discard the session's CSL and reset internal state so the next
@@ -288,6 +305,7 @@ mod tests {
             "test-session".into(),
             CslManagerConfig::default(),
         )
+        .unwrap()
     }
 
     fn test_manager_with_config(
@@ -295,7 +313,7 @@ mod tests {
         session_id: &str,
         config: CslManagerConfig,
     ) -> CslManager {
-        CslManager::new(make_store(tmp), session_id.into(), config)
+        CslManager::new(make_store(tmp), session_id.into(), config).unwrap()
     }
 
     #[tokio::test]
@@ -391,7 +409,7 @@ mod tests {
             gc_retain_snapshots: 1,
         };
         let store = make_store(&tmp);
-        let mut mgr = CslManager::new(Arc::clone(&store), "test-gc".into(), config);
+        let mut mgr = CslManager::new(Arc::clone(&store), "test-gc".into(), config).unwrap();
 
         // Turn 1: Snapshot(seq=1)
         mgr.persist_turn(1, &[user_msg("t1")], &default_state())
@@ -456,10 +474,11 @@ mod tests {
         ];
         mgr.persist_turn(2, &msgs2, &default_state()).await.unwrap();
 
-        let child = mgr.fork("child-session", 1).await.unwrap();
+        let (child, child_mat) = mgr.fork("child-session", 1).await.unwrap();
         assert_eq!(child.last_seq(), 1);
         assert_eq!(child.last_turn(), 1);
         assert_eq!(child.session_id(), "child-session");
+        assert!(child_mat.is_some());
 
         // Load child and verify only turn 1 messages.
         let mut child2 =
@@ -500,7 +519,8 @@ mod tests {
             Arc::clone(&store),
             "test-patch".into(),
             CslManagerConfig::default(),
-        );
+        )
+        .unwrap();
 
         let state = SessionStateCompact {
             recent_tools: vec!["read".into()],
@@ -652,7 +672,8 @@ mod tests {
             Arc::clone(&store),
             "test-reset-dup".into(),
             CslManagerConfig::default(),
-        );
+        )
+        .unwrap();
 
         // Turn 1 writes Snapshot(seq=1)
         mgr.persist_turn(1, &[user_msg("t1"), assistant_msg("r1")], &default_state())
@@ -678,7 +699,8 @@ mod tests {
             Arc::clone(&store),
             "test-reset-dup".into(),
             CslManagerConfig::default(),
-        );
+        )
+        .unwrap();
         let mat = mgr2.load().await.unwrap().unwrap();
         assert_eq!(mat.messages[0]["content"], "fresh");
     }
@@ -693,7 +715,8 @@ mod tests {
             Arc::clone(&store),
             "test-auto-advance".into(),
             CslManagerConfig::default(),
-        );
+        )
+        .unwrap();
 
         // Turn 1: 2 messages.
         let t1 = vec![user_msg("q1"), assistant_msg("a1")];
@@ -735,7 +758,8 @@ mod tests {
             Arc::clone(&store),
             "test-reset-safe".into(),
             CslManagerConfig::default(),
-        );
+        )
+        .unwrap();
 
         mgr.persist_turn(1, &[user_msg("t1")], &default_state())
             .await
@@ -763,7 +787,8 @@ mod tests {
             Arc::clone(&store),
             "test-clear-cont".into(),
             CslManagerConfig::default(),
-        );
+        )
+        .unwrap();
 
         // Turn 1: state WITH continuity set.
         let continuity = astra_turn_types::continuity::ContinuityState {
@@ -796,7 +821,8 @@ mod tests {
             Arc::clone(&store),
             "test-clear-cont".into(),
             CslManagerConfig::default(),
-        );
+        )
+        .unwrap();
         let mat = mgr2.load().await.unwrap().unwrap();
         assert!(
             mat.session_state.continuity.is_none(),
@@ -815,7 +841,8 @@ mod tests {
             Arc::clone(&store),
             "test-clear-deleg".into(),
             CslManagerConfig::default(),
-        );
+        )
+        .unwrap();
 
         // Turn 1: state WITH delegation.
         let state1 = SessionStateCompact {
@@ -845,7 +872,8 @@ mod tests {
             Arc::clone(&store),
             "test-clear-deleg".into(),
             CslManagerConfig::default(),
-        );
+        )
+        .unwrap();
         let mat = mgr2.load().await.unwrap().unwrap();
         assert!(
             mat.session_state.delegation.is_none(),
@@ -863,7 +891,7 @@ mod tests {
 
         // Parent: 2 turns, 4 messages.
         let mut parent =
-            CslManager::new(Arc::clone(&store), "p".into(), CslManagerConfig::default());
+            CslManager::new(Arc::clone(&store), "p".into(), CslManagerConfig::default()).unwrap();
         let t1 = vec![user_msg("q1"), assistant_msg("a1")];
         parent.persist_turn(1, &t1, &default_state()).await.unwrap();
         let t2 = vec![
@@ -875,7 +903,7 @@ mod tests {
         parent.persist_turn(2, &t2, &default_state()).await.unwrap();
 
         // Fork at turn 2 → child gets Snapshot with 4 messages.
-        let mut child = parent.fork("c", 2).await.unwrap();
+        let (mut child, _) = parent.fork("c", 2).await.unwrap();
 
         // Child's first turn adds 2 new messages (6 total).
         let t3 = vec![
@@ -891,7 +919,7 @@ mod tests {
         // Reload child and verify: should have exactly 6 messages, not 10
         // (would be 10 if delta duplicated all 6 messages onto the 4-message snapshot).
         let mut child2 =
-            CslManager::new(Arc::clone(&store), "c".into(), CslManagerConfig::default());
+            CslManager::new(Arc::clone(&store), "c".into(), CslManagerConfig::default()).unwrap();
         let mat = child2.load().await.unwrap().unwrap();
         assert_eq!(
             mat.messages.len(),
@@ -968,7 +996,7 @@ mod tests {
             snapshot_interval: 2,
             gc_retain_snapshots: 1,
         };
-        let mut mgr = CslManager::new(failing_store, "gc-fail".into(), config);
+        let mut mgr = CslManager::new(failing_store, "gc-fail".into(), config).unwrap();
 
         // Turn 1: Snapshot(seq=1)
         let t1 = vec![user_msg("q1"), assistant_msg("a1")];
@@ -1003,7 +1031,8 @@ mod tests {
         // Reload from the real store and verify we have 6 messages, not 8.
         // (If turn_start was stale at 2, delta for turn 3 would append msgs[2..6]=4 items
         //  onto the 4-message snapshot, giving 8.)
-        let mut mgr2 = CslManager::new(real_store, "gc-fail".into(), CslManagerConfig::default());
+        let mut mgr2 =
+            CslManager::new(real_store, "gc-fail".into(), CslManagerConfig::default()).unwrap();
         let mat = mgr2.load().await.unwrap().unwrap();
         assert_eq!(
             mat.messages.len(),
@@ -1021,7 +1050,8 @@ mod tests {
         let store = make_store(&tmp);
 
         // Write 2 turns.
-        let mut mgr = CslManager::new(Arc::clone(&store), "s".into(), CslManagerConfig::default());
+        let mut mgr =
+            CslManager::new(Arc::clone(&store), "s".into(), CslManagerConfig::default()).unwrap();
         let t1 = vec![user_msg("q1"), assistant_msg("a1")];
         mgr.persist_turn(1, &t1, &default_state()).await.unwrap();
         let t2 = vec![
@@ -1033,7 +1063,8 @@ mod tests {
         mgr.persist_turn(2, &t2, &default_state()).await.unwrap();
 
         // Fresh manager loads the session (4 messages).
-        let mut mgr2 = CslManager::new(Arc::clone(&store), "s".into(), CslManagerConfig::default());
+        let mut mgr2 =
+            CslManager::new(Arc::clone(&store), "s".into(), CslManagerConfig::default()).unwrap();
         let mat = mgr2.load().await.unwrap().unwrap();
         assert_eq!(mat.messages.len(), 4);
 
@@ -1050,7 +1081,8 @@ mod tests {
         mgr2.persist_turn(3, &t3, &default_state()).await.unwrap();
 
         // Reload and verify: should have 6 messages, not 10.
-        let mut mgr3 = CslManager::new(Arc::clone(&store), "s".into(), CslManagerConfig::default());
+        let mut mgr3 =
+            CslManager::new(Arc::clone(&store), "s".into(), CslManagerConfig::default()).unwrap();
         let mat = mgr3.load().await.unwrap().unwrap();
         assert_eq!(
             mat.messages.len(),
@@ -1070,7 +1102,8 @@ mod tests {
             Arc::clone(&store),
             "fewer-msgs".into(),
             CslManagerConfig::default(),
-        );
+        )
+        .unwrap();
 
         // Turn 1: 4 messages.
         let t1 = vec![
@@ -1107,7 +1140,8 @@ mod tests {
             Arc::clone(&store),
             "fewer-msgs".into(),
             CslManagerConfig::default(),
-        );
+        )
+        .unwrap();
         let mat = mgr2.load().await.unwrap().unwrap();
         // Messages from snapshot (turn 1) + empty delta = still 4.
         assert_eq!(mat.messages.len(), 4);
@@ -1123,15 +1157,17 @@ mod tests {
             Arc::clone(&store),
             "parent-t0".into(),
             CslManagerConfig::default(),
-        );
+        )
+        .unwrap();
 
         let t1 = vec![user_msg("q1"), assistant_msg("a1")];
         parent.persist_turn(1, &t1, &default_state()).await.unwrap();
 
         // Fork at turn 0 — no entries qualify (all entries are turn >= 1).
-        let child = parent.fork("child-t0", 0).await.unwrap();
+        let (child, child_mat) = parent.fork("child-t0", 0).await.unwrap();
         assert_eq!(child.last_seq(), 0, "child should have no CSL data");
         assert_eq!(child.last_turn(), 0);
+        assert!(child_mat.is_none());
 
         // Child's first persist should write a fresh snapshot.
         let mut child = child;
@@ -1143,7 +1179,8 @@ mod tests {
             Arc::clone(&store),
             "child-t0".into(),
             CslManagerConfig::default(),
-        );
+        )
+        .unwrap();
         let mat = loader.load().await.unwrap().unwrap();
         assert_eq!(mat.messages.len(), 2);
         assert_eq!(mat.messages[0]["content"], "child-q1");
@@ -1159,7 +1196,8 @@ mod tests {
             Arc::clone(&store),
             "reset-load".into(),
             CslManagerConfig::default(),
-        );
+        )
+        .unwrap();
 
         let t1 = vec![user_msg("q1"), assistant_msg("a1")];
         mgr.persist_turn(1, &t1, &default_state()).await.unwrap();
@@ -1217,7 +1255,8 @@ mod tests {
             Arc::clone(&store),
             "state-load".into(),
             CslManagerConfig::default(),
-        );
+        )
+        .unwrap();
         mgr.persist_turn(1, &[user_msg("t1")], &state)
             .await
             .unwrap();
@@ -1227,10 +1266,40 @@ mod tests {
             Arc::clone(&store),
             "state-load".into(),
             CslManagerConfig::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(mgr2.last_session_state().budget_remaining_tokens, 0);
         mgr2.load().await.unwrap();
         assert_eq!(mgr2.last_session_state().budget_remaining_tokens, 50_000);
         assert_eq!(mgr2.last_session_state().recent_tools, vec!["read"]);
+    }
+
+    // ── Session ID validation at CslManager level ─────────────────────
+
+    #[test]
+    fn rejects_invalid_session_ids_at_construction() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+
+        for bad_id in ["../etc/passwd", "foo/bar", "a\\b", "..", ""] {
+            let result = CslManager::new(
+                Arc::clone(&store),
+                bad_id.to_string(),
+                CslManagerConfig::default(),
+            );
+            assert!(result.is_err(), "session_id '{bad_id}' should be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_rejects_invalid_child_session_id() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = test_manager(&tmp);
+        mgr.persist_turn(1, &[user_msg("t1")], &default_state())
+            .await
+            .unwrap();
+
+        let result = mgr.fork("../malicious", 1).await;
+        assert!(result.is_err(), "fork with invalid child ID should fail");
     }
 }
