@@ -1824,12 +1824,14 @@ impl ServerAgenticLoopHost {
                 let per = (hint_tokens / active_skill_names.len() as u32).max(1);
                 active_skill_names
                     .iter()
-                    .map(|name| astra_turn_core::context_assembly_trace::SkillInjection {
-                        skill_name: (*name).to_string(),
-                        skill_version: None,
-                        tokens: per,
-                        selection_reason: "active_output_skill".into(),
-                    })
+                    .map(
+                        |name| astra_turn_core::context_assembly_trace::SkillInjection {
+                            skill_name: (*name).to_string(),
+                            skill_version: None,
+                            tokens: per,
+                            selection_reason: "active_output_skill".into(),
+                        },
+                    )
                     .collect()
             };
         let breakdown =
