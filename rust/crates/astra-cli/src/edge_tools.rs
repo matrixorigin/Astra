@@ -103,7 +103,7 @@ use worktree::extract_github_owner_repo;
 #[path = "edge_tools/memoria.rs"]
 pub(crate) mod memoria;
 #[cfg(test)]
-use memoria::parse_memory_search_contents;
+use astra_tools::memoria::parse_memory_search_contents;
 #[path = "edge_tools/ask_user.rs"]
 mod ask_user;
 #[path = "edge_tools/context_analysis.rs"]

@@ -13,10 +13,6 @@ pub(super) async fn handle_stats_command(arg: &str, state: &ReplState) {
             let rest = sub.strip_prefix("health").unwrap_or("").trim();
             super::slash_health::handle_health_command(rest, state).await;
         }
-        sub if sub.starts_with("learn") => {
-            let rest = sub.strip_prefix("learn").unwrap_or("").trim();
-            super::slash_learn::handle_learn_command(rest, state);
-        }
         sub if sub.starts_with("cost") => {
             let rest = sub.strip_prefix("cost").unwrap_or("").trim();
             handle_cost_command(rest, state);

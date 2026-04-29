@@ -856,78 +856,6 @@ impl PatternLibrary {
         since = "0.9.0",
         note = "Superseded by SelfModel + LLM reasoning. Use self-awareness-driven exploration instead of programmatic opportunity generation."
     )]
-    pub fn exploration_opportunities(&self) -> Vec<ExplorationOpportunity> {
-        let mut opportunities = Vec::new();
-
-        // Check each task type for low-confidence areas
-        for (&task_type, keys) in &self.type_index {
-            let patterns: Vec<&ToolChainPattern> =
-                keys.iter().filter_map(|k| self.patterns.get(k)).collect();
-
-            if patterns.is_empty() {
-                continue;
-            }
-
-            // Group by domain
-            let mut domain_groups: HashMap<Option<DomainHint>, Vec<&ToolChainPattern>> =
-                HashMap::new();
-            for p in &patterns {
-                domain_groups.entry(p.domain).or_default().push(p);
-            }
-
-            for (domain, group) in &domain_groups {
-                let avg_success: f64 =
-                    group.iter().map(|p| p.success_rate()).sum::<f64>() / group.len() as f64;
-                let avg_quality: f64 =
-                    group.iter().map(|p| p.avg_quality()).sum::<f64>() / group.len() as f64;
-                let total_obs: u32 = group.iter().map(|p| p.total_count()).sum();
-                let has_drift = group.iter().any(|p| p.is_drifting());
-
-                // Low confidence if: few observations, low success, or active drift
-                let confidence = if total_obs < 5 {
-                    0.2 // cold start
-                } else if has_drift {
-                    0.3 // drift undermines confidence
-                } else {
-                    avg_success * 0.6 + avg_quality * 0.4
-                };
-
-                if confidence < 0.5 {
-                    // Collect tools from this domain that have worked elsewhere
-                    let all_domain_tools: Vec<String> = group
-                        .iter()
-                        .flat_map(|p| p.tools.iter().cloned())
-                        .collect::<std::collections::HashSet<_>>()
-                        .into_iter()
-                        .collect();
-
-                    opportunities.push(ExplorationOpportunity {
-                        task_type,
-                        domain: *domain,
-                        confidence,
-                        reason: if total_obs < 5 {
-                            ExplorationReason::ColdStart
-                        } else if has_drift {
-                            ExplorationReason::Drift
-                        } else {
-                            ExplorationReason::LowSuccess
-                        },
-                        known_tools: all_domain_tools,
-                        pattern_count: group.len(),
-                    });
-                }
-            }
-        }
-
-        // Sort by confidence ascending (lowest confidence = most urgent)
-        opportunities.sort_by(|a, b| {
-            a.confidence
-                .partial_cmp(&b.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        opportunities
-    }
-
     /// Report health metrics for the pattern library.
     pub fn health_report(&self) -> PatternLibraryHealth {
         let total = self.patterns.len();
@@ -949,56 +877,6 @@ impl PatternLibrary {
             low_quality,
         }
     }
-
-    /// Get a learning summary for display (e.g., /learn stats).
-    pub fn learning_summary(&self) -> LearningSummary {
-        let total_patterns = self.patterns.len();
-        let active_patterns = self
-            .patterns
-            .values()
-            .filter(|p| p.total_count() >= 2 && p.decayed_score() > 0.1)
-            .count();
-        let drifting = self.detect_drift().len();
-
-        let avg_success = if total_patterns > 0 {
-            self.patterns
-                .values()
-                .map(|p| p.success_rate())
-                .sum::<f64>()
-                / total_patterns as f64
-        } else {
-            0.0
-        };
-
-        let top_patterns: Vec<(String, f64)> = {
-            let mut sorted: Vec<_> = self
-                .patterns
-                .values()
-                .filter(|p| p.total_count() >= 2)
-                .collect();
-            sorted.sort_by(|a, b| {
-                b.decayed_score()
-                    .partial_cmp(&a.decayed_score())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            sorted
-                .iter()
-                .take(5)
-                .map(|p| (p.signature.clone(), p.decayed_score()))
-                .collect()
-        };
-
-        let exploration = self.exploration_opportunities();
-
-        LearningSummary {
-            total_patterns,
-            active_patterns,
-            drifting_patterns: drifting,
-            avg_success_rate: avg_success,
-            top_patterns,
-            exploration_opportunities: exploration.len(),
-        }
-    }
 }
 
 // ─── Drift & Exploration Types ───────────────────────────────────────────────
@@ -1017,31 +895,6 @@ pub struct DriftReport {
     /// True if drift exceeds the critical threshold.
     pub is_critical: bool,
 }
-
-/// Reason an exploration opportunity was identified.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ExplorationReason {
-    /// New domain/task with insufficient data.
-    ColdStart,
-    /// Existing patterns are drifting (performance degraded).
-    Drift,
-    /// Success rate is consistently low.
-    LowSuccess,
-}
-
-/// An area where active exploration could improve learning.
-#[derive(Debug, Clone)]
-pub struct ExplorationOpportunity {
-    pub task_type: TaskType,
-    pub domain: Option<DomainHint>,
-    /// Estimated confidence (0.0–1.0).
-    pub confidence: f64,
-    pub reason: ExplorationReason,
-    /// Tools already tried in this area.
-    pub known_tools: Vec<String>,
-    pub pattern_count: usize,
-}
-
 /// Health metrics for the pattern library.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PatternLibraryHealth {
@@ -1050,19 +903,6 @@ pub struct PatternLibraryHealth {
     pub heavily_decayed: usize,
     pub low_quality: usize,
 }
-
-/// Summary statistics for the learning pipeline.
-#[derive(Debug, Clone)]
-pub struct LearningSummary {
-    pub total_patterns: usize,
-    pub active_patterns: usize,
-    pub drifting_patterns: usize,
-    pub avg_success_rate: f64,
-    /// Top patterns by decayed score: (signature, score).
-    pub top_patterns: Vec<(String, f64)>,
-    pub exploration_opportunities: usize,
-}
-
 // ─── DriftSource bridge ─────────────────────────────────────────────────────
 
 impl astra_learning::DriftSource for PatternLibrary {
@@ -2348,94 +2188,6 @@ mod tests {
 
     // ── Active Exploration Tests ──
 
-    #[test]
-    fn exploration_opportunities_cold_start() {
-        let mut lib = PatternLibrary::new();
-        // Only 2 observations — cold start
-        lib.record_outcome(
-            &tools(&["new_tool"]),
-            TaskType::Memory,
-            None,
-            true,
-            0.5,
-            None,
-        );
-        lib.record_outcome(
-            &tools(&["new_tool"]),
-            TaskType::Memory,
-            None,
-            false,
-            0.0,
-            None,
-        );
-
-        let opps = lib.exploration_opportunities();
-        assert!(
-            opps.iter().any(
-                |o| o.task_type == TaskType::Memory && o.reason == ExplorationReason::ColdStart
-            ),
-            "Cold start area should be flagged: {opps:?}"
-        );
-    }
-
-    #[test]
-    fn exploration_opportunities_low_success() {
-        let mut lib = PatternLibrary::new();
-        // Lots of observations but low success rate
-        for _ in 0..2 {
-            lib.record_outcome(
-                &tools(&["bad"]),
-                TaskType::Fetch,
-                Some(DomainHint::Web),
-                true,
-                0.3,
-                None,
-            );
-        }
-        for _ in 0..8 {
-            lib.record_outcome(
-                &tools(&["bad"]),
-                TaskType::Fetch,
-                Some(DomainHint::Web),
-                false,
-                0.0,
-                None,
-            );
-        }
-
-        let opps = lib.exploration_opportunities();
-        assert!(
-            opps.iter()
-                .any(|o| o.reason == ExplorationReason::LowSuccess),
-            "Low success area should be flagged: {opps:?}"
-        );
-    }
-
-    #[test]
-    fn exploration_opportunities_empty_when_confident() {
-        let mut lib = PatternLibrary::new();
-        for _ in 0..20 {
-            lib.record_outcome(&tools(&["reliable"]), TaskType::Code, None, true, 0.9, None);
-        }
-        let opps = lib.exploration_opportunities();
-        assert!(
-            opps.is_empty(),
-            "High-confidence area should NOT be flagged"
-        );
-    }
-
-    #[test]
-    fn learning_summary_covers_all_fields() {
-        let mut lib = PatternLibrary::new();
-        for _ in 0..10 {
-            lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.9, None);
-        }
-        let summary = lib.learning_summary();
-        assert_eq!(summary.total_patterns, 1);
-        assert!(summary.active_patterns >= 1);
-        assert!(summary.avg_success_rate > 0.8);
-        assert!(!summary.top_patterns.is_empty());
-    }
 
     #[test]
     fn recent_outcomes_window_caps_at_drift_window() {
