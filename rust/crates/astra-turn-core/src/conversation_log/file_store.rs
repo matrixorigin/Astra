@@ -755,6 +755,7 @@ mod tests {
             "a\\b",
             "..",
             "",
+            "   ",
             "has\0nul",
             "has\nnewline",
             "has\ttab",

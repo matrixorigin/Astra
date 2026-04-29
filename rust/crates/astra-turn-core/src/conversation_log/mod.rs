@@ -1104,6 +1104,7 @@ mod tests {
     fn validate_session_id_rejects_invalid() {
         for bad in [
             "",
+            "   ",
             "../etc/passwd",
             "foo/bar",
             "a\\b",
