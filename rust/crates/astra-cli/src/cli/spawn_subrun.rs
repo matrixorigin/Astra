@@ -300,6 +300,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             bridge_turn_chain_id: None,
             bridge_user_query_event_id: None,
             turn_event_buffer: None,
+            csl_last_seq: 0,
+            csl_turn_start_message_count: 0,
         };
 
         // Inherit skills from parent: pre-populate discovered skills

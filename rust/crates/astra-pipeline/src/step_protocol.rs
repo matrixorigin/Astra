@@ -852,7 +852,7 @@ pub struct HeavyCheckpoint {
     pub continuity_state: Option<serde_json::Value>,
 }
 /// Summary of a completed delegation sub-run, stored in HeavyCheckpoint for recovery.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DelegationSubRunSummary {
     pub run_id: String,
     pub agent_id: String,

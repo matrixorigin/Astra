@@ -26,6 +26,7 @@ pub mod compression_types;
 pub mod concurrency_safety;
 pub mod confidence_contract;
 pub mod context_assembly_trace;
+pub mod conversation_log;
 pub mod edge_executor_id;
 pub mod error_recovery;
 pub mod evaluation;

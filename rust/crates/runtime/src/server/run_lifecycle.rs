@@ -688,6 +688,7 @@ struct PostLoopPersistContext {
     hook_db_writer: Option<Arc<dyn TurnHookDbWriter>>,
     observer_worker: Option<Arc<dyn TurnObserverWorker>>,
     tool_event_writer: Option<Arc<dyn TurnToolEventWriter>>,
+    csl_store: Option<Arc<dyn astra_turn_core::conversation_log::CslStore>>,
 }
 
 impl PostLoopPersistContext {
@@ -701,6 +702,9 @@ impl PostLoopPersistContext {
         learning_stack: &PipelineLearningStack,
         loop_success: bool,
     ) {
+        // 0. Persist CSL TurnDelta (and optional Snapshot).
+        self.persist_csl_turn_delta(state).await;
+
         // 1. Persist user_query + llm_response core events.
         persist_server_loop_core_events(
             &self.matrixone,
@@ -778,6 +782,89 @@ impl PostLoopPersistContext {
             None => None,
         };
         learning_stack.save_with_active_canary(active_canary);
+    }
+
+    async fn persist_csl_turn_delta(&self, state: &AgenticLoopState) {
+        use astra_turn_core::conversation_log::{CslEntry, SessionStateCompact, SessionStatePatch};
+
+        let Some(ref store) = self.csl_store else {
+            return;
+        };
+
+        let appended = if state.csl_turn_start_message_count < state.messages.len() {
+            state.messages[state.csl_turn_start_message_count..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        let state_patch = SessionStatePatch {
+            continuity: Some(state.continuity.clone()),
+            blocked_tools: Some(state.restricted_tools.iter().cloned().collect()),
+            recent_tools: Some(state.recent_tools.clone()),
+            approval_overrides: state
+                .approval_overrides
+                .as_ref()
+                .and_then(|ao| serde_json::to_value(ao).ok()),
+            interruption: state
+                .interruption
+                .as_ref()
+                .and_then(|i| serde_json::to_value(i).ok()),
+            budget_remaining_tokens: Some(state.max_turn_input_tokens),
+            budget_remaining_rounds: Some(state.remaining_turns as u32),
+            consecutive_ctx_errors: Some(state.consecutive_context_window_errors),
+        };
+
+        let next_seq = state.csl_last_seq + 1;
+        let delta = CslEntry::TurnDelta {
+            seq: next_seq,
+            turn: state.session_turn,
+            appended,
+            state_patch: Some(state_patch),
+        };
+
+        if let Err(e) = store.append(&self.session_id, &delta).await {
+            tracing::warn!(
+                session_id = %self.session_id,
+                error = %e,
+                "CSL TurnDelta persist failed"
+            );
+            return;
+        }
+
+        // Snapshot every 5 turns.
+        const SNAPSHOT_INTERVAL: u32 = 5;
+        if state.session_turn > 0 && state.session_turn.is_multiple_of(SNAPSHOT_INTERVAL) {
+            let snapshot = CslEntry::Snapshot {
+                seq: next_seq + 1,
+                turn: state.session_turn,
+                messages: state.messages.clone(),
+                session_state: SessionStateCompact {
+                    continuity: Some(state.continuity.clone()),
+                    blocked_tools: state.restricted_tools.iter().cloned().collect(),
+                    recent_tools: state.recent_tools.clone(),
+                    approval_overrides: state
+                        .approval_overrides
+                        .as_ref()
+                        .and_then(|ao| serde_json::to_value(ao).ok()),
+                    budget_remaining_tokens: state.max_turn_input_tokens,
+                    budget_remaining_rounds: state.remaining_turns as u32,
+                    consecutive_ctx_errors: state.consecutive_context_window_errors,
+                    interruption: state
+                        .interruption
+                        .as_ref()
+                        .and_then(|i| serde_json::to_value(i).ok()),
+                    ..Default::default()
+                },
+            };
+
+            if let Err(e) = store.append(&self.session_id, &snapshot).await {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    error = %e,
+                    "CSL Snapshot persist failed"
+                );
+            }
+        }
     }
 }
 
@@ -1467,6 +1554,89 @@ impl AgenticRunLifecycleService {
         self
     }
 
+    fn build_csl_store(&self) -> Option<Arc<dyn astra_turn_core::conversation_log::CslStore>> {
+        let pool = self.shared_pool.as_ref()?;
+        let store =
+            astra_turn_core::conversation_log::db_store::DbCslStore::new(self.matrixone.clone())
+                .with_pool(pool.clone());
+        Some(Arc::new(store))
+    }
+
+    async fn restore_csl_history(&self, session_id: &str, loop_state: &mut AgenticLoopState) {
+        let Some(csl_store) = self.build_csl_store() else {
+            return;
+        };
+        match csl_store.load_from_latest_snapshot(session_id).await {
+            Ok(entries) if !entries.is_empty() => {
+                match astra_turn_core::conversation_log::materialize(&entries) {
+                    Ok(mat) => {
+                        let mut restored = mat.messages;
+                        restored.push(loop_state.messages.remove(0));
+                        loop_state.messages = restored;
+                        loop_state.csl_last_seq = mat.last_seq;
+
+                        let ss = mat.session_state;
+                        if let Some(c) = ss.continuity {
+                            if loop_state.continuity
+                                == astra_turn_types::continuity::ContinuityState::default()
+                            {
+                                loop_state.continuity = c;
+                            }
+                        }
+                        if !ss.blocked_tools.is_empty() {
+                            loop_state
+                                .restricted_tools
+                                .extend(ss.blocked_tools);
+                        }
+                        if !ss.recent_tools.is_empty() {
+                            loop_state.recent_tools = ss.recent_tools;
+                        }
+                        if let Some(ao_value) = ss.approval_overrides {
+                            if loop_state.approval_overrides.is_none() {
+                                if let Ok(ao) = serde_json::from_value(ao_value) {
+                                    loop_state.approval_overrides = Some(ao);
+                                }
+                            }
+                        }
+                        if let Some(intr_value) = ss.interruption {
+                            if loop_state.interruption.is_none() {
+                                if let Ok(intr) = serde_json::from_value(intr_value) {
+                                    loop_state.interruption = Some(intr);
+                                }
+                            }
+                        }
+                        if ss.budget_remaining_tokens > 0 {
+                            loop_state.max_turn_input_tokens = ss.budget_remaining_tokens;
+                        }
+                        if ss.budget_remaining_rounds > 0 {
+                            loop_state.remaining_turns = ss.budget_remaining_rounds as usize;
+                        }
+                        if ss.consecutive_ctx_errors > 0 {
+                            loop_state.consecutive_context_window_errors =
+                                ss.consecutive_ctx_errors;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            session_id,
+                            error = %e,
+                            "CSL materialize failed; starting with empty history"
+                        );
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    session_id,
+                    error = %e,
+                    "CSL load failed; starting with empty history"
+                );
+            }
+        }
+        loop_state.csl_turn_start_message_count = loop_state.messages.len();
+    }
+
     /// Wait for all in-flight background agentic loop tasks to finish.
     ///
     /// Called during graceful shutdown. Polls the task counter with 100ms
@@ -2039,6 +2209,8 @@ impl AgenticRunLifecycleService {
             bridge_turn_chain_id: None,
             bridge_user_query_event_id: None,
             turn_event_buffer: None,
+            csl_last_seq: 0,
+            csl_turn_start_message_count: 0,
         }
     }
 
@@ -2390,6 +2562,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
         }
         loop_state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
+
+        // ── CSL: Load conversation history from the log ─────────────
+        if request.session_id.is_some() {
+            self.restore_csl_history(&session_id, &mut loop_state).await;
+        }
+
         self.configure_loop_state_runtime_controls(
             &mut loop_state,
             &cancel_flag,
@@ -2499,6 +2677,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             hook_db_writer: self.hook_db_writer.clone(),
             observer_worker: self.observer_worker.clone(),
             tool_event_writer: self.tool_event_writer.clone(),
+            csl_store: self.build_csl_store(),
         };
 
         // Background task tracking: background_task_count is incremented before
@@ -2788,6 +2967,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
         state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
 
+        // ── CSL: Load conversation history from the log ─────────────
+        if request.session_id.is_some() {
+            self.restore_csl_history(&session_id, &mut state).await;
+        }
+
         let plan_resume_hint = if let Some(shared) = &self.shared_pool {
             let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
             astra_plan::plan_resume_hint_for_session(&repo, &session_id).await
@@ -2888,6 +3072,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             hook_db_writer: self.hook_db_writer.clone(),
             observer_worker: self.observer_worker.clone(),
             tool_event_writer: self.tool_event_writer.clone(),
+            csl_store: self.build_csl_store(),
         };
 
         // Background task tracking (same pattern as the create_run spawn above).
@@ -3686,6 +3871,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             bridge_turn_chain_id: None,
             bridge_user_query_event_id: None,
             turn_event_buffer: None,
+            csl_last_seq: 0,
+            csl_turn_start_message_count: 0,
         };
 
         // ── Wire ServerToolExecutor for sub-run tool execution ──────────
@@ -6381,6 +6568,124 @@ mod tests {
         assert!(
             source.contains(".with_workspace_artifact_store("),
             "server run lifecycle should inject a workspace artifact store into ServerToolExecutor"
+        );
+    }
+
+    // ── CSL wiring structural checks ───────────────────────────────────────
+
+    #[test]
+    fn create_run_loads_csl_history() {
+        let source = include_str!("run_lifecycle.rs");
+        let create_run_start = source.find("async fn create_run(").expect("create_run must exist");
+        let stream_chat_start =
+            source.find("async fn stream_chat(").expect("stream_chat must exist");
+        let create_run_body = &source[create_run_start..stream_chat_start];
+        assert!(
+            create_run_body.contains("restore_csl_history"),
+            "create_run must call restore_csl_history to load CSL conversation state"
+        );
+    }
+
+    #[test]
+    fn stream_chat_loads_csl_history() {
+        let source = include_str!("run_lifecycle.rs");
+        let stream_chat_start =
+            source.find("async fn stream_chat(").expect("stream_chat must exist");
+        let stream_chat_body = &source[stream_chat_start..];
+        assert!(
+            stream_chat_body.contains("restore_csl_history"),
+            "stream_chat must call restore_csl_history to load CSL conversation state"
+        );
+    }
+
+    #[test]
+    fn persist_csl_emits_state_patch() {
+        let source = include_str!("run_lifecycle.rs");
+        let persist_fn = source
+            .find("async fn persist_csl_turn_delta")
+            .expect("persist_csl_turn_delta must exist");
+        let persist_body = &source[persist_fn..persist_fn + 2000];
+        assert!(
+            persist_body.contains("state_patch: Some(state_patch)"),
+            "persist_csl_turn_delta must emit a real state_patch, not None"
+        );
+        assert!(
+            persist_body.contains("budget_remaining_tokens"),
+            "state_patch must include budget_remaining_tokens"
+        );
+        assert!(
+            persist_body.contains("budget_remaining_rounds"),
+            "state_patch must include budget_remaining_rounds"
+        );
+        assert!(
+            persist_body.contains("consecutive_ctx_errors"),
+            "state_patch must include consecutive_ctx_errors"
+        );
+    }
+
+    #[test]
+    fn persist_csl_snapshot_interval() {
+        let source = include_str!("run_lifecycle.rs");
+        let persist_fn = source
+            .find("async fn persist_csl_turn_delta")
+            .expect("persist_csl_turn_delta must exist");
+        let persist_body = &source[persist_fn..persist_fn + 2000];
+        assert!(
+            persist_body.contains("SNAPSHOT_INTERVAL"),
+            "persist_csl_turn_delta must define a SNAPSHOT_INTERVAL constant"
+        );
+        assert!(
+            persist_body.contains("is_multiple_of(SNAPSHOT_INTERVAL)"),
+            "snapshot should be written every SNAPSHOT_INTERVAL turns"
+        );
+        assert!(
+            persist_body.contains("CslEntry::Snapshot"),
+            "snapshot branch must construct a CslEntry::Snapshot"
+        );
+    }
+
+    #[test]
+    fn restore_csl_recovers_all_session_state_fields() {
+        let source = include_str!("run_lifecycle.rs");
+        let restore_fn = source
+            .find("async fn restore_csl_history")
+            .expect("restore_csl_history must exist");
+        let restore_body = &source[restore_fn..restore_fn + 3000];
+        let required_fields = [
+            "continuity",
+            "blocked_tools",
+            "recent_tools",
+            "approval_overrides",
+            "interruption",
+            "budget_remaining_tokens",
+            "budget_remaining_rounds",
+            "consecutive_ctx_errors",
+        ];
+        for field in &required_fields {
+            assert!(
+                restore_body.contains(field),
+                "restore_csl_history must restore {field} from SessionStateCompact"
+            );
+        }
+    }
+
+    #[test]
+    fn both_entry_points_wire_csl_store_to_persist_context() {
+        let source = include_str!("run_lifecycle.rs");
+        let create_run_start = source.find("async fn create_run(").expect("create_run must exist");
+        let stream_chat_start =
+            source.find("async fn stream_chat(").expect("stream_chat must exist");
+
+        let create_run_body = &source[create_run_start..stream_chat_start];
+        assert!(
+            create_run_body.contains("csl_store: self.build_csl_store()"),
+            "create_run must pass csl_store to PostLoopPersistContext"
+        );
+
+        let stream_chat_body = &source[stream_chat_start..];
+        assert!(
+            stream_chat_body.contains("csl_store: self.build_csl_store()"),
+            "stream_chat must pass csl_store to PostLoopPersistContext"
         );
     }
 }

@@ -1383,6 +1383,23 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .execute(&pool)
     .await?;
 
+    // ─── Conversation State Log (CSL) ──────────────────────────────────────────
+
+    query(
+        "CREATE TABLE IF NOT EXISTS conversation_log (
+            session_id  VARCHAR(64) NOT NULL,
+            seq         BIGINT NOT NULL,
+            turn        INT NOT NULL,
+            entry_type  TINYINT NOT NULL,
+            payload     MEDIUMTEXT NOT NULL,
+            created_at  DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (session_id, seq),
+            INDEX idx_csl_snapshot (session_id, entry_type, seq DESC)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // ─── Schema migration tracking ──────────────────────────────────────────────
 
     query(

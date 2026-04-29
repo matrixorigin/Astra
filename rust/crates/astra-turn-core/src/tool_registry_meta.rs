@@ -88,7 +88,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         pinned: true,
         intents: &[IntentType::CodeEdit, IntentType::CodeRead, IntentType::Git],
         scope: Scope::Local,
-        schema_tokens: 30,
+        schema_tokens: 35,
     },
     ToolMeta {
         name: "read_file",

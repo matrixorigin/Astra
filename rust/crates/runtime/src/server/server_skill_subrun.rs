@@ -427,6 +427,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             bridge_turn_chain_id: None,
             bridge_user_query_event_id: None,
             turn_event_buffer: None,
+            csl_last_seq: 0,
+            csl_turn_start_message_count: 0,
         };
 
         // ── Wire ServerToolExecutor for skill sub-run tool execution ────

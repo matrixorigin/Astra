@@ -639,6 +639,8 @@ pub(crate) async fn stream_chat_sse(
         bridge_turn_chain_id: Some(uuid::Uuid::now_v7().to_string()),
         bridge_user_query_event_id: Some(uuid::Uuid::now_v7().to_string()),
         turn_event_buffer: None,
+        csl_last_seq: 0,
+        csl_turn_start_message_count: 0,
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────
