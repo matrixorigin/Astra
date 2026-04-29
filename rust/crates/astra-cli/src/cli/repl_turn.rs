@@ -1950,16 +1950,21 @@ fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: 
         format!("{:.1}s", elapsed.as_secs_f64())
     };
 
-    let total_tokens = result.prompt_tokens + result.completion_tokens;
+    // Display billable totals: `↑` is the WHOLE input (fresh + cached + creation)
+    // because all three occupy the context window and are all billed (just at
+    // different rates). Showing only `prompt_tokens` (fresh) hides the dominant
+    // portion of real traffic on cache-heavy turns and makes cache% nonsensical.
+    let total_input = result.prompt_tokens + result.cache_read_tokens + result.cache_creation_tokens;
+    let total_tokens = total_input + result.completion_tokens;
     let tokens_str = if total_tokens > 1000 {
         format!("{:.1}k", total_tokens as f64 / 1000.0)
     } else {
         format!("{total_tokens}")
     };
-    let prompt_short = if result.prompt_tokens > 1000 {
-        format!("{:.1}k", result.prompt_tokens as f64 / 1000.0)
+    let prompt_short = if total_input > 1000 {
+        format!("{:.1}k", total_input as f64 / 1000.0)
     } else {
-        format!("{}", result.prompt_tokens)
+        format!("{total_input}")
     };
     let completion_short = if result.completion_tokens > 1000 {
         format!("{:.1}k", result.completion_tokens as f64 / 1000.0)
@@ -2012,11 +2017,11 @@ fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: 
         ));
     }
 
-    // Cache savings indicator
+    // Cache hit rate across the full billable input. Denominator must include
+    // ALL three input buckets (fresh + cache read + cache creation), otherwise
+    // cache_creation-heavy turns report 100% when they actually wrote a lot.
     if result.cache_read_tokens > 0 {
-        let cache_pct = result.cache_read_tokens as f64
-            / (result.prompt_tokens + result.cache_read_tokens).max(1) as f64
-            * 100.0;
+        let cache_pct = result.cache_read_tokens as f64 / total_input.max(1) as f64 * 100.0;
         parts.push(format!("cache:{cache_pct:.0}%"));
     }
 
@@ -4175,11 +4180,12 @@ mod tests {
 
     #[test]
     fn cache_hit_percentage_formula() {
-        // Formula from print_turn_status_line:
-        // cache_pct = cache_read / (prompt + cache_read) * 100
+        // Denominator = full billable input (fresh + cache-read + cache-creation).
         let prompt = 200u64;
         let cache_read = 800u64;
-        let cache_pct = cache_read as f64 / (prompt + cache_read).max(1) as f64 * 100.0;
+        let cache_creation = 0u64;
+        let total_input = prompt + cache_read + cache_creation;
+        let cache_pct = cache_read as f64 / total_input.max(1) as f64 * 100.0;
         assert!((cache_pct - 80.0).abs() < 0.01);
     }
 
@@ -4187,15 +4193,35 @@ mod tests {
     fn cache_hit_percentage_zero_when_no_cache() {
         let prompt = 1000u64;
         let cache_read = 0u64;
-        let cache_pct = cache_read as f64 / (prompt + cache_read).max(1) as f64 * 100.0;
+        let cache_creation = 0u64;
+        let total_input = prompt + cache_read + cache_creation;
+        let cache_pct = cache_read as f64 / total_input.max(1) as f64 * 100.0;
         assert!((cache_pct - 0.0).abs() < 0.01);
     }
 
     #[test]
-    fn cache_hit_percentage_100_when_all_cached() {
+    fn cache_hit_percentage_with_heavy_cache_creation() {
+        // Regression guard: cache_creation-heavy turn must NOT report 100% hit
+        // rate. Before the denominator fix, a turn with fresh=12, cache_read=29816,
+        // cache_creation=38788 reported cache:100% (29816 / (12+29816) = 99.96%).
+        let prompt = 12u64;
+        let cache_read = 29_816u64;
+        let cache_creation = 38_788u64;
+        let total_input = prompt + cache_read + cache_creation;
+        let cache_pct = cache_read as f64 / total_input.max(1) as f64 * 100.0;
+        assert!(
+            (cache_pct - 43.5).abs() < 1.0,
+            "expected ~43.5%, got {cache_pct:.1}%"
+        );
+    }
+
+    #[test]
+    fn cache_hit_percentage_100_only_when_all_input_was_cache_read() {
         let prompt = 0u64;
         let cache_read = 5000u64;
-        let cache_pct = cache_read as f64 / (prompt + cache_read).max(1) as f64 * 100.0;
+        let cache_creation = 0u64;
+        let total_input = prompt + cache_read + cache_creation;
+        let cache_pct = cache_read as f64 / total_input.max(1) as f64 * 100.0;
         assert!((cache_pct - 100.0).abs() < 0.01);
     }
 

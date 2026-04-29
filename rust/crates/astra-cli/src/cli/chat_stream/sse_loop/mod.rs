@@ -692,6 +692,8 @@ pub(crate) async fn stream_chat_sse(
         verdict_events: &state.stall.verdict_events,
         has_any_usage: state.has_any_usage,
         total_prompt: state.total_prompt,
+        total_cache_read: state.total_cache_read,
+        total_cache_creation: state.total_cache_creation,
         total_completion: state.total_completion,
         current_session_id: state.current_session_id.as_deref(),
     });

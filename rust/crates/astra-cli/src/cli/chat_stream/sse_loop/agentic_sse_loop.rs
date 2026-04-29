@@ -30,6 +30,8 @@ pub(crate) struct StreamLoopSidecarEprint<'a> {
     pub(crate) verdict_events: &'a [VerdictEvent],
     pub(crate) has_any_usage: bool,
     pub(crate) total_prompt: u64,
+    pub(crate) total_cache_read: u64,
+    pub(crate) total_cache_creation: u64,
     pub(crate) total_completion: u64,
     pub(crate) current_session_id: Option<&'a str>,
 }
@@ -45,6 +47,8 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
         verdict_events,
         has_any_usage,
         total_prompt,
+        total_cache_read,
+        total_cache_creation,
         total_completion,
         current_session_id,
     } = ctx;
@@ -60,6 +64,13 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
     let model_tag = model.unwrap_or("auto");
     let session_tag = session_id_footer_abbrev(current_session_id);
     if verbose_mode && !quiet {
+        // `↑` is the full billable input: fresh + cache-read + cache-creation.
+        // All three occupy the context window and are all billed (different
+        // rates). Showing only `total_prompt` (fresh) made cache-heavy turns
+        // look like ↑12 when the actual traffic was 60k+.
+        let total_input = total_prompt
+            .saturating_add(total_cache_read)
+            .saturating_add(total_cache_creation);
         eprintln!(
             "{}",
             format!(
@@ -71,7 +82,7 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
                     "?".to_string()
                 },
                 if has_any_usage {
-                    format_token_count_compact(total_prompt)
+                    format_token_count_compact(total_input)
                 } else {
                     "?".to_string()
                 },
