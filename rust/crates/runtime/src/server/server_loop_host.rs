@@ -275,6 +275,7 @@ impl astra_turn_core::cloud_summary::SummaryLlmClient for RequestAwareSummaryCli
             (!self.header_overrides.is_empty()).then_some(&self.header_overrides),
             self.completions_url_override.as_deref(),
             self.request_timeout,
+            &ThinkingConfig::Off,
         )
         .await
         {

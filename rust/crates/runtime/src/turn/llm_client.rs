@@ -1481,6 +1481,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
                             header_overrides,
                             completions_url_override,
                             request_timeout,
+                            thinking,
                         )
                         .await
                         .map_err(|error| error.with_details_json(details_json));
@@ -1558,6 +1559,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
                         header_overrides,
                         completions_url_override,
                         request_timeout,
+                        thinking,
                     )
                     .await
                     .map_err(|error| attach_partial_details(error, &partial));
@@ -2044,11 +2046,15 @@ pub(crate) async fn call_llm_nonstream_fallback(
         None,
         None,
         None,
+        &ThinkingConfig::Off,
     )
     .await
 }
 
 /// Like [`call_llm_nonstream_fallback`] but applies a [`ThinkingConfig`] to the request body.
+///
+/// Thin wrapper over [`call_llm_nonstream_fallback_with_request_overrides`] — prefer calling
+/// that directly for new code. Retained for call sites that don't need header/URL overrides.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_llm_nonstream_fallback_with_thinking(
     client: &reqwest::Client,
@@ -2062,49 +2068,22 @@ pub(crate) async fn call_llm_nonstream_fallback_with_thinking(
     timeout: std::time::Duration,
     thinking: &ThinkingConfig,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    let started = Instant::now();
-    let messages = consolidate_system_messages(messages);
-    let body = build_provider_request_body(
-        &messages,
+    call_llm_nonstream_fallback_with_request_overrides(
+        client,
+        messages,
         tools,
         model_name,
+        api_key,
+        base_url,
         provider,
         max_output_tokens,
+        timeout,
         None,
-        false,
+        None,
+        None,
         thinking,
-    );
-    let url = llm_request_url(base_url, None, provider, model_name, false);
-    let mut req = client
-        .post(&url)
-        .header("content-type", "application/json")
-        .timeout(timeout);
-    req = apply_provider_auth(req, provider, api_key, None);
-    let response = req.json(&body).send().await.map_err(|e| {
-        astra_core::ClassifiedError::new(
-            astra_core::ErrorKind::Network,
-            format!("LLM nonstream request failed: {e}"),
-        )
-    })?;
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        let kind = if status.as_u16() == 401 || status.as_u16() == 403 {
-            astra_core::ErrorKind::Auth
-        } else if is_context_window_error(&text) {
-            astra_core::ErrorKind::ContextWindow
-        } else {
-            astra_core::ErrorKind::Unknown
-        };
-        return Err(astra_core::ClassifiedError::new(
-            kind,
-            format!("LLM returned {status}: {}", &text[..text.len().min(500)]),
-        ));
-    }
-    let v: Value = serde_json::from_str(&text).unwrap_or(json!({}));
-    Ok(parse_nonstream_response_for_provider(
-        &v, provider, model_name, started,
-    ))
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2121,6 +2100,7 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
     header_overrides: Option<&HashMap<String, String>>,
     completions_url_override: Option<&str>,
     request_timeout: Option<std::time::Duration>,
+    thinking: &ThinkingConfig,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     let started = Instant::now();
 
@@ -2134,7 +2114,7 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
         max_output_tokens,
         None,
         false,
-        &ThinkingConfig::Off,
+        thinking,
     );
 
     let url = llm_request_url(

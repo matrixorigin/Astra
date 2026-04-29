@@ -5057,9 +5057,10 @@ async fn apply_restored_session(
 
     if let Some(ref m) = restored.model {
         state.model = Some(m.clone());
-        state.cached_pricing = slash_stats::fallback_pricing(m);
+        let base = astra_turn_core::thinking_config::resolve_model_thinking(m).0;
+        state.cached_pricing = slash_stats::fallback_pricing(base);
         state.context_budget =
-            prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(m));
+            prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(base));
     }
 
     if let Some(ref learning_json) = restored.learning_snapshot_json

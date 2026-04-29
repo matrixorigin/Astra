@@ -330,11 +330,13 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     touch_prep_ui_phase(&ctx.prep_ui_phase, "Starting…");
 
     let git_branch = read_git_branch_abbrev();
-    let (resolved_model, thinking_config) = ctx
-        .model
-        .map(astra_turn_core::thinking_config::resolve_model_thinking)
-        .map(|(m, t)| (Some(m), t))
-        .unwrap_or((None, astra_turn_core::thinking_config::ThinkingConfig::Off));
+    let (resolved_model, thinking_config) = match ctx.model {
+        Some(m) => {
+            let (name, cfg) = astra_turn_core::thinking_config::resolve_model_thinking(m);
+            (Some(name), cfg)
+        }
+        None => (None, astra_turn_core::thinking_config::ThinkingConfig::Off),
+    };
     let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
         messages: ctx.messages,
         session_id: ctx.current_session_id,

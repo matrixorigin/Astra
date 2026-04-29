@@ -141,7 +141,40 @@ pub(super) async fn handle_slash_command(
                     &items,
                     state.model.as_deref(),
                 ) {
-                    state.model = Some(chosen.clone());
+                    // Two-level selection: if model supports thinking, prompt for mode
+                    let opts = astra_turn_core::thinking_config::thinking_options(&chosen);
+                    let model_with_suffix = if opts.is_empty() {
+                        chosen.clone()
+                    } else {
+                        let thinking_items: Vec<(String, String)> = opts
+                            .iter()
+                            .map(|o| {
+                                let marker = if o.is_default { " (default)" } else { "" };
+                                (o.label.to_string(), marker.to_string())
+                            })
+                            .collect();
+                        let default_idx = opts.iter().position(|o| o.is_default);
+                        let default_label = default_idx.map(|i| opts[i].label);
+                        if let Some(picked) = interactive_select(
+                            "Select thinking mode:",
+                            &thinking_items,
+                            default_label,
+                        ) {
+                            let selected_opt = opts.iter().find(|o| o.label == picked);
+                            let suffix = selected_opt
+                                .map(|o| {
+                                    astra_turn_core::thinking_config::thinking_suffix_for(&o.config)
+                                })
+                                .unwrap_or("");
+                            format!("{chosen}{suffix}")
+                        } else {
+                            // Cancelled thinking selection — use model without thinking
+                            eprintln!("{}", "  Thinking mode: Normal".dim());
+                            chosen.clone()
+                        }
+                    };
+
+                    state.model = Some(model_with_suffix.clone());
                     state.cached_pricing = slash_stats::extract_pricing_for_model(&models, &chosen)
                         .unwrap_or_else(|| slash_stats::fallback_pricing(&chosen));
                     state.context_budget = prompts::ContextBudget::from_runtime_config(
@@ -151,7 +184,7 @@ pub(super) async fn handle_slash_command(
                     eprintln!(
                         "  {} {}",
                         theme::icon_ok(),
-                        format!("Model set to: {chosen}").green()
+                        format!("Model set to: {model_with_suffix}").green()
                     );
                 } else {
                     eprintln!("{}", "  Cancelled.".dim());
@@ -227,9 +260,12 @@ pub(super) async fn handle_slash_command(
             }
 
             state.model = Some(arg.to_string());
-            state.cached_pricing = slash_stats::fallback_pricing(arg);
-            state.context_budget =
-                prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(arg));
+            let base_model = astra_turn_core::thinking_config::resolve_model_thinking(arg).0;
+            state.cached_pricing = slash_stats::fallback_pricing(base_model);
+            state.context_budget = prompts::ContextBudget::from_runtime_config(
+                &state.runtime_config,
+                Some(base_model),
+            );
             eprintln!("{}", format!("  \u{2713}  Model set to: {}", arg).green());
             if let Some(ref j) = state.journal {
                 let _ = j.append(&session_journal::JournalEvent::config_change(

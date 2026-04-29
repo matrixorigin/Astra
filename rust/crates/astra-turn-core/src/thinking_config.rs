@@ -190,6 +190,26 @@ fn remove_key(body: &mut Value, key: &str) {
 /// The suffix appended to model display names to indicate thinking mode.
 pub const THINKING_SUFFIX: &str = "(thinking)";
 
+/// Encode a ThinkingConfig as a model name suffix for storage in state.model.
+pub fn thinking_suffix_for(config: &ThinkingConfig) -> &'static str {
+    match config {
+        ThinkingConfig::Off => "",
+        ThinkingConfig::Enabled { .. } => THINKING_SUFFIX,
+        ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::Low,
+        } => "(thinking:low)",
+        ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::Medium,
+        } => "(thinking:medium)",
+        ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::High,
+        } => "(thinking:high)",
+        ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::Max,
+        } => "(thinking:max)",
+    }
+}
+
 /// Returns true if the model supports extended thinking.
 pub fn supports_thinking(model_name: &str) -> bool {
     let m = model_name.to_lowercase();
@@ -203,12 +223,25 @@ pub fn supports_thinking(model_name: &str) -> bool {
 }
 
 /// Returns true if the model should use adaptive thinking (Opus 4.6+, Sonnet 4.6+).
+/// Model naming convention: `claude-{family}-4-{minor}` where minor is a single digit.
+/// Date-based names like `claude-sonnet-4-20250514-v1:0` have multi-digit suffixes (dates).
 fn is_adaptive_model(model_name: &str) -> bool {
     let m = model_name.to_lowercase();
-    m.contains("opus-4-6")
-        || m.contains("opus-4.6")
-        || m.contains("sonnet-4-6")
-        || m.contains("sonnet-4.6")
+    for prefix in ["opus-4-", "opus-4.", "sonnet-4-", "sonnet-4."] {
+        if let Some(pos) = m.find(prefix) {
+            let after = &m[pos + prefix.len()..];
+            // Single-digit = minor version (e.g., "6", "7"). Multi-digit = date (e.g., "20250514").
+            if let Some(ch) = after.chars().next() {
+                if ch.is_ascii_digit() && !after.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
+                {
+                    if (ch as u32 - '0' as u32) >= 6 {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Infer the appropriate ThinkingConfig for a model that supports thinking.
@@ -224,15 +257,112 @@ pub fn infer_thinking_config(model_name: &str) -> ThinkingConfig {
     }
 }
 
-/// Parse a model selector string. If it ends with `(thinking)`, strip the suffix
-/// and return the real model name + inferred ThinkingConfig.
+/// Parse a model selector string. If it ends with a thinking suffix, strip it
+/// and return the real model name + corresponding ThinkingConfig.
 /// Otherwise return the original name + Off.
 pub fn resolve_model_thinking(model_selector: &str) -> (&str, ThinkingConfig) {
+    // Check explicit effort suffixes first (longest match wins)
+    for (suffix, config) in [
+        (
+            "(thinking:low)",
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Low,
+            },
+        ),
+        (
+            "(thinking:medium)",
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Medium,
+            },
+        ),
+        (
+            "(thinking:high)",
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High,
+            },
+        ),
+        (
+            "(thinking:max)",
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Max,
+            },
+        ),
+    ] {
+        if let Some(base) = model_selector.strip_suffix(suffix) {
+            return (base.trim_end(), config);
+        }
+    }
+    // Generic "(thinking)" — infer from model name
     if let Some(base) = model_selector.strip_suffix(THINKING_SUFFIX) {
         let base = base.trim_end();
-        (base, infer_thinking_config(base))
+        return (base, infer_thinking_config(base));
+    }
+    (model_selector, ThinkingConfig::Off)
+}
+
+// ─── Two-level /model selection ─────────────────────────────────────────────
+
+/// A selectable thinking option shown in the /model second-level prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThinkingOption {
+    /// Display label (e.g., "Normal", "Thinking (Low)", "Thinking (High)")
+    pub label: &'static str,
+    /// The ThinkingConfig to use when this option is selected.
+    pub config: ThinkingConfig,
+    /// Whether this is the default selection (shown with ← marker).
+    pub is_default: bool,
+}
+
+/// Returns the available thinking options for a model.
+///
+/// - Non-thinking models: empty vec (skip second prompt).
+/// - Claude 3.7 / Claude 4.x (pre-4.6): `[Normal, Thinking]` (2 options).
+/// - Claude 4.6+: `[Normal, Thinking (Low), Thinking (High)]` (3 options).
+///
+/// Note: Medium/Max efforts are intentionally omitted from the UI but remain
+/// supported in `thinking_suffix_for`/`resolve_model_thinking` for programmatic
+/// use and future extensibility.
+pub fn thinking_options(model_name: &str) -> Vec<ThinkingOption> {
+    if !supports_thinking(model_name) {
+        return vec![];
+    }
+    if is_adaptive_model(model_name) {
+        vec![
+            ThinkingOption {
+                label: "Normal",
+                config: ThinkingConfig::Off,
+                is_default: false,
+            },
+            ThinkingOption {
+                label: "Thinking (Low)",
+                config: ThinkingConfig::Adaptive {
+                    effort: ThinkingEffort::Low,
+                },
+                is_default: false,
+            },
+            ThinkingOption {
+                label: "Thinking (High)",
+                config: ThinkingConfig::Adaptive {
+                    effort: ThinkingEffort::High,
+                },
+                is_default: true,
+            },
+        ]
     } else {
-        (model_selector, ThinkingConfig::Off)
+        vec![
+            ThinkingOption {
+                label: "Normal",
+                config: ThinkingConfig::Off,
+                is_default: false,
+            },
+            ThinkingOption {
+                label: "Thinking",
+                config: ThinkingConfig::Enabled {
+                    budget_tokens: 10_000,
+                },
+                is_default: true,
+            },
+        ]
     }
 }
 
@@ -417,7 +547,8 @@ mod tests {
     }
 
     #[test]
-    fn infer_adaptive_for_4_6_models() {
+    fn infer_adaptive_for_4_6_plus_models() {
+        // 4.6
         assert_eq!(
             infer_thinking_config("us.anthropic.claude-opus-4-6-v1"),
             ThinkingConfig::Adaptive {
@@ -425,7 +556,14 @@ mod tests {
             }
         );
         assert_eq!(
-            infer_thinking_config("us.anthropic.claude-sonnet-4-6-v1"),
+            infer_thinking_config("us.anthropic.claude-sonnet-4-6"),
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High
+            }
+        );
+        // 4.7+ (real model from .models.yaml)
+        assert_eq!(
+            infer_thinking_config("us.anthropic.claude-opus-4-7"),
             ThinkingConfig::Adaptive {
                 effort: ThinkingEffort::High
             }
@@ -465,6 +603,102 @@ mod tests {
         let (name, cfg) = resolve_model_thinking("us.anthropic.claude-opus-4-6-v1");
         assert_eq!(name, "us.anthropic.claude-opus-4-6-v1");
         assert_eq!(cfg, ThinkingConfig::Off);
+    }
+
+    #[test]
+    fn real_models_yaml_validation() {
+        // Non-thinking models from .models.yaml
+        for name in [
+            "qwen-plus",
+            "qwen-max",
+            "qwen-turbo",
+            "qwen-flash",
+            "qwen3-coder-next",
+            "qwen3.5-flash",
+            "deepseek-v4-pro",
+            "qwen3.6-plus",
+            "qwen2.5-3b-instruct",
+            "ep-glm-5-439797",
+            "MiniMax-M2.5",
+            "MiniMax-M2.7",
+            "glm-5.1",
+        ] {
+            assert!(
+                !supports_thinking(name),
+                "{name} should NOT support thinking"
+            );
+            let (_, cfg) = resolve_model_thinking(name);
+            assert_eq!(
+                cfg,
+                ThinkingConfig::Off,
+                "{name} without suffix should be Off"
+            );
+        }
+
+        // Thinking models from .models.yaml — adaptive (4.6+)
+        for name in [
+            "us.anthropic.claude-sonnet-4-6",
+            "us.anthropic.claude-opus-4-7",
+        ] {
+            assert!(supports_thinking(name), "{name} should support thinking");
+            let selector = format!("{name}(thinking)");
+            let (resolved, cfg) = resolve_model_thinking(&selector);
+            assert_eq!(resolved, name);
+            assert!(
+                matches!(cfg, ThinkingConfig::Adaptive { .. }),
+                "{name}(thinking) should infer Adaptive, got {cfg:?}"
+            );
+        }
+    }
+
+    // ─── thinking_options tests ─────────────────────────────────────────
+
+    #[test]
+    fn thinking_options_non_thinking_model_empty() {
+        assert!(thinking_options("qwen-plus").is_empty());
+        assert!(thinking_options("gpt-4o").is_empty());
+    }
+
+    #[test]
+    fn thinking_options_claude_37_two_levels() {
+        let opts = thinking_options("claude-3-7-sonnet-20250219");
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0].label, "Normal");
+        assert_eq!(opts[0].config, ThinkingConfig::Off);
+        assert!(!opts[0].is_default);
+        assert_eq!(opts[1].label, "Thinking");
+        assert!(matches!(opts[1].config, ThinkingConfig::Enabled { .. }));
+        assert!(opts[1].is_default);
+    }
+
+    #[test]
+    fn thinking_options_claude_46_three_levels() {
+        let opts = thinking_options("us.anthropic.claude-sonnet-4-6");
+        assert_eq!(opts.len(), 3);
+        assert_eq!(opts[0].label, "Normal");
+        assert_eq!(opts[0].config, ThinkingConfig::Off);
+        assert_eq!(opts[1].label, "Thinking (Low)");
+        assert!(matches!(
+            opts[1].config,
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Low
+            }
+        ));
+        assert_eq!(opts[2].label, "Thinking (High)");
+        assert!(matches!(
+            opts[2].config,
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High
+            }
+        ));
+        assert!(opts[2].is_default);
+    }
+
+    #[test]
+    fn thinking_options_claude_47_three_levels() {
+        let opts = thinking_options("us.anthropic.claude-opus-4-7");
+        assert_eq!(opts.len(), 3);
+        assert!(opts[2].is_default);
     }
 
     // === TDD fix tests ===
