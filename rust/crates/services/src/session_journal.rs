@@ -1651,28 +1651,6 @@ fn extract_json_str(line: &str, needle: &str) -> Option<String> {
 
 // ── Session listing with metadata ────────────────────────────────────────────
 
-/// Metadata for session listing (mtime, size, staleness).
-#[derive(Debug, Clone)]
-pub struct SessionListMeta {
-    pub session_id: String,
-    /// Journal file modification time.
-    pub last_modified: std::time::SystemTime,
-    /// Journal file size in bytes.
-    pub journal_bytes: u64,
-    /// Total disk usage: journal + workspace dir (recursive).
-    pub total_bytes: u64,
-    /// Turn count (fast count).
-    pub turns: u32,
-}
-
-impl SessionListMeta {
-    /// Get the age of this session (time since last modified).
-    pub fn age(&self) -> std::time::Duration {
-        self.last_modified
-            .elapsed()
-            .unwrap_or(std::time::Duration::ZERO)
-    }
-}
 // ── Session cleanup / lifecycle ──────────────────────────────────────────────
 
 /// Metadata about a session that's a candidate for cleanup.

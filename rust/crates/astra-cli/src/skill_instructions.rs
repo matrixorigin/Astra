@@ -179,16 +179,6 @@ impl From<&SkillInstruction> for SkillMetadata {
     }
 }
 
-/// Load level for progressive skill loading.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SkillLoadLevel {
-    /// Level 1: Only metadata (name, description, triggers). ~100 tokens.
-    Metadata,
-    /// Level 2: Full instructions loaded. Variable tokens.
-    Instructions,
-    /// Level 3: All resources (templates, scripts) loaded.
-    Resources,
-}
 
 /// Parse SKILL.md content into a SkillInstruction.
 ///

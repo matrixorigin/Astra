@@ -626,22 +626,6 @@ impl ThinClient {
             .send()
             .await?)
     }
-
-    pub async fn post_memory_retrieve_json(
-        &self,
-        token: &str,
-        body: &Value,
-    ) -> Result<Response, ThinClientError> {
-        let url = self.url(paths::MEMORY_RETRIEVE)?;
-        Ok(self
-            .http
-            .post(url)
-            .headers(Self::bearer_headers(token)?)
-            .json(body)
-            .send()
-            .await?)
-    }
-
     // ── Tasks (§5.5 state CRUD — `router_builder`) ───────────────────────────
 
     pub async fn get_tasks_query_text(
@@ -659,136 +643,7 @@ impl ThinClient {
             .await?;
         Self::text_or_api(resp).await
     }
-
-    pub async fn post_tasks_json(
-        &self,
-        token: &str,
-        body: &Value,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(paths::TASKS)?;
-        let resp = self
-            .http
-            .post(url)
-            .headers(Self::bearer_headers(token)?)
-            .json(body)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
-    pub async fn get_task_text(
-        &self,
-        token: &str,
-        task_id: &str,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(&paths::task(task_id))?;
-        let resp = self
-            .http
-            .get(url)
-            .headers(Self::bearer_headers(token)?)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
-    pub async fn get_task_progress_text(
-        &self,
-        token: &str,
-        task_id: &str,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(&paths::task_progress(task_id))?;
-        let resp = self
-            .http
-            .get(url)
-            .headers(Self::bearer_headers(token)?)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
-    pub async fn put_task_status_json(
-        &self,
-        token: &str,
-        task_id: &str,
-        body: &Value,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(&paths::task_status(task_id))?;
-        let resp = self
-            .http
-            .put(url)
-            .headers(Self::bearer_headers(token)?)
-            .json(body)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
     // ── Context snapshots ──────────────────────────────────────────────────
-
-    pub async fn get_context_query_text(
-        &self,
-        token: &str,
-        query: &[(&str, String)],
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(paths::CONTEXT)?;
-        let resp = self
-            .http
-            .get(url)
-            .headers(Self::bearer_headers(token)?)
-            .query(query)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
-    pub async fn post_context_json(
-        &self,
-        token: &str,
-        body: &Value,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(paths::CONTEXT)?;
-        let resp = self
-            .http
-            .post(url)
-            .headers(Self::bearer_headers(token)?)
-            .json(body)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
-    pub async fn get_context_capture_text(
-        &self,
-        token: &str,
-        context_capture_id: &str,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(&paths::context_capture(context_capture_id))?;
-        let resp = self
-            .http
-            .get(url)
-            .headers(Self::bearer_headers(token)?)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
-    /// `POST /chat/route` — non-streaming route/classify (optional for IDE/SDK).
-    pub async fn post_chat_route_json(
-        &self,
-        token: &str,
-        body: &Value,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(paths::CHAT_ROUTE)?;
-        let resp = self
-            .http
-            .post(url)
-            .headers(Self::bearer_headers(token)?)
-            .json(body)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
     /// `POST /v1/chat/completions` — lightweight LLM proxy for verification judge.
     ///
     /// Returns the raw JSON response from the server's completions proxy.
@@ -1404,23 +1259,6 @@ impl ThinClient {
         let resp = req.send().await?;
         Self::json_or_error(resp).await
     }
-
-    /// `GET /tasks/{task_id}/lease` — current lease metadata.
-    pub async fn get_task_lease(
-        &self,
-        bearer_override: Option<&str>,
-        task_id: &str,
-    ) -> Result<Value, ThinClientError> {
-        let url = self.url(&paths::task_lease(task_id))?;
-        let resp = self
-            .http
-            .get(url)
-            .headers(self.auth_headers_for(bearer_override))
-            .send()
-            .await?;
-        Self::json_or_error(resp).await
-    }
-
     /// `POST /tasks/{task_id}/lease/claim`
     pub async fn post_task_lease_claim(
         &self,
@@ -1443,53 +1281,6 @@ impl ThinClient {
         let resp = req.send().await?;
         Self::json_or_error(resp).await
     }
-
-    /// `POST /tasks/{task_id}/lease/release`
-    pub async fn post_task_lease_release(
-        &self,
-        bearer_override: Option<&str>,
-        edge_transport_id: Option<&str>,
-        task_id: &str,
-        body: &TaskLeaseMutationRequest,
-    ) -> Result<Value, ThinClientError> {
-        let url = self.url(&paths::task_lease_release(task_id))?;
-        let mut req = self
-            .http
-            .post(url)
-            .headers(self.auth_headers_for(bearer_override))
-            .json(body);
-        if let Some(id) = edge_transport_id
-            && let Ok(v) = HeaderValue::from_str(id)
-        {
-            req = req.header(ASTRA_EDGE_ID_HEADER, v);
-        }
-        let resp = req.send().await?;
-        Self::json_or_error(resp).await
-    }
-
-    /// `POST /tasks/{task_id}/lease/renew`
-    pub async fn post_task_lease_renew(
-        &self,
-        bearer_override: Option<&str>,
-        edge_transport_id: Option<&str>,
-        task_id: &str,
-        body: &TaskLeaseMutationRequest,
-    ) -> Result<Value, ThinClientError> {
-        let url = self.url(&paths::task_lease_renew(task_id))?;
-        let mut req = self
-            .http
-            .post(url)
-            .headers(self.auth_headers_for(bearer_override))
-            .json(body);
-        if let Some(id) = edge_transport_id
-            && let Ok(v) = HeaderValue::from_str(id)
-        {
-            req = req.header(ASTRA_EDGE_ID_HEADER, v);
-        }
-        let resp = req.send().await?;
-        Self::json_or_error(resp).await
-    }
-
     // ── Plan lifecycle ─────────────────────────────────────────────────────
 
     /// `POST /plans/{plan_id}/step-runs` — record the start of a subtask
@@ -1573,58 +1364,6 @@ impl ThinClient {
             path.push_str(&l.to_string());
         }
         let url = self.url(&path)?;
-        let resp = self
-            .http
-            .get(url)
-            .headers(Self::bearer_headers(token)?)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
-    /// `POST /plans/{plan_id}/rewind` — suffix reset from an anchor.
-    pub async fn post_plan_rewind(
-        &self,
-        token: &str,
-        plan_id: &str,
-        body: &Value,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(&paths::plan_rewind(plan_id))?;
-        let resp = self
-            .http
-            .post(url)
-            .headers(Self::bearer_headers(token)?)
-            .json(body)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
-    /// `POST /plans/{plan_id}/redo-step` — single-subtask reset.
-    pub async fn post_plan_redo_step(
-        &self,
-        token: &str,
-        plan_id: &str,
-        body: &Value,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(&paths::plan_redo_step(plan_id))?;
-        let resp = self
-            .http
-            .post(url)
-            .headers(Self::bearer_headers(token)?)
-            .json(body)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
-    /// `GET /plans?session_id=…` — list plans scoped to a session (resume).
-    pub async fn get_plans_for_session_text(
-        &self,
-        token: &str,
-        session_id: &str,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(&format!("/plans?session_id={session_id}"))?;
         let resp = self
             .http
             .get(url)
