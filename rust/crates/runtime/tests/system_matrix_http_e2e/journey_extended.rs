@@ -244,7 +244,7 @@ pub async fn run_chat_stream_session_info_smoke() {
         "test_llm_rounds": [{
             "role": "assistant",
             "content": "stream smoke reply",
-            "usage": { "prompt": 3, "completion": 5, "total": 8 }
+            "usage": { "prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8 }
         }]
     });
     let req = Request::builder()

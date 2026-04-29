@@ -1370,7 +1370,7 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
                     "kind": "stream_transport",
                     "details": {
                         "partial_full_text": partial_text,
-                        "usage": { "prompt": 17, "completion": 3 }
+                        "usage": { "prompt_tokens": 17, "completion_tokens": 3 }
                     }
                 }
             }]
@@ -2964,8 +2964,8 @@ pub async fn run_bridge_tail_parse_error_artifact_preserves_partial_state_routes
             format!("data: {{\"type\":\"text_delta\",\"content\":\"{partial_text}\"}}\n\n"),
             format!("data: {{\"type\":\"reasoning_delta\",\"content\":\"{partial_reasoning}\"}}\n\n"),
             "data: {\"type\":\"tool_call_start\",\"tool\":\"bash\",\"call_id\":\"call-1\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}\n\n".to_string(),
-            "data: {\"type\":\"usage\",\"prompt_tokens\":13,\"completion_tokens\":5}\n\n".to_string(),
-            "data: {\"type\":\"usage\",\"prompt_tokens\":13".to_string()
+            "data: {\"type\":\"usage\",\"input_tokens\":13,\"output_tokens\":5}\n\n".to_string(),
+            "data: {\"type\":\"usage\",\"input_tokens\":13".to_string()
         ]
     });
     let (status, body) = chat_turn_full(app, auth, payload).await;

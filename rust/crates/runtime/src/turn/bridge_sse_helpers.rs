@@ -95,15 +95,13 @@ pub(crate) fn apply_forward_llm_sse_event(
             Ok(vec![render_sse(event)])
         }
         "usage" => {
+            // Canonical token usage keys (see `turn::token_usage::TokenUsage::to_json_map`).
             for key in [
-                "prompt_tokens",
-                "completion_tokens",
-                "cache_read_tokens",
+                "input_tokens",
+                "cached_input_tokens",
                 "cache_creation_tokens",
-                "prompt",
-                "completion",
-                "cache_read",
-                "cache_creation",
+                "output_tokens",
+                "total_tokens",
             ] {
                 if let Some(value) = event.get(key).cloned() {
                     usage.insert(key.to_string(), value);
@@ -204,11 +202,11 @@ mod tests {
     fn render_sse_map_roundtrips() {
         let mut map = Map::new();
         map.insert("type".to_string(), Value::String("usage".to_string()));
-        map.insert("prompt_tokens".to_string(), Value::from(100));
+        map.insert("input_tokens".to_string(), Value::from(100));
         let bytes = render_sse_map(&map);
         let s = std::str::from_utf8(&bytes).unwrap();
         assert!(s.contains("\"type\":\"usage\""));
-        assert!(s.contains("\"prompt_tokens\":100"));
+        assert!(s.contains("\"input_tokens\":100"));
     }
 
     #[test]
@@ -230,7 +228,7 @@ mod tests {
             "full_text": "hello",
             "reasoning": "thought",
             "tool_calls": [{"id": "tc1"}],
-            "usage": {"prompt": 100},
+            "usage": {"input_tokens": 100},
             "model_used": "gpt-4",
         });
         let mut saw = false;
@@ -319,7 +317,7 @@ mod tests {
         )
         .unwrap();
         apply_forward_llm_sse_event(
-            &json!({"type": "usage", "prompt_tokens": 11, "completion_tokens": 4}),
+            &json!({"type": "usage", "input_tokens": 11, "output_tokens": 4, "total_tokens": 15}),
             &mut saw,
             &mut text,
             &mut reasoning,
@@ -333,8 +331,8 @@ mod tests {
         assert_eq!(reasoning, "think");
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0]["function"]["name"], "bash");
-        assert_eq!(usage["prompt_tokens"], 11);
-        assert_eq!(usage["completion_tokens"], 4);
+        assert_eq!(usage["input_tokens"], 11);
+        assert_eq!(usage["output_tokens"], 4);
     }
 
     #[test]

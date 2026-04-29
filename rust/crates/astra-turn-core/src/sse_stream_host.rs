@@ -809,7 +809,10 @@ mod tests {
 
     #[tokio::test]
     async fn noop_host_captures_usage() {
-        let events = sse_event("usage", ",\"prompt_tokens\":100,\"completion_tokens\":50");
+        let events = sse_event(
+            "usage",
+            ",\"input_tokens\":100,\"output_tokens\":50,\"total_tokens\":150",
+        );
         let chunks = chunks_from_sse(&events);
         let mut stream = stream::iter(chunks);
         let mut host = NoopSseStreamHost;

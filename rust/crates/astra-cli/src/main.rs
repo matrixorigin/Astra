@@ -1428,7 +1428,7 @@ mod tests {
             "data: {{\"type\":\"session_info\",\"session_id\":\"{session_id}\"}}\n\n\
              data: {{\"type\":\"text_delta\",\"content\":\"{text}\"}}\n\n\
              data: {{\"type\":\"text_done\",\"full_text\":\"{text}\"}}\n\n\
-             data: {{\"type\":\"usage\",\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n\
+             data: {{\"type\":\"usage\",\"input_tokens\":10,\"output_tokens\":5}}\n\n\
              data: {{\"type\":\"turn_complete\",\"has_tool_calls\":false}}\n\n\
              data: [DONE]\n\n"
         )

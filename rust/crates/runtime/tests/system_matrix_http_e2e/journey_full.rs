@@ -52,7 +52,7 @@ async fn run_tool_backed_chat_turn(
             {
                 "full_text": "tool-backed calibration reply",
                 "reasoning": "",
-                "usage": { "prompt": 7, "completion": 9, "total": 16 }
+                "usage": { "prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16 }
             }
         ]
     });
@@ -1116,7 +1116,7 @@ pub async fn run_product_matrix_full_journey(
         "test_llm_rounds": [{
             "full_text": LLM_TEXT,
             "reasoning": "",
-            "usage": { "prompt": 5, "completion": 15, "total": 20 }
+            "usage": { "prompt_tokens": 5, "completion_tokens": 15, "total_tokens": 20 }
         }]
     });
 

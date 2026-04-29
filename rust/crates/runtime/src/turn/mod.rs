@@ -37,9 +37,13 @@ pub mod prompt_cache;
 pub mod result_quality {
     pub use astra_turn_types::{ResultQuality, classify_result, quality_feedback};
 }
+pub mod bedrock_eventstream;
+pub(crate) mod bedrock_stream;
+pub(crate) mod bedrock_transport;
 pub(crate) mod services;
 pub mod skill_selector;
 pub mod skill_tool;
+pub mod token_usage;
 pub(crate) mod tool_side_effects;
 pub mod turn_trace_collector;
 

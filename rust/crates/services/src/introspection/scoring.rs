@@ -285,9 +285,9 @@ pub fn analyze_context_health(
     };
 
     let (llm_usage_info, llm_usage_note) = if let Some(usage) = llm_usage {
-        let prompt = usage.get("prompt").and_then(|v| v.as_i64());
-        let completion = usage.get("completion").and_then(|v| v.as_i64());
-        let total = usage.get("total").and_then(|v| v.as_i64());
+        let prompt = billable_input_from_canonical(usage);
+        let completion = usage.get("output_tokens").and_then(|v| v.as_i64());
+        let total = usage.get("total_tokens").and_then(|v| v.as_i64());
         let util = ((prompt.unwrap_or(0) as f64 / cw) * 1000.0).round() / 1000.0;
         (
             Some(LlmUsageInfo {
@@ -608,6 +608,22 @@ pub fn parse_token_usage(raw: &str) -> Option<Value> {
     serde_json::from_str(raw).ok()
 }
 
+/// Sum the billable input buckets (`input_tokens` + `cached_input_tokens` +
+/// `cache_creation_tokens`) from a canonical [`TokenUsage`]-shaped JSON value.
+/// Returns `None` when no recognizable input field is present.
+pub fn billable_input_from_canonical(usage: &Value) -> Option<i64> {
+    let input = usage.get("input_tokens").and_then(Value::as_i64)?;
+    let cached = usage
+        .get("cached_input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let creation = usage
+        .get("cache_creation_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    Some(input + cached + creation)
+}
+
 pub fn parse_relevance_scores(raw: &str) -> HashMap<String, f64> {
     let val: Value = match serde_json::from_str(raw) {
         Ok(v) => v,
@@ -674,7 +690,13 @@ mod tests {
     #[test]
     fn test_health_with_llm_usage() {
         let budget = serde_json::json!({"history": 5000});
-        let llm = serde_json::json!({"prompt": 60000, "completion": 500, "total": 60500});
+        let llm = serde_json::json!({
+            "input_tokens": 60000,
+            "cached_input_tokens": 0,
+            "cache_creation_tokens": 0,
+            "output_tokens": 500,
+            "total_tokens": 60500,
+        });
         let result = analyze_context_health(&budget, &[], Some(60000), Some(&llm), 128000);
         assert!(result.llm_usage.is_some());
         let u = result.llm_usage.unwrap();

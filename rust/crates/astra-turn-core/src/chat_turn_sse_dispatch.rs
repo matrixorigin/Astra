@@ -317,12 +317,9 @@ fn apply_one_event(
             }
         }
         "usage" => {
-            // Providers either expose usage fields flat on the event or wrap
-            // them inside a nested `"usage": {...}` object. Flat wins if
-            // present; nested is consulted only as a fallback so a provider
-            // that switches shape mid-stream never silently zeroes these
-            // counters. All four fields (prompt/completion/cache_read/
-            // cache_creation) share this precedence.
+            // Canonical wire shape produced by the runtime (see
+            // `astra_runtime::turn::token_usage::TokenUsage`). Fields may be
+            // either flat on the event or nested under `"usage"`; flat wins.
             let nested = event.get("usage");
             let read_u64 = |field: &str| -> Option<u64> {
                 event
@@ -330,17 +327,20 @@ fn apply_one_event(
                     .and_then(|v| v.as_u64())
                     .or_else(|| nested.and_then(|u| u.get(field)).and_then(|v| v.as_u64()))
             };
-            let prompt = read_u64("prompt_tokens");
-            let completion = read_u64("completion_tokens");
-            if prompt.is_none() && completion.is_none() {
+            let input = read_u64("input_tokens");
+            let output = read_u64("output_tokens");
+            if input.is_none() && output.is_none() {
                 if accum.error_message.is_none() {
                     accum.error_message = Some("Error: invalid usage payload".to_string());
                 }
                 return;
             }
-            accum.prompt_tokens = prompt.unwrap_or(0);
-            accum.completion_tokens = completion.unwrap_or(0);
-            accum.cache_read_tokens = read_u64("cache_read_tokens").unwrap_or(0);
+            // Local accum exposes the legacy field names; map them through.
+            // (prompt_tokens stores FRESH input — cache read/creation are
+            // counted separately below so the sum is the billable total.)
+            accum.prompt_tokens = input.unwrap_or(0);
+            accum.completion_tokens = output.unwrap_or(0);
+            accum.cache_read_tokens = read_u64("cached_input_tokens").unwrap_or(0);
             accum.cache_creation_tokens = read_u64("cache_creation_tokens").unwrap_or(0);
             accum.has_usage = true;
         }
@@ -572,7 +572,7 @@ mod tests {
     fn usage_captured() {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
-            &sse("usage", ",\"prompt_tokens\":100,\"completion_tokens\":50"),
+            &sse("usage", ",\"input_tokens\":100,\"output_tokens\":50"),
             &mut a,
             &mut vec![],
         );
@@ -876,7 +876,7 @@ mod tests {
     #[test]
     fn framer_ttft_not_set_on_usage_only() {
         // usage events alone should not trigger ttft
-        let block = sse("usage", ",\"prompt_tokens\":100,\"completion_tokens\":5");
+        let block = sse("usage", ",\"input_tokens\":100,\"output_tokens\":5");
         let mut f = ChatTurnSseFramer::new();
         let _ = f.push_lossy_bytes(block.as_bytes());
         assert!(f.ttft_ms.is_none(), "usage-only event must not set ttft");
@@ -890,7 +890,7 @@ mod tests {
         dispatch_chat_turn_sse_event_block(
             &sse(
                 "usage",
-                ",\"prompt_tokens\":100,\"completion_tokens\":50,\"cache_read_tokens\":25,\"cache_creation_tokens\":10",
+                ",\"input_tokens\":100,\"output_tokens\":50,\"cached_input_tokens\":25,\"cache_creation_tokens\":10",
             ),
             &mut a,
             &mut vec![],
@@ -906,7 +906,7 @@ mod tests {
     fn usage_cache_tokens_default_to_zero_when_missing() {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
-            &sse("usage", ",\"prompt_tokens\":100,\"completion_tokens\":50"),
+            &sse("usage", ",\"input_tokens\":100,\"output_tokens\":50"),
             &mut a,
             &mut vec![],
         );
@@ -921,7 +921,7 @@ mod tests {
         dispatch_chat_turn_sse_event_block(
             &sse(
                 "usage",
-                ",\"prompt_tokens\":100,\"completion_tokens\":50,\"cache_read_tokens\":null,\"cache_creation_tokens\":null",
+                ",\"input_tokens\":100,\"output_tokens\":50,\"cached_input_tokens\":null,\"cache_creation_tokens\":null",
             ),
             &mut a,
             &mut vec![],
@@ -936,7 +936,7 @@ mod tests {
         dispatch_chat_turn_sse_event_block(
             &sse(
                 "usage",
-                ",\"cache_read_tokens\":500,\"cache_creation_tokens\":100",
+                ",\"cached_input_tokens\":500,\"cache_creation_tokens\":100",
             ),
             &mut a,
             &mut vec![],
@@ -955,11 +955,11 @@ mod tests {
             "{}{}",
             sse(
                 "usage",
-                ",\"prompt_tokens\":100,\"completion_tokens\":50,\"cache_read_tokens\":30,\"cache_creation_tokens\":10"
+                ",\"input_tokens\":100,\"output_tokens\":50,\"cached_input_tokens\":30,\"cache_creation_tokens\":10"
             ),
             sse(
                 "usage",
-                ",\"prompt_tokens\":200,\"completion_tokens\":80,\"cache_read_tokens\":60,\"cache_creation_tokens\":0"
+                ",\"input_tokens\":200,\"output_tokens\":80,\"cached_input_tokens\":60,\"cache_creation_tokens\":0"
             ),
         );
         dispatch_chat_turn_sse_event_block(&block, &mut a, &mut vec![]);
@@ -1075,7 +1075,7 @@ mod tests {
         let mut a = ChatTurnSseAccum::default();
         // as_u64() returns None for negative values
         dispatch_chat_turn_sse_event_block(
-            &sse("usage", ",\"prompt_tokens\":-1,\"completion_tokens\":-5"),
+            &sse("usage", ",\"input_tokens\":-1,\"output_tokens\":-5"),
             &mut a,
             &mut vec![],
         );
@@ -1088,7 +1088,7 @@ mod tests {
     fn usage_float_tokens_treated_as_zero() {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
-            &sse("usage", ",\"prompt_tokens\":1.5,\"completion_tokens\":2.7"),
+            &sse("usage", ",\"input_tokens\":1.5,\"output_tokens\":2.7"),
             &mut a,
             &mut vec![],
         );
@@ -1101,7 +1101,7 @@ mod tests {
     fn usage_missing_cache_tokens_default_to_zero() {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
-            &sse("usage", ",\"prompt_tokens\":100,\"completion_tokens\":50"),
+            &sse("usage", ",\"input_tokens\":100,\"output_tokens\":50"),
             &mut a,
             &mut vec![],
         );
@@ -1318,7 +1318,7 @@ mod tests {
     fn usage_negative_tokens_treated_as_invalid() {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
-            &sse("usage", ",\"prompt_tokens\":-5,\"completion_tokens\":-10"),
+            &sse("usage", ",\"input_tokens\":-5,\"output_tokens\":-10"),
             &mut a,
             &mut vec![],
         );
@@ -1333,7 +1333,7 @@ mod tests {
         let mut a = ChatTurnSseAccum::default();
         // Float values cannot be parsed as i64 by serde, so as_i64() returns None.
         dispatch_chat_turn_sse_event_block(
-            "data: {\"type\":\"usage\",\"prompt_tokens\":3.14,\"completion_tokens\":2.71}\n\n",
+            "data: {\"type\":\"usage\",\"input_tokens\":3.14,\"output_tokens\":2.71}\n\n",
             &mut a,
             &mut vec![],
         );
@@ -1520,7 +1520,7 @@ mod tests {
     fn usage_nested_fallback_captures_all_four_counters() {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
-            "data: {\"type\":\"usage\",\"usage\":{\"prompt_tokens\":101,\"completion_tokens\":42,\"cache_read_tokens\":7,\"cache_creation_tokens\":13}}\n\n",
+            "data: {\"type\":\"usage\",\"usage\":{\"input_tokens\":101,\"output_tokens\":42,\"cached_input_tokens\":7,\"cache_creation_tokens\":13}}\n\n",
             &mut a,
             &mut vec![],
         );
@@ -1540,7 +1540,7 @@ mod tests {
     fn usage_flat_wins_over_nested() {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
-            "data: {\"type\":\"usage\",\"prompt_tokens\":1,\"completion_tokens\":2,\"cache_read_tokens\":3,\"cache_creation_tokens\":4,\"usage\":{\"prompt_tokens\":999,\"completion_tokens\":999,\"cache_read_tokens\":999,\"cache_creation_tokens\":999}}\n\n",
+            "data: {\"type\":\"usage\",\"input_tokens\":1,\"output_tokens\":2,\"cached_input_tokens\":3,\"cache_creation_tokens\":4,\"usage\":{\"input_tokens\":999,\"output_tokens\":999,\"cached_input_tokens\":999,\"cache_creation_tokens\":999}}\n\n",
             &mut a,
             &mut vec![],
         );
@@ -1555,7 +1555,7 @@ mod tests {
     fn usage_mixed_flat_and_nested_per_field() {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
-            "data: {\"type\":\"usage\",\"prompt_tokens\":50,\"completion_tokens\":10,\"usage\":{\"cache_read_tokens\":11,\"cache_creation_tokens\":22}}\n\n",
+            "data: {\"type\":\"usage\",\"input_tokens\":50,\"output_tokens\":10,\"usage\":{\"cached_input_tokens\":11,\"cache_creation_tokens\":22}}\n\n",
             &mut a,
             &mut vec![],
         );

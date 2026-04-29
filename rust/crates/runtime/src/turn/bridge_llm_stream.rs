@@ -18,9 +18,8 @@ use uuid::Uuid;
 
 use crate::turn::bridge_sse_helpers::render_sse;
 use crate::turn::llm_client::{
-    LlmCallResult, LlmCancel, apply_provider_auth, build_provider_request_body,
-    consolidate_system_messages, llm_request_url_for_provider, provider_uses_bedrock_converse,
-    sleep_ms_or_llm_cancel,
+    LlmCancel, apply_provider_auth, build_provider_request_body, consolidate_system_messages,
+    llm_request_url_for_provider, provider_uses_bedrock_converse, sleep_ms_or_llm_cancel,
 };
 use astra_turn_core::bridge_rate_limit_cooldown::{
     PerModelCooldown, RateLimitAction, is_overload_status, is_rate_limit_status,
@@ -124,56 +123,209 @@ fn bridge_llm_cancel(cc: &Option<Arc<CancellationToken>>) -> LlmCancel<'_> {
     }
 }
 
-fn synthetic_stream_from_result(
-    mut result: LlmCallResult,
-    model_name: &str,
-) -> impl futures_util::Stream<Item = Bytes> + Send + 'static {
-    ensure_tool_call_ids(&mut result.tool_calls);
-    let mut events = Vec::new();
-    if !result.full_text.is_empty() && result.tool_calls.is_empty() {
-        events.push(render_sse(
-            &json!({"type":"text_delta","content": result.full_text}),
-        ));
+/// Build the canonical `usage` SSE event JSON from an `LlmCallResult::usage`
+/// map (which uses our canonical keys). Returns `None` when the map is empty.
+fn usage_sse_event_from_result_map(m: &Map<String, Value>) -> Option<Value> {
+    if m.is_empty() {
+        return None;
     }
-    if !result.reasoning.is_empty() {
-        events.push(render_sse(
-            &json!({"type":"reasoning_delta","content": result.reasoning}),
-        ));
-    }
-    for tc in &result.tool_calls {
-        if let Some(obj) = tc.as_object() {
-            let mut tc = obj.clone();
-            if let Some(event) = tool_call_start_event(&mut tc) {
-                events.push(render_sse(&event));
-            }
-        }
-    }
-    let prompt = result.usage.get("prompt").and_then(Value::as_i64);
-    let completion = result.usage.get("completion").and_then(Value::as_i64);
-    if prompt.is_some() || completion.is_some() {
-        let cache_read = result.usage.get("cache_read").and_then(Value::as_i64);
-        let cache_creation = result.usage.get("cache_creation").and_then(Value::as_i64);
-        events.push(render_sse(&json!({
-            "type": "usage",
-            "prompt_tokens": prompt,
-            "completion_tokens": completion,
-            "cache_read_tokens": cache_read,
-            "cache_creation_tokens": cache_creation,
-        })));
-    }
-    events.push(render_sse(&json!({
-        "type": "_inprocess_summary",
-        "full_text": result.full_text,
-        "reasoning": result.reasoning,
-        "tool_calls": result.tool_calls,
-        "usage": result.usage,
-        "model_used": model_name,
-    })));
-    futures_util::stream::iter(events)
+    let u = crate::turn::token_usage::TokenUsage::from_json_map(m);
+    Some(json!({
+        "type": "usage",
+        "input_tokens": u.input_tokens,
+        "cached_input_tokens": u.cached_input_tokens,
+        "cache_creation_tokens": u.cache_creation_tokens,
+        "output_tokens": u.output_tokens,
+        "total_tokens": u.total_tokens(),
+    }))
 }
 
 fn turn_timeout_s() -> f64 {
     astra_core::RuntimeLimits::global().turn_timeout_s
+}
+
+/// What the retry-loop should do with the current non-2xx response.
+///
+/// Returned by [`classify_non_success_and_record_cooldown`] so both the
+/// Bedrock and OpenAI streaming paths share exactly one piece of
+/// error-classification + cooldown-bookkeeping code.
+enum RetryDecision {
+    /// Retryable transient error. If `Some(delay_ms)`, the caller must
+    /// sleep that long before attempting again. Applies to 429, 529/503
+    /// (overload), and generic 5xx.
+    Retry { delay_ms: Option<u64> },
+    /// Terminal error — caller must return `Err(last_err)`.
+    Terminal,
+}
+
+/// Classify a non-2xx response and update the rate-limit cooldown tracker.
+///
+/// Maps:
+/// - `429`           → `record_429` + Retry (respecting cooldown's advised delay)
+/// - `503`/`529`     → `record_529` + Retry (overload path)
+/// - other `5xx`     → Retry without cooldown bookkeeping
+/// - other `4xx`     → Terminal
+///
+/// `model_key` is the cooldown scope (normally `model_name`). `log_tag` is
+/// a short prefix for warn messages so logs reveal which HTTP path triggered.
+fn classify_non_success_and_record_cooldown(
+    status: u16,
+    retry_after_ms: Option<u64>,
+    cooldown: &PerModelCooldown,
+    model_key: &str,
+    has_fallback: bool,
+    log_tag: &str,
+) -> RetryDecision {
+    if is_rate_limit_status(status) {
+        let action = cooldown.with(model_key, |c| c.record_429(retry_after_ms, has_fallback));
+        astra_core::agent_warn!(
+            "llm",
+            "{log_tag} rate limit (429) on {model_key}: action={action:?}"
+        );
+        let delay_ms = match action {
+            RateLimitAction::WaitAndRetry { delay_ms } => Some(delay_ms),
+            _ => None,
+        };
+        return RetryDecision::Retry { delay_ms };
+    }
+    if is_overload_status(status) {
+        let action = cooldown.with(model_key, |c| c.record_529(retry_after_ms, has_fallback));
+        astra_core::agent_warn!(
+            "llm",
+            "{log_tag} overload ({status}) on {model_key}: action={action:?}"
+        );
+        let delay_ms = match action {
+            RateLimitAction::WaitAndRetry { delay_ms } => Some(delay_ms),
+            _ => None,
+        };
+        return RetryDecision::Retry { delay_ms };
+    }
+    if status >= 500 {
+        return RetryDecision::Retry { delay_ms: None };
+    }
+    RetryDecision::Terminal
+}
+
+/// Bedrock Converse streaming POST with the same retry + cooldown discipline
+/// the OpenAI branch of [`call_llm_stream`] uses:
+///
+/// - HTTP 429 → `record_429` on the cooldown tracker + retry with backoff.
+/// - HTTP 5xx → record via `record_529` for overload (529 / 503) or plain
+///   retry otherwise, bounded by `LLM_MAX_RETRIES`.
+/// - Network errors → retry with exponential backoff.
+/// - On the first 2xx response, hand the body to
+///   [`bedrock_transport::bedrock_stream_response_bytes`] and return the
+///   canonical internal SSE stream.
+#[allow(clippy::too_many_arguments)]
+async fn bedrock_stream_with_retry(
+    client: &reqwest::Client,
+    messages: &[Value],
+    tools: &[Value],
+    model_name: &str,
+    api_key: &str,
+    base_url: &str,
+    provider: &str,
+    max_output_tokens: Option<usize>,
+    has_fallback: bool,
+    client_cancel: Option<Arc<CancellationToken>>,
+) -> Result<Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>, String> {
+    let cooldown = rate_limit_cooldown();
+    let model_key = model_name;
+
+    let body = build_provider_request_body(
+        messages,
+        tools,
+        model_name,
+        provider,
+        max_output_tokens,
+        None,
+        true,
+    );
+    let url = llm_request_url_for_provider(base_url, provider, model_name, true);
+
+    let total_budget = crate::turn::llm_client::llm_total_budget();
+    let started = std::time::Instant::now();
+    let mut last_err = String::new();
+
+    for attempt in 0..=LLM_MAX_RETRIES {
+        if attempt > 0 && started.elapsed() > total_budget {
+            return Err(format!(
+                "bedrock stream total budget exhausted ({:.0}s): {last_err}",
+                total_budget.as_secs_f64()
+            ));
+        }
+        if attempt > 0 {
+            let delay = LLM_RETRY_BASE_MS * (1 << (attempt - 1));
+            sleep_ms_or_llm_cancel(delay, bridge_llm_cancel(&client_cancel))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
+        let mut req = client.post(&url).header("content-type", "application/json");
+        req = apply_provider_auth(req, provider, api_key, None);
+
+        let request_started = std::time::Instant::now();
+        let response = match req.json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("bedrock converse-stream send failed: {e}");
+                astra_core::agent_warn!(
+                    "llm",
+                    "bedrock network retry: attempt={attempt} model={model_name} err={e}"
+                );
+                continue;
+            }
+        };
+
+        let status = response.status().as_u16();
+        if response.status().is_success() {
+            cooldown.with(model_key, |c| c.record_success());
+            let idle = crate::turn::llm_client::stream_idle_timeout();
+            return Ok(Box::pin(
+                crate::turn::bedrock_transport::bedrock_stream_response_bytes(
+                    response,
+                    model_name.to_string(),
+                    request_started,
+                    client_cancel,
+                    idle,
+                ),
+            ));
+        }
+
+        let retry_after_ms = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after_ms);
+        let text = response
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<body read error: {e}>"));
+        last_err = format!("bedrock converse-stream HTTP {status}: {text}");
+
+        match classify_non_success_and_record_cooldown(
+            status,
+            retry_after_ms,
+            cooldown,
+            model_key,
+            has_fallback,
+            "bedrock",
+        ) {
+            RetryDecision::Retry { delay_ms } => {
+                if let Some(d) = delay_ms {
+                    sleep_ms_or_llm_cancel(d, bridge_llm_cancel(&client_cancel))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                continue;
+            }
+            RetryDecision::Terminal => return Err(last_err),
+        }
+    }
+
+    Err(format!(
+        "bedrock stream exhausted {LLM_MAX_RETRIES} retries: {last_err}"
+    ))
 }
 
 /// Call LLM streaming API, yield SSE bytes.
@@ -214,8 +366,7 @@ pub(crate) async fn call_llm_stream(
 
     let messages = consolidate_system_messages(messages);
     if provider_uses_bedrock_converse(provider) {
-        let fb_timeout = crate::turn::llm_client::llm_fallback_timeout();
-        let result = crate::turn::llm_client::call_llm_nonstream_fallback(
+        return bedrock_stream_with_retry(
             &client,
             &messages,
             tools,
@@ -224,11 +375,10 @@ pub(crate) async fn call_llm_stream(
             base_url,
             provider,
             max_output_tokens,
-            fb_timeout,
+            has_fallback,
+            client_cancel,
         )
-        .await
-        .map_err(|e| e.to_string())?;
-        return Ok(Box::pin(synthetic_stream_from_result(result, model_name)));
+        .await;
     }
 
     let body = build_provider_request_body(
@@ -410,28 +560,8 @@ pub(crate) async fn call_llm_stream(
                                                     }
                                                 }
                                             }
-                                            let prompt =
-                                                result.usage.get("prompt").and_then(Value::as_i64);
-                                            let completion = result
-                                                .usage
-                                                .get("completion")
-                                                .and_then(Value::as_i64);
-                                            if prompt.is_some() || completion.is_some() {
-                                                let cache_read = result
-                                                    .usage
-                                                    .get("cache_read")
-                                                    .and_then(Value::as_i64);
-                                                let cache_creation = result
-                                                    .usage
-                                                    .get("cache_creation")
-                                                    .and_then(Value::as_i64);
-                                                yield render_sse(&json!({
-                                                    "type": "usage",
-                                                    "prompt_tokens": prompt,
-                                                    "completion_tokens": completion,
-                                                    "cache_read_tokens": cache_read,
-                                                    "cache_creation_tokens": cache_creation,
-                                                }));
+                                            if let Some(event) = usage_sse_event_from_result_map(&result.usage) {
+                                                yield render_sse(&event);
                                             }
                                         }
                                         Err(e) => {
@@ -509,18 +639,8 @@ pub(crate) async fn call_llm_stream(
                                                         }
                                                     }
                                                 }
-                                                let prompt = result.usage.get("prompt").and_then(Value::as_i64);
-                                                let completion = result.usage.get("completion").and_then(Value::as_i64);
-                                                if prompt.is_some() || completion.is_some() {
-                                                    let cache_read = result.usage.get("cache_read").and_then(Value::as_i64);
-                                                    let cache_creation = result.usage.get("cache_creation").and_then(Value::as_i64);
-                                                    yield render_sse(&json!({
-                                                        "type": "usage",
-                                                        "prompt_tokens": prompt,
-                                                        "completion_tokens": completion,
-                                                        "cache_read_tokens": cache_read,
-                                                        "cache_creation_tokens": cache_creation,
-                                                    }));
+                                                if let Some(event) = usage_sse_event_from_result_map(&result.usage) {
+                                                    yield render_sse(&event);
                                                 }
                                             }
                                             Err(error) => {
@@ -560,50 +680,24 @@ pub(crate) async fn call_llm_stream(
                                 }
                             };
                             // Some providers attach usage to a chunk that also contains choices,
-                            // so parse usage first on every chunk.
+                            // so parse usage first on every chunk. Streaming endpoints are
+                            // OpenAI-compatible; Bedrock is intercepted earlier.
                             made_progress = true;
-                            if let Some(u) = chunk.get("usage").and_then(Value::as_object) {
-                                // OpenAI/Anthropic: prompt_tokens / completion_tokens
-                                // Bedrock Converse: inputTokens / outputTokens
-                                let prompt = u.get("prompt_tokens").and_then(Value::as_i64)
-                                    .or_else(|| u.get("inputTokens").and_then(Value::as_i64));
-                                let completion = u.get("completion_tokens").and_then(Value::as_i64)
-                                    .or_else(|| u.get("outputTokens").and_then(Value::as_i64));
-                                if prompt.is_some() || completion.is_some() {
-                                    let mut usage_map = Map::new();
-                                    if let Some(value) = prompt {
-                                        usage_map.insert("prompt".to_string(), Value::from(value));
-                                    }
-                                    if let Some(value) = completion {
-                                        usage_map.insert("completion".to_string(), Value::from(value));
-                                    }
-                                    if let (Some(p), Some(c)) = (prompt, completion) {
-                                        usage_map.insert("total".to_string(), Value::from(p + c));
-                                    }
-                                    usage = usage_map;
-                                    // OpenAI: prompt_tokens_details.cached_tokens
-                                    // Anthropic (via proxy): cache_read_input_tokens / cache_creation_input_tokens
-                                    // Bedrock Converse: cacheReadInputTokens / cacheWriteInputTokens
-                                    let cache_read = u.get("prompt_tokens_details")
-                                        .and_then(|d| d.get("cached_tokens"))
-                                        .and_then(Value::as_i64)
-                                        .or_else(|| u.get("cache_read_input_tokens").and_then(Value::as_i64))
-                                        .or_else(|| u.get("cacheReadInputTokens").and_then(Value::as_i64))
-                                        .or_else(|| u.get("cacheReadInputTokensCount").and_then(Value::as_i64));
-                                    let cache_creation = u.get("prompt_tokens_details")
-                                        .and_then(|d| d.get("cache_creation_input_tokens"))
-                                        .and_then(Value::as_i64)
-                                        .or_else(|| u.get("cache_creation_input_tokens").and_then(Value::as_i64))
-                                        .or_else(|| u.get("cacheWriteInputTokens").and_then(Value::as_i64))
-                                        .or_else(|| u.get("cacheWriteInputTokensCount").and_then(Value::as_i64));
-                                    yield render_sse(&json!({
-                                        "type": "usage",
-                                        "prompt_tokens": prompt,
-                                        "completion_tokens": completion,
-                                        "cache_read_tokens": cache_read,
-                                        "cache_creation_tokens": cache_creation,
-                                    }));
-                                }
+                            if let Some(u) = chunk.get("usage").and_then(Value::as_object)
+                                && let Some(extracted) = crate::turn::token_usage::extract_usage(
+                                    crate::turn::token_usage::UsageDialect::OpenAi,
+                                    u,
+                                )
+                            {
+                                usage = extracted.to_json_map();
+                                yield render_sse(&json!({
+                                    "type": "usage",
+                                    "input_tokens": extracted.input_tokens,
+                                    "cached_input_tokens": extracted.cached_input_tokens,
+                                    "cache_creation_tokens": extracted.cache_creation_tokens,
+                                    "output_tokens": extracted.output_tokens,
+                                    "total_tokens": extracted.total_tokens(),
+                                }));
                             }
 
                             let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
@@ -727,52 +821,27 @@ pub(crate) async fn call_llm_stream(
             .unwrap_or_else(|e| format!("<body read error: {e}>"));
         last_err = format!("LLM error {status}: {text}");
 
-        // Record rate-limit errors to cooldown tracker
-        if is_rate_limit_status(status) {
-            let action = cooldown.with(model_key, |c| c.record_429(retry_after_ms, has_fallback));
-            astra_core::agent_warn!(
-                "llm",
-                "rate limit (429) on {}: action={:?}",
-                model_key,
-                action,
-            );
-
-            // If cooldown says to wait, honor it
-            if let RateLimitAction::WaitAndRetry { delay_ms } = action {
-                sleep_ms_or_llm_cancel(delay_ms, bridge_llm_cancel(&client_cancel))
-                    .await
-                    .map_err(|e| e.to_string())?;
+        match classify_non_success_and_record_cooldown(
+            status,
+            retry_after_ms,
+            cooldown,
+            model_key,
+            has_fallback,
+            "openai-stream",
+        ) {
+            RetryDecision::Retry { delay_ms } => {
+                if let Some(d) = delay_ms {
+                    sleep_ms_or_llm_cancel(d, bridge_llm_cancel(&client_cancel))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                continue;
             }
-            continue; // Retryable
+            // 4xx (except 429) is not retryable — fail immediately.
+            // Context-window errors are detected by content at the call site
+            // (bridge_inprocess forward()), not here.
+            RetryDecision::Terminal => return Err(last_err),
         }
-
-        if is_overload_status(status) {
-            let action = cooldown.with(model_key, |c| c.record_529(retry_after_ms, has_fallback));
-            astra_core::agent_warn!(
-                "llm",
-                "server overload ({status}) on {}: action={:?}",
-                model_key,
-                action,
-            );
-
-            // If cooldown says to wait, honor it
-            if let RateLimitAction::WaitAndRetry { delay_ms } = action {
-                sleep_ms_or_llm_cancel(delay_ms, bridge_llm_cancel(&client_cancel))
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            continue; // Retryable
-        }
-
-        // Other 5xx errors are retryable but don't affect cooldown state
-        if status >= 500 {
-            continue;
-        }
-
-        // 4xx (except 429) is not retryable — fail immediately.
-        // Context-window errors are detected by content at the call site
-        // (bridge_inprocess forward()), not here.
-        return Err(last_err);
     }
 
     // All retries exhausted
@@ -1166,6 +1235,216 @@ mod tests {
         assert!(
             suffix_calls >= 2,
             "both idle and transport fallback paths should emit only the missing text suffix"
+        );
+    }
+
+    // ── Bedrock streaming retry contract ────────────────────────────────
+
+    /// Hand-roll a minimal AWS EventStream frame (two string headers +
+    /// JSON payload) matching Bedrock's Converse event envelope.
+    fn build_bedrock_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
+        fn enc_str(out: &mut Vec<u8>, name: &str, value: &str) {
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+            out.push(7); // string type
+            out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            out.extend_from_slice(value.as_bytes());
+        }
+        let mut headers = Vec::new();
+        enc_str(&mut headers, ":message-type", "event");
+        enc_str(&mut headers, ":event-type", event_type);
+        let headers_len = headers.len() as u32;
+        let total_len = 12 + headers_len + payload.len() as u32 + 4;
+        let mut out = Vec::with_capacity(total_len as usize);
+        out.extend_from_slice(&total_len.to_be_bytes());
+        out.extend_from_slice(&headers_len.to_be_bytes());
+        let prelude_crc = crc32fast::hash(&out[0..8]);
+        out.extend_from_slice(&prelude_crc.to_be_bytes());
+        out.extend_from_slice(&headers);
+        out.extend_from_slice(payload);
+        let msg_crc = crc32fast::hash(&out);
+        out.extend_from_slice(&msg_crc.to_be_bytes());
+        out
+    }
+
+    /// Raw TCP server that returns HTTP 429 on the first POST and a valid
+    /// Bedrock EventStream body on the second. Counts hits so the test
+    /// can assert both attempts happened and the cooldown tracker saw the
+    /// 429 → retry transition.
+    async fn spawn_bedrock_retry_server(hits: Arc<AtomicU32>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind bedrock retry listener");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let hits = hits.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 8192];
+                    let _ = socket.read(&mut buf).await.unwrap_or(0);
+                    let n = hits.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        // First attempt → 429 Too Many Requests.
+                        let body = "{\"message\":\"rate limited\"}";
+                        let resp = format!(
+                            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                        let _ = socket.shutdown().await;
+                    } else {
+                        // Second attempt → 200 + valid EventStream body.
+                        let start = build_bedrock_frame("messageStart", br#"{"role":"assistant"}"#);
+                        let delta = build_bedrock_frame(
+                            "contentBlockDelta",
+                            br#"{"contentBlockIndex":0,"delta":{"text":"hi"}}"#,
+                        );
+                        let stop =
+                            build_bedrock_frame("messageStop", br#"{"stopReason":"end_turn"}"#);
+                        let meta = build_bedrock_frame(
+                            "metadata",
+                            br#"{"usage":{"inputTokens":3,"outputTokens":1,"totalTokens":4}}"#,
+                        );
+                        let mut body = Vec::new();
+                        body.extend_from_slice(&start);
+                        body.extend_from_slice(&delta);
+                        body.extend_from_slice(&stop);
+                        body.extend_from_slice(&meta);
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.amazon.eventstream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = socket.write_all(header.as_bytes()).await;
+                        let _ = socket.write_all(&body).await;
+                        let _ = socket.shutdown().await;
+                    }
+                });
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        format!("http://{addr}")
+    }
+
+    // ── classify_non_success_and_record_cooldown (shared retry helper) ──
+
+    #[test]
+    fn classify_429_records_cooldown_and_returns_retry_with_delay() {
+        let cd = PerModelCooldown::new();
+        let d = classify_non_success_and_record_cooldown(
+            429,
+            Some(2500),
+            &cd,
+            "test-model",
+            false,
+            "unit",
+        );
+        match d {
+            RetryDecision::Retry { delay_ms } => {
+                // Cooldown's own delay can override our hint; just assert SOME delay came back.
+                assert!(delay_ms.is_some(), "429 should yield a wait delay");
+            }
+            RetryDecision::Terminal => panic!("429 must be retryable"),
+        }
+    }
+
+    #[test]
+    fn classify_529_records_overload_and_returns_retry() {
+        let cd = PerModelCooldown::new();
+        let d =
+            classify_non_success_and_record_cooldown(529, None, &cd, "test-model", false, "unit");
+        assert!(matches!(d, RetryDecision::Retry { .. }));
+    }
+
+    #[test]
+    fn classify_generic_5xx_retries_without_cooldown() {
+        let cd = PerModelCooldown::new();
+        let d =
+            classify_non_success_and_record_cooldown(502, None, &cd, "test-model", false, "unit");
+        match d {
+            RetryDecision::Retry { delay_ms } => assert!(
+                delay_ms.is_none(),
+                "plain 5xx should not request a cooldown-imposed delay"
+            ),
+            RetryDecision::Terminal => panic!("5xx must be retryable"),
+        }
+    }
+
+    #[test]
+    fn classify_4xx_except_429_is_terminal() {
+        let cd = PerModelCooldown::new();
+        for status in [400u16, 401, 403, 404, 422] {
+            let d = classify_non_success_and_record_cooldown(
+                status,
+                None,
+                &cd,
+                "test-model",
+                false,
+                "unit",
+            );
+            assert!(
+                matches!(d, RetryDecision::Terminal),
+                "{status} must be terminal, got {d:?}"
+            );
+        }
+    }
+
+    // Trivial Debug impl used by the above assertion messages.
+    impl std::fmt::Debug for RetryDecision {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                RetryDecision::Retry { delay_ms } => {
+                    write!(f, "Retry {{ delay_ms: {delay_ms:?} }}")
+                }
+                RetryDecision::Terminal => write!(f, "Terminal"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bedrock_streaming_retries_on_429_and_delivers_body() {
+        // Retry base delay is the compile-time `LLM_RETRY_BASE_MS` (1s).
+        // Total test time with one retry ≈ 1s sleep + network round-trips.
+        let hits = Arc::new(AtomicU32::new(0));
+        let base_url = spawn_bedrock_retry_server(hits.clone()).await;
+
+        let messages = vec![json!({"role":"user","content":"say hi"})];
+        let stream = call_llm_stream(
+            &messages,
+            &[],
+            "anthropic.claude-sonnet-4-test",
+            "dummy-key",
+            &base_url,
+            "bedrock",
+            Some(32),
+            false,
+            None,
+        )
+        .await
+        .expect("stream should succeed after retry");
+
+        // Drive the stream to completion.
+        let mut all = Vec::new();
+        let mut s = stream;
+        while let Some(chunk) = s.next().await {
+            all.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8_lossy(&all);
+        assert!(
+            body.contains("\"text_delta\""),
+            "stream must deliver canonical text_delta after retry; got: {body}"
+        );
+        assert!(
+            body.contains("_inprocess_summary"),
+            "stream must end with _inprocess_summary: {body}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "server must have seen 2 POSTs (the 429 + the successful retry)"
         );
     }
 }

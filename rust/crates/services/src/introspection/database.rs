@@ -9,9 +9,9 @@ use astra_core::{
 
 use super::scoring::{
     DEGRADATION_DELTA, QUALITY_DEGRADED, QUALITY_GOOD, TOKEN_CHAR_RATIO, analyze_context_health,
-    compaction_effectiveness, compaction_forecast, compute_trend, memory_recall_final_score,
-    memory_recall_score, parse_relevance_scores, parse_token_usage, pollution_ratio,
-    relevance_quality, zone_balance,
+    billable_input_from_canonical, compaction_effectiveness, compaction_forecast, compute_trend,
+    memory_recall_final_score, memory_recall_score, parse_relevance_scores, parse_token_usage,
+    pollution_ratio, relevance_quality, zone_balance,
 };
 use super::{
     EpisodicStats, IntrospectionService, MemoryIntrospectionResponse, ProceduralStats,
@@ -179,9 +179,10 @@ impl IntrospectionService for DatabaseIntrospectionService {
                 }
 
                 if let Some(ref usage) = llm_usage_val {
-                    stats.llm_prompt_tokens = usage.get("prompt").and_then(|v| v.as_i64());
-                    stats.llm_completion_tokens = usage.get("completion").and_then(|v| v.as_i64());
-                    stats.llm_total_tokens = usage.get("total").and_then(|v| v.as_i64());
+                    stats.llm_prompt_tokens = billable_input_from_canonical(usage);
+                    stats.llm_completion_tokens =
+                        usage.get("output_tokens").and_then(|v| v.as_i64());
+                    stats.llm_total_tokens = usage.get("total_tokens").and_then(|v| v.as_i64());
                 }
 
                 let budget_raw: Option<String> = latest.try_get("token_budget").ok();
@@ -193,7 +194,7 @@ impl IntrospectionService for DatabaseIntrospectionService {
                         .filter_map(|r| {
                             let raw: String = r.try_get("token_usage").ok()?;
                             let u = parse_token_usage(&raw)?;
-                            u.get("prompt")?.as_i64()
+                            billable_input_from_canonical(&u)
                         })
                         .collect();
 
@@ -368,7 +369,7 @@ impl IntrospectionService for DatabaseIntrospectionService {
 
         let prompt_history: Vec<i64> = usages
             .iter()
-            .filter_map(|u| u.get("prompt")?.as_i64())
+            .filter_map(billable_input_from_canonical)
             .collect();
 
         let trend = compute_trend(&prompt_history);
@@ -381,23 +382,27 @@ impl IntrospectionService for DatabaseIntrospectionService {
             .iter()
             .map(|u| {
                 serde_json::json!({
-                    "prompt": u.get("prompt"),
-                    "completion": u.get("completion"),
-                    "total": u.get("total"),
+                    "input_tokens": u.get("input_tokens"),
+                    "cached_input_tokens": u.get("cached_input_tokens"),
+                    "cache_creation_tokens": u.get("cache_creation_tokens"),
+                    "output_tokens": u.get("output_tokens"),
+                    "total_tokens": u.get("total_tokens"),
                 })
             })
             .collect();
 
         let cw = context_window.max(1);
-        let current_prompt = current.get("prompt").and_then(|v| v.as_i64()).unwrap_or(0);
+        let current_prompt = billable_input_from_canonical(&current).unwrap_or(0);
 
         Ok(serde_json::json!({
             "turns_sampled": rows.len(),
             "trend": trend,
             "current_tokens": {
-                "prompt": current.get("prompt"),
-                "completion": current.get("completion"),
-                "total": current.get("total"),
+                "input_tokens": current.get("input_tokens"),
+                "cached_input_tokens": current.get("cached_input_tokens"),
+                "cache_creation_tokens": current.get("cache_creation_tokens"),
+                "output_tokens": current.get("output_tokens"),
+                "total_tokens": current.get("total_tokens"),
             },
             "context_window_limit": context_window,
             "utilization": ((current_prompt as f64 / cw as f64) * 1000.0).round() / 1000.0,
@@ -530,21 +535,20 @@ impl IntrospectionService for DatabaseIntrospectionService {
                 .filter_map(|r| {
                     let raw: String = r.try_get("token_usage").ok()?;
                     let u = parse_token_usage(&raw)?;
-                    u.get("prompt")?.as_i64()
+                    billable_input_from_canonical(&u)
                 })
                 .collect();
 
             let current_prompt = current_usage
                 .as_ref()
-                .and_then(|u| u.get("prompt")?.as_i64());
+                .and_then(billable_input_from_canonical);
 
             if let Some(ref cu) = current_usage {
-                result["llm_prompt_tokens"] =
-                    serde_json::json!(cu.get("prompt").and_then(|v| v.as_i64()));
+                result["llm_prompt_tokens"] = serde_json::json!(billable_input_from_canonical(cu));
                 result["llm_completion_tokens"] =
-                    serde_json::json!(cu.get("completion").and_then(|v| v.as_i64()));
+                    serde_json::json!(cu.get("output_tokens").and_then(|v| v.as_i64()));
                 result["llm_total_tokens"] =
-                    serde_json::json!(cu.get("total").and_then(|v| v.as_i64()));
+                    serde_json::json!(cu.get("total_tokens").and_then(|v| v.as_i64()));
             }
 
             let reversed_prompts: Vec<i64> = trend_prompts.iter().copied().rev().collect();

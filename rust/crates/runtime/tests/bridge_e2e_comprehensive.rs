@@ -600,7 +600,7 @@ async fn bridge_turn_persists_llm_round_journal_event() {
         "edge_tools": [tool_schema("read_file"), tool_schema("grep")],
         "test_llm_rounds": [{
             "tool_calls": [tool_call("tc-bridge-round", "read_file", json!({"path": "README.md"}))],
-            "usage": { "prompt": 321, "completion": 45, "cache_read": 7, "total": 373 }
+            "usage": { "prompt_tokens": 321, "completion_tokens": 45, "prompt_tokens_details": {"cached_tokens": 7}, "total_tokens": 373 }
         }]
     });
 
@@ -616,7 +616,9 @@ async fn bridge_turn_persists_llm_round_journal_event() {
         .expect("llm_round event should be persisted");
     assert_eq!(llm_round.turn, Some(1));
     assert_eq!(llm_round.round, Some(0));
-    assert_eq!(llm_round.tokens_in, Some(321));
+    // Fresh input = prompt_tokens(321) - cached_tokens(7) = 314.
+    // Journal records the disjoint buckets: fresh input, cache read, output.
+    assert_eq!(llm_round.tokens_in, Some(314));
     assert_eq!(llm_round.tokens_out, Some(45));
     assert_eq!(llm_round.cache_read_tokens, Some(7));
     assert_eq!(llm_round.tool_calls_returned, Some(1));
@@ -676,7 +678,7 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
                 "explain": true,
                 "test_llm_rounds": [{
                     "tool_calls": [tool_call("tc-matrix-read", "read_file", json!({"path": "README.md"}))],
-                    "usage": { "prompt": 500, "completion": 30, "total": 530 }
+                    "usage": { "prompt_tokens": 500, "completion_tokens": 30, "total_tokens": 530 }
                 }]
             }),
             expected_text: None,
@@ -699,7 +701,7 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
                         tool_call("tc-matrix-list", "list_dir", json!({"path": "."})),
                         tool_call("tc-matrix-read", "read_file", json!({"path": "README.md"}))
                     ],
-                    "usage": { "prompt": 700, "completion": 50, "total": 750 }
+                    "usage": { "prompt_tokens": 700, "completion_tokens": 50, "total_tokens": 750 }
                 }]
             }),
             expected_text: None,
@@ -750,7 +752,7 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
                 "explain": true,
                 "test_llm_rounds": [{
                     "tool_calls": [tool_call("tc-matrix-repair", "str_replace", json!({"path": "rust/crates/astra-tools/src/git_gix.rs"}))],
-                    "usage": { "prompt": 900, "completion": 40, "total": 940 }
+                    "usage": { "prompt_tokens": 900, "completion_tokens": 40, "total_tokens": 940 }
                 }]
             }),
             expected_text: None,
@@ -770,7 +772,7 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
                 "explain": true,
                 "test_llm_rounds": [{
                     "tool_calls": [tool_call("tc-matrix-memory-store", "memory_store", json!({"content": "User likes Rust"}))],
-                    "usage": { "prompt": 650, "completion": 35, "total": 685 }
+                    "usage": { "prompt_tokens": 650, "completion_tokens": 35, "total_tokens": 685 }
                 }]
             }),
             expected_text: None,
@@ -790,7 +792,7 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
                 "explain": true,
                 "test_llm_rounds": [{
                     "tool_calls": [tool_call("tc-matrix-memory-search", "memory_search", json!({"query": "preferred language"}))],
-                    "usage": { "prompt": 640, "completion": 35, "total": 675 }
+                    "usage": { "prompt_tokens": 640, "completion_tokens": 35, "total_tokens": 675 }
                 }]
             }),
             expected_text: None,
@@ -1867,18 +1869,34 @@ async fn usage_token_tracking_persisted_in_llm_response() {
     assert_eq!(core.len(), 1);
     let lr = core[0].llm_response_event.as_ref().unwrap();
 
-    // token_usage should be persisted.
+    // token_usage should be persisted with canonical keys
+    // (see `turn::token_usage::TokenUsage::to_json_map`).
     assert!(lr.token_usage.is_some(), "token_usage should be persisted");
     let usage = lr.token_usage.as_ref().unwrap();
+    // Fixture is the Anthropic-on-proxy DISJOINT shape: top-level
+    // `cache_read_input_tokens` + `cache_creation_input_tokens`, no nested
+    // `prompt_tokens_details`. Per
+    // `turn::token_usage::UsageDialect::OpenAi`'s field-presence
+    // disambiguation, prompt_tokens(42) is ALREADY the fresh count; cache
+    // counts are disjoint additions. Total billable = 42 + 5 + 10 + 7 = 64.
     assert_eq!(
-        usage.get("prompt_tokens").and_then(Value::as_i64),
+        usage.get("input_tokens").and_then(Value::as_i64),
         Some(42),
-        "prompt_tokens should be 42"
+        "disjoint shape: prompt_tokens IS the fresh count"
     );
     assert_eq!(
-        usage.get("completion_tokens").and_then(Value::as_i64),
-        Some(7),
-        "completion_tokens should be 7"
+        usage.get("cached_input_tokens").and_then(Value::as_i64),
+        Some(5),
+    );
+    assert_eq!(
+        usage.get("cache_creation_tokens").and_then(Value::as_i64),
+        Some(10),
+    );
+    assert_eq!(usage.get("output_tokens").and_then(Value::as_i64), Some(7),);
+    assert_eq!(
+        usage.get("total_tokens").and_then(Value::as_i64),
+        Some(64),
+        "disjoint sum: 42 + 5 + 10 + 7"
     );
 }
 
@@ -1935,14 +1953,14 @@ async fn usage_tracking_across_multi_turn_independent() {
     let core = cap.core_plans.lock().await;
     assert_eq!(core.len(), 2, "two core persist calls");
 
-    // Turn 1 usage.
+    // Turn 1 usage (canonical keys).
     let lr1 = core[0].llm_response_event.as_ref().unwrap();
     assert!(lr1.token_usage.is_some());
     assert_eq!(
         lr1.token_usage
             .as_ref()
             .unwrap()
-            .get("prompt_tokens")
+            .get("input_tokens")
             .and_then(Value::as_i64),
         Some(100)
     );
@@ -1954,7 +1972,7 @@ async fn usage_tracking_across_multi_turn_independent() {
         lr2.token_usage
             .as_ref()
             .unwrap()
-            .get("prompt_tokens")
+            .get("input_tokens")
             .and_then(Value::as_i64),
         Some(250)
     );
@@ -2118,14 +2136,14 @@ async fn large_payload_many_tools_and_long_messages() {
         "should persist at least 10 tool events, got {total}"
     );
 
-    // Verify usage persisted.
+    // Verify usage persisted (canonical keys).
     let lr = core[0].llm_response_event.as_ref().unwrap();
     assert!(lr.token_usage.is_some());
     assert_eq!(
         lr.token_usage
             .as_ref()
             .unwrap()
-            .get("prompt_tokens")
+            .get("input_tokens")
             .and_then(Value::as_i64),
         Some(5000)
     );
@@ -4326,7 +4344,7 @@ async fn session_turn_content_accuracy() {
         "test_llm_rounds": [{
             "full_text": llm_response,
             "reasoning": reasoning_text,
-            "usage": { "prompt": 100, "completion": 50, "total": 150 }
+            "usage": { "prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150 }
         }]
     });
 
@@ -4352,8 +4370,8 @@ async fn session_turn_content_accuracy() {
     );
     assert!(lr.token_usage.is_some(), "token usage must be persisted");
     let usage = lr.token_usage.as_ref().unwrap();
-    assert_eq!(usage.get("prompt").and_then(Value::as_i64), Some(100));
-    assert_eq!(usage.get("completion").and_then(Value::as_i64), Some(50));
+    assert_eq!(usage.get("input_tokens").and_then(Value::as_i64), Some(100));
+    assert_eq!(usage.get("output_tokens").and_then(Value::as_i64), Some(50));
 }
 
 /// Multi-turn: event_ids across turns are unique (no duplicates)
@@ -4434,7 +4452,7 @@ async fn explain_event_text_only_no_tools() {
         "explain": true,
         "test_llm_rounds": [{
             "full_text": "Just text.",
-            "usage": { "prompt": 50, "completion": 20, "total": 70 }
+            "usage": { "prompt_tokens": 50, "completion_tokens": 20, "total_tokens": 70 }
         }]
     });
 
@@ -4466,7 +4484,7 @@ async fn explain_event_auxiliary_llm_calls() {
         "explain": true,
         "test_llm_rounds": [{
             "full_text": "Auxiliary check.",
-            "usage": { "prompt": 300, "completion": 100, "total": 400 }
+            "usage": { "prompt_tokens": 300, "completion_tokens": 100, "total_tokens": 400 }
         }]
     });
 
@@ -4793,7 +4811,7 @@ async fn batch_explain_counts_all_tools() {
                 tool_call("tc-be2", "grep", json!({"pattern": "foo"})),
                 tool_call("tc-be3", "list_dir", json!({"path": "/"}))
             ],
-            "usage": { "prompt": 500, "completion": 150, "total": 650 }
+            "usage": { "prompt_tokens": 500, "completion_tokens": 150, "total_tokens": 650 }
         }]
     });
 
@@ -5057,7 +5075,7 @@ async fn sse_all_events_have_type_field() {
             "full_text": "Some text",
             "reasoning": "Thinking...",
             "tool_calls": [tool_call("tc-tc1", "read_file", json!({"path": "a"}))],
-            "usage": { "prompt": 100, "completion": 50 }
+            "usage": { "prompt_tokens": 100, "completion_tokens": 50 }
         }]
     });
 
@@ -5147,7 +5165,7 @@ async fn sse_all_data_frames_valid_json() {
             "full_text": "text here",
             "reasoning": "reason here",
             "tool_calls": [tool_call("tc-jv1", "read_file", json!({"path": "a"}))],
-            "usage": { "prompt": 100, "completion": 50, "total": 150 }
+            "usage": { "prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150 }
         }]
     });
 
@@ -5376,7 +5394,7 @@ async fn observability_explain_steps_structure() {
                 tool_call("tc-s1", "read_file", json!({"path": "a"})),
                 tool_call("tc-s2", "read_file", json!({"path": "b"}))
             ],
-            "usage": { "prompt": 100, "completion": 50 }
+            "usage": { "prompt_tokens": 100, "completion_tokens": 50 }
         }]
     });
 
@@ -5508,7 +5526,7 @@ async fn observability_explain_event_has_structured_fields() {
         "edge_tools": [tool_schema("read_file")],
         "test_llm_rounds": [{
             "full_text": "Observed.",
-            "usage": { "prompt": 300, "completion": 100 }
+            "usage": { "prompt_tokens": 300, "completion_tokens": 100 }
         }]
     });
 
@@ -5807,7 +5825,7 @@ async fn gap_explain_usage_tokens_accuracy() {
         "explain": true,
         "test_llm_rounds": [{
             "full_text": "Token result.",
-            "usage": { "prompt": 500, "completion": 150, "total": 650 }
+            "usage": { "prompt_tokens": 500, "completion_tokens": 150, "total_tokens": 650 }
         }]
     });
 
@@ -7943,7 +7961,7 @@ async fn a2_edge_profile_selection_task_type_reaches_bridge() {
         "explain": true,
         "test_llm_rounds": [{
             "full_text": "The code looks well-structured.",
-            "usage": { "prompt": 1000, "completion": 100, "total": 1100 }
+            "usage": { "prompt_tokens": 1000, "completion_tokens": 100, "total_tokens": 1100 }
         }]
     });
 
@@ -8069,7 +8087,7 @@ async fn a2_explain_shows_tools_selected_and_available_counts() {
         "explain": true,
         "test_llm_rounds": [{
             "tool_calls": [tool_call("tc-rd", "read_file", json!({"path": "README.md"}))],
-            "usage": { "prompt": 500, "completion": 30, "total": 530 }
+            "usage": { "prompt_tokens": 500, "completion_tokens": 30, "total_tokens": 530 }
         }]
     });
 
@@ -8630,11 +8648,11 @@ async fn a5_explain_with_multi_round_tool_flow() {
                     tool_call("tc-r1", "read_file", json!({"path": "main.rs"})),
                     tool_call("tc-g1", "grep", json!({"pattern": "fn main"})),
                 ],
-                "usage": { "prompt": 500, "completion": 30, "total": 530 }
+                "usage": { "prompt_tokens": 500, "completion_tokens": 30, "total_tokens": 530 }
             },
             {
                 "full_text": "The code analysis shows a well-structured main function.",
-                "usage": { "prompt": 800, "completion": 50, "total": 850 }
+                "usage": { "prompt_tokens": 800, "completion_tokens": 50, "total_tokens": 850 }
             }
         ]
     });
@@ -9072,7 +9090,7 @@ async fn golden_code_review_parallel_reads() {
                 tool_call("tc-2", "read_file", json!({"path": "src/auth/jwt.rs"})),
                 tool_call("tc-3", "read_file", json!({"path": "src/auth/middleware.rs"}))
             ],
-            "usage": {"prompt": 1200, "completion": 80, "total": 1280}
+            "usage": {"prompt_tokens": 1200, "completion_tokens": 80, "total_tokens": 1280}
         }]
     });
     let (st, body) = chat_turn(&app, payload_r1).await;
@@ -9117,7 +9135,7 @@ async fn golden_code_review_parallel_reads() {
         "round_index": 1,
         "test_llm_rounds": [{
             "full_text": "## Code Review: Authentication Module\n\n### Findings:\n1. **JWT verification** looks correct — uses `jsonwebtoken` crate properly.\n2. **Middleware** correctly extracts and validates tokens.\n3. **Missing**: No token refresh mechanism.\n\n### Recommendations:\n- Add token refresh endpoint\n- Add rate limiting to auth endpoints\n- Consider adding CSRF protection",
-            "usage": {"prompt": 1800, "completion": 200, "total": 2000}
+            "usage": {"prompt_tokens": 1800, "completion_tokens": 200, "total_tokens": 2000}
         }]
     });
     let (st, body) = chat_turn(&app, payload_r2).await;
@@ -9169,7 +9187,7 @@ async fn golden_debugging_three_rounds() {
             "tool_calls": [
                 tool_call("tc-1", "read_file", json!({"path": "src/UserService.java"}))
             ],
-            "usage": {"prompt": 800, "completion": 30, "total": 830}
+            "usage": {"prompt_tokens": 800, "completion_tokens": 30, "total_tokens": 830}
         }]
     });
     let (st, _) = chat_turn(&app, payload_r1).await;
@@ -9193,7 +9211,7 @@ async fn golden_debugging_three_rounds() {
                 tool_call("tc-2", "grep", json!({"pattern": "UserRepository", "path": "src/"})),
                 tool_call("tc-3", "grep", json!({"pattern": "findById", "path": "src/"}))
             ],
-            "usage": {"prompt": 1200, "completion": 40, "total": 1240}
+            "usage": {"prompt_tokens": 1200, "completion_tokens": 40, "total_tokens": 1240}
         }]
     });
     let (st, body) = chat_turn(&app, payload_r2).await;
@@ -9227,7 +9245,7 @@ async fn golden_debugging_three_rounds() {
         "round_index": 2,
         "test_llm_rounds": [{
             "full_text": "## Bug Analysis\n\nThe `NullPointerException` occurs because `findById()` returns `Optional<User>`, but line 42 calls `.getName()` directly without unwrapping.\n\n**Fix:**\n```java\nreturn repo.findById(id)\n    .map(User::getName)\n    .orElseThrow(() -> new UserNotFoundException(id));\n```",
-            "usage": {"prompt": 2000, "completion": 150, "total": 2150}
+            "usage": {"prompt_tokens": 2000, "completion_tokens": 150, "total_tokens": 2150}
         }]
     });
     let (st, body) = chat_turn(&app, payload_r3).await;
@@ -9269,7 +9287,7 @@ async fn golden_extended_thinking_with_tools() {
                 tool_call("tc-1", "grep", json!({"pattern": "fn sort", "path": "src/"})),
                 tool_call("tc-2", "grep", json!({"pattern": "impl.*Sort", "path": "src/"}))
             ],
-            "usage": {"prompt": 500, "completion": 100, "total": 600}
+            "usage": {"prompt_tokens": 500, "completion_tokens": 100, "total_tokens": 600}
         }]
     });
     let (st, body) = chat_turn(&app, payload).await;
@@ -9298,7 +9316,7 @@ async fn golden_token_usage_tracking() {
         "round_index": 0,
         "test_llm_rounds": [{
             "full_text": "Here's the summary of README.md...",
-            "usage": {"prompt": 500, "completion": 120, "total": 620}
+            "usage": {"prompt_tokens": 500, "completion_tokens": 120, "total_tokens": 620}
         }]
     });
     let (st, body) = chat_turn(&app, payload).await;
@@ -9349,7 +9367,7 @@ async fn golden_round_budget_forces_synthesis() {
         "round_index": 3,
         "test_llm_rounds": [{
             "full_text": "## Architecture Overview\n\nThe system uses a client-server architecture:\n- `main.rs`: Entry point\n- `server.rs`: Server implementation\n- `client.rs`: Client implementation",
-            "usage": {"prompt": 2500, "completion": 100, "total": 2600}
+            "usage": {"prompt_tokens": 2500, "completion_tokens": 100, "total_tokens": 2600}
         }]
     });
     let (st, body) = chat_turn(&app, payload).await;
@@ -9808,7 +9826,7 @@ async fn c1_trace_core_plan_has_user_and_response() {
         "edge_tools": [tool_schema("read_file")],
         "test_llm_rounds": [{
             "full_text": "Rust is a systems programming language.",
-            "usage": {"prompt": 100, "completion": 50, "total": 150}
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
         }]
     });
     let (st, _) = chat_turn(&app, payload).await;
@@ -10012,7 +10030,7 @@ async fn c2_journal_core_events_complete() {
         "edge_tools": [],
         "test_llm_rounds": [{
             "full_text": "Trees are hierarchical data structures.",
-            "usage": {"prompt": 80, "completion": 30, "total": 110}
+            "usage": {"prompt_tokens": 80, "completion_tokens": 30, "total_tokens": 110}
         }]
     });
     let (st, _) = chat_turn(&app, payload).await;
@@ -10165,7 +10183,7 @@ async fn c3_explain_event_comprehensive_fields() {
         "explain": true,
         "test_llm_rounds": [{
             "full_text": "Analysis complete.",
-            "usage": {"prompt": 500, "completion": 200, "total": 700},
+            "usage": {"prompt_tokens": 500, "completion_tokens": 200, "total_tokens": 700},
             "tool_calls": [
                 tool_call("tc-e1", "read_file", json!({"path": "main.rs"})),
                 tool_call("tc-e2", "grep", json!({"pattern": "fn main"}))

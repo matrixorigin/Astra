@@ -554,6 +554,14 @@ pub struct AgenticLoopState {
     /// True once the current `final_text` has already been sent to the user.
     /// Deferred completion paths leave this false so finalization emits exactly once.
     pub final_text_streamed: bool,
+    // Run-level token aggregators. See `turn::token_usage::TokenUsage` for
+    // the per-call invariant: these four fields are DISJOINT buckets whose
+    // sum equals the billable total across the whole run.
+    //
+    // - total_prompt         → fresh input tokens (billed at full rate)
+    // - total_cache_read     → cached input tokens (discount rate)
+    // - total_cache_creation → cache write tokens (premium rate)
+    // - total_completion     → output tokens
     pub total_prompt: u64,
     pub total_completion: u64,
     pub total_cache_read: u64,

@@ -1714,8 +1714,18 @@ impl InProcessChatTurnBridge {
                         loop_text = t;
                         loop_reasoning = r;
                         loop_tool_calls = tc;
-                        for (k, v) in u_delta {
-                            usage.insert(k, v);
+                        // Test fixtures provide raw OpenAI-style usage; normalize
+                        // through the same extractor the real provider path uses
+                        // so downstream `TokenUsage::from_json_map` sees canonical
+                        // keys. Bedrock-flavored fixtures are dispatched via the
+                        // configured provider string.
+                        if !u_delta.is_empty()
+                            && let Some(tu) = crate::turn::token_usage::extract_usage(
+                                crate::turn::token_usage::UsageDialect::for_provider(&provider),
+                                &u_delta,
+                            )
+                        {
+                            usage = tu.to_json_map();
                         }
                     }
                     #[cfg(not(feature = "bridge-e2e-hooks"))]
@@ -2535,14 +2545,15 @@ impl InProcessChatTurnBridge {
                     }
                 }
                 let round_ms = loop_started.elapsed().as_millis();
-                let tok_in = usage.get("prompt").and_then(Value::as_i64).unwrap_or(0);
-                let tok_out = usage.get("completion").and_then(Value::as_i64).unwrap_or(0);
+                let usage_snapshot = crate::turn::token_usage::TokenUsage::from_json_map(&usage);
                 astra_core::agent_info!(
                     "llm",
-                    "⏱ LLM round done: total={}ms tok_in={} tok_out={} tools={} model={} sid={} r={}",
+                    "⏱ LLM round done: total={}ms tok_in={} tok_cached={} tok_cache_write={} tok_out={} tools={} model={} sid={} r={}",
                     round_ms,
-                    tok_in,
-                    tok_out,
+                    usage_snapshot.input_tokens,
+                    usage_snapshot.cached_input_tokens,
+                    usage_snapshot.cache_creation_tokens,
+                    usage_snapshot.output_tokens,
                     loop_tool_calls.len(),
                     if resolved_model.is_empty() { &model_name } else { &resolved_model },
                     session_id,
@@ -2551,16 +2562,22 @@ impl InProcessChatTurnBridge {
                 llm_steps.push(json!({
                     "step": "llm",
                     "duration_ms": round_ms as i64,
-                    "in": usage.get("prompt").and_then(Value::as_i64),
-                    "out": usage.get("completion").and_then(Value::as_i64),
+                    "in": usage_snapshot.input_tokens,
+                    "cached_in": usage_snapshot.cached_input_tokens,
+                    "cache_write": usage_snapshot.cache_creation_tokens,
+                    "out": usage_snapshot.output_tokens,
                     "tool_calls": loop_tool_calls.len(),
                 }));
 
-                let prompt_from_usage = usage
-                    .get("prompt")
-                    .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)));
-                if let Some(p) = prompt_from_usage.filter(|&p| p > 0) {
-                    last_measured_prompt = Some(p);
+                // `last_measured_prompt` drives budget-pressure heuristics that want the
+                // total billable input (fresh + cached + creation). Cache hits still occupy
+                // context, so including them is the honest metric here.
+                let billable_input = usage_snapshot
+                    .input_tokens
+                    .saturating_add(usage_snapshot.cached_input_tokens)
+                    .saturating_add(usage_snapshot.cache_creation_tokens);
+                if billable_input > 0 {
+                    last_measured_prompt = Some(billable_input);
                 }
                 let capture_model = if resolved_model.is_empty() {
                     model_name.as_str()
@@ -2618,18 +2635,10 @@ impl InProcessChatTurnBridge {
                     buf.record_llm_round(LlmRoundRecord {
                         ttft_ms: None,
                         duration_ms: round_ms as u64,
-                        prompt_tokens: usage
-                            .get("prompt")
-                            .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
-                            .unwrap_or(0),
-                        completion_tokens: usage
-                            .get("completion")
-                            .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
-                            .unwrap_or(0),
-                        cache_read_tokens: usage
-                            .get("cache_read")
-                            .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
-                            .unwrap_or(0),
+                        prompt_tokens: usage_snapshot.input_tokens,
+                        completion_tokens: usage_snapshot.output_tokens,
+                        cache_read_tokens: usage_snapshot.cached_input_tokens,
+                        cache_creation_tokens: usage_snapshot.cache_creation_tokens,
                         tool_calls_returned: loop_tool_calls.len().min(u32::MAX as usize) as u32,
                         tool_call_names: loop_tool_calls
                             .iter()
@@ -2663,9 +2672,7 @@ impl InProcessChatTurnBridge {
                         &model_name,
                         &provider,
                     );
-                    let cache_read = usage.get("cache_read")
-                        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
-                        .unwrap_or(0);
+                    let cache_read = usage_snapshot.cached_input_tokens;
                     if let Some(event) = cache_detector.detect_break(&fp, cache_read) {
                         let causes: Vec<String> = event.causes.iter().map(|c| c.to_string()).collect();
                         eprintln!("[cache_diagnostics] cache break: {} | {}",
@@ -3110,17 +3117,20 @@ impl InProcessChatTurnBridge {
                     .and_then(|function| function.get("name"))
                     .and_then(Value::as_str)
                     .map(|name| json!({ "name": name }));
+                let final_usage = crate::turn::token_usage::TokenUsage::from_json_map(&usage);
                 if llm_steps.is_empty() {
                     llm_steps.push(json!({
                         "step": "llm",
                         "duration_ms": llm_duration_ms,
-                        "in": usage.get("prompt").and_then(Value::as_i64),
-                        "out": usage.get("completion").and_then(Value::as_i64),
+                        "in": final_usage.input_tokens,
+                        "cached_in": final_usage.cached_input_tokens,
+                        "cache_write": final_usage.cache_creation_tokens,
+                        "out": final_usage.output_tokens,
                         "tool_calls": all_round_tool_calls.len(),
                     }));
                 }
-                let aux_tokens_in = usage.get("prompt").and_then(Value::as_i64);
-                let aux_tokens_out = usage.get("completion").and_then(Value::as_i64);
+                let aux_tokens_in = Some(final_usage.input_tokens as i64);
+                let aux_tokens_out = Some(final_usage.output_tokens as i64);
                 let auxiliary_llm_calls = Some(vec![json!({
                     "purpose": "primary_generation",
                     "ms": llm_duration_ms,
@@ -3162,15 +3172,15 @@ impl InProcessChatTurnBridge {
                     "confidence": 0.0,
                     "tier": 0,
                     "latency_ms": 0,
-                    "estimated_tokens": usage.get("total").and_then(Value::as_i64),
+                    "estimated_tokens": final_usage.total_tokens() as i64,
                     "skipped": model_override.is_some(),
                     "reason": model_override.as_ref().map(|_| "model_override").unwrap_or(""),
                     "cloud_loop_turns": cloud_loop_turns,
                 }));
                 let explain_event = build_explain_event(
                     turn_started.elapsed().as_millis() as i64,
-                    usage.get("prompt").and_then(Value::as_i64),
-                    usage.get("completion").and_then(Value::as_i64),
+                    Some(final_usage.input_tokens as i64),
+                    Some(final_usage.output_tokens as i64),
                     all_round_tool_calls.len(),
                     edge_tools.len(),
                     tool_selection,
@@ -4598,38 +4608,20 @@ mod tests {
 
     #[test]
     fn sse_usage_event_with_cache_tokens_format() {
-        // Verify the SSE event format that bridge emits matches what ChatTurnSseAccum expects
-        let prompt = Some(1000i64);
-        let completion = Some(500i64);
-        let cache_read: Option<i64> = Some(800);
-
+        // Canonical SSE usage event keys (see
+        // `astra_runtime::turn::token_usage::TokenUsage::to_json_map`).
         let event = json!({
             "type": "usage",
-            "prompt_tokens": prompt,
-            "completion_tokens": completion,
-            "cache_read_tokens": cache_read,
+            "input_tokens": 1000i64,
+            "cached_input_tokens": 800i64,
+            "cache_creation_tokens": 0i64,
+            "output_tokens": 500i64,
+            "total_tokens": 2300i64,
         });
         assert_eq!(event["type"], "usage");
-        assert_eq!(event["prompt_tokens"].as_i64(), Some(1000));
-        assert_eq!(event["completion_tokens"].as_i64(), Some(500));
-        assert_eq!(event["cache_read_tokens"].as_i64(), Some(800));
-    }
-
-    #[test]
-    fn sse_usage_event_null_cache_matches_dispatcher_handling() {
-        // Non-stream fallback emits cache_read_tokens: null
-        let event = json!({
-            "type": "usage",
-            "prompt_tokens": 1000,
-            "completion_tokens": 500,
-            "cache_read_tokens": Value::Null,
-        });
-        // ChatTurnSseAccum uses .as_u64().unwrap_or(0) for null → 0
-        let cache_read = event
-            .get("cache_read_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        assert_eq!(cache_read, 0);
+        assert_eq!(event["input_tokens"].as_i64(), Some(1000));
+        assert_eq!(event["cached_input_tokens"].as_i64(), Some(800));
+        assert_eq!(event["output_tokens"].as_i64(), Some(500));
     }
 
     // ── Combined cache layer tests ──────────────────────────────────────
@@ -4820,9 +4812,10 @@ mod tests {
             ChatTurnSseAccum, dispatch_chat_turn_sse_event_block,
         };
 
-        fn sse_usage(prompt: u64, completion: u64, cache_read: u64, cache_creation: u64) -> String {
+        fn sse_usage(input: u64, output: u64, cached: u64, cache_creation: u64) -> String {
+            let total = input + output + cached + cache_creation;
             format!(
-                "data: {{\"type\":\"usage\",\"prompt_tokens\":{prompt},\"completion_tokens\":{completion},\"cache_read_tokens\":{cache_read},\"cache_creation_tokens\":{cache_creation}}}\n\n"
+                "data: {{\"type\":\"usage\",\"input_tokens\":{input},\"output_tokens\":{output},\"cached_input_tokens\":{cached},\"cache_creation_tokens\":{cache_creation},\"total_tokens\":{total}}}\n\n"
             )
         }
 
@@ -6037,26 +6030,18 @@ mod tests {
     }
 
     #[test]
-    fn p3_usage_key_is_prompt_tokens_not_prompt() {
-        // Regression: the P3 code previously used usage.get("prompt") which always
-        // returned None. The correct key from LLM providers is "prompt_tokens".
-        let mut usage = serde_json::Map::new();
-        usage.insert("prompt_tokens".to_string(), json!(45000));
-        usage.insert("completion_tokens".to_string(), json!(2000));
-
-        // This is the exact expression from the P3 code path
-        let estimated_tokens = usage
-            .get("prompt_tokens")
-            .and_then(Value::as_i64)
-            .unwrap_or(0) as usize;
+    fn p3_usage_reads_canonical_input_tokens_key() {
+        // The bridge's usage map uses the canonical key set produced by
+        // `turn::token_usage::TokenUsage::to_json_map`. Ensure the key name
+        // expected downstream matches.
+        let u = crate::turn::token_usage::TokenUsage {
+            input_tokens: 45000,
+            output_tokens: 2000,
+            ..Default::default()
+        };
+        let m = u.to_json_map();
+        let estimated_tokens = m.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as usize;
         assert_eq!(estimated_tokens, 45000);
-
-        // The old buggy key must NOT work
-        let wrong = usage.get("prompt").and_then(Value::as_i64).unwrap_or(0) as usize;
-        assert_eq!(
-            wrong, 0,
-            "usage.get(\"prompt\") should return None — the key is prompt_tokens"
-        );
     }
 
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -6813,6 +6798,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 2,
                 cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 ttft_ms: None,
                 duration_ms: 1,
                 tool_calls_returned: 0,

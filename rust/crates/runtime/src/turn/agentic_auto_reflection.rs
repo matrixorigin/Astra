@@ -691,6 +691,7 @@ pub(crate) async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
             prompt_tokens: reflection_result.prompt_tokens,
             completion_tokens: reflection_result.completion_tokens,
             cache_read_tokens: reflection_result.cache_read_tokens,
+            cache_creation_tokens: 0,
             tool_calls_returned: 0,
             tool_call_names: vec![],
             finish_reason: Some("auto_reflection".into()),

@@ -2,6 +2,7 @@ pub use astra_services::storage::*;
 
 use std::time::Duration;
 
+use serde_json::Value;
 use sqlx::{MySql, query};
 
 use astra_turn_core::contracts::{
@@ -49,9 +50,17 @@ pub(crate) async fn insert_core_turn_event(
     .bind(&event.llm_model_used)
     .bind(event.llm_params.as_ref().map(serde_json::Value::to_string))
     .bind(&event.reasoning_content)
-    .bind(event.token_usage.as_ref().and_then(|v| v.get("input").or_else(|| v.get("prompt"))).and_then(|v| v.as_i64()))
-    .bind(event.token_usage.as_ref().and_then(|v| v.get("output").or_else(|| v.get("completion"))).and_then(|v| v.as_i64()))
-    .bind(event.token_usage.as_ref().and_then(|v| v.get("total")).and_then(|v| v.as_i64()))
+    // `token_usage` uses the canonical shape produced by
+    // `turn::token_usage::TokenUsage::to_json_map`. The `input_tokens` column
+    // records billable input = fresh + cached + creation.
+    .bind(event.token_usage.as_ref().and_then(|v| {
+        let input = v.get("input_tokens").and_then(Value::as_i64)?;
+        let cached = v.get("cached_input_tokens").and_then(Value::as_i64).unwrap_or(0);
+        let creation = v.get("cache_creation_tokens").and_then(Value::as_i64).unwrap_or(0);
+        Some(input + cached + creation)
+    }))
+    .bind(event.token_usage.as_ref().and_then(|v| v.get("output_tokens")).and_then(|v| v.as_i64()))
+    .bind(event.token_usage.as_ref().and_then(|v| v.get("total_tokens")).and_then(|v| v.as_i64()))
     .execute(&mut **tx)
     .await?;
     insert_agent_event_edges(

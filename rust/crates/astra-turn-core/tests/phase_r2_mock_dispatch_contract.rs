@@ -193,13 +193,22 @@ fn mock_llm_terminal_sequence_populates_usage_tokens() {
     // This matches what mock_llm.rs now writes just before `done`.
     let usage = json!({
         "type": "usage",
-        "prompt_tokens": 200u64,
-        "completion_tokens": 50u64,
+        "input_tokens": 200u64,
+        "cached_input_tokens": 0u64,
+        "cache_creation_tokens": 0u64,
+        "output_tokens": 50u64,
+        "total_tokens": 250u64,
     });
     let done = json!({
         "type": "done",
         "tokens_used": 200u64,
-        "usage": { "prompt_tokens": 200u64, "completion_tokens": 50u64 },
+        "usage": {
+            "input_tokens": 200u64,
+            "cached_input_tokens": 0u64,
+            "cache_creation_tokens": 0u64,
+            "output_tokens": 50u64,
+            "total_tokens": 250u64,
+        },
     });
 
     let mut accum = ChatTurnSseAccum::default();
@@ -212,14 +221,10 @@ fn mock_llm_terminal_sequence_populates_usage_tokens() {
         "mock terminal sequence did not populate accum.has_usage — \
          usage event is missing or malformed"
     );
-    assert_eq!(
-        accum.prompt_tokens, 200,
-        "mock terminal usage event must set prompt_tokens"
-    );
-    assert_eq!(
-        accum.completion_tokens, 50,
-        "mock terminal usage event must set completion_tokens"
-    );
+    // `prompt_tokens` in ChatTurnSseAccum stores fresh input tokens (see
+    // `chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block`).
+    assert_eq!(accum.prompt_tokens, 200, "fresh input_tokens");
+    assert_eq!(accum.completion_tokens, 50, "output_tokens");
 }
 
 /// Regression anchor: the mock's `done` event alone (with usage NESTED

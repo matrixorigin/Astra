@@ -996,6 +996,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             prompt_tokens: turn_result.accum.prompt_tokens,
             completion_tokens: turn_result.accum.completion_tokens,
             cache_read_tokens: turn_result.accum.cache_read_tokens,
+            cache_creation_tokens: 0,
             tool_calls_returned: turn_result.accum.tool_calls.len() as u32,
             tool_call_names: tool_names,
             // Synthesise per OpenAI protocol when upstream leaves the field

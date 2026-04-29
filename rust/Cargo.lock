@@ -383,6 +383,7 @@ dependencies = [
  "axum 0.8.9",
  "base64",
  "chrono",
+ "crc32fast",
  "criterion",
  "dashmap",
  "dirs 6.0.0",

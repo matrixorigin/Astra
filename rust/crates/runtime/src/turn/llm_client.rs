@@ -1247,7 +1247,9 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
     // (e.g. MiniMax) reject system messages after the first position.
     let messages = consolidate_system_messages(messages);
 
-    let use_streaming_endpoint = !provider_uses_bedrock_converse(provider);
+    // All providers stream — including Bedrock (via converse-stream +
+    // AWS vnd.amazon.eventstream). The body builder and URL builder flip
+    // to the streaming variant for every supported provider.
     let body = build_provider_request_body(
         &messages,
         tools,
@@ -1255,7 +1257,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
         provider,
         max_output_tokens,
         None,
-        use_streaming_endpoint,
+        true,
     );
 
     let url = llm_request_url(
@@ -1263,7 +1265,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
         completions_url_override,
         provider,
         model_name,
-        use_streaming_endpoint,
+        true,
     );
 
     let mut last_err = String::new();
@@ -1365,15 +1367,51 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
             // Success — record to cooldown tracker
             cooldown.with(model_key, |c| c.record_success());
             if provider_uses_bedrock_converse(provider) {
-                let v: Value = response.json().await.map_err(|e| {
-                    astra_core::ClassifiedError::new(
-                        astra_core::ErrorKind::StreamTransport,
-                        e.to_string(),
-                    )
-                })?;
-                return Ok(parse_nonstream_response_for_provider(
-                    &v, provider, model_name, started,
-                ));
+                match crate::turn::bedrock_transport::collect_bedrock_stream(
+                    response, model_name, started, cancel, idle_pre,
+                )
+                .await
+                {
+                    Ok(result) => return Ok(result),
+                    Err(crate::turn::bedrock_transport::BedrockStreamError::Cancelled) => {
+                        return Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::Cancelled,
+                            "LLM call cancelled",
+                        ));
+                    }
+                    Err(crate::turn::bedrock_transport::BedrockStreamError::Exception {
+                        kind,
+                        message,
+                    }) => {
+                        use crate::turn::bedrock_stream::{RetryKind, is_retryable_exception};
+                        match is_retryable_exception(&kind) {
+                            RetryKind::RateLimit => {
+                                last_err = format!("bedrock throttle: {message}");
+                                last_kind = astra_core::ErrorKind::RateLimit;
+                                cooldown.with(model_key, |c| {
+                                    let _ = c.record_429(None, has_fallback);
+                                });
+                                continue;
+                            }
+                            RetryKind::Transient => {
+                                last_err = format!("bedrock transient {kind}: {message}");
+                                last_kind = astra_core::ErrorKind::ServerError;
+                                continue;
+                            }
+                            RetryKind::Terminal => {
+                                return Err(astra_core::ClassifiedError::new(
+                                    astra_core::ErrorKind::Unknown,
+                                    format!("bedrock {kind}: {message}"),
+                                ));
+                            }
+                        }
+                    }
+                    Err(crate::turn::bedrock_transport::BedrockStreamError::Transport(e)) => {
+                        last_err = format!("bedrock transport: {e}");
+                        last_kind = astra_core::ErrorKind::StreamTransport;
+                        continue;
+                    }
+                }
             }
             let byte_stream = response.bytes_stream();
             match collect_llm_stream(
@@ -1728,55 +1766,17 @@ async fn collect_llm_stream(
                 });
             }
         };
-        // Parse usage from any chunk
-        if let Some(u) = chunk.get("usage").and_then(Value::as_object) {
-            // OpenAI/Anthropic: prompt_tokens / completion_tokens
-            // Bedrock Converse: inputTokens / outputTokens
-            let prompt = u
-                .get("prompt_tokens")
-                .and_then(Value::as_i64)
-                .or_else(|| u.get("inputTokens").and_then(Value::as_i64));
-            let completion = u
-                .get("completion_tokens")
-                .and_then(Value::as_i64)
-                .or_else(|| u.get("outputTokens").and_then(Value::as_i64));
-            if prompt.is_some() || completion.is_some() {
-                let mut usage_map = Map::new();
-                if let Some(value) = prompt {
-                    usage_map.insert("prompt".to_string(), Value::from(value));
-                }
-                if let Some(value) = completion {
-                    usage_map.insert("completion".to_string(), Value::from(value));
-                }
-                if let (Some(p), Some(c)) = (prompt, completion) {
-                    usage_map.insert("total".to_string(), Value::from(p + c));
-                }
-                // Cache tokens: OpenAI / Anthropic / Bedrock
-                let cache_read = u
-                    .get("prompt_tokens_details")
-                    .and_then(|d| d.get("cached_tokens"))
-                    .and_then(Value::as_i64)
-                    .or_else(|| u.get("cache_read_input_tokens").and_then(Value::as_i64))
-                    .or_else(|| u.get("cacheReadInputTokens").and_then(Value::as_i64))
-                    .or_else(|| u.get("cacheReadInputTokensCount").and_then(Value::as_i64));
-                let cache_creation = u
-                    .get("prompt_tokens_details")
-                    .and_then(|d| d.get("cache_creation_input_tokens"))
-                    .and_then(Value::as_i64)
-                    .or_else(|| u.get("cache_creation_input_tokens").and_then(Value::as_i64))
-                    .or_else(|| u.get("cacheWriteInputTokens").and_then(Value::as_i64))
-                    .or_else(|| u.get("cacheWriteInputTokensCount").and_then(Value::as_i64));
-                if let Some(cr) = cache_read {
-                    usage_map.insert("cache_read".to_string(), Value::from(cr));
-                    usage_map.insert("cache_read_input_tokens".to_string(), Value::from(cr));
-                }
-                if let Some(cc) = cache_creation {
-                    usage_map.insert("cache_creation".to_string(), Value::from(cc));
-                    usage_map.insert("cache_creation_input_tokens".to_string(), Value::from(cc));
-                }
-                usage = usage_map;
-                made_progress = true;
-            }
+        // Parse usage from any chunk. Streaming endpoints we call are always
+        // OpenAI-compatible: Bedrock Converse streams are intercepted at a
+        // higher level and converted via the non-stream fallback path.
+        if let Some(u) = chunk.get("usage").and_then(Value::as_object)
+            && let Some(extracted) = crate::turn::token_usage::extract_usage(
+                crate::turn::token_usage::UsageDialect::OpenAi,
+                u,
+            )
+        {
+            usage = extracted.to_json_map();
+            made_progress = true;
         }
 
         let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
@@ -2140,46 +2140,17 @@ fn parse_bedrock_nonstream_response(
     let mut full_text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
-    let mut usage = Map::new();
-
-    if let Some(u) = v.get("usage").and_then(Value::as_object) {
-        if let Some(p) = u.get("inputTokens").and_then(Value::as_i64) {
-            usage.insert("prompt".to_string(), Value::from(p));
-        }
-        if let Some(c) = u.get("outputTokens").and_then(Value::as_i64) {
-            usage.insert("completion".to_string(), Value::from(c));
-        }
-        if let Some(cache_read) = u
-            .get("cacheReadInputTokens")
-            .or_else(|| u.get("cacheReadInputTokensCount"))
-            .and_then(Value::as_i64)
-        {
-            usage.insert("cache_read".to_string(), Value::from(cache_read));
-            usage.insert(
-                "cache_read_input_tokens".to_string(),
-                Value::from(cache_read),
-            );
-        }
-        if let Some(cache_write) = u
-            .get("cacheWriteInputTokens")
-            .or_else(|| u.get("cacheWriteInputTokensCount"))
-            .and_then(Value::as_i64)
-        {
-            usage.insert("cache_creation".to_string(), Value::from(cache_write));
-            usage.insert(
-                "cache_creation_input_tokens".to_string(),
-                Value::from(cache_write),
-            );
-        }
-        if let Some(t) = u.get("totalTokens").and_then(Value::as_i64) {
-            usage.insert("total".to_string(), Value::from(t));
-        } else if let (Some(p), Some(c)) = (
-            u.get("inputTokens").and_then(Value::as_i64),
-            u.get("outputTokens").and_then(Value::as_i64),
-        ) {
-            usage.insert("total".to_string(), Value::from(p + c));
-        }
-    }
+    let usage = v
+        .get("usage")
+        .and_then(Value::as_object)
+        .and_then(|u| {
+            crate::turn::token_usage::extract_usage(
+                crate::turn::token_usage::UsageDialect::BedrockConverse,
+                u,
+            )
+        })
+        .map(|u| u.to_json_map())
+        .unwrap_or_default();
 
     if let Some(content_blocks) = v
         .get("output")
@@ -2243,22 +2214,17 @@ fn parse_openai_compatible_nonstream_response(
     let mut full_text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
-    let mut usage = Map::new();
-
-    if let Some(u) = v.get("usage").and_then(Value::as_object) {
-        if let Some(p) = u.get("prompt_tokens").and_then(Value::as_i64) {
-            usage.insert("prompt".to_string(), Value::from(p));
-        }
-        if let Some(c) = u.get("completion_tokens").and_then(Value::as_i64) {
-            usage.insert("completion".to_string(), Value::from(c));
-        }
-        if let (Some(p), Some(c)) = (
-            u.get("prompt_tokens").and_then(Value::as_i64),
-            u.get("completion_tokens").and_then(Value::as_i64),
-        ) {
-            usage.insert("total".to_string(), Value::from(p + c));
-        }
-    }
+    let usage = v
+        .get("usage")
+        .and_then(Value::as_object)
+        .and_then(|u| {
+            crate::turn::token_usage::extract_usage(
+                crate::turn::token_usage::UsageDialect::OpenAi,
+                u,
+            )
+        })
+        .map(|u| u.to_json_map())
+        .unwrap_or_default();
 
     if let Some(choice) = v
         .get("choices")
@@ -2864,7 +2830,18 @@ mod tests {
         assert_eq!(r.full_text, "hello");
         assert_eq!(r.reasoning, "think");
         assert_eq!(r.tool_calls.len(), 1);
-        assert_eq!(r.usage.get("total").and_then(Value::as_i64), Some(15));
+        assert_eq!(
+            r.usage.get("input_tokens").and_then(Value::as_u64),
+            Some(10)
+        );
+        assert_eq!(
+            r.usage.get("output_tokens").and_then(Value::as_u64),
+            Some(5)
+        );
+        assert_eq!(
+            r.usage.get("total_tokens").and_then(Value::as_u64),
+            Some(15)
+        );
     }
 
     #[test]
@@ -2898,7 +2875,18 @@ mod tests {
             Some(r#"{"cmd":"pwd"}"#)
         );
         assert_eq!(r.finish_reason.as_deref(), Some("tool_calls"));
-        assert_eq!(r.usage.get("total").and_then(Value::as_i64), Some(15));
+        assert_eq!(
+            r.usage.get("input_tokens").and_then(Value::as_u64),
+            Some(10)
+        );
+        assert_eq!(
+            r.usage.get("output_tokens").and_then(Value::as_u64),
+            Some(5)
+        );
+        assert_eq!(
+            r.usage.get("total_tokens").and_then(Value::as_u64),
+            Some(15)
+        );
     }
 
     #[test]
@@ -2925,22 +2913,26 @@ mod tests {
             "anthropic.claude-sonnet-4-20250514-v1:0",
             Instant::now(),
         );
-        assert_eq!(r.usage.get("cache_read").and_then(Value::as_i64), Some(8));
         assert_eq!(
-            r.usage
-                .get("cache_read_input_tokens")
-                .and_then(Value::as_i64),
+            r.usage.get("input_tokens").and_then(Value::as_u64),
+            Some(10)
+        );
+        assert_eq!(
+            r.usage.get("cached_input_tokens").and_then(Value::as_u64),
             Some(8)
         );
         assert_eq!(
-            r.usage.get("cache_creation").and_then(Value::as_i64),
+            r.usage.get("cache_creation_tokens").and_then(Value::as_u64),
             Some(3)
         );
         assert_eq!(
-            r.usage
-                .get("cache_creation_input_tokens")
-                .and_then(Value::as_i64),
-            Some(3)
+            r.usage.get("output_tokens").and_then(Value::as_u64),
+            Some(5)
+        );
+        // Bedrock billing identity: input + cached + creation + output.
+        assert_eq!(
+            r.usage.get("total_tokens").and_then(Value::as_u64),
+            Some(26)
         );
     }
 
@@ -3104,123 +3096,11 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
-    #[serial(stream_idle_env)]
-    async fn collect_llm_stream_bedrock_usage_input_tokens_output_tokens() {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            // Bedrock Converse streaming: usage uses inputTokens/outputTokens instead of
-            // prompt_tokens/completion_tokens. Verify the fallback parsing works.
-            let d1 = json!({"choices":[{"delta":{"content":"Hi"}}]});
-            let u = json!({"usage":{"inputTokens":100,"outputTokens":50}});
-            let body = format!("data: {d1}\n\ndata: {u}\n\n");
-            let stream = stream::iter(vec![Ok(Bytes::from(body))]);
-            let res = collect_llm_stream(
-                stream,
-                "anthropic.claude-sonnet-4-20250514-v1:0",
-                Instant::now(),
-                LlmCancel::None,
-                stream_idle_timeout(),
-                stream_idle_timeout_after_progress(),
-            )
-            .await
-            .expect("collect");
-            assert_eq!(res.full_text, "Hi");
-            assert_eq!(res.usage.get("prompt").and_then(Value::as_i64), Some(100));
-            assert_eq!(
-                res.usage.get("completion").and_then(Value::as_i64),
-                Some(50)
-            );
-            assert_eq!(res.usage.get("total").and_then(Value::as_i64), Some(150));
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    #[serial(stream_idle_env)]
-    async fn collect_llm_stream_bedrock_cache_read_input_tokens() {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            // Bedrock Converse: cacheReadInputTokens / cacheWriteInputTokens
-            let d1 = json!({"choices":[{"delta":{"content":"Cached"}}]});
-            let u = json!({"usage":{"inputTokens":200,"outputTokens":10,"cacheReadInputTokens":150,"cacheWriteInputTokens":50}});
-            let body = format!("data: {d1}\n\ndata: {u}\n\n");
-            let stream = stream::iter(vec![Ok(Bytes::from(body))]);
-            let res = collect_llm_stream(
-                stream,
-                "anthropic.claude-sonnet-4-20250514-v1:0",
-                Instant::now(),
-                LlmCancel::None,
-                stream_idle_timeout(),
-                stream_idle_timeout_after_progress(),
-            )
-            .await
-            .expect("collect");
-            assert_eq!(res.usage.get("prompt").and_then(Value::as_i64), Some(200));
-            assert_eq!(res.usage.get("completion").and_then(Value::as_i64), Some(10));
-            assert_eq!(res.usage.get("cache_read").and_then(Value::as_i64), Some(150));
-            assert_eq!(res.usage.get("cache_read_input_tokens").and_then(Value::as_i64), Some(150));
-            assert_eq!(res.usage.get("cache_creation").and_then(Value::as_i64), Some(50));
-            assert_eq!(res.usage.get("cache_creation_input_tokens").and_then(Value::as_i64), Some(50));
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    #[serial(stream_idle_env)]
-    async fn collect_llm_stream_bedrock_cache_read_input_tokens_count() {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            // Some Bedrock models use cacheReadInputTokensCount / cacheWriteInputTokensCount
-            let d1 = json!({"choices":[{"delta":{"content":"Alt"}}]});
-            let u = json!({"usage":{"inputTokens":300,"outputTokens":20,"cacheReadInputTokensCount":200,"cacheWriteInputTokensCount":100}});
-            let body = format!("data: {d1}\n\ndata: {u}\n\n");
-            let stream = stream::iter(vec![Ok(Bytes::from(body))]);
-            let res = collect_llm_stream(
-                stream,
-                "anthropic.claude-3-5-sonnet-v1:0",
-                Instant::now(),
-                LlmCancel::None,
-                stream_idle_timeout(),
-                stream_idle_timeout_after_progress(),
-            )
-            .await
-            .expect("collect");
-            assert_eq!(res.usage.get("prompt").and_then(Value::as_i64), Some(300));
-            assert_eq!(res.usage.get("cache_read").and_then(Value::as_i64), Some(200));
-            assert_eq!(res.usage.get("cache_creation").and_then(Value::as_i64), Some(100));
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    #[serial(stream_idle_env)]
-    async fn collect_llm_stream_bedrock_usage_without_cache_still_counts_tokens() {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            // Bedrock response with only inputTokens/outputTokens, no cache fields
-            let d1 = json!({"choices":[{"delta":{"content":"No cache"}}]});
-            let u = json!({"usage":{"inputTokens":50,"outputTokens":25}});
-            let body = format!("data: {d1}\n\ndata: {u}\n\n");
-            let stream = stream::iter(vec![Ok(Bytes::from(body))]);
-            let res = collect_llm_stream(
-                stream,
-                "anthropic.claude-3-haiku-v1:0",
-                Instant::now(),
-                LlmCancel::None,
-                stream_idle_timeout(),
-                stream_idle_timeout_after_progress(),
-            )
-            .await
-            .expect("collect");
-            assert_eq!(res.usage.get("prompt").and_then(Value::as_i64), Some(50));
-            assert_eq!(
-                res.usage.get("completion").and_then(Value::as_i64),
-                Some(25)
-            );
-            assert_eq!(res.usage.get("total").and_then(Value::as_i64), Some(75));
-            // No cache fields → should not appear
-            assert_eq!(res.usage.get("cache_read"), None);
-            assert_eq!(res.usage.get("cache_creation"), None);
-        })
-        .await;
-    }
+    // Note: Bedrock no longer uses `collect_llm_stream` (see `bridge_llm_stream::
+    // call_llm_stream` — it detects Bedrock and invokes the non-stream fallback
+    // instead). Bedrock usage extraction is covered by
+    // `parse_bedrock_nonstream_response_extracts_*` and the unit tests in
+    // `turn::token_usage`.
 
     #[tokio::test]
     #[serial(stream_idle_env)]
@@ -3243,9 +3123,18 @@ mod tests {
             .expect("collect");
             assert_eq!(res.full_text, "Hi there");
             assert_eq!(res.reasoning, "R");
-            assert_eq!(res.usage.get("prompt").and_then(Value::as_i64), Some(3));
-            assert_eq!(res.usage.get("completion").and_then(Value::as_i64), Some(4));
-            assert_eq!(res.usage.get("total").and_then(Value::as_i64), Some(7));
+            assert_eq!(
+                res.usage.get("input_tokens").and_then(Value::as_u64),
+                Some(3)
+            );
+            assert_eq!(
+                res.usage.get("output_tokens").and_then(Value::as_u64),
+                Some(4)
+            );
+            assert_eq!(
+                res.usage.get("total_tokens").and_then(Value::as_u64),
+                Some(7)
+            );
             assert_eq!(res.model_used, "gpt-test");
             assert!(res.tool_calls.is_empty());
             // No finish_reason chunk was sent, so it should be None

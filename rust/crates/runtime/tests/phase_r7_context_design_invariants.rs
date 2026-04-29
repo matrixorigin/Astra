@@ -471,7 +471,7 @@ fn missing_cache_usage_fields_default_to_zero() {
     {
         let mut accum = ChatTurnSseAccum::default();
         let mut pending: Vec<ChatTurnEdgePending> = Vec::new();
-        let block = "data: {\"type\":\"usage\",\"prompt_tokens\":100,\"completion_tokens\":25}\n\n";
+        let block = "data: {\"type\":\"usage\",\"input_tokens\":100,\"output_tokens\":25}\n\n";
         let _effects = dispatch_chat_turn_sse_event_block(block, &mut accum, &mut pending);
         assert!(accum.has_usage, "has_usage must latch true");
         assert_eq!(accum.prompt_tokens, 100);
@@ -490,8 +490,8 @@ fn missing_cache_usage_fields_default_to_zero() {
     {
         let mut accum = ChatTurnSseAccum::default();
         let mut pending: Vec<ChatTurnEdgePending> = Vec::new();
-        let block = "data: {\"type\":\"usage\",\"prompt_tokens\":50,\"completion_tokens\":10,\
-                     \"cache_read_tokens\":null,\"cache_creation_tokens\":null}\n\n";
+        let block = "data: {\"type\":\"usage\",\"input_tokens\":50,\"output_tokens\":10,\
+                     \"cached_input_tokens\":null,\"cache_creation_tokens\":null}\n\n";
         let _effects = dispatch_chat_turn_sse_event_block(block, &mut accum, &mut pending);
         assert_eq!(accum.cache_read_tokens, 0);
         assert_eq!(accum.cache_creation_tokens, 0);
@@ -502,8 +502,8 @@ fn missing_cache_usage_fields_default_to_zero() {
     {
         let mut accum = ChatTurnSseAccum::default();
         let mut pending: Vec<ChatTurnEdgePending> = Vec::new();
-        let block = "data: {\"type\":\"usage\",\"prompt_tokens\":1,\"completion_tokens\":1,\
-                     \"cache_read_tokens\":\"nope\",\"cache_creation_tokens\":\"nope\"}\n\n";
+        let block = "data: {\"type\":\"usage\",\"input_tokens\":1,\"output_tokens\":1,\
+                     \"cached_input_tokens\":\"nope\",\"cache_creation_tokens\":\"nope\"}\n\n";
         let _effects = dispatch_chat_turn_sse_event_block(block, &mut accum, &mut pending);
         assert_eq!(
             accum.cache_read_tokens, 0,

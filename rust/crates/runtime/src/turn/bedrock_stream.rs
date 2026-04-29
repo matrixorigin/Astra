@@ -1,0 +1,691 @@
+//! Bedrock Converse streaming accumulator.
+//!
+//! Consumes decoded [`EventStreamFrame`]s (from
+//! [`super::bedrock_eventstream`]) and produces two things:
+//!
+//! 1. A sequence of **canonical internal events** ([`BedrockStreamEvent`])
+//!    that the runtime can forward to SSE clients (text deltas, reasoning
+//!    deltas, tool-call starts, usage, stop, exception).
+//! 2. A final aggregated [`LlmCallResult`] via [`into_result`].
+//!
+//! This module knows nothing about HTTP; it only understands Bedrock's
+//! `contentBlockDelta`/`messageStop`/`metadata` event shapes.
+
+use std::collections::BTreeMap;
+
+use serde_json::{Map, Value, json};
+
+use super::bedrock_eventstream::EventStreamFrame;
+use super::llm_client::LlmCallResult;
+use super::token_usage::{TokenUsage, UsageDialect, extract_usage};
+
+/// Incremental events yielded by the accumulator as frames arrive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BedrockStreamEvent {
+    /// Incremental assistant-text chunk.
+    TextDelta(String),
+    /// Incremental reasoning/thinking chunk.
+    ReasoningDelta(String),
+    /// A new tool call starts (emitted on the `contentBlockStart` that
+    /// introduces a `toolUse` block). Arguments stream as text via
+    /// subsequent `contentBlockDelta.toolUse.input` deltas and are parsed
+    /// when [`BedrockStreamAccumulator::into_result`] is called.
+    ToolCallStart { id: String, name: String },
+    /// Final usage metadata (emitted on `metadata` frame).
+    Usage(TokenUsage),
+    /// Stream terminated with a stopReason.
+    MessageStop { stop_reason: String },
+    /// Exception frame — the stream should be considered aborted.
+    Exception { kind: String, message: String },
+}
+
+/// Errors the accumulator can surface. A malformed frame poisons the stream;
+/// Bedrock exception *frames* are NOT surfaced here (they're normal data
+/// carried by [`BedrockStreamEvent::Exception`]) — only frames we can't
+/// parse at all end up here.
+#[derive(Debug, thiserror::Error)]
+pub enum BedrockStreamError {
+    #[error("payload not valid JSON: {0}")]
+    PayloadJson(#[from] serde_json::Error),
+    #[error("frame missing `:event-type` header")]
+    MissingEventType,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ToolCallInProgress {
+    id: String,
+    name: String,
+    /// Arguments arrive as streamed JSON text; we concatenate and parse at the end.
+    args_buf: String,
+}
+
+/// Bedrock Converse streaming aggregator.
+#[derive(Debug, Default)]
+pub struct BedrockStreamAccumulator {
+    full_text: String,
+    reasoning: String,
+    /// content_block_index → tool call under construction. `BTreeMap` so we
+    /// emit tool calls in declared order when `into_result` runs.
+    tool_calls: BTreeMap<u64, ToolCallInProgress>,
+    usage: Option<TokenUsage>,
+    finish_reason: Option<String>,
+    exception: Option<(String, String)>,
+}
+
+/// Classify a Bedrock exception `kind` string for retry / cooldown handling.
+///
+/// Retryable = AWS-documented transient errors (rate limiting + mid-stream
+/// transport blips). Non-retryable = validation / auth / model access
+/// (fixing these needs user intervention, retrying just burns budget).
+pub(crate) fn is_retryable_exception(kind: &str) -> RetryKind {
+    // Case-insensitive: AWS uses lowerCamelCase but older models occasionally
+    // upper-case the first letter.
+    let lowered = kind.to_ascii_lowercase();
+    match lowered.as_str() {
+        "throttlingexception" => RetryKind::RateLimit,
+        "internalservererror"
+        | "internalservererrorexception"
+        | "internalfailure"
+        | "serviceunavailableexception"
+        | "modelstreamerrorexception" => RetryKind::Transient,
+        _ => RetryKind::Terminal,
+    }
+}
+
+/// Convenience: shorthand for `is_retryable_exception(kind).is_retryable()`.
+/// Use this at call sites that only need the boolean decision.
+pub(crate) fn retryable_exception(kind: &str) -> bool {
+    is_retryable_exception(kind).is_retryable()
+}
+
+/// How an exception kind should be treated by the retry loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryKind {
+    /// Retry with cooldown bookkeeping (429-equivalent).
+    RateLimit,
+    /// Retry with backoff, no cooldown bookkeeping (5xx-equivalent).
+    Transient,
+    /// Do not retry.
+    Terminal,
+}
+
+impl RetryKind {
+    pub(crate) fn is_retryable(self) -> bool {
+        !matches!(self, Self::Terminal)
+    }
+}
+
+impl BedrockStreamAccumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// True once a terminal frame (`messageStop` or `exception`) has been seen.
+    pub fn is_finished(&self) -> bool {
+        self.finish_reason.is_some() || self.exception.is_some()
+    }
+
+    /// Consume one frame and return any canonical incremental events it produced.
+    pub fn push_frame(
+        &mut self,
+        frame: &EventStreamFrame,
+    ) -> Result<Vec<BedrockStreamEvent>, BedrockStreamError> {
+        // Exception frames come with `:message-type: exception` and a
+        // provider-specific `:exception-type` header.
+        if frame.message_type() == Some("exception") {
+            let kind = frame.exception_type().unwrap_or("unknown").to_string();
+            let msg = parse_json_or_empty(&frame.payload)
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            self.exception = Some((kind.clone(), msg.clone()));
+            return Ok(vec![BedrockStreamEvent::Exception { kind, message: msg }]);
+        }
+
+        let event_type = frame
+            .event_type()
+            .ok_or(BedrockStreamError::MissingEventType)?;
+        let payload: Value = if frame.payload.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&frame.payload)?
+        };
+
+        match event_type {
+            "messageStart" => Ok(vec![]),
+
+            "contentBlockStart" => {
+                let Some(tool_use) = payload
+                    .get("start")
+                    .and_then(|s| s.get("toolUse"))
+                    .and_then(Value::as_object)
+                else {
+                    return Ok(vec![]);
+                };
+                let idx = payload
+                    .get("contentBlockIndex")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let id = tool_use
+                    .get("toolUseId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let name = tool_use
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                // Bedrock's protocol guarantees unique `contentBlockIndex`
+                // per tool call, but a buggy gateway could violate that.
+                // Never drop an already-in-progress buffer on collision:
+                // keep the first-seen id/name and suppress the duplicate
+                // ToolCallStart event so downstream doesn't see phantom calls.
+                use std::collections::btree_map::Entry;
+                match self.tool_calls.entry(idx) {
+                    Entry::Vacant(v) => {
+                        v.insert(ToolCallInProgress {
+                            id: id.clone(),
+                            name: name.clone(),
+                            args_buf: String::new(),
+                        });
+                        Ok(vec![BedrockStreamEvent::ToolCallStart { id, name }])
+                    }
+                    Entry::Occupied(existing) => {
+                        astra_core::agent_warn!(
+                            "llm",
+                            "bedrock: duplicate contentBlockStart for index {}: \
+                             keeping first-seen id={:?}, ignoring id={:?}",
+                            idx,
+                            existing.get().id,
+                            id
+                        );
+                        Ok(vec![])
+                    }
+                }
+            }
+
+            "contentBlockDelta" => {
+                let Some(delta) = payload.get("delta") else {
+                    return Ok(vec![]);
+                };
+                if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                    self.full_text.push_str(text);
+                    return Ok(vec![BedrockStreamEvent::TextDelta(text.to_string())]);
+                }
+                if let Some(rc_text) = delta
+                    .get("reasoningContent")
+                    .and_then(|rc| rc.get("text"))
+                    .and_then(Value::as_str)
+                {
+                    self.reasoning.push_str(rc_text);
+                    return Ok(vec![BedrockStreamEvent::ReasoningDelta(
+                        rc_text.to_string(),
+                    )]);
+                }
+                // Some models emit reasoning as `reasoningContent.reasoningText.text`.
+                if let Some(rt_text) = delta
+                    .get("reasoningContent")
+                    .and_then(|rc| rc.get("reasoningText"))
+                    .and_then(|rt| rt.get("text"))
+                    .and_then(Value::as_str)
+                {
+                    self.reasoning.push_str(rt_text);
+                    return Ok(vec![BedrockStreamEvent::ReasoningDelta(
+                        rt_text.to_string(),
+                    )]);
+                }
+                if let Some(tool_input) = delta
+                    .get("toolUse")
+                    .and_then(|t| t.get("input"))
+                    .and_then(Value::as_str)
+                {
+                    let idx = payload
+                        .get("contentBlockIndex")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    // Bedrock guarantees a matching `contentBlockStart` before
+                    // any delta, so the entry should exist. Tolerate missing
+                    // (create a stub) rather than panic.
+                    let entry = self.tool_calls.entry(idx).or_default();
+                    entry.args_buf.push_str(tool_input);
+                    return Ok(vec![]);
+                }
+                Ok(vec![])
+            }
+
+            "contentBlockStop" => Ok(vec![]),
+
+            "messageStop" => {
+                let stop_reason = payload
+                    .get("stopReason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("stop")
+                    .to_string();
+                self.finish_reason = Some(map_bedrock_finish_reason(&stop_reason));
+                Ok(vec![BedrockStreamEvent::MessageStop { stop_reason }])
+            }
+
+            "metadata" => {
+                let Some(usage_obj) = payload.get("usage").and_then(Value::as_object) else {
+                    return Ok(vec![]);
+                };
+                let Some(u) = extract_usage(UsageDialect::BedrockConverse, usage_obj) else {
+                    return Ok(vec![]);
+                };
+                self.usage = Some(u);
+                Ok(vec![BedrockStreamEvent::Usage(u)])
+            }
+
+            // Unknown event types (future extensions) — ignore. Do not
+            // fail the stream just because Bedrock added a new frame type.
+            _ => Ok(vec![]),
+        }
+    }
+
+    /// Finalize into an [`LlmCallResult`]. Parses any in-flight tool-call
+    /// JSON buffers and converts usage to the canonical key shape.
+    pub fn into_result(self, model_name: &str, duration_ms: u64) -> LlmCallResult {
+        let tool_calls = self
+            .tool_calls
+            .into_values()
+            .map(|t| {
+                let args = if t.args_buf.is_empty() {
+                    json!({})
+                } else {
+                    serde_json::from_str::<Value>(&t.args_buf).unwrap_or_else(|_| {
+                        // Bedrock's streamed JSON is normally well-formed; if a
+                        // provider gateway corrupts it, surface the raw string
+                        // so downstream repair/logging can see what happened
+                        // rather than silently dropping the tool call.
+                        Value::String(t.args_buf.clone())
+                    })
+                };
+                json!({
+                    "id": t.id,
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "arguments": args.to_string(),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let usage_map: Map<String, Value> = self.usage.map(|u| u.to_json_map()).unwrap_or_default();
+
+        // If an exception killed the stream and no stopReason arrived, tag
+        // the finish_reason so the finalization layer doesn't think the
+        // turn completed normally.
+        let finish_reason = self.finish_reason.or_else(|| {
+            self.exception
+                .as_ref()
+                .map(|(kind, _)| format!("exception:{kind}"))
+        });
+
+        LlmCallResult {
+            full_text: self.full_text,
+            reasoning: self.reasoning,
+            tool_calls,
+            usage: usage_map,
+            model_used: model_name.to_string(),
+            duration_ms,
+            finish_reason,
+        }
+    }
+}
+
+fn map_bedrock_finish_reason(stop_reason: &str) -> String {
+    match stop_reason {
+        "tool_use" => "tool_calls".to_string(),
+        "max_tokens" => "length".to_string(),
+        "end_turn" => "stop".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn parse_json_or_empty(bytes: &[u8]) -> Value {
+    if bytes.is_empty() {
+        return Value::Null;
+    }
+    serde_json::from_slice(bytes).unwrap_or(Value::Null)
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::super::bedrock_eventstream::EventStreamFrame;
+    use super::*;
+
+    fn frame(msg_type: &str, event_type: &str, payload: &[u8]) -> EventStreamFrame {
+        use std::collections::HashMap;
+        let mut headers = HashMap::new();
+        headers.insert(":message-type".to_string(), msg_type.to_string());
+        headers.insert(":event-type".to_string(), event_type.to_string());
+        EventStreamFrame {
+            headers,
+            payload: payload.to_vec(),
+        }
+    }
+
+    fn exception_frame(exc_type: &str, payload: &[u8]) -> EventStreamFrame {
+        use std::collections::HashMap;
+        let mut headers = HashMap::new();
+        headers.insert(":message-type".to_string(), "exception".to_string());
+        headers.insert(":exception-type".to_string(), exc_type.to_string());
+        EventStreamFrame {
+            headers,
+            payload: payload.to_vec(),
+        }
+    }
+
+    #[test]
+    fn text_only_stream_accumulates_full_text() {
+        let mut acc = BedrockStreamAccumulator::new();
+        acc.push_frame(&frame("event", "messageStart", br#"{"role":"assistant"}"#))
+            .unwrap();
+        let d1 = acc
+            .push_frame(&frame(
+                "event",
+                "contentBlockDelta",
+                br#"{"contentBlockIndex":0,"delta":{"text":"Hello "}}"#,
+            ))
+            .unwrap();
+        assert_eq!(d1, vec![BedrockStreamEvent::TextDelta("Hello ".into())]);
+        acc.push_frame(&frame(
+            "event",
+            "contentBlockDelta",
+            br#"{"contentBlockIndex":0,"delta":{"text":"world"}}"#,
+        ))
+        .unwrap();
+        acc.push_frame(&frame(
+            "event",
+            "contentBlockStop",
+            br#"{"contentBlockIndex":0}"#,
+        ))
+        .unwrap();
+        acc.push_frame(&frame(
+            "event",
+            "messageStop",
+            br#"{"stopReason":"end_turn"}"#,
+        ))
+        .unwrap();
+        acc.push_frame(&frame(
+            "event",
+            "metadata",
+            br#"{"usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15}}"#,
+        ))
+        .unwrap();
+
+        let r = acc.into_result("claude", 42);
+        assert_eq!(r.full_text, "Hello world");
+        assert!(r.tool_calls.is_empty());
+        assert_eq!(r.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(r.usage["input_tokens"], 10);
+        assert_eq!(r.usage["output_tokens"], 5);
+        assert_eq!(r.usage["total_tokens"], 15);
+        assert_eq!(r.duration_ms, 42);
+    }
+
+    #[test]
+    fn reasoning_delta_is_captured() {
+        let mut acc = BedrockStreamAccumulator::new();
+        let evs = acc
+            .push_frame(&frame(
+                "event",
+                "contentBlockDelta",
+                br#"{"contentBlockIndex":0,"delta":{"reasoningContent":{"text":"thinking..."}}}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            evs,
+            vec![BedrockStreamEvent::ReasoningDelta("thinking...".into())]
+        );
+        let r = acc.into_result("claude", 0);
+        assert_eq!(r.reasoning, "thinking...");
+    }
+
+    #[test]
+    fn nested_reasoning_text_variant_is_captured() {
+        // Some models nest reasoning under reasoningContent.reasoningText.text.
+        let mut acc = BedrockStreamAccumulator::new();
+        acc.push_frame(&frame(
+            "event",
+            "contentBlockDelta",
+            br#"{"contentBlockIndex":0,"delta":{"reasoningContent":{"reasoningText":{"text":"hm"}}}}"#,
+        ))
+        .unwrap();
+        let r = acc.into_result("claude", 0);
+        assert_eq!(r.reasoning, "hm");
+    }
+
+    #[test]
+    fn tool_use_with_args_split_across_multiple_deltas() {
+        let mut acc = BedrockStreamAccumulator::new();
+        let start = acc
+            .push_frame(&frame(
+                "event",
+                "contentBlockStart",
+                br#"{"contentBlockIndex":1,"start":{"toolUse":{"toolUseId":"tu-1","name":"bash"}}}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            start,
+            vec![BedrockStreamEvent::ToolCallStart {
+                id: "tu-1".into(),
+                name: "bash".into(),
+            }]
+        );
+        // JSON arguments streamed in three pieces.
+        for chunk in [r#"{"comm"#, r#"and":"#, r#""\"pwd\""}"#] {
+            let payload = format!(
+                r#"{{"contentBlockIndex":1,"delta":{{"toolUse":{{"input":{}}}}}}}"#,
+                serde_json::to_string(chunk).unwrap()
+            );
+            acc.push_frame(&frame("event", "contentBlockDelta", payload.as_bytes()))
+                .unwrap();
+        }
+        acc.push_frame(&frame(
+            "event",
+            "contentBlockStop",
+            br#"{"contentBlockIndex":1}"#,
+        ))
+        .unwrap();
+        acc.push_frame(&frame(
+            "event",
+            "messageStop",
+            br#"{"stopReason":"tool_use"}"#,
+        ))
+        .unwrap();
+        let r = acc.into_result("claude", 0);
+        assert_eq!(r.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.tool_calls[0]["id"], "tu-1");
+        assert_eq!(r.tool_calls[0]["function"]["name"], "bash");
+        // Arguments came back as the full re-assembled JSON string.
+        let args_str = r.tool_calls[0]["function"]["arguments"].as_str().unwrap();
+        let args: Value = serde_json::from_str(args_str).unwrap();
+        assert_eq!(args["command"], "\"pwd\"");
+    }
+
+    #[test]
+    fn cache_tokens_in_metadata_are_captured() {
+        let mut acc = BedrockStreamAccumulator::new();
+        acc.push_frame(&frame(
+            "event",
+            "metadata",
+            br#"{"usage":{"inputTokens":100,"outputTokens":20,"cacheReadInputTokens":800,"cacheWriteInputTokens":50,"totalTokens":970}}"#,
+        ))
+        .unwrap();
+        let r = acc.into_result("claude", 0);
+        assert_eq!(r.usage["input_tokens"], 100);
+        assert_eq!(r.usage["cached_input_tokens"], 800);
+        assert_eq!(r.usage["cache_creation_tokens"], 50);
+        assert_eq!(r.usage["output_tokens"], 20);
+        // Canonical disjoint-sum identity.
+        assert_eq!(r.usage["total_tokens"], 970);
+    }
+
+    #[test]
+    fn exception_frame_sets_exception_and_fakes_finish_reason() {
+        let mut acc = BedrockStreamAccumulator::new();
+        let evs = acc
+            .push_frame(&exception_frame(
+                "throttlingException",
+                br#"{"message":"rate limited"}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            evs,
+            vec![BedrockStreamEvent::Exception {
+                kind: "throttlingException".into(),
+                message: "rate limited".into()
+            }]
+        );
+        assert!(acc.is_finished());
+        let r = acc.into_result("claude", 0);
+        assert_eq!(
+            r.finish_reason.as_deref(),
+            Some("exception:throttlingException")
+        );
+    }
+
+    #[test]
+    fn unknown_event_type_is_ignored_not_fatal() {
+        let mut acc = BedrockStreamAccumulator::new();
+        let evs = acc
+            .push_frame(&frame("event", "futureEventType", b"{}"))
+            .unwrap();
+        assert!(evs.is_empty());
+    }
+
+    // ── Retry classification ────────────────────────────────────────────
+
+    #[test]
+    fn throttling_is_rate_limit_retryable() {
+        assert_eq!(
+            is_retryable_exception("throttlingException"),
+            RetryKind::RateLimit
+        );
+        assert!(RetryKind::RateLimit.is_retryable());
+    }
+
+    #[test]
+    fn transient_server_errors_are_retryable() {
+        for k in [
+            "internalServerError",
+            "internalServerErrorException",
+            "internalFailure",
+            "serviceUnavailableException",
+            "modelStreamErrorException",
+        ] {
+            assert_eq!(
+                is_retryable_exception(k),
+                RetryKind::Transient,
+                "{k} should be Transient"
+            );
+            assert!(RetryKind::Transient.is_retryable());
+        }
+    }
+
+    #[test]
+    fn exception_classification_is_case_insensitive() {
+        assert_eq!(
+            is_retryable_exception("ThrottlingException"),
+            RetryKind::RateLimit
+        );
+        assert_eq!(
+            is_retryable_exception("INTERNALSERVERERROR"),
+            RetryKind::Transient
+        );
+    }
+
+    #[test]
+    fn retryable_exception_wrapper_matches_classifier() {
+        // The wrapper must agree with the classifier's `is_retryable()` for
+        // every case — it's just a boolean convenience layer.
+        for (k, want) in [
+            ("throttlingException", true),
+            ("internalServerError", true),
+            ("serviceUnavailableException", true),
+            ("modelStreamErrorException", true),
+            ("validationException", false),
+            ("accessDeniedException", false),
+            ("resourceNotFoundException", false),
+        ] {
+            assert_eq!(retryable_exception(k), want, "kind={k}");
+        }
+    }
+
+    #[test]
+    fn validation_and_auth_errors_are_terminal() {
+        for k in [
+            "validationException",
+            "accessDeniedException",
+            "resourceNotFoundException",
+            "modelNotReadyException",
+        ] {
+            assert_eq!(
+                is_retryable_exception(k),
+                RetryKind::Terminal,
+                "{k} should be Terminal"
+            );
+            assert!(!RetryKind::Terminal.is_retryable());
+        }
+    }
+
+    #[test]
+    fn duplicate_content_block_start_does_not_clobber_in_progress_args() {
+        // Bedrock's protocol guarantees unique contentBlockIndex per tool
+        // call, but a buggy gateway could violate that. Make sure a repeat
+        // `contentBlockStart` on the same index does NOT drop the
+        // already-streamed argument bytes of the first call. Instead, the
+        // first-seen id/name/args win and the duplicate is ignored.
+        let mut acc = BedrockStreamAccumulator::new();
+        acc.push_frame(&frame(
+            "event",
+            "contentBlockStart",
+            br#"{"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"tu-first","name":"bash"}}}"#,
+        ))
+        .unwrap();
+        acc.push_frame(&frame(
+            "event",
+            "contentBlockDelta",
+            br#"{"contentBlockIndex":0,"delta":{"toolUse":{"input":"{\"cmd\":\"ls\"}"}}}"#,
+        ))
+        .unwrap();
+        // Duplicate start for the same index — must NOT overwrite tu-first's buffer.
+        acc.push_frame(&frame(
+            "event",
+            "contentBlockStart",
+            br#"{"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"tu-clobber","name":"rm"}}}"#,
+        ))
+        .unwrap();
+        let r = acc.into_result("claude", 0);
+        assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.tool_calls[0]["id"], "tu-first");
+        assert_eq!(r.tool_calls[0]["function"]["name"], "bash");
+        // Args from the first run must survive.
+        let args: Value =
+            serde_json::from_str(r.tool_calls[0]["function"]["arguments"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(args["cmd"], "ls");
+    }
+
+    #[test]
+    fn message_stop_sets_finished() {
+        let mut acc = BedrockStreamAccumulator::new();
+        assert!(!acc.is_finished());
+        acc.push_frame(&frame(
+            "event",
+            "messageStop",
+            br#"{"stopReason":"max_tokens"}"#,
+        ))
+        .unwrap();
+        assert!(acc.is_finished());
+        let r = acc.into_result("claude", 0);
+        assert_eq!(r.finish_reason.as_deref(), Some("length"));
+    }
+}

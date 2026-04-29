@@ -176,13 +176,22 @@ fn done_event(tokens: u64) -> String {
     //   mock_done_event_alone_leaves_usage_unset_regression_anchor
     let usage = sse_line(&serde_json::json!({
         "type": "usage",
-        "prompt_tokens": tokens,
-        "completion_tokens": 50u64,
+        "input_tokens": tokens,
+        "cached_input_tokens": 0u64,
+        "cache_creation_tokens": 0u64,
+        "output_tokens": 50u64,
+        "total_tokens": tokens + 50,
     }));
     let done = sse_line(&serde_json::json!({
         "type": "done",
         "tokens_used": tokens,
-        "usage": { "prompt_tokens": tokens, "completion_tokens": 50 },
+        "usage": {
+            "input_tokens": tokens,
+            "cached_input_tokens": 0u64,
+            "cache_creation_tokens": 0u64,
+            "output_tokens": 50u64,
+            "total_tokens": tokens + 50,
+        },
     }));
     format!("{usage}{done}")
 }
