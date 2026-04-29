@@ -2472,12 +2472,6 @@ impl PlanModeState {
         Ok(())
     }
 }
-
-/// Format the plan mode prompt (for display)
-pub fn format_plan_mode_prompt() -> &'static str {
-    "plan> "
-}
-
 // ─── Plan Mode Entry Card ────────────────────────────────────────────────────
 
 /// Format the plan mode entry card shown when user enters /plan.
@@ -2992,12 +2986,6 @@ pub fn format_status_line(plan: &TaskPlan) -> String {
     let bar = mini_progress_bar(pct, 8);
     format!("{} {}% ({}/{})", bar, pct, done, total)
 }
-
-/// Generate a plan modification prompt for LLM
-pub fn plan_modification_prompt(state: &PlanModeState, user_request: &str) -> String {
-    state.plan_mode_prompt(user_request)
-}
-
 /// Check if user input is a resume command for paused plan execution.
 ///
 /// Delegates to [`crate::plan_resume::message_signals_resume`] so that all
@@ -4386,19 +4374,6 @@ Return JSON in the same format as the original plan:
 
     prompt
 }
-
-/// Format replan suggestion for CLI display.
-pub fn format_replan_suggestion(suggestion: &ReplanSuggestion) -> String {
-    let mut out = String::new();
-    out.push('\n');
-    out.push_str("  ⚠️ Replan Suggested\n");
-    out.push_str(&format!("  Reason: {}\n", suggestion.reason.format()));
-    out.push_str(&format!("  Action: {}\n", suggestion.suggested_action));
-    out.push('\n');
-    out.push_str("  Type '/plan replan' to regenerate the plan\n");
-    out
-}
-
 // ─── Plan Templates ─────────────────────────────────────────────────────────
 
 /// A reusable plan template.
@@ -4547,53 +4522,6 @@ pub fn builtin_templates() -> Vec<PlanTemplate> {
         },
     ]
 }
-
-/// Find matching templates for a project context.
-pub fn suggest_templates(context: &ProjectContext, goal: &str) -> Vec<&'static str> {
-    let templates = builtin_templates();
-    let goal_lower = goal.to_lowercase();
-    let mut matches = Vec::new();
-
-    for t in &templates {
-        // Language match
-        let lang_match = t.languages.is_empty()
-            || t.languages.iter().any(|l| {
-                context
-                    .languages
-                    .iter()
-                    .any(|cl| cl.eq_ignore_ascii_case(l))
-            });
-        if !lang_match {
-            continue;
-        }
-
-        // Goal keyword match
-        let name_match =
-            goal_lower.contains(&t.name.replace('-', " ")) || goal_lower.contains(&t.name);
-        let desc_match = t
-            .description
-            .split_whitespace()
-            .any(|w| w.len() > 3 && goal_lower.contains(&w.to_lowercase()));
-
-        if name_match || desc_match {
-            matches.push(t.name.as_str());
-        }
-    }
-
-    // Static lifetime trick: return names that match the builtin list
-    let builtin = builtin_templates();
-    let mut result = Vec::new();
-    for m in matches {
-        for bt in &builtin {
-            if bt.name == m {
-                // Leak the string for static lifetime (these are a fixed small set)
-                result.push(&*Box::leak(bt.name.clone().into_boxed_str()));
-            }
-        }
-    }
-    result
-}
-
 /// Instantiate a template by name, customizing the goal.
 pub fn instantiate_template(name: &str, goal: &str) -> Option<TaskPlan> {
     let templates = builtin_templates();

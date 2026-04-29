@@ -286,27 +286,10 @@ pub fn plan(id: &str) -> String {
 pub fn plan_status(id: &str) -> String {
     format!("/plans/{id}/status")
 }
-
-#[inline]
-pub fn plan_execute(id: &str) -> String {
-    format!("/plans/{id}/execute")
-}
-
-#[inline]
-pub fn plan_exit_mode(id: &str) -> String {
-    format!("/plans/{id}/exit-plan-mode")
-}
-
 #[inline]
 pub fn plan_rewind(id: &str) -> String {
     format!("/plans/{id}/rewind")
 }
-
-#[inline]
-pub fn plan_redo_step(id: &str) -> String {
-    format!("/plans/{id}/redo-step")
-}
-
 /// `POST /plans/{id}/step-runs` (create) and `GET /plans/{id}/step-runs` (list).
 /// Same path, different methods — read + write share the prefix for API
 /// consumer intuition.

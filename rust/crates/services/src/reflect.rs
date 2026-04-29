@@ -197,41 +197,6 @@ pub struct DataCompleteness {
     /// Human-readable warnings about data gaps.
     pub warnings: Vec<String>,
 }
-
-/// Assess data completeness by comparing local journal to cloud event count.
-pub fn assess_data_completeness(
-    session_id: &str,
-    cloud_event_count: Option<u32>,
-) -> DataCompleteness {
-    let journal_events = match crate::session_journal::read_journal(session_id) {
-        Ok(events) => events.len() as u32,
-        Err(_) => 0,
-    };
-    let cloud_events = cloud_event_count.unwrap_or(0);
-    let missing = journal_events.saturating_sub(cloud_events);
-    let confidence = if journal_events == 0 {
-        0.0
-    } else if cloud_events == 0 {
-        0.5 // local-only, no cloud verification
-    } else {
-        1.0 - (missing as f64 / journal_events as f64).min(1.0)
-    };
-    let mut warnings = Vec::new();
-    if missing > 0 {
-        warnings.push(format!("{missing} events may be missing from cloud DB"));
-    }
-    if journal_events == 0 {
-        warnings.push("No local journal found".to_string());
-    }
-    DataCompleteness {
-        journal_events,
-        cloud_events,
-        missing_from_cloud: missing,
-        confidence,
-        warnings,
-    }
-}
-
 fn truncate_graph_summary(value: &str, max_chars: usize) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
