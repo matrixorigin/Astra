@@ -703,13 +703,13 @@ pub(crate) async fn stream_chat_sse(
         current_session_id: state.current_session_id.as_deref(),
     });
 
-    let csl_appended_messages =
-        if state.csl_turn_start_message_count < state.messages.len() {
-            state.messages[state.csl_turn_start_message_count..].to_vec()
-        } else {
-            Vec::new()
-        };
-    let csl_full_messages = state.messages.clone();
+    let csl_turn_start = state.csl_turn_start_message_count;
+    let csl_full_messages = std::mem::take(&mut state.messages);
+    let csl_appended_messages = if csl_turn_start < csl_full_messages.len() {
+        csl_full_messages[csl_turn_start..].to_vec()
+    } else {
+        Vec::new()
+    };
 
     let result = build_stream_result(StreamResultBuild {
         tool_health_entries: p.tool_health_entries,

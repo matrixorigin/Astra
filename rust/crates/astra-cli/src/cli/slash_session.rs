@@ -5825,6 +5825,138 @@ mod resume_tests {
         );
     }
 
+    // ── CSL resume tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn restore_from_csl_populates_history_and_state() {
+        use astra_turn_core::conversation_log::{
+            CslEntry, CslStore, SessionStateCompact, file_store::FileCslStore,
+        };
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("csl-resume-{}", uuid::Uuid::new_v4());
+
+        let store = FileCslStore::new(session_journal::local_sessions_dir());
+        let snapshot = CslEntry::Snapshot {
+            seq: 0,
+            turn: 1,
+            messages: vec![
+                serde_json::json!({"role": "user", "content": "hello"}),
+                serde_json::json!({"role": "assistant", "content": "hi there"}),
+            ],
+            session_state: SessionStateCompact {
+                recent_tools: vec!["bash".into(), "read_file".into()],
+                ..Default::default()
+            },
+        };
+        store.append(&session_id, &snapshot).await.unwrap();
+
+        let delta = CslEntry::TurnDelta {
+            seq: 1,
+            turn: 2,
+            appended: vec![
+                serde_json::json!({"role": "user", "content": "what next?"}),
+                serde_json::json!({"role": "assistant", "content": "let's continue"}),
+            ],
+            state_patch: None,
+        };
+        store.append(&session_id, &delta).await.unwrap();
+
+        let mut state = ReplState::default();
+        restore_journal_history_if_available(&mut state, &session_id).await;
+
+        assert_eq!(state.history.len(), 2, "should have 2 user/assistant pairs");
+        assert_eq!(state.history[0].0, "hello");
+        assert_eq!(state.history[0].1, "hi there");
+        assert_eq!(state.history[1].0, "what next?");
+        assert_eq!(state.history[1].1, "let's continue");
+        assert!(state.csl_store.is_some(), "CSL store should be set");
+        assert_eq!(state.csl_last_seq, 1, "should track last seq from delta");
+        assert_eq!(
+            state.recent_tools,
+            vec!["bash".to_string(), "read_file".to_string()],
+            "should restore recent_tools from snapshot state"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_without_csl_falls_back_to_journal() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("no-csl-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 3);
+
+        let mut state = ReplState::default();
+        restore_journal_history_if_available(&mut state, &session_id).await;
+
+        assert!(
+            !state.history.is_empty(),
+            "should fall back to journal history"
+        );
+        assert!(state.csl_store.is_none(), "CSL store should remain None");
+        assert_eq!(state.csl_last_seq, 0, "CSL seq should remain 0");
+    }
+
+    // ── derive_history_pairs_from_messages tests ─────────────────────────
+
+    #[test]
+    fn derive_history_pairs_simple_conversation() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "q1"}),
+            serde_json::json!({"role": "assistant", "content": "a1"}),
+            serde_json::json!({"role": "user", "content": "q2"}),
+            serde_json::json!({"role": "assistant", "content": "a2"}),
+        ];
+        let pairs = derive_history_pairs_from_messages(&messages);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0], ("q1".into(), "a1".into()));
+        assert_eq!(pairs[1], ("q2".into(), "a2".into()));
+    }
+
+    #[test]
+    fn derive_history_pairs_skips_tool_messages() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "fix the bug"}),
+            serde_json::json!({"role": "assistant", "content": "I'll read the file"}),
+            serde_json::json!({"role": "tool", "content": "file contents here"}),
+            serde_json::json!({"role": "assistant", "content": "done, fixed it"}),
+            serde_json::json!({"role": "user", "content": "thanks"}),
+            serde_json::json!({"role": "assistant", "content": "you're welcome"}),
+        ];
+        let pairs = derive_history_pairs_from_messages(&messages);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, "fix the bug");
+        assert_eq!(pairs[0].1, "done, fixed it");
+        assert_eq!(pairs[1].0, "thanks");
+        assert_eq!(pairs[1].1, "you're welcome");
+    }
+
+    #[test]
+    fn derive_history_pairs_empty_messages() {
+        let pairs = derive_history_pairs_from_messages(&[]);
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn derive_history_pairs_user_only_no_assistant() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hello"}),
+        ];
+        let pairs = derive_history_pairs_from_messages(&messages);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0], ("hello".into(), String::new()));
+    }
+
+    #[test]
+    fn derive_history_pairs_structured_content_becomes_empty() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "question"}),
+            serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "answer"}]}),
+        ];
+        let pairs = derive_history_pairs_from_messages(&messages);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "question");
+        assert_eq!(pairs[0].1, "", "non-string content becomes empty string");
+    }
+
     #[tokio::test]
     async fn restore_session_into_state_rejects_stale_remote_session_before_local_restore() {
         let (_tmp, _guard) = isolated_sessions_dir();
