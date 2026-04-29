@@ -384,8 +384,7 @@ pub enum CslStoreError {
 }
 
 pub(crate) fn validate_session_id(session_id: &str) -> Result<(), CslStoreError> {
-    astra_services::session_journal::validate_session_id(session_id)
-        .map_err(CslStoreError::InvalidSessionId)
+    astra_core::session_id::validate(session_id).map_err(CslStoreError::InvalidSessionId)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

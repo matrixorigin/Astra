@@ -21,6 +21,7 @@ pub mod runtime_limits;
 #[doc(hidden)]
 pub use tracing;
 pub mod session_env_overlay;
+pub mod session_id;
 pub mod sync_poison;
 pub use confidence::ConfidenceInterval;
 pub use config::*;

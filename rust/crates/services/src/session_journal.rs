@@ -36,48 +36,9 @@ pub fn local_sessions_dir() -> PathBuf {
 
 /// Validate that a session ID is safe for use as a filesystem path component.
 ///
-/// Rejects:
-/// - empty or whitespace-only IDs
-/// - non-ASCII characters (blocks Unicode invisibles, RTL overrides, homoglyphs)
-/// - ASCII control characters (including NUL and DEL)
-/// - path separators (`/`, `\`), `..` anywhere (guards against traversal)
-/// - `.` as a standalone ID (maps to current directory)
-/// - IDs longer than 200 bytes (filesystem NAME_MAX safety)
-/// - multi-component paths after OS normalization
+/// Delegates to [`astra_core::session_id::validate`] — the single source of truth.
 pub fn validate_session_id(session_id: &str) -> Result<(), String> {
-    if session_id.is_empty() || session_id.trim().is_empty() {
-        return Err("session ID cannot be empty".to_string());
-    }
-    if !session_id.is_ascii() {
-        return Err(format!(
-            "invalid session ID {:?}: must contain only ASCII characters",
-            session_id
-        ));
-    }
-    if session_id.len() > 200 {
-        return Err(format!(
-            "invalid session ID (len={}): must be at most 200 bytes",
-            session_id.len()
-        ));
-    }
-    if session_id == "."
-        || session_id.contains('/')
-        || session_id.contains('\\')
-        || session_id.contains("..")
-        || session_id.bytes().any(|b| b.is_ascii_control())
-    {
-        return Err(format!(
-            "invalid session ID {:?}: must not contain path separators, '..', or control characters",
-            session_id
-        ));
-    }
-    if Path::new(session_id).components().count() != 1 {
-        return Err(format!(
-            "invalid session ID {:?}: must be a single path component",
-            session_id
-        ));
-    }
-    Ok(())
+    astra_core::session_id::validate(session_id)
 }
 
 /// Redirect session journal + workspace + step checkpoint paths on **this thread** to `dir`.
@@ -894,6 +855,8 @@ impl JournalWriter {
     /// Create a writer for the given session ID.
     /// Creates the parent directory if needed.
     pub fn new(session_id: &str) -> std::io::Result<Self> {
+        validate_session_id(session_id)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let dir = journal_dir();
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{session_id}.jsonl"));
@@ -1169,6 +1132,8 @@ fn parse_journal_text(content: &str) -> (Vec<JournalEvent>, usize, usize) {
 
 /// Read all events from a session journal file.
 pub fn read_journal(session_id: &str) -> std::io::Result<Vec<JournalEvent>> {
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let path = journal_dir().join(format!("{session_id}.jsonl"));
     if !path.exists() {
         return Ok(Vec::new());
@@ -1255,6 +1220,8 @@ pub fn find_latest_approval_required(
 pub fn read_journal_for_digest(
     session_id: &str,
 ) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let path = journal_dir().join(format!("{session_id}.jsonl"));
     if !path.exists() {
         return Err(std::io::Error::new(
@@ -1341,6 +1308,9 @@ pub fn list_sessions_by_time(limit: usize) -> std::io::Result<Vec<String>> {
 
 /// Count turn events in a journal without fully parsing all events.
 pub fn count_turns(session_id: &str) -> u32 {
+    if validate_session_id(session_id).is_err() {
+        return 0;
+    }
     use std::io::BufRead;
     let path = journal_dir().join(format!("{session_id}.jsonl"));
     let file = match std::fs::File::open(&path) {
@@ -1359,6 +1329,7 @@ pub fn count_turns(session_id: &str) -> u32 {
 /// Returns `(first_user_input, model, timestamp)` without parsing the entire JSONL.
 /// Designed for fast session listing via partial journal reads.
 pub fn peek_session_meta(session_id: &str) -> Option<SessionPeek> {
+    validate_session_id(session_id).ok()?;
     use std::io::BufRead;
     let path = journal_dir().join(format!("{session_id}.jsonl"));
     let file = std::fs::File::open(&path).ok()?;
