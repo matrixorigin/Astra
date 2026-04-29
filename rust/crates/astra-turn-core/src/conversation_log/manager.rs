@@ -6,20 +6,8 @@ use std::sync::Arc;
 
 use super::{
     AppendMeta, CslEntry, CslStore, CslStoreError, MaterializedState, SessionStateCompact,
-    SessionStatePatch, materialize,
+    SessionStatePatch, materialize, validate_session_id,
 };
-
-fn validate_session_id(session_id: &str) -> Result<(), CslStoreError> {
-    if session_id.is_empty()
-        || session_id.contains('/')
-        || session_id.contains('\\')
-        || session_id.contains("..")
-        || session_id.bytes().any(|b| b < 0x20)
-    {
-        return Err(CslStoreError::InvalidSessionId(session_id.to_string()));
-    }
-    Ok(())
-}
 
 #[derive(Debug, Clone)]
 pub struct CslManagerConfig {
@@ -1289,6 +1277,7 @@ mod tests {
             "has\0nul",
             "has\nnewline",
             "has\ttab",
+            "has\x7Fdel",
         ] {
             let result = CslManager::new(
                 Arc::clone(&store),

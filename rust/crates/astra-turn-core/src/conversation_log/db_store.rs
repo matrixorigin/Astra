@@ -8,7 +8,7 @@ use sqlx::{Row, mysql::MySqlRow, query};
 
 use astra_core::{MatrixOneSettings, SharedPool, connect_matrixone};
 
-use super::{CslEntry, CslStore, CslStoreError, materialize};
+use super::{CslEntry, CslStore, CslStoreError, materialize, validate_session_id};
 
 /// Database-backed CSL store. Each session's entries live in the
 /// `conversation_log` table, keyed by `(session_id, seq)`.
@@ -56,6 +56,7 @@ impl CslStore for DbCslStore {
         entry: &CslEntry,
         meta: &super::AppendMeta,
     ) -> Result<(), CslStoreError> {
+        validate_session_id(session_id)?;
         let pool = self.get_pool().await?;
         let payload = serde_json::to_string(entry)?;
         let entry_type: i8 = if entry.is_snapshot() { 0 } else { 1 };
@@ -83,6 +84,7 @@ impl CslStore for DbCslStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<CslEntry>, CslStoreError> {
+        validate_session_id(session_id)?;
         let pool = self.get_pool().await?;
 
         // First check if any snapshot exists — avoids deserializing all rows
@@ -130,6 +132,7 @@ impl CslStore for DbCslStore {
         session_id: &str,
         after_seq: u64,
     ) -> Result<Vec<CslEntry>, CslStoreError> {
+        validate_session_id(session_id)?;
         let pool = self.get_pool().await?;
         let rows = query(
             "SELECT payload FROM conversation_log \
@@ -150,6 +153,7 @@ impl CslStore for DbCslStore {
         session_id: &str,
         before_seq: u64,
     ) -> Result<u64, CslStoreError> {
+        validate_session_id(session_id)?;
         let pool = self.get_pool().await?;
         let result = query("DELETE FROM conversation_log WHERE session_id = ? AND seq < ?")
             .bind(session_id)
@@ -167,6 +171,8 @@ impl CslStore for DbCslStore {
         new_session_id: &str,
         fork_after_turn: u32,
     ) -> Result<u64, CslStoreError> {
+        validate_session_id(parent_session_id)?;
+        validate_session_id(new_session_id)?;
         let pool = self.get_pool().await?;
 
         let mut tx = pool
@@ -228,6 +234,7 @@ impl CslStore for DbCslStore {
     }
 
     async fn snapshot_seqs(&self, session_id: &str) -> Result<Vec<u64>, CslStoreError> {
+        validate_session_id(session_id)?;
         let pool = self.get_pool().await?;
         let rows = query(
             "SELECT seq FROM conversation_log \

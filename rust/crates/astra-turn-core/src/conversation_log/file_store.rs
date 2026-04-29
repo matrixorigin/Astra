@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
-use super::{CslEntry, CslStore, CslStoreError, materialize};
+use super::{CslEntry, CslStore, CslStoreError, materialize, validate_session_id};
 
 const LOG_FILENAME: &str = "conversation_log.jsonl";
 
@@ -23,18 +23,6 @@ impl FileCslStore {
         Self {
             base_dir: base_dir.into(),
         }
-    }
-
-    fn validate_session_id(session_id: &str) -> Result<(), CslStoreError> {
-        if session_id.is_empty()
-            || session_id.contains('/')
-            || session_id.contains('\\')
-            || session_id.contains("..")
-            || session_id.bytes().any(|b| b < 0x20)
-        {
-            return Err(CslStoreError::InvalidSessionId(session_id.to_string()));
-        }
-        Ok(())
     }
 
     fn log_path(&self, session_id: &str) -> PathBuf {
@@ -116,7 +104,7 @@ impl CslStore for FileCslStore {
         entry: &CslEntry,
         _meta: &super::AppendMeta,
     ) -> Result<(), CslStoreError> {
-        Self::validate_session_id(session_id)?;
+        validate_session_id(session_id)?;
         let path = self.log_path(session_id);
         let entry = entry.clone();
         tokio::task::spawn_blocking(move || Self::append_entry(&path, &entry))
@@ -128,7 +116,7 @@ impl CslStore for FileCslStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<CslEntry>, CslStoreError> {
-        Self::validate_session_id(session_id)?;
+        validate_session_id(session_id)?;
         let path = self.log_path(session_id);
         let entries = tokio::task::spawn_blocking(move || Self::read_all_entries(&path))
             .await
@@ -153,7 +141,7 @@ impl CslStore for FileCslStore {
         session_id: &str,
         after_seq: u64,
     ) -> Result<Vec<CslEntry>, CslStoreError> {
-        Self::validate_session_id(session_id)?;
+        validate_session_id(session_id)?;
         let path = self.log_path(session_id);
         let entries = tokio::task::spawn_blocking(move || Self::read_all_entries(&path))
             .await
@@ -169,7 +157,7 @@ impl CslStore for FileCslStore {
         session_id: &str,
         before_seq: u64,
     ) -> Result<u64, CslStoreError> {
-        Self::validate_session_id(session_id)?;
+        validate_session_id(session_id)?;
         let path = self.log_path(session_id);
         tokio::task::spawn_blocking(move || {
             let entries = Self::read_all_entries(&path)?;
@@ -194,8 +182,8 @@ impl CslStore for FileCslStore {
         new_session_id: &str,
         fork_after_turn: u32,
     ) -> Result<u64, CslStoreError> {
-        Self::validate_session_id(parent_session_id)?;
-        Self::validate_session_id(new_session_id)?;
+        validate_session_id(parent_session_id)?;
+        validate_session_id(new_session_id)?;
         let parent_path = self.log_path(parent_session_id);
         let new_path = self.log_path(new_session_id);
 
@@ -761,9 +749,23 @@ mod tests {
         let store = FileCslStore::new(tmp.path());
         let snap = make_snapshot(0, 1, vec![user_msg("hi")]);
 
-        for bad_id in ["../etc/passwd", "foo/bar", "a\\b", "..", ""] {
+        for bad_id in [
+            "../etc/passwd",
+            "foo/bar",
+            "a\\b",
+            "..",
+            "",
+            "has\0nul",
+            "has\nnewline",
+            "has\ttab",
+            "has\x7Fdel",
+        ] {
             let result = store.append(bad_id, &snap, &meta()).await;
-            assert!(result.is_err(), "session_id '{bad_id}' should be rejected");
+            match result {
+                Err(CslStoreError::InvalidSessionId(_)) => {}
+                Err(other) => panic!("'{bad_id}': expected InvalidSessionId, got {other}"),
+                Ok(_) => panic!("session_id '{bad_id}' should be rejected"),
+            }
         }
     }
 

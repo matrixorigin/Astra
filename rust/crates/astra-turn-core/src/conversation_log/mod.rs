@@ -376,10 +376,22 @@ pub enum CslStoreError {
     Serde(#[from] serde_json::Error),
     #[error("materialize error: {0}")]
     Materialize(#[from] MaterializeError),
-    #[error("invalid session_id: {0}")]
+    #[error("invalid session_id: {0:?}")]
     InvalidSessionId(String),
     #[error("{0}")]
     Other(String),
+}
+
+pub(crate) fn validate_session_id(session_id: &str) -> Result<(), CslStoreError> {
+    if session_id.is_empty()
+        || session_id.contains('/')
+        || session_id.contains('\\')
+        || session_id.contains("..")
+        || session_id.bytes().any(|b| b.is_ascii_control())
+    {
+        return Err(CslStoreError::InvalidSessionId(session_id.to_string()));
+    }
+    Ok(())
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
