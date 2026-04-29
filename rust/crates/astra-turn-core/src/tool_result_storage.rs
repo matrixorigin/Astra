@@ -6,7 +6,39 @@
 //! reference.  This prevents oversized tool outputs from bloating the LLM
 //! context window while still preserving the full output for later retrieval.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+
+/// Maximum length of the human-readable portion of a sanitized filename.
+/// Full filename has an 8-char hex hash suffix to prevent collisions when
+/// different `tool_call_id`s sanitize to the same string.
+const SAFE_ID_MAX_READABLE: usize = 64;
+
+/// Sanitize a tool_call_id into a filesystem-safe filename stem.
+///
+/// Replaces every non-`[A-Za-z0-9_-]` character with `_`, truncates the
+/// readable portion, and appends an 8-char hex hash of the original id to
+/// prevent collisions (e.g. `a/b` and `a_b` would otherwise both map to `a_b`).
+fn safe_filename_stem(tool_call_id: &str) -> String {
+    let mut readable: String = tool_call_id
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if readable.chars().count() > SAFE_ID_MAX_READABLE {
+        readable = readable.chars().take(SAFE_ID_MAX_READABLE).collect();
+    }
+    let mut hasher = DefaultHasher::new();
+    tool_call_id.hash(&mut hasher);
+    let suffix = hasher.finish();
+    format!("{readable}-{suffix:016x}")
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -56,17 +88,8 @@ pub fn maybe_persist_tool_result(
         return None;
     }
 
-    // Sanitize tool_call_id for filesystem safety
-    let safe_id: String = tool_call_id
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    // Sanitize tool_call_id for filesystem safety (with hash suffix to avoid collisions)
+    let safe_id = safe_filename_stem(tool_call_id);
     let file_path = dir.join(format!("{safe_id}.txt"));
 
     if let Err(e) = std::fs::write(&file_path, content) {
@@ -80,20 +103,44 @@ pub fn maybe_persist_tool_result(
     Some(build_replacement(tool_name, content, &file_path))
 }
 
+/// Persist a tool result to disk unconditionally (no size threshold).
+///
+/// Used by compaction to save full content before clearing. Unlike
+/// `maybe_persist_tool_result`, this always writes regardless of content size.
+/// Returns `true` on success.
+pub fn maybe_persist_tool_result_unconditional(
+    session_dir: &Path,
+    tool_call_id: &str,
+    _tool_name: &str,
+    content: &str,
+) -> bool {
+    let dir = session_dir.join(TOOL_RESULTS_SUBDIR);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!(
+            "[tool_result_storage] failed to create dir {}: {e}",
+            dir.display()
+        );
+        return false;
+    }
+
+    let safe_id = safe_filename_stem(tool_call_id);
+    let file_path = dir.join(format!("{safe_id}.txt"));
+
+    if let Err(e) = std::fs::write(&file_path, content) {
+        eprintln!(
+            "[tool_result_storage] failed to write {}: {e}",
+            file_path.display()
+        );
+        return false;
+    }
+    true
+}
+
 /// Read a previously-persisted tool result back from disk.
 ///
 /// Returns `None` if the file doesn't exist or can't be read.
 pub fn read_persisted_result(session_dir: &Path, tool_call_id: &str) -> Option<String> {
-    let safe_id: String = tool_call_id
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let safe_id = safe_filename_stem(tool_call_id);
     let file_path = session_dir
         .join(TOOL_RESULTS_SUBDIR)
         .join(format!("{safe_id}.txt"));
@@ -170,11 +217,23 @@ mod tests {
         assert!(replacement.contains("bash"));
         assert!(replacement.contains("persisted to disk"));
 
-        // File was written
-        let file_path = dir.join(TOOL_RESULTS_SUBDIR).join("call-42.txt");
-        assert!(file_path.exists());
+        // File was written (name is `<safe_id>-<hash>.txt` to avoid collisions)
+        let results_dir = dir.join(TOOL_RESULTS_SUBDIR);
+        let entries: Vec<_> = std::fs::read_dir(&results_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let file_path = entries[0].path();
+        let fname = file_path.file_name().unwrap().to_string_lossy();
+        assert!(fname.starts_with("call-42-"));
+        assert!(fname.ends_with(".txt"));
         let stored = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(stored.len(), content.len());
+
+        // Roundtrip read via public API
+        let recovered = read_persisted_result(&dir, "call-42").unwrap();
+        assert_eq!(recovered, content);
 
         // Replacement is much smaller than original
         assert!(replacement.len() < content.len() / 5);

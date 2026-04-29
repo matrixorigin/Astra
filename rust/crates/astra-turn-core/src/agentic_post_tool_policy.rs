@@ -142,7 +142,9 @@ pub fn apply_agentic_post_tool_policy(
         append_openai_user_content_messages(messages, &verdict.injections);
 
         for tool in &verdict.avoid_tools {
-            restricted_tools.insert(tool.clone());
+            if !crate::turn_guard::is_read_only_never_restrict(tool) {
+                restricted_tools.insert(tool.clone());
+            }
         }
 
         match verdict.severity {
@@ -315,7 +317,12 @@ mod tests {
 
         assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
         assert_eq!(remaining_turns, 8);
-        assert!(restricted_tools.contains("read_file"));
+        // read_file is read-only — it should NOT be restricted (model needs it
+        // for observation), but it should still appear in the verdict audit.
+        assert!(
+            !restricted_tools.contains("read_file"),
+            "read-only tools must not be added to restricted_tools"
+        );
         assert!(
             messages
                 .iter()
@@ -323,11 +330,6 @@ mod tests {
         );
         assert_eq!(verdict_events.len(), 1);
         assert_eq!(verdict_events[0].severity, "warning");
-        assert!(
-            verdict_events[0]
-                .avoid_tools
-                .contains(&"read_file".to_string())
-        );
     }
 
     #[test]
@@ -366,14 +368,12 @@ mod tests {
         });
 
         assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
-        assert!(restricted_tools.contains("read_file"));
-        assert_eq!(verdict_events.len(), 1);
+        // read_file is read-only — the filter prevents it from entering restricted_tools.
         assert!(
-            verdict_events[0]
-                .avoid_tools
-                .contains(&"read_file".to_string()),
-            "cache-waste warning should become a real restriction"
+            !restricted_tools.contains("read_file"),
+            "read-only tools must not be added to restricted_tools"
         );
+        assert_eq!(verdict_events.len(), 1);
     }
 
     #[test]

@@ -137,6 +137,11 @@ const READ_ONLY_NEVER_RESTRICT: &[&str] = &[
     "git_log",
 ];
 
+/// Check if a tool name is in the read-only never-restrict set.
+pub fn is_read_only_never_restrict(tool: &str) -> bool {
+    READ_ONLY_NEVER_RESTRICT.contains(&tool)
+}
+
 /// Insert deprioritized tool names from [`TurnGuard`] into the selector restriction set (CLI parity).
 ///
 /// Read-only tools in [`READ_ONLY_NEVER_RESTRICT`] are excluded: they can
@@ -630,6 +635,11 @@ impl TurnGuard {
             self.consecutive_warnings = 0;
         }
 
+        // Consolidate: at most 2 injection messages to avoid noise overload.
+        // Primary = first (highest-priority: stall/divergence/escalation).
+        // Secondary = remaining tips joined into one message.
+        let injections = consolidate_injections(injections);
+
         TurnVerdict {
             injections,
             avoid_tools: avoid_tools_vec,
@@ -703,6 +713,18 @@ impl Default for TurnGuard {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Cap injections at 2 messages: primary (first) stays intact, remaining
+/// are merged into one secondary message separated by newlines.
+fn consolidate_injections(injections: Vec<String>) -> Vec<String> {
+    if injections.len() <= 2 {
+        return injections;
+    }
+    let mut iter = injections.into_iter();
+    let primary = iter.next().unwrap();
+    let secondary = iter.collect::<Vec<_>>().join("\n\n");
+    vec![primary, secondary]
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -1876,6 +1898,88 @@ mod tests {
             final_window > initial_window,
             "stall window must widen after repeated ignored corrections \
              (initial={initial_window}, final={final_window})"
+        );
+    }
+
+    // ─── Optimization: avoid_tools must respect READ_ONLY_NEVER_RESTRICT ─────
+
+    #[test]
+    fn read_only_tools_never_in_avoid_tools_or_restricted() {
+        let mut guard = TurnGuard::new();
+        // Trigger stall on read_file (3 identical calls)
+        let calls = [make_tool_call("read_file", r#"{"path":"a.rs"}"#)];
+        guard.record_tool_calls(&calls);
+        guard.record_tool_calls(&calls);
+        guard.record_tool_calls(&calls);
+
+        let verdict = guard.evaluate();
+        // Stall should be detected and injections should exist
+        assert!(verdict.stall_detected, "stall must be detected");
+        assert!(!verdict.injections.is_empty(), "should have injections");
+
+        // read_file must NOT be in avoid_tools — it's read-only
+        assert!(
+            !verdict.avoid_tools.contains(&"read_file".to_string()),
+            "read_file must never be in avoid_tools; got: {:?}",
+            verdict.avoid_tools
+        );
+
+        // And not in restricted_tools either
+        let mut restricted = HashSet::new();
+        merge_deprioritized_tools_into_restricted(&guard, &mut restricted);
+        assert!(
+            !restricted.contains("read_file"),
+            "read_file must never be added to restricted_tools; got: {:?}",
+            restricted
+        );
+    }
+
+    #[test]
+    fn avoid_tools_restricts_non_read_only_tools() {
+        let mut guard = TurnGuard::new();
+        // bash errors → deprioritize
+        guard.record_tool_result("bash", "Error: permission denied");
+        guard.record_tool_result("bash", "Error: permission denied");
+        guard.record_tool_result("bash", "Error: permission denied");
+
+        let verdict = guard.evaluate();
+        assert!(verdict.avoid_tools.contains(&"bash".to_string()));
+
+        let mut restricted = HashSet::new();
+        merge_deprioritized_tools_into_restricted(&guard, &mut restricted);
+        assert!(
+            restricted.contains("bash"),
+            "non-read-only tool bash should be restricted"
+        );
+    }
+
+    // ─── Optimization: injection consolidation ────────────────────────────────
+
+    #[test]
+    fn verdict_injections_capped_at_two_messages() {
+        let mut guard = TurnGuard::new();
+        // Trigger multiple injection sources simultaneously:
+        // 1. Stall (3x same call)
+        let calls = [make_tool_call("read_file", r#"{"path":"a.rs"}"#)];
+        guard.record_tool_calls(&calls);
+        guard.record_tool_calls(&calls);
+        guard.record_tool_calls(&calls);
+        // 2. Cache hits (will trigger cache duplication warning)
+        guard.record_cache_hit("read_file");
+        guard.record_cache_hit("read_file");
+        guard.record_cache_hit("read_file");
+        guard.record_cache_hit("read_file");
+        // 3. Tool errors (will trigger deprioritize warning)
+        guard.record_tool_result("bash", "Error: fail");
+        guard.record_tool_result("bash", "Error: fail");
+        guard.record_tool_result("bash", "Error: fail");
+
+        let verdict = guard.evaluate();
+        assert!(
+            verdict.injections.len() <= 2,
+            "verdict must consolidate injections to at most 2 messages, got {}: {:?}",
+            verdict.injections.len(),
+            verdict.injections
         );
     }
 }

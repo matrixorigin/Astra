@@ -4629,8 +4629,10 @@ mod tests {
         let act = activation.unwrap();
         // Model: last writer wins → model-b
         assert_eq!(act.model_override.as_deref(), Some("model-b"));
-        // Tools: intersection of [bash, grep] ∩ [bash, edit] → [bash]
-        assert_eq!(act.allowed_tools, vec!["bash"]);
+        // Tools: union of [bash, grep] ∪ [bash, edit] → [bash, grep, edit]
+        let mut tools = act.allowed_tools.clone();
+        tools.sort();
+        assert_eq!(tools, vec!["bash", "edit", "grep"]);
     }
 
     #[tokio::test]

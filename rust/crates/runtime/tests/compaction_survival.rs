@@ -48,12 +48,13 @@ fn make_file_content(path: &str, lines: usize) -> String {
 }
 
 fn is_content_usable(content: &str) -> bool {
+    const MIN_USABLE_LEN: usize = 50;
     !content.contains("[folded:")
         && !content.contains("[Cleared")
         && !content.contains("[Previous tool output cleared]")
         && !content.contains("[tool result cleared")
         && !content.contains("(cached")
-        && content.len() > 50
+        && content.len() > MIN_USABLE_LEN
 }
 
 // ─── Scenario: Review then Fix ──────────────────────────────────────────
@@ -398,4 +399,208 @@ fn mutation_evidence_survives_all_compaction_stages() {
         bash_output,
         "bash output must never be compacted"
     );
+}
+
+// ─── Complex scenario: multi-file review → edit → verify cycle ──────────
+//
+// Simulates a realistic 12-round agentic workflow:
+// Rounds 0-2: read 6 files for review
+// Rounds 3-4: grep for patterns across codebase
+// Rounds 5-7: str_replace edits on 3 files
+// Rounds 8-9: bash compile + test
+// Rounds 10-11: re-read modified files to verify
+//
+// Invariants:
+// 1. Files being edited (rounds 5-7) must have their earlier reads (round 0-2)
+//    intact at the time of edit
+// 2. Mutation evidence (str_replace, bash) is never cleared
+// 3. At low pressure, all 6 initial reads survive through round 5
+
+#[test]
+fn complex_review_edit_verify_cycle() {
+    let files: Vec<(String, String)> = (0..6)
+        .map(|i| {
+            (
+                format!("file_{i}.rs"),
+                make_file_content(&format!("file_{i}.rs"), 50 + i * 10),
+            )
+        })
+        .collect();
+
+    let mut messages = vec![json!({"role": "user", "content": "review and fix all issues"})];
+
+    // Rounds 0-2: read 6 files (2 per round)
+    for round in 0..3u32 {
+        let i = (round * 2) as usize;
+        messages.push(assistant_tool_calls(&[
+            (&format!("r{round}-a",), "read_file"),
+            (&format!("r{round}-b"), "read_file"),
+        ]));
+        messages.push(tool_result_with_round(
+            &format!("r{round}-a"),
+            &files[i].1,
+            round,
+            "read_file",
+        ));
+        messages.push(tool_result_with_round(
+            &format!("r{round}-b"),
+            &files[i + 1].1,
+            round,
+            "read_file",
+        ));
+    }
+
+    // Rounds 3-4: grep
+    for round in 3..=4u32 {
+        messages.push(assistant_tool_calls(&[(&format!("r{round}-g"), "grep")]));
+        messages.push(tool_result_with_round(
+            &format!("r{round}-g"),
+            &format!("grep round {round}: pattern found in 8 files"),
+            round,
+            "grep",
+        ));
+    }
+
+    // Before edits begin (round 5), run compaction at low pressure
+    astra_turn_core::microcompact::compact_tool_results_adaptive(
+        &mut messages,
+        0.3,
+        Default::default(),
+    );
+
+    // All 6 file reads must still be intact for the model to craft str_replace
+    for round in 0..3u32 {
+        for suffix in ["a", "b"] {
+            let call_id = format!("r{round}-{suffix}");
+            let msg = messages
+                .iter()
+                .find(|m| {
+                    m.get("tool_call_id")
+                        .and_then(|v| v.as_str())
+                        .map_or(false, |id| id == call_id)
+                })
+                .unwrap_or_else(|| panic!("missing tool result for {call_id}"));
+            let content = msg["content"].as_str().unwrap();
+            assert!(
+                is_content_usable(content),
+                "file read {call_id} must survive at low pressure before edit phase. \
+                 Got {} chars: {}",
+                content.len(),
+                &content[..content.len().min(100)]
+            );
+        }
+    }
+
+    // Rounds 5-7: str_replace edits
+    for round in 5..=7u32 {
+        messages.push(assistant_tool_calls(&[(
+            &format!("r{round}-e"),
+            "str_replace",
+        )]));
+        messages.push(tool_result_with_round(
+            &format!("r{round}-e"),
+            &format!("Successfully replaced content in file_{}.rs", round - 5),
+            round,
+            "str_replace",
+        ));
+    }
+
+    // Rounds 8-9: bash compile + test
+    messages.push(assistant_tool_calls(&[("r8-bash", "bash")]));
+    messages.push(tool_result_with_round(
+        "r8-bash",
+        "Compiling... Finished dev target(s) in 12.5s",
+        8,
+        "bash",
+    ));
+    messages.push(assistant_tool_calls(&[("r9-bash", "bash")]));
+    messages.push(tool_result_with_round(
+        "r9-bash",
+        "running 42 tests\ntest result: ok. 42 passed; 0 failed",
+        9,
+        "bash",
+    ));
+
+    // Run compaction at moderate pressure (simulating context growth)
+    astra_turn_core::microcompact::compact_tool_results_adaptive(
+        &mut messages,
+        0.7,
+        Default::default(),
+    );
+
+    // Mutation evidence must NEVER be cleared
+    for call_id in ["r5-e", "r6-e", "r7-e", "r8-bash", "r9-bash"] {
+        let msg = messages
+            .iter()
+            .find(|m| {
+                m.get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .map_or(false, |id| id == call_id)
+            })
+            .unwrap_or_else(|| panic!("missing {call_id}"));
+        let content = msg["content"].as_str().unwrap();
+        assert!(
+            !content.contains("[Cleared") && !content.contains("[Previous tool output cleared]"),
+            "mutation evidence {call_id} must never be compacted. Got: {content}"
+        );
+    }
+
+    // Rounds 10-11: re-read for verification (fresh reads)
+    messages.push(assistant_tool_calls(&[
+        ("r10-a", "read_file"),
+        ("r10-b", "read_file"),
+    ]));
+    messages.push(tool_result_with_round(
+        "r10-a",
+        &make_file_content("file_0.rs", 50),
+        10,
+        "read_file",
+    ));
+    messages.push(tool_result_with_round(
+        "r10-b",
+        &make_file_content("file_1.rs", 60),
+        10,
+        "read_file",
+    ));
+
+    // Final compaction at high pressure
+    astra_turn_core::microcompact::compact_tool_results_adaptive(
+        &mut messages,
+        0.85,
+        Default::default(),
+    );
+
+    // Fresh reads (round 10) must survive — they're the most recent
+    for call_id in ["r10-a", "r10-b"] {
+        let msg = messages
+            .iter()
+            .find(|m| {
+                m.get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .map_or(false, |id| id == call_id)
+            })
+            .unwrap();
+        let content = msg["content"].as_str().unwrap();
+        assert!(
+            is_content_usable(content),
+            "fresh re-read {call_id} must survive high-pressure compaction"
+        );
+    }
+
+    // Mutation evidence STILL intact after high-pressure compaction
+    for call_id in ["r5-e", "r6-e", "r7-e", "r8-bash", "r9-bash"] {
+        let msg = messages
+            .iter()
+            .find(|m| {
+                m.get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .map_or(false, |id| id == call_id)
+            })
+            .unwrap();
+        let content = msg["content"].as_str().unwrap();
+        assert!(
+            !content.contains("[Cleared") && !content.contains("[Previous tool output cleared]"),
+            "mutation evidence {call_id} must survive even high-pressure compaction"
+        );
+    }
 }

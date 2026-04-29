@@ -11,6 +11,7 @@ use super::agentic_loop_host::{
     try_write_heavy_checkpoint,
 };
 use crate::orchestration::permission_sync::PermissionResponseMessaging;
+use astra_services::SessionArtifactStore;
 use astra_turn_core::interruption::{
     InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
 };
@@ -827,20 +828,28 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 
         // Adaptive microcompact: scale aggressiveness with context pressure.
         // Use state-aware variant when SessionFacts has active files (pin list).
+        // Persist cleared content to disk when a session directory is available.
         let strategy = state.compact_strategy;
+        let session_dir = state.current_session_id.as_deref().and_then(|sid| {
+            astra_services::local_session_artifact_store()
+                .session_dir(sid)
+                .ok()
+        });
         let mc = if !state.session_facts.active_files.is_empty() {
-            astra_turn_core::microcompact::compact_tool_results_state_aware(
+            astra_turn_core::microcompact::compact_tool_results_state_aware_with_persistence(
                 &mut state.messages,
                 pressure,
                 &state.session_facts,
                 5,
                 strategy,
+                session_dir.as_deref(),
             )
         } else {
-            astra_turn_core::microcompact::compact_tool_results_adaptive(
+            astra_turn_core::microcompact::compact_tool_results_adaptive_with_persistence(
                 &mut state.messages,
                 pressure,
                 strategy,
+                session_dir.as_deref(),
             )
         };
         if mc.results_compacted > 0 && !quiet {

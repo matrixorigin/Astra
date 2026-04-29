@@ -406,6 +406,24 @@ pub fn compact_tool_results_adaptive(
     compact_tool_results_with_config(messages, &config, strategy)
 }
 
+/// Pressure-adaptive compaction with optional disk persistence.
+///
+/// When `session_dir` is `Some`, full tool result content is persisted to disk
+/// via `tool_result_storage` before being cleared. This allows session resume
+/// to recover the full content from `~/.astra/sessions/<id>/tool-results/`.
+///
+/// When `session_dir` is `None`, behaves identically to `compact_tool_results_adaptive`.
+pub fn compact_tool_results_adaptive_with_persistence(
+    messages: &mut [Value],
+    pressure: f64,
+    strategy: CompactStrategy,
+    session_dir: Option<&std::path::Path>,
+) -> CompactStats {
+    crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
+    let config = AdaptiveCompactConfig::from_pressure(pressure);
+    compact_tool_results_with_persistence(messages, &config, strategy, session_dir)
+}
+
 /// State-aware variant: uses `SessionFacts.active_files` as a pin list.
 /// Files actively being worked on (last `pin_turns` turns) are never compacted,
 /// regardless of count/token pressure. Other files follow normal compaction rules.
@@ -418,7 +436,21 @@ pub fn compact_tool_results_state_aware(
 ) -> CompactStats {
     crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
     let config = AdaptiveCompactConfig::from_pressure(pressure);
-    compact_tool_results_with_pin_list(messages, &config, facts, pin_turns, strategy)
+    compact_tool_results_with_pin_list(messages, &config, facts, pin_turns, strategy, None)
+}
+
+/// State-aware compaction with optional disk persistence.
+pub fn compact_tool_results_state_aware_with_persistence(
+    messages: &mut [Value],
+    pressure: f64,
+    facts: &crate::cloud_session_facts::SessionFacts,
+    pin_turns: u32,
+    strategy: CompactStrategy,
+    session_dir: Option<&std::path::Path>,
+) -> CompactStats {
+    crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
+    let config = AdaptiveCompactConfig::from_pressure(pressure);
+    compact_tool_results_with_pin_list(messages, &config, facts, pin_turns, strategy, session_dir)
 }
 
 fn compact_tool_results_with_pin_list(
@@ -427,6 +459,7 @@ fn compact_tool_results_with_pin_list(
     facts: &crate::cloud_session_facts::SessionFacts,
     pin_turns: u32,
     strategy: CompactStrategy,
+    session_dir: Option<&std::path::Path>,
 ) -> CompactStats {
     let keep = config.keep_recent;
 
@@ -482,13 +515,38 @@ fn compact_tool_results_with_pin_list(
     let mut stats = CompactStats::default();
 
     for &(idx, tokens) in unpinned.iter().take(to_compact) {
-        stats.tokens_saved += tokens;
-        stats.results_compacted += 1;
         let call_id = messages[idx]
             .get("tool_call_id")
             .and_then(Value::as_str)
-            .unwrap_or("");
-        messages[idx]["content"] = Value::String(maps.cleared_placeholder(call_id, strategy));
+            .unwrap_or("")
+            .to_string();
+
+        // If a session_dir is configured, we MUST successfully persist to disk
+        // before clearing. A failed write followed by a clear would silently
+        // lose the tool output. If persistence fails, skip this entry so the
+        // content survives in-memory for the next compaction attempt.
+        if let Some(dir) = session_dir {
+            if let Some(content) = messages[idx].get("content").and_then(Value::as_str) {
+                let content = content.to_string();
+                let tool_name = id_to_name
+                    .get(call_id.as_str())
+                    .copied()
+                    .or_else(|| messages[idx].get("name").and_then(Value::as_str))
+                    .unwrap_or("unknown")
+                    .to_string();
+                let persisted = crate::tool_result_storage::maybe_persist_tool_result_unconditional(
+                    dir, &call_id, &tool_name, &content,
+                );
+                if !persisted {
+                    // Disk write failed — do not clear; keep the content in memory.
+                    continue;
+                }
+            }
+        }
+
+        stats.tokens_saved += tokens;
+        stats.results_compacted += 1;
+        messages[idx]["content"] = Value::String(maps.cleared_placeholder(&call_id, strategy));
     }
 
     stats
@@ -609,6 +667,93 @@ fn compact_tool_results_with_config(
             .and_then(Value::as_str)
             .unwrap_or("");
         messages[idx]["content"] = Value::String(maps.cleared_placeholder(call_id, strategy));
+    }
+
+    stats
+}
+
+fn compact_tool_results_with_persistence(
+    messages: &mut [Value],
+    config: &AdaptiveCompactConfig,
+    strategy: CompactStrategy,
+    session_dir: Option<&std::path::Path>,
+) -> CompactStats {
+    crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
+    let keep = config.keep_recent;
+
+    let maps = build_tool_call_maps(messages);
+    let id_to_name = maps.name_ref_map();
+
+    let compactable: Vec<(usize, usize)> = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, msg)| {
+            if !is_compactable_tool_result(msg, &id_to_name) {
+                return None;
+            }
+            let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
+            if content.len() < MIN_COMPACT_SIZE || is_cleared_content(content) {
+                return None;
+            }
+            Some((i, estimate_tokens(content)))
+        })
+        .collect();
+
+    if compactable.is_empty() {
+        return CompactStats::default();
+    }
+
+    let count_based = compactable.len().saturating_sub(keep);
+    let total_tokens: usize = compactable.iter().map(|(_, t)| t).sum();
+    let budget = config.token_budget;
+    let token_based = if total_tokens > budget {
+        let mut cumulative = 0usize;
+        let mut n = 0usize;
+        for &(_, tokens) in &compactable {
+            if total_tokens - cumulative <= budget {
+                break;
+            }
+            cumulative += tokens;
+            n += 1;
+        }
+        n.min(compactable.len() - 1)
+    } else {
+        0
+    };
+
+    let to_compact = count_based.max(token_based);
+    let mut stats = CompactStats::default();
+
+    for &(idx, tokens) in compactable.iter().take(to_compact) {
+        let call_id = messages[idx]
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        // Persist full content to disk before clearing. If persistence fails,
+        // skip this entry — clearing without a successful write would lose data.
+        if let Some(dir) = session_dir {
+            if let Some(content) = messages[idx].get("content").and_then(Value::as_str) {
+                let content = content.to_string();
+                let tool_name = id_to_name
+                    .get(call_id.as_str())
+                    .copied()
+                    .or_else(|| messages[idx].get("name").and_then(Value::as_str))
+                    .unwrap_or("unknown")
+                    .to_string();
+                let persisted = crate::tool_result_storage::maybe_persist_tool_result_unconditional(
+                    dir, &call_id, &tool_name, &content,
+                );
+                if !persisted {
+                    continue;
+                }
+            }
+        }
+
+        stats.tokens_saved += tokens;
+        stats.results_compacted += 1;
+        messages[idx]["content"] = Value::String(maps.cleared_placeholder(&call_id, strategy));
     }
 
     stats
@@ -2369,5 +2514,121 @@ mod tests {
         // Invalid JSON returns empty
         let result = super::normalize_args("not json");
         assert!(result.is_empty());
+    }
+
+    // ─── Optimization: compaction persists cleared content to disk ──────────
+
+    #[test]
+    fn adaptive_compaction_persists_cleared_content_to_disk() {
+        let dir = std::env::temp_dir().join("mc_persist_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let big = "x".repeat(2000);
+        let mut messages = vec![
+            assistant_with_tools(&[
+                ("c1", "read_file"),
+                ("c2", "read_file"),
+                ("c3", "read_file"),
+                ("c4", "read_file"),
+                ("c5", "read_file"),
+                ("c6", "read_file"),
+                ("c7", "read_file"),
+                ("c8", "read_file"),
+            ]),
+            tool_result("c1", &big),
+            tool_result("c2", &big),
+            tool_result("c3", &big),
+            tool_result("c4", &big),
+            tool_result("c5", &big),
+            tool_result("c6", &big),
+            tool_result("c7", &big),
+            tool_result("c8", &big),
+        ];
+
+        let stats = compact_tool_results_adaptive_with_persistence(
+            &mut messages,
+            0.3,
+            CompactStrategy::Normalized,
+            Some(&dir),
+        );
+
+        assert!(
+            stats.results_compacted > 0,
+            "should compact at least some results"
+        );
+
+        // Every compacted result should have its full content persisted to disk
+        for msg in &messages {
+            if msg.get("role").and_then(Value::as_str) != Some("tool") {
+                continue;
+            }
+            let content = msg["content"].as_str().unwrap_or("");
+            if !is_cleared_content(content) {
+                continue;
+            }
+            let call_id = msg["tool_call_id"].as_str().unwrap();
+            let recovered = crate::tool_result_storage::read_persisted_result(&dir, call_id);
+            assert!(
+                recovered.is_some(),
+                "cleared result for {call_id} must have been persisted to disk"
+            );
+            assert_eq!(
+                recovered.unwrap(),
+                big,
+                "persisted content must match original"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adaptive_compaction_without_persistence_works_as_before() {
+        let big = "x".repeat(2000);
+        let mut messages = vec![
+            assistant_with_tools(&[
+                ("c1", "read_file"),
+                ("c2", "read_file"),
+                ("c3", "read_file"),
+                ("c4", "read_file"),
+                ("c5", "read_file"),
+                ("c6", "read_file"),
+                ("c7", "read_file"),
+                ("c8", "read_file"),
+            ]),
+            tool_result("c1", &big),
+            tool_result("c2", &big),
+            tool_result("c3", &big),
+            tool_result("c4", &big),
+            tool_result("c5", &big),
+            tool_result("c6", &big),
+            tool_result("c7", &big),
+            tool_result("c8", &big),
+        ];
+
+        // session_dir=None → no persistence, just clear as before
+        let stats = compact_tool_results_adaptive_with_persistence(
+            &mut messages,
+            0.3,
+            CompactStrategy::Normalized,
+            None,
+        );
+        assert!(stats.results_compacted > 0);
+
+        // Cleared results should NOT have disk files (no session dir)
+        for msg in &messages {
+            if msg.get("role").and_then(Value::as_str) != Some("tool") {
+                continue;
+            }
+            let content = msg["content"].as_str().unwrap_or("");
+            if is_cleared_content(content) {
+                // Placeholder should be the regular cleared placeholder (no disk reference)
+                assert!(
+                    !content.contains("persisted-output"),
+                    "without session_dir, no disk reference should appear"
+                );
+            }
+        }
     }
 }

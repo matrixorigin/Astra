@@ -550,6 +550,17 @@ pub fn build_stall_reflection(
 
     // Classify stall type
     let (what_happened, why, what_to_try, confidence) = match top_tool {
+        Some((ref name, count)) if count >= 3 && is_exploration_tool(name) && is_read_only_tool(name) => (
+            format!(
+                "Used '{}' {} times in the last {} turns without progressing.",
+                name, count, window
+            ),
+            "The file content is already in your context from earlier reads. Re-reading won't add new information.".to_string(),
+            "The content you need is already in the conversation. Take direct action: \
+                 use str_replace or write_file to make edits, or synthesize what you've learned \
+                 and respond to the user.".to_string(),
+            0.85,
+        ),
         Some((ref name, count)) if count >= 3 && is_exploration_tool(name) => (
             format!(
                 "Used '{}' {} times in the last {} turns without progressing.",
@@ -607,10 +618,13 @@ pub fn build_stall_reflection(
     };
 
     let mut avoid_tools: Vec<String> = error_tools.iter().map(|s| s.to_string()).collect();
-    // Also suggest avoiding the most-repeated tool if it's not already blocked
+    // Suggest avoiding the most-repeated tool — but never read-only tools.
+    // Read-only tools are always needed for observation and should stay available;
+    // the guidance message already tells the model to act on existing context.
     if let Some((name, count)) = &top_tool
         && *count >= 3
         && !avoid_tools.contains(name)
+        && !is_read_only_tool(name)
     {
         avoid_tools.push(name.clone());
     }
@@ -632,6 +646,23 @@ fn is_exploration_tool(name: &str) -> bool {
     // `read_file` triggers. This is scoped to the top-tool diagnostic and
     // does NOT affect single-round reward-hacking chain classification.
     EXPLORATION_TOOLS.contains(&name) || CONSULTATIVE_TOOLS.contains(&name)
+}
+
+/// Read-only tools that must never be removed from the model's tool set.
+/// These are observational — the model needs them to verify state after edits.
+/// Mirrors `turn_guard::READ_ONLY_NEVER_RESTRICT`.
+fn is_read_only_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "list_dir"
+            | "grep"
+            | "glob"
+            | "git_status"
+            | "git_diff"
+            | "git_show"
+            | "git_log"
+    )
 }
 
 /// Detect if the LLM ignored a previous stall nudge by using tools
@@ -2397,6 +2428,52 @@ mod tests {
             "low user feedback must amplify risk ({} vs {})",
             with_low_feedback.risk,
             without_feedback.risk
+        );
+    }
+
+    // ─── Optimization: read_file stall gives context-aware guidance ──────────
+
+    #[test]
+    fn read_file_stall_reflection_suggests_direct_edit_not_avoid() {
+        let sigs = make_sigs(&[
+            &["read_file"],
+            &["read_file"],
+            &["read_file"],
+            &["read_file"],
+        ]);
+        let reflection = build_stall_reflection(&sigs, &[], 0);
+
+        // The guidance should tell the model to use the content already in context
+        assert!(
+            reflection.what_to_try.contains("already in")
+                || reflection.what_to_try.contains("str_replace")
+                || reflection.what_to_try.contains("write_file")
+                || reflection.what_to_try.contains("direct action"),
+            "read_file stall must suggest using content already in context, not just 'stop using read_file'. Got: {}",
+            reflection.what_to_try
+        );
+        // Must NOT suggest removing read_file from available tools
+        assert!(
+            !reflection.what_to_try.contains("Stop using 'read_file'"),
+            "guidance must not tell model to stop using read_file entirely. Got: {}",
+            reflection.what_to_try
+        );
+    }
+
+    #[test]
+    fn read_file_stall_does_not_add_to_avoid_tools() {
+        let sigs = make_sigs(&[
+            &["read_file"],
+            &["read_file"],
+            &["read_file"],
+            &["read_file"],
+        ]);
+        let reflection = build_stall_reflection(&sigs, &[], 0);
+
+        assert!(
+            !reflection.avoid_tools.contains(&"read_file".to_string()),
+            "read_file must not be in avoid_tools — it's read-only and may be needed later. Got: {:?}",
+            reflection.avoid_tools
         );
     }
 }
