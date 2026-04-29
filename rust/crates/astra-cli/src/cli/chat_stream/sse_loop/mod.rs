@@ -38,6 +38,7 @@ use astra_runtime::{
     turn::turn_guard::TurnGuard,
 };
 
+use astra_turn_core::conversation_log::{CslStore, file_store::FileCslStore, materialize};
 use crate::{StreamResult, cli_utils::terminal_width_usize, edge_tools};
 
 use super::ChatTurnParams;
@@ -206,7 +207,8 @@ pub(crate) async fn stream_chat_sse(
             executor.expand_sandbox_path(PathBuf::from(dir));
         }
     }
-    let mut messages = openai_messages_from_repl_history(p.history, p.message);
+    let mut messages =
+        load_turn_messages(p.csl_store, p.session_id, p.history, p.message).await;
 
     // ─── Context pre-fetch (disabled) ─────────────────────────────────────
     let all_schemas = if p.plan_only_chat {
@@ -461,6 +463,7 @@ pub(crate) async fn stream_chat_sse(
         })
         .clone();
 
+    let csl_turn_start = messages.len();
     let mut state = AgenticLoopState {
         messages,
         tool_results: Vec::new(),
@@ -639,8 +642,8 @@ pub(crate) async fn stream_chat_sse(
         bridge_turn_chain_id: Some(uuid::Uuid::now_v7().to_string()),
         bridge_user_query_event_id: Some(uuid::Uuid::now_v7().to_string()),
         turn_event_buffer: None,
-        csl_last_seq: 0,
-        csl_turn_start_message_count: 0,
+        csl_last_seq: p.csl_last_seq,
+        csl_turn_start_message_count: csl_turn_start,
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────
@@ -700,6 +703,14 @@ pub(crate) async fn stream_chat_sse(
         current_session_id: state.current_session_id.as_deref(),
     });
 
+    let csl_appended_messages =
+        if state.csl_turn_start_message_count < state.messages.len() {
+            state.messages[state.csl_turn_start_message_count..].to_vec()
+        } else {
+            Vec::new()
+        };
+    let csl_full_messages = state.messages.clone();
+
     let result = build_stream_result(StreamResultBuild {
         tool_health_entries: p.tool_health_entries,
         session_id: state.current_session_id,
@@ -739,9 +750,32 @@ pub(crate) async fn stream_chat_sse(
             .unwrap_or_default(),
         llm_rounds: state.turn_event_buffer.as_ref().map(|b| b.current_round()),
         interruption: state.interruption.as_ref().map(|i| i.to_json()),
+        csl_appended_messages,
+        csl_full_messages,
     });
     Ok(result)
 }
+
+async fn load_turn_messages(
+    csl_store: Option<&FileCslStore>,
+    session_id: Option<&str>,
+    history: &[(String, String)],
+    current_message: &str,
+) -> Vec<serde_json::Value> {
+    if let (Some(store), Some(sid)) = (csl_store, session_id) {
+        if let Ok(entries) = store.load_from_latest_snapshot(sid).await {
+            if !entries.is_empty() {
+                if let Ok(mat) = materialize(&entries) {
+                    let mut msgs = mat.messages;
+                    msgs.push(json!({"role": "user", "content": current_message}));
+                    return msgs;
+                }
+            }
+        }
+    }
+    openai_messages_from_repl_history(history, current_message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::detect_turn_hook_sets;

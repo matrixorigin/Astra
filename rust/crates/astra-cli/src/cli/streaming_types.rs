@@ -125,6 +125,10 @@ pub(crate) struct StreamResult {
     /// Structured interruption context when the runtime completed the turn
     /// partially (for example due to budget exhaustion after tool progress).
     pub(crate) interruption: Option<serde_json::Value>,
+    /// Messages appended during this turn (from `csl_turn_start_message_count` onward).
+    pub(crate) csl_appended_messages: Vec<serde_json::Value>,
+    /// Full messages array after this turn (for CSL Snapshot persistence).
+    pub(crate) csl_full_messages: Vec<serde_json::Value>,
 }
 
 impl StreamResult {

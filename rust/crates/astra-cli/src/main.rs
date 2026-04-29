@@ -1498,6 +1498,8 @@ mod tests {
             runtime_continuity: None,
             turn_index: 0,
             evolution_service: None,
+            csl_store: None,
+            csl_last_seq: 0,
         })
         .await
         .unwrap();
@@ -1571,6 +1573,8 @@ mod tests {
             runtime_continuity: None,
             turn_index: 0,
             evolution_service: None,
+            csl_store: None,
+            csl_last_seq: 0,
         })
         .await;
         assert!(result.is_err());
@@ -1660,6 +1664,8 @@ mod tests {
             runtime_continuity: None,
             turn_index: 0,
             evolution_service: None,
+            csl_store: None,
+            csl_last_seq: 0,
         })
         .await
         .unwrap();

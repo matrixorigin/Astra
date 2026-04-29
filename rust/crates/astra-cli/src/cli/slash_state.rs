@@ -141,6 +141,7 @@ pub(super) async fn handle_state_command(
             }
             state.last_response = state.history.last().map(|(_, resp)| resp.clone());
             state.continuation_anchor = None;
+            state.csl_last_seq = 0;
             if actual == 1 {
                 eprintln!(
                     "  {} Undid 1 turn: {}",
@@ -368,6 +369,8 @@ pub(super) async fn handle_state_command(
                     runtime_continuity: None,
                     turn_index: 0,
                     evolution_service: state.evolution_service.clone(),
+                    csl_store: None,
+                    csl_last_seq: 0,
                 }) => r,
                 _ = tokio::signal::ctrl_c() => {
                     if let Some(ref t) = _cancel_token_guard { t.cancel(); }
@@ -476,6 +479,8 @@ pub(super) async fn handle_state_command(
                             runtime_continuity: None,
                             turn_index: 0,
                             evolution_service: state.evolution_service.clone(),
+                            csl_store: None,
+                            csl_last_seq: 0,
                         })
                         .await;
 
@@ -565,6 +570,8 @@ pub(super) async fn handle_state_command(
                                     runtime_continuity: None,
                                     turn_index: 0,
                                     evolution_service: state.evolution_service.clone(),
+                                    csl_store: None,
+                                    csl_last_seq: 0,
                                 })
                                 .await;
                                 if let Ok(sr2) = synth_result {

@@ -1265,6 +1265,8 @@ pub(super) async fn handle_info_command(
                 runtime_continuity: None,
                 turn_index: 0,
                 evolution_service: state.evolution_service.clone(),
+                csl_store: None,
+                csl_last_seq: 0,
             })
             .await
             .map_err(|f| f.error)?;

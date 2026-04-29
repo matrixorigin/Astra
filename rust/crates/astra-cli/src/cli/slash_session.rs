@@ -4738,16 +4738,74 @@ fn apply_restored_cloud_heavy_state(state: &mut ReplState, restored: &RestoredSe
     );
 }
 
-fn restore_journal_history_if_available(state: &mut ReplState, session_id: &str) {
+async fn restore_journal_history_if_available(state: &mut ReplState, session_id: &str) {
+    // Try CSL first — full-fidelity message history
+    let base_dir = session_journal::local_sessions_dir();
+    let store =
+        astra_turn_core::conversation_log::file_store::FileCslStore::new(base_dir);
+    if let Ok(entries) = astra_turn_core::conversation_log::CslStore::load_from_latest_snapshot(
+        &store, session_id,
+    )
+    .await
+    {
+        if !entries.is_empty() {
+            if let Ok(mat) = astra_turn_core::conversation_log::materialize(&entries) {
+                state.history = derive_history_pairs_from_messages(&mat.messages);
+                state.csl_store = Some(store);
+                state.csl_last_seq = mat.last_seq;
+                if !mat.session_state.recent_tools.is_empty() {
+                    state.recent_tools = mat.session_state.recent_tools;
+                }
+                return;
+            }
+        }
+    }
+
+    // Fall back to journal-based history (pre-CSL sessions)
     let history = repl_runtime::restore_history_from_journal(session_id);
-    // Prefer local journal when it has MORE entries than cloud-restored history,
-    // since more entries likely means a later or more complete session.
-    // When local journal is smaller, keep cloud history (it's fresher).
-    // Tiebreaker: when local and cloud have equal entry count, keep cloud
-    // (cloud restore is the authoritative source; local journal may be stale).
     if history.len() > state.history.len() || state.history.is_empty() {
         state.history = history;
     }
+}
+
+fn derive_history_pairs_from_messages(
+    messages: &[serde_json::Value],
+) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut current_user = String::new();
+    let mut current_assistant = String::new();
+
+    for msg in messages {
+        let role = msg
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let content = msg
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        match role {
+            "user" => {
+                if !current_user.is_empty() || !current_assistant.is_empty() {
+                    pairs.push((
+                        std::mem::take(&mut current_user),
+                        std::mem::take(&mut current_assistant),
+                    ));
+                }
+                current_user = content;
+            }
+            "assistant" => {
+                current_assistant = content;
+            }
+            _ => {}
+        }
+    }
+    if !current_user.is_empty() || !current_assistant.is_empty() {
+        pairs.push((current_user, current_assistant));
+    }
+    pairs
 }
 
 async fn apply_restored_session(
@@ -4955,7 +5013,7 @@ async fn apply_restored_session(
         state.learning_snapshot = Some(learning_json.clone());
     }
 
-    restore_journal_history_if_available(state, &restored.session_id);
+    restore_journal_history_if_available(state, &restored.session_id).await;
 
     if let Ok(events) = session_journal::read_journal(&restored.session_id) {
         state.last_turn_event = events
@@ -5692,13 +5750,13 @@ mod resume_tests {
         assert_eq!(serde_json::to_value(exported).unwrap(), approval_json);
     }
 
-    #[test]
-    fn restore_journal_history_if_available_preserves_existing_history_when_journal_missing() {
+    #[tokio::test]
+    async fn restore_journal_history_if_available_preserves_existing_history_when_journal_missing() {
         let (_tmp, _guard) = isolated_sessions_dir();
         let mut state = ReplState::default();
         state.history = vec![("from-cloud".to_string(), "still-here".to_string())];
 
-        restore_journal_history_if_available(&mut state, "missing-session");
+        restore_journal_history_if_available(&mut state, "missing-session").await;
 
         assert_eq!(
             state.history,
@@ -5706,8 +5764,8 @@ mod resume_tests {
         );
     }
 
-    #[test]
-    fn restore_journal_history_if_available_does_not_overwrite_cloud_history() {
+    #[tokio::test]
+    async fn restore_journal_history_if_available_does_not_overwrite_cloud_history() {
         let (_tmp, _guard) = isolated_sessions_dir();
         let session_id = format!("resume-history-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 1);
@@ -5715,7 +5773,7 @@ mod resume_tests {
         let mut state = ReplState::default();
         state.history = vec![("from-cloud".to_string(), "cloud-data".to_string())];
 
-        restore_journal_history_if_available(&mut state, &session_id);
+        restore_journal_history_if_available(&mut state, &session_id).await;
 
         // Cloud-restored history is preserved when non-empty; local journal is not used
         // to overwrite fresher cloud state.
@@ -5725,8 +5783,8 @@ mod resume_tests {
         );
     }
 
-    #[test]
-    fn restore_journal_history_if_available_prefers_local_when_more_entries() {
+    #[tokio::test]
+    async fn restore_journal_history_if_available_prefers_local_when_more_entries() {
         let (_tmp, _guard) = isolated_sessions_dir();
         let session_id = format!("resume-more-{}", uuid::Uuid::new_v4());
         // Write a journal with multiple turn events so local has more history entries.
@@ -5756,7 +5814,7 @@ mod resume_tests {
         let mut state = ReplState::default();
         state.history = vec![("from-cloud".to_string(), "cloud-1".to_string())];
 
-        restore_journal_history_if_available(&mut state, &session_id);
+        restore_journal_history_if_available(&mut state, &session_id).await;
 
         // Local journal wins when it has more entries (3 local vs 1 cloud).
         assert_eq!(

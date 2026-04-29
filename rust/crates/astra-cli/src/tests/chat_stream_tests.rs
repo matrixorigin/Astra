@@ -81,6 +81,8 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
         runtime_continuity: None,
         turn_index: 0,
         evolution_service: None,
+        csl_store: None,
+        csl_last_seq: 0,
     })
     .await
     .unwrap();
@@ -167,6 +169,8 @@ async fn stream_chat_sse_simple_text_response() {
         runtime_continuity: None,
         turn_index: 0,
         evolution_service: None,
+        csl_store: None,
+        csl_last_seq: 0,
     })
     .await
     .unwrap();
@@ -256,6 +260,8 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         runtime_continuity: None,
         turn_index: 0,
         evolution_service: None,
+        csl_store: None,
+        csl_last_seq: 0,
     })
     .await
     .unwrap();
@@ -349,6 +355,8 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             runtime_continuity: None,
             turn_index: 0,
             evolution_service: None,
+            csl_store: None,
+            csl_last_seq: 0,
         })
         .await
         .unwrap();
@@ -434,6 +442,8 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         runtime_continuity: None,
         turn_index: 0,
         evolution_service: None,
+        csl_store: None,
+        csl_last_seq: 0,
     })
     .await
     .unwrap();
@@ -547,6 +557,8 @@ async fn stream_chat_sse_api_error_propagated() {
         runtime_continuity: None,
         turn_index: 0,
         evolution_service: None,
+        csl_store: None,
+        csl_last_seq: 0,
     })
     .await;
     assert!(result.is_err());
@@ -636,6 +648,8 @@ async fn stream_chat_sse_with_tool_call_loop() {
         runtime_continuity: None,
         turn_index: 0,
         evolution_service: None,
+        csl_store: None,
+        csl_last_seq: 0,
     })
     .await
     .unwrap();
@@ -748,6 +762,8 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         runtime_continuity: None,
         turn_index: 0,
         evolution_service: None,
+        csl_store: None,
+        csl_last_seq: 0,
     })
     .await
     .unwrap();
@@ -903,6 +919,8 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
         runtime_continuity: None,
         turn_index: 0,
         evolution_service: None,
+        csl_store: None,
+        csl_last_seq: 0,
     })
     .await
     .unwrap();
