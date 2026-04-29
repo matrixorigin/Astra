@@ -1487,10 +1487,18 @@ async fn apply_turn_success_async(
     apply_turn_success_sync(state, selector, profile, line, result, turn_start);
 
     // Persist CSL via CslManager.
-    let session_state = build_full_session_state_compact(state, csl_checkpoint_fields);
     let turn = state.turn;
+    let prev_state = state
+        .csl_manager
+        .as_ref()
+        .map(|m| m.last_session_state().clone())
+        .unwrap_or_default();
+    let session_state = build_full_session_state_compact(state, csl_checkpoint_fields, &prev_state);
     if let Some(mgr) = state.csl_manager.as_mut() {
-        if let Err(e) = mgr.persist_turn(turn, &final_messages, &session_state).await {
+        if let Err(e) = mgr
+            .persist_turn(turn, &final_messages, &session_state)
+            .await
+        {
             astra_core::agent_warn!("csl", "persist failed: {e}");
         }
     }
@@ -1517,13 +1525,11 @@ fn apply_turn_success_sync(
                     astra_services::session_journal::local_sessions_dir(),
                 ),
             );
-            state.csl_manager = Some(
-                astra_turn_core::conversation_log::manager::CslManager::new(
-                    store,
-                    session_id.to_string(),
-                    Default::default(),
-                ),
-            );
+            state.csl_manager = Some(astra_turn_core::conversation_log::manager::CslManager::new(
+                store,
+                session_id.to_string(),
+                Default::default(),
+            ));
         }
 
         // Initialize observability session if hub is available and session not yet created
@@ -1946,32 +1952,49 @@ pub(crate) async fn try_llm_skill_improvement(
 struct CslCheckpointFields {
     blocked_tools: Vec<String>,
     approval_overrides: Option<serde_json::Value>,
-    budget_remaining_tokens: u64,
-    budget_remaining_rounds: u32,
-    consecutive_ctx_errors: u32,
+    /// `None` when no HeavyCheckpoint exists — preserves previous CSL value.
+    budget_remaining_tokens: Option<u64>,
+    budget_remaining_rounds: Option<u32>,
+    consecutive_ctx_errors: Option<u32>,
     interruption: Option<serde_json::Value>,
+    delegation: Option<astra_turn_core::conversation_log::DelegationCompact>,
+    compaction_tracker: Option<serde_json::Value>,
 }
 
 fn extract_csl_fields_from_result(result: &StreamResult) -> CslCheckpointFields {
     if let Some(astra_pipeline::step_protocol::StepCheckpoint::Heavy(ref heavy)) =
         result.last_heavy_checkpoint
     {
+        let delegation = match (&heavy.delegation_id, &heavy.delegation_pattern) {
+            (Some(id), Some(pattern)) => {
+                Some(astra_turn_core::conversation_log::DelegationCompact {
+                    id: id.clone(),
+                    pattern: pattern.clone(),
+                    completed_sub_runs: heavy.delegation_sub_run_summaries.clone(),
+                })
+            }
+            _ => None,
+        };
         CslCheckpointFields {
             blocked_tools: heavy.blocked_tools.clone(),
             approval_overrides: heavy.approval_overrides.clone(),
-            budget_remaining_tokens: heavy.budget_remaining_tokens,
-            budget_remaining_rounds: heavy.budget_remaining_rounds,
-            consecutive_ctx_errors: heavy.consecutive_context_window_errors,
+            budget_remaining_tokens: Some(heavy.budget_remaining_tokens),
+            budget_remaining_rounds: Some(heavy.budget_remaining_rounds),
+            consecutive_ctx_errors: Some(heavy.consecutive_context_window_errors),
             interruption: heavy.interruption.clone(),
+            delegation,
+            compaction_tracker: heavy.compaction_state.clone(),
         }
     } else {
         CslCheckpointFields {
             blocked_tools: Vec::new(),
             approval_overrides: None,
-            budget_remaining_tokens: 0,
-            budget_remaining_rounds: 0,
-            consecutive_ctx_errors: 0,
+            budget_remaining_tokens: None,
+            budget_remaining_rounds: None,
+            consecutive_ctx_errors: None,
             interruption: result.interruption.clone(),
+            delegation: None,
+            compaction_tracker: None,
         }
     }
 }
@@ -1979,17 +2002,25 @@ fn extract_csl_fields_from_result(result: &StreamResult) -> CslCheckpointFields 
 fn build_full_session_state_compact(
     state: &ReplState,
     cp: CslCheckpointFields,
+    prev_state: &astra_turn_core::conversation_log::SessionStateCompact,
 ) -> astra_turn_core::conversation_log::SessionStateCompact {
     astra_turn_core::conversation_log::SessionStateCompact {
         recent_tools: state.recent_tools.clone(),
         continuity: state.runtime_continuity.clone(),
         blocked_tools: cp.blocked_tools,
         approval_overrides: cp.approval_overrides,
-        budget_remaining_tokens: cp.budget_remaining_tokens,
-        budget_remaining_rounds: cp.budget_remaining_rounds,
-        consecutive_ctx_errors: cp.consecutive_ctx_errors,
+        budget_remaining_tokens: cp
+            .budget_remaining_tokens
+            .unwrap_or(prev_state.budget_remaining_tokens),
+        budget_remaining_rounds: cp
+            .budget_remaining_rounds
+            .unwrap_or(prev_state.budget_remaining_rounds),
+        consecutive_ctx_errors: cp
+            .consecutive_ctx_errors
+            .unwrap_or(prev_state.consecutive_ctx_errors),
         interruption: cp.interruption,
-        ..Default::default()
+        delegation: cp.delegation,
+        compaction_tracker: cp.compaction_tracker,
     }
 }
 
@@ -5469,8 +5500,8 @@ mod tests {
     #[tokio::test]
     async fn csl_first_turn_writes_snapshot_and_advances_seq() {
         use astra_turn_core::conversation_log::{
-            CslStore, file_store::FileCslStore, manager::CslManager, materialize,
-            SessionStateCompact,
+            CslStore, SessionStateCompact, file_store::FileCslStore, manager::CslManager,
+            materialize,
         };
 
         let (_tmp, _guard) = isolated_sessions_dir();
@@ -5489,12 +5520,17 @@ mod tests {
         let mut session_state = SessionStateCompact::default();
         session_state.recent_tools = vec!["bash".into()];
 
-        mgr.persist_turn(1, &full_messages, &session_state).await.unwrap();
+        mgr.persist_turn(1, &full_messages, &session_state)
+            .await
+            .unwrap();
 
         assert!(mgr.last_seq() > 0, "seq should advance after first turn");
 
         let entries = store.load_from_latest_snapshot(&session_id).await.unwrap();
-        assert!(!entries.is_empty(), "should have written at least one entry");
+        assert!(
+            !entries.is_empty(),
+            "should have written at least one entry"
+        );
         assert!(entries[0].is_snapshot(), "first entry must be a Snapshot");
 
         let mat = materialize(&entries).unwrap();
@@ -5505,8 +5541,8 @@ mod tests {
     #[tokio::test]
     async fn csl_subsequent_turn_writes_delta_not_snapshot() {
         use astra_turn_core::conversation_log::{
-            CslEntry, CslStore, file_store::FileCslStore, manager::CslManager, materialize,
-            SessionStateCompact,
+            CslEntry, CslStore, SessionStateCompact, file_store::FileCslStore, manager::CslManager,
+            materialize,
         };
 
         let (_tmp, _guard) = isolated_sessions_dir();
@@ -5521,7 +5557,9 @@ mod tests {
             serde_json::json!({"role": "user", "content": "q1"}),
             serde_json::json!({"role": "assistant", "content": "a1"}),
         ];
-        mgr.persist_turn(1, &t1_msgs, &SessionStateCompact::default()).await.unwrap();
+        mgr.persist_turn(1, &t1_msgs, &SessionStateCompact::default())
+            .await
+            .unwrap();
         let seq_after_t1 = mgr.last_seq();
 
         mgr.mark_turn_start(t1_msgs.len());
@@ -5531,7 +5569,9 @@ mod tests {
             serde_json::json!({"role": "user", "content": "q2"}),
             serde_json::json!({"role": "assistant", "content": "a2"}),
         ];
-        mgr.persist_turn(2, &t2_full, &SessionStateCompact::default()).await.unwrap();
+        mgr.persist_turn(2, &t2_full, &SessionStateCompact::default())
+            .await
+            .unwrap();
         let seq_after_t2 = mgr.last_seq();
         assert!(
             seq_after_t2 > seq_after_t1,
@@ -5556,8 +5596,8 @@ mod tests {
     #[tokio::test]
     async fn csl_periodic_snapshot_every_5_turns() {
         use astra_turn_core::conversation_log::{
-            CslStore, file_store::FileCslStore, manager::CslManager, materialize,
-            SessionStateCompact,
+            CslStore, SessionStateCompact, file_store::FileCslStore, manager::CslManager,
+            materialize,
         };
 
         let (_tmp, _guard) = isolated_sessions_dir();
@@ -5573,7 +5613,9 @@ mod tests {
                 .map(|i| serde_json::json!({"role": "user", "content": format!("turn {i}")}))
                 .collect();
             mgr.mark_turn_start(if t == 1 { 0 } else { (t - 1) as usize });
-            mgr.persist_turn(t, &full, &SessionStateCompact::default()).await.unwrap();
+            mgr.persist_turn(t, &full, &SessionStateCompact::default())
+                .await
+                .unwrap();
         }
 
         let entries = store.load_from_latest_snapshot(&session_id).await.unwrap();
@@ -5598,7 +5640,7 @@ mod tests {
     #[tokio::test]
     async fn csl_persist_and_resume_roundtrip() {
         use astra_turn_core::conversation_log::{
-            file_store::FileCslStore, manager::CslManager, SessionStateCompact,
+            SessionStateCompact, file_store::FileCslStore, manager::CslManager,
         };
 
         let (_tmp, _guard) = isolated_sessions_dir();
@@ -5644,8 +5686,8 @@ mod tests {
     #[tokio::test]
     async fn csl_undo_resets_seq_and_next_turn_writes_fresh_snapshot() {
         use astra_turn_core::conversation_log::{
-            CslStore, file_store::FileCslStore, manager::CslManager, materialize,
-            SessionStateCompact,
+            CslStore, SessionStateCompact, file_store::FileCslStore, manager::CslManager,
+            materialize,
         };
 
         let (_tmp, _guard) = isolated_sessions_dir();
@@ -5661,17 +5703,19 @@ mod tests {
                 .map(|i| serde_json::json!({"role": "user", "content": format!("q{i}")}))
                 .collect();
             mgr.mark_turn_start(if t == 1 { 0 } else { (t - 1) as usize });
-            mgr.persist_turn(t, &full, &SessionStateCompact::default()).await.unwrap();
+            mgr.persist_turn(t, &full, &SessionStateCompact::default())
+                .await
+                .unwrap();
         }
         assert!(mgr.last_seq() > 0, "seq should be > 0 after 2 turns");
 
         mgr.reset().await.unwrap();
         assert_eq!(mgr.last_seq(), 0, "seq should be 0 after reset");
 
-        let post_undo_msgs = vec![
-            serde_json::json!({"role": "user", "content": "after-undo"}),
-        ];
-        mgr.persist_turn(2, &post_undo_msgs, &SessionStateCompact::default()).await.unwrap();
+        let post_undo_msgs = vec![serde_json::json!({"role": "user", "content": "after-undo"})];
+        mgr.persist_turn(2, &post_undo_msgs, &SessionStateCompact::default())
+            .await
+            .unwrap();
 
         let entries = store.load_from_latest_snapshot(&session_id).await.unwrap();
         let mat = materialize(&entries).unwrap();

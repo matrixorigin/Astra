@@ -206,8 +206,7 @@ pub(crate) async fn stream_chat_sse(
             executor.expand_sandbox_path(PathBuf::from(dir));
         }
     }
-    let mut messages =
-        load_turn_messages(p.pre_loaded_messages.take(), p.history, p.message);
+    let mut messages = load_turn_messages(p.pre_loaded_messages.take(), p.history, p.message);
 
     // ─── Context pre-fetch (disabled) ─────────────────────────────────────
     let all_schemas = if p.plan_only_chat {

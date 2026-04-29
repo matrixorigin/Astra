@@ -706,7 +706,10 @@ impl PostLoopPersistContext {
         if let Some(ref mgr) = self.csl_manager {
             let mut mgr = mgr.lock().await;
             let session_state = extract_session_state_compact(state);
-            if let Err(e) = mgr.persist_turn(state.session_turn, &state.messages, &session_state).await {
+            if let Err(e) = mgr
+                .persist_turn(state.session_turn, &state.messages, &session_state)
+                .await
+            {
                 tracing::warn!(
                     session_id = %self.session_id,
                     error = %e,
@@ -793,7 +796,6 @@ impl PostLoopPersistContext {
         };
         learning_stack.save_with_active_canary(active_canary);
     }
-
 }
 
 fn extract_session_state_compact(
@@ -814,7 +816,8 @@ fn extract_session_state_compact(
             .interruption
             .as_ref()
             .and_then(|i| serde_json::to_value(i).ok()),
-        ..Default::default()
+        delegation: None,
+        compaction_tracker: Some(state.compaction_effectiveness.to_json()),
     }
 }
 
@@ -1529,7 +1532,9 @@ impl AgenticRunLifecycleService {
         match mgr.load().await {
             Ok(Some(mat)) => {
                 let mut restored = mat.messages;
-                restored.push(loop_state.messages.remove(0));
+                if !loop_state.messages.is_empty() {
+                    restored.push(loop_state.messages.remove(0));
+                }
                 loop_state.messages = restored;
 
                 let ss = mat.session_state;
@@ -6525,9 +6530,12 @@ mod tests {
     #[test]
     fn create_run_loads_csl_history() {
         let source = include_str!("run_lifecycle.rs");
-        let create_run_start = source.find("async fn create_run(").expect("create_run must exist");
-        let stream_chat_start =
-            source.find("async fn stream_chat(").expect("stream_chat must exist");
+        let create_run_start = source
+            .find("async fn create_run(")
+            .expect("create_run must exist");
+        let stream_chat_start = source
+            .find("async fn stream_chat(")
+            .expect("stream_chat must exist");
         let create_run_body = &source[create_run_start..stream_chat_start];
         assert!(
             create_run_body.contains("restore_csl_history"),
@@ -6538,8 +6546,9 @@ mod tests {
     #[test]
     fn stream_chat_loads_csl_history() {
         let source = include_str!("run_lifecycle.rs");
-        let stream_chat_start =
-            source.find("async fn stream_chat(").expect("stream_chat must exist");
+        let stream_chat_start = source
+            .find("async fn stream_chat(")
+            .expect("stream_chat must exist");
         let stream_chat_body = &source[stream_chat_start..];
         assert!(
             stream_chat_body.contains("restore_csl_history"),
@@ -6617,9 +6626,12 @@ mod tests {
     #[test]
     fn both_entry_points_wire_csl_manager_to_persist_context() {
         let source = include_str!("run_lifecycle.rs");
-        let create_run_start = source.find("async fn create_run(").expect("create_run must exist");
-        let stream_chat_start =
-            source.find("async fn stream_chat(").expect("stream_chat must exist");
+        let create_run_start = source
+            .find("async fn create_run(")
+            .expect("create_run must exist");
+        let stream_chat_start = source
+            .find("async fn stream_chat(")
+            .expect("stream_chat must exist");
 
         let create_run_body = &source[create_run_start..stream_chat_start];
         assert!(

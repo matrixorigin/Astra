@@ -108,27 +108,15 @@ pub struct DelegationCompact {
 /// - `Some(Some(v))` = set to value `v`
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionStatePatch {
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "nullable"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "nullable")]
     pub continuity: Option<Option<ContinuityState>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_tools: Option<Vec<String>>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "nullable"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "nullable")]
     pub approval_overrides: Option<Option<Value>>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "nullable"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "nullable")]
     pub interruption: Option<Option<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_remaining_tokens: Option<u64>,
@@ -136,17 +124,9 @@ pub struct SessionStatePatch {
     pub budget_remaining_rounds: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consecutive_ctx_errors: Option<u32>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "nullable"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "nullable")]
     pub delegation: Option<Option<DelegationCompact>>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "nullable"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "nullable")]
     pub compaction_tracker: Option<Option<Value>>,
 }
 
@@ -370,6 +350,18 @@ pub trait CslStore: Send + Sync {
         new_session_id: &str,
         fork_after_turn: u32,
     ) -> Result<u64, CslStoreError>;
+
+    /// Return seq numbers of all Snapshot entries, in ascending order.
+    /// Used by GC to find which snapshots to retain without deserializing payloads.
+    /// Default: falls back to `load_after(0)` + filter (deserializes everything).
+    async fn snapshot_seqs(&self, session_id: &str) -> Result<Vec<u64>, CslStoreError> {
+        let entries = self.load_after(session_id, 0).await?;
+        Ok(entries
+            .iter()
+            .filter(|e| e.is_snapshot())
+            .map(|e| e.seq())
+            .collect())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -707,7 +699,9 @@ mod tests {
         };
         let patch = SessionStatePatch {
             continuity: Some(Some(continuity.clone())),
-            interruption: Some(Some(json!({"kind": "budget_exhausted", "resume_action": "continue"}))),
+            interruption: Some(Some(
+                json!({"kind": "budget_exhausted", "resume_action": "continue"}),
+            )),
             ..Default::default()
         };
         state.apply_patch(&patch);
@@ -904,10 +898,7 @@ mod tests {
         // Turn 2 patch set blocked_tools
         assert_eq!(state.session_state.blocked_tools, vec!["bash"]);
         // Turn 3 patch set recent_tools
-        assert_eq!(
-            state.session_state.recent_tools,
-            vec!["read_file", "bash"]
-        );
+        assert_eq!(state.session_state.recent_tools, vec!["read_file", "bash"]);
         // Budget decremented across turns
         assert_eq!(state.session_state.budget_remaining_tokens, 60_000);
         assert_eq!(state.session_state.budget_remaining_rounds, 8);
@@ -1066,9 +1057,16 @@ mod tests {
             ..Default::default()
         };
         let json_str = serde_json::to_string(&patch).unwrap();
-        assert!(json_str.contains("continuity"), "Some(None) must serialize as null, not be omitted");
+        assert!(
+            json_str.contains("continuity"),
+            "Some(None) must serialize as null, not be omitted"
+        );
         let deser: SessionStatePatch = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(deser.continuity, Some(None), "JSON null must deserialize to Some(None)");
+        assert_eq!(
+            deser.continuity,
+            Some(None),
+            "JSON null must deserialize to Some(None)"
+        );
     }
 
     #[test]
@@ -1078,8 +1076,15 @@ mod tests {
             ..Default::default()
         };
         let json_str = serde_json::to_string(&patch).unwrap();
-        assert!(json_str.contains("delegation"), "Some(None) must serialize as null, not be omitted");
+        assert!(
+            json_str.contains("delegation"),
+            "Some(None) must serialize as null, not be omitted"
+        );
         let deser: SessionStatePatch = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(deser.delegation, Some(None), "JSON null must deserialize to Some(None)");
+        assert_eq!(
+            deser.delegation,
+            Some(None),
+            "JSON null must deserialize to Some(None)"
+        );
     }
 }

@@ -25,11 +25,25 @@ impl FileCslStore {
         }
     }
 
+    fn validate_session_id(session_id: &str) -> Result<(), CslStoreError> {
+        if session_id.is_empty()
+            || session_id.contains('/')
+            || session_id.contains('\\')
+            || session_id.contains("..")
+        {
+            return Err(CslStoreError::Other(
+                "invalid session_id: must not contain path separators or '..'".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn log_path(&self, session_id: &str) -> PathBuf {
         self.base_dir.join(session_id).join(LOG_FILENAME)
     }
 
     /// Read all entries from the JSONL file. Returns empty vec if file doesn't exist.
+    /// Gracefully skips a corrupted trailing line (e.g. from a crash mid-write).
     fn read_all_entries(path: &Path) -> Result<Vec<CslEntry>, CslStoreError> {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
@@ -37,12 +51,23 @@ impl FileCslStore {
             Err(e) => return Err(e.into()),
         };
         let mut entries = Vec::new();
-        for line in content.lines() {
+        let lines: Vec<&str> = content.lines().collect();
+        let total = lines.len();
+        for (idx, line) in lines.into_iter().enumerate() {
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
-            entries.push(serde_json::from_str(line)?);
+            match serde_json::from_str::<CslEntry>(line) {
+                Ok(entry) => entries.push(entry),
+                Err(e) if idx == total - 1 => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "skipping corrupted trailing JSONL line: {e}"
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
         Ok(entries)
     }
@@ -92,6 +117,7 @@ impl CslStore for FileCslStore {
         entry: &CslEntry,
         _meta: &super::AppendMeta,
     ) -> Result<(), CslStoreError> {
+        Self::validate_session_id(session_id)?;
         let path = self.log_path(session_id);
         let entry = entry.clone();
         tokio::task::spawn_blocking(move || Self::append_entry(&path, &entry))
@@ -103,6 +129,7 @@ impl CslStore for FileCslStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<CslEntry>, CslStoreError> {
+        Self::validate_session_id(session_id)?;
         let path = self.log_path(session_id);
         let entries = tokio::task::spawn_blocking(move || Self::read_all_entries(&path))
             .await
@@ -127,6 +154,7 @@ impl CslStore for FileCslStore {
         session_id: &str,
         after_seq: u64,
     ) -> Result<Vec<CslEntry>, CslStoreError> {
+        Self::validate_session_id(session_id)?;
         let path = self.log_path(session_id);
         let entries = tokio::task::spawn_blocking(move || Self::read_all_entries(&path))
             .await
@@ -142,6 +170,7 @@ impl CslStore for FileCslStore {
         session_id: &str,
         before_seq: u64,
     ) -> Result<u64, CslStoreError> {
+        Self::validate_session_id(session_id)?;
         let path = self.log_path(session_id);
         tokio::task::spawn_blocking(move || {
             let entries = Self::read_all_entries(&path)?;
@@ -166,6 +195,8 @@ impl CslStore for FileCslStore {
         new_session_id: &str,
         fork_after_turn: u32,
     ) -> Result<u64, CslStoreError> {
+        Self::validate_session_id(parent_session_id)?;
+        Self::validate_session_id(new_session_id)?;
         let parent_path = self.log_path(parent_session_id);
         let new_path = self.log_path(new_session_id);
 
@@ -285,7 +316,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .append(sid, &make_snapshot(2, 3, vec![user_msg("compacted")]), &meta())
+            .append(
+                sid,
+                &make_snapshot(2, 3, vec![user_msg("compacted")]),
+                &meta(),
+            )
             .await
             .unwrap();
         store
@@ -351,7 +386,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .append(sid, &make_snapshot(2, 3, vec![user_msg("new_snap")]), &meta())
+            .append(
+                sid,
+                &make_snapshot(2, 3, vec![user_msg("new_snap")]),
+                &meta(),
+            )
             .await
             .unwrap();
         store
@@ -428,7 +467,11 @@ mod tests {
         let parent = "tool-parent";
 
         store
-            .append(parent, &make_snapshot(0, 1, vec![user_msg("read file")]), &meta())
+            .append(
+                parent,
+                &make_snapshot(0, 1, vec![user_msg("read file")]),
+                &meta(),
+            )
             .await
             .unwrap();
         store
@@ -535,7 +578,10 @@ mod tests {
 
         store.fork(parent, "patch-child", 2).await.unwrap();
 
-        let entries = store.load_from_latest_snapshot("patch-child").await.unwrap();
+        let entries = store
+            .load_from_latest_snapshot("patch-child")
+            .await
+            .unwrap();
         let state = materialize(&entries).unwrap();
         assert_eq!(state.session_state.blocked_tools, vec!["bash", "write"]);
         assert_eq!(state.session_state.recent_tools, vec!["read_file"]);
@@ -552,7 +598,7 @@ mod tests {
     ///   Turn 3: load → verify both turns visible
     #[tokio::test]
     async fn csl_multi_turn_persist_load_roundtrip() {
-        use crate::conversation_log::{SessionStatePatch, SessionStateCompact};
+        use crate::conversation_log::{SessionStateCompact, SessionStatePatch};
 
         let tmp = TempDir::new().unwrap();
         let store = FileCslStore::new(tmp.path());
@@ -706,5 +752,96 @@ mod tests {
         assert_eq!(mat.messages[0]["content"], "compacted_summary");
         assert_eq!(mat.session_state.budget_remaining_tokens, 70_000);
         assert_eq!(mat.session_state.blocked_tools, vec!["bash"]);
+    }
+
+    // ── Path traversal protection ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn rejects_path_traversal_session_ids() {
+        let tmp = TempDir::new().unwrap();
+        let store = FileCslStore::new(tmp.path());
+        let snap = make_snapshot(0, 1, vec![user_msg("hi")]);
+
+        for bad_id in ["../etc/passwd", "foo/bar", "a\\b", "..", ""] {
+            let result = store.append(bad_id, &snap, &meta()).await;
+            assert!(result.is_err(), "session_id '{bad_id}' should be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_valid_session_ids() {
+        let tmp = TempDir::new().unwrap();
+        let store = FileCslStore::new(tmp.path());
+        let snap = make_snapshot(0, 1, vec![user_msg("hi")]);
+
+        for good_id in [
+            "abc123",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "session_with-dashes.and.dots",
+        ] {
+            let result = store.append(good_id, &snap, &meta()).await;
+            assert!(
+                result.is_ok(),
+                "session_id '{good_id}' should be accepted: {:?}",
+                result.err()
+            );
+        }
+    }
+
+    // ── Corrupted trailing JSONL line ──────────────────────────────────
+
+    #[tokio::test]
+    async fn corrupted_trailing_line_is_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let store = FileCslStore::new(tmp.path());
+        let sid = "corrupt-trailing";
+
+        store
+            .append(sid, &make_snapshot(0, 1, vec![user_msg("good")]), &meta())
+            .await
+            .unwrap();
+
+        // Manually append a corrupted line to the JSONL file.
+        let path = tmp.path().join(sid).join("conversation_log.jsonl");
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "{{truncated garbage").unwrap();
+
+        let entries = store.load_from_latest_snapshot(sid).await.unwrap();
+        assert_eq!(entries.len(), 1, "should skip corrupted trailing line");
+        assert!(entries[0].is_snapshot());
+    }
+
+    #[tokio::test]
+    async fn corrupted_middle_line_is_error() {
+        let tmp = TempDir::new().unwrap();
+        let store = FileCslStore::new(tmp.path());
+        let sid = "corrupt-middle";
+
+        store
+            .append(sid, &make_snapshot(0, 1, vec![user_msg("good")]), &meta())
+            .await
+            .unwrap();
+
+        // Insert a corrupted line in the middle, then add a valid one after.
+        let path = tmp.path().join(sid).join("conversation_log.jsonl");
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "{{garbage").unwrap();
+        let delta = make_delta(1, 2, vec![user_msg("after")]);
+        let line = serde_json::to_string(&delta).unwrap();
+        writeln!(f, "{line}").unwrap();
+
+        let result = store.load_from_latest_snapshot(sid).await;
+        assert!(
+            result.is_err(),
+            "corrupted non-trailing line should cause error"
+        );
     }
 }

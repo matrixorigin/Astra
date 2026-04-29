@@ -85,11 +85,25 @@ impl CslStore for DbCslStore {
     ) -> Result<Vec<CslEntry>, CslStoreError> {
         let pool = self.get_pool().await?;
 
-        // Single query: find the latest snapshot's seq via subquery and load from there.
+        // First check if any snapshot exists — avoids deserializing all rows
+        // when the subquery would return -1 (no snapshot → seq >= -1 → all rows).
+        let has_snapshot: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conversation_log \
+             WHERE session_id = ? AND entry_type = 0)",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(false);
+
+        if !has_snapshot {
+            return Ok(Vec::new());
+        }
+
         let rows = query(
             "SELECT payload FROM conversation_log \
              WHERE session_id = ? AND seq >= ( \
-                 SELECT COALESCE(MAX(seq), -1) FROM conversation_log \
+                 SELECT MAX(seq) FROM conversation_log \
                  WHERE session_id = ? AND entry_type = 0 \
              ) \
              ORDER BY seq ASC",
@@ -100,19 +114,15 @@ impl CslStore for DbCslStore {
         .await
         .map_err(|e| CslStoreError::Other(format!("load from snapshot: {e}")))?;
 
-        // If no snapshot exists, the subquery returns -1 and we get all rows.
-        // Filter to only return entries starting from a Snapshot.
         if rows.is_empty() {
             return Ok(Vec::new());
         }
 
-        let entries: Vec<CslEntry> = rows.iter().map(Self::entry_from_row).collect::<Result<_, _>>()?;
-        // If there's no snapshot in the result (subquery returned -1, meaning no
-        // snapshot exists), return empty — materialize() requires a leading Snapshot.
-        match entries.first() {
-            Some(e) if e.is_snapshot() => Ok(entries),
-            _ => Ok(Vec::new()),
-        }
+        let entries: Vec<CslEntry> = rows
+            .iter()
+            .map(Self::entry_from_row)
+            .collect::<Result<_, _>>()?;
+        Ok(entries)
     }
 
     async fn load_after(
@@ -215,6 +225,21 @@ impl CslStore for DbCslStore {
             .map_err(|e| CslStoreError::Other(format!("fork commit: {e}")))?;
 
         Ok(1)
+    }
+
+    async fn snapshot_seqs(&self, session_id: &str) -> Result<Vec<u64>, CslStoreError> {
+        let pool = self.get_pool().await?;
+        let rows = query(
+            "SELECT seq FROM conversation_log \
+             WHERE session_id = ? AND entry_type = 0 \
+             ORDER BY seq ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| CslStoreError::Other(format!("snapshot_seqs: {e}")))?;
+
+        Ok(rows.iter().map(|r| r.get::<i64, _>("seq") as u64).collect())
     }
 }
 
@@ -354,7 +379,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .append(sid, &make_snapshot(2, 3, vec![user_msg("compacted")]), &meta())
+            .append(
+                sid,
+                &make_snapshot(2, 3, vec![user_msg("compacted")]),
+                &meta(),
+            )
             .await
             .unwrap();
         store
@@ -391,7 +420,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .append(sid, &make_snapshot(2, 3, vec![user_msg("new_snap")]), &meta())
+            .append(
+                sid,
+                &make_snapshot(2, 3, vec![user_msg("new_snap")]),
+                &meta(),
+            )
             .await
             .unwrap();
         store
@@ -506,7 +539,11 @@ mod tests {
         cleanup(&store, child).await;
 
         store
-            .append(parent, &make_snapshot(0, 1, vec![user_msg("read file")]), &meta())
+            .append(
+                parent,
+                &make_snapshot(0, 1, vec![user_msg("read file")]),
+                &meta(),
+            )
             .await
             .unwrap();
         store

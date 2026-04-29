@@ -804,7 +804,6 @@ pub struct AgenticLoopState {
     pub bridge_user_query_event_id: Option<String>,
     /// Created at turn start, flushed at turn end or on interruption.
     pub turn_event_buffer: Option<astra_services::session_journal::TurnEventBuffer>,
-
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
