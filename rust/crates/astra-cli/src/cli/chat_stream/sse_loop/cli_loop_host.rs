@@ -310,7 +310,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             capabilities: astra_thin_client::builtin_capability_preset(),
             project_root: self.project_root.as_path(),
             git_branch: None,
-            thinking_budget_tokens: None,
+            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         });
         if let Some(max_tokens) = request.max_output_tokens {
             payload["max_tokens"] = json!(max_tokens);

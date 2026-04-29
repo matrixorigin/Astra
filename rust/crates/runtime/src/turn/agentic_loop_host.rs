@@ -687,10 +687,10 @@ pub struct AgenticLoopState {
     /// Skill subruns set this to cap total cost.
     pub max_cumulative_tokens: u64,
 
-    // ── Thinking budget ──
-    /// Optional thinking/reasoning budget in tokens for models with extended thinking.
-    /// When Some, passed to the API request so the server constrains thinking output.
-    pub thinking_budget_tokens: Option<u32>,
+    // ── Thinking config ──
+    /// Thinking/reasoning configuration for extended thinking models.
+    /// Applied to the LLM request body via provider-specific wire format.
+    pub thinking: astra_turn_core::thinking_config::ThinkingConfig,
 
     // ── Recently accessed files ──
     /// Recently accessed file paths tracked for post-compaction restoration.
@@ -1142,7 +1142,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         budget_wrapup_injected: false,
         skill_produced_output: false,
         max_cumulative_tokens: 0,
-        thinking_budget_tokens: None,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         recent_file_reads: Vec::new(),
         permission_context: None,
         permission_handler: None,
@@ -1495,7 +1495,7 @@ pub(crate) mod tests {
             budget_wrapup_injected: false,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
-            thinking_budget_tokens: None,
+            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
             recent_file_reads: Vec::new(),
             permission_context: None,
             permission_handler: None,

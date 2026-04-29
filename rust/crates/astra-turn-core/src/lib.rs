@@ -61,6 +61,7 @@ pub mod stop_hooks_yaml;
 pub mod streaming_tool_exec;
 pub mod tail_persist;
 pub mod task;
+pub mod thinking_config;
 pub mod tool_args_repair;
 pub mod tool_call_shape;
 pub mod tool_health;

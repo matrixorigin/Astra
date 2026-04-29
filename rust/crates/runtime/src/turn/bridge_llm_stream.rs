@@ -228,6 +228,7 @@ async fn bedrock_stream_with_retry(
     max_output_tokens: Option<usize>,
     has_fallback: bool,
     client_cancel: Option<Arc<CancellationToken>>,
+    thinking: &astra_turn_core::thinking_config::ThinkingConfig,
 ) -> Result<Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>, String> {
     let cooldown = rate_limit_cooldown();
     let model_key = model_name;
@@ -240,6 +241,7 @@ async fn bedrock_stream_with_retry(
         max_output_tokens,
         None,
         true,
+        thinking,
     );
     let url = llm_request_url_for_provider(base_url, provider, model_name, true);
 
@@ -353,6 +355,7 @@ pub(crate) async fn call_llm_stream(
     max_output_tokens: Option<usize>,
     has_fallback: bool,
     client_cancel: Option<Arc<CancellationToken>>,
+    thinking: &astra_turn_core::thinking_config::ThinkingConfig,
 ) -> Result<Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>, String> {
     let cooldown = rate_limit_cooldown();
     let model_key = model_name;
@@ -377,6 +380,7 @@ pub(crate) async fn call_llm_stream(
             max_output_tokens,
             has_fallback,
             client_cancel,
+            thinking,
         )
         .await;
     }
@@ -389,6 +393,7 @@ pub(crate) async fn call_llm_stream(
         max_output_tokens,
         None,
         true,
+        thinking,
     );
 
     let url = llm_request_url_for_provider(base_url, provider, model_name, true);
@@ -1010,6 +1015,7 @@ mod tests {
             None,
             false,
             None,
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .expect("stream");
@@ -1107,6 +1113,7 @@ mod tests {
             None,
             false,
             None,
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .expect("bridge stream");
@@ -1150,6 +1157,7 @@ mod tests {
             None,
             false,
             None,
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .expect("bridge stream");
@@ -1197,6 +1205,7 @@ mod tests {
             None,
             false,
             None,
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .expect("bridge stream");

@@ -139,7 +139,6 @@ fn build_bug_report(state: &ReplState) -> String {
         ("MO_MAX_TOOL_RETRIES", false),
         ("MO_RETRY_BASE_MS", false),
         ("MO_BUDGET_LIMIT", false),
-        ("MO_THINKING_BUDGET", false),
     ];
     for (var, sensitive) in &config_vars {
         match std::env::var(var) {

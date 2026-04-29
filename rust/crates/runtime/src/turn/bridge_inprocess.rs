@@ -800,6 +800,10 @@ impl InProcessChatTurnBridge {
             .get("agent_id")
             .and_then(Value::as_str)
             .map(ToString::to_string);
+        let thinking_config = payload
+            .get("thinking")
+            .map(astra_turn_core::thinking_config::ThinkingConfig::from_payload_value)
+            .unwrap_or_default();
 
         let matrixone = self.matrixone.clone();
         let encryptor = self.encryptor.clone();
@@ -1804,6 +1808,7 @@ impl InProcessChatTurnBridge {
                             Some(max_output_tokens),
                             has_fallback,
                             cc.clone(),
+                            &thinking_config,
                         )
                         .await
                         {
@@ -1923,6 +1928,7 @@ impl InProcessChatTurnBridge {
                                 Some(max_output_tokens / 2), // reduce output budget too
                                 has_fallback,
                                 cc.clone(),
+                                &thinking_config,
                             )
                             .await
                             {

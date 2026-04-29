@@ -104,6 +104,7 @@ pub(super) async fn completions_handler(
         Some(request.max_tokens as usize),
         Some(request.temperature),
         false,
+        &astra_turn_core::thinking_config::ThinkingConfig::Off,
     );
 
     let url = crate::turn::llm_client::llm_request_url_for_provider(

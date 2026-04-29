@@ -171,7 +171,7 @@ impl AgenticLoopHost for SubRunHost {
             capabilities: astra_thin_client::builtin_capability_preset(),
             project_root: &self.project_root,
             git_branch: None,
-            thinking_budget_tokens: None,
+            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         });
 
         if let Some(max_tokens) = self.max_completion_tokens {
@@ -574,7 +574,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             budget_wrapup_injected: false,
             skill_produced_output: false,
             max_cumulative_tokens: SUBRUN_MAX_CUMULATIVE_TOKENS,
-            thinking_budget_tokens: None,
+            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
             recent_file_reads: Vec::new(),
             permission_context: None,
             permission_handler: None,

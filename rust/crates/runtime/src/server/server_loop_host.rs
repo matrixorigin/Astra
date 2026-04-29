@@ -45,6 +45,7 @@ use astra_core::SharedPool;
 use astra_services::LlmTokenServiceConfig;
 use astra_turn_core::bridge_rate_limit_cooldown::RateLimitAction;
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
+use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_core::tool_schema_prune::{
     filter_tool_schemas_by_excluded_names, prune_tool_schemas,
 };
@@ -2428,6 +2429,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 (!llm_cfg.header_overrides.is_empty()).then_some(&llm_cfg.header_overrides),
                 llm_cfg.completions_url_override.as_deref(),
                 llm_cfg.request_timeout,
+                &state.thinking,
             )
             .await;
 
@@ -2792,6 +2794,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             (!llm_cfg.header_overrides.is_empty()).then_some(&llm_cfg.header_overrides),
             llm_cfg.completions_url_override.as_deref(),
             llm_cfg.request_timeout,
+            &ThinkingConfig::Off,
         )
         .await
         {
@@ -4073,7 +4076,7 @@ mod tests {
             budget_wrapup_injected: false,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
-            thinking_budget_tokens: None,
+            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
             recent_file_reads: Vec::new(),
             permission_context: None,
             permission_handler: None,

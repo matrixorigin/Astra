@@ -330,21 +330,23 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     touch_prep_ui_phase(&ctx.prep_ui_phase, "Starting…");
 
     let git_branch = read_git_branch_abbrev();
-    let thinking_budget_tokens: Option<u32> = std::env::var("MO_THINKING_BUDGET")
-        .ok()
-        .and_then(|v| v.parse().ok());
+    let (resolved_model, thinking_config) = ctx
+        .model
+        .map(astra_turn_core::thinking_config::resolve_model_thinking)
+        .map(|(m, t)| (Some(m), t))
+        .unwrap_or((None, astra_turn_core::thinking_config::ThinkingConfig::Off));
     let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
         messages: ctx.messages,
         session_id: ctx.current_session_id,
         agent_id: Some("astra-cli"),
-        model: ctx.model,
+        model: resolved_model,
         explain_verbose: ctx.explain.explain_verbose,
         explain_on: ctx.explain.explain_on,
         edge_executor_id: edge_executor_instance_id(),
         capabilities: astra_thin_client::builtin_capability_preset(),
         project_root: ctx.project_root,
         git_branch,
-        thinking_budget_tokens,
+        thinking: thinking_config,
     });
 
     // Inject ephemeral prefix (e.g., skill listing) at the start of messages.

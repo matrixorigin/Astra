@@ -406,7 +406,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             budget_wrapup_injected: false,
             skill_produced_output: false,
             max_cumulative_tokens: SUBRUN_MAX_CUMULATIVE_TOKENS,
-            thinking_budget_tokens: None,
+            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
             recent_file_reads: Vec::new(),
             permission_context: None,
             permission_handler: None,

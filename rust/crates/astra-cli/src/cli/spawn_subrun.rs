@@ -279,7 +279,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             budget_wrapup_injected: false,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
-            thinking_budget_tokens: None,
+            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
             recent_file_reads: Vec::new(),
             permission_context: config.permission_context,
             permission_handler: None,

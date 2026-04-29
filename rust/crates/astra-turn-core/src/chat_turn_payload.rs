@@ -22,9 +22,8 @@ pub struct ChatTurnBasePayloadInput<'a> {
     pub capabilities: Vec<String>,
     pub project_root: &'a Path,
     pub git_branch: Option<String>,
-    /// Optional thinking/reasoning budget in tokens. When Some, the server should
-    /// constrain extended-thinking output to this many tokens.
-    pub thinking_budget_tokens: Option<u32>,
+    /// Thinking/reasoning configuration for extended thinking models.
+    pub thinking: crate::thinking_config::ThinkingConfig,
 }
 
 /// Invariant fields for `POST /chat/stream` (or equivalent) before dynamic tool schemas and callbacks.
@@ -43,7 +42,7 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
         capabilities,
         project_root,
         git_branch,
-        thinking_budget_tokens,
+        thinking,
     } = input;
     let mut payload = json!({
         "messages": messages,
@@ -59,9 +58,9 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
             detect_workspace_context(project_root),
         ),
     });
-    if let Some(budget) = thinking_budget_tokens {
+    if thinking.is_enabled() {
         if let Some(obj) = payload.as_object_mut() {
-            obj.insert("thinking_budget_tokens".to_string(), json!(budget));
+            obj.insert("thinking".to_string(), thinking.to_payload_value());
         }
     }
     payload
@@ -162,7 +161,7 @@ mod tests {
             capabilities: vec!["bash".into(), "fs".into()],
             project_root: Path::new("/tmp"),
             git_branch: Some("main".into()),
-            thinking_budget_tokens: None,
+            thinking: crate::thinking_config::ThinkingConfig::Off,
         });
         assert_eq!(p["messages"], json!(msgs));
         assert_eq!(p["session_id"], Value::Null);
@@ -175,8 +174,8 @@ mod tests {
         assert_eq!(p["edge_profile"]["cwd"], "/tmp");
         assert_eq!(p["edge_profile"]["git_branch"], "main");
         assert!(p["edge_profile"].get("memoria_url").is_some());
-        // thinking_budget_tokens = None → field absent
-        assert!(p.get("thinking_budget_tokens").is_none());
+        // thinking = Off → field absent
+        assert!(p.get("thinking").is_none());
     }
 
     #[test]
@@ -192,7 +191,7 @@ mod tests {
             capabilities: vec![],
             project_root: Path::new("/"),
             git_branch: None,
-            thinking_budget_tokens: None,
+            thinking: crate::thinking_config::ThinkingConfig::Off,
         });
         assert_eq!(p["session_id"], "sess-1");
         assert_eq!(p["agent_id"], Value::Null);
@@ -200,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn base_payload_thinking_budget_included_when_some() {
+    fn base_payload_thinking_included_when_enabled() {
         let p = chat_turn_base_payload(ChatTurnBasePayloadInput {
             messages: &[],
             session_id: None,
@@ -212,13 +211,16 @@ mod tests {
             capabilities: vec![],
             project_root: Path::new("/"),
             git_branch: None,
-            thinking_budget_tokens: Some(10000),
+            thinking: crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: 10000,
+            },
         });
-        assert_eq!(p["thinking_budget_tokens"], 10000);
+        assert_eq!(p["thinking"]["mode"], "enabled");
+        assert_eq!(p["thinking"]["budget_tokens"], 10000);
     }
 
     #[test]
-    fn base_payload_thinking_budget_absent_when_none() {
+    fn base_payload_thinking_absent_when_off() {
         let p = chat_turn_base_payload(ChatTurnBasePayloadInput {
             messages: &[],
             session_id: None,
@@ -230,9 +232,9 @@ mod tests {
             capabilities: vec![],
             project_root: Path::new("/"),
             git_branch: None,
-            thinking_budget_tokens: None,
+            thinking: crate::thinking_config::ThinkingConfig::Off,
         });
-        assert!(p.get("thinking_budget_tokens").is_none());
+        assert!(p.get("thinking").is_none());
     }
 
     #[test]
