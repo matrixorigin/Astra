@@ -72,7 +72,17 @@ fn strip_leading_wrappers(segment: &str) -> &str {
 
 /// Returns true if any character in this segment triggers a workspace
 /// mutation (redirect, in-place edit, known mutating verb).
+///
+/// Benign fd-redirect stripping (`2>&1`, `1>&2`, `&>/dev/null`, `>/dev/null`,
+/// …) is delegated to
+/// [`astra_turn_core::cloud_approval_policy::strip_benign_fd_redirects`] —
+/// the single source of truth shared with the permission gate so the two
+/// classifiers cannot drift. See the drift-guard test
+/// `tool_side_effects::read_only_permission_implies_non_mutating_cache_classification`.
 fn segment_is_mutating(segment_lower: &str) -> bool {
+    let normalized =
+        astra_turn_core::cloud_approval_policy::strip_benign_fd_redirects(segment_lower);
+    let segment_lower = normalized.as_str();
     // `cmd > file` and `cmd >file` (no space). `>>` first to avoid double-count.
     let has_redirect = segment_lower.contains(">>")
         || segment_lower
@@ -282,6 +292,84 @@ mod tests {
         assert!(intent("echo hi > foo.txt").mutating);
         assert!(intent("echo hi >>foo.txt").mutating);
         assert!(!intent("rg --files | head -n 50").mutating);
+    }
+
+    /// Regression: benign fd redirects must NOT be classified as mutating.
+    /// Covers every pattern stripped by `strip_benign_fd_redirects`. Keep in
+    /// sync with the twin guard in `astra_turn_core::cloud_approval_policy`.
+    #[test]
+    fn benign_fd_redirects_are_not_mutating() {
+        assert!(!intent("cargo check 2>&1").mutating);
+        assert!(!intent("cargo check 1>&2").mutating);
+        assert!(!intent("cargo check 2>/dev/null").mutating);
+        assert!(!intent("cargo check 1>/dev/null").mutating);
+        assert!(!intent("cargo check >/dev/null").mutating);
+        assert!(!intent("cargo check &>/dev/null").mutating);
+        assert!(!intent("cargo check 2>&1 | head -50").mutating);
+        // Append-form combined redirect: `&>>` MUST still be stripped so the
+        // surviving `>>` in a literal filename doesn't false-positive.
+        assert!(!intent("cargo check &>> /tmp/unused_log").mutating);
+    }
+
+    /// Residual-risk guard: the target filename surviving after redirect-
+    /// stripping MUST NOT accidentally match any mutating-verb heuristic in
+    /// `segment_is_mutating`. Twin of
+    /// `astra_turn_core::cloud_approval_policy::benign_fd_redirect_target_filenames_are_inert`;
+    /// keep the two corpora aligned.
+    #[test]
+    fn benign_fd_redirect_target_filenames_are_inert() {
+        // Filenames textually containing mutating-verb substrings must not
+        // flip the intent to mutating after redirect stripping.
+        assert!(!intent("cargo check &>> /tmp/rm_me.log").mutating);
+        assert!(!intent("cargo check &>> /var/log/mv_state").mutating);
+        assert!(!intent("cargo check &>> ./cp_backup.log").mutating);
+        assert!(!intent("cargo check &> /tmp/chmod.out").mutating);
+        assert!(!intent("cargo check 2> /tmp/git_commit_trace.log").mutating);
+        assert!(!intent("cargo check &>> /tmp/rm_me.log && echo done").mutating);
+        // Malformed tail (no target after `2>`): conservative contract —
+        // the dangling `>` is left in place so it trips the mutation scan.
+        // Twin of `cloud_approval_policy::…::benign_fd_redirect_target_filenames_are_inert`;
+        // if you change this, change both sides.
+        assert!(intent("cargo check 2>").mutating);
+        // Non-ASCII filename: UTF-8 sequence must survive the byte-level
+        // scan intact (no mojibake that could hit a write-verb substring).
+        assert!(!intent("cargo check &>> /tmp/日志.log").mutating);
+    }
+
+    /// Residual-risk guard: malformed trailing redirect (`cmd 2>` with no
+    /// target after the operator) MUST fall back to conservative mutation
+    /// classification on both gates. Shell itself errors on dangling
+    /// redirects; we prefer false-positive approval over silent miss.
+    /// Twin of
+    /// `astra_turn_core::cloud_approval_policy::malformed_trailing_redirect_stays_conservative`;
+    /// if you change this, change both sides.
+    #[test]
+    fn malformed_trailing_redirect_stays_conservative() {
+        assert!(intent("cargo check 2>").mutating);
+        assert!(intent("cargo check >").mutating);
+        assert!(intent("cargo check 2>>").mutating);
+        // Bash combined redirect variants must also fall back to mutating
+        // when dangling. Previously `.replace("&>", " ")` silently ate the
+        // operator and made `cargo check &>` look read-only.
+        assert!(intent("cargo check &>").mutating);
+        assert!(intent("cargo check &>>").mutating);
+    }
+
+    /// Residual-risk guard: fd-redirect detection MUST require a token
+    /// boundary to the **left** of the digit. `echo a2>/tmp/x` — `a2` is the
+    /// echo argument, `>` is a real stdout redirect writing to `/tmp/x`; the
+    /// command genuinely mutates and must be classified as mutating. Twin of
+    /// `astra_turn_core::cloud_approval_policy::fd_redirect_requires_left_token_boundary`;
+    /// keep the two corpora aligned.
+    #[test]
+    fn fd_redirect_requires_left_token_boundary() {
+        assert!(intent("echo a2>/tmp/x").mutating);
+        assert!(intent("echo a2>>/tmp/x").mutating);
+        // Sanity: genuine fd redirects (digit at a token boundary) remain
+        // non-mutating after stripping.
+        assert!(!intent("cargo check 2>/tmp/log").mutating);
+        assert!(!intent("2>/tmp/log cargo check").mutating);
+        assert!(!intent("true | 2>/tmp/log cargo check").mutating);
     }
 
     #[test]

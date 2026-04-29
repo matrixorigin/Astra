@@ -1,4 +1,4 @@
-use astra_turn_core::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind};
+use astra_turn_core::cloud_approval_policy::{cloud_gated_tool_kind, CloudGatedToolKind};
 use serde_json::Value;
 
 /// Local/legacy mutating tools that are not covered by cloud approval policy.
@@ -70,7 +70,7 @@ mod tests {
     use std::collections::HashSet;
 
     use astra_turn_core::cloud_approval_policy::{
-        CLOUD_APPROVAL_REQUIRED_TOOLS, CloudGatedToolKind, cloud_gated_tool_kind,
+        cloud_gated_tool_kind, CloudGatedToolKind, CLOUD_APPROVAL_REQUIRED_TOOLS,
     };
 
     use super::*;
@@ -150,6 +150,110 @@ mod tests {
                 "read-only tool must not require argument mutation classification: {name}"
             );
         }
+    }
+
+    /// Guards against silent drift between
+    /// [`astra_turn_core::cloud_approval_policy::bash_command_is_read_only`] (permission gate)
+    /// and [`crate::bash_intent::bash_command_looks_mutating`] (cache eviction gate).
+    ///
+    /// Invariant: if the permission gate approves a command as read-only, the
+    /// cache-eviction gate must **not** classify it as mutating. Otherwise a
+    /// command could be approved silently yet still evict the idempotency
+    /// cache (or, worse, approved silently AND skip eviction for a real
+    /// mutation). A shared corpus makes future regressions visible.
+    #[test]
+    fn read_only_permission_implies_non_mutating_cache_classification() {
+        use astra_turn_core::cloud_approval_policy::bash_command_is_read_only;
+
+        use crate::bash_intent::bash_command_looks_mutating;
+
+        // Corpus spans positive and negative cases across both gates.
+        let corpus = [
+            // read-only shapes
+            "ls",
+            "cat foo.rs",
+            "sed -n '1,20p' a.rs",
+            "grep -r pattern .",
+            "git status",
+            "git log --oneline",
+            "cargo check",
+            "cd rust && cargo check 2>&1 | head -50",
+            "cd /tmp && cat file.txt",
+            // fd-redirect variants — every benign form the normalizer strips
+            // should remain read-only on the permission gate AND non-mutating
+            // on the cache gate. Regression corpus for `strip_benign_fd_redirects`.
+            "cargo check 1>&2",
+            "cargo check 2>/dev/null",
+            "cargo check 1>/dev/null",
+            "cargo check >/dev/null",
+            "cargo check &>/dev/null",
+            // Extended fd-redirect coverage — mirror of the twin tests in
+            // `cloud_approval_policy` and `bash_intent`. Keeps the drift
+            // guard corpus from lagging behind single-gate tests.
+            "cargo check &>> /tmp/unused_log",
+            "cargo check 2> /tmp/git_commit_trace.log",
+            "cargo check 2>> /tmp/rm_me.log",
+            // mutating shapes (both gates should agree these are NOT read-only,
+            // and the cache gate SHOULD flag them as mutating)
+            "rm file.txt",
+            "sed -i 's/a/b/' foo.rs",
+            "echo hi > foo.txt",
+            "cd /tmp && mv x y",
+            "npm install react",
+            // Left-boundary regression: `a2` is an echo arg, `>` is a real
+            // stdout redirect — must be classified as mutating on both gates.
+            "echo a2>/tmp/x",
+            "echo a2>>/tmp/x",
+        ];
+
+        // Commands that genuinely mutate the workspace (redirect, in-place
+        // edit, rm/mv/install). Both gates MUST agree here; these are the
+        // dual-gate subset. Git write verbs like `git add` are intentionally
+        // excluded from the dual-gate invariant — the permission gate denies
+        // them (deny-by-default) but the cache gate's deny-list only tracks
+        // disk-level mutation, so full symmetry would be a false invariant.
+        // That asymmetry is pinned separately in the `git add .` assertion
+        // below.
+        let both_gates_mutation_corpus = [
+            "rm file.txt",
+            "sed -i 's/a/b/' foo.rs",
+            "echo hi > foo.txt",
+            "cd /tmp && mv x y",
+            "npm install react",
+            // Left-boundary regression — `a2` is echo's arg, `>` is a real
+            // stdout redirect. Must be flagged mutating on BOTH gates.
+            "echo a2>/tmp/x",
+            "echo a2>>/tmp/x",
+        ];
+
+        for cmd in corpus {
+            if bash_command_is_read_only(cmd) {
+                assert!(
+                    !bash_command_looks_mutating(cmd),
+                    "drift detected: permission gate says read-only but cache gate says mutating: {cmd:?}"
+                );
+            }
+        }
+
+        for cmd in both_gates_mutation_corpus {
+            assert!(
+                !bash_command_is_read_only(cmd),
+                "dual-gate mutation corpus regressed: permission gate now allows: {cmd:?}"
+            );
+            assert!(
+                bash_command_looks_mutating(cmd),
+                "dual-gate mutation corpus regressed: cache gate no longer flags: {cmd:?}"
+            );
+        }
+
+        // `git add .` asymmetry is intentional and pinned here: the
+        // permission gate MUST deny it (deny-by-default on git write verbs)
+        // while the cache gate MAY NOT flag it (disk-level mutation only).
+        // If either side flips, update `both_gates_mutation_corpus` above.
+        assert!(
+            !bash_command_is_read_only("git add ."),
+            "permission gate must deny `git add .` (deny-by-default on git write verbs)"
+        );
     }
 
     #[test]
