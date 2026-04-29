@@ -384,15 +384,8 @@ pub enum CslStoreError {
 }
 
 pub(crate) fn validate_session_id(session_id: &str) -> Result<(), CslStoreError> {
-    if session_id.is_empty()
-        || session_id.contains('/')
-        || session_id.contains('\\')
-        || session_id.contains("..")
-        || session_id.bytes().any(|b| b.is_ascii_control())
-    {
-        return Err(CslStoreError::InvalidSessionId(session_id.to_string()));
-    }
-    Ok(())
+    astra_services::session_journal::validate_session_id(session_id)
+        .map_err(|_| CslStoreError::InvalidSessionId(session_id.to_string()))
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

@@ -35,7 +35,8 @@ pub fn local_sessions_dir() -> PathBuf {
 }
 
 /// Validate that a session ID is safe for use as a filesystem path component.
-/// Rejects path traversal attempts (`..`, `/`, `\`) and empty/whitespace-only IDs.
+/// Rejects empty/whitespace-only IDs, path traversal (`..`, `/`, `\`),
+/// ASCII control characters (including NUL and DEL), and multi-component paths.
 pub fn validate_session_id(session_id: &str) -> Result<(), String> {
     if session_id.is_empty() || session_id.trim().is_empty() {
         return Err("session ID cannot be empty".to_string());
@@ -43,16 +44,17 @@ pub fn validate_session_id(session_id: &str) -> Result<(), String> {
     if session_id.contains('/')
         || session_id.contains('\\')
         || session_id.contains("..")
-        || session_id.contains('\0')
+        || session_id.bytes().any(|b| b.is_ascii_control())
     {
         return Err(format!(
-            "invalid session ID '{session_id}': must not contain '/', '\\\\', '..', or null bytes"
+            "invalid session ID {:?}: must not contain path separators, '..', or control characters",
+            session_id
         ));
     }
-    // Must be a single path component (no directory separators after normalization)
     if Path::new(session_id).components().count() != 1 {
         return Err(format!(
-            "invalid session ID '{session_id}': must be a single path component"
+            "invalid session ID {:?}: must be a single path component",
+            session_id
         ));
     }
     Ok(())
@@ -5315,6 +5317,9 @@ mod tests {
         assert!(validate_session_id("").is_err());
         assert!(validate_session_id("   ").is_err());
         assert!(validate_session_id("a\0b").is_err());
+        assert!(validate_session_id("has\nnewline").is_err());
+        assert!(validate_session_id("has\ttab").is_err());
+        assert!(validate_session_id("has\x7Fdel").is_err());
     }
 
     #[test]
