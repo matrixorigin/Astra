@@ -6101,6 +6101,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn edge_tool_result_401_refreshes_and_retries_without_terminal_auth_failure() {
         static CREDENTIALS_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
             std::sync::OnceLock::new();

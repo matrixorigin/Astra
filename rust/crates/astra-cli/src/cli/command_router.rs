@@ -285,28 +285,13 @@ async fn execute_repl_bridge_command(
         "/team" => slash_team::handle_team_command(arg, api, profile, &mut state).await,
         "/telemetry" => slash_telemetry::handle_telemetry_command(arg, &state),
         "/task" => {
-            slash_task::handle_task_command(
-                arg,
-                &mut state,
-                api,
-                profile.as_deref(),
-                token.as_deref(),
-            )
-            .await
+            slash_task::handle_task_command(arg, &mut state, api, profile, token.as_deref()).await
         }
         "/memory" => {
             handle_memory_domain_command("/memory", arg, api, &mut state, token.as_deref()).await?
         }
         "/review" | "/grep" => {
-            handle_info_command(
-                slash_cmd,
-                arg,
-                api,
-                &mut state,
-                profile.as_deref(),
-                token.as_deref(),
-            )
-            .await?
+            handle_info_command(slash_cmd, arg, api, &mut state, profile, token.as_deref()).await?
         }
         "/diff" => {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
