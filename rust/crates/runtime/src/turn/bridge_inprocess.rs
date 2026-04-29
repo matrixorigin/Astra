@@ -1634,15 +1634,6 @@ impl InProcessChatTurnBridge {
             let llm_started = Instant::now();
             let budget = crate::prompts::budget_for_model(Some(&model_name));
             let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
-            let max_rounds = astra_turn_core::routing::max_tool_rounds();
-            let _round_limit: i64 = if use_e2e_llm {
-                bridge_e2e
-                    .as_ref()
-                    .map(|r| (r.len() as i64).clamp(1, max_rounds))
-                    .unwrap_or(1)
-            } else {
-                max_rounds
-            };
 
             let mut last_measured_prompt: Option<u64> = None;
             let mut cache_detector = astra_turn_core::cloud_cache_diagnostics::CacheBreakDetector::new();

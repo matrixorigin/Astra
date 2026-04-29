@@ -311,6 +311,7 @@ mod tests {
             api: astra_thin_client::ThinClient::new("http://localhost:1", None).unwrap(),
             api_token: "test".to_string(),
             delegation_engine: None,
+            delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: None,
             evolution_service: None,

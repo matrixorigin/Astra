@@ -202,6 +202,14 @@ impl AgenticLoopHost for SubRunHost {
 
         set_payload_tool_results_if_non_empty(&mut payload, &state.tool_results);
 
+        // Sub-runs share the parent's session_id but have no turn_event_buffer.
+        // Tell the bridge not to write llm_round events — the parent's journal
+        // already records delegation results. Without this, the bridge writes
+        // duplicate rounds to the parent's journal file.
+        if let Some(root) = payload.as_object_mut() {
+            root.insert("root_turn_journal_owned".into(), json!(true));
+        }
+
         let resp = self
             .api
             .post_chat_turn_retry_429(&self.token, &payload, 3, true)
@@ -551,6 +559,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             api: self.api.clone(),
             api_token: self.token.clone(),
             delegation_engine: None,
+            delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: None,
             evolution_service: None,

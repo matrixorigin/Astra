@@ -44,7 +44,7 @@ pub(crate) fn tool_call_invalidates_read_cache(name: &str, args: Option<&Value>)
         Some(CloudGatedToolKind::Execute)
     ) {
         return args
-            .and_then(crate::turn::tool_argument_hints::command_hint_from_args)
+            .and_then(astra_turn_core::tool_argument_hints::command_hint_from_args)
             .is_some_and(crate::bash_intent::bash_command_looks_mutating);
     }
     if name == "git_worktree" {
@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn read_only_tools_do_not_overlap_mutation_classification() {
-        for &name in crate::turn::headless_tool_assembly::READ_ONLY_TOOLS {
+        for &name in astra_turn_core::headless_tool_assembly::READ_ONLY_TOOLS {
             assert!(
                 !tool_name_invalidates_read_cache(name),
                 "read-only tool must not also be name-classified as mutation: {name}"

@@ -629,6 +629,10 @@ pub struct AgenticLoopState {
     /// When set, the loop intercepts `delegate` tool calls and routes them
     /// through the delegation engine instead of the headless tool round.
     pub delegation_engine: Option<Arc<crate::server::delegation_engine::DelegationEngine>>,
+    /// Number of delegations executed in the current turn. Used to prevent
+    /// runaway delegation loops where the parent agent keeps delegating
+    /// without synthesizing results.
+    pub delegations_this_turn: u32,
 
     // ── Composite Snapshot ──
     /// Optional data snapshot provider for building composite snapshots.
@@ -1113,6 +1117,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
         api_token: String::new(),
         delegation_engine: None,
+        delegations_this_turn: 0,
         project_context: None,
         checkpoint_gate: None,
         evolution_service: None,
@@ -1465,6 +1470,7 @@ pub(crate) mod tests {
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
             delegation_engine: None,
+            delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: None,
             evolution_service: None,

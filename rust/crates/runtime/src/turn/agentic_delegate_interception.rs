@@ -90,6 +90,83 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
         };
     }
 
+    // Per-turn delegation limit: prevent runaway delegation loops where the
+    // parent agent keeps delegating without synthesizing results.
+    const MAX_DELEGATIONS_PER_TURN: u32 = 3;
+    if turn_result.accum.tool_calls.iter().any(is_delegation_call)
+        && state.delegations_this_turn >= MAX_DELEGATIONS_PER_TURN
+    {
+        if !quiet {
+            host.emit_headless_line(
+                HeadlessStderrStyle::Yellow,
+                format!(
+                    "⚠️  Delegation limit reached ({MAX_DELEGATIONS_PER_TURN} per turn). Synthesize existing results instead of delegating again."
+                ),
+            );
+        }
+        // Return delegate calls as errors so the model sees the refusal.
+        let mut effective = Vec::new();
+        for tc in &turn_result.accum.tool_calls {
+            if is_delegation_call(tc) {
+                // Skip delegation calls — they'll be returned as error tool_results below.
+            } else {
+                effective.push(tc.clone());
+            }
+        }
+        // Inject error tool_results for the refused delegate calls.
+        let delegate_calls: Vec<&Value> = turn_result
+            .accum
+            .tool_calls
+            .iter()
+            .filter(|tc| is_delegation_call(tc))
+            .collect();
+        if !delegate_calls.is_empty() {
+            let tc_entries: Vec<Value> = delegate_calls
+                .iter()
+                .map(|tc| {
+                    let id = tc
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+                    serde_json::json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": DELEGATE_TOOL_NAME,
+                            "arguments": "{}",
+                        }
+                    })
+                })
+                .collect();
+            let assistant_msg = serde_json::json!({
+                "role": "assistant",
+                "content": Value::Null,
+                "tool_calls": tc_entries,
+            });
+            state.messages.push(assistant_msg);
+            for tc in &delegate_calls {
+                let id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
+                let tool_msg = serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": format!(
+                        "ERROR: Delegation limit reached ({} delegations already executed this turn). \
+                         You must synthesize the results from previous delegations and respond to the user directly. \
+                         Do NOT delegate again.",
+                        state.delegations_this_turn
+                    ),
+                });
+                state.messages.push(tool_msg);
+            }
+        }
+        return DelegationInterceptionResult {
+            effective_tool_calls: effective,
+            intercepted_any: true,
+        };
+    }
+
     let (delegation_results, remaining_tool_calls) = if let Some(engine) = &state.delegation_engine
     {
         let adaptive_delegation_context =
@@ -149,6 +226,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
     }
 
     if !delegation_results.is_empty() {
+        state.delegations_this_turn += delegation_results.len() as u32;
         if !quiet {
             for result in &delegation_results {
                 for (style, line) in &result.preview_lines {
@@ -1771,5 +1849,50 @@ mod tests {
             "{:?}",
             state.tool_results
         );
+    }
+
+    #[tokio::test]
+    async fn intercept_delegations_refuses_after_per_turn_limit() {
+        let mut host = MockHost::new(Vec::new()).with_valid_tools(&["delegate"]);
+        let mut state = make_state();
+        state.delegation_engine = Some(make_test_delegation_engine());
+        // Simulate 3 delegations already executed this turn.
+        state.delegations_this_turn = 3;
+
+        let turn_result = HostTurnResult {
+            accum: crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum {
+                has_tool_calls: true,
+                tool_calls: vec![json!({
+                    "id": "call_4th",
+                    "type": "function",
+                    "function": {
+                        "name": "delegate",
+                        "arguments": "{\"task\":\"one more\",\"agents\":[\"coder\"]}"
+                    }
+                })],
+                ..crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum::default()
+            },
+            ttft_ms: Some(10),
+            edge_tool_round: Vec::new(),
+            error_kind: None,
+        };
+
+        let valid_tool_names = host.valid_tool_names().clone();
+        let result =
+            intercept_delegations(&mut host, &mut state, &turn_result, true, &valid_tool_names)
+                .await;
+
+        assert!(result.intercepted_any);
+        // Delegate call should NOT be in effective_tool_calls.
+        assert!(result.effective_tool_calls.is_empty());
+        // Error message injected into messages.
+        let last_msg = state.messages.last().unwrap();
+        let content = last_msg["content"].as_str().unwrap_or_default();
+        assert!(
+            content.contains("Delegation limit reached"),
+            "expected refusal message, got: {content}"
+        );
+        // Counter should NOT have incremented (delegation was refused).
+        assert_eq!(state.delegations_this_turn, 3);
     }
 }

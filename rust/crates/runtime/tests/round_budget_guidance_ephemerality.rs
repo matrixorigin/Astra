@@ -2,6 +2,8 @@
 //!
 //! The countdown-based round budget directive has been replaced by the
 //! anomaly-based `LoopCircuitBreaker`. These tests verify that:
+// These tests intentionally call deprecated functions to verify their no-op contract.
+#![allow(deprecated)]
 //!
 //!   * `round_budget_directive` always returns empty (agent never sees budget pressure)
 //!   * `synthesize_or_batch_directive` always returns empty

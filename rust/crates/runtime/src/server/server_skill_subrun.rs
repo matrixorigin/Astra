@@ -391,6 +391,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 .expect("valid dummy URL"),
             api_token: String::new(),
             delegation_engine: None,
+            delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: None,
             evolution_service: None,

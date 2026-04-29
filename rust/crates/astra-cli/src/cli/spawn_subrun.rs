@@ -264,6 +264,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             api: self.api.clone(),
             api_token: self.token.clone(),
             delegation_engine: None,
+            delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: None,
             evolution_service: None,

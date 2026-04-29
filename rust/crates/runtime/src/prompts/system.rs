@@ -1123,10 +1123,12 @@ const TASK_TYPE_KEYWORDS: &[(&str, &[&str])] = &[
 pub const ROUND_BUDGET_THRESHOLD: u32 = 8;
 pub const ROUND_BUDGET_HARD_LIMIT: u32 = 15;
 
+#[deprecated(note = "Circuit breaker replaces countdown budget. Always returns empty.")]
 pub fn round_budget_directive(_round_index: u32) -> String {
     String::new()
 }
 
+#[deprecated(note = "Circuit breaker replaces countdown budget. Always returns empty.")]
 pub fn round_budget_directive_with(_round_index: u32, _warning: u32, _limit: u32) -> String {
     String::new()
 }
@@ -1241,6 +1243,7 @@ fn trailing_tool_result_count(messages: &[serde_json::Value]) -> usize {
         .count()
 }
 
+#[deprecated(note = "Circuit breaker replaces countdown budget. Always returns empty.")]
 pub fn synthesize_or_batch_directive(
     _messages: &[serde_json::Value],
     _round_index: u32,
@@ -1365,6 +1368,7 @@ pub const STALL_NUDGE: &str = "You appear to be repeating the same tool calls. \
      Please try a different approach or summarize what you've found so far.";
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

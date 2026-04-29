@@ -594,6 +594,7 @@ pub(crate) async fn stream_chat_sse(
         api: p.api.clone(),
         api_token: p.token.to_string(),
         delegation_engine: p.delegation_engine,
+        delegations_this_turn: 0,
         project_context,
         checkpoint_gate: None,
         evolution_service: p.evolution_service.clone(),

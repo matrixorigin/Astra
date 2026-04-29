@@ -716,3 +716,94 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod pinned_budget_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn pinned_tools_included_even_with_tiny_budget() {
+        let schemas = vec![
+            json!({"function": {"name": "bash", "description": "Execute shell commands", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}),
+            json!({"function": {"name": "read_file", "description": "Read file contents", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}),
+            json!({"function": {"name": "str_replace", "description": "Replace text in files", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"}}, "required": ["path", "old_str", "new_str"]}}}),
+            json!({"function": {"name": "git_diff", "description": "Show git diff", "parameters": {"type": "object", "properties": {}}}}),
+            json!({"function": {"name": "git_status", "description": "Show git status", "parameters": {"type": "object", "properties": {}}}}),
+        ];
+
+        let registry = ToolRegistry::new(schemas);
+
+        // Verify pinned schemas are resolved
+        let pinned = registry.pinned_schemas();
+        let pinned_names: Vec<&str> = pinned.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            pinned_names.contains(&"bash"),
+            "bash should be pinned, got: {:?}",
+            pinned_names
+        );
+        assert!(
+            pinned_names.contains(&"read_file"),
+            "read_file should be pinned, got: {:?}",
+            pinned_names
+        );
+        assert!(
+            pinned_names.contains(&"str_replace"),
+            "str_replace should be pinned, got: {:?}",
+            pinned_names
+        );
+
+        // budget_select_measured with budget=0: pinned survive, dynamic excluded.
+        let git_diff_idx = TOOL_CATALOG
+            .iter()
+            .position(|t| t.name == "git_diff")
+            .expect("git_diff must exist in TOOL_CATALOG");
+        let git_status_idx = TOOL_CATALOG
+            .iter()
+            .position(|t| t.name == "git_status")
+            .expect("git_status must exist in TOOL_CATALOG");
+
+        let ranked = vec![(git_diff_idx, 0.8), (git_status_idx, 0.5)];
+        let result = registry.budget_select_measured(&ranked, 0);
+
+        let result_names: Vec<&str> = result
+            .iter()
+            .filter_map(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+            })
+            .collect();
+
+        // Pinned tools present (budget-exempt)
+        assert!(
+            result_names.contains(&"bash"),
+            "bash must survive zero budget, got: {:?}",
+            result_names
+        );
+        assert!(
+            result_names.contains(&"read_file"),
+            "read_file must survive zero budget, got: {:?}",
+            result_names
+        );
+        assert!(
+            result_names.contains(&"str_replace"),
+            "str_replace must survive zero budget, got: {:?}",
+            result_names
+        );
+        // Dynamic tools excluded — proves budget is actually enforced
+        assert!(
+            !result_names.contains(&"git_diff"),
+            "git_diff should be excluded at zero budget"
+        );
+        assert!(
+            !result_names.contains(&"git_status"),
+            "git_status should be excluded at zero budget"
+        );
+        assert_eq!(
+            result_names.len(),
+            3,
+            "only pinned tools should survive zero budget"
+        );
+    }
+}

@@ -1799,7 +1799,7 @@ impl ServerAgenticLoopHost {
             task_type,
             cache_cfg,
         );
-        let skill_injections: Vec<crate::turn::context_assembly_trace::SkillInjection> =
+        let skill_injections: Vec<astra_turn_core::context_assembly_trace::SkillInjection> =
             if active_skill_names.is_empty() {
                 vec![]
             } else {
@@ -1824,7 +1824,7 @@ impl ServerAgenticLoopHost {
                 let per = (hint_tokens / active_skill_names.len() as u32).max(1);
                 active_skill_names
                     .iter()
-                    .map(|name| crate::turn::context_assembly_trace::SkillInjection {
+                    .map(|name| astra_turn_core::context_assembly_trace::SkillInjection {
                         skill_name: (*name).to_string(),
                         skill_version: None,
                         tokens: per,
@@ -2003,12 +2003,7 @@ impl ServerAgenticLoopHost {
         } else {
             String::new()
         };
-        let tool_cfg = astra_config::runtime_config::RuntimeConfig::load().tool_selection;
-        let round_budget_hint = crate::prompts::round_budget_directive_with(
-            0,
-            tool_cfg.effective_round_budget_warning(),
-            tool_cfg.effective_round_budget_limit(),
-        );
+        let round_budget_hint = String::new(); // deprecated: circuit breaker replaces countdown budget
         let plan_resume = self
             .plan_resume_hint
             .read()
@@ -4084,6 +4079,7 @@ mod tests {
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: "test-token".to_string(),
             delegation_engine: None,
+            delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: None,
             evolution_service: None,

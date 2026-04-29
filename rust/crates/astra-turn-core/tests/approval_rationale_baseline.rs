@@ -19,9 +19,7 @@
 //! `#` are comments and skipped. Blank / whitespace-only lines ARE
 //! counted (they exercise the `Empty` rationale path).
 
-use astra_turn_core::cloud_approval_policy::{
-    BashApprovalReason, bash_command_approval_reason,
-};
+use astra_turn_core::cloud_approval_policy::{BashApprovalReason, bash_command_approval_reason};
 
 const CORPUS: &str = include_str!("fixtures/bash_command_corpus.txt");
 
@@ -77,7 +75,10 @@ fn read_only_majority_is_preserved() {
         "read-only ratio collapsed: {}/{} = {:.2} (expected >= 0.45). \
          Buckets: {:?}. Investigate `strip_benign_fd_redirects` or \
          `matches_read_only_prefix` for over-conservative changes.",
-        b.read_only, b.total, ratio, b
+        b.read_only,
+        b.total,
+        ratio,
+        b
     );
 }
 
@@ -92,7 +93,8 @@ fn write_indicators_are_still_flagged() {
         "write-indicator count collapsed to {} (expected >= 15). \
          Mutating commands no longer flagged — SAFETY regression. \
          Buckets: {:?}",
-        b.write_indicator, b
+        b.write_indicator,
+        b
     );
 }
 
@@ -102,7 +104,8 @@ fn shell_injection_is_still_detected() {
     assert!(
         b.shell_injection >= 2,
         "shell-injection count dropped to {} (expected >= 2). Buckets: {:?}",
-        b.shell_injection, b
+        b.shell_injection,
+        b
     );
 }
 
@@ -113,7 +116,8 @@ fn unknown_prefix_still_fires() {
         b.unknown_prefix >= 2,
         "unknown-prefix count dropped to {} (expected >= 2). \
          Allowlist may have grown too permissive. Buckets: {:?}",
-        b.unknown_prefix, b
+        b.unknown_prefix,
+        b
     );
 }
 

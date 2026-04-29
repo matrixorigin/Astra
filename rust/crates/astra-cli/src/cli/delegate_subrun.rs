@@ -331,7 +331,16 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
             repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
             max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
-            stall: Default::default(),
+            stall: {
+                let mut s = astra_runtime::turn::agentic_loop_host::StallTrackingState::default();
+                s.circuit_breaker = astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
+                    astra_turn_core::loop_circuit_breaker::BreakerConfig {
+                        absolute_max_rounds: 40,
+                        ..Default::default()
+                    },
+                );
+                s
+            },
             telemetry: Default::default(),
             skills: SkillState {
                 resolver: self.skill_resolver.clone(),
@@ -368,6 +377,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             api: self.api.clone(),
             api_token: self.token.clone(),
             delegation_engine: None,
+            delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: config.checkpoint_gate.clone(),
             evolution_service: None,
@@ -900,5 +910,47 @@ mod tests {
         );
         assert_eq!(r.len(), 4);
         assert!(!r.contains("bash"));
+    }
+
+    #[test]
+    fn all_tool_schemas_includes_write_tools() {
+        let schemas = crate::edge_tools::all_tool_schemas();
+        let names: Vec<&str> = schemas
+            .iter()
+            .filter_map(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+            })
+            .collect();
+        assert!(names.contains(&"bash"), "must include bash");
+        assert!(names.contains(&"str_replace"), "must include str_replace");
+        assert!(names.contains(&"write_file"), "must include write_file");
+        assert!(names.contains(&"read_file"), "must include read_file");
+        assert!(
+            names.len() > 20,
+            "expected >20 tool schemas, got {}",
+            names.len()
+        );
+    }
+
+    #[test]
+    fn coder_agent_restricted_tools_allows_write_tools() {
+        let mut registry = astra_services::coordination::AgentProfileRegistry::new();
+        register_default_agents(&mut registry);
+
+        let coder = registry.get("coder").unwrap();
+        let all_schemas = crate::edge_tools::all_tool_schemas();
+        let valid_tool_names =
+            astra_runtime::turn::tool_schema_prune::openai_tool_names_from_schemas(&all_schemas);
+
+        let restricted = build_restricted_tools(&coder.skill_filter, &valid_tool_names);
+
+        // Empty skill_filter = no restrictions = all tools available (including write tools)
+        assert!(
+            restricted.is_empty(),
+            "coder agent should have no tool restrictions, but got: {:?}",
+            restricted
+        );
     }
 }

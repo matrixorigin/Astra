@@ -50,6 +50,11 @@ pub struct BreakerConfig {
     pub stall_threshold: usize,
     /// Consecutive identical-signature rounds before tripping.
     pub repetition_threshold: usize,
+    /// Consecutive read-only rounds (tool_count > 0, no mutation) before tripping,
+    /// regardless of whether tool signatures are novel. Catches "creative but
+    /// unproductive exploration" where the agent uses different grep patterns
+    /// each round without ever writing.
+    pub read_only_stall_threshold: usize,
     /// Max rounds in HalfOpen before aborting.
     pub half_open_patience: usize,
     /// Hard ceiling (pure infrastructure guard, prevents infinite loops from bugs).
@@ -61,6 +66,7 @@ impl Default for BreakerConfig {
         Self {
             stall_threshold: 3,
             repetition_threshold: 3,
+            read_only_stall_threshold: 8,
             half_open_patience: 2,
             absolute_max_rounds: 200,
         }
@@ -135,7 +141,10 @@ impl LoopCircuitBreaker {
     }
 
     fn evaluate_closed(&mut self) -> BreakerAction {
-        if self.detect_repetition_stall() || self.detect_no_progress_stall() {
+        if self.detect_repetition_stall()
+            || self.detect_no_progress_stall()
+            || self.detect_prolonged_read_only_stall()
+        {
             self.state = BreakerState::Open;
             BreakerAction::InjectCorrection
         } else {
@@ -147,8 +156,10 @@ impl LoopCircuitBreaker {
         self.half_open_rounds += 1;
         let latest = &self.rounds[self.rounds.len() - 1];
 
-        // Recovery: agent produced a mutation or broke BOTH stall patterns.
-        let still_stalling = self.detect_repetition_stall() || self.detect_no_progress_stall();
+        // Recovery: agent produced a mutation or broke ALL stall patterns.
+        let still_stalling = self.detect_repetition_stall()
+            || self.detect_no_progress_stall()
+            || self.detect_prolonged_read_only_stall();
         if latest.produced_mutation || !still_stalling {
             self.state = BreakerState::Closed;
             self.half_open_rounds = 0;
@@ -184,6 +195,20 @@ impl LoopCircuitBreaker {
         tail.iter()
             .all(|r| !r.produced_mutation && r.tool_count > 0)
             && self.no_new_patterns_in_tail(n)
+    }
+
+    /// Detect prolonged read-only exploration: N consecutive rounds with
+    /// tool_count > 0 but no mutation, regardless of signature novelty.
+    /// This catches "creative but unproductive" loops where the agent uses
+    /// different grep/git_show patterns each round without ever writing.
+    fn detect_prolonged_read_only_stall(&self) -> bool {
+        let n = self.config.read_only_stall_threshold;
+        if n == 0 || self.rounds.len() < n {
+            return false;
+        }
+        let tail = &self.rounds[self.rounds.len() - n..];
+        tail.iter()
+            .all(|r| !r.produced_mutation && r.tool_count > 0)
     }
 
     /// Check if the last N rounds introduced any new tool signature not seen
@@ -273,13 +298,21 @@ mod tests {
     }
 
     #[test]
-    fn varied_exploration_does_not_trip_even_if_long() {
+    fn varied_exploration_trips_at_read_only_threshold() {
         let mut cb = LoopCircuitBreaker::new(BreakerConfig::default());
-        // Many exploration rounds but each with NEW tool signatures.
-        for i in 0..20 {
-            let action = cb.observe(signal(&[&format!("read_file:file{i}.rs")], false));
-            assert_eq!(action, BreakerAction::Continue);
+        // 7 exploration rounds (below read_only_stall_threshold of 8).
+        for i in 0..7 {
+            assert_eq!(
+                cb.observe(signal(&[&format!("read_file:file{i}.rs")], false)),
+                BreakerAction::Continue
+            );
         }
+        // Round 8 hits the read-only stall threshold.
+        assert_eq!(
+            cb.observe(signal(&["read_file:file7.rs"], false)),
+            BreakerAction::InjectCorrection
+        );
+        assert_eq!(cb.state(), BreakerState::Open);
     }
 
     // ─── Repetition stall detection ─────────────────────────────────────
@@ -494,5 +527,76 @@ mod tests {
         let action = cb.observe(signal(&["grep:new_pattern"], false));
         assert_eq!(action, BreakerAction::Continue);
         assert_eq!(cb.state(), BreakerState::Closed);
+    }
+
+    // ─── Prolonged read-only stall detection ────────────────────────────
+
+    #[test]
+    fn read_only_stall_does_not_trip_below_threshold() {
+        let mut cb = LoopCircuitBreaker::new(BreakerConfig::default());
+        // 7 rounds of unique read-only exploration (threshold is 8).
+        for i in 0..7 {
+            assert_eq!(
+                cb.observe(signal(&[&format!("grep:pattern{i}")], false)),
+                BreakerAction::Continue
+            );
+        }
+        assert_eq!(cb.state(), BreakerState::Closed);
+    }
+
+    #[test]
+    fn read_only_stall_mutation_resets_streak() {
+        let mut cb = LoopCircuitBreaker::new(BreakerConfig::default());
+        // 6 read-only rounds.
+        for i in 0..6 {
+            cb.observe(signal(&[&format!("grep:p{i}")], false));
+        }
+        // Mutation resets the streak.
+        cb.observe(signal(&["write_file:fix.rs"], true));
+        // 7 more read-only rounds (below threshold again).
+        for i in 0..7 {
+            assert_eq!(
+                cb.observe(signal(&[&format!("grep:q{i}")], false)),
+                BreakerAction::Continue
+            );
+        }
+        // Round 8 after mutation trips.
+        assert_eq!(
+            cb.observe(signal(&["grep:q7"], false)),
+            BreakerAction::InjectCorrection
+        );
+    }
+
+    #[test]
+    fn read_only_stall_empty_rounds_do_not_count() {
+        let mut cb = LoopCircuitBreaker::new(BreakerConfig::default());
+        // Interleave read-only rounds with empty (text-only) rounds.
+        for i in 0..20 {
+            if i % 2 == 0 {
+                cb.observe(signal(&[&format!("grep:p{i}")], false));
+            } else {
+                // Empty round (tool_count=0) breaks the read-only streak.
+                cb.observe(RoundSignal {
+                    tool_signatures: BTreeSet::new(),
+                    produced_mutation: false,
+                    tool_count: 0,
+                });
+            }
+        }
+        // Never trips because empty rounds break the consecutive streak.
+        assert_eq!(cb.state(), BreakerState::Closed);
+    }
+
+    #[test]
+    fn read_only_stall_disabled_when_threshold_zero() {
+        let mut cb = LoopCircuitBreaker::new(BreakerConfig {
+            read_only_stall_threshold: 0,
+            ..Default::default()
+        });
+        // 50 read-only rounds — never trips because threshold is disabled.
+        for i in 0..50 {
+            let action = cb.observe(signal(&[&format!("grep:p{i}")], false));
+            assert_eq!(action, BreakerAction::Continue);
+        }
     }
 }

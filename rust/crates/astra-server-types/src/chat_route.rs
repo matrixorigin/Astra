@@ -9,6 +9,9 @@ pub struct ChatRouteResponse {
     tier: u8,
     matched_by: String,
     tool_filter: String,
+    /// Deprecated: the actual per-turn round limit is now governed by
+    /// `LoopCircuitBreaker::absolute_max_rounds`. This field is retained for
+    /// API backward compatibility and reflects a route-level hint only.
     max_tool_rounds: u32,
     task_type: String,
 }

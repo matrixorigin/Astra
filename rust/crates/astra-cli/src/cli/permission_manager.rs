@@ -6,7 +6,7 @@ use astra_runtime::tool_sandbox::{
 };
 use astra_runtime::{compensation_prompt_note, explicit_approval_reason};
 use astra_thin_client::ApprovalKind;
-use astra_turn_core::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind};
+use astra_turn_core::cloud_approval_policy::{CloudGatedToolKind, bash_command_approval_reason, cloud_gated_tool_kind};
 use astra_turn_core::tool_argument_hints::{
     command_hint_from_args, path_hint_from_args, permission_prompt_primary_detail,
 };

@@ -190,10 +190,6 @@ const WRITE_INDICATORS: &[&str] = &[
     "exec ",
 ];
 
-fn effective_bash_command(command: &str) -> &str {
-    command.trim()
-}
-
 /// Strip benign fd forwarding (`2>&1`, `1>&2`, `&>/dev/null`, `>/dev/null`,
 /// …) so downstream redirect scans don't flag pure stderr/stdout plumbing as
 /// a workspace mutation.
@@ -488,7 +484,7 @@ pub fn bash_command_is_read_only(command: &str) -> bool {
 /// 4. For each segment: reject on write indicators, then require read-only prefix
 /// 5. Default to [`BashApprovalReason::UnknownPrefix`] for unknown commands
 pub fn bash_command_approval_reason(command: &str) -> Option<BashApprovalReason> {
-    let cmd = effective_bash_command(command);
+    let cmd = command.trim();
 
     if cmd.is_empty() {
         return Some(BashApprovalReason::Empty);

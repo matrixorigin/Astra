@@ -1,4 +1,5 @@
 #![cfg(feature = "bridge-e2e-hooks")]
+#![allow(deprecated)]
 //! Comprehensive bridge E2E tests — persistence, multi-turn, errors, cancellation.
 //!
 //! These tests complement `edge_cloud_round_trip_e2e.rs` by focusing on:
