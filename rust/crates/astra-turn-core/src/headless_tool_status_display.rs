@@ -4,19 +4,7 @@ use serde_json::{Map, Value};
 
 use astra_text_utils::str_preview::{github_repo_display, shorten_path, truncate_str};
 
-#[derive(Debug, Clone, Copy)]
-enum ToolCat {
-    Github,
-    File,
-    Shell,
-    Search,
-    Git,
-    Code,
-    Mo,
-    Memory,
-    Utility,
-    Other,
-}
+use crate::tool_categories::{ToolDisplayCategory, registry};
 
 fn format_path_location(
     path: &str,
@@ -36,57 +24,6 @@ fn format_path_location(
             format!("{short_path}:{line}")
         }
         (None, _) => shorten_path(path, max_chars),
-    }
-}
-
-fn categorize(name: &str) -> ToolCat {
-    match name {
-        n if n.starts_with("github_") => ToolCat::Github,
-        "read_file" | "view_file" | "write_file" | "create_file" | "edit_file" | "str_replace"
-        | "multi_edit" | "delete_file" => ToolCat::File,
-        "run_command" | "shell" | "exec" | "bash" | "powershell" | "run_build_test" => {
-            ToolCat::Shell
-        }
-        "search" | "grep" | "find" | "glob" | "list_dir" | "tool_search" | "web_search"
-        | "web_fetch" => ToolCat::Search,
-        "git_diff" | "git_log" | "git_show" | "git_blame" | "git_file_history"
-        | "git_contributors" | "git_log_search" | "git_status" | "git_commit"
-        | "git_revert_commit" | "git_stash" | "git_checkout_file" | "git_worktree" => ToolCat::Git,
-        "find_definition" | "find_references" | "symbol_search" | "symbols" | "call_graph"
-        | "hover_info" | "type_hierarchy" | "rename_symbol" | "dead_code" | "extract_members"
-        | "lsp" => ToolCat::Code,
-        "mo_query" | "mo_snapshot" | "mo_branch" => ToolCat::Mo,
-        n if n.starts_with("memoria_") || n.starts_with("memory_") => ToolCat::Memory,
-        "ask_user"
-        | "sleep"
-        | "send_message"
-        | "spawn_agent"
-        | "diagnose"
-        | "env"
-        | "notebook_edit"
-        | "config"
-        | "brief"
-        | "share_context"
-        | "query_context"
-        | "task_create"
-        | "task_list"
-        | "task_get"
-        | "task_update"
-        | "task_stop"
-        | "get_agent_info"
-        | "reflect"
-        | "context_analysis"
-        | "run_chain"
-        | "rollback_file_edits"
-        | "rollback_database_snapshots"
-        | "rollback_turn_actions"
-        | "adjust_config"
-        | "prioritize_tool"
-        | "deprioritize_tool"
-        | "set_goal"
-        | "compress_context"
-        | "rollback_session_state" => ToolCat::Utility,
-        _ => ToolCat::Other,
     }
 }
 
@@ -792,17 +729,17 @@ fn fmt_default(obj: &Map<String, Value>) -> Option<String> {
 #[must_use]
 pub fn tool_call_detail(name: &str, args: &Value) -> Option<String> {
     let obj = args.as_object()?;
-    match categorize(name) {
-        ToolCat::Github => fmt_github_tool(name, obj),
-        ToolCat::File => fmt_file_tool(name, obj),
-        ToolCat::Shell => fmt_shell_tool(name, obj),
-        ToolCat::Search => fmt_search_tool(name, obj),
-        ToolCat::Git => fmt_git_tool(name, obj),
-        ToolCat::Code => fmt_code_tool(name, obj),
-        ToolCat::Mo => fmt_mo_tool(name, obj),
-        ToolCat::Memory => fmt_memory_tool(name, obj),
-        ToolCat::Utility => fmt_utility_tool(name, obj),
-        ToolCat::Other => fmt_default(obj),
+    match registry().display_category(name) {
+        ToolDisplayCategory::Github => fmt_github_tool(name, obj),
+        ToolDisplayCategory::File => fmt_file_tool(name, obj),
+        ToolDisplayCategory::Shell => fmt_shell_tool(name, obj),
+        ToolDisplayCategory::Search => fmt_search_tool(name, obj),
+        ToolDisplayCategory::Git => fmt_git_tool(name, obj),
+        ToolDisplayCategory::Code => fmt_code_tool(name, obj),
+        ToolDisplayCategory::Mo => fmt_mo_tool(name, obj),
+        ToolDisplayCategory::Memory => fmt_memory_tool(name, obj),
+        ToolDisplayCategory::Utility => fmt_utility_tool(name, obj),
+        ToolDisplayCategory::Other => fmt_default(obj),
     }
 }
 

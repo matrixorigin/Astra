@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use astra_text_utils::str_preview::truncate_str;
 
-use super::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind};
+use super::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind_with_args};
 
 /// Parse `function.arguments` from an LLM tool call: either a JSON object or a string of JSON.
 pub fn normalize_llm_function_arguments(arguments: &Value) -> Value {
@@ -36,7 +36,7 @@ pub fn permission_prompt_primary_detail(tool_name: &str, args: &Value) -> Option
     if tool_name.starts_with("mcp_") {
         return Some(mcp_args_summary(args));
     }
-    match cloud_gated_tool_kind(tool_name) {
+    match cloud_gated_tool_kind_with_args(tool_name, Some(args)) {
         Some(CloudGatedToolKind::Execute) => command_hint_from_args(args).map(String::from),
         Some(CloudGatedToolKind::Write) => path_hint_from_args(args),
         None => command_hint_from_args(args)

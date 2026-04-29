@@ -187,7 +187,7 @@ impl SseStreamHost for SpeculatingHost {
         if Some(&name) == self.deny_tool.as_ref() {
             return;
         }
-        if !should_speculate(&name, None) {
+        if !should_speculate(&name, None, None) {
             return;
         }
         let _ = exec

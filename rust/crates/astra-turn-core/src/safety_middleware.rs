@@ -7,7 +7,9 @@ use serde_json::Value;
 use astra_sandbox::{CommandRisk, analyze_command_risks};
 
 const DESTRUCTIVE_KEYWORDS: &[&str] = &["DROP", "DELETE", "TRUNCATE", "ALTER", "GRANT", "REVOKE"];
-const SHELL_EXECUTION_TOOLS: &[&str] = &["bash", "exec", "run_command", "shell"];
+fn is_shell_execution_tool(name: &str) -> bool {
+    crate::tool_categories::registry().is_shell(name)
+}
 
 /// Safe commands that can be used inside command substitution `$(...)`.
 /// These commands only read state and don't have dangerous side effects.
@@ -430,7 +432,7 @@ fn shell_obfuscation_guard(
     tool_name: &str,
     tool_args: &Value,
 ) -> Result<Option<String>, SafetyGuardEvalError> {
-    if !SHELL_EXECUTION_TOOLS.contains(&tool_name) {
+    if !is_shell_execution_tool(tool_name) {
         return Ok(None);
     }
     let Some(command) = tool_args.get("command").and_then(Value::as_str) else {

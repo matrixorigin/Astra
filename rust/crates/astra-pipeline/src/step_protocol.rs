@@ -1425,46 +1425,7 @@ pub struct CachedToolResult {
     pub cached_at: u64,
 }
 
-/// Tool idempotency classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolIdempotency {
-    /// Safe to re-execute (no side effects): read_file, grep, git_log, etc.
-    PureRead,
-    /// Overwrite-style write (safe if file unchanged): write_file
-    IdempotentWrite,
-    /// Must check cache, never blindly re-execute: bash, github_create_issue
-    NonIdempotent,
-}
-
-/// Classify a tool's idempotency level.
-pub fn classify_tool_idempotency(tool_name: &str) -> ToolIdempotency {
-    match tool_name {
-        // Pure read tools — safe to re-execute
-        "read_file" | "grep" | "glob" | "list_dir" | "git_status" | "git_log" | "git_diff"
-        | "git_blame" | "git_file_history" | "git_contributors" | "git_log_search"
-        | "github_list_prs" | "github_get_pr" | "github_list_issues" | "github_get_issue"
-        | "github_ci_status" | "github_repo_stats" | "mo_query" | "memory_search"
-        | "memory_profile" | "web_fetch" | "get_agent_info" | "reflect" => {
-            ToolIdempotency::PureRead
-        }
-
-        // Idempotent writes — overwrite semantics
-        "write_file" => ToolIdempotency::IdempotentWrite,
-
-        // Non-idempotent — must cache result
-        "bash"
-        | "str_replace"
-        | "github_create_issue"
-        | "memory_store"
-        | "memory_purge"
-        | "memory_correct"
-        | "mo_snapshot"
-        | "mo_branch" => ToolIdempotency::NonIdempotent,
-
-        // Unknown tools: treat as non-idempotent (safe default)
-        _ => ToolIdempotency::NonIdempotent,
-    }
-}
+pub use astra_turn_types::{ToolIdempotency, classify_tool_idempotency};
 
 /// Trait for idempotency caches. InMemory for local, MatrixOne for cloud.
 pub trait IdempotencyCache {

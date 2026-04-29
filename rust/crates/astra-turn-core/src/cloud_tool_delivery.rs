@@ -15,7 +15,7 @@ use uuid::Uuid;
 use futures_util::stream::StreamExt;
 
 use crate::action_compensation::{compensation_prompt_note, explicit_approval_reason};
-use crate::cloud_approval_policy::{bash_command_is_read_only, edge_tool_requires_cloud_approval};
+use crate::cloud_approval_policy::edge_tool_requires_cloud_approval_with_args;
 use crate::edge_ledger::{
     DEFAULT_POLL_INTERVAL_MS, MSG_TOOL_LEDGER_TIMEOUT, approval_callback_key,
     persist_value_for_ledger_tool_result, take_ledger_entry, tool_callback_key,
@@ -48,19 +48,9 @@ fn cloud_tool_requires_approval(tool_call: &Value) -> bool {
         .and_then(|f| f.get("name"))
         .and_then(Value::as_str)
         .unwrap_or("");
-
-    // Special handling for bash: check if command is read-only
-    if name == "bash" || name == "shell" || name == "exec" || name == "run_command" {
-        let args = raw_tool_arguments(tool_call);
-        let parsed = normalize_llm_function_arguments(&args);
-        if let Some(command) = parsed.get("command").and_then(Value::as_str)
-            && bash_command_is_read_only(command)
-        {
-            return false; // Read-only bash commands don't need approval
-        }
-    }
-
-    edge_tool_requires_cloud_approval(name)
+    let raw = raw_tool_arguments(tool_call);
+    let parsed = normalize_llm_function_arguments(&raw);
+    edge_tool_requires_cloud_approval_with_args(name, Some(&parsed))
 }
 
 fn raw_tool_arguments(tool_call: &Value) -> Value {

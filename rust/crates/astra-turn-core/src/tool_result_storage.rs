@@ -6,8 +6,6 @@
 //! reference.  This prevents oversized tool outputs from bloating the LLM
 //! context window while still preserving the full output for later retrieval.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 /// Maximum length of the human-readable portion of a sanitized filename.
@@ -34,9 +32,9 @@ fn safe_filename_stem(tool_call_id: &str) -> String {
     if readable.chars().count() > SAFE_ID_MAX_READABLE {
         readable = readable.chars().take(SAFE_ID_MAX_READABLE).collect();
     }
-    let mut hasher = DefaultHasher::new();
-    tool_call_id.hash(&mut hasher);
-    let suffix = hasher.finish();
+    // FNV-1a 64-bit: stable and deterministic across processes/Rust versions,
+    // unlike std::collections::hash_map::DefaultHasher which has no stability guarantees.
+    let suffix = fnv1a_64(tool_call_id.as_bytes());
     format!("{readable}-{suffix:016x}")
 }
 
@@ -57,6 +55,16 @@ const PERSISTED_TAG_CLOSE: &str = "</persisted-output>";
 
 /// Subdirectory under the session folder for tool result files.
 const TOOL_RESULTS_SUBDIR: &str = "tool-results";
+
+/// FNV-1a 64-bit hash — stable and deterministic across processes and Rust versions.
+fn fnv1a_64(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -111,6 +119,8 @@ pub fn maybe_persist_tool_result(
 pub fn maybe_persist_tool_result_unconditional(
     session_dir: &Path,
     tool_call_id: &str,
+    // tool_name is reserved for future metadata embedding in the persisted file header.
+    // Currently unused because the file is identified solely by tool_call_id.
     _tool_name: &str,
     content: &str,
 ) -> bool {
@@ -309,6 +319,14 @@ mod tests {
         assert!(replacement.contains("line "));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fnv1a_64_known_vectors() {
+        // empty string → offset basis
+        assert_eq!(super::fnv1a_64(b""), 0xcbf29ce484222325);
+        // "a" → well-known FNV-1a-64 value
+        assert_eq!(super::fnv1a_64(b"a"), 0xaf63dc4c8601ec8c);
     }
 
     #[test]

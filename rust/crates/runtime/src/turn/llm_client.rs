@@ -1730,8 +1730,16 @@ async fn collect_llm_stream(
         };
         // Parse usage from any chunk
         if let Some(u) = chunk.get("usage").and_then(Value::as_object) {
-            let prompt = u.get("prompt_tokens").and_then(Value::as_i64);
-            let completion = u.get("completion_tokens").and_then(Value::as_i64);
+            // OpenAI/Anthropic: prompt_tokens / completion_tokens
+            // Bedrock Converse: inputTokens / outputTokens
+            let prompt = u
+                .get("prompt_tokens")
+                .and_then(Value::as_i64)
+                .or_else(|| u.get("inputTokens").and_then(Value::as_i64));
+            let completion = u
+                .get("completion_tokens")
+                .and_then(Value::as_i64)
+                .or_else(|| u.get("outputTokens").and_then(Value::as_i64));
             if prompt.is_some() || completion.is_some() {
                 let mut usage_map = Map::new();
                 if let Some(value) = prompt {
@@ -1742,6 +1750,29 @@ async fn collect_llm_stream(
                 }
                 if let (Some(p), Some(c)) = (prompt, completion) {
                     usage_map.insert("total".to_string(), Value::from(p + c));
+                }
+                // Cache tokens: OpenAI / Anthropic / Bedrock
+                let cache_read = u
+                    .get("prompt_tokens_details")
+                    .and_then(|d| d.get("cached_tokens"))
+                    .and_then(Value::as_i64)
+                    .or_else(|| u.get("cache_read_input_tokens").and_then(Value::as_i64))
+                    .or_else(|| u.get("cacheReadInputTokens").and_then(Value::as_i64))
+                    .or_else(|| u.get("cacheReadInputTokensCount").and_then(Value::as_i64));
+                let cache_creation = u
+                    .get("prompt_tokens_details")
+                    .and_then(|d| d.get("cache_creation_input_tokens"))
+                    .and_then(Value::as_i64)
+                    .or_else(|| u.get("cache_creation_input_tokens").and_then(Value::as_i64))
+                    .or_else(|| u.get("cacheWriteInputTokens").and_then(Value::as_i64))
+                    .or_else(|| u.get("cacheWriteInputTokensCount").and_then(Value::as_i64));
+                if let Some(cr) = cache_read {
+                    usage_map.insert("cache_read".to_string(), Value::from(cr));
+                    usage_map.insert("cache_read_input_tokens".to_string(), Value::from(cr));
+                }
+                if let Some(cc) = cache_creation {
+                    usage_map.insert("cache_creation".to_string(), Value::from(cc));
+                    usage_map.insert("cache_creation_input_tokens".to_string(), Value::from(cc));
                 }
                 usage = usage_map;
                 made_progress = true;
@@ -3069,6 +3100,124 @@ mod tests {
                 }
                 other => panic!("expected transport error, got {other:?}"),
             }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial(stream_idle_env)]
+    async fn collect_llm_stream_bedrock_usage_input_tokens_output_tokens() {
+        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+            // Bedrock Converse streaming: usage uses inputTokens/outputTokens instead of
+            // prompt_tokens/completion_tokens. Verify the fallback parsing works.
+            let d1 = json!({"choices":[{"delta":{"content":"Hi"}}]});
+            let u = json!({"usage":{"inputTokens":100,"outputTokens":50}});
+            let body = format!("data: {d1}\n\ndata: {u}\n\n");
+            let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+            let res = collect_llm_stream(
+                stream,
+                "anthropic.claude-sonnet-4-20250514-v1:0",
+                Instant::now(),
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+            )
+            .await
+            .expect("collect");
+            assert_eq!(res.full_text, "Hi");
+            assert_eq!(res.usage.get("prompt").and_then(Value::as_i64), Some(100));
+            assert_eq!(
+                res.usage.get("completion").and_then(Value::as_i64),
+                Some(50)
+            );
+            assert_eq!(res.usage.get("total").and_then(Value::as_i64), Some(150));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial(stream_idle_env)]
+    async fn collect_llm_stream_bedrock_cache_read_input_tokens() {
+        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+            // Bedrock Converse: cacheReadInputTokens / cacheWriteInputTokens
+            let d1 = json!({"choices":[{"delta":{"content":"Cached"}}]});
+            let u = json!({"usage":{"inputTokens":200,"outputTokens":10,"cacheReadInputTokens":150,"cacheWriteInputTokens":50}});
+            let body = format!("data: {d1}\n\ndata: {u}\n\n");
+            let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+            let res = collect_llm_stream(
+                stream,
+                "anthropic.claude-sonnet-4-20250514-v1:0",
+                Instant::now(),
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+            )
+            .await
+            .expect("collect");
+            assert_eq!(res.usage.get("prompt").and_then(Value::as_i64), Some(200));
+            assert_eq!(res.usage.get("completion").and_then(Value::as_i64), Some(10));
+            assert_eq!(res.usage.get("cache_read").and_then(Value::as_i64), Some(150));
+            assert_eq!(res.usage.get("cache_read_input_tokens").and_then(Value::as_i64), Some(150));
+            assert_eq!(res.usage.get("cache_creation").and_then(Value::as_i64), Some(50));
+            assert_eq!(res.usage.get("cache_creation_input_tokens").and_then(Value::as_i64), Some(50));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial(stream_idle_env)]
+    async fn collect_llm_stream_bedrock_cache_read_input_tokens_count() {
+        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+            // Some Bedrock models use cacheReadInputTokensCount / cacheWriteInputTokensCount
+            let d1 = json!({"choices":[{"delta":{"content":"Alt"}}]});
+            let u = json!({"usage":{"inputTokens":300,"outputTokens":20,"cacheReadInputTokensCount":200,"cacheWriteInputTokensCount":100}});
+            let body = format!("data: {d1}\n\ndata: {u}\n\n");
+            let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+            let res = collect_llm_stream(
+                stream,
+                "anthropic.claude-3-5-sonnet-v1:0",
+                Instant::now(),
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+            )
+            .await
+            .expect("collect");
+            assert_eq!(res.usage.get("prompt").and_then(Value::as_i64), Some(300));
+            assert_eq!(res.usage.get("cache_read").and_then(Value::as_i64), Some(200));
+            assert_eq!(res.usage.get("cache_creation").and_then(Value::as_i64), Some(100));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial(stream_idle_env)]
+    async fn collect_llm_stream_bedrock_usage_without_cache_still_counts_tokens() {
+        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+            // Bedrock response with only inputTokens/outputTokens, no cache fields
+            let d1 = json!({"choices":[{"delta":{"content":"No cache"}}]});
+            let u = json!({"usage":{"inputTokens":50,"outputTokens":25}});
+            let body = format!("data: {d1}\n\ndata: {u}\n\n");
+            let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+            let res = collect_llm_stream(
+                stream,
+                "anthropic.claude-3-haiku-v1:0",
+                Instant::now(),
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+            )
+            .await
+            .expect("collect");
+            assert_eq!(res.usage.get("prompt").and_then(Value::as_i64), Some(50));
+            assert_eq!(
+                res.usage.get("completion").and_then(Value::as_i64),
+                Some(25)
+            );
+            assert_eq!(res.usage.get("total").and_then(Value::as_i64), Some(75));
+            // No cache fields → should not appear
+            assert_eq!(res.usage.get("cache_read"), None);
+            assert_eq!(res.usage.get("cache_creation"), None);
         })
         .await;
     }

@@ -7,9 +7,11 @@ pub mod continuity;
 mod implicit_feedback;
 mod result_quality;
 pub mod session_facts;
+mod tool_idempotency;
 
 pub use implicit_feedback::{
     ImplicitSignal, StructuredFeedback, detect_implicit_feedback_signal,
     implicit_feedback_context_injection, implicit_feedback_rating,
 };
 pub use result_quality::{ResultQuality, classify_result, quality_feedback};
+pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};

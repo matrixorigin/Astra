@@ -989,12 +989,8 @@ impl<'a> CliSseStreamHost<'a> {
     /// side effects so their errors are recoverable — the model can retry or
     /// use a different approach.
     fn tool_error_triggers_turn_rollback(tool: &str, args: &Value) -> bool {
-        if tool == "bash" {
-            let command = args.get("command").and_then(Value::as_str).unwrap_or("");
-            return !astra_turn_core::cloud_approval_policy::bash_command_is_read_only(command);
-        }
-        // Non-bash tools: only cloud-gated (mutation) tools trigger rollback.
-        astra_turn_core::cloud_approval_policy::cloud_gated_tool_kind(tool).is_some()
+        astra_turn_core::cloud_approval_policy::cloud_gated_tool_kind_with_args(tool, Some(args))
+            .is_some()
     }
 
     fn batch_transaction_boundary_violation(tool: &str, args: &Value) -> Option<String> {
@@ -2819,7 +2815,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         if call_id.is_empty() {
             return;
         }
-        if !astra_turn_core::streaming_tool_exec::should_speculate(&tool_name, None) {
+        let args = astra_turn_core::parallel_tool_exec::parse_tool_args(tool_call);
+        if !astra_turn_core::streaming_tool_exec::should_speculate(&tool_name, args.as_ref(), None)
+        {
             return;
         }
         tracing::debug!(

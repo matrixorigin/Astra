@@ -8,6 +8,7 @@ use astra_runtime::{compensation_prompt_note, explicit_approval_reason};
 use astra_thin_client::ApprovalKind;
 use astra_turn_core::cloud_approval_policy::{
     CloudGatedToolKind, bash_command_approval_reason, cloud_gated_tool_kind,
+    cloud_gated_tool_kind_with_args,
 };
 use astra_turn_core::tool_argument_hints::{
     command_hint_from_args, path_hint_from_args, permission_prompt_primary_detail,
@@ -75,7 +76,7 @@ fn content_aware_fingerprint(
 ) -> astra_turn_core::approval_fingerprint::ApprovalFingerprint {
     use astra_turn_core::approval_fingerprint::ApprovalFingerprint;
 
-    match cloud_gated_tool_kind(name) {
+    match cloud_gated_tool_kind_with_args(name, Some(args)) {
         Some(CloudGatedToolKind::Execute) => {
             if let Some(cmd) = command_hint_from_args(args) {
                 let lower = cmd.to_ascii_lowercase();
@@ -609,7 +610,9 @@ impl PermissionManager {
             PermissionMode::Deny => return ApprovalDecision::Deny,
             PermissionMode::Prompt => {}
         }
-        let fp = match (cloud_gated_tool_kind(tool), detail) {
+        let synthetic_args = detail.map(|d| serde_json::json!({"command": d}));
+        let kind = cloud_gated_tool_kind_with_args(tool, synthetic_args.as_ref());
+        let fp = match (kind, detail) {
             (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
                 astra_turn_core::approval_fingerprint::ApprovalFingerprint::shell(tool, cmd, false)
             }
@@ -831,7 +834,9 @@ impl PermissionManager {
             PermissionMode::Prompt => {}
         }
 
-        let fp = match (cloud_gated_tool_kind(tool), detail) {
+        let synthetic_args = detail.map(|d| serde_json::json!({"command": d}));
+        let kind = cloud_gated_tool_kind_with_args(tool, synthetic_args.as_ref());
+        let fp = match (kind, detail) {
             (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
                 astra_turn_core::approval_fingerprint::ApprovalFingerprint::shell(tool, cmd, false)
             }
@@ -858,6 +863,14 @@ impl PermissionManager {
 
     fn classify(name: &str) -> SideEffect {
         match cloud_gated_tool_kind(name) {
+            Some(CloudGatedToolKind::Execute) => SideEffect::Execute,
+            Some(CloudGatedToolKind::Write) => SideEffect::Write,
+            None => SideEffect::Read,
+        }
+    }
+
+    fn classify_with_args(name: &str, args: &serde_json::Value) -> SideEffect {
+        match cloud_gated_tool_kind_with_args(name, Some(args)) {
             Some(CloudGatedToolKind::Execute) => SideEffect::Execute,
             Some(CloudGatedToolKind::Write) => SideEffect::Write,
             None => SideEffect::Read,
@@ -920,6 +933,9 @@ impl PermissionManager {
     }
 
     fn execute_decision(name: &str, args: &serde_json::Value) -> ExecuteDecision {
+        // Use name-only kind to determine if this is a shell tool —
+        // execute_decision evaluates the command content's risk level
+        // and must see the command even for read-only commands.
         let cmd_str = match cloud_gated_tool_kind(name) {
             Some(CloudGatedToolKind::Execute) => command_hint_from_args(args).unwrap_or(""),
             _ => return ExecuteDecision::Ask,
@@ -1019,7 +1035,7 @@ impl PermissionManager {
     }
 
     fn format_tool_display(name: &str, args: &serde_json::Value) -> (String, Option<String>) {
-        let side = Self::classify(name);
+        let side = Self::classify_with_args(name, args);
         let icon = match side {
             SideEffect::Execute => "▶",
             SideEffect::Write => "✎",
@@ -1140,7 +1156,9 @@ impl PermissionManager {
         match choice {
             'y' => ApprovalDecision::Allow,
             'a' => {
-                let fp = match (cloud_gated_tool_kind(tool), detail) {
+                let synthetic_args = detail.map(|d| serde_json::json!({"command": d}));
+                let kind = cloud_gated_tool_kind_with_args(tool, synthetic_args.as_ref());
+                let fp = match (kind, detail) {
                     (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
                         astra_turn_core::approval_fingerprint::ApprovalFingerprint::shell(
                             tool, cmd, false,
@@ -1165,7 +1183,9 @@ impl PermissionManager {
                 ApprovalDecision::Allow
             }
             's' => {
-                let fp = match (cloud_gated_tool_kind(tool), detail) {
+                let synthetic_args = detail.map(|d| serde_json::json!({"command": d}));
+                let kind = cloud_gated_tool_kind_with_args(tool, synthetic_args.as_ref());
+                let fp = match (kind, detail) {
                     (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
                         astra_turn_core::approval_fingerprint::ApprovalFingerprint::shell(
                             tool, cmd, false,
@@ -1229,7 +1249,7 @@ impl PermissionManager {
             return false;
         }
 
-        let side_effect = Self::classify(name);
+        let side_effect = Self::classify_with_args(name, args);
 
         // Step 2: Git safety checks.
         // Hard violations always require explicit approval.
@@ -1476,7 +1496,7 @@ impl PermissionManager {
         }
 
         // Step 2: Read-only tools always allowed (before overrides, same as check()).
-        let side_effect = Self::classify(name);
+        let side_effect = Self::classify_with_args(name, args);
 
         // Step 3: Git safety checks.
         // Hard violations (injection, config manipulation) are bypass-immune.
@@ -2230,12 +2250,30 @@ mod tests {
     // ── format_tool_display ───────────────────────────────────────────────────
 
     #[test]
-    fn format_shows_command_for_bash() {
+    fn format_shows_read_icon_for_read_only_bash() {
         let (header, detail) =
             PermissionManager::format_tool_display("bash", &serde_json::json!({"command": "ls"}));
         assert!(header.contains("bash"));
-        assert!(header.contains("▶"));
+        // "ls" is read-only — shows read icon, not execute icon
+        assert!(
+            header.contains("◉"),
+            "read-only bash should show ◉, got: {header}"
+        );
         assert!(detail.unwrap().contains("ls"));
+    }
+
+    #[test]
+    fn format_shows_execute_icon_for_mutating_bash() {
+        let (header, detail) = PermissionManager::format_tool_display(
+            "bash",
+            &serde_json::json!({"command": "rm -rf /"}),
+        );
+        assert!(header.contains("bash"));
+        assert!(
+            header.contains("▶"),
+            "mutating bash should show ▶, got: {header}"
+        );
+        assert!(detail.unwrap().contains("rm"));
     }
 
     #[test]

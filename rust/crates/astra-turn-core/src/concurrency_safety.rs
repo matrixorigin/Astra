@@ -1,32 +1,24 @@
-//! Concurrency-safety metadata for tool calls (gap #3).
+//! Concurrency-safety registry for **dynamic / MCP tools**.
 //!
-//! Replaces the static `READ_ONLY_TOOLS` list in
-//! [`crate::parallel_tool_exec`] with a registry-backed declaration so
-//! tools (including MCP-provided ones) can register their own concurrency
-//! semantics without patching a central list.
+//! Static tools are classified by [`crate::tool_categories::classify`]
+//! which is args-aware and authoritative. This module provides a
+//! process-wide registry for tools discovered at runtime (MCP servers,
+//! plugins) that are not in the static tool table.
 //!
 //! ## Levels
 //!
 //! * [`ConcurrencySafety::ReadOnly`] — pure reads, may run fully in
-//!   parallel with each other and with concurrent writes to unrelated
-//!   resources.
-//! * [`ConcurrencySafety::Mutating`] — may modify state; must not run
-//!   concurrently with reads or writes of the same resource. The
-//!   executor serializes these after all read-only calls complete.
-//! * [`ConcurrencySafety::Serial`] — stronger form of mutating; must be
-//!   the only tool running when it executes (e.g. shell / bash that
-//!   affects arbitrary state). Sibling mutating tools are aborted on
-//!   error to match claude-code semantics.
-//! * [`ConcurrencySafety::Unknown`] — fallback when the tool isn't
-//!   registered. The executor treats `Unknown` as `Mutating` to stay
-//!   safe by default.
+//!   parallel with each other.
+//! * [`ConcurrencySafety::Mutating`] — may modify state; serialized
+//!   after all read-only calls complete.
+//! * [`ConcurrencySafety::Serial`] — must be the only tool running.
+//! * [`ConcurrencySafety::Unknown`] — fallback; treated as `Mutating`.
 //!
-//! ## Integration path
+//! ## Usage
 //!
-//! The registry is additive: existing `is_read_only_tool` callers keep
-//! working. A helper [`ConcurrencySafetyRegistry::bootstrap_default`]
-//! seeds the canonical read-only list from `parallel_tool_exec` so
-//! migration to the new trait can proceed tool-by-tool.
+//! MCP tools call [`global_register`] on load. The parallel executor
+//! falls back to [`global_is_parallelizable`] for names not in the
+//! static table.
 
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
@@ -83,33 +75,13 @@ impl ConcurrencySafetyRegistry {
         Self::default()
     }
 
-    /// Seed the registry with the canonical read-only tools. Call once
-    /// at runtime startup; later callers may override individual entries
-    /// via [`Self::register`].
+    /// Create an empty registry for MCP / dynamic tool registrations.
+    ///
+    /// Static tools are classified by [`crate::tool_categories::classify`]
+    /// which is consulted first by the parallel executor. This registry
+    /// is only a fallback for dynamically discovered tools.
     pub fn bootstrap_default() -> Self {
-        let mut r = Self::new();
-        for name in super::parallel_tool_exec::read_only_tool_names() {
-            r.register(name, ConcurrencySafety::ReadOnly);
-        }
-        // The canonical mutating-and-serial tool is `bash` — sibling aborts
-        // key off this in parallel_tool_exec.
-        r.register("bash", ConcurrencySafety::Serial);
-        r.register("BashTool", ConcurrencySafety::Serial);
-        r.register("powershell", ConcurrencySafety::Serial);
-        r.register("PowerShellTool", ConcurrencySafety::Serial);
-        // Common file-mutating tools. Consumers may refine via register().
-        for name in [
-            "write_file",
-            "WriteFileTool",
-            "edit_file",
-            "EditFileTool",
-            "apply_patch",
-            "ApplyPatchTool",
-            "delete_file",
-        ] {
-            r.register(name, ConcurrencySafety::Mutating);
-        }
-        r
+        Self::new()
     }
 
     /// Register or override a tool's safety level.
@@ -160,17 +132,11 @@ impl ConcurrencySafetyRegistry {
     }
 }
 
-// ── Global registry ───────────────────────────────────────────────────────
+// ── Global registry (MCP / dynamic tools only) ──────────────────────────
 //
-// The global registry is the source of truth consulted by
-// `parallel_tool_exec::is_read_only_tool` for names that are NOT in the static
-// READ_ONLY_TOOLS list. MCP tools / dynamic tools call `global_register` on
-// load and their declared safety is picked up transparently by the existing
-// parallel-dispatch path.
-//
-// The global is additive: it never downgrades the static list (a tool in
-// READ_ONLY_TOOLS is always treated as read-only) — it only provides a path
-// for tools that would otherwise be Unknown to opt in.
+// Static tools are classified by `tool_categories::classify()` which is
+// consulted first. This global registry is the fallback for MCP and
+// dynamically-discovered tools that call `global_register` on load.
 
 fn global_cell() -> &'static RwLock<ConcurrencySafetyRegistry> {
     static CELL: OnceLock<RwLock<ConcurrencySafetyRegistry>> = OnceLock::new();
@@ -259,34 +225,27 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_default_seeds_canonical_read_only_tools() {
+    fn bootstrap_default_is_empty() {
         let r = ConcurrencySafetyRegistry::bootstrap_default();
-        // Representative tools from the canonical list.
-        assert_eq!(r.classify("read_file"), ConcurrencySafety::ReadOnly);
-        assert_eq!(r.classify("grep"), ConcurrencySafety::ReadOnly);
-        assert_eq!(r.classify("git_status"), ConcurrencySafety::ReadOnly);
-        assert!(r.is_parallelizable("glob"));
+        assert!(
+            r.is_empty(),
+            "bootstrap should be empty — static tools use tool_categories::classify"
+        );
     }
 
     #[test]
-    fn bootstrap_default_marks_bash_as_serial() {
-        let r = ConcurrencySafetyRegistry::bootstrap_default();
-        assert_eq!(r.classify("bash"), ConcurrencySafety::Serial);
-        assert!(r.classify("bash").is_strictly_serial());
-    }
-
-    #[test]
-    fn bootstrap_default_marks_writes_as_mutating() {
-        let r = ConcurrencySafetyRegistry::bootstrap_default();
-        assert_eq!(r.classify("write_file"), ConcurrencySafety::Mutating);
-        assert_eq!(r.classify("edit_file"), ConcurrencySafety::Mutating);
-        assert!(!r.is_parallelizable("write_file"));
-    }
-
-    #[test]
-    fn bootstrap_default_unknown_tool_falls_through() {
-        let r = ConcurrencySafetyRegistry::bootstrap_default();
-        assert_eq!(r.classify("brand_new_mcp_tool"), ConcurrencySafety::Unknown);
+    fn static_tools_classified_via_tool_categories() {
+        // Static tools are NOT in the registry — they go through
+        // tool_categories::classify which is the authoritative path.
+        assert!(super::super::parallel_tool_exec::is_read_only_tool(
+            "read_file"
+        ));
+        assert!(super::super::parallel_tool_exec::is_read_only_tool("grep"));
+        assert!(super::super::parallel_tool_exec::is_read_only_tool("glob"));
+        assert!(!super::super::parallel_tool_exec::is_read_only_tool("bash"));
+        assert!(!super::super::parallel_tool_exec::is_read_only_tool(
+            "write_file"
+        ));
     }
 
     #[test]
@@ -304,50 +263,25 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_default_classification_matches_static_read_only_list() {
-        // The registry should agree with the legacy is_read_only_tool for
-        // every name in the canonical list — this guards against drift if
-        // the list is updated without refreshing bootstrap_default.
-        let r = ConcurrencySafetyRegistry::bootstrap_default();
-        for name in super::super::parallel_tool_exec::read_only_tool_names() {
-            assert!(
-                r.is_parallelizable(name),
-                "canonical read-only tool {name} not flagged parallelizable"
-            );
-            assert!(
-                super::super::parallel_tool_exec::is_read_only_tool(name),
-                "legacy classifier disagrees for {name}"
-            );
-        }
-    }
-
-    #[test]
-    fn global_registry_bootstrap_mirrors_canonical_list() {
-        // Global is bootstrapped lazily with bootstrap_default, so every
-        // canonical read-only name must classify as ReadOnly there too.
-        for name in super::super::parallel_tool_exec::read_only_tool_names() {
-            assert_eq!(
-                global_classify(name),
-                ConcurrencySafety::ReadOnly,
-                "global registry disagrees for {name}"
-            );
-            assert!(global_is_parallelizable(name));
-        }
-    }
-
-    #[test]
-    fn global_register_opts_new_tool_into_parallelizable() {
-        // A fresh MCP-style tool not in the static list should be treated
-        // as Unknown → mutating by default, then become parallelizable
-        // once it declares itself ReadOnly via global_register.
+    fn global_register_opts_mcp_tool_into_parallelizable() {
         let name = "mcp_test_global_register_tool";
-        // Pre-registration: unknown.
+        // Pre-registration: unknown in both paths.
         assert_eq!(global_classify(name), ConcurrencySafety::Unknown);
         assert!(!super::super::parallel_tool_exec::is_read_only_tool(name));
-        // Register.
+        // Register via the global dynamic registry.
         global_register(name, ConcurrencySafety::ReadOnly);
-        // Post-registration: seen as read-only by both APIs.
+        // Post-registration: the fallback path picks it up.
         assert_eq!(global_classify(name), ConcurrencySafety::ReadOnly);
+        assert!(global_is_parallelizable(name));
         assert!(super::super::parallel_tool_exec::is_read_only_tool(name));
+    }
+
+    #[test]
+    fn unknown_dynamic_tool_is_not_parallelizable() {
+        assert_eq!(
+            global_classify("brand_new_mcp_tool"),
+            ConcurrencySafety::Unknown
+        );
+        assert!(!global_is_parallelizable("brand_new_mcp_tool"));
     }
 }

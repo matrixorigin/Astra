@@ -5,6 +5,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::tool_call_shape::{tool_call_arguments_value, tool_call_name};
+use crate::tool_categories::registry;
 
 /// Errors from stall / divergence / reward-hacking heuristics (invalid configuration or inputs).
 #[derive(Debug, Clone, Error, PartialEq)]
@@ -33,39 +34,6 @@ pub fn cli_agentic_tool_round_budget_abort_msg(current_limit: usize) -> String {
         current_limit,
     )
 }
-
-/// Tools considered "exploration" — low-value if used repeatedly without
-/// a "productive" tool call in between.
-const EXPLORATION_TOOLS: &[&str] = &[
-    "bash",
-    "list_dir",
-    "read_file",
-    "glob",
-    "grep",
-    "symbol_search",
-    "hover_info",
-    "call_graph",
-    "find_definition",
-    "find_references",
-    "symbols",
-];
-
-/// Tools that NEVER mutate the filesystem — they are purely consultative.
-/// A stream of repeated calls to these, without any interleaved mutating tool
-/// (`write_file`, `str_replace`, `create_file`, bash-with-side-effects, etc.),
-/// is diagnostic of an agent narrating implementation as prose instead of
-/// emitting real edits (observed in session 26f73ee4 where 12 `skill` calls
-/// produced 0 write_file/str_replace calls across an entire plan).
-///
-/// We keep this LIST SEPARATE from `EXPLORATION_TOOLS` because the two signals
-/// serve different detectors:
-///   * `EXPLORATION_TOOLS` drives single-round "all-exploration chain"
-///     detection (reward-hacking guard). Adding `skill` there would
-///     over-aggressively hard-block deferred follow-ups like `read_file`
-///     after a productive skill consultation — a legitimate pattern.
-///   * `CONSULTATIVE_TOOLS` drives the multi-round top-tool diagnostic below,
-///     where repetition across ≥3 rounds is the actual anti-pattern.
-const CONSULTATIVE_TOOLS: &[&str] = &["skill", "discover_skills"];
 
 /// Maximum consecutive exploration-only rounds before triggering correction.
 /// Lowered from 8→5→3: with auto-expanding read_file (full-file on 2nd+ ranged
@@ -283,7 +251,7 @@ pub fn assess_reward_hacking(
     if tool_names.len() >= 2
         && tool_names
             .iter()
-            .all(|name| EXPLORATION_TOOLS.contains(&name.as_str()))
+            .all(|name| registry().is_exploration(name))
     {
         flags.push("exploration-only tool chain".to_string());
         risk += 0.25;
@@ -321,7 +289,7 @@ pub fn reward_hacking_avoid_tools(tool_calls: &[Value]) -> Vec<String> {
     let all_exploration = tool_names.len() >= 2
         && tool_names
             .iter()
-            .all(|name| EXPLORATION_TOOLS.contains(&name.as_str()));
+            .all(|name| registry().is_exploration(name));
 
     let mut counts = HashMap::new();
     for name in tool_names {
@@ -639,30 +607,11 @@ pub fn build_stall_reflection(
 }
 
 fn is_exploration_tool(name: &str) -> bool {
-    // For the top-tool diagnostic in `build_stall_reflection`, treat
-    // consultative tools (skill/discover_skills) as exploration too so that
-    // an agent repeatedly calling `skill` without writing files triggers the
-    // same "stop exploring, take direct action" nudge that repeat `grep` /
-    // `read_file` triggers. This is scoped to the top-tool diagnostic and
-    // does NOT affect single-round reward-hacking chain classification.
-    EXPLORATION_TOOLS.contains(&name) || CONSULTATIVE_TOOLS.contains(&name)
+    registry().is_exploration_or_consultative(name)
 }
 
-/// Read-only tools that must never be removed from the model's tool set.
-/// These are observational — the model needs them to verify state after edits.
-/// Mirrors `turn_guard::READ_ONLY_NEVER_RESTRICT`.
 fn is_read_only_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "read_file"
-            | "list_dir"
-            | "grep"
-            | "glob"
-            | "git_status"
-            | "git_diff"
-            | "git_show"
-            | "git_log"
-    )
+    crate::turn_guard::is_read_only_never_restrict(name)
 }
 
 /// Detect if the LLM ignored a previous stall nudge by using tools

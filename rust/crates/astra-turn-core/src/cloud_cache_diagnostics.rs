@@ -156,36 +156,64 @@ impl CacheBreakDetector {
         self.stats.total_turns += 1;
 
         let event = if let Some(ref prev) = self.last_fingerprint {
+            // Check fingerprint changes regardless of cache temperature.
+            let fingerprint_causes = diff_fingerprints(prev, current);
+
             // Check if cache is now cold (was hitting, now not)
             let was_hitting = self.last_cache_read_tokens >= MIN_CACHE_HIT_TOKENS;
             let now_cold = cache_read_tokens < MIN_CACHE_HIT_TOKENS;
 
             if was_hitting && now_cold {
-                let mut causes = diff_fingerprints(prev, current);
-
-                // If fingerprints match but cache is cold, check for TTL expiry
+                // Hot→cold transition: always a break event.
+                // If fingerprints also changed, include those causes;
+                // otherwise attribute to TTL expiry (if gap > 5min) or unknown cold start.
+                let mut causes = fingerprint_causes;
                 if causes.is_empty() {
                     let gap_seconds = now.saturating_sub(self.last_timestamp_secs);
                     if gap_seconds > CACHE_TTL_5MIN_SECS {
                         causes.push(CacheBreakCause::TtlExpired { gap_seconds });
                     }
                 }
-
                 if !causes.is_empty() {
                     self.consecutive_cold_turns += 1;
                     self.stats.cache_misses += 1;
                     Some(CacheBreakEvent { causes })
                 } else {
-                    self.stats.cache_hits += 1;
-                    None
-                }
-            } else {
-                if cache_read_tokens >= MIN_CACHE_HIT_TOKENS {
-                    self.consecutive_cold_turns = 0;
-                    self.stats.cache_hits += 1;
-                } else {
+                    // Hot→cold with no identifiable cause — still count as miss,
+                    // the cache was lost even though we can't explain why.
+                    self.consecutive_cold_turns += 1;
                     self.stats.cache_misses += 1;
+                    Some(CacheBreakEvent {
+                        causes: vec![CacheBreakCause::TtlExpired {
+                            gap_seconds: now.saturating_sub(self.last_timestamp_secs),
+                        }],
+                    })
                 }
+            } else if !fingerprint_causes.is_empty() && now_cold {
+                // Fingerprint changed AND cache is cold — definite miss.
+                self.consecutive_cold_turns += 1;
+                self.stats.cache_misses += 1;
+                Some(CacheBreakEvent {
+                    causes: fingerprint_causes,
+                })
+            } else if !fingerprint_causes.is_empty() {
+                // Fingerprint changed but cache is still hitting (partial cache, or
+                // new prefix coincidentally matches an existing cache entry).
+                // This is NOT a clean hit — count as miss since the prefix changed.
+                self.consecutive_cold_turns = self.consecutive_cold_turns.saturating_add(1);
+                self.stats.cache_misses += 1;
+                Some(CacheBreakEvent {
+                    causes: fingerprint_causes,
+                })
+            } else if cache_read_tokens >= MIN_CACHE_HIT_TOKENS {
+                // No fingerprint change AND cache is hitting → genuine hit.
+                self.consecutive_cold_turns = 0;
+                self.stats.cache_hits += 1;
+                None
+            } else {
+                // No fingerprint change AND cache is cold — could be first-turn warm-up
+                // or a model that doesn't support caching. Count as miss.
+                self.stats.cache_misses += 1;
                 None
             }
         } else {
@@ -258,13 +286,28 @@ mod tests {
     }
 
     #[test]
-    fn no_break_when_cache_still_hitting() {
+    fn break_when_fingerprint_changes_even_with_cache_hit() {
         let mut d = CacheBreakDetector::new();
         let fp1 = fp("v1", "t", "m", "p");
         let fp2 = fp("v2", "t", "m", "p");
         d.detect_break(&fp1, 5000);
-        // Fingerprint changed but cache still hitting
-        assert!(d.detect_break(&fp2, 3000).is_none());
+        // Fingerprint changed (system prompt) — this is a real cache break
+        // even if the new prefix coincidentally still has cache_read > 0.
+        // The old prefix cache was invalidated; hit rate must reflect this.
+        let event = d.detect_break(&fp2, 3000);
+        assert!(event.is_some());
+        let causes = event.unwrap().causes;
+        assert!(causes.contains(&CacheBreakCause::SystemPromptChanged));
+    }
+
+    #[test]
+    fn no_break_when_fingerprint_stable_and_cache_hitting() {
+        let mut d = CacheBreakDetector::new();
+        let fp1 = fp("p", "t", "m", "prov");
+        d.detect_break(&fp1, 5000);
+        // Same fingerprint, cache still hitting — genuine hit, no break
+        assert!(d.detect_break(&fp1, 3000).is_none());
+        assert_eq!(d.stats.cache_hits, 1);
     }
 
     #[test]

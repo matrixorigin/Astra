@@ -268,20 +268,17 @@ fn unified_compaction_at_low_pressure_preserves_recent_reads() {
     let file_a = make_file_content("skill_tool.rs", 80);
     let file_b = make_file_content("server_loop_host.rs", 60);
 
-    let mut messages: Vec<Value> = Vec::new();
-
     // Round 0: read 3 files (these are the ones model will edit)
-    messages.push(assistant_tool_calls(&[
-        ("r0-a", "read_file"),
-        ("r0-b", "read_file"),
-        ("r0-c", "read_file"),
-    ]));
-    messages.push(tool_result("r0-a", &file_a));
-    messages.push(tool_result("r0-b", &file_b));
-    messages.push(tool_result(
-        "r0-c",
-        &make_file_content("tool_registry.rs", 30),
-    ));
+    let mut messages: Vec<Value> = vec![
+        assistant_tool_calls(&[
+            ("r0-a", "read_file"),
+            ("r0-b", "read_file"),
+            ("r0-c", "read_file"),
+        ]),
+        tool_result("r0-a", &file_a),
+        tool_result("r0-b", &file_b),
+        tool_result("r0-c", &make_file_content("tool_registry.rs", 30)),
+    ];
 
     // Rounds 1-3: analysis (grep, read, bash)
     for round in 1..=3u32 {
@@ -374,19 +371,11 @@ fn mutation_evidence_survives_all_compaction_stages() {
     // str_replace and bash outputs must be completely intact
     let edit_result = messages
         .iter()
-        .find(|m| {
-            m.get("tool_call_id")
-                .and_then(|v| v.as_str())
-                .map_or(false, |id| id == "r1-edit")
-        })
+        .find(|m| m.get("tool_call_id").and_then(|v| v.as_str()) == Some("r1-edit"))
         .unwrap();
     let bash_result = messages
         .iter()
-        .find(|m| {
-            m.get("tool_call_id")
-                .and_then(|v| v.as_str())
-                .map_or(false, |id| id == "r1-bash")
-        })
+        .find(|m| m.get("tool_call_id").and_then(|v| v.as_str()) == Some("r1-bash"))
         .unwrap();
 
     assert_eq!(
@@ -477,7 +466,7 @@ fn complex_review_edit_verify_cycle() {
                 .find(|m| {
                     m.get("tool_call_id")
                         .and_then(|v| v.as_str())
-                        .map_or(false, |id| id == call_id)
+                        .is_some_and(|id| id == call_id)
                 })
                 .unwrap_or_else(|| panic!("missing tool result for {call_id}"));
             let content = msg["content"].as_str().unwrap();
@@ -535,7 +524,7 @@ fn complex_review_edit_verify_cycle() {
             .find(|m| {
                 m.get("tool_call_id")
                     .and_then(|v| v.as_str())
-                    .map_or(false, |id| id == call_id)
+                    .is_some_and(|id| id == call_id)
             })
             .unwrap_or_else(|| panic!("missing {call_id}"));
         let content = msg["content"].as_str().unwrap();
@@ -577,7 +566,7 @@ fn complex_review_edit_verify_cycle() {
             .find(|m| {
                 m.get("tool_call_id")
                     .and_then(|v| v.as_str())
-                    .map_or(false, |id| id == call_id)
+                    .is_some_and(|id| id == call_id)
             })
             .unwrap();
         let content = msg["content"].as_str().unwrap();
@@ -594,7 +583,7 @@ fn complex_review_edit_verify_cycle() {
             .find(|m| {
                 m.get("tool_call_id")
                     .and_then(|v| v.as_str())
-                    .map_or(false, |id| id == call_id)
+                    .is_some_and(|id| id == call_id)
             })
             .unwrap();
         let content = msg["content"].as_str().unwrap();

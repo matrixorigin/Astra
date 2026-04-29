@@ -563,8 +563,12 @@ pub(crate) async fn call_llm_stream(
                             // so parse usage first on every chunk.
                             made_progress = true;
                             if let Some(u) = chunk.get("usage").and_then(Value::as_object) {
-                                let prompt = u.get("prompt_tokens").and_then(Value::as_i64);
-                                let completion = u.get("completion_tokens").and_then(Value::as_i64);
+                                // OpenAI/Anthropic: prompt_tokens / completion_tokens
+                                // Bedrock Converse: inputTokens / outputTokens
+                                let prompt = u.get("prompt_tokens").and_then(Value::as_i64)
+                                    .or_else(|| u.get("inputTokens").and_then(Value::as_i64));
+                                let completion = u.get("completion_tokens").and_then(Value::as_i64)
+                                    .or_else(|| u.get("outputTokens").and_then(Value::as_i64));
                                 if prompt.is_some() || completion.is_some() {
                                     let mut usage_map = Map::new();
                                     if let Some(value) = prompt {
@@ -579,14 +583,19 @@ pub(crate) async fn call_llm_stream(
                                     usage = usage_map;
                                     // OpenAI: prompt_tokens_details.cached_tokens
                                     // Anthropic (via proxy): cache_read_input_tokens / cache_creation_input_tokens
+                                    // Bedrock Converse: cacheReadInputTokens / cacheWriteInputTokens
                                     let cache_read = u.get("prompt_tokens_details")
                                         .and_then(|d| d.get("cached_tokens"))
                                         .and_then(Value::as_i64)
-                                        .or_else(|| u.get("cache_read_input_tokens").and_then(Value::as_i64));
+                                        .or_else(|| u.get("cache_read_input_tokens").and_then(Value::as_i64))
+                                        .or_else(|| u.get("cacheReadInputTokens").and_then(Value::as_i64))
+                                        .or_else(|| u.get("cacheReadInputTokensCount").and_then(Value::as_i64));
                                     let cache_creation = u.get("prompt_tokens_details")
                                         .and_then(|d| d.get("cache_creation_input_tokens"))
                                         .and_then(Value::as_i64)
-                                        .or_else(|| u.get("cache_creation_input_tokens").and_then(Value::as_i64));
+                                        .or_else(|| u.get("cache_creation_input_tokens").and_then(Value::as_i64))
+                                        .or_else(|| u.get("cacheWriteInputTokens").and_then(Value::as_i64))
+                                        .or_else(|| u.get("cacheWriteInputTokensCount").and_then(Value::as_i64));
                                     yield render_sse(&json!({
                                         "type": "usage",
                                         "prompt_tokens": prompt,

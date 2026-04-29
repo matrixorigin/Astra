@@ -25,7 +25,7 @@ use std::time::Instant;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinHandle;
 
-use super::parallel_tool_exec::{ToolExecResult, ToolExecutorFn, is_read_only_tool};
+use super::parallel_tool_exec::{ToolExecResult, ToolExecutorFn, is_read_only_tool_with_args};
 use super::permission_types::PermissionDecision;
 
 /// Environment variable gating speculative streaming execution.
@@ -47,11 +47,18 @@ pub fn streaming_tool_exec_enabled() -> bool {
 ///    layer has already pre-evaluated the call and returned `Deny` or
 ///    `Escalate`, we must not run it — the user hasn't consented.
 ///
+/// Args-aware: `bash "git status"` is eligible for speculation because
+/// it's classified as read-only. `bash "rm -rf"` is not.
+///
 /// The host is expected to re-check permission at the batch-phase merge point
 /// so that observability/journal events fire exactly once regardless of
 /// whether speculation happened.
-pub fn should_speculate(tool_name: &str, perm_decision: Option<&PermissionDecision>) -> bool {
-    if !is_read_only_tool(tool_name) {
+pub fn should_speculate(
+    tool_name: &str,
+    args: Option<&serde_json::Value>,
+    perm_decision: Option<&PermissionDecision>,
+) -> bool {
+    if !is_read_only_tool_with_args(tool_name, args) {
         return false;
     }
     match perm_decision {
@@ -144,7 +151,8 @@ impl StreamingToolExecutor {
     }
 
     /// Called when a complete tool_use block arrives from SSE stream.
-    /// If the tool is read-only, begins speculative execution immediately.
+    /// If the tool is read-only (args-aware), begins speculative execution
+    /// immediately. `bash "git status"` is eligible; `bash "rm"` is not.
     /// Returns true if speculative execution was started.
     pub async fn on_tool_block(
         &self,
@@ -153,7 +161,8 @@ impl StreamingToolExecutor {
         tool_call: serde_json::Value,
         original_index: usize,
     ) -> bool {
-        if !is_read_only_tool(&tool_name) {
+        let args = super::parallel_tool_exec::parse_tool_args(&tool_call);
+        if !is_read_only_tool_with_args(&tool_name, args.as_ref()) {
             return false;
         }
 
@@ -517,28 +526,53 @@ mod tests {
     #[test]
     fn should_speculate_gates() {
         // Read-only + unknown permission → speculate
-        assert!(should_speculate("read_file", None));
-        assert!(should_speculate("grep", None));
+        assert!(should_speculate("read_file", None, None));
+        assert!(should_speculate("grep", None, None));
         // Read-only + Approve → speculate
         assert!(should_speculate(
             "read_file",
+            None,
             Some(&PermissionDecision::approve())
         ));
         // Read-only + Deny → no speculation
         assert!(!should_speculate(
             "read_file",
+            None,
             Some(&PermissionDecision::deny("policy"))
         ));
         // Read-only + Escalate → no speculation
         assert!(!should_speculate(
             "read_file",
+            None,
             Some(&PermissionDecision::Escalate)
         ));
-        // Non-read-only never speculates
-        assert!(!should_speculate("bash", None));
+        // Non-read-only never speculates (bash without args)
+        assert!(!should_speculate("bash", None, None));
         assert!(!should_speculate(
             "write_file",
+            None,
             Some(&PermissionDecision::approve())
+        ));
+    }
+
+    #[test]
+    fn should_speculate_bash_read_only_command() {
+        let args = json!({"command": "git status"});
+        assert!(should_speculate("bash", Some(&args), None));
+
+        let args_ls = json!({"command": "ls -la"});
+        assert!(should_speculate("bash", Some(&args_ls), None));
+
+        // Mutating bash command — no speculation
+        let args_rm = json!({"command": "rm -rf /"});
+        assert!(!should_speculate("bash", Some(&args_rm), None));
+
+        // Read-only bash + Deny permission — still no speculation
+        let args_safe = json!({"command": "git status"});
+        assert!(!should_speculate(
+            "bash",
+            Some(&args_safe),
+            Some(&PermissionDecision::deny("policy"))
         ));
     }
 

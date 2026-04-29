@@ -114,46 +114,22 @@ pub struct TurnGuard {
     adaptive_thresholds: stall::AdaptiveStallThresholds,
 }
 
-/// Read-only core tools that are safe-by-construction and must never be
-/// hidden from the model, even after repeated spurious failures. Restricting
-/// a read-only tool typically creates a **false-positive cascade**: one bad
-/// verifier run deprioritizes `read_file`, the next turn can't observe file
-/// state, which causes further verification failures — snowballing into a
-/// stuck agent.
-///
-/// Mutating tools (bash, write_file, str_replace, delete_file, …) are
-/// **not** on this list — their deprioritization is a legitimate brake.
-///
-/// Keep in sync with the tool names registered in `schemas.rs`. Membership
-/// is checked case-sensitively.
-const READ_ONLY_NEVER_RESTRICT: &[&str] = &[
-    "read_file",
-    "list_dir",
-    "grep",
-    "glob",
-    "git_status",
-    "git_diff",
-    "git_show",
-    "git_log",
-];
-
-/// Check if a tool name is in the read-only never-restrict set.
+/// Check if a tool is read-only and must never be restricted.
+/// Delegates to the central [`crate::tool_categories`] registry.
 pub fn is_read_only_never_restrict(tool: &str) -> bool {
-    READ_ONLY_NEVER_RESTRICT.contains(&tool)
+    crate::tool_categories::registry().is_never_restrict(tool)
 }
 
-/// Insert deprioritized tool names from [`TurnGuard`] into the selector restriction set (CLI parity).
-///
-/// Read-only tools in [`READ_ONLY_NEVER_RESTRICT`] are excluded: they can
-/// still be surfaced via `ToolHealthTracker::deprioritized_tools()` for
-/// telemetry/logging, but they are *not* removed from the model's tool
-/// schema. See the rationale on that constant.
+/// Insert deprioritized tool names from [`TurnGuard`] into the selector
+/// restriction set (CLI parity). Read-only tools are excluded — they must
+/// stay visible to the model.
 pub fn merge_deprioritized_tools_into_restricted(
     turn_guard: &TurnGuard,
     restricted: &mut HashSet<String>,
 ) {
+    let reg = crate::tool_categories::registry();
     for t in turn_guard.health.deprioritized_tools() {
-        if READ_ONLY_NEVER_RESTRICT.contains(&t) {
+        if reg.is_never_restrict(t) {
             continue;
         }
         restricted.insert(t.to_string());
@@ -555,7 +531,7 @@ impl TurnGuard {
                 true // second consecutive Critical → force stop
             } else {
                 // First Critical: restrict to read-only tools
-                for t in CLOUD_APPROVAL_REQUIRED_TOOLS {
+                for &t in CLOUD_APPROVAL_REQUIRED_TOOLS.iter() {
                     avoid_tools.insert(t.to_string());
                 }
                 injections.push(
@@ -1124,7 +1100,7 @@ mod tests {
         );
         assert_eq!(v.severity, VerdictSeverity::Critical);
         // Should restrict every canonical cloud-gated write/execute tool.
-        for tool in CLOUD_APPROVAL_REQUIRED_TOOLS {
+        for &tool in CLOUD_APPROVAL_REQUIRED_TOOLS.iter() {
             assert!(
                 v.avoid_tools.contains(&tool.to_string()),
                 "first Critical should restrict {tool}"
@@ -1596,14 +1572,22 @@ mod tests {
     fn merge_does_not_restrict_read_only_tools_even_after_many_failures() {
         let mut guard = TurnGuard::new();
         // Drive far past CONSECUTIVE_FAILURE_THRESHOLD for every read-only tool.
-        for tool in super::READ_ONLY_NEVER_RESTRICT {
+        // Use the live registry so any newly added never-restrict tools are
+        // automatically covered — no static copy to drift from.
+        let reg = crate::tool_categories::registry();
+        let never_restrict_tools: Vec<&'static str> = reg
+            .read_only_names()
+            .into_iter()
+            .filter(|&n| reg.is_never_restrict(n))
+            .collect();
+        for tool in &never_restrict_tools {
             deprioritize_tool(&mut guard, tool, 10);
         }
 
         let mut restricted: HashSet<String> = HashSet::new();
         super::merge_deprioritized_tools_into_restricted(&guard, &mut restricted);
 
-        for tool in super::READ_ONLY_NEVER_RESTRICT {
+        for tool in &never_restrict_tools {
             assert!(
                 !restricted.contains(*tool),
                 "read-only tool `{tool}` must not be restricted after repeated failures; \

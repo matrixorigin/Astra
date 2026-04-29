@@ -4,7 +4,7 @@ use serde_json::Value;
 use astra_services::{MutationActionCategory, MutationCompensationPolicy};
 
 use super::cloud_approval_policy::{
-    CloudGatedToolKind, bash_command_is_read_only, cloud_gated_tool_kind,
+    CloudGatedToolKind, bash_command_is_read_only, cloud_gated_tool_kind_with_args,
 };
 use super::tool_result_semantics::is_resource_limit_output;
 use astra_sandbox::{CommandRisk, analyze_command_risks};
@@ -800,7 +800,7 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
             ActionCategory::Execute,
             "external MCP action has no automatic rollback registered",
         ),
-        _ => match cloud_gated_tool_kind(tool_name) {
+        _ => match cloud_gated_tool_kind_with_args(tool_name, Some(&normalized_args)) {
             Some(CloudGatedToolKind::Write) => ActionCompensationProfile::manual(
                 true,
                 ActionCategory::Write,
@@ -818,6 +818,7 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
 
 fn profile_requires_explicit_approval(
     tool_name: &str,
+    args: Option<&Value>,
     profile: &ActionCompensationProfile,
 ) -> bool {
     if profile.category == ActionCategory::Read {
@@ -826,17 +827,17 @@ fn profile_requires_explicit_approval(
     if !profile.bounded {
         return true;
     }
-    !profile.reversible && cloud_gated_tool_kind(tool_name).is_some()
+    !profile.reversible && cloud_gated_tool_kind_with_args(tool_name, args).is_some()
 }
 
 pub fn tool_requires_explicit_approval(tool_name: &str, args: &Value) -> bool {
     let profile = tool_action_profile(tool_name, args);
-    profile_requires_explicit_approval(tool_name, &profile)
+    profile_requires_explicit_approval(tool_name, Some(args), &profile)
 }
 
 pub fn explicit_approval_reason(tool_name: &str, args: &Value) -> Option<String> {
     let profile = tool_action_profile(tool_name, args);
-    if !profile_requires_explicit_approval(tool_name, &profile) {
+    if !profile_requires_explicit_approval(tool_name, Some(args), &profile) {
         return None;
     }
     let reason = match (profile.bounded, profile.reversible) {
@@ -1360,7 +1361,7 @@ mod tests {
     fn cloud_approval_required_tools_never_fall_back_to_read_profiles() {
         fn sample_args(tool_name: &str) -> Value {
             match tool_name {
-                "bash" | "exec" | "run_command" | "shell" => {
+                "bash" | "exec" | "run_command" | "shell" | "powershell" => {
                     json!({"command": "touch tmp.txt"})
                 }
                 "create_file" | "write_file" => json!({"path": "tmp.txt", "content": "ok"}),
@@ -1375,6 +1376,9 @@ mod tests {
                 "multi_edit" => {
                     json!({"path": "tmp.txt", "edits": [{"old_str": "a", "new_str": "b"}]})
                 }
+                "apply_patch" => {
+                    json!({"path": "tmp.txt", "patch": "--- a\n+++ b\n@@ -1 +1 @@\n-a\n+b"})
+                }
                 "rollback_database_snapshots" | "rollback_file_edits" | "rollback_turn_actions" => {
                     json!({})
                 }
@@ -1382,7 +1386,7 @@ mod tests {
             }
         }
 
-        for &tool_name in crate::cloud_approval_policy::CLOUD_APPROVAL_REQUIRED_TOOLS {
+        for &tool_name in crate::cloud_approval_policy::CLOUD_APPROVAL_REQUIRED_TOOLS.iter() {
             let profile = tool_action_profile(tool_name, &sample_args(tool_name));
             assert_ne!(
                 profile.category,

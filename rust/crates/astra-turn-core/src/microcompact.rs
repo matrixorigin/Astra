@@ -269,43 +269,9 @@ impl ToolCallMaps {
 /// These contain a file reference the LLM needs to re-read the output.
 const PERSISTED_TAG: &str = "<persisted-output>";
 
-/// Tool names whose results are safe to compact (read-only, reproducible).
-/// Excluded: bash (non-idempotent), write_file/str_replace (mutation records),
-/// skill (instructions), delegate (delegation records).
-const COMPACTABLE_TOOLS: &[&str] = &[
-    "read_file",
-    "grep",
-    "glob",
-    "list_dir",
-    "git_show",
-    "git_diff",
-    "git_log",
-    "git_status",
-    "git_blame",
-    "git_file_history",
-    "git_contributors",
-    "git_log_search",
-    "web_search",
-    "web_fetch",
-    // Code intel tools (idempotent reads, can produce large output)
-    "symbols",
-    "find_definition",
-    "find_references",
-    "symbol_search",
-    "hover_info",
-    "call_graph",
-    "type_hierarchy",
-    "dead_code",
-    "extract_members",
-    // GitHub read-only tools
-    "github_list_prs",
-    "github_get_pr",
-    "github_ci_status",
-    "github_list_issues",
-    "github_get_issue",
-    "github_repo_stats",
-    "get_agent_info",
-];
+fn is_compactable_tool_name(name: &str) -> bool {
+    crate::tool_categories::registry().is_compactable(name)
+}
 
 /// How many recent compactable tool results to keep intact.
 const KEEP_RECENT: usize = 6;
@@ -777,12 +743,12 @@ fn is_compactable_tool_result(
     }
     // Check tool name from the message itself
     if let Some(name) = msg.get("name").and_then(Value::as_str) {
-        return COMPACTABLE_TOOLS.contains(&name);
+        return is_compactable_tool_name(name);
     }
     // Look up tool name via tool_call_id → assistant message mapping
     if let Some(call_id) = msg.get("tool_call_id").and_then(Value::as_str) {
         if let Some(&name) = id_to_name.get(call_id) {
-            return COMPACTABLE_TOOLS.contains(&name);
+            return is_compactable_tool_name(name);
         }
     }
     // Unknown tool — don't compact (could be bash, skill, or write_file)

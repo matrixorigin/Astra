@@ -97,7 +97,7 @@ impl SseStreamHost for SpeculatingHost {
         } else {
             Some(PermissionDecision::approve())
         };
-        if !should_speculate(&tool_name, perm.as_ref()) {
+        if !should_speculate(&tool_name, None, perm.as_ref()) {
             return;
         }
 

@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn all_cloud_write_tools_invalidate_read_cache() {
-        for &name in CLOUD_APPROVAL_REQUIRED_TOOLS {
+        for &name in CLOUD_APPROVAL_REQUIRED_TOOLS.iter() {
             match cloud_gated_tool_kind(name) {
                 Some(CloudGatedToolKind::Write) => assert!(
                     tool_name_invalidates_read_cache(name),
@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn read_only_tools_do_not_overlap_mutation_classification() {
-        for &name in astra_turn_core::headless_tool_assembly::READ_ONLY_TOOLS {
+        for &name in astra_turn_core::headless_tool_assembly::READ_ONLY_TOOLS.iter() {
             assert!(
                 !tool_name_invalidates_read_cache(name),
                 "read-only tool must not also be name-classified as mutation: {name}"

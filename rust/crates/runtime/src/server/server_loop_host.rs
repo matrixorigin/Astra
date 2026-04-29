@@ -1428,10 +1428,12 @@ impl ServerAgenticLoopHost {
                 let (id, tool_name, args) = parse_flat_tool_call_event(tc);
 
                 // ── Dedup read-only tool invocations within a short window ──
-                // Only applies when concurrency_safety classifies the tool as
-                // read-only / parallelizable; mutating tools skip the cache.
-                let is_cacheable =
-                    astra_turn_core::parallel_tool_exec::is_read_only_tool(&tool_name);
+                // Only applies when the tool is parallelizable (args-aware);
+                // mutating tools skip the cache.
+                let is_cacheable = astra_turn_core::parallel_tool_exec::is_read_only_tool_with_args(
+                    &tool_name,
+                    Some(&args),
+                );
                 let sig = if is_cacheable {
                     Some(
                         astra_turn_core::tool_result_dedup::CallSignature::from_args(

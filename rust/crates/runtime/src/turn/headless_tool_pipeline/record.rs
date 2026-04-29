@@ -166,7 +166,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 Some(&execution.args),
             )
         {
-            self.ctx.idempotency_cache.evict_tools(READ_ONLY_TOOLS);
+            self.ctx.idempotency_cache.evict_tools(&READ_ONLY_TOOLS);
         }
 
         if !is_err && READ_ONLY_TOOLS.contains(&execution.name.as_str()) {

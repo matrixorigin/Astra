@@ -1,6 +1,6 @@
 use astra_runtime::tool_registry::ToolChain;
 use astra_turn_core::cloud_approval_policy::{
-    CloudGatedToolKind, bash_command_is_read_only, cloud_gated_tool_kind,
+    CloudGatedToolKind, bash_command_is_read_only, cloud_gated_tool_kind_with_args,
 };
 use astra_turn_core::safety_middleware::{SafetyMiddlewareDecision, evaluate_tool_safety_request};
 use astra_turn_core::stall::{
@@ -55,7 +55,7 @@ impl ToolSafetyGuard {
         let mutating_steps = chain
             .steps
             .iter()
-            .filter(|step| is_mutating_tool(&step.tool))
+            .filter(|step| is_mutating_tool(&step.tool, Some(&step.args)))
             .count();
         if mutating_steps > MAX_RUN_CHAIN_MUTATING_STEPS {
             return Err(format!(
@@ -99,9 +99,9 @@ impl ToolSafetyGuard {
     }
 }
 
-fn is_mutating_tool(name: &str) -> bool {
+fn is_mutating_tool(name: &str, args: Option<&Value>) -> bool {
     matches!(
-        cloud_gated_tool_kind(name),
+        cloud_gated_tool_kind_with_args(name, args),
         Some(CloudGatedToolKind::Write | CloudGatedToolKind::Execute)
     )
 }

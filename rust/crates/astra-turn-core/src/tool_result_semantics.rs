@@ -101,8 +101,7 @@ const TRANSIENT_ERROR_PATTERNS: &[&str] = &[
 /// Uses the canonical [`crate::cloud_approval_policy::CLOUD_APPROVAL_REQUIRED_TOOLS`] list
 /// plus MCP tools (`mcp_*` prefix) which run external server code with unknown side effects.
 fn is_mutation_tool(tool: &str) -> bool {
-    crate::cloud_approval_policy::CLOUD_APPROVAL_REQUIRED_TOOLS.contains(&tool)
-        || tool.starts_with("mcp_")
+    crate::cloud_approval_policy::is_cloud_approval_required(tool) || tool.starts_with("mcp_")
 }
 
 /// Well-known hard error patterns that SHOULD trigger rollback.

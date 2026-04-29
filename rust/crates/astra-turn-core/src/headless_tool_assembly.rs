@@ -211,38 +211,14 @@ pub fn headless_unknown_local_tool_openai_pair(
     openai_tool_roundtrip_values(tool_call_id, tool_name, err.as_str())
 }
 
-/// Read-only tools — safe to execute concurrently and cache across turns.
-/// Side-effectful tools must not appear here.
-pub const READ_ONLY_TOOLS: &[&str] = &[
-    "read_file",
-    "list_dir",
-    "grep",
-    "glob",
-    "symbols",
-    "find_definition",
-    "find_references",
-    "symbol_search",
-    "hover_info",
-    "call_graph",
-    "type_hierarchy",
-    "dead_code",
-    "extract_members",
-    "git_status",
-    "git_diff",
-    "git_log",
-    "git_show",
-    "git_blame",
-    "git_file_history",
-    "git_contributors",
-    "git_log_search",
-    "github_list_prs",
-    "github_get_pr",
-    "github_ci_status",
-    "github_list_issues",
-    "github_get_issue",
-    "github_repo_stats",
-    "get_agent_info",
-];
+/// Read-only tools for headless (edge) execution — safe to execute
+/// concurrently and cache across turns. Derived from the central
+/// [`crate::tool_categories`] registry (excludes web/memory/aliases).
+///
+/// This is a lazily-initialized static so callers can use
+/// `READ_ONLY_TOOLS.contains(&name)` with zero allocation per call.
+pub static READ_ONLY_TOOLS: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| crate::tool_categories::registry().headless_read_only_names());
 
 /// One edge-executed tool row in the current LLM round (ordering preserved vs `tool_calls`).
 pub trait EdgeToolRoundRow {
@@ -803,9 +779,9 @@ mod tests {
             "memory_purge",
             "memory_correct",
         ];
-        for tool in READ_ONLY_TOOLS {
+        for &tool in READ_ONLY_TOOLS.iter() {
             assert!(
-                !SIDE_EFFECTFUL.contains(tool),
+                !SIDE_EFFECTFUL.contains(&tool),
                 "READ_ONLY_TOOLS must not contain side-effectful tool: {tool}"
             );
         }

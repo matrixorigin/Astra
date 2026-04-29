@@ -54,81 +54,71 @@ pub fn shared_tool_semaphore() -> Arc<Semaphore> {
 
 // ───────────────────────────── Tool Classification ──────────────────────
 
-/// Read-only tool names that are safe for parallel execution.
-/// These tools do not modify the filesystem or have side-effects.
-///
-/// NOTE: This list should stay in sync with
-/// `astra_turn_core::sse_stream_host::is_tool_concurrency_safe` for the tools
-/// advertised in the prompt's "Batching read-only tool calls" section. The two
-/// lists are not forcibly unified (different scopes: concurrency safety vs
-/// strict read-only classification), but the prompt-advertised set must appear
-/// in both.
-static READ_ONLY_TOOLS: &[&str] = &[
-    "read_file",
-    "file_read",
-    "ReadFileTool",
-    "grep",
-    "GrepTool",
-    "glob",
-    "GlobTool",
-    "list_dir",
-    "ListDirTool",
-    "web_fetch",
-    "WebFetchTool",
-    "web_search",
-    "WebSearchTool",
-    "memory_search",
-    "memory_retrieve",
-    "get_file_contents",
-    "search_code",
-    "list_files",
-    "find_files",
-    "view_file",
-    // git read-only inspection tools (no mutation)
-    "git_status",
-    "git_diff",
-    "git_log",
-    "git_show",
-    "git_blame",
-    // code-intelligence read-only queries
-    "find_definition",
-    "find_references",
-];
+/// Extract tool name from a tool call JSON value.
+fn extract_tool_name(tc: &Value) -> &str {
+    tc.get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(|n| n.as_str())
+        .or_else(|| tc.get("name").and_then(|n| n.as_str()))
+        .unwrap_or("")
+}
 
-/// Classify a tool call as read-only or mutating. Consults the canonical
-/// static list first; for names not in the list, falls back to the
-/// process-wide [`crate::concurrency_safety`] registry so MCP / dynamic
-/// tools that have declared `ConcurrencySafety::ReadOnly` are recognized
-/// by the parallel dispatcher.
+/// Parse the `arguments` field from a tool call into a `serde_json::Value`.
+/// Returns `None` if the field is missing or not parseable.
+pub fn parse_tool_args(tc: &Value) -> Option<Value> {
+    let raw = tc
+        .get("function")
+        .and_then(|f| f.get("arguments"))
+        .or_else(|| tc.get("arguments"))?;
+
+    match raw {
+        Value::Object(_) => Some(raw.clone()),
+        Value::String(s) => serde_json::from_str(s).ok(),
+        _ => None,
+    }
+}
+
+/// Classify a tool call as parallelizable using args-aware classification.
+///
+/// For shell tools (bash, BashTool), inspects the `command` argument to
+/// determine if the command is read-only (e.g. `git status`, `ls`).
+/// Falls back to the process-wide [`crate::concurrency_safety`] registry
+/// for MCP / dynamic tools not in the static table.
 pub fn is_read_only_tool(tool_name: &str) -> bool {
-    if READ_ONLY_TOOLS.contains(&tool_name) {
+    if crate::tool_categories::classify_name(tool_name).parallelizable {
         return true;
     }
     crate::concurrency_safety::global_is_parallelizable(tool_name)
 }
 
-/// Iterate the canonical read-only tool names. Provided so the
-/// [`crate::concurrency_safety`] registry can seed itself from the same
-/// authoritative list.
-pub fn read_only_tool_names() -> impl Iterator<Item = &'static str> {
-    READ_ONLY_TOOLS.iter().copied()
+/// Args-aware variant: classify a tool call as parallelizable, inspecting
+/// the command argument for shell tools.
+pub fn is_read_only_tool_with_args(tool_name: &str, args: Option<&Value>) -> bool {
+    if crate::tool_categories::classify(tool_name, args).parallelizable {
+        return true;
+    }
+    crate::concurrency_safety::global_is_parallelizable(tool_name)
+}
+
+/// Iterate the canonical read-only tool names from the central registry.
+pub fn read_only_tool_names() -> Vec<&'static str> {
+    crate::tool_categories::registry().read_only_names()
 }
 
 /// Partition tool calls into (read_only, mutating) groups, preserving
 /// original indices for result reassembly.
+///
+/// Uses args-aware classification: `bash "git status"` is partitioned as
+/// read-only (parallelizable), while `bash "rm -rf /"` is mutating.
 pub fn partition_tool_calls(tool_calls: &[Value]) -> (Vec<(usize, &Value)>, Vec<(usize, &Value)>) {
     let mut read_only = Vec::new();
     let mut mutating = Vec::new();
 
     for (i, tc) in tool_calls.iter().enumerate() {
-        let name = tc
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(|n| n.as_str())
-            .or_else(|| tc.get("name").and_then(|n| n.as_str()))
-            .unwrap_or("");
+        let name = extract_tool_name(tc);
+        let args = parse_tool_args(tc);
 
-        if is_read_only_tool(name) {
+        if is_read_only_tool_with_args(name, args.as_ref()) {
             read_only.push((i, tc));
         } else {
             mutating.push((i, tc));
@@ -550,7 +540,6 @@ mod tests {
     /// Verifies that panicked tasks produce synthetic error results instead of being dropped.
     #[tokio::test]
     async fn result_count_equals_tool_call_count() {
-        // 3 read-only tool calls: one will "fail" (return error), but all must produce results
         let calls = vec![
             json!({"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}),
             json!({"id": "c2", "function": {"name": "read_file", "arguments": "{}"}}),
@@ -562,7 +551,6 @@ mod tests {
             let n = counter_clone.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 if n == 1 {
-                    // Simulate an error (not a panic — panics are caught by inner spawn)
                     (
                         "c2".into(),
                         "read_file".into(),
@@ -580,5 +568,166 @@ mod tests {
             calls.len(),
             "result count must equal tool_call count — no results may be silently dropped"
         );
+    }
+
+    // ── Args-aware classification tests ──────────────────────────────────
+
+    fn make_bash_call(id: &str, command: &str) -> Value {
+        json!({
+            "id": id,
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": json!({"command": command}).to_string()
+            }
+        })
+    }
+
+    fn make_bash_call_parsed_args(id: &str, command: &str) -> Value {
+        json!({
+            "id": id,
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": {"command": command}
+            }
+        })
+    }
+
+    #[test]
+    fn args_aware_bash_git_status_is_read_only() {
+        let args = json!({"command": "git status"});
+        assert!(is_read_only_tool_with_args("bash", Some(&args)));
+    }
+
+    #[test]
+    fn args_aware_bash_rm_is_not_read_only() {
+        let args = json!({"command": "rm -rf /"});
+        assert!(!is_read_only_tool_with_args("bash", Some(&args)));
+    }
+
+    #[test]
+    fn args_aware_bash_no_args_still_mutating() {
+        assert!(!is_read_only_tool_with_args("bash", None));
+    }
+
+    #[test]
+    fn args_aware_non_shell_ignores_args() {
+        let args = json!({"command": "git status"});
+        assert!(!is_read_only_tool_with_args("write_file", Some(&args)));
+        assert!(is_read_only_tool_with_args("read_file", Some(&args)));
+    }
+
+    #[test]
+    fn parse_tool_args_string_arguments() {
+        let tc = json!({
+            "function": {
+                "name": "bash",
+                "arguments": "{\"command\": \"git status\"}"
+            }
+        });
+        let parsed = parse_tool_args(&tc).unwrap();
+        assert_eq!(parsed["command"], "git status");
+    }
+
+    #[test]
+    fn parse_tool_args_object_arguments() {
+        let tc = json!({
+            "function": {
+                "name": "bash",
+                "arguments": {"command": "ls -la"}
+            }
+        });
+        let parsed = parse_tool_args(&tc).unwrap();
+        assert_eq!(parsed["command"], "ls -la");
+    }
+
+    #[test]
+    fn parse_tool_args_missing_returns_none() {
+        let tc = json!({"function": {"name": "bash"}});
+        assert!(parse_tool_args(&tc).is_none());
+    }
+
+    #[test]
+    fn partition_bash_git_status_is_parallel() {
+        let calls = vec![
+            make_tool_call("read_file", "1"),
+            make_bash_call("2", "git status"),
+            make_tool_call("grep", "3"),
+            make_bash_call("4", "rm -rf /"),
+        ];
+        let (ro, mut_) = partition_tool_calls(&calls);
+        assert_eq!(ro.len(), 3, "read_file + bash(git status) + grep");
+        assert_eq!(mut_.len(), 1, "bash(rm) only");
+        assert_eq!(ro[0].0, 0); // read_file
+        assert_eq!(ro[1].0, 1); // bash "git status"
+        assert_eq!(ro[2].0, 2); // grep
+        assert_eq!(mut_[0].0, 3); // bash "rm -rf /"
+    }
+
+    #[test]
+    fn partition_bash_with_parsed_object_args() {
+        let calls = vec![
+            make_bash_call_parsed_args("1", "ls -la"),
+            make_bash_call_parsed_args("2", "git push origin main"),
+        ];
+        let (ro, mut_) = partition_tool_calls(&calls);
+        assert_eq!(ro.len(), 1);
+        assert_eq!(mut_.len(), 1);
+        assert_eq!(ro[0].0, 0); // ls
+        assert_eq!(mut_[0].0, 1); // git push
+    }
+
+    #[test]
+    fn partition_mixed_batch_bash_read_only_commands() {
+        let calls = vec![
+            make_tool_call("read_file", "1"),
+            make_bash_call("2", "cargo check 2>&1 | head -50"),
+            make_bash_call("3", "git diff HEAD"),
+            make_tool_call("write_file", "4"),
+            make_bash_call("5", "cargo build"),
+            make_tool_call("grep", "6"),
+        ];
+        let (ro, mut_) = partition_tool_calls(&calls);
+        // read_file + bash(cargo check|head) + bash(git diff) + grep = 4
+        assert_eq!(ro.len(), 4);
+        // write_file + bash(cargo build) = 2
+        assert_eq!(mut_.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn parallel_round_bash_read_only_runs_in_parallel() {
+        let calls = vec![
+            make_tool_call("read_file", "1"),
+            make_bash_call("2", "git status"),
+            make_bash_call("3", "ls -la"),
+            make_tool_call("grep", "4"),
+        ];
+        let outcome = execute_parallel_round(&calls, make_executor(0)).await;
+        assert_eq!(outcome.parallel_count, 4, "all 4 should run in parallel");
+        assert_eq!(outcome.sequential_count, 0);
+    }
+
+    #[tokio::test]
+    async fn parallel_round_bash_mutating_runs_sequential() {
+        let calls = vec![
+            make_bash_call("1", "git status"),  // read-only → parallel
+            make_bash_call("2", "cargo build"), // mutating → sequential
+            make_bash_call("3", "ls"),          // read-only → parallel
+        ];
+        let outcome = execute_parallel_round(&calls, make_executor(0)).await;
+        assert_eq!(outcome.parallel_count, 2);
+        assert_eq!(outcome.sequential_count, 1);
+    }
+
+    #[tokio::test]
+    async fn parallel_round_bash_no_args_is_sequential() {
+        let calls = vec![
+            make_tool_call("bash", "1"), // no args → mutating
+            make_tool_call("read_file", "2"),
+        ];
+        let outcome = execute_parallel_round(&calls, make_executor(0)).await;
+        assert_eq!(outcome.parallel_count, 1); // read_file only
+        assert_eq!(outcome.sequential_count, 1); // bash without args
     }
 }
