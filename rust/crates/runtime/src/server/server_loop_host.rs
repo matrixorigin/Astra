@@ -2050,11 +2050,9 @@ impl ServerAgenticLoopHost {
         );
         let budget_chars = budget.effective_input_limit() * 4;
 
-        // ── Micro-compact: clear old tool results before main compaction ──
-        let micro_compacted_messages = {
-            let msgs = state.messages.clone();
-            crate::turn::cloud::analytics::run_micro_compact(&msgs)
-        };
+        // Tool result compaction is handled by compact_tool_results_adaptive
+        // in agentic_loop_lifecycle.rs. No separate analytics pass needed.
+        let micro_compacted_messages = state.messages.clone();
 
         // Use Memoria-based compaction (async with HTTP client)
         let memoria_config = crate::turn::cloud::memoria_compact::MemoriaCompactConfig::default();

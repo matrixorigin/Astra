@@ -1421,20 +1421,9 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             let turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
             apply_per_turn_adaptation(state, turn_tokens);
 
-            // P0: Proactive context folding at turn end.
-            // Fold old read-only tool results to maintain predictable context size.
-            let fold_result = super::context_compression::fold_old_read_only_results(
-                &mut state.messages,
-                state.current_round_index,
-            );
-            if fold_result.folded_count > 0 {
-                astra_core::agent_debug!(
-                    "context_folding",
-                    "Folded {} tool results, freed ~{} tokens",
-                    fold_result.folded_count,
-                    fold_result.tokens_freed_estimate
-                );
-            }
+            // Context compaction is handled by the single unified pass in
+            // agentic_loop_lifecycle.rs (compact_tool_results_adaptive) which
+            // runs before each LLM call. No per-round folding needed here.
         }
     }
 

@@ -26,8 +26,6 @@ pub enum CompactionEventType {
     LlmSummary,
     /// Fallback to pure truncation.
     Fallback,
-    /// Time-based tool result clearing.
-    TimeBased,
     /// Memoria-based compaction.
     Memoria,
 }
@@ -62,15 +60,9 @@ pub struct CompactionEvent {
     pub compression_ratio: f64,
     /// Whether LLM summary was generated.
     pub has_summary: bool,
-    /// Tool IDs that were cleared (for time-based).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub cleared_tool_ids: Vec<String>,
     /// Files recovered as attachments.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recovered_files: Vec<String>,
-    /// Gap in minutes (for time-based compaction).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gap_minutes: Option<u32>,
     /// Session memory fallback reason (if applicable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sm_fallback_reason: Option<String>,
@@ -97,9 +89,7 @@ impl CompactionEvent {
             tokens_saved,
             compression_ratio,
             has_summary: boundary.summary.is_some(),
-            cleared_tool_ids: Vec::new(),
             recovered_files: boundary.recent_files.clone(),
-            gap_minutes: None,
             sm_fallback_reason: None,
         }
     }
@@ -129,9 +119,7 @@ impl CompactionEvent {
             tokens_saved,
             compression_ratio,
             has_summary: memories_retrieved > 0,
-            cleared_tool_ids: Vec::new(),
             recovered_files: Vec::new(),
-            gap_minutes: None,
             sm_fallback_reason: None,
         }
     }
@@ -161,147 +149,44 @@ impl CompactionEvent {
             tokens_saved,
             compression_ratio,
             has_summary: false,
-            cleared_tool_ids: Vec::new(),
             recovered_files: Vec::new(),
-            gap_minutes: None,
             sm_fallback_reason: Some(reason.to_string()),
         }
     }
-
-    /// Create a time-based compaction event.
-    pub fn time_based(
-        gap_minutes: u32,
-        cleared_tool_ids: Vec<String>,
-        tokens_saved: usize,
-    ) -> Self {
-        Self {
-            event_type: CompactionEventType::TimeBased,
-            tier: "time_based".to_string(),
-            pre_tokens: 0,
-            post_tokens: 0,
-            messages_before: 0,
-            messages_after: 0,
-            tokens_saved,
-            compression_ratio: 1.0,
-            has_summary: false,
-            cleared_tool_ids,
-            recovered_files: Vec::new(),
-            gap_minutes: Some(gap_minutes),
-            sm_fallback_reason: None,
-        }
-    }
 }
+
+/// Stub text replacing cleared tool results.
+pub const MICRO_COMPACT_STUB: &str = "[tool result cleared \u{2014} re-run if needed]";
 
 // ---------------------------------------------------------------------------
-// Time-Based Compaction Config
+// Turn-Count-Based Micro-Compaction
 // ---------------------------------------------------------------------------
-
-/// Configuration for time-based microcompaction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TimeBasedCompactConfig {
-    /// Whether time-based compaction is enabled.
-    pub enabled: bool,
-    /// Minimum gap in minutes to trigger compaction.
-    pub gap_threshold_minutes: u32,
-    /// Number of recent tool results to keep.
-    pub keep_recent: usize,
-}
-
-impl Default for TimeBasedCompactConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            gap_threshold_minutes: 60,
-            keep_recent: 5,
-        }
-    }
-}
-
-/// Trigger data for time-based compaction.
-#[derive(Debug, Clone)]
-pub struct TimeBasedTrigger {
-    /// Gap in minutes since last assistant message.
-    pub gap_minutes: u32,
-    /// Tool result IDs to clear.
-    pub tool_ids_to_clear: Vec<String>,
-    /// Estimated tokens that will be saved.
-    pub estimated_tokens_saved: usize,
-}
-
-/// Evaluate whether time-based compaction should trigger.
-pub fn evaluate_time_based_trigger(
-    messages: &[Value],
-    config: &TimeBasedCompactConfig,
-) -> Option<TimeBasedTrigger> {
-    if !config.enabled {
-        return None;
-    }
-
-    // Find the last assistant message timestamp
-    let last_assistant_ts = find_last_assistant_timestamp(messages)?;
-    let now = chrono::Utc::now().timestamp() as u64;
-    let gap_secs = now.saturating_sub(last_assistant_ts);
-    let gap_minutes = (gap_secs / 60) as u32;
-
-    if gap_minutes < config.gap_threshold_minutes {
-        return None;
-    }
-
-    // Find tool results to clear (keeping recent ones)
-    let (tool_ids, estimated_tokens) = find_clearable_tool_results(messages, config.keep_recent);
-
-    if tool_ids.is_empty() {
-        return None;
-    }
-
-    Some(TimeBasedTrigger {
-        gap_minutes,
-        tool_ids_to_clear: tool_ids,
-        estimated_tokens_saved: estimated_tokens,
-    })
-}
-
-/// Find the timestamp of the last assistant message.
-///
-/// Checks `timestamp`, `metadata.created_at`, and `metadata.timestamp` fields.
-fn find_last_assistant_timestamp(messages: &[Value]) -> Option<u64> {
-    for msg in messages.iter().rev() {
-        if msg.get("role").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        if let Some(ts) = msg.get("timestamp").and_then(Value::as_u64) {
-            return Some(ts);
-        }
-        if let Some(meta) = msg.get("metadata") {
-            for key in ["created_at", "timestamp"] {
-                if let Some(ts) = meta.get(key).and_then(Value::as_u64) {
-                    return Some(ts);
-                }
-            }
-        }
-        return None;
-    }
-    None
-}
 
 /// Tool names whose results are eligible for microcompaction clearing.
-/// Only tools producing large, reproducible output that the LLM can re-run if needed.
 fn is_clearable_tool(name: &str) -> bool {
     let n = name.to_lowercase();
-    // File read operations
-    n.contains("read_file") || n.contains("file_read") || n.contains("view_file")
-        || n.contains("open_file") || n == "cat"
-        // Shell / terminal
-        || n.contains("bash") || n.contains("shell") || n.contains("terminal")
-        || n == "run_terminal_cmd" || n.contains("powershell")
-        // Search / listing
-        || n.contains("grep") || n.contains("glob") || n.contains("list_dir")
-        || n.contains("find_file") || n.contains("codebase_search")
-        // Web
-        || n.contains("web_search") || n.contains("web_fetch")
-        // File write/edit outputs (the *result* is clearable, the action already happened)
-        || n.contains("file_edit") || n.contains("file_write") || n.contains("edit_file")
-        || n.contains("write_file") || n.contains("create_file")
+    n.contains("read_file")
+        || n.contains("file_read")
+        || n.contains("view_file")
+        || n.contains("open_file")
+        || n == "cat"
+        || n.contains("bash")
+        || n.contains("shell")
+        || n.contains("terminal")
+        || n == "run_terminal_cmd"
+        || n.contains("powershell")
+        || n.contains("grep")
+        || n.contains("glob")
+        || n.contains("list_dir")
+        || n.contains("find_file")
+        || n.contains("codebase_search")
+        || n.contains("web_search")
+        || n.contains("web_fetch")
+        || n.contains("file_edit")
+        || n.contains("file_write")
+        || n.contains("edit_file")
+        || n.contains("write_file")
+        || n.contains("create_file")
 }
 
 /// Build a map from tool_call_id → tool function name by scanning assistant messages.
@@ -328,9 +213,6 @@ fn build_tool_name_map(messages: &[Value]) -> std::collections::HashMap<String, 
 }
 
 /// Collect clearable tool results as `(tool_call_id, estimated_tokens)` pairs.
-/// Only includes results from tools in the clearable set (file reads, shell, search, web, edits).
-/// Tool results without a matching assistant tool_call (no name resolvable) are still included
-/// to avoid leaking memory from orphaned results.
 fn collect_tool_results(messages: &[Value]) -> Vec<(String, usize)> {
     let name_map = build_tool_name_map(messages);
     messages
@@ -340,8 +222,6 @@ fn collect_tool_results(messages: &[Value]) -> Vec<(String, usize)> {
                 return None;
             }
             let id = msg.get("tool_call_id").and_then(Value::as_str)?;
-            // If we can resolve the tool name, only keep clearable tools.
-            // If we can't resolve (orphaned result), include it — clearing stale orphans is safe.
             if let Some(name) = name_map.get(id) {
                 if !is_clearable_tool(name) {
                     return None;
@@ -365,123 +245,6 @@ fn split_clearable(tool_results: Vec<(String, usize)>, keep_recent: usize) -> (V
     let ids: Vec<String> = clearable.into_iter().map(|(id, _)| id).collect();
     (ids, total_tokens)
 }
-
-/// Find tool result IDs that can be cleared (oldest first, keeping recent).
-fn find_clearable_tool_results(messages: &[Value], keep_recent: usize) -> (Vec<String>, usize) {
-    split_clearable(collect_tool_results(messages), keep_recent)
-}
-
-// ---------------------------------------------------------------------------
-// Semantic Microcompact — Hot File Protection
-// ---------------------------------------------------------------------------
-
-/// Number of recent user messages to scan for hot file references.
-const HOT_FILE_SCAN_TURNS: usize = 5;
-
-/// Extract file-path-like tokens from a string.
-/// Matches patterns like `src/foo.rs`, `./bar/baz.py`, `/home/user/file.txt`.
-fn extract_file_paths(text: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    // Simple heuristic: tokens containing '/' or '.' with a file extension
-    for token in text.split_whitespace() {
-        // Strip surrounding punctuation (backticks, quotes, parens, commas)
-        let cleaned = token.trim_matches(|c: char| {
-            c == '`' || c == '\'' || c == '"' || c == '(' || c == ')' || c == ',' || c == ':'
-        });
-        if cleaned.is_empty() {
-            continue;
-        }
-        // Must contain a path separator or look like a file path
-        let has_separator = cleaned.contains('/') || cleaned.contains('\\');
-        let has_extension = cleaned.rfind('.').map_or(false, |dot| {
-            let ext = &cleaned[dot + 1..];
-            !ext.is_empty() && ext.len() <= 10 && ext.chars().all(|c| c.is_alphanumeric())
-        });
-        if has_separator || (has_extension && cleaned.len() > 3) {
-            paths.push(cleaned.to_string());
-        }
-    }
-    paths
-}
-
-/// Collect "hot" file paths from the last N user messages.
-fn collect_hot_files(messages: &[Value], scan_turns: usize) -> std::collections::HashSet<String> {
-    let mut hot = std::collections::HashSet::new();
-    let mut user_count = 0usize;
-    for msg in messages.iter().rev() {
-        if msg.get("role").and_then(Value::as_str) != Some("user") {
-            continue;
-        }
-        if let Some(text) = msg.get("content").and_then(Value::as_str) {
-            for path in extract_file_paths(text) {
-                // Store both full path and basename for flexible matching
-                if let Some(base) = path.rsplit('/').next() {
-                    if !base.is_empty() {
-                        hot.insert(base.to_string());
-                    }
-                }
-                hot.insert(path);
-            }
-        }
-        user_count += 1;
-        if user_count >= scan_turns {
-            break;
-        }
-    }
-    hot
-}
-
-/// Check whether a tool result references any hot file.
-fn references_hot_file(msg: &Value, hot_files: &std::collections::HashSet<String>) -> bool {
-    if hot_files.is_empty() {
-        return false;
-    }
-    let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
-    // Check tool_call arguments too (the file path passed to the tool)
-    for hot in hot_files {
-        if content.contains(hot.as_str()) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Filter out tool-result IDs that reference hot files, returning protected count.
-fn protect_hot_file_results(
-    ids_to_clear: &mut Vec<String>,
-    messages: &[Value],
-    hot_files: &std::collections::HashSet<String>,
-) -> usize {
-    if hot_files.is_empty() || ids_to_clear.is_empty() {
-        return 0;
-    }
-    // Build id→message index for quick lookup
-    let tool_msgs: std::collections::HashMap<&str, &Value> = messages
-        .iter()
-        .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
-        .filter_map(|m| {
-            let id = m.get("tool_call_id").and_then(Value::as_str)?;
-            Some((id, m))
-        })
-        .collect();
-
-    let before = ids_to_clear.len();
-    ids_to_clear.retain(|id| {
-        if let Some(msg) = tool_msgs.get(id.as_str()) {
-            !references_hot_file(msg, hot_files)
-        } else {
-            true // not found → keep in clear list
-        }
-    });
-    before - ids_to_clear.len()
-}
-
-/// Stub text replacing cleared tool results.
-pub const MICRO_COMPACT_STUB: &str = "[tool result cleared \u{2014} re-run if needed]";
-
-// ---------------------------------------------------------------------------
-// Turn-Count-Based Micro-Compaction
-// ---------------------------------------------------------------------------
 
 /// Configuration for turn-count-based microcompaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -564,72 +327,6 @@ pub fn apply_micro_compact(
         })
         .collect();
     (result, cleared)
-}
-
-/// Run the full micro-compact pipeline: evaluate turn-count and time-based triggers,
-/// collect a union of IDs to clear, then apply once.
-/// Returns the (possibly compacted) messages.
-pub fn run_micro_compact(messages: &[Value]) -> Vec<Value> {
-    let mut ids_to_clear = Vec::new();
-    let mut total_tokens_saved = 0usize;
-    let mut gap_minutes = 0u32;
-
-    let tc_config = TurnCountCompactConfig::default();
-    if let Some(trigger) = evaluate_turn_count_trigger(messages, &tc_config) {
-        total_tokens_saved += trigger.estimated_tokens_saved;
-        ids_to_clear.extend(trigger.tool_ids_to_clear);
-    }
-
-    let tb_config = TimeBasedCompactConfig::default();
-    if let Some(trigger) = evaluate_time_based_trigger(messages, &tb_config) {
-        gap_minutes = trigger.gap_minutes;
-        total_tokens_saved += trigger.estimated_tokens_saved;
-        // Merge IDs (dedup via HashSet below in apply_micro_compact)
-        for id in trigger.tool_ids_to_clear {
-            if !ids_to_clear.contains(&id) {
-                ids_to_clear.push(id);
-            }
-        }
-    }
-
-    if ids_to_clear.is_empty() {
-        return messages.to_vec();
-    }
-
-    // Semantic protection: preserve tool results referencing "hot" files
-    let hot_files = collect_hot_files(messages, HOT_FILE_SCAN_TURNS);
-    let protected = protect_hot_file_results(&mut ids_to_clear, messages, &hot_files);
-
-    if ids_to_clear.is_empty() {
-        if protected > 0 {
-            eprintln!(
-                "[micro_compact] all {} candidates protected by hot-file references",
-                protected
-            );
-        }
-        return messages.to_vec();
-    }
-
-    let (compacted, cleared) = apply_micro_compact(messages, &ids_to_clear);
-    if cleared > 0 {
-        let protect_note = if protected > 0 {
-            format!(", {} protected", protected)
-        } else {
-            String::new()
-        };
-        if gap_minutes > 0 {
-            eprintln!(
-                "[micro_compact] cleared {} tool results (~{} tokens, {}min gap{})",
-                cleared, total_tokens_saved, gap_minutes, protect_note
-            );
-        } else {
-            eprintln!(
-                "[micro_compact] cleared {} tool results (~{} tokens{})",
-                cleared, total_tokens_saved, protect_note
-            );
-        }
-    }
-    compacted
 }
 
 // ---------------------------------------------------------------------------
@@ -901,14 +598,6 @@ mod tests {
     }
 
     #[test]
-    fn time_based_config_defaults() {
-        let config = TimeBasedCompactConfig::default();
-        assert!(config.enabled);
-        assert_eq!(config.gap_threshold_minutes, 60);
-        assert_eq!(config.keep_recent, 5);
-    }
-
-    #[test]
     fn message_range_by_indices() {
         let range = MessageRange::by_indices(5, Some(10));
         let messages: Vec<Value> = (0..20).map(|i| json!({"id": format!("m{i}")})).collect();
@@ -966,62 +655,6 @@ mod tests {
         assert!(!result.compacted_ranges.is_empty());
         // Post tokens should be less than pre
         assert!(result.post_tokens <= result.pre_tokens);
-    }
-
-    // ── Time-based micro-compact ──
-
-    #[test]
-    fn time_based_trigger_fires_after_gap() {
-        let old_ts = chrono::Utc::now().timestamp() as u64 - 2700; // 45 min ago
-        let messages = vec![
-            json!({"role": "user", "content": "hi"}),
-            json!({"role": "assistant", "content": "hello", "timestamp": old_ts}),
-            json!({"role": "tool", "tool_call_id": "c1", "content": "r1"}),
-            json!({"role": "tool", "tool_call_id": "c2", "content": "r2"}),
-            json!({"role": "tool", "tool_call_id": "c3", "content": "r3"}),
-            json!({"role": "tool", "tool_call_id": "c4", "content": "r4"}),
-        ];
-        let config = TimeBasedCompactConfig {
-            enabled: true,
-            gap_threshold_minutes: 30,
-            keep_recent: 3,
-        };
-        let t = evaluate_time_based_trigger(&messages, &config).unwrap();
-        assert!(t.gap_minutes >= 44);
-        assert_eq!(t.tool_ids_to_clear.len(), 1); // 4 - keep_recent(3)
-    }
-
-    #[test]
-    fn time_based_trigger_skips_short_gap() {
-        let recent_ts = chrono::Utc::now().timestamp() as u64 - 300;
-        let messages = vec![
-            json!({"role": "assistant", "content": "hi", "timestamp": recent_ts}),
-            json!({"role": "tool", "tool_call_id": "c1", "content": "x".repeat(5000)}),
-        ];
-        let config = TimeBasedCompactConfig {
-            enabled: true,
-            gap_threshold_minutes: 30,
-            keep_recent: 5,
-        };
-        assert!(evaluate_time_based_trigger(&messages, &config).is_none());
-    }
-
-    #[test]
-    fn time_based_fallback_without_timestamps() {
-        let messages = vec![
-            json!({"role": "assistant", "content": "no ts"}),
-            json!({"role": "tool", "tool_call_id": "c1", "content": "data"}),
-        ];
-        assert!(
-            evaluate_time_based_trigger(&messages, &TimeBasedCompactConfig::default()).is_none()
-        );
-    }
-
-    #[test]
-    fn find_timestamp_checks_metadata() {
-        let msgs =
-            vec![json!({"role": "assistant", "content": "a", "metadata": {"created_at": 1000u64}})];
-        assert_eq!(find_last_assistant_timestamp(&msgs), Some(1000));
     }
 
     // ── Turn-count micro-compact ──
@@ -1299,57 +932,6 @@ mod tests {
     }
 
     #[test]
-    fn find_last_assistant_timestamp_empty_messages() {
-        assert!(find_last_assistant_timestamp(&[]).is_none());
-    }
-
-    #[test]
-    fn find_last_assistant_timestamp_no_assistants() {
-        let messages = vec![
-            json!({"role": "user", "content": "hi", "timestamp": 1000}),
-            json!({"role": "tool", "tool_call_id": "c1", "timestamp": 2000}),
-        ];
-        assert!(find_last_assistant_timestamp(&messages).is_none());
-    }
-
-    #[test]
-    fn find_last_assistant_timestamp_no_timestamp_field() {
-        let messages = vec![json!({"role": "assistant", "content": "no timestamp at all"})];
-        // Assistant found, but no timestamp/metadata → returns None
-        assert!(find_last_assistant_timestamp(&messages).is_none());
-    }
-
-    #[test]
-    fn find_last_assistant_timestamp_from_metadata_created_at() {
-        let messages =
-            vec![json!({"role": "assistant", "content": "hi", "metadata": {"created_at": 5000}})];
-        assert_eq!(find_last_assistant_timestamp(&messages), Some(5000));
-    }
-
-    #[test]
-    fn find_last_assistant_timestamp_from_metadata_timestamp() {
-        let messages =
-            vec![json!({"role": "assistant", "content": "hi", "metadata": {"timestamp": 7000}})];
-        assert_eq!(find_last_assistant_timestamp(&messages), Some(7000));
-    }
-
-    #[test]
-    fn find_last_assistant_timestamp_prefers_direct_over_metadata() {
-        let messages = vec![
-            json!({"role": "assistant", "content": "hi", "timestamp": 3000, "metadata": {"created_at": 1000}}),
-        ];
-        assert_eq!(find_last_assistant_timestamp(&messages), Some(3000));
-    }
-
-    #[test]
-    fn find_last_assistant_timestamp_string_timestamp_not_parsed() {
-        let messages =
-            vec![json!({"role": "assistant", "content": "hi", "timestamp": "2024-01-01"})];
-        // String timestamp → as_u64() returns None → metadata checked → None → returns None
-        assert!(find_last_assistant_timestamp(&messages).is_none());
-    }
-
-    #[test]
     fn evaluate_turn_count_trigger_disabled() {
         let messages = vec![json!({"role": "tool", "tool_call_id": "c1", "content": "x"})];
         let config = TurnCountCompactConfig {
@@ -1391,28 +973,6 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_time_based_trigger_disabled_by_default() {
-        // TimeBasedCompactConfig default has enabled=false
-        let config = TimeBasedCompactConfig::default();
-        let messages = vec![
-            json!({"role": "assistant", "content": "old", "timestamp": 1000}),
-            json!({"role": "tool", "tool_call_id": "c1", "content": "big data"}),
-        ];
-        assert!(evaluate_time_based_trigger(&messages, &config).is_none());
-    }
-
-    #[test]
-    fn evaluate_time_based_trigger_no_assistants_returns_none() {
-        let config = TimeBasedCompactConfig {
-            enabled: true,
-            gap_threshold_minutes: 0,
-            keep_recent: 0,
-        };
-        let messages = vec![json!({"role": "tool", "tool_call_id": "c1", "content": "data"})];
-        assert!(evaluate_time_based_trigger(&messages, &config).is_none());
-    }
-
-    #[test]
     fn apply_micro_compact_empty_messages() {
         let (result, cleared) = apply_micro_compact(&[], &["c1".to_string()]);
         assert!(result.is_empty());
@@ -1441,20 +1001,6 @@ mod tests {
     }
 
     #[test]
-    fn run_micro_compact_empty_messages_returns_empty() {
-        let result = run_micro_compact(&[]);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn run_micro_compact_single_system_message_noop() {
-        let messages = vec![json!({"role": "system", "content": "You are helpful"})];
-        let result = run_micro_compact(&messages);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["content"], "You are helpful");
-    }
-
-    #[test]
     fn compression_ratio_zero_pre_tokens() {
         // When pre_tokens is 0, should return ratio 1.0 (no compression)
         let event = CompactionEvent::from_boundary(
@@ -1464,231 +1010,5 @@ mod tests {
             0,
         );
         assert!((event.compression_ratio - 1.0).abs() < f64::EPSILON);
-    }
-
-    // ── Semantic Microcompact: Hot File Tests ──
-
-    #[test]
-    fn extract_file_paths_basic() {
-        let paths = extract_file_paths("look at src/main.rs and ./lib/utils.py please");
-        assert!(paths.contains(&"src/main.rs".to_string()));
-        assert!(paths.contains(&"./lib/utils.py".to_string()));
-    }
-
-    #[test]
-    fn extract_file_paths_backtick_wrapped() {
-        let paths = extract_file_paths("edit `rust/crates/runtime/src/turn/bridge_inprocess.rs`");
-        assert!(paths.contains(&"rust/crates/runtime/src/turn/bridge_inprocess.rs".to_string()));
-    }
-
-    #[test]
-    fn extract_file_paths_no_false_positives() {
-        let paths = extract_file_paths("hello world 42 true false");
-        assert!(paths.is_empty());
-    }
-
-    #[test]
-    fn collect_hot_files_from_recent_user_messages() {
-        let messages = vec![
-            serde_json::json!({"role": "user", "content": "read src/foo.rs"}),
-            serde_json::json!({"role": "assistant", "content": "here it is"}),
-            serde_json::json!({"role": "user", "content": "now check lib/bar.py"}),
-        ];
-        let hot = collect_hot_files(&messages, 5);
-        assert!(hot.contains("src/foo.rs"));
-        assert!(hot.contains("foo.rs")); // basename
-        assert!(hot.contains("lib/bar.py"));
-        assert!(hot.contains("bar.py"));
-    }
-
-    #[test]
-    fn collect_hot_files_respects_scan_limit() {
-        let messages = vec![
-            serde_json::json!({"role": "user", "content": "old file ancient.rs"}),
-            serde_json::json!({"role": "assistant", "content": "ok"}),
-            serde_json::json!({"role": "user", "content": "recent file new.rs"}),
-        ];
-        let hot = collect_hot_files(&messages, 1); // only last user message
-        assert!(hot.contains("new.rs"));
-        assert!(!hot.contains("ancient.rs"));
-    }
-
-    #[test]
-    fn protect_hot_file_results_preserves_referenced() {
-        let messages = vec![
-            serde_json::json!({"role": "user", "content": "read src/main.rs"}),
-            serde_json::json!({"role": "assistant", "content": "", "tool_calls": [
-                {"id": "c1", "function": {"name": "read_file", "arguments": "{\"path\":\"src/main.rs\"}"}}
-            ]}),
-            serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": "fn main() { ... src/main.rs content ..."}),
-            serde_json::json!({"role": "assistant", "content": "", "tool_calls": [
-                {"id": "c2", "function": {"name": "read_file", "arguments": "{\"path\":\"old.rs\"}"}}
-            ]}),
-            serde_json::json!({"role": "tool", "tool_call_id": "c2", "content": "old file content"}),
-        ];
-        let hot = collect_hot_files(&messages, 5);
-        let mut ids = vec!["c1".to_string(), "c2".to_string()];
-        let protected = protect_hot_file_results(&mut ids, &messages, &hot);
-        assert_eq!(protected, 1); // c1 protected
-        assert_eq!(ids, vec!["c2".to_string()]); // only c2 remains
-    }
-
-    #[test]
-    fn protect_hot_file_results_empty_hot_files_noop() {
-        let messages =
-            vec![serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": "stuff"})];
-        let hot = std::collections::HashSet::new();
-        let mut ids = vec!["c1".to_string()];
-        let protected = protect_hot_file_results(&mut ids, &messages, &hot);
-        assert_eq!(protected, 0);
-        assert_eq!(ids.len(), 1);
-    }
-
-    // ── Edge-case tests: extract_file_paths ──
-
-    #[test]
-    fn extract_file_paths_unicode() {
-        let paths = extract_file_paths("修改 src/文件.rs 和 café/test.py");
-        assert!(paths.contains(&"src/文件.rs".to_string()));
-        assert!(paths.contains(&"café/test.py".to_string()));
-    }
-
-    #[test]
-    fn extract_file_paths_no_extension_special_files() {
-        // Makefile, Dockerfile, README have no extension and no separator
-        let paths = extract_file_paths("update Makefile and Dockerfile and README");
-        assert!(!paths.contains(&"Makefile".to_string()));
-        assert!(!paths.contains(&"Dockerfile".to_string()));
-        assert!(!paths.contains(&"README".to_string()));
-    }
-
-    #[test]
-    fn extract_file_paths_deeply_nested() {
-        let paths = extract_file_paths("check a/b/c/d/e/f/g/h/i/j.rs");
-        assert!(paths.contains(&"a/b/c/d/e/f/g/h/i/j.rs".to_string()));
-    }
-
-    #[test]
-    fn extract_file_paths_with_line_numbers() {
-        // src/main.rs:42 — colon is trimmed from edges by trim_matches,
-        // but the internal `:42` suffix remains. The path still gets extracted
-        // because it contains a separator (`/`).
-        let paths = extract_file_paths("error at src/main.rs:42");
-        assert!(
-            paths.iter().any(|p| p.starts_with("src/main.rs")),
-            "path with line number suffix should be extracted: {:?}",
-            paths
-        );
-    }
-
-    // ── Edge-case tests: hot file protection ──
-
-    #[test]
-    fn protect_hot_file_basename_collision() {
-        // Two hot files with same basename — both should be in hot set
-        let messages = vec![
-            json!({"role": "user", "content": "compare src/main.rs and lib/main.rs"}),
-            json!({"role": "assistant", "content": "", "tool_calls": [
-                {"id": "c1", "function": {"name": "read_file", "arguments": "{\"path\":\"src/main.rs\"}"}}
-            ]}),
-            json!({"role": "tool", "tool_call_id": "c1", "content": "src/main.rs content here"}),
-            json!({"role": "assistant", "content": "", "tool_calls": [
-                {"id": "c2", "function": {"name": "read_file", "arguments": "{\"path\":\"lib/main.rs\"}"}}
-            ]}),
-            json!({"role": "tool", "tool_call_id": "c2", "content": "lib/main.rs content here"}),
-            json!({"role": "assistant", "content": "", "tool_calls": [
-                {"id": "c3", "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}}
-            ]}),
-            json!({"role": "tool", "tool_call_id": "c3", "content": "unrelated output"}),
-        ];
-        let hot = collect_hot_files(&messages, 5);
-        assert!(hot.contains("src/main.rs"));
-        assert!(hot.contains("lib/main.rs"));
-        assert!(hot.contains("main.rs")); // basename
-
-        let mut ids = vec!["c1".to_string(), "c2".to_string(), "c3".to_string()];
-        let protected = protect_hot_file_results(&mut ids, &messages, &hot);
-        assert_eq!(protected, 2); // both c1 and c2 protected
-        assert_eq!(ids, vec!["c3".to_string()]);
-    }
-
-    #[test]
-    fn tool_result_references_multiple_hot_files() {
-        // Tool result mentions 3 hot files — one match is enough for protection
-        let messages = vec![
-            json!({"role": "user", "content": "check src/a.rs and src/b.rs and src/c.rs"}),
-            json!({"role": "assistant", "content": "", "tool_calls": [
-                {"id": "c1", "function": {"name": "bash", "arguments": "{\"command\":\"grep\"}"}}
-            ]}),
-            json!({"role": "tool", "tool_call_id": "c1", "content": "found in src/a.rs, src/b.rs, and src/c.rs"}),
-        ];
-        let hot = collect_hot_files(&messages, 5);
-        let mut ids = vec!["c1".to_string()];
-        let protected = protect_hot_file_results(&mut ids, &messages, &hot);
-        assert_eq!(protected, 1);
-        assert!(ids.is_empty());
-    }
-
-    #[test]
-    fn run_micro_compact_integration_hot_files() {
-        // Build a realistic conversation with 15+ messages:
-        // - 10+ clearable tool results (exceeds trigger_threshold=8 + keep_recent=3)
-        // - User mentions src/foo.rs in a recent message
-        // - One tool result references src/foo.rs → should be preserved
-        let mut messages: Vec<Value> = Vec::new();
-
-        // Generate 12 read_file tool call/result pairs (all clearable)
-        for i in 0..12 {
-            let call_id = format!("call_{i}");
-            let content = if i == 5 {
-                // This tool result references the hot file
-                "content of src/foo.rs: fn main() {}".to_string()
-            } else {
-                format!("content of file_{i}.txt: some data")
-            };
-            messages.push(json!({
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{
-                    "id": call_id,
-                    "function": {"name": "read_file", "arguments": format!("{{\"path\":\"file_{i}.txt\"}}")}
-                }]
-            }));
-            messages.push(json!({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": content
-            }));
-        }
-
-        // Recent user message mentions src/foo.rs
-        messages.push(json!({"role": "user", "content": "now fix the bug in src/foo.rs"}));
-        messages.push(json!({"role": "assistant", "content": "I'll fix it."}));
-
-        let result = run_micro_compact(&messages);
-
-        // The tool result for call_5 (referencing src/foo.rs) should be preserved
-        let call_5_msg = result
-            .iter()
-            .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_5"))
-            .unwrap();
-        assert!(
-            call_5_msg["content"]
-                .as_str()
-                .unwrap()
-                .contains("src/foo.rs"),
-            "tool result referencing hot file should be preserved"
-        );
-
-        // Older tool results should be cleared (but recent ones kept)
-        let call_0_msg = result
-            .iter()
-            .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_0"))
-            .unwrap();
-        assert_eq!(
-            call_0_msg["content"].as_str().unwrap(),
-            MICRO_COMPACT_STUB,
-            "old non-hot tool result should be cleared"
-        );
     }
 }

@@ -1491,8 +1491,8 @@ impl InProcessChatTurnBridge {
             let (merged_messages, _initial_tier) = {
                 let raw = messages.clone();
 
-                // ── Micro-compact: clear old tool results before main compaction ──
-                let raw = crate::turn::cloud::analytics::run_micro_compact(&raw);
+                // Tool result compaction is handled by compact_tool_results_adaptive
+                // in agentic_loop_lifecycle.rs. No separate analytics pass here.
 
                 // Compute model budget for tier-aware compaction using cache-aware estimation.
                 // Tool schemas are cache-eligible (stable prefix), so we estimate their cost.

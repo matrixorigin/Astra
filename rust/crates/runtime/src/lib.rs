@@ -325,9 +325,8 @@ pub use turn::{
     cloud::{
         analytics::{
             CompactionEvent, CompactionEventType, MICRO_COMPACT_STUB, MessageRange,
-            PartialCompactRequest, PartialCompactResult, TimeBasedCompactConfig, TimeBasedTrigger,
-            TurnCountCompactConfig, TurnCountTrigger, apply_micro_compact, compact_partial,
-            evaluate_time_based_trigger, evaluate_turn_count_trigger, run_micro_compact,
+            PartialCompactRequest, PartialCompactResult, TurnCountCompactConfig, TurnCountTrigger,
+            apply_micro_compact, compact_partial, evaluate_turn_count_trigger,
         },
         compaction::{
             CompactBoundary, CompactCircuitBreaker, CompactResult, CompactTrigger, compact_tiered,
