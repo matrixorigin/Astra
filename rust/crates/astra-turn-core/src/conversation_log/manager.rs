@@ -1268,18 +1268,24 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp);
 
-        for bad_id in [
+        let long_id = "a".repeat(201);
+        let cases: Vec<&str> = vec![
             "../etc/passwd",
             "foo/bar",
             "a\\b",
             "..",
             "",
             "   ",
+            ".",
             "has\0nul",
             "has\nnewline",
             "has\ttab",
             "has\x7Fdel",
-        ] {
+            "café",
+            "abc\u{200B}def",
+            &long_id,
+        ];
+        for bad_id in cases {
             let result = CslManager::new(
                 Arc::clone(&store),
                 bad_id.to_string(),

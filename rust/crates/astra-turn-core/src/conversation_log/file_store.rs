@@ -749,18 +749,24 @@ mod tests {
         let store = FileCslStore::new(tmp.path());
         let snap = make_snapshot(0, 1, vec![user_msg("hi")]);
 
-        for bad_id in [
+        let long_id = "a".repeat(201);
+        let cases: Vec<&str> = vec![
             "../etc/passwd",
             "foo/bar",
             "a\\b",
             "..",
             "",
             "   ",
+            ".",
             "has\0nul",
             "has\nnewline",
             "has\ttab",
             "has\x7Fdel",
-        ] {
+            "café",
+            "abc\u{200B}def",
+            &long_id,
+        ];
+        for bad_id in cases {
             let result = store.append(bad_id, &snap, &meta()).await;
             match result {
                 Err(CslStoreError::InvalidSessionId(_)) => {}

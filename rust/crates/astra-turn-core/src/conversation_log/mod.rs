@@ -377,7 +377,7 @@ pub enum CslStoreError {
     Serde(#[from] serde_json::Error),
     #[error("materialize error: {0}")]
     Materialize(#[from] MaterializeError),
-    #[error("invalid session_id: {0:?}")]
+    #[error("{0}")]
     InvalidSessionId(String),
     #[error("{0}")]
     Other(String),
@@ -385,7 +385,7 @@ pub enum CslStoreError {
 
 pub(crate) fn validate_session_id(session_id: &str) -> Result<(), CslStoreError> {
     astra_services::session_journal::validate_session_id(session_id)
-        .map_err(|_| CslStoreError::InvalidSessionId(session_id.to_string()))
+        .map_err(CslStoreError::InvalidSessionId)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -1102,9 +1102,11 @@ mod tests {
 
     #[test]
     fn validate_session_id_rejects_invalid() {
-        for bad in [
+        let long_id = "a".repeat(201);
+        let cases: Vec<&str> = vec![
             "",
             "   ",
+            ".",
             "../etc/passwd",
             "foo/bar",
             "a\\b",
@@ -1113,7 +1115,12 @@ mod tests {
             "has\nnewline",
             "has\ttab",
             "has\x7Fdel",
-        ] {
+            "café",
+            "abc\u{200B}def",
+            "\u{202E}secret",
+            &long_id,
+        ];
+        for bad in cases {
             match validate_session_id(bad) {
                 Err(CslStoreError::InvalidSessionId(_)) => {}
                 other => panic!("{bad:?}: expected InvalidSessionId, got {other:?}"),

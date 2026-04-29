@@ -35,13 +35,33 @@ pub fn local_sessions_dir() -> PathBuf {
 }
 
 /// Validate that a session ID is safe for use as a filesystem path component.
-/// Rejects empty/whitespace-only IDs, path traversal (`..`, `/`, `\`),
-/// ASCII control characters (including NUL and DEL), and multi-component paths.
+///
+/// Rejects:
+/// - empty or whitespace-only IDs
+/// - non-ASCII characters (blocks Unicode invisibles, RTL overrides, homoglyphs)
+/// - ASCII control characters (including NUL and DEL)
+/// - path separators (`/`, `\`), `..` anywhere (guards against traversal)
+/// - `.` as a standalone ID (maps to current directory)
+/// - IDs longer than 200 bytes (filesystem NAME_MAX safety)
+/// - multi-component paths after OS normalization
 pub fn validate_session_id(session_id: &str) -> Result<(), String> {
     if session_id.is_empty() || session_id.trim().is_empty() {
         return Err("session ID cannot be empty".to_string());
     }
-    if session_id.contains('/')
+    if !session_id.is_ascii() {
+        return Err(format!(
+            "invalid session ID {:?}: must contain only ASCII characters",
+            session_id
+        ));
+    }
+    if session_id.len() > 200 {
+        return Err(format!(
+            "invalid session ID (len={}): must be at most 200 bytes",
+            session_id.len()
+        ));
+    }
+    if session_id == "."
+        || session_id.contains('/')
         || session_id.contains('\\')
         || session_id.contains("..")
         || session_id.bytes().any(|b| b.is_ascii_control())
@@ -5309,17 +5329,25 @@ mod tests {
     // ── Session ID Validation Security Tests ──
 
     #[test]
-    fn validate_session_id_rejects_path_traversal() {
+    fn validate_session_id_rejects_invalid() {
         assert!(validate_session_id("../../etc/passwd").is_err());
         assert!(validate_session_id("../sibling").is_err());
         assert!(validate_session_id("a/b/c").is_err());
         assert!(validate_session_id("a\\b").is_err());
         assert!(validate_session_id("").is_err());
         assert!(validate_session_id("   ").is_err());
+        assert!(validate_session_id(".").is_err());
         assert!(validate_session_id("a\0b").is_err());
         assert!(validate_session_id("has\nnewline").is_err());
         assert!(validate_session_id("has\ttab").is_err());
         assert!(validate_session_id("has\x7Fdel").is_err());
+        // Non-ASCII: Unicode invisible chars, RTL override, homoglyphs
+        assert!(validate_session_id("café").is_err());
+        assert!(validate_session_id("abc\u{200B}def").is_err());
+        assert!(validate_session_id("\u{202E}secret").is_err());
+        // Max length
+        assert!(validate_session_id(&"a".repeat(201)).is_err());
+        assert!(validate_session_id(&"a".repeat(200)).is_ok());
     }
 
     #[test]
