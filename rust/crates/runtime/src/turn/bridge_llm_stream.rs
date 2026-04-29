@@ -1447,4 +1447,114 @@ mod tests {
             "server must have seen 2 POSTs (the 429 + the successful retry)"
         );
     }
+
+    /// Bedrock delivers `metadata` (carrying usage) in a SEPARATE TCP chunk
+    /// AFTER `messageStop`. The streaming transport must keep draining the
+    /// byte stream until EOS — it cannot exit early when `messageStop`
+    /// arrives, or usage accounting silently becomes zero.
+    ///
+    /// Regression guard: the previous transport broke out on
+    /// `accum.is_finished()` (true after `messageStop`), losing the usage
+    /// frame. Symptom in practice: CLI status line shows `tokens:0 (↑0 ↓0)`
+    /// even for successful Claude/Bedrock turns.
+    async fn spawn_bedrock_split_meta_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind bedrock split listener");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 8192];
+                    let _ = socket.read(&mut buf).await.unwrap_or(0);
+                    let start = build_bedrock_frame("messageStart", br#"{"role":"assistant"}"#);
+                    let delta = build_bedrock_frame(
+                        "contentBlockDelta",
+                        br#"{"contentBlockIndex":0,"delta":{"text":"hi"}}"#,
+                    );
+                    let stop =
+                        build_bedrock_frame("messageStop", br#"{"stopReason":"end_turn"}"#);
+                    let meta = build_bedrock_frame(
+                        "metadata",
+                        br#"{"usage":{"inputTokens":42,"outputTokens":7,"totalTokens":49}}"#,
+                    );
+                    // Part 1: start + delta + stop
+                    let mut part1 = Vec::new();
+                    part1.extend_from_slice(&start);
+                    part1.extend_from_slice(&delta);
+                    part1.extend_from_slice(&stop);
+                    // Use chunked transfer to deliver metadata in a distinct
+                    // read unit — emulates real Bedrock where metadata
+                    // arrives after messageStop on the wire.
+                    let header = "HTTP/1.1 200 OK\r\n\
+                                  Content-Type: application/vnd.amazon.eventstream\r\n\
+                                  Transfer-Encoding: chunked\r\n\
+                                  Connection: close\r\n\r\n";
+                    let _ = socket.write_all(header.as_bytes()).await;
+                    let _ = socket
+                        .write_all(format!("{:x}\r\n", part1.len()).as_bytes())
+                        .await;
+                    let _ = socket.write_all(&part1).await;
+                    let _ = socket.write_all(b"\r\n").await;
+                    // Force a flush boundary so the client observes the
+                    // close of the first chunk and tries to exit before
+                    // seeing the metadata chunk.
+                    let _ = socket.flush().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    let _ = socket
+                        .write_all(format!("{:x}\r\n", meta.len()).as_bytes())
+                        .await;
+                    let _ = socket.write_all(&meta).await;
+                    let _ = socket.write_all(b"\r\n").await;
+                    let _ = socket.write_all(b"0\r\n\r\n").await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn bedrock_stream_drains_metadata_after_message_stop() {
+        let base_url = spawn_bedrock_split_meta_server().await;
+        let messages = vec![json!({"role":"user","content":"hi"})];
+        let stream = call_llm_stream(
+            &messages,
+            &[],
+            "anthropic.claude-sonnet-4-test",
+            "dummy-key",
+            &base_url,
+            "bedrock",
+            Some(32),
+            false,
+            None,
+        )
+        .await
+        .expect("stream should succeed");
+
+        let mut all = Vec::new();
+        let mut s = stream;
+        while let Some(chunk) = s.next().await {
+            all.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8_lossy(&all);
+        assert!(
+            body.contains("\"type\":\"usage\""),
+            "canonical usage SSE event MUST be delivered from the metadata frame \
+             that arrives after messageStop; body was:\n{body}"
+        );
+        assert!(
+            body.contains("\"input_tokens\":42"),
+            "usage must carry the accounted input_tokens=42 from metadata frame; body:\n{body}"
+        );
+        assert!(
+            body.contains("\"output_tokens\":7"),
+            "usage must carry the accounted output_tokens=7 from metadata frame; body:\n{body}"
+        );
+    }
 }

@@ -137,7 +137,12 @@ pub(crate) fn bedrock_stream_response_bytes(
                 }
             }
 
-            if accum.is_finished() {
+            // Do NOT break on `accum.is_finished()` after `messageStop` —
+            // Bedrock Converse delivers the `metadata` frame (carrying
+            // usage) AFTER `messageStop`, often in a separate TCP chunk.
+            // Draining until EOS is the only way to capture usage.
+            // Exceptions are the one exception: they are truly terminal.
+            if accum.has_exception() {
                 break;
             }
         }
@@ -254,7 +259,10 @@ pub(crate) async fn collect_bedrock_stream(
             }
         }
 
-        if accum.is_finished() {
+        // See [`bedrock_stream_response_bytes`] — `metadata` (usage) arrives
+        // AFTER `messageStop`, so we drain until EOS. Only a true terminal
+        // (exception) justifies an early exit.
+        if accum.has_exception() {
             break;
         }
     }

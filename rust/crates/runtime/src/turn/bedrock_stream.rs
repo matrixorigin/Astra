@@ -120,9 +120,13 @@ impl BedrockStreamAccumulator {
         Self::default()
     }
 
-    /// True once a terminal frame (`messageStop` or `exception`) has been seen.
-    pub fn is_finished(&self) -> bool {
-        self.finish_reason.is_some() || self.exception.is_some()
+    /// True only when an exception frame has been seen — the only signal
+    /// that justifies an early exit from a transport loop. `messageStop`
+    /// alone is NOT terminal because Bedrock Converse emits the `metadata`
+    /// frame (carrying usage) AFTER `messageStop`, so draining the byte
+    /// stream until EOS is required for correct token accounting.
+    pub fn has_exception(&self) -> bool {
+        self.exception.is_some()
     }
 
     /// Consume one frame and return any canonical incremental events it produced.
@@ -544,7 +548,7 @@ mod tests {
                 message: "rate limited".into()
             }]
         );
-        assert!(acc.is_finished());
+        assert!(acc.has_exception());
         let r = acc.into_result("claude", 0);
         assert_eq!(
             r.finish_reason.as_deref(),
@@ -675,16 +679,23 @@ mod tests {
     }
 
     #[test]
-    fn message_stop_sets_finished() {
+    fn message_stop_sets_finish_reason_but_not_terminal() {
+        // `messageStop` carries the stopReason but is NOT the last frame —
+        // Bedrock follows it with `metadata` (usage). The accumulator must
+        // record the finish_reason without flagging `has_exception`, so the
+        // transport keeps draining the stream for the trailing metadata.
         let mut acc = BedrockStreamAccumulator::new();
-        assert!(!acc.is_finished());
+        assert!(!acc.has_exception());
         acc.push_frame(&frame(
             "event",
             "messageStop",
             br#"{"stopReason":"max_tokens"}"#,
         ))
         .unwrap();
-        assert!(acc.is_finished());
+        assert!(
+            !acc.has_exception(),
+            "messageStop must NOT flag as exception — metadata still follows"
+        );
         let r = acc.into_result("claude", 0);
         assert_eq!(r.finish_reason.as_deref(), Some("length"));
     }
