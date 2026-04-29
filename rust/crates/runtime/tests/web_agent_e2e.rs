@@ -1055,8 +1055,8 @@ async fn usage_event_emitted() {
     let events = chat_stream_collect(&app, payload).await;
     let usage = find_events(&events, "usage");
     assert!(!usage.is_empty(), "expected usage event");
-    assert_eq!(usage[0]["prompt_tokens"], 100);
-    assert_eq!(usage[0]["completion_tokens"], 50);
+    assert_eq!(usage[0]["input_tokens"], 100);
+    assert_eq!(usage[0]["output_tokens"], 50);
 }
 
 // ── Edge tool delivery via ledger ────────────────────────────────────────────
