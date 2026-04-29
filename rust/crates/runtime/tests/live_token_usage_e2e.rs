@@ -180,7 +180,10 @@ async fn call_openai_compatible(
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("SKIP [{}/{}]: HTTP send failed: {e}", model.provider, model.name);
+            eprintln!(
+                "SKIP [{}/{}]: HTTP send failed: {e}",
+                model.provider, model.name
+            );
             return None;
         }
     };
@@ -188,7 +191,10 @@ async fn call_openai_compatible(
     let raw: Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("SKIP [{}/{}]: json parse failed: {e}", model.provider, model.name);
+            eprintln!(
+                "SKIP [{}/{}]: json parse failed: {e}",
+                model.provider, model.name
+            );
             return None;
         }
     };
@@ -243,7 +249,10 @@ async fn call_bedrock_converse(
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("SKIP [{}/{}]: HTTP send failed: {e}", model.provider, model.name);
+            eprintln!(
+                "SKIP [{}/{}]: HTTP send failed: {e}",
+                model.provider, model.name
+            );
             return None;
         }
     };
@@ -251,7 +260,10 @@ async fn call_bedrock_converse(
     let raw: Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("SKIP [{}/{}]: json parse failed: {e}", model.provider, model.name);
+            eprintln!(
+                "SKIP [{}/{}]: json parse failed: {e}",
+                model.provider, model.name
+            );
             return None;
         }
     };
@@ -382,7 +394,9 @@ async fn per_provider_token_usage_invariants() {
         assert_nonzero_input_and_output(&r.normalized, &tag);
         assert_disjoint_sum_identity(&r.normalized, &tag);
         match dialect {
-            UsageDialect::OpenAi => assert_openai_inclusive_identity(&r.raw_usage, &r.normalized, &tag),
+            UsageDialect::OpenAi => {
+                assert_openai_inclusive_identity(&r.raw_usage, &r.normalized, &tag)
+            }
             UsageDialect::BedrockConverse => {
                 assert_bedrock_disjoint_identity(&r.raw_usage, &r.normalized, &tag)
             }
@@ -454,10 +468,7 @@ async fn bedrock_cache_read_does_not_regress_on_repeat() {
             return None;
         }
         eprintln!("[{tag}] raw usage: {}", raw["usage"]);
-        extract_usage(
-            UsageDialect::BedrockConverse,
-            raw["usage"].as_object()?,
-        )
+        extract_usage(UsageDialect::BedrockConverse, raw["usage"].as_object()?)
     }
 
     let Some(first) = one_call(&client, &url, &model.api_key, &body, &tag).await else {
@@ -605,7 +616,9 @@ async fn bedrock_converse_stream_yields_metadata_after_message_stop() {
     }
 
     eprintln!("[{tag}] event counts: {event_type_counts:?}");
-    eprintln!("[{tag}] messageStop at frame {saw_message_stop_at:?}, metadata at {saw_metadata_at:?}");
+    eprintln!(
+        "[{tag}] messageStop at frame {saw_message_stop_at:?}, metadata at {saw_metadata_at:?}"
+    );
     eprintln!(
         "[{tag}] assembled text ({} chars): {assembled_text:?}",
         assembled_text.len()
@@ -620,8 +633,16 @@ async fn bedrock_converse_stream_yields_metadata_after_message_stop() {
             >= 2,
         "[{tag}] streaming should yield ≥ 2 contentBlockDelta frames; got {event_type_counts:?}"
     );
-    assert_eq!(event_type_counts.get("messageStop").copied(), Some(1), "[{tag}]");
-    assert_eq!(event_type_counts.get("metadata").copied(), Some(1), "[{tag}]");
+    assert_eq!(
+        event_type_counts.get("messageStop").copied(),
+        Some(1),
+        "[{tag}]"
+    );
+    assert_eq!(
+        event_type_counts.get("metadata").copied(),
+        Some(1),
+        "[{tag}]"
+    );
     assert!(!assembled_text.trim().is_empty(), "[{tag}]");
     assert!(stop_reason.is_some(), "[{tag}]");
 

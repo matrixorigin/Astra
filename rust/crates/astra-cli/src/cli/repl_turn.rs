@@ -1954,7 +1954,8 @@ fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: 
     // because all three occupy the context window and are all billed (just at
     // different rates). Showing only `prompt_tokens` (fresh) hides the dominant
     // portion of real traffic on cache-heavy turns and makes cache% nonsensical.
-    let total_input = result.prompt_tokens + result.cache_read_tokens + result.cache_creation_tokens;
+    let total_input =
+        result.prompt_tokens + result.cache_read_tokens + result.cache_creation_tokens;
     let total_tokens = total_input + result.completion_tokens;
     let tokens_str = if total_tokens > 1000 {
         format!("{:.1}k", total_tokens as f64 / 1000.0)

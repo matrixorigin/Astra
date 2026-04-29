@@ -277,8 +277,14 @@ fn extract_pricing_inherits_cache_read_from_family_when_missing() {
         "pricing_completion": 0.002,
     })];
     let p = slash_stats::extract_pricing_for_model(&models, "qwen-plus").unwrap();
-    assert_eq!(p.cache_write, None, "no Anthropic-style write premium for qwen");
-    assert!(p.cache_read.is_some(), "cache_read inherited from fallback_pricing");
+    assert_eq!(
+        p.cache_write, None,
+        "no Anthropic-style write premium for qwen"
+    );
+    assert!(
+        p.cache_read.is_some(),
+        "cache_read inherited from fallback_pricing"
+    );
 }
 
 #[test]
@@ -307,7 +313,8 @@ fn bedrock_claude_sonnet_cost_uses_family_cache_rates() {
         "pricing_prompt": 0.003,
         "pricing_completion": 0.015,
     })];
-    let p = slash_stats::extract_pricing_for_model(&models, "us.anthropic.claude-sonnet-4-6").unwrap();
+    let p =
+        slash_stats::extract_pricing_for_model(&models, "us.anthropic.claude-sonnet-4-6").unwrap();
     // cache_read from family fallback = 0.0003 (10% of $3/Mtok)
     assert!(
         (p.cache_read.unwrap() - 0.0003).abs() < 1e-8,
