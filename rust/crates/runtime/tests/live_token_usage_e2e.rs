@@ -206,6 +206,71 @@ async fn openai_compatible_qwen_plus_populates_usage() {
     );
 }
 
+/// GLM (magikcloud intermediary) — provider dialect routes to OpenAi.
+/// Exercises the GLM family separately from DashScope since GLM's
+/// behind-the-scenes shape can subtly differ (e.g. cached_tokens at
+/// top level or in details).
+#[tokio::test]
+#[ignore = "hits real magikcloud/GLM API; run with --ignored"]
+async fn openai_compatible_glm_populates_usage() {
+    let models = load_models_yaml();
+    let model = find_model(&models, "ep-glm-5-439797");
+    let client = http_client();
+
+    let (raw, usage) = call_openai_compatible(&client, model, "Say hi.").await;
+    eprintln!("glm raw usage: {}", raw.get("usage").unwrap());
+    eprintln!("glm normalized: {usage:?}");
+
+    assert!(usage.input_tokens + usage.cached_input_tokens > 0);
+    assert!(usage.output_tokens > 0);
+    assert_eq!(
+        usage.total_tokens(),
+        usage.input_tokens
+            + usage.cached_input_tokens
+            + usage.cache_creation_tokens
+            + usage.output_tokens,
+    );
+}
+
+/// MiniMax uses `prompt_tokens_details.cached_tokens` (inclusive shape).
+/// Regression guard: the extractor must deduct cached from prompt_tokens
+/// so `input_tokens` reports only FRESH input.
+#[tokio::test]
+#[ignore = "hits real MiniMax API; run with --ignored"]
+async fn openai_compatible_minimax_populates_usage() {
+    let models = load_models_yaml();
+    let model = find_model(&models, "MiniMax-M2.5");
+    let client = http_client();
+
+    let (raw, usage) = call_openai_compatible(&client, model, "Say hi.").await;
+    eprintln!("minimax raw usage: {}", raw.get("usage").unwrap());
+    eprintln!("minimax normalized: {usage:?}");
+
+    assert!(usage.input_tokens + usage.cached_input_tokens > 0);
+    assert!(usage.output_tokens > 0);
+
+    // Disjoint identity.
+    assert_eq!(
+        usage.total_tokens(),
+        usage.input_tokens
+            + usage.cached_input_tokens
+            + usage.cache_creation_tokens
+            + usage.output_tokens,
+        "disjoint sum identity"
+    );
+
+    // MiniMax shape: prompt_tokens is inclusive of cached_tokens under
+    // prompt_tokens_details. `input_tokens + cached_input_tokens + cache_creation_tokens` must equal raw `prompt_tokens`.
+    let raw_prompt = raw["usage"]["prompt_tokens"]
+        .as_u64()
+        .expect("prompt_tokens");
+    assert_eq!(
+        raw_prompt,
+        usage.input_tokens + usage.cached_input_tokens + usage.cache_creation_tokens,
+        "MiniMax inclusive shape: fresh + cached + creation == prompt_tokens"
+    );
+}
+
 #[tokio::test]
 #[ignore = "hits real Bedrock API; run with --ignored"]
 async fn bedrock_claude_sonnet_populates_usage() {

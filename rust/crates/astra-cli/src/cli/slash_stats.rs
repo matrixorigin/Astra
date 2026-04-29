@@ -484,6 +484,13 @@ pub(crate) fn format_cost(cost: f64) -> String {
 }
 
 /// Extract pricing data for a model from the API models list.
+///
+/// Recognizes three shapes:
+/// - `pricing: {...}` — full PricingData JSON (all fields optional except prompt/completion)
+/// - `pricing_cache_read` / `pricing_cache_write` at top level — explicit cache rates
+/// - `pricing_prompt` / `pricing_completion` only — base rates, cache rates inherited
+///   from the model-family defaults (see [`fallback_pricing`]) so non-Anthropic
+///   families don't get mis-estimated with Anthropic's 10%/125% multipliers.
 pub(crate) fn extract_pricing_for_model(
     models: &[serde_json::Value],
     model_name: &str,
@@ -499,7 +506,7 @@ pub(crate) fn extract_pricing_for_model(
         if let Some(pricing) = m.get("pricing") {
             return serde_json::from_value(pricing.clone()).ok();
         }
-        // Fallback: top-level pricing_prompt / pricing_completion fields
+        // Top-level pricing_prompt / pricing_completion / pricing_cache_*
         let prompt = m
             .get("pricing_prompt")
             .and_then(|v| v.as_f64())
@@ -509,11 +516,19 @@ pub(crate) fn extract_pricing_for_model(
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
         if prompt > 0.0 || completion > 0.0 {
+            let explicit_cache_read = m.get("pricing_cache_read").and_then(|v| v.as_f64());
+            let explicit_cache_write = m.get("pricing_cache_write").and_then(|v| v.as_f64());
+            // For missing cache rates, inherit from the family-specific fallback
+            // (Claude: 10%/125%, OpenAI: 25%/no-write, DeepSeek: 25%/no-write, ...).
+            // Without this merge every non-Anthropic model would get Claude's
+            // 10%/125% defaults in `cost_for_tokens`, which can mis-estimate
+            // cached costs by 4× on OpenAI-family providers.
+            let family = fallback_pricing(model_name);
             return Some(astra_services::models::PricingData {
                 prompt,
                 completion,
-                cache_read: None,
-                cache_write: None,
+                cache_read: explicit_cache_read.or(family.cache_read),
+                cache_write: explicit_cache_write.or(family.cache_write),
             });
         }
         return None;
@@ -602,6 +617,45 @@ pub(crate) fn fallback_pricing(model_name: &str) -> astra_services::models::Pric
             prompt: 0.00027,
             completion: 0.0011,
             cache_read: Some(0.00007),
+            cache_write: None,
+        };
+    }
+    // Qwen (DashScope): cache reads ≈ 40% of input, no cache_write premium.
+    // Per-Mtok varies widely by Qwen tier (qwen-plus, qwen-max, ...); leave
+    // prompt/completion for the yaml to populate and supply only the cache
+    // ratio so `extract_pricing_for_model` can blend it in.
+    if name.contains("qwen") {
+        return PricingData {
+            prompt: 0.0008,
+            completion: 0.002,
+            cache_read: Some(0.00032),
+            cache_write: None,
+        };
+    }
+    // MiniMax: cache reads discounted, no cache_write premium.
+    if name.contains("minimax") {
+        return PricingData {
+            prompt: 0.0008,
+            completion: 0.008,
+            cache_read: Some(0.0002),
+            cache_write: None,
+        };
+    }
+    // GLM / Zhipu: cache reads ~25% of input, no cache_write premium.
+    if name.contains("glm") {
+        return PricingData {
+            prompt: 0.0005,
+            completion: 0.0015,
+            cache_read: Some(0.000125),
+            cache_write: None,
+        };
+    }
+    // Kimi (Moonshot): cache reads ~25%, no cache_write premium.
+    if name.contains("kimi") || name.contains("moonshot") {
+        return PricingData {
+            prompt: 0.003,
+            completion: 0.015,
+            cache_read: Some(0.00075),
             cache_write: None,
         };
     }

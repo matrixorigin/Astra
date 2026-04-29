@@ -239,3 +239,85 @@ fn fallback_cost_calculation_with_cache() {
         "cost={cost} expected={expected}"
     );
 }
+
+// ── family-specific fallback pricing (non-Anthropic) ─────────────────────────
+
+#[test]
+fn fallback_qwen_has_no_cache_write_premium() {
+    let p = slash_stats::fallback_pricing("qwen-plus");
+    assert!(p.cache_read.is_some(), "qwen should define cache_read");
+    assert_eq!(
+        p.cache_write, None,
+        "qwen has no cache_write concept — must not default to Anthropic's 125% premium"
+    );
+}
+
+#[test]
+fn fallback_minimax_has_no_cache_write_premium() {
+    let p = slash_stats::fallback_pricing("MiniMax-M2.5");
+    assert_eq!(p.cache_write, None);
+}
+
+#[test]
+fn fallback_glm_has_no_cache_write_premium() {
+    let p = slash_stats::fallback_pricing("glm-5.1");
+    assert_eq!(p.cache_write, None);
+}
+
+// ── extract_pricing_for_model inherits missing cache rates from family ───────
+
+#[test]
+fn extract_pricing_inherits_cache_read_from_family_when_missing() {
+    // Qwen model with only base prompt/completion prices — the extractor
+    // should inherit the qwen family's cache_read rate and leave cache_write
+    // None (no write premium on DashScope).
+    let models = vec![serde_json::json!({
+        "name": "qwen-plus",
+        "pricing_prompt": 0.0008,
+        "pricing_completion": 0.002,
+    })];
+    let p = slash_stats::extract_pricing_for_model(&models, "qwen-plus").unwrap();
+    assert_eq!(p.cache_write, None, "no Anthropic-style write premium for qwen");
+    assert!(p.cache_read.is_some(), "cache_read inherited from fallback_pricing");
+}
+
+#[test]
+fn extract_pricing_preserves_explicit_cache_rates() {
+    let models = vec![serde_json::json!({
+        "name": "claude-sonnet",
+        "pricing_prompt": 0.003,
+        "pricing_completion": 0.015,
+        "pricing_cache_read": 0.0003,
+        "pricing_cache_write": 0.00375,
+    })];
+    let p = slash_stats::extract_pricing_for_model(&models, "claude-sonnet").unwrap();
+    assert!((p.cache_read.unwrap() - 0.0003).abs() < 1e-10);
+    assert!((p.cache_write.unwrap() - 0.00375).abs() < 1e-10);
+}
+
+#[test]
+fn bedrock_claude_sonnet_cost_uses_family_cache_rates() {
+    // Regression guard: a Bedrock Claude Sonnet model whose yaml only has
+    // prompt/completion (no explicit cache_read / cache_write) should STILL
+    // compute cost with the 10%/125% Anthropic cache multipliers via the
+    // family fallback — not the raw 10%/125% literals of an arbitrary
+    // prompt value.
+    let models = vec![serde_json::json!({
+        "name": "us.anthropic.claude-sonnet-4-6",
+        "pricing_prompt": 0.003,
+        "pricing_completion": 0.015,
+    })];
+    let p = slash_stats::extract_pricing_for_model(&models, "us.anthropic.claude-sonnet-4-6").unwrap();
+    // cache_read from family fallback = 0.0003 (10% of $3/Mtok)
+    assert!(
+        (p.cache_read.unwrap() - 0.0003).abs() < 1e-8,
+        "expected sonnet cache_read = $0.0003/Ktok, got {:?}",
+        p.cache_read
+    );
+    // cache_write from family fallback = 0.00375 (125% of $3/Mtok)
+    assert!(
+        (p.cache_write.unwrap() - 0.00375).abs() < 1e-8,
+        "expected sonnet cache_write = $0.00375/Ktok, got {:?}",
+        p.cache_write
+    );
+}
