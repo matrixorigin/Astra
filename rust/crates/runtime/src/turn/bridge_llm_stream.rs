@@ -1431,6 +1431,7 @@ mod tests {
             Some(32),
             false,
             None,
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .expect("stream should succeed after retry");
@@ -1549,6 +1550,7 @@ mod tests {
             Some(32),
             false,
             None,
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
         )
         .await
         .expect("stream should succeed");
