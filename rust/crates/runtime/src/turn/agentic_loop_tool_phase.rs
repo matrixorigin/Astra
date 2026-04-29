@@ -141,24 +141,21 @@ fn update_runtime_todo_from_tool_records(
     }
 
     let turn = session_turn_number(state);
-    if let Some(failed) = meaningful.iter().find(|record| !record.ok) {
-        let reason = tool_record_result_text(failed);
-        let reason = if reason.trim().is_empty() {
-            format!("{} failed", failed.name)
-        } else {
-            format!("{} failed: {reason}", failed.name)
-        };
-        state
-            .continuity
-            .todos
-            .mark_blocked(&active_id, reason.clone());
-        state.continuity.verification.set(
-            astra_turn_types::continuity::VerificationStatus::Failed,
-            reason,
-            turn,
-        );
-    } else {
-        let evidence = meaningful
+
+    // Partition meaningful records into successes and failures. A mixed
+    // parallel tool batch (e.g. `grep` ok + `read_file` 404) must still
+    // contribute the successful evidence before we consider blocking —
+    // otherwise one incidental failure would permanently suppress all
+    // the accumulated signal from the round and prematurely stall the
+    // todo.
+    let (successes, failures): (Vec<_>, Vec<_>) =
+        meaningful.iter().copied().partition(|rec| rec.ok);
+
+    // Always record success evidence first, independent of any failures
+    // in the same round — successes reflect real progress on the active
+    // todo and must not be discarded by a co-scheduled failure.
+    if !successes.is_empty() {
+        let evidence = successes
             .iter()
             .map(|record| format!("{} ok", record.name))
             .collect::<Vec<_>>()
@@ -167,11 +164,64 @@ fn update_runtime_todo_from_tool_records(
             .continuity
             .todos
             .add_evidence(&active_id, evidence.clone());
-        state.continuity.verification.set(
-            astra_turn_types::continuity::VerificationStatus::Passed,
-            evidence,
-            turn,
-        );
+        // Only raise verification to Passed when nothing failed this
+        // round — a partial success must not mask a co-scheduled
+        // failure from the verification signal.
+        if failures.is_empty() {
+            state.continuity.verification.set(
+                astra_turn_types::continuity::VerificationStatus::Passed,
+                evidence,
+                turn,
+            );
+        }
+    }
+
+    // Decide whether a failure is decisive enough to block the todo.
+    // Heuristic: block only if the LAST meaningful tool failed (the
+    // round's terminal action) or if every tool in the round failed.
+    // This avoids premature stalls from incidental failures co-scheduled
+    // with successful exploratory reads, while still catching rounds
+    // whose primary/terminal action clearly did not land.
+    let last_failed = meaningful.last().is_some_and(|rec| !rec.ok);
+    if !failures.is_empty() {
+        let decisive = last_failed;
+        if decisive {
+            // Use the actual last tool (the terminal/decisive action).
+            let failed = meaningful.last().unwrap();
+            let reason = tool_record_result_text(failed);
+            let reason = if reason.trim().is_empty() {
+                format!("{} failed", failed.name)
+            } else {
+                format!("{} failed: {reason}", failed.name)
+            };
+            state
+                .continuity
+                .todos
+                .mark_blocked(&active_id, reason.clone());
+            state.continuity.verification.set(
+                astra_turn_types::continuity::VerificationStatus::Failed,
+                reason,
+                turn,
+            );
+        } else {
+            // Non-decisive failure (e.g. parallel read 404 alongside
+            // successful work). Record it in the verification signal so
+            // the next round still sees it, but do not block the todo —
+            // evidence from the successful tools has already been added
+            // above.
+            let failed = failures.first().unwrap();
+            let reason = tool_record_result_text(failed);
+            let reason = if reason.trim().is_empty() {
+                format!("{} failed (non-blocking)", failed.name)
+            } else {
+                format!("{} failed (non-blocking): {reason}", failed.name)
+            };
+            state.continuity.verification.set(
+                astra_turn_types::continuity::VerificationStatus::Failed,
+                reason,
+                turn,
+            );
+        }
     }
     state.continuity.sync_facts(state.session_facts.clone());
     state.session_facts = state.continuity.facts.clone();
@@ -1581,6 +1631,86 @@ mod tests {
         assert_eq!(
             state.continuity.verification.last_status,
             Some(astra_turn_types::continuity::VerificationStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn mixed_batch_non_blocking_failure_preserves_evidence() {
+        // Failure is NOT last → non-blocking: evidence recorded, todo stays in-progress
+        let mut state = make_state();
+        state.continuity.ensure_tracked_goal(
+            "Implement mixed batch handling and validate non-blocking failures",
+        );
+        advance_runtime_todo_before_tool_round(&mut state);
+
+        update_runtime_todo_from_tool_records(
+            &mut state,
+            &[tool_record("read_file", false), tool_record("grep", true)],
+        );
+
+        let active = state.continuity.todos.active_or_next().unwrap();
+        assert_eq!(
+            active.status,
+            astra_turn_types::continuity::TodoStatus::InProgress
+        );
+        assert_eq!(active.evidence, vec!["grep ok".to_string()]);
+        assert_eq!(
+            state.continuity.verification.last_status,
+            Some(astra_turn_types::continuity::VerificationStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn mixed_batch_last_failed_blocks_todo() {
+        // Failure IS last → blocking
+        let mut state = make_state();
+        state
+            .continuity
+            .ensure_tracked_goal("Implement last-failed detection and validate blocking behavior");
+        advance_runtime_todo_before_tool_round(&mut state);
+
+        update_runtime_todo_from_tool_records(
+            &mut state,
+            &[tool_record("grep", true), tool_record("cargo", false)],
+        );
+
+        let item = state
+            .continuity
+            .todos
+            .items
+            .iter()
+            .find(|i| i.id == "runtime-goal")
+            .unwrap();
+        assert_eq!(
+            item.status,
+            astra_turn_types::continuity::TodoStatus::Blocked
+        );
+        assert!(item.evidence.contains(&"grep ok".to_string()));
+    }
+
+    #[test]
+    fn all_failed_batch_blocks_todo() {
+        let mut state = make_state();
+        state
+            .continuity
+            .ensure_tracked_goal("Implement all-failed detection and validate batch blocking");
+        advance_runtime_todo_before_tool_round(&mut state);
+
+        update_runtime_todo_from_tool_records(
+            &mut state,
+            &[tool_record("bash", false), tool_record("cargo", false)],
+        );
+
+        let item = state
+            .continuity
+            .todos
+            .items
+            .iter()
+            .find(|i| i.id == "runtime-goal")
+            .unwrap();
+        assert_eq!(
+            item.status,
+            astra_turn_types::continuity::TodoStatus::Blocked
         );
     }
 

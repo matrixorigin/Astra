@@ -524,35 +524,23 @@ fn update_session_facts_from_turn(state: &mut super::agentic_loop_host::AgenticL
     // Sync facts → continuity once, then let the todo-completion hook mutate
     // todos on `state.continuity` only.
     //
-    // INVARIANT (enforced by debug_assert below):
-    //   `complete_active_runtime_todo_if_finalized` must mutate neither
-    //   `state.session_facts` nor `state.continuity.facts`. It only touches
-    //   `state.continuity.todos`. This keeps the three snapshots
-    //   (`session_facts`, `continuity.facts`, `facts_before`) trivially
-    //   equal after the hook, so no clone-back is required.
+    // INVARIANT (now STRUCTURAL, no longer assertion-based):
+    //   `complete_active_runtime_todo_if_finalized` receives only a
+    //   narrow `&mut ContinuityState` borrow plus two scalar gating
+    //   inputs (`had_error`, `final_text`). It cannot name
+    //   `state.session_facts` at all, so there is nothing to silently
+    //   overwrite in a future refactor — the compiler enforces the
+    //   contract that previously lived in a debug_assert (stripped in
+    //   release builds). `continuity.facts` is reachable through the
+    //   borrow but must remain untouched by policy; the caller
+    //   re-derives `plan_state` into both sides after this returns.
     //
-    // If a future hook revision needs to mutate facts, update BOTH sides
-    // explicitly (mutate `continuity.facts` and mirror to `session_facts`)
-    // and loosen/replace this assertion — do not reintroduce a silent
-    // clone-back that would mask divergence.
-    let facts_before = state.session_facts.clone();
-    state.continuity.sync_facts(facts_before.clone());
-    // Snapshot `continuity.facts` AFTER sync and BEFORE the hook, so the
-    // post-hook assertion genuinely verifies the hook did not touch
-    // `continuity.facts` (asserting against `facts_before` would be
-    // tautological — we just wrote that value in).
-    #[cfg(debug_assertions)]
-    let continuity_facts_snapshot = state.continuity.facts.clone();
-    complete_active_runtime_todo_if_finalized(state, had_error);
-    debug_assert_eq!(
-        state.session_facts, facts_before,
-        "complete_active_runtime_todo_if_finalized must not mutate session_facts"
-    );
-    #[cfg(debug_assertions)]
-    debug_assert_eq!(
-        state.continuity.facts, continuity_facts_snapshot,
-        "complete_active_runtime_todo_if_finalized must not mutate continuity.facts"
-    );
+    // If a future hook revision genuinely needs to mutate facts, widen
+    // the parameter list explicitly and update BOTH sides (mutate
+    // `continuity.facts` and mirror to `session_facts`) in the caller —
+    // do not reintroduce a silent clone-back.
+    state.continuity.sync_facts(state.session_facts.clone());
+    complete_active_runtime_todo_if_finalized(&mut state.continuity, had_error, &state.final_text);
     // After the hook may have advanced todos (e.g. marking the active todo
     // done), re-derive plan_state from the updated todos and write it into
     // both session_facts and continuity.facts.
@@ -599,17 +587,22 @@ fn update_session_facts_from_turn(state: &mut super::agentic_loop_host::AgenticL
 }
 
 fn complete_active_runtime_todo_if_finalized(
-    state: &mut super::agentic_loop_host::AgenticLoopState,
+    continuity: &mut astra_turn_types::continuity::ContinuityState,
     had_error: bool,
+    final_text: &str,
 ) {
-    // INVARIANT: this function must only mutate `state.continuity` (todos,
-    // verification). It must NOT write to `state.session_facts` — the caller
-    // clones facts back from continuity after return, so any direct writes
-    // to session_facts would be silently overwritten.
-    if had_error || state.final_text.trim().is_empty() {
+    // STRUCTURAL INVARIANT: this hook receives only `&mut ContinuityState`
+    // plus two scalar inputs. It has no path to `state.session_facts` or
+    // any other `AgenticLoopState` field, so the compiler now enforces
+    // what a release-stripped `debug_assert` previously only documented.
+    // The only legal mutation targets are `continuity.todos` and
+    // `continuity.verification`; `continuity.facts` must remain untouched
+    // by policy — the caller re-derives `plan_state` into both sides
+    // (`session_facts` and `continuity.facts`) after this returns.
+    if had_error || final_text.trim().is_empty() {
         return;
     }
-    let Some(active) = state.continuity.todos.active_or_next().cloned() else {
+    let Some(active) = continuity.todos.active_or_next().cloned() else {
         return;
     };
     if active.status != astra_turn_types::continuity::TodoStatus::InProgress {
@@ -620,12 +613,11 @@ fn complete_active_runtime_todo_if_finalized(
     // Otherwise the manifest keeps advertising `in_progress` forever and
     // misleads future rounds.
     if active.evidence.is_empty() {
-        state
-            .continuity
+        continuity
             .todos
             .add_evidence(&active.id, "answered without tool invocation");
     }
-    state.continuity.todos.mark_done(
+    continuity.todos.mark_done(
         &active.id,
         "final response completed after verified tool evidence",
     );
@@ -677,7 +669,11 @@ mod tests {
         state.final_text = "Here is your answer.".to_string();
         seed_active_todo(&mut state);
 
-        complete_active_runtime_todo_if_finalized(&mut state, /*had_error=*/ false);
+        complete_active_runtime_todo_if_finalized(
+            &mut state.continuity,
+            /*had_error=*/ false,
+            &state.final_text,
+        );
 
         let item = state
             .continuity
@@ -707,7 +703,11 @@ mod tests {
         state.final_text = String::new();
         seed_active_todo(&mut state);
 
-        complete_active_runtime_todo_if_finalized(&mut state, /*had_error=*/ false);
+        complete_active_runtime_todo_if_finalized(
+            &mut state.continuity,
+            /*had_error=*/ false,
+            &state.final_text,
+        );
 
         let item = state
             .continuity
@@ -735,7 +735,11 @@ mod tests {
         state.final_text = "partial output before failure".to_string();
         seed_active_todo(&mut state);
 
-        complete_active_runtime_todo_if_finalized(&mut state, /*had_error=*/ true);
+        complete_active_runtime_todo_if_finalized(
+            &mut state.continuity,
+            /*had_error=*/ true,
+            &state.final_text,
+        );
 
         let item = state
             .continuity
