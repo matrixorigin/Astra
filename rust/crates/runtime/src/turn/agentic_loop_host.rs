@@ -805,12 +805,6 @@ pub struct AgenticLoopState {
     /// Created at turn start, flushed at turn end or on interruption.
     pub turn_event_buffer: Option<astra_services::session_journal::TurnEventBuffer>,
 
-    // ── Conversation State Log (CSL) ──
-    /// Last seq written to the CSL for this session.
-    pub csl_last_seq: u64,
-    /// Number of messages at the start of this turn (before agentic loop runs).
-    /// Used to compute the TurnDelta at turn end.
-    pub csl_turn_start_message_count: usize,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -1170,8 +1164,6 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         bridge_turn_chain_id: None,
         bridge_user_query_event_id: None,
         turn_event_buffer: None,
-        csl_last_seq: 0,
-        csl_turn_start_message_count: 0,
     }
 }
 
@@ -1525,8 +1517,6 @@ pub(crate) mod tests {
             bridge_turn_chain_id: None,
             bridge_user_query_event_id: None,
             turn_event_buffer: None,
-            csl_last_seq: 0,
-            csl_turn_start_message_count: 0,
         }
     }
 

@@ -9,6 +9,7 @@
 
 pub mod db_store;
 pub mod file_store;
+pub mod manager;
 
 use astra_pipeline::step_protocol::DelegationSubRunSummary;
 use astra_turn_types::continuity::ContinuityState;
@@ -99,31 +100,100 @@ pub struct DelegationCompact {
 
 /// Incremental patch — only changed fields.
 /// `None` = field unchanged from the previous state.
+///
+/// For nullable fields (`approval_overrides`, `interruption`, `compaction_tracker`),
+/// `Option<Option<Value>>` is used:
+/// - `None` = unchanged (field omitted in JSON)
+/// - `Some(None)` = explicitly cleared (serialized as JSON `null`)
+/// - `Some(Some(v))` = set to value `v`
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionStatePatch {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub continuity: Option<ContinuityState>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "nullable"
+    )]
+    pub continuity: Option<Option<ContinuityState>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_tools: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval_overrides: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interruption: Option<Value>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "nullable"
+    )]
+    pub approval_overrides: Option<Option<Value>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "nullable"
+    )]
+    pub interruption: Option<Option<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_remaining_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_remaining_rounds: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consecutive_ctx_errors: Option<u32>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "nullable"
+    )]
+    pub delegation: Option<Option<DelegationCompact>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "nullable"
+    )]
+    pub compaction_tracker: Option<Option<Value>>,
+}
+
+/// Generic serde helper for `Option<Option<T>>` that preserves JSON `null` as `Some(None)`.
+///
+/// Without this, serde_json maps JSON `null` to `None` for `Option<T>`, losing the
+/// distinction between "field absent" and "field explicitly set to null".
+///
+/// Semantics:
+/// - `None` = field absent (unchanged in a patch) — skipped by `skip_serializing_if`
+/// - `Some(None)` = explicitly cleared (serialized as JSON `null`)
+/// - `Some(Some(v))` = set to value `v`
+mod nullable {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S, T: Serialize>(
+        val: &Option<Option<T>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match val {
+            Some(Some(v)) => v.serialize(serializer),
+            // Some(None) → JSON null; None is dead code due to skip_serializing_if
+            Some(None) | None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D, T: Deserialize<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Option<T>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // When called, the field IS present in JSON.
+        // Option::deserialize naturally maps JSON null → None, value → Some(v).
+        // Wrap in outer Some to distinguish from "field absent" (outer None).
+        Ok(Some(Option::<T>::deserialize(deserializer)?))
+    }
 }
 
 impl SessionStateCompact {
     /// Apply an incremental patch, updating only the fields present in `patch`.
     pub fn apply_patch(&mut self, patch: &SessionStatePatch) {
         if let Some(c) = &patch.continuity {
-            self.continuity = Some(c.clone());
+            self.continuity = c.clone();
         }
         if let Some(bt) = &patch.blocked_tools {
             self.blocked_tools = bt.clone();
@@ -132,10 +202,10 @@ impl SessionStateCompact {
             self.recent_tools = rt.clone();
         }
         if let Some(ao) = &patch.approval_overrides {
-            self.approval_overrides = Some(ao.clone());
+            self.approval_overrides = ao.clone();
         }
         if let Some(intr) = &patch.interruption {
-            self.interruption = Some(intr.clone());
+            self.interruption = intr.clone();
         }
         if let Some(t) = patch.budget_remaining_tokens {
             self.budget_remaining_tokens = t;
@@ -145,6 +215,12 @@ impl SessionStateCompact {
         }
         if let Some(e) = patch.consecutive_ctx_errors {
             self.consecutive_ctx_errors = e;
+        }
+        if let Some(d) = &patch.delegation {
+            self.delegation = d.clone();
+        }
+        if let Some(ct) = &patch.compaction_tracker {
+            self.compaction_tracker = ct.clone();
         }
     }
 }
@@ -238,14 +314,30 @@ pub fn materialize(entries: &[CslEntry]) -> Result<MaterializedState, Materializ
     })
 }
 
+// ─── Append metadata ───────────────────────────────────────────────────────
+
+/// Metadata carried alongside each [`CslStore::append`] call.
+/// `FileCslStore` ignores these (JSONL has no columns); `DbCslStore` writes
+/// them to dedicated DB columns for audit/query.
+#[derive(Debug, Clone, Default)]
+pub struct AppendMeta {
+    pub trace_id: Option<String>,
+    pub message_count: Option<u32>,
+}
+
 // ─── Store trait ────────────────────────────────────────────────────────────
 
 /// Persistence backend for the CSL. Implementations exist for local files
-/// ([`file_store::FileCslStore`]) and database (future `DbCslStore`).
+/// ([`file_store::FileCslStore`]) and database ([`db_store::DbCslStore`]).
 #[async_trait]
 pub trait CslStore: Send + Sync {
     /// Append an entry to the log for `session_id`.
-    async fn append(&self, session_id: &str, entry: &CslEntry) -> Result<(), CslStoreError>;
+    async fn append(
+        &self,
+        session_id: &str,
+        entry: &CslEntry,
+        meta: &AppendMeta,
+    ) -> Result<(), CslStoreError>;
 
     /// Load entries from the latest [`Snapshot`](CslEntry::Snapshot) onward.
     /// Returns entries in seq order, starting with the Snapshot.
@@ -488,7 +580,7 @@ mod tests {
         let mut state = SessionStateCompact::default();
         let patch = SessionStatePatch {
             blocked_tools: Some(vec!["x".into()]),
-            approval_overrides: Some(json!({"tool": "bash", "approved": true})),
+            approval_overrides: Some(Some(json!({"tool": "bash", "approved": true}))),
             ..Default::default()
         };
         state.apply_patch(&patch);
@@ -614,8 +706,8 @@ mod tests {
             verification: Default::default(),
         };
         let patch = SessionStatePatch {
-            continuity: Some(continuity.clone()),
-            interruption: Some(json!({"kind": "budget_exhausted", "resume_action": "continue"})),
+            continuity: Some(Some(continuity.clone())),
+            interruption: Some(Some(json!({"kind": "budget_exhausted", "resume_action": "continue"}))),
             ..Default::default()
         };
         state.apply_patch(&patch);
@@ -641,11 +733,12 @@ mod tests {
             continuity: None,
             blocked_tools: Some(vec!["new".into()]),
             recent_tools: Some(vec!["new_tool".into()]),
-            approval_overrides: Some(json!({"new": true})),
-            interruption: Some(json!({"new": "reason"})),
+            approval_overrides: Some(Some(json!({"new": true}))),
+            interruption: Some(Some(json!({"new": "reason"}))),
             budget_remaining_tokens: Some(42_000),
             budget_remaining_rounds: Some(3),
             consecutive_ctx_errors: Some(5),
+            ..Default::default()
         };
         state.apply_patch(&patch);
         assert_eq!(state.blocked_tools, vec!["new"]);
@@ -671,8 +764,8 @@ mod tests {
                 SessionStatePatch {
                     blocked_tools: Some(vec!["bash".into(), "write".into()]),
                     recent_tools: Some(vec!["read_file".into()]),
-                    approval_overrides: Some(json!({"tool": "bash", "approved": true})),
-                    interruption: Some(json!({"kind": "paused"})),
+                    approval_overrides: Some(Some(json!({"tool": "bash", "approved": true}))),
+                    interruption: Some(Some(json!({"kind": "paused"}))),
                     ..Default::default()
                 },
             ),
@@ -894,5 +987,99 @@ mod tests {
         assert!(json_str.contains("consecutive_ctx_errors"));
         // Fields not set should be absent
         assert!(!json_str.contains("continuity"));
+    }
+
+    // ── Bug fix: apply_patch must be able to clear continuity/delegation ──
+
+    #[test]
+    fn patch_clears_continuity_via_explicit_none() {
+        let continuity = astra_turn_types::continuity::ContinuityState {
+            goal: Default::default(),
+            todos: Default::default(),
+            facts: Default::default(),
+            user_corrections: vec![],
+            verification: Default::default(),
+        };
+        let mut state = SessionStateCompact {
+            continuity: Some(continuity),
+            ..Default::default()
+        };
+
+        // A patch that explicitly says "clear continuity" must result in None.
+        let patch = SessionStatePatch {
+            continuity: Some(None),
+            ..Default::default()
+        };
+        state.apply_patch(&patch);
+        assert!(
+            state.continuity.is_none(),
+            "apply_patch should clear continuity when patch has Some(None)"
+        );
+    }
+
+    #[test]
+    fn patch_clears_delegation_via_explicit_none() {
+        let mut state = SessionStateCompact {
+            delegation: Some(DelegationCompact {
+                id: "d1".into(),
+                pattern: "review".into(),
+                completed_sub_runs: vec![],
+            }),
+            ..Default::default()
+        };
+
+        let patch = SessionStatePatch {
+            delegation: Some(None),
+            ..Default::default()
+        };
+        state.apply_patch(&patch);
+        assert!(
+            state.delegation.is_none(),
+            "apply_patch should clear delegation when patch has Some(None)"
+        );
+    }
+
+    #[test]
+    fn patch_none_continuity_leaves_existing_untouched() {
+        let continuity = astra_turn_types::continuity::ContinuityState {
+            goal: Default::default(),
+            todos: Default::default(),
+            facts: Default::default(),
+            user_corrections: vec![],
+            verification: Default::default(),
+        };
+        let mut state = SessionStateCompact {
+            continuity: Some(continuity.clone()),
+            ..Default::default()
+        };
+
+        // patch.continuity = None means "unchanged".
+        let patch = SessionStatePatch::default();
+        state.apply_patch(&patch);
+        assert_eq!(state.continuity, Some(continuity));
+    }
+
+    #[test]
+    fn serde_patch_continuity_clear_roundtrip() {
+        let patch = SessionStatePatch {
+            continuity: Some(None),
+            ..Default::default()
+        };
+        let json_str = serde_json::to_string(&patch).unwrap();
+        assert!(json_str.contains("continuity"), "Some(None) must serialize as null, not be omitted");
+        let deser: SessionStatePatch = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(deser.continuity, Some(None), "JSON null must deserialize to Some(None)");
+    }
+
+    #[test]
+    fn serde_patch_delegation_clear_roundtrip() {
+        let patch = SessionStatePatch {
+            delegation: Some(None),
+            ..Default::default()
+        };
+        let json_str = serde_json::to_string(&patch).unwrap();
+        assert!(json_str.contains("delegation"), "Some(None) must serialize as null, not be omitted");
+        let deser: SessionStatePatch = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(deser.delegation, Some(None), "JSON null must deserialize to Some(None)");
     }
 }

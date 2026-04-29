@@ -50,19 +50,27 @@ impl DbCslStore {
 
 #[async_trait]
 impl CslStore for DbCslStore {
-    async fn append(&self, session_id: &str, entry: &CslEntry) -> Result<(), CslStoreError> {
+    async fn append(
+        &self,
+        session_id: &str,
+        entry: &CslEntry,
+        meta: &super::AppendMeta,
+    ) -> Result<(), CslStoreError> {
         let pool = self.get_pool().await?;
         let payload = serde_json::to_string(entry)?;
         let entry_type: i8 = if entry.is_snapshot() { 0 } else { 1 };
 
         query(
-            "INSERT INTO conversation_log (session_id, seq, turn, entry_type, payload) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO conversation_log \
+             (session_id, seq, turn, entry_type, trace_id, message_count, payload) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(session_id)
         .bind(entry.seq() as i64)
         .bind(entry.turn() as i32)
         .bind(entry_type)
+        .bind(meta.trace_id.as_deref())
+        .bind(meta.message_count.map(|c| c as i32))
         .bind(&payload)
         .execute(&pool)
         .await
@@ -77,42 +85,34 @@ impl CslStore for DbCslStore {
     ) -> Result<Vec<CslEntry>, CslStoreError> {
         let pool = self.get_pool().await?;
 
-        // Find the latest snapshot's seq.
-        let snap_row = query(
-            "SELECT seq FROM conversation_log \
-             WHERE session_id = ? AND entry_type = 0 \
-             ORDER BY seq DESC LIMIT 1",
+        // Single query: find the latest snapshot's seq via subquery and load from there.
+        let rows = query(
+            "SELECT payload FROM conversation_log \
+             WHERE session_id = ? AND seq >= ( \
+                 SELECT COALESCE(MAX(seq), -1) FROM conversation_log \
+                 WHERE session_id = ? AND entry_type = 0 \
+             ) \
+             ORDER BY seq ASC",
         )
         .bind(session_id)
-        .fetch_optional(&pool)
+        .bind(session_id)
+        .fetch_all(&pool)
         .await
-        .map_err(|e| CslStoreError::Other(format!("snapshot lookup: {e}")))?;
+        .map_err(|e| CslStoreError::Other(format!("load from snapshot: {e}")))?;
 
-        let rows = match snap_row {
-            Some(row) => {
-                let snap_seq: i64 = row
-                    .try_get("seq")
-                    .map_err(|e| CslStoreError::Other(format!("seq column: {e}")))?;
-                query(
-                    "SELECT payload FROM conversation_log \
-                     WHERE session_id = ? AND seq >= ? \
-                     ORDER BY seq ASC",
-                )
-                .bind(session_id)
-                .bind(snap_seq)
-                .fetch_all(&pool)
-                .await
-                .map_err(|e| CslStoreError::Other(format!("load from snapshot: {e}")))?
-            }
-            None => {
-                // No snapshot found — return empty. materialize() requires a
-                // Snapshot as the first entry, so returning orphan TurnDeltas
-                // would just cause a MissingSnapshot error downstream.
-                return Ok(Vec::new());
-            }
-        };
+        // If no snapshot exists, the subquery returns -1 and we get all rows.
+        // Filter to only return entries starting from a Snapshot.
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        rows.iter().map(Self::entry_from_row).collect()
+        let entries: Vec<CslEntry> = rows.iter().map(Self::entry_from_row).collect::<Result<_, _>>()?;
+        // If there's no snapshot in the result (subquery returned -1, meaning no
+        // snapshot exists), return empty — materialize() requires a leading Snapshot.
+        match entries.first() {
+            Some(e) if e.is_snapshot() => Ok(entries),
+            _ => Ok(Vec::new()),
+        }
     }
 
     async fn load_after(
@@ -159,6 +159,11 @@ impl CslStore for DbCslStore {
     ) -> Result<u64, CslStoreError> {
         let pool = self.get_pool().await?;
 
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| CslStoreError::Other(format!("fork begin tx: {e}")))?;
+
         // Load parent entries up to fork_after_turn.
         let rows = query(
             "SELECT payload FROM conversation_log \
@@ -167,11 +172,14 @@ impl CslStore for DbCslStore {
         )
         .bind(parent_session_id)
         .bind(fork_after_turn as i32)
-        .fetch_all(&pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| CslStoreError::Other(format!("fork read: {e}")))?;
 
         if rows.is_empty() {
+            tx.commit()
+                .await
+                .map_err(|e| CslStoreError::Other(format!("fork commit: {e}")))?;
             return Ok(0);
         }
 
@@ -180,10 +188,10 @@ impl CslStore for DbCslStore {
             .map(Self::entry_from_row)
             .collect::<Result<_, _>>()?;
 
-        // Materialize state at fork point, write as single Snapshot.
+        // Materialize state at fork point, write as single Snapshot at seq=1.
         let mat = materialize(&entries)?;
         let fork_snapshot = CslEntry::Snapshot {
-            seq: 0,
+            seq: 1,
             turn: mat.last_turn,
             messages: mat.messages,
             session_state: mat.session_state,
@@ -191,15 +199,20 @@ impl CslStore for DbCslStore {
 
         let payload = serde_json::to_string(&fork_snapshot)?;
         query(
-            "INSERT INTO conversation_log (session_id, seq, turn, entry_type, payload) \
-             VALUES (?, 0, ?, 0, ?)",
+            "INSERT INTO conversation_log \
+             (session_id, seq, turn, entry_type, payload) \
+             VALUES (?, 1, ?, 0, ?)",
         )
         .bind(new_session_id)
         .bind(mat.last_turn as i32)
         .bind(&payload)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| CslStoreError::Other(format!("fork write: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| CslStoreError::Other(format!("fork commit: {e}")))?;
 
         Ok(1)
     }
@@ -210,8 +223,12 @@ impl CslStore for DbCslStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation_log::SessionStateCompact;
+    use crate::conversation_log::{AppendMeta, SessionStateCompact};
     use serde_json::json;
+
+    fn meta() -> AppendMeta {
+        AppendMeta::default()
+    }
 
     fn user_msg(content: &str) -> serde_json::Value {
         json!({"role": "user", "content": content})
@@ -265,14 +282,17 @@ mod tests {
         let pool = store.get_pool().await.expect("DB connection required");
         query(
             "CREATE TABLE IF NOT EXISTS conversation_log (
-                session_id  VARCHAR(64) NOT NULL,
-                seq         BIGINT NOT NULL,
-                turn        INT NOT NULL,
-                entry_type  TINYINT NOT NULL,
-                payload     MEDIUMTEXT NOT NULL,
-                created_at  DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                session_id    VARCHAR(64) NOT NULL,
+                seq           BIGINT NOT NULL,
+                turn          INT NOT NULL,
+                entry_type    TINYINT NOT NULL,
+                trace_id      VARCHAR(64) DEFAULT NULL,
+                message_count INT DEFAULT NULL,
+                payload       MEDIUMTEXT NOT NULL,
+                created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
                 PRIMARY KEY (session_id, seq),
-                INDEX idx_csl_snapshot (session_id, entry_type, seq DESC)
+                INDEX idx_csl_snapshot (session_id, entry_type, seq DESC),
+                INDEX idx_csl_turn (session_id, turn)
             )",
         )
         .execute(&pool)
@@ -299,10 +319,10 @@ mod tests {
         cleanup(&store, sid).await;
 
         let snap = make_snapshot(0, 1, vec![user_msg("hello")]);
-        store.append(sid, &snap).await.unwrap();
+        store.append(sid, &snap, &meta()).await.unwrap();
 
         let delta = make_delta(1, 2, vec![user_msg("turn2"), assistant_msg("resp2")]);
-        store.append(sid, &delta).await.unwrap();
+        store.append(sid, &delta, &meta()).await.unwrap();
 
         let entries = store.load_from_latest_snapshot(sid).await.unwrap();
         assert_eq!(entries.len(), 2);
@@ -326,19 +346,19 @@ mod tests {
 
         // Two snapshots with deltas between.
         store
-            .append(sid, &make_snapshot(0, 1, vec![user_msg("old")]))
+            .append(sid, &make_snapshot(0, 1, vec![user_msg("old")]), &meta())
             .await
             .unwrap();
         store
-            .append(sid, &make_delta(1, 2, vec![user_msg("delta_old")]))
+            .append(sid, &make_delta(1, 2, vec![user_msg("delta_old")]), &meta())
             .await
             .unwrap();
         store
-            .append(sid, &make_snapshot(2, 3, vec![user_msg("compacted")]))
+            .append(sid, &make_snapshot(2, 3, vec![user_msg("compacted")]), &meta())
             .await
             .unwrap();
         store
-            .append(sid, &make_delta(3, 4, vec![user_msg("new")]))
+            .append(sid, &make_delta(3, 4, vec![user_msg("new")]), &meta())
             .await
             .unwrap();
 
@@ -363,19 +383,19 @@ mod tests {
         cleanup(&store, sid).await;
 
         store
-            .append(sid, &make_snapshot(0, 1, vec![user_msg("old")]))
+            .append(sid, &make_snapshot(0, 1, vec![user_msg("old")]), &meta())
             .await
             .unwrap();
         store
-            .append(sid, &make_delta(1, 2, vec![user_msg("mid")]))
+            .append(sid, &make_delta(1, 2, vec![user_msg("mid")]), &meta())
             .await
             .unwrap();
         store
-            .append(sid, &make_snapshot(2, 3, vec![user_msg("new_snap")]))
+            .append(sid, &make_snapshot(2, 3, vec![user_msg("new_snap")]), &meta())
             .await
             .unwrap();
         store
-            .append(sid, &make_delta(3, 4, vec![user_msg("latest")]))
+            .append(sid, &make_delta(3, 4, vec![user_msg("latest")]), &meta())
             .await
             .unwrap();
 
@@ -403,6 +423,7 @@ mod tests {
             .append(
                 parent,
                 &make_snapshot(0, 1, vec![user_msg("t1"), assistant_msg("r1")]),
+                &meta(),
             )
             .await
             .unwrap();
@@ -410,6 +431,7 @@ mod tests {
             .append(
                 parent,
                 &make_delta(1, 2, vec![user_msg("t2"), assistant_msg("r2")]),
+                &meta(),
             )
             .await
             .unwrap();
@@ -417,6 +439,7 @@ mod tests {
             .append(
                 parent,
                 &make_delta(2, 3, vec![user_msg("t3"), assistant_msg("r3")]),
+                &meta(),
             )
             .await
             .unwrap();
@@ -445,15 +468,15 @@ mod tests {
         cleanup(&store, sid).await;
 
         store
-            .append(sid, &make_snapshot(0, 1, vec![]))
+            .append(sid, &make_snapshot(0, 1, vec![]), &meta())
             .await
             .unwrap();
         store
-            .append(sid, &make_delta(1, 2, vec![user_msg("a")]))
+            .append(sid, &make_delta(1, 2, vec![user_msg("a")]), &meta())
             .await
             .unwrap();
         store
-            .append(sid, &make_delta(2, 3, vec![user_msg("b")]))
+            .append(sid, &make_delta(2, 3, vec![user_msg("b")]), &meta())
             .await
             .unwrap();
 
@@ -483,7 +506,7 @@ mod tests {
         cleanup(&store, child).await;
 
         store
-            .append(parent, &make_snapshot(0, 1, vec![user_msg("read file")]))
+            .append(parent, &make_snapshot(0, 1, vec![user_msg("read file")]), &meta())
             .await
             .unwrap();
         store
@@ -494,6 +517,7 @@ mod tests {
                     1,
                     vec![tool_result_msg("c1", "fn main() {}"), assistant_msg("done")],
                 ),
+                &meta(),
             )
             .await
             .unwrap();

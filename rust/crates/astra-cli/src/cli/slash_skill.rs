@@ -1779,8 +1779,7 @@ Follow these steps:
                 runtime_continuity: state.runtime_continuity.as_ref(),
                 turn_index: state.turn,
                 evolution_service: None,
-                csl_store: None,
-                csl_last_seq: 0,
+                pre_loaded_messages: None,
             })
             .await
             .map_err(|e| e.to_string())?;

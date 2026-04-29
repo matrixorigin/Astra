@@ -129,8 +129,7 @@ pub(crate) struct StreamResultBuild<'a> {
     pub(crate) turn_observability_events: Vec<astra_services::session_journal::JournalEvent>,
     pub(crate) llm_rounds: Option<u32>,
     pub(crate) interruption: Option<serde_json::Value>,
-    pub(crate) csl_appended_messages: Vec<serde_json::Value>,
-    pub(crate) csl_full_messages: Vec<serde_json::Value>,
+    pub(crate) final_messages: Vec<serde_json::Value>,
 }
 
 pub(crate) fn resolved_tool_metrics<I>(
@@ -197,8 +196,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         turn_observability_events,
         llm_rounds,
         interruption,
-        csl_appended_messages,
-        csl_full_messages,
+        final_messages,
     } = ctx;
     let (tool_calls_count, tools_used) =
         resolved_tool_metrics(tool_calls_count, tools_used, &tool_call_records);
@@ -266,8 +264,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         turn_observability_events,
         llm_rounds,
         interruption,
-        csl_appended_messages,
-        csl_full_messages,
+        final_messages,
     }
 }
 #[cfg(test)]
@@ -321,8 +318,7 @@ mod tests {
             turn_observability_events: Vec::new(),
             llm_rounds: None,
             interruption: None,
-            csl_appended_messages: Vec::new(),
-            csl_full_messages: Vec::new(),
+            final_messages: Vec::new(),
         }
     }
 

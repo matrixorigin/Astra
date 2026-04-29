@@ -1777,8 +1777,7 @@ async fn plan_executor_task(
                     runtime_continuity: None,
                     turn_index: ctx.turn,
                     evolution_service: ctx.evolution_service.clone(),
-                    csl_store: None,
-                    csl_last_seq: 0,
+                    pre_loaded_messages: None,
                 })
                 .await;
 
@@ -2759,8 +2758,7 @@ mod tests {
             turn_observability_events: Vec::new(),
             llm_rounds: None,
             interruption: None,
-            csl_appended_messages: Vec::new(),
-            csl_full_messages: Vec::new(),
+            final_messages: Vec::new(),
         }
     }
 
@@ -3784,8 +3782,7 @@ All acceptance checks pass:
             turn_observability_events: Vec::new(),
             llm_rounds: Some(3),
             interruption: None,
-            csl_appended_messages: Vec::new(),
-            csl_full_messages: Vec::new(),
+            final_messages: Vec::new(),
         };
 
         let mut turn_evt = session_journal::JournalEvent::turn(

@@ -45,6 +45,7 @@ pub(super) async fn handle_state_command(
             state.session_id = new_sid.clone();
             state.turn = 0;
             state.run_id = None;
+            state.csl_manager = None;
             state.history.clear();
             state.total_prompt_tokens = 0;
             state.total_completion_tokens = 0;
@@ -141,7 +142,9 @@ pub(super) async fn handle_state_command(
             }
             state.last_response = state.history.last().map(|(_, resp)| resp.clone());
             state.continuation_anchor = None;
-            state.csl_last_seq = 0;
+            if let Some(ref mut mgr) = state.csl_manager {
+                let _ = mgr.reset().await;
+            }
             if actual == 1 {
                 eprintln!(
                     "  {} Undid 1 turn: {}",
@@ -369,8 +372,7 @@ pub(super) async fn handle_state_command(
                     runtime_continuity: None,
                     turn_index: 0,
                     evolution_service: state.evolution_service.clone(),
-                    csl_store: None,
-                    csl_last_seq: 0,
+                    pre_loaded_messages: None,
                 }) => r,
                 _ = tokio::signal::ctrl_c() => {
                     if let Some(ref t) = _cancel_token_guard { t.cancel(); }
@@ -479,8 +481,7 @@ pub(super) async fn handle_state_command(
                             runtime_continuity: None,
                             turn_index: 0,
                             evolution_service: state.evolution_service.clone(),
-                            csl_store: None,
-                            csl_last_seq: 0,
+                            pre_loaded_messages: None,
                         })
                         .await;
 
@@ -570,8 +571,7 @@ pub(super) async fn handle_state_command(
                                     runtime_continuity: None,
                                     turn_index: 0,
                                     evolution_service: state.evolution_service.clone(),
-                                    csl_store: None,
-                                    csl_last_seq: 0,
+                                    pre_loaded_messages: None,
                                 })
                                 .await;
                                 if let Ok(sr2) = synth_result {

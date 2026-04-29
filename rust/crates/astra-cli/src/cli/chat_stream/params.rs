@@ -159,11 +159,9 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) turn_index: u32,
     /// Shared evolution service for multi-axis self-evolution.
     pub(crate) evolution_service: Option<Arc<astra_runtime::evolution::service::EvolutionService>>,
-    /// Local CSL store for loading conversation history from JSONL.
-    pub(crate) csl_store:
-        Option<&'a astra_turn_core::conversation_log::file_store::FileCslStore>,
-    /// Last CSL sequence number (threaded into AgenticLoopState).
-    pub(crate) csl_last_seq: u64,
+    /// Pre-loaded CSL messages (from CslManager.load() in repl_turn).
+    /// When present, these are used instead of converting history pairs.
+    pub(crate) pre_loaded_messages: Option<Vec<serde_json::Value>>,
 }
 
 /// Bundle of "basic CLI" fields shared across one-shot CLI chat invocations
@@ -245,8 +243,7 @@ impl<'a> ChatTurnParams<'a> {
             runtime_continuity: None,
             turn_index: 0,
             evolution_service: None,
-            csl_store: None,
-            csl_last_seq: 0,
+            pre_loaded_messages: None,
         }
     }
 }

@@ -56,6 +56,8 @@ pub struct ForkSessionResult {
     pub new_session_id: String,
     /// Turn-like events copied from parent (excludes synthetic fork/start lines).
     pub events_copied: usize,
+    /// The actual turn number the session was forked after.
+    pub forked_at_turn: u32,
     /// Data-branch name generated when `DataBranchOptions::create_data_branch` was set.
     pub data_branch_name: Option<String>,
     /// Composite snapshot at the fork point — references to all state dimensions
@@ -232,6 +234,7 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
     Ok(ForkSessionResult {
         new_session_id: new_id,
         events_copied: copied,
+        forked_at_turn,
         data_branch_name,
         fork_snapshot,
     })

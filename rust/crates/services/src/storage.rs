@@ -1387,14 +1387,17 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS conversation_log (
-            session_id  VARCHAR(64) NOT NULL,
-            seq         BIGINT NOT NULL,
-            turn        INT NOT NULL,
-            entry_type  TINYINT NOT NULL,
-            payload     MEDIUMTEXT NOT NULL,
-            created_at  DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            session_id    VARCHAR(64) NOT NULL,
+            seq           BIGINT NOT NULL,
+            turn          INT NOT NULL,
+            entry_type    TINYINT NOT NULL,
+            trace_id      VARCHAR(64) DEFAULT NULL,
+            message_count INT DEFAULT NULL,
+            payload       MEDIUMTEXT NOT NULL,
+            created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (session_id, seq),
-            INDEX idx_csl_snapshot (session_id, entry_type, seq DESC)
+            INDEX idx_csl_snapshot (session_id, entry_type, seq DESC),
+            INDEX idx_csl_turn (session_id, turn)
         )",
     )
     .execute(&pool)
@@ -1563,6 +1566,17 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
         "add UNIQUE (plan_id, subtask_id, attempt) on plan_step_runs",
         "ALTER TABLE plan_step_runs \
          ADD UNIQUE KEY uq_step_runs_subtask_attempt (plan_id, subtask_id, attempt)",
+    )
+    .await?;
+
+    run_migration(
+        pool,
+        9,
+        "add trace_id, message_count, idx_csl_turn to conversation_log",
+        "ALTER TABLE conversation_log \
+         ADD COLUMN trace_id VARCHAR(64) DEFAULT NULL, \
+         ADD COLUMN message_count INT DEFAULT NULL, \
+         ADD INDEX idx_csl_turn (session_id, turn)",
     )
     .await?;
 

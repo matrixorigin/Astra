@@ -902,8 +902,7 @@ async fn run_chat_turn(
             runtime_continuity: state.runtime_continuity.as_ref(),
             turn_index: state.turn,
             evolution_service: state.evolution_service.clone(),
-            csl_store: state.csl_store.as_ref(),
-            csl_last_seq: state.csl_last_seq,
+            pre_loaded_messages: None,
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             // Trigger cancellation to interrupt any in-flight SSE streaming.
@@ -1483,10 +1482,18 @@ async fn apply_turn_success_async(
     mut result: StreamResult,
     turn_start: Instant,
 ) {
-    let csl_appended = std::mem::take(&mut result.csl_appended_messages);
-    let csl_full = std::mem::take(&mut result.csl_full_messages);
+    let final_messages = std::mem::take(&mut result.final_messages);
+    let csl_checkpoint_fields = extract_csl_fields_from_result(&result);
     apply_turn_success_sync(state, selector, profile, line, result, turn_start);
-    persist_csl_after_turn(state, &csl_appended, &csl_full).await;
+
+    // Persist CSL via CslManager.
+    let session_state = build_full_session_state_compact(state, csl_checkpoint_fields);
+    let turn = state.turn;
+    if let Some(mgr) = state.csl_manager.as_mut() {
+        if let Err(e) = mgr.persist_turn(turn, &final_messages, &session_state).await {
+            astra_core::agent_warn!("csl", "persist failed: {e}");
+        }
+    }
     check_skill_improvement_async(state).await;
 }
 
@@ -1504,10 +1511,17 @@ fn apply_turn_success_sync(
         state.session_id = Some(session_id.to_string());
         state.run_id = result.run_id.clone();
 
-        if state.csl_store.is_none() {
-            state.csl_store = Some(
+        if state.csl_manager.is_none() {
+            let store = std::sync::Arc::new(
                 astra_turn_core::conversation_log::file_store::FileCslStore::new(
                     astra_services::session_journal::local_sessions_dir(),
+                ),
+            );
+            state.csl_manager = Some(
+                astra_turn_core::conversation_log::manager::CslManager::new(
+                    store,
+                    session_id.to_string(),
+                    Default::default(),
                 ),
             );
         }
@@ -1929,66 +1943,53 @@ pub(crate) async fn try_llm_skill_improvement(
     Ok(true)
 }
 
-async fn persist_csl_after_turn(
-    state: &mut ReplState,
-    appended: &[serde_json::Value],
-    full_messages: &[serde_json::Value],
-) {
-    use astra_turn_core::conversation_log::{CslEntry, CslStore, SessionStateCompact};
+struct CslCheckpointFields {
+    blocked_tools: Vec<String>,
+    approval_overrides: Option<serde_json::Value>,
+    budget_remaining_tokens: u64,
+    budget_remaining_rounds: u32,
+    consecutive_ctx_errors: u32,
+    interruption: Option<serde_json::Value>,
+}
 
-    let Some(ref store) = state.csl_store else {
-        return;
-    };
-    let Some(ref session_id) = state.session_id else {
-        return;
-    };
-
-    let session_state = SessionStateCompact {
-        recent_tools: state.recent_tools.clone(),
-        ..Default::default()
-    };
-
-    if state.csl_last_seq == 0 {
-        let snapshot = CslEntry::Snapshot {
-            seq: 1,
-            turn: state.turn,
-            messages: full_messages.to_vec(),
-            session_state: session_state.clone(),
-        };
-        match store.append(session_id, &snapshot).await {
-            Ok(()) => state.csl_last_seq = 1,
-            Err(e) => astra_core::agent_warn!("csl", "Snapshot persist failed: {e}"),
+fn extract_csl_fields_from_result(result: &StreamResult) -> CslCheckpointFields {
+    if let Some(astra_pipeline::step_protocol::StepCheckpoint::Heavy(ref heavy)) =
+        result.last_heavy_checkpoint
+    {
+        CslCheckpointFields {
+            blocked_tools: heavy.blocked_tools.clone(),
+            approval_overrides: heavy.approval_overrides.clone(),
+            budget_remaining_tokens: heavy.budget_remaining_tokens,
+            budget_remaining_rounds: heavy.budget_remaining_rounds,
+            consecutive_ctx_errors: heavy.consecutive_context_window_errors,
+            interruption: heavy.interruption.clone(),
         }
     } else {
-        let next_seq = state.csl_last_seq + 1;
-        let patch = astra_turn_core::conversation_log::SessionStatePatch {
-            recent_tools: Some(state.recent_tools.clone()),
-            ..Default::default()
-        };
-        let delta = CslEntry::TurnDelta {
-            seq: next_seq,
-            turn: state.turn,
-            appended: appended.to_vec(),
-            state_patch: Some(patch),
-        };
-        if let Err(e) = store.append(session_id, &delta).await {
-            astra_core::agent_warn!("csl", "TurnDelta persist failed: {e}");
-            return;
+        CslCheckpointFields {
+            blocked_tools: Vec::new(),
+            approval_overrides: None,
+            budget_remaining_tokens: 0,
+            budget_remaining_rounds: 0,
+            consecutive_ctx_errors: 0,
+            interruption: result.interruption.clone(),
         }
-        state.csl_last_seq = next_seq;
+    }
+}
 
-        if state.turn > 0 && state.turn.is_multiple_of(5) {
-            let snap_seq = state.csl_last_seq + 1;
-            let snap = CslEntry::Snapshot {
-                seq: snap_seq,
-                turn: state.turn,
-                messages: full_messages.to_vec(),
-                session_state,
-            };
-            if store.append(session_id, &snap).await.is_ok() {
-                state.csl_last_seq = snap_seq;
-            }
-        }
+fn build_full_session_state_compact(
+    state: &ReplState,
+    cp: CslCheckpointFields,
+) -> astra_turn_core::conversation_log::SessionStateCompact {
+    astra_turn_core::conversation_log::SessionStateCompact {
+        recent_tools: state.recent_tools.clone(),
+        continuity: state.runtime_continuity.clone(),
+        blocked_tools: cp.blocked_tools,
+        approval_overrides: cp.approval_overrides,
+        budget_remaining_tokens: cp.budget_remaining_tokens,
+        budget_remaining_rounds: cp.budget_remaining_rounds,
+        consecutive_ctx_errors: cp.consecutive_ctx_errors,
+        interruption: cp.interruption,
+        ..Default::default()
     }
 }
 
@@ -4144,8 +4145,7 @@ mod tests {
             turn_observability_events: Vec::new(),
             llm_rounds: None,
             interruption: None,
-            csl_appended_messages: Vec::new(),
-            csl_full_messages: Vec::new(),
+            final_messages: Vec::new(),
         }
     }
 
@@ -5463,39 +5463,36 @@ mod tests {
     }
 
     // ── CSL persistence tests ────────────────────────────────────────────
+    // These tests now exercise CslManager directly (the unified abstraction).
+    // The old `persist_csl_after_turn` function was deleted in the Phase 2 refactor.
 
     #[tokio::test]
     async fn csl_first_turn_writes_snapshot_and_advances_seq() {
-        use astra_turn_core::conversation_log::{CslStore, file_store::FileCslStore, materialize};
+        use astra_turn_core::conversation_log::{
+            CslStore, file_store::FileCslStore, manager::CslManager, materialize,
+            SessionStateCompact,
+        };
 
         let (_tmp, _guard) = isolated_sessions_dir();
         let session_id = format!("csl-first-{}", uuid::Uuid::new_v4());
 
-        let mut state = ReplState::default();
-        state.session_id = Some(session_id.clone());
-        state.turn = 1;
-        state.csl_store = Some(FileCslStore::new(
+        let store = std::sync::Arc::new(FileCslStore::new(
             astra_services::session_journal::local_sessions_dir(),
         ));
-        state.csl_last_seq = 0;
-        state.recent_tools = vec!["bash".into()];
+        let mut mgr = CslManager::new(store.clone(), session_id.clone(), Default::default());
 
         let full_messages = vec![
             serde_json::json!({"role": "user", "content": "hello"}),
             serde_json::json!({"role": "assistant", "content": "hi"}),
         ];
 
-        persist_csl_after_turn(&mut state, &full_messages, &full_messages).await;
+        let mut session_state = SessionStateCompact::default();
+        session_state.recent_tools = vec!["bash".into()];
 
-        // seq should have advanced past 0
-        assert!(state.csl_last_seq > 0 || {
-            // Even if seq stays at 0 for the first snapshot, verify a second
-            // turn doesn't write another snapshot
-            true
-        });
+        mgr.persist_turn(1, &full_messages, &session_state).await.unwrap();
 
-        // Verify the snapshot was persisted and is loadable
-        let store = state.csl_store.as_ref().unwrap();
+        assert!(mgr.last_seq() > 0, "seq should advance after first turn");
+
         let entries = store.load_from_latest_snapshot(&session_id).await.unwrap();
         assert!(!entries.is_empty(), "should have written at least one entry");
         assert!(entries[0].is_snapshot(), "first entry must be a Snapshot");
@@ -5508,49 +5505,39 @@ mod tests {
     #[tokio::test]
     async fn csl_subsequent_turn_writes_delta_not_snapshot() {
         use astra_turn_core::conversation_log::{
-            CslEntry, CslStore, file_store::FileCslStore, materialize,
+            CslEntry, CslStore, file_store::FileCslStore, manager::CslManager, materialize,
+            SessionStateCompact,
         };
 
         let (_tmp, _guard) = isolated_sessions_dir();
         let session_id = format!("csl-delta-{}", uuid::Uuid::new_v4());
 
-        let mut state = ReplState::default();
-        state.session_id = Some(session_id.clone());
-        state.csl_store = Some(FileCslStore::new(
+        let store = std::sync::Arc::new(FileCslStore::new(
             astra_services::session_journal::local_sessions_dir(),
         ));
+        let mut mgr = CslManager::new(store.clone(), session_id.clone(), Default::default());
 
-        // First turn: should write snapshot
-        state.turn = 1;
-        state.csl_last_seq = 0;
         let t1_msgs = vec![
             serde_json::json!({"role": "user", "content": "q1"}),
             serde_json::json!({"role": "assistant", "content": "a1"}),
         ];
-        persist_csl_after_turn(&mut state, &t1_msgs, &t1_msgs).await;
-        let seq_after_t1 = state.csl_last_seq;
+        mgr.persist_turn(1, &t1_msgs, &SessionStateCompact::default()).await.unwrap();
+        let seq_after_t1 = mgr.last_seq();
 
-        // Second turn: should write delta, NOT another snapshot
-        state.turn = 2;
-        let t2_appended = vec![
-            serde_json::json!({"role": "user", "content": "q2"}),
-            serde_json::json!({"role": "assistant", "content": "a2"}),
-        ];
+        mgr.mark_turn_start(t1_msgs.len());
         let t2_full = vec![
             serde_json::json!({"role": "user", "content": "q1"}),
             serde_json::json!({"role": "assistant", "content": "a1"}),
             serde_json::json!({"role": "user", "content": "q2"}),
             serde_json::json!({"role": "assistant", "content": "a2"}),
         ];
-        persist_csl_after_turn(&mut state, &t2_appended, &t2_full).await;
-        let seq_after_t2 = state.csl_last_seq;
+        mgr.persist_turn(2, &t2_full, &SessionStateCompact::default()).await.unwrap();
+        let seq_after_t2 = mgr.last_seq();
         assert!(
             seq_after_t2 > seq_after_t1,
             "seq should advance: t1={seq_after_t1}, t2={seq_after_t2}"
         );
 
-        // Verify: snapshot + delta in the log
-        let store = state.csl_store.as_ref().unwrap();
         let entries = store.load_from_latest_snapshot(&session_id).await.unwrap();
         let snapshot_count = entries.iter().filter(|e| e.is_snapshot()).count();
         let delta_count = entries
@@ -5560,7 +5547,6 @@ mod tests {
         assert_eq!(snapshot_count, 1, "should have exactly 1 snapshot");
         assert_eq!(delta_count, 1, "should have exactly 1 delta");
 
-        // Materialize should reconstruct the full conversation
         let mat = materialize(&entries).unwrap();
         assert_eq!(mat.messages.len(), 4);
         assert_eq!(mat.messages[2]["content"], "q2");
@@ -5569,46 +5555,38 @@ mod tests {
 
     #[tokio::test]
     async fn csl_periodic_snapshot_every_5_turns() {
-        use astra_turn_core::conversation_log::{CslStore, file_store::FileCslStore, materialize};
+        use astra_turn_core::conversation_log::{
+            CslStore, file_store::FileCslStore, manager::CslManager, materialize,
+            SessionStateCompact,
+        };
 
         let (_tmp, _guard) = isolated_sessions_dir();
         let session_id = format!("csl-snap5-{}", uuid::Uuid::new_v4());
 
-        let mut state = ReplState::default();
-        state.session_id = Some(session_id.clone());
-        state.csl_store = Some(FileCslStore::new(
+        let store = std::sync::Arc::new(FileCslStore::new(
             astra_services::session_journal::local_sessions_dir(),
         ));
+        let mut mgr = CslManager::new(store.clone(), session_id.clone(), Default::default());
 
-        // Simulate 5 turns
         for t in 1..=5u32 {
-            state.turn = t;
-            let msg = serde_json::json!({"role": "user", "content": format!("turn {t}")});
             let full: Vec<serde_json::Value> = (1..=t)
                 .map(|i| serde_json::json!({"role": "user", "content": format!("turn {i}")}))
                 .collect();
-            persist_csl_after_turn(&mut state, &[msg], &full).await;
+            mgr.mark_turn_start(if t == 1 { 0 } else { (t - 1) as usize });
+            mgr.persist_turn(t, &full, &SessionStateCompact::default()).await.unwrap();
         }
 
-        // Turn 5 triggers a periodic snapshot. load_from_latest_snapshot returns
-        // entries starting from the LATEST snapshot — so we expect just that one
-        // snapshot (turn 5) with no trailing deltas.
-        let store = state.csl_store.as_ref().unwrap();
         let entries = store.load_from_latest_snapshot(&session_id).await.unwrap();
         assert_eq!(entries.len(), 1, "only the latest snapshot should remain");
         assert!(entries[0].is_snapshot());
         assert_eq!(entries[0].turn(), 5);
 
-        // Verify the snapshot captured all 5 turns of messages
         let mat = materialize(&entries).unwrap();
         assert_eq!(mat.messages.len(), 5, "snapshot should contain all 5 turns");
         assert_eq!(mat.messages[4]["content"], "turn 5");
 
-        // Verify seq advanced: initial snapshot (seq=1) + 3 deltas (2,3,4) +
-        // turn 5 delta (5) + periodic snapshot (6) = 6
-        assert_eq!(state.csl_last_seq, 6);
+        assert_eq!(mgr.last_seq(), 6);
 
-        // load_after(0) should show ALL entries (both snapshots + deltas)
         let all_entries = store.load_after(&session_id, 0).await.unwrap();
         let total_snapshots = all_entries.iter().filter(|e| e.is_snapshot()).count();
         assert_eq!(
@@ -5619,25 +5597,21 @@ mod tests {
 
     #[tokio::test]
     async fn csl_persist_and_resume_roundtrip() {
-        use astra_turn_core::conversation_log::{CslStore, file_store::FileCslStore, materialize};
+        use astra_turn_core::conversation_log::{
+            file_store::FileCslStore, manager::CslManager, SessionStateCompact,
+        };
 
         let (_tmp, _guard) = isolated_sessions_dir();
         let session_id = format!("csl-rt-{}", uuid::Uuid::new_v4());
 
-        // Phase 1: Persist 3 turns
-        let mut state = ReplState::default();
-        state.session_id = Some(session_id.clone());
-        state.csl_store = Some(FileCslStore::new(
+        let store = std::sync::Arc::new(FileCslStore::new(
             astra_services::session_journal::local_sessions_dir(),
         ));
+        let mut mgr = CslManager::new(store.clone(), session_id.clone(), Default::default());
 
         for t in 1..=3u32 {
-            state.turn = t;
-            state.recent_tools = vec![format!("tool_{t}")];
-            let appended = vec![
-                serde_json::json!({"role": "user", "content": format!("q{t}")}),
-                serde_json::json!({"role": "assistant", "content": format!("a{t}")}),
-            ];
+            let mut session_state = SessionStateCompact::default();
+            session_state.recent_tools = vec![format!("tool_{t}")];
             let full: Vec<serde_json::Value> = (1..=t)
                 .flat_map(|i| {
                     vec![
@@ -5646,15 +5620,15 @@ mod tests {
                     ]
                 })
                 .collect();
-            persist_csl_after_turn(&mut state, &appended, &full).await;
+            mgr.mark_turn_start(if t == 1 { 0 } else { ((t - 1) * 2) as usize });
+            mgr.persist_turn(t, &full, &session_state).await.unwrap();
         }
 
-        let saved_seq = state.csl_last_seq;
+        let saved_seq = mgr.last_seq();
 
-        // Phase 2: Resume from CSL in fresh state
-        let store = FileCslStore::new(astra_services::session_journal::local_sessions_dir());
-        let entries = store.load_from_latest_snapshot(&session_id).await.unwrap();
-        let mat = materialize(&entries).unwrap();
+        // Resume from CSL in fresh manager
+        let mut mgr2 = CslManager::new(store, session_id.clone(), Default::default());
+        let mat = mgr2.load().await.unwrap().expect("should have entries");
 
         assert_eq!(mat.messages.len(), 6, "3 turns × 2 messages");
         assert_eq!(mat.messages[0]["content"], "q1");
@@ -5669,42 +5643,38 @@ mod tests {
 
     #[tokio::test]
     async fn csl_undo_resets_seq_and_next_turn_writes_fresh_snapshot() {
-        use astra_turn_core::conversation_log::{CslStore, file_store::FileCslStore};
+        use astra_turn_core::conversation_log::{
+            CslStore, file_store::FileCslStore, manager::CslManager, materialize,
+            SessionStateCompact,
+        };
 
         let (_tmp, _guard) = isolated_sessions_dir();
         let session_id = format!("csl-undo-{}", uuid::Uuid::new_v4());
 
-        let mut state = ReplState::default();
-        state.session_id = Some(session_id.clone());
-        state.csl_store = Some(FileCslStore::new(
+        let store = std::sync::Arc::new(FileCslStore::new(
             astra_services::session_journal::local_sessions_dir(),
         ));
+        let mut mgr = CslManager::new(store.clone(), session_id.clone(), Default::default());
 
-        // Persist 2 turns
         for t in 1..=2u32 {
-            state.turn = t;
-            let msgs = vec![serde_json::json!({"role": "user", "content": format!("q{t}")})];
             let full: Vec<serde_json::Value> = (1..=t)
                 .map(|i| serde_json::json!({"role": "user", "content": format!("q{i}")}))
                 .collect();
-            persist_csl_after_turn(&mut state, &msgs, &full).await;
+            mgr.mark_turn_start(if t == 1 { 0 } else { (t - 1) as usize });
+            mgr.persist_turn(t, &full, &SessionStateCompact::default()).await.unwrap();
         }
-        assert!(state.csl_last_seq > 0, "seq should be > 0 after 2 turns");
+        assert!(mgr.last_seq() > 0, "seq should be > 0 after 2 turns");
 
-        // Simulate /undo — resets seq to 0
-        state.csl_last_seq = 0;
+        mgr.reset().await.unwrap();
+        assert_eq!(mgr.last_seq(), 0, "seq should be 0 after reset");
 
-        // Next turn should write a fresh snapshot (not a delta)
-        state.turn = 2; // after undo, turn count goes back
         let post_undo_msgs = vec![
             serde_json::json!({"role": "user", "content": "after-undo"}),
         ];
-        persist_csl_after_turn(&mut state, &post_undo_msgs, &post_undo_msgs).await;
+        mgr.persist_turn(2, &post_undo_msgs, &SessionStateCompact::default()).await.unwrap();
 
-        // Verify: the latest snapshot should contain the post-undo state
-        let store = state.csl_store.as_ref().unwrap();
         let entries = store.load_from_latest_snapshot(&session_id).await.unwrap();
-        let mat = astra_turn_core::conversation_log::materialize(&entries).unwrap();
+        let mat = materialize(&entries).unwrap();
         assert_eq!(mat.messages.len(), 1, "fresh snapshot should have 1 msg");
         assert_eq!(mat.messages[0]["content"], "after-undo");
     }
