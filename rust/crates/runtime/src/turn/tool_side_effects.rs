@@ -1,4 +1,4 @@
-use astra_turn_core::cloud_approval_policy::{cloud_gated_tool_kind, CloudGatedToolKind};
+use astra_turn_core::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind};
 use serde_json::Value;
 
 /// Local/legacy mutating tools that are not covered by cloud approval policy.
@@ -70,7 +70,7 @@ mod tests {
     use std::collections::HashSet;
 
     use astra_turn_core::cloud_approval_policy::{
-        cloud_gated_tool_kind, CloudGatedToolKind, CLOUD_APPROVAL_REQUIRED_TOOLS,
+        CLOUD_APPROVAL_REQUIRED_TOOLS, CloudGatedToolKind, cloud_gated_tool_kind,
     };
 
     use super::*;

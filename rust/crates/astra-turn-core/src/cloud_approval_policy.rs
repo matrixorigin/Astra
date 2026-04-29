@@ -310,10 +310,11 @@ fn strip_fd_redirect_to_file(input: &str) -> String {
     out
 }
 
-fn has_write_indicators(command: &str) -> bool {
+fn first_write_indicator(command: &str) -> Option<&'static str> {
     WRITE_INDICATORS
         .iter()
-        .any(|indicator| command.contains(indicator))
+        .copied()
+        .find(|indicator| command.contains(indicator))
 }
 
 fn matches_read_only_prefix(command: &str) -> bool {
@@ -326,11 +327,6 @@ fn matches_read_only_prefix(command: &str) -> bool {
         }
     }
     false
-}
-
-fn bash_segment_is_read_only(command: &str) -> bool {
-    let cmd = command.trim();
-    !cmd.is_empty() && !has_write_indicators(cmd) && matches_read_only_prefix(cmd)
 }
 
 fn has_shell_injection_vector(command: &str) -> bool {
@@ -349,49 +345,212 @@ fn split_compound_segments(command: &str) -> impl Iterator<Item = &str> {
         .filter(|segment| !segment.is_empty())
 }
 
+/// Why a bash command was classified as **requiring approval** (not read-only).
+///
+/// Returned by [`bash_command_approval_reason`]. Surfaced in CLI approval
+/// prompts so users can understand *why* a command tripped the classifier
+/// (e.g. "writes to file via `>`", "shell injection vector `$(`", …) rather
+/// than just seeing a generic "approval required" banner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BashApprovalReason {
+    /// Command string was empty after trimming.
+    Empty,
+    /// Contains `$(`, backtick, or `;` — can hide arbitrary commands.
+    ShellInjection,
+    /// Contains a write indicator (`>`, `rm`, `sed -i`, etc.). `String` is
+    /// the first matched indicator for display.
+    WriteIndicator(String),
+    /// Command prefix is not in the read-only allowlist. `String` is the
+    /// first token (e.g. `foobar`, `npm`) for display.
+    UnknownPrefix(String),
+}
+
+impl BashApprovalReason {
+    /// Short, human-readable rationale suitable for an approval prompt line.
+    pub fn display(&self) -> String {
+        match self {
+            BashApprovalReason::Empty => "empty command".to_string(),
+            BashApprovalReason::ShellInjection => {
+                "shell injection vector (`$(…)`, backtick, or `;`)".to_string()
+            }
+            BashApprovalReason::WriteIndicator(ind) => {
+                // Action-oriented phrasing tells the user *what the command
+                // does*; the raw token is cited in parentheses so power users
+                // can still correlate with their command text.
+                let action = humanize_write_indicator(ind.as_str());
+                format!("{action} (`{trimmed}`)", trimmed = ind.trim())
+            }
+            BashApprovalReason::UnknownPrefix(tok) => {
+                // Frame as risk ("may modify your system") rather than
+                // implementation detail ("not in allowlist") — the latter is
+                // jargon for non-developer users.
+                format!("`{tok}` may modify your system (unrecognized command)")
+            }
+        }
+    }
+}
+
+/// Map a [`WRITE_INDICATORS`] token to an action-oriented phrase suitable
+/// for end-user approval prompts. Falls back to a generic phrase when no
+/// specific mapping exists (so new indicators added to `WRITE_INDICATORS`
+/// don't silently regress to machine-translation-y default text).
+///
+/// Kept as a small, explicit table rather than a HashMap: the indicator list
+/// is static and short, ordering doesn't matter, and a table is grep-friendly
+/// for future maintainers.
+fn humanize_write_indicator(indicator: &str) -> &'static str {
+    // Prefix-match table ordered most-specific-first so `"sed -i"` wins over
+    // a hypothetical shorter `"sed"`. We match by `starts_with` (after trim)
+    // because some indicators carry a trailing space (e.g. `"rm "`).
+    let trimmed = indicator.trim();
+    const TABLE: &[(&str, &str)] = &[
+        // Redirections — most common case; glyph is opaque to non-technical users.
+        (">>", "appends to a file"),
+        (">", "writes to a file"),
+        // File operations
+        ("rm", "deletes files"),
+        ("mv", "moves or renames files"),
+        ("cp", "copies files"),
+        ("mkdir", "creates directories"),
+        ("rmdir", "removes directories"),
+        ("touch", "creates or updates files"),
+        ("chmod", "changes file permissions"),
+        ("chown", "changes file ownership"),
+        ("ln", "creates a link"),
+        ("sed -i", "edits files in place"),
+        ("perl -pi", "edits files in place"),
+        // Git write verbs
+        ("git add", "stages changes in git"),
+        ("git commit", "creates a git commit"),
+        ("git push", "pushes to a remote"),
+        ("git pull", "pulls from a remote"),
+        ("git merge", "merges branches"),
+        ("git rebase", "rebases a branch"),
+        ("git reset", "resets git state"),
+        ("git checkout", "switches branches or restores files"),
+        ("git stash pop", "applies and drops a stash"),
+        ("git stash apply", "applies a stash"),
+        ("git stash drop", "drops a stash"),
+        ("git stash clear", "clears all stashes"),
+        ("git clean", "deletes untracked files"),
+        ("git rm", "removes files from git"),
+        ("git mv", "moves files in git"),
+        // Package managers
+        ("npm install", "installs packages"),
+        ("npm i", "installs packages"),
+        ("npm uninstall", "uninstalls packages"),
+        ("npm update", "updates packages"),
+        ("pip install", "installs packages"),
+        ("pip3 install", "installs packages"),
+        ("pip uninstall", "uninstalls packages"),
+        ("cargo install", "installs a cargo binary"),
+        ("cargo build", "builds the cargo project"),
+        // Pipes that can execute arbitrary code
+        ("| tee", "writes via `tee`"),
+        ("| xargs", "pipes to `xargs` (may execute commands)"),
+        ("| sh", "pipes into a shell"),
+        ("| bash", "pipes into a shell"),
+        ("| sudo", "pipes into `sudo`"),
+    ];
+    for (prefix, phrase) in TABLE {
+        if trimmed.starts_with(prefix) {
+            return phrase;
+        }
+    }
+    // Conservative fallback: new indicators added to WRITE_INDICATORS without
+    // a humanized mapping still get a non-jargon phrase. The raw token is
+    // appended by the caller so users see what tripped.
+    "may modify your system"
+}
+
 /// Check if a bash command is read-only (safe for concurrent execution).
 ///
 /// Returns `true` if the command appears to only read data without side effects.
 /// Used to allow read-only bash commands to run concurrently without user approval.
 ///
+/// Thin wrapper over [`bash_command_approval_reason`]: returns `true` iff the
+/// classifier reports no reason to require approval. See that function for the
+/// full algorithm.
+pub fn bash_command_is_read_only(command: &str) -> bool {
+    bash_command_approval_reason(command).is_none()
+}
+
+/// Classify a bash command and return the rationale if approval is required.
+///
+/// Returns `None` when the command is read-only (no approval needed). Returns
+/// `Some(reason)` explaining why the command tripped the classifier — used by
+/// CLI approval prompts to show users *why* a command needs their confirmation.
+///
 /// # Algorithm
-/// 1. Normalize harmless fd forwarding (`2>&1`, `1>&2`, `/dev/null`)
+/// 1. Normalize harmless fd forwarding (`2>&1`, `1>&2`, `/dev/null`, …)
 /// 2. Reject shell expansion/sequencing forms that can hide arbitrary commands
 /// 3. Split read-only compounds/pipelines (`cargo check | head -50`) into segments
-/// 4. Reject any segment with write indicators; otherwise match read-only prefixes
-/// 5. Default to false (require approval) for unknown commands
-pub fn bash_command_is_read_only(command: &str) -> bool {
+/// 4. For each segment: reject on write indicators, then require read-only prefix
+/// 5. Default to [`BashApprovalReason::UnknownPrefix`] for unknown commands
+pub fn bash_command_approval_reason(command: &str) -> Option<BashApprovalReason> {
     let cmd = effective_bash_command(command);
 
-    // Empty command is not read-only (edge case)
     if cmd.is_empty() {
-        return false;
+        return Some(BashApprovalReason::Empty);
     }
 
     let normalized = strip_benign_fd_redirects(cmd);
     let normalized = normalized.trim();
-    if normalized.is_empty() || has_shell_injection_vector(normalized) {
-        return false;
+    if normalized.is_empty() {
+        return Some(BashApprovalReason::Empty);
+    }
+    if has_shell_injection_vector(normalized) {
+        return Some(BashApprovalReason::ShellInjection);
     }
 
     let mut saw_segment = false;
-    split_compound_segments(normalized).all(|segment| {
+    let mut first_failure: Option<BashApprovalReason> = None;
+    for segment in split_compound_segments(normalized) {
         saw_segment = true;
-        if segment.contains('|') {
+        let reason = if segment.contains('|') {
             let mut saw_pipe_segment = false;
-            segment
-                .split('|')
-                .map(str::trim)
-                .filter(|segment| !segment.is_empty())
-                .all(|pipe_segment| {
-                    saw_pipe_segment = true;
-                    bash_segment_is_read_only(pipe_segment)
-                })
-                && saw_pipe_segment
+            let mut pipe_failure: Option<BashApprovalReason> = None;
+            for pipe_segment in segment.split('|').map(str::trim).filter(|s| !s.is_empty()) {
+                saw_pipe_segment = true;
+                if let Some(r) = bash_segment_approval_reason(pipe_segment) {
+                    pipe_failure = Some(r);
+                    break;
+                }
+            }
+            if !saw_pipe_segment {
+                Some(BashApprovalReason::Empty)
+            } else {
+                pipe_failure
+            }
         } else {
-            bash_segment_is_read_only(segment)
+            bash_segment_approval_reason(segment)
+        };
+        if let Some(r) = reason {
+            first_failure = Some(r);
+            break;
         }
-    }) && saw_segment
+    }
+    if !saw_segment {
+        return Some(BashApprovalReason::Empty);
+    }
+    first_failure
+}
+
+/// Segment-level classifier with rationale. Returns `None` if the segment is
+/// a valid read-only command.
+fn bash_segment_approval_reason(command: &str) -> Option<BashApprovalReason> {
+    let cmd = command.trim();
+    if cmd.is_empty() {
+        return Some(BashApprovalReason::Empty);
+    }
+    if let Some(indicator) = first_write_indicator(cmd) {
+        return Some(BashApprovalReason::WriteIndicator(indicator.to_string()));
+    }
+    if !matches_read_only_prefix(cmd) {
+        let first_token = cmd.split_whitespace().next().unwrap_or(cmd).to_string();
+        return Some(BashApprovalReason::UnknownPrefix(first_token));
+    }
+    None
 }
 
 /// Kind of side effect for tools gated before edge execution.
@@ -751,6 +910,178 @@ mod tests {
         // After a pipe / semicolon / `&` / `(` the digit is also a genuine
         // fd specifier (fresh command token boundary).
         assert!(bash_command_is_read_only("true | 2>/tmp/log cargo check"));
+    }
+
+    // ── bash_command_approval_reason tests (TDD for rationale surfacing) ──
+
+    /// Read-only commands must return `None` (no approval reason) — the
+    /// reason API must stay in lock-step with `bash_command_is_read_only`.
+    #[test]
+    fn approval_reason_none_for_read_only() {
+        assert_eq!(bash_command_approval_reason("ls -la"), None);
+        assert_eq!(
+            bash_command_approval_reason("cargo check 2>&1 | head"),
+            None
+        );
+        assert_eq!(bash_command_approval_reason("git status"), None);
+    }
+
+    /// Empty / whitespace-only commands must surface [`BashApprovalReason::Empty`].
+    #[test]
+    fn approval_reason_empty_command() {
+        assert_eq!(
+            bash_command_approval_reason(""),
+            Some(BashApprovalReason::Empty)
+        );
+        assert_eq!(
+            bash_command_approval_reason("   "),
+            Some(BashApprovalReason::Empty)
+        );
+    }
+
+    /// Shell injection vectors (`$(`, backtick, `;`) must surface
+    /// [`BashApprovalReason::ShellInjection`] so the approval prompt can
+    /// explain that arbitrary commands could be hidden.
+    #[test]
+    fn approval_reason_shell_injection() {
+        assert_eq!(
+            bash_command_approval_reason("echo $(rm -rf /)"),
+            Some(BashApprovalReason::ShellInjection)
+        );
+        assert_eq!(
+            bash_command_approval_reason("echo `rm -rf /`"),
+            Some(BashApprovalReason::ShellInjection)
+        );
+        assert_eq!(
+            bash_command_approval_reason("ls; rm foo"),
+            Some(BashApprovalReason::ShellInjection)
+        );
+    }
+
+    /// Write indicators must be surfaced with the matched token so the
+    /// approval prompt can display *which* mutation pattern tripped.
+    /// Post-humanization contract: `display()` cites the raw token (so
+    /// power users can correlate) and describes the action in plain
+    /// language. See `approval_reason_write_indicator_display_is_humanized`
+    /// for the full per-indicator phrase contract.
+    #[test]
+    fn approval_reason_write_indicator_names_the_token() {
+        let reason = bash_command_approval_reason("rm -rf /tmp/foo");
+        match reason {
+            Some(BashApprovalReason::WriteIndicator(ref ind)) => {
+                assert!(
+                    !ind.is_empty(),
+                    "write indicator must carry the matched token for display"
+                );
+                assert!(
+                    ind.trim() == "rm" || ind.starts_with("rm"),
+                    "expected `rm` indicator, got {ind:?}"
+                );
+            }
+            other => panic!("expected WriteIndicator, got {other:?}"),
+        }
+        // Verify `display()` cites the raw token (trimmed) so power users
+        // can correlate with their command text.
+        let display = reason.unwrap().display();
+        assert!(
+            display.contains("rm"),
+            "display must cite raw token `rm`: {display}"
+        );
+        // And it uses humanized action-oriented prose (not jargon).
+        assert!(
+            !display.contains("write indicator"),
+            "display must not leak `write indicator` jargon: {display}"
+        );
+    }
+
+    /// Unknown-prefix commands must name the first token so users can see
+    /// *which* command failed the allowlist check.
+    #[test]
+    fn approval_reason_unknown_prefix_names_first_token() {
+        assert_eq!(
+            bash_command_approval_reason("foobar --flag"),
+            Some(BashApprovalReason::UnknownPrefix("foobar".to_string()))
+        );
+        // Pipeline: first-failing pipe segment's first token is reported.
+        match bash_command_approval_reason("cat file | foobar") {
+            Some(BashApprovalReason::UnknownPrefix(tok)) => {
+                assert_eq!(tok, "foobar");
+            }
+            other => panic!("expected UnknownPrefix(foobar), got {other:?}"),
+        }
+    }
+
+    /// UX: `WriteIndicator::display()` must use action-oriented prose that
+    /// explains *what the command does* rather than leaking the raw token
+    /// name ("write indicator `>` detected" is machine-translation-y and the
+    /// `>` glyph is opaque to non-technical users). Verify humanized
+    /// mappings exist for the most common indicators.
+    #[test]
+    fn approval_reason_write_indicator_display_is_humanized() {
+        let cases = [
+            (">", "writes to a file"),
+            (">>", "appends to a file"),
+            ("rm ", "deletes files"),
+            ("mv ", "moves or renames files"),
+            ("sed -i", "edits files in place"),
+            ("chmod ", "changes file permissions"),
+            ("npm install", "installs packages"),
+        ];
+        for (ind, expected_phrase) in cases {
+            let display = BashApprovalReason::WriteIndicator(ind.to_string()).display();
+            assert!(
+                display.contains(expected_phrase),
+                "WriteIndicator({ind:?}).display() = {display:?} should contain {expected_phrase:?}"
+            );
+            // Humanized output must still cite the raw token so power users
+            // can correlate with their command text.
+            assert!(
+                display.contains(ind.trim()),
+                "humanized display should still cite raw token `{ind}`: {display:?}"
+            );
+        }
+    }
+
+    /// UX: `UnknownPrefix::display()` must frame the issue as a *risk* (the
+    /// command may modify the system) rather than as an implementation
+    /// detail ("not in allowlist"). Non-developer users don't know what an
+    /// allowlist is, but they understand "may modify your system".
+    #[test]
+    fn approval_reason_unknown_prefix_display_is_risk_framed() {
+        let display = BashApprovalReason::UnknownPrefix("foobar".to_string()).display();
+        assert!(
+            display.contains("foobar"),
+            "display must cite the unknown token: {display}"
+        );
+        assert!(
+            display.to_lowercase().contains("modify")
+                || display.to_lowercase().contains("unrecognized")
+                || display.to_lowercase().contains("unknown"),
+            "display should frame as risk/unknown, not allowlist jargon: {display}"
+        );
+        // Negative assertion: the old technical-jargon phrase must not
+        // reappear (guards against accidental revert).
+        assert!(
+            !display.contains("allowlist"),
+            "display must not leak `allowlist` jargon: {display}"
+        );
+    }
+
+    /// The `display()` method must produce non-empty, human-readable text
+    /// for every variant (the CLI appends this directly to the approval
+    /// banner; a blank string would be a silent UX regression).
+    #[test]
+    fn approval_reason_display_is_non_empty_for_all_variants() {
+        let variants = [
+            BashApprovalReason::Empty,
+            BashApprovalReason::ShellInjection,
+            BashApprovalReason::WriteIndicator(">".to_string()),
+            BashApprovalReason::UnknownPrefix("foobar".to_string()),
+        ];
+        for v in variants {
+            let s = v.display();
+            assert!(!s.is_empty(), "display() must be non-empty for {v:?}");
+        }
     }
 
     /// Residual-risk guard: malformed trailing redirect (`cmd 2>` / `cmd >`

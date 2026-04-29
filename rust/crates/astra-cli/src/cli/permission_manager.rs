@@ -287,6 +287,58 @@ pub(super) struct PermissionManager {
 }
 
 impl PermissionManager {
+    /// Format the cloud-approval banner, appending a rationale when the
+    /// classifier can explain *why* a bash command tripped.
+    ///
+    /// For non-bash tools (or bash calls that don't carry a command string)
+    /// the banner falls back to the original `"Cloud approval required: {tool}"`
+    /// so existing UX is preserved.
+    fn cloud_approval_banner(tool: &str, detail: Option<&str>) -> String {
+        if tool == "bash" {
+            match detail {
+                Some(cmd) => match bash_command_approval_reason(cmd) {
+                    Some(reason) => {
+                        return format!(
+                            "  ☁  Cloud approval required: {tool}  ({})",
+                            reason.display()
+                        );
+                    }
+                    None => {
+                        // Contract violation: the CLI entered the cloud
+                        // approval path for a bash command, but the
+                        // classifier reports no reason to require
+                        // approval. This means `bash_command_is_read_only`
+                        // and `bash_command_approval_reason` disagree, or
+                        // the caller routed a read-only command here.
+                        // Surface loudly in dev; degrade gracefully in prod.
+                        debug_assert!(
+                            false,
+                            "bash approval banner: classifier returned None for {cmd:?} \
+                             but approval path was entered — check read-only vs approval_reason drift"
+                        );
+                        tracing::warn!(
+                            command = %cmd,
+                            "cloud_approval_banner: bash command entered approval path but \
+                             classifier reports read-only"
+                        );
+                    }
+                },
+                None => {
+                    // bash without a command string is a caller bug — the
+                    // approval prompt cannot be precise without the text.
+                    debug_assert!(
+                        false,
+                        "bash approval banner: detail=None; caller must forward the command string"
+                    );
+                    tracing::warn!(
+                        "cloud_approval_banner: bash entered approval path without command detail"
+                    );
+                }
+            }
+        }
+        format!("  ☁  Cloud approval required: {tool}")
+    }
+
     fn cloud_approval_is_explicit(approval_kind: ApprovalKind) -> bool {
         matches!(approval_kind, ApprovalKind::Explicit)
     }
@@ -532,10 +584,7 @@ impl PermissionManager {
                 PermissionMode::Auto => return ApprovalDecision::Allow,
                 PermissionMode::Prompt => {}
             }
-            eprintln!(
-                "{}",
-                format!("  ☁  Cloud approval required: {tool}").yellow()
-            );
+            eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
             if let Some(detail) = detail.filter(|s| !s.is_empty()) {
                 eprintln!("{}", Self::format_prompt_detail(detail).dim());
             }
@@ -582,10 +631,7 @@ impl PermissionManager {
             astra_turn_core::approval_fingerprint::DenialAction::Continue => {}
         }
 
-        eprintln!(
-            "{}",
-            format!("  ☁  Cloud approval required: {tool}").yellow()
-        );
+        eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
         if let Some(detail) = detail.filter(|s| !s.is_empty()) {
             eprintln!("{}", Self::format_prompt_detail(detail).dim());
         }
@@ -615,10 +661,7 @@ impl PermissionManager {
         }
         let explicit = Self::cloud_approval_is_explicit(approval_kind);
         if explicit {
-            eprintln!(
-                "{}",
-                format!("  ☁  Cloud approval required: {tool}").yellow()
-            );
+            eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
             if let Some(detail) = detail.filter(|s| !s.is_empty()) {
                 eprintln!("{}", Self::format_prompt_detail(detail).dim());
             }
@@ -641,10 +684,7 @@ impl PermissionManager {
                 _ => ApprovalDecision::Deny,
             };
         }
-        eprintln!(
-            "{}",
-            format!("  ☁  Cloud approval required: {tool}").yellow()
-        );
+        eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
         if let Some(detail) = detail.filter(|s| !s.is_empty()) {
             eprintln!("{}", Self::format_prompt_detail(detail).dim());
         }

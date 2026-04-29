@@ -1,0 +1,129 @@
+# Representative bash-command corpus sampled from typical dev workflows.
+# Lines starting with `#` are comments. Blank / whitespace-only lines ARE
+# part of the corpus (they exercise the Empty reason path). Counting rule
+# in the test: a line is a sample iff it is not a comment.
+#
+# This fixture drives `approval_rationale_baseline.rs` — a guard-rail test
+# that locks the *distribution* of classification verdicts from
+# `bash_command_approval_reason`. If a classifier change causes the
+# distribution to drift (e.g. benign commands suddenly all classified as
+# mutating), the test fails and surfaces user-visible UX regression
+# before it ships.
+#
+# Keep the corpus roughly balanced. Counts are asserted as ranges, not
+# exact numbers, so small additions here are fine — but moving a command
+# from one category to another is a conscious choice and the test will
+# tell you.
+
+# ── read-only: navigation & inspection ───────────────────────
+ls
+ls -la
+ls rust/crates
+pwd
+whoami
+date
+cat Cargo.toml
+cat README.md
+head -20 rust/crates/runtime/src/lib.rs
+tail -50 /tmp/log.txt
+wc -l src/main.rs
+file /bin/bash
+stat Cargo.toml
+which cargo
+type cargo
+echo hello
+echo "build complete"
+printf "%s\n" hello
+true
+false
+
+# ── read-only: search & filter ───────────────────────────────
+grep -r TODO src/
+grep -n "fn main" src/main.rs
+rg --type rust bash_command
+find . -name "*.rs"
+find rust/crates -type f -name Cargo.toml
+sort file.txt
+uniq -c file.txt
+cut -d, -f1 data.csv
+awk "{print \$1}" file.txt
+sed -n "1,10p" file.txt
+
+# ── read-only: build/test/git inspection ─────────────────────
+cargo check
+cargo check --workspace
+cargo build --release
+cargo test -p astra-turn-core
+cargo clippy
+cargo fmt --check
+cargo tree
+git status
+git log --oneline -20
+git diff HEAD~1
+git show HEAD
+git branch
+git remote -v
+npm list
+npm outdated
+pip list
+go version
+
+# ── read-only with benign fd redirects ───────────────────────
+cargo check 2>&1 | head -50
+cargo test 2>/dev/null
+ls &>/dev/null
+grep foo bar.txt &>> /tmp/search.log
+echo hi > /dev/null
+cargo build 1>/dev/null 2>&1
+
+# ── pipes & composition (read-only) ──────────────────────────
+ls | head -10
+cat /etc/passwd | grep root
+git log --oneline | head
+ps aux | grep cargo | head -5
+find . -name "*.rs" | wc -l
+
+# ── write-indicator: file mutation ───────────────────────────
+rm -rf target
+rm file.txt
+mv old.txt new.txt
+cp src.txt dst.txt
+mkdir -p build
+touch newfile.txt
+chmod +x script.sh
+chown user:user file.txt
+ln -s target link
+sed -i "s/foo/bar/" file.txt
+awk "{print}" file > out.txt
+cat > /tmp/new.txt
+echo test >> log.txt
+tee output.log
+
+# ── write-indicator: git/npm write verbs ─────────────────────
+git commit -m msg
+git add .
+git push origin main
+git pull
+git checkout -b feature
+git reset --hard
+git clean -fd
+npm install
+npm update
+pip install requests
+cargo install ripgrep
+apt install foo
+
+# ── shell injection ──────────────────────────────────────────
+ls $(pwd)
+echo hi; rm file
+true && rm file
+
+# ── unknown prefix (not in allowlist) ────────────────────────
+foobar_unknown
+myscript.sh arg1 arg2
+./custom_binary --flag
+xyzzy --version
+
+# ── empty / malformed ────────────────────────────────────────
+
+   
