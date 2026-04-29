@@ -608,8 +608,7 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
         meta_flags.contains(ToolFlags::COMPACTABLE)
     };
 
-    let never_restrict =
-        meta_category.is_read_only() || meta_category == ToolCategory::Consultative;
+    let never_restrict = meta_category.is_never_restrict();
 
     let exploration = if shell_read_only {
         true
@@ -1363,8 +1362,8 @@ mod tests {
         );
         assert!(!c.approval_required);
         assert!(
-            c.never_restrict,
-            "consultative tools must never be restricted"
+            !c.never_restrict,
+            "consultative tools must be restrictable for stall avoidance"
         );
         assert!(c.exploration, "consultative tools count as exploration");
     }
@@ -1629,7 +1628,10 @@ mod tests {
         for name in ["skill", "discover_skills"] {
             let c = classify_name(name);
             assert!(c.parallelizable, "{name} must be parallelizable");
-            assert!(c.never_restrict, "{name} must never be restricted");
+            assert!(
+                !c.never_restrict,
+                "{name} must be restrictable for stall avoidance"
+            );
             assert!(!c.approval_required);
         }
     }

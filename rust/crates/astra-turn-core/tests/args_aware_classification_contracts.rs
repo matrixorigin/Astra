@@ -466,7 +466,10 @@ fn consultative_tools_pipeline_consistency() {
         assert_eq!(c.category, ToolCategory::Consultative, "{name}");
         assert!(c.parallelizable, "{name} should be parallelizable");
         assert!(!c.approval_required, "{name} should skip approval");
-        assert!(c.never_restrict, "{name} should be never-restrict");
+        assert!(
+            !c.never_restrict,
+            "{name} should be restrictable (stall avoidance)"
+        );
         assert!(c.exploration, "{name} should count as exploration");
         assert!(!c.compactable, "{name} should not be compactable");
     }
