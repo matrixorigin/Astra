@@ -1,5 +1,7 @@
 //! Slash command routing for the REPL.
 
+use std::io::IsTerminal;
+
 use super::*;
 use crate::command_usage;
 
@@ -32,6 +34,22 @@ fn model_list_entry_name(entry: &serde_json::Value) -> Option<&str> {
         .get("name")
         .or_else(|| entry.get("model_name"))
         .and_then(|v| v.as_str())
+}
+
+fn model_list_entry_supports_thinking(entry: &serde_json::Value) -> Option<bool> {
+    entry
+        .get("supports_thinking")
+        .and_then(|v| v.as_bool())
+        .or_else(|| {
+            entry
+                .get("quirks")
+                .and_then(|q| q.get("supports_thinking"))
+                .and_then(|v| v.as_bool())
+        })
+}
+
+fn model_list_entry_provider(entry: &serde_json::Value) -> Option<&str> {
+    entry.get("provider").and_then(|v| v.as_str())
 }
 
 fn find_model_list_entry<'a>(
@@ -142,7 +160,28 @@ pub(super) async fn handle_slash_command(
                     state.model.as_deref(),
                 ) {
                     // Two-level selection: if model supports thinking, prompt for mode
-                    let opts = astra_turn_core::thinking_config::thinking_options(&chosen);
+                    let selected_model = find_model_list_entry(&models, &chosen);
+                    if selected_model.is_none() {
+                        tracing::warn!(
+                            model = %chosen,
+                            "selected model not found in model list — \
+                             thinking-mode detection unavailable, falling back to defaults"
+                        );
+                        if std::io::stderr().is_terminal() {
+                            eprintln!(
+                                "  ⚠ Unknown model '{}' — thinking mode detection unavailable.",
+                                chosen
+                            );
+                        }
+                    }
+                    let supports_thinking =
+                        selected_model.and_then(model_list_entry_supports_thinking);
+                    let provider = selected_model.and_then(model_list_entry_provider);
+                    let opts = astra_turn_core::thinking_config::thinking_options_with_capability(
+                        &chosen,
+                        provider,
+                        supports_thinking,
+                    );
                     let model_with_suffix = if opts.is_empty() {
                         chosen.clone()
                     } else {
@@ -308,11 +347,11 @@ pub(super) async fn handle_slash_command(
 
         "/history" | "/grep" | "/review" | "/copy" | "/diagnostics" | "/lsp" | "/context"
         | "/version" | "/whoami" | "/rewind" | "/turn" | "/report" => {
-            handle_info_command(cmd, arg, api, state, token).await?;
+            handle_info_command(cmd, arg, api, state, profile, token).await?;
         }
 
         "/skill" => {
-            handle_skill_command(arg, api, state, token).await?;
+            handle_skill_command(arg, api, state, profile, token).await?;
         }
 
         "/mcp" => {
@@ -500,7 +539,7 @@ pub(super) async fn handle_slash_command(
         }
 
         "/task" => {
-            slash_task::handle_task_command(arg, state, api, token).await;
+            slash_task::handle_task_command(arg, state, api, profile, token).await;
         }
 
         "/resume" => {
@@ -581,5 +620,30 @@ mod model_list_json_tests {
     fn is_active_numeric_zero_means_inactive() {
         let v = serde_json::json!({"name": "m", "is_active": 0});
         assert!(!model_list_entry_is_active(&v));
+    }
+
+    #[test]
+    fn reads_flattened_supports_thinking_from_model_list() {
+        let v = serde_json::json!({"name": "qwen", "supports_thinking": true});
+        assert_eq!(model_list_entry_supports_thinking(&v), Some(true));
+    }
+
+    #[test]
+    fn reads_nested_quirks_supports_thinking_for_legacy_detail_shapes() {
+        let v = serde_json::json!({
+            "name": "qwen",
+            "quirks": { "supports_thinking": false }
+        });
+        assert_eq!(model_list_entry_supports_thinking(&v), Some(false));
+    }
+
+    #[test]
+    fn flattened_supports_thinking_wins_over_nested_quirks() {
+        let v = serde_json::json!({
+            "name": "qwen",
+            "supports_thinking": true,
+            "quirks": { "supports_thinking": false }
+        });
+        assert_eq!(model_list_entry_supports_thinking(&v), Some(true));
     }
 }

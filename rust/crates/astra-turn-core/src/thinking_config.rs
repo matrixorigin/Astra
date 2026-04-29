@@ -4,6 +4,8 @@
 //! native wire format. Designed for extensibility — new modes (e.g., future
 //! "auto" heuristic) can be added as variants without breaking existing callers.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -14,8 +16,8 @@ use serde_json::{Value, json};
 /// | Variant | Bedrock Converse | Anthropic Messages | OpenAI-compatible |
 /// |---------|------------------|--------------------|-------------------|
 /// | `Off` | (no field) | (no field) | (no field) |
-/// | `Enabled{budget}` | `additionalModelRequestFields.thinking` | `thinking` | ignored |
-/// | `Adaptive{effort}` | `additionalModelRequestFields.thinking` | `thinking` | `reasoning_effort` |
+/// | `Enabled{budget}` | `additionalModelRequestFields.thinking` | `thinking` | provider-specific (`enable_thinking` for DashScope/Qwen) |
+/// | `Adaptive{effort}` | `additionalModelRequestFields.{thinking,output_config}` | `thinking` + `output_config.effort` | `reasoning_effort` (or provider-specific thinking flag) |
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ThinkingConfig {
@@ -27,7 +29,7 @@ pub enum ThinkingConfig {
     Enabled { budget_tokens: u32 },
     /// Adaptive thinking — model decides how much to think.
     /// Compatible with Claude Opus 4.6+, Sonnet 4.6+.
-    /// For OpenAI-compatible providers, maps to `reasoning_effort`.
+    /// For generic OpenAI-compatible providers, maps to `reasoning_effort`.
     Adaptive {
         #[serde(default = "default_effort")]
         effort: ThinkingEffort,
@@ -73,13 +75,14 @@ impl ThinkingConfig {
                 remove_temperature_from_inference_config(body);
             }
             Self::Adaptive { effort } => {
-                // Always emit `effort` explicitly; relying on provider default is
-                // semantically ambiguous across Bedrock/Anthropic versions.
-                let thinking = json!({
-                    "type": "adaptive",
-                    "effort": effort_str(*effort),
+                body["additionalModelRequestFields"] = json!({
+                    "thinking": {
+                        "type": "adaptive"
+                    },
+                    "output_config": {
+                        "effort": effort_str(*effort)
+                    }
                 });
-                body["additionalModelRequestFields"] = json!({ "thinking": thinking });
                 remove_temperature_from_inference_config(body);
             }
         }
@@ -101,12 +104,12 @@ impl ThinkingConfig {
                 remove_key(body, "top_k");
             }
             Self::Adaptive { effort } => {
-                // Always emit `effort` explicitly (see apply_bedrock rationale).
-                let thinking = json!({
-                    "type": "adaptive",
-                    "effort": effort_str(*effort),
+                body["thinking"] = json!({
+                    "type": "adaptive"
                 });
-                body["thinking"] = thinking;
+                body["output_config"] = json!({
+                    "effort": effort_str(*effort)
+                });
                 remove_key(body, "temperature");
                 remove_key(body, "top_p");
                 remove_key(body, "top_k");
@@ -158,6 +161,158 @@ impl ThinkingConfig {
 impl ThinkingEffort {
     pub fn as_str(self) -> &'static str {
         effort_str(self)
+    }
+
+    /// Order used for softening/escalation. Higher ordinal = more tokens.
+    fn ordinal(self) -> u8 {
+        match self {
+            ThinkingEffort::Low => 0,
+            ThinkingEffort::Medium => 1,
+            ThinkingEffort::High => 2,
+            ThinkingEffort::Max => 3,
+        }
+    }
+
+    fn from_ordinal(o: u8) -> ThinkingEffort {
+        match o {
+            0 => ThinkingEffort::Low,
+            1 => ThinkingEffort::Medium,
+            2 => ThinkingEffort::High,
+            _ => ThinkingEffort::Max,
+        }
+    }
+
+    /// Cap effort at `ceiling` — if current is stronger than ceiling, drop to ceiling.
+    /// Used by the per-turn dampener: user's picked effort is the ceiling, not the floor.
+    pub fn capped_at(self, ceiling: ThinkingEffort) -> ThinkingEffort {
+        Self::from_ordinal(self.ordinal().min(ceiling.ordinal()))
+    }
+}
+
+impl fmt::Display for ThinkingEffort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl fmt::Display for ThinkingConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ThinkingConfig::Off => write!(f, "off"),
+            ThinkingConfig::Enabled { budget_tokens } => {
+                write!(f, "enabled(budget:{})", budget_tokens)
+            }
+            ThinkingConfig::Adaptive { effort } => write!(f, "adaptive({})", effort),
+        }
+    }
+}
+
+/// Signals the runtime uses to decide how much thinking a turn actually warrants.
+///
+/// The user's choice of `thinking:high` via `/model` encodes an INTENT ceiling
+/// ("I'm willing to spend this much"), not a command to burn the full budget on
+/// every turn regardless of question. A short "why does X do Y?" question does
+/// not need 30k reasoning tokens. This struct feeds `ThinkingConfig::scale_for_turn`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TurnComplexitySignals {
+    /// Length of the user's input in characters. Shorter = lower complexity prior.
+    pub input_char_len: usize,
+    /// True when the user's message indicates a workspace modification intent —
+    /// "implement / fix / refactor / 修复 / 实现" etc. Modification implies
+    /// multi-step reasoning, so we do NOT dampen in that case.
+    pub has_modification_intent: bool,
+    /// True when this turn is a mid-task continuation (e.g. "继续" / "continue")
+    /// where the real complexity lives in the ongoing task, not in the literal
+    /// user input. Conservative: we keep full effort here so we don't starve
+    /// multi-round work of reasoning budget.
+    pub is_continuation: bool,
+}
+
+impl TurnComplexitySignals {
+    /// Heuristic factory from a raw user message. Callers needing more precise
+    /// signals (e.g. plan executor) can construct the struct directly.
+    pub fn from_message(message: &str) -> Self {
+        let trimmed = message.trim();
+        let lower = trimmed.to_lowercase();
+        let has_modification_intent = [
+            "implement",
+            "fix",
+            "refactor",
+            "optimize",
+            "build",
+            "rewrite",
+            "修复",
+            "实现",
+            "重构",
+            "优化",
+            "修改",
+            "重写",
+        ]
+        .iter()
+        .any(|kw| lower.contains(kw));
+        let is_continuation = matches!(
+            trimmed,
+            "continue" | "Continue" | "go on" | "keep going" | "继续" | "接着" | "go" | "next"
+        );
+        Self {
+            input_char_len: trimmed.chars().count(),
+            has_modification_intent,
+            is_continuation,
+        }
+    }
+
+    /// Returns true when the turn is short, read-only, and not a continuation —
+    /// the profile where full high/max thinking budget is almost always wasted.
+    fn is_lightweight(&self) -> bool {
+        self.input_char_len > 0
+            && self.input_char_len <= 120
+            && !self.has_modification_intent
+            && !self.is_continuation
+    }
+}
+
+impl ThinkingConfig {
+    /// Return a per-turn dampened copy of this config based on observed signals.
+    ///
+    /// Philosophy: the user's pick via `/model` is a **ceiling** on spend, not a
+    /// floor. For a short interrogative question, burning a full `max` or `high`
+    /// reasoning budget is pure waste — empirically this was the immediate cause
+    /// of the session-36500dd9 spiral where a 37-token question produced 30k+
+    /// output tokens and triggered the circuit breaker.
+    ///
+    /// What this does NOT do:
+    /// - never INCREASES effort (the user's pick is the ceiling)
+    /// - never turns thinking OFF if the user explicitly enabled it
+    /// - never changes the user's stored preference (caller must use the
+    ///   returned value for THIS turn only)
+    ///
+    /// Conservative fallback: when signals don't clearly indicate lightweight
+    /// work, returns self unchanged so multi-step / implementation turns are
+    /// unaffected.
+    pub fn scale_for_turn(&self, signals: TurnComplexitySignals) -> ThinkingConfig {
+        if !signals.is_lightweight() {
+            return self.clone();
+        }
+        match self {
+            ThinkingConfig::Off => ThinkingConfig::Off,
+            ThinkingConfig::Enabled { budget_tokens } => {
+                // Cap at 4k for lightweight turns. This covers Anthropic's minimum
+                // viable thinking budget (1024) with headroom, without wasting spend
+                // on turns that will produce a short answer.
+                let capped = (*budget_tokens).min(4_000);
+                ThinkingConfig::Enabled {
+                    budget_tokens: capped,
+                }
+            }
+            ThinkingConfig::Adaptive { effort } => {
+                // Drop effort by one level with a Low floor. The user still sees
+                // "thinking" behaviour (model still reasons), just doesn't burn
+                // high/max-level budget on trivial questions.
+                ThinkingConfig::Adaptive {
+                    effort: effort.capped_at(ThinkingEffort::Medium),
+                }
+            }
+        }
     }
 }
 
@@ -326,44 +481,112 @@ pub fn thinking_options(model_name: &str) -> Vec<ThinkingOption> {
     if !supports_thinking(model_name) {
         return vec![];
     }
-    if is_adaptive_model(model_name) {
-        vec![
-            ThinkingOption {
-                label: "Normal",
-                config: ThinkingConfig::Off,
-                is_default: false,
-            },
-            ThinkingOption {
-                label: "Thinking (Low)",
-                config: ThinkingConfig::Adaptive {
-                    effort: ThinkingEffort::Low,
-                },
-                is_default: false,
-            },
-            ThinkingOption {
-                label: "Thinking (High)",
-                config: ThinkingConfig::Adaptive {
-                    effort: ThinkingEffort::High,
-                },
-                is_default: true,
-            },
-        ]
-    } else {
-        vec![
-            ThinkingOption {
-                label: "Normal",
-                config: ThinkingConfig::Off,
-                is_default: false,
-            },
-            ThinkingOption {
-                label: "Thinking",
-                config: ThinkingConfig::Enabled {
-                    budget_tokens: 10_000,
-                },
-                is_default: true,
-            },
-        ]
+    thinking_options_for_supported_model(model_name)
+}
+
+/// Returns thinking options when the server has explicit capability metadata.
+///
+/// `Some(true)` enables a provider-appropriate thinking picker even for models
+/// not covered by local name heuristics. DashScope-compatible providers use the
+/// budget-based option that maps to `enable_thinking`; other explicit
+/// OpenAI-compatible reasoning models use adaptive effort so the wire request
+/// carries `reasoning_effort`. `Some(false)` suppresses options even if the
+/// model name would otherwise match.
+pub fn thinking_options_with_capability(
+    model_name: &str,
+    provider: Option<&str>,
+    supports_thinking_override: Option<bool>,
+) -> Vec<ThinkingOption> {
+    match supports_thinking_override {
+        Some(false) => vec![],
+        Some(true) => {
+            if provider_uses_budget_thinking(provider) {
+                thinking_options_for_budget_thinking()
+            } else if provider_is_anthropic_like(provider)
+                || (provider.is_none() && supports_thinking(model_name))
+            {
+                thinking_options_for_supported_model(model_name)
+            } else {
+                // No provider hint and the model name doesn't match any known
+                // budget-thinking or Anthropic-like model — fall back to adaptive
+                // reasoning (OpenAI-style `reasoning_effort`).
+                tracing::debug!(
+                    model_name,
+                    "supports_thinking capability override=true with no provider hint \
+                     and unrecognised model — defaulting to adaptive reasoning picker"
+                );
+                thinking_options_for_adaptive_reasoning()
+            }
+        }
+        None => thinking_options(model_name),
     }
+}
+
+fn thinking_options_for_supported_model(model_name: &str) -> Vec<ThinkingOption> {
+    if is_adaptive_model(model_name) {
+        thinking_options_for_adaptive_reasoning()
+    } else {
+        thinking_options_for_budget_thinking()
+    }
+}
+
+fn thinking_options_for_adaptive_reasoning() -> Vec<ThinkingOption> {
+    vec![
+        ThinkingOption {
+            label: "Normal",
+            config: ThinkingConfig::Off,
+            is_default: false,
+        },
+        ThinkingOption {
+            label: "Thinking (Low)",
+            config: ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Low,
+            },
+            is_default: false,
+        },
+        ThinkingOption {
+            label: "Thinking (High)",
+            config: ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High,
+            },
+            is_default: true,
+        },
+    ]
+}
+
+fn thinking_options_for_budget_thinking() -> Vec<ThinkingOption> {
+    vec![
+        ThinkingOption {
+            label: "Normal",
+            config: ThinkingConfig::Off,
+            is_default: false,
+        },
+        ThinkingOption {
+            label: "Thinking",
+            config: ThinkingConfig::Enabled {
+                budget_tokens: 10_000,
+            },
+            is_default: true,
+        },
+    ]
+}
+
+fn provider_uses_budget_thinking(provider: Option<&str>) -> bool {
+    provider
+        .map(|p| {
+            let p = p.to_ascii_lowercase();
+            p.contains("dashscope") || p.contains("aliyun") || p.contains("alibaba")
+        })
+        .unwrap_or(false)
+}
+
+fn provider_is_anthropic_like(provider: Option<&str>) -> bool {
+    provider
+        .map(|p| {
+            let p = p.to_ascii_lowercase();
+            p.contains("anthropic") || p.contains("bedrock")
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -418,7 +641,11 @@ mod tests {
 
         assert_eq!(
             body["additionalModelRequestFields"]["thinking"],
-            json!({"type": "adaptive", "effort": "low"})
+            json!({"type": "adaptive"})
+        );
+        assert_eq!(
+            body["additionalModelRequestFields"]["output_config"],
+            json!({"effort": "low"})
         );
         assert!(body["inferenceConfig"].get("temperature").is_none());
     }
@@ -472,10 +699,8 @@ mod tests {
         }
         .apply_anthropic(&mut body);
 
-        assert_eq!(
-            body["thinking"],
-            json!({"type": "adaptive", "effort": "medium"})
-        );
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"], json!({"effort": "medium"}));
         assert!(body.get("temperature").is_none());
     }
 
@@ -544,6 +769,64 @@ mod tests {
         ));
         assert!(!supports_thinking("gpt-4o"));
         assert!(!supports_thinking("qwen-plus"));
+    }
+
+    #[test]
+    fn thinking_options_with_capability_uses_dashscope_budget_thinking() {
+        let opts = thinking_options_with_capability("qwen-plus", Some("dashscope"), Some(true));
+
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0].label, "Normal");
+        assert_eq!(opts[1].label, "Thinking");
+        assert!(matches!(
+            opts[1].config,
+            ThinkingConfig::Enabled {
+                budget_tokens: 10_000
+            }
+        ));
+    }
+
+    #[test]
+    fn thinking_options_with_capability_uses_openai_adaptive_reasoning() {
+        let opts = thinking_options_with_capability("gpt-5", Some("openai"), Some(true));
+
+        assert_eq!(opts.len(), 3);
+        assert_eq!(opts[0].label, "Normal");
+        assert_eq!(opts[1].label, "Thinking (Low)");
+        assert_eq!(opts[2].label, "Thinking (High)");
+        assert!(matches!(
+            opts[2].config,
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High
+            }
+        ));
+    }
+
+    #[test]
+    fn thinking_options_with_capability_provider_takes_precedence_over_claude_name() {
+        let opts = thinking_options_with_capability(
+            "claude-sonnet-4-20250514",
+            Some("openai"),
+            Some(true),
+        );
+
+        assert!(matches!(
+            opts[2].config,
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High
+            }
+        ));
+    }
+
+    #[test]
+    fn thinking_options_with_capability_false_overrides_name_heuristic() {
+        let opts = thinking_options_with_capability(
+            "claude-sonnet-4-20250514",
+            Some("anthropic"),
+            Some(false),
+        );
+
+        assert!(opts.is_empty());
     }
 
     #[test]
@@ -703,33 +986,35 @@ mod tests {
 
     // === TDD fix tests ===
 
-    /// Fix #1a: Bedrock Adaptive High must serialize `effort: "high"` explicitly,
-    /// not rely on API default (which may differ from our intended semantics).
+    /// Adaptive models expect the effort outside the `thinking` object.
     #[test]
-    fn bedrock_adaptive_high_includes_effort_field() {
+    fn bedrock_adaptive_high_uses_output_config_effort() {
         let cfg = ThinkingConfig::Adaptive {
             effort: ThinkingEffort::High,
         };
         let mut body = json!({ "inferenceConfig": { "temperature": 0.5 } });
         cfg.apply_bedrock(&mut body);
         assert_eq!(
-            body["additionalModelRequestFields"]["thinking"]["effort"], "high",
-            "Adaptive::High must emit effort=high explicitly"
+            body["additionalModelRequestFields"]["thinking"],
+            json!({"type": "adaptive"})
+        );
+        assert_eq!(
+            body["additionalModelRequestFields"]["output_config"],
+            json!({"effort": "high"})
         );
     }
 
-    /// Fix #1b: same for Anthropic path.
+    /// Anthropic Messages rejects `thinking.adaptive.effort`; effort belongs in
+    /// `output_config.effort`.
     #[test]
-    fn anthropic_adaptive_high_includes_effort_field() {
+    fn anthropic_adaptive_high_uses_output_config_effort() {
         let cfg = ThinkingConfig::Adaptive {
             effort: ThinkingEffort::High,
         };
         let mut body = json!({ "temperature": 0.5 });
         cfg.apply_anthropic(&mut body);
-        assert_eq!(
-            body["thinking"]["effort"], "high",
-            "Adaptive::High must emit effort=high explicitly"
-        );
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"], json!({"effort": "high"}));
     }
 
     /// Fix #2: `from_payload_value` must gracefully accept the legacy wire format
@@ -767,6 +1052,122 @@ mod tests {
         assert_eq!(
             ThinkingConfig::from_payload_value(&garbage),
             ThinkingConfig::Off
+        );
+    }
+
+    // ─── Dynamic budget scaling ─────────────────────────────────────────
+
+    #[test]
+    fn scale_for_turn_short_conceptual_question_drops_high_to_medium() {
+        let cfg = ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::High,
+        };
+        let sig = TurnComplexitySignals::from_message("why does the circuit breaker abort?");
+        assert!(sig.is_lightweight());
+        let scaled = cfg.scale_for_turn(sig);
+        assert_eq!(
+            scaled,
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Medium
+            },
+            "short conceptual Q should drop high → medium"
+        );
+    }
+
+    #[test]
+    fn scale_for_turn_chinese_conceptual_question_dampens() {
+        let cfg = ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::Max,
+        };
+        let sig = TurnComplexitySignals::from_message("为啥其他model看不到thinking和不thinking?");
+        let scaled = cfg.scale_for_turn(sig);
+        assert_eq!(
+            scaled,
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Medium
+            }
+        );
+    }
+
+    #[test]
+    fn scale_for_turn_modification_intent_not_dampened() {
+        let cfg = ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::High,
+        };
+        let sig = TurnComplexitySignals::from_message("fix the bug in auth.rs");
+        assert!(!sig.is_lightweight());
+        let scaled = cfg.scale_for_turn(sig);
+        assert_eq!(scaled, cfg, "modification intent should not dampen");
+    }
+
+    #[test]
+    fn scale_for_turn_continuation_not_dampened() {
+        let cfg = ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::High,
+        };
+        let sig = TurnComplexitySignals::from_message("继续");
+        assert!(!sig.is_lightweight());
+        let scaled = cfg.scale_for_turn(sig);
+        assert_eq!(scaled, cfg, "continuation should not dampen");
+    }
+
+    #[test]
+    fn scale_for_turn_long_message_not_dampened() {
+        let cfg = ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::High,
+        };
+        let long = "why is this happening? ".repeat(20); // > 120 chars
+        let sig = TurnComplexitySignals::from_message(&long);
+        let scaled = cfg.scale_for_turn(sig);
+        assert_eq!(scaled, cfg, "long message should not dampen");
+    }
+
+    #[test]
+    fn scale_for_turn_enabled_budget_capped_at_4k() {
+        let cfg = ThinkingConfig::Enabled {
+            budget_tokens: 10_000,
+        };
+        let sig = TurnComplexitySignals::from_message("what is a session id?");
+        let scaled = cfg.scale_for_turn(sig);
+        assert_eq!(
+            scaled,
+            ThinkingConfig::Enabled {
+                budget_tokens: 4_000
+            }
+        );
+    }
+
+    #[test]
+    fn scale_for_turn_off_stays_off() {
+        let sig = TurnComplexitySignals::from_message("why?");
+        assert_eq!(ThinkingConfig::Off.scale_for_turn(sig), ThinkingConfig::Off);
+    }
+
+    #[test]
+    fn scale_for_turn_low_effort_stays_low() {
+        let cfg = ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::Low,
+        };
+        let sig = TurnComplexitySignals::from_message("why?");
+        let scaled = cfg.scale_for_turn(sig);
+        assert_eq!(
+            scaled,
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Low
+            },
+            "Low effort should not escalate"
+        );
+    }
+
+    #[test]
+    fn capped_at_never_increases() {
+        assert_eq!(
+            ThinkingEffort::Low.capped_at(ThinkingEffort::High),
+            ThinkingEffort::Low
+        );
+        assert_eq!(
+            ThinkingEffort::Max.capped_at(ThinkingEffort::Medium),
+            ThinkingEffort::Medium
         );
     }
 }

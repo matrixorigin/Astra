@@ -1070,6 +1070,7 @@ pub(super) async fn handle_info_command(
     arg: &str,
     api: &astra_thin_client::ThinClient,
     state: &mut ReplState,
+    profile: Option<&str>,
     token: Option<&str>,
 ) -> Result<(), String> {
     match cmd {
@@ -1222,6 +1223,7 @@ pub(super) async fn handle_info_command(
             let sr = stream_chat_sse(ChatTurnParams {
                 api,
                 token: tok,
+                auth_profile: profile,
                 message: &prompt,
                 session_id: state.session_id.as_deref(),
                 model: state.model.as_deref(),

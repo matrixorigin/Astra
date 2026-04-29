@@ -127,6 +127,19 @@ fn coding_discipline_section() -> &'static str {
      - **Imports and dependencies**: when adding new functionality, add required imports/deps.\n"
 }
 
+/// Turn discipline: brief announcements, terminal summary, no externalized reasoning.
+/// Pure static — complements coding_discipline_section with session-flow rules.
+/// Empirically, turns that churn >10 rounds usually lack a standing commitment to
+/// summarize; requiring a turn-end summary creates implicit convergence pressure.
+fn turn_discipline_section() -> &'static str {
+    "\n## Turn Discipline\n\
+     - **Announce once, briefly**: before your first tool call, write ONE sentence saying what you're about to do. Don't narrate every step.\n\
+     - **End with a short summary**: close the turn with 1-2 sentences stating what changed and what's next. This is the deliverable — not a list of tools you ran.\n\
+     - **No externalized reasoning**: deliberation belongs in <think> blocks. Skip \"Let me think...\" / \"Hmm\" / \"Actually, wait\" — noise, not content.\n\
+     - **Lead with the answer**: \"The bug is on line 42 because X\" beats \"Looking at the code, I notice line 42 might be relevant, let me investigate…\".\n\
+     - **Match depth to task**: a one-line question gets a one-line answer, not a structured report.\n"
+}
+
 /// Parallel tool calls + token efficiency + build/test warning. Pure static.
 fn parallel_and_efficiency_section() -> &'static str {
     "\n## Think-Before-Act\n\
@@ -673,6 +686,7 @@ pub fn build_system_prompt_sections_with_style(
         PromptSection::stable(core_rules_section(), CacheScope::Global),
         PromptSection::stable(planning_section().to_string(), CacheScope::Global),
         PromptSection::stable(coding_discipline_section().to_string(), CacheScope::Global),
+        PromptSection::stable(turn_discipline_section().to_string(), CacheScope::Global),
         PromptSection::stable(
             parallel_and_efficiency_section().to_string(),
             CacheScope::Global,

@@ -414,9 +414,20 @@ pub struct ToolSelectionConfig {
 
     /// Circuit breaker: consecutive read-only rounds (tools called but no
     /// mutation) before tripping, regardless of signature novelty. Catches
-    /// "creative but unproductive" exploration loops. 0 = use default (8).
+    /// "creative but unproductive" exploration loops. 0 = use default (12).
     #[serde(default)]
     pub circuit_breaker_read_only_stall_threshold: u32,
+
+    /// Circuit breaker: maximum number of introspect (self-check) soft-signals
+    /// emitted per turn before the breaker falls back to Continue. Prevents
+    /// unbounded self-check prompts on genuinely long read-only sessions.
+    ///
+    /// - `0` = use default (3).
+    /// - Any explicit value ≥ 1 is honored (floor is 1).
+    /// - For effectively unbounded behavior, set a very large value
+    ///   (e.g. `u32::MAX`) rather than `0` — `0` is reserved for "use default".
+    #[serde(default)]
+    pub circuit_breaker_max_introspect_emissions: u32,
 
     /// Mid-loop guard: number of consecutive single-tool rounds tolerated
     /// before the runtime injects a parallel-batching corrective. 0 = use
@@ -699,7 +710,13 @@ impl ToolSelectionConfig {
     }
 
     pub fn effective_circuit_breaker_read_only_stall_threshold(&self) -> u32 {
-        resolve_threshold(self.circuit_breaker_read_only_stall_threshold, 8, 3)
+        resolve_threshold(self.circuit_breaker_read_only_stall_threshold, 12, 4)
+    }
+
+    /// Resolved circuit breaker introspect emissions cap (0 → default 3, floor 1).
+    /// Use a high explicit value (e.g. 1000) to approximate "unbounded" behavior.
+    pub fn effective_circuit_breaker_max_introspect_emissions(&self) -> u32 {
+        resolve_threshold(self.circuit_breaker_max_introspect_emissions, 3, 1)
     }
 
     /// Resolved parallel-batching force streak threshold (0 → default of 5).
@@ -870,6 +887,7 @@ impl Default for ToolSelectionConfig {
             circuit_breaker_half_open_patience: 0,
             circuit_breaker_absolute_max_rounds: 0,
             circuit_breaker_read_only_stall_threshold: 0,
+            circuit_breaker_max_introspect_emissions: 0,
             parallel_batching_force_streak: 0,
             redundant_reads_midloop_threshold: 0,
             sequential_read_churn_eval_threshold: 0,
@@ -1402,6 +1420,7 @@ impl RuntimeConfig {
             circuit_breaker_half_open_patience,
             circuit_breaker_absolute_max_rounds,
             circuit_breaker_read_only_stall_threshold,
+            circuit_breaker_max_introspect_emissions,
             parallel_batching_force_streak,
             redundant_reads_midloop_threshold,
             sequential_read_churn_eval_threshold,
@@ -1492,6 +1511,11 @@ impl RuntimeConfig {
                 .tool_selection
                 .circuit_breaker_read_only_stall_threshold,
             circuit_breaker_read_only_stall_threshold,
+            0,
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.circuit_breaker_max_introspect_emissions,
+            circuit_breaker_max_introspect_emissions,
             0,
         );
         merge_if_non_default(
@@ -2002,6 +2026,7 @@ mod tests {
                 circuit_breaker_half_open_patience: 0,
                 circuit_breaker_absolute_max_rounds: 0,
                 circuit_breaker_read_only_stall_threshold: 0,
+                circuit_breaker_max_introspect_emissions: 0,
                 parallel_batching_force_streak: 0,
                 redundant_reads_midloop_threshold: 0,
                 sequential_read_churn_eval_threshold: 0,

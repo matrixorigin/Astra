@@ -325,6 +325,7 @@ pub(super) async fn handle_state_command(
                 r = stream_chat_sse(ChatTurnParams {
                     api,
                     token: tok,
+                    auth_profile: profile,
                     message: prompts::COMPACT_SUMMARY_REQUEST,
                     session_id: state.session_id.as_deref(),
                     model: state.model.as_deref(),
@@ -437,6 +438,7 @@ pub(super) async fn handle_state_command(
                         let extract_result = stream_chat_sse(ChatTurnParams {
                             api,
                             token: tok,
+                            auth_profile: profile,
                             message: &extract_msg,
                             session_id: state.session_id.as_deref(),
                             model: state.model.as_deref(),
@@ -527,6 +529,7 @@ pub(super) async fn handle_state_command(
                                 let synth_result = stream_chat_sse(ChatTurnParams {
                                     api,
                                     token: tok,
+                                    auth_profile: profile,
                                     message: &synthesis_prompt,
                                     session_id: state.session_id.as_deref(),
                                     model: state.model.as_deref(),

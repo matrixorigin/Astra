@@ -1734,6 +1734,7 @@ async fn plan_executor_task(
                 stream_chat_sse(ChatTurnParams {
                     api: &ctx.api,
                     token: &ctx.token,
+                    auth_profile: ctx.profile.as_deref(),
                     message: &prompt,
                     session_id: ctx.session_id.as_deref(),
                     model: ctx.model.as_deref(),

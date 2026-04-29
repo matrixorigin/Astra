@@ -262,6 +262,7 @@ impl AgenticLoopHost for SubRunHost {
             RenderPolicy::Silent,
             Some(edge_ctx),
             0,                                              // pre_clear_lines
+            None,                                           // auth_profile
             self.cancel_token.as_ref().map(|t| t.as_ref()), // propagate parent cancel
         )
         .await;

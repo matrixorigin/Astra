@@ -99,6 +99,17 @@ pub(crate) fn provider_uses_bedrock_converse(provider: &str) -> bool {
     llm_provider_protocol(provider) == LlmProviderProtocol::BedrockConverse
 }
 
+/// Returns true only when the *provider* is known to be DashScope / Aliyun / Alibaba.
+///
+/// We intentionally do NOT match on model name here: Qwen models are also served
+/// through generic OpenAI-compatible proxies (vLLM, Ollama, SGLang, …) that do not
+/// accept `enable_thinking` and may 400 on unknown top-level fields. Matching the
+/// provider name alone avoids false positives on those deployments.
+pub(crate) fn provider_uses_dashscope_thinking(provider: &str) -> bool {
+    let provider = provider.to_ascii_lowercase();
+    provider.contains("dashscope") || provider.contains("aliyun") || provider.contains("alibaba")
+}
+
 /// Global HTTP client for LLM requests (connection pooling, reuse).
 fn global_llm_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -910,6 +921,22 @@ pub(crate) fn build_provider_request_body(
             }
             if is_anthropic {
                 thinking.apply_anthropic(&mut body);
+            } else if provider_uses_dashscope_thinking(provider) {
+                // DashScope/Qwen uses a binary `enable_thinking` flag; there is no equivalent
+                // of `reasoning_effort`. For `Enabled` this is a direct mapping. For `Adaptive`
+                // we enable thinking but the `effort` level is silently dropped — warn so
+                // operators can diagnose unexpected latency or cost behaviour.
+                if thinking.is_enabled() {
+                    body["enable_thinking"] = json!(true);
+                } else if let ThinkingConfig::Adaptive { effort } = thinking {
+                    tracing::warn!(
+                        provider,
+                        effort = ?effort,
+                        "DashScope/Qwen does not support `reasoning_effort`; \
+                         Adaptive mode mapped to `enable_thinking: true` — effort level ignored"
+                    );
+                    body["enable_thinking"] = json!(true);
+                }
             } else {
                 thinking.apply_openai(&mut body);
             }
@@ -2047,41 +2074,6 @@ pub(crate) async fn call_llm_nonstream_fallback(
         None,
         None,
         &ThinkingConfig::Off,
-    )
-    .await
-}
-
-/// Like [`call_llm_nonstream_fallback`] but applies a [`ThinkingConfig`] to the request body.
-///
-/// Thin wrapper over [`call_llm_nonstream_fallback_with_request_overrides`] — prefer calling
-/// that directly for new code. Retained for call sites that don't need header/URL overrides.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn call_llm_nonstream_fallback_with_thinking(
-    client: &reqwest::Client,
-    messages: &[Value],
-    tools: &[Value],
-    model_name: &str,
-    api_key: &str,
-    base_url: &str,
-    provider: &str,
-    max_output_tokens: Option<usize>,
-    timeout: std::time::Duration,
-    thinking: &ThinkingConfig,
-) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    call_llm_nonstream_fallback_with_request_overrides(
-        client,
-        messages,
-        tools,
-        model_name,
-        api_key,
-        base_url,
-        provider,
-        max_output_tokens,
-        timeout,
-        None,
-        None,
-        None,
-        thinking,
     )
     .await
 }
@@ -5453,7 +5445,7 @@ mod tests {
             "adaptive"
         );
         assert_eq!(
-            body["additionalModelRequestFields"]["thinking"]["effort"],
+            body["additionalModelRequestFields"]["output_config"]["effort"],
             "low"
         );
         // Temperature removed even though it was requested
@@ -5516,6 +5508,27 @@ mod tests {
     }
 
     #[test]
+    fn build_anthropic_body_with_thinking_adaptive_uses_output_config_effort() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "claude-opus-4-7",
+            "anthropic",
+            Some(16000),
+            Some(0.7),
+            true,
+            &ThinkingConfig::Adaptive {
+                effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+            },
+        );
+
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"], json!({"effort": "high"}));
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
     fn build_anthropic_body_with_thinking_off() {
         let messages = vec![json!({"role": "user", "content": "hello"})];
         let body = build_provider_request_body(
@@ -5552,6 +5565,79 @@ mod tests {
         assert_eq!(body["model"], "o3");
         assert_eq!(body["reasoning_effort"], "medium");
         assert_eq!(body["stream"], true);
+    }
+
+    /// Qwen models served through the *DashScope* provider use `enable_thinking`.
+    /// The provider name (not model name) is the discriminator — the same Qwen model
+    /// served through a generic vLLM/Ollama proxy with provider="openai" must NOT
+    /// receive `enable_thinking` because those proxies reject unknown top-level fields.
+    #[test]
+    fn build_dashscope_qwen_body_with_thinking_enabled() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "qwen3.6-plus",
+            "dashscope",
+            Some(4096),
+            Some(0.7),
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 10_000,
+            },
+        );
+
+        assert_eq!(body["model"], "qwen3.6-plus");
+        assert_eq!(body["enable_thinking"], true);
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["temperature"], 0.7);
+    }
+
+    /// Same Qwen model through a generic OpenAI-compatible proxy must NOT get
+    /// `enable_thinking` — the proxy does not know about that field and may 400.
+    #[test]
+    fn build_generic_proxy_qwen_body_does_not_set_dashscope_flag() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "qwen3.6-plus",
+            "openai",
+            Some(4096),
+            Some(0.7),
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 10_000,
+            },
+        );
+
+        assert_eq!(body["model"], "qwen3.6-plus");
+        // Generic OpenAI-compatible proxy: no DashScope-specific field.
+        assert!(body.get("enable_thinking").is_none());
+        // Enabled thinking has no OpenAI mapping (no reasoning_effort either).
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["temperature"], 0.7);
+    }
+
+    #[test]
+    fn build_standard_openai_body_with_budget_thinking_does_not_send_dashscope_flag() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "gpt-4o",
+            "openai",
+            Some(4096),
+            Some(0.7),
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 10_000,
+            },
+        );
+
+        assert!(body.get("enable_thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["temperature"], 0.7);
     }
 
     #[test]

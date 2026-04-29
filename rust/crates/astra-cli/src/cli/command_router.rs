@@ -284,12 +284,29 @@ async fn execute_repl_bridge_command(
     match slash_cmd {
         "/team" => slash_team::handle_team_command(arg, api, profile, &mut state).await,
         "/telemetry" => slash_telemetry::handle_telemetry_command(arg, &state),
-        "/task" => slash_task::handle_task_command(arg, &mut state, api, token.as_deref()).await,
+        "/task" => {
+            slash_task::handle_task_command(
+                arg,
+                &mut state,
+                api,
+                profile.as_deref(),
+                token.as_deref(),
+            )
+            .await
+        }
         "/memory" => {
             handle_memory_domain_command("/memory", arg, api, &mut state, token.as_deref()).await?
         }
         "/review" | "/grep" => {
-            handle_info_command(slash_cmd, arg, api, &mut state, token.as_deref()).await?
+            handle_info_command(
+                slash_cmd,
+                arg,
+                api,
+                &mut state,
+                profile.as_deref(),
+                token.as_deref(),
+            )
+            .await?
         }
         "/diff" => {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -410,6 +427,7 @@ pub(super) async fn execute_cli_command(
             let skill_search = astra_core::SkillSearchSettings::default();
             let chat_ctx = crate::chat_stream::BasicCliChatContext {
                 api,
+                auth_profile: profile.as_deref(),
                 message: &message,
                 model: global_model.as_deref(),
                 provider: None,
@@ -820,6 +838,7 @@ pub(super) async fn execute_cli_command(
             };
             let chat_ctx = crate::chat_stream::BasicCliChatContext {
                 api,
+                auth_profile: profile.as_deref(),
                 message: &message,
                 model: args.model.as_deref().or(global_model.as_deref()),
                 provider: None,
@@ -1370,6 +1389,7 @@ pub(super) async fn run_print_mode(
 
     let chat_ctx = crate::chat_stream::BasicCliChatContext {
         api,
+        auth_profile: profile,
         message: &message,
         model,
         provider: None,

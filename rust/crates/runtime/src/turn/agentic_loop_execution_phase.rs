@@ -77,6 +77,20 @@ fn inject_runtime_attention_manifest(state: &mut AgenticLoopState) {
     }
 }
 
+fn circuit_breaker_introspection_message(
+    llm_rounds_completed: u32,
+    consecutive_read_only: usize,
+) -> String {
+    format!(
+        "[Self-check — round {}] You have been reading/exploring for {} consecutive rounds \
+         without writing. Take a moment to assess:\n\
+         - Do you have enough information to produce your answer? If yes, do so now.\n\
+         - If not, what specific information are you still missing?\n\
+         Tools remain available.",
+        llm_rounds_completed, consecutive_read_only
+    )
+}
+
 pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -206,6 +220,20 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             astra_turn_core::loop_circuit_breaker::BreakerAction::InjectCorrection => {
                 state.stall.forced_round_budget_phase1 = true;
                 state.stall.circuit_breaker.correction_injected();
+                // Physical tool lockout for the upcoming round.
+                //
+                // Historically this path injected a text-only corrective that
+                // said "tools are disabled" but didn't actually restrict them,
+                // so the model sometimes ignored the instruction and kept
+                // calling tools (observed: session 36500dd9 round 13 kept
+                // using bash/read_file despite the message). Adding every
+                // valid tool to `restricted_tools` flips the phase1 promise
+                // from aspirational to enforced: the CLI-side tool selector
+                // filters these out before the next payload is built, so the
+                // model physically cannot emit another tool call this round.
+                for name in host.valid_tool_names() {
+                    state.restricted_tools.insert(name.clone());
+                }
                 state.messages.push(serde_json::json!({
                     "role": "user",
                     "content": round_budget_phase1_message(state.llm_rounds_completed, &state.message),
@@ -265,7 +293,44 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 finalize_and_render(host, state).await;
                 return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
             }
+            astra_turn_core::loop_circuit_breaker::BreakerAction::Introspect {
+                consecutive_read_only,
+            } => {
+                // `introspection_count` is monotonic for the lifetime of this turn
+                // (not reset between introspect emissions). It mirrors the breaker's
+                // own `introspect_emissions_since_last_write` counter but is retained
+                // for structured logging / observability only.
+                state.stall.introspection_count = state.stall.introspection_count.saturating_add(1);
+                let emission_index = state.stall.introspection_count;
+                state.messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": circuit_breaker_introspection_message(
+                        state.llm_rounds_completed,
+                        consecutive_read_only,
+                    ),
+                }));
+                tracing::info!(
+                    target: "astra::loop_guard",
+                    tier = "circuit_breaker_introspect",
+                    round = state.llm_rounds_completed,
+                    consecutive_read_only,
+                    emission = emission_index,
+                    "circuit breaker introspection — periodic self-check injected"
+                );
+                if !prep.quiet {
+                    host.emit_headless_line(
+                        HeadlessStderrStyle::Yellow,
+                        format!(
+                            "↻ Self-check prompt injected at round {} ({} consecutive read-only rounds, emission #{}).",
+                            state.llm_rounds_completed, consecutive_read_only, emission_index
+                        ),
+                    );
+                }
+            }
             astra_turn_core::loop_circuit_breaker::BreakerAction::Continue => {}
+            // BreakerAction is #[non_exhaustive] — future soft-intervention
+            // variants should default to a no-op so the loop continues.
+            _ => {}
         }
     }
 
@@ -1401,9 +1466,11 @@ pub(crate) fn round_budget_phase1_message(round_index: u32, original_query: &str
     format!(
         "{ROUND_BUDGET_PHASE1_MARKER}\n\
          Runtime correction: this turn has used {round_index} tool rounds and \
-         is past the configured hard limit. The runtime has now disabled all \
-         tools for the next round — your next response MUST be a final \
-         text-only answer.\n\n\
+         is past the configured hard limit.\n\n\
+         Tool access for the next round has been restricted by the runtime. \
+         Any tool calls you emit WILL BE DROPPED before execution — the runtime will \
+         not invoke them and you will not receive results. Your next message must \
+         be the final text-only answer.\n\n\
          IMPORTANT (anti-hallucination):\n\
          - Synthesize what you DID verify with the tool calls already made.\n\
          - Explicitly list anything you could NOT verify or finish.\n\
@@ -2054,6 +2121,15 @@ mod tests {
     use super::*;
     use crate::observability_integration::ObservabilityHub;
     use crate::turn::agentic_loop_host::tests::{MockHost, make_state, text_result};
+
+    #[test]
+    fn circuit_breaker_introspection_message_uses_actual_read_only_streak() {
+        let message = circuit_breaker_introspection_message(18, 12);
+
+        assert!(message.contains("[Self-check — round 18]"));
+        assert!(message.contains("12 consecutive rounds"));
+        assert!(!message.contains("18 consecutive rounds"));
+    }
 
     #[test]
     fn observe_turn_end_without_tools_records_outer_session_turn() {

@@ -38,6 +38,7 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
+        auth_profile: None,
         message: "hi",
         session_id: None,
         model: None,
@@ -125,6 +126,7 @@ async fn stream_chat_sse_simple_text_response() {
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
+        auth_profile: None,
         message: "hi",
         session_id: None,
         model: None,
@@ -215,6 +217,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
+        auth_profile: None,
         message: "hi",
         session_id: Some("sess-traced"),
         model: None,
@@ -309,6 +312,7 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
         let result = stream_chat_sse(ChatTurnParams {
             api: &api,
             token: "fake-token",
+            auth_profile: None,
             message: "hi",
             session_id,
             model: None,
@@ -395,6 +399,7 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
+        auth_profile: None,
         message: "hi",
         session_id: None,
         model: None,
@@ -509,6 +514,7 @@ async fn stream_chat_sse_api_error_propagated() {
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
+        auth_profile: None,
         message: "hi",
         session_id: None,
         model: None,
@@ -599,6 +605,7 @@ async fn stream_chat_sse_with_tool_call_loop() {
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
+        auth_profile: None,
         message: "run echo hi",
         session_id: None,
         model: None,
@@ -712,6 +719,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
+        auth_profile: None,
         message: "write inside a transaction",
         session_id: None,
         model: None,
@@ -868,6 +876,7 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
+        auth_profile: None,
         message: "review local changes",
         session_id: None,
         model: None,

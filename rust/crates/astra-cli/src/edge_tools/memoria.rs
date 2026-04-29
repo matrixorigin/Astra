@@ -34,8 +34,9 @@ impl ToolExecutor {
         }
 
         // Build endpoint and payload
+        let cloud_token = self.cloud_token();
         let (endpoint, payload, auth_header) = if let (Some(cloud_base), Some(token)) =
-            (&self.cloud_base, &self.cloud_token)
+            (&self.cloud_base, cloud_token.as_deref())
         {
             (
                 format!("{cloud_base}/memory/{op}"),

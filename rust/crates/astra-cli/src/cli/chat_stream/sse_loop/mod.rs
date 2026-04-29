@@ -48,6 +48,70 @@ use agentic_sse_loop::{
 use cli_loop_host::CliAgenticLoopHost;
 use serde_json::json;
 
+/// Map `ToolSelectionConfig` (from `astra-config`) to `BreakerConfig` (from
+/// `astra-turn-core`).
+///
+/// Lives in the CLI because `astra-config` and `astra-turn-core` are sibling
+/// crates with no dependency edge between them; adding `impl From<…> for
+/// BreakerConfig` in either crate would introduce an unwanted dependency.
+/// The CLI is the natural composition layer that already depends on both.
+/// If a second caller appears, promote this to a dedicated adapter crate
+/// rather than coupling the two base crates.
+fn circuit_breaker_config_from_tool_selection(
+    config: &astra_config::runtime_config::ToolSelectionConfig,
+) -> astra_turn_core::loop_circuit_breaker::BreakerConfig {
+    // Resolve each threshold and warn when a user-supplied value was clamped
+    // to its floor so operators can diagnose unexpected behaviour.
+    macro_rules! resolve_and_warn {
+        ($raw:expr, $effective:expr, $name:literal) => {{
+            let raw = $raw;
+            let effective = $effective;
+            if raw > 0 && effective != raw {
+                tracing::warn!(
+                    config_field = $name,
+                    user_value = raw,
+                    applied_value = effective,
+                    "circuit breaker config value below floor — clamped to minimum"
+                );
+            }
+            effective as usize
+        }};
+    }
+
+    astra_turn_core::loop_circuit_breaker::BreakerConfig {
+        stall_threshold: resolve_and_warn!(
+            config.circuit_breaker_stall_threshold,
+            config.effective_circuit_breaker_stall_threshold(),
+            "circuit_breaker_stall_threshold"
+        ),
+        repetition_threshold: resolve_and_warn!(
+            config.circuit_breaker_repetition_threshold,
+            config.effective_circuit_breaker_repetition_threshold(),
+            "circuit_breaker_repetition_threshold"
+        ),
+        read_only_stall_threshold: resolve_and_warn!(
+            config.circuit_breaker_read_only_stall_threshold,
+            config.effective_circuit_breaker_read_only_stall_threshold(),
+            "circuit_breaker_read_only_stall_threshold"
+        ),
+        max_introspect_emissions: resolve_and_warn!(
+            config.circuit_breaker_max_introspect_emissions,
+            config.effective_circuit_breaker_max_introspect_emissions(),
+            "circuit_breaker_max_introspect_emissions"
+        ),
+        half_open_patience: resolve_and_warn!(
+            config.circuit_breaker_half_open_patience,
+            config.effective_circuit_breaker_half_open_patience(),
+            "circuit_breaker_half_open_patience"
+        ),
+        absolute_max_rounds: resolve_and_warn!(
+            config.circuit_breaker_absolute_max_rounds,
+            config.effective_circuit_breaker_absolute_max_rounds(),
+            "circuit_breaker_absolute_max_rounds"
+        ),
+    }
+}
+
 async fn finalize_root_mailbox(
     slot: Option<&mut Option<astra_messaging::router::AgentMailbox>>,
     mailbox: &mut Option<astra_messaging::router::AgentMailbox>,
@@ -94,9 +158,9 @@ pub(crate) async fn stream_chat_sse(
     // Capture the model id up front for later `resolve_for_model` calls —
     // `p.model` (Option<&str>) gets consumed into `host.model` below.
     let model_id_for_policy = p.model;
-    let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-        .tool_selection
-        .resolve_for_model(model_id_for_policy);
+    let tool_selection_config = astra_config::runtime_config::RuntimeConfig::load().tool_selection;
+    let resolved_tool_policy = tool_selection_config.resolve_for_model(model_id_for_policy);
+    let circuit_breaker_config = circuit_breaker_config_from_tool_selection(&tool_selection_config);
 
     // Paint an immediate spinner so the user sees feedback during init (executor, schemas,
     // skill discovery, etc.) before the per-turn prep spinner takes over.
@@ -343,7 +407,8 @@ pub(crate) async fn stream_chat_sse(
     // ─── Build host + state ──────────────────────────────────────────────
     let mut host = CliAgenticLoopHost {
         api: p.api,
-        token: p.token,
+        token: p.token.to_string(),
+        auth_profile: p.auth_profile,
         model: p.model,
         explain: p.explain,
         render_md: p.render_md,
@@ -509,13 +574,16 @@ pub(crate) async fn stream_chat_sse(
             forced_parallel_batching: false,
             forced_round_budget_phase1: false,
             forced_round_budget_phase2: false,
+            introspection_count: 0,
             forced_redundant_reads_corrective: false,
             forced_cache_waste_corrective: false,
             forced_exploration_family_corrective: false,
             forced_exploration_family_phase2: false,
             exploration_family_corrective_family: None,
             nudge_count: 0,
-            circuit_breaker: Default::default(),
+            circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
+                circuit_breaker_config,
+            ),
             guardrail_tuner: astra_runtime::guardrail_tuning::GuardrailTuner::default(),
             guardrail_tuner_records_cursor: 0,
         },
@@ -756,8 +824,10 @@ fn load_turn_messages(
     openai_messages_from_repl_history(history, current_message)
 }
 
+
 #[cfg(test)]
 mod tests {
+    use super::circuit_breaker_config_from_tool_selection;
     use super::detect_turn_hook_sets;
     use super::extend_restricted_with_blocked_tools;
     use astra_pipeline::pattern::PatternLibrary;
@@ -769,6 +839,56 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+
+    #[test]
+    fn circuit_breaker_config_uses_runtime_config_defaults() {
+        let cfg = circuit_breaker_config_from_tool_selection(
+            &astra_config::runtime_config::ToolSelectionConfig::default(),
+        );
+
+        assert_eq!(cfg.stall_threshold, 3);
+        assert_eq!(cfg.repetition_threshold, 3);
+        assert_eq!(cfg.read_only_stall_threshold, 12);
+        // `0` in user config means "use default (3)", NOT the BreakerConfig sentinel "unbounded".
+        assert_eq!(cfg.max_introspect_emissions, 3);
+        assert_eq!(cfg.half_open_patience, 2);
+        assert_eq!(cfg.absolute_max_rounds, 200);
+    }
+
+    #[test]
+    fn circuit_breaker_config_uses_runtime_config_overrides_with_floors() {
+        let tool_selection = astra_config::runtime_config::ToolSelectionConfig {
+            circuit_breaker_stall_threshold: 1,
+            circuit_breaker_repetition_threshold: 7,
+            circuit_breaker_read_only_stall_threshold: 2,
+            // user=0 → effective_*() returns default (3); floor is 1
+            circuit_breaker_max_introspect_emissions: 0,
+            circuit_breaker_half_open_patience: 5,
+            circuit_breaker_absolute_max_rounds: 10,
+            ..Default::default()
+        };
+
+        let cfg = circuit_breaker_config_from_tool_selection(&tool_selection);
+
+        assert_eq!(cfg.stall_threshold, 2);
+        assert_eq!(cfg.repetition_threshold, 7);
+        assert_eq!(cfg.read_only_stall_threshold, 4);
+        // user=0 means "use default" → 3, never unbounded (BreakerConfig.0 sentinel)
+        assert_eq!(cfg.max_introspect_emissions, 3);
+        assert_eq!(cfg.half_open_patience, 5);
+        assert_eq!(cfg.absolute_max_rounds, 20);
+    }
+
+    #[test]
+    fn circuit_breaker_config_introspect_floor_is_one() {
+        // user supplies explicit value=1 (at the floor) — should pass through unchanged
+        let tool_selection = astra_config::runtime_config::ToolSelectionConfig {
+            circuit_breaker_max_introspect_emissions: 1,
+            ..Default::default()
+        };
+        let cfg = circuit_breaker_config_from_tool_selection(&tool_selection);
+        assert_eq!(cfg.max_introspect_emissions, 1);
+    }
 
     #[test]
     fn read_only_requests_skip_stop_hooks() {

@@ -208,7 +208,8 @@ pub(super) struct EdgeSseContext<'a> {
 /// - Cloud API posting (tool results, approvals) via [`astra_thin_client::ThinClient`]
 struct CliSseStreamHost<'a> {
     api: &'a astra_thin_client::ThinClient,
-    token: &'a str,
+    token: String,
+    auth_profile: Option<&'a str>,
     executor_id: &'a str,
     executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
     render_policy: RenderPolicy,
@@ -266,6 +267,24 @@ struct CliSseStreamHost<'a> {
     /// Optional ObservabilityHub for streaming-speculation metric reporting.
     observability_hub:
         Option<std::sync::Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    /// Set when posting edge-side tool or approval results receives 401.
+    auth_failure: bool,
+}
+
+const EDGE_AUTH_FAILURE_MESSAGE: &str =
+    "401 Unauthorized: session expired while posting edge tool results";
+
+fn is_edge_auth_failure(e: &astra_thin_client::ThinClientError) -> bool {
+    matches!(
+        e,
+        astra_thin_client::ThinClientError::Api { status, .. } if status.as_u16() == 401
+    )
+}
+
+fn apply_edge_auth_failure_result(accum: &mut ChatTurnSseAccum, auth_failure: bool) {
+    if auth_failure {
+        accum.error_message = Some(EDGE_AUTH_FAILURE_MESSAGE.to_string());
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -312,6 +331,15 @@ const EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK: &str = "turn_rollback";
 
 impl<'a> CliSseStreamHost<'a> {
     fn from_edge_ctx(ctx: EdgeSseContext<'a>, term_width: usize, render_md: bool) -> Self {
+        Self::from_edge_ctx_with_auth(ctx, term_width, render_md, None)
+    }
+
+    fn from_edge_ctx_with_auth(
+        ctx: EdgeSseContext<'a>,
+        term_width: usize,
+        render_md: bool,
+        auth_profile: Option<&'a str>,
+    ) -> Self {
         let suppress_reasoning =
             ctx.render_policy == RenderPolicy::Silent || ctx.skill_continuation;
         let active_turn_rollback = ctx.turn_rollback_on_failure.then(|| ActiveTurnRollback {
@@ -343,7 +371,8 @@ impl<'a> CliSseStreamHost<'a> {
         let streaming_tool_exec = build_streaming_tool_exec(std::sync::Arc::clone(&ctx.executor));
         Self {
             api: ctx.api,
-            token: ctx.token,
+            token: ctx.token.to_string(),
+            auth_profile,
             executor_id: ctx.executor_id,
             executor: ctx.executor,
             render_policy: ctx.render_policy,
@@ -364,6 +393,7 @@ impl<'a> CliSseStreamHost<'a> {
             tool_cache: ctx.tool_cache,
             streaming_tool_exec,
             observability_hub: ctx.observability_hub,
+            auth_failure: false,
         }
     }
 
@@ -381,6 +411,107 @@ impl<'a> CliSseStreamHost<'a> {
             print!("{s}");
             let _ = io::stdout().flush();
             self.render.track_output(s);
+        }
+    }
+
+    fn mark_edge_auth_failure(&mut self) {
+        self.auth_failure = true;
+        if let Some(token) = self.cancel_token {
+            token.cancel();
+        }
+    }
+
+    fn handle_post_tool_result_error(&mut self, e: &astra_thin_client::ThinClientError) -> bool {
+        if is_edge_auth_failure(e) {
+            self.mark_edge_auth_failure();
+            true
+        } else if !self.render_policy.suppress_tool_ui() {
+            eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
+            false
+        } else {
+            false
+        }
+    }
+
+    fn handle_post_approval_error(&mut self, e: &astra_thin_client::ThinClientError) -> bool {
+        if is_edge_auth_failure(e) {
+            self.mark_edge_auth_failure();
+            true
+        } else if !self.render_policy.suppress_tool_ui() {
+            eprintln!("{}", edge_sse_post_approval_fail_line(e).yellow());
+            false
+        } else {
+            false
+        }
+    }
+
+    async fn refresh_edge_token_after_401(&mut self) -> bool {
+        let Some(profile) = self.auth_profile else {
+            return false;
+        };
+        if !self.render_policy.is_silent() {
+            eprintln!("{}", "  Token expired, attempting refresh…".yellow());
+        }
+        if !super::repl_runtime::attempt_token_refresh(self.api, Some(profile)).await {
+            return false;
+        }
+        let Some(new_token) = super::repl_runtime::current_access_token(Some(profile)) else {
+            return false;
+        };
+        self.token = new_token;
+        if !self.render_policy.is_silent() {
+            eprintln!("  {} Token refreshed, continuing…", crate::theme::icon_ok());
+        }
+        true
+    }
+
+    async fn post_tool_result_with_auth_retry(
+        &mut self,
+        body: &astra_thin_client::ToolResultRequest,
+    ) -> bool {
+        let result = self
+            .api
+            .post_tool_result(Some(self.token.as_str()), Some(self.executor_id), body)
+            .await;
+        match result {
+            Ok(_) => false,
+            Err(e) if is_edge_auth_failure(&e) && self.refresh_edge_token_after_401().await => {
+                let retry = self
+                    .api
+                    .post_tool_result(Some(self.token.as_str()), Some(self.executor_id), body)
+                    .await;
+                if let Err(ref retry_err) = retry {
+                    self.handle_post_tool_result_error(retry_err)
+                } else {
+                    false
+                }
+            }
+            Err(e) => self.handle_post_tool_result_error(&e),
+        }
+    }
+
+    async fn post_approval_with_auth_retry(
+        &mut self,
+        body: &astra_thin_client::ApprovalRespondRequest,
+    ) -> bool {
+        let result = self
+            .api
+            .post_approval(Some(self.token.as_str()), body)
+            .await;
+        match result {
+            Ok(_) => false,
+            Err(e) if is_edge_auth_failure(&e) && self.refresh_edge_token_after_401().await => {
+                let retry = self
+                    .api
+                    .post_approval(Some(self.token.as_str()), body)
+                    .await;
+                if let Err(ref retry_err) = retry {
+                    self.handle_post_approval_error(retry_err)
+                } else {
+                    false
+                }
+            }
+            Err(e) => self.handle_post_approval_error(&e),
         }
     }
 
@@ -520,10 +651,7 @@ impl<'a> CliSseStreamHost<'a> {
             output: Some(output),
             duration_ms: Some(duration_ms),
         };
-        let _ = self
-            .api
-            .post_tool_result(Some(self.token), Some(self.executor_id), &body)
-            .await;
+        let _ = self.post_tool_result_with_auth_retry(&body).await;
         result
     }
 }
@@ -1047,32 +1175,7 @@ impl<'a> CliSseStreamHost<'a> {
             output: Some(output),
             duration_ms: Some(duration_ms),
         };
-        let post_result = self
-            .api
-            .post_tool_result(Some(self.token), Some(self.executor_id), &body)
-            .await;
-
-        if let Err(ref e) = post_result {
-            let is_auth_failure = matches!(
-                e,
-                astra_thin_client::ThinClientError::Api { status, .. }
-                    if status.as_u16() == 401
-            );
-
-            if is_auth_failure {
-                if let Some(token) = self.cancel_token {
-                    token.cancel();
-                }
-                if !self.render_policy.is_silent() {
-                    eprintln!(
-                        "{}",
-                        "Session expired. Please re-authenticate with `astra auth login`.".red()
-                    );
-                }
-            } else if !self.render_policy.suppress_tool_ui() {
-                eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
-            }
-        }
+        let _ = self.post_tool_result_with_auth_retry(&body).await;
 
         result
     }
@@ -2149,34 +2252,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             output: Some(output),
             duration_ms: Some(duration_ms),
         };
-        let post_result = self
-            .api
-            .post_tool_result(Some(self.token), Some(self.executor_id), &body)
-            .await;
-
-        if let Err(ref e) = post_result {
-            // Check if this is a 401 Unauthorized - session is invalid, abort SSE stream
-            let is_auth_failure = matches!(
-                e,
-                astra_thin_client::ThinClientError::Api { status, .. }
-                    if status.as_u16() == 401
-            );
-
-            if is_auth_failure {
-                // Cancel the SSE stream immediately - don't wait for idle timeout
-                if let Some(token) = self.cancel_token {
-                    token.cancel();
-                }
-                if !self.render_policy.is_silent() {
-                    eprintln!(
-                        "{}",
-                        "Session expired. Please re-authenticate with `astra auth login`.".red()
-                    );
-                }
-            } else if !self.render_policy.suppress_tool_ui() {
-                eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
-            }
-        }
+        let _ = self.post_tool_result_with_auth_retry(&body).await;
         self.edge_tool_round
             .last()
             .cloned()
@@ -2238,31 +2314,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             tool_name: Some(tool.to_string()),
             approval_kind: Some(approval_kind),
         };
-        let post_result = self.api.post_approval(Some(self.token), &body).await;
-
-        if let Err(ref e) = post_result {
-            // Check if this is a 401 Unauthorized - session is invalid, abort SSE stream
-            let is_auth_failure = matches!(
-                e,
-                astra_thin_client::ThinClientError::Api { status, .. }
-                    if status.as_u16() == 401
-            );
-
-            if is_auth_failure {
-                // Cancel the SSE stream immediately - don't wait for idle timeout
-                if let Some(token) = self.cancel_token {
-                    token.cancel();
-                }
-                if !self.render_policy.is_silent() {
-                    eprintln!(
-                        "{}",
-                        "Session expired. Please re-authenticate with `astra auth login`.".red()
-                    );
-                }
-            } else if !self.render_policy.suppress_tool_ui() {
-                eprintln!("{}", edge_sse_post_approval_fail_line(e).yellow());
-            }
-        }
+        let _ = self.post_approval_with_auth_retry(&body).await;
         EdgeApprovalResult {
             request_id: request_id.to_string(),
             decision: decision_str.to_string(),
@@ -2319,29 +2371,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 tool_name: Some(request.tool.clone()),
                 approval_kind: Some(request.approval_kind),
             };
-            let post_result = self.api.post_approval(Some(self.token), &body).await;
-            if let Err(ref e) = post_result {
-                let is_auth_failure = matches!(
-                    e,
-                    astra_thin_client::ThinClientError::Api { status, .. }
-                        if status.as_u16() == 401
-                );
-
-                if is_auth_failure {
-                    if let Some(token) = self.cancel_token {
-                        token.cancel();
-                    }
-                    if !self.render_policy.is_silent() {
-                        eprintln!(
-                            "{}",
-                            "Session expired. Please re-authenticate with `astra auth login`."
-                                .red()
-                        );
-                    }
-                } else if !self.render_policy.suppress_tool_ui() {
-                    eprintln!("{}", edge_sse_post_approval_fail_line(e).yellow());
-                }
-            }
+            let _ = self.post_approval_with_auth_retry(&body).await;
             results.push(EdgeApprovalResult {
                 request_id: request.request_id.clone(),
                 decision: decision_str.to_string(),
@@ -2744,31 +2774,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 output: Some(output),
                 duration_ms: Some(duration_ms),
             };
-            let post_result = self
-                .api
-                .post_tool_result(Some(self.token), Some(self.executor_id), &body)
-                .await;
-            if let Err(ref e) = post_result {
-                let is_auth = matches!(
-                    e,
-                    astra_thin_client::ThinClientError::Api { status, .. }
-                        if status.as_u16() == 401
-                );
-                if is_auth {
-                    if let Some(token) = self.cancel_token {
-                        token.cancel();
-                    }
-                    if !self.render_policy.is_silent() {
-                        eprintln!(
-                            "{}",
-                            "Session expired. Please re-authenticate with `astra auth login`."
-                                .red()
-                        );
-                    }
-                    break;
-                } else if !self.render_policy.suppress_tool_ui() {
-                    eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
-                }
+            if self.post_tool_result_with_auth_retry(&body).await {
+                break;
             }
         }
 
@@ -2888,6 +2895,8 @@ pub(super) struct TurnResult {
     pub(super) ttft_ms: Option<u64>,
     /// Ordered executions from this SSE stream (for rounds without legacy `tool_call` events).
     pub(super) edge_tool_round: Vec<EdgeToolExecResult>,
+    /// New access token obtained by an in-stream auth refresh, if any.
+    pub(super) refreshed_token: Option<String>,
 }
 
 impl Deref for TurnResult {
@@ -2911,6 +2920,7 @@ impl TurnResult {
             core: ChatTurnSseAccum::default(),
             ttft_ms: None,
             edge_tool_round: Vec::new(),
+            refreshed_token: None,
         }
     }
 }
@@ -5894,6 +5904,7 @@ pub(super) async fn consume_turn_sse(
     render_policy: RenderPolicy,
     edge: Option<EdgeSseContext<'_>>,
     pre_clear_lines: usize,
+    auth_profile: Option<&str>,
     cancel_token: Option<&tokio_util::sync::CancellationToken>,
 ) -> TurnResult {
     // Release the payload/HTTP prep line here so TTFT (`on_before_sse_read_loop`) can take over
@@ -5908,56 +5919,67 @@ pub(super) async fn consume_turn_sse(
 
     // Delegate to runtime's generic SSE consumer with the appropriate host
     let idle = stream_idle_timeout();
-    let (sse_result, edge_tool_round, mut md_renderer, lines_written, _pending_xml_buffer) =
-        if let Some(ctx) = edge {
-            let mut host = CliSseStreamHost::from_edge_ctx(
-                ctx,
-                term_width,
-                render_md && !render_policy.suppress_text(),
-            );
-            // pre_clear_lines only applies to non-md fallback path.
-            if host.render.md.is_none() {
-                host.render.lines_written = pre_clear_lines;
-            }
-            let (result, _abort) = consume_sse_stream_cancellable(
-                &mut byte_stream,
-                &mut host,
-                idle,
-                cancel_token,
-                None,
-            )
-            .await;
-            let lw = host.render.lines_written;
-            let md = host.render.md.take();
-            let pending = std::mem::take(&mut host.xml_tag_buffer);
-            (result, host.edge_tool_round, md, lw, pending)
-        } else {
-            let mut render = StreamRenderState::with_term_width(
-                term_width,
-                render_md && !render_policy.suppress_text(),
-                false,
-            );
-            if render.md.is_none() {
-                render.lines_written = pre_clear_lines;
-            }
-            let mut host = NoopSseStreamHost;
-            let (result, _abort) = consume_sse_stream_cancellable(
-                &mut byte_stream,
-                &mut host,
-                idle,
-                cancel_token,
-                None,
-            )
-            .await;
-            let lw = render.lines_written;
-            let md = render.md.take();
-            (result, Vec::new(), md, lw, String::new())
-        };
+    let (
+        mut sse_result,
+        edge_tool_round,
+        mut md_renderer,
+        lines_written,
+        _pending_xml_buffer,
+        auth_failure,
+        refreshed_token,
+    ) = if let Some(ctx) = edge {
+        let original_token = ctx.token.to_string();
+        let mut host = CliSseStreamHost::from_edge_ctx_with_auth(
+            ctx,
+            term_width,
+            render_md && !render_policy.suppress_text(),
+            auth_profile,
+        );
+        // pre_clear_lines only applies to non-md fallback path.
+        if host.render.md.is_none() {
+            host.render.lines_written = pre_clear_lines;
+        }
+        let (result, _abort) =
+            consume_sse_stream_cancellable(&mut byte_stream, &mut host, idle, cancel_token, None)
+                .await;
+        let lw = host.render.lines_written;
+        let md = host.render.md.take();
+        let pending = std::mem::take(&mut host.xml_tag_buffer);
+        let auth_failure = host.auth_failure;
+        let refreshed_token = (host.token != original_token).then(|| host.token.clone());
+        (
+            result,
+            host.edge_tool_round,
+            md,
+            lw,
+            pending,
+            auth_failure,
+            refreshed_token,
+        )
+    } else {
+        let mut render = StreamRenderState::with_term_width(
+            term_width,
+            render_md && !render_policy.suppress_text(),
+            false,
+        );
+        if render.md.is_none() {
+            render.lines_written = pre_clear_lines;
+        }
+        let mut host = NoopSseStreamHost;
+        let (result, _abort) =
+            consume_sse_stream_cancellable(&mut byte_stream, &mut host, idle, cancel_token, None)
+                .await;
+        let lw = render.lines_written;
+        let md = render.md.take();
+        (result, Vec::new(), md, lw, String::new(), false, None)
+    };
+    apply_edge_auth_failure_result(&mut sse_result.accum, auth_failure);
 
     let mut result = TurnResult {
         core: sse_result.accum,
         ttft_ms: sse_result.ttft_ms,
         edge_tool_round,
+        refreshed_token,
     };
     super::streaming_md::strip_xml_tags_inplace(&mut result.full_text);
     // When the model emits both native tool calls AND <invoke> XML text in the
@@ -6023,9 +6045,10 @@ pub(super) fn dispatch_turn_event_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli_utils::{CredentialsFile, Profile, save_credentials};
     use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
     use tempfile::tempdir;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // ── D-9 regression: speculative success flag must gate reuse ──
@@ -6035,6 +6058,144 @@ mod tests {
     // with non-empty error message) was silently reused as a successful
     // tool_result because the consumer discarded `success` with `_ok`.
     // See `reusable_speculative_output` for the fix rationale.
+
+    #[test]
+    fn edge_post_auth_failure_is_auth_error_not_user_cancel() {
+        let mut accum = ChatTurnSseAccum {
+            error_message: Some("Cancelled by user".to_string()),
+            ..Default::default()
+        };
+
+        apply_edge_auth_failure_result(&mut accum, true);
+
+        let error = accum.error_message.as_deref().unwrap_or_default();
+        assert!(error.contains("401 Unauthorized"));
+        assert!(!error.contains("Cancelled by user"));
+    }
+
+    #[test]
+    fn edge_post_without_auth_failure_keeps_existing_error() {
+        let mut accum = ChatTurnSseAccum {
+            error_message: Some("Cancelled by user".to_string()),
+            ..Default::default()
+        };
+
+        apply_edge_auth_failure_result(&mut accum, false);
+
+        assert_eq!(accum.error_message.as_deref(), Some("Cancelled by user"));
+    }
+
+    #[test]
+    fn edge_auth_failure_detector_only_matches_http_401_api_errors() {
+        let unauthorized = astra_thin_client::ThinClientError::Api {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            body: "expired".to_string(),
+        };
+        let forbidden = astra_thin_client::ThinClientError::Api {
+            status: reqwest::StatusCode::FORBIDDEN,
+            body: "forbidden".to_string(),
+        };
+
+        assert!(is_edge_auth_failure(&unauthorized));
+        assert!(!is_edge_auth_failure(&forbidden));
+    }
+
+    #[tokio::test]
+    async fn edge_tool_result_401_refreshes_and_retries_without_terminal_auth_failure() {
+        static CREDENTIALS_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+        let _guard = CREDENTIALS_ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("credentials env lock");
+
+        let credentials_dir = tempdir().expect("credentials dir");
+        unsafe { std::env::set_var("ASTRA_CREDENTIALS_DIR", credentials_dir.path()) };
+        struct CredentialsEnvGuard;
+        impl Drop for CredentialsEnvGuard {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("ASTRA_CREDENTIALS_DIR") };
+            }
+        }
+        let _env_guard = CredentialsEnvGuard;
+
+        let mut creds = CredentialsFile {
+            current_profile: Some("test".to_string()),
+            ..Default::default()
+        };
+        creds.profiles.insert(
+            "test".to_string(),
+            Profile {
+                access_token: Some("expired-token".to_string()),
+                refresh_token: Some("refresh-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).expect("save credentials");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(astra_thin_client::paths::TOOLS_RESULT))
+            .and(header("authorization", "Bearer expired-token"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": "expired"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(astra_thin_client::paths::AUTH_REFRESH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fresh-token",
+                "refresh_token": "fresh-refresh-token"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(astra_thin_client::paths::TOOLS_RESULT))
+            .and(header("authorization", "Bearer fresh-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(server.uri().as_str(), None).expect("client");
+        let workspace = tempdir().expect("workspace");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
+        let mut tool_cache = EdgeToolCache::new(10);
+        let ctx = EdgeSseContext {
+            api: &api,
+            token: "expired-token",
+            executor_id: "edge-test",
+            executor,
+            render_policy: RenderPolicy::Silent,
+            perm_manager: None,
+            cancel_token: None,
+            stream_event_tx: None,
+            approval_request_tx: None,
+            skill_resolver: None,
+            skill_continuation: false,
+            turn_rollback_on_failure: false,
+            tool_cache: &mut tool_cache,
+            observability_hub: None,
+        };
+        let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, Some("test"));
+        let body = astra_thin_client::ToolResultRequest {
+            request_id: "req-1".to_string(),
+            status: "ok".to_string(),
+            output: Some("done".to_string()),
+            duration_ms: Some(1),
+        };
+
+        let terminal_auth_failure = host.post_tool_result_with_auth_retry(&body).await;
+
+        assert!(!terminal_auth_failure);
+        assert!(!host.auth_failure);
+        assert_eq!(host.token, "fresh-token");
+    }
 
     #[test]
     fn reusable_speculative_output_accepts_successful_result() {

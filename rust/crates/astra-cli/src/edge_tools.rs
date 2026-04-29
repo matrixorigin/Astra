@@ -323,7 +323,7 @@ pub struct ToolExecutor {
     /// so the server can add user_id for proper multi-user isolation.
     pub cloud_base: Option<String>,
     /// Auth token for cloud proxy calls.
-    pub cloud_token: Option<String>,
+    cloud_token: std::sync::Arc<std::sync::RwLock<Option<String>>>,
     /// Optional GitHub token for authenticated GitHub API requests.
     pub github_token: Option<String>,
     /// Shared async GitHub client for edge tools.
@@ -439,7 +439,7 @@ impl ToolExecutor {
         Self {
             project_root: root.clone(),
             cloud_base: None,
-            cloud_token: None,
+            cloud_token: std::sync::Arc::new(std::sync::RwLock::new(None)),
             // TODO: Consider using a zeroize-capable wrapper for tokens to prevent
             // memory-resident secrets from lingering after drop.
             github_token: astra_tools::github::resolve_github_token(),
@@ -652,8 +652,19 @@ impl ToolExecutor {
     /// Configure cloud proxy for memory tool calls.
     pub fn with_cloud(mut self, base: impl Into<String>, token: impl Into<String>) -> Self {
         self.cloud_base = Some(base.into());
-        self.cloud_token = Some(token.into());
+        self.set_cloud_token(token);
         self
+    }
+
+    pub(crate) fn set_cloud_token(&self, token: impl Into<String>) {
+        *self.cloud_token.write().unwrap_or_else(|e| e.into_inner()) = Some(token.into());
+    }
+
+    pub(crate) fn cloud_token(&self) -> Option<String> {
+        self.cloud_token
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     // ─── Task management methods (delegated to task_mgmt module) ────────────
@@ -1630,6 +1641,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
         (dir, executor)
+    }
+
+    #[test]
+    fn cloud_token_updates_after_cloud_configuration() {
+        let executor = test_executor().with_cloud("https://cloud.example", "old-token");
+        assert_eq!(executor.cloud_token().as_deref(), Some("old-token"));
+
+        executor.set_cloud_token("new-token");
+        assert_eq!(executor.cloud_token().as_deref(), Some("new-token"));
     }
 
     mod aggregate_tests;

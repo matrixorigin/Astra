@@ -126,6 +126,7 @@ pub(super) async fn handle_skill_command(
     arg: &str,
     api: &astra_thin_client::ThinClient,
     state: &mut ReplState,
+    profile: Option<&str>,
     token: Option<&str>,
 ) -> Result<(), String> {
     // Parse subcommand and remaining args from `arg`
@@ -1736,6 +1737,7 @@ Follow these steps:
             let result = stream_chat_sse(ChatTurnParams {
                 api,
                 token: tok,
+                auth_profile: profile,
                 message: &reflection_message,
                 session_id: state.session_id.as_deref(),
                 model: state.model.as_deref(),

@@ -246,12 +246,13 @@ mod tests {
         );
         // Full prompt with all sections should be under ~2600 tokens (~10400 chars)
         // Enhanced prompt adds: Planning Protocol, Context Strategy, Discovery Before Access,
-        // Coding Discipline (including Executor rule), Parallel Tool Calls (with Limit/Anti-pattern),
-        // Token Efficiency, Build/Test Guidance, Plan Execution, Search Strategy (with Simple vs Complex).
+        // Coding Discipline (including Executor rule), Turn Discipline (announce/summary/no-narration),
+        // Parallel Tool Calls (with Limit/Anti-pattern), Token Efficiency, Build/Test Guidance,
+        // Plan Execution, Search Strategy (with Simple vs Complex).
         // Headroom: ~200 chars above measured size. Bump when adding new rules.
         assert!(
-            p.len() < 12500,
-            "compressed prompt should be under 12500 chars, got {}",
+            p.len() < 13000,
+            "compressed prompt should be under 13000 chars, got {}",
             p.len()
         );
     }
@@ -947,13 +948,13 @@ mod tests {
         assert!(p.contains("## Build & Test Loop"));
         assert!(p.contains("## Git Workflow"));
         assert!(p.contains("## Memory Rules"));
-        // Budget: full prompt should still be reasonable (allows for Executor rule addition
-        // and Parallel Tool Calls Limit/Anti-pattern, Search Strategy Simple vs Complex,
-        // Batching read-only tool calls).
+        // Budget: full prompt should still be reasonable (allows for Executor rule addition,
+        // Parallel Tool Calls Limit/Anti-pattern, Search Strategy Simple vs Complex,
+        // Batching read-only tool calls, and Turn Discipline (announce/summary/no-narration)).
         // Headroom: ~200 chars above measured size. Bump when adding new rules.
         assert!(
-            p.len() < 19000,
-            "full toolset prompt should be under 19000 chars, got {}",
+            p.len() < 19800,
+            "full toolset prompt should be under 19800 chars, got {}",
             p.len()
         );
     }

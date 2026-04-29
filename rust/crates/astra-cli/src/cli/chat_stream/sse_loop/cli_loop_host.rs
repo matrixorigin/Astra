@@ -44,7 +44,8 @@ use super::agentic_loop_turn::{
 /// which delegates to the existing `fetch_chat_turn_sse` pipeline.
 pub(crate) struct CliAgenticLoopHost<'a> {
     pub api: &'a astra_thin_client::ThinClient,
-    pub token: &'a str,
+    pub token: String,
+    pub auth_profile: Option<&'a str>,
     pub model: Option<&'a str>,
     pub explain: ExplainMode,
     pub render_md: bool,
@@ -185,7 +186,8 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 
         let turn_result = fetch_chat_turn_sse(ChatTurnSseFetchRequest {
             api: self.api,
-            token: self.token,
+            token: self.token.as_str(),
+            auth_profile: self.auth_profile,
             model: effective_model,
             explain: self.explain,
             render_md: self.render_md,
@@ -275,6 +277,10 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         state.approval_overrides = self.perm_manager.export_session_overrides();
 
         let turn_result = turn_result?;
+        if let Some(refreshed_token) = turn_result.refreshed_token.clone() {
+            self.executor.set_cloud_token(refreshed_token.clone());
+            self.token = refreshed_token;
+        }
 
         Ok(HostTurnResult {
             accum: turn_result.core,
@@ -318,7 +324,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 
         let resp = self
             .api
-            .post_chat_turn_retry_429(self.token, &payload, CHAT_TURN_POST_MAX_RETRIES, true)
+            .post_chat_turn_retry_429(&self.token, &payload, CHAT_TURN_POST_MAX_RETRIES, true)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -337,7 +343,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             RenderPolicy::Silent,
             Some(EdgeSseContext {
                 api: self.api,
-                token: self.token,
+                token: &self.token,
                 executor_id: "auto-reflection",
                 executor: Arc::clone(&self.executor),
                 render_policy: RenderPolicy::Silent,
@@ -352,6 +358,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 observability_hub: None,
             }),
             0,
+            self.auth_profile,
             state.cancellation.token.as_deref(),
         )
         .await;

@@ -333,6 +333,14 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let (resolved_model, thinking_config) = match ctx.model {
         Some(m) => {
             let (name, cfg) = astra_turn_core::thinking_config::resolve_model_thinking(m);
+            // Per-turn dampener: the model suffix encodes the user's CEILING
+            // (e.g. `thinking:high`), not a command to burn that budget on every
+            // turn regardless of content. Short read-only questions get a
+            // capped effort — multi-step / modification turns pass through
+            // unchanged. See `ThinkingConfig::scale_for_turn` for the policy.
+            let signals =
+                astra_turn_core::thinking_config::TurnComplexitySignals::from_message(ctx.message);
+            let cfg = cfg.scale_for_turn(signals);
             (Some(name), cfg)
         }
         None => (None, astra_turn_core::thinking_config::ThinkingConfig::Off),
@@ -912,6 +920,7 @@ fn inject_bridge_turn_identity(
 pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub api: &'a astra_thin_client::ThinClient,
     pub token: &'a str,
+    pub auth_profile: Option<&'a str>,
     pub model: Option<&'a str>,
     pub explain: ExplainMode,
     pub render_md: bool,
@@ -1063,6 +1072,7 @@ pub(crate) async fn fetch_chat_turn_sse(
     let ChatTurnSseFetchRequest {
         api,
         token,
+        auth_profile,
         model,
         explain,
         render_md,
@@ -1210,6 +1220,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         render_policy,
         Some(edge_ctx),
         pre_clear_lines,
+        auth_profile,
         cancel_token,
     )
     .await;

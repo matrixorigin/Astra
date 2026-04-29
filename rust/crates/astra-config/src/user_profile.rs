@@ -387,6 +387,12 @@ pub enum Scenario {
     DevOps,
     /// Learning: tutorials, explanations.
     Learning,
+    /// Quick conceptual Q&A — short questions about how something works, where
+    /// something lives, or why a previous decision was made. Deliberately tight
+    /// budget so a 37-token "why does X do Y?" cannot ratchet into a 23-tool
+    /// exploration. This scenario is preferred over `Exploration` when the query
+    /// is short and interrogative AND the workspace doesn't need to be mutated.
+    QuickAnswer,
 }
 
 impl Scenario {
@@ -403,6 +409,7 @@ impl Scenario {
             Scenario::Documentation => vec!["view", "edit", "create"],
             Scenario::DevOps => vec!["bash", "view", "edit", "create"],
             Scenario::Learning => vec!["view", "grep", "web_search"],
+            Scenario::QuickAnswer => vec!["view", "grep"],
         }
     }
 
@@ -488,6 +495,17 @@ impl Scenario {
                 memory_top_k: Some(10),
                 verification_strictness: None,
                 tool_budget_tokens: 700,
+            },
+            // QuickAnswer is intentionally the tightest profile in the set.
+            // Budget tuned so a short "why/how/where does X work" question cannot
+            // exceed ~3-5 tool calls in total without an explicit escalation.
+            Scenario::QuickAnswer => ScenarioStrategy {
+                max_tools_per_turn: 5,
+                prefer_read_only: true,
+                detail_level: Verbosity::Normal,
+                memory_top_k: Some(5),
+                verification_strictness: None,
+                tool_budget_tokens: 500,
             },
         }
     }
@@ -583,6 +601,7 @@ impl ScenarioDetector {
             Scenario::Documentation,
             Scenario::DevOps,
             Scenario::Learning,
+            Scenario::QuickAnswer,
         ];
 
         scenarios
@@ -740,6 +759,22 @@ fn scenario_keywords(scenario: Scenario) -> Vec<&'static str> {
         ],
         Scenario::Learning => vec![
             "learn", "tutorial", "example", "teach", "explain", "how does", "what is",
+        ],
+        // Keyword overlap with Exploration/Learning is intentional — QuickAnswer
+        // wins only when the fallback-routing pre-filter in `agentic_adaptive_tuning`
+        // confirms the query is short AND interrogative AND read-only. Keywords here
+        // exist so the scoring path can still identify it if those preconditions match.
+        Scenario::QuickAnswer => vec![
+            "why",
+            "what",
+            "where",
+            "which",
+            "who",
+            "为啥",
+            "为什么",
+            "怎么",
+            "哪里",
+            "哪个",
         ],
     }
 }

@@ -1455,6 +1455,7 @@ mod tests {
         let result = stream_chat_sse(ChatTurnParams {
             api: &api,
             token: "fake-token",
+            auth_profile: None,
             message: "hi",
             session_id: None,
             model: None,
@@ -1529,6 +1530,7 @@ mod tests {
         let result = stream_chat_sse(ChatTurnParams {
             api: &api,
             token: "fake-token",
+            auth_profile: None,
             message: "hi",
             session_id: None,
             model: None,
@@ -1619,6 +1621,7 @@ mod tests {
         let result = stream_chat_sse(ChatTurnParams {
             api: &api,
             token: "fake-token",
+            auth_profile: None,
             message: "run echo hi",
             session_id: None,
             model: None,

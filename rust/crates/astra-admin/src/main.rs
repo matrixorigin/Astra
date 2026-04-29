@@ -37,6 +37,16 @@ fn print_model_load_server_result(body: &str, model_name: &str) {
     } else if !active {
         println!("  connectivity: (not in response; run: astra-admin model check {model_name})");
     }
+    // Show inferred thinking capability (stored in quirks.supports_thinking at load time)
+    let supports_thinking = value
+        .get("quirks")
+        .and_then(|q| q.get("supports_thinking"))
+        .and_then(serde_json::Value::as_bool);
+    match supports_thinking {
+        Some(true) => println!("  thinking: supported ✓"),
+        Some(false) => println!("  thinking: not supported"),
+        None => {}
+    }
     if !active {
         eprintln!(
             "  warning: model is inactive — server probe failed or was skipped; fix YAML then `astra-admin model load <file> --update-existing`, or `astra-admin model check {model_name}`"

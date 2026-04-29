@@ -5,6 +5,7 @@ pub(super) async fn handle_task_command(
     arg: &str,
     state: &mut ReplState,
     api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
     token: Option<&str>,
 ) {
     use astra_services::{TaskCreateRequest, TaskService, TaskStatus};
@@ -225,6 +226,7 @@ pub(super) async fn handle_task_command(
             // Clone owned values for the background task
             let api_clone = api.clone();
             let prompt = sub_arg.to_string();
+            let bg_profile = profile.map(ToString::to_string);
             let bg_session_id = state.session_id.clone();
             let bg_model = state.model.clone();
             let bg_history = state.history.clone();
@@ -273,6 +275,7 @@ pub(super) async fn handle_task_command(
                 let result = stream_chat_sse(ChatTurnParams {
                     api: &api_clone,
                     token: &token_str,
+                    auth_profile: bg_profile.as_deref(),
                     message: &prompt,
                     session_id: bg_session_id.as_deref(),
                     model: bg_model.as_deref(),

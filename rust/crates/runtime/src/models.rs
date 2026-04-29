@@ -14,6 +14,26 @@ pub async fn create_model_handler(
     Json(request): Json<ModelCreateRequest>,
 ) -> Result<(StatusCode, Json<ModelResponse>), (StatusCode, Json<ErrorResponse>)> {
     let admin = state.admin_authorizer.require_admin(&headers).await?;
+
+    // Auto-infer `supports_thinking` at load time. Priority order:
+    //   1. Explicit `quirks.supports_thinking` in the request body (highest).
+    //   2. `tags` contains "reasoning" — declarative, works for any model/provider.
+    //   3. Model-name heuristic (backward compat for known Claude/Gemini names).
+    let quirks = {
+        let mut q = request.quirks.unwrap_or_default();
+        if q.supports_thinking.is_none() {
+            let has_reasoning_tag = request
+                .tags
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case("reasoning"));
+            q.supports_thinking = Some(
+                has_reasoning_tag
+                    || astra_turn_core::thinking_config::supports_thinking(&request.name),
+            );
+        }
+        Some(q)
+    };
+
     let model = state
         .model_service
         .create_model(
@@ -32,7 +52,7 @@ pub async fn create_model_handler(
                 pricing: request.pricing,
                 architecture: request.architecture,
                 tags: request.tags,
-                quirks: request.quirks,
+                quirks,
             },
         )
         .await?;

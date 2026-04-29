@@ -859,6 +859,7 @@ async fn run_chat_turn(
         result = stream_chat_sse(ChatTurnParams {
             api: ctx.api,
             token,
+            auth_profile: ctx.profile,
             message,
             session_id,
             model: state.model.as_deref(),

@@ -574,6 +574,7 @@ fn format_scenario(s: Scenario) -> &'static str {
         Scenario::Documentation => "Documentation",
         Scenario::DevOps => "DevOps",
         Scenario::Learning => "Learning",
+        Scenario::QuickAnswer => "Quick Answer",
     }
 }
 

@@ -59,6 +59,8 @@ pub type ApprovalRequestTx = mpsc::UnboundedSender<ApprovalRequest>;
 pub(crate) struct ChatTurnParams<'a> {
     pub(crate) api: &'a astra_thin_client::ThinClient,
     pub(crate) token: &'a str,
+    /// Credential profile used for in-turn auth refresh when edge result posts hit 401.
+    pub(crate) auth_profile: Option<&'a str>,
     pub(crate) message: &'a str,
     pub(crate) session_id: Option<&'a str>,
     pub(crate) model: Option<&'a str>,
@@ -173,6 +175,7 @@ pub(crate) struct ChatTurnParams<'a> {
 /// at each retry site in `command_router.rs`.
 pub(crate) struct BasicCliChatContext<'a> {
     pub api: &'a astra_thin_client::ThinClient,
+    pub auth_profile: Option<&'a str>,
     pub message: &'a str,
     pub model: Option<&'a str>,
     pub provider: Option<&'a str>,
@@ -200,6 +203,7 @@ impl<'a> ChatTurnParams<'a> {
         ChatTurnParams {
             api: ctx.api,
             token,
+            auth_profile: ctx.auth_profile,
             message: ctx.message,
             session_id,
             model: ctx.model,

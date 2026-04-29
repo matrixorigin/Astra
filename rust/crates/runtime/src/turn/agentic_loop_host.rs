@@ -427,6 +427,15 @@ pub struct StallTrackingState {
     /// Set when phase-1 fired and the model still attempted tool calls on
     /// the very next round. One-shot per turn.
     pub forced_round_budget_phase2: bool,
+    /// Monotonic count of circuit-breaker introspection (self-check) prompts
+    /// injected this turn. Used for post-turn telemetry so operators can see
+    /// how often the breaker nudged the model on long read-only sessions.
+    ///
+    /// Note: this counter is distinct from the breaker's internal
+    /// `introspect_emissions()` counter — the breaker's counter resets on
+    /// mutation (for cap enforcement), while this counter monotonically
+    /// accumulates across the whole turn (for diagnostics).
+    pub introspection_count: u32,
     /// Whether the redundant-reads mid-loop corrective injected a guidance
     /// message this loop. Fires when the model has re-read overlapping line
     /// ranges of the same file enough times to cross

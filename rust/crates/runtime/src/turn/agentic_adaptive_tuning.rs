@@ -62,6 +62,59 @@ fn looks_like_code_review_query(message: &str) -> bool {
         .any(|kw| lower.contains(kw))
 }
 
+/// Detects short conceptual questions that should be answered with a tight
+/// tool budget rather than routed through the main Exploration path.
+///
+/// Rationale: a 37-token "why does X do Y?" does not need a 15-tool exploration
+/// budget. When the classifier mistakes such a question for Exploration it
+/// loosens `max_tools_per_turn` / `tool_budget_tokens` and the model happily
+/// fans out across the codebase instead of answering from the two or three
+/// files that would suffice. QuickAnswer is the narrow-scope counterpart.
+///
+/// Preconditions (ALL must hold):
+/// - Query is short (heuristic: ≤200 chars / roughly ≤50 tokens)
+/// - Query starts with or contains an interrogative (why/what/where/which/how
+///   plus common Chinese equivalents), or ends with `?` / `？`
+/// - Task profile is read-only (no workspace mutation expected)
+///
+/// The short-length check is load-bearing: we want the model to spend budget
+/// proportional to question complexity, not proportional to the loosest scenario
+/// that happens to match.
+fn looks_like_quick_answer_query(message: &str) -> bool {
+    let trimmed = message.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 200 {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    let has_question_mark = trimmed.ends_with('?') || trimmed.ends_with('？');
+
+    // English markers are matched at word boundaries only — naive substring
+    // matching on "how " false-positives on "show me…" (index 1..5 == "how ").
+    // We build word-boundary-aware matching by splitting on whitespace/punctuation.
+    let english_markers = [
+        "why", "what", "where", "which", "how", "who", "whose", "whom",
+    ];
+    let has_english_interrogative = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| english_markers.contains(&word));
+
+    // Chinese interrogatives — substring matching is fine here since the
+    // shape is unambiguous (these are multi-character markers that don't
+    // appear as internal substrings of unrelated words).
+    let chinese_markers = [
+        "为啥",
+        "为什么",
+        "怎么",
+        "哪里",
+        "哪个",
+        "什么是",
+        "什么情况",
+    ];
+    let has_chinese_interrogative = chinese_markers.iter().any(|m| lower.contains(m));
+
+    has_question_mark || has_english_interrogative || has_chinese_interrogative
+}
+
 fn looks_like_debug_query(message: &str) -> bool {
     let lower = message.to_lowercase();
     [
@@ -76,6 +129,17 @@ fn fallback_scenario_from_routing(
     task_profile: astra_turn_core::chat_turn_heuristics::TaskExecutionProfile,
     task_type: crate::pipeline::routing::TaskType,
 ) -> Option<astra_config::user_profile::Scenario> {
+    // QuickAnswer fast-path — checked BEFORE other scenarios so it wins over
+    // Exploration for the "why does X do Y?" case. Only fires when the task
+    // is read-only; debug/review keywords take precedence because they imply
+    // deeper intent even on short queries.
+    if !task_profile.mutates_workspace
+        && !looks_like_code_review_query(message)
+        && !looks_like_debug_query(message)
+        && looks_like_quick_answer_query(message)
+    {
+        return Some(astra_config::user_profile::Scenario::QuickAnswer);
+    }
     if !task_profile.mutates_workspace && looks_like_code_review_query(message) {
         return Some(astra_config::user_profile::Scenario::CodeReview);
     }
@@ -1209,5 +1273,65 @@ mod tests {
             ),
             Some(Scenario::Debugging)
         );
+    }
+
+    // ─── QuickAnswer fast-path ──────────────────────────────────────────
+
+    #[test]
+    fn short_interrogative_routes_to_quick_answer_not_exploration() {
+        let q = "why does the circuit breaker abort here?";
+        let task_profile = infer_task_execution_profile(q);
+        assert!(!task_profile.mutates_workspace);
+        assert_eq!(
+            fallback_scenario_from_routing(q, task_profile, TaskType::Code),
+            Some(Scenario::QuickAnswer),
+            "short interrogative read-only query should route to QuickAnswer"
+        );
+    }
+
+    #[test]
+    fn short_chinese_interrogative_routes_to_quick_answer() {
+        // The literal session-36500dd9 turn-4 query shape.
+        let q = "为啥其他models即使配置了reasoning, /model选择后，也看不到thinking?";
+        let task_profile = infer_task_execution_profile(q);
+        assert!(!task_profile.mutates_workspace);
+        assert_eq!(
+            fallback_scenario_from_routing(q, task_profile, TaskType::Code),
+            Some(Scenario::QuickAnswer)
+        );
+    }
+
+    #[test]
+    fn debug_keyword_wins_over_quick_answer() {
+        // Even when short and interrogative, a debug query (already has "failing")
+        // should route to Debugging — it needs more tools than QuickAnswer offers.
+        let q = "why is this test failing?";
+        let task_profile = infer_task_execution_profile(q);
+        assert_eq!(
+            fallback_scenario_from_routing(q, task_profile, TaskType::Code),
+            Some(Scenario::Debugging)
+        );
+    }
+
+    #[test]
+    fn long_question_does_not_route_to_quick_answer() {
+        // Even if interrogative, a long question implies complexity — Exploration
+        // wins (budget-loose) instead of QuickAnswer (budget-tight).
+        let q = "why does the agentic loop trip the circuit breaker when we have more than five \
+                 consecutive rounds of read-only tool calls but only when the model is claude-sonnet-4-6 \
+                 with thinking:high and how does that interact with the adaptive scenario classifier?";
+        let task_profile = infer_task_execution_profile(q);
+        let res = fallback_scenario_from_routing(q, task_profile, TaskType::Code);
+        assert_ne!(res, Some(Scenario::QuickAnswer));
+    }
+
+    #[test]
+    fn non_interrogative_short_query_does_not_route_to_quick_answer() {
+        // "show me the file" is short but not interrogative in the strict sense —
+        // falls through to Exploration.
+        let q = "show me the auth flow";
+        let task_profile = infer_task_execution_profile(q);
+        let res = fallback_scenario_from_routing(q, task_profile, TaskType::Code);
+        assert_ne!(res, Some(Scenario::QuickAnswer));
     }
 }
