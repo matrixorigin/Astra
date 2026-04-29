@@ -30,6 +30,7 @@ help:
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
 	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (typecheck, Jest+coverage+Mode A in-process, build)"
 	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (set ASTRA_SDK_ONLINE_E2E=1 + API to also run make test-sdk-online)"
+	@echo "  make test-live-llm      - Live LLM suite (real provider APIs from .models.yaml; one model per provider)"
 	@echo "  make test-contract      - Run contract tests (http/admin/config)"
 	@echo "  (also: test-sdk-offline, test-sdk-online — @astra/sdk; offline in test-offline; remote E2E opt-in on test-online)"
 	@echo ""
@@ -514,7 +515,7 @@ test-online:
 		-e "DROP DATABASE IF EXISTS $$TEST_DB; CREATE DATABASE $$TEST_DB;" 2>/dev/null || \
 	mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS --skip-ssl \
 		-e "DROP DATABASE IF EXISTS $$TEST_DB; CREATE DATABASE $$TEST_DB;" 2>/dev/null || true; \
-	echo "Running astra-runtime ignored unit tests (live DB)..."; \
+	echo "Running astra-runtime ignored unit tests (live DB; live-LLM suite gated by ASTRA_LIVE_LLM)..."; \
 	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 		$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) -- --ignored; \
 	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
@@ -525,6 +526,18 @@ test-online:
 	else \
 		echo "Skipping @astra/sdk remote E2E (set ASTRA_SDK_ONLINE_E2E=1 with API running, or: make test-sdk-online)"; \
 	fi
+	@echo ""
+	@echo "NOTE: live-LLM suite (real provider APIs, reads .models.yaml) auto-skips unless"
+	@echo "      ASTRA_LIVE_LLM=1 is set. Run it explicitly with: make test-live-llm"
+
+# Live-LLM suite: hits real provider APIs listed in .models.yaml.
+# Picks ONE model per distinct provider at runtime — what's in the yaml gets
+# tested, nothing is hard-coded. Bypasses MatrixOne / DB fixtures entirely.
+.PHONY: test-live-llm
+test-live-llm:
+	@echo "Running live-LLM token usage tests (reads .models.yaml; one model per provider)..."
+	@ASTRA_LIVE_LLM=1 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
+		--test live_token_usage_e2e -- --ignored --nocapture
 
 # @astra/sdk — no real HTTP API (Mode A in-process runs via ASTRA_SDK_E2E=1 in test:coverage)
 .PHONY: test-sdk-offline

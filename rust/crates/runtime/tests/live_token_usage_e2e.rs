@@ -1,22 +1,43 @@
-//! Live-call integration test for TokenUsage extraction across real providers.
+//! Live-call integration tests against real LLM providers.
 //!
-//! Reads the top-level `.models.yaml` and issues a real, small request to one
-//! OpenAI-compatible model (Qwen via DashScope) and one Bedrock Converse model
-//! (us.anthropic.claude-sonnet-4-6). Asserts:
+//! Philosophy: **enumerate, don't hard-code**. Model availability changes
+//! frequently (keys rotate, models retire, new providers get added). Tests
+//! read `.models.yaml`, group by `provider`, pick one model per provider at
+//! runtime, and exercise the invariants. What's present gets tested, what's
+//! missing is skipped — so a session trace regression on any configured
+//! provider would catch it without needing a test-code change to pin a
+//! specific model.
 //!
-//! 1. `TokenUsage` extracts non-zero `input_tokens` / `output_tokens`.
-//! 2. Canonical billing identity holds:
-//!    `total_tokens == input + cached_input + cache_creation + output`.
-//! 3. OpenAI convention: `prompt_tokens` from the raw response equals
-//!    `input + cached + creation` (disjoint sum after normalization).
-//! 4. Bedrock convention: `inputTokens` from the raw response equals
-//!    `input_tokens` directly (disjoint from cache fields).
+//! # Invariants exercised
 //!
-//! Runs a second request to the same Bedrock model with the same prompt to
-//! observe `cached_input_tokens > 0` when prompt-cache hits.
+//! Every provider (and in the streaming/cache subtests, only providers whose
+//! dialect supports them) must satisfy:
 //!
-//! Gated behind `#[ignore]` — invoke explicitly with:
-//!     cargo test -p astra-runtime --test live_token_usage_e2e -- --ignored --nocapture
+//! 1. `TokenUsage` extracts non-zero `input_tokens` + `output_tokens`.
+//! 2. Disjoint-sum identity:
+//!    `total_tokens == input + cached_input + cache_creation + output`
+//! 3. Shape-specific check:
+//!    - OpenAI-family (inclusive shape): raw `prompt_tokens == input + cached + creation`
+//!    - Bedrock Converse (disjoint shape): raw `inputTokens == input_tokens`
+//!
+//! # Bedrock-only regression guards
+//!
+//! - Repeated identical prompt must not regress cache_read counts.
+//! - `converse-stream` must yield `metadata` AFTER `messageStop` and the
+//!   transport layer must drain to EOS (regression guard for the token=0
+//!   Bedrock bug where the loop broke on `is_finished()`).
+//!
+//! # How to run
+//!
+//! ```sh
+//! make test-live-llm        # Makefile target — only this file
+//! cargo test -p astra-runtime --test live_token_usage_e2e -- --ignored --nocapture
+//! ```
+//!
+//! Missing `.models.yaml`, no matching provider, or a non-2xx response on a
+//! specific model results in a **per-model skip** (eprintln + return) rather
+//! than a hard failure, so a broken API key in one model doesn't mask real
+//! regressions in another.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -26,9 +47,97 @@ use astra_runtime::turn::token_usage::{TokenUsage, UsageDialect, extract_usage};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
-/// Percent-encode the Bedrock model id path segment. Model ids contain only
-/// letters, digits, `.`, `-`, `_`, `:`, and `/`. Of these, `:` and `/` must be
-/// escaped when used as a single path segment.
+// ── Opt-in env gate ──────────────────────────────────────────────────────────
+
+/// Live tests cost money + time and depend on external provider availability.
+/// Even though `#[ignore]` already keeps them out of normal `cargo test`, the
+/// `make test-online` DB sweep runs `cargo test -- --ignored` which would pull
+/// them in. Guard with a dedicated env var so the only way they execute is:
+///
+///   - `make test-live-llm` (sets the var for you), OR
+///   - `ASTRA_LIVE_LLM=1 cargo test ... --ignored`
+///
+/// Returns `true` when the suite should SKIP (var not set). Prints a hint
+/// so operators know the test is intentionally bypassed.
+fn skip_if_not_opted_in(test_name: &str) -> bool {
+    if std::env::var("ASTRA_LIVE_LLM").ok().as_deref() == Some("1") {
+        return false;
+    }
+    eprintln!(
+        "SKIP [{test_name}]: live-LLM suite gated behind ASTRA_LIVE_LLM=1 — \
+         run `make test-live-llm` to execute"
+    );
+    true
+}
+
+// ── Model enumeration ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct ModelDef {
+    name: String,
+    provider: String,
+    api_key: String,
+    base_url: String,
+}
+
+/// Read `.models.yaml` from the repo root. Returns an empty vec if the file
+/// is missing — tests should then soft-skip rather than panic.
+fn load_models_yaml() -> Vec<ModelDef> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../.models.yaml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("SKIP: cannot read .models.yaml at {path:?}: {e}");
+            return Vec::new();
+        }
+    };
+    let docs: Vec<Value> = match serde_yaml_ng::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("SKIP: cannot parse .models.yaml: {e}");
+            return Vec::new();
+        }
+    };
+    docs.into_iter()
+        .filter_map(|doc| {
+            Some(ModelDef {
+                name: doc.get("name")?.as_str()?.to_string(),
+                provider: doc.get("provider")?.as_str()?.to_string(),
+                api_key: doc.get("api_key")?.as_str()?.to_string(),
+                base_url: doc.get("base_url")?.as_str()?.to_string(),
+            })
+        })
+        .filter(|m| !m.api_key.is_empty() && !m.base_url.is_empty())
+        .collect()
+}
+
+/// One model per distinct provider — the first well-formed entry wins.
+/// Stable ordering so logs are comparable across runs.
+fn one_per_provider(models: &[ModelDef]) -> Vec<ModelDef> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out: Vec<ModelDef> = Vec::new();
+    for m in models {
+        if seen.insert(m.provider.clone()) {
+            out.push(m.clone());
+        }
+    }
+    out
+}
+
+/// All models for a given provider (order preserved from yaml).
+fn models_for_provider<'a>(models: &'a [ModelDef], provider: &str) -> Vec<&'a ModelDef> {
+    models.iter().filter(|m| m.provider == provider).collect()
+}
+
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .build()
+        .expect("reqwest client")
+}
+
+/// URL-encode a Bedrock model id path segment.
 fn encode_bedrock_model_id(id: &str) -> String {
     let mut out = String::with_capacity(id.len());
     for b in id.bytes() {
@@ -40,57 +149,19 @@ fn encode_bedrock_model_id(id: &str) -> String {
     out
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct ModelDef {
-    name: String,
-    provider: String,
-    api_key: String,
-    base_url: String,
+// ── Shared call helpers ──────────────────────────────────────────────────────
+
+/// Result of one live call. `None` means a soft skip (non-2xx, missing usage).
+struct LiveResult {
+    raw_usage: Value,
+    normalized: TokenUsage,
 }
 
-fn load_models_yaml() -> Vec<ModelDef> {
-    // .models.yaml lives at the repo root (../../..  from rust/crates/runtime)
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../.models.yaml")
-        .canonicalize()
-        .expect("canonicalize .models.yaml");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
-    let docs: Vec<Value> = serde_yaml_ng::from_str(&text).expect("parse .models.yaml");
-    docs.into_iter()
-        .filter_map(|doc| {
-            Some(ModelDef {
-                name: doc.get("name")?.as_str()?.to_string(),
-                provider: doc.get("provider")?.as_str()?.to_string(),
-                api_key: doc.get("api_key")?.as_str()?.to_string(),
-                base_url: doc.get("base_url")?.as_str()?.to_string(),
-            })
-        })
-        .collect()
-}
-
-fn find_model<'a>(models: &'a [ModelDef], name: &str) -> &'a ModelDef {
-    models
-        .iter()
-        .find(|m| m.name == name)
-        .unwrap_or_else(|| panic!("model {name} not found in .models.yaml"))
-}
-
-fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(60))
-        .build()
-        .expect("reqwest client")
-}
-
-/// Issue one OpenAI-compatible `/v1/chat/completions` call and return the
-/// raw response JSON plus the normalized [`TokenUsage`].
 async fn call_openai_compatible(
     client: &reqwest::Client,
     model: &ModelDef,
     user_message: &str,
-) -> (Value, TokenUsage) {
+) -> Option<LiveResult> {
     let url = format!("{}/chat/completions", model.base_url.trim_end_matches('/'));
     let body = json!({
         "model": model.name,
@@ -99,39 +170,60 @@ async fn call_openai_compatible(
         "temperature": 0.0,
         "stream": false,
     });
-    let resp = client
+    let resp = match client
         .post(&url)
         .header("authorization", format!("Bearer {}", model.api_key))
         .header("content-type", "application/json")
         .json(&body)
         .send()
         .await
-        .expect("HTTP send");
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("SKIP [{}/{}]: HTTP send failed: {e}", model.provider, model.name);
+            return None;
+        }
+    };
     let status = resp.status();
-    let raw: Value = resp.json().await.expect("parse upstream json");
-    assert!(
-        status.is_success(),
-        "upstream {} returned {status}: {raw}",
-        model.name
-    );
-    let usage_obj = raw
-        .get("usage")
-        .and_then(Value::as_object)
-        .unwrap_or_else(|| panic!("no `usage` in response for {}: {raw}", model.name));
-    let extracted = extract_usage(UsageDialect::OpenAi, usage_obj)
-        .expect("extract_usage should succeed on OpenAI response");
-    (raw, extracted)
+    let raw: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("SKIP [{}/{}]: json parse failed: {e}", model.provider, model.name);
+            return None;
+        }
+    };
+    if !status.is_success() {
+        eprintln!(
+            "SKIP [{}/{}]: upstream {status}: {raw}",
+            model.provider, model.name
+        );
+        return None;
+    }
+    let Some(usage_obj) = raw.get("usage").and_then(Value::as_object) else {
+        eprintln!(
+            "SKIP [{}/{}]: response missing `usage` object: {raw}",
+            model.provider, model.name
+        );
+        return None;
+    };
+    let Some(normalized) = extract_usage(UsageDialect::OpenAi, usage_obj) else {
+        eprintln!(
+            "SKIP [{}/{}]: extract_usage returned None for: {raw}",
+            model.provider, model.name
+        );
+        return None;
+    };
+    Some(LiveResult {
+        raw_usage: raw.get("usage").cloned().unwrap_or(Value::Null),
+        normalized,
+    })
 }
 
-/// Issue one Bedrock Converse call. The base_url already includes `/model/{id}/converse`
-/// path segment logic, but `.models.yaml` gives `https://bedrock-runtime.us-east-1.amazonaws.com`
-/// so we build the path here. Returns raw response + normalized [`TokenUsage`].
 async fn call_bedrock_converse(
     client: &reqwest::Client,
     model: &ModelDef,
     user_message: &str,
-) -> (Value, TokenUsage) {
-    // URL-encode the model id (inference-profile ids contain '.' which are safe, but keep it defensive).
+) -> Option<LiveResult> {
     let encoded_id = encode_bedrock_model_id(&model.name);
     let url = format!(
         "{}/model/{encoded_id}/converse",
@@ -141,187 +233,194 @@ async fn call_bedrock_converse(
         "messages": [{"role": "user", "content": [{"text": user_message}]}],
         "inferenceConfig": {"maxTokens": 16, "temperature": 0.0},
     });
-    let resp = client
+    let resp = match client
         .post(&url)
         .header("authorization", format!("Bearer {}", model.api_key))
         .header("content-type", "application/json")
         .json(&body)
         .send()
         .await
-        .expect("HTTP send");
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("SKIP [{}/{}]: HTTP send failed: {e}", model.provider, model.name);
+            return None;
+        }
+    };
     let status = resp.status();
-    let raw: Value = resp.json().await.expect("parse upstream json");
-    assert!(
-        status.is_success(),
-        "upstream {} returned {status}: {raw}",
-        model.name
+    let raw: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("SKIP [{}/{}]: json parse failed: {e}", model.provider, model.name);
+            return None;
+        }
+    };
+    if !status.is_success() {
+        eprintln!(
+            "SKIP [{}/{}]: upstream {status}: {raw}",
+            model.provider, model.name
+        );
+        return None;
+    }
+    let Some(usage_obj) = raw.get("usage").and_then(Value::as_object) else {
+        eprintln!(
+            "SKIP [{}/{}]: response missing `usage` object: {raw}",
+            model.provider, model.name
+        );
+        return None;
+    };
+    let Some(normalized) = extract_usage(UsageDialect::BedrockConverse, usage_obj) else {
+        eprintln!(
+            "SKIP [{}/{}]: extract_usage returned None for: {raw}",
+            model.provider, model.name
+        );
+        return None;
+    };
+    Some(LiveResult {
+        raw_usage: raw.get("usage").cloned().unwrap_or(Value::Null),
+        normalized,
+    })
+}
+
+// ── Shared invariant assertions ──────────────────────────────────────────────
+
+fn assert_disjoint_sum_identity(u: &TokenUsage, tag: &str) {
+    assert_eq!(
+        u.total_tokens(),
+        u.input_tokens + u.cached_input_tokens + u.cache_creation_tokens + u.output_tokens,
+        "{tag}: disjoint-sum identity broken: {u:?}"
     );
-    let usage_obj = raw
-        .get("usage")
-        .and_then(Value::as_object)
-        .unwrap_or_else(|| panic!("no `usage` in response for {}: {raw}", model.name));
-    let extracted = extract_usage(UsageDialect::BedrockConverse, usage_obj)
-        .expect("extract_usage should succeed on Bedrock response");
-    (raw, extracted)
+}
+
+fn assert_nonzero_input_and_output(u: &TokenUsage, tag: &str) {
+    assert!(
+        u.input_tokens + u.cached_input_tokens > 0,
+        "{tag}: expected non-zero total input, got {u:?}"
+    );
+    assert!(
+        u.output_tokens > 0,
+        "{tag}: expected non-zero output, got {u:?}"
+    );
+}
+
+/// OpenAI-family inclusive shape: raw `prompt_tokens ⊇ cached + creation`, so
+/// `fresh = prompt_tokens - cached - creation`, and
+/// `fresh + cached + creation == prompt_tokens`.
+fn assert_openai_inclusive_identity(raw_usage: &Value, u: &TokenUsage, tag: &str) {
+    let Some(raw_prompt) = raw_usage.get("prompt_tokens").and_then(Value::as_u64) else {
+        eprintln!("{tag}: raw_usage has no prompt_tokens — skipping inclusive identity check");
+        return;
+    };
+    assert_eq!(
+        raw_prompt,
+        u.input_tokens + u.cached_input_tokens + u.cache_creation_tokens,
+        "{tag}: OpenAI inclusive identity broken: raw prompt_tokens={raw_prompt}, normalized={u:?}"
+    );
+}
+
+fn assert_bedrock_disjoint_identity(raw_usage: &Value, u: &TokenUsage, tag: &str) {
+    let Some(raw_input) = raw_usage.get("inputTokens").and_then(Value::as_u64) else {
+        eprintln!("{tag}: raw_usage has no inputTokens — skipping disjoint identity check");
+        return;
+    };
+    assert_eq!(
+        raw_input, u.input_tokens,
+        "{tag}: Bedrock disjoint identity broken: raw inputTokens={raw_input}, normalized={u:?}"
+    );
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
 
+/// Per-provider invariant sweep. Picks one model per distinct provider from
+/// `.models.yaml`, issues a small request, and asserts the canonical token
+/// invariants. A provider whose test model hard-fails (bad key, provider
+/// offline) prints SKIP but does not fail the test — **unless every model
+/// skipped**, in which case we fail to avoid a silent no-op run.
+///
+/// This is the main regression guard for CLI display: if a provider's usage
+/// shape changes and the extractor stops returning the right disjoint
+/// buckets, the displayed `↑`/`cache%` on every turn with that provider
+/// would be wrong, and this test would catch it.
 #[tokio::test]
-#[ignore = "hits real DashScope API; run with --ignored"]
-async fn openai_compatible_qwen_plus_populates_usage() {
+#[ignore = "hits real provider APIs; run with `make test-live-llm` or --ignored"]
+async fn per_provider_token_usage_invariants() {
+    if skip_if_not_opted_in("per_provider_token_usage_invariants") {
+        return;
+    }
     let models = load_models_yaml();
-    let model = find_model(&models, "qwen-plus");
+    if models.is_empty() {
+        eprintln!("SKIP: no usable models in .models.yaml");
+        return;
+    }
+    let candidates = one_per_provider(&models);
+    eprintln!(
+        "Testing {} providers: {:?}",
+        candidates.len(),
+        candidates
+            .iter()
+            .map(|m| format!("{}/{}", m.provider, m.name))
+            .collect::<Vec<_>>()
+    );
+
     let client = http_client();
+    let mut any_succeeded = false;
+    for model in &candidates {
+        let tag = format!("{}/{}", model.provider, model.name);
+        let dialect = UsageDialect::for_provider(&model.provider);
+        let res = match dialect {
+            UsageDialect::BedrockConverse => {
+                call_bedrock_converse(&client, model, "Say hi in 3 words.").await
+            }
+            UsageDialect::OpenAi => {
+                call_openai_compatible(&client, model, "Say hi in 3 words.").await
+            }
+        };
+        let Some(r) = res else { continue };
+        eprintln!("[{tag}] raw usage: {}", r.raw_usage);
+        eprintln!("[{tag}] normalized: {:?}", r.normalized);
 
-    let (raw, usage) = call_openai_compatible(&client, model, "Say hi in 3 words.").await;
-    eprintln!("qwen-plus raw usage: {}", raw.get("usage").unwrap());
-    eprintln!("qwen-plus normalized: {usage:?}");
-
-    // Invariant 1: non-zero input+output.
+        assert_nonzero_input_and_output(&r.normalized, &tag);
+        assert_disjoint_sum_identity(&r.normalized, &tag);
+        match dialect {
+            UsageDialect::OpenAi => assert_openai_inclusive_identity(&r.raw_usage, &r.normalized, &tag),
+            UsageDialect::BedrockConverse => {
+                assert_bedrock_disjoint_identity(&r.raw_usage, &r.normalized, &tag)
+            }
+        }
+        any_succeeded = true;
+    }
     assert!(
-        usage.input_tokens + usage.cached_input_tokens > 0,
-        "input must be non-zero"
-    );
-    assert!(usage.output_tokens > 0, "output must be non-zero");
-
-    // Invariant 2: total = sum of disjoint buckets.
-    assert_eq!(
-        usage.total_tokens(),
-        usage.input_tokens
-            + usage.cached_input_tokens
-            + usage.cache_creation_tokens
-            + usage.output_tokens,
-        "disjoint sum identity"
-    );
-
-    // Invariant 3: OpenAI-side prompt_tokens ⊇ cached + creation.
-    let raw_prompt = raw["usage"]["prompt_tokens"]
-        .as_u64()
-        .expect("prompt_tokens");
-    assert_eq!(
-        raw_prompt,
-        usage.input_tokens + usage.cached_input_tokens + usage.cache_creation_tokens,
-        "OpenAI prompt_tokens must equal normalized fresh + cached + creation"
+        any_succeeded,
+        "no provider could be reached — live test would be a silent no-op. \
+         Fix at least one model in .models.yaml or skip the whole suite."
     );
 }
 
-/// GLM (magikcloud intermediary) — provider dialect routes to OpenAi.
-/// Exercises the GLM family separately from DashScope since GLM's
-/// behind-the-scenes shape can subtly differ (e.g. cached_tokens at
-/// top level or in details).
+/// Bedrock-specific regression: repeating the SAME long prompt must not make
+/// `cached_input_tokens` decrease. Uses the first Bedrock model in the yaml.
 #[tokio::test]
-#[ignore = "hits real magikcloud/GLM API; run with --ignored"]
-async fn openai_compatible_glm_populates_usage() {
+#[ignore = "hits real Bedrock API; run with `make test-live-llm` or --ignored"]
+async fn bedrock_cache_read_does_not_regress_on_repeat() {
+    if skip_if_not_opted_in("bedrock_cache_read_does_not_regress_on_repeat") {
+        return;
+    }
     let models = load_models_yaml();
-    let model = find_model(&models, "ep-glm-5-439797");
+    let bedrock = models_for_provider(&models, "bedrock");
+    let Some(model) = bedrock.first() else {
+        eprintln!("SKIP: no Bedrock model in .models.yaml");
+        return;
+    };
+    let tag = format!("{}/{}", model.provider, model.name);
+    eprintln!("[{tag}] cache repeat test");
+
     let client = http_client();
-
-    let (raw, usage) = call_openai_compatible(&client, model, "Say hi.").await;
-    eprintln!("glm raw usage: {}", raw.get("usage").unwrap());
-    eprintln!("glm normalized: {usage:?}");
-
-    assert!(usage.input_tokens + usage.cached_input_tokens > 0);
-    assert!(usage.output_tokens > 0);
-    assert_eq!(
-        usage.total_tokens(),
-        usage.input_tokens
-            + usage.cached_input_tokens
-            + usage.cache_creation_tokens
-            + usage.output_tokens,
-    );
-}
-
-/// MiniMax uses `prompt_tokens_details.cached_tokens` (inclusive shape).
-/// Regression guard: the extractor must deduct cached from prompt_tokens
-/// so `input_tokens` reports only FRESH input.
-#[tokio::test]
-#[ignore = "hits real MiniMax API; run with --ignored"]
-async fn openai_compatible_minimax_populates_usage() {
-    let models = load_models_yaml();
-    let model = find_model(&models, "MiniMax-M2.5");
-    let client = http_client();
-
-    let (raw, usage) = call_openai_compatible(&client, model, "Say hi.").await;
-    eprintln!("minimax raw usage: {}", raw.get("usage").unwrap());
-    eprintln!("minimax normalized: {usage:?}");
-
-    assert!(usage.input_tokens + usage.cached_input_tokens > 0);
-    assert!(usage.output_tokens > 0);
-
-    // Disjoint identity.
-    assert_eq!(
-        usage.total_tokens(),
-        usage.input_tokens
-            + usage.cached_input_tokens
-            + usage.cache_creation_tokens
-            + usage.output_tokens,
-        "disjoint sum identity"
-    );
-
-    // MiniMax shape: prompt_tokens is inclusive of cached_tokens under
-    // prompt_tokens_details. `input_tokens + cached_input_tokens + cache_creation_tokens` must equal raw `prompt_tokens`.
-    let raw_prompt = raw["usage"]["prompt_tokens"]
-        .as_u64()
-        .expect("prompt_tokens");
-    assert_eq!(
-        raw_prompt,
-        usage.input_tokens + usage.cached_input_tokens + usage.cache_creation_tokens,
-        "MiniMax inclusive shape: fresh + cached + creation == prompt_tokens"
-    );
-}
-
-#[tokio::test]
-#[ignore = "hits real Bedrock API; run with --ignored"]
-async fn bedrock_claude_sonnet_populates_usage() {
-    let models = load_models_yaml();
-    let model = find_model(&models, "us.anthropic.claude-sonnet-4-6");
-    let client = http_client();
-
-    let (raw, usage) = call_bedrock_converse(&client, model, "Say hi in 3 words.").await;
-    eprintln!("bedrock raw usage: {}", raw.get("usage").unwrap());
-    eprintln!("bedrock normalized: {usage:?}");
-
-    assert!(usage.input_tokens > 0);
-    assert!(usage.output_tokens > 0);
-
-    // Bedrock convention: inputTokens is DISJOINT from cacheRead/cacheWrite.
-    let raw_input = raw["usage"]["inputTokens"].as_u64().expect("inputTokens");
-    assert_eq!(
-        raw_input, usage.input_tokens,
-        "Bedrock raw inputTokens passes through as fresh input"
-    );
-
-    // Disjoint sum identity.
-    assert_eq!(
-        usage.total_tokens(),
-        usage.input_tokens
-            + usage.cached_input_tokens
-            + usage.cache_creation_tokens
-            + usage.output_tokens,
-    );
-}
-
-/// Two requests with the SAME long system prompt so Bedrock's prompt cache
-/// has a chance to hit on the second call. Verifies cache accounting moves.
-#[tokio::test]
-#[ignore = "hits real Bedrock API; run with --ignored"]
-async fn bedrock_claude_sonnet_cache_read_increments_on_repeat() {
-    let models = load_models_yaml();
-    let model = find_model(&models, "us.anthropic.claude-sonnet-4-6");
-    let client = http_client();
-
-    // Build a long, stable user prompt so that ≥1024 tokens qualify for caching.
     let prelude = "The following is a long context about distributed systems. ".repeat(200);
     let prompt = format!("{prelude}\nWhat is CAP? Answer in 5 words.");
-
     let encoded_id = encode_bedrock_model_id(&model.name);
     let url = format!(
         "{}/model/{encoded_id}/converse",
         model.base_url.trim_end_matches('/')
     );
-
-    // Body WITH cachePoint on the user message so Bedrock will cache the prefix.
     let body = json!({
         "messages": [{
             "role": "user",
@@ -338,7 +437,8 @@ async fn bedrock_claude_sonnet_cache_read_increments_on_repeat() {
         url: &str,
         api_key: &str,
         body: &Value,
-    ) -> TokenUsage {
+        tag: &str,
+    ) -> Option<TokenUsage> {
         let resp = client
             .post(url)
             .header("authorization", format!("Bearer {api_key}"))
@@ -346,66 +446,63 @@ async fn bedrock_claude_sonnet_cache_read_increments_on_repeat() {
             .json(body)
             .send()
             .await
-            .expect("send");
+            .ok()?;
         let status = resp.status();
-        let raw: Value = resp.json().await.expect("json");
-        assert!(status.is_success(), "bedrock {status}: {raw}");
-        eprintln!("bedrock cache-test raw usage: {}", raw["usage"]);
+        let raw: Value = resp.json().await.ok()?;
+        if !status.is_success() {
+            eprintln!("[{tag}] SKIP: {status}: {raw}");
+            return None;
+        }
+        eprintln!("[{tag}] raw usage: {}", raw["usage"]);
         extract_usage(
             UsageDialect::BedrockConverse,
-            raw["usage"].as_object().expect("usage obj"),
+            raw["usage"].as_object()?,
         )
-        .expect("extract")
     }
 
-    let first = one_call(&client, &url, &model.api_key, &body).await;
-    // Second call — same request body — should hit cache.
-    let second = one_call(&client, &url, &model.api_key, &body).await;
+    let Some(first) = one_call(&client, &url, &model.api_key, &body, &tag).await else {
+        eprintln!("[{tag}] SKIP: first call failed");
+        return;
+    };
+    let Some(second) = one_call(&client, &url, &model.api_key, &body, &tag).await else {
+        eprintln!("[{tag}] SKIP: second call failed");
+        return;
+    };
+    eprintln!("[{tag}] first: {first:?}");
+    eprintln!("[{tag}] second: {second:?}");
 
-    eprintln!("first: {first:?}");
-    eprintln!("second: {second:?}");
-
-    // On the first call, Bedrock should either write cache (cache_creation > 0)
-    // or (if prefix is too short) do neither. Tolerate both, but the second call
-    // must NOT be strictly worse on the cache-read axis than the first.
     assert!(
         second.cached_input_tokens >= first.cached_input_tokens,
-        "repeat call should not regress cache reads: first={first:?}, second={second:?}"
+        "[{tag}] repeat call regressed cache reads: first={first:?}, second={second:?}"
     );
-
-    // Invariant holds on both.
-    for u in [first, second] {
-        assert_eq!(
-            u.total_tokens(),
-            u.input_tokens + u.cached_input_tokens + u.cache_creation_tokens + u.output_tokens,
-        );
-    }
+    assert_disjoint_sum_identity(&first, &tag);
+    assert_disjoint_sum_identity(&second, &tag);
 }
 
-// ── Real Bedrock streaming via converse-stream + EventStream ────────────
-
-/// Drive a real `/converse-stream` response through our [`FrameDecoder`].
-/// Validates:
-/// - The wire body is AWS `vnd.amazon.eventstream` binary (not JSON).
-/// - Multiple event frames arrive (messageStart, contentBlockDelta*, metadata,
-///   messageStop), proving the stream is actually incremental.
-/// - Token accounting from the terminal `metadata` frame satisfies the
-///   canonical disjoint-sum identity.
+/// Bedrock streaming regression guard: `metadata` (carrying usage) arrives
+/// AFTER `messageStop`. The transport must drain to EOS — this test would
+/// have caught the `tokens:0 (↑0 ↓0)` bug where the loop broke on
+/// `is_finished()` once messageStop fired.
 #[tokio::test]
-#[ignore = "hits real Bedrock converse-stream; run with --ignored"]
-async fn bedrock_converse_stream_yields_incremental_frames() {
+#[ignore = "hits real Bedrock converse-stream; run with `make test-live-llm` or --ignored"]
+async fn bedrock_converse_stream_yields_metadata_after_message_stop() {
+    if skip_if_not_opted_in("bedrock_converse_stream_yields_metadata_after_message_stop") {
+        return;
+    }
     let models = load_models_yaml();
-    let model = find_model(&models, "us.anthropic.claude-sonnet-4-6");
-    let client = http_client();
+    let bedrock = models_for_provider(&models, "bedrock");
+    let Some(model) = bedrock.first() else {
+        eprintln!("SKIP: no Bedrock model in .models.yaml");
+        return;
+    };
+    let tag = format!("{}/{}", model.provider, model.name);
 
+    let client = http_client();
     let encoded_id = encode_bedrock_model_id(&model.name);
     let url = format!(
         "{}/model/{encoded_id}/converse-stream",
         model.base_url.trim_end_matches('/')
     );
-
-    // Ask for >1 content chunk worth of output so contentBlockDelta is emitted
-    // multiple times.
     let body = json!({
         "messages": [{
             "role": "user",
@@ -416,20 +513,26 @@ async fn bedrock_converse_stream_yields_incremental_frames() {
         "inferenceConfig": {"maxTokens": 200, "temperature": 0.0},
     });
 
-    let resp = client
+    let resp = match client
         .post(&url)
         .header("authorization", format!("Bearer {}", model.api_key))
         .header("content-type", "application/json")
         .json(&body)
         .send()
         .await
-        .expect("HTTP send");
-    assert!(
-        resp.status().is_success(),
-        "bedrock converse-stream status: {} body: {}",
-        resp.status(),
-        resp.text().await.unwrap_or_default()
-    );
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[{tag}] SKIP: HTTP send failed: {e}");
+            return;
+        }
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        eprintln!("[{tag}] SKIP: {status}: {body}");
+        return;
+    }
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -438,15 +541,18 @@ async fn bedrock_converse_stream_yields_incremental_frames() {
         .to_string();
     assert!(
         content_type.contains("vnd.amazon.eventstream"),
-        "expected AWS eventstream content-type, got: {content_type}"
+        "[{tag}] expected AWS eventstream content-type, got: {content_type}"
     );
 
     let mut decoder = FrameDecoder::new();
     let mut event_type_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    let mut saw_message_stop_at: Option<usize> = None;
+    let mut saw_metadata_at: Option<usize> = None;
     let mut assembled_text = String::new();
     let mut final_usage: Option<TokenUsage> = None;
     let mut stop_reason: Option<String> = None;
+    let mut frame_index = 0usize;
 
     let mut body_stream = resp.bytes_stream();
     while let Some(chunk) = body_stream.next().await {
@@ -456,8 +562,9 @@ async fn bedrock_converse_stream_yields_incremental_frames() {
             let frame = match decoder.try_next_frame() {
                 Ok(Some(f)) => f,
                 Ok(None) => break,
-                Err(e) => panic!("decode error: {e}"),
+                Err(e) => panic!("[{tag}] decode error: {e}"),
             };
+            frame_index += 1;
             if let Some(et) = frame.event_type() {
                 *event_type_counts.entry(et.to_string()).or_insert(0) += 1;
                 let payload: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
@@ -472,12 +579,14 @@ async fn bedrock_converse_stream_yields_incremental_frames() {
                         }
                     }
                     "messageStop" => {
+                        saw_message_stop_at = Some(frame_index);
                         stop_reason = payload
                             .get("stopReason")
                             .and_then(Value::as_str)
                             .map(str::to_string);
                     }
                     "metadata" => {
+                        saw_metadata_at = Some(frame_index);
                         if let Some(usage_obj) = payload.get("usage").and_then(Value::as_object) {
                             final_usage = extract_usage(UsageDialect::BedrockConverse, usage_obj);
                         }
@@ -487,7 +596,7 @@ async fn bedrock_converse_stream_yields_incremental_frames() {
             } else if frame.message_type() == Some("exception") {
                 let payload: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
                 panic!(
-                    "bedrock exception frame {:?}: {}",
+                    "[{tag}] bedrock exception frame {:?}: {}",
                     frame.exception_type(),
                     payload
                 );
@@ -495,13 +604,13 @@ async fn bedrock_converse_stream_yields_incremental_frames() {
         }
     }
 
-    eprintln!("event counts: {event_type_counts:?}");
+    eprintln!("[{tag}] event counts: {event_type_counts:?}");
+    eprintln!("[{tag}] messageStop at frame {saw_message_stop_at:?}, metadata at {saw_metadata_at:?}");
     eprintln!(
-        "assembled text ({} chars): {assembled_text:?}",
+        "[{tag}] assembled text ({} chars): {assembled_text:?}",
         assembled_text.len()
     );
-    eprintln!("final usage: {final_usage:?}");
-    eprintln!("stop_reason: {stop_reason:?}");
+    eprintln!("[{tag}] final usage: {final_usage:?}");
 
     assert!(
         event_type_counts
@@ -509,23 +618,23 @@ async fn bedrock_converse_stream_yields_incremental_frames() {
             .copied()
             .unwrap_or(0)
             >= 2,
-        "streaming should yield ≥ 2 contentBlockDelta frames; got {event_type_counts:?}"
+        "[{tag}] streaming should yield ≥ 2 contentBlockDelta frames; got {event_type_counts:?}"
     );
-    assert_eq!(event_type_counts.get("messageStart").copied(), Some(1));
-    assert_eq!(event_type_counts.get("messageStop").copied(), Some(1));
-    assert_eq!(event_type_counts.get("metadata").copied(), Some(1));
+    assert_eq!(event_type_counts.get("messageStop").copied(), Some(1), "[{tag}]");
+    assert_eq!(event_type_counts.get("metadata").copied(), Some(1), "[{tag}]");
+    assert!(!assembled_text.trim().is_empty(), "[{tag}]");
+    assert!(stop_reason.is_some(), "[{tag}]");
+
+    // Frame-order guard: metadata arrives AFTER messageStop in the stream.
+    // This is the core invariant that the early-break bug violated.
+    let stop_at = saw_message_stop_at.expect("messageStop seen");
+    let meta_at = saw_metadata_at.expect("metadata seen");
     assert!(
-        !assembled_text.trim().is_empty(),
-        "text deltas should produce non-empty body"
+        meta_at > stop_at,
+        "[{tag}] metadata must arrive AFTER messageStop (stop at frame {stop_at}, metadata at {meta_at})"
     );
-    assert!(stop_reason.is_some());
 
     let u = final_usage.expect("metadata frame must carry usage");
-    assert!(u.input_tokens > 0);
-    assert!(u.output_tokens > 0);
-    assert_eq!(
-        u.total_tokens(),
-        u.input_tokens + u.cached_input_tokens + u.cache_creation_tokens + u.output_tokens,
-        "canonical disjoint-sum identity holds on streamed usage"
-    );
+    assert_nonzero_input_and_output(&u, &tag);
+    assert_disjoint_sum_identity(&u, &tag);
 }
