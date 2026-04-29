@@ -276,7 +276,6 @@ fn pattern_key(signature: &str, task_type: TaskType) -> String {
     format!("{signature}@{task_type:?}")
 }
 
-#[allow(deprecated)]
 impl PatternLibrary {
     pub fn new() -> Self {
         Self::default()
@@ -847,38 +846,8 @@ impl PatternLibrary {
 
     // ─── Active Exploration ──────────────────────────────────────────────────
 
-    /// Find domains/task types where confidence is low and exploration would help.
-    ///
-    /// Returns suggestions for tool combinations to try when the system has
-    /// low confidence in a particular area. Unlike epsilon-greedy (which
-    /// rediscovers old patterns), this identifies gaps in coverage.
-    #[deprecated(
-        since = "0.9.0",
-        note = "Superseded by SelfModel + LLM reasoning. Use self-awareness-driven exploration instead of programmatic opportunity generation."
-    )]
-    /// Report health metrics for the pattern library.
-    pub fn health_report(&self) -> PatternLibraryHealth {
-        let total = self.patterns.len();
-        let drifting = self.patterns.values().filter(|p| p.is_drifting()).count();
-        let decayed = self
-            .patterns
-            .values()
-            .filter(|p| p.time_decay_factor() < 0.5)
-            .count();
-        let low_quality = self
-            .patterns
-            .values()
-            .filter(|p| p.score() < 0.3 && p.total_count() >= 5)
-            .count();
-        PatternLibraryHealth {
-            total_patterns: total,
-            drifting_patterns: drifting,
-            heavily_decayed: decayed,
-            low_quality,
-        }
-    }
-}
 
+}
 // ─── Drift & Exploration Types ───────────────────────────────────────────────
 
 /// Report of a drifting pattern.
@@ -895,14 +864,6 @@ pub struct DriftReport {
     /// True if drift exceeds the critical threshold.
     pub is_critical: bool,
 }
-/// Health metrics for the pattern library.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PatternLibraryHealth {
-    pub total_patterns: usize,
-    pub drifting_patterns: usize,
-    pub heavily_decayed: usize,
-    pub low_quality: usize,
-}
 // ─── DriftSource bridge ─────────────────────────────────────────────────────
 
 impl astra_learning::DriftSource for PatternLibrary {
@@ -914,7 +875,6 @@ impl astra_learning::DriftSource for PatternLibrary {
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
 
