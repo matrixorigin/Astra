@@ -106,6 +106,14 @@ pub struct SubRunConfig {
     pub mailbox: Option<astra_messaging::router::AgentMailbox>,
     /// Cancellation token — when cancelled, the sub-run should stop gracefully.
     pub cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+    /// Resolved parent prefix for prompt-cache inheritance on the
+    /// delegated child's first API call (Bug B step 2). Populated by
+    /// [`DelegationEngine`] when its `prefix_store` is set and a
+    /// matching parent capture is present; `None` otherwise.
+    /// Executors that don't consume it (e.g. server-side
+    /// `ServerAgenticLoopHost`) can ignore this field — the child
+    /// runs fresh, same behavior as pre-fork-prefix.
+    pub inherited_prefix: Option<crate::orchestration::InheritedChildPrefix>,
 }
 
 impl std::fmt::Debug for SubRunConfig {
@@ -1131,6 +1139,14 @@ pub struct DelegationEngine {
     gate: Option<Arc<dyn VerificationGate>>,
     /// Optional mailbox router for inter-agent messaging.
     mailbox_router: Option<Arc<AgentMailboxRouter>>,
+    /// Optional fork-prefix store shared with the spawner. When
+    /// present, delegate sub-run configs get `inherited_prefix`
+    /// populated by looking up the parent's captured ForkPrefix in
+    /// this store (Bug B step 2). When absent, the delegate path
+    /// behaves as pre-fork-prefix — `inherited_prefix` stays None
+    /// and the child runs fresh.
+    prefix_store:
+        Option<Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
 }
 
 impl DelegationEngine {
@@ -1150,6 +1166,7 @@ impl DelegationEngine {
             executor: Arc::new(StubSubRunExecutor),
             gate: None,
             mailbox_router: None,
+            prefix_store: None,
         }
     }
 
@@ -1167,6 +1184,7 @@ impl DelegationEngine {
             executor,
             gate: None,
             mailbox_router: None,
+            prefix_store: None,
         }
     }
 
@@ -1180,6 +1198,61 @@ impl DelegationEngine {
     pub fn with_mailbox_router(mut self, router: Arc<AgentMailboxRouter>) -> Self {
         self.mailbox_router = Some(router);
         self
+    }
+
+    /// Attach the fork-prefix store the spawner owns. Delegate
+    /// sub-runs will then inherit the parent's captured prefix for
+    /// prompt-cache reuse — matching spawn_agent behavior. When
+    /// unset, delegate sub-runs run fresh (pre-fork-prefix
+    /// behavior).
+    pub fn with_prefix_store(
+        mut self,
+        store: Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>,
+    ) -> Self {
+        self.prefix_store = Some(store);
+        self
+    }
+
+    /// Resolve a parent prefix for a delegated sub-run's config.
+    /// Returns `None` (no inheritance) when:
+    /// - no prefix_store is configured
+    /// - no parent prefix captured for `parent_run_id`
+    /// - resolver rejects the prefix (provider / model mismatch,
+    ///   thinking budget clamp, etc.) — soft-fallback semantics,
+    ///   same as spawn_agent
+    ///
+    /// `child_provider` and `child_model_id` come from the resolved
+    /// agent profile's model string. For now we use
+    /// [`astra_turn_core::fork_prefix::ProviderKind::from_provider_hint`]
+    /// on the model name — the same inference the spawner uses.
+    fn resolve_inherited_prefix_for_delegate(
+        &self,
+        parent_run_id: &str,
+        child_model_id: &str,
+    ) -> Option<crate::orchestration::InheritedChildPrefix> {
+        let store = self.prefix_store.as_ref()?;
+        let child_provider =
+            astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(child_model_id);
+        let spec = astra_turn_core::orchestration_spawn_tool::InheritPrefixSpec {
+            from_run_id: Some(parent_run_id.to_string()),
+            required: false,
+        };
+        let ctx = astra_turn_core::fork_resolve::SpawnResolveContext {
+            caller_run_id: Some(parent_run_id.to_string()),
+            child_provider,
+            child_model_id: child_model_id.to_string(),
+            // Delegate doesn't expose max_output_tokens (agent
+            // profile carries max_turns only), so leave None —
+            // validate_spawn will skip the thinking-budget clamp
+            // check.
+            child_max_output_tokens: None,
+        };
+        let outcome = astra_turn_core::fork_resolve::resolve_inherit_prefix(
+            Some(&spec),
+            &ctx,
+            store.as_ref(),
+        );
+        crate::orchestration::spawner::build_inherited_child_prefix(&outcome)
     }
 
     /// Get the progress broadcaster from the underlying tracker, if configured.
@@ -1207,6 +1280,7 @@ impl DelegationEngine {
             executor: self.executor.clone(),
             gate: Some(gate),
             mailbox_router: self.mailbox_router.clone(),
+            prefix_store: self.prefix_store.clone(),
         }
     }
     /// Validate a delegation request without executing it.
@@ -1900,6 +1974,18 @@ impl DelegationEngine {
             let enhanced_task =
                 team_prompts::wrap_task_with_coordination(&coordination_prompt, &request.task);
 
+            // Bug B step 2: resolve parent prefix for
+            // fork-cache inheritance if a store is configured.
+            // Uses the delegated agent's resolved model id (falls
+            // back to an empty string hint, which maps to
+            // `Other("")` — resolver will soft-fallback if the
+            // parent's provider doesn't match). Soft semantics
+            // match spawn_agent: on miss or mismatch the child
+            // runs fresh, no hard error.
+            let delegate_model = profile.model_override.as_deref().unwrap_or("");
+            let inherited_prefix = self
+                .resolve_inherited_prefix_for_delegate(&request.parent_run_id, delegate_model);
+
             configs.push(SubRunConfig {
                 run_id: sub_run_id,
                 agent_profile: profile,
@@ -1921,6 +2007,7 @@ impl DelegationEngine {
                 checkpoint_gate: None,
                 mailbox,
                 cancel_token: Some(child_cancel),
+                inherited_prefix,
             });
         }
         drop(reg);
@@ -2181,6 +2268,13 @@ impl DelegationEngine {
                                         HashMap::new(),
                                     )
                                 });
+                            let delegate_model =
+                                profile.model_override.as_deref().unwrap_or("");
+                            let inherited_prefix = self
+                                .resolve_inherited_prefix_for_delegate(
+                                    &request.parent_run_id,
+                                    delegate_model,
+                                );
                             SubRunConfig {
                                 run_id: uuid::Uuid::new_v4().to_string(),
                                 agent_profile: profile,
@@ -2197,6 +2291,7 @@ impl DelegationEngine {
                                 checkpoint_gate: None,
                                 mailbox: None,
                                 cancel_token: cancel_for_retry.clone(),
+                                inherited_prefix,
                             }
                         },
                     )
@@ -2371,6 +2466,7 @@ impl DelegationEngine {
                 checkpoint_gate: None,
                 mailbox,
                 cancel_token: Some(child_cancel),
+            inherited_prefix: None,
             };
 
             let exec_result = match per_stage_timeout {
@@ -2478,6 +2574,7 @@ impl DelegationEngine {
                         checkpoint_gate: None,
                         mailbox: None,
                         cancel_token: cancel_for_retry.clone(),
+                    inherited_prefix: None,
                     },
                 )
                 .await
@@ -2660,6 +2757,7 @@ impl DelegationEngine {
                 checkpoint_gate: None,
                 mailbox: prod_mailbox,
                 cancel_token: cancel_token.cloned(),
+            inherited_prefix: None,
             };
             let prod_exec = match per_round_timeout {
                 Some(dur) => {
@@ -2761,6 +2859,7 @@ impl DelegationEngine {
                         checkpoint_gate: None,
                         mailbox: None,
                         cancel_token: cancel_for_retry.clone(),
+                    inherited_prefix: None,
                     },
                 )
                 .await
@@ -2864,6 +2963,7 @@ impl DelegationEngine {
                 checkpoint_gate: None,
                 mailbox: rev_mailbox,
                 cancel_token: cancel_token.cloned(),
+            inherited_prefix: None,
             };
             let rev_exec = match per_round_timeout {
                 Some(dur) => {
@@ -3097,6 +3197,7 @@ impl DelegationEngine {
                 checkpoint_gate: None,
                 mailbox: fork_mailbox,
                 cancel_token: cancel_token.cloned(),
+            inherited_prefix: None,
             };
 
             let executor = self.executor.clone();
@@ -4476,6 +4577,7 @@ mod tests {
             checkpoint_gate: None,
             mailbox: None,
             cancel_token: None,
+        inherited_prefix: None,
         };
 
         let result = executor.execute(config).await.unwrap();
@@ -6365,5 +6467,122 @@ mod tests {
             fn_body.contains("cancel_tokens"),
             "cleanup_delegation must clean up cancel_tokens map"
         );
+    }
+
+    // ─── Bug B step 2 regression guards ──────────────────────────
+
+    #[test]
+    fn subrun_config_exposes_inherited_prefix_field() {
+        let src = include_str!("delegation_engine.rs");
+        assert!(
+            src.contains(
+                "pub inherited_prefix: Option<crate::orchestration::InheritedChildPrefix>"
+            ),
+            "SubRunConfig must expose pub inherited_prefix typed \
+             as Option<InheritedChildPrefix>"
+        );
+    }
+
+    #[test]
+    fn delegation_engine_accepts_prefix_store_builder() {
+        let src = include_str!("delegation_engine.rs");
+        assert!(
+            src.contains("pub fn with_prefix_store"),
+            "DelegationEngine::with_prefix_store must exist so the \
+             CLI startup path can plumb the shared store"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_inherited_prefix_returns_none_without_store() {
+        let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
+        let run_store = Arc::new(astra_services::runs::InMemoryRunStateStore::default());
+        let tracker = Arc::new(DelegationTracker::new());
+        let engine = DelegationEngine::with_executor(
+            registry,
+            Arc::new(RunEngine::new(run_store)),
+            tracker,
+            Arc::new(StubSubRunExecutor),
+        );
+        let out = engine.resolve_inherited_prefix_for_delegate("run-parent", "MiniMax-M2.5");
+        assert!(
+            out.is_none(),
+            "engine without prefix_store must return None inherited_prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_inherited_prefix_resolves_captured_parent() {
+        use astra_turn_core::fork_capture::{
+            CaptureRequest, ForkCaptureOutcome, capture_parent_prefix, set_fork_flag_for_tests,
+        };
+        use astra_turn_core::fork_prefix::{
+            CacheMode, ProviderKind, SystemBlock, ThinkingConfigSlice, ToolSchemaEntry,
+            hash_tool_schema,
+        };
+        use astra_turn_core::fork_prefix_store::{InMemoryPrefixStore, PrefixCaptureSink};
+
+        let prev_flag = set_fork_flag_for_tests(true);
+        let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
+        let schema = serde_json::json!({"function": {"name": "bash"}});
+        let (schema_bytes, schema_hash) = hash_tool_schema(&schema);
+        let parent_msgs = serde_json::json!([
+            {"role": "user", "content": "analyze"},
+            {"role": "assistant", "content": "done"}
+        ]);
+        let canonical = serde_json::to_vec(&parent_msgs).unwrap();
+        let capture = capture_parent_prefix(
+            CaptureRequest {
+                parent_run_id: "run-step2".into(),
+                parent_turn_seq: 1,
+                provider: ProviderKind::Other("MiniMax-M2.5".into()),
+                model_id: "MiniMax-M2.5".into(),
+                thinking: Some(ThinkingConfigSlice {
+                    enabled: false,
+                    budget_tokens: 0,
+                    kind: "disabled".into(),
+                }),
+                system_blocks: vec![SystemBlock {
+                    bytes: b"sys".to_vec(),
+                    has_cache_control: true,
+                }],
+                tool_schemas: vec![ToolSchemaEntry {
+                    name: "bash".into(),
+                    canonical_bytes: schema_bytes,
+                    hash: schema_hash,
+                }],
+                beta_headers: vec![],
+                canonical_prefix_bytes: canonical,
+                cache_mode: CacheMode::Write,
+                captured_at_secs: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                microcompact_fired_in_turn: false,
+            },
+            &*store,
+        );
+        assert!(matches!(capture, ForkCaptureOutcome::Captured { .. }));
+
+        let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
+        let run_store = Arc::new(astra_services::runs::InMemoryRunStateStore::default());
+        let tracker = Arc::new(DelegationTracker::new());
+        let engine = DelegationEngine::with_executor(
+            registry,
+            Arc::new(RunEngine::new(run_store)),
+            tracker,
+            Arc::new(StubSubRunExecutor),
+        )
+        .with_prefix_store(store);
+
+        let out = engine.resolve_inherited_prefix_for_delegate("run-step2", "MiniMax-M2.5");
+        let inherited = out.expect("engine must resolve captured parent prefix");
+        assert_eq!(inherited.parent_run_id, "run-step2");
+        assert!(
+            !inherited.prefix_messages.is_empty(),
+            "resolved prefix must carry the captured parent messages"
+        );
+
+        astra_turn_core::fork_capture::restore_fork_flag_raw_for_tests(prev_flag);
     }
 }

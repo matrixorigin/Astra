@@ -4,7 +4,7 @@
 //! at runtime without pre-defined team configurations.
 
 mod fork_cache_probe;
-mod spawner;
+pub(crate) mod spawner;
 
 pub use astra_turn_core::orchestration_context_cache::{
     AgentFindings, CacheStats, CachedFile, Finding, FindingCategory, Knowledge, SharedContextCache,

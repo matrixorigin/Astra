@@ -166,13 +166,25 @@ pub(crate) async fn initialize_multi_agent_runtime(
         delegate_executor = delegate_executor.with_fork_cache_sink(sink);
     }
 
+    // Build the shared fork-prefix store once up-front so both the
+    // spawner and the delegation engine hold the same Arc. Bug B
+    // step 2: without shared state, a prefix captured on a parent
+    // turn (recorded into the spawner's store) would be invisible
+    // to the delegate path — defeating the purpose.
+    let prefix_store: std::sync::Arc<
+        dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink,
+    > = std::sync::Arc::new(
+        astra_turn_core::fork_prefix_store::InMemoryPrefixStore::new(),
+    );
+
     let engine = astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
         registry,
         std::sync::Arc::new(astra_runtime::server::run_engine::RunEngine::new(run_store)),
         tracker,
         std::sync::Arc::new(delegate_executor),
     )
-    .with_mailbox_router(mailbox_router.clone());
+    .with_mailbox_router(mailbox_router.clone())
+    .with_prefix_store(prefix_store.clone());
     state.delegation_engine = Some(std::sync::Arc::new(engine));
 
     let mut spawn_executor = spawn_subrun::CliSpawnAgentExecutor::new(
@@ -219,12 +231,6 @@ pub(crate) async fn initialize_multi_agent_runtime(
         };
         spawn_executor = spawn_executor.with_fork_cache_sink(sink);
     }
-
-    let prefix_store: std::sync::Arc<
-        dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink,
-    > = std::sync::Arc::new(
-        astra_turn_core::fork_prefix_store::InMemoryPrefixStore::new(),
-    );
 
     state.agent_spawner = Some(std::sync::Arc::new(
         astra_runtime::orchestration::DynamicAgentSpawner::with_broadcaster(

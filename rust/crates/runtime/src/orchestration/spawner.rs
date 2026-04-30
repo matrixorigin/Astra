@@ -1118,7 +1118,11 @@ pub enum SpawnError {
 /// telemetry layer (PR 5.6+) may want to emit a structured
 /// "reconstruct failed" event here; currently the failure is silent
 /// because no sink is wired through at this layer.
-fn build_inherited_child_prefix(
+///
+/// Visibility: `pub(crate)` so `server::delegation_engine` can
+/// share the same helper — delegate path wires fork-prefix exactly
+/// the same way the spawner does (Bug B step 2).
+pub(crate) fn build_inherited_child_prefix(
     resolve_outcome: &PrefixResolveOutcome,
 ) -> Option<InheritedChildPrefix> {
     let prefix = match resolve_outcome {

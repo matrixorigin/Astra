@@ -281,15 +281,14 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             tool_cache: super::stream_render::EdgeToolCache::new(
                 resolved_tool_policy.max_identical_tool_calls,
             ),
-            // Delegate path: `inherited_prefix` remains None until
-            // DelegationEngine learns to populate SubRunConfig with
-            // a resolved prefix (follow-up PR). `fork_cache_sink`
-            // propagates from the executor so observability is
-            // ready the moment the engine-side wiring lands — no
-            // additional executor-level change needed then. The
-            // probe helper early-returns on None inherited so
-            // there's no behavior change today.
-            inherited_prefix: None,
+            // Bug B step 2: consume the inherited_prefix the
+            // DelegationEngine resolved (from its prefix_store + the
+            // parent's run id). When None, the child runs fresh —
+            // same as pre-fork-prefix. The probe helper inside
+            // `on_turn_completed` early-returns on None, so a delegate
+            // without resolved inheritance emits nothing, just like
+            // the spawn_agent path.
+            inherited_prefix: config.inherited_prefix.clone(),
             fork_cache_sink: self.fork_cache_sink.clone(),
             fork_cache_probe_state:
                 astra_runtime::orchestration::ForkCacheProbeState::new(),
@@ -325,10 +324,24 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         }
         let user_message = user_parts.join("");
 
-        let messages = vec![
-            json!({ "role": "system", "content": system_prompt }),
-            json!({ "role": "user", "content": user_message }),
-        ];
+        // Bug B step 2: prepend the parent's captured messages when
+        // the engine resolved a ForkPrefix for this delegation.
+        // Mirrors the spawn_subrun ordering: system prompt stays
+        // at [0] as the child's identity, the parent transcript
+        // sits behind it as cacheable context, and the child's
+        // task message is the fresh suffix. When no prefix was
+        // resolved, this degenerates to the pre-fix 2-message layout.
+        let mut messages = Vec::with_capacity(
+            2 + config
+                .inherited_prefix
+                .as_ref()
+                .map_or(0, |ip| ip.prefix_messages.len()),
+        );
+        messages.push(json!({ "role": "system", "content": system_prompt }));
+        if let Some(ref ip) = config.inherited_prefix {
+            messages.extend(ip.prefix_messages.iter().cloned());
+        }
+        messages.push(json!({ "role": "user", "content": user_message }));
 
         let restricted_tools = build_restricted_tools(&profile.skill_filter, &valid_tool_names);
 
