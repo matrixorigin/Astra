@@ -335,7 +335,7 @@ impl ActionAuditEntry {
 /// wire-level field order.
 fn canonical_sha256_hex(value: &serde_json::Value) -> String {
     let canonical = canonicalize(value);
-    let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
+    let bytes = serde_json::to_vec(&canonical).expect("canonical serde_json::Value must serialize");
     let digest = Sha256::digest(&bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -724,7 +724,7 @@ impl ActionPlan {
 
         // Empty tool names.
         for a in &actions {
-            if a.tool.is_empty() {
+            if a.tool.trim().is_empty() {
                 return Err(ActionPlanError::EmptyToolName {
                     action_index: a.index,
                 });

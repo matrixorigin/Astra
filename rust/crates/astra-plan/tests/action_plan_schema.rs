@@ -177,6 +177,20 @@ fn rejects_action_with_empty_tool_name() {
     );
 }
 
+#[test]
+fn rejects_action_with_whitespace_only_tool_name() {
+    let err = ActionPlan::new(
+        vec![Action::new(0, " \t\n ", json!({}))],
+        vec![PostCondition::ToolCallSucceeded { action_index: 0 }],
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(err, ActionPlanError::EmptyToolName { action_index: 0 }),
+        "expected EmptyToolName {{ 0 }}, got {err:?}",
+    );
+}
+
 // ─── Invariant 6: JSON round-trip preserves identity ─────────────────────────
 //
 // ActionPlans cross process boundaries (persistence, replay, audit). Every
@@ -266,6 +280,25 @@ fn serde_rejects_action_with_extra_free_text_field() {
     assert!(
         result.is_err(),
         "typed ActionPlan JSON must reject extra free-text action fields instead of ignoring them",
+    );
+}
+
+#[test]
+fn serde_rejects_action_with_whitespace_only_tool_name() {
+    let invalid = json!({
+        "actions": [
+            {"index": 0, "tool": "   ", "args": {}}
+        ],
+        "expected_postconditions": [
+            {"kind": "tool_call_succeeded", "action_index": 0}
+        ]
+    });
+
+    let result = serde_json::from_value::<ActionPlan>(invalid);
+
+    assert!(
+        result.is_err(),
+        "deserialization must reject whitespace-only tool names just like ActionPlan::new",
     );
 }
 
