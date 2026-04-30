@@ -53,12 +53,17 @@ fn tracking_executor(delay_ms: u64) -> (ToolExecutorFn, Arc<AtomicUsize>) {
 }
 
 #[tokio::test]
-async fn happy_5_read_only_tools_elapsed_close_to_slowest() {
-    let delay = 80u64;
+async fn happy_5_read_only_tools_run_in_parallel() {
+    // Prove parallelism with a deterministic signal (peak concurrency tracked
+    // inside the executor), not with wall-clock timing. Wall-clock bounds are
+    // coupled to scheduler pressure when the whole workspace test suite runs
+    // in parallel, so an "expected 1× delay, allow 3×" check flakes under
+    // load. Peak ≥ 2 proves "not serialized" regardless of CI load.
+    let delay = 40u64;
     let calls: Vec<Value> = (0..5)
         .map(|i| tool_call("read_file", &format!("c{i}")))
         .collect();
-    let (exec, _peak) = tracking_executor(delay);
+    let (exec, peak) = tracking_executor(delay);
 
     let start = Instant::now();
     let outcome = execute_parallel_round(&calls, exec).await;
@@ -66,12 +71,23 @@ async fn happy_5_read_only_tools_elapsed_close_to_slowest() {
 
     assert_eq!(outcome.results.len(), 5);
     assert_eq!(outcome.parallel_count, 5);
-    // Elapsed should be close to 1× delay, far less than sum (5×).
-    // Generous bound to avoid CI flakes: < 3× delay is still proof of parallelism.
+
+    // Primary (deterministic) assertion: more than one tool was in flight
+    // simultaneously, so the batch was not silently serialized.
+    let observed_peak = peak.load(Ordering::SeqCst);
     assert!(
-        elapsed < Duration::from_millis(delay * 3),
-        "5 parallel read-only tools took {elapsed:?}, expected ≪ {}ms",
-        delay * 5
+        observed_peak >= 2,
+        "5 read-only tools must run in parallel; observed peak={observed_peak}",
+    );
+
+    // Loose wall-clock backstop: catch catastrophic regressions where the
+    // batch fully serializes (which would take ≈ 5×delay). The bound is
+    // intentionally much larger than the parallel ideal — it only has to
+    // rule out complete serialization, not assert latency targets.
+    assert!(
+        elapsed < Duration::from_millis(delay * 5),
+        "5 parallel read-only tools took {elapsed:?}; close to serial ({}ms)",
+        delay * 5,
     );
 }
 
