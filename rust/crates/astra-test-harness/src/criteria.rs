@@ -100,6 +100,12 @@ pub struct CriterionResult {
     /// Short human explanation (≤ 200 chars). Surfaces in report
     /// on FAIL; suppressed on PASS unless `--verbose`.
     pub detail: String,
+    /// Optional untruncated diagnostic. The Judger path fills this
+    /// with the full judge text (including all quorum votes) so a
+    /// FAIL report can show everything without re-running. `None`
+    /// when the short `detail` already contains the full story.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub full_detail: Option<String>,
     /// For Judger only: the score the judger returned.
     #[serde(default)]
     pub score: Option<f64>,
@@ -156,6 +162,7 @@ fn evaluate_one(
                         outcome.tools_used
                     )
                 },
+                full_detail: None,
                 score: None,
             }
         }
@@ -165,6 +172,7 @@ fn evaluate_one(
                 criterion: c.clone(),
                 passed: pass,
                 detail: format!("exit_code {} (expected {})", outcome.exit_code, code),
+                full_detail: None,
                 score: None,
             }
         }
@@ -175,6 +183,7 @@ fn evaluate_one(
                 criterion: c.clone(),
                 passed: pass,
                 detail: format!("tool_calls_count={n}, expected {min}..={max}"),
+                full_detail: None,
                 score: None,
             }
         }
@@ -196,14 +205,16 @@ fn evaluate_one(
                                 outcome.stderr.len()
                             )
                         },
-                        score: None,
+                        full_detail: None,
+                score: None,
                     }
                 }
                 Err(e) => CriterionResult {
                     criterion: c.clone(),
                     passed: false,
                     detail: format!("invalid regex /{pattern}/: {e}"),
-                    score: None,
+                    full_detail: None,
+                score: None,
                 },
             }
         }
@@ -220,6 +231,7 @@ fn evaluate_one(
                         outcome.text.len()
                     )
                 },
+                full_detail: None,
                 score: None,
             }
         }
@@ -231,7 +243,8 @@ fn evaluate_one(
                     detail: format!(
                         "session_event_count {event_type} skipped (no session capture; enable with debug_log: true or --capture-session)"
                     ),
-                    score: None,
+                    full_detail: None,
+                score: None,
                 };
             };
             let n = sess.count_events(event_type);
@@ -242,6 +255,7 @@ fn evaluate_one(
                 detail: format!(
                     "session events type={event_type} count={n} (expected >= {min})"
                 ),
+                full_detail: None,
                 score: None,
             }
         }
@@ -253,7 +267,8 @@ fn evaluate_one(
                     detail: format!(
                         "journal_tool_called {name} skipped (no session capture)"
                     ),
-                    score: None,
+                    full_detail: None,
+                score: None,
                 };
             };
             let tools = sess.tools_invoked();
@@ -268,6 +283,7 @@ fn evaluate_one(
                         "journal tool {name} NOT invoked (journal tools: {tools:?})"
                     )
                 },
+                full_detail: None,
                 score: None,
             }
         }
@@ -275,6 +291,7 @@ fn evaluate_one(
             criterion: c.clone(),
             passed: false,
             detail: "judger not yet evaluated (handled by runner)".into(),
+            full_detail: None,
             score: None,
         },
     }

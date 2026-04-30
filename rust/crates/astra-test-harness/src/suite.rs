@@ -201,6 +201,7 @@ mod tests {
             Ok(JudgerScore {
                 score: self.score,
                 rationale: "fixed".into(),
+                full_rationale: "fixed".into(),
             })
         }
     }
@@ -263,6 +264,7 @@ mod tests {
                 Ok(JudgerScore {
                     score: 1.0,
                     rationale: "".into(),
+                    full_rationale: "".into(),
                 })
             }
         }

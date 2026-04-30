@@ -10,9 +10,11 @@ use clap::Parser;
 
 use astra_test_harness::case::Case;
 use astra_test_harness::exec::AstraCliExecutor;
-use astra_test_harness::judger::{AstraCliJudger, JudgerConfig};
+use astra_test_harness::judger::{
+    warn_if_same_family, AstraCliJudger, Judger, JudgerConfig, QuorumAgg, QuorumJudger,
+};
 use astra_test_harness::report::{render, Format};
-use astra_test_harness::runner::RunnerConfig;
+use astra_test_harness::runner::{resolve_models, RunnerConfig};
 use astra_test_harness::suite::{DiskSessionLoader, SessionCaptureMode, SuiteRunner};
 
 #[derive(Debug, Parser)]
@@ -51,6 +53,17 @@ struct Args {
     /// pathological judger call.
     #[arg(long, default_value_t = 60)]
     judger_timeout: u64,
+
+    /// Run the judger N times per criterion and aggregate the scores.
+    /// N=1 (default) matches pre-quorum behavior. N>=3 is recommended
+    /// when you've observed flaky pass/fail from a single call.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    judger_n: u32,
+
+    /// Aggregation for `--judger-n`: `median` (default, robust to one
+    /// outlier), `mean`, `min` (paranoid — one LOW vote kills), `max`.
+    #[arg(long, value_name = "AGG", default_value = "median")]
+    judger_agg: String,
 
     /// Output format: `text` (default, human) or `json` (CI).
     #[arg(long, default_value = "text")]
@@ -101,7 +114,35 @@ async fn main() -> Result<()> {
     };
 
     let executor = AstraCliExecutor::new(runner_cfg.clone());
-    let judger = AstraCliJudger::new(judger_cfg);
+    let cli_judger = AstraCliJudger::new(judger_cfg);
+    let quorum_agg: QuorumAgg = args
+        .judger_agg
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
+    // Build the active judger — either the raw CLI judger (N=1) or a
+    // quorum decorator. Doing this with a boxed trait object keeps the
+    // SuiteRunner signature unchanged.
+    let judger: Box<dyn Judger> = if args.judger_n > 1 {
+        Box::new(QuorumJudger::new(cli_judger, args.judger_n, quorum_agg))
+    } else {
+        Box::new(cli_judger)
+    };
+
+    // Same-family warning: judger scoring its own family is a known
+    // source of inflated scores. Resolve the full set of tested models
+    // from the cases + fallback so the advisor sees every collision.
+    if !args.no_judger {
+        let mut tested: Vec<String> = Vec::new();
+        for c in &cases {
+            if let Ok(ms) = resolve_models(c, &runner_cfg) {
+                tested.extend(ms);
+            }
+        }
+        tested.sort();
+        tested.dedup();
+        warn_if_same_family(&args.judger_model, &tested);
+    }
+
     let session_loader = DiskSessionLoader;
 
     let session_mode = if args.capture_session || args.verbose {
@@ -112,7 +153,7 @@ async fn main() -> Result<()> {
 
     let runner = SuiteRunner {
         executor: &executor,
-        judger: &judger,
+        judger: judger.as_ref(),
         session_loader: &session_loader,
         runner_cfg,
         no_judger: args.no_judger,

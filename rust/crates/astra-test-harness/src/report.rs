@@ -99,6 +99,19 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         for c in &run.criteria {
             let m = if c.passed { " ok " } else { "FAIL" };
             s.push_str(&format!("    [{m}] {}\n", c.detail));
+            // FAIL or --verbose: dump the untruncated diagnostic if
+            // the criterion carries one (judger quorum votes, etc.).
+            // Indented block so it's visually nested under the fail.
+            if (!c.passed || verbose)
+                && let Some(full) = c.full_detail.as_deref()
+                && full != c.detail
+            {
+                for line in full.lines() {
+                    s.push_str("        ");
+                    s.push_str(line);
+                    s.push('\n');
+                }
+            }
         }
         if verbose || !run.passed {
             if !run.outcome.text.is_empty() {
@@ -185,6 +198,7 @@ mod tests {
                     },
                     passed: true,
                     detail: "tool Read was called".into(),
+                    full_detail: None,
                     score: None,
                 }],
                 session: None,
