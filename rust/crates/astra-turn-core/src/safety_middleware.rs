@@ -1824,8 +1824,7 @@ mod tests {
         // Backticks are always blocked in Strict mode regardless of command.
         // Uses check_shell_command_safety_with_mode directly to avoid depending
         // on the process-global trust mode (which other tests may mutate).
-        let reason =
-            check_shell_command_safety_with_mode("echo `cat file.txt`", TrustMode::Strict);
+        let reason = check_shell_command_safety_with_mode("echo `cat file.txt`", TrustMode::Strict);
         assert!(
             reason
                 .as_deref()
