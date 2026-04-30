@@ -1115,7 +1115,7 @@ async fn edge_tool_delivery_emits_tool_request_and_waits_for_result() {
     assert_eq!(status, StatusCode::OK);
 
     // Wait for the stream to complete.
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+    let _events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("stream timed out")
         .expect("reader task failed");
