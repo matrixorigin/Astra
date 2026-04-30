@@ -824,7 +824,6 @@ fn load_turn_messages(
     openai_messages_from_repl_history(history, current_message)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::circuit_breaker_config_from_tool_selection;

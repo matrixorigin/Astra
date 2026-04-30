@@ -204,7 +204,7 @@ pub(super) async fn handle_slash_command(
                                 .map(|o| {
                                     astra_turn_core::thinking_config::thinking_suffix_for(&o.config)
                                 })
-                                .unwrap_or("");
+                                .unwrap_or_default();
                             format!("{chosen}{suffix}")
                         } else {
                             // Cancelled thinking selection — use model without thinking

@@ -54,6 +54,103 @@ fn print_model_load_server_result(body: &str, model_name: &str) {
     }
 }
 
+fn yaml_str(entry: &serde_yaml_ng::Value, key: &str) -> Option<String> {
+    entry
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+}
+
+fn yaml_i64(entry: &serde_yaml_ng::Value, key: &str) -> Option<i64> {
+    entry.get(key).and_then(|v| v.as_i64())
+}
+
+fn yaml_f64(entry: &serde_yaml_ng::Value, key: &str) -> Option<f64> {
+    entry.get(key).and_then(|v| v.as_f64())
+}
+
+fn yaml_str_vec(entry: &serde_yaml_ng::Value, key: &str) -> Option<Vec<String>> {
+    entry.get(key).and_then(|v| v.as_sequence()).map(|seq| {
+        seq.iter()
+            .filter_map(|item| item.as_str().map(ToString::to_string))
+            .collect()
+    })
+}
+
+/// Merge optional YAML model fields into an existing JSON object in-place.
+/// Handles: description, context_window, max_completion_tokens, tags,
+/// supported_parameters, architecture, pricing_prompt/completion.
+fn apply_optional_yaml_fields(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    entry: &serde_yaml_ng::Value,
+) {
+    if let Some(v) = yaml_str(entry, "description") {
+        obj.insert("description".into(), serde_json::json!(v));
+    }
+    if let Some(v) = yaml_i64(entry, "context_window") {
+        obj.insert("context_window".into(), serde_json::json!(v));
+    }
+    if let Some(v) = yaml_i64(entry, "max_completion_tokens") {
+        obj.insert("max_completion_tokens".into(), serde_json::json!(v));
+    }
+    if let Some(v) = yaml_str_vec(entry, "tags") {
+        obj.insert("tags".into(), serde_json::json!(v));
+    }
+    if let Some(v) = yaml_str_vec(entry, "supported_parameters") {
+        obj.insert("supported_parameters".into(), serde_json::json!(v));
+    }
+    if let Some(v) = yaml_str(entry, "architecture") {
+        obj.insert("architecture".into(), serde_json::json!(v));
+    }
+    let prompt_price = yaml_f64(entry, "pricing_prompt");
+    let completion_price = yaml_f64(entry, "pricing_completion");
+    if prompt_price.is_some() || completion_price.is_some() {
+        obj.insert(
+            "pricing".into(),
+            serde_json::json!({
+                "prompt": prompt_price.unwrap_or(0.0),
+                "completion": completion_price.unwrap_or(0.0),
+            }),
+        );
+    }
+}
+
+fn build_model_update_payload(
+    entry: &serde_yaml_ng::Value,
+    provider: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "api_key": api_key,
+        "provider": provider,
+    });
+    let obj = payload.as_object_mut().unwrap();
+    if let Some(v) = base_url {
+        obj.insert("base_url".into(), serde_json::json!(v));
+    }
+    apply_optional_yaml_fields(obj, entry);
+    payload
+}
+
+fn build_model_create_payload(
+    entry: &serde_yaml_ng::Value,
+    name: &str,
+    provider: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "name": name,
+        "provider": provider,
+        "api_key": api_key,
+        "base_url": base_url,
+    });
+    let obj = payload.as_object_mut().unwrap();
+    apply_optional_yaml_fields(obj, entry);
+    payload
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let cli = Cli::parse();
@@ -321,12 +418,13 @@ async fn main() -> Result<(), String> {
                     .get("base_url")
                     .and_then(serde_yaml_ng::Value::as_str)
                     .map(ToString::to_string);
-                let payload = serde_json::json!({
-                    "name": model_name,
-                    "provider": provider,
-                    "api_key": api_key,
-                    "base_url": base_url
-                });
+                let payload = build_model_create_payload(
+                    entry,
+                    model_name,
+                    provider,
+                    api_key,
+                    base_url.as_deref(),
+                );
                 match api
                     .post_bearer_path_json_text(&token, paths::MODELS, &payload)
                     .await
@@ -344,11 +442,12 @@ async fn main() -> Result<(), String> {
                                     "skipped (already exists): {model_name} — need non-empty api_key in YAML to use --update-existing"
                                 );
                             } else {
-                                let mut upd =
-                                    serde_json::json!({ "api_key": api_key, "provider": provider });
-                                if let Some(ref u) = base_url {
-                                    upd["base_url"] = serde_json::json!(u);
-                                }
+                                let upd = build_model_update_payload(
+                                    entry,
+                                    provider,
+                                    api_key,
+                                    base_url.as_deref(),
+                                );
                                 let body = api
                                     .put_bearer_path_json_text(
                                         &token,
