@@ -151,7 +151,10 @@ fn stop_on_failure_halts_handler_and_marks_remaining_unmet() {
 
     // Postcondition 0 met; 1 failed ⇒ unmet; 2 and 3 never observed ⇒ unmet.
     assert_eq!(result.met.len(), 1);
-    assert_eq!(result.met[0], PostCondition::ToolCallSucceeded { action_index: 0 });
+    assert_eq!(
+        result.met[0],
+        PostCondition::ToolCallSucceeded { action_index: 0 }
+    );
     let unmet_indices: Vec<u32> = result
         .unmet
         .iter()
@@ -210,7 +213,9 @@ fn handler_receives_original_tool_and_args() {
     .unwrap();
 
     let result = Executor::new(ExecutionPolicy::RunAll).run(&plan, &EchoHandler);
-    let ObservedOutcome::ToolCall { tool, result: r, .. } = &result.observations[0];
+    let ObservedOutcome::ToolCall {
+        tool, result: r, ..
+    } = &result.observations[0];
     assert_eq!(tool, "write_file");
     assert_eq!(
         r["echo_args"],

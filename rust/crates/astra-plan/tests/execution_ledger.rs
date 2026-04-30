@@ -145,6 +145,21 @@ fn zero_capacity_is_rejected_at_construction() {
     );
 }
 
+#[test]
+fn zero_capacity_is_rejected_during_deserialization() {
+    let encoded = json!({
+        "capacity": 0,
+        "entries": []
+    });
+
+    let result = serde_json::from_value::<ExecutionLedger>(encoded);
+
+    assert!(
+        result.is_err(),
+        "deserializing capacity=0 would make record() loop forever; reject it at the boundary",
+    );
+}
+
 // ─── Invariant 7: serde round-trip — ledger persists across process ────────
 //
 // The self-awareness system assumes ledgers can be snapshotted and rehydrated
@@ -164,6 +179,25 @@ fn serde_round_trip_preserves_capacity_len_order_and_contents() {
     let orig_tags: Vec<String> = ledger.iter().map(extract_tag).collect();
     let decoded_tags: Vec<String> = decoded.iter().map(extract_tag).collect();
     assert_eq!(decoded_tags, orig_tags);
+}
+
+#[test]
+fn over_capacity_snapshot_is_rejected_during_deserialization() {
+    let mut ledger = ExecutionLedger::new(1).unwrap();
+    ledger.record(run("one", "one"));
+    let mut encoded = serde_json::to_value(&ledger).unwrap();
+    let first_entry = encoded["entries"][0].clone();
+    encoded["entries"]
+        .as_array_mut()
+        .expect("entries array")
+        .push(first_entry);
+
+    let result = serde_json::from_value::<ExecutionLedger>(encoded);
+
+    assert!(
+        result.is_err(),
+        "deserialization must not admit snapshots whose entries already exceed capacity",
+    );
 }
 
 // ─── Invariant 8: decoded ledger still honors overflow semantics ────────────

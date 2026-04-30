@@ -89,14 +89,23 @@ fn driver_and_executor_produce_equivalent_results_for_every_pattern() {
             }
             let r_driver = driver.finish();
 
-            assert_eq!(r_exec.observations, r_driver.observations,
-                "observations differ for policy={policy:?} pattern={pattern:?}");
-            assert_eq!(r_exec.met, r_driver.met,
-                "met differs for policy={policy:?} pattern={pattern:?}");
-            assert_eq!(r_exec.unmet, r_driver.unmet,
-                "unmet differs for policy={policy:?} pattern={pattern:?}");
-            assert_eq!(r_exec.audit.len(), r_driver.audit.len(),
-                "audit len differs for policy={policy:?} pattern={pattern:?}");
+            assert_eq!(
+                r_exec.observations, r_driver.observations,
+                "observations differ for policy={policy:?} pattern={pattern:?}"
+            );
+            assert_eq!(
+                r_exec.met, r_driver.met,
+                "met differs for policy={policy:?} pattern={pattern:?}"
+            );
+            assert_eq!(
+                r_exec.unmet, r_driver.unmet,
+                "unmet differs for policy={policy:?} pattern={pattern:?}"
+            );
+            assert_eq!(
+                r_exec.audit.len(),
+                r_driver.audit.len(),
+                "audit len differs for policy={policy:?} pattern={pattern:?}"
+            );
             for (ea, da) in r_exec.audit.iter().zip(r_driver.audit.iter()) {
                 assert_eq!(ea.action_index, da.action_index);
                 assert_eq!(ea.tool, da.tool);
@@ -158,7 +167,13 @@ fn outcome_with_wrong_index_is_rejected_with_expected_and_got() {
 
     let err = driver.record(outcome(7, true)).unwrap_err();
     assert!(
-        matches!(err, DriverError::OutcomeIndexMismatch { expected: 0, got: 7 }),
+        matches!(
+            err,
+            DriverError::OutcomeIndexMismatch {
+                expected: 0,
+                got: 7
+            }
+        ),
         "expected OutcomeIndexMismatch {{expected:0, got:7}}, got {err:?}",
     );
 }

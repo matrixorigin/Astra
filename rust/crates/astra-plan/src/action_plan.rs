@@ -17,7 +17,7 @@
 //! Drift any of these and the observation diff silently misses cases.
 
 use astra_turn_types::{ToolIdempotency, classify_tool_idempotency};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,6 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Intentionally minimal. No `description`, no `narrative`, no `reasoning`.
 /// Free text belongs in the decomposition phase (`TaskPlan`), not here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Action {
     index: u32,
     tool: String,
@@ -69,6 +70,7 @@ impl Action {
 /// free-form intent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum PostCondition {
     /// The tool call at `action_index` finished with success semantics.
     /// (What "success" means for a given tool is the executor's contract.)
@@ -114,6 +116,7 @@ impl PostCondition {
 /// when the matcher has a real new case — not speculatively.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum ObservedOutcome {
     /// A tool invocation completed. `success` encodes the tool's own
     /// success-or-failure signal; `result` is opaque audit payload (must not
@@ -186,6 +189,8 @@ pub enum ActionPlanError {
     DuplicateActionIndex { index: u32 },
     /// Action indices aren't `0..N`; observation diff requires dense keys.
     NonDenseIndices { observed: Vec<u32> },
+    /// An action's index does not match its position in the action vector.
+    ActionIndexPositionMismatch { position: u32, index: u32 },
     /// A postcondition references an action that doesn't exist.
     DanglingPostCondition { action_index: u32 },
     /// An action has no postcondition covering it — it would execute without
@@ -206,17 +211,14 @@ impl std::fmt::Display for ActionPlanError {
             Self::NonDenseIndices { observed } => {
                 write!(f, "action indices must be 0..N, got {observed:?}")
             }
+            Self::ActionIndexPositionMismatch { position, index } => {
+                write!(f, "action at position {position} has index {index}")
+            }
             Self::DanglingPostCondition { action_index } => {
-                write!(
-                    f,
-                    "postcondition references unknown action {action_index}"
-                )
+                write!(f, "postcondition references unknown action {action_index}")
             }
             Self::UncoveredAction { action_index } => {
-                write!(
-                    f,
-                    "action {action_index} has no postcondition covering it"
-                )
+                write!(f, "action {action_index} has no postcondition covering it")
             }
         }
     }
@@ -227,10 +229,27 @@ impl std::error::Error for ActionPlanError {}
 // ─── ActionPlan ──────────────────────────────────────────────────────────────
 
 /// A dense, typed, verifier-ready plan step.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ActionPlan {
     actions: Vec<Action>,
     expected_postconditions: Vec<PostCondition>,
+}
+
+impl<'de> Deserialize<'de> for ActionPlan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ActionPlanWire {
+            actions: Vec<Action>,
+            expected_postconditions: Vec<PostCondition>,
+        }
+
+        let wire = ActionPlanWire::deserialize(deserializer)?;
+        Self::new(wire.actions, wire.expected_postconditions).map_err(serde::de::Error::custom)
+    }
 }
 
 // ─── Executor ────────────────────────────────────────────────────────────────
@@ -259,6 +278,7 @@ pub trait ActionHandler {
 /// `met`/`unmet` partition the plan's `expected_postconditions`;
 /// `audit` records what actually ran in the exact order it ran.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionResult {
     pub observations: Vec<ObservedOutcome>,
     pub met: Vec<PostCondition>,
@@ -271,6 +291,7 @@ pub struct ExecutionResult {
 /// `observations[i]` one-to-one; both end at the same index when
 /// `ExecutionPolicy::StopOnFailure` halts execution early.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionAuditEntry {
     pub action_index: u32,
     pub tool: String,
@@ -414,7 +435,10 @@ impl std::fmt::Display for DriverError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoPendingAction => {
-                write!(f, "record() called with no pending action; call next_action() first")
+                write!(
+                    f,
+                    "record() called with no pending action; call next_action() first"
+                )
             }
             Self::OutcomeIndexMismatch { expected, got } => write!(
                 f,
@@ -490,7 +514,8 @@ impl<'a> ExecutionDriver<'a> {
         }
 
         let action = &self.plan.actions[self.cursor];
-        self.audit.push(ActionAuditEntry::from_run(action, &outcome));
+        self.audit
+            .push(ActionAuditEntry::from_run(action, &outcome));
 
         // Halt decision uses the same rule as Executor::run.
         let satisfies_this_action = self
@@ -578,12 +603,18 @@ pub enum ExecutionLedgerError {
     /// A ledger with capacity 0 is a silent memory hole — every `record`
     /// would be dropped, leaving `latest()` forever `None`. Reject loudly.
     ZeroCapacity,
+    /// A persisted snapshot already exceeds its declared bound.
+    EntriesExceedCapacity { len: usize, capacity: usize },
 }
 
 impl std::fmt::Display for ExecutionLedgerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ZeroCapacity => write!(f, "ExecutionLedger capacity must be > 0"),
+            Self::EntriesExceedCapacity { len, capacity } => write!(
+                f,
+                "ExecutionLedger snapshot has {len} entries but capacity is {capacity}"
+            ),
         }
     }
 }
@@ -596,10 +627,41 @@ impl std::error::Error for ExecutionLedgerError {}
 /// Iteration is oldest → newest so renderers and replay both see a stable
 /// direction. `latest()` is the load-bearing accessor: the self-model reads
 /// it (and only it) to surface unmet postconditions to the next turn.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ExecutionLedger {
     capacity: usize,
     entries: std::collections::VecDeque<ExecutionResult>,
+}
+
+impl<'de> Deserialize<'de> for ExecutionLedger {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ExecutionLedgerWire {
+            capacity: usize,
+            entries: std::collections::VecDeque<ExecutionResult>,
+        }
+
+        let wire = ExecutionLedgerWire::deserialize(deserializer)?;
+        if wire.capacity == 0 {
+            return Err(serde::de::Error::custom(ExecutionLedgerError::ZeroCapacity));
+        }
+        if wire.entries.len() > wire.capacity {
+            return Err(serde::de::Error::custom(
+                ExecutionLedgerError::EntriesExceedCapacity {
+                    len: wire.entries.len(),
+                    capacity: wire.capacity,
+                },
+            ));
+        }
+        Ok(Self {
+            capacity: wire.capacity,
+            entries: wire.entries,
+        })
+    }
 }
 
 impl ExecutionLedger {
@@ -683,6 +745,16 @@ impl ActionPlan {
         if seen != expected {
             let observed: Vec<u32> = seen.into_iter().collect();
             return Err(ActionPlanError::NonDenseIndices { observed });
+        }
+
+        for (position, action) in actions.iter().enumerate() {
+            let position = position as u32;
+            if action.index != position {
+                return Err(ActionPlanError::ActionIndexPositionMismatch {
+                    position,
+                    index: action.index,
+                });
+            }
         }
 
         // Dangling postconditions.

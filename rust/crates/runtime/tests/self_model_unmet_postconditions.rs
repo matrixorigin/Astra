@@ -82,9 +82,9 @@ fn attached_unmet_postconditions_are_visible_on_the_struct() {
 // part of the contract.
 #[test]
 fn prompt_renders_unmet_postconditions_under_a_dedicated_header() {
-    let unmet = vec![UnmetPostCondition::from(&PostCondition::ToolCallSucceeded {
-        action_index: 3,
-    })];
+    let unmet = vec![UnmetPostCondition::from(
+        &PostCondition::ToolCallSucceeded { action_index: 3 },
+    )];
     let sm = minimal_self_model().with_unmet_postconditions(unmet);
     let rendered = sm.to_system_prompt_section();
 
@@ -155,7 +155,9 @@ fn prompt_bounded_for_large_unmet_lists_with_truncation_marker() {
     // Bound check: the section dedicated to unmet postconditions must not
     // contain all 500 indices verbatim. We assert a generous upper bound.
     let count_hits = (0u32..500)
-        .filter(|i| rendered.contains(&format!("action {i}")) || rendered.contains(&format!("#{i}")))
+        .filter(|i| {
+            rendered.contains(&format!("action {i}")) || rendered.contains(&format!("#{i}"))
+        })
         .count();
     assert!(
         count_hits <= 20,

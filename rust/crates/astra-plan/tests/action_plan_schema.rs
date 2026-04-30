@@ -133,6 +133,32 @@ fn rejects_duplicate_action_indices() {
     );
 }
 
+#[test]
+fn rejects_out_of_order_action_indices_even_when_dense() {
+    let err = ActionPlan::new(
+        vec![
+            Action::new(1, "bash", json!({"cmd": "second"})),
+            Action::new(0, "bash", json!({"cmd": "first"})),
+        ],
+        vec![
+            PostCondition::ToolCallSucceeded { action_index: 0 },
+            PostCondition::ToolCallSucceeded { action_index: 1 },
+        ],
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            ActionPlanError::ActionIndexPositionMismatch {
+                position: 0,
+                index: 1
+            }
+        ),
+        "expected ActionIndexPositionMismatch {{ position: 0, index: 1 }}, got {err:?}",
+    );
+}
+
 // ─── Invariant 5: actions must name a non-empty tool ─────────────────────────
 //
 // The tool name is the anchor for idempotency classification and audit. An
@@ -185,6 +211,64 @@ fn serde_round_trip_preserves_actions_and_postconditions() {
     );
 }
 
+#[test]
+fn serde_rejects_invalid_plan_instead_of_bypassing_constructor() {
+    let invalid = json!({
+        "actions": [
+            {"index": 0, "tool": "bash", "args": {}}
+        ],
+        "expected_postconditions": [
+            {"kind": "tool_call_succeeded", "action_index": 99}
+        ]
+    });
+
+    let result = serde_json::from_value::<ActionPlan>(invalid);
+
+    assert!(
+        result.is_err(),
+        "deserialization must enforce ActionPlan::new invariants; dangling postconditions cannot enter via JSON",
+    );
+}
+
+#[test]
+fn serde_rejects_empty_plan_instead_of_fabricating_noop_execution() {
+    let invalid = json!({
+        "actions": [],
+        "expected_postconditions": []
+    });
+
+    let result = serde_json::from_value::<ActionPlan>(invalid);
+
+    assert!(
+        result.is_err(),
+        "deserialization must reject empty plans just like ActionPlan::new",
+    );
+}
+
+#[test]
+fn serde_rejects_action_with_extra_free_text_field() {
+    let invalid = json!({
+        "actions": [
+            {
+                "index": 0,
+                "tool": "bash",
+                "args": {},
+                "description": "free-text intent must not be accepted here"
+            }
+        ],
+        "expected_postconditions": [
+            {"kind": "tool_call_succeeded", "action_index": 0}
+        ]
+    });
+
+    let result = serde_json::from_value::<ActionPlan>(invalid);
+
+    assert!(
+        result.is_err(),
+        "typed ActionPlan JSON must reject extra free-text action fields instead of ignoring them",
+    );
+}
+
 // ─── Invariant 7: ActionPlan is distinct from TaskPlan narrative ─────────────
 //
 // Guard test: typed ActionPlan must not accidentally re-introduce free-text
@@ -203,7 +287,8 @@ fn action_public_surface_is_tool_and_args_only() {
     let obj = v.as_object().expect("Action must serialize to object");
 
     let keys: std::collections::BTreeSet<&str> = obj.keys().map(|k| k.as_str()).collect();
-    let expected: std::collections::BTreeSet<&str> = ["index", "tool", "args"].into_iter().collect();
+    let expected: std::collections::BTreeSet<&str> =
+        ["index", "tool", "args"].into_iter().collect();
 
     assert_eq!(
         keys, expected,

@@ -15,8 +15,8 @@
 //! breaks the "self-model sees the current truth" invariant.
 
 use astra_plan::action_plan::{
-    Action, ActionHandler, ActionPlan, ExecutionLedger, ExecutionPolicy, Executor,
-    ObservedOutcome, PostCondition,
+    Action, ActionHandler, ActionPlan, ExecutionLedger, ExecutionPolicy, Executor, ObservedOutcome,
+    PostCondition,
 };
 use astra_runtime::self_model::{SelfModel, UnmetPostCondition};
 use serde_json::json;
@@ -227,5 +227,10 @@ fn ledger_binding_wins_over_previously_set_unmet_regardless_of_order() {
 
     assert_eq!(sm_a.unmet_postconditions, sm_b.unmet_postconditions);
     // And neither retains the "manual" index 100.
-    assert!(!sm_a.unmet_postconditions.iter().any(|u| u.action_index == 100));
+    assert!(
+        !sm_a
+            .unmet_postconditions
+            .iter()
+            .any(|u| u.action_index == 100)
+    );
 }

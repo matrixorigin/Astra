@@ -75,7 +75,10 @@ fn audit_idempotency_matches_central_registry() {
     let result = Executor::new(ExecutionPolicy::RunAll).run(&plan, &OkHandler);
 
     assert_eq!(result.audit[0].idempotency, ToolIdempotency::PureRead);
-    assert_eq!(result.audit[1].idempotency, ToolIdempotency::IdempotentWrite);
+    assert_eq!(
+        result.audit[1].idempotency,
+        ToolIdempotency::IdempotentWrite
+    );
     assert_eq!(result.audit[2].idempotency, ToolIdempotency::NonIdempotent);
     assert_eq!(result.audit[3].idempotency, ToolIdempotency::NonIdempotent);
 }
@@ -212,8 +215,7 @@ fn execution_result_serde_preserves_audit() {
     let result = Executor::new(ExecutionPolicy::RunAll).run(&plan, &OkHandler);
 
     let encoded = serde_json::to_string(&result).unwrap();
-    let decoded: astra_plan::action_plan::ExecutionResult =
-        serde_json::from_str(&encoded).unwrap();
+    let decoded: astra_plan::action_plan::ExecutionResult = serde_json::from_str(&encoded).unwrap();
 
     assert_eq!(decoded.audit.len(), result.audit.len());
     for (a, b) in decoded.audit.iter().zip(result.audit.iter()) {

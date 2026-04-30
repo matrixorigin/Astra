@@ -569,8 +569,7 @@ impl SelfModel {
         ledger: &astra_plan::action_plan::ExecutionLedger,
     ) -> Self {
         if let Some(latest_unmet) = ledger.latest_unmet() {
-            self.unmet_postconditions =
-                latest_unmet.iter().map(UnmetPostCondition::from).collect();
+            self.unmet_postconditions = latest_unmet.iter().map(UnmetPostCondition::from).collect();
         }
         self
     }

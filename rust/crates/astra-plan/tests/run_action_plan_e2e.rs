@@ -51,8 +51,9 @@ async fn read_existing_file_produces_met_postcondition_with_output() {
     assert_eq!(result.audit.len(), 1);
 
     // The real tool output surfaces in the observation payload.
-    let astra_plan::action_plan::ObservedOutcome::ToolCall { result: payload, .. } =
-        &result.observations[0];
+    let astra_plan::action_plan::ObservedOutcome::ToolCall {
+        result: payload, ..
+    } = &result.observations[0];
     let output = payload["output"].as_str().unwrap_or("");
     assert!(
         output.contains("world"),
@@ -212,9 +213,9 @@ async fn run_all_produces_one_audit_and_one_observation_per_action() {
 
     let plan = ActionPlan::new(
         vec![
-            Action::new(0, "read_file", json!({"path": "a.txt"})),       // ok
+            Action::new(0, "read_file", json!({"path": "a.txt"})), // ok
             Action::new(1, "read_file", json!({"path": "missing.txt"})), // fail
-            Action::new(2, "read_file", json!({"path": "c.txt"})),       // ok
+            Action::new(2, "read_file", json!({"path": "c.txt"})), // ok
         ],
         vec![
             PostCondition::ToolCallSucceeded { action_index: 0 },
