@@ -30,16 +30,19 @@ criteria:
     name: spawn_agent
   - type: stderr_matches
     pattern: '\[fork-cache\]'
+  # Either clean reuse or a classified drift satisfies the pipeline
+  # contract. G1 attribution (non-empty changed_tools) is scored
+  # below by the judger reading the stderr data fence.
+  - type: fork_cache_class
+    expect: [hit, partial_drift]
   - type: judger
     question: |
-      Look at the [fork-cache] events in stderr. For THIS case,
-      either:
-        (a) a `hit` event is OK (prefix still matched), OR
-        (b) a `partial_drift` event that names specific changed tools
-            in its `changed_tools` field (a non-empty list, not the
-            empty vec![] of the pre-G1 bug).
-      Score 1.0 if the event carries attribution — either a clean
-      hit or a partial_drift with a populated changed_tools list.
-      Score 0.3 if partial_drift but `changed_tools` is empty
-      (G1 regression). Score 0.0 if no event appears.
+      Look at the [fork-cache] event in the stderr data fence. If the
+      classification is `partial_drift`, does the event's
+      `changed_tools` field contain at least one tool name? A
+      populated `changed_tools` list is the G1 evidence we're
+      probing for. An empty list with class=partial_drift is the
+      pre-G1 regression. Score 1.0 for clean hit OR partial_drift
+      with non-empty changed_tools. Score 0.3 for partial_drift
+      with empty changed_tools. Score 0.0 if no event visible.
     threshold: 0.7

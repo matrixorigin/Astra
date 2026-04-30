@@ -37,14 +37,15 @@ criteria:
     # Fallback MUST emit a fork-cache event — the mismatch is a
     # classifiable outcome, not a silent skip.
     pattern: '\[fork-cache\]'
+  # Provider mismatch → validation_failed or fallback; both are
+  # acceptable soft-fallback classifications.
+  - type: fork_cache_class
+    expect: [validation_failed, fallback]
   - type: judger
     question: |
-      Did the stderr [fork-cache] event indicate a provider mismatch
-      (validation_error or fallback-with-reason "ProviderMismatch"),
-      AND did the child still complete (no panic, no crash)? A
-      correct run: event classifies as validation-failed / fallback,
-      child run succeeded without the prefix, final text surfaces
-      the child's reply or at least acknowledges the fallback.
-      Score 1.0 for clean soft-fallback. Score 0.3 for crash or
-      missing telemetry. Score 0.0 for panic or corrupt prefix reuse.
+      The deterministic fork_cache_class criterion already pinned
+      that a soft-fallback event appeared. Score whether the child
+      still completed cleanly: did the final text either surface the
+      child's reply OR transparently acknowledge the fallback? A
+      correct run doesn't crash and doesn't silently claim success.
     threshold: 0.7

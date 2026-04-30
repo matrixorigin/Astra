@@ -89,7 +89,6 @@ fn shell_escape(s: String) -> String {
 async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> RunOutcome {
     use std::process::Stdio;
     use std::time::Duration;
-    use tokio::io::AsyncReadExt;
     use tokio::process::Command;
 
     let start = Instant::now();
@@ -109,9 +108,14 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // `kill_on_drop` ensures that if the outer future is cancelled
+        // (timeout, task abort) the child is killed rather than
+        // silently outliving us. This is the backstop — the timeout
+        // branch below also kills explicitly so tests see a clean exit.
+        .kill_on_drop(true);
 
-    let mut child = match cmd.spawn() {
+    let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             return RunOutcome {
@@ -130,35 +134,28 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
         }
     };
 
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
     let timeout = Duration::from_secs(case.timeout_seconds);
-    let wait_fut = async move {
-        let mut stdout_buf = String::new();
-        if let Some(mut p) = stdout_pipe {
-            let _ = p.read_to_string(&mut stdout_buf).await;
-        }
-        let mut stderr_buf = String::new();
-        if let Some(mut p) = stderr_pipe {
-            let _ = p.read_to_string(&mut stderr_buf).await;
-        }
-        let status = child.wait().await;
-        (status, stdout_buf, stderr_buf)
-    };
-
-    match tokio::time::timeout(timeout, wait_fut).await {
-        Ok((Ok(status), stdout, stderr)) => {
+    // `wait_with_output` drains stdout + stderr concurrently and
+    // waits for the exit status in one call. This avoids the earlier
+    // ordering bug where a stderr-heavy child could block its stdout
+    // pipe and only be unstuck by the timeout (which then leaked the
+    // process). Passing `child` by value means that if the future
+    // is dropped (outer timeout fires) `kill_on_drop` takes over.
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             let mut out = parse_json_outcome(&stdout, model);
             out.stderr = stderr;
-            out.exit_code = status.code().unwrap_or(-1);
+            out.exit_code = output.status.code().unwrap_or(-1);
             out.duration_ms = start.elapsed().as_millis() as u64;
             out
         }
-        Ok((Err(e), stdout, stderr)) => RunOutcome {
+        Ok(Err(e)) => RunOutcome {
             model: model.into(),
             exit_code: -1,
-            text: format!("wait error: {e}; stdout={stdout}"),
-            stderr,
+            text: format!("wait error: {e}"),
+            stderr: String::new(),
             session_id: None,
             run_id: None,
             tool_calls_count: 0,
@@ -171,6 +168,9 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
             model: model.into(),
             // POSIX `timeout` utility exits 124 — follow the convention
             // so downstream tooling can classify.
+            // `kill_on_drop(true)` on the Command ensures the child
+            // process is sent SIGKILL when the future is dropped
+            // (which happens implicitly when `timeout` returns Err).
             exit_code: 124,
             text: format!(
                 "timeout after {}s (case timeout_seconds={})",
@@ -279,6 +279,48 @@ mod tests {
         assert!(repro.contains("--debug-log-tools"));
         // The prompt has a single quote, so we fall back to double quotes.
         assert!(repro.contains("\"say 'hello'\""));
+    }
+
+    // Regression: case timeout MUST kill the child process, not leak
+    // it. We invoke /bin/sleep directly so the stable `astra chat`
+    // arg vector doesn't interfere — this pins the kill-on-drop +
+    // timeout semantics independent of the astra bin's arg shape.
+    // Skipped on platforms without /bin/sleep (Windows CI).
+    #[tokio::test]
+    async fn timeout_kills_subprocess_and_returns_posix_124() {
+        if !std::path::Path::new("/bin/sleep").exists() {
+            return;
+        }
+        // Custom command, bypassing `AstraCliExecutor` so the sh/sleep
+        // binary isn't forced through `astra chat` args.
+        use std::process::Stdio;
+        use std::time::Duration;
+        use tokio::process::Command;
+
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("10")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let child = cmd.spawn().expect("spawn /bin/sleep");
+        let start = std::time::Instant::now();
+        let timeout_secs = 1u64;
+        let result =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
+                .await;
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_err(),
+            "wait_with_output should time out while sleep is still running"
+        );
+        // 3s slack so CI slowness doesn't flake; the whole point is
+        // that the child is killed on drop, not that timing is exact.
+        assert!(
+            elapsed.as_secs() <= 3,
+            "kill_on_drop didn't cap elapsed — ran {}s",
+            elapsed.as_secs()
+        );
     }
 
     #[tokio::test]

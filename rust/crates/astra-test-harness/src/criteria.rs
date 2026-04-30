@@ -64,6 +64,25 @@ pub enum Criterion {
     /// session is loaded (see `SessionEventCount`).
     JournalToolCalled { name: String },
 
+    /// Passes when at least one `[fork-cache]` JSON event in stderr
+    /// has its `class` field in `expect`. Deterministic alternative
+    /// to letting a judger classify the event from prose — pins the
+    /// exact runtime contract (class is one of hit / miss /
+    /// partial_drift / validation_failed / fallback).
+    ///
+    /// Example:
+    /// ```yaml
+    /// - type: fork_cache_class
+    ///   expect: [hit]
+    /// ```
+    ForkCacheClass {
+        /// Accepted class names. A stderr event whose `class` equals
+        /// any of these passes. Case-sensitive match against the
+        /// serialized enum name in the event.
+        #[serde(default)]
+        expect: Vec<String>,
+    },
+
     /// LLM judger — calls a scoring model with the prompt +
     /// context and expects a number in [0.0, 1.0]. Passes when
     /// score >= `threshold`. Most expensive; put last.
@@ -287,6 +306,27 @@ fn evaluate_one(
                 score: None,
             }
         }
+        Criterion::ForkCacheClass { expect } => {
+            let hits = parse_fork_cache_classes(&outcome.stderr);
+            let pass = hits.iter().any(|c| expect.iter().any(|e| e == c));
+            CriterionResult {
+                criterion: c.clone(),
+                passed: pass,
+                detail: if pass {
+                    format!(
+                        "fork-cache event with class in {expect:?} observed (all seen: {hits:?})"
+                    )
+                } else if hits.is_empty() {
+                    "no [fork-cache] events observed in stderr".to_string()
+                } else {
+                    format!(
+                        "no [fork-cache] event matched {expect:?}; seen classes: {hits:?}"
+                    )
+                },
+                full_detail: None,
+                score: None,
+            }
+        }
         Criterion::Judger { .. } => CriterionResult {
             criterion: c.clone(),
             passed: false,
@@ -295,6 +335,38 @@ fn evaluate_one(
             score: None,
         },
     }
+}
+
+/// Scan stderr for `[fork-cache] {...}` JSON lines and return the
+/// `class` field from each. Silently skips malformed lines — a
+/// single corrupt event should not hide the valid ones.
+fn parse_fork_cache_classes(stderr: &str) -> Vec<String> {
+    let mut classes = Vec::new();
+    for line in stderr.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("[fork-cache]") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(rest) else {
+            continue;
+        };
+        // The event may carry `class` directly or wrap it in a
+        // discriminator object. Prefer direct `class` field.
+        if let Some(s) = v.get("class").and_then(|c| c.as_str()) {
+            classes.push(s.to_string());
+        } else if let Some(obj) = v.as_object() {
+            // Fallback: the runtime's ForkCacheEvent serializes as a
+            // tagged enum, so the top-level key names the variant
+            // (e.g. `{"hit": {...}}`, `{"partial_drift": {...}}`).
+            // Accept the first key as the class when nothing else
+            // presents itself.
+            if let Some(k) = obj.keys().next() {
+                classes.push(k.clone());
+            }
+        }
+    }
+    classes
 }
 
 /// True when every non-Judger criterion passed. Used by the runner
@@ -548,5 +620,96 @@ mod tests {
         let criteria = vec![Criterion::ExitCode { code: 0 }];
         let results: Vec<CriterionResult> = vec![];
         assert!(!non_judger_all_pass(&criteria, &results));
+    }
+
+    // ── ForkCacheClass tests ──
+
+    fn outcome_with_stderr(stderr: &str) -> RunOutcome {
+        let mut out = outcome_with_tools(&[]);
+        out.stderr = stderr.to_string();
+        out
+    }
+
+    #[test]
+    fn fork_cache_class_passes_on_direct_class_field() {
+        let out =
+            outcome_with_stderr("noise\n[fork-cache] {\"class\":\"hit\",\"ratio\":0.9}\nmore");
+        let r = evaluate_deterministic(
+            &[Criterion::ForkCacheClass {
+                expect: vec!["hit".into()],
+            }],
+            &out,
+        );
+        assert!(r[0].passed);
+    }
+
+    #[test]
+    fn fork_cache_class_passes_on_tagged_enum_shape() {
+        // When the runtime ships the event as a tagged enum
+        // `{"partial_drift": {...}}`, the first key names the class.
+        let out = outcome_with_stderr(
+            "[fork-cache] {\"partial_drift\":{\"changed_tools\":[\"spawn_agent\"]}}",
+        );
+        let r = evaluate_deterministic(
+            &[Criterion::ForkCacheClass {
+                expect: vec!["partial_drift".into()],
+            }],
+            &out,
+        );
+        assert!(r[0].passed);
+    }
+
+    #[test]
+    fn fork_cache_class_fails_when_only_other_classes_seen() {
+        let out = outcome_with_stderr("[fork-cache] {\"class\":\"miss\"}");
+        let r = evaluate_deterministic(
+            &[Criterion::ForkCacheClass {
+                expect: vec!["hit".into()],
+            }],
+            &out,
+        );
+        assert!(!r[0].passed);
+        assert!(r[0].detail.contains("miss"));
+    }
+
+    #[test]
+    fn fork_cache_class_fails_when_no_events_seen() {
+        let out = outcome_with_stderr("unrelated noise");
+        let r = evaluate_deterministic(
+            &[Criterion::ForkCacheClass {
+                expect: vec!["hit".into()],
+            }],
+            &out,
+        );
+        assert!(!r[0].passed);
+        assert!(r[0].detail.contains("no [fork-cache]"));
+    }
+
+    #[test]
+    fn fork_cache_class_ignores_malformed_event_and_uses_good_ones() {
+        let out = outcome_with_stderr(
+            "[fork-cache] this is not json\n[fork-cache] {\"class\":\"hit\"}\n",
+        );
+        let r = evaluate_deterministic(
+            &[Criterion::ForkCacheClass {
+                expect: vec!["hit".into()],
+            }],
+            &out,
+        );
+        assert!(r[0].passed, "one malformed event must not mask a later valid hit");
+    }
+
+    #[test]
+    fn fork_cache_class_accepts_any_of_multiple_expected_classes() {
+        // Soft-fallback contract: "validation_failed" OR "fallback"
+        // both satisfy a provider-mismatch case. Expect list is OR.
+        let out = outcome_with_stderr("[fork-cache] {\"class\":\"validation_failed\"}");
+        let r = evaluate_deterministic(
+            &[Criterion::ForkCacheClass {
+                expect: vec!["fallback".into(), "validation_failed".into()],
+            }],
+            &out,
+        );
+        assert!(r[0].passed);
     }
 }

@@ -26,12 +26,15 @@ criteria:
     name: delegate
   - type: stderr_matches
     pattern: '\[fork-cache\]'
+  # G2 correctness: delegate path must produce a classifiable event
+  # — hit when inheritance works, or a soft-fallback class if not.
+  - type: fork_cache_class
+    expect: [hit, partial_drift, validation_failed, fallback]
   - type: judger
     question: |
-      Did a [fork-cache] event appear in the stderr for the delegate
-      sub-run specifically (not a parent spawn)? The event should
-      reference the delegated child's run_id or show a capture that
-      the child consumed. Score 1.0 for visible event on the
-      delegate path. Score 0.3 if only the parent turn has events
-      but the delegate child has none. Score 0.0 for no events.
+      Look at the stderr data fence. Does the [fork-cache] event
+      reference the delegated child's run (run_id or agent_type
+      matching the delegation payload), AND did the final answer
+      contain the child's reply? Score 1.0 for both. Score 0.4 for
+      either only. Score 0.0 for neither.
     threshold: 0.7

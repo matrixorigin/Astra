@@ -32,14 +32,15 @@ criteria:
     name: spawn_agent
   - type: stderr_matches
     pattern: '\[fork-cache\]'
+  # Either a clean hit (clamp didn't matter) or a classified
+  # validation_failed / fallback satisfies the contract.
+  - type: fork_cache_class
+    expect: [hit, validation_failed, fallback]
   - type: judger
     question: |
-      Did the stderr [fork-cache] event either:
-        (a) successfully reuse the prefix (cache hit, no conflict),
-            meaning the clamp happened not to matter; OR
-        (b) emit a ThinkingBudgetConflict / validation-failed event
-            and the child still ran to completion without the prefix?
-      A correct run does NOT crash and does NOT silently send a
-      corrupt cache key. Score 1.0 for clean hit or clean fallback.
-      Score 0.3 for crash or silent corruption. Score 0.0 for panic.
+      Deterministic class check already covered the classification.
+      Score only whether the child completed cleanly — no crash, no
+      silent corrupt prefix. Look for either the child's reply in
+      the final text OR an explicit acknowledgment that a fallback
+      occurred.
     threshold: 0.7

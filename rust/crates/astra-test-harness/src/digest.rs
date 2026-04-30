@@ -23,7 +23,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 /// Collected digest blob. The `json` field is whatever
@@ -75,20 +74,19 @@ impl DigestCollector for AstraCliDigestCollector {
             .arg(session_id)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            // Capture stderr to avoid pipe backpressure stalling the
+            // child — wait_with_output drains both concurrently.
+            .stderr(Stdio::piped())
+            // See exec.rs for the kill_on_drop rationale.
+            .kill_on_drop(true);
 
-        let mut child = cmd.spawn().map_err(|e| format!("spawn digest: {e}"))?;
-        let mut stdout = child.stdout.take().ok_or("no stdout from digest")?;
-        let mut buf = String::new();
+        let child = cmd.spawn().map_err(|e| format!("spawn digest: {e}"))?;
         let timeout = Duration::from_secs(self.timeout_seconds);
-        let read_fut = async move {
-            let _ = stdout.read_to_string(&mut buf).await;
-            let _ = child.wait().await;
-            buf
-        };
-        let stdout_body = tokio::time::timeout(timeout, read_fut)
+        let output = tokio::time::timeout(timeout, child.wait_with_output())
             .await
-            .map_err(|_| format!("digest timeout after {}s", timeout.as_secs()))?;
+            .map_err(|_| format!("digest timeout after {}s", timeout.as_secs()))?
+            .map_err(|e| format!("digest wait: {e}"))?;
+        let stdout_body = String::from_utf8_lossy(&output.stdout).to_string();
 
         let trimmed = stdout_body.trim();
         if trimmed.is_empty() {

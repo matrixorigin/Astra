@@ -34,18 +34,16 @@ criteria:
   - type: text_contains
     needle: "CHILD:"
   - type: stderr_matches
-    # Anchors the line to the fork-cache prefix. Classification (hit
-    # vs drift vs miss) is verified by the judger below since the
-    # token ratios are model-dependent.
+    # Anchors the line to the fork-cache prefix.
     pattern: '\[fork-cache\]'
+  # Deterministic classification — no judger drift on the happy path.
+  - type: fork_cache_class
+    expect: [hit]
   - type: judger
     question: |
-      Inspect the agent's stderr (shown in the prompt scaffold as
-      embedded in the transcript). Did the [fork-cache] event the
-      runtime emitted indicate a CACHE HIT (class=hit) rather than
-      miss or partial_drift? A hit means cache_read_tokens was a
-      meaningful fraction of expected — i.e. the child actually
-      benefited from the parent's prefix. Score 1.0 for confirmed
-      hit. Score 0.4 for partial_drift. Score 0.0 for miss or when
-      no event is visible.
+      Did the child agent's reply appear verbatim in the final answer
+      (prefixed with "CHILD:")? The fork_cache_class criterion above
+      already pins the cache classification; the judger only scores
+      whether the delegation's observable outcome surfaced in the
+      final text.
     threshold: 0.7
