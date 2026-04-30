@@ -3090,8 +3090,7 @@ mod tests {
     async fn collect_llm_stream_transport_after_partial_carries_partial_result() {
         let err = sample_reqwest_stream_error().await;
         let d1 = json!({"choices":[{"delta":{"content":"partial"}}]});
-        let byte_stream =
-            stream::iter(vec![Ok(Bytes::from(format!("data: {d1}\n\n"))), Err(err)]);
+        let byte_stream = stream::iter(vec![Ok(Bytes::from(format!("data: {d1}\n\n"))), Err(err)]);
         let res = collect_llm_stream(
             byte_stream,
             "test-model",
@@ -3213,13 +3212,9 @@ mod tests {
         let args = res.tool_calls[0]["function"]["arguments"]
             .as_str()
             .expect("arguments string");
-        let parsed: Value =
-            serde_json::from_str(args).expect("valid merged JSON args");
+        let parsed: Value = serde_json::from_str(args).expect("valid merged JSON args");
         assert_eq!(parsed, json!({"foo":"bar"}));
-        assert_eq!(
-            res.tool_calls[0]["function"]["name"].as_str(),
-            Some("bash")
-        );
+        assert_eq!(res.tool_calls[0]["function"]["name"].as_str(), Some("bash"));
     }
 
     #[tokio::test]
