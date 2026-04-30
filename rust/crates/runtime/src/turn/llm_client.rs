@@ -2415,7 +2415,6 @@ mod tests {
     use futures_util::StreamExt;
     use futures_util::stream;
     use serde_json::json;
-    use serial_test::serial;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -2440,25 +2439,6 @@ mod tests {
             }
         }
         Guard
-    }
-
-    /// Drift guard: after the temp-env migration, llm_client tests must not
-    /// re-introduce raw unsafe env mutation for env plumbing. Use
-    /// `temp_env::async_with_vars` instead so the env state is restored via
-    /// RAII even when a test panics.
-    #[test]
-    fn llm_client_tests_use_temp_env_not_unsafe_set_var() {
-        // Build sentinels at runtime from disjoint fragments so no single
-        // literal in this test matches itself in the include_str source.
-        let unsafe_open = format!("{}{}", "unsafe", " { ");
-        let std_env = format!("{}{}", "std::", "env::");
-        let sentinel_set = format!("{unsafe_open}{std_env}set_{}", "var");
-        let sentinel_remove = format!("{unsafe_open}{std_env}remove_{}", "var");
-        let source = include_str!("llm_client.rs");
-        assert!(
-            !source.contains(&sentinel_set) && !source.contains(&sentinel_remove),
-            "llm_client tests must use temp_env::async_with_vars instead of raw unsafe env mutation"
-        );
     }
 
     #[tokio::test]
@@ -3086,62 +3066,49 @@ mod tests {
         assert!(st.next().await.is_none());
     }
 
-    // ── serial(stream_idle_env): all tests below mutate ASTRA_STREAM_IDLE_TIMEOUT_MS
-    // which is read at startup and cached globally. Parallel execution causes
-    // race conditions where one test's timeout value bleeds into another test's
-    // LlmClient construction. Any new test that sets this env var MUST be tagged.
-
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn collect_llm_stream_surfaces_transport_error() {
-        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            let err = sample_reqwest_stream_error().await;
-            let byte_stream = stream::iter(vec![Err(err)]);
-            let started = Instant::now();
-            let res = collect_llm_stream(
-                byte_stream,
-                "test-model",
-                started,
-                LlmCancel::None,
-                stream_idle_timeout(),
-                stream_idle_timeout_after_progress(),
-            )
-            .await;
-            assert!(
-                matches!(res, Err(StreamCollectError::Transport { .. })),
-                "expected transport error, got: {res:?}"
-            );
-        })
+        let err = sample_reqwest_stream_error().await;
+        let byte_stream = stream::iter(vec![Err(err)]);
+        let started = Instant::now();
+        let res = collect_llm_stream(
+            byte_stream,
+            "test-model",
+            started,
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
         .await;
+        assert!(
+            matches!(res, Err(StreamCollectError::Transport { .. })),
+            "expected transport error, got: {res:?}"
+        );
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn collect_llm_stream_transport_after_partial_carries_partial_result() {
-        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            let err = sample_reqwest_stream_error().await;
-            let d1 = json!({"choices":[{"delta":{"content":"partial"}}]});
-            let byte_stream =
-                stream::iter(vec![Ok(Bytes::from(format!("data: {d1}\n\n"))), Err(err)]);
-            let res = collect_llm_stream(
-                byte_stream,
-                "test-model",
-                Instant::now(),
-                LlmCancel::None,
-                stream_idle_timeout(),
-                stream_idle_timeout_after_progress(),
-            )
-            .await
-            .expect_err("transport error");
-            match res {
-                StreamCollectError::Transport { partial, .. } => {
-                    assert_eq!(partial.full_text, "partial");
-                    assert_eq!(partial.model_used, "test-model");
-                }
-                other => panic!("expected transport error, got {other:?}"),
+        let err = sample_reqwest_stream_error().await;
+        let d1 = json!({"choices":[{"delta":{"content":"partial"}}]});
+        let byte_stream =
+            stream::iter(vec![Ok(Bytes::from(format!("data: {d1}\n\n"))), Err(err)]);
+        let res = collect_llm_stream(
+            byte_stream,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect_err("transport error");
+        match res {
+            StreamCollectError::Transport { partial, .. } => {
+                assert_eq!(partial.full_text, "partial");
+                assert_eq!(partial.model_used, "test-model");
             }
-        })
-        .await;
+            other => panic!("expected transport error, got {other:?}"),
+        }
     }
 
     // Note: Bedrock no longer uses `collect_llm_stream` (see `bridge_llm_stream::
@@ -3151,288 +3118,243 @@ mod tests {
     // `turn::token_usage`.
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn collect_llm_stream_aggregates_delta_text_reasoning_usage() {
-        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            let d1 = json!({"choices":[{"delta":{"content":"Hi ","reasoning_content":"R"}}]});
-            let d2 = json!({"choices":[{"delta":{"content":"there"}}]});
-            let u = json!({"usage":{"prompt_tokens":3,"completion_tokens":4}});
-            let body = format!("data: {d1}\n\ndata: {d2}\n\ndata: {u}\n\n");
-            let stream = stream::iter(vec![Ok(Bytes::from(body))]);
-            let res = collect_llm_stream(
-                stream,
-                "gpt-test",
-                Instant::now(),
-                LlmCancel::None,
-                stream_idle_timeout(),
-                stream_idle_timeout_after_progress(),
-            )
-            .await
-            .expect("collect");
-            assert_eq!(res.full_text, "Hi there");
-            assert_eq!(res.reasoning, "R");
-            assert_eq!(
-                res.usage.get("input_tokens").and_then(Value::as_u64),
-                Some(3)
-            );
-            assert_eq!(
-                res.usage.get("output_tokens").and_then(Value::as_u64),
-                Some(4)
-            );
-            assert_eq!(
-                res.usage.get("total_tokens").and_then(Value::as_u64),
-                Some(7)
-            );
-            assert_eq!(res.model_used, "gpt-test");
-            assert!(res.tool_calls.is_empty());
-            // No finish_reason chunk was sent, so it should be None
-            assert_eq!(res.finish_reason, None);
-        })
-        .await;
+        let d1 = json!({"choices":[{"delta":{"content":"Hi ","reasoning_content":"R"}}]});
+        let d2 = json!({"choices":[{"delta":{"content":"there"}}]});
+        let u = json!({"usage":{"prompt_tokens":3,"completion_tokens":4}});
+        let body = format!("data: {d1}\n\ndata: {d2}\n\ndata: {u}\n\n");
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let res = collect_llm_stream(
+            stream,
+            "gpt-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("collect");
+        assert_eq!(res.full_text, "Hi there");
+        assert_eq!(res.reasoning, "R");
+        assert_eq!(
+            res.usage.get("input_tokens").and_then(Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            res.usage.get("output_tokens").and_then(Value::as_u64),
+            Some(4)
+        );
+        assert_eq!(
+            res.usage.get("total_tokens").and_then(Value::as_u64),
+            Some(7)
+        );
+        assert_eq!(res.model_used, "gpt-test");
+        assert!(res.tool_calls.is_empty());
+        // No finish_reason chunk was sent, so it should be None
+        assert_eq!(res.finish_reason, None);
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn collect_llm_stream_extracts_finish_reason_stop() {
-        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            let d1 = json!({"choices":[{"delta":{"content":"Hello"}}]});
-            let done = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
-            let body = format!("data: {d1}\n\ndata: {done}\n\n");
-            let stream = stream::iter(vec![Ok(Bytes::from(body))]);
-            let res = collect_llm_stream(
-                stream,
-                "m",
-                Instant::now(),
-                LlmCancel::None,
-                stream_idle_timeout(),
-                stream_idle_timeout_after_progress(),
-            )
-            .await
-            .expect("collect");
-            assert_eq!(res.full_text, "Hello");
-            assert_eq!(res.finish_reason.as_deref(), Some("stop"));
-        })
-        .await;
+        let d1 = json!({"choices":[{"delta":{"content":"Hello"}}]});
+        let done = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+        let body = format!("data: {d1}\n\ndata: {done}\n\n");
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let res = collect_llm_stream(
+            stream,
+            "m",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("collect");
+        assert_eq!(res.full_text, "Hello");
+        assert_eq!(res.finish_reason.as_deref(), Some("stop"));
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn collect_llm_stream_extracts_finish_reason_length() {
-        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            let d1 = json!({"choices":[{"delta":{"content":"truncated"}}]});
-            let done = json!({"choices":[{"delta":{},"finish_reason":"length"}]});
-            let body = format!("data: {d1}\n\ndata: {done}\n\n");
-            let stream = stream::iter(vec![Ok(Bytes::from(body))]);
-            let res = collect_llm_stream(
-                stream,
-                "m",
-                Instant::now(),
-                LlmCancel::None,
-                stream_idle_timeout(),
-                stream_idle_timeout_after_progress(),
-            )
-            .await
-            .expect("collect");
-            assert_eq!(res.finish_reason.as_deref(), Some("length"));
-        })
-        .await;
+        let d1 = json!({"choices":[{"delta":{"content":"truncated"}}]});
+        let done = json!({"choices":[{"delta":{},"finish_reason":"length"}]});
+        let body = format!("data: {d1}\n\ndata: {done}\n\n");
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let res = collect_llm_stream(
+            stream,
+            "m",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("collect");
+        assert_eq!(res.finish_reason.as_deref(), Some("length"));
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn collect_llm_stream_merges_tool_call_argument_chunks() {
-        temp_env::async_with_vars(
-            [("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))],
-            async {
-                let c1 = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"foo"}}]}}]});
-                let c2 = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\":\"bar\"}"}}]}}]});
-                let body = format!("data: {c1}\n\ndata: {c2}\n\n");
-                let stream = stream::iter(vec![Ok(Bytes::from(body))]);
-                let res = collect_llm_stream(
-                    stream,
-                    "m",
-                    Instant::now(),
-                    LlmCancel::None,
-                    stream_idle_timeout(),
-                    stream_idle_timeout_after_progress(),
-                )
-                .await
-                .expect("collect");
-                assert_eq!(res.tool_calls.len(), 1);
-                let args = res.tool_calls[0]["function"]["arguments"]
-                    .as_str()
-                    .expect("arguments string");
-                let parsed: Value =
-                    serde_json::from_str(args).expect("valid merged JSON args");
-                assert_eq!(parsed, json!({"foo":"bar"}));
-                assert_eq!(
-                    res.tool_calls[0]["function"]["name"].as_str(),
-                    Some("bash")
-                );
-            },
+        let c1 = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"foo"}}]}}]});
+        let c2 = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\":\"bar\"}"}}]}}]});
+        let body = format!("data: {c1}\n\ndata: {c2}\n\n");
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let res = collect_llm_stream(
+            stream,
+            "m",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("collect");
+        assert_eq!(res.tool_calls.len(), 1);
+        let args = res.tool_calls[0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments string");
+        let parsed: Value =
+            serde_json::from_str(args).expect("valid merged JSON args");
+        assert_eq!(parsed, json!({"foo":"bar"}));
+        assert_eq!(
+            res.tool_calls[0]["function"]["name"].as_str(),
+            Some("bash")
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_triggers() {
+        let _guard = set_test_stream_timeouts(1, None);
+        let pending_stream = stream::pending::<Result<Bytes, reqwest::Error>>();
+        let started = Instant::now();
+        let res = collect_llm_stream(
+            pending_stream,
+            "test-model",
+            started,
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
         )
         .await;
+        assert!(
+            matches!(
+                res,
+                Err(StreamCollectError::IdleTimeout {
+                    made_progress: false,
+                    ..
+                })
+            ),
+            "expected idle timeout, got: {res:?}"
+        );
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
-    async fn stream_idle_timeout_triggers() {
-        // Keep this test fast: override idle timeout to 1ms.
-        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("1"))], async {
-            // Stream that never yields any bytes (simulates a hung connection).
-            let pending_stream = stream::pending::<Result<Bytes, reqwest::Error>>();
-            let started = Instant::now();
-            let res = collect_llm_stream(
+    async fn stream_idle_timeout_after_partial_output_marks_progress() {
+        let _guard = set_test_stream_timeouts(1, Some(1));
+        let d1 = json!({"choices":[{"delta":{"content":"partial"}}]});
+        let stream = stream::iter(vec![Ok(Bytes::from(format!("data: {d1}\n\n")))])
+            .chain(stream::pending::<Result<Bytes, reqwest::Error>>());
+        let res = collect_llm_stream(
+            stream,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await;
+        match res.expect_err("idle timeout after partial output") {
+            StreamCollectError::IdleTimeout {
+                made_progress,
+                partial,
+                ..
+            } => {
+                assert!(made_progress, "partial output should mark progress");
+                assert_eq!(partial.full_text, "partial");
+            }
+            other => panic!("expected idle timeout after partial output, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_respects_cancel_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_signal = flag.clone();
+        let pending_stream = stream::pending::<Result<Bytes, reqwest::Error>>();
+        let started = Instant::now();
+        let handle = tokio::spawn(async move {
+            collect_llm_stream(
                 pending_stream,
                 "test-model",
                 started,
-                LlmCancel::None,
+                LlmCancel::Flag(flag.as_ref()),
                 stream_idle_timeout(),
                 stream_idle_timeout_after_progress(),
             )
-            .await;
-            assert!(
-                matches!(
-                    res,
-                    Err(StreamCollectError::IdleTimeout {
-                        made_progress: false,
-                        ..
-                    })
-                ),
-                "expected idle timeout, got: {res:?}"
-            );
-        })
-        .await;
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        flag_signal.store(true, Ordering::SeqCst);
+        let res = handle.await.expect("join");
+        assert!(
+            matches!(res, Err(StreamCollectError::Cancelled { .. })),
+            "expected cancel, got: {res:?}"
+        );
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
-    async fn stream_idle_timeout_after_partial_output_marks_progress() {
-        temp_env::async_with_vars(
-            [
-                ("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("1")),
-                ("ASTRA_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS", Some("1")),
-            ],
-            async {
-                let d1 = json!({"choices":[{"delta":{"content":"partial"}}]});
-                let stream = stream::iter(vec![Ok(Bytes::from(format!("data: {d1}\n\n")))])
-                    .chain(stream::pending::<Result<Bytes, reqwest::Error>>());
-                let res = collect_llm_stream(
-                    stream,
-                    "test-model",
-                    Instant::now(),
-                    LlmCancel::None,
-                    stream_idle_timeout(),
-                    stream_idle_timeout_after_progress(),
-                )
-                .await;
-                match res.expect_err("idle timeout after partial output") {
-                    StreamCollectError::IdleTimeout {
-                        made_progress,
-                        partial,
-                        ..
-                    } => {
-                        assert!(made_progress, "partial output should mark progress");
-                        assert_eq!(partial.full_text, "partial");
-                    }
-                    other => panic!("expected idle timeout after partial output, got {other:?}"),
-                }
-            },
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    #[serial(stream_idle_env)]
-    async fn collect_llm_stream_respects_cancel_flag() {
-        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            let flag = Arc::new(AtomicBool::new(false));
-            let flag_signal = flag.clone();
-            let pending_stream = stream::pending::<Result<Bytes, reqwest::Error>>();
-            let started = Instant::now();
-            let handle = tokio::spawn(async move {
-                collect_llm_stream(
-                    pending_stream,
-                    "test-model",
-                    started,
-                    LlmCancel::Flag(flag.as_ref()),
-                    stream_idle_timeout(),
-                    stream_idle_timeout_after_progress(),
-                )
-                .await
-            });
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            flag_signal.store(true, Ordering::SeqCst);
-            let res = handle.await.expect("join");
-            assert!(
-                matches!(res, Err(StreamCollectError::Cancelled { .. })),
-                "expected cancel, got: {res:?}"
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn collect_llm_stream_respects_cancel_token() {
-        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            let token = CancellationToken::new();
-            let token_for_stream = token.clone();
-            let pending_stream = stream::pending::<Result<Bytes, reqwest::Error>>();
-            let started = Instant::now();
-            let handle = tokio::spawn(async move {
-                collect_llm_stream(
-                    pending_stream,
-                    "test-model",
-                    started,
-                    LlmCancel::Token(&token_for_stream),
-                    stream_idle_timeout(),
-                    stream_idle_timeout_after_progress(),
-                )
-                .await
-            });
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            token.cancel();
-            let res = handle.await.expect("join");
-            assert!(
-                matches!(res, Err(StreamCollectError::Cancelled { .. })),
-                "expected cancel, got: {res:?}"
-            );
-        })
-        .await;
+        let token = CancellationToken::new();
+        let token_for_stream = token.clone();
+        let pending_stream = stream::pending::<Result<Bytes, reqwest::Error>>();
+        let started = Instant::now();
+        let handle = tokio::spawn(async move {
+            collect_llm_stream(
+                pending_stream,
+                "test-model",
+                started,
+                LlmCancel::Token(&token_for_stream),
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        token.cancel();
+        let res = handle.await.expect("join");
+        assert!(
+            matches!(res, Err(StreamCollectError::Cancelled { .. })),
+            "expected cancel, got: {res:?}"
+        );
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn collect_llm_stream_flag_and_token_cancels_on_token() {
-        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            let flag = Arc::new(AtomicBool::new(false));
-            let flag_for_join = flag.clone();
-            let token = CancellationToken::new();
-            let token_signal = token.clone();
-            let pending_stream = stream::pending::<Result<Bytes, reqwest::Error>>();
-            let started = Instant::now();
-            let handle = tokio::spawn(async move {
-                collect_llm_stream(
-                    pending_stream,
-                    "test-model",
-                    started,
-                    LlmCancel::FlagAndToken(flag.as_ref(), &token_signal),
-                    stream_idle_timeout(),
-                    stream_idle_timeout_after_progress(),
-                )
-                .await
-            });
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            token.cancel();
-            let res = handle.await.expect("join");
-            assert!(
-                matches!(res, Err(StreamCollectError::Cancelled { .. })),
-                "expected cancel, got: {res:?}"
-            );
-            assert!(!flag_for_join.load(Ordering::SeqCst));
-        })
-        .await;
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_for_join = flag.clone();
+        let token = CancellationToken::new();
+        let token_signal = token.clone();
+        let pending_stream = stream::pending::<Result<Bytes, reqwest::Error>>();
+        let started = Instant::now();
+        let handle = tokio::spawn(async move {
+            collect_llm_stream(
+                pending_stream,
+                "test-model",
+                started,
+                LlmCancel::FlagAndToken(flag.as_ref(), &token_signal),
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        token.cancel();
+        let res = handle.await.expect("join");
+        assert!(
+            matches!(res, Err(StreamCollectError::Cancelled { .. })),
+            "expected cancel, got: {res:?}"
+        );
+        assert!(!flag_for_join.load(Ordering::SeqCst));
     }
 
     #[derive(Clone)]
@@ -3674,59 +3596,51 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn collect_llm_stream_decodes_lossy_utf8_inside_json_string() {
-        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            let mut v: Vec<u8> = Vec::new();
-            v.extend_from_slice(br#"data: {"choices":[{"delta":{"content":"a"#);
-            v.push(0xff);
-            v.extend_from_slice(br#""}}]}"#);
-            v.extend_from_slice(b"\n\n");
-            let stream = stream::iter(vec![Ok(Bytes::from(v))]);
-            let res = collect_llm_stream(
-                stream,
-                "m",
-                Instant::now(),
-                LlmCancel::None,
-                stream_idle_timeout(),
-                stream_idle_timeout_after_progress(),
-            )
-            .await
-            .expect("collect");
-            assert_eq!(res.full_text, "a\u{FFFD}");
-        })
-        .await;
+        let mut v: Vec<u8> = Vec::new();
+        v.extend_from_slice(br#"data: {"choices":[{"delta":{"content":"a"#);
+        v.push(0xff);
+        v.extend_from_slice(br#""}}]}"#);
+        v.extend_from_slice(b"\n\n");
+        let stream = stream::iter(vec![Ok(Bytes::from(v))]);
+        let res = collect_llm_stream(
+            stream,
+            "m",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("collect");
+        assert_eq!(res.full_text, "a\u{FFFD}");
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn call_llm_and_collect_retries_after_429_retry_after_zero() {
-        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            reset_rate_limit_cooldown_for_tests();
-            let hits = Arc::new(AtomicU32::new(0));
-            let app = Router::new()
-                .route("/chat/completions", post(mock_429_retry_zero_then_sse))
-                .with_state(Hit(hits.clone()));
-            let base = spawn_local_http_server(app).await;
-            let messages = vec![json!({"role":"user","content":"x"})];
-            let res = call_llm_and_collect(
-                &messages,
-                &[],
-                "m",
-                "k",
-                &base,
-                "openai",
-                None,
-                false,
-                LlmCancel::None,
-                &ThinkingConfig::Off,
-            )
-            .await
-            .expect("llm ok");
-            assert_eq!(res.full_text, "after-429");
-            assert_eq!(hits.load(Ordering::SeqCst), 2);
-        })
-        .await;
+        reset_rate_limit_cooldown_for_tests();
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_429_retry_zero_then_sse))
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let res = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+            &ThinkingConfig::Off,
+        )
+        .await
+        .expect("llm ok");
+        assert_eq!(res.full_text, "after-429");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -3764,65 +3678,57 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn call_llm_and_collect_retries_after_529_retry_after_zero() {
-        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            reset_rate_limit_cooldown_for_tests();
-            let hits = Arc::new(AtomicU32::new(0));
-            let app = Router::new()
-                .route("/chat/completions", post(mock_529_retry_zero_then_sse))
-                .with_state(Hit(hits.clone()));
-            let base = spawn_local_http_server(app).await;
-            let messages = vec![json!({"role":"user","content":"x"})];
-            let res = call_llm_and_collect(
-                &messages,
-                &[],
-                "m",
-                "k",
-                &base,
-                "openai",
-                None,
-                false,
-                LlmCancel::None,
-                &ThinkingConfig::Off,
-            )
-            .await
-            .expect("llm ok");
-            assert_eq!(res.full_text, "after-529");
-            assert_eq!(hits.load(Ordering::SeqCst), 2);
-        })
-        .await;
+        reset_rate_limit_cooldown_for_tests();
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_529_retry_zero_then_sse))
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let res = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+            &ThinkingConfig::Off,
+        )
+        .await
+        .expect("llm ok");
+        assert_eq!(res.full_text, "after-529");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn call_llm_and_collect_retries_after_503_retry_after_zero() {
-        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            reset_rate_limit_cooldown_for_tests();
-            let hits = Arc::new(AtomicU32::new(0));
-            let app = Router::new()
-                .route("/chat/completions", post(mock_503_retry_zero_then_sse))
-                .with_state(Hit(hits.clone()));
-            let base = spawn_local_http_server(app).await;
-            let messages = vec![json!({"role":"user","content":"x"})];
-            let res = call_llm_and_collect(
-                &messages,
-                &[],
-                "m",
-                "k",
-                &base,
-                "openai",
-                None,
-                false,
-                LlmCancel::None,
-                &ThinkingConfig::Off,
-            )
-            .await
-            .expect("llm ok");
-            assert_eq!(res.full_text, "after-503");
-            assert_eq!(hits.load(Ordering::SeqCst), 2);
-        })
-        .await;
+        reset_rate_limit_cooldown_for_tests();
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_503_retry_zero_then_sse))
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let res = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+            &ThinkingConfig::Off,
+        )
+        .await
+        .expect("llm ok");
+        assert_eq!(res.full_text, "after-503");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -3887,132 +3793,116 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn output_escalation_e2e_length_then_stop() {
         // Verifies: first call returns finish_reason=length, second returns stop.
         // This is the data path used by server_loop_host's escalation loop.
-        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            reset_rate_limit_cooldown_for_tests();
-            let hits = Arc::new(AtomicU32::new(0));
-            let app = Router::new()
-                .route("/chat/completions", post(mock_length_then_stop))
-                .with_state(Hit(hits.clone()));
-            let base = spawn_local_http_server(app).await;
-            let messages = vec![json!({"role":"user","content":"x"})];
+        reset_rate_limit_cooldown_for_tests();
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_length_then_stop))
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
 
-            // First call: finish_reason=length
-            let res1 = call_llm_and_collect(
-                &messages,
-                &[],
-                "m",
-                "k",
-                &base,
-                "openai",
-                Some(1000),
-                false,
-                LlmCancel::None,
-                &ThinkingConfig::Off,
-            )
-            .await
-            .expect("llm ok");
-            assert_eq!(res1.full_text, "truncat");
-            assert_eq!(res1.finish_reason.as_deref(), Some("length"));
-
-            // Second call (escalated): finish_reason=stop
-            let res2 = call_llm_and_collect(
-                &messages,
-                &[],
-                "m",
-                "k",
-                &base,
-                "openai",
-                Some(4000),
-                false,
-                LlmCancel::None,
-                &ThinkingConfig::Off,
-            )
-            .await
-            .expect("llm ok");
-            assert_eq!(res2.full_text, "complete response");
-            assert_eq!(res2.finish_reason.as_deref(), Some("stop"));
-            assert_eq!(hits.load(Ordering::SeqCst), 2);
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    #[serial(stream_idle_env)]
-    async fn finish_reason_stop_no_retry() {
-        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            reset_rate_limit_cooldown_for_tests();
-            let hits = Arc::new(AtomicU32::new(0));
-            async fn mock_stop(State(Hit(c)): State<Hit>) -> Response {
-                c.fetch_add(1, Ordering::SeqCst);
-                let d = json!({"choices":[{"delta":{"content":"ok"}}]});
-                let done = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
-                let body = format!("data: {d}\n\ndata: {done}\n\n");
-                Response::builder()
-                    .status(200)
-                    .header("content-type", "text/event-stream")
-                    .body(Body::from(body))
-                    .unwrap()
-            }
-            let app = Router::new()
-                .route("/chat/completions", post(mock_stop))
-                .with_state(Hit(hits.clone()));
-            let base = spawn_local_http_server(app).await;
-            let messages = vec![json!({"role":"user","content":"x"})];
-            let res = call_llm_and_collect(
-                &messages,
-                &[],
-                "m",
-                "k",
-                &base,
-                "openai",
-                Some(1000),
-                false,
-                LlmCancel::None,
-                &ThinkingConfig::Off,
-            )
-            .await
-            .expect("llm ok");
-            assert_eq!(res.finish_reason.as_deref(), Some("stop"));
-            assert_eq!(hits.load(Ordering::SeqCst), 1, "no retry when stop");
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    #[serial(stream_idle_env)]
-    async fn finish_reason_tool_calls_extracted() {
-        temp_env::async_with_vars(
-            [("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))],
-            async {
-                let d = json!({"choices":[{
-                    "delta":{"tool_calls":[{"index":0,"id":"tc1","type":"function","function":{"name":"bash","arguments":"{}"}}]},
-                    "finish_reason":"tool_calls"
-                }]});
-                let body = format!("data: {d}\n\n");
-                let stream = stream::iter(vec![Ok(Bytes::from(body))]);
-                let res = collect_llm_stream(
-                    stream,
-                    "m",
-                    Instant::now(),
-                    LlmCancel::None,
-                    stream_idle_timeout(),
-                    stream_idle_timeout_after_progress(),
-                )
-                .await
-                .expect("collect");
-                assert_eq!(res.finish_reason.as_deref(), Some("tool_calls"));
-                assert_eq!(res.tool_calls.len(), 1);
-            },
+        // First call: finish_reason=length
+        let res1 = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            Some(1000),
+            false,
+            LlmCancel::None,
+            &ThinkingConfig::Off,
         )
-        .await;
+        .await
+        .expect("llm ok");
+        assert_eq!(res1.full_text, "truncat");
+        assert_eq!(res1.finish_reason.as_deref(), Some("length"));
+
+        // Second call (escalated): finish_reason=stop
+        let res2 = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            Some(4000),
+            false,
+            LlmCancel::None,
+            &ThinkingConfig::Off,
+        )
+        .await
+        .expect("llm ok");
+        assert_eq!(res2.full_text, "complete response");
+        assert_eq!(res2.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
+    async fn finish_reason_stop_no_retry() {
+        reset_rate_limit_cooldown_for_tests();
+        let hits = Arc::new(AtomicU32::new(0));
+        async fn mock_stop(State(Hit(c)): State<Hit>) -> Response {
+            c.fetch_add(1, Ordering::SeqCst);
+            let d = json!({"choices":[{"delta":{"content":"ok"}}]});
+            let done = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+            let body = format!("data: {d}\n\ndata: {done}\n\n");
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        }
+        let app = Router::new()
+            .route("/chat/completions", post(mock_stop))
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let res = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            Some(1000),
+            false,
+            LlmCancel::None,
+            &ThinkingConfig::Off,
+        )
+        .await
+        .expect("llm ok");
+        assert_eq!(res.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "no retry when stop");
+    }
+
+    #[tokio::test]
+    async fn finish_reason_tool_calls_extracted() {
+        let d = json!({"choices":[{
+            "delta":{"tool_calls":[{"index":0,"id":"tc1","type":"function","function":{"name":"bash","arguments":"{}"}}]},
+            "finish_reason":"tool_calls"
+        }]});
+        let body = format!("data: {d}\n\n");
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let res = collect_llm_stream(
+            stream,
+            "m",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("collect");
+        assert_eq!(res.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(res.tool_calls.len(), 1);
+    }
+
+    #[tokio::test]
     async fn call_llm_and_collect_falls_back_immediately_after_partial_stream_idle() {
         let _guard = set_test_stream_timeouts(10, Some(10));
         let state = StreamIdleHit {
@@ -4051,7 +3941,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn call_llm_and_collect_preserves_partial_stream_details_when_fallback_fails() {
         let _guard = set_test_stream_timeouts(10, Some(10));
         let state = StreamIdleHit {
@@ -4160,7 +4049,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn call_llm_and_collect_retries_stream_once_when_idle_before_output() {
         let _guard = set_test_stream_timeouts(10, None);
         let hits = Arc::new(AtomicU32::new(0));
@@ -4200,31 +4088,27 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn call_llm_and_collect_returns_context_window_error_kind() {
-        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            reset_rate_limit_cooldown_for_tests();
-            let app = Router::new().route("/chat/completions", post(mock_400_context_window));
-            let base = spawn_local_http_server(app).await;
-            let messages = vec![json!({"role":"user","content":"x"})];
-            let err = call_llm_and_collect(
-                &messages,
-                &[],
-                "m",
-                "k",
-                &base,
-                "openai",
-                None,
-                false,
-                LlmCancel::None,
-                &ThinkingConfig::Off,
-            )
-            .await
-            .expect_err("should fail with context window");
-            assert_eq!(err.kind, astra_core::ErrorKind::ContextWindow);
-            assert!(err.message.contains("context_length_exceeded"));
-        })
-        .await;
+        reset_rate_limit_cooldown_for_tests();
+        let app = Router::new().route("/chat/completions", post(mock_400_context_window));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let err = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+            &ThinkingConfig::Off,
+        )
+        .await
+        .expect_err("should fail with context window");
+        assert_eq!(err.kind, astra_core::ErrorKind::ContextWindow);
+        assert!(err.message.contains("context_length_exceeded"));
     }
 
     /// Mock server that returns 401 Unauthorized.
@@ -4236,36 +4120,32 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn call_llm_and_collect_returns_auth_error_kind() {
-        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            reset_rate_limit_cooldown_for_tests();
-            let app = Router::new().route("/chat/completions", post(mock_401));
-            let base = spawn_local_http_server(app).await;
-            let messages = vec![json!({"role":"user","content":"x"})];
-            let err = call_llm_and_collect(
-                &messages,
-                &[],
-                "m",
-                "k",
-                &base,
-                "openai",
-                None,
-                false,
-                LlmCancel::None,
-                &ThinkingConfig::Off,
-            )
-            .await
-            .expect_err("should fail with auth");
-            assert_eq!(err.kind, astra_core::ErrorKind::Auth);
-            assert!(
-                !err.message.contains("Unauthorized"),
-                "auth error message must not echo provider body, got: {}",
-                err.message
-            );
-            assert!(err.message.contains("authentication failed"));
-        })
-        .await;
+        reset_rate_limit_cooldown_for_tests();
+        let app = Router::new().route("/chat/completions", post(mock_401));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let err = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+            &ThinkingConfig::Off,
+        )
+        .await
+        .expect_err("should fail with auth");
+        assert_eq!(err.kind, astra_core::ErrorKind::Auth);
+        assert!(
+            !err.message.contains("Unauthorized"),
+            "auth error message must not echo provider body, got: {}",
+            err.message
+        );
+        assert!(err.message.contains("authentication failed"));
     }
 
     #[test]
@@ -5097,25 +4977,21 @@ mod tests {
     }
 
     async fn parse_fixture(name: &str) -> LlmCallResult {
-        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
-            let bytes = load_fixture(name);
-            let stream = stream::iter(vec![Ok::<_, reqwest::Error>(bytes)]);
-            collect_llm_stream(
-                stream,
-                "test-model",
-                Instant::now(),
-                LlmCancel::None,
-                stream_idle_timeout(),
-                stream_idle_timeout_after_progress(),
-            )
-            .await
-            .expect("collect")
-        })
+        let bytes = load_fixture(name);
+        let stream = stream::iter(vec![Ok::<_, reqwest::Error>(bytes)]);
+        collect_llm_stream(
+            stream,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
         .await
+        .expect("collect")
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn golden_minimax_m25_simple_think_extracted() {
         // MiniMax M2.5: <think> in delta.content → reasoning extracted, full_text clean
         let res = parse_fixture("minimax_m25_simple.sse").await;
@@ -5139,7 +5015,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn golden_minimax_m27_simple_think_extracted() {
         // MiniMax M2.7: same <think> pattern, verify reasoning/text split
         let res = parse_fixture("minimax_m27_simple.sse").await;
@@ -5162,7 +5037,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn golden_qwen36plus_reasoning_content_field() {
         // Qwen3.6-plus: reasoning via delta.reasoning_content (not <think> tags)
         let res = parse_fixture("qwen36plus_simple.sse").await;
@@ -5182,7 +5056,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn golden_kimi_k25_reasoning_content_field() {
         // Kimi-k2.5: reasoning via delta.reasoning_content
         let res = parse_fixture("kimi_k25_simple.sse").await;
@@ -5198,7 +5071,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn golden_minimax_m25_tool_call_with_think() {
         // MiniMax M2.5 tool call: <think> in content + tool_calls in delta
         let res = parse_fixture("minimax_m25_tool_call.sse").await;
@@ -5219,7 +5091,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(stream_idle_env)]
     async fn golden_qwen_plus_tool_call_no_reasoning() {
         // Qwen-plus: pure tool call, no reasoning
         let res = parse_fixture("qwen_plus_tool_call.sse").await;

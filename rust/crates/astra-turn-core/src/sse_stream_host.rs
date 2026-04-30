@@ -41,28 +41,14 @@ pub const STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
 /// still catching genuinely stalled connections.
 pub const STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS: u64 = 300_000;
 
-/// Stream idle timeout (pre-progress).
-///
-/// Returns the value of `ASTRA_STREAM_IDLE_TIMEOUT_MS` env var when set,
-/// otherwise falls back to [`STREAM_IDLE_TIMEOUT_MS`].
+/// Stream idle timeout (pre-progress), fixed at [`STREAM_IDLE_TIMEOUT_MS`].
 pub fn stream_idle_timeout() -> std::time::Duration {
-    let ms = std::env::var("ASTRA_STREAM_IDLE_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(STREAM_IDLE_TIMEOUT_MS);
-    std::time::Duration::from_millis(ms)
+    std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS)
 }
 
-/// Stream idle timeout (post-progress).
-///
-/// Returns the value of `ASTRA_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS` env var when set,
-/// otherwise falls back to [`STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS`].
+/// Stream idle timeout (post-progress), fixed at [`STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS`].
 pub fn stream_idle_timeout_after_progress() -> std::time::Duration {
-    let ms = std::env::var("ASTRA_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS);
-    std::time::Duration::from_millis(ms)
+    std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS)
 }
 
 // ─── Data types ──────────────────────────────────────────────────────────────
