@@ -43,6 +43,12 @@ pub struct CliSpawnAgentExecutor {
     skill_resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     skill_search: SkillSearchSettings,
     active_session_id: Option<String>,
+    /// Optional sink for fork-cache telemetry. When `None` the
+    /// executor still forwards `inherited_prefix` so child messages
+    /// prepend the parent prefix — but no ForkCacheEvent is emitted.
+    /// Zero-cost when unset.
+    fork_cache_sink:
+        Option<Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink>>,
 }
 
 impl CliSpawnAgentExecutor {
@@ -62,7 +68,19 @@ impl CliSpawnAgentExecutor {
             skill_resolver: None,
             skill_search: SkillSearchSettings::default(),
             active_session_id: None,
+            fork_cache_sink: None,
         }
+    }
+
+    /// Install a fork-cache event sink. When present, every child
+    /// spawn that inherited a parent prefix emits exactly one
+    /// `ForkCacheEvent` on its first ingested turn.
+    pub fn with_fork_cache_sink(
+        mut self,
+        sink: Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink>,
+    ) -> Self {
+        self.fork_cache_sink = Some(sink);
+        self
     }
 
     pub fn with_skill_resolver(
@@ -139,6 +157,10 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             tool_cache: super::stream_render::EdgeToolCache::new(
                 resolved_tool_policy.max_identical_tool_calls,
             ),
+            inherited_prefix: config.inherited_prefix.clone(),
+            fork_cache_sink: self.fork_cache_sink.clone(),
+            fork_cache_probe_state:
+                astra_runtime::orchestration::ForkCacheProbeState::new(),
         };
 
         // Build system message from agent type definition
@@ -154,10 +176,25 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             )
         };
 
-        let messages = vec![
-            json!({ "role": "system", "content": system_prompt }),
-            json!({ "role": "user", "content": config.task }),
-        ];
+        // PR 5.6: if the spawner resolved a parent prefix, prepend
+        // the captured prefix messages between the system prompt
+        // and the child's own task. System prompt stays at [0] so
+        // it reads as the child's own identity; inherited messages
+        // sit behind it as "historical context from parent" that
+        // the provider can hit in its prompt cache. The child task
+        // at the tail is always fresh (cacheable only for future
+        // child turns, not for this first call).
+        let mut messages = Vec::with_capacity(
+            2 + config
+                .inherited_prefix
+                .as_ref()
+                .map_or(0, |ip| ip.prefix_messages.len()),
+        );
+        messages.push(json!({ "role": "system", "content": system_prompt }));
+        if let Some(ref ip) = config.inherited_prefix {
+            messages.extend(ip.prefix_messages.iter().cloned());
+        }
+        messages.push(json!({ "role": "user", "content": config.task }));
 
         // Build restricted tools based on agent type's allowed_tools
         let restricted_tools: HashSet<String> = if config.allowed_tools.iter().any(|t| t == "*") {

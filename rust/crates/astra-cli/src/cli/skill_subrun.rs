@@ -80,6 +80,22 @@ pub(crate) struct SubRunHost {
     pub(crate) agent_id: String,
     /// Cross-turn tool output cache for edge-path dedup within this sub-run.
     pub(crate) tool_cache: super::stream_render::EdgeToolCache,
+    /// Captured parent prefix, if the spawner resolved one. Consumed
+    /// by `on_turn_completed` on the first successful ingested turn
+    /// to emit a single [`ForkCacheEvent`]. `None` means the child
+    /// wasn't asked to inherit — no probe runs.
+    pub(crate) inherited_prefix:
+        Option<astra_runtime::orchestration::InheritedChildPrefix>,
+    /// Sink for fork-cache events. Shares lifetime with the
+    /// executor. When `None` no probe fires — the executor simply
+    /// didn't plumb one through (harmless, telemetry is off).
+    pub(crate) fork_cache_sink: Option<
+        std::sync::Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink>,
+    >,
+    /// One-shot state tracking whether the first-turn probe has
+    /// already fired. The hook is called every turn; we only want
+    /// to emit one event per child spawn.
+    pub(crate) fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState,
 }
 
 /// A progress event emitted by a sub-run agent.
@@ -316,6 +332,27 @@ impl AgenticLoopHost for SubRunHost {
             }
         }
     }
+
+    fn on_turn_completed(&mut self, state: &AgenticLoopState) {
+        // PR 5.6: probe the first successful ingested turn's
+        // cache_read_input_tokens against the parent-side estimate.
+        // Subsequent turns no-op. Sink may be None — runtime is
+        // harmless without telemetry. We pass the *accumulated*
+        // total_cache_read because ingest has already added the
+        // current turn's cache_read_input_tokens into it, and this
+        // is the first call after ingest, so the accumulator IS the
+        // first-turn value.
+        if let Some(ref sink) = self.fork_cache_sink {
+            astra_runtime::orchestration::maybe_emit_fork_cache_probe(
+                &mut self.fork_cache_probe_state,
+                self.inherited_prefix.as_ref(),
+                state.current_run_id.as_deref().unwrap_or(""),
+                state.total_cache_read,
+                astra_turn_core::fork_cache_event::ForkCacheThresholds::default(),
+                sink.as_ref(),
+            );
+        }
+    }
 }
 
 // ─── CliSkillSubRunExecutor ──────────────────────────────────────────────────
@@ -447,6 +484,13 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             tool_cache: super::stream_render::EdgeToolCache::new(
                 resolved_tool_policy.max_identical_tool_calls,
             ),
+            // Skill sub-runs don't participate in fork-prefix cache
+            // inheritance — skills are user-invoked, not spawner-
+            // driven. Leave empty.
+            inherited_prefix: None,
+            fork_cache_sink: None,
+            fork_cache_probe_state:
+                astra_runtime::orchestration::ForkCacheProbeState::new(),
         };
 
         let messages = vec![
@@ -651,6 +695,9 @@ mod tests {
             progress_tx: None,
             agent_id: String::new(),
             tool_cache: crate::stream_render::EdgeToolCache::new(3),
+            inherited_prefix: None,
+            fork_cache_sink: None,
+            fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
         };
         assert!(host.is_quiet());
     }
@@ -676,6 +723,9 @@ mod tests {
             progress_tx: Some(tx),
             agent_id: "test-agent".to_string(),
             tool_cache: crate::stream_render::EdgeToolCache::new(3),
+            inherited_prefix: None,
+            fork_cache_sink: None,
+            fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
         };
         assert!(!host.is_quiet());
     }
@@ -700,6 +750,9 @@ mod tests {
             progress_tx: None,
             agent_id: String::new(),
             tool_cache: crate::stream_render::EdgeToolCache::new(3),
+            inherited_prefix: None,
+            fork_cache_sink: None,
+            fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
         };
         let schema = json!({
             "type": "function",

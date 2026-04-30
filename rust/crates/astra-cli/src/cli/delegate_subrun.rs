@@ -253,6 +253,13 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             tool_cache: super::stream_render::EdgeToolCache::new(
                 resolved_tool_policy.max_identical_tool_calls,
             ),
+            // Delegate sub-runs don't participate in fork-prefix
+            // cache inheritance — delegation uses narrative summary
+            // instead of byte-identical prefix reuse. Leave empty.
+            inherited_prefix: None,
+            fork_cache_sink: None,
+            fork_cache_probe_state:
+                astra_runtime::orchestration::ForkCacheProbeState::new(),
         };
 
         // Build system message from agent profile.
