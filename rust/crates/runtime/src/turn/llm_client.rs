@@ -689,7 +689,7 @@ fn build_bedrock_tool_blocks(tool_calls: Option<&Vec<Value>>) -> Vec<Value> {
         .collect()
 }
 
-fn build_bedrock_message_content(msg: &Value) -> Vec<Value> {
+fn build_bedrock_message_content(msg: &Value, include_reasoning_content: bool) -> Vec<Value> {
     let role = msg.get("role").and_then(Value::as_str).unwrap_or_default();
     match role {
         "tool" => {
@@ -727,8 +727,10 @@ fn build_bedrock_message_content(msg: &Value) -> Vec<Value> {
         }
         "assistant" => {
             let mut blocks = Vec::new();
-            // Bedrock requires reasoningContent FIRST in the content array.
-            if let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str) {
+            // Bedrock requires reasoningContent FIRST when thinking is enabled.
+            if include_reasoning_content
+                && let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str)
+            {
                 if !rc.is_empty() {
                     let mut reasoning_text = json!({"text": rc});
                     if let Some(sig) = msg.get("reasoning_signature").and_then(Value::as_str) {
@@ -871,7 +873,10 @@ fn flush_tool_buffer(out: &mut Vec<Value>, buffer: &mut Vec<Value>) {
     }));
 }
 
-fn build_bedrock_messages(messages: &[Value]) -> (Vec<Value>, Vec<Value>) {
+fn build_bedrock_messages(
+    messages: &[Value],
+    include_reasoning_content: bool,
+) -> (Vec<Value>, Vec<Value>) {
     let mut system = Vec::new();
     let mut out = Vec::new();
     // Bedrock Converse requires all toolResult blocks for a given assistant
@@ -890,10 +895,13 @@ fn build_bedrock_messages(messages: &[Value]) -> (Vec<Value>, Vec<Value>) {
                 system.extend(build_bedrock_text_content_blocks(msg.get("content")));
             }
             "tool" => {
-                tool_buffer.extend(build_bedrock_message_content(msg));
+                tool_buffer.extend(build_bedrock_message_content(
+                    msg,
+                    include_reasoning_content,
+                ));
             }
             "user" | "assistant" => {
-                let content = build_bedrock_message_content(msg);
+                let content = build_bedrock_message_content(msg, include_reasoning_content);
                 if !content.is_empty() {
                     out.push(json!({
                         "role": role,
@@ -1041,7 +1049,8 @@ pub(crate) fn build_provider_request_body(
     match llm_provider_protocol(provider) {
         LlmProviderProtocol::BedrockConverse => {
             let repaired = repair_openai_tool_pairing_for_bedrock(messages);
-            let (system, bedrock_messages) = build_bedrock_messages(&repaired);
+            let (system, bedrock_messages) =
+                build_bedrock_messages(&repaired, thinking.is_enabled());
             let mut body = json!({
                 "messages": bedrock_messages,
             });
@@ -5614,7 +5623,9 @@ mod tests {
             Some(4096),
             None,
             true,
-            &ThinkingConfig::Off,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
         );
         let bedrock_msgs = body["messages"].as_array().unwrap();
         // First message is user "hello"
@@ -5860,8 +5871,8 @@ mod tests {
         assert_eq!(rc_sig, "sig_from_bedrock");
     }
 
-    // Contract negative-bypass: thinking disabled → guard does NOT fire even if
-    // signature is missing (non-thinking runs never send `thinking` blocks).
+    // Contract negative-bypass: thinking disabled → stale reasoning history
+    // is not serialized, so the signature guard has nothing to enforce.
     #[test]
     fn bedrock_thinking_signature_contract_silent_when_thinking_off() {
         let messages = vec![
@@ -5874,7 +5885,7 @@ mod tests {
             }),
             json!({"role": "tool", "tool_call_id": "tc1", "content": "ok"}),
         ];
-        let _ = build_provider_request_body(
+        let body = build_provider_request_body(
             &messages,
             &[],
             "us.anthropic.claude-sonnet-4-6",
@@ -5884,7 +5895,12 @@ mod tests {
             true,
             &ThinkingConfig::Off,
         );
-        // Reaching this line means the assert did NOT fire when thinking=off.
+        let assistant = &body["messages"][1];
+        let content = assistant["content"].as_array().unwrap();
+        assert!(
+            !content.iter().any(|b| b.get("reasoningContent").is_some()),
+            "thinking=off must suppress stale reasoningContent so Bedrock never sees an unsigned reasoning block"
+        );
     }
 
     #[test]
@@ -6192,10 +6208,13 @@ mod tests {
                 true,
                 &ThinkingConfig::Off,
             );
-            // Bedrock message builder always mirrors reasoning_content when
-            // present — but thinking=off at the provider config level means
-            // the provider won't *expect* a signature. No panic, no 400.
             assert!(body.get("additionalModelRequestFields").is_none());
+            let assistant = &body["messages"][1];
+            let content = assistant["content"].as_array().unwrap();
+            assert!(
+                !content.iter().any(|b| b.get("reasoningContent").is_some()),
+                "thinking=off should not serialize stale reasoningContent"
+            );
         }
 
         // ── Row: Bedrock + Thinking::Enabled + no tool_call + turn-1 ──
@@ -6258,15 +6277,11 @@ mod tests {
         // matching SSE signature capture, this test becomes real coverage
         // by removing the `#[ignore]`.
         //
-        // The companion tripwire `anthropic_thinking_todo_has_not_rotted`
-        // fails the build once the review window elapses, forcing a
-        // decision: implement, defer explicitly, or delete. That is how
-        // this ignore avoids permanent rot.
-        //
-        // TODO(anthropic-thinking, due=2026-11-01): remove `#[ignore]` and
-        // implement the typed-block serializer + SSE signature capture.
+        // TODO(anthropic-thinking): remove `#[ignore]` and implement the
+        // typed-block serializer + SSE signature capture before enabling
+        // native Anthropic multi-turn thinking.
         #[test]
-        #[ignore = "blocked on typed-block serializer — tripwire: anthropic_thinking_todo_has_not_rotted (due 2026-11-01)"]
+        #[ignore = "blocked on typed-block serializer for native Anthropic thinking"]
         fn anthropic_thinking_tool_call_multi_turn_needs_typed_blocks() {
             let messages = vec![
                 user("compute 2+2"),
@@ -6293,35 +6308,6 @@ mod tests {
             assert_eq!(assistant_content[0]["thinking"], "thinking...");
             assert_eq!(assistant_content[0]["signature"], "real_sig");
             assert_eq!(assistant_content[1]["type"], "tool_use");
-        }
-
-        // Tripwire: forces the Anthropic thinking TODO to be addressed (or
-        // explicitly re-scheduled with a new date) by the stated deadline.
-        // Fails the build on or after 2026-11-01 UTC (epoch 1_793_491_200).
-        //
-        // When this test goes red: either (a) implement the Anthropic typed-
-        // block serializer and remove the `#[ignore]` above, (b) delete the
-        // ignored test if the Anthropic native provider path is dropped, or
-        // (c) push the deadline forward in both this test and the comment
-        // above — and justify why in the commit message. The point is that
-        // the `#[ignore]` can never become permanent infrastructure.
-        #[test]
-        fn anthropic_thinking_todo_has_not_rotted() {
-            const DEADLINE_EPOCH_SECS: u64 = 1_793_491_200; // 2026-11-01T00:00:00Z
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            assert!(
-                now < DEADLINE_EPOCH_SECS,
-                "anthropic-thinking TODO rotted past 2026-11-01 — either \
-                 implement the typed-block serializer for Anthropic native \
-                 multi-turn thinking (removing the `#[ignore]` on \
-                 anthropic_thinking_tool_call_multi_turn_needs_typed_blocks), \
-                 delete the ignored test if the Anthropic path is gone, or \
-                 push the deadline forward with justification. \
-                 See comment above the ignored test for details."
-            );
         }
 
         // ── Row: OpenAI + Thinking::Adaptive(effort) ──
