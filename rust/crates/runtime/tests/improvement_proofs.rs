@@ -447,55 +447,6 @@ mod memory_awareness {
 
     // ── 2c. Freshness decay improves recency bias ─────────────────────────
 
-    /// Without freshness decay, two identical messages at positions 5 and 95
-    /// (out of 100) would have the same TF-IDF score. With decay, the recent
-    /// one at position 95 scores higher — which is correct because recent
-    /// context is more likely to be relevant.
-    #[test]
-    fn freshness_decay_correctly_prioritizes_recent_over_old() {
-        let decay_base: f64 = 0.95;
-        let total_messages = 100;
-
-        // Same message at position 5 (old) and 95 (recent)
-        let base_tfidf_score = 0.75; // same content → same TF-IDF score
-
-        // WITHOUT decay: both score 0.75 — no way to break the tie meaningfully
-        let old_score_pos5 = base_tfidf_score;
-        let old_score_pos95 = base_tfidf_score;
-        assert_eq!(
-            old_score_pos5, old_score_pos95,
-            "Without decay, identical content at different positions scores the same"
-        );
-
-        // WITH decay: recent message gets much higher effective score
-        let distance_pos5 = total_messages - 5 - 1; // 94 messages away from end
-        let distance_pos95 = total_messages - 95 - 1; // 4 messages away from end
-
-        let new_score_pos5 = base_tfidf_score * decay_base.powi(distance_pos5);
-        let new_score_pos95 = base_tfidf_score * decay_base.powi(distance_pos95);
-
-        assert!(
-            new_score_pos95 > new_score_pos5,
-            "With decay, recent msg ({new_score_pos95:.4}) should beat old msg ({new_score_pos5:.4})"
-        );
-
-        // Quantify the improvement: how much does decay help?
-        let recency_boost = new_score_pos95 / new_score_pos5;
-        assert!(
-            recency_boost > 5.0,
-            "Recent message should be boosted {recency_boost:.1}x over old — \
-             old system gives 1.0x (no boost)"
-        );
-
-        // At 94 messages back, the old message is decayed to ~5.7% of original
-        let old_msg_retention = decay_base.powi(94);
-        assert!(
-            old_msg_retention < 0.10,
-            "Very old messages are heavily discounted: {:.1}% retained",
-            old_msg_retention * 100.0
-        );
-    }
-
     // ── 2d. Adaptive budget vs fixed budget ───────────────────────────────
 
     #[test]
@@ -1173,9 +1124,7 @@ mod selection_feedback_loop {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 mod non_happy_path {
-    use astra_turn_core::stall::{
-        DivergenceStatus, build_stall_reflection, detect_divergence, detect_server_stall,
-    };
+    use astra_turn_core::stall::build_stall_reflection;
     use astra_turn_core::tool_health::ToolHealthTracker;
     use std::collections::BTreeSet;
 
@@ -1242,67 +1191,7 @@ mod non_happy_path {
         );
     }
 
-    // ── B.2: Divergence Detection ──
-
-    #[test]
-    fn divergence_detects_exact_repeat_loop() {
-        // P2.5: divergence is defined by signature repetition, not by
-        // which tools appear. Genuine exact-repeat loop → Diverging.
-        let sigs = make_sigs(&[&["bash"], &["bash"], &["bash"], &["bash"], &["bash"]]);
-        let status = detect_divergence(&sigs).unwrap();
-        assert!(
-            matches!(status, DivergenceStatus::Diverging(_)),
-            "Exact sig repetition across window should be diverging; got {status:?}"
-        );
-    }
-
-    #[test]
-    fn divergence_resets_on_productive_tool() {
-        let sigs = make_sigs(&[&["bash"], &["list_dir"], &["memory_store"], &["bash"]]);
-        let status = detect_divergence(&sigs).unwrap();
-        assert!(
-            !matches!(status, DivergenceStatus::Diverging(_)),
-            "Productive tool use should reset divergence counter"
-        );
-    }
-
-    #[test]
-    fn divergence_and_stall_agree_on_loops() {
-        // P2.5 unified both detectors around signature diversity: a genuine
-        // exact-repeat loop trips both. Diverse exploration trips neither.
-        let loop_sigs = make_sigs(&[&["bash"], &["bash"], &["bash"], &["bash"], &["bash"]]);
-        let diverse_sigs = make_sigs(&[
-            &["bash"],
-            &["list_dir"],
-            &["read_file"],
-            &["grep"],
-            &["glob"],
-            &["bash"],
-            &["list_dir"],
-            &["read_file"],
-        ]);
-
-        assert!(
-            detect_server_stall(&loop_sigs, 3).unwrap(),
-            "Exact-repeat triggers stall"
-        );
-        assert!(
-            matches!(
-                detect_divergence(&loop_sigs).unwrap(),
-                DivergenceStatus::Diverging(_)
-            ),
-            "Exact-repeat triggers divergence"
-        );
-        assert!(
-            !detect_server_stall(&diverse_sigs, 3).unwrap(),
-            "Diverse rounds are not stall"
-        );
-        assert_eq!(
-            detect_divergence(&diverse_sigs).unwrap(),
-            DivergenceStatus::Healthy,
-            "Diverse rounds are healthy"
-        );
-    }
+    // ── B.2: Divergence Detection (covered by nonhappy_path.rs::stall_detection) ──
 
     // ── B.3: Per-Tool Error Budget ──
 

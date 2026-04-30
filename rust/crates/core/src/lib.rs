@@ -390,62 +390,38 @@ mod tests {
     // --- bearer_token ---
 
     #[test]
-    fn bearer_token_valid() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer abc123".parse().unwrap());
-        assert_eq!(bearer_token(&headers).ok(), Some("abc123"));
+    fn bearer_token_ok_cases() {
+        let cases: &[(&str, &str)] = &[
+            ("Bearer abc123", "abc123"),
+            ("Bearer token with spaces", "token with spaces"),
+            ("Bearer mytoken", "mytoken"),
+            ("Bearer  double", " double"),
+        ];
+        for &(header_val, expected) in cases {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", header_val.parse().unwrap());
+            assert_eq!(
+                bearer_token(&headers).ok(), Some(expected),
+                "header '{header_val}' should yield '{expected}'"
+            );
+        }
     }
 
     #[test]
-    fn bearer_token_missing_header() {
-        let headers = HeaderMap::new();
-        assert!(bearer_token(&headers).is_err());
-    }
+    fn bearer_token_err_cases() {
+        // Missing header
+        assert!(bearer_token(&HeaderMap::new()).is_err());
 
-    #[test]
-    fn bearer_token_wrong_prefix() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Basic abc".parse().unwrap());
-        assert!(bearer_token(&headers).is_err());
-    }
-
-    #[test]
-    fn bearer_token_empty_after_prefix() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer ".parse().unwrap());
-        assert!(bearer_token(&headers).is_err());
-    }
-
-    #[test]
-    fn bearer_token_with_spaces() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer token with spaces".parse().unwrap());
-        assert_eq!(bearer_token(&headers).ok(), Some("token with spaces"));
-    }
-
-    // --- bearer_token edge cases ---
-
-    #[test]
-    fn bearer_token_lowercase_header_name() {
-        // HeaderMap is case-insensitive
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", "Bearer mytoken".parse().unwrap());
-        assert_eq!(bearer_token(&headers).ok(), Some("mytoken"));
-    }
-
-    #[test]
-    fn bearer_token_no_space_after_bearer() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearertoken".parse().unwrap());
-        assert!(bearer_token(&headers).is_err());
-    }
-
-    #[test]
-    fn bearer_token_double_space() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer  double".parse().unwrap());
-        // starts_with("Bearer ") matches, then remainder is " double" (with leading space)
-        assert_eq!(bearer_token(&headers).ok(), Some(" double"));
+        // Wrong prefix / malformed
+        let err_cases = ["Basic abc", "Bearer ", "Bearertoken"];
+        for header_val in &err_cases {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", header_val.parse().unwrap());
+            assert!(
+                bearer_token(&headers).is_err(),
+                "header '{header_val}' should be Err"
+            );
+        }
     }
 
     // --- error_response edge cases ---

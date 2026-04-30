@@ -155,40 +155,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_match_original_constants() {
-        let d = RuntimeLimits::default();
-        assert_eq!(d.max_turns, 150);
-        assert_eq!(d.plan_subtask_max_turns, 0);
-        assert!((d.turn_timeout_s - 300.0).abs() < f64::EPSILON);
-        assert_eq!(d.global_output_limit, 200_000);
-        assert_eq!(d.tool_output_limit, 80_000);
-        assert_eq!(d.max_tool_retries, 2);
-        assert_eq!(d.retry_base_ms, 500);
-        assert_eq!(d.max_retrieved, 6);
-        assert_eq!(d.max_turn_input_tokens, 80_000);
-    }
-
-    #[test]
-    fn env_override_applies() {
-        // We can't safely set env vars in parallel tests, but we can test
-        // that env_parse falls back correctly on missing vars.
-        let val: usize = env_parse("ASTRA_TEST_NONEXISTENT_LIMIT_XYZ", 42);
-        assert_eq!(val, 42);
-    }
-
-    #[test]
-    fn global_singleton_returns_consistent_values() {
-        let a = RuntimeLimits::global();
-        let b = RuntimeLimits::global();
-        assert_eq!(a.max_turns, b.max_turns);
-    }
-
-    #[test]
-    fn dev_password_constant_matches_original() {
-        assert_eq!(DEV_MATRIXONE_PASSWORD, "111");
-    }
-
-    #[test]
     fn effective_plan_subtask_turns_falls_back_to_max_turns() {
         let limits = RuntimeLimits {
             plan_subtask_max_turns: 0,

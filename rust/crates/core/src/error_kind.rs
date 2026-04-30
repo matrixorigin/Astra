@@ -662,111 +662,49 @@ mod tests {
     // ── classify_tool_output ──
 
     #[test]
-    fn classify_resource_limit() {
-        assert_eq!(
-            classify_tool_output("fork: Resource temporarily unavailable"),
-            ErrorKind::ResourceLimit
-        );
-        assert_eq!(
-            classify_tool_output("Cannot allocate memory"),
-            ErrorKind::ResourceLimit
-        );
-    }
-
-    #[test]
-    fn classify_command_timeout() {
-        assert_eq!(
-            classify_tool_output("command timed out after 30s"),
-            ErrorKind::ToolTimeout
-        );
-        assert_eq!(
-            classify_tool_output("grep timed out"),
-            ErrorKind::ToolTimeout
-        );
-    }
-
-    #[test]
-    fn classify_network_transient() {
-        assert_eq!(
-            classify_tool_output("connection timed out after 30s"),
-            ErrorKind::Network
-        );
-        assert_eq!(classify_tool_output("ETIMEDOUT"), ErrorKind::Network);
-        assert_eq!(
-            classify_tool_output("HTTP 503 Service Unavailable"),
-            ErrorKind::Network
-        );
-    }
-
-    #[test]
-    fn classify_auth() {
-        assert_eq!(classify_tool_output("401 Unauthorized"), ErrorKind::Auth);
-        assert_eq!(
-            classify_tool_output("Permission denied: insufficient scope"),
-            ErrorKind::Auth
-        );
-    }
-
-    #[test]
-    fn classify_not_found() {
-        assert_eq!(
-            classify_tool_output("No such file or directory"),
-            ErrorKind::ToolNotFound
-        );
-        assert_eq!(
-            classify_tool_output("ENOENT: file does not exist"),
-            ErrorKind::ToolNotFound
-        );
-    }
-
-    #[test]
-    fn classify_invalid_args() {
-        assert_eq!(
-            classify_tool_output("invalid argument: expected integer"),
-            ErrorKind::ToolInvalidArgs
-        );
-    }
-
-    #[test]
-    fn classify_unavailable() {
-        assert_eq!(
-            classify_tool_output("command not found: rg"),
-            ErrorKind::ToolUnavailable
-        );
-    }
-
-    #[test]
-    fn classify_workspace_read_before_write() {
-        assert_eq!(
-            classify_tool_output("File has not been read yet — read it first before editing"),
-            ErrorKind::ToolInvalidArgs
-        );
-        assert_eq!(
-            classify_tool_output(
-                "File was only partially read; read the full file before overwriting"
-            ),
-            ErrorKind::ToolInvalidArgs
-        );
-    }
-
-    #[test]
-    fn classify_unknown_fallback() {
-        assert_eq!(
-            classify_tool_output("something completely unexpected happened"),
-            ErrorKind::Unknown
-        );
-    }
-
-    // ── Unhappy path / edge cases ──
-
-    #[test]
-    fn classify_empty_string() {
-        assert_eq!(classify_tool_output(""), ErrorKind::Unknown);
-    }
-
-    #[test]
-    fn classify_whitespace_only() {
-        assert_eq!(classify_tool_output("   \n\t  "), ErrorKind::Unknown);
+    fn classify_tool_output_cases() {
+        let cases: &[(&str, ErrorKind)] = &[
+            // ResourceLimit
+            ("fork: Resource temporarily unavailable", ErrorKind::ResourceLimit),
+            ("Cannot allocate memory", ErrorKind::ResourceLimit),
+            ("系统资源不足，无法完成操作", ErrorKind::ResourceLimit),
+            ("内存不足", ErrorKind::ResourceLimit),
+            // ToolTimeout
+            ("command timed out after 30s", ErrorKind::ToolTimeout),
+            ("grep timed out", ErrorKind::ToolTimeout),
+            // Network
+            ("connection timed out after 30s", ErrorKind::Network),
+            ("ETIMEDOUT", ErrorKind::Network),
+            ("HTTP 503 Service Unavailable", ErrorKind::Network),
+            // Auth
+            ("401 Unauthorized", ErrorKind::Auth),
+            ("Permission denied: insufficient scope", ErrorKind::Auth),
+            ("EACCES: permission denied", ErrorKind::Auth),
+            ("EPERM: operation not permitted", ErrorKind::Auth),
+            // ToolNotFound
+            ("No such file or directory", ErrorKind::ToolNotFound),
+            ("ENOENT: file does not exist", ErrorKind::ToolNotFound),
+            ("Is a directory", ErrorKind::ToolNotFound),
+            ("EISDIR: illegal operation on a directory", ErrorKind::ToolNotFound),
+            // ToolInvalidArgs
+            ("invalid argument: expected integer", ErrorKind::ToolInvalidArgs),
+            ("File has not been read yet — read it first before editing", ErrorKind::ToolInvalidArgs),
+            ("File was only partially read; read the full file before overwriting", ErrorKind::ToolInvalidArgs),
+            ("Error: file is too large (97716 bytes)", ErrorKind::ToolInvalidArgs),
+            // ToolUnavailable
+            ("command not found: rg", ErrorKind::ToolUnavailable),
+            ("bash: rg: command not found", ErrorKind::ToolUnavailable),
+            // Unknown
+            ("something completely unexpected happened", ErrorKind::Unknown),
+            ("", ErrorKind::Unknown),
+            ("   \n\t  ", ErrorKind::Unknown),
+        ];
+        for &(input, expected) in cases {
+            assert_eq!(
+                classify_tool_output(input), expected,
+                "classify_tool_output({input:?}) should be {expected:?}"
+            );
+        }
     }
 
     #[test]
@@ -776,84 +714,21 @@ mod tests {
     }
 
     #[test]
-    fn classify_chinese_resource_limit() {
-        assert_eq!(
-            classify_tool_output("系统资源不足，无法完成操作"),
-            ErrorKind::ResourceLimit
-        );
-        assert_eq!(classify_tool_output("内存不足"), ErrorKind::ResourceLimit);
-    }
-
-    #[test]
-    fn classify_priority_command_not_found_over_not_found() {
-        // "command not found" should be ToolUnavailable, not ToolNotFound
-        assert_eq!(
-            classify_tool_output("bash: rg: command not found"),
-            ErrorKind::ToolUnavailable
-        );
-    }
-
-    #[test]
-    fn classify_priority_command_timeout_over_network_timeout() {
-        // "command timed out after 30s" should be ToolTimeout, not Network
-        assert_eq!(
-            classify_tool_output("command timed out after 30s"),
-            ErrorKind::ToolTimeout
-        );
-        // But "connection timed out" should be Network
-        assert_eq!(
-            classify_tool_output("connection timed out after 30s"),
-            ErrorKind::Network
-        );
-    }
-
-    #[test]
-    fn classify_priority_workspace_guard_over_network() {
-        // Workspace guard errors contain "retry" which could match Network
-        assert_eq!(
-            classify_tool_output("File has not been read yet — read it first before editing"),
-            ErrorKind::ToolInvalidArgs
-        );
-    }
-
-    #[test]
-    fn classify_priority_resource_limit_first() {
-        // Resource limit should win over everything
+    fn classify_priority_rules() {
+        // Resource limit wins over network
         assert_eq!(
             classify_tool_output("fork: Resource temporarily unavailable (connection timeout)"),
             ErrorKind::ResourceLimit
         );
-    }
-
-    #[test]
-    fn classify_is_a_directory() {
+        // "command timed out" = ToolTimeout, not Network
         assert_eq!(
-            classify_tool_output("Is a directory"),
-            ErrorKind::ToolNotFound
+            classify_tool_output("command timed out after 30s"),
+            ErrorKind::ToolTimeout
         );
+        // "connection timed out" = Network
         assert_eq!(
-            classify_tool_output("EISDIR: illegal operation on a directory"),
-            ErrorKind::ToolNotFound
-        );
-    }
-
-    #[test]
-    fn classify_file_too_large() {
-        assert_eq!(
-            classify_tool_output("Error: file is too large (97716 bytes)"),
-            ErrorKind::ToolInvalidArgs
-        );
-    }
-
-    #[test]
-    fn classify_eacces_eperm() {
-        assert_eq!(
-            classify_tool_output("EACCES: permission denied"),
-            ErrorKind::Auth
-        );
-        assert_eq!(
-            classify_tool_output("EPERM: operation not permitted"),
-            ErrorKind::Auth
+            classify_tool_output("connection timed out after 30s"),
+            ErrorKind::Network
         );
     }
 

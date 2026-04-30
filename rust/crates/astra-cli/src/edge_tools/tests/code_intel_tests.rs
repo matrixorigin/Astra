@@ -143,8 +143,8 @@ async fn find_definition_in_repo() {
         .await;
     // Should find our own struct definition
     assert!(
-        result.contains("ToolExecutor") || result.contains("No definitions"),
-        "unexpected: {result}"
+        result.contains("ToolExecutor"),
+        "should find ToolExecutor definition in own repo: {result}"
     );
 }
 
@@ -162,8 +162,8 @@ async fn find_definition_regex_pattern() {
         .execute("find_definition", &json!({"symbol": "git_st.*"}))
         .await;
     assert!(
-        result.contains("git_st") || result.contains("No definitions"),
-        "should match regex: {result}"
+        result.contains("git_st"),
+        "regex should match git_st* symbols: {result}"
     );
 }
 
@@ -484,8 +484,8 @@ async fn find_references_in_repo() {
         .await;
     // Should find references in our own codebase
     assert!(
-        result.contains("ToolExecutor") || result.contains("No references"),
-        "unexpected: {result}"
+        result.contains("ToolExecutor"),
+        "should find ToolExecutor references in own repo: {result}"
     );
 }
 
@@ -509,7 +509,7 @@ async fn find_references_with_include_filter() {
         .await;
     // All results should be .rs files
     assert!(
-        result.contains("ToolExecutor") || result.contains("No references"),
-        "unexpected: {result}"
+        result.contains("ToolExecutor"),
+        "should find ToolExecutor references with include filter: {result}"
     );
 }

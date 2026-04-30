@@ -7,7 +7,6 @@
 //!
 //! Shares the same env conventions as `services_db_integration.rs`.
 
-use astra_core::{DEV_MATRIXONE_PASSWORD, MatrixOneSettings, SharedPool, resolve_database_name};
 use astra_services::ensure_core_schema;
 use astra_services::state_sync::{PlanStepRunSyncRow, PlanSyncRow};
 use astra_services::{MatrixOneSyncService, StateSyncService};
@@ -15,35 +14,12 @@ use serde_json::Value;
 use sqlx::Row;
 use uuid::Uuid;
 
-fn require_db_it_env() -> MatrixOneSettings {
-    assert_eq!(
-        std::env::var("ASTRA_TEST_DB_IT").as_deref(),
-        Ok("1"),
-        "set ASTRA_TEST_DB_IT=1 for ignored plan_sync_db_it tests"
-    );
-    dotenvy::dotenv().ok();
-    MatrixOneSettings {
-        host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-        port: std::env::var("MATRIXONE_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6001),
-        user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
-        password: std::env::var("MATRIXONE_PASSWORD")
-            .unwrap_or_else(|_| DEV_MATRIXONE_PASSWORD.to_string()),
-        database: resolve_database_name(&|k| std::env::var(k).ok()),
-    }
-}
+mod common;
+use common::require_db_it_env;
 
 async fn setup_pool() -> sqlx::Pool<sqlx::MySql> {
-    let settings = require_db_it_env();
-    let catalog =
-        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
-    ensure_core_schema(&settings, &catalog)
-        .await
-        .expect("ensure_core_schema; is MatrixOne up?");
-    let shared = SharedPool::new(&settings).await.expect("SharedPool::new");
-    shared.get().clone()
+    let pool = common::setup_pool().await;
+    pool.get().clone()
 }
 
 async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, plan_prefix: &str) {

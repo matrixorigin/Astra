@@ -12,7 +12,7 @@
 //! created before `idx_skill_active_created_at` existed, this suite runs a **test-only** `CREATE INDEX`
 //! (ignores duplicate-name errors) so the listing path is validated against the intended DDL.
 
-use astra_core::{DEV_MATRIXONE_PASSWORD, MatrixOneSettings, SharedPool, resolve_database_name};
+use astra_core::{MatrixOneSettings, SharedPool};
 use astra_services::event_ingestion::{EventIngestionWorker, IngestionConfig, IngestionEvent};
 use astra_services::session_audit::TurnListParams;
 use astra_services::session_audit::{
@@ -38,41 +38,16 @@ use astra_services::{
     MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, MAX_MARKETPLACE_SEARCH_OFFSET,
     MarketplaceStatsService, MatrixOneDurableTaskLifecycle, MatrixOneSyncService,
     SessionArtifactJsonStore, SessionArtifactStore, SessionListFilter, SessionService,
-    SkillSearchQuery, SkillService, StagedMutationState, StateSyncService, ensure_core_schema,
+    SkillSearchQuery, SkillService, StagedMutationState, StateSyncService,
 };
 use sqlx::Row;
 use std::collections::HashSet;
 use uuid::Uuid;
 
-fn require_db_it_env() -> MatrixOneSettings {
-    assert_eq!(
-        std::env::var("ASTRA_TEST_DB_IT").as_deref(),
-        Ok("1"),
-        "set ASTRA_TEST_DB_IT=1 for ignored services_db_integration tests"
-    );
-    dotenvy::dotenv().ok();
-    MatrixOneSettings {
-        host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-        port: std::env::var("MATRIXONE_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6001),
-        user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
-        password: std::env::var("MATRIXONE_PASSWORD")
-            .unwrap_or_else(|_| DEV_MATRIXONE_PASSWORD.to_string()),
-        database: resolve_database_name(&|k| std::env::var(k).ok()),
-    }
-}
+mod common;
 
 async fn setup_pool_and_settings() -> (SharedPool, MatrixOneSettings) {
-    let settings = require_db_it_env();
-    let catalog =
-        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
-    ensure_core_schema(&settings, &catalog)
-        .await
-        .expect("ensure_core_schema; is MatrixOne up?");
-    let pool = SharedPool::new(&settings).await.expect("SharedPool::new");
-    (pool, settings)
+    common::setup_pool_and_settings().await
 }
 
 /// Test-only: align older dev databases with current `skills_registry` DDL (no product migration).

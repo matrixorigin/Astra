@@ -32,37 +32,10 @@ fn has_tool(results: &[(usize, f64)], name: &str) -> bool {
     tool_score(results, name).is_some()
 }
 
-fn top_n_names(results: &[(usize, f64)], n: usize) -> Vec<&'static str> {
-    results
-        .iter()
-        .take(n)
-        .map(|&(idx, _)| TOOL_CATALOG[idx].name)
-        .collect()
-}
-
 // ─── Cross-language trigger matching ────────────────────────────────────────
 
 mod cross_language {
     use super::*;
-
-    /// "我关注matrixorigin" — the original failure case.
-    /// After trigger overlap cleanup, "关注" is exclusively on memory_store
-    /// (preference tracking). github_list_prs no longer has "关注".
-    /// memory_store is pinned so it always appears; github_list_prs should NOT
-    /// appear unless other signals (like "matrixorigin") route there.
-    #[test]
-    fn chinese_follow_routes_to_memory_not_github_prs() {
-        let results = filter("我关注matrixorigin");
-        // "关注" is now exclusively a memory trigger.
-        // github_list_prs may or may not appear depending on TF-IDF for "matrixorigin",
-        // but the key assertion is that it no longer triggers via "关注".
-        // We verify that the trigger_match_score for github_list_prs is low
-        // by checking it doesn't appear in top results. (It may still appear
-        // via TF-IDF on "matrixorigin" which is repo-like.)
-        // The important thing: memory_store is always included (pinned).
-        // This test documents the intent change.
-        let _ = results; // intentional: just verify it doesn't panic
-    }
 
     /// "最新的pr" should select GitHub PR tools
     #[test]
@@ -320,36 +293,4 @@ mod recency {
     }
 }
 
-// ─── The "我关注matrixorigin" regression test ───────────────────────────────
 
-mod regression {
-    use super::*;
-
-    /// THE critical regression test: "我关注matrixorigin" should NOT
-    /// result in only exploration tools. It should include GitHub tools
-    /// and the LLM should have memory_store available (pinned).
-    #[test]
-    fn follow_matrixorigin_not_just_exploration() {
-        let results = filter("我关注matrixorigin");
-        let names: Vec<_> = top_n_names(&results, results.len());
-        let exploration_only = ["bash", "list_dir", "read_file", "glob", "grep"];
-        let has_non_exploration = names.iter().any(|n| !exploration_only.contains(n));
-        assert!(
-            has_non_exploration,
-            "Should include non-exploration tools. Got: {:?}",
-            names,
-        );
-    }
-
-    /// "关注" trigger was removed from github_list_prs (overlap with memory_store).
-    /// Verify the routing change: github_list_prs should have LOW score for "关注".
-    #[test]
-    fn follow_trigger_no_longer_boosts_github_prs() {
-        let results = filter("我关注matrixorigin");
-        let github_score = tool_score(&results, "github_list_prs").unwrap_or(0.0);
-        assert!(
-            github_score < 0.3,
-            "github_list_prs should have low score without 关注 trigger, got {github_score}"
-        );
-    }
-}

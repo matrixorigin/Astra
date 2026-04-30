@@ -94,33 +94,4 @@ macro_rules! agent_escalation {
     };
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn macros_compile_and_format_correctly() {
-        agent_error!("test", "something failed: {}", "reason");
-        agent_warn!("test", "low disk space");
-        agent_info!("test", "session started");
-        agent_debug!("test", "dbg {}", 1);
-    }
 
-    #[test]
-    fn persist_fail_macro_formats_kv() {
-        agent_persist_fail!(
-            "bridge",
-            session = "abc123",
-            events = 42usize,
-            error = "timeout"
-        );
-    }
-
-    #[test]
-    fn escalation_macro_formats_kv() {
-        agent_escalation!(
-            "turnguard",
-            severity = "Critical",
-            nudge_count = 5usize,
-            force_stop = true
-        );
-    }
-}

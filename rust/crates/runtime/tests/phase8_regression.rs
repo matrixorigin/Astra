@@ -34,239 +34,106 @@ mod universal_stemming {
         word_boundary_match(&lower, &chars, needle)
     }
 
-    // ── Plural -s ──
-
     #[test]
-    fn plural_s_commits() {
-        assert!(wbm("show commits", "commit"));
+    fn plural_s() {
+        let cases = [
+            ("show commits", "commit"),
+            ("list branches", "branch"),
+            ("recent merges", "merge"),
+            ("available tools", "tool"),
+            ("changed files", "file"),
+            ("open prs", "pr"),
+        ];
+        for (haystack, needle) in &cases {
+            assert!(wbm(haystack, needle), "'{haystack}' should match '{needle}'");
+        }
     }
 
     #[test]
-    fn plural_s_branches() {
-        assert!(wbm("list branches", "branch"));
+    fn plural_es() {
+        let cases = [
+            ("open issues", "issue"),
+            ("remote branches", "branch"),
+            ("recent fixes", "fix"),
+        ];
+        for (haystack, needle) in &cases {
+            assert!(wbm(haystack, needle), "'{haystack}' should match '{needle}'");
+        }
     }
 
     #[test]
-    fn plural_s_merges() {
-        assert!(wbm("recent merges", "merge"));
+    fn past_tense_ed() {
+        let cases = [
+            ("committed yesterday", "commit"),
+            ("merged into main", "merge"),
+            ("rebased on main", "rebase"),
+            ("fixed the bug", "fix"),
+            ("analyzed the code", "analyze"),
+        ];
+        for (haystack, needle) in &cases {
+            assert!(wbm(haystack, needle), "'{haystack}' should match '{needle}'");
+        }
     }
 
     #[test]
-    fn plural_s_tools() {
-        assert!(wbm("available tools", "tool"));
+    fn gerund_ing() {
+        let cases = [
+            ("committing changes", "commit"),
+            ("merging branches", "merge"),
+            ("rebasing on main", "rebase"),
+            ("debugging the issue", "debug"),
+            ("stashing changes", "stash"),
+            ("branching strategy", "branch"),
+        ];
+        for (haystack, needle) in &cases {
+            assert!(wbm(haystack, needle), "'{haystack}' should match '{needle}'");
+        }
     }
 
     #[test]
-    fn plural_s_files() {
-        assert!(wbm("changed files", "file"));
-    }
-
-    #[test]
-    fn plural_s_prs() {
-        assert!(wbm("open prs", "pr"));
-    }
-
-    // ── Plural -es ──
-
-    #[test]
-    fn plural_es_issues() {
-        assert!(wbm("open issues", "issue"));
-    }
-
-    #[test]
-    fn plural_es_branches_git() {
-        assert!(wbm("remote branches", "branch"));
-    }
-
-    #[test]
-    fn plural_es_fixes() {
-        assert!(wbm("recent fixes", "fix"));
-    }
-
-    // ── Past tense -ed ──
-
-    #[test]
-    fn past_committed() {
-        assert!(wbm("committed yesterday", "commit"));
-    }
-
-    #[test]
-    fn past_merged() {
-        assert!(wbm("merged into main", "merge"));
-    }
-
-    #[test]
-    fn past_rebased() {
-        assert!(wbm("rebased on main", "rebase"));
-    }
-
-    #[test]
-    fn past_fixed() {
-        assert!(wbm("fixed the bug", "fix"));
-    }
-
-    #[test]
-    fn past_analyzed() {
-        assert!(wbm("analyzed the code", "analyze"));
-    }
-
-    // ── Gerund -ing ──
-
-    #[test]
-    fn gerund_committing() {
-        assert!(wbm("committing changes", "commit"));
-    }
-
-    #[test]
-    fn gerund_merging() {
-        assert!(wbm("merging branches", "merge"));
-    }
-
-    #[test]
-    fn gerund_rebasing() {
-        assert!(wbm("rebasing on main", "rebase"));
-    }
-
-    #[test]
-    fn gerund_debugging() {
-        assert!(wbm("debugging the issue", "debug"));
-    }
-
-    // ── Doubled consonant + suffix ──
-
-    #[test]
-    fn doubled_committing() {
+    fn doubled_consonant_suffix() {
         assert!(wbm("committing now", "commit"));
-    }
-
-    #[test]
-    fn doubled_committed() {
         assert!(wbm("just committed", "commit"));
     }
 
     #[test]
-    fn doubled_stashing() {
-        // "stash" + "ing" = "stashing" (no doubling)
-        assert!(wbm("stashing changes", "stash"));
-    }
-
-    // ── Multi-word stems ──
-
-    #[test]
-    fn multiword_pull_requests() {
+    fn multiword_stems() {
         assert!(wbm("show pull requests", "pull request"));
-    }
-
-    #[test]
-    fn multiword_pull_request_singular() {
         assert!(wbm("create a pull request", "pull request"));
     }
 
-    // ── False positive prevention ──
-
     #[test]
-    fn no_false_positive_community() {
+    fn false_positive_prevention() {
         assert!(!wbm("community guidelines", "commit"));
-    }
-
-    #[test]
-    fn no_false_positive_mission() {
         assert!(!wbm("mission statement", "miss"));
-    }
-
-    #[test]
-    fn no_false_positive_branch_in_branching() {
-        // "branching" SHOULD match "branch" — it's a valid stem
-        assert!(wbm("branching strategy", "branch"));
-    }
-
-    #[test]
-    fn no_false_positive_this_contains_hi() {
-        // "this" should NOT match "hi" (substring trap)
         assert!(!wbm("this is a test", "hi"));
-    }
-
-    #[test]
-    fn no_false_positive_token_contains_ok() {
         assert!(!wbm("tokenbudget", "ok"));
     }
 
-    // ── CJK keywords unaffected by stemming ──
-
     #[test]
-    fn cjk_github_keyword() {
+    fn cjk_keywords_unaffected() {
         assert!(wbm("查看仓库信息", "仓库"));
-    }
-
-    #[test]
-    fn cjk_commit_keyword() {
         assert!(wbm("最近的提交", "提交"));
-    }
-
-    #[test]
-    fn cjk_branch_keyword() {
         assert!(wbm("切换分支", "分支"));
     }
 
-    // ── Exact match still works ──
-
     #[test]
-    fn exact_git() {
+    fn exact_match() {
         assert!(wbm("git diff HEAD", "git"));
-    }
-
-    #[test]
-    fn exact_diff() {
         assert!(wbm("show the diff", "diff"));
-    }
-
-    #[test]
-    fn exact_pr() {
         assert!(wbm("review the pr", "pr"));
-    }
-
-    #[test]
-    fn exact_ci() {
         assert!(wbm("check ci status", "ci"));
     }
 
-    // ── Universality proof: SAME rule handles all suffixes ──
-    // These tests prove that no per-keyword hack is needed.
-    // If ANY of these fail, the stemming rule is broken — don't add keywords.
-
     #[test]
-    fn universality_any_noun_plural() {
-        // Made-up stems — proves the RULE works, not keyword lists
+    fn universality_proof() {
+        // Made-up stems prove the RULE works, not keyword lists
         assert!(wbm("the frobnicators are ready", "frobnicator"));
-    }
-
-    #[test]
-    fn universality_any_verb_ed() {
         assert!(wbm("frobulated the data", "frobulate"));
-    }
-
-    #[test]
-    fn universality_any_verb_ing() {
         assert!(wbm("frobulating now", "frobulate"));
-    }
-
-    #[test]
-    fn universality_suffix_ly() {
         assert!(wbm("runs efficiently", "efficient"));
-    }
-
-    #[test]
-    fn universality_suffix_ment() {
         assert!(wbm("deployment succeeded", "deploy"));
-    }
-
-    #[test]
-    fn universality_suffix_tion() {
-        assert!(wbm("compilation failed", "compila")); // NOTE: "compila" + "tion" = "compilation"
-    }
-
-    #[test]
-    fn universality_suffix_er() {
+        assert!(wbm("compilation failed", "compila"));
         assert!(wbm("the debugger crashed", "debug"));
     }
 }

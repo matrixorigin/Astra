@@ -241,10 +241,12 @@ async fn verify_global_on_empty_contract_succeeds() {
         .await
         .unwrap();
 
-    // Global verification on a contract with no global criteria should not fail
+    // Global verification on a contract with no global criteria should succeed
     let results = svc.verify_global(&contract.task_id).await.unwrap();
-    // May return empty vec or auto-generated checks — both are fine
-    let _ = results;
+    // Empty contract: either no checks run (empty vec) or all pass
+    for r in &results {
+        assert!(r.passed, "unexpected failure: {:?}", r);
+    }
 }
 
 #[tokio::test]

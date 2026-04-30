@@ -7,46 +7,21 @@
 //! Uses `MATRIXONE_*` env vars (after `dotenvy`) with the same defaults as local dev (`127.0.0.1:6001`, …).
 //! Effective database name includes optional `ASTRA_DATABASE_PREFIX` (same as `AppSettings`).
 
-use astra_core::{DEV_MATRIXONE_PASSWORD, MatrixOneSettings, SharedPool, resolve_database_name};
+use astra_core::SharedPool;
 use astra_services::multi_agent::{
     DatabaseEdgeRegistryService, DatabaseTaskLeaseService, EdgeRegistryService, LeaseClaimResult,
     TaskLeaseHoldCache, TaskLeaseService, push_tasks_pack_held_mysql,
 };
-use astra_services::storage::ensure_core_schema;
 use astra_services::task_orchestrator::{TaskRecord, TaskStatus};
 use sqlx::Row;
 use std::sync::Arc;
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
-fn require_it_env() -> MatrixOneSettings {
-    assert_eq!(
-        std::env::var("ASTRA_TEST_DB_IT").as_deref(),
-        Ok("1"),
-        "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
-    );
-    dotenvy::dotenv().ok();
-    MatrixOneSettings {
-        host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-        port: std::env::var("MATRIXONE_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6001),
-        user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
-        password: std::env::var("MATRIXONE_PASSWORD")
-            .unwrap_or_else(|_| DEV_MATRIXONE_PASSWORD.to_string()),
-        database: resolve_database_name(&|k| std::env::var(k).ok()),
-    }
-}
+mod common;
 
 async fn setup_pool() -> SharedPool {
-    let settings = require_it_env();
-    let catalog =
-        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
-    ensure_core_schema(&settings, &catalog)
-        .await
-        .expect("ensure_core_schema; is MatrixOne up?");
-    SharedPool::new(&settings).await.expect("SharedPool::new")
+    common::setup_pool().await
 }
 
 async fn cleanup_task(pool: &sqlx::Pool<sqlx::MySql>, task_id: &str) {

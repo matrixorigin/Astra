@@ -364,22 +364,6 @@ fn e2e_remove_rule() {
 
 // ─── E2E: Signal Context ────────────────────────────────────────────────────
 
-/// Test that signal context is preserved.
-#[test]
-fn e2e_signal_context_preserved() {
-    let engine = AutoTuningEngine::new();
-
-    let signal = FeedbackSignal::new(SignalType::Correction)
-        .with_turn("turn_123")
-        .with_context("tool", serde_json::json!("bash"))
-        .with_context("reason", serde_json::json!("wrong command"));
-
-    engine.record_feedback(signal);
-
-    // Aggregator should have the signal (indirectly verified through rule evaluation)
-    // Direct verification would require exposing aggregator internals
-}
-
 // ─── E2E: Default Rules Integration ─────────────────────────────────────────
 
 /// Test that default rules can be loaded and used.
