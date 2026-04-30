@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use astra_turn_core::parallel_tool_exec::{
     MAX_CONCURRENT_READ_ONLY, MAX_CONCURRENT_TOOL_EXECUTIONS, ToolExecutorFn,
-    execute_parallel_round,
+    execute_parallel_round, parse_tool_args, partition_tool_calls,
 };
 use serde_json::{Value, json};
 
@@ -18,6 +18,14 @@ fn tool_call(name: &str, id: &str) -> Value {
         "id": id,
         "type": "function",
         "function": { "name": name, "arguments": "{}" }
+    })
+}
+
+fn tool_call_with_arguments(name: &str, id: &str, arguments: Value) -> Value {
+    json!({
+        "id": id,
+        "type": "function",
+        "function": { "name": name, "arguments": arguments }
     })
 }
 
@@ -304,6 +312,47 @@ fn shared_tool_semaphore_returns_same_instance() {
     );
 }
 
+#[test]
+fn tool_arg_parser_handles_nested_quotes_unicode_and_malformed_fail_closed() {
+    let nested = tool_call_with_arguments(
+        "bash",
+        "q1",
+        Value::String(
+            json!({
+                "command": "printf '%s' \"hello \\\"astra\\\" 边云\"",
+                "env": {"GREETING": "hello \"quoted\""},
+                "flags": ["--json", "emoji-🚀"]
+            })
+            .to_string(),
+        ),
+    );
+    let parsed = parse_tool_args(&nested).expect("nested JSON string args should parse");
+    assert_eq!(
+        parsed["command"], "printf '%s' \"hello \\\"astra\\\" 边云\"",
+        "escaped quotes and unicode must survive parsing"
+    );
+    assert_eq!(parsed["env"]["GREETING"], "hello \"quoted\"");
+
+    let malformed = tool_call_with_arguments(
+        "bash",
+        "bad",
+        Value::String("{\"command\":\"git status\"".into()),
+    );
+    assert!(parse_tool_args(&malformed).is_none());
+
+    let calls = vec![malformed];
+    let (read_only, mutating) = partition_tool_calls(&calls);
+    assert!(
+        read_only.is_empty(),
+        "malformed bash args must not be classified as read-only"
+    );
+    assert_eq!(
+        mutating.len(),
+        1,
+        "malformed bash args must fail closed into the mutating lane"
+    );
+}
+
 // ── Sibling-abort coverage for non-bash mutating tools ──
 //
 // Previously, the sibling-abort guard only fired when the failing tool was
@@ -359,4 +408,60 @@ async fn unhappy_any_failing_mutating_tool_aborts_siblings() {
             r.content
         );
     }
+}
+
+#[tokio::test]
+async fn complex_mixed_failures_abort_only_queued_mutations_after_trigger() {
+    let mut calls: Vec<Value> = (0..10)
+        .map(|i| tool_call("read_file", &format!("r{i:02}")))
+        .collect();
+    for i in 0..5 {
+        calls.push(tool_call("write_file", &format!("w{i:02}")));
+    }
+
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let writes_seen = Arc::new(AtomicUsize::new(0));
+    let invocations_c = invocations.clone();
+    let writes_seen_c = writes_seen.clone();
+    let exec: ToolExecutorFn = Arc::new(move |tc: Value| {
+        let invocations = invocations_c.clone();
+        let writes_seen = writes_seen_c.clone();
+        Box::pin(async move {
+            invocations.fetch_add(1, Ordering::SeqCst);
+            let call_id = tc["id"].as_str().unwrap_or("").to_string();
+            let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+            if name == "write_file" {
+                let write_index = writes_seen.fetch_add(1, Ordering::SeqCst);
+                if write_index == 2 {
+                    return (call_id, name, "simulated disk full".into(), false);
+                }
+            }
+            (call_id, name, "ok".into(), true)
+        })
+    });
+
+    let outcome = execute_parallel_round(&calls, exec).await;
+
+    assert_eq!(outcome.parallel_count, 10);
+    assert_eq!(outcome.sequential_count, 5);
+    assert!(outcome.sibling_aborted);
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        13,
+        "10 reads + first 3 writes should run; 2 queued writes should abort"
+    );
+    assert_eq!(outcome.results.len(), 15);
+    assert!(outcome.results[12].content.contains("disk full"));
+    assert!(
+        outcome.results[13]
+            .content
+            .to_lowercase()
+            .contains("aborted")
+    );
+    assert!(
+        outcome.results[14]
+            .content
+            .to_lowercase()
+            .contains("aborted")
+    );
 }

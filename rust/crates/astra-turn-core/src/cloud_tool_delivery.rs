@@ -1101,6 +1101,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_result_wait_is_user_scoped_and_does_not_consume_wrong_user_entry() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let tc = read_tool("shared-call");
+        ledger.lock().await.insert(
+            tool_callback_key("user-b", "shared-call"),
+            json!({"body": {"request_id": "shared-call", "status": "ok", "output": "wrong-user"}}),
+        );
+
+        let user_a_delivery =
+            wait_tool_result_ledger_for_tool(&ledger, "user-a", &tc, Duration::from_millis(60))
+                .await;
+
+        assert_eq!(user_a_delivery.tool_results.len(), 1);
+        assert_eq!(user_a_delivery.tool_results[0].status, "timed_out");
+        assert!(
+            user_a_delivery.tool_results[0]
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("output"))
+                .and_then(Value::as_str)
+                .is_some_and(|output| output.contains(MSG_TOOL_LEDGER_TIMEOUT)),
+            "wrong user's ledger entry must not satisfy user-a wait"
+        );
+        assert!(
+            ledger
+                .lock()
+                .await
+                .contains_key(&tool_callback_key("user-b", "shared-call")),
+            "wrong user's callback should remain available for that user"
+        );
+
+        let user_b_delivery =
+            wait_tool_result_ledger_for_tool(&ledger, "user-b", &tc, Duration::from_millis(60))
+                .await;
+        assert_eq!(user_b_delivery.tool_results[0].status, "ok");
+        assert_eq!(
+            user_b_delivery.tool_results[0]
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("output"))
+                .and_then(Value::as_str),
+            Some("wrong-user")
+        );
+        assert!(ledger.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn approval_wait_is_user_and_namespace_scoped() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let tc = write_tool("shared-approval");
+        {
+            let mut guard = ledger.lock().await;
+            guard.insert(
+                tool_callback_key("user-a", "shared-approval"),
+                json!({"body": {"request_id": "shared-approval", "status": "ok", "output": "tool-result-not-approval"}}),
+            );
+            guard.insert(
+                approval_callback_key("user-b", "shared-approval"),
+                json!({"kind": "approval_respond", "body": {"request_id": "shared-approval", "decision": "allow"}}),
+            );
+        }
+
+        let user_a_result =
+            wait_approval_ledger_for_tool(&ledger, "user-a", &tc, Duration::from_millis(60), None)
+                .await;
+
+        let user_a_delivery = user_a_result.expect_err(
+            "user-a must time out instead of consuming a tool-result namespace or user-b approval",
+        );
+        assert_eq!(
+            user_a_delivery.persist_tool_results[0]["result"],
+            MSG_APPROVAL_LEDGER_TIMEOUT
+        );
+        {
+            let guard = ledger.lock().await;
+            assert!(guard.contains_key(&tool_callback_key("user-a", "shared-approval")));
+            assert!(guard.contains_key(&approval_callback_key("user-b", "shared-approval")));
+        }
+
+        wait_approval_ledger_for_tool(&ledger, "user-b", &tc, Duration::from_millis(60), None)
+            .await
+            .expect("user-b should consume its own approval");
+        let guard = ledger.lock().await;
+        assert!(guard.contains_key(&tool_callback_key("user-a", "shared-approval")));
+        assert!(!guard.contains_key(&approval_callback_key("user-b", "shared-approval")));
+    }
+
+    #[tokio::test]
     async fn write_file_waits_approval_then_tool() {
         let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let uid = "u2";

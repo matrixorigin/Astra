@@ -8,7 +8,8 @@
  * - `ASTRA_SDK_USERNAME` + `ASTRA_SDK_PASSWORD`
  * for authenticated tests (`getMe`, `listSessions`, …). Optional: `ASTRA_SDK_PATH_PREFIX`, `ASTRA_SDK_TEST_RUN_ID`.
  */
-import { AstraClient } from '../../client';
+import { AstraApiError, AstraClient } from '../../client';
+import type { StreamEvent } from '../../types';
 import { startLocalE2eServer, type LocalE2eServer } from './local-e2e-server';
 
 const e2e = process.env.ASTRA_SDK_E2E === '1';
@@ -17,6 +18,16 @@ const describeReal = e2e && Boolean(process.env.ASTRA_SDK_BASE_URL) ? describe :
 
 function healthUrlFromBaseUrl(base: string): string {
   return `${base.replace(/\/$/, '')}/health`;
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const started = Date.now();
+  while (!predicate()) {
+    if (Date.now() - started > timeoutMs) {
+      throw new Error('timed out waiting for local e2e condition');
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 describeLocal('integration / online (Mode A: local HTTP harness)', () => {
@@ -80,6 +91,174 @@ describeLocal('integration / online (Mode A: local HTTP harness)', () => {
     });
     const evs = await client.getRunEvents('run-h2', 4);
     expect(evs.map((e) => e.type)).toEqual(['text_delta', 'turn_complete']);
+  });
+
+  test('multi-turn streamChat preserves session context and replays persisted run events', async () => {
+    const client = new AstraClient({
+      baseUrl: harness.baseUrl,
+      accessToken: harness.staticAccessToken,
+    });
+    const session = await client.createSession({
+      title: 'local multi-turn',
+      metadata: { scenario: 'context-regression' },
+    });
+
+    const firstEvents: StreamEvent[] = [];
+    const first = client.streamChat(
+      {
+        sessionId: session.sessionId,
+        message: 'turn one',
+        context: { memory: ['prefer PKCE'], turn: 1 },
+        model: 'harness-model',
+      },
+      { onEvent: (event) => firstEvents.push(event) },
+    );
+    await waitFor(() => firstEvents.some((event) => event.type === 'turn_complete'));
+    first.close();
+
+    const firstRunId = firstEvents.find((event) => event.type === 'session_info')?.run_id;
+    expect(firstRunId).toBeDefined();
+    const replay = await client.getRunEvents(firstRunId!, 2);
+    expect(replay.map((event) => event.type)).toEqual(['text_delta', 'usage', 'turn_complete']);
+    expect(replay[0]).toMatchObject({
+      type: 'text_delta',
+      content: expect.stringContaining('"prefer PKCE"'),
+    });
+
+    const secondEvents: StreamEvent[] = [];
+    const second = client.streamChat(
+      {
+        sessionId: session.sessionId,
+        message: 'turn two',
+        context: { memory: ['prefer PKCE', 'schema changed'], turn: 2 },
+      },
+      { onEvent: (event) => secondEvents.push(event) },
+    );
+    await waitFor(() => secondEvents.some((event) => event.type === 'turn_complete'));
+    second.close();
+
+    expect(secondEvents.find((event) => event.type === 'text_delta')).toMatchObject({
+      type: 'text_delta',
+      content: expect.stringContaining('turn=2'),
+    });
+    expect(secondEvents.find((event) => event.type === 'usage')).toMatchObject({
+      type: 'usage',
+      cache_read_tokens: 100,
+    });
+
+    const audit = await client.getSessionAudit(session.sessionId);
+    expect(audit.turn_count).toBe(2);
+    expect(audit.status).toBe('active');
+    const activity = await client.getSessionActivity(session.sessionId);
+    expect(activity.total).toBeGreaterThanOrEqual(10);
+  });
+
+  test('closed session rejects a follow-up stream with a surfaced error event', async () => {
+    const client = new AstraClient({
+      baseUrl: harness.baseUrl,
+      accessToken: harness.staticAccessToken,
+    });
+    const session = await client.createSession({ title: 'close guard' });
+    await client.closeSession(session.sessionId);
+
+    const events: StreamEvent[] = [];
+    const sse = client.streamChat(
+      { sessionId: session.sessionId, message: 'should fail' },
+      { onEvent: (event) => events.push(event) },
+    );
+    await waitFor(() => events.some((event) => event.type === 'error'));
+    sse.close();
+
+    expect(events[0]).toMatchObject({
+      type: 'error',
+      message: expect.stringContaining('session is closed'),
+      retryable: false,
+    });
+  });
+
+  test('memory store/search/retrieve/purge runs through local HTTP state', async () => {
+    const client = new AstraClient({
+      baseUrl: harness.baseUrl,
+      accessToken: harness.staticAccessToken,
+    });
+    const semantic = await client.memoryStore({
+      content: 'OAuth migration prefers PKCE and preserves sessions',
+      memory_type: 'semantic',
+      session_id: 'sess-memory-http',
+      trust_tier: 'T2',
+    });
+    await client.memoryStore({
+      content: 'Cloud-edge callbacks are idempotent by request id',
+      memory_type: 'procedural',
+      session_id: 'sess-memory-http',
+    });
+
+    expect(semantic.id).toMatch(/^mem-/);
+    const search = await client.memorySearch('OAuth PKCE', 1);
+    expect(search).toHaveLength(1);
+    expect(search[0]).toMatchObject({ id: semantic.id, score: 1 });
+
+    const retrieved = await client.memoryRetrieve('callbacks request id', 5);
+    expect(retrieved.map((memory) => memory.content)).toContain(
+      'Cloud-edge callbacks are idempotent by request id',
+    );
+
+    await client.memoryPurge('OAuth');
+    const afterPurge = await client.memorySearch('OAuth PKCE', 5);
+    expect(afterPurge).toEqual([]);
+  });
+
+  test('memory purge rejects an empty topic without deleting unrelated memories', async () => {
+    const client = new AstraClient({
+      baseUrl: harness.baseUrl,
+      accessToken: harness.staticAccessToken,
+    });
+    await client.memoryStore({
+      content: 'Do not delete this unrelated memory',
+      memory_type: 'semantic',
+    });
+
+    await expect(client.memoryPurge('')).rejects.toBeInstanceOf(AstraApiError);
+    const stillThere = await client.memorySearch('unrelated memory', 5);
+    expect(stillThere.map((memory) => memory.content)).toContain(
+      'Do not delete this unrelated memory',
+    );
+  });
+
+  test('delegation lifecycle persists child runs across delegate/list/pause/resume', async () => {
+    const client = new AstraClient({
+      baseUrl: harness.baseUrl,
+      accessToken: harness.staticAccessToken,
+    });
+
+    const result = await client.delegateRun('run-parent-http', {
+      delegation_id: 'del-http',
+      parent_run_id: 'run-parent-http',
+      task: 'fan out to cloud and edge agents',
+      pattern: { fan_out: { agent_ids: ['agent-cloud', 'agent-edge'] } },
+      user_id: 'harness-uid-1',
+      depth: 1,
+      context: { session_id: 'sess-delegation-http' },
+    });
+    expect(result.status).toBe('completed');
+    expect(result.agent_results.map((agent) => agent.agent_id)).toEqual([
+      'agent-cloud',
+      'agent-edge',
+    ]);
+
+    const listed = await client.listDelegations('run-parent-http');
+    expect(listed.sub_run_ids).toEqual([
+      'run-parent-http-agent-cloud-child',
+      'run-parent-http-agent-edge-child',
+    ]);
+    await expect(client.pauseDelegations('run-parent-http')).resolves.toEqual({
+      parent_run_id: 'run-parent-http',
+      affected: 2,
+    });
+    await expect(client.resumeDelegations('run-parent-http')).resolves.toEqual({
+      parent_run_id: 'run-parent-http',
+      affected: 2,
+    });
   });
 
   test('pathPrefix: same routes under /api + client.pathPrefix', async () => {

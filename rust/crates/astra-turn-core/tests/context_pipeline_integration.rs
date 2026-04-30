@@ -82,6 +82,46 @@ fn fallback_head_tail_for_opaque_blob() {
     assert!(out.contains(COMPRESSION_MARKER), "fallback missing marker");
 }
 
+#[test]
+fn json_object_compression_carries_marker_and_preserves_stable_keys() {
+    let mut obj = serde_json::Map::new();
+    for i in 0..80 {
+        obj.insert(
+            format!("key_{i:02}"),
+            json!({"idx": i, "pad": "x".repeat(300)}),
+        );
+    }
+    let content = Value::Object(obj).to_string();
+    assert!(content.len() > DEFAULT_COMPRESSION_BUDGET_CHARS);
+
+    let out = compress_with_default_budget("tool_search", &content);
+    assert!(
+        out.contains(COMPRESSION_MARKER.trim_start()),
+        "object compression must carry marker: {out}"
+    );
+    assert!(out.contains("key_00"), "first stable key should survive");
+    assert!(out.contains("key_11"), "key budget boundary should survive");
+    assert!(
+        !out.contains("key_79"),
+        "tail keys should be summarized, not leaked"
+    );
+}
+
+#[test]
+fn fallback_compression_preserves_utf8_boundaries() {
+    let content = format!("{}{}{}", "头".repeat(3_000), "MIDDLE", "🚀".repeat(3_000));
+    assert!(content.len() > DEFAULT_COMPRESSION_BUDGET_CHARS);
+
+    let out = compress_with_default_budget("read_file", &content);
+    assert!(out.contains(COMPRESSION_MARKER));
+    assert!(out.starts_with('头'), "head unicode content should survive");
+    assert!(out.ends_with('🚀'), "tail unicode content should survive");
+    assert!(
+        !out.contains("MIDDLE"),
+        "middle sentinel should be elided by fallback compression"
+    );
+}
+
 // ─── cp-oversized-single-message ──────────────────────────────────────────
 
 #[test]
@@ -129,6 +169,25 @@ fn canonical_arg_form_means_key_order_does_not_break_cache_key() {
     assert_eq!(
         a.input_hash, b.input_hash,
         "canonicalised args must produce identical hash regardless of key order"
+    );
+}
+
+#[test]
+fn context_hash_isolates_identical_reads_across_sessions() {
+    let mut cache = ResultCache::new(8, None);
+    let args = json!({"path": "/workspace/README.md"});
+    let session_a = CallSignature::from_args("read_file", &args).with_ctx_hash(0xA57A);
+    let session_b = CallSignature::from_args("read_file", &args).with_ctx_hash(0xBEEF);
+
+    cache.record(session_a.clone(), "session A contents".into());
+
+    assert_eq!(
+        cache.lookup(&session_a).as_deref(),
+        Some("session A contents")
+    );
+    assert!(
+        cache.lookup(&session_b).is_none(),
+        "same tool args in a different context/session must not reuse stale output"
     );
 }
 

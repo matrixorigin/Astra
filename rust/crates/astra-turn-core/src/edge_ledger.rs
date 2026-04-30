@@ -350,6 +350,34 @@ mod tests {
     }
 
     #[test]
+    fn callback_keys_partition_user_and_callback_namespaces() {
+        let request_id = "same-request";
+        let user_a_tool = tool_callback_key("user-a", request_id);
+        let user_b_tool = tool_callback_key("user-b", request_id);
+        let user_a_approval = approval_callback_key("user-a", request_id);
+        let user_a_prompt = user_prompt_callback_key("user-a", request_id);
+
+        let keys: std::collections::HashSet<_> = [
+            user_a_tool.as_str(),
+            user_b_tool.as_str(),
+            user_a_approval.as_str(),
+            user_a_prompt.as_str(),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            keys.len(),
+            4,
+            "same request_id must never collide across users or callback namespaces"
+        );
+        assert_eq!(user_a_tool, "user-a:tool:same-request");
+        assert_eq!(user_b_tool, "user-b:tool:same-request");
+        assert_eq!(user_a_approval, "user-a:approval:same-request");
+        assert_eq!(user_a_prompt, "user-a:user_prompt:same-request");
+    }
+
+    #[test]
     fn ensure_tool_call_ids_fills_empty_and_skips_nonempty() {
         let mut calls = vec![
             json!({"id": "", "function": {"name": "x", "arguments": "{}"}}),
@@ -1077,6 +1105,30 @@ mod tests {
         assert!(ledger.contains_key("fresh"));
         assert_eq!(ts.get("fresh"), Some(&now));
         assert!(!ts.contains_key("stale"));
+    }
+
+    #[test]
+    fn sweep_expired_entries_inner_preserves_unexpired_observed_keys() {
+        let mut ledger: HashMap<String, Value> = HashMap::new();
+        let mut ts: HashMap<String, Instant> = HashMap::new();
+        let now = Instant::now();
+        let max_age = Duration::from_secs(60);
+
+        ledger.insert("old-but-valid".into(), json!({"v": 1}));
+        ledger.insert("brand-new".into(), json!({"v": 2}));
+        ts.insert("old-but-valid".into(), now - Duration::from_secs(59));
+
+        let removed = sweep_expired_entries_inner(&mut ledger, &mut ts, now, max_age);
+
+        assert_eq!(removed, 0);
+        assert_eq!(ledger.len(), 2);
+        assert!(ledger.contains_key("old-but-valid"));
+        assert!(ledger.contains_key("brand-new"));
+        assert_eq!(
+            ts.get("old-but-valid"),
+            Some(&(now - Duration::from_secs(59)))
+        );
+        assert_eq!(ts.get("brand-new"), Some(&now));
     }
 
     /// audit-#6: the timestamps side-table must not retain entries for keys

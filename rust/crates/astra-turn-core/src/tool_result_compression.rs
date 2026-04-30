@@ -133,7 +133,10 @@ fn compress_json_object(v: &Value, _budget: usize) -> String {
     let elided = obj.len() - JSON_OBJECT_KEY_LIMIT;
     kept.insert(
         "__compressed__".into(),
-        Value::String(format!("{elided} more keys elided")),
+        Value::String(format!(
+            "{}{elided} more keys elided …]",
+            COMPRESSION_MARKER.trim_start()
+        )),
     );
     Value::Object(kept).to_string()
 }

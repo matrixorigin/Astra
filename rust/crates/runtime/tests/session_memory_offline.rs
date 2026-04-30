@@ -474,3 +474,81 @@ async fn compaction_degrades_gracefully_when_retrieve_errors() {
         "failed retrieve should skip memory_context injection"
     );
 }
+
+#[tokio::test]
+async fn concurrent_l1_persistence_keeps_session_scopes_separate() {
+    let fake = std::sync::Arc::new(RecordingFake::new());
+    let messages_a = vec![
+        user_msg("remember project A prefers PKCE"),
+        assistant_msg("project A PKCE preference recorded"),
+    ];
+    let messages_b = vec![
+        user_msg("remember project B prefers device-code auth"),
+        assistant_msg("project B device-code preference recorded"),
+    ];
+    let l1_a = build_l1_from_messages(&messages_a, 2, 2_000);
+    let l1_b = build_l1_from_messages(&messages_b, 2, 2_000);
+
+    let (ra, rb) = tokio::join!(
+        persist_l1(fake.as_ref(), &l1_a, "sess-a"),
+        persist_l1(fake.as_ref(), &l1_b, "sess-b"),
+    );
+    ra.expect("session A persist should succeed");
+    rb.expect("session B persist should succeed");
+
+    let ops = fake.ops();
+    let purge_sessions: std::collections::BTreeSet<String> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Purge { session_id } => Some(session_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        purge_sessions,
+        ["sess-a".to_string(), "sess-b".to_string()]
+            .into_iter()
+            .collect()
+    );
+
+    let stores: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Store {
+                content,
+                memory_type,
+                session_id: Some(session_id),
+                trust_tier,
+            } => Some((
+                session_id.as_str(),
+                memory_type.as_str(),
+                trust_tier.as_deref(),
+                content,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stores.len(),
+        2,
+        "one working-memory store per session: {ops:?}"
+    );
+    assert!(
+        stores.iter().any(|(session, memory_type, trust, content)| {
+            *session == "sess-a"
+                && *memory_type == "working"
+                && *trust == Some("T2")
+                && content.contains("project A")
+        }),
+        "session A store should keep session A content only: {stores:?}"
+    );
+    assert!(
+        stores.iter().any(|(session, memory_type, trust, content)| {
+            *session == "sess-b"
+                && *memory_type == "working"
+                && *trust == Some("T2")
+                && content.contains("project B")
+        }),
+        "session B store should keep session B content only: {stores:?}"
+    );
+}

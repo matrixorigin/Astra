@@ -881,6 +881,69 @@ async fn concurrent_team_executions_isolated() {
     assert!(log.iter().any(|e| e.contains("coder-b")));
 }
 
+#[tokio::test]
+async fn concurrent_same_team_executions_have_distinct_runs_and_history_records() {
+    let store = Arc::new(InMemoryTeamStore::new());
+    let team = test_team(
+        "same-team",
+        TeamCoordination::Pipeline,
+        vec![("worker", Some("Handle one request"))],
+    );
+    let team_id = team.team_id.clone();
+    store.save_team(&team).await.unwrap();
+
+    struct EchoExecutor;
+    #[async_trait]
+    impl SubRunExecutor for EchoExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id.clone(),
+                run_id: config.run_id,
+                status: "completed".to_string(),
+                output: Some(format!("done by {}", config.agent_profile.agent_id)),
+                error: None,
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                tool_calls: 1,
+            })
+        }
+    }
+
+    let (orch, run_engine, _) =
+        setup_orchestrator_with_executor(store.clone(), Arc::new(EchoExecutor)).await;
+    let (report_a, report_b) = tokio::join!(
+        orch.execute_team("same-team", "task A", None),
+        orch.execute_team("same-team", "task B", None),
+    );
+
+    assert_eq!(report_a.status, TeamExecutionStatus::Completed);
+    assert_eq!(report_b.status, TeamExecutionStatus::Completed);
+    assert_ne!(report_a.parent_run_id, report_b.parent_run_id);
+    assert_ne!(report_a.delegation_id, report_b.delegation_id);
+
+    let run_a = run_engine
+        .load_run(&report_a.parent_run_id)
+        .await
+        .unwrap()
+        .expect("run A should be persisted");
+    let run_b = run_engine
+        .load_run(&report_b.parent_run_id)
+        .await
+        .unwrap()
+        .expect("run B should be persisted");
+    assert_eq!(run_a.status, "completed");
+    assert_eq!(run_b.status, "completed");
+
+    let history = store.list_executions(&team_id, 10).await.unwrap();
+    assert_eq!(
+        history.len(),
+        2,
+        "concurrent same-team executions must both be recorded"
+    );
+    let tasks: std::collections::BTreeSet<_> = history.iter().map(|e| e.task.as_str()).collect();
+    assert_eq!(tasks, ["task A", "task B"].into_iter().collect());
+}
+
 /// Tests that sequential coordination with stop_on_success stops after first success.
 #[tokio::test]
 async fn sequential_stop_on_success_stops_early() {

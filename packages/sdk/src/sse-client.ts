@@ -72,8 +72,12 @@ export class SSEClient {
   }
 
   async connect(): Promise<void> {
-    this.closed = false;
     this.retryCount = 0;
+    await this.connectAttempt();
+  }
+
+  private async connectAttempt(): Promise<void> {
+    this.closed = false;
     this.options.onStateChange?.('connecting');
 
     this.controller = new AbortController();
@@ -195,7 +199,7 @@ export class SSEClient {
     await new Promise((r) => setTimeout(r, delay));
 
     if (!this.closed) {
-      await this.connect();
+      await this.connectAttempt();
     }
   }
 }
