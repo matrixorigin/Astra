@@ -82,30 +82,39 @@ pub(crate) async fn initialize_multi_agent_runtime(
     if let Some(session_id) = state.session_id.clone() {
         spawn_executor = spawn_executor.with_active_session_id(session_id);
     }
-    // Fork-cache observability: when ASTRA_FORK_CACHE_SINK=stderr
-    // is set, every spawned child that inherited a parent prefix
-    // emits one structured JSON line to stderr. Zero impact when
-    // the env var is unset. Gated separately from
-    // ASTRA_FORK_INHERIT_PREFIX so operators can turn observation
-    // on without enabling the inheritance behavior — useful for
-    // deploying the capture primitives in observe-only mode.
-    if matches!(
-        std::env::var("ASTRA_FORK_CACHE_SINK").as_deref(),
-        Ok("stderr") | Ok("STDERR")
-    ) {
+
+    // Fork-prefix pipeline: driven entirely by RuntimeConfig (which
+    // already layers defaults → user TOML → project TOML → env
+    // override `ASTRA_FORK_INHERIT_PREFIX`). No separate observability
+    // flag — when the pipeline is on, the operator's chosen sink
+    // (Noop / Stderr) is installed. When off, the sink is never
+    // attached and the capture helper early-returns on every call.
+    //
+    // Keep the prefix store attached unconditionally: cheap to own,
+    // and the capture helper's flag check is the real gate — storing
+    // is a no-op when flag is off, so there's no behavior change for
+    // operators who haven't opted in.
+    let runtime_cfg = astra_config::runtime_config::RuntimeConfig::load();
+    let fork_cfg = &runtime_cfg.fork_prefix;
+    // Sync the process-global flag turn-core reads on the hot path
+    // with the config value. Must happen before any turn runs, and
+    // before any capture attempt on this process — so the startup
+    // path is the right place to call it exactly once.
+    astra_turn_core::fork_capture::set_fork_inherit_prefix_enabled(fork_cfg.enabled);
+    if fork_cfg.enabled {
         let sink: std::sync::Arc<
             dyn astra_turn_core::fork_cache_event::ForkCacheEventSink,
-        > = std::sync::Arc::new(
-            astra_turn_core::fork_cache_event::StderrForkCacheSink,
-        );
+        > = match fork_cfg.sink {
+            astra_config::runtime_config::ForkCacheSinkKind::Noop => {
+                std::sync::Arc::new(astra_turn_core::fork_cache_event::NoopForkCacheSink)
+            }
+            astra_config::runtime_config::ForkCacheSinkKind::Stderr => {
+                std::sync::Arc::new(astra_turn_core::fork_cache_event::StderrForkCacheSink)
+            }
+        };
         spawn_executor = spawn_executor.with_fork_cache_sink(sink);
     }
 
-    // Install a PrefixCaptureSink on the spawner so captured parent
-    // prefixes can flow into child spawns. Gated by the
-    // ASTRA_FORK_INHERIT_PREFIX env var via the capture helper — if
-    // disabled, the store is present but stays empty (captures
-    // no-op), and resolves return Disabled.
     let prefix_store: std::sync::Arc<
         dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink,
     > = std::sync::Arc::new(

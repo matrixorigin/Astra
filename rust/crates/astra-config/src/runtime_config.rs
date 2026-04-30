@@ -70,6 +70,103 @@ pub struct RuntimeConfig {
     /// environments. Defaults to Strict — never flip this silently.
     #[serde(default)]
     pub safety: SafetyConfig,
+
+    /// Fork-prefix cache inheritance configuration.
+    ///
+    /// Controls whether child spawns inherit their parent's cacheable
+    /// prefix (for prompt-cache reuse) and how fork-cache telemetry
+    /// events are emitted. Defaults to disabled — operators must
+    /// opt in explicitly.
+    #[serde(default)]
+    pub fork_prefix: ForkPrefixConfig,
+}
+
+// ─── Fork-Prefix Configuration ───────────────────────────────────────────────
+
+/// Telemetry sink selection for fork-cache events.
+///
+/// Serialized as lowercase strings in TOML so config files stay
+/// readable (`sink = "stderr"` rather than `sink = "Stderr"`). Adding
+/// a new variant is a breaking config change — update the TOML docs
+/// and any deployed config files in lockstep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ForkCacheSinkKind {
+    /// No events emitted. Safe default — zero observable behavior.
+    #[default]
+    Noop,
+    /// Write each event as a JSON line to stderr with `[fork-cache]`
+    /// prefix. Intended for local development and `jq`-friendly
+    /// pipelines without a full observability backend.
+    Stderr,
+}
+
+/// Fork-prefix pipeline configuration.
+///
+/// When `enabled` is false, the whole pipeline is a no-op regardless
+/// of other fields — captures return `FeatureDisabled`, resolves
+/// produce `Disabled`, executors see `inherited_prefix: None`. No
+/// ForkCacheEvent ever fires.
+///
+/// When `enabled` is true, captures happen on every parent turn
+/// end, spawns with `inherit_prefix` reuse captured prefixes, and
+/// telemetry events flow to the configured `sink`.
+///
+/// Thresholds tune the classifier in `fork_cache_event::evaluate`.
+///
+/// Invariants:
+/// - `miss_floor > 0.0`
+/// - `hit_threshold > miss_floor`
+/// - `hit_threshold <= 1.0`
+///
+/// Invalid values silently fall back to classifier defaults at
+/// runtime (via `ForkCacheThresholds::validate`); callers that want
+/// strict config rejection should `validate()` the loaded config.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForkPrefixConfig {
+    /// Master switch for the fork-prefix pipeline. When `false`,
+    /// every stage (capture / resolve / reconstruct / probe) is a
+    /// no-op. Environment variable `ASTRA_FORK_INHERIT_PREFIX` can
+    /// override this at startup (1/true/on/yes → true, else false).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Telemetry sink to install. `Noop` discards events; `Stderr`
+    /// writes JSON lines with `[fork-cache]` prefix. Ignored when
+    /// `enabled` is false.
+    #[serde(default)]
+    pub sink: ForkCacheSinkKind,
+
+    /// Ratio (observed/expected cache_read_tokens) at or above
+    /// which a probe classifies as `Hit`. Default 0.80.
+    #[serde(default = "default_fork_hit_threshold")]
+    pub hit_threshold: f64,
+
+    /// Ratio below which a probe classifies as `Miss`. Between
+    /// `miss_floor` and `hit_threshold` is `PartialDrift`. Default
+    /// 0.05 — distinguishes "essentially nothing reused" from
+    /// "some reuse happened".
+    #[serde(default = "default_fork_miss_floor")]
+    pub miss_floor: f64,
+}
+
+fn default_fork_hit_threshold() -> f64 {
+    0.80
+}
+
+fn default_fork_miss_floor() -> f64 {
+    0.05
+}
+
+impl Default for ForkPrefixConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sink: ForkCacheSinkKind::Noop,
+            hit_threshold: default_fork_hit_threshold(),
+            miss_floor: default_fork_miss_floor(),
+        }
+    }
 }
 
 /// Safety-guard configuration.
@@ -148,6 +245,7 @@ impl Default for RuntimeConfig {
             context_window: ContextWindowConfig::default(),
             adaptive_tuning: AdaptiveTuningConfig::default(),
             safety: SafetyConfig::default(),
+            fork_prefix: ForkPrefixConfig::default(),
         }
     }
 }
@@ -1315,6 +1413,7 @@ impl RuntimeConfig {
             context_window,
             adaptive_tuning,
             safety,
+            fork_prefix,
         } = other;
 
         merge_if_non_default(&mut self.version, version, default_config_version());
@@ -1798,6 +1897,15 @@ impl RuntimeConfig {
             self.safety = safety;
         }
 
+        // ForkPrefixConfig: whole-struct replacement when `other`
+        // differs from default. Simple enough to treat atomically —
+        // sub-field merging would just add complexity without
+        // meaningful use cases (you either want fork-prefix on with
+        // a specific sink / thresholds, or off).
+        if fork_prefix != ForkPrefixConfig::default() {
+            self.fork_prefix = fork_prefix;
+        }
+
         self
     }
 
@@ -1825,6 +1933,22 @@ impl RuntimeConfig {
         }
         if let Ok(val) = std::env::var("ASTRA_CAPTURE_TRACES") {
             self.telemetry.capture_context_traces = val == "1" || val.to_lowercase() == "true";
+        }
+        // Fork-prefix master switch — `config.fork_prefix.enabled`
+        // is the source of truth, but we keep this env override so
+        // operators can flip the feature on or off without
+        // redeploying. Recognises 1/true/on/yes (case-insensitive)
+        // as true; any other value (including absence) is a no-op
+        // on whatever the TOML config said — we DON'T treat unset
+        // as false, because that would clobber an intentional
+        // `enabled = true` in the TOML. Only EXPLICITLY turn it off
+        // via `ASTRA_FORK_INHERIT_PREFIX=0`.
+        if let Ok(val) = std::env::var("ASTRA_FORK_INHERIT_PREFIX") {
+            let normalized = val.trim().to_ascii_lowercase();
+            self.fork_prefix.enabled = matches!(
+                normalized.as_str(),
+                "1" | "true" | "on" | "yes"
+            );
         }
     }
 
@@ -2088,6 +2212,7 @@ mod tests {
                 tuning_cycle_interval: 8,
             },
             safety: SafetyConfig::default(),
+            fork_prefix: ForkPrefixConfig::default(),
         });
 
         assert_eq!(merged.version, "2.0");
@@ -2707,5 +2832,120 @@ mod tests {
         // …while the zero-valued fields inherit the global default.
         assert_eq!(policy.max_identical_tool_calls, 3);
         assert_eq!(policy.max_tools_per_turn, 15);
+    }
+
+    // ─── Fork-prefix config ─────────────────────────────────────────
+
+    #[test]
+    fn fork_prefix_defaults_to_disabled_noop_sink() {
+        let cfg = ForkPrefixConfig::default();
+        assert!(!cfg.enabled, "fork-prefix must default to disabled");
+        assert_eq!(cfg.sink, ForkCacheSinkKind::Noop);
+        assert!((cfg.hit_threshold - 0.80).abs() < 1e-9);
+        assert!((cfg.miss_floor - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fork_prefix_parses_from_toml() {
+        let toml_str = r#"
+            version = "1.0"
+
+            [fork_prefix]
+            enabled = true
+            sink = "stderr"
+            hit_threshold = 0.85
+            miss_floor = 0.10
+        "#;
+        let cfg: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.fork_prefix.enabled);
+        assert_eq!(cfg.fork_prefix.sink, ForkCacheSinkKind::Stderr);
+        assert!((cfg.fork_prefix.hit_threshold - 0.85).abs() < 1e-9);
+        assert!((cfg.fork_prefix.miss_floor - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fork_prefix_missing_section_uses_defaults() {
+        // A TOML without the section must not fail — defaults fill in.
+        let toml_str = r#"version = "1.0""#;
+        let cfg: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.fork_prefix.enabled);
+        assert_eq!(cfg.fork_prefix.sink, ForkCacheSinkKind::Noop);
+    }
+
+    #[test]
+    fn fork_prefix_sink_rename_to_lowercase() {
+        // Serialization uses lowercase literals for readability. The
+        // tripwire pins both directions so a future rename to e.g.
+        // `SnakeCase` is an explicit breaking config change.
+        let s = toml::to_string(&ForkPrefixConfig {
+            enabled: true,
+            sink: ForkCacheSinkKind::Stderr,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            s.contains("sink = \"stderr\""),
+            "expected lowercase serialization, got {s}"
+        );
+    }
+
+    #[test]
+    fn fork_prefix_env_override_turns_on() {
+        // SAFETY: tests that mutate env vars are serialized via the
+        // `ENV_LOCK` pattern in other tests — here we use a scoped
+        // set+remove, which is racy in principle but deterministic
+        // in practice because no other test touches this var. If
+        // flakes appear, wrap with ENV_LOCK like neighboring tests.
+        // SAFETY: set_var/remove_var are `unsafe` in Rust 2024.
+        unsafe {
+            std::env::set_var("ASTRA_FORK_INHERIT_PREFIX", "1");
+        }
+        let mut cfg = RuntimeConfig::default();
+        cfg.apply_env_overrides();
+        assert!(cfg.fork_prefix.enabled);
+        unsafe {
+            std::env::remove_var("ASTRA_FORK_INHERIT_PREFIX");
+        }
+    }
+
+    #[test]
+    fn fork_prefix_env_override_turns_off_explicitly() {
+        // An explicit `ASTRA_FORK_INHERIT_PREFIX=0` must override a
+        // TOML that said `enabled = true`. This is the deploy-time
+        // kill switch contract.
+        unsafe {
+            std::env::set_var("ASTRA_FORK_INHERIT_PREFIX", "0");
+        }
+        let mut cfg = RuntimeConfig::default();
+        cfg.fork_prefix.enabled = true; // pretend TOML set it
+        cfg.apply_env_overrides();
+        assert!(
+            !cfg.fork_prefix.enabled,
+            "env override=0 must beat TOML enabled=true"
+        );
+        unsafe {
+            std::env::remove_var("ASTRA_FORK_INHERIT_PREFIX");
+        }
+    }
+
+    #[test]
+    fn fork_prefix_env_accepts_various_truthy_spellings() {
+        // These operational aliases are widely used; pinning them
+        // avoids "I set ASTRA_FORK_INHERIT_PREFIX=true but it didn't
+        // turn on" confusion.
+        for truthy in ["1", "true", "TRUE", "on", "yes", "Yes"] {
+            unsafe {
+                std::env::set_var("ASTRA_FORK_INHERIT_PREFIX", truthy);
+            }
+            let mut cfg = RuntimeConfig::default();
+            cfg.apply_env_overrides();
+            assert!(
+                cfg.fork_prefix.enabled,
+                "value {truthy:?} must be interpreted as truthy"
+            );
+        }
+        unsafe {
+            std::env::remove_var("ASTRA_FORK_INHERIT_PREFIX");
+        }
     }
 }

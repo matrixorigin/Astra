@@ -50,10 +50,15 @@ use crate::fork_prefix_store::PrefixCaptureSink;
 // Feature flag
 // ---------------------------------------------------------------------
 
-/// Environment variable that gates the fork-inherit-prefix feature.
-/// When set to `1`, `true`, `on`, or `yes` (case-insensitive) the
-/// capture site writes to the sink; any other value (or unset) keeps
-/// it dark.
+/// Environment variable name that astra-config reads as an override
+/// for `RuntimeConfig.fork_prefix.enabled`. Kept here as a public
+/// constant so deployment scripts, tests, and docs can reference
+/// the same string without hard-coding it.
+///
+/// The variable is consumed by `RuntimeConfig::apply_env_overrides`
+/// (astra-config crate), NOT by turn-core. turn-core reads the
+/// resolved flag via [`is_fork_inherit_prefix_enabled`], which is
+/// populated by the CLI/server startup path.
 pub const FORK_INHERIT_PREFIX_ENV: &str = "ASTRA_FORK_INHERIT_PREFIX";
 
 /// Tri-state cache of the feature-flag evaluation.
@@ -62,51 +67,42 @@ pub const FORK_INHERIT_PREFIX_ENV: &str = "ASTRA_FORK_INHERIT_PREFIX";
 /// load on steady state.
 static FORK_FLAG_CACHE: AtomicU8 = AtomicU8::new(0);
 
-/// Returns whether the fork-inherit-prefix feature is enabled. Reads
-/// the env var on first call and caches the result for the rest of
-/// the process lifetime — the flag is intended as a deploy-time
-/// switch, not a mid-session toggle.
+/// Returns whether the fork-inherit-prefix feature is enabled.
 ///
-/// Tests that need to override the flag without setting env vars
-/// should use [`set_fork_flag_for_tests`].
+/// The flag is backed by a process-global `AtomicU8` that callers
+/// (the CLI / server startup path) explicitly set from
+/// `RuntimeConfig.fork_prefix.enabled` via
+/// [`set_fork_inherit_prefix_enabled`]. Keeping the flag separate
+/// from the config struct lets the hot path stay a single relaxed
+/// atomic load (thousands of times per turn) without locking
+/// `RuntimeConfig`.
 ///
-/// **Test-mode quirk**: under `#[cfg(test)]` the env-var read is
-/// skipped entirely — only the explicit value set via
-/// `set_fork_flag_for_tests` is honored; an unread cache (state 0)
-/// is treated as disabled. This prevents leaked env vars in CI from
-/// flipping the default for tests that forgot to install a
-/// `FlagGuard`.
+/// State values:
+/// - 0 (unread) — no one has set the flag; reads as `false`.
+/// - 1 (disabled) — explicitly off.
+/// - 2 (enabled) — explicitly on.
+///
+/// Unread defaults to disabled so that missing startup wiring
+/// produces no-op behavior rather than silently relying on env.
+/// This is the safe direction — the only cost is the operator has
+/// to explicitly enable the feature.
 pub fn is_fork_inherit_prefix_enabled() -> bool {
     match FORK_FLAG_CACHE.load(Ordering::Relaxed) {
-        1 => false,
         2 => true,
-        _ => {
-            // State 0 (unread).
-            #[cfg(test)]
-            {
-                // Tests MUST set an explicit value via FlagGuard.
-                // An unread cache falls through as disabled without
-                // consulting the environment — CI env pollution is
-                // a real hazard and making the default explicit
-                // keeps test behavior deterministic regardless of
-                // test ordering.
-                false
-            }
-            #[cfg(not(test))]
-            {
-                let enabled = std::env::var(FORK_INHERIT_PREFIX_ENV)
-                    .map(|v| {
-                        matches!(
-                            v.trim().to_ascii_lowercase().as_str(),
-                            "1" | "true" | "on" | "yes"
-                        )
-                    })
-                    .unwrap_or(false);
-                FORK_FLAG_CACHE.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
-                enabled
-            }
-        }
+        // state 0 (unread) or 1 (disabled) — both treated as false.
+        _ => false,
     }
+}
+
+/// Set the fork-inherit-prefix feature flag at runtime startup.
+///
+/// Intended to be called once from CLI/server bootstrap after
+/// loading `RuntimeConfig`. Can be called again to live-toggle —
+/// every subsequent `is_fork_inherit_prefix_enabled()` observes
+/// the new value (relaxed atomic — no cross-thread ordering
+/// guarantees needed for a feature flag).
+pub fn set_fork_inherit_prefix_enabled(enabled: bool) {
+    FORK_FLAG_CACHE.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
 }
 
 /// Test-only: force the feature flag to a specific value and bypass
