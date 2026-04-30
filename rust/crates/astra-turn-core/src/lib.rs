@@ -35,6 +35,7 @@ pub mod explain;
 pub mod explain_report_lines;
 pub mod file_edit_journal;
 pub mod followup_suggestion;
+pub mod fork_prefix;
 pub mod headless_tool_assembly;
 pub mod headless_tool_status_display;
 pub mod headless_tool_stderr_lines;
