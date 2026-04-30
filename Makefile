@@ -590,6 +590,30 @@ test-contract:
 		--test http_contract --test admin_contract
 	@$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-core --lib settings_contract_tests
 
+# ----------------------------------------------------------------------------
+# Declarative CLI test harness (astra-test-harness).
+#
+# Runs the YAML cases at rust/crates/astra-test-harness/cases against
+# a fallback model list. Requires a running API server + fresh login.
+# Override MODELS for a quick single-model smoke:
+#     make test-harness MODELS=qwen-flash
+# Override CASES to point at a different suite directory.
+# ----------------------------------------------------------------------------
+.PHONY: test-harness
+test-harness:
+	@echo "Running astra-test-harness (unit tests + live suite)..."
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-test-harness
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-test-harness --release
+	@MODELS="$${MODELS:-qwen-flash}"; \
+	CASES="$${CASES:-rust/crates/astra-test-harness/cases}"; \
+	JUDGER="$${JUDGER:-$$MODELS}"; \
+	echo "  cases=$$CASES models=$$MODELS judger=$$JUDGER"; \
+	./rust/target/release/astra-test \
+		--suite $$CASES \
+		--models $$MODELS \
+		--judger-model $$JUDGER \
+		--no-judger
+
 # ============================================================================
 # Code Quality
 # ============================================================================

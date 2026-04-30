@@ -46,8 +46,12 @@ pub struct Case {
 
     /// Optional extra CLI flags passed through to `astra chat`.
     /// Intended escape hatch for cases that need e.g. `--explain`.
-    /// Flags are appended after all harness-managed flags; do NOT
-    /// use this to override `-m`, `--model`, `--json`, `-y`.
+    /// Flags are appended after harness-managed flags — and most
+    /// CLI parsers let later flags win, so a malicious or careless
+    /// case could clobber `-m/--model/--json/-y/--message`. The
+    /// loader rejects any reserved flag at parse time; this comment
+    /// is documentation only, the enforcement is in
+    /// [`validate_extra_cli_args`].
     #[serde(default)]
     pub extra_cli_args: Vec<String>,
 
@@ -61,6 +65,41 @@ fn default_timeout_seconds() -> u64 {
     180
 }
 
+/// Flags the harness owns and must not be overridden by a case.
+/// The CLI parser chosen by `astra chat` lets later args win for most
+/// of these, so a case that included them could silently clobber the
+/// harness's prompt or output format — making the whole run
+/// meaningless. Fail fast at case load instead.
+pub(crate) const RESERVED_CLI_ARGS: &[&str] = &[
+    "-m",
+    "--message",
+    "--model",
+    "--json",
+    "-y",
+    "--approve-all",
+    "--quiet",
+];
+
+/// Validate that `args` does not contain any reserved flag. Returns
+/// the first offender so the error message is precise. Exact-string
+/// match: a user that really needs `--model-prefix` (hypothetical)
+/// isn't blocked.
+pub(crate) fn validate_extra_cli_args(args: &[String]) -> Result<(), String> {
+    for a in args {
+        for r in RESERVED_CLI_ARGS {
+            if a == r {
+                return Err(format!(
+                    "reserved CLI flag {a:?} in extra_cli_args — the harness \
+                     manages this flag; pick a different mechanism (adjust \
+                     prompt text, use a different harness flag, or open an \
+                     issue if you need legitimate override support)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Case {
     /// Load a case from a YAML file on disk.
     pub fn from_path(path: &Path) -> Result<Self, anyhow::Error> {
@@ -68,6 +107,10 @@ impl Case {
             .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
         let case: Case = serde_yaml_ng::from_str(&src)
             .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
+        // Fail fast on reserved-flag abuse so a typo in one case
+        // doesn't silently poison an entire suite run.
+        validate_extra_cli_args(&case.extra_cli_args)
+            .map_err(|e| anyhow::anyhow!("case {}: {e}", path.display()))?;
         Ok(case)
     }
 
@@ -131,5 +174,49 @@ mod tests {
         let path = dir.path().join("bad.yaml");
         std::fs::write(&path, "description: no name or prompt\n").unwrap();
         assert!(Case::from_path(&path).is_err());
+    }
+
+    // ── Reserved CLI flag rejection (Review #5) ──
+
+    #[test]
+    fn parse_rejects_reserved_flags_in_extra_cli_args() {
+        for reserved in ["-m", "--message", "--model", "--json", "-y", "--quiet"] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("bad.yaml");
+            let yaml = format!(
+                "name: c\nprompt: p\nextra_cli_args: [{reserved:?}, \"something\"]\n"
+            );
+            std::fs::write(&path, yaml).unwrap();
+            let err = Case::from_path(&path)
+                .err()
+                .unwrap_or_else(|| panic!("{reserved} was accepted"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(reserved) && msg.contains("reserved"),
+                "error should name the reserved flag {reserved}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_accepts_non_reserved_extra_cli_args() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ok.yaml");
+        std::fs::write(
+            &path,
+            "name: c\nprompt: p\nextra_cli_args: [\"--debug-log-tools\", \"--explain\"]\n",
+        )
+        .unwrap();
+        let c = Case::from_path(&path).expect("non-reserved flags should be accepted");
+        assert_eq!(
+            c.extra_cli_args,
+            vec!["--debug-log-tools".to_string(), "--explain".to_string()]
+        );
+    }
+
+    #[test]
+    fn validate_extra_cli_args_accepts_empty_and_unknown() {
+        assert!(validate_extra_cli_args(&[]).is_ok());
+        assert!(validate_extra_cli_args(&["--whatever".into()]).is_ok());
     }
 }

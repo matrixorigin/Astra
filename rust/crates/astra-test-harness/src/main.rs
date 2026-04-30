@@ -33,13 +33,17 @@ struct Args {
     #[arg(long, value_name = "CSV", default_value = "")]
     models: String,
 
-    /// Path to the astra release binary. Subprocess invocation target.
-    #[arg(
-        long,
-        value_name = "PATH",
-        default_value = "./rust/target/release/astra"
-    )]
-    astra_bin: PathBuf,
+    /// Path to the astra binary. Subprocess invocation target. When
+    /// unset, the harness searches (in order):
+    /// 1. `ASTRA_BIN` env var
+    /// 2. `astra` on `$PATH`
+    /// 3. `rust/target/release/astra` relative to the nearest
+    ///    workspace root above CWD.
+    ///
+    /// Resolution is performed only once at startup; the chosen path
+    /// is logged to stderr for transparency.
+    #[arg(long, value_name = "PATH")]
+    astra_bin: Option<PathBuf>,
 
     /// Working directory for each subprocess. Defaults to CWD.
     #[arg(long, value_name = "DIR")]
@@ -94,9 +98,62 @@ struct Args {
     no_digest_on_fail: bool,
 }
 
+/// Resolve the astra binary path. See the `--astra-bin` doc comment
+/// for the resolution order. Returns an error only when no candidate
+/// is usable, with a message that explains what was tried.
+fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(p) = explicit {
+        // Explicit flag wins — but still verify it's an executable
+        // file so the first subprocess spawn isn't the one to surface
+        // the typo.
+        if !p.is_file() {
+            anyhow::bail!(
+                "--astra-bin {:?} does not exist or is not a file",
+                p.display()
+            );
+        }
+        return Ok(p);
+    }
+    if let Ok(env_path) = std::env::var("ASTRA_BIN")
+        && !env_path.trim().is_empty()
+    {
+        let p = PathBuf::from(env_path);
+        if p.is_file() {
+            eprintln!("[astra-test] using astra bin from ASTRA_BIN: {}", p.display());
+            return Ok(p);
+        }
+    }
+    if let Ok(found) = which::which("astra") {
+        eprintln!("[astra-test] using astra bin from PATH: {}", found.display());
+        return Ok(found);
+    }
+    // Last resort: walk up from CWD looking for a Cargo workspace root
+    // with `rust/target/release/astra`. Covers the common dev case of
+    // running the harness from any subdirectory inside the repo.
+    let cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("cwd: {e}"))?;
+    for ancestor in cwd.ancestors() {
+        let candidate = ancestor.join("rust/target/release/astra");
+        if candidate.is_file() {
+            eprintln!(
+                "[astra-test] using astra bin from workspace: {}",
+                candidate.display()
+            );
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!(
+        "could not locate the astra binary. Tried: --astra-bin flag, \
+         ASTRA_BIN env var, `astra` on PATH, and rust/target/release/astra \
+         relative to any ancestor of {}",
+        cwd.display()
+    )
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    let astra_bin = resolve_astra_bin(args.astra_bin.clone())?;
 
     let cases = Case::load_dir(&args.suite)
         .with_context(|| format!("load cases from {}", args.suite.display()))?;
@@ -112,11 +169,11 @@ async fn main() -> Result<()> {
         .collect();
 
     let mut runner_cfg =
-        RunnerConfig::new(args.astra_bin.clone()).with_fallback_models(fallback_models);
+        RunnerConfig::new(astra_bin.clone()).with_fallback_models(fallback_models);
     runner_cfg.working_dir = args.working_dir.clone();
 
     let judger_cfg = JudgerConfig {
-        astra_bin: args.astra_bin.clone(),
+        astra_bin: astra_bin.clone(),
         default_model: args.judger_model.clone(),
         timeout_seconds: args.judger_timeout,
     };
@@ -162,7 +219,7 @@ async fn main() -> Result<()> {
     // Digest collector: always construct, conditionally wire. Keeping
     // the value out of scope when disabled lets the SuiteRunner see
     // `None` and skip the subprocess per-FAIL.
-    let digest = AstraCliDigestCollector::new(args.astra_bin.clone());
+    let digest = AstraCliDigestCollector::new(astra_bin.clone());
     let digest_collector: Option<&dyn astra_test_harness::digest::DigestCollector> =
         if args.no_digest_on_fail { None } else { Some(&digest) };
 

@@ -48,21 +48,38 @@ pub enum Criterion {
     /// Passes when the session journal contains at least `min`
     /// events with `type == event_type`. Requires session capture.
     /// Use for structural checks ("at least one subagent_spawned
-    /// event appears"). SKIPS (passes) when no session is loaded
-    /// so offline smoke runs don't blanket-fail — explicit opt-in
-    /// via `debug_log: true` or `--capture-session`.
+    /// event appears").
+    ///
+    /// FAILS when no session is loaded, UNLESS `optional: true` —
+    /// in which case the criterion skip-passes with a note. Default
+    /// strict semantics mean: if a case author wrote this criterion
+    /// and the session isn't available, something is wrong (bad
+    /// session_id, journal not flushed, loader misconfigured) and
+    /// the case should surface that as a failure instead of silently
+    /// passing.
     SessionEventCount {
         event_type: String,
         #[serde(default = "default_event_min")]
         min: u32,
+        /// When true, skip-pass when session is unavailable. Use
+        /// sparingly — only for cases that are meaningful even
+        /// without the journal check.
+        #[serde(default)]
+        optional: bool,
     },
 
     /// Passes when the given tool name appears in the journal's
     /// `tool_invocation` events. Journal is the source of truth
     /// for tool calls — `tools_used` from the CLI envelope may
-    /// miss tools emitted inside sub-agent runs. SKIPS when no
-    /// session is loaded (see `SessionEventCount`).
-    JournalToolCalled { name: String },
+    /// miss tools emitted inside sub-agent runs.
+    ///
+    /// FAILS when no session is loaded unless `optional: true`. See
+    /// `SessionEventCount` for the rationale.
+    JournalToolCalled {
+        name: String,
+        #[serde(default)]
+        optional: bool,
+    },
 
     /// Passes when at least one `[fork-cache]` JSON event in stderr
     /// has its `class` field in `expect`. Deterministic alternative
@@ -254,16 +271,35 @@ fn evaluate_one(
                 score: None,
             }
         }
-        Criterion::SessionEventCount { event_type, min } => {
+        Criterion::SessionEventCount {
+            event_type,
+            min,
+            optional,
+        } => {
             let Some(sess) = session else {
+                // Session unavailable. Default (strict): FAIL with
+                // an actionable detail so the reviewer knows the
+                // criterion was requested but couldn't run. Setting
+                // `optional: true` opts into skip-pass.
+                let passed = *optional;
+                let detail = if *optional {
+                    format!(
+                        "session_event_count {event_type} skipped (optional + no session capture)"
+                    )
+                } else {
+                    format!(
+                        "session_event_count {event_type} FAILED: no session \
+                         loaded (enable debug_log: true in the case or \
+                         --capture-session on the CLI; set optional: true on \
+                         the criterion to skip-pass instead)"
+                    )
+                };
                 return CriterionResult {
                     criterion: c.clone(),
-                    passed: true,
-                    detail: format!(
-                        "session_event_count {event_type} skipped (no session capture; enable with debug_log: true or --capture-session)"
-                    ),
+                    passed,
+                    detail,
                     full_detail: None,
-                score: None,
+                    score: None,
                 };
             };
             let n = sess.count_events(event_type);
@@ -278,16 +314,26 @@ fn evaluate_one(
                 score: None,
             }
         }
-        Criterion::JournalToolCalled { name } => {
+        Criterion::JournalToolCalled { name, optional } => {
             let Some(sess) = session else {
+                let passed = *optional;
+                let detail = if *optional {
+                    format!(
+                        "journal_tool_called {name} skipped (optional + no session capture)"
+                    )
+                } else {
+                    format!(
+                        "journal_tool_called {name} FAILED: no session loaded \
+                         (enable debug_log: true / --capture-session; or set \
+                         optional: true on the criterion to skip-pass)"
+                    )
+                };
                 return CriterionResult {
                     criterion: c.clone(),
-                    passed: true,
-                    detail: format!(
-                        "journal_tool_called {name} skipped (no session capture)"
-                    ),
+                    passed,
+                    detail,
                     full_detail: None,
-                score: None,
+                    score: None,
                 };
             };
             let tools = sess.tools_invoked();
@@ -553,6 +599,7 @@ mod tests {
             &[Criterion::SessionEventCount {
                 event_type: "llm_round".into(),
                 min: 2,
+                optional: false,
             }],
             &out,
             Some(&sess),
@@ -561,16 +608,36 @@ mod tests {
     }
 
     #[test]
-    fn session_event_count_skips_when_no_capture() {
+    fn session_event_count_fails_by_default_when_no_capture() {
+        // Pre-fix semantics: this used to skip-pass, which masked
+        // genuine session-capture failures. New default: FAIL with
+        // an actionable hint. `optional: true` opts back into skip.
         let out = outcome_with_tools(&[]);
         let r = evaluate_deterministic(
             &[Criterion::SessionEventCount {
                 event_type: "llm_round".into(),
                 min: 2,
+                optional: false,
             }],
             &out,
         );
-        assert!(r[0].passed);
+        assert!(!r[0].passed, "default must FAIL, not skip");
+        assert!(r[0].detail.contains("FAILED"));
+        assert!(r[0].detail.contains("optional: true"));
+    }
+
+    #[test]
+    fn session_event_count_optional_skips_when_no_capture() {
+        let out = outcome_with_tools(&[]);
+        let r = evaluate_deterministic(
+            &[Criterion::SessionEventCount {
+                event_type: "llm_round".into(),
+                min: 2,
+                optional: true,
+            }],
+            &out,
+        );
+        assert!(r[0].passed, "optional=true must skip-pass");
         assert!(r[0].detail.contains("skipped"));
     }
 
@@ -587,6 +654,7 @@ mod tests {
         let r = evaluate_deterministic_with_session(
             &[Criterion::JournalToolCalled {
                 name: "Read".into(),
+                optional: false,
             }],
             &out,
             Some(&sess),
@@ -604,12 +672,41 @@ mod tests {
         let r = evaluate_deterministic_with_session(
             &[Criterion::JournalToolCalled {
                 name: "Grep".into(),
+                optional: false,
             }],
             &out,
             Some(&sess),
         );
         assert!(!r[0].passed);
         assert!(r[0].detail.contains("NOT invoked"));
+    }
+
+    #[test]
+    fn journal_tool_called_fails_by_default_when_no_capture() {
+        let out = outcome_with_tools(&[]);
+        let r = evaluate_deterministic(
+            &[Criterion::JournalToolCalled {
+                name: "Read".into(),
+                optional: false,
+            }],
+            &out,
+        );
+        assert!(!r[0].passed, "default must FAIL");
+        assert!(r[0].detail.contains("FAILED"));
+    }
+
+    #[test]
+    fn journal_tool_called_optional_skips_when_no_capture() {
+        let out = outcome_with_tools(&[]);
+        let r = evaluate_deterministic(
+            &[Criterion::JournalToolCalled {
+                name: "Read".into(),
+                optional: true,
+            }],
+            &out,
+        );
+        assert!(r[0].passed);
+        assert!(r[0].detail.contains("skipped"));
     }
 
     #[test]
