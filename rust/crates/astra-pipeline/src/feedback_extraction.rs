@@ -9,39 +9,6 @@
 
 use astra_turn_types::StructuredFeedback;
 
-/// System prompt for the feedback extraction sub-task.
-// TODO: wire into bridge for complex corrections that heuristic_extract cannot handle
-#[allow(dead_code)]
-pub const FEEDBACK_EXTRACTION_SYSTEM: &str = "\
-You are a feedback extraction agent. Given a user correction and the prior assistant response, \
-extract a structured feedback rule. Respond with ONLY a JSON object, no other text.
-
-Format:
-{
-  \"rule\": \"What the user wants changed (the actionable directive)\",
-  \"reason\": \"Why — the incident, preference, or past failure that motivated this\",
-  \"apply_when\": \"When/where this rule applies (domain, task type, tool, or situation)\"
-}
-
-Guidelines:
-- \"rule\" should be a clear, actionable directive (e.g., \"Use real database in integration tests, not mocks\")
-- \"reason\" should capture the WHY — if the user didn't state one, write \"Not stated\"
-- \"apply_when\" should be specific (e.g., \"When writing integration tests for the auth module\") not vague
-- If the correction is too vague to extract a rule, set rule to the correction text verbatim
-- Keep each field under 200 characters";
-
-/// Build the user message for feedback extraction.
-// TODO: wire into bridge for complex corrections that heuristic_extract cannot handle
-#[allow(dead_code)]
-pub fn build_extraction_message(correction_text: &str, prior_assistant_text: &str) -> String {
-    let prior = if prior_assistant_text.is_empty() {
-        "(no prior response)".to_string()
-    } else {
-        truncate(prior_assistant_text, 500)
-    };
-    format!("Prior assistant response:\n{prior}\n\nUser correction:\n{correction_text}")
-}
-
 /// Parse the LLM's JSON response into a `StructuredFeedback`.
 ///
 /// Returns `None` if the response is not valid JSON or missing required fields.
@@ -167,14 +134,6 @@ fn extract_directive(text: &str) -> Option<(String, usize)> {
     None
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let end = s.floor_char_boundary(max);
-        s[..end].to_string()
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -426,35 +385,5 @@ mod tests {
     #[test]
     fn extract_directive_none_for_complex() {
         assert!(extract_directive("the approach doesn't work").is_none());
-    }
-
-    // ── build_extraction_message ──
-
-    #[test]
-    fn build_message_with_prior() {
-        let msg = build_extraction_message("wrong approach", "I used method A");
-        assert!(msg.contains("I used method A"));
-        assert!(msg.contains("wrong approach"));
-    }
-
-    #[test]
-    fn build_message_without_prior() {
-        let msg = build_extraction_message("wrong approach", "");
-        assert!(msg.contains("(no prior response)"));
-    }
-
-    #[test]
-    fn build_message_truncates_long_prior() {
-        let long = "x".repeat(1000);
-        let msg = build_extraction_message("fix it", &long);
-        assert!(msg.len() < 1000);
-    }
-
-    #[test]
-    fn system_prompt_is_well_formed() {
-        assert!(FEEDBACK_EXTRACTION_SYSTEM.contains("rule"));
-        assert!(FEEDBACK_EXTRACTION_SYSTEM.contains("reason"));
-        assert!(FEEDBACK_EXTRACTION_SYSTEM.contains("apply_when"));
-        assert!(FEEDBACK_EXTRACTION_SYSTEM.contains("JSON"));
     }
 }

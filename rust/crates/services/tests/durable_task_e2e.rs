@@ -109,7 +109,7 @@ async fn e2e_contract_create_verify_deliver() {
     // 6. Global verification
     let global = svc.verify_global(&task_id).await.unwrap();
     // Global checks may be empty if no project build/test detected — that's fine
-    let _ = global;
+    assert!(global.is_empty() || global.iter().all(|c| !c.criterion_id.is_empty()));
 
     // 7. Deliver
     let delivery = svc.deliver_task(&task_id).await.unwrap();
@@ -265,11 +265,9 @@ async fn begin_subtask_wrong_state_is_error() {
         .await
         .unwrap();
 
-    // Begin subtask that has unmet dependency
-    let result = svc.begin_subtask(&contract.task_id, "verify-content").await;
-    // This might succeed or fail depending on dependency checking —
-    // we just verify no panic
-    let _ = result;
+    // Begin subtask that has unmet dependency — currently succeeds (dependency
+    // checking not yet enforced), but must not panic
+    let _result = svc.begin_subtask(&contract.task_id, "verify-content").await;
 
     // Begin non-existent subtask
     let result = svc.begin_subtask(&contract.task_id, "nonexistent").await;

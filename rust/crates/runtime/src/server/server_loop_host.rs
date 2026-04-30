@@ -538,9 +538,7 @@ pub struct ServerAgenticLoopHost {
     plan_resume_hint: Arc<std::sync::RwLock<Option<String>>>,
 
     // ── Tool execution ──
-    #[allow(dead_code)] // used in Step 3: wire edge tool delivery via ledger
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
-    #[allow(dead_code)] // used in Step 3
     user_id: String,
     session_id: String,
     /// Session-scoped cache for dedup of identical read-only tool invocations

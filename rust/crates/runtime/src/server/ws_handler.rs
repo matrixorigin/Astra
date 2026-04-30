@@ -198,7 +198,6 @@ pub(super) enum WsServerMessage {
 
     /// Tool requires user approval before execution.
     #[serde(rename = "tool_approval_request")]
-    #[allow(dead_code)] // Protocol variant — constructed in approval gate handler (Phase 5)
     ToolApprovalRequest {
         request_id: String,
         tool: String,

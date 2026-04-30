@@ -173,26 +173,3 @@ fn readline_thread_main(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn readline_request_variants_are_constructible() {
-        let _ = ReadlineRequest::ReadLine("❯ ".into());
-        let _ = ReadlineRequest::AddHistory("hello".into());
-        let _ = ReadlineRequest::Shutdown(PathBuf::from("/tmp/hist"));
-    }
-
-    #[test]
-    fn readline_response_variants_are_constructible() {
-        let _ = ReadlineResponse::Line {
-            result: Ok("hello".into()),
-            pending_execute: None,
-        };
-        let _ = ReadlineResponse::Line {
-            result: Err(ReadlineError::Interrupted),
-            pending_execute: Some("/help".into()),
-        };
-    }
-}

@@ -38,11 +38,6 @@ fn tool_score(results: &[(usize, f64)], name: &str) -> Option<f64> {
         .map(|&(_, s)| s)
 }
 
-#[allow(dead_code)] // kept for future tests
-fn has_tool(results: &[(usize, f64)], name: &str) -> bool {
-    tool_score(results, name).is_some()
-}
-
 fn tool_names(results: &[(usize, f64)]) -> Vec<&'static str> {
     results
         .iter()

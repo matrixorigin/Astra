@@ -931,16 +931,7 @@ fn format_state(state: ConnectionState) -> String {
     }
 }
 
-fn format_duration(d: std::time::Duration) -> String {
-    let secs = d.as_secs();
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m {}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
-    }
-}
+use super::slash_agent::format_duration;
 
 /// Handle `/mcp complete <server>:<ref_type>:<name> <arg_name> [partial_value]`
 ///

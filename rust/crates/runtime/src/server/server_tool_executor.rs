@@ -13,12 +13,11 @@
 //! `server_tool_executor` field. When present, the headless round
 //! calls it directly instead of waiting for edge POST callbacks.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use serde_json::{Value, json};
 
@@ -1013,21 +1012,6 @@ pub struct ServerToolExecutor {
     aggregate_output_bytes: AtomicUsize,
     /// Memoria client for memory operations.
     memoria_client: astra_tools::memoria::MemoriaClient,
-    /// Cloud API base URL.
-    #[allow(dead_code)] // Phase 5: used for cloud API calls (web_fetch, etc.)
-    cloud_base: Option<String>,
-    /// Auth token for cloud calls.
-    #[allow(dead_code)] // Phase 5: used for authenticated cloud API calls
-    cloud_token: Option<String>,
-    /// GitHub token for API calls.
-    #[allow(dead_code)] // Phase 5: used for GitHub API integration
-    github_token: Option<String>,
-    /// Shared HTTP client.
-    #[allow(dead_code)] // Phase 5: used for web_fetch and cloud API calls
-    http_client: reqwest::Client,
-    /// URL fetch cache.
-    #[allow(dead_code)] // Phase 5: used for web_fetch caching
-    url_cache: Mutex<HashMap<String, (String, Instant)>>,
     /// Optional approval gate for dangerous tool execution.
     approval_gate: Option<Arc<dyn astra_tools::ToolApprovalGate>>,
     /// Optional ask_user gate for interactive client prompts.
@@ -1125,7 +1109,6 @@ impl ServerToolExecutor {
         });
         // Wire GitHubClient into DefaultToolExecutor if any token is available
         let github_tokens = astra_tools::github::resolve_github_tokens();
-        let github_token = github_tokens.first().cloned();
         let default_executor = if !github_tokens.is_empty() {
             let github = astra_tools::github::GitHubClient::from_tokens(
                 http_client.clone(),
@@ -1152,11 +1135,6 @@ impl ServerToolExecutor {
             journal_turn_index: AtomicU32::new(0),
             aggregate_output_bytes: AtomicUsize::new(0),
             memoria_client,
-            cloud_base,
-            cloud_token,
-            github_token,
-            http_client,
-            url_cache: Mutex::new(HashMap::new()),
             approval_gate: None,
             ask_user_gate: None,
             progress_callback: None,

@@ -99,12 +99,12 @@ mod trigger_specificity {
     /// "pull request" (longer) should score higher than "pr" (shorter)
     /// for the same tool (github_list_prs).
     #[test]
-    fn longer_trigger_scores_higher() {
+    fn longer_trigger_scores_comparably() {
         let r1 = filter("show me the pull request list");
         let r2 = filter("show me the pr list");
         let s1 = tool_score(&r1, "github_list_prs").unwrap_or(0.0);
         let s2 = tool_score(&r2, "github_list_prs").unwrap_or(0.0);
-        // Both should be present; longer match is at least as good
+        // Both should be present; longer match is at least comparable (within 20%)
         assert!(s1 >= s2 * 0.8, "pull request ({s1}) vs pr ({s2})");
     }
 
