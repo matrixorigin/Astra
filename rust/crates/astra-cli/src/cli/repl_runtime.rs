@@ -1690,4 +1690,92 @@ mod tests {
             "plan_mode must remain None on mismatch"
         );
     }
+
+    // ─── auto-auth regression guards ──────────────────────────
+    //
+    // During real-world verification the credentials file appeared
+    // to have its access_token cleared after a `chat -m` run with
+    // a still-valid token — which would be a real bug (forces the
+    // user to /login every turn). The underlying behavior is
+    // actually correct: `try_silent_auth` only reaches the
+    // token-clearing branch when (a) auth_me returns 4xx AND (b)
+    // refresh fails with a non-transient error AND (c) no
+    // concurrent process has rotated the refresh token. The
+    // perceived regression was from a specific 401 during one run
+    // that happened to coincide with manual inspection.
+    //
+    // These tests pin the semantics of
+    // `should_keep_credentials_on_refresh_error` so transport /
+    // server-side / parse errors don't accidentally start clearing
+    // creds — those are all recoverable conditions.
+
+    #[test]
+    fn server_5xx_preserves_credentials() {
+        // Server is down temporarily — do NOT clobber creds. If we
+        // cleared on 5xx, a transient server outage would force
+        // every user to /login every time.
+        use astra_thin_client::ThinClientError;
+        let err = ThinClientError::Api {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body: "oops".into(),
+        };
+        assert!(
+            should_keep_credentials_on_refresh_error(&err),
+            "5xx from server must preserve credentials"
+        );
+    }
+
+    #[test]
+    fn malformed_refresh_response_preserves_credentials() {
+        // Server returned 200 but body didn't parse — treat like
+        // transient error. If refresh truly failed, next attempt
+        // will classify correctly.
+        let raw = serde_json::from_str::<serde_json::Value>("not-json").unwrap_err();
+        let err = astra_thin_client::ThinClientError::Json(raw);
+        assert!(
+            should_keep_credentials_on_refresh_error(&err),
+            "malformed refresh response must not clear credentials"
+        );
+    }
+
+    #[test]
+    fn server_4xx_clears_credentials() {
+        // The one path that SHOULD clear: 4xx from /auth/refresh
+        // means the refresh token is permanently invalid (revoked /
+        // expired). Leaving it around would cause silent failure
+        // on every subsequent refresh. Pin this behavior so a
+        // future over-correction toward "never clear" doesn't sneak
+        // in and hide real auth failures.
+        use astra_thin_client::ThinClientError;
+        let err = ThinClientError::Api {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            body: "token revoked".into(),
+        };
+        assert!(
+            !should_keep_credentials_on_refresh_error(&err),
+            "4xx from /auth/refresh must clear credentials so \
+             next login works cleanly"
+        );
+    }
+
+    #[test]
+    fn keep_credentials_helper_enum_matches_silent_refresh_error() {
+        // Cross-check: SilentRefreshError::keep_credentials must
+        // agree with should_keep_credentials_on_refresh_error for
+        // every Thin variant. A mismatch would make one code path
+        // clear creds while another preserves them on the same
+        // underlying error — confusing and hard to debug. Pin the
+        // agreement at compile/test time.
+        let thin = astra_thin_client::ThinClientError::Api {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            body: "".into(),
+        };
+        let direct = should_keep_credentials_on_refresh_error(&thin);
+        let wrapped = SilentRefreshError::Thin(thin).keep_credentials();
+        assert_eq!(
+            direct, wrapped,
+            "SilentRefreshError::Thin wrapper must defer to \
+             should_keep_credentials_on_refresh_error"
+        );
+    }
 }

@@ -223,9 +223,28 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         };
 
         let task_profile = infer_task_execution_profile(&config.task);
-        let subrun_session_id = format!("spawn-{}-{}", config.run_id, config.agent_id);
-        let step_recorder =
-            StepRecorder::with_persistence(&subrun_session_id, &format!("{}-run", config.run_id));
+        // Local step-recorder session id: kept synthetic (`spawn-...`)
+        // because it's only used for local journal / step file
+        // persistence — server never sees this.
+        let local_subrun_session_id = format!("spawn-{}-{}", config.run_id, config.agent_id);
+        let step_recorder = StepRecorder::with_persistence(
+            &local_subrun_session_id,
+            &format!("{}-run", config.run_id),
+        );
+
+        // Wire session for the *server-facing* `chat_turn_base_payload`:
+        // pass None so the server opens a fresh session for this child
+        // turn rather than rejecting a synthetic `spawn-...` id with
+        // "Session not found" — discovered during real-world MiniMax
+        // spawn_agent verification. Reusing the parent's active
+        // session id would risk cross-contamination when multiple
+        // children share one parent, and cross-child race conditions
+        // on per-session state.
+        //
+        // Local continuity (transcript, step recorder, tool journal)
+        // still uses `local_subrun_session_id` which is client-side
+        // only, so children remain traceable offline.
+        let server_session_id: Option<String> = None;
 
         let start_time = std::time::Instant::now();
         let progress_emitter = config.progress_emitter.clone();
@@ -236,7 +255,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let mut state = AgenticLoopState {
             messages,
             tool_results: Vec::new(),
-            current_session_id: Some(subrun_session_id),
+            current_session_id: server_session_id,
             current_run_id: Some(config.run_id.clone()),
             recursion_depth: config.recursion_depth,
             final_text: String::new(),
@@ -507,5 +526,57 @@ mod tests {
             None,
         );
         assert!(executor.skill_resolver.is_none());
+    }
+
+    /// Regression guard for "Session not found" during real-world
+    /// spawn_agent: the previous code set
+    /// `current_session_id: Some("spawn-<run>-<agent>")` on the
+    /// child's `AgenticLoopState`, then forwarded that synthetic id
+    /// into the server-facing `chat_turn_base_payload` — which the
+    /// server rejected because it had never registered the id. The
+    /// fix is to pass `None` for the child's server-facing session,
+    /// letting the server open a fresh one per child turn.
+    ///
+    /// We can't directly test the async `execute` path (needs a
+    /// mock agentic loop + HTTP), so this is a structural regression:
+    /// grep the source for the tell-tale synthetic-id pattern that
+    /// would re-introduce the bug.
+    #[test]
+    fn child_must_not_send_synthetic_session_id_to_server() {
+        let src = include_str!("spawn_subrun.rs");
+        // The bug had `current_session_id: Some(subrun_session_id)`
+        // where subrun_session_id was a `spawn-...` synthetic.
+        // Guard the fix: the server-facing session id must be a
+        // distinct variable explicitly set to None.
+        assert!(
+            src.contains("let server_session_id: Option<String> = None;"),
+            "child must not reuse the local synthetic subrun id as \
+             its server-facing session — regression of \"Session \
+             not found\" during real-world spawn_agent calls"
+        );
+        assert!(
+            src.contains("current_session_id: server_session_id"),
+            "child AgenticLoopState must consume `server_session_id` \
+             (the None-typed variable above), not a fresh Some(...)"
+        );
+    }
+
+    #[test]
+    fn local_subrun_session_id_still_threads_to_step_recorder() {
+        // Local persistence (journal / transcript / step recorder)
+        // must continue to use the synthetic subrun id so multiple
+        // concurrent children don't collide on parent's session
+        // files. This test pins the split between server-facing
+        // (None) and local (`spawn-...`) session identities.
+        let src = include_str!("spawn_subrun.rs");
+        assert!(
+            src.contains("let local_subrun_session_id = format!(\"spawn-{}-{}\""),
+            "local-only subrun id must still be built for the step \
+             recorder to avoid cross-child file collisions"
+        );
+        assert!(
+            src.contains("StepRecorder::with_persistence(\n            &local_subrun_session_id,"),
+            "step recorder must take the local synthetic id"
+        );
     }
 }

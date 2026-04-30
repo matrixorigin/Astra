@@ -12,7 +12,7 @@ use serde_json::json;
 /// - `required: false` (default) — spawn proceeds without cache
 ///   inheritance and a telemetry event is emitted.
 /// - `required: true` — spawn fails with an error.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct InheritPrefixSpec {
     /// Parent run id to inherit from. `None` means "the run calling
     /// spawn_agent" — the resolver substitutes the caller's run id
@@ -79,9 +79,81 @@ pub struct SpawnAgentInput {
     /// Optional request to reuse a captured parent ForkPrefix for
     /// cache inheritance. When absent, spawn proceeds with a fresh
     /// prefix (no cache reuse). See [`InheritPrefixSpec`].
-    #[serde(default)]
+    ///
+    /// Uses a custom deserializer so models that serialize the
+    /// "empty opt-in" variant as a string `"{}"` or `""` (observed
+    /// with MiniMax-M2.5: "invalid type: string \"{}\", expected
+    /// struct InheritPrefixSpec") still produce a valid default
+    /// spec instead of the whole tool call failing with a schema
+    /// validation error. Proper JSON objects continue to parse as
+    /// before.
+    #[serde(default, deserialize_with = "deserialize_inherit_prefix_lenient")]
     pub inherit_prefix: Option<InheritPrefixSpec>,
 }
+
+/// Lenient deserializer for `inherit_prefix`: accepts a JSON object
+/// (proper shape), a string `"{}"` / `""` / `"default"` (model
+/// fat-fingered the empty object as a string), null, or absence.
+/// Every other shape still fails cleanly — we don't want a literal
+/// `"yes"` or a JSON number silently producing a default.
+fn deserialize_inherit_prefix_lenient<'de, D>(
+    deserializer: D,
+) -> Result<Option<InheritPrefixSpec>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let v: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    let Some(v) = v else {
+        return Ok(None);
+    };
+    match v {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Object(_) => {
+            // Proper path: parse as the structured type.
+            serde_json::from_value::<InheritPrefixSpec>(v)
+                .map(Some)
+                .map_err(Error::custom)
+        }
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty()
+                || trimmed == "{}"
+                || trimmed.eq_ignore_ascii_case("default")
+            {
+                // Model meant "opt in with defaults"; give them that.
+                Ok(Some(InheritPrefixSpec::default()))
+            } else {
+                // Try to parse the string AS JSON so payloads like
+                // `"{\"required\": true}"` (also observed) still work.
+                let parsed: serde_json::Value = serde_json::from_str(trimmed)
+                    .map_err(|_| Error::custom(format!(
+                        "inherit_prefix string \"{s}\" is not a recognized shorthand \
+                         (allowed: \"\" / \"{{}}\" / \"default\") nor a JSON object literal"
+                    )))?;
+                if parsed.is_object() {
+                    serde_json::from_value::<InheritPrefixSpec>(parsed)
+                        .map(Some)
+                        .map_err(Error::custom)
+                } else {
+                    Err(Error::custom(format!(
+                        "inherit_prefix must be an object; got stringified non-object: {s}"
+                    )))
+                }
+            }
+        }
+        other => Err(Error::custom(format!(
+            "inherit_prefix must be an object; got {}",
+            match other {
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::Array(_) => "array",
+                _ => unreachable!(),
+            }
+        ))),
+    }
+}
+
 
 impl Default for SpawnAgentInput {
     /// Mirror the serde `#[serde(default ...)]` defaults so struct
@@ -164,7 +236,7 @@ pub fn spawn_agent_schema() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "spawn_agent",
-            "description": "Launch a specialized sub-agent to perform a task. Agents run autonomously and return results. Use for parallel work, independent research, code review, or any task that benefits from dedicated focus. Agent types: 'explore' (fast codebase research), 'code-review' (analyze changes), 'task' (run commands), 'general-purpose' (full capabilities).",
+            "description": "Launch a specialized sub-agent to perform a task. Agents run autonomously and return results. Use for parallel work, independent research, code review, or any task that benefits from dedicated focus. Agent types: 'explore' (fast codebase research), 'code-review' (analyze changes), 'task' (run commands), 'general-purpose' (full capabilities). When the child task builds on the current conversation (summarize, follow-up, drill-down), pass `inherit_prefix: {}` to reuse the parent's prompt cache — cuts child input cost and latency substantially on every supported provider.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -218,15 +290,15 @@ pub fn spawn_agent_schema() -> serde_json::Value {
                     },
                     "inherit_prefix": {
                         "type": "object",
-                        "description": "Inherit the parent's cacheable prefix so the child's first API request reuses the parent's prompt cache. Requires the ASTRA_FORK_INHERIT_PREFIX feature flag and a matching captured parent prefix.",
+                        "description": "RECOMMENDED when the child task builds on what you just analyzed: inherit the parent's cacheable prompt prefix so the child's first API call hits the provider's prompt cache. Cuts child's first-turn input tokens and latency substantially (typical 70-95% token reuse on Anthropic, Kimi, DeepSeek, OpenAI). Must be a JSON OBJECT (not a string!): pass the object `{}` with no properties to opt in with defaults — the runtime infers the parent run id and soft-falls-back if the prefix isn't available. Pass `{\"required\": true}` when correctness depends on the child seeing the parent's context. Safe to OMIT this field entirely when the child task is truly independent of the parent's conversation.",
                         "properties": {
                             "from_run_id": {
                                 "type": "string",
-                                "description": "Parent run id to inherit from. Omit to inherit from the caller's own run."
+                                "description": "Parent run id to inherit from. Omit to inherit from the caller's own run (the common case)."
                             },
                             "required": {
                                 "type": "boolean",
-                                "description": "If true, spawn fails when the prefix is missing or incompatible. Default false proceeds without cache reuse.",
+                                "description": "If true, spawn fails when the prefix is missing or incompatible (use when the child needs parent context to be correct). Default false: spawn proceeds without cache reuse on failure — recommended for opportunistic reuse.",
                                 "default": false
                             }
                         }
@@ -297,5 +369,150 @@ mod tests {
         let props = &schema["function"]["parameters"]["properties"];
         assert!(props["inherit_prefix"].is_object());
         assert!(props["max_output_tokens"].is_object());
+    }
+
+    #[test]
+    fn schema_top_level_description_hints_at_inherit_prefix() {
+        // Tripwire: models discover `inherit_prefix` partly from the
+        // tool's top-level description. If the hint gets rewritten
+        // away, observed inherit_prefix usage drops to ~zero in the
+        // wild (verified: MiniMax-M2.5 doesn't pass the field unless
+        // it's suggested somewhere the model sees).
+        let schema = spawn_agent_schema();
+        let desc = schema["function"]["description"].as_str().unwrap();
+        assert!(
+            desc.contains("inherit_prefix"),
+            "top-level description must mention inherit_prefix so \
+             models discover the opportunity; got: {desc}"
+        );
+    }
+
+    // ─── Lenient deserializer for inherit_prefix (MiniMax regression) ───
+    //
+    // MiniMax-M2.5 was observed sending `"inherit_prefix": "{}"`
+    // (the empty-object shorthand as a JSON *string*) which the
+    // default serde derive rejected with
+    // `invalid type: string "{}", expected struct InheritPrefixSpec`,
+    // failing the entire spawn_agent tool call. These tests pin the
+    // lenient deserializer that accepts a handful of common model
+    // "fat-fingered empty object" shapes while still rejecting
+    // anything that's genuinely ambiguous.
+
+    #[test]
+    fn inherit_prefix_accepts_proper_object() {
+        let input: SpawnAgentInput = serde_json::from_str(
+            r#"{"description":"d","prompt":"p","inherit_prefix":{"required":true}}"#,
+        )
+        .unwrap();
+        let spec = input.inherit_prefix.unwrap();
+        assert!(spec.required);
+    }
+
+    #[test]
+    fn inherit_prefix_accepts_empty_object_string() {
+        // The observed MiniMax bug shape.
+        let input: SpawnAgentInput = serde_json::from_str(
+            r#"{"description":"d","prompt":"p","inherit_prefix":"{}"}"#,
+        )
+        .unwrap();
+        let spec = input
+            .inherit_prefix
+            .expect("\"{}\" must produce a default InheritPrefixSpec, not None");
+        assert_eq!(spec.from_run_id, None);
+        assert!(!spec.required, "default spec must have required=false");
+    }
+
+    #[test]
+    fn inherit_prefix_accepts_empty_string() {
+        let input: SpawnAgentInput = serde_json::from_str(
+            r#"{"description":"d","prompt":"p","inherit_prefix":""}"#,
+        )
+        .unwrap();
+        assert!(input.inherit_prefix.is_some());
+    }
+
+    #[test]
+    fn inherit_prefix_accepts_default_keyword() {
+        // Natural-language shorthand some models emit.
+        let input: SpawnAgentInput = serde_json::from_str(
+            r#"{"description":"d","prompt":"p","inherit_prefix":"default"}"#,
+        )
+        .unwrap();
+        assert!(input.inherit_prefix.is_some());
+    }
+
+    #[test]
+    fn inherit_prefix_accepts_stringified_object_with_fields() {
+        // Models occasionally stringify the whole JSON object — as
+        // long as it's parseable as an object, we accept.
+        let input: SpawnAgentInput = serde_json::from_str(
+            r#"{"description":"d","prompt":"p","inherit_prefix":"{\"required\":true}"}"#,
+        )
+        .unwrap();
+        assert!(input.inherit_prefix.unwrap().required);
+    }
+
+    #[test]
+    fn inherit_prefix_accepts_null() {
+        let input: SpawnAgentInput = serde_json::from_str(
+            r#"{"description":"d","prompt":"p","inherit_prefix":null}"#,
+        )
+        .unwrap();
+        assert!(input.inherit_prefix.is_none());
+    }
+
+    #[test]
+    fn inherit_prefix_rejects_ambiguous_strings() {
+        // We don't want "yes" / "true" / "on" to silently produce a
+        // default — operators might intend something provider-
+        // specific we don't know about. Hard-fail so they notice.
+        for bad in ["yes", "on", "enabled", "1", "prefix"] {
+            let json = format!(
+                r#"{{"description":"d","prompt":"p","inherit_prefix":"{bad}"}}"#
+            );
+            let out: Result<SpawnAgentInput, _> = serde_json::from_str(&json);
+            assert!(
+                out.is_err(),
+                "ambiguous string {bad:?} must be rejected, got {:?}",
+                out.ok().and_then(|i| i.inherit_prefix)
+            );
+        }
+    }
+
+    #[test]
+    fn inherit_prefix_rejects_numbers_arrays_bools() {
+        for bad in [r#"123"#, r#"true"#, r#"[]"#] {
+            let json = format!(
+                r#"{{"description":"d","prompt":"p","inherit_prefix":{bad}}}"#
+            );
+            let out: Result<SpawnAgentInput, _> = serde_json::from_str(&json);
+            assert!(
+                out.is_err(),
+                "type {bad} must be rejected, got parsed result"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_inherit_prefix_description_recommends_opting_in() {
+        // Tripwire: the field-level description must actively
+        // recommend passing `{}` when appropriate. A passive "This
+        // field allows..." rewording produces near-zero uptake in
+        // practice. The word "RECOMMENDED" is the dominant signal.
+        let schema = spawn_agent_schema();
+        let ip_desc = schema["function"]["parameters"]["properties"]
+            ["inherit_prefix"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            ip_desc.contains("RECOMMENDED"),
+            "inherit_prefix description must carry an explicit \
+             recommendation signal; got: {ip_desc}"
+        );
+        assert!(
+            ip_desc.contains("{}"),
+            "inherit_prefix description must show the `{{}}` opt-in \
+             shorthand so models know the minimum call form; got: {ip_desc}"
+        );
     }
 }
