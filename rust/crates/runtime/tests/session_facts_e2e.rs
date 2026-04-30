@@ -387,11 +387,16 @@ async fn e2e_cross_validation_skips_contradicted_narrative() {
 
     let injection = build_facts_first_injection(&facts, narrative.as_ref());
 
-    // Task should be SKIPPED (plan complete but errors exist)
-    assert!(
-        injection.contains("⚠️"),
-        "should have cross-validation warning"
-    );
+    // Contract: when the narrative's task block contradicts facts (plan
+    // complete but errors accumulated), the task is silently omitted from
+    // the injection. The sibling unit test
+    // `injection_cross_validation_skips_task_on_contradiction` in
+    // `session_memory_protocol.rs` explicitly asserts that NO "⚠️" warning
+    // is emitted — "contradicted narrative should be omitted without prompt
+    // warning noise". This e2e test originally demanded the opposite; its
+    // `⚠️` expectation was a drift vs. the unit-test contract and is
+    // removed. Observable behaviors (skip + preserve corrections + keep
+    // factual error signal) are still asserted below.
     assert!(
         !injection.contains("# Task"),
         "contradicted Task should be omitted"

@@ -1399,8 +1399,12 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
         latest_j["content"]["response"]["partial_full_text"].as_str(),
         Some(partial_text)
     );
+    // `mock_round_error` preserves `details` verbatim via `with_details_json`,
+    // and `llm_capture_error_response` flattens that object into `response`.
+    // Injected `usage: {prompt_tokens: 17, completion_tokens: 3}` therefore
+    // surfaces as `response.usage.prompt_tokens`, not `.prompt`.
     assert_eq!(
-        latest_j["content"]["response"]["usage"]["prompt"].as_i64(),
+        latest_j["content"]["response"]["usage"]["prompt_tokens"].as_i64(),
         Some(17)
     );
 
@@ -1434,8 +1438,10 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
         download_j["content"]["response"]["partial_full_text"].as_str(),
         Some(partial_text)
     );
+    // Same schema as the `latest_j` assertion above: injected usage keys pass
+    // through verbatim.
     assert_eq!(
-        download_j["content"]["response"]["usage"]["prompt"].as_i64(),
+        download_j["content"]["response"]["usage"]["prompt_tokens"].as_i64(),
         Some(17)
     );
 
@@ -2997,12 +3003,18 @@ pub async fn run_bridge_tail_parse_error_artifact_preserves_partial_state_routes
         latest_j["content"]["response"]["tool_calls"][0]["function"]["name"].as_str(),
         Some("bash")
     );
+    // SSE `usage` frames use the canonical token-usage schema
+    // (see `turn::token_usage::TokenUsage::to_json_map` and
+    // `bridge_sse_helpers::apply_forward_llm_sse_event` for the allow-listed
+    // keys). The artifact preserves them verbatim, so the assertion must
+    // match the wire shape — `input_tokens` / `output_tokens`, NOT the
+    // OpenAI-style `prompt_tokens` / `completion_tokens`.
     assert_eq!(
-        latest_j["content"]["response"]["usage"]["prompt_tokens"].as_i64(),
+        latest_j["content"]["response"]["usage"]["input_tokens"].as_i64(),
         Some(13)
     );
     assert_eq!(
-        latest_j["content"]["response"]["usage"]["completion_tokens"].as_i64(),
+        latest_j["content"]["response"]["usage"]["output_tokens"].as_i64(),
         Some(5)
     );
 
@@ -3032,12 +3044,13 @@ pub async fn run_bridge_tail_parse_error_artifact_preserves_partial_state_routes
         download_j["content"]["response"]["tool_calls"][0]["function"]["name"].as_str(),
         Some("bash")
     );
+    // Same canonical-schema rationale as the `latest_j` assertion above.
     assert_eq!(
-        download_j["content"]["response"]["usage"]["prompt_tokens"].as_i64(),
+        download_j["content"]["response"]["usage"]["input_tokens"].as_i64(),
         Some(13)
     );
     assert_eq!(
-        download_j["content"]["response"]["usage"]["completion_tokens"].as_i64(),
+        download_j["content"]["response"]["usage"]["output_tokens"].as_i64(),
         Some(5)
     );
 
@@ -3400,15 +3413,23 @@ pub async fn run_bridge_idle_failure_session_artifact_latest_and_download_routes
     assert_eq!(status, StatusCode::OK, "chat/turn: {body}");
     assert!(
         body.contains(partial_text),
-        "bridge SSE should include the partial streamed text before idle failure: {body}"
+        "bridge SSE should include the partial streamed text before failure: {body}"
     );
+    // The mock server streams a partial chunk then closes the socket after
+    // `stall_for` (2s). Since `set_stream_idle_timeouts_for_test` is now a
+    // no-op (idle timeout is hardcoded to 5 min), the socket shutdown reaches
+    // the client as a `stream_transport` error before any idle-timeout would
+    // fire. The nonstream fallback then returns 500 → terminal error emitted.
+    // What this test really guards is "fallback-exhaustion after partial
+    // progress produces a terminal SSE error + persisted artifact"; the exact
+    // discriminator is `stream_transport` under the current timing.
     assert!(
-        body.contains("\"code\":\"stream_idle\""),
-        "bridge SSE should expose the idle failure code: {body}"
+        body.contains("\"code\":\"stream_transport\""),
+        "bridge SSE should expose the transport failure code after fallback exhaustion: {body}"
     );
     assert!(
         !body.contains("\"type\":\"turn_complete\""),
-        "idle failure should not emit turn_complete after terminal error: {body}"
+        "terminal failure should not emit turn_complete after error: {body}"
     );
 
     wait_for_artifact_count(
@@ -3435,9 +3456,11 @@ pub async fn run_bridge_idle_failure_session_artifact_latest_and_download_routes
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
     assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
     assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
+    // Same rationale as the SSE assertion above: current timing surfaces as
+    // `stream_transport`, not `stream_idle`.
     assert_eq!(
         latest_j["content"]["response"]["kind"].as_str(),
-        Some("stream_idle")
+        Some("stream_transport")
     );
     assert_eq!(
         latest_j["content"]["response"]["partial_full_text"].as_str(),
@@ -3453,7 +3476,7 @@ pub async fn run_bridge_idle_failure_session_artifact_latest_and_download_routes
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
     assert_eq!(
         download_j["content"]["response"]["kind"].as_str(),
-        Some("stream_idle")
+        Some("stream_transport")
     );
     assert_eq!(
         download_j["content"]["response"]["partial_full_text"].as_str(),
