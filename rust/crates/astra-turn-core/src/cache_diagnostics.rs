@@ -6,10 +6,26 @@
 //!
 //! diagnostics with token impact estimates and auto-remediation suggestions.
 
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
+
+/// Default source key used by the shortcut `record_turn` API. Callers that
+/// only track a single query stream (e.g., a CLI main loop) never need to
+/// deal with source keys — they always read/write this slot.
+pub const DEFAULT_SOURCE: &str = "main";
+
+/// Upper bound on concurrently tracked sources. Matches claudecode's
+/// `MAX_TRACKED_SOURCES = 10`. Each entry is one `PromptStateSnapshot`
+/// (~small); the cap exists to prevent unbounded growth when long-running
+/// runtimes spawn many distinct subagent ids. LRU-evicted on overflow.
+///
+/// The LRU uses a `Vec` for ordering, so each write is O(n) in the cap.
+/// At cap=10 that's negligible; raising this above ~64 should switch
+/// `source_order` to `VecDeque` or an indexed linked structure.
+const MAX_TRACKED_SOURCES: usize = 10;
 
 // ---------------------------------------------------------------------------
 // Cache break classification
@@ -133,11 +149,30 @@ const CACHE_TTL_5MIN_SECS: u64 = 300;
 const CACHE_TTL_1HOUR_SECS: u64 = 3_600;
 
 /// Detects and classifies prompt cache breaks between turns.
+///
+/// A single detector instance tracks cache state per *source* — a logical
+/// query stream (e.g. `"main"`, `"agent:session_memory"`, `"fork:<run_id>"`).
+/// Each source has its own `previous` snapshot; a break in one source does
+/// not corrupt attribution for another. This mirrors claudecode's
+/// `previousStateBySource` map and is a prerequisite for the fork-prefix
+/// primitive (PR 1+), where parent and child streams need independent
+/// attribution.
+///
+/// Backwards compatibility: the legacy `record_turn(snapshot, actual)`
+/// helper writes through to the [`DEFAULT_SOURCE`] slot, so pre-existing
+/// single-stream callers are unaffected.
 #[derive(Debug, Default)]
 pub struct CacheBreakDetector {
-    /// Previous turn's snapshot (None on first turn).
-    previous: Option<PromptStateSnapshot>,
-    /// Cumulative stats.
+    /// Previous snapshot per source. LRU-evicted at [`MAX_TRACKED_SOURCES`]
+    /// entries so unbounded subagent spawns cannot leak memory. The
+    /// `source_order` vector tracks insertion/refresh order (back = most
+    /// recent); eviction drops the front.
+    per_source: HashMap<String, PromptStateSnapshot>,
+    /// Insertion/refresh order for LRU eviction. Kept in sync with
+    /// `per_source`: every write to a source appends/refreshes its key
+    /// here; eviction pops from the front.
+    source_order: Vec<String>,
+    /// Cumulative stats (aggregated across all sources).
     pub stats: CacheStats,
     /// Optional directory where per-break diagnostic JSON artifacts are
     /// written. When `None` (default) no artifact is emitted. Intended for
@@ -186,24 +221,48 @@ impl CacheBreakDetector {
         self
     }
 
-    /// Record a new turn's prompt state and detect cache breaks.
-    ///
-    /// Returns `Some(event)` if a cache break was detected, `None` if cache
-    /// prefix was stable (likely a hit).
-    ///
-    /// `actual_cache_read_tokens` is from the API response — if available and
-    /// near zero, it confirms a cache miss even when hashes match (TTL expiry).
+    /// Record a turn against the [`DEFAULT_SOURCE`] stream. Shortcut for
+    /// `record_turn_for_source(DEFAULT_SOURCE, …)`. Existing single-stream
+    /// callers should continue using this method; multi-source callers
+    /// (fork primitive, subagent managers) should use the source-keyed form.
     pub fn record_turn(
         &mut self,
         current: PromptStateSnapshot,
         actual_cache_read_tokens: Option<u64>,
     ) -> Option<CacheBreakEvent> {
+        self.record_turn_for_source(DEFAULT_SOURCE, current, actual_cache_read_tokens)
+    }
+
+    /// Record a new turn's prompt state against a named source stream, and
+    /// detect cache breaks relative to that source's previous snapshot.
+    ///
+    /// Sources are logical query streams — e.g. `"main"`, `"agent:explore"`,
+    /// `"fork:<run_id>"`. Each source has its own previous snapshot; a
+    /// break in stream A does not poison attribution for stream B. Up to
+    /// [`MAX_TRACKED_SOURCES`] sources are tracked concurrently; the
+    /// least-recently-written source is dropped on overflow.
+    ///
+    /// Returns `Some(event)` if this source's prefix broke, `None` if it
+    /// was stable (cache hit). The first turn for a new source is a
+    /// non-break miss (no baseline to compare against).
+    ///
+    /// `actual_cache_read_tokens` is from the API response — if available
+    /// and near zero, it confirms a cache miss even when hashes match
+    /// (TTL expiry).
+    pub fn record_turn_for_source(
+        &mut self,
+        source: &str,
+        current: PromptStateSnapshot,
+        actual_cache_read_tokens: Option<u64>,
+    ) -> Option<CacheBreakEvent> {
         self.stats.total_turns += 1;
 
-        let event = if let Some(prev) = &self.previous {
+        let previous_for_source = self.per_source.get(source).cloned();
+
+        let event = if let Some(prev) = previous_for_source.as_ref() {
             self.detect_break(prev, &current, actual_cache_read_tokens)
         } else {
-            // First turn — always a "miss" but not a "break"
+            // First turn for this source — always a "miss" but not a "break"
             self.stats.cache_misses += 1;
             None
         };
@@ -217,15 +276,49 @@ impl CacheBreakDetector {
             }
             if let Some(dir) = self.diff_dir.clone() {
                 self.diff_seq = self.diff_seq.wrapping_add(1);
-                let _ =
-                    write_diff_artifact(&dir, self.diff_seq, self.previous.as_ref(), &current, evt);
+                let _ = write_diff_artifact(
+                    &dir,
+                    self.diff_seq,
+                    previous_for_source.as_ref(),
+                    &current,
+                    evt,
+                );
             }
-        } else if self.previous.is_some() {
+        } else if previous_for_source.is_some() {
             self.stats.cache_hits += 1;
         }
 
-        self.previous = Some(current);
+        self.write_source_snapshot(source, current);
         event
+    }
+
+    /// Insert/refresh a source's snapshot and maintain LRU order. Called
+    /// from `record_turn_for_source` after detection completes so the
+    /// detection path reads the OLD snapshot, then we overwrite.
+    fn write_source_snapshot(&mut self, source: &str, snapshot: PromptStateSnapshot) {
+        self.per_source.insert(source.to_string(), snapshot);
+        if let Some(pos) = self.source_order.iter().position(|s| s == source) {
+            self.source_order.remove(pos);
+        }
+        self.source_order.push(source.to_string());
+
+        while self.source_order.len() > MAX_TRACKED_SOURCES {
+            let evicted = self.source_order.remove(0);
+            self.per_source.remove(&evicted);
+        }
+    }
+
+    /// Number of source streams currently tracked. Exposed for diagnostics
+    /// and tests — callers should not make routing decisions based on it.
+    pub fn tracked_source_count(&self) -> usize {
+        self.per_source.len()
+    }
+
+    /// Peek at a source's last snapshot without mutating state. Intended
+    /// for the fork primitive (PR 1+) to build a `ForkPrefix` from the
+    /// parent's captured state at turn boundary.
+    pub fn snapshot_for_source(&self, source: &str) -> Option<&PromptStateSnapshot> {
+        self.per_source.get(source)
     }
 
     /// Compare two snapshots and classify the break.
@@ -468,9 +561,19 @@ impl CacheBreakDetector {
             0
         };
 
+        // Compression hints are a whole-session property, not per-source.
+        // We use the DEFAULT_SOURCE (main stream) as the representative
+        // snapshot: the protected prefix tokens are whatever the main
+        // conversation last saw. Subagent streams don't influence what
+        // the main compression pipeline treats as cache-valid prefix.
+        //
+        // NOTE: if the main turn loop is ever wired to record under a
+        // different source key (e.g. `"repl_main_thread"` as in
+        // claudecode), this lookup must be updated in lockstep or the
+        // protected-token estimate will silently fall to 0.
         let protected_token_estimate = self
-            .previous
-            .as_ref()
+            .per_source
+            .get(DEFAULT_SOURCE)
             .map(|s| s.cache_eligible_tokens)
             .unwrap_or(0);
 
@@ -1065,5 +1168,191 @@ mod tests {
 
         let count = std::fs::read_dir(tmp.path()).unwrap().count();
         assert_eq!(count, 0, "no artifacts should be written on hits");
+    }
+
+    // ---------------------------------------------------------------------
+    // Per-source tracking — prerequisites for the fork prefix primitive.
+    // Each source stream has its own `previous` slot; breaks in one do not
+    // poison attribution for another.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn default_source_constant_is_stable() {
+        // Guard DEFAULT_SOURCE's literal value in one place rather than
+        // duplicating "main" across every test that uses the shortcut API.
+        assert_eq!(DEFAULT_SOURCE, "main");
+    }
+
+    #[test]
+    fn legacy_record_turn_writes_default_source() {
+        let tools = make_tools(&["bash"]);
+        let mut det = CacheBreakDetector::new();
+        det.record_turn(snap("p", &tools, "claude"), None);
+        assert_eq!(det.tracked_source_count(), 1);
+        assert!(det.snapshot_for_source(DEFAULT_SOURCE).is_some());
+    }
+
+    #[test]
+    fn sources_are_independent_on_divergence() {
+        // Source A keeps a stable prefix (should register hits).
+        // Source B changes its system prompt each turn (should register breaks).
+        // Source A's hit count must not be polluted by B's misses beyond the
+        // aggregate stats, and each source's `previous` must come from its
+        // own stream, not the globally last-written one.
+        let tools = make_tools(&["bash"]);
+        let mut det = CacheBreakDetector::new();
+
+        det.record_turn_for_source("A", snap("prompt-A", &tools, "m"), None);
+        det.record_turn_for_source("B", snap("prompt-B-v1", &tools, "m"), None);
+
+        // A stable — this must be a HIT, even though B was written in between.
+        let a_second = det.record_turn_for_source("A", snap("prompt-A", &tools, "m"), None);
+        assert!(
+            a_second.is_none(),
+            "A's second turn must hit because A's own previous matched"
+        );
+
+        // B breaks — system prompt changed for B.
+        let b_second =
+            det.record_turn_for_source("B", snap("prompt-B-v2", &tools, "m"), None);
+        assert!(
+            matches!(
+                b_second.as_ref().map(|e| &e.reason),
+                Some(CacheBreakReason::SystemPromptChanged)
+            ),
+            "B must register a break, got {b_second:?}"
+        );
+
+        // Aggregate stats reflect both streams: 4 total turns, 2 initial
+        // misses (first of each source) + 1 hit (A's second) + 1 break (B's second).
+        assert_eq!(det.stats.total_turns, 4);
+        assert_eq!(det.stats.cache_hits, 1);
+        assert_eq!(det.stats.cache_misses, 3); // A's first + B's first + B's break
+    }
+
+    #[test]
+    fn break_in_one_source_does_not_corrupt_another_baseline() {
+        // After a break in source B, source A's subsequent identical turn
+        // must still hit — baselines are per-source.
+        let tools = make_tools(&["bash"]);
+        let mut det = CacheBreakDetector::new();
+
+        det.record_turn_for_source("A", snap("p-A", &tools, "m"), None);
+        det.record_turn_for_source("B", snap("p-B-v1", &tools, "m"), None);
+        det.record_turn_for_source("B", snap("p-B-v2", &tools, "m"), None); // B break
+
+        // A's prefix is unchanged — must hit.
+        let a_next = det.record_turn_for_source("A", snap("p-A", &tools, "m"), None);
+        assert!(a_next.is_none(), "A must still hit after B broke");
+    }
+
+    #[test]
+    fn lru_evicts_oldest_source_above_cap() {
+        let tools = make_tools(&["bash"]);
+        let mut det = CacheBreakDetector::new();
+
+        // Fill past the cap. The oldest source ("s00") must be evicted.
+        for i in 0..(MAX_TRACKED_SOURCES + 3) {
+            let source = format!("s{i:02}");
+            det.record_turn_for_source(&source, snap("p", &tools, "m"), None);
+        }
+        assert_eq!(det.tracked_source_count(), MAX_TRACKED_SOURCES);
+        assert!(
+            det.snapshot_for_source("s00").is_none(),
+            "oldest source should have been evicted"
+        );
+        assert!(
+            det.snapshot_for_source(&format!("s{:02}", MAX_TRACKED_SOURCES + 2)).is_some(),
+            "newest source must still be tracked"
+        );
+    }
+
+    #[test]
+    fn refreshing_a_source_prevents_its_eviction() {
+        // LRU must be refresh-aware: if source S is written again, it moves
+        // to the back of the queue and does not get evicted in favor of
+        // newer sources.
+        let tools = make_tools(&["bash"]);
+        let mut det = CacheBreakDetector::new();
+
+        det.record_turn_for_source("pinned", snap("p", &tools, "m"), None);
+        // Fill the rest to the cap; "pinned" is currently oldest.
+        for i in 0..(MAX_TRACKED_SOURCES - 1) {
+            det.record_turn_for_source(&format!("t{i}"), snap("p", &tools, "m"), None);
+        }
+        // Refresh pinned — it becomes most recent.
+        det.record_turn_for_source("pinned", snap("p", &tools, "m"), None);
+        // One more write triggers eviction — but "pinned" is no longer oldest.
+        det.record_turn_for_source("overflow", snap("p", &tools, "m"), None);
+
+        assert!(
+            det.snapshot_for_source("pinned").is_some(),
+            "refreshed source must survive eviction"
+        );
+        assert!(
+            det.snapshot_for_source("t0").is_none(),
+            "t0 was oldest after the refresh and should have been evicted"
+        );
+    }
+
+    #[test]
+    fn snapshot_for_source_is_readonly() {
+        // Peeking must not alter LRU order. If it did, reading a source
+        // would shield it from eviction — that's a footgun.
+        let tools = make_tools(&["bash"]);
+        let mut det = CacheBreakDetector::new();
+        det.record_turn_for_source("first", snap("p", &tools, "m"), None);
+        for i in 0..MAX_TRACKED_SOURCES {
+            det.record_turn_for_source(&format!("s{i}"), snap("p", &tools, "m"), None);
+        }
+        // Peek "first" many times; it must still be the eviction candidate.
+        for _ in 0..5 {
+            let _ = det.snapshot_for_source("first");
+        }
+        det.record_turn_for_source("final", snap("p", &tools, "m"), None);
+        assert!(
+            det.snapshot_for_source("first").is_none(),
+            "peek must not count as a refresh — 'first' should have been evicted"
+        );
+    }
+
+    #[test]
+    fn diff_artifact_uses_per_source_prev() {
+        // When a break fires on source B, the diff artifact must embed B's
+        // previous snapshot — not the globally last-written snapshot, which
+        // might belong to a different source (A) entirely.
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = make_tools(&["bash"]);
+        let mut det = CacheBreakDetector::new().with_diff_dir(tmp.path());
+
+        det.record_turn_for_source("A", snap("prompt-A-stable", &tools, "m"), None);
+        det.record_turn_for_source("B", snap("prompt-B-v1", &tools, "m"), None);
+        // Now write A again (unchanged) so that A is globally last-written.
+        det.record_turn_for_source("A", snap("prompt-A-stable", &tools, "m"), None);
+        // Now break B. The artifact's `prev` must be B's v1, not A's prompt.
+        det.record_turn_for_source("B", snap("prompt-B-v2", &tools, "m"), None);
+
+        let files: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(files.len(), 1, "exactly one artifact expected");
+        let body = std::fs::read_to_string(&files[0]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // We can't read the prompt text back (only hashes are stored), but
+        // we can verify the prev system_prompt_hash matches B's v1 hash,
+        // not A's.
+        let b_v1_hash = snap("prompt-B-v1", &tools, "m").system_prompt_hash;
+        let a_stable_hash = snap("prompt-A-stable", &tools, "m").system_prompt_hash;
+        let artifact_prev_hash = v["prev"]["system_prompt_hash"].as_u64().unwrap();
+        assert_eq!(
+            artifact_prev_hash, b_v1_hash,
+            "artifact prev must come from B's own stream, not the global last write"
+        );
+        assert_ne!(
+            artifact_prev_hash, a_stable_hash,
+            "artifact prev must not leak A's snapshot into B's break record"
+        );
     }
 }
