@@ -542,6 +542,36 @@ pub fn hash_tool_schema(value: &serde_json::Value) -> (Vec<u8>, ContentHash) {
     (canonical, hash)
 }
 
+/// Convert a list of tool schemas as they appear in a wire payload
+/// into `Vec<ToolSchemaEntry>`. Handles both common schema shapes
+/// (OpenAI's nested `{function: {name, ...}}` and Anthropic's flat
+/// `{name, ...}`) so both CLI and server-side hosts can reuse the
+/// same helper when populating [`crate::fork_capture::CaptureRequest`].
+///
+/// Nameless schemas are dropped: a schema with no detectable name
+/// cannot be attributed in `ForkCacheEvent::drift`, so inventing a
+/// placeholder would produce a misleading telemetry event. The order
+/// of returned entries preserves input order.
+pub fn build_tool_schema_entries(schemas: &[serde_json::Value]) -> Vec<ToolSchemaEntry> {
+    schemas
+        .iter()
+        .filter_map(|schema| {
+            let name = schema
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .or_else(|| schema.get("name").and_then(|n| n.as_str()))?
+                .to_string();
+            let (canonical_bytes, hash) = hash_tool_schema(schema);
+            Some(ToolSchemaEntry {
+                name,
+                canonical_bytes,
+                hash,
+            })
+        })
+        .collect()
+}
+
 /// Serialize a JSON value with keys sorted at every object level. The
 /// built-in `serde_json::to_vec` preserves insertion order, which is
 /// fine for most IO but not for content-hashing — a downstream caller
@@ -1192,5 +1222,66 @@ mod tests {
         // observable behavior (oversized threshold) — this test exists
         // to force review of that change.
         assert_eq!(PREFIX_SOFT_CAP_BYTES, 2 * 1024 * 1024);
+    }
+
+    // ── build_tool_schema_entries: shared CLI+server capture helper ──
+
+    #[test]
+    fn build_tool_schema_entries_extracts_openai_nested_name() {
+        let schemas = vec![
+            serde_json::json!({
+                "type": "function",
+                "function": {"name": "spawn_agent", "parameters": {}}
+            }),
+            serde_json::json!({
+                "type": "function",
+                "function": {"name": "Read", "parameters": {}}
+            }),
+        ];
+        let entries = build_tool_schema_entries(&schemas);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "spawn_agent");
+        assert_eq!(entries[1].name, "Read");
+        assert!(!entries[0].canonical_bytes.is_empty());
+    }
+
+    #[test]
+    fn build_tool_schema_entries_extracts_anthropic_flat_name() {
+        let schemas = vec![serde_json::json!({
+            "name": "Grep",
+            "input_schema": {"type": "object"},
+        })];
+        let entries = build_tool_schema_entries(&schemas);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Grep");
+    }
+
+    #[test]
+    fn build_tool_schema_entries_drops_nameless_schemas() {
+        let schemas = vec![
+            serde_json::json!({"function": {"description": "no name"}}),
+            serde_json::json!({"description": "also no name"}),
+            serde_json::json!({"name": "ok_one"}),
+        ];
+        let entries = build_tool_schema_entries(&schemas);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "ok_one");
+    }
+
+    #[test]
+    fn build_tool_schema_entries_is_key_order_independent() {
+        // Critical: cache identity depends on canonical_bytes being
+        // stable across key reorderings. If this test ever fails,
+        // `fork-cache` events stop attributing correctly.
+        let a = serde_json::json!({
+            "function": {"name": "X", "parameters": {"a": 1, "b": 2}}
+        });
+        let b = serde_json::json!({
+            "function": {"parameters": {"b": 2, "a": 1}, "name": "X"}
+        });
+        let ea = build_tool_schema_entries(&[a]);
+        let eb = build_tool_schema_entries(&[b]);
+        assert_eq!(ea[0].hash, eb[0].hash);
+        assert_eq!(ea[0].canonical_bytes, eb[0].canonical_bytes);
     }
 }

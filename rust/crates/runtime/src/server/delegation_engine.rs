@@ -1213,6 +1213,17 @@ impl DelegationEngine {
         self
     }
 
+    /// Read-only accessor for the attached prefix store. Used by
+    /// `run_lifecycle::build_host` so the server-side parent loop
+    /// host captures into the same store the delegate path reads
+    /// from — without this, delegate sub-runs could never inherit
+    /// because no parent capture would ever land in the store.
+    pub fn prefix_store(
+        &self,
+    ) -> Option<&Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>> {
+        self.prefix_store.as_ref()
+    }
+
     /// Resolve a parent prefix for a delegated sub-run's config.
     /// Returns `None` (no inheritance) when:
     /// - no prefix_store is configured

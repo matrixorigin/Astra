@@ -1932,6 +1932,16 @@ impl AgenticRunLifecycleService {
             if let Some(broadcaster) = de.progress_broadcaster() {
                 builder = builder.with_progress_broadcaster(Arc::clone(broadcaster));
             }
+            // G2: share the delegation engine's fork-prefix store with
+            // the parent loop host so `on_turn_completed` captures land
+            // in the same store the delegate path reads from. Without
+            // this, server-side parent turns never capture and
+            // delegate sub-runs can't inherit the prefix (that was the
+            // exact "out of scope" leg called out in 45a3a39e9's
+            // commit body).
+            if let Some(store) = de.prefix_store() {
+                builder = builder.with_prefix_store(Some(Arc::clone(store)));
+            }
         }
         // Wire test LLM rounds from request context (E2E test hook).
         #[cfg(feature = "bridge-e2e-hooks")]
@@ -3675,6 +3685,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
         }
+        // NOTE on grandchild inheritance: delegated children don't get
+        // a prefix_store wired here because this sub-run executor
+        // doesn't own one. Grandchild captures would be valuable for
+        // deeper delegation trees but require threading the store into
+        // `ServerSubRunExecutor` separately — scope-cut from G2 v1.
         let mut host = builder.build();
 
         // Build the task prompt, incorporating previous output if pipeline.

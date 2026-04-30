@@ -588,6 +588,19 @@ pub struct ServerAgenticLoopHost {
     /// `tool_call` id would be emitted once per host instance. See
     /// `web_agent_e2e::skill_invocation_costs_exactly_two_llm_rounds_today`.
     emitted_tool_call_ids: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+
+    // ── Fork-prefix parent capture (G2) ──
+    /// Optional fork-prefix store. When set + the fork-prefix feature
+    /// flag is on, `on_turn_completed` captures the parent turn's
+    /// cacheable prefix so delegate / spawn_agent sub-runs routed
+    /// through the server-side DelegationEngine can inherit it. Mirrors
+    /// the CLI-side wiring in `CliAgenticLoopHost::prefix_store`.
+    prefix_store:
+        Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
+    /// Tool schemas advertised to the LLM this turn — used to populate
+    /// `CaptureRequest.tool_schemas` for per-tool drift attribution.
+    /// Updated by `execute_turn` each round.
+    last_turn_tool_schemas: Vec<Value>,
 }
 
 /// Builder for [`ServerAgenticLoopHost`].
@@ -622,6 +635,9 @@ pub struct ServerAgenticLoopHostBuilder {
     /// within the same chat turn (e.g. parent + skill subrun).
     #[cfg(feature = "bridge-e2e-hooks")]
     shared_dedup_state: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
+    /// Optional fork-prefix store for parent-turn capture (G2).
+    prefix_store:
+        Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
 }
 
 impl ServerAgenticLoopHostBuilder {
@@ -658,7 +674,21 @@ impl ServerAgenticLoopHostBuilder {
             llm_request_capture: None,
             #[cfg(feature = "bridge-e2e-hooks")]
             shared_dedup_state: None,
+            prefix_store: None,
         }
+    }
+
+    /// Inject a shared fork-prefix store. When set, the built host
+    /// captures the parent turn's cacheable prefix into this store so
+    /// delegate / spawn_agent sub-runs can inherit it. `None` (default)
+    /// makes `on_turn_completed` a no-op — preserves zero-overhead
+    /// behavior for callers that don't enable the fork-prefix feature.
+    pub fn with_prefix_store(
+        mut self,
+        store: Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
+    ) -> Self {
+        self.prefix_store = store;
+        self
     }
 
     /// Share a parent host's `emitted_tool_call_ids` HashSet with the host
@@ -836,6 +866,8 @@ impl ServerAgenticLoopHostBuilder {
             emitted_tool_call_ids: self.shared_dedup_state.unwrap_or_else(|| {
                 std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()))
             }),
+            prefix_store: self.prefix_store,
+            last_turn_tool_schemas: Vec::new(),
         }
     }
 }
@@ -2192,6 +2224,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
         let turn_started = Instant::now();
 
+        // Stash the tool schemas advertised to the LLM this turn so
+        // `on_turn_completed` can pass them into the fork-prefix
+        // CaptureRequest. `edge_tools` is the authoritative view —
+        // it's what gets serialized into the wire payload below.
+        // Cheap clone (schemas are small JSON values) and only keeps
+        // one turn's worth.
+        self.last_turn_tool_schemas = self.edge_tools.clone();
+
         // ── Test hook: mock LLM rounds ──────────────────────────────────
         #[cfg(feature = "bridge-e2e-hooks")]
         {
@@ -2920,6 +2960,60 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
     fn valid_tool_names(&self) -> &HashSet<String> {
         &self.valid_tools
+    }
+
+    fn on_turn_completed(
+        &mut self,
+        state: &crate::turn::agentic_loop_host::AgenticLoopState,
+    ) {
+        // G2: server-side parent capture. Mirrors the CLI host's
+        // `on_turn_completed`, so delegate / spawn_agent sub-runs
+        // routed through the server DelegationEngine can inherit the
+        // parent's cacheable prefix. No-op unless the store was wired
+        // in and the feature flag is on (`capture_parent_prefix`
+        // early-returns if so).
+        let Some(store) = self.prefix_store.as_ref() else {
+            return;
+        };
+        let parent_run_id = match state.current_run_id.as_deref() {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => return,
+        };
+        let model_id = self.model_override.clone().unwrap_or_default();
+        let provider =
+            astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model_id);
+        let Ok(canonical_prefix_bytes) = serde_json::to_vec(&state.messages) else {
+            return;
+        };
+        let captured_at_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Populate tool_schemas from the turn's advertised list so
+        // per-tool drift attribution works. `system_blocks` stays
+        // empty for now: the server assembles system messages via
+        // `build_system_messages_cached` per-turn and does not retain
+        // the canonical byte form. A follow-up can thread the
+        // system_msgs Vec<Value> through the same stash path if the
+        // telemetry attribution need arises.
+        let tool_schemas = astra_turn_core::fork_prefix::build_tool_schema_entries(
+            &self.last_turn_tool_schemas,
+        );
+        let req = astra_turn_core::fork_capture::CaptureRequest {
+            parent_run_id,
+            parent_turn_seq: state.llm_rounds_completed,
+            provider,
+            model_id,
+            thinking: None,
+            system_blocks: vec![],
+            tool_schemas,
+            beta_headers: vec![],
+            canonical_prefix_bytes,
+            cache_mode: astra_turn_core::fork_prefix::CacheMode::Write,
+            captured_at_secs,
+            microcompact_fired_in_turn: false,
+        };
+        let _ = astra_turn_core::fork_capture::capture_parent_prefix(req, store.as_ref());
     }
 
     fn inject_tool_schema(&mut self, schema: Value) {
@@ -5557,5 +5651,143 @@ mod tests {
             !visible_names.contains(&"write_file"),
             "write_file not in delegation allowlist, must be restricted"
         );
+    }
+
+    // ── G2: server-side parent capture (on_turn_completed) ──
+    //
+    // These tests pin three behaviors of the server host's capture
+    // path so a future refactor can't silently regress:
+    //
+    //  1. No store wired → no-op (zero overhead for callers that
+    //     don't enable fork-prefix).
+    //  2. Store wired + feature flag off → capture returns
+    //     FeatureDisabled and nothing lands in the sink. This is the
+    //     dark-ship contract.
+    //  3. Store wired + flag on + non-empty run_id/messages →
+    //     prefix lands in the sink with the right run_id and the
+    //     tool_schemas are populated from the advertised edge_tools.
+
+    mod fork_prefix_capture_g2 {
+        use super::*;
+        use astra_turn_core::fork_capture::{
+            FORK_FLAG_TEST_MUTEX, restore_fork_flag_raw_for_tests, set_fork_flag_for_tests,
+        };
+        use astra_turn_core::fork_prefix_store::{InMemoryPrefixStore, PrefixCaptureSink};
+        use std::sync::Arc;
+
+        struct FlagGuard {
+            _lock: std::sync::MutexGuard<'static, ()>,
+            prev_raw: u8,
+        }
+        impl FlagGuard {
+            fn set(enabled: bool) -> Self {
+                let lock = FORK_FLAG_TEST_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let prev_raw = set_fork_flag_for_tests(enabled);
+                Self {
+                    _lock: lock,
+                    prev_raw,
+                }
+            }
+        }
+        impl Drop for FlagGuard {
+            fn drop(&mut self) {
+                restore_fork_flag_raw_for_tests(self.prev_raw);
+            }
+        }
+
+        fn state_with_run(run_id: &str) -> AgenticLoopState {
+            let mut state = crate::turn::agentic_loop_host::tests::make_state();
+            state.current_run_id = Some(run_id.to_string());
+            state.messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+            state
+        }
+
+        fn build_host_with(
+            store: Option<Arc<dyn PrefixCaptureSink>>,
+            tools: Vec<Value>,
+        ) -> ServerAgenticLoopHost {
+            ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u".to_string(),
+                "s".to_string(),
+            )
+            .with_edge_tools(tools)
+            .with_prefix_store(store)
+            .build()
+        }
+
+        #[test]
+        fn on_turn_completed_is_noop_without_store() {
+            // No store wired, no flag touched — must not panic, must
+            // not affect any state the loop depends on.
+            let _guard = FlagGuard::set(false);
+            let mut host = build_host_with(None, sample_edge_tools());
+            let state = state_with_run("run-1");
+            host.on_turn_completed(&state);
+            // Nothing to assert beyond "it ran without side effects".
+        }
+
+        #[test]
+        fn on_turn_completed_respects_feature_flag_off() {
+            let _guard = FlagGuard::set(false);
+            let store = Arc::new(InMemoryPrefixStore::new());
+            let store_arc: Arc<dyn PrefixCaptureSink> = store.clone();
+            let mut host = build_host_with(Some(store_arc), sample_edge_tools());
+            // Simulate that the loop completed one turn.
+            host.last_turn_tool_schemas = sample_edge_tools();
+            host.on_turn_completed(&state_with_run("run-off"));
+            assert_eq!(
+                store.tracked_count(),
+                0,
+                "flag off must not write to the store"
+            );
+        }
+
+        #[test]
+        fn on_turn_completed_captures_when_flag_on_and_store_wired() {
+            let _guard = FlagGuard::set(true);
+            let store = Arc::new(InMemoryPrefixStore::new());
+            let store_arc: Arc<dyn PrefixCaptureSink> = store.clone();
+            let mut host = build_host_with(Some(store_arc), sample_edge_tools());
+            // execute_turn would normally stash this; mimic it here.
+            host.last_turn_tool_schemas = sample_edge_tools();
+            host.on_turn_completed(&state_with_run("run-capture"));
+            assert_eq!(
+                store.tracked_count(),
+                1,
+                "flag on + store + valid run_id must produce one entry"
+            );
+            let pfx = store
+                .get_prefix("run-capture")
+                .expect("prefix stored under parent_run_id");
+            // tool_schemas from edge_tools should have been populated.
+            assert_eq!(
+                pfx.tool_schemas().len(),
+                2,
+                "two advertised tools → two ToolSchemaEntry"
+            );
+            let names: Vec<_> = pfx.tool_schemas().iter().map(|t| t.name.as_str()).collect();
+            assert!(names.contains(&"bash"));
+            assert!(names.contains(&"read_file"));
+        }
+
+        #[test]
+        fn on_turn_completed_skips_when_run_id_missing() {
+            let _guard = FlagGuard::set(true);
+            let store = Arc::new(InMemoryPrefixStore::new());
+            let store_arc: Arc<dyn PrefixCaptureSink> = store.clone();
+            let mut host = build_host_with(Some(store_arc), sample_edge_tools());
+            let mut state = state_with_run("whatever");
+            state.current_run_id = None; // simulate pre-run state
+            host.on_turn_completed(&state);
+            assert_eq!(
+                store.tracked_count(),
+                0,
+                "missing run_id must skip capture"
+            );
+        }
     }
 }
