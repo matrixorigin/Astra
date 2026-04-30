@@ -112,13 +112,20 @@ fn apply_optional_yaml_fields(
         );
     }
     if let Some(thinking_mode) = yaml_str(entry, "thinking_mode") {
-        let quirks = obj
-            .entry("quirks")
-            .or_insert_with(|| serde_json::json!({}));
-        quirks
-            .as_object_mut()
-            .unwrap()
-            .insert("thinking_mode".into(), serde_json::json!(thinking_mode));
+        match thinking_mode.as_str() {
+            "controllable" | "native" => {
+                let quirks = obj.entry("quirks").or_insert_with(|| serde_json::json!({}));
+                if let Some(qobj) = quirks.as_object_mut() {
+                    qobj.insert("thinking_mode".into(), serde_json::json!(thinking_mode));
+                }
+            }
+            other => {
+                eprintln!(
+                    "  warning: ignoring invalid thinking_mode {other:?} \
+                     (expected \"controllable\" or \"native\")"
+                );
+            }
+        }
     }
 }
 
@@ -712,8 +719,13 @@ mod tests {
             tags: [code, chat, reasoning]
             "#,
         );
-        let payload =
-            build_model_create_payload(&entry, "us.anthropic.claude-sonnet-4-6", "bedrock", "test-key", None);
+        let payload = build_model_create_payload(
+            &entry,
+            "us.anthropic.claude-sonnet-4-6",
+            "bedrock",
+            "test-key",
+            None,
+        );
         let quirks = payload.get("quirks").expect("quirks must be present");
         assert_eq!(
             quirks.get("thinking_mode").and_then(|v| v.as_str()),
@@ -732,7 +744,8 @@ mod tests {
             api_key: test-key
             "#,
         );
-        let payload = build_model_create_payload(&entry, "qwen3-235b", "dashscope", "test-key", None);
+        let payload =
+            build_model_create_payload(&entry, "qwen3-235b", "dashscope", "test-key", None);
         let quirks = payload.get("quirks").expect("quirks must be present");
         assert_eq!(
             quirks.get("thinking_mode").and_then(|v| v.as_str()),
@@ -757,7 +770,7 @@ mod tests {
                 || quirks
                     .unwrap()
                     .get("thinking_mode")
-                    .map_or(true, |v| v.is_null()),
+                    .is_none_or(|v| v.is_null()),
             "no thinking_mode in YAML should not inject one into quirks"
         );
     }
@@ -772,10 +785,29 @@ mod tests {
             "#,
         );
         let payload = build_model_update_payload(&entry, "bedrock", "test-key", None);
-        let quirks = payload.get("quirks").expect("quirks must be present in update");
+        let quirks = payload
+            .get("quirks")
+            .expect("quirks must be present in update");
         assert_eq!(
             quirks.get("thinking_mode").and_then(|v| v.as_str()),
             Some("controllable"),
+        );
+    }
+
+    #[test]
+    fn create_payload_rejects_invalid_thinking_mode() {
+        let entry = yaml(
+            r#"
+            name: test
+            provider: x
+            api_key: k
+            thinking_mode: Controllable
+            "#,
+        );
+        let payload = build_model_create_payload(&entry, "test", "x", "k", None);
+        assert!(
+            payload.get("quirks").is_none(),
+            "invalid thinking_mode must not be forwarded to quirks"
         );
     }
 
@@ -799,12 +831,21 @@ mod tests {
             thinking_mode: controllable
             "#,
         );
-        let payload = build_model_create_payload(&entry, "test-model", "bedrock", "k", Some("https://example.com"));
+        let payload = build_model_create_payload(
+            &entry,
+            "test-model",
+            "bedrock",
+            "k",
+            Some("https://example.com"),
+        );
         assert_eq!(payload["description"], "test description");
         assert_eq!(payload["context_window"], 200000);
         assert_eq!(payload["max_completion_tokens"], 4096);
         assert_eq!(payload["tags"], serde_json::json!(["code", "chat"]));
-        assert_eq!(payload["supported_parameters"], serde_json::json!(["tools"]));
+        assert_eq!(
+            payload["supported_parameters"],
+            serde_json::json!(["tools"])
+        );
         assert_eq!(payload["architecture"], "transformer");
         assert!(payload["pricing"]["prompt"].as_f64().unwrap() > 0.0);
         assert_eq!(
