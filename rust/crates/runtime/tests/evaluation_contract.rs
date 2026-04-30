@@ -80,8 +80,8 @@ fn build_unconfigured_app() -> axum::Router {
 }
 
 fn dummy_matrixone() -> MatrixOneSettings {
-    // Use an invalid host so sqlx connection fails immediately without retrying
-    // for the full acquire_timeout duration.
+    // Placeholder settings — the memory-health/memory-metrics routes only call
+    // Memoria over HTTP and never open a DB connection, so this is never dialed.
     MatrixOneSettings {
         host: "invalid.test".to_string(),
         port: 1,
@@ -268,36 +268,33 @@ async fn memory_health_and_metrics_use_mock_memoria() {
     assert_eq!(json["noise_filtered_confidence_samples"], 12);
 }
 
+// Drift/quality/slo routes require a DB and are not backed by Memoria.
+// Verify they return 500 using the unconfigured stub (no TCP attempt).
 #[tokio::test]
-async fn memoria_stubbed_evaluation_routes_surface_expected_errors() {
-    let memoria_base_url = start_mock_memoria_health().await;
-    let app = build_memoria_backed_app(memoria_base_url);
+async fn db_dependent_evaluation_routes_return_error_without_db() {
+    let app = build_unconfigured_app();
 
     let cases = [
-        (
-            "GET",
-            "/evaluation/drift",
-            body::Body::empty(),
-            false,
-            StatusCode::INTERNAL_SERVER_ERROR,
-        ),
+        ("GET", "/evaluation/drift", body::Body::empty(), false),
         (
             "GET",
             "/evaluation/quality/trend?model=gpt-4",
             body::Body::empty(),
             false,
-            StatusCode::INTERNAL_SERVER_ERROR,
         ),
         (
             "GET",
             "/evaluation/slo/dashboard",
             body::Body::empty(),
             false,
-            StatusCode::INTERNAL_SERVER_ERROR,
         ),
     ];
-    for (method, uri, b, json_ct, expected_status) in cases {
+    for (method, uri, b, json_ct) in cases {
         let resp = oneshot_eval(app.clone(), method, uri, b, json_ct).await;
-        assert_eq!(resp.status(), expected_status, "{method} {uri}");
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{method} {uri}"
+        );
     }
 }
