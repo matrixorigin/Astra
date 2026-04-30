@@ -1,0 +1,24 @@
+name: selector_spawn_agent_visible_across_matrix
+description: |
+  G3 regression. Pre-G3, the tfidf tool selector hid `spawn_agent`
+  from models because the tool has no entry in TOOL_CATALOG. This
+  case pins three different model families (alibaba, anthropic,
+  minimax) and asserts all three pick the tool up — the fix should
+  work across families, not just the one used during development.
+prompt: |
+  You have a `spawn_agent` tool. Spawn a child and ask it to reply
+  with exactly "G3-matrix-ok". Surface the child's reply in your
+  final answer.
+models:
+  - qwen-flash
+  - us.anthropic.claude-sonnet-4-6
+  - MiniMax-M2.7
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: spawn_agent
+  - type: tools_count_between
+    min: 1
+    max: 4

@@ -1,0 +1,26 @@
+name: skill_discovery_uses_skill_tool
+description: |
+  The skill/discover_skills tools are injected dynamically by the
+  runtime's lifecycle preamble when a resolver is present. A
+  regression in that injection path (or in the selector surfacing
+  those names) would make skills silently uncallable. This case
+  asks for a skill-relevant task and verifies the model reached for
+  the `skill` or `discover_skills` tool rather than improvising.
+prompt: |
+  I want to analyze a past astra session to find token waste. There's
+  likely a skill for this. Use whichever tool discovers available
+  skills and tell me the name of the most relevant one. Do not try
+  to perform the analysis — I only want the skill's name.
+timeout_seconds: 120
+criteria:
+  - type: exit_code
+    code: 0
+  - type: judger
+    question: |
+      Did the agent invoke a tool named `skill` or `discover_skills`
+      (check tools_used list), and did its final answer name a
+      specific skill (e.g. "analyze_session" or "analyze-session")?
+      Score 1.0 for both. Score 0.4 for naming a skill but without
+      using the discovery tool (could be guessing). Score 0.0 if no
+      specific skill is named.
+    threshold: 0.6

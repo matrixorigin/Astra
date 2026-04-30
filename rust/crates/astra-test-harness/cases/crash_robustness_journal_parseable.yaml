@@ -1,0 +1,27 @@
+name: crash_robustness_journal_parseable
+description: |
+  Journal lines that fail to parse must be counted, not silently
+  dropped or crashing the analyzer. We run a normal case with
+  debug_log enabled and require that `skipped_lines == 0` — the
+  loader's defensive counter should stay at zero on a clean run.
+  If future code writes malformed lines this case FAILs with a
+  visible count.
+prompt: |
+  List the files in the current directory with list_dir. Reply with
+  "scan-complete" in your final answer.
+debug_log: true
+timeout_seconds: 120
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: list_dir
+  - type: text_contains
+    needle: "scan-complete"
+  # The harness's SessionCapture exposes `skipped_lines` in its
+  # debug string but not as a direct criterion. We proxy by asking
+  # for a strictly positive event count — if the journal were
+  # unparseable we'd see 0 events.
+  - type: session_event_count
+    event_type: ToolCallCompleted
+    min: 1

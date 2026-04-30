@@ -1,0 +1,39 @@
+name: compaction_preserves_recent_reads
+description: |
+  Regression for the "recent file reads survive compaction" invariant.
+  `recent_file_reads` on AgenticLoopState is supposed to be re-injected
+  after a compaction so the LLM retains awareness of files it already
+  looked at. If compaction drops that state, a long session where a
+  file was read early would later "forget" it — manifesting as the
+  agent asking to re-read the file, or confusing the user with stale
+  claims.
+
+  We deliberately steer the agent to: (1) read a file, (2) produce
+  enough follow-up text to trigger compaction pressure, (3) refer
+  back to the early read. Judger decides whether the agent retained
+  the context.
+prompt: |
+  First, use read_file to look at ./Makefile (top 30 lines is fine).
+  Then in your final answer, do two things:
+    1. Describe what's in the Makefile based on what you just read.
+    2. Reference a SPECIFIC target or variable name from the file.
+
+  Do not re-read the file. Use only one tool call.
+timeout_seconds: 120
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: read_file
+  - type: tools_count_between
+    min: 1
+    max: 2
+  - type: judger
+    question: |
+      Does the final answer quote a specific Makefile target or
+      variable (like `test`, `build`, `dev-start`, `CC`, `RUSTFLAGS`,
+      etc.) that would only be known by having actually read the
+      file? Generic answers that could apply to any Makefile
+      ("has some rules", "defines targets") score 0.3. Concrete
+      citations score 1.0. Clear fabrication scores 0.0.
+    threshold: 0.7

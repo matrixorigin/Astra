@@ -1,0 +1,35 @@
+name: judger_quorum_catches_flaky_scores
+description: |
+  Meta-regression for Item 4's QuorumJudger. A borderline case that
+  a single judger call might score inconsistently. We ask for a
+  response that would score high-variance (subjective quality
+  judgment) and pin the threshold at the borderline. When this case
+  is run with --judger-n 3, outlier-driven flakes are smoothed out;
+  without quorum, it may pass/fail stochastically between runs.
+
+  Not a green-path regression — this case is a deliberate probe to
+  be run with explicit quorum settings. Included so we can re-run
+  periodically and confirm variance stays bounded.
+prompt: |
+  Explain TCP in exactly one short sentence that mentions at least
+  three concepts: "reliability", "ordering", and "connection". Do
+  not use tools.
+timeout_seconds: 60
+criteria:
+  - type: exit_code
+    code: 0
+  - type: text_contains
+    needle: "reliab"
+  - type: text_contains
+    needle: "order"
+  - type: text_contains
+    needle: "connect"
+  - type: judger
+    question: |
+      Is the explanation a single sentence, factually correct about
+      TCP, and does it mention reliability, ordering, and
+      connections naturally (not as a list)? A score of 0.7-1.0
+      means all three concepts are present in a coherent sentence.
+      Below 0.7 means something is missing or the sentence reads
+      unnaturally.
+    threshold: 0.7
