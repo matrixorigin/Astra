@@ -862,6 +862,13 @@ pub(super) async fn execute_cli_command(
             )
             .await;
 
+            // Keep a clone of the Arc so we can drain background
+            // spawned children before process exit — otherwise
+            // background tasks (the default spawn_agent mode) get
+            // aborted when main returns, which silently drops any
+            // ForkCacheEvent / child telemetry they would have
+            // emitted on their first response.
+            let spawner_handle_for_drain = one_shot_spawner.clone();
             let chat_ctx = crate::chat_stream::BasicCliChatContext {
                 api,
                 auth_profile: profile.as_deref(),
@@ -909,6 +916,22 @@ pub(super) async fn execute_cli_command(
                 p.last_session_id = Some(sid.clone());
                 save_credentials(&creds)?;
             }
+
+            // Drain any background-spawned child agents before
+            // returning. Without this, background tasks (the
+            // default spawn_agent mode) are aborted when main
+            // returns, which silently drops any ForkCacheEvent /
+            // child output they would have emitted. Deadline is
+            // bounded so a misbehaving child can't hang the CLI;
+            // tasks exceeding it are aborted with a log warning.
+            //
+            // We drain BEFORE writing result to stdout so the
+            // [fork-cache] stderr lines (if any) appear before the
+            // JSON/text result — operators grepping stderr don't
+            // see the order swap.
+            spawner_handle_for_drain
+                .shutdown_and_wait(std::time::Duration::from_secs(30))
+                .await;
 
             // Output result
             if args.json {
