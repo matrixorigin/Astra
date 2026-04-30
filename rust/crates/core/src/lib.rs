@@ -178,7 +178,7 @@ impl std::error::Error for InvalidTransition {}
 pub async fn connect_matrixone(settings: &MatrixOneSettings) -> Result<Pool<MySql>, sqlx::Error> {
     MySqlPoolOptions::new()
         .max_connections(1)
-        .acquire_timeout(std::time::Duration::from_secs(2))
+        .acquire_timeout(std::time::Duration::from_millis(500))
         .connect(&settings.database_url_with_password())
         .await
 }
