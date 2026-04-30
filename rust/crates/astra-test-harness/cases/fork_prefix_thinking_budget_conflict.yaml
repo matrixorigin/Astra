@@ -1,0 +1,45 @@
+name: fork_prefix_thinking_budget_conflict
+description: |
+  Regression for `ForkValidationError::ThinkingBudgetConflict`.
+  Anthropic's KV cache key includes `thinking.budget_tokens`. If the
+  child's `max_output_tokens` clamps the effective budget to a
+  different value than the parent used, the cache key diverges and
+  reuse is meaningless. The resolver must catch this and soft-fall
+  back rather than send a corrupt prefix.
+
+  The child is explicitly constrained with a tiny max_output_tokens
+  that forces the thinking budget to be clamped, so validation
+  fires.
+prompt: |
+  You have a `spawn_agent` tool.
+
+  Call it with:
+    agent_id: "child-thinking-clamp"
+    task: "Reply: thinking-clamp-ok"
+    max_output_tokens: 256   # deliberately low to force budget clamp
+    inherit_prefix: {}
+
+  Surface the child's reply in the final answer. If the spawn
+  soft-falls back without the prefix, acknowledge that in the text.
+models:
+  - us.anthropic.claude-sonnet-4-6
+debug_log: true
+timeout_seconds: 240
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: spawn_agent
+  - type: stderr_matches
+    pattern: '\[fork-cache\]'
+  - type: judger
+    question: |
+      Did the stderr [fork-cache] event either:
+        (a) successfully reuse the prefix (cache hit, no conflict),
+            meaning the clamp happened not to matter; OR
+        (b) emit a ThinkingBudgetConflict / validation-failed event
+            and the child still ran to completion without the prefix?
+      A correct run does NOT crash and does NOT silently send a
+      corrupt cache key. Score 1.0 for clean hit or clean fallback.
+      Score 0.3 for crash or silent corruption. Score 0.0 for panic.
+    threshold: 0.7

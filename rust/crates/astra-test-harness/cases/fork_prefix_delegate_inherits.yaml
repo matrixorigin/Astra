@@ -1,0 +1,37 @@
+name: fork_prefix_delegate_inherits
+description: |
+  G2 regression: the delegate path (not spawn_agent) goes through
+  the server-side DelegationEngine. Before G2 the engine could
+  populate `SubRunConfig.inherited_prefix` but no parent capture
+  ever landed in the store because the server loop host had no
+  on_turn_completed hook. This case forces the delegate path and
+  verifies a [fork-cache] event appears — which can only happen if
+  both the capture (G2) and the resolve (pre-G2 plumbing) are wired.
+prompt: |
+  You have a `delegate` tool available (a specialized sub-agent
+  coordinator different from `spawn_agent`).
+
+  Delegate a task to a coder sub-agent asking it to reply with
+  exactly "delegate-G2-ok". Wait for the result. Surface the
+  coder's reply verbatim in your final answer.
+
+  Do not use spawn_agent — this case specifically exercises the
+  delegate path.
+debug_log: true
+timeout_seconds: 300
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: delegate
+  - type: stderr_matches
+    pattern: '\[fork-cache\]'
+  - type: judger
+    question: |
+      Did a [fork-cache] event appear in the stderr for the delegate
+      sub-run specifically (not a parent spawn)? The event should
+      reference the delegated child's run_id or show a capture that
+      the child consumed. Score 1.0 for visible event on the
+      delegate path. Score 0.3 if only the parent turn has events
+      but the delegate child has none. Score 0.0 for no events.
+    threshold: 0.7

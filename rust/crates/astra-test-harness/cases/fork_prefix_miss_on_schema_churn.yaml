@@ -1,0 +1,45 @@
+name: fork_prefix_miss_on_schema_churn
+description: |
+  Regression for G1: when a tool's schema churns between parent and
+  child turns, the fork-cache event must attribute the break by tool
+  name (not generic "drift"). Pre-G1 this was shipping with
+  `tool_schemas: vec![]`, so `changed_tools` stayed empty even when
+  the real break was a dynamic agent list embedded in a tool
+  description.
+
+  The case first induces a "dynamic tool list" scenario: the model
+  spawns a sub-agent whose schema definition SHOULD differ between
+  parent capture time and child resolve time (we force this by
+  asking the parent to run several turns, each listing available
+  agents, before spawning — which triggers `spawn_agent`'s schema
+  to include different dynamic fields per turn).
+prompt: |
+  You have a `spawn_agent` tool. Before using it:
+
+  1. First, briefly describe (in the final text) what tools you
+     currently see as available. Just the names, one line.
+  2. Then call spawn_agent with agent_id="child-G1-drift",
+     task="Reply: drift-ok", and inherit_prefix: {}.
+  3. Surface the child's reply in your final answer.
+debug_log: true
+timeout_seconds: 240
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: spawn_agent
+  - type: stderr_matches
+    pattern: '\[fork-cache\]'
+  - type: judger
+    question: |
+      Look at the [fork-cache] events in stderr. For THIS case,
+      either:
+        (a) a `hit` event is OK (prefix still matched), OR
+        (b) a `partial_drift` event that names specific changed tools
+            in its `changed_tools` field (a non-empty list, not the
+            empty vec![] of the pre-G1 bug).
+      Score 1.0 if the event carries attribution — either a clean
+      hit or a partial_drift with a populated changed_tools list.
+      Score 0.3 if partial_drift but `changed_tools` is empty
+      (G1 regression). Score 0.0 if no event appears.
+    threshold: 0.7

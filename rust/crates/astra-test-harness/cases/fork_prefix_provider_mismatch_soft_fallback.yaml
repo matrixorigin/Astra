@@ -1,0 +1,50 @@
+name: fork_prefix_provider_mismatch_soft_fallback
+description: |
+  Regression for `ForkValidationError::ProviderMismatch`: when a
+  child's model is on a different provider than the captured parent
+  prefix, the resolver must soft-fallback (run without the prefix)
+  and emit a classifiable telemetry event. Crashing or silently
+  succeeding with a corrupt prefix is a P0 bug — this case guards
+  against both.
+
+  The child is explicitly asked to use a model from a different
+  family than the parent, so `ProviderKind` hashes diverge and
+  validation fires.
+prompt: |
+  You have a `spawn_agent` tool.
+
+  Step 1 — call spawn_agent with:
+    agent_id: "child-cross-provider"
+    task: "Reply: cross-provider-fallback-ok"
+    model: "qwen-flash"   # different provider family than the parent
+    inherit_prefix: {}
+
+  Step 2 — surface the child's reply in your final answer. If the
+  spawn fails, still report what you saw.
+
+  Note: parent MUST be on claude-sonnet-4-6 for this case to exercise
+  the mismatch — drive this case with --models us.anthropic.claude-sonnet-4-6.
+models:
+  - us.anthropic.claude-sonnet-4-6
+debug_log: true
+timeout_seconds: 240
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: spawn_agent
+  - type: stderr_matches
+    # Fallback MUST emit a fork-cache event — the mismatch is a
+    # classifiable outcome, not a silent skip.
+    pattern: '\[fork-cache\]'
+  - type: judger
+    question: |
+      Did the stderr [fork-cache] event indicate a provider mismatch
+      (validation_error or fallback-with-reason "ProviderMismatch"),
+      AND did the child still complete (no panic, no crash)? A
+      correct run: event classifies as validation-failed / fallback,
+      child run succeeded without the prefix, final text surfaces
+      the child's reply or at least acknowledges the fallback.
+      Score 1.0 for clean soft-fallback. Score 0.3 for crash or
+      missing telemetry. Score 0.0 for panic or corrupt prefix reuse.
+    threshold: 0.7

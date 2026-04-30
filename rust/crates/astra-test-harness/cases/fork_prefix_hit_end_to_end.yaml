@@ -1,0 +1,51 @@
+name: fork_prefix_hit_end_to_end
+description: |
+  End-to-end regression for the fork-prefix cache inheritance pipeline.
+  Requires `[fork_prefix] enabled = true, sink = "stderr"` in
+  ~/.astra/config/runtime.toml. When the parent spawns a child with
+  `inherit_prefix: {}`, the stderr sink must log a [fork-cache] event
+  whose classification is `hit` — i.e. the child's first response
+  actually reused the parent's cached prefix. Without this case, the
+  pipeline could ship empty events and we'd believe it worked.
+prompt: |
+  You have a `spawn_agent` tool.
+
+  Step 1 — call it ONCE with this structure:
+    tool_call: spawn_agent
+    args:
+      agent_id: "child-G1"
+      task: "Reply with exactly: inherited-ok"
+      inherit_prefix: {}
+
+  Step 2 — include the child's exact reply in your final answer,
+  prefixed with `CHILD:`.
+
+  Do not re-spawn. Do not use other tools.
+debug_log: true
+timeout_seconds: 240
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: spawn_agent
+  - type: tools_count_between
+    min: 1
+    max: 3
+  - type: text_contains
+    needle: "CHILD:"
+  - type: stderr_matches
+    # Anchors the line to the fork-cache prefix. Classification (hit
+    # vs drift vs miss) is verified by the judger below since the
+    # token ratios are model-dependent.
+    pattern: '\[fork-cache\]'
+  - type: judger
+    question: |
+      Inspect the agent's stderr (shown in the prompt scaffold as
+      embedded in the transcript). Did the [fork-cache] event the
+      runtime emitted indicate a CACHE HIT (class=hit) rather than
+      miss or partial_drift? A hit means cache_read_tokens was a
+      meaningful fraction of expected — i.e. the child actually
+      benefited from the parent's prefix. Score 1.0 for confirmed
+      hit. Score 0.4 for partial_drift. Score 0.0 for miss or when
+      no event is visible.
+    threshold: 0.7
