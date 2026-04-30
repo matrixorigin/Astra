@@ -66,7 +66,7 @@ pub async fn get_admin_config_handler(
         .admin_config_service
         .get(&key)
         .await
-        .map_err(internal_error)?;
+        .map_err(|e| error_response(StatusCode::BAD_REQUEST, e))?;
     match value {
         Some(v) => Ok(Json(AdminConfigGetResponse {
             key,
@@ -259,5 +259,22 @@ mod tests {
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["value"], "gpt-4o-mini");
+    }
+
+    // GET /admin/config/{key} for an unknown key must return 400, not 500.
+    #[tokio::test]
+    async fn get_unknown_key_returns_400() {
+        let app = app_with_service(StubAdminConfigService::empty());
+        let req = Request::builder()
+            .uri("/admin/config/not_a_real_key")
+            .header("authorization", "Bearer stub-admin-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "unknown key must return 400, not 500"
+        );
     }
 }
