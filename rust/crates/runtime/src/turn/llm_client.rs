@@ -952,6 +952,19 @@ fn bedrock_messages_contain_tool_blocks(messages: &[Value]) -> bool {
     })
 }
 
+/// Global counter: number of Bedrock thinking requests observed with a
+/// `reasoningContent.text` block but no `signature`. Incremented by
+/// [`assert_bedrock_thinking_signature_contract`] whenever the invariant is
+/// violated. Exposed as a `pub static` so health/metric handlers can surface
+/// it without plumbing a handle through every call site — matches the
+/// convention used by `PERSIST_FAIL_COUNT` / `PERSIST_OK_COUNT`.
+///
+/// Any non-zero value in production means at least one turn will 400 at
+/// Bedrock; on-call should page and check `astra_core::agent_warn!` logs
+/// tagged `llm` for `bedrock signature contract violation`.
+pub static BEDROCK_THINKING_SIGNATURE_VIOLATION_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Guard against the recurring Bedrock thinking-mode regression:
 /// `messages.N.content.0.thinking.signature: Field required` (HTTP 400).
 ///
@@ -963,7 +976,9 @@ fn bedrock_messages_contain_tool_blocks(messages: &[Value]) -> bool {
 /// Behavior:
 /// - Debug builds / tests: `debug_assert!` — fails loud so the offending
 ///   refactor can't merge.
-/// - Release builds: structured warn log so on-call can grep after the fact.
+/// - Release builds: structured warn log + counter increment. On-call
+///   monitors [`BEDROCK_THINKING_SIGNATURE_VIOLATION_COUNT`] as a
+///   continuous-signal tripwire rather than scanning logs.
 fn assert_bedrock_thinking_signature_contract(bedrock_messages: &[Value]) {
     for (idx, msg) in bedrock_messages.iter().enumerate() {
         let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
@@ -990,7 +1005,11 @@ fn assert_bedrock_thinking_signature_contract(bedrock_messages: &[Value]) {
             if has_signature {
                 continue;
             }
-            // This combo will 400. Fail loudly in tests, metric in prod.
+            // This combo will 400. Count it so on-call can trigger on a
+            // non-zero tripwire instead of grepping logs; panic in debug/test
+            // so regressions can't merge silently.
+            BEDROCK_THINKING_SIGNATURE_VIOLATION_COUNT
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             debug_assert!(
                 false,
                 "Bedrock thinking contract violation: messages[{idx}] has \
@@ -5719,6 +5738,59 @@ mod tests {
         );
     }
 
+    /// Helper for counter tests: build a body that would violate the
+    /// signature contract, catching the debug_assert panic so the test can
+    /// observe the counter's post-increment state.
+    fn attempt_violating_bedrock_thinking_build() {
+        let messages = vec![
+            json!({"role": "user", "content": "q"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "tc1", "type": "function",
+                    "function": {"name": "noop", "arguments": "{}"}
+                }],
+                "reasoning_content": "thinking without signature",
+            }),
+            json!({"role": "tool", "tool_call_id": "tc1", "content": "ok"}),
+        ];
+        let _ = build_provider_request_body(
+            &messages,
+            &[],
+            "us.anthropic.claude-sonnet-4-6",
+            "bedrock",
+            Some(4096),
+            None,
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+        );
+    }
+
+    // Counter increments alongside the debug_assert so release builds can
+    // expose a continuous-signal tripwire (BEDROCK_THINKING_SIGNATURE_VIOLATION_COUNT).
+    // The counter must increment even if the panic short-circuits the rest of
+    // the build — otherwise monitoring misses the first violation.
+    #[test]
+    fn bedrock_thinking_signature_violation_increments_counter() {
+        use std::sync::atomic::Ordering;
+        let before = BEDROCK_THINKING_SIGNATURE_VIOLATION_COUNT.load(Ordering::Relaxed);
+        // debug_assert panics in test/debug builds; catch so we can read the
+        // counter afterward. The fetch_add runs *before* the debug_assert so
+        // the counter observes the violation even when the assert fires.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            attempt_violating_bedrock_thinking_build,
+        ));
+        let after = BEDROCK_THINKING_SIGNATURE_VIOLATION_COUNT.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "counter must advance on every signature-contract violation \
+             (before={before}, after={after})"
+        );
+    }
+
     // Guard that the debug_assert in `assert_bedrock_thinking_signature_contract`
     // actually fires when a reasoning block arrives without signature. This is
     // the "scream if this ever regresses again" safety net for PR #284's class
@@ -6171,20 +6243,30 @@ mod tests {
 
         // ── Row: Anthropic + Thinking::Enabled + tool_call + turn-2 ──
         //
-        // KNOWN GAP: Anthropic native API requires assistant.content as an
-        // array of typed blocks (`{"type":"thinking","thinking":"...","signature":"..."}`,
+        // KNOWN GAP — tracked (created 2026-05-01): Anthropic native API
+        // requires assistant.content as an array of typed blocks
+        // (`{"type":"thinking","thinking":"...","signature":"..."}`,
         // `{"type":"tool_use",...}`). Today's code path passes OpenAI-shape
-        // `reasoning_content` / `reasoning_signature` directly, which Anthropic
-        // will reject. This is a latent bug equivalent to the Bedrock one —
-        // pinned here as `#[ignore]` so a) nobody accidentally ships it, and
-        // b) when a future PR adds Anthropic native multi-turn thinking, the
-        // ignore line forces this test to become real coverage.
+        // `reasoning_content` / `reasoning_signature` directly, which
+        // Anthropic will reject with the same class of 400 as Bedrock's
+        // `thinking.signature: Field required`.
         //
-        // TODO(anthropic-thinking): remove `#[ignore]` and implement the
-        // equivalent of `build_bedrock_messages` for Anthropic thinking
-        // blocks (typed content array) + SSE signature capture equivalent.
+        // Pinned here as `#[ignore]` so: (a) nobody accidentally ships
+        // Anthropic native multi-turn thinking in a broken state, and
+        // (b) when a future PR implements the typed-block serializer
+        // (equivalent to `build_bedrock_messages` for Anthropic) plus the
+        // matching SSE signature capture, this test becomes real coverage
+        // by removing the `#[ignore]`.
+        //
+        // The companion tripwire `anthropic_thinking_todo_has_not_rotted`
+        // fails the build once the review window elapses, forcing a
+        // decision: implement, defer explicitly, or delete. That is how
+        // this ignore avoids permanent rot.
+        //
+        // TODO(anthropic-thinking, due=2026-11-01): remove `#[ignore]` and
+        // implement the typed-block serializer + SSE signature capture.
         #[test]
-        #[ignore = "anthropic native thinking multi-turn not yet implemented — see TODO above"]
+        #[ignore = "blocked on typed-block serializer — tripwire: anthropic_thinking_todo_has_not_rotted (due 2026-11-01)"]
         fn anthropic_thinking_tool_call_multi_turn_needs_typed_blocks() {
             let messages = vec![
                 user("compute 2+2"),
@@ -6211,6 +6293,35 @@ mod tests {
             assert_eq!(assistant_content[0]["thinking"], "thinking...");
             assert_eq!(assistant_content[0]["signature"], "real_sig");
             assert_eq!(assistant_content[1]["type"], "tool_use");
+        }
+
+        // Tripwire: forces the Anthropic thinking TODO to be addressed (or
+        // explicitly re-scheduled with a new date) by the stated deadline.
+        // Fails the build on or after 2026-11-01 UTC (epoch 1_793_491_200).
+        //
+        // When this test goes red: either (a) implement the Anthropic typed-
+        // block serializer and remove the `#[ignore]` above, (b) delete the
+        // ignored test if the Anthropic native provider path is dropped, or
+        // (c) push the deadline forward in both this test and the comment
+        // above — and justify why in the commit message. The point is that
+        // the `#[ignore]` can never become permanent infrastructure.
+        #[test]
+        fn anthropic_thinking_todo_has_not_rotted() {
+            const DEADLINE_EPOCH_SECS: u64 = 1_793_491_200; // 2026-11-01T00:00:00Z
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            assert!(
+                now < DEADLINE_EPOCH_SECS,
+                "anthropic-thinking TODO rotted past 2026-11-01 — either \
+                 implement the typed-block serializer for Anthropic native \
+                 multi-turn thinking (removing the `#[ignore]` on \
+                 anthropic_thinking_tool_call_multi_turn_needs_typed_blocks), \
+                 delete the ignored test if the Anthropic path is gone, or \
+                 push the deadline forward with justification. \
+                 See comment above the ignored test for details."
+            );
         }
 
         // ── Row: OpenAI + Thinking::Adaptive(effort) ──

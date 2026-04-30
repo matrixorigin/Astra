@@ -393,6 +393,58 @@ mod tests {
         assert_eq!(usage["output_tokens"], 4);
     }
 
+    /// `apply_forward_llm_sse_event` forwards `reasoning_done` verbatim so
+    /// that downstream consumers (CLI `chat_turn_sse_dispatch`) can read the
+    /// `signature` field. The forwarding currently relies on
+    /// `serde_json::to_string(event)` preserving every field unchanged.
+    ///
+    /// This test pins that behavior explicitly: if anyone ever changes the
+    /// forward path to filter or project fields, this test goes red before
+    /// signatures silently disappear on the way to CLI — which would reopen
+    /// the Bedrock HTTP 400 `thinking.signature: Field required` regression.
+    #[test]
+    fn apply_forward_reasoning_done_preserves_signature_bytes() {
+        let event = json!({
+            "type": "reasoning_done",
+            "signature": "sig_forward_through"
+        });
+        let mut saw = false;
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut reasoning_sig = String::new();
+        let mut tool_calls = Vec::new();
+        let mut usage = Map::new();
+        let mut model = String::new();
+        let frames = apply_forward_llm_sse_event(
+            &event,
+            &mut saw,
+            &mut text,
+            &mut reasoning,
+            &mut reasoning_sig,
+            &mut tool_calls,
+            &mut usage,
+            &mut model,
+        )
+        .unwrap();
+        assert_eq!(
+            frames.len(),
+            1,
+            "reasoning_done must produce exactly one forwarded SSE frame"
+        );
+        let wire = std::str::from_utf8(&frames[0]).unwrap();
+        assert!(wire.contains("\"type\":\"reasoning_done\""), "wire: {wire}");
+        assert!(
+            wire.contains("\"signature\":\"sig_forward_through\""),
+            "signature field must survive the forward path verbatim: {wire}"
+        );
+        // Also verify no signature leaks into accum via the forward path
+        // (signature capture is CLI's job, not the bridge forwarder's).
+        assert!(
+            reasoning_sig.is_empty(),
+            "forward path must not accumulate signature — that's the CLI's job via dispatch"
+        );
+    }
+
     #[test]
     fn apply_forward_ignores_unknown_type() {
         let event = json!({"type": "unknown_event"});
