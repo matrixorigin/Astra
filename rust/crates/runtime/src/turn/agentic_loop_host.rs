@@ -196,6 +196,42 @@ pub trait AgenticLoopHost: Send {
     ///
     /// Default: no-op (tests, headless, sub-run hosts).
     fn render_final_text(&mut self, _text: &str) {}
+
+    /// Post-sampling turn-completed hook — fires exactly once
+    /// immediately after a successful LLM response has been received
+    /// AND cleanly ingested (`state.current_run_id`, `state.messages`,
+    /// `state.final_text` are now current), and BEFORE any side
+    /// effects (tool phase, microcompact-for-next-turn, memory
+    /// extraction).
+    ///
+    /// Name intentionally drops "parent" — this host may itself be
+    /// running as a spawned sub-agent (sub-run / delegated child).
+    /// Every loop that completes a turn sees this hook, regardless
+    /// of where it sits in the delegation tree.
+    ///
+    /// This is the canonical capture slot for downstream work that
+    /// must share the parent's prompt cache — see
+    /// `astra_turn_core::fork_capture`. Hosts that want to record a
+    /// `ForkPrefix` into a `PrefixCaptureSink` implement this method.
+    ///
+    /// Default: no-op. All five in-tree hosts (CLI, server, bridge,
+    /// sub-run, mocks) pick up the default; only hosts that need
+    /// capture override it.
+    ///
+    /// Contract:
+    /// - Fires only on the happy path: `execute_turn` returned `Ok`
+    ///   AND ingest produced a non-Fatal outcome
+    ///   (`Continue` / `Break` / `HasToolCalls`). Fatal ingest
+    ///   outcomes (rate-limit error string in SSE, context-window
+    ///   overflow) do NOT fire it — state is partially updated and
+    ///   capture would write a corrupt prefix.
+    /// - Fires BEFORE iteration-control dispatch so any side effect
+    ///   scheduled by the loop sees state as it was on hook exit.
+    /// - `state` is `&` not `&mut` — the hook is observational, not
+    ///   state-mutating. Mutating state here would re-introduce the
+    ///   exact "writing through multiple layers of references" pain
+    ///   claudecode's `CacheSafeParams` slot was designed to avoid.
+    fn on_turn_completed(&mut self, _state: &AgenticLoopState) {}
 }
 
 // ─── Loop state sub-structs ──────────────────────────────────────────────────
@@ -1196,6 +1232,12 @@ pub(crate) mod tests {
         pub(crate) last_reflection_prompt: Option<String>,
         pub(crate) rendered_final_text: Vec<String>,
         pub(crate) executed_messages: Vec<Vec<Value>>,
+        /// PR 5a test observer: number of times the turn loop has
+        /// invoked the parent-turn-completed hook. Each entry is the
+        /// value of `state.current_run_id` at hook time so tests can
+        /// assert the hook runs AFTER `ingest_agentic_turn_stream`
+        /// populated that field.
+        pub(crate) turn_completed_run_ids: Vec<Option<String>>,
     }
 
     impl MockHost {
@@ -1212,6 +1254,7 @@ pub(crate) mod tests {
                 last_reflection_prompt: None,
                 rendered_final_text: Vec::new(),
                 executed_messages: Vec::new(),
+                turn_completed_run_ids: Vec::new(),
             }
         }
 
@@ -1304,6 +1347,11 @@ pub(crate) mod tests {
 
         fn render_final_text(&mut self, text: &str) {
             self.rendered_final_text.push(text.to_string());
+        }
+
+        fn on_turn_completed(&mut self, state: &AgenticLoopState) {
+            self.turn_completed_run_ids
+                .push(state.current_run_id.clone());
         }
     }
 

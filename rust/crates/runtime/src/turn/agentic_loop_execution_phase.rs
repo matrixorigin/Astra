@@ -10,8 +10,9 @@ use super::agentic_loop_lifecycle::{
     tool_record_is_workspace_mutation,
 };
 use astra_turn_core::agentic_turn_ingest::{
-    AgenticIngestIterationControl, AgenticTurnIngestMut, agentic_turn_stream_snapshot_with_kind,
-    ingest_agentic_turn_stream, map_ingest_outcome_to_iteration_control,
+    AgenticIngestIterationControl, AgenticTurnIngestMut, AgenticTurnIngestOutcome,
+    agentic_turn_stream_snapshot_with_kind, ingest_agentic_turn_stream,
+    map_ingest_outcome_to_iteration_control,
 };
 use astra_turn_core::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
 
@@ -484,7 +485,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     update_turn_trace_collector(state, &turn_result);
 
     let edge_len = turn_result.edge_tool_round.len();
-    match map_ingest_outcome_to_iteration_control(ingest_agentic_turn_stream(
+    let ingest_outcome = ingest_agentic_turn_stream(
         &snap,
         edge_len,
         |i| turn_result.edge_tool_round[i].tool.clone(),
@@ -512,7 +513,25 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
             turn_policy: state.last_turn_policy.clone(),
         },
-    )) {
+    );
+
+    // PR 5a: post-sampling hook. Fires exactly once after a
+    // successful turn has been received AND cleanly ingested
+    // (non-Fatal outcome), BEFORE any side effects (tool phase,
+    // microcompact prep, memory extraction).
+    //
+    // Fatal ingest outcomes include SSE-embedded rate limits,
+    // context-window overflows, and provider 5xx strings. On those,
+    // state is only partially updated — firing the hook would let a
+    // downstream capture snapshot record a corrupt prefix. We peek
+    // at the variant via `matches!` so the original `ingest_outcome`
+    // can still move by-value into the control-flow mapper below.
+    let ingest_is_fatal = matches!(ingest_outcome, AgenticTurnIngestOutcome::Fatal(_));
+    if !ingest_is_fatal {
+        host.on_turn_completed(state);
+    }
+
+    match map_ingest_outcome_to_iteration_control(ingest_outcome) {
         AgenticIngestIterationControl::Fatal(e) => {
             use astra_core::ErrorKind;
 
@@ -2119,6 +2138,7 @@ mod tests {
     use astra_services::session_journal::ToolCallRecord;
 
     use super::*;
+    use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
     use crate::observability_integration::ObservabilityHub;
     use crate::turn::agentic_loop_host::tests::{MockHost, make_state, text_result};
 
@@ -2247,6 +2267,134 @@ mod tests {
         assert!(manifests[0].contains("checkpoint restore refactor"));
         assert!(manifests[0].contains("rust/crates/astra-pipeline/src/step_restore.rs"));
         assert!(!manifests[0].contains("stale compacted summary"));
+    }
+
+    // PR 5a: the turn loop must invoke host.on_turn_completed
+    // exactly once per successful ingested turn, AFTER run_id is
+    // populated by ingest but BEFORE tool execution / side effects.
+
+    #[tokio::test]
+    async fn turn_completed_hook_fires_once_on_successful_turn() {
+        let mut state = make_state();
+        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))]);
+
+        let _ = execute_turn_and_ingest_phase(
+            &mut host,
+            &mut state,
+            0,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            host.turn_completed_run_ids.len(),
+            1,
+            "hook must fire exactly once per successful turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_completed_hook_observes_ingested_run_id() {
+        // Precondition: ingest_agentic_turn_stream populates
+        // state.current_run_id before the hook runs. The hook must
+        // see whatever ingest left there — not some stale pre-turn
+        // value, not None from before ingest.
+        let mut state = make_state();
+        // Pretend a previous turn set this; ingest would normally
+        // overwrite, but for a turn without server-assigned run_id
+        // the value flows through unchanged. The assertion below
+        // is simply "whatever state.current_run_id is post-ingest,
+        // the hook sees the same thing".
+        state.current_run_id = Some("pre-existing-run".to_string());
+        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))]);
+
+        let _ = execute_turn_and_ingest_phase(
+            &mut host,
+            &mut state,
+            0,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            host.turn_completed_run_ids,
+            vec![state.current_run_id.clone()],
+            "hook must observe post-ingest run_id, matching current state"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_completed_hook_does_not_fire_on_fatal_ingest_outcome() {
+        // Even when execute_turn itself returns Ok, the SSE stream
+        // may carry an error that ingest classifies as Fatal (rate
+        // limit, context window, provider 500). A Fatal ingest
+        // leaves state.messages / current_run_id only partially
+        // updated; capturing would poison any downstream sink with
+        // a corrupt prefix. The hook MUST NOT fire on Fatal.
+        let mut state = make_state();
+        let error_result = HostTurnResult {
+            accum: ChatTurnSseAccum {
+                error_message: Some("Error: simulated fatal".into()),
+                has_usage: false,
+                ..ChatTurnSseAccum::default()
+            },
+            ttft_ms: Some(1),
+            edge_tool_round: Vec::new(),
+            error_kind: Some(astra_core::ErrorKind::RateLimit),
+        };
+        let mut host = MockHost::new(vec![error_result]);
+
+        let _ = execute_turn_and_ingest_phase(
+            &mut host,
+            &mut state,
+            0,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+        )
+        .await;
+        assert!(
+            host.turn_completed_run_ids.is_empty(),
+            "hook must not fire when ingest returns Fatal"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_completed_hook_does_not_fire_when_execute_turn_errors() {
+        // An empty MockHost returns BudgetExhausted on execute_turn.
+        // The hook must NOT fire in the error path — we only want
+        // to snapshot state after a successful response is ingested.
+        let mut state = make_state();
+        let mut host = MockHost::new(vec![]); // no turns queued
+
+        let result = execute_turn_and_ingest_phase(
+            &mut host,
+            &mut state,
+            0,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "setup sanity: execute_turn should fail without queued results"
+        );
+        assert!(
+            host.turn_completed_run_ids.is_empty(),
+            "hook must not fire on execute_turn error"
+        );
     }
 
     #[test]
