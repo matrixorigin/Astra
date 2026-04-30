@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 /// deal with source keys — they always read/write this slot.
 pub const DEFAULT_SOURCE: &str = "main";
 
-/// Upper bound on concurrently tracked sources. Matches claudecode's
-/// `MAX_TRACKED_SOURCES = 10`. Each entry is one `PromptStateSnapshot`
+/// Upper bound on concurrently tracked sources, capped at 10.
+/// Each entry is one `PromptStateSnapshot`
 /// (~small); the cap exists to prevent unbounded growth when long-running
 /// runtimes spawn many distinct subagent ids. LRU-evicted on overflow.
 ///
@@ -153,10 +153,9 @@ const CACHE_TTL_1HOUR_SECS: u64 = 3_600;
 /// A single detector instance tracks cache state per *source* — a logical
 /// query stream (e.g. `"main"`, `"agent:session_memory"`, `"fork:<run_id>"`).
 /// Each source has its own `previous` snapshot; a break in one source does
-/// not corrupt attribution for another. This mirrors claudecode's
-/// `previousStateBySource` map and is a prerequisite for the fork-prefix
-/// primitive (PR 1+), where parent and child streams need independent
-/// attribution.
+/// not corrupt attribution for another. The per-source map is a
+/// prerequisite for the fork-prefix primitive (PR 1+), where parent
+/// and child streams need independent attribution.
 ///
 /// Backwards compatibility: the legacy `record_turn(snapshot, actual)`
 /// helper writes through to the [`DEFAULT_SOURCE`] slot, so pre-existing
@@ -568,9 +567,9 @@ impl CacheBreakDetector {
         // the main compression pipeline treats as cache-valid prefix.
         //
         // NOTE: if the main turn loop is ever wired to record under a
-        // different source key (e.g. `"repl_main_thread"` as in
-        // claudecode), this lookup must be updated in lockstep or the
-        // protected-token estimate will silently fall to 0.
+        // different source key (e.g. `"repl_main_thread"`), this lookup
+        // must be updated in lockstep or the protected-token estimate
+        // will silently fall to 0.
         let protected_token_estimate = self
             .per_source
             .get(DEFAULT_SOURCE)

@@ -230,7 +230,7 @@ pub trait AgenticLoopHost: Send {
     /// - `state` is `&` not `&mut` — the hook is observational, not
     ///   state-mutating. Mutating state here would re-introduce the
     ///   exact "writing through multiple layers of references" pain
-    ///   claudecode's `CacheSafeParams` slot was designed to avoid.
+    ///   the dedicated capture slot was designed to avoid.
     fn on_turn_completed(&mut self, _state: &AgenticLoopState) {}
 }
 
@@ -288,8 +288,8 @@ pub struct SkillState {
     /// Tool allow-list from the most recently activated skill (additive only).
     /// When set, the host ensures these tools are present in the model's tool
     /// schemas (via `inject_skill_allowed_tools`), but never restricts other
-    /// tools. This aligns with Claude Code's semantics where `allowed_tools`
-    /// is a visibility hint, not a security boundary.
+    /// tools. `allowed_tools` is treated as a visibility hint, not a
+    /// security boundary.
     pub allowed_tools: Option<HashSet<String>>,
     /// Request-scoped tool/skill constraints supplied by the external caller.
     /// Nested runs inherit these constraints unchanged.

@@ -22,7 +22,7 @@
 //! 3. **Per-tool hashing.** `tool_schemas` stores each tool's canonical
 //!    bytes + SHA-256 separately. When a fork's first response reports a
 //!    cache break, `cache_diagnostics::CacheBreakDetector` can name
-//!    exactly which tool's description churned — matching claudecode's
+//!    exactly which tool's description churned — matching the field
 //!    observation that same-name schema churn (dynamic agent lists
 //!    embedded in a tool description) accounts for ~77% of tool breaks.
 //!
@@ -40,12 +40,12 @@
 //!    reconstructor refuses and the caller gets
 //!    `ForkValidationError::ProviderMismatch`.
 //!
-//! 6. **`CacheMode::SkipWrite` for fire-and-forget.** Matches claudecode's
-//!    `skipCacheWrite` path: a fork that will never have future requests
-//!    reading its tail (extraction, speculation) should not add a new
-//!    cache_control marker at its own end — that marker would write a
-//!    fresh cache entry for a prefix no one will read. The reconstructor
-//!    shifts the marker one position upstream in that mode.
+//! 6. **`CacheMode::SkipWrite` for fire-and-forget.** A fork that will
+//!    never have future requests reading its tail (extraction,
+//!    speculation) should not add a new cache_control marker at its own
+//!    end — that marker would write a fresh cache entry for a prefix
+//!    no one will read. The reconstructor shifts the marker one
+//!    position upstream in that mode.
 //!
 //! This module ONLY defines the type, its construction, validation, and
 //! hashing. It does NOT:
@@ -191,8 +191,8 @@ impl ProviderKind {
     }
 }
 
-/// Write-policy for the child's first API request. Mirrors claudecode's
-/// `skipCacheWrite`.
+/// Write-policy for the child's first API request. Controls whether
+/// the first response's cache tail becomes a fresh cache entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheMode {
     /// Child's first request may write a fresh cache entry for its tail.

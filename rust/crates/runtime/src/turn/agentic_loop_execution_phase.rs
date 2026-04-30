@@ -1415,9 +1415,9 @@ pub(crate) fn parallel_batching_force_message(streak: usize, original_query: &st
 // Phase 2 is the safety net: if the model still produces tool calls after
 // phase 1 (i.e. ignores both the corrective AND attempts tools that were
 // runtime-restricted), `should_abort_for_round_budget_phase2` returns true
-// and the caller aborts the loop — equivalent to Claude Code's
-// `error_max_turns` but reached only after one extra grace round, which
-// avoids the overkill of an immediate hard cap on weaker models.
+// and the caller aborts the loop — analogous to a hard max-turns error,
+// but reached only after one extra grace round, which avoids the
+// overkill of an immediate hard cap on weaker models.
 
 pub(crate) const ROUND_BUDGET_PHASE1_MARKER: &str = "## ⤴ Round Budget Reached";
 

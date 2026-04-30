@@ -116,7 +116,7 @@ pub struct ForkCacheEvent {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ForkCacheThresholds {
     /// Ratio at or above which we classify as Hit. Default 0.80 —
-    /// matches claudecode's `MIN_CACHE_MISS_TOKENS` heuristic
+    /// mirrors the conventional 20% cache-miss drop heuristic
     /// (observed drop > 20% triggers a break).
     pub hit_threshold: f64,
     /// Ratio below which we classify as full Miss. Between

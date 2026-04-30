@@ -71,8 +71,7 @@ use crate::fork_prefix::ForkPrefix;
 pub const DEFAULT_PREFIX_TTL_SECS: u64 = 10 * 60;
 
 /// Maximum number of concurrently tracked parent-run prefixes. Beyond
-/// this, the oldest entry is evicted on insert. Matches the scale of
-/// claudecode's module-level slot (which holds exactly one) plus
+/// this, the oldest entry is evicted on insert. Sized to leave
 /// headroom for parallel root agents. Tuneable via `with_config`.
 pub const DEFAULT_MAX_ENTRIES: usize = 64;
 
@@ -256,8 +255,7 @@ impl PrefixCaptureSink for InMemoryPrefixStore {
             .expect("prefix store eviction lock poisoned");
 
         // Overwrite semantics: the newest capture for a given parent
-        // run wins, mirroring claudecode's `saveCacheSafeParams` slot
-        // which is also last-write-wins. We insert first, then check
+        // run wins (last-write-wins). We insert first, then check
         // whether we need to evict — so a refresh on an existing key
         // never counts toward the cap.
         self.entries.insert(run_id.to_string(), prefix);
