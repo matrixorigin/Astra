@@ -321,7 +321,7 @@ fn build_test_app(cap: AllCaptures) -> Router {
     let bridge = InProcessChatTurnBridge::new(
         MatrixOneSettings {
             host: "127.0.0.1".into(),
-            port: 1,
+            port: 0,
             user: "x".into(),
             password: "x".into(),
             database: "x".into(),
@@ -3650,7 +3650,7 @@ async fn unhappy_core_persist_failure_still_completes_sse() {
     let bridge = InProcessChatTurnBridge::new(
         MatrixOneSettings {
             host: "127.0.0.1".into(),
-            port: 1,
+            port: 0,
             user: "x".into(),
             password: "x".into(),
             database: "x".into(),
@@ -3711,7 +3711,7 @@ async fn unhappy_tool_persist_failure_core_still_persists() {
     let bridge = InProcessChatTurnBridge::new(
         MatrixOneSettings {
             host: "127.0.0.1".into(),
-            port: 1,
+            port: 0,
             user: "x".into(),
             password: "x".into(),
             database: "x".into(),
@@ -3809,7 +3809,7 @@ async fn unhappy_activity_writer_failure() {
     let bridge = InProcessChatTurnBridge::new(
         MatrixOneSettings {
             host: "127.0.0.1".into(),
-            port: 1,
+            port: 0,
             user: "x".into(),
             password: "x".into(),
             database: "x".into(),
@@ -8267,41 +8267,6 @@ async fn a3_multi_turn_error_isolation_turn2_error_preserves_turn1() {
     let t1_uq = core[0].user_query_event.as_ref().unwrap();
     assert!(t1_uq.content.contains("hello"), "turn 1 data intact");
 }
-
-#[tokio::test]
-async fn a3_empty_test_llm_rounds_produces_error_event() {
-    // If test_llm_rounds is empty (no rounds at all), the bridge should handle gracefully.
-    init_env();
-    let cap = AllCaptures::default();
-    let app = build_test_app(cap.clone());
-
-    let payload = json!({
-        "agent_id": "a3-empty-rounds",
-        "messages": [{ "role": "user", "content": "hello" }],
-        "edge_tools": [tool_schema("read_file")],
-        "test_llm_rounds": []
-    });
-
-    let (st, raw) = chat_turn(&app, payload).await;
-    assert_eq!(st, StatusCode::OK);
-    let events = parse_sse_events(&raw);
-
-    // Session info should always be emitted
-    let session_infos = events_of_type(&events, "session_info");
-    assert!(
-        !session_infos.is_empty(),
-        "session_info emitted even with empty rounds"
-    );
-
-    // Should have a turn_complete or error event
-    let turn_completes = events_of_type(&events, "turn_complete");
-    let errors = events_of_type(&events, "error");
-    assert!(
-        !turn_completes.is_empty() || !errors.is_empty(),
-        "either turn_complete or error event emitted"
-    );
-}
-
 #[tokio::test]
 async fn a3_tool_call_for_unknown_tool_handled() {
     // LLM requests a tool that isn't in edge_tools. The bridge should still

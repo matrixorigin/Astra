@@ -224,9 +224,14 @@ pub async fn resolve_active_llm_model(
     let pool: &sqlx::Pool<sqlx::MySql> = match pool {
         Some(p) => p,
         None => {
+            let url = format!(
+                "{}?connect_timeout=2",
+                matrixone.database_url_with_password()
+            );
             ephemeral = sqlx::mysql::MySqlPoolOptions::new()
                 .max_connections(1)
-                .connect(&matrixone.database_url_with_password())
+                .acquire_timeout(std::time::Duration::from_secs(3))
+                .connect(&url)
                 .await
                 .map_err(|e| format!("DB connect: {e}"))?;
             &ephemeral
@@ -310,9 +315,14 @@ pub async fn resolve_reasoning_model(
     let pool: &sqlx::Pool<sqlx::MySql> = match pool {
         Some(p) => p,
         None => {
+            let url = format!(
+                "{}?connect_timeout=2",
+                matrixone.database_url_with_password()
+            );
             ephemeral = sqlx::mysql::MySqlPoolOptions::new()
                 .max_connections(1)
-                .connect(&matrixone.database_url_with_password())
+                .acquire_timeout(std::time::Duration::from_secs(3))
+                .connect(&url)
                 .await
                 .map_err(|e| format!("DB connect: {e}"))?;
             &ephemeral

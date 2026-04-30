@@ -353,7 +353,7 @@ fn build_test_app() -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>)
     let lifecycle = AgenticRunLifecycleService::new(
         MatrixOneSettings {
             host: "127.0.0.1".into(),
-            port: 1,
+            port: 0,
             user: "x".into(),
             password: "x".into(),
             database: "x".into(),
@@ -388,7 +388,7 @@ fn build_test_app_with_hooks() -> (
     let lifecycle = AgenticRunLifecycleService::new(
         MatrixOneSettings {
             host: "127.0.0.1".into(),
-            port: 1,
+            port: 0,
             user: "x".into(),
             password: "x".into(),
             database: "x".into(),
@@ -430,7 +430,7 @@ fn build_test_app_with_hooks_and_skills() -> (
     let lifecycle = AgenticRunLifecycleService::new(
         MatrixOneSettings {
             host: "127.0.0.1".into(),
-            port: 1,
+            port: 0,
             user: "x".into(),
             password: "x".into(),
             database: "x".into(),
