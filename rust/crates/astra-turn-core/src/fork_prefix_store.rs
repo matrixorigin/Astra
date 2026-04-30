@@ -52,7 +52,7 @@
 //! - `ForkCacheEvent` telemetry (PR 5).
 //! - Disk-backed persistence.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
@@ -159,6 +159,10 @@ type TimeSource = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// across threads.
 pub struct InMemoryPrefixStore {
     entries: DashMap<String, Arc<ForkPrefix>>,
+    /// Serializes the write-side insert+evict critical section. Reads
+    /// stay lock-free through `DashMap`, while capacity maintenance
+    /// becomes exact and telemetry only reports successful removals.
+    eviction_lock: Mutex<()>,
     config: PrefixStoreConfig,
     /// Injected time source. Stored as `Arc<dyn Fn>` rather than a
     /// raw fn pointer so each test instance can own an independent
@@ -206,6 +210,7 @@ impl InMemoryPrefixStore {
         );
         Self {
             entries: DashMap::new(),
+            eviction_lock: Mutex::new(()),
             config,
             now_secs: Arc::new(wall_clock_secs),
         }
@@ -216,10 +221,7 @@ impl InMemoryPrefixStore {
     /// inject clocks too. `#[doc(hidden)]` keeps it off the public
     /// doc surface.
     #[doc(hidden)]
-    pub fn with_time_source(
-        mut self,
-        now_secs: impl Fn() -> u64 + Send + Sync + 'static,
-    ) -> Self {
+    pub fn with_time_source(mut self, now_secs: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
         self.now_secs = Arc::new(now_secs);
         self
     }
@@ -248,6 +250,11 @@ impl InMemoryPrefixStore {
 
 impl PrefixCaptureSink for InMemoryPrefixStore {
     fn record_prefix(&self, run_id: &str, prefix: Arc<ForkPrefix>) -> Vec<String> {
+        let _eviction_guard = self
+            .eviction_lock
+            .lock()
+            .expect("prefix store eviction lock poisoned");
+
         // Overwrite semantics: the newest capture for a given parent
         // run wins, mirroring claudecode's `saveCacheSafeParams` slot
         // which is also last-write-wins. We insert first, then check
@@ -255,20 +262,19 @@ impl PrefixCaptureSink for InMemoryPrefixStore {
         // never counts toward the cap.
         self.entries.insert(run_id.to_string(), prefix);
 
-        // Capacity is soft under concurrency: DashMap has no atomic
-        // "insert-and-check-len", so multiple threads observing an
-        // over-cap condition will each try to evict. We loop until
-        // we're at-or-below the cap OR no more eligible victims
-        // exist, reporting ALL evicted keys so telemetry (PR 3+)
-        // can emit one event per eviction. Bounded iterations:
-        // we can't evict ourselves (excluded) and the loop
-        // terminates when `oldest_key_excluding` returns None.
+        // Capacity maintenance is serialized on the write path:
+        // `DashMap` keeps reads concurrent, while this short critical
+        // section avoids duplicate eviction attempts and keeps the
+        // returned telemetry aligned with removals that actually
+        // happened. Bounded iterations: we can't evict ourselves
+        // (excluded) and the loop terminates when no victim remains.
         let mut evicted: Vec<String> = Vec::new();
         while self.entries.len() > self.config.max_entries {
             match self.oldest_key_excluding(run_id) {
                 Some(victim) => {
-                    self.entries.remove(&victim);
-                    evicted.push(victim);
+                    if self.entries.remove(&victim).is_some() {
+                        evicted.push(victim);
+                    }
                 }
                 None => break, // only our own entry left — can't evict further
             }
@@ -349,10 +355,10 @@ fn wall_clock_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::fork_prefix::{
-        CacheMode, ForkPrefix, ProviderKind, SystemBlock, ThinkingConfigSlice, ToolSchemaEntry,
-        hash_tool_schema,
+        hash_tool_schema, CacheMode, ForkPrefix, ProviderKind, SystemBlock, ThinkingConfigSlice,
+        ToolSchemaEntry,
     };
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     /// Per-test controllable clock. Each test instantiates one so
     /// parallel test execution doesn't create inter-test timing races
@@ -494,7 +500,11 @@ mod tests {
         clock.set(1_020);
         let evicted = store.record_prefix("run-C", make_prefix("run-C", 1_020));
 
-        assert_eq!(evicted, vec!["run-A".to_string()], "oldest run should be evicted");
+        assert_eq!(
+            evicted,
+            vec!["run-A".to_string()],
+            "oldest run should be evicted"
+        );
         assert!(store.get_prefix("run-A").is_none());
         assert!(store.get_prefix("run-B").is_some());
         assert!(store.get_prefix("run-C").is_some());
@@ -523,7 +533,10 @@ mod tests {
         let evicted = store.record_prefix("run-B", make_prefix("run-B", 1_500));
 
         assert_eq!(evicted, vec!["run-A".to_string()]);
-        assert!(store.get_prefix("run-B").is_some(), "new write must survive");
+        assert!(
+            store.get_prefix("run-B").is_some(),
+            "new write must survive"
+        );
         assert!(store.get_prefix("run-A").is_none());
     }
 
@@ -615,24 +628,25 @@ mod tests {
     fn concurrent_writes_from_many_parents_do_not_deadlock_and_stay_bounded() {
         // Exercises concurrent writes + reads. Two things we assert:
         // 1. No deadlock (join completes).
-        // 2. Capacity stays bounded — NOT at the hard cap (capacity
-        //    is soft under concurrency: DashMap gives us no atomic
-        //    insert-and-check-len), but bounded by cap + one slack
-        //    per writer thread worst case. In practice it's much
-        //    tighter because each over-cap insert evicts one entry;
-        //    we allow generous slack so CI slowness doesn't flake.
+        // 2. Capacity stays at the hard cap after all writes.
+        // 3. Eviction telemetry reports exactly the entries that were
+        //    actually removed: unique writes - final live entries.
         const THREADS: usize = 8;
         const WRITES_PER_THREAD: usize = 50;
+        const TOTAL_WRITES: usize = THREADS * WRITES_PER_THREAD;
 
         let clock = FakeClock::starting_at(1_000);
         let store = Arc::new(store_at(&clock));
+        let eviction_reports = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
         for i in 0..THREADS {
             let s = store.clone();
+            let reports = eviction_reports.clone();
             handles.push(std::thread::spawn(move || {
                 for j in 0..WRITES_PER_THREAD {
                     let run_id = format!("run-{i}-{j}");
-                    s.record_prefix(&run_id, make_prefix(&run_id, 1_000));
+                    let evicted = s.record_prefix(&run_id, make_prefix(&run_id, 1_000));
+                    reports.fetch_add(evicted.len(), Ordering::SeqCst);
                     let _ = s.get_prefix(&run_id);
                 }
             }));
@@ -640,15 +654,16 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        // Soft bound: at most (cap + 1 slack per thread). In the
-        // worst case every thread races past the cap simultaneously
-        // and each evicts a different victim; transient overshoot
-        // bounded by THREADS.
-        let soft_cap = DEFAULT_MAX_ENTRIES + THREADS;
         let size = store.tracked_count();
+        let reported = eviction_reports.load(Ordering::SeqCst);
         assert!(
-            size <= soft_cap,
-            "size {size} exceeded soft cap {soft_cap} (cap + thread slack)"
+            size <= DEFAULT_MAX_ENTRIES,
+            "size {size} exceeded hard cap {DEFAULT_MAX_ENTRIES}"
+        );
+        assert_eq!(
+            reported + size,
+            TOTAL_WRITES,
+            "eviction reports must match the number of removed unique writes"
         );
     }
 
@@ -755,7 +770,8 @@ mod tests {
         );
 
         store.record_prefix("E", make_prefix("E", 1_000));
-        clock.set(1_100); // entry aged out
+        // Entry is now stale.
+        clock.set(1_100);
         // Concurrent-refresh analogue: rewrite E with a fresh
         // snapshot before the sweep runs. In the buggy implementation
         // the prior naive `remove(&key)` would delete this fresh
