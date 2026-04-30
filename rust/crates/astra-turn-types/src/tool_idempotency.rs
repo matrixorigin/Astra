@@ -2,7 +2,8 @@
 ///
 /// Shared across `astra-pipeline` (retry policies) and `astra-turn-core`
 /// (central tool registry) via `astra-turn-types`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolIdempotency {
     /// Safe to re-execute (no side effects): read_file, grep, git_log, etc.
     PureRead,

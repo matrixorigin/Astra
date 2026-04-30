@@ -333,11 +333,13 @@ version = "0.1.0"
 dependencies = [
  "astra-core",
  "astra-services",
+ "astra-turn-types",
  "async-trait",
  "chrono",
  "dotenvy",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tempfile",
  "tokio",

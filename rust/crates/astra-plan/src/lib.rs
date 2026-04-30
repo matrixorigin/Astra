@@ -1,5 +1,6 @@
 //! Astra Plan — goal decomposition engine for breaking complex tasks into subtasks.
 
+pub mod action_plan;
 pub mod analytical;
 pub mod decompose;
 pub mod metrics;

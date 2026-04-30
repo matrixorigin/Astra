@@ -84,6 +84,34 @@ pub struct SelfModel {
     /// them or try anyway.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub low_confidence_tools: Vec<LowConfidenceTool>,
+    /// Postconditions that the most recent `ActionPlan` execution did not
+    /// satisfy. Surfaced so the next turn's LLM reasoning is grounded in
+    /// structured "what I expected but didn't observe", not in re-reading
+    /// its own free-text plan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet_postconditions: Vec<UnmetPostCondition>,
+}
+
+/// A single unmet postcondition, typed for prompt rendering and audit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnmetPostCondition {
+    pub action_index: u32,
+    /// Stable discriminator matching `PostCondition` variants, so the
+    /// renderer and any downstream tooling can grow new cases without a
+    /// lossy `Debug` round-trip.
+    pub kind: String,
+}
+
+impl From<&astra_plan::action_plan::PostCondition> for UnmetPostCondition {
+    fn from(pc: &astra_plan::action_plan::PostCondition) -> Self {
+        use astra_plan::action_plan::PostCondition as Pc;
+        match pc {
+            Pc::ToolCallSucceeded { action_index } => Self {
+                action_index: *action_index,
+                kind: "tool_call_succeeded".to_string(),
+            },
+        }
+    }
 }
 
 /// A tool that has been failing at a high rate in recent use, surfaced
@@ -511,7 +539,40 @@ impl SelfModel {
             recent_correction_excerpts: Vec::new(),
             outcome_bias: std::collections::BTreeMap::new(),
             low_confidence_tools: Vec::new(),
+            unmet_postconditions: Vec::new(),
         }
+    }
+
+    /// Attach the set of postconditions that the most recent `ActionPlan`
+    /// run failed to satisfy. Empty input clears any previously attached set.
+    pub fn with_unmet_postconditions(mut self, unmet: Vec<UnmetPostCondition>) -> Self {
+        self.unmet_postconditions = unmet;
+        self
+    }
+
+    /// Bind the self-model to the most recent entry of an
+    /// [`astra_plan::action_plan::ExecutionLedger`].
+    ///
+    /// Three-state semantics:
+    /// * **empty ledger** (no runs yet) → no-op; any previously attached
+    ///   `unmet_postconditions` is preserved.
+    /// * **latest ran and everything was met** → `unmet_postconditions` is
+    ///   cleared; stale verdicts must not linger past a successful run.
+    /// * **latest ran with unmet** → `unmet_postconditions` is replaced by
+    ///   the latest run's unmet list (typed via `UnmetPostCondition::from`).
+    ///
+    /// The ledger binding is the authoritative source when present, so it
+    /// overrides any manual `with_unmet_postconditions` call made earlier
+    /// in the builder chain.
+    pub fn with_execution_ledger(
+        mut self,
+        ledger: &astra_plan::action_plan::ExecutionLedger,
+    ) -> Self {
+        if let Some(latest_unmet) = ledger.latest_unmet() {
+            self.unmet_postconditions =
+                latest_unmet.iter().map(UnmetPostCondition::from).collect();
+        }
+        self
     }
 
     /// Attach a guardrail view (called by edge_tools after `snapshot_with_strategy`).
@@ -952,6 +1013,18 @@ impl SelfModel {
                     "  - {}: failure_rate={:.2} over {} samples",
                     entry.name, entry.fail_rate, entry.samples
                 );
+            }
+        }
+
+        if !self.unmet_postconditions.is_empty() {
+            const MAX_SHOWN: usize = 5;
+            let total = self.unmet_postconditions.len();
+            s.push_str("⚠ Unmet postconditions from last action plan:\n");
+            for entry in self.unmet_postconditions.iter().take(MAX_SHOWN) {
+                let _ = writeln!(s, "  - action {} ({})", entry.action_index, entry.kind);
+            }
+            if total > MAX_SHOWN {
+                let _ = writeln!(s, "  … {} more", total - MAX_SHOWN);
             }
         }
 
