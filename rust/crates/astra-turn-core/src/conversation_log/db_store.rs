@@ -2,20 +2,37 @@
 //!
 //! Uses the `conversation_log` table with composite PK `(session_id, seq)`.
 //! All writes are INSERT-only; GC is a batch DELETE.
+//!
+//! ## Pool lifecycle
+//! Prefer constructing via `DbCslStore::new(settings).with_pool(shared_pool)` —
+//! the runtime always provides a `SharedPool` and that path has zero overhead.
+//!
+//! If `with_pool` is *not* called (e.g. integration tests), the first call to
+//! `get_pool` creates a connection pool and caches it behind an `Arc<OnceCell>`
+//! so subsequent calls reuse the same pool rather than opening a new one each time.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use sqlx::{Row, mysql::MySqlRow, query};
+use sqlx::{mysql::MySqlRow, query, Row};
+use tokio::sync::OnceCell;
 
-use astra_core::{MatrixOneSettings, SharedPool, connect_matrixone};
+use astra_core::{connect_matrixone, MatrixOneSettings, SharedPool};
 
-use super::{CslEntry, CslStore, CslStoreError, materialize, validate_session_id};
+use super::{materialize, validate_session_id, CslEntry, CslStore, CslStoreError};
 
 /// Database-backed CSL store. Each session's entries live in the
 /// `conversation_log` table, keyed by `(session_id, seq)`.
+///
+/// Clone is cheap — both `SharedPool` and the lazy `OnceCell` are `Arc`-wrapped.
 #[derive(Clone, Debug)]
 pub struct DbCslStore {
     matrixone: MatrixOneSettings,
+    /// Pre-built shared pool (production path via `with_pool`).
     pool: Option<SharedPool>,
+    /// Lazily-initialized pool for callers that skip `with_pool` (tests, CLI).
+    /// Shared across clones so only one pool is ever created per `DbCslStore` lineage.
+    lazy_pool: Arc<OnceCell<sqlx::Pool<sqlx::MySql>>>,
 }
 
 impl DbCslStore {
@@ -23,6 +40,7 @@ impl DbCslStore {
         Self {
             matrixone,
             pool: None,
+            lazy_pool: Arc::new(OnceCell::new()),
         }
     }
 
@@ -31,13 +49,23 @@ impl DbCslStore {
         self
     }
 
+    /// Returns the pool to use for this request.
+    ///
+    /// * If `with_pool` was called → returns the pre-built `SharedPool` (zero cost).
+    /// * Otherwise → lazily initialises a connection pool **once** and reuses it
+    ///   for all subsequent calls, preventing per-call pool creation.
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, CslStoreError> {
         if let Some(ref pool) = self.pool {
             return Ok(pool.get().clone());
         }
-        connect_matrixone(&self.matrixone)
+        self.lazy_pool
+            .get_or_try_init(|| async {
+                connect_matrixone(&self.matrixone)
+                    .await
+                    .map_err(|e| CslStoreError::Other(format!("pool connect: {e}")))
+            })
             .await
-            .map_err(|e| CslStoreError::Other(format!("pool connect: {e}")))
+            .cloned()
     }
 
     fn entry_from_row(row: &MySqlRow) -> Result<CslEntry, CslStoreError> {

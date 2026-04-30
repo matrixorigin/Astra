@@ -7,6 +7,7 @@
 //! [`materialize`] replays the log to reconstruct the current
 //! `messages: Vec<Value>` + [`SessionStateCompact`] that the LLM sees.
 
+#[cfg(feature = "db-store")]
 pub mod db_store;
 pub mod file_store;
 pub mod manager;

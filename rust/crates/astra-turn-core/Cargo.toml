@@ -3,6 +3,12 @@ name = "astra-turn-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Enables the database-backed CslStore (`DbCslStore`) and its sqlx dependency.
+# Consumers that only need the in-process / file-backed stores (CLI, unit tests)
+# should NOT enable this feature so they don't pay the sqlx compile cost.
+db-store = ["dep:sqlx"]
+
 [dependencies]
 astra-core.workspace = true
 astra-messaging.workspace = true
@@ -26,7 +32,7 @@ reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml_ng.workspace = true
-sqlx = { workspace = true, features = ["chrono"] }
+sqlx = { workspace = true, features = ["chrono"], optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
