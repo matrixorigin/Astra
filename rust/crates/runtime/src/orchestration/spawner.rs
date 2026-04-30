@@ -4,6 +4,7 @@ use crate::messaging::SubRunInfo;
 use astra_messaging::router::AgentMailboxRouter;
 use astra_messaging::types::AgentAddress;
 use astra_turn_core::fork_prefix_store::PrefixCaptureSink;
+use astra_turn_core::fork_reconstruct::reconstruct_messages;
 use astra_turn_core::fork_resolve::{
     PrefixResolveOutcome, SpawnResolveContext, resolve_inherit_prefix,
 };
@@ -147,6 +148,48 @@ pub struct SpawnRunConfig {
         Option<std::sync::Arc<tokio::sync::RwLock<super::permission_sync::PermissionSyncContext>>>,
     /// Skills inherited from parent agent.
     pub inherited_skills: Vec<String>,
+    /// Captured parent prefix for prompt-cache inheritance. Present
+    /// only when the child spawn requested inherit_prefix AND the
+    /// resolver returned `Resolved`. Executors (CLI / server) that
+    /// implement fork-prefix consumption prepend
+    /// `inherited_prefix.prefix_messages` to the child's state.messages
+    /// and emit a `ForkCacheEvent` after the child's first response.
+    /// Executors that don't yet support it can ignore this field — the
+    /// child will simply run without cache inheritance (equivalent to
+    /// the PR 4 soft-fallback path).
+    pub inherited_prefix: Option<InheritedChildPrefix>,
+}
+
+/// Payload an executor needs to consume an inherited prefix.
+///
+/// Assembled by the spawner at spawn time from a resolved
+/// [`ForkPrefix`]. Held as a plain struct (not an `Arc<ForkPrefix>`)
+/// so the executor sees exactly the inputs it needs without also
+/// needing to know about prefix storage internals.
+#[derive(Debug, Clone)]
+pub struct InheritedChildPrefix {
+    /// Cross-reference to the captured prefix. Forwarded into the
+    /// `ForkCacheEvent` the executor emits after the child's first
+    /// response, so telemetry can join back to the capture.
+    pub prefix_id: String,
+    /// Parent run id (for the same join key).
+    pub parent_run_id: String,
+    /// Provider-scoped model id the prefix was captured against;
+    /// required for ForkCacheEvent payload.
+    pub provider: astra_turn_core::fork_prefix::ProviderKind,
+    /// Reconstructed message array to prepend to the child's
+    /// `state.messages` — the output of
+    /// [`astra_turn_core::fork_reconstruct::reconstruct_messages`]
+    /// called on the prefix with no additional suffix (the executor
+    /// appends its own child task message).
+    pub prefix_messages: Vec<serde_json::Value>,
+    /// Estimated cache-eligible tokens from the parent's perspective.
+    /// Used as the `expected_cache_read_tokens` baseline when the
+    /// executor evaluates the child's first response for a
+    /// `ForkCacheEvent`. Zero is a valid sentinel for "no estimate
+    /// available" — the evaluator handles it via the degenerate
+    /// branch in `evaluate_fork_cache`.
+    pub expected_cache_read_tokens: u64,
 }
 
 impl std::fmt::Debug for SpawnRunConfig {
@@ -515,7 +558,17 @@ impl DynamicAgentSpawner {
             .await
             .insert(agent_id.clone(), state);
 
-        // 6b. Record the resolve outcome. We do this after the
+        // 6b. Reconstruct the inherited prefix payload for the
+        // executor BEFORE moving resolve_outcome into the outcomes
+        // map. Called only if the resolver produced `Resolved`;
+        // all other outcomes (Disabled / Fallback / Failed) leave
+        // `inherited_prefix` as None so the executor runs fresh.
+        // Reconstruct errors are rare (would imply corrupt capture
+        // bytes) — we degrade to None rather than fail the spawn,
+        // mirroring soft-fallback semantics.
+        let inherited_prefix = build_inherited_child_prefix(&resolve_outcome);
+
+        // 6c. Record the resolve outcome. We do this after the
         // active_agents insert so any observer who sees the agent
         // via `list_agents` can safely look up its resolve outcome
         // without a race. Key is agent_id (not run_id) because
@@ -571,6 +624,7 @@ impl DynamicAgentSpawner {
             permission_context,
             // Skills inherited from parent
             inherited_skills: context.inherited_skills.clone(),
+            inherited_prefix,
         };
 
         // 8. Execute or launch
@@ -1052,6 +1106,50 @@ pub enum SpawnError {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+/// Build the [`InheritedChildPrefix`] payload handed to the executor.
+///
+/// Only produces `Some` when `resolve_outcome` is `Resolved`. On
+/// reconstruct error (corrupt canonical bytes — rare, implies the
+/// captured prefix was mangled in-flight) we degrade to `None`: the
+/// child runs fresh, same as the non-resolved path. A future
+/// telemetry layer (PR 5.6+) may want to emit a structured
+/// "reconstruct failed" event here; currently the failure is silent
+/// because no sink is wired through at this layer.
+fn build_inherited_child_prefix(
+    resolve_outcome: &PrefixResolveOutcome,
+) -> Option<InheritedChildPrefix> {
+    let prefix = match resolve_outcome {
+        PrefixResolveOutcome::Resolved { prefix } => prefix,
+        _ => return None,
+    };
+    // reconstruct_messages ONLY fails when the captured canonical
+    // bytes are not a JSON array of message objects. That would
+    // imply a corrupt capture — extremely rare in practice. We
+    // degrade to None rather than failing the spawn, so the child
+    // runs fresh (equivalent to the resolver's soft-fallback path).
+    // A future telemetry layer (PR 5.6+) may want to emit a
+    // "reconstruct failed" event here; currently no sink is wired
+    // through so the failure is silent.
+    match reconstruct_messages(prefix, Vec::new()) {
+        Ok(r) => Some(InheritedChildPrefix {
+            prefix_id: prefix.prefix_id.clone(),
+            parent_run_id: prefix.parent_run_id.clone(),
+            provider: prefix.provider.clone(),
+            prefix_messages: r.messages,
+            // Best-effort estimate. PR 1 doesn't carry a cache-token
+            // estimate on ForkPrefix itself; the capture site could
+            // plumb one through in a future PR. For now we pass 0 so
+            // the evaluator's degenerate branch classifies early
+            // observations as Miss or ExceededExpected until a real
+            // estimate is wired — neither label is a false positive
+            // against "cache worked", which preserves dashboard
+            // integrity.
+            expected_cache_read_tokens: 0,
+        }),
+        Err(_) => None,
+    }
+}
+
 /// Build permission summary from spawn context.
 fn build_permission_summary(context: &SpawnContext) -> PermissionSummary {
     let mut summary = PermissionSummary::default();
@@ -1319,6 +1417,45 @@ mod tests {
             Self {
                 captured_depth: std::sync::Mutex::new(None),
             }
+        }
+    }
+
+    /// Executor that captures the `inherited_prefix` field from the
+    /// SpawnRunConfig so PR 5.5 tests can assert the spawner builds
+    /// it correctly from the resolver outcome.
+    struct CapturingPrefixExecutor {
+        captured: std::sync::Mutex<Option<Option<InheritedChildPrefix>>>,
+    }
+
+    impl CapturingPrefixExecutor {
+        fn new() -> Self {
+            Self {
+                captured: std::sync::Mutex::new(None),
+            }
+        }
+        fn take_captured(&self) -> Option<Option<InheritedChildPrefix>> {
+            self.captured.lock().unwrap().take()
+        }
+    }
+
+    #[async_trait]
+    impl SpawnAgentExecutor for CapturingPrefixExecutor {
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            *self.captured.lock().unwrap() = Some(config.inherited_prefix.clone());
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "completed".into(),
+                output: Some("ok".into()),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
         }
     }
 
@@ -1756,7 +1893,16 @@ mod tests {
                 hash,
             }],
             beta_headers: vec![],
-            canonical_prefix_bytes: b"canonical".to_vec(),
+            // Must be a JSON array of message objects — the
+            // reconstructor (PR 5b) parses this back on the child
+            // spawn path. A raw non-JSON marker would make
+            // `reconstruct_messages` fail and produce a None
+            // inherited_prefix, hiding the actual resolve behavior
+            // we're testing.
+            canonical_prefix_bytes: serde_json::to_vec(&serde_json::json!([
+                {"role": "user", "content": "parent message"}
+            ]))
+            .expect("static json encodes"),
             cache_mode: CacheMode::Write,
             captured_at_secs: wall_now_secs(),
             microcompact_fired_in_turn: false,
@@ -1903,6 +2049,138 @@ mod tests {
         assert!(
             matches!(outcome, PrefixResolveOutcome::Disabled),
             "expected Disabled, got {outcome:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // PR 5.5 — inherited_prefix populates SpawnRunConfig when resolver
+    // returns Resolved, and is None in every other outcome path. The
+    // executor is the only place that sees SpawnRunConfig; we use a
+    // CapturingPrefixExecutor to introspect what the spawner built.
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn resolved_prefix_populates_spawn_run_config_inherited_prefix() {
+        let _g = FlagGuard::set(true);
+        let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
+        let exec = Arc::new(CapturingPrefixExecutor::new());
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_prefix_store(store.clone())
+            .with_executor(exec.clone() as Arc<dyn SpawnAgentExecutor>);
+
+        let model = explore_agent_model(&spawner);
+        capture_parent_for(&*store, "run-parent-A", &model);
+
+        // Sync spawn (background=false) so the executor runs before
+        // spawn() returns and we can read the captured config.
+        let mut input = child_with_inherit(false);
+        input.background = false;
+        let ctx = parent_context("run-parent-A");
+        let _ = spawner.spawn(input, &ctx).await.unwrap();
+
+        let captured = exec
+            .take_captured()
+            .expect("executor must have been called exactly once");
+        let inherited = captured.expect("Resolved outcome must produce Some inherited_prefix");
+        assert_eq!(inherited.parent_run_id, "run-parent-A");
+        assert!(!inherited.prefix_id.is_empty());
+        assert!(
+            !inherited.prefix_messages.is_empty(),
+            "prefix_messages must carry the parent's captured messages"
+        );
+        assert!(matches!(
+            inherited.provider,
+            astra_turn_core::fork_prefix::ProviderKind::Anthropic
+        ));
+    }
+
+    #[tokio::test]
+    async fn fallback_outcome_leaves_inherited_prefix_none() {
+        // Resolver Fallback (no matching parent capture) must yield
+        // `inherited_prefix: None` on the config — executor can tell
+        // from the config alone that it should run fresh.
+        let _g = FlagGuard::set(true);
+        let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
+        let exec = Arc::new(CapturingPrefixExecutor::new());
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_prefix_store(store)
+            .with_executor(exec.clone() as Arc<dyn SpawnAgentExecutor>);
+
+        let mut input = child_with_inherit(false);
+        input.background = false;
+        let ctx = parent_context("run-no-capture");
+        let _ = spawner.spawn(input, &ctx).await.unwrap();
+
+        let captured = exec.take_captured().unwrap();
+        assert!(
+            captured.is_none(),
+            "Fallback outcome must produce None inherited_prefix, got Some(...)"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_outcome_leaves_inherited_prefix_none() {
+        // No inherit_prefix spec at all (most common path) — outcome
+        // is Disabled and inherited_prefix is None, same as Fallback.
+        let _g = FlagGuard::set(true);
+        let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
+        let exec = Arc::new(CapturingPrefixExecutor::new());
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_prefix_store(store)
+            .with_executor(exec.clone() as Arc<dyn SpawnAgentExecutor>);
+
+        let input = SpawnAgentInput {
+            description: "no inherit".into(),
+            prompt: "work".into(),
+            agent_type: "explore".into(),
+            background: false,
+            ..Default::default()
+        };
+        let ctx = parent_context("run-parent");
+        let _ = spawner.spawn(input, &ctx).await.unwrap();
+
+        let captured = exec.take_captured().unwrap();
+        assert!(
+            captured.is_none(),
+            "Disabled outcome must produce None inherited_prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn inherited_prefix_messages_round_trip_byte_identical() {
+        // Cache-reuse precondition: the executor-visible
+        // prefix_messages, when re-serialized, must equal the bytes
+        // the capture recorded. Without this, no prompt cache hit is
+        // possible on the child's first API call.
+        let _g = FlagGuard::set(true);
+        let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
+        let exec = Arc::new(CapturingPrefixExecutor::new());
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_prefix_store(store.clone())
+            .with_executor(exec.clone() as Arc<dyn SpawnAgentExecutor>);
+        let model = explore_agent_model(&spawner);
+        capture_parent_for(&*store, "run-parent-bid", &model);
+
+        // Grab the captured prefix bytes from the sink directly so we
+        // can diff against what the executor eventually sees.
+        let stored_prefix = store
+            .get_prefix("run-parent-bid")
+            .expect("capture must have persisted");
+        let captured_canonical = stored_prefix.canonical_prefix_bytes().clone();
+
+        let mut input = child_with_inherit(false);
+        input.background = false;
+        let _ = spawner
+            .spawn(input, &parent_context("run-parent-bid"))
+            .await
+            .unwrap();
+
+        let captured = exec.take_captured().unwrap().unwrap();
+        let reserialized = serde_json::to_vec(&captured.prefix_messages).unwrap();
+        assert_eq!(
+            reserialized.as_slice(),
+            captured_canonical.as_slice(),
+            "re-serialized prefix_messages must equal captured canonical bytes"
         );
     }
 }
