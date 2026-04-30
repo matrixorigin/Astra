@@ -568,6 +568,13 @@ impl SelfModel {
         mut self,
         ledger: &astra_plan::action_plan::ExecutionLedger,
     ) -> Self {
+        // `latest_unmet()` distinguishes three cases:
+        //   * `None`            → ledger empty (never ran) → preserve caller's field as-is.
+        //   * `Some(vec![])`    → latest ran, everything met → overwrite with empty vec
+        //                         (this is what clears stale verdicts after a successful run).
+        //   * `Some(non-empty)` → latest ran with unmet → overwrite with the latest set.
+        // Merging the last two into a single assignment is deliberate: any
+        // `Some` from the ledger is authoritative for "most recent run".
         if let Some(latest_unmet) = ledger.latest_unmet() {
             self.unmet_postconditions = latest_unmet.iter().map(UnmetPostCondition::from).collect();
         }
