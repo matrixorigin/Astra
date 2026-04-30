@@ -4204,9 +4204,10 @@ mod tests {
 
     async fn setup_runtime_db_pool(database: &str) -> (MatrixOneSettings, SharedPool) {
         let settings = runtime_db_it_settings(database);
-        let mut bootstrap = settings.clone();
-        bootstrap.database =
+        let catalog =
             std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+        let mut bootstrap = settings.clone();
+        bootstrap.database = catalog.clone();
         let admin_pool = connect_matrixone(&bootstrap)
             .await
             .expect("connect bootstrap catalog");
@@ -4218,7 +4219,7 @@ mod tests {
         .await
         .expect("create test database");
         admin_pool.close().await;
-        ensure_core_schema(&settings)
+        ensure_core_schema(&settings, &catalog)
             .await
             .expect("ensure_core_schema; is MatrixOne up?");
         let pool = SharedPool::new(&settings).await.expect("SharedPool::new");

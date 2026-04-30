@@ -18,6 +18,8 @@ async fn execute_cli_health_command() {
         false,
         None,
         &api,
+        false,
+        0.0,
     )
     .await;
     // Health command should succeed regardless of auth

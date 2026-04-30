@@ -73,6 +73,7 @@ impl DatabaseAdminConfigService {
 #[async_trait]
 impl AdminConfigService for DatabaseAdminConfigService {
     async fn get(&self, key: &str) -> Result<Option<String>, String> {
+        validate_key(key)?;
         let pool = self.get_pool().await?;
         let row = query("SELECT config_value FROM admin_config WHERE config_key = ?")
             .bind(key)
@@ -141,7 +142,8 @@ pub struct UnconfiguredAdminConfigService;
 
 #[async_trait]
 impl AdminConfigService for UnconfiguredAdminConfigService {
-    async fn get(&self, _key: &str) -> Result<Option<String>, String> {
+    async fn get(&self, key: &str) -> Result<Option<String>, String> {
+        validate_key(key)?;
         Ok(None)
     }
 
@@ -178,5 +180,28 @@ mod tests {
         assert!(err.contains("unknown admin config key"));
         assert!(err.contains("arbitrary_key"));
         assert!(err.contains(ADMIN_CONFIG_KEY_REASONING_MODEL));
+    }
+
+    // get() must reject unknown keys — callers should not silently read
+    // a non-existent key and get None back as if it were "just unset".
+    #[tokio::test]
+    async fn get_unknown_key_returns_err() {
+        let svc = UnconfiguredAdminConfigService;
+        let result = svc.get("not_a_real_key").await;
+        assert!(
+            result.is_err(),
+            "get() with unknown key must return Err, not Ok(None)"
+        );
+        let err = result.unwrap_err();
+        assert!(err.contains("unknown admin config key"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn get_known_key_does_not_err_on_unconfigured() {
+        let svc = UnconfiguredAdminConfigService;
+        // Known key on an unconfigured service returns Ok(None), not Err.
+        let result = svc.get(ADMIN_CONFIG_KEY_REASONING_MODEL).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), None);
     }
 }

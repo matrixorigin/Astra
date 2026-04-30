@@ -38,7 +38,9 @@ fn require_it_env() -> MatrixOneSettings {
 
 async fn setup_pool() -> SharedPool {
     let settings = require_it_env();
-    ensure_core_schema(&settings)
+    let catalog =
+        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+    ensure_core_schema(&settings, &catalog)
         .await
         .expect("ensure_core_schema; is MatrixOne up?");
     SharedPool::new(&settings).await.expect("SharedPool::new")

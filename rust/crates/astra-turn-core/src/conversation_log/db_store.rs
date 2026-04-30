@@ -327,14 +327,14 @@ mod tests {
 
     async fn test_store() -> DbCslStore {
         let settings = MatrixOneSettings {
-            host: std::env::var("MO_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-            port: std::env::var("MO_PORT")
+            host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+            port: std::env::var("MATRIXONE_PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(6001),
-            user: std::env::var("MO_USER").unwrap_or_else(|_| "root".into()),
-            password: std::env::var("MO_PASSWORD").unwrap_or_else(|_| "111".into()),
-            database: std::env::var("MO_DATABASE").unwrap_or_else(|_| "astra_test".into()),
+            user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
+            password: std::env::var("MATRIXONE_PASSWORD").unwrap_or_else(|_| "111".into()),
+            database: std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "astra_test".into()),
         };
         let store = DbCslStore::new(settings);
 

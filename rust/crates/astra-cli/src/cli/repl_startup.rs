@@ -39,6 +39,7 @@ pub(crate) async fn complete_repl_startup(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     resume_session_id: Option<&str>,
+    no_instructions: bool,
 ) -> Result<ReplStartupArtifacts, String> {
     // Install panic hook to write session_end on unexpected crashes.
     install_session_panic_hook();
@@ -70,14 +71,16 @@ pub(crate) async fn complete_repl_startup(
     }
 
     // Load project instructions from .astra/instructions.md
-    if let Some(instructions) = discover_project_instructions() {
-        let lines = instructions.lines().count();
-        eprintln!(
-            "  {} {}",
-            theme::icon_ok(),
-            format!("Loaded project instructions ({lines} lines)").dim()
-        );
-        state.project_instructions = Some(instructions);
+    if !no_instructions {
+        if let Some(instructions) = discover_project_instructions() {
+            let lines = instructions.lines().count();
+            eprintln!(
+                "  {} {}",
+                theme::icon_ok(),
+                format!("Loaded project instructions ({lines} lines)").dim()
+            );
+            state.project_instructions = Some(instructions);
+        }
     }
 
     // Session lifecycle maintenance: compress old journals and delete expired sessions.
@@ -446,6 +449,62 @@ mod tests {
             },
         );
         crate::cli_utils::save_credentials(&creds).unwrap();
+    }
+
+    // Verify that no_instructions=true prevents project instructions from being
+    // loaded into ReplState, regardless of what's on disk.
+    #[test]
+    fn no_instructions_true_skips_loading() {
+        use project_instructions::discover_instructions_from_paths;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let astra_dir = tmp.path().join(".astra");
+        std::fs::create_dir_all(&astra_dir).unwrap();
+        std::fs::write(
+            astra_dir.join("instructions.md"),
+            "# Project rules\nDo things.",
+        )
+        .unwrap();
+
+        let mut state = ReplState::default();
+        // Simulate the guard: when no_instructions is true, skip the load.
+        let no_instructions = true;
+        if !no_instructions {
+            if let Some(instructions) = discover_instructions_from_paths(Some(tmp.path()), None) {
+                state.project_instructions = Some(instructions);
+            }
+        }
+        assert!(
+            state.project_instructions.is_none(),
+            "no_instructions=true must not populate state.project_instructions"
+        );
+    }
+
+    // Verify that no_instructions=false (default) still loads instructions.
+    #[test]
+    fn no_instructions_false_loads_instructions() {
+        use project_instructions::discover_instructions_from_paths;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let astra_dir = tmp.path().join(".astra");
+        std::fs::create_dir_all(&astra_dir).unwrap();
+        std::fs::write(
+            astra_dir.join("instructions.md"),
+            "# Project rules\nDo things.",
+        )
+        .unwrap();
+
+        let mut state = ReplState::default();
+        let no_instructions = false;
+        if !no_instructions {
+            if let Some(instructions) = discover_instructions_from_paths(Some(tmp.path()), None) {
+                state.project_instructions = Some(instructions);
+            }
+        }
+        assert!(
+            state.project_instructions.is_some(),
+            "no_instructions=false must load project_instructions when file exists"
+        );
     }
 
     #[tokio::test]

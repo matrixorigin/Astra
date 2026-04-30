@@ -37,7 +37,9 @@ fn require_db_it_env() -> MatrixOneSettings {
 
 async fn setup_pool() -> sqlx::Pool<sqlx::MySql> {
     let settings = require_db_it_env();
-    ensure_core_schema(&settings)
+    let catalog =
+        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+    ensure_core_schema(&settings, &catalog)
         .await
         .expect("ensure_core_schema; is MatrixOne up?");
     let shared = SharedPool::new(&settings).await.expect("SharedPool::new");
@@ -766,7 +768,9 @@ async fn migration_dedupe_removes_duplicate_attempt_tuples() {
         .unwrap();
 
     let settings = require_db_it_env();
-    ensure_core_schema(&settings)
+    let catalog =
+        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+    ensure_core_schema(&settings, &catalog)
         .await
         .expect("migrations must succeed even with pre-existing duplicates");
 

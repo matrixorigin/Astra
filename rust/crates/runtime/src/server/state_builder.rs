@@ -7,7 +7,7 @@ use super::*;
 pub async fn build_server_state(
     settings: AppSettings,
 ) -> Result<AppState, Box<dyn std::error::Error>> {
-    ensure_core_schema(&settings.matrixone).await?;
+    ensure_core_schema(&settings.matrixone, &settings.database_bootstrap_catalog).await?;
     let shared_pool = SharedPool::new(&settings.matrixone).await?;
     let lease_hold_cache = Arc::new(TaskLeaseHoldCache::default());
     // Build a single encryptor from settings (falls back to env var when not explicitly set).

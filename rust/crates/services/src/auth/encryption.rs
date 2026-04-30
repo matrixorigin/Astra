@@ -145,10 +145,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn from_key_some_ignores_env_var() {
         // Even if ASTRA_TOKEN_ENCRYPTION_KEY is absent, Some(key) must succeed.
-        // We remove the env var in this isolated test (no other test sets it concurrently
-        // because these tests don't depend on the env var).
         let prev = std::env::var("ASTRA_TOKEN_ENCRYPTION_KEY").ok();
         unsafe { std::env::remove_var("ASTRA_TOKEN_ENCRYPTION_KEY") };
         let result = FernetTokenEncryptor::from_key(Some("standalone-key"));
@@ -160,6 +159,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn from_key_none_falls_back_to_env() {
         let prev = std::env::var("ASTRA_TOKEN_ENCRYPTION_KEY").ok();
         unsafe { std::env::set_var("ASTRA_TOKEN_ENCRYPTION_KEY", "env-key") };
@@ -176,6 +176,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn from_key_none_without_env_fails() {
         let prev = std::env::var("ASTRA_TOKEN_ENCRYPTION_KEY").ok();
         unsafe { std::env::remove_var("ASTRA_TOKEN_ENCRYPTION_KEY") };

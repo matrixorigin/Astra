@@ -235,9 +235,12 @@ where
     Ok(result.rows_affected())
 }
 
-/// When `ASTRA_AUTO_CREATE_DATABASE=1`, connect to a bootstrap catalog (default `mysql`) and
+/// When `ASTRA_AUTO_CREATE_DATABASE=1`, connect to `bootstrap_catalog` and
 /// run `CREATE DATABASE IF NOT EXISTS` for [`MatrixOneSettings::database`] before normal DDL.
-async fn ensure_matrixone_database_exists(settings: &MatrixOneSettings) -> Result<(), sqlx::Error> {
+async fn ensure_matrixone_database_exists(
+    settings: &MatrixOneSettings,
+    bootstrap_catalog: &str,
+) -> Result<(), sqlx::Error> {
     use std::error::Error;
 
     crate::snapshot_sql::validate_sql_identifier(&settings.database, "matrixone database")
@@ -247,18 +250,15 @@ async fn ensure_matrixone_database_exists(settings: &MatrixOneSettings) -> Resul
                 e,
             )) as Box<dyn Error + Send + Sync>)
         })?;
-    let catalog =
-        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".to_string());
-    crate::snapshot_sql::validate_sql_identifier(&catalog, "matrixone bootstrap catalog").map_err(
-        |e| {
+    crate::snapshot_sql::validate_sql_identifier(bootstrap_catalog, "matrixone bootstrap catalog")
+        .map_err(|e| {
             sqlx::Error::Configuration(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 e,
             )) as Box<dyn Error + Send + Sync>)
-        },
-    )?;
+        })?;
     let mut admin_settings = settings.clone();
-    admin_settings.database = catalog;
+    admin_settings.database = bootstrap_catalog.to_string();
     let admin_pool = connect_matrixone(&admin_settings).await?;
     let ddl = format!(
         "CREATE DATABASE IF NOT EXISTS {}",
@@ -269,7 +269,10 @@ async fn ensure_matrixone_database_exists(settings: &MatrixOneSettings) -> Resul
     Ok(())
 }
 
-pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx::Error> {
+pub async fn ensure_core_schema(
+    settings: &MatrixOneSettings,
+    bootstrap_catalog: &str,
+) -> Result<(), sqlx::Error> {
     // Tests and startup paths can race on schema bootstrap inside the same process.
     // Serialize schema setup so migration markers and DDL stay idempotent.
     let _init_guard = CORE_SCHEMA_INIT_LOCK
@@ -282,7 +285,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
         .map(|v| v == "1")
         .unwrap_or(false)
     {
-        ensure_matrixone_database_exists(settings).await?;
+        ensure_matrixone_database_exists(settings, bootstrap_catalog).await?;
     }
     let pool = connect_matrixone(settings).await?;
 

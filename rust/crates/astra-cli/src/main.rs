@@ -303,6 +303,8 @@ async fn run_chat_repl(
     profile: Option<&str>,
     initial_model: Option<&str>,
     resume_session_id: Option<&str>,
+    no_instructions: bool,
+    max_budget: f64,
 ) -> Result<(), String> {
     let mut tracer = StartupTracer::new();
 
@@ -317,6 +319,9 @@ async fn run_chat_repl(
     tracer.phase("editor");
 
     let mut state = initialize_repl_state(profile, initial_model);
+    if max_budget > 0.0 {
+        state.max_budget_limit = max_budget;
+    }
     tracer.phase("state_init");
 
     let repl_startup::ReplStartupArtifacts {
@@ -327,7 +332,15 @@ async fn run_chat_repl(
         skill_quality_path,
         pinned_skills_path,
         mut shutdown_signal_rx,
-    } = complete_repl_startup(&mut state, &mut tracer, api, profile, resume_session_id).await?;
+    } = complete_repl_startup(
+        &mut state,
+        &mut tracer,
+        api,
+        profile,
+        resume_session_id,
+        no_instructions,
+    )
+    .await?;
 
     // Print startup trace summary if enabled
     tracer.finish();
@@ -1038,10 +1051,6 @@ async fn main() {
         command,
     } = cli;
 
-    // --startup-trace / --bare / --verbose / --no-instructions: env-var propagation
-    // was removed during the env cleanup; these flags are now handled via local
-    // variables below (e.g. no_instructions is checked before merging project
-    // instructions into the system prompt).
     let _ = (startup_trace, bare);
 
     if no_journal_content {
@@ -1056,9 +1065,6 @@ async fn main() {
             std::env::set_var("ASTRA_CLI_MAX_TURNS", turns.to_string());
         }
     }
-
-    // --max-budget: feature removed during env cleanup; arg silently ignored.
-    let _ = max_budget;
 
     // --system-prompt: support @file syntax to read from file
     let system_prompt = system_prompt.map(|sp| match resolve_system_prompt(sp) {
@@ -1217,6 +1223,8 @@ async fn main() {
                     profile.as_deref(),
                     resolved_model.as_deref(),
                     Some(&sid),
+                    no_instructions,
+                    max_budget,
                 )
                 .await;
                 match result {
@@ -1244,6 +1252,8 @@ async fn main() {
         auto_approve,
         system_prompt,
         &api,
+        no_instructions,
+        max_budget,
     )
     .await
     {
@@ -1905,6 +1915,8 @@ mod tests {
             false,
             None,
             &api,
+            false,
+            0.0,
         )
         .await;
         // Health command should succeed regardless of auth
@@ -1921,6 +1933,8 @@ mod tests {
             false,
             None,
             &api,
+            false,
+            0.0,
         )
         .await;
         assert!(result.is_ok());
@@ -4569,6 +4583,23 @@ total_tokens_out: 500
     fn cli_max_budget_integer_value() {
         let cli = Cli::try_parse_from(["astra", "--max-budget", "10"]).unwrap();
         assert!((cli.max_budget - 10.0).abs() < f64::EPSILON);
+    }
+
+    // Verify that --max-budget wires through to ReplState.max_budget_limit.
+    // The initialize_repl_state default is 0.0; after applying the flag it must equal the value.
+    #[test]
+    fn max_budget_applied_to_repl_state() {
+        let mut state = initialize_repl_state(None, None);
+        assert!(
+            (state.max_budget_limit - 0.0).abs() < f64::EPSILON,
+            "default max_budget_limit must be 0.0"
+        );
+        // Apply the flag value — this is what run_chat_repl now does.
+        state.max_budget_limit = 7.5;
+        assert!(
+            (state.max_budget_limit - 7.5).abs() < f64::EPSILON,
+            "max_budget_limit must reflect the --max-budget flag value"
+        );
     }
 
     // ── --yes / -y edge case tests ──

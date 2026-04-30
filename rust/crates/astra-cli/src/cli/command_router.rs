@@ -360,6 +360,7 @@ fn handle_permission_command(arg: &str, state: &mut ReplState) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_cli_command(
     command: Option<Command>,
     profile: Option<String>,
@@ -367,11 +368,21 @@ pub(super) async fn execute_cli_command(
     auto_approve: bool,
     system_prompt: Option<String>,
     api: &astra_thin_client::ThinClient,
+    no_instructions: bool,
+    max_budget: f64,
 ) -> Result<ExitCode, String> {
     match command {
         // No subcommand → interactive REPL (Codex-style default)
         None | Some(Command::Interactive) => {
-            run_chat_repl(api, profile.as_deref(), global_model.as_deref(), None).await?;
+            run_chat_repl(
+                api,
+                profile.as_deref(),
+                global_model.as_deref(),
+                None,
+                no_instructions,
+                max_budget,
+            )
+            .await?;
             Ok(ExitCode::Success)
         }
 
@@ -772,7 +783,15 @@ pub(super) async fn execute_cli_command(
             } else {
                 // No message → start REPL with optional pre-set session/model
                 let model = args.model.as_deref().or(global_model.as_deref());
-                run_chat_repl(api, profile.as_deref(), model, None).await?;
+                run_chat_repl(
+                    api,
+                    profile.as_deref(),
+                    model,
+                    None,
+                    no_instructions,
+                    max_budget,
+                )
+                .await?;
                 return Ok(ExitCode::Success);
             };
 
