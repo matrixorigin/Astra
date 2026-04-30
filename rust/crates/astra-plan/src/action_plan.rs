@@ -134,6 +134,44 @@ impl ObservedOutcome {
     }
 }
 
+/// Translate an `astra_tools::ToolResult` into a typed `ObservedOutcome`.
+///
+/// The sole bridge between the external tool world (where success is a
+/// `bool` flag on free-form payload) and the plan world (where success is
+/// structurally encoded). The mapping rules — and only these — are:
+///
+/// | `ToolResult`              | `ObservedOutcome::ToolCall` |
+/// |---------------------------|-----------------------------|
+/// | `is_error == false`       | `success: true`             |
+/// | `is_error == true`        | `success: false`            |
+/// | `output: String`          | `result["output"]`          |
+/// | `metadata: Some(map)`     | `result["metadata"] = map`  |
+/// | `metadata: None`          | key absent (not `null`)     |
+/// | (from `&Action`)          | `action_index`, `tool`      |
+///
+/// `is_error` is the single source of truth for success: this function
+/// never inspects `output` for "Error"-like prefixes. That heuristic
+/// belongs to legacy `ToolResult::from_string`, not here.
+pub fn observation_from_tool_result(
+    action: &Action,
+    tool_result: astra_tools::ToolResult,
+) -> ObservedOutcome {
+    let mut result = serde_json::Map::new();
+    result.insert(
+        "output".to_string(),
+        serde_json::Value::String(tool_result.output),
+    );
+    if let Some(meta) = tool_result.metadata {
+        result.insert("metadata".to_string(), serde_json::Value::Object(meta));
+    }
+    ObservedOutcome::ToolCall {
+        action_index: action.index(),
+        tool: action.tool().to_string(),
+        success: !tool_result.is_error,
+        result: serde_json::Value::Object(result),
+    }
+}
+
 // ─── ActionPlanError ─────────────────────────────────────────────────────────
 
 /// Construction errors — each one names a specific invariant violation so the
@@ -500,6 +538,36 @@ impl<'a> ExecutionDriver<'a> {
             audit: self.audit,
         }
     }
+}
+
+/// Drive an `ActionPlan` against a real `astra_tools::ToolExecutor` and
+/// return the classified `ExecutionResult`.
+///
+/// This is the async adapter around `ExecutionDriver`: the plan layer stays
+/// sync-pure, and this thin function owns the `await` boundary for tool
+/// invocations. It does not inject audit-logging, approval gating, journal
+/// writes, or streaming — those belong to higher-level composition and are
+/// not mixed into the observation pipeline.
+///
+/// The adapter is generic over `?Sized` so callers can pass a trait object
+/// (`&dyn ToolExecutor`) just as naturally as a concrete executor.
+pub async fn run_action_plan<E: astra_tools::ToolExecutor + ?Sized>(
+    plan: &ActionPlan,
+    policy: ExecutionPolicy,
+    executor: &E,
+) -> ExecutionResult {
+    let mut driver = ExecutionDriver::new(plan, policy);
+    // Clone the pending Action each iteration so the borrow of `driver` ends
+    // before `await` — this lets `driver.record(...)` take &mut self after
+    // the async tool call resolves.
+    while let Some(pending) = driver.next_action().cloned() {
+        let tool_result = executor.execute(pending.tool(), pending.args()).await;
+        let outcome = observation_from_tool_result(&pending, tool_result);
+        driver
+            .record(outcome)
+            .expect("driver protocol holds: outcome index == pending action");
+    }
+    driver.finish()
 }
 
 // ─── ExecutionLedger ─────────────────────────────────────────────────────────
