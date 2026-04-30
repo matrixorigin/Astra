@@ -78,8 +78,6 @@ fn yaml_str_vec(entry: &serde_yaml_ng::Value, key: &str) -> Option<Vec<String>> 
 }
 
 /// Merge optional YAML model fields into an existing JSON object in-place.
-/// Handles: description, context_window, max_completion_tokens, tags,
-/// supported_parameters, architecture, pricing_prompt/completion.
 fn apply_optional_yaml_fields(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     entry: &serde_yaml_ng::Value,
@@ -112,6 +110,15 @@ fn apply_optional_yaml_fields(
                 "completion": completion_price.unwrap_or(0.0),
             }),
         );
+    }
+    if let Some(thinking_mode) = yaml_str(entry, "thinking_mode") {
+        let quirks = obj
+            .entry("quirks")
+            .or_insert_with(|| serde_json::json!({}));
+        quirks
+            .as_object_mut()
+            .unwrap()
+            .insert("thinking_mode".into(), serde_json::json!(thinking_mode));
     }
 }
 
@@ -681,5 +688,128 @@ async fn main() -> Result<(), String> {
             print_json_or_raw(&body);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn yaml(s: &str) -> serde_yaml_ng::Value {
+        serde_yaml_ng::from_str(s).unwrap()
+    }
+
+    // ── thinking_mode propagation (TDD: red → green) ────────────────────
+
+    #[test]
+    fn create_payload_includes_thinking_mode_controllable() {
+        let entry = yaml(
+            r#"
+            name: us.anthropic.claude-sonnet-4-6
+            provider: bedrock
+            thinking_mode: controllable
+            api_key: test-key
+            tags: [code, chat, reasoning]
+            "#,
+        );
+        let payload =
+            build_model_create_payload(&entry, "us.anthropic.claude-sonnet-4-6", "bedrock", "test-key", None);
+        let quirks = payload.get("quirks").expect("quirks must be present");
+        assert_eq!(
+            quirks.get("thinking_mode").and_then(|v| v.as_str()),
+            Some("controllable"),
+            "explicit thinking_mode: controllable must be forwarded in quirks"
+        );
+    }
+
+    #[test]
+    fn create_payload_includes_thinking_mode_native() {
+        let entry = yaml(
+            r#"
+            name: qwen3-235b
+            provider: dashscope
+            thinking_mode: native
+            api_key: test-key
+            "#,
+        );
+        let payload = build_model_create_payload(&entry, "qwen3-235b", "dashscope", "test-key", None);
+        let quirks = payload.get("quirks").expect("quirks must be present");
+        assert_eq!(
+            quirks.get("thinking_mode").and_then(|v| v.as_str()),
+            Some("native"),
+        );
+    }
+
+    #[test]
+    fn create_payload_no_quirks_when_thinking_mode_absent() {
+        let entry = yaml(
+            r#"
+            name: gpt-4o
+            provider: openai
+            api_key: test-key
+            "#,
+        );
+        let payload = build_model_create_payload(&entry, "gpt-4o", "openai", "test-key", None);
+        // No thinking_mode in YAML → no quirks key (server fallback handles tags)
+        let quirks = payload.get("quirks");
+        assert!(
+            quirks.is_none()
+                || quirks
+                    .unwrap()
+                    .get("thinking_mode")
+                    .map_or(true, |v| v.is_null()),
+            "no thinking_mode in YAML should not inject one into quirks"
+        );
+    }
+
+    #[test]
+    fn update_payload_includes_thinking_mode() {
+        let entry = yaml(
+            r#"
+            provider: bedrock
+            thinking_mode: controllable
+            api_key: test-key
+            "#,
+        );
+        let payload = build_model_update_payload(&entry, "bedrock", "test-key", None);
+        let quirks = payload.get("quirks").expect("quirks must be present in update");
+        assert_eq!(
+            quirks.get("thinking_mode").and_then(|v| v.as_str()),
+            Some("controllable"),
+        );
+    }
+
+    // ── existing field propagation (regression guard) ───────────────────
+
+    #[test]
+    fn create_payload_includes_all_optional_fields() {
+        let entry = yaml(
+            r#"
+            name: test-model
+            provider: bedrock
+            api_key: k
+            description: "test description"
+            context_window: 200000
+            max_completion_tokens: 4096
+            tags: [code, chat]
+            supported_parameters: [tools]
+            architecture: transformer
+            pricing_prompt: 0.001
+            pricing_completion: 0.002
+            thinking_mode: controllable
+            "#,
+        );
+        let payload = build_model_create_payload(&entry, "test-model", "bedrock", "k", Some("https://example.com"));
+        assert_eq!(payload["description"], "test description");
+        assert_eq!(payload["context_window"], 200000);
+        assert_eq!(payload["max_completion_tokens"], 4096);
+        assert_eq!(payload["tags"], serde_json::json!(["code", "chat"]));
+        assert_eq!(payload["supported_parameters"], serde_json::json!(["tools"]));
+        assert_eq!(payload["architecture"], "transformer");
+        assert!(payload["pricing"]["prompt"].as_f64().unwrap() > 0.0);
+        assert_eq!(
+            payload["quirks"]["thinking_mode"].as_str(),
+            Some("controllable")
+        );
     }
 }
