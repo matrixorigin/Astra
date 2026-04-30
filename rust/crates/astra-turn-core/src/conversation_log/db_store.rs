@@ -14,12 +14,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sqlx::{mysql::MySqlRow, query, Row};
+use sqlx::{Row, mysql::MySqlRow, query};
 use tokio::sync::OnceCell;
 
-use astra_core::{connect_matrixone, MatrixOneSettings, SharedPool};
+use astra_core::{MatrixOneSettings, SharedPool, connect_matrixone};
 
-use super::{materialize, validate_session_id, CslEntry, CslStore, CslStoreError};
+use super::{CslEntry, CslStore, CslStoreError, materialize, validate_session_id};
 
 /// Database-backed CSL store. Each session's entries live in the
 /// `conversation_log` table, keyed by `(session_id, seq)`.

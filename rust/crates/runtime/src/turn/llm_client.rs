@@ -854,6 +854,18 @@ fn build_bedrock_tools(tools: &[Value]) -> Vec<Value> {
     out
 }
 
+fn bedrock_messages_contain_tool_blocks(messages: &[Value]) -> bool {
+    messages.iter().any(|msg| {
+        msg.get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|b| b.get("toolUse").is_some() || b.get("toolResult").is_some())
+            })
+    })
+}
+
 pub(crate) fn build_provider_request_body(
     messages: &[Value],
     tools: &[Value],
@@ -887,6 +899,8 @@ pub(crate) fn build_provider_request_body(
             let bedrock_tools = build_bedrock_tools(tools);
             if !bedrock_tools.is_empty() {
                 body["toolConfig"] = json!({ "tools": bedrock_tools });
+            } else if bedrock_messages_contain_tool_blocks(&bedrock_messages) {
+                body["toolConfig"] = json!({ "tools": [] });
             }
             thinking.apply_bedrock(&mut body);
             body
@@ -4859,6 +4873,63 @@ mod tests {
             .filter_map(|b| b.get("toolResult")?.get("toolUseId")?.as_str())
             .collect();
         assert_eq!(ids, vec!["a", "b"], "{body:#?}");
+        // empty tools + tool blocks in history ⇒ toolConfig must still be present
+        assert!(
+            body.get("toolConfig").is_some(),
+            "toolConfig missing: {body:#?}"
+        );
+    }
+
+    #[test]
+    fn build_bedrock_body_includes_tool_config_when_history_has_tool_blocks() {
+        let messages = vec![
+            json!({"role": "user", "content": "list files"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "c1", "name": "bash", "content": "file.txt"}),
+            json!({"role": "user", "content": "thanks"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "us.anthropic.claude-sonnet-4-6",
+            "bedrock",
+            None,
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        assert_eq!(
+            body["toolConfig"]["tools"],
+            json!([]),
+            "empty tools array required when history contains tool blocks"
+        );
+    }
+
+    #[test]
+    fn build_bedrock_body_omits_tool_config_when_no_tools_anywhere() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "us.anthropic.claude-sonnet-4-6",
+            "bedrock",
+            None,
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        assert!(
+            body.get("toolConfig").is_none(),
+            "toolConfig should be absent when no tools: {body:#?}"
+        );
     }
 
     #[test]
