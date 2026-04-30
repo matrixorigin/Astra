@@ -58,6 +58,7 @@ pub mod recent_arg_hints;
 pub mod response_guard;
 pub mod routing;
 pub mod safety_middleware;
+pub mod selector_observability;
 pub mod skill_selector_metrics;
 pub mod sse_blocks;
 pub mod sse_edge_stderr_lines;

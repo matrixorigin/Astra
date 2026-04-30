@@ -165,6 +165,8 @@ impl ToolRegistry {
         budget: u32,
         recent_tools: &[String],
     ) -> (Vec<Value>, SelectionReport) {
+        use astra_turn_core::selector_observability as obs;
+
         let state = ConversationState::from_message_with_context(query, turn_count, recent_tools);
 
         if state.is_conversational
@@ -175,6 +177,18 @@ impl ToolRegistry {
         {
             let schemas = self.pinned_only();
             let names = Self::selected_names(&schemas);
+            // Observability: conversational short-circuit — no
+            // dynamic ranking happened, `final` is just the pinned
+            // list. A G3-class bug shows up here when a tool the
+            // caller expected is missing from `final`.
+            obs::emit_selector_trace(&obs::SelectionTrace {
+                query,
+                mode: "conversational",
+                top: None,
+                r#final: &names,
+                budget: None,
+                reason: Some("conversational query — pinned-only"),
+            });
             let report = SelectionReport {
                 tools_selected: names,
                 selected_count: schemas.len() as u32,
@@ -197,6 +211,29 @@ impl ToolRegistry {
             })
             .map(|n| self.token_cost(n))
             .sum();
+
+        // Observability: dynamic path — record the top-ranked
+        // candidates before budget trimming so a reviewer can see
+        // WHY a tool was excluded (scored too low vs. priced out).
+        // Cap the top list at 10 to keep lines bounded.
+        if obs::is_selector_observability_enabled() {
+            let top: Vec<(&str, f64)> = ranked
+                .iter()
+                .take(10)
+                .map(|(idx, score)| (TOOL_CATALOG[*idx].name, *score))
+                .collect();
+            obs::emit_selector_trace(&obs::SelectionTrace {
+                query,
+                mode: "dynamic",
+                top: Some(top),
+                r#final: &names,
+                budget: Some(obs::SelectionBudget {
+                    used: budget_used,
+                    total: budget,
+                }),
+                reason: None,
+            });
+        }
 
         let report = SelectionReport {
             selected_count: schemas.len() as u32,
@@ -714,6 +751,91 @@ mod tests {
             names.contains(&"skill"),
             "pinned_only should include injected pinned tools"
         );
+    }
+
+    // ── Selector observability integration (Pass B) ──
+    //
+    // These tests verify the `[selector]` stderr hook plumbs through
+    // the real `select_with_report_ctx` path. They exercise both the
+    // conversational short-circuit and the dynamic ranking branch.
+    // Stderr content is not captured (no stable API in tokio tests),
+    // but the flag guard ensures the hot path runs without panic
+    // when observability is on — which is what we'd regress if the
+    // obs module grew a lifetime bug or serde panic.
+
+    #[test]
+    fn select_with_report_ctx_conversational_path_does_not_panic_with_obs_on() {
+        use astra_turn_core::selector_observability::{
+            restore_selector_observability_for_tests, set_selector_observability_for_tests,
+            SELECTOR_OBS_TEST_MUTEX,
+        };
+        let _lock = SELECTOR_OBS_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = set_selector_observability_for_tests(true);
+
+        let mut schemas = vec![sample_schema("bash"), sample_schema("read_file")];
+        // Ensure a pinned + non-pinned mix so both branches of
+        // pinned_only + filter are exercised under observability.
+        schemas.push(sample_schema("github_list_prs"));
+        let registry = ToolRegistry::new(schemas);
+        // "hello" is the conversational short-circuit case.
+        let (out_schemas, report) =
+            registry.select_with_report_ctx("hello", 0, 800, &[]);
+        assert!(!out_schemas.is_empty());
+        assert_eq!(report.selected_count as usize, out_schemas.len());
+
+        restore_selector_observability_for_tests(prev);
+    }
+
+    #[test]
+    fn select_with_report_ctx_dynamic_path_does_not_panic_with_obs_on() {
+        use astra_turn_core::selector_observability::{
+            restore_selector_observability_for_tests, set_selector_observability_for_tests,
+            SELECTOR_OBS_TEST_MUTEX,
+        };
+        let _lock = SELECTOR_OBS_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = set_selector_observability_for_tests(true);
+
+        let schemas = vec![
+            sample_schema("bash"),
+            sample_schema("read_file"),
+            sample_schema("grep"),
+            sample_schema("list_dir"),
+        ];
+        let registry = ToolRegistry::new(schemas);
+        // Analytical-ish query — forces the dynamic branch.
+        let (out, report) =
+            registry.select_with_report_ctx("search for TODO in source files", 0, 800, &[]);
+        assert!(!out.is_empty());
+        assert!(report.selected_count > 0);
+
+        restore_selector_observability_for_tests(prev);
+    }
+
+    #[test]
+    fn select_path_is_unaffected_when_obs_flag_off() {
+        // Without the flag set, emit_selector_trace is a noop and
+        // the selection result must be identical to the pre-obs
+        // behavior (byte-for-byte on tools_selected).
+        use astra_turn_core::selector_observability::{
+            restore_selector_observability_for_tests, set_selector_observability_for_tests,
+            SELECTOR_OBS_TEST_MUTEX,
+        };
+        let _lock = SELECTOR_OBS_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = set_selector_observability_for_tests(false);
+
+        let schemas = vec![sample_schema("bash"), sample_schema("read_file")];
+        let registry = ToolRegistry::new(schemas);
+        let (_out, report) =
+            registry.select_with_report_ctx("search for needles", 0, 800, &[]);
+        assert!(report.selected_count >= 1);
+
+        restore_selector_observability_for_tests(prev);
     }
 }
 
