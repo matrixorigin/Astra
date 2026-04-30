@@ -2045,6 +2045,24 @@ fn append_context_flags(cmd: &mut Command, before: Option<usize>, after: Option<
     }
 }
 
+/// Kill the child's entire process group (SIGKILL to -pgid), then reap.
+/// Falls back to `child.kill()` on non-unix platforms. Needed so orphaned
+/// grandchildren don't hold the stdio pipes open past the kill.
+async fn kill_process_group(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            // `kill -9 -<pid>` signals the whole group. We spawn this through
+            // std::process because we just want a best-effort blast.
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &format!("-{pid}")])
+                .output();
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
 async fn run_readonly_command_with_partial(
     cmd: &mut Command,
     timeout: Duration,
@@ -2054,6 +2072,13 @@ async fn run_readonly_command_with_partial(
     command_kind: &str,
 ) -> Result<ReadOnlyCommandOutput, String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    // Put the child into its own process group so `kill -9 -<pgid>` on
+    // timeout/cancellation reaps orphaned grandchildren (e.g. `sleep 60 &`)
+    // that would otherwise keep the stdio pipes open, causing the drain
+    // below to hang for the full grandchild lifetime.
+    #[cfg(unix)]
+    cmd.process_group(0);
 
     let mut child = cmd
         .spawn()
@@ -2099,16 +2124,14 @@ async fn run_readonly_command_with_partial(
             Ok(None) => {
                 if tokio::time::Instant::now() >= deadline {
                     timed_out = true;
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                    kill_process_group(&mut child).await;
                     break;
                 }
                 if let Some(token) = cancel_token {
                     tokio::select! {
                         _ = token.cancelled() => {
                             cancelled = true;
-                            let _ = child.kill().await;
-                            let _ = child.wait().await;
+                            kill_process_group(&mut child).await;
                             break;
                         }
                         _ = tokio::time::sleep(Duration::from_millis(25)) => {}
@@ -3378,14 +3401,15 @@ printf 'probe.txt:1:needle\n'
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
 
-        // Use `exec sleep` so that when the timeout fires, bash *is* the sleep
-        // process — SIGKILL then frees the stdout pipe immediately. Without
-        // `exec`, bash's `sleep` child survives as an orphan and holds the
-        // pipe open for its full duration, adding ~1s of dead wait to the test.
+        // Regression guard against the pipe-leak bug fixed by
+        // `kill_process_group`: if bash's `sleep` child were left as an
+        // orphan holding the stdio pipe, this test would block for the full
+        // 5s sleep even though timeout=0.2s. Killing the process group
+        // reaps the sleep too.
         let result = execute_bash(
             &ctx,
             &serde_json::json!({
-                "command": "echo start; exec sleep 5; echo done",
+                "command": "echo start; sleep 5; echo done",
                 "timeout": 0.2
             }),
         )

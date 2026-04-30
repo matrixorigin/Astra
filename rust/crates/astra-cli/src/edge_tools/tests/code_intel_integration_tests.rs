@@ -381,19 +381,46 @@ async fn find_definition_cross_directory_with_path_filter() {
     );
 }
 
+/// Multi-file Rust fixture with cross-file usage of `extract_symbols` and
+/// `cached_parse` — the two symbols used by the find_references tests
+/// below. Replaces the previous "scan the whole monorepo" pattern which
+/// ran 1-3s per test.
+fn find_references_fixture() -> (tempfile::TempDir, ToolExecutor) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/code_intel.rs"),
+        r#"
+pub fn cached_parse(source: &str) -> Vec<String> {
+    // Minimal implementation for tests.
+    vec![source.to_string()]
+}
+
+pub fn extract_symbols(source: &str) -> Vec<String> {
+    let _parsed = cached_parse(source);
+    vec!["sym".to_string()]
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/edge_tools.rs"),
+        r#"
+use crate::code_intel::extract_symbols;
+
+pub fn dispatch(src: &str) -> Vec<String> {
+    extract_symbols(src)
+}
+"#,
+    )
+    .unwrap();
+    let executor = ToolExecutor::new(dir.path());
+    (dir, executor)
+}
+
 #[tokio::test]
 async fn find_references_multifile_finds_all_usages() {
-    // Test find_references across a multi-file Rust project
-    // using our own codebase (guaranteed to have cross-file references)
-    let root = {
-        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.pop();
-        p.pop();
-        p
-    };
-    let executor = ToolExecutor::new(root);
-
-    // extract_symbols is used in both code_intel.rs and edge_tools.rs
+    let (_dir, executor) = find_references_fixture();
     let result = executor
         .execute(
             "find_references",
@@ -407,7 +434,6 @@ async fn find_references_multifile_finds_all_usages() {
         result.contains("extract_symbols"),
         "should find references: {result}"
     );
-    // Should find in multiple files
     if !result.contains("No references") {
         assert!(
             result.contains("code_intel.rs"),
@@ -418,15 +444,7 @@ async fn find_references_multifile_finds_all_usages() {
 
 #[tokio::test]
 async fn find_references_categorizes_imports_and_definitions() {
-    let root = {
-        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.pop();
-        p.pop();
-        p
-    };
-    let executor = ToolExecutor::new(root);
-
-    // cached_parse is defined in code_intel.rs and used there
+    let (_dir, executor) = find_references_fixture();
     let result = executor
         .execute(
             "find_references",
@@ -436,7 +454,6 @@ async fn find_references_categorizes_imports_and_definitions() {
             }),
         )
         .await;
-    // Should find it (it's used in many functions in code_intel.rs)
     if !result.contains("No references") {
         assert!(
             result.contains("cached_parse"),

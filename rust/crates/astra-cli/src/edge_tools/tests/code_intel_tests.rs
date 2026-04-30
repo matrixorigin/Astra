@@ -478,32 +478,19 @@ async fn find_references_requires_symbol() {
 
 #[tokio::test]
 async fn find_references_in_repo() {
-    let root = {
-        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.pop();
-        p.pop();
-        p
-    };
-    let executor = ToolExecutor::new(root);
+    let (_dir, executor) = find_definition_fixture();
     let result = executor
         .execute("find_references", &json!({"symbol": "ToolExecutor"}))
         .await;
-    // Should find references in our own codebase
     assert!(
         result.contains("ToolExecutor"),
-        "should find ToolExecutor references in own repo: {result}"
+        "should find ToolExecutor references in fixture: {result}"
     );
 }
 
 #[tokio::test]
 async fn find_references_with_include_filter() {
-    let root = {
-        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.pop();
-        p.pop();
-        p
-    };
-    let executor = ToolExecutor::new(root);
+    let (_dir, executor) = find_definition_fixture();
     let result = executor
         .execute(
             "find_references",

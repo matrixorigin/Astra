@@ -30,6 +30,20 @@ const CONSECUTIVE_ERROR_THRESHOLD: u64 = 3;
 /// Consecutive 529 errors needed to trigger model fallback.
 const MODEL_FALLBACK_THRESHOLD: u64 = 3;
 
+/// Default delay before retrying when the provider returned 429/529 but
+/// **did not include** a `Retry-After` header. Real LLM providers almost
+/// always include it on rate-limit responses; this fallback fires on badly
+/// behaved proxies, mocks, or transient errors. Kept at 5s because:
+/// 1. most providers unblock within 1–10s;
+/// 2. below the 20s SHORT_RETRY_THRESHOLD so we still retry rather than
+///    entering cooldown.
+///
+/// If you see test timeouts blamed on "retry_after: None", either have the
+/// mock supply `Retry-After: 0` (realistic modern provider behaviour) or
+/// install a shorter override via a test-only hook. Don't treat 5s as a
+/// magic constant to grep for — it's a policy choice.
+const DEFAULT_RETRY_AFTER_MS: u64 = 5_000;
+
 // ── State Constants ──────────────────────────────────────────────────────────
 
 const STATE_ACTIVE: u8 = 0;
@@ -253,8 +267,10 @@ impl RateLimitCooldown {
             }
         }
 
-        // Below threshold: wait and retry
-        let delay = retry_after_ms.unwrap_or(5000);
+        // Below threshold: wait and retry. When the provider omitted the
+        // `Retry-After` header we fall back to [`DEFAULT_RETRY_AFTER_MS`] —
+        // see the constant's doc for why 5s and when to override.
+        let delay = retry_after_ms.unwrap_or(DEFAULT_RETRY_AFTER_MS);
         RateLimitAction::WaitAndRetry { delay_ms: delay }
     }
 
@@ -905,11 +921,14 @@ mod tests {
     fn single_429_below_threshold_waits_and_retries() {
         let rl = RateLimitCooldown::new();
         let action = rl.record_429(None, false);
-        // Below consecutive threshold → WaitAndRetry with default 5000ms
-        assert!(matches!(
+        // Below consecutive threshold + no Retry-After header → WaitAndRetry
+        // falls back to DEFAULT_RETRY_AFTER_MS.
+        assert_eq!(
             action,
-            RateLimitAction::WaitAndRetry { delay_ms: 5000 }
-        ));
+            RateLimitAction::WaitAndRetry {
+                delay_ms: DEFAULT_RETRY_AFTER_MS,
+            }
+        );
     }
 
     #[test]

@@ -713,6 +713,27 @@ fn pre_filter_dynamic_with_pressure_and_cooccurrence(
 
 /// Core pre-filter implementation.
 #[allow(clippy::too_many_arguments)]
+/// Cap the query length for scoring purposes. Triggers are short keywords;
+/// nothing past the first few hundred chars of a user message moves the
+/// needle for tool selection, and scanning longer queries is super-linear
+/// (every trigger in every tool re-splits the full haystack — a 10k-char
+/// query turns one `pre_filter_dynamic` call into millions of char
+/// comparisons).
+const SCORING_QUERY_CHAR_CAP: usize = 1024;
+
+/// UTF-8-safe prefix: return `&s[..=cap]` but snapped down to a char boundary.
+/// `str::get` returns `None` inside a multibyte sequence, hence the snap.
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn pre_filter_dynamic_core(
     state: &ConversationState,
     query: &str,
@@ -728,6 +749,10 @@ fn pre_filter_dynamic_core(
         return vec![];
     }
 
+    // Truncate first — downstream callees do O(haystack_len) work per trigger
+    // per tool (~500 calls per scoring), so an un-truncated 10k-char paste
+    // would burn seconds of CPU on every turn.
+    let query: &str = truncate_at_char_boundary(query, SCORING_QUERY_CHAR_CAP);
     let query_lower = query.to_lowercase();
     let query_chars: Vec<char> = query.chars().collect();
     let query_terms = tokenize(query);
@@ -1294,15 +1319,13 @@ mod tests {
 
     #[test]
     fn pre_filter_very_long_query() {
+        // Regression guard: `pre_filter_dynamic_core` truncates via
+        // `SCORING_QUERY_CHAR_CAP` so even huge pastes (10 000+ chars) stay
+        // cheap. Before truncation this test ran ~5s because every trigger
+        // in every tool re-split the full haystack.
         let state = state_at_turn(1);
-        // 200 repeats = 1000 chars, already far beyond realistic LLM prompts
-        // and enough to exercise every large-input branch. The previous 2000
-        // repeats (10 000 chars) took ~5s because the scoring is super-linear
-        // in query length — if that is ever a real concern it deserves a
-        // dedicated perf benchmark, not an offline unit test.
-        let long_query = "read ".repeat(200);
+        let long_query = "read ".repeat(2000);
         let results = pre_filter_dynamic(&state, &long_query);
-        // Should not panic on very long queries
         for (_, score) in &results {
             assert!(*score >= 0.0 && *score <= 10.0);
         }

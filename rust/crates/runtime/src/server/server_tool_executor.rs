@@ -4839,11 +4839,13 @@ esac
     async fn github_tools_delegate_to_default_executor() {
         let (exec, _dir) = test_executor();
         // Invariant under test: github_* tools are routed to the default
-        // executor, not rejected as "server-mode-only". We pass an empty
-        // `repo` so we don't make a real GitHub round-trip — the routing
-        // decision happens before the network call.
+        // executor, not rejected as "server-mode-only". We OMIT `repo`
+        // entirely so `github_list_prs` short-circuits via the
+        // `GITHUB_MISSING_REPO_ERROR` path before any network call —
+        // `Some("")` still triggers `github_resolve_repo` which hits the
+        // real API and adds ~500ms of flake-inducing latency.
         let result = exec
-            .execute_with_metadata("github_list_prs", &json!({"repo": ""}))
+            .execute_with_metadata("github_list_prs", &json!({}))
             .await;
         assert!(
             !result

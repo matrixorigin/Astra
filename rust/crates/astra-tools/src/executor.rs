@@ -581,12 +581,13 @@ mod tests {
     #[tokio::test]
     async fn dispatch_bash_timeout_keeps_partial_output() {
         let (_tmp, exec) = test_executor();
-        // `exec sleep` replaces bash so SIGKILL frees the stdout pipe
-        // immediately; see the equivalent note in shell_ops.rs.
+        // Regression guard: pipe-leak via orphaned `sleep` would stall this
+        // test for the full 5s. `kill_process_group` (in shell_ops) kills
+        // the whole group on timeout.
         let result = exec
             .execute(
                 "bash",
-                &serde_json::json!({"command": "echo start; exec sleep 5; echo done", "timeout": 0.2}),
+                &serde_json::json!({"command": "echo start; sleep 5; echo done", "timeout": 0.2}),
             )
             .await;
         assert!(result.is_error);
