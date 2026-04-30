@@ -1,0 +1,30 @@
+name: spawn_agent_hello
+description: |
+  Verify the model picks up the `spawn_agent` tool for a task that
+  clearly benefits from delegation, and that it surfaces the
+  sub-agent result in its final answer. This is the canonical
+  orchestration smoke test.
+prompt: |
+  You have a `spawn_agent` tool available. Spawn a sub-agent and
+  ask it to reply with exactly "hello from child". Then report
+  the sub-agent's exact reply verbatim in your final answer,
+  prefixed with "CHILD:".
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: spawn_agent
+  - type: tools_count_between
+    min: 1
+    max: 6
+  - type: text_contains
+    needle: "CHILD:"
+  - type: judger
+    question: |
+      Did the agent correctly delegate via spawn_agent and surface
+      the child's reply in its final answer? A correct response
+      spawns a child, receives its reply, and includes that reply
+      (prefixed "CHILD:") in the final text. Partial credit if it
+      spawned but didn't surface the reply.
+    threshold: 0.7

@@ -529,6 +529,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "astra-test-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "clap",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "astra-text-utils"
 version = "0.1.0"
 dependencies = [

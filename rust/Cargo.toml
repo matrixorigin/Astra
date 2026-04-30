@@ -23,6 +23,7 @@ members = [
     "crates/astra-evolution",
     "crates/astra-learning",
     "crates/astra-sync-adapters",
+    "crates/astra-test-harness",
 ]
 resolver = "2"
 

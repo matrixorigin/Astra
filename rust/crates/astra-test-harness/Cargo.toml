@@ -1,0 +1,26 @@
+[package]
+name = "astra-test-harness"
+version.workspace = true
+edition.workspace = true
+description = "CLI test framework for astra — runs YAML cases × model list, captures session state, scores with agent judger."
+
+[[bin]]
+name = "astra-test"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "fs", "time", "io-util"] }
+anyhow = "1"
+async-trait = { workspace = true }
+regex = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

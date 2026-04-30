@@ -1,0 +1,14 @@
+name: hello_text_contains
+description: |
+  Smoke case — send the model a trivial prompt and assert that the
+  reply mentions the magic phrase. No tool calls expected. Used to
+  verify the harness end-to-end before richer cases.
+prompt: |
+  Please reply with a single short sentence that contains the word
+  "astra-harness-ok" verbatim. Do not use any tools.
+timeout_seconds: 60
+criteria:
+  - type: exit_code
+    code: 0
+  - type: text_contains
+    needle: astra-harness-ok
