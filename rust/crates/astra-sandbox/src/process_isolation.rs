@@ -504,6 +504,10 @@ pub async fn execute_isolated(
             timed_out = true;
             let _ = child.kill().await;
             let _ = child.wait().await;
+            // Abort I/O reader tasks immediately — grandchild processes may
+            // still hold the pipes open (e.g. `sleep` surviving shell kill).
+            stdout_task.abort();
+            stderr_task.abort();
             break;
         }
 
@@ -516,6 +520,7 @@ pub async fn execute_isolated(
 
     let _ = stdout_task.await;
     let _ = stderr_task.await;
+    // Drain any remaining buffered chunks from before the abort/completion.
     drain_stream_chunks(
         &mut rx,
         &mut stdout_bytes,
