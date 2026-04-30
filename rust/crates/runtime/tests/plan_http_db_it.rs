@@ -208,7 +208,9 @@ async fn seed_plan_with_subtasks(app: &Router, goal: &str, subtasks: &[&str]) ->
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn post_plans_creates_row_owned_by_authenticated_user() {
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
 
     let goal = format!("http-create-{}", Uuid::new_v4().simple());
     let (status, body) =
@@ -235,7 +237,9 @@ async fn post_plans_creates_row_owned_by_authenticated_user() {
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn get_plan_invalid_id_returns_400_not_500() {
-    let Some((app, _pool)) = setup_app().await else { return; };
+    let Some((app, _pool)) = setup_app().await else {
+        return;
+    };
     let (status, body) = request_json(app, "GET", "/plans/..%2Fetc%2Fpasswd", None).await;
     // Path traversal in plan_id must be rejected by validate_plan_id → 400.
     assert!(
@@ -247,7 +251,9 @@ async fn get_plan_invalid_id_returns_400_not_500() {
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn get_plan_unknown_id_returns_404() {
-    let Some((app, _pool)) = setup_app().await else { return; };
+    let Some((app, _pool)) = setup_app().await else {
+        return;
+    };
     let (status, _) = request_json(app, "GET", "/plans/doesnotexist-xyz", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
@@ -255,7 +261,9 @@ async fn get_plan_unknown_id_returns_404() {
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn put_plan_with_stale_expected_version_returns_409() {
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
     let (plan_id, version) = seed_plan_with_subtasks(&app, "http-ver-conflict", &["a", "b"]).await;
 
     // First edit with the correct version → 200.
@@ -292,7 +300,9 @@ async fn put_plan_with_stale_expected_version_returns_409() {
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn rewind_resets_suffix_and_records_timeline_event() {
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-rewind", &["a", "b", "c"]).await;
 
     // Mark all three as completed so rewind from 2 resets b+c.
@@ -363,7 +373,9 @@ async fn rewind_resets_suffix_and_records_timeline_event() {
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn redo_step_resets_single_subtask_only() {
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-redo", &["a", "b"]).await;
 
     // Mark a + b as completed.
@@ -411,7 +423,9 @@ async fn redo_step_resets_single_subtask_only() {
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn start_and_finish_step_run_round_trips_through_plan_step_runs_table() {
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-runs", &["s1", "s2"]).await;
 
     let session_id = format!("sit-http-{}", Uuid::new_v4().simple());
@@ -494,7 +508,9 @@ async fn start_and_finish_step_run_round_trips_through_plan_step_runs_table() {
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn execute_pins_active_plan_id_on_session() {
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
     let (plan_id, v0) = seed_plan_with_subtasks(&app, "http-exec", &["s1"]).await;
     let session_id = format!("sit-exec-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
@@ -541,7 +557,9 @@ async fn execute_pins_active_plan_id_on_session() {
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn delete_plan_clears_active_plan_id_on_any_session() {
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-del", &["s1"]).await;
     let session_id = format!("sit-del-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
@@ -585,7 +603,9 @@ async fn post_completed_step_run_persists_finalized_row_in_one_call() {
     // round-trips; the one-shot `POST /plans/{id}/step-runs/completed` must
     // create the row already finalized (status set, finished_at populated)
     // in a single request.
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
     let (plan_id, _) = seed_plan_with_subtasks(&app, "cli-oneshot", &["s1"]).await;
     let session_id = format!("sit-oneshot-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
@@ -640,7 +660,9 @@ async fn post_completed_step_run_rejects_in_progress_status() {
     // The one-shot endpoint is for terminal states only — an attempt that
     // ended in_progress shouldn't exist. The handler must 400 so callers
     // route that case through POST /step-runs instead.
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
     let (plan_id, _) = seed_plan_with_subtasks(&app, "cli-oneshot-bad", &["s1"]).await;
     let session_id = format!("sit-oneshot-bad-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
@@ -674,7 +696,9 @@ async fn end_to_end_thin_client_posts_step_run_pair_and_persists_row() {
     // it uses the real `ThinClient` against a real HTTP server to post a
     // step-run start + finish pair, and verifies the DB row has all the
     // trace fields populated correctly.
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
     let (plan_id, _) = seed_plan_with_subtasks(&app, "cli-e2e-step-run", &["s1"]).await;
     let session_id = format!("sit-cli-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
@@ -770,7 +794,9 @@ async fn exit_plan_mode_approved_clears_session_active_plan_id() {
     // because the guard reads active_plan_id. The server-tool path
     // (`tool_exit_plan_mode`) clears active_plan_id on approve; the REST
     // handler must mirror that for web-agent parity.
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-exit-clears", &["s1"]).await;
     let session_id = format!("sit-exit-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
@@ -831,7 +857,9 @@ async fn exit_plan_mode_approved_clears_session_active_plan_id() {
 async fn exit_plan_mode_rejected_leaves_active_plan_id_pinned() {
     // Control: rejecting keeps the plan pinned so the next authoring pass
     // still benefits from the write guard.
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-exit-keeps", &["s1"]).await;
     let session_id = format!("sit-reject-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
@@ -875,7 +903,9 @@ async fn exit_plan_mode_rejected_leaves_active_plan_id_pinned() {
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn exit_plan_mode_records_lifecycle_decision() {
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-exit", &["s1"]).await;
 
     let (_, get_body) = request_json(app.clone(), "GET", &format!("/plans/{plan_id}"), None).await;
@@ -920,7 +950,9 @@ async fn exit_plan_mode_records_lifecycle_decision() {
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn start_step_run_rejects_attempt_out_of_range() {
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-attempt-range", &["s1"]).await;
     let session_id = format!("sit-attempt-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
@@ -960,7 +992,9 @@ async fn start_step_run_rejects_attempt_out_of_range() {
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn post_completed_step_run_rejects_attempt_out_of_range() {
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-cattempt", &["s1"]).await;
     let session_id = format!("sit-cattempt-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
@@ -995,7 +1029,9 @@ async fn post_completed_step_run_rejects_attempt_out_of_range() {
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn rewind_rejects_oversized_reason_string() {
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-rewind-big", &["a", "b"]).await;
 
     // 20k > the 5k cap we'll install.
@@ -1019,7 +1055,9 @@ async fn rewind_rejects_oversized_reason_string() {
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn finish_step_run_rejects_oversized_error_and_artifact_ref() {
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-finish-big", &["s1"]).await;
     let session_id = format!("sit-finish-big-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
@@ -1090,7 +1128,9 @@ async fn finish_step_run_rejects_oversized_error_and_artifact_ref() {
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn rewind_cancels_open_step_runs_for_reset_subtasks() {
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-rewind-abort", &["a", "b", "c"]).await;
     let session_id = format!("sit-rewind-abort-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
@@ -1182,7 +1222,9 @@ async fn rewind_cancels_open_step_runs_for_reset_subtasks() {
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn execute_plan_handler_rejects_empty_session_id_with_400() {
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-exec-nosess", &["s1"]).await;
 
     let (_, get_body) = request_json(app.clone(), "GET", &format!("/plans/{plan_id}"), None).await;
@@ -1226,7 +1268,9 @@ async fn execute_plan_handler_rejects_empty_session_id_with_400() {
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn start_step_run_rejects_unknown_subtask_id_with_400() {
-    let Some((app, pool)) = setup_app().await else { return; };
+    let Some((app, pool)) = setup_app().await else {
+        return;
+    };
     let (plan_id, _) = seed_plan_with_subtasks(&app, "http-run-nosub", &["s1"]).await;
     let session_id = format!("sit-nosub-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;

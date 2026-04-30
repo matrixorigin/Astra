@@ -347,10 +347,15 @@ pub(crate) async fn sleep_ms_or_llm_cancel(
 }
 
 /// Per-chunk idle watchdog (pre-progress): no SSE JSON for this long → treat as stalled.
-/// Delegate to the canonical public function in sse_stream_host.
+/// Production delegates to the canonical timeout in `sse_stream_host`; tests may
+/// override it through unit-test locals or the `bridge-e2e-hooks` integration hook.
 pub(crate) fn stream_idle_timeout() -> std::time::Duration {
     #[cfg(test)]
     if let Some(d) = TEST_STREAM_IDLE_TIMEOUT.with(|c| *c.borrow()) {
+        return d;
+    }
+    #[cfg(feature = "bridge-e2e-hooks")]
+    if let Some(d) = bridge_e2e_stream_idle_timeout_override() {
         return d;
     }
     astra_turn_core::sse_stream_host::stream_idle_timeout()
@@ -358,12 +363,89 @@ pub(crate) fn stream_idle_timeout() -> std::time::Duration {
 
 /// Per-chunk idle watchdog (post-progress): once at least one SSE chunk has been
 /// received, allow a longer idle window to accommodate thinking/reasoning pauses.
+/// Production delegates to the canonical timeout in `sse_stream_host`; tests may
+/// override it through unit-test locals or the `bridge-e2e-hooks` integration hook.
 pub(crate) fn stream_idle_timeout_after_progress() -> std::time::Duration {
     #[cfg(test)]
     if let Some(d) = TEST_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS.with(|c| *c.borrow()) {
         return d;
     }
+    #[cfg(feature = "bridge-e2e-hooks")]
+    if let Some(d) = bridge_e2e_stream_idle_timeout_after_progress_override() {
+        return d;
+    }
     astra_turn_core::sse_stream_host::stream_idle_timeout_after_progress()
+}
+
+#[cfg(feature = "bridge-e2e-hooks")]
+static BRIDGE_E2E_STREAM_IDLE_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "bridge-e2e-hooks")]
+static BRIDGE_E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "bridge-e2e-hooks")]
+pub(crate) struct BridgeE2eStreamIdleTimeoutGuard {
+    prev_pre_ms: u64,
+    prev_post_ms: u64,
+}
+
+#[cfg(feature = "bridge-e2e-hooks")]
+impl Drop for BridgeE2eStreamIdleTimeoutGuard {
+    fn drop(&mut self) {
+        restore_bridge_e2e_stream_idle_timeouts_for_test(self.prev_pre_ms, self.prev_post_ms);
+    }
+}
+
+#[cfg(feature = "bridge-e2e-hooks")]
+fn duration_override(ms: u64) -> Option<std::time::Duration> {
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
+#[cfg(feature = "bridge-e2e-hooks")]
+fn bridge_e2e_stream_idle_timeout_override() -> Option<std::time::Duration> {
+    duration_override(BRIDGE_E2E_STREAM_IDLE_TIMEOUT_MS.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+#[cfg(feature = "bridge-e2e-hooks")]
+fn bridge_e2e_stream_idle_timeout_after_progress_override() -> Option<std::time::Duration> {
+    duration_override(
+        BRIDGE_E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS.load(std::sync::atomic::Ordering::SeqCst),
+    )
+}
+
+#[cfg(feature = "bridge-e2e-hooks")]
+pub(crate) fn set_bridge_e2e_stream_idle_timeouts_for_test(
+    pre_ms: u64,
+    post_ms: u64,
+) -> BridgeE2eStreamIdleTimeoutGuard {
+    assert!(pre_ms > 0, "pre-progress idle timeout must be positive");
+    assert!(post_ms > 0, "post-progress idle timeout must be positive");
+    let prev_pre_ms =
+        BRIDGE_E2E_STREAM_IDLE_TIMEOUT_MS.swap(pre_ms, std::sync::atomic::Ordering::SeqCst);
+    let prev_post_ms = BRIDGE_E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS
+        .swap(post_ms, std::sync::atomic::Ordering::SeqCst);
+    BridgeE2eStreamIdleTimeoutGuard {
+        prev_pre_ms,
+        prev_post_ms,
+    }
+}
+
+#[cfg(feature = "bridge-e2e-hooks")]
+pub(crate) fn restore_bridge_e2e_stream_idle_timeouts_for_test(pre_ms: u64, post_ms: u64) {
+    BRIDGE_E2E_STREAM_IDLE_TIMEOUT_MS.store(pre_ms, std::sync::atomic::Ordering::SeqCst);
+    BRIDGE_E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS
+        .store(post_ms, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(feature = "bridge-e2e-hooks")]
+pub(crate) fn current_bridge_e2e_stream_idle_timeouts_for_test()
+-> (Option<std::time::Duration>, Option<std::time::Duration>) {
+    (
+        bridge_e2e_stream_idle_timeout_override(),
+        bridge_e2e_stream_idle_timeout_after_progress_override(),
+    )
 }
 
 #[cfg(test)]
@@ -2462,6 +2544,17 @@ mod tests {
             }
         }
         Guard
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[test]
+    fn bridge_e2e_stream_idle_timeout_override_is_visible_to_runtime_paths() {
+        let _guard = set_bridge_e2e_stream_idle_timeouts_for_test(123, 456);
+        assert_eq!(stream_idle_timeout(), std::time::Duration::from_millis(123));
+        assert_eq!(
+            stream_idle_timeout_after_progress(),
+            std::time::Duration::from_millis(456)
+        );
     }
 
     #[tokio::test]

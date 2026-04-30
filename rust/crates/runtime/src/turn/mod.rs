@@ -47,6 +47,32 @@ pub mod token_usage;
 pub(crate) mod tool_side_effects;
 pub mod turn_trace_collector;
 
+#[cfg(feature = "bridge-e2e-hooks")]
+pub mod stream_idle_test_hooks {
+    pub struct StreamIdleTimeoutGuard {
+        inner: Option<super::llm_client::BridgeE2eStreamIdleTimeoutGuard>,
+    }
+
+    impl Drop for StreamIdleTimeoutGuard {
+        fn drop(&mut self) {
+            let _ = self.inner.take();
+        }
+    }
+
+    pub fn set_stream_idle_timeouts_for_test(pre_ms: u64, post_ms: u64) -> StreamIdleTimeoutGuard {
+        StreamIdleTimeoutGuard {
+            inner: Some(
+                super::llm_client::set_bridge_e2e_stream_idle_timeouts_for_test(pre_ms, post_ms),
+            ),
+        }
+    }
+
+    pub fn current_stream_idle_timeouts_for_test()
+    -> (Option<std::time::Duration>, Option<std::time::Duration>) {
+        super::llm_client::current_bridge_e2e_stream_idle_timeouts_for_test()
+    }
+}
+
 // Re-export from astra-turn-core for public API compatibility
 pub use astra_turn_core::{
     agentic_prepare_payload, agentic_recursion_guard, agentic_turn_telemetry, boost_domain_hints,

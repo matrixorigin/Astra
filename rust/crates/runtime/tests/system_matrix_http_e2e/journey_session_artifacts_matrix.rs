@@ -142,13 +142,22 @@ struct RawTransportServerHits {
     nonstream_hits: Arc<AtomicU32>,
 }
 
-/// Stream idle timeout override was previously env-controlled; now hardcoded. This is a
-/// no-op placeholder so test call sites keep compiling. Callers should expect full-length
-/// timeouts (5 minutes) — the tests that used short overrides may take longer.
-struct StreamIdleEnvGuard;
+type StreamIdleEnvGuard = astra_runtime::turn::stream_idle_test_hooks::StreamIdleTimeoutGuard;
 
-fn set_stream_idle_timeouts_for_test(_pre_ms: u64, _post_ms: u64) -> StreamIdleEnvGuard {
-    StreamIdleEnvGuard
+fn set_stream_idle_timeouts_for_test(pre_ms: u64, post_ms: u64) -> StreamIdleEnvGuard {
+    astra_runtime::turn::stream_idle_test_hooks::set_stream_idle_timeouts_for_test(pre_ms, post_ms)
+}
+
+#[test]
+fn stream_idle_timeout_guard_sets_runtime_override_for_integration_tests() {
+    let _guard = set_stream_idle_timeouts_for_test(123, 456);
+    assert_eq!(
+        astra_runtime::turn::stream_idle_test_hooks::current_stream_idle_timeouts_for_test(),
+        (
+            Some(std::time::Duration::from_millis(123)),
+            Some(std::time::Duration::from_millis(456))
+        )
+    );
 }
 
 /// Asserts the number of non-stream fallback hits falls inside `min..=max`.
@@ -3350,6 +3359,146 @@ pub async fn run_bridge_client_disconnect_session_artifact_latest_and_download_r
     );
 
     assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
+
+    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
+        .bind(&model_name)
+        .execute(pool)
+        .await;
+    cleanup_session_data(pool, &session_id).await;
+    ctx.pool.close().await;
+}
+
+pub async fn run_bridge_idle_failure_session_artifact_latest_and_download_routes() {
+    let _idle_env = set_stream_idle_timeouts_for_test(250, 250);
+    let partial_text = "bridge idle partial";
+    let (base_url, hits) = spawn_raw_idle_after_progress_server(
+        partial_text,
+        std::time::Duration::from_secs(2),
+        500,
+        r#"{"error":{"message":"fallback idle recovery failed"}}"#,
+    )
+    .await;
+
+    let b = bootstrap().await;
+    let ctx = &b.ctx;
+    let app = &ctx.app;
+    let auth = &b.auth_header;
+    let pool = &ctx.pool;
+    let model_name = format!("bridge-idle-{}", ctx.suffix);
+
+    let (st_model, model_j) = post_json(
+        app,
+        "/models",
+        Some(auth.as_str()),
+        json!({
+            "name": model_name,
+            "provider": "openai",
+            "api_key": "idle-e2e-key",
+            "base_url": base_url
+        }),
+    )
+    .await;
+    assert_eq!(st_model, StatusCode::CREATED, "create model: {model_j}");
+    sqlx::query("UPDATE infra_llm_models SET is_active = 1 WHERE model_name = ?")
+        .bind(&model_name)
+        .execute(pool)
+        .await
+        .expect("force-activate idle test model");
+    hits.nonstream_hits.store(1, Ordering::SeqCst);
+
+    let (st_sess, sess) = post_json(
+        app,
+        "/sessions",
+        Some(auth.as_str()),
+        json!({
+            "title": "bridge idle failed latest download",
+            "metadata": { "full_llm_capture": true, "suite": "bridge_idle_failed_latest_download" }
+        }),
+    )
+    .await;
+    assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
+    let session_id = sess["session_id"].as_str().expect("session_id").to_string();
+
+    let payload = json!({
+        "agent_id": "system-matrix-bridge-idle-artifact",
+        "session_id": &session_id,
+        "model": model_name,
+        "messages": [{ "role": "user", "content": "trigger a bridge idle failure after partial output" }]
+    });
+    let (status, body) = chat_turn_full(app, auth, payload).await;
+    assert_eq!(status, StatusCode::OK, "chat/turn: {body}");
+    assert!(
+        body.contains(partial_text),
+        "bridge SSE should include the partial streamed text before idle failure: {body}"
+    );
+    assert!(
+        body.contains("\"code\":\"stream_idle\""),
+        "bridge SSE should expose the idle failure code: {body}"
+    );
+    assert!(
+        !body.contains("\"type\":\"turn_complete\""),
+        "idle failure should not emit turn_complete after terminal error: {body}"
+    );
+
+    wait_for_artifact_count(
+        pool,
+        &session_id,
+        "llm_capture",
+        1,
+        std::time::Duration::from_secs(15),
+    )
+    .await;
+
+    let row = sqlx::query(
+        "SELECT artifact_id \
+         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
+         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    )
+    .bind(&session_id)
+    .fetch_one(pool)
+    .await
+    .expect("latest bridge idle llm_capture row");
+    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+
+    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
+    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
+    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
+    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
+    assert_eq!(
+        latest_j["content"]["response"]["kind"].as_str(),
+        Some("stream_idle")
+    );
+    assert_eq!(
+        latest_j["content"]["response"]["partial_full_text"].as_str(),
+        Some(partial_text)
+    );
+
+    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
+    let (st_download, _download_headers, download_body) =
+        get_bytes(app, &download_path, Some(auth), &[]).await;
+    assert_eq!(st_download, StatusCode::OK, "artifact download");
+    let download_j: serde_json::Value =
+        serde_json::from_slice(&download_body).expect("download json");
+    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
+    assert_eq!(
+        download_j["content"]["response"]["kind"].as_str(),
+        Some("stream_idle")
+    );
+    assert_eq!(
+        download_j["content"]["response"]["partial_full_text"].as_str(),
+        Some(partial_text)
+    );
+
+    assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        hits.nonstream_hits.load(Ordering::SeqCst),
+        2,
+        "expected one model-connectivity probe and one fallback request"
+    );
 
     let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
         .bind(&session_id)

@@ -3275,17 +3275,15 @@ mod tests {
         // The captured artifact must present the canonical schema that the SSE
         // path produces, so downstream consumers see one shape across success
         // and failure.
-        let error = astra_core::ClassifiedError::new(
-            astra_core::ErrorKind::StreamTransport,
-            "boom",
-        )
-        .with_details_json(
-            json!({
-                "partial_full_text": "half",
-                "usage": { "prompt_tokens": 17, "completion_tokens": 3 }
-            })
-            .to_string(),
-        );
+        let error =
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, "boom")
+                .with_details_json(
+                    json!({
+                        "partial_full_text": "half",
+                        "usage": { "prompt_tokens": 17, "completion_tokens": 3 }
+                    })
+                    .to_string(),
+                );
         let response = llm_capture_error_response(&error);
         assert_eq!(response["usage"]["input_tokens"].as_i64(), Some(17));
         assert_eq!(response["usage"]["output_tokens"].as_i64(), Some(3));
@@ -3300,22 +3298,20 @@ mod tests {
         // When details already speak the canonical dialect we must not touch
         // them — double-normalization would zero out fields the OpenAI
         // extractor doesn't know (`cached_input_tokens`, `cache_creation_tokens`).
-        let error = astra_core::ClassifiedError::new(
-            astra_core::ErrorKind::StreamTransport,
-            "boom",
-        )
-        .with_details_json(
-            json!({
-                "usage": {
-                    "input_tokens": 11,
-                    "cached_input_tokens": 2,
-                    "cache_creation_tokens": 1,
-                    "output_tokens": 4,
-                    "total_tokens": 18
-                }
-            })
-            .to_string(),
-        );
+        let error =
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, "boom")
+                .with_details_json(
+                    json!({
+                        "usage": {
+                            "input_tokens": 11,
+                            "cached_input_tokens": 2,
+                            "cache_creation_tokens": 1,
+                            "output_tokens": 4,
+                            "total_tokens": 18
+                        }
+                    })
+                    .to_string(),
+                );
         let response = llm_capture_error_response(&error);
         assert_eq!(response["usage"]["input_tokens"].as_i64(), Some(11));
         assert_eq!(response["usage"]["cached_input_tokens"].as_i64(), Some(2));
@@ -3328,16 +3324,14 @@ mod tests {
         // If we cannot identify the dialect, preserve raw keys — dropping
         // fields silently is worse than asking downstream code to
         // defensively parse.
-        let error = astra_core::ClassifiedError::new(
-            astra_core::ErrorKind::StreamTransport,
-            "boom",
-        )
-        .with_details_json(
-            json!({
-                "usage": { "tokens_in": 7, "tokens_out": 2 }
-            })
-            .to_string(),
-        );
+        let error =
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, "boom")
+                .with_details_json(
+                    json!({
+                        "usage": { "tokens_in": 7, "tokens_out": 2 }
+                    })
+                    .to_string(),
+                );
         let response = llm_capture_error_response(&error);
         assert_eq!(response["usage"]["tokens_in"].as_i64(), Some(7));
         assert_eq!(response["usage"]["tokens_out"].as_i64(), Some(2));

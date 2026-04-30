@@ -503,28 +503,14 @@ async fn e2e_matrix_bridge_client_disconnect_session_artifact_latest_and_downloa
         .await;
 }
 
-// Removed: `e2e_matrix_bridge_idle_failure_session_artifact_latest_and_download`.
-//
-// The test was designed to drive the bridge through an IDLE path
-// (stream stalls → nonstream fallback → fallback also fails → `stream_idle`
-// error code + artifact). It relied on `set_stream_idle_timeouts_for_test`
-// shortening the idle watchdog from the production default to 250 ms so the
-// mock server's 2-second socket shutdown would trip it.
-//
-// That helper became a no-op (see `journey_session_artifacts_matrix.rs`):
-// the idle timeout is hardcoded to 5 minutes across
-// `astra_turn_core::sse_stream_host::{stream_idle_timeout,
-// stream_idle_timeout_after_progress}`. With no override hook reachable from
-// integration tests, the mock's 2s close always surfaces as a transport
-// error long before any idle path could fire — so the test stopped exercising
-// what its name promised. Keeping it (with assertions adjusted to match the
-// transport path) would duplicate coverage already provided by
-// `e2e_matrix_bridge_transport_failure_session_artifact_latest_and_download`
-// and leave the suite lying about what it verifies.
-//
-// Follow-up needed: re-expose the idle timeout as a config/env hook so an
-// integration test can genuinely drive the idle path, then restore this
-// test. Tracked in: <TODO: open issue referencing this PR>.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
+async fn e2e_matrix_bridge_idle_failure_session_artifact_latest_and_download() {
+    require_system_e2e_env();
+    journey_session_artifacts_matrix::run_bridge_idle_failure_session_artifact_latest_and_download_routes()
+        .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
 async fn e2e_matrix_bridge_rate_limit_failure_session_artifact_latest_and_download() {

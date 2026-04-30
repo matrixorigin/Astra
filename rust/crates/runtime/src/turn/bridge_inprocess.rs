@@ -4,7 +4,7 @@
 ///
 /// | Behavior | Implementation |
 /// |------------------------|------|
-/// | Long-lived stream "stall" / no chunks | [`super::llm_client::stream_idle_timeout`] on SSE `next()` (5 min default, `ASTRA_STREAM_IDLE_TIMEOUT_MS`) |
+/// | Long-lived stream "stall" / no chunks | [`super::llm_client::stream_idle_timeout`] on SSE `next()` (5 min default; shortened only by the `bridge-e2e-hooks` test hook) |
 /// | Recover via one-shot completion | [`super::llm_client::call_llm_nonstream_fallback`] after idle in both `call_llm_and_collect` and [`call_llm_stream`] below |
 /// | User cancel clears in-flight work | HTTP `/chat/turn` passes `CancellationToken`; dropping the SSE body (client disconnect) cancels in-flight LLM byte/SSE consumption in-process |
 /// | Cooldown / 429 wait cannot ignore disconnect | [`super::llm_client::sleep_ms_or_llm_cancel`] on retry backoff + rate-limit waits in [`call_llm_stream`]; initial cooldown wait `select!`s [`wait_until_cancelled_or_pending`](super::llm_client::wait_until_cancelled_or_pending) in the bridge stream |
