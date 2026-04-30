@@ -30,8 +30,24 @@ pub(crate) fn render_sse_map(event: &Map<String, Value>) -> Bytes {
 }
 
 /// Emit a `reasoning_done` SSE event if reasoning text is non-empty.
-pub(crate) fn reasoning_done_sse_bytes_if_needed(reasoning: &str) -> Option<Bytes> {
-    (!reasoning.is_empty()).then(|| render_sse(&json!({"type": "reasoning_done"})))
+///
+/// For Bedrock thinking mode, `signature` must travel with the reasoning back
+/// to the provider on the next turn. We attach it here (non-empty only) so CLI
+/// hosts can capture it via [`chat_turn_sse_dispatch`] and replay it in
+/// subsequent assistant messages. Without this, Bedrock returns
+/// `messages.N.content.0.thinking.signature: Field required` on multi-turn
+/// tool-call continuations.
+pub(crate) fn reasoning_done_sse_bytes_if_needed(
+    reasoning: &str,
+    signature: &str,
+) -> Option<Bytes> {
+    (!reasoning.is_empty()).then(|| {
+        let mut event = json!({"type": "reasoning_done"});
+        if !signature.is_empty() {
+            event["signature"] = Value::String(signature.to_string());
+        }
+        render_sse(&event)
+    })
 }
 
 /// Maps one parsed JSON event from the in-process LLM SSE stream to bytes forwarded
@@ -222,14 +238,37 @@ mod tests {
 
     #[test]
     fn reasoning_done_none_when_empty() {
-        assert!(reasoning_done_sse_bytes_if_needed("").is_none());
+        assert!(reasoning_done_sse_bytes_if_needed("", "").is_none());
+        assert!(
+            reasoning_done_sse_bytes_if_needed("", "sig_ignored").is_none(),
+            "no reasoning => no event even if signature is present"
+        );
     }
 
     #[test]
     fn reasoning_done_some_when_nonempty() {
-        let bytes = reasoning_done_sse_bytes_if_needed("thinking...").unwrap();
+        let bytes = reasoning_done_sse_bytes_if_needed("thinking...", "").unwrap();
         let s = std::str::from_utf8(&bytes).unwrap();
         assert!(s.contains("reasoning_done"));
+        assert!(
+            !s.contains("signature"),
+            "empty signature must not appear in event body: {s}"
+        );
+    }
+
+    // Guards PR #284 follow-up regression: Bedrock thinking-mode multi-turn
+    // tool calls fail with HTTP 400 `messages.N.content.0.thinking.signature:
+    // Field required` unless the reasoning signature survives the SSE hop
+    // from bridge to CLI and gets replayed on the next assistant message.
+    #[test]
+    fn reasoning_done_carries_signature_when_present() {
+        let bytes = reasoning_done_sse_bytes_if_needed("thinking...", "abc123sig").unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(s.contains("\"type\":\"reasoning_done\""));
+        assert!(
+            s.contains("\"signature\":\"abc123sig\""),
+            "signature must be embedded in reasoning_done: {s}"
+        );
     }
 
     #[test]

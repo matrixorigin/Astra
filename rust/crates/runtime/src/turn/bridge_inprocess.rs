@@ -2549,7 +2549,10 @@ impl InProcessChatTurnBridge {
                 }
                 if !loop_reasoning.is_empty() {
                     reasoning.push_str(&loop_reasoning);
-                    if let Some(done) = reasoning_done_sse_bytes_if_needed(&loop_reasoning) {
+                    if let Some(done) = reasoning_done_sse_bytes_if_needed(
+                        &loop_reasoning,
+                        &loop_reasoning_signature,
+                    ) {
                         yield done;
                     }
                 }

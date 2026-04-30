@@ -217,6 +217,17 @@ fn apply_one_event(
             }
         }
         "thinking_done" | "reasoning_done" => {
+            // Bedrock thinking mode attaches a `signature` that must round-trip
+            // to the provider on the next turn inside the assistant message's
+            // `reasoningContent` block. Without it, Bedrock rejects with HTTP
+            // 400 `messages.N.content.0.thinking.signature: Field required`.
+            // Capture here so downstream multi-turn tool-call continuations
+            // (headless + delegate paths) can replay it.
+            if let Some(sig) = event.get("signature").and_then(|v| v.as_str())
+                && !sig.is_empty()
+            {
+                accum.reasoning_signature.push_str(sig);
+            }
             effects.push(SseRenderEffect::StopThinkingSpinner);
         }
         "tool_call_start" => {
@@ -533,6 +544,106 @@ mod tests {
         let efx = dispatch_chat_turn_sse_event_block(&block, &mut a, &mut vec![]);
         assert_eq!(a.full_text, "hello world");
         assert!(!efx.is_empty());
+    }
+
+    /// Regression for Bedrock thinking-mode multi-turn:
+    /// Bedrock returns `messages.N.content.0.thinking.signature: Field required`
+    /// HTTP 400 on turn-2 if the provider signature from turn-1 is not replayed
+    /// inside the assistant `reasoningContent` block. The signature hops
+    /// bridge→CLI on the `reasoning_done` SSE event; this test pins the
+    /// accumulator wire contract so regressions surface as a red unit test
+    /// before they reach Bedrock.
+    #[test]
+    fn reasoning_done_captures_signature_into_accum() {
+        let mut a = ChatTurnSseAccum::default();
+        let block = format!(
+            "{}{}",
+            sse("reasoning_delta", ",\"content\":\"let me think\""),
+            sse("reasoning_done", ",\"signature\":\"sig_abc123\""),
+        );
+        dispatch_chat_turn_sse_event_block(&block, &mut a, &mut vec![]);
+        assert_eq!(a.reasoning_content, "let me think");
+        assert_eq!(
+            a.reasoning_signature, "sig_abc123",
+            "signature from reasoning_done must land in accum so it can round-trip to Bedrock"
+        );
+    }
+
+    #[test]
+    fn reasoning_done_without_signature_leaves_accum_empty() {
+        let mut a = ChatTurnSseAccum::default();
+        let block = sse("reasoning_done", "");
+        dispatch_chat_turn_sse_event_block(&block, &mut a, &mut vec![]);
+        assert!(a.reasoning_signature.is_empty());
+    }
+
+    /// Cross-module wire contract: Bedrock thinking-mode tool-call multi-turn.
+    ///
+    /// This is the integration point that fell through the cracks in PR #284:
+    /// the signature captured on the bridge-side `LlmCallResult` must travel
+    /// through the SSE boundary to CLI's `ChatTurnSseAccum`, and then be
+    /// round-tripped into the *next* assistant message so the subsequent
+    /// Bedrock body carries `reasoningContent.reasoningText.signature`.
+    ///
+    /// If either leg breaks, Bedrock responds with HTTP 400
+    /// `messages.N.content.0.thinking.signature: Field required`. This test
+    /// exercises the full seam so unit-level green lights can't mask the
+    /// regression again.
+    #[test]
+    fn signature_round_trips_from_sse_into_next_assistant_message() {
+        use crate::headless_tool_assembly::{
+            EdgeToolRoundRow, openai_assistant_with_tool_calls_message_ext,
+        };
+
+        struct Row;
+        impl EdgeToolRoundRow for Row {
+            fn tool_name(&self) -> &str {
+                "noop"
+            }
+            fn tool_args(&self) -> &Value {
+                static NULL: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+                NULL.get_or_init(|| Value::Null)
+            }
+            fn tool_output(&self) -> &str {
+                ""
+            }
+            fn tool_duration_ms(&self) -> u64 {
+                0
+            }
+        }
+
+        let mut accum = ChatTurnSseAccum::default();
+        let stream = format!(
+            "{}{}{}",
+            sse("reasoning_delta", ",\"content\":\"thinking...\""),
+            sse("reasoning_done", ",\"signature\":\"sig_realish_base64\""),
+            sse(
+                "tool_call",
+                ",\"call_id\":\"tc-1\",\"tool\":\"noop\",\"arguments\":{}"
+            ),
+        );
+        dispatch_chat_turn_sse_event_block(&stream, &mut accum, &mut vec![]);
+
+        assert_eq!(accum.reasoning_signature, "sig_realish_base64");
+
+        let server_tool_calls = vec![serde_json::json!({
+            "id": "tc-1",
+            "type": "function",
+            "function": {"name": "noop", "arguments": "{}"}
+        })];
+        let msg = openai_assistant_with_tool_calls_message_ext::<Row>(
+            &server_tool_calls,
+            &[],
+            &accum.reasoning_content,
+            &accum.reasoning_signature,
+            true,
+        );
+        assert_eq!(
+            msg["reasoning_signature"].as_str(),
+            Some("sig_realish_base64"),
+            "signature must flow: bridge SSE → dispatch accum → next assistant message"
+        );
+        assert_eq!(msg["reasoning_content"].as_str(), Some("thinking..."));
     }
 
     #[test]
