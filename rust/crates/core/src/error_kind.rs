@@ -665,7 +665,10 @@ mod tests {
     fn classify_tool_output_cases() {
         let cases: &[(&str, ErrorKind)] = &[
             // ResourceLimit
-            ("fork: Resource temporarily unavailable", ErrorKind::ResourceLimit),
+            (
+                "fork: Resource temporarily unavailable",
+                ErrorKind::ResourceLimit,
+            ),
             ("Cannot allocate memory", ErrorKind::ResourceLimit),
             ("系统资源不足，无法完成操作", ErrorKind::ResourceLimit),
             ("内存不足", ErrorKind::ResourceLimit),
@@ -685,23 +688,42 @@ mod tests {
             ("No such file or directory", ErrorKind::ToolNotFound),
             ("ENOENT: file does not exist", ErrorKind::ToolNotFound),
             ("Is a directory", ErrorKind::ToolNotFound),
-            ("EISDIR: illegal operation on a directory", ErrorKind::ToolNotFound),
+            (
+                "EISDIR: illegal operation on a directory",
+                ErrorKind::ToolNotFound,
+            ),
             // ToolInvalidArgs
-            ("invalid argument: expected integer", ErrorKind::ToolInvalidArgs),
-            ("File has not been read yet — read it first before editing", ErrorKind::ToolInvalidArgs),
-            ("File was only partially read; read the full file before overwriting", ErrorKind::ToolInvalidArgs),
-            ("Error: file is too large (97716 bytes)", ErrorKind::ToolInvalidArgs),
+            (
+                "invalid argument: expected integer",
+                ErrorKind::ToolInvalidArgs,
+            ),
+            (
+                "File has not been read yet — read it first before editing",
+                ErrorKind::ToolInvalidArgs,
+            ),
+            (
+                "File was only partially read; read the full file before overwriting",
+                ErrorKind::ToolInvalidArgs,
+            ),
+            (
+                "Error: file is too large (97716 bytes)",
+                ErrorKind::ToolInvalidArgs,
+            ),
             // ToolUnavailable
             ("command not found: rg", ErrorKind::ToolUnavailable),
             ("bash: rg: command not found", ErrorKind::ToolUnavailable),
             // Unknown
-            ("something completely unexpected happened", ErrorKind::Unknown),
+            (
+                "something completely unexpected happened",
+                ErrorKind::Unknown,
+            ),
             ("", ErrorKind::Unknown),
             ("   \n\t  ", ErrorKind::Unknown),
         ];
         for &(input, expected) in cases {
             assert_eq!(
-                classify_tool_output(input), expected,
+                classify_tool_output(input),
+                expected,
                 "classify_tool_output({input:?}) should be {expected:?}"
             );
         }

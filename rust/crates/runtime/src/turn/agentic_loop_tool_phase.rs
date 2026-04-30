@@ -909,6 +909,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             tool_calls: all_tool_calls,
             edge_tool_round: edge_round_for_headless,
             reasoning_content: turn_result.accum.reasoning_content.as_str(),
+            reasoning_signature: turn_result.accum.reasoning_signature.as_str(),
             edge_callback_outputs: &edge_callback_outputs,
             messages: &mut state.messages,
             tool_results: &mut state.tool_results,

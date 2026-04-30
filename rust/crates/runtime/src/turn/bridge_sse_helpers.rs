@@ -42,6 +42,7 @@ pub(crate) fn apply_forward_llm_sse_event(
     saw_inprocess_summary: &mut bool,
     loop_text: &mut String,
     loop_reasoning: &mut String,
+    loop_reasoning_signature: &mut String,
     loop_tool_calls: &mut Vec<Value>,
     usage: &mut Map<String, Value>,
     resolved_model: &mut String,
@@ -59,6 +60,11 @@ pub(crate) fn apply_forward_llm_sse_event(
                 .to_string();
             *loop_reasoning = event
                 .get("reasoning")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            *loop_reasoning_signature = event
+                .get("reasoning_signature")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
@@ -121,6 +127,7 @@ pub(crate) fn extend_forward_from_validated_sse_block(
     saw_inprocess_summary: &mut bool,
     loop_text: &mut String,
     loop_reasoning: &mut String,
+    loop_reasoning_signature: &mut String,
     loop_tool_calls: &mut Vec<Value>,
     usage: &mut Map<String, Value>,
     resolved_model: &mut String,
@@ -133,6 +140,7 @@ pub(crate) fn extend_forward_from_validated_sse_block(
             saw_inprocess_summary,
             loop_text,
             loop_reasoning,
+            loop_reasoning_signature,
             loop_tool_calls,
             usage,
             resolved_model,
@@ -147,6 +155,7 @@ pub(crate) fn flush_tail_buf_into_llm_forward(
     saw_inprocess_summary: &mut bool,
     loop_text: &mut String,
     loop_reasoning: &mut String,
+    loop_reasoning_signature: &mut String,
     loop_tool_calls: &mut Vec<Value>,
     usage: &mut Map<String, Value>,
     resolved_model: &mut String,
@@ -162,6 +171,7 @@ pub(crate) fn flush_tail_buf_into_llm_forward(
             saw_inprocess_summary,
             loop_text,
             loop_reasoning,
+            loop_reasoning_signature,
             loop_tool_calls,
             usage,
             resolved_model,
@@ -177,6 +187,7 @@ pub(crate) fn flush_tail_buf_into_llm_forward(
             saw_inprocess_summary,
             loop_text,
             loop_reasoning,
+            loop_reasoning_signature,
             loop_tool_calls,
             usage,
             resolved_model,
@@ -234,6 +245,7 @@ mod tests {
         let mut saw = false;
         let mut text = String::new();
         let mut reasoning = String::new();
+        let mut reasoning_sig = String::new();
         let mut tool_calls = Vec::new();
         let mut usage = Map::new();
         let mut model = String::new();
@@ -242,6 +254,7 @@ mod tests {
             &mut saw,
             &mut text,
             &mut reasoning,
+            &mut reasoning_sig,
             &mut tool_calls,
             &mut usage,
             &mut model,
@@ -264,6 +277,7 @@ mod tests {
         let mut saw = false;
         let mut text = String::new();
         let mut reasoning = String::new();
+        let mut reasoning_sig = String::new();
         let mut tool_calls = Vec::new();
         let mut usage = Map::new();
         let mut model = String::new();
@@ -272,6 +286,7 @@ mod tests {
             &mut saw,
             &mut text,
             &mut reasoning,
+            &mut reasoning_sig,
             &mut tool_calls,
             &mut usage,
             &mut model,
@@ -287,6 +302,7 @@ mod tests {
         let mut saw = false;
         let mut text = String::new();
         let mut reasoning = String::new();
+        let mut reasoning_sig = String::new();
         let mut tool_calls = Vec::new();
         let mut usage = Map::new();
         let mut model = String::new();
@@ -296,6 +312,7 @@ mod tests {
             &mut saw,
             &mut text,
             &mut reasoning,
+            &mut reasoning_sig,
             &mut tool_calls,
             &mut usage,
             &mut model,
@@ -311,6 +328,7 @@ mod tests {
             &mut saw,
             &mut text,
             &mut reasoning,
+            &mut reasoning_sig,
             &mut tool_calls,
             &mut usage,
             &mut model,
@@ -321,6 +339,7 @@ mod tests {
             &mut saw,
             &mut text,
             &mut reasoning,
+            &mut reasoning_sig,
             &mut tool_calls,
             &mut usage,
             &mut model,
@@ -341,6 +360,7 @@ mod tests {
         let mut saw = false;
         let mut text = String::new();
         let mut reasoning = String::new();
+        let mut reasoning_sig = String::new();
         let mut tool_calls = Vec::new();
         let mut usage = Map::new();
         let mut model = String::new();
@@ -349,6 +369,7 @@ mod tests {
             &mut saw,
             &mut text,
             &mut reasoning,
+            &mut reasoning_sig,
             &mut tool_calls,
             &mut usage,
             &mut model,
@@ -363,6 +384,7 @@ mod tests {
         let mut saw = false;
         let mut text = String::new();
         let mut reasoning = String::new();
+        let mut reasoning_sig = String::new();
         let mut tool_calls = Vec::new();
         let mut usage = Map::new();
         let mut model = String::new();
@@ -371,6 +393,7 @@ mod tests {
             &mut saw,
             &mut text,
             &mut reasoning,
+            &mut reasoning_sig,
             &mut tool_calls,
             &mut usage,
             &mut model,

@@ -45,7 +45,10 @@ mod universal_stemming {
             ("open prs", "pr"),
         ];
         for (haystack, needle) in &cases {
-            assert!(wbm(haystack, needle), "'{haystack}' should match '{needle}'");
+            assert!(
+                wbm(haystack, needle),
+                "'{haystack}' should match '{needle}'"
+            );
         }
     }
 
@@ -57,7 +60,10 @@ mod universal_stemming {
             ("recent fixes", "fix"),
         ];
         for (haystack, needle) in &cases {
-            assert!(wbm(haystack, needle), "'{haystack}' should match '{needle}'");
+            assert!(
+                wbm(haystack, needle),
+                "'{haystack}' should match '{needle}'"
+            );
         }
     }
 
@@ -71,7 +77,10 @@ mod universal_stemming {
             ("analyzed the code", "analyze"),
         ];
         for (haystack, needle) in &cases {
-            assert!(wbm(haystack, needle), "'{haystack}' should match '{needle}'");
+            assert!(
+                wbm(haystack, needle),
+                "'{haystack}' should match '{needle}'"
+            );
         }
     }
 
@@ -86,7 +95,10 @@ mod universal_stemming {
             ("branching strategy", "branch"),
         ];
         for (haystack, needle) in &cases {
-            assert!(wbm(haystack, needle), "'{haystack}' should match '{needle}'");
+            assert!(
+                wbm(haystack, needle),
+                "'{haystack}' should match '{needle}'"
+            );
         }
     }
 

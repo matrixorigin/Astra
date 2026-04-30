@@ -134,7 +134,6 @@ fn extract_directive(text: &str) -> Option<(String, usize)> {
     None
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

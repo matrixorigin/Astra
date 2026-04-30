@@ -1115,7 +1115,7 @@ async fn edge_tool_delivery_emits_tool_request_and_waits_for_result() {
     assert_eq!(status, StatusCode::OK);
 
     // Wait for the stream to complete.
-    let _events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("stream timed out")
         .expect("reader task failed");
@@ -4532,7 +4532,7 @@ async fn analysis_turn_injects_circuit_breaker_correction_after_repetition_stall
     let status = post_tool_result(&app, "tc-analysis-r4", "src/lib.rs:12:// TODO", "success").await;
     assert_eq!(status, StatusCode::OK);
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+    let _events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("stream timed out")
         .expect("reader task failed");

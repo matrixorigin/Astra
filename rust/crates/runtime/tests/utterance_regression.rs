@@ -94,11 +94,20 @@ fn signal_github_queries() {
         ("memoria最新的ci状态", &["is_github", "is_fetch"]),
         ("给matrixorigin创建一个issue", &["is_github", "is_mutate"]),
         ("matrixorigin仓库的情况", &["is_github", "is_fetch"]),
-        ("list all open pull requests for memoria", &["is_github", "is_fetch"]),
+        (
+            "list all open pull requests for memoria",
+            &["is_github", "is_fetch"],
+        ),
         ("show me PR #123 details", &["is_github", "is_fetch"]),
         ("check CI status for the main branch", &["is_github"]),
-        ("create a new issue for this bug", &["is_github", "is_mutate"]),
-        ("show me the github actions status", &["is_github", "is_fetch"]),
+        (
+            "create a new issue for this bug",
+            &["is_github", "is_mutate"],
+        ),
+        (
+            "show me the github actions status",
+            &["is_github", "is_fetch"],
+        ),
         ("show repository information", &["is_github", "is_fetch"]),
     ];
     for &(query, flags) in cases {
@@ -145,7 +154,10 @@ fn signal_git_queries() {
         ("当前分支是什么", &["is_git", "is_fetch"]),
         ("合并这个分支到main", &["is_git"]),
         ("git status", &["is_git"]),
-        ("show me the git log for the last 5 commits", &["is_git", "is_fetch"]),
+        (
+            "show me the git log for the last 5 commits",
+            &["is_git", "is_fetch"],
+        ),
         ("show me the diff", &["is_git"]),
         ("create a new branch from main", &["is_git", "is_mutate"]),
         ("rebase this branch onto main", &["is_git"]),
@@ -237,7 +249,10 @@ fn signal_analytical_queries() {
     ];
     for query in &cases {
         let s = SelectionSnapshot::from_query(query);
-        assert!(s.is_analytical, "query '{query}': expected is_analytical=true");
+        assert!(
+            s.is_analytical,
+            "query '{query}': expected is_analytical=true"
+        );
     }
 }
 
@@ -284,12 +299,28 @@ fn signal_history_references() {
 #[test]
 fn conversational_queries_return_empty() {
     let cases = [
-        "你好", "谢谢", "再见", "好的", "是的", "嗯",
-        "hi", "hello", "thanks", "thank you", "bye", "ok", "yes", "no", "nope",
+        "你好",
+        "谢谢",
+        "再见",
+        "好的",
+        "是的",
+        "嗯",
+        "hi",
+        "hello",
+        "thanks",
+        "thank you",
+        "bye",
+        "ok",
+        "yes",
+        "no",
+        "nope",
     ];
     for query in &cases {
         let s = SelectionSnapshot::from_query(query);
-        assert!(s.is_conversational, "query '{query}': expected is_conversational");
+        assert!(
+            s.is_conversational,
+            "query '{query}': expected is_conversational"
+        );
         assert!(
             s.dynamic_tools.is_empty(),
             "query '{query}': conversational should get 0 dynamic tools, got {}",
@@ -564,7 +595,11 @@ fn tool_selection_git_blame() {
 
 #[test]
 fn tool_selection_github_ci_status() {
-    let cases = ["what's the CI build status", "CI状态怎么样", "check ci status"];
+    let cases = [
+        "what's the CI build status",
+        "CI状态怎么样",
+        "check ci status",
+    ];
     for query in &cases {
         let s = SelectionSnapshot::from_query(query);
         assert!(
@@ -654,16 +689,20 @@ fn tool_selection_context_analysis() {
     // context_analysis should rank above memory_profile for session queries
     let s = SelectionSnapshot::from_query("这个session的啊");
     let names = s.tool_names();
-    let ctx_pos = names.iter().position(|n| *n == "context_analysis").unwrap_or(999);
-    let mem_pos = names.iter().position(|n| *n == "memory_profile").unwrap_or(999);
+    let ctx_pos = names
+        .iter()
+        .position(|n| *n == "context_analysis")
+        .unwrap_or(999);
+    let mem_pos = names
+        .iter()
+        .position(|n| *n == "memory_profile")
+        .unwrap_or(999);
     assert!(ctx_pos < mem_pos, "Got: {:?}", names);
 }
 
 #[test]
 fn tool_selection_diagnose() {
-    let s = SelectionSnapshot::from_query(
-        "check the current session health and tool availability",
-    );
+    let s = SelectionSnapshot::from_query("check the current session health and tool availability");
     assert!(s.tool_names().contains(&"diagnose"));
 }
 
@@ -684,8 +723,15 @@ mod invariants {
     #[test]
     fn non_conversational_always_gets_tools() {
         let queries = [
-            "matrixorigin", "我关注这个项目", "help me please", "show me the code",
-            "analyze performance", "12345", "kubernetes deployment", "帮帮我", "what about this",
+            "matrixorigin",
+            "我关注这个项目",
+            "help me please",
+            "show me the code",
+            "analyze performance",
+            "12345",
+            "kubernetes deployment",
+            "帮帮我",
+            "what about this",
         ];
         for q in &queries {
             let s = SelectionSnapshot::from_query(q);
@@ -703,15 +749,20 @@ mod invariants {
         assert!(
             q0.confidence <= q2.confidence,
             "0-signal ({:.2}) should have <= confidence than 2+-signal ({:.2})",
-            q0.confidence, q2.confidence
+            q0.confidence,
+            q2.confidence
         );
     }
 
     #[test]
     fn github_queries_include_github_tools() {
         let queries = [
-            "list PRs", "show me the issues", "check CI status",
-            "create an issue", "github actions", "matrixorigin最新的pr",
+            "list PRs",
+            "show me the issues",
+            "check CI status",
+            "create an issue",
+            "github actions",
+            "matrixorigin最新的pr",
         ];
         for q in &queries {
             let s = SelectionSnapshot::from_query(q);
@@ -726,7 +777,11 @@ mod invariants {
     #[test]
     fn git_queries_include_git_tools() {
         let queries = [
-            "git status", "show me the diff", "git log", "rebase onto main", "stash changes",
+            "git status",
+            "show me the diff",
+            "git log",
+            "rebase onto main",
+            "stash changes",
         ];
         for q in &queries {
             let s = SelectionSnapshot::from_query(q);
@@ -751,19 +806,32 @@ mod invariants {
     #[test]
     fn signal_count_consistent() {
         let queries = [
-            "hi", "show me PRs", "analyze why CI failed and fix it",
-            "matrixorigin", "git diff", "create issue",
+            "hi",
+            "show me PRs",
+            "analyze why CI failed and fix it",
+            "matrixorigin",
+            "git diff",
+            "create issue",
         ];
         for q in &queries {
             let state = ConversationState::from_message(q, 1);
             let manual_count = [
-                state.is_fetch, state.is_mutate, state.is_github,
-                state.is_git, state.is_analytical, state.references_history,
-            ].iter().filter(|&&x| x).count();
+                state.is_fetch,
+                state.is_mutate,
+                state.is_github,
+                state.is_git,
+                state.is_analytical,
+                state.references_history,
+            ]
+            .iter()
+            .filter(|&&x| x)
+            .count();
             assert_eq!(
-                state.signal_count(), manual_count,
+                state.signal_count(),
+                manual_count,
                 "signal_count() mismatch for '{q}': method={} manual={}",
-                state.signal_count(), manual_count
+                state.signal_count(),
+                manual_count
             );
         }
     }
@@ -825,7 +893,11 @@ mod mixed_intent {
         assert!(s.is_analytical);
         assert!(s.is_mutate);
         assert!(s.is_github);
-        assert!(s.signal_count >= 4, "Should have 4+ signals: {}", s.signal_count);
+        assert!(
+            s.signal_count >= 4,
+            "Should have 4+ signals: {}",
+            s.signal_count
+        );
     }
 }
 
@@ -836,12 +908,21 @@ mod mixed_intent {
 #[test]
 fn vague_queries_not_conversational() {
     let cases = [
-        "帮帮忙", "看看这个", "怎么搞", "接下来怎么办",
-        "help me with this", "kubernetes", "matrixorigin的东西", "what about",
+        "帮帮忙",
+        "看看这个",
+        "怎么搞",
+        "接下来怎么办",
+        "help me with this",
+        "kubernetes",
+        "matrixorigin的东西",
+        "what about",
     ];
     for query in &cases {
         let s = SelectionSnapshot::from_query(query);
-        assert!(!s.is_conversational, "query '{query}': should not be conversational");
+        assert!(
+            !s.is_conversational,
+            "query '{query}': should not be conversational"
+        );
     }
 }
 
@@ -850,7 +931,10 @@ fn vague_queries_still_get_tools() {
     let cases = ["帮我写一个排序算法", "help me with this", "kubernetes"];
     for query in &cases {
         let s = SelectionSnapshot::from_query(query);
-        assert!(s.dynamic_tools.len() >= 3, "query '{query}': should get tools");
+        assert!(
+            s.dynamic_tools.len() >= 3,
+            "query '{query}': should get tools"
+        );
     }
 }
 
@@ -865,8 +949,12 @@ mod edge_cases {
     fn empty_and_special_inputs() {
         // None of these should panic
         let cases = [
-            ("", 0), ("a", 0), ("12345", 0), ("!@#$%^&*()", 0),
-            ("???", 0), ("...", 0),
+            ("", 0),
+            ("a", 0),
+            ("12345", 0),
+            ("!@#$%^&*()", 0),
+            ("???", 0),
+            ("...", 0),
         ];
         for (query, expected_signals) in &cases {
             let s = SelectionSnapshot::from_query(query);
@@ -895,7 +983,10 @@ mod edge_cases {
     fn repeated_keywords() {
         let s = SelectionSnapshot::from_query("list list list show show show");
         assert!(s.is_fetch);
-        assert_eq!(s.signal_count, 1, "Multiple keywords in same signal = still 1");
+        assert_eq!(
+            s.signal_count, 1,
+            "Multiple keywords in same signal = still 1"
+        );
     }
 
     #[test]
@@ -910,7 +1001,10 @@ mod edge_cases {
     #[test]
     fn japanese_cjk_overlap() {
         let s = SelectionSnapshot::from_query("分析してください");
-        assert!(s.is_analytical, "'分析' should trigger even in Japanese context");
+        assert!(
+            s.is_analytical,
+            "'分析' should trigger even in Japanese context"
+        );
     }
 
     #[test]
@@ -948,7 +1042,10 @@ mod trigger_quality {
                 if let Some(&other) = seen.get(trigger)
                     && other != tool.name
                 {
-                    panic!("Duplicate trigger '{trigger}' in both '{other}' and '{}'", tool.name);
+                    panic!(
+                        "Duplicate trigger '{trigger}' in both '{other}' and '{}'",
+                        tool.name
+                    );
                 }
                 seen.insert(trigger, tool.name);
             }
@@ -960,7 +1057,11 @@ mod trigger_quality {
         for tool in TOOL_CATALOG.iter() {
             let mut seen = std::collections::HashSet::new();
             for trigger in tool.triggers {
-                assert!(seen.insert(trigger), "Duplicate trigger '{trigger}' in tool '{}'", tool.name);
+                assert!(
+                    seen.insert(trigger),
+                    "Duplicate trigger '{trigger}' in tool '{}'",
+                    tool.name
+                );
             }
         }
     }
@@ -969,10 +1070,15 @@ mod trigger_quality {
     fn no_single_char_cjk_triggers() {
         for tool in TOOL_CATALOG {
             for &trigger in tool.triggers {
-                let cjk_chars: Vec<char> = trigger.chars()
-                    .filter(|c| ('\u{4E00}'..='\u{9FFF}').contains(c)).collect();
+                let cjk_chars: Vec<char> = trigger
+                    .chars()
+                    .filter(|c| ('\u{4E00}'..='\u{9FFF}').contains(c))
+                    .collect();
                 if !cjk_chars.is_empty() && trigger.chars().count() <= 1 {
-                    panic!("Tool '{}' has single-char CJK trigger '{trigger}'", tool.name);
+                    panic!(
+                        "Tool '{}' has single-char CJK trigger '{trigger}'",
+                        tool.name
+                    );
                 }
             }
         }
@@ -983,7 +1089,10 @@ mod trigger_quality {
         for tool in TOOL_CATALOG {
             for &trigger in tool.triggers {
                 if trigger.is_ascii() && trigger.len() <= 2 {
-                    panic!("Tool '{}' has ultra-short trigger '{trigger}' (<=2 chars)", tool.name);
+                    panic!(
+                        "Tool '{}' has ultra-short trigger '{trigger}' (<=2 chars)",
+                        tool.name
+                    );
                 }
             }
         }
@@ -997,7 +1106,10 @@ mod trigger_quality {
                 let chars: Vec<char> = trigger.chars().collect();
                 let is_cjk = chars.iter().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(c));
                 if is_cjk && chars.len() <= 2 && chars.iter().all(|c| dangerous.contains(c)) {
-                    panic!("Tool '{}' has CJK trigger '{trigger}' of only common particles", tool.name);
+                    panic!(
+                        "Tool '{}' has CJK trigger '{trigger}' of only common particles",
+                        tool.name
+                    );
                 }
             }
         }
@@ -1006,29 +1118,57 @@ mod trigger_quality {
     #[test]
     fn minimum_trigger_count() {
         for tool in TOOL_CATALOG {
-            assert!(tool.triggers.len() >= 4, "Tool '{}' has only {} triggers", tool.name, tool.triggers.len());
+            assert!(
+                tool.triggers.len() >= 4,
+                "Tool '{}' has only {} triggers",
+                tool.name,
+                tool.triggers.len()
+            );
         }
     }
 
     #[test]
     fn save_disambiguation() {
-        let wf = TOOL_CATALOG.iter().find(|t| t.name == "write_file").unwrap();
-        let ms = TOOL_CATALOG.iter().find(|t| t.name == "memory_store").unwrap();
-        assert!(!wf.triggers.contains(&"保存"), "write_file should use '保存文件' not bare '保存'");
-        assert!(ms.triggers.contains(&"保存"), "memory_store should keep '保存'");
+        let wf = TOOL_CATALOG
+            .iter()
+            .find(|t| t.name == "write_file")
+            .unwrap();
+        let ms = TOOL_CATALOG
+            .iter()
+            .find(|t| t.name == "memory_store")
+            .unwrap();
+        assert!(
+            !wf.triggers.contains(&"保存"),
+            "write_file should use '保存文件' not bare '保存'"
+        );
+        assert!(
+            ms.triggers.contains(&"保存"),
+            "memory_store should keep '保存'"
+        );
     }
 
     #[test]
     fn remember_not_on_search() {
-        let ms = TOOL_CATALOG.iter().find(|t| t.name == "memory_search").unwrap();
+        let ms = TOOL_CATALOG
+            .iter()
+            .find(|t| t.name == "memory_search")
+            .unwrap();
         assert!(!ms.triggers.contains(&"remember"));
     }
 
     #[test]
     fn no_bare_pr_or_ci_trigger() {
         for tool in TOOL_CATALOG {
-            assert!(!tool.triggers.contains(&"pr"), "Tool '{}' has bare 'pr'", tool.name);
-            assert!(!tool.triggers.contains(&"ci"), "Tool '{}' has bare 'ci'", tool.name);
+            assert!(
+                !tool.triggers.contains(&"pr"),
+                "Tool '{}' has bare 'pr'",
+                tool.name
+            );
+            assert!(
+                !tool.triggers.contains(&"ci"),
+                "Tool '{}' has bare 'ci'",
+                tool.name
+            );
         }
     }
 }
@@ -1042,18 +1182,35 @@ fn memory_query_ranks_memory_above_github() {
     let s = SelectionSnapshot::from_query("我有哪些记忆？");
     assert!(s.is_memory);
     let names = s.tool_names();
-    let mem_pos = names.iter().position(|n| n.contains("memory")).unwrap_or(999);
-    let gh_pos = names.iter().position(|n| *n == "github_list_prs").unwrap_or(999);
-    assert!(mem_pos < gh_pos, "memory tools should rank above github. Got: {:?}", names);
+    let mem_pos = names
+        .iter()
+        .position(|n| n.contains("memory"))
+        .unwrap_or(999);
+    let gh_pos = names
+        .iter()
+        .position(|n| *n == "github_list_prs")
+        .unwrap_or(999);
+    assert!(
+        mem_pos < gh_pos,
+        "memory tools should rank above github. Got: {:?}",
+        names
+    );
 }
 
 #[test]
 fn git_query_ranks_git_above_mo_query() {
     let s = SelectionSnapshot::from_query("show me recent commits");
     let names = s.tool_names();
-    let git_pos = names.iter().position(|n| n.starts_with("git_")).unwrap_or(999);
+    let git_pos = names
+        .iter()
+        .position(|n| n.starts_with("git_"))
+        .unwrap_or(999);
     let mo_pos = names.iter().position(|n| *n == "mo_query").unwrap_or(999);
-    assert!(git_pos < mo_pos, "git tools should rank above mo_query. Got: {:?}", names);
+    assert!(
+        git_pos < mo_pos,
+        "git tools should rank above mo_query. Got: {:?}",
+        names
+    );
 }
 
 #[test]
@@ -1113,7 +1270,9 @@ mod edge_case_regression {
 
     #[test]
     fn queries_with_urls() {
-        let s = SelectionSnapshot::from_query("check https://github.com/matrixorigin/matrixone/pull/123");
+        let s = SelectionSnapshot::from_query(
+            "check https://github.com/matrixorigin/matrixone/pull/123",
+        );
         assert!(s.is_github);
 
         let s = SelectionSnapshot::from_query("fetch https://example.com/api/data");
@@ -1140,7 +1299,9 @@ mod edge_case_regression {
 
     #[test]
     fn multiline_query() {
-        let s = SelectionSnapshot::from_query("我需要做三件事：\n1. 检查git状态\n2. 看看PR\n3. 修改代码");
+        let s = SelectionSnapshot::from_query(
+            "我需要做三件事：\n1. 检查git状态\n2. 看看PR\n3. 修改代码",
+        );
         assert!(s.is_git);
         assert!(s.is_github);
         assert!(s.is_mutate);
@@ -1148,10 +1309,14 @@ mod edge_case_regression {
 
     #[test]
     fn queries_with_code_snippets() {
-        let s = SelectionSnapshot::from_query("fix this function:\nfn main() {\n    println!(\"hello\");\n}");
+        let s = SelectionSnapshot::from_query(
+            "fix this function:\nfn main() {\n    println!(\"hello\");\n}",
+        );
         assert!(s.signal_count >= 1);
 
-        let s = SelectionSnapshot::from_query("fix this error: thread 'main' panicked at 'index out of bounds'");
+        let s = SelectionSnapshot::from_query(
+            "fix this error: thread 'main' panicked at 'index out of bounds'",
+        );
         assert!(s.is_mutate);
     }
 
@@ -1225,14 +1390,26 @@ mod trigger_verification {
         // "我有问题" should NOT strongly match memory_profile
         let s = SelectionSnapshot::from_query("我有问题");
         let names = s.tool_names();
-        let mp_pos = names.iter().position(|n| *n == "memory_profile").unwrap_or(999);
-        assert!(mp_pos >= 3, "我有问题 should not strongly trigger memory_profile (pos={mp_pos})");
+        let mp_pos = names
+            .iter()
+            .position(|n| *n == "memory_profile")
+            .unwrap_or(999);
+        assert!(
+            mp_pos >= 3,
+            "我有问题 should not strongly trigger memory_profile (pos={mp_pos})"
+        );
 
         // "你好" should NOT strongly match get_agent_info
         let s = SelectionSnapshot::from_query("你好");
         let names = s.tool_names();
-        let ai_pos = names.iter().position(|n| *n == "get_agent_info").unwrap_or(999);
-        assert!(ai_pos >= 2 || names.is_empty(), "你好 should not strongly trigger get_agent_info (pos={ai_pos})");
+        let ai_pos = names
+            .iter()
+            .position(|n| *n == "get_agent_info")
+            .unwrap_or(999);
+        assert!(
+            ai_pos >= 2 || names.is_empty(),
+            "你好 should not strongly trigger get_agent_info (pos={ai_pos})"
+        );
 
         // "的" should not cause false matches
         let s = SelectionSnapshot::from_query("这个的确有意思");
@@ -1335,35 +1512,42 @@ mod pipeline_integration {
         let q = "list github pull requests and check CI status";
 
         let normal = selector.select(&make_ctx(q)).await;
-        let aggressive = selector.select(&SelectionContext {
-            budget_pressure: 0.9,
-            ..make_ctx(q)
-        }).await;
+        let aggressive = selector
+            .select(&SelectionContext {
+                budget_pressure: 0.9,
+                ..make_ctx(q)
+            })
+            .await;
 
         assert!(
             normal.tool_names.len() >= aggressive.tool_names.len(),
             "higher pressure should select fewer tools: normal={}, aggressive={}",
-            normal.tool_names.len(), aggressive.tool_names.len()
+            normal.tool_names.len(),
+            aggressive.tool_names.len()
         );
     }
 
     #[tokio::test]
     async fn pressure_doesnt_lose_primary_tool() {
         let selector = TfIdfSelector::new(test_registry());
-        let result = selector.select(&SelectionContext {
-            budget_pressure: 0.9,
-            ..make_ctx("show open pull requests")
-        }).await;
+        let result = selector
+            .select(&SelectionContext {
+                budget_pressure: 0.9,
+                ..make_ctx("show open pull requests")
+            })
+            .await;
         assert!(result.tool_names.contains(&"github_list_prs".to_string()));
     }
 
     #[tokio::test]
     async fn restricted_tool_excluded() {
         let selector = TfIdfSelector::new(test_registry());
-        let result = selector.select(&SelectionContext {
-            restricted_tools: vec!["github_ci_status".to_string()],
-            ..make_ctx("show pull requests and check CI")
-        }).await;
+        let result = selector
+            .select(&SelectionContext {
+                restricted_tools: vec!["github_ci_status".to_string()],
+                ..make_ctx("show pull requests and check CI")
+            })
+            .await;
         assert!(!result.tool_names.contains(&"github_ci_status".to_string()));
         assert!(result.tool_names.contains(&"github_list_prs".to_string()));
     }
@@ -1371,10 +1555,12 @@ mod pipeline_integration {
     #[tokio::test]
     async fn restricted_git_doesnt_affect_github() {
         let selector = TfIdfSelector::new(test_registry());
-        let result = selector.select(&SelectionContext {
-            restricted_tools: vec!["git_log".to_string(), "git_diff".to_string()],
-            ..make_ctx("list open PRs on github")
-        }).await;
+        let result = selector
+            .select(&SelectionContext {
+                restricted_tools: vec!["git_log".to_string(), "git_diff".to_string()],
+                ..make_ctx("list open PRs on github")
+            })
+            .await;
         assert!(result.tool_names.contains(&"github_list_prs".to_string()));
     }
 
@@ -1382,10 +1568,12 @@ mod pipeline_integration {
     async fn github_domain_hint_helps_entity_query() {
         let selector = TfIdfSelector::new(test_registry());
         let without = selector.select(&make_ctx("matrixorigin")).await;
-        let with = selector.select(&SelectionContext {
-            memory_domain_hints: vec![DomainHint::GitHub],
-            ..make_ctx("matrixorigin")
-        }).await;
+        let with = selector
+            .select(&SelectionContext {
+                memory_domain_hints: vec![DomainHint::GitHub],
+                ..make_ctx("matrixorigin")
+            })
+            .await;
 
         let without_has_github = without.tool_names.iter().any(|n| n.starts_with("github_"));
         let with_has_github = with.tool_names.iter().any(|n| n.starts_with("github_"));
@@ -1397,62 +1585,89 @@ mod pipeline_integration {
     #[tokio::test]
     async fn database_domain_hint_boosts_mo_tools() {
         let selector = TfIdfSelector::new(test_registry());
-        let result = selector.select(&SelectionContext {
-            memory_domain_hints: vec![DomainHint::Database],
-            ..make_ctx("查询一下数据库")
-        }).await;
-        let has_db = result.tool_names.iter().any(|n| n.contains("mo_") || n.contains("query"));
-        assert!(has_db, "database hint should promote db tools: {:?}", result.tool_names);
+        let result = selector
+            .select(&SelectionContext {
+                memory_domain_hints: vec![DomainHint::Database],
+                ..make_ctx("查询一下数据库")
+            })
+            .await;
+        let has_db = result
+            .tool_names
+            .iter()
+            .any(|n| n.contains("mo_") || n.contains("query"));
+        assert!(
+            has_db,
+            "database hint should promote db tools: {:?}",
+            result.tool_names
+        );
     }
 
     #[tokio::test]
     async fn recent_tools_boost_followup() {
         let selector = TfIdfSelector::new(test_registry());
         let recent = vec!["github_list_prs".to_string()];
-        let result = selector.select(&SelectionContext {
-            turn_count: 3,
-            recent_tools: &recent,
-            ..make_ctx("还有呢？")
-        }).await;
+        let result = selector
+            .select(&SelectionContext {
+                turn_count: 3,
+                recent_tools: &recent,
+                ..make_ctx("还有呢？")
+            })
+            .await;
         let has_github = result.tool_names.iter().any(|n| n.starts_with("github_"));
-        assert!(has_github, "follow-up should include github tools: {:?}", result.tool_names);
+        assert!(
+            has_github,
+            "follow-up should include github tools: {:?}",
+            result.tool_names
+        );
     }
 
     #[tokio::test]
     async fn recent_tools_dont_overpower_new_intent() {
         let selector = TfIdfSelector::new(test_registry());
         let recent = vec!["github_list_prs".to_string()];
-        let result = selector.select(&SelectionContext {
-            turn_count: 3,
-            recent_tools: &recent,
-            ..make_ctx("check git diff for the latest changes")
-        }).await;
+        let result = selector
+            .select(&SelectionContext {
+                turn_count: 3,
+                recent_tools: &recent,
+                ..make_ctx("check git diff for the latest changes")
+            })
+            .await;
         let has_git = result.tool_names.iter().any(|n| n.starts_with("git_"));
-        assert!(has_git, "explicit git intent should override recent github: {:?}", result.tool_names);
+        assert!(
+            has_git,
+            "explicit git intent should override recent github: {:?}",
+            result.tool_names
+        );
     }
 
     #[tokio::test]
     async fn cjk_queries_full_pipeline() {
         let selector = TfIdfSelector::new(test_registry());
 
-        let result = selector.select(&make_ctx("matrixorigin memoria 最新的pr?")).await;
+        let result = selector
+            .select(&make_ctx("matrixorigin memoria 最新的pr?"))
+            .await;
         assert!(result.tool_names.contains(&"github_list_prs".to_string()));
 
         let result = selector.select(&make_ctx("我有哪些记忆？")).await;
         assert!(result.tool_names.iter().any(|n| n.contains("memory")));
 
-        let result = selector.select(&make_ctx("谁改了这个文件？最近的提交记录")).await;
+        let result = selector
+            .select(&make_ctx("谁改了这个文件？最近的提交记录"))
+            .await;
         assert!(result.tool_names.iter().any(|n| n.starts_with("git_")));
     }
 
     #[tokio::test]
     async fn combined_pressure_and_restriction() {
         let selector = TfIdfSelector::new(test_registry());
-        let result = selector.select(&SelectionContext {
-            budget_pressure: 0.6,
-            restricted_tools: vec!["github_ci_status".to_string()],
-            ..make_ctx("check CI and show open PRs")
-        }).await;
+        let result = selector
+            .select(&SelectionContext {
+                budget_pressure: 0.6,
+                restricted_tools: vec!["github_ci_status".to_string()],
+                ..make_ctx("check CI and show open PRs")
+            })
+            .await;
         assert!(!result.tool_names.contains(&"github_ci_status".to_string()));
         assert!(result.tool_names.contains(&"github_list_prs".to_string()));
     }
@@ -1460,23 +1675,33 @@ mod pipeline_integration {
     #[tokio::test]
     async fn combined_hints_and_pressure() {
         let selector = TfIdfSelector::new(test_registry());
-        let result = selector.select(&SelectionContext {
-            budget_pressure: 0.6,
-            memory_domain_hints: vec![DomainHint::GitHub],
-            ..make_ctx("matrixorigin 的状态")
-        }).await;
+        let result = selector
+            .select(&SelectionContext {
+                budget_pressure: 0.6,
+                memory_domain_hints: vec![DomainHint::GitHub],
+                ..make_ctx("matrixorigin 的状态")
+            })
+            .await;
         let has_github = result.tool_names.iter().any(|n| n.starts_with("github_"));
-        assert!(has_github, "domain hint should help under pressure: {:?}", result.tool_names);
+        assert!(
+            has_github,
+            "domain hint should help under pressure: {:?}",
+            result.tool_names
+        );
     }
 
     #[tokio::test]
     async fn clear_query_higher_confidence_than_vague() {
         let selector = TfIdfSelector::new(test_registry());
-        let clear = selector.select(&make_ctx("list open pull requests on github repository")).await;
+        let clear = selector
+            .select(&make_ctx("list open pull requests on github repository"))
+            .await;
         let vague = selector.select(&make_ctx("help")).await;
         assert!(
             clear.confidence >= vague.confidence,
-            "clear={} vague={}", clear.confidence, vague.confidence
+            "clear={} vague={}",
+            clear.confidence,
+            vague.confidence
         );
     }
 
@@ -1484,6 +1709,10 @@ mod pipeline_integration {
     async fn conversational_selects_few_dynamic_tools() {
         let selector = TfIdfSelector::new(test_registry());
         let result = selector.select(&make_ctx("你好啊")).await;
-        assert!(result.tool_names.len() <= 12, "conversational: {:?}", result.tool_names);
+        assert!(
+            result.tool_names.len() <= 12,
+            "conversational: {:?}",
+            result.tool_names
+        );
     }
 }

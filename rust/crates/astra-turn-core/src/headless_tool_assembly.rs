@@ -330,6 +330,7 @@ pub fn openai_assistant_with_tool_calls_message<T: EdgeToolRoundRow>(
         server_tool_calls,
         edge_round,
         reasoning_content,
+        "",
         false,
     )
 }
@@ -343,6 +344,7 @@ pub fn openai_assistant_with_tool_calls_message_ext<T: EdgeToolRoundRow>(
     server_tool_calls: &[Value],
     edge_round: &[T],
     reasoning_content: &str,
+    reasoning_signature: &str,
     force_reasoning_field: bool,
 ) -> Value {
     let tool_calls = if !server_tool_calls.is_empty() {
@@ -378,6 +380,12 @@ pub fn openai_assistant_with_tool_calls_message_ext<T: EdgeToolRoundRow>(
                 "reasoning_content".to_string(),
                 Value::String(reasoning_content.to_string()),
             );
+            if !reasoning_signature.is_empty() {
+                obj.insert(
+                    "reasoning_signature".to_string(),
+                    Value::String(reasoning_signature.to_string()),
+                );
+            }
         }
     } else if force_reasoning_field && let Some(obj) = msg.as_object_mut() {
         obj.insert(
@@ -440,7 +448,13 @@ pub fn begin_headless_tool_round_opening<Edge: EdgeToolRoundRow>(
     edge_round: &[Edge],
     reasoning_content: &str,
 ) -> HeadlessRoundOpening {
-    begin_headless_tool_round_opening_ext(server_tool_calls, edge_round, reasoning_content, false)
+    begin_headless_tool_round_opening_ext(
+        server_tool_calls,
+        edge_round,
+        reasoning_content,
+        "",
+        false,
+    )
 }
 
 /// Extended variant that accepts `force_reasoning_field` for thinking-model sessions.
@@ -449,12 +463,14 @@ pub fn begin_headless_tool_round_opening_ext<Edge: EdgeToolRoundRow>(
     server_tool_calls: &[Value],
     edge_round: &[Edge],
     reasoning_content: &str,
+    reasoning_signature: &str,
     force_reasoning_field: bool,
 ) -> HeadlessRoundOpening {
     let assistant_message = openai_assistant_with_tool_calls_message_ext(
         server_tool_calls,
         edge_round,
         reasoning_content,
+        reasoning_signature,
         force_reasoning_field,
     );
     let indices = headless_round_tool_indices(server_tool_calls.len(), edge_round.len());

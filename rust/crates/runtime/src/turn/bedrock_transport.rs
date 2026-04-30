@@ -154,6 +154,7 @@ pub(crate) fn bedrock_stream_response_bytes(
             "type": "_inprocess_summary",
             "full_text": result.full_text,
             "reasoning": result.reasoning,
+            "reasoning_signature": result.reasoning_signature,
             "tool_calls": result.tool_calls,
             "usage": result.usage,
             "model_used": result.model_used,

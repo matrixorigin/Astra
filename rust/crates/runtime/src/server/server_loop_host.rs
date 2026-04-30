@@ -2155,6 +2155,7 @@ impl ServerAgenticLoopHost {
         ChatTurnSseAccum {
             full_text: result.full_text.clone(),
             reasoning_content: result.reasoning.clone(),
+            reasoning_signature: result.reasoning_signature.clone(),
             tool_calls: result.tool_calls.clone(),
             has_tool_calls: !result.tool_calls.is_empty(),
             prompt_tokens,
@@ -3579,6 +3580,7 @@ mod tests {
         let result = LlmCallResult {
             full_text: "Hello world".to_string(),
             reasoning: "thinking...".to_string(),
+            reasoning_signature: String::new(),
             tool_calls: vec![json!({"id": "tc1", "function": {"name": "bash"}})],
             usage: Map::from_iter([
                 ("input_tokens".to_string(), json!(100)),

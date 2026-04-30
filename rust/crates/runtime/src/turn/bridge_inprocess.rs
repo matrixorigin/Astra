@@ -1681,6 +1681,7 @@ impl InProcessChatTurnBridge {
                 let mut loop_tool_calls: Vec<Value> = Vec::new();
                 let mut loop_text = String::new();
                 let mut loop_reasoning = String::new();
+                let mut loop_reasoning_signature = String::new();
                 let mut attempt_in_round = 0_u32;
                 let request_capture_model = if resolved_model.is_empty() {
                     model_name.clone()
@@ -2124,6 +2125,7 @@ impl InProcessChatTurnBridge {
                                         &mut saw_inprocess_summary,
                                         &mut loop_text,
                                         &mut loop_reasoning,
+                                        &mut loop_reasoning_signature,
                                         &mut loop_tool_calls,
                                         &mut usage,
                                         &mut resolved_model,
@@ -2305,6 +2307,7 @@ impl InProcessChatTurnBridge {
                         &mut saw_inprocess_summary,
                         &mut loop_text,
                         &mut loop_reasoning,
+                        &mut loop_reasoning_signature,
                         &mut loop_tool_calls,
                         &mut usage,
                         &mut resolved_model,
@@ -5463,6 +5466,7 @@ mod tests {
         let mut saw = false;
         let mut text = String::new();
         let mut reasoning = String::new();
+        let mut reasoning_sig = String::new();
         let mut tc = vec![];
         let mut usage = Map::new();
         let mut model = String::new();
@@ -5471,6 +5475,7 @@ mod tests {
             &mut saw,
             &mut text,
             &mut reasoning,
+            &mut reasoning_sig,
             &mut tc,
             &mut usage,
             &mut model,
@@ -5492,6 +5497,7 @@ mod tests {
         let mut saw = false;
         let mut text = String::new();
         let mut reasoning = String::new();
+        let mut reasoning_sig = String::new();
         let mut tc = vec![];
         let mut usage = Map::new();
         let mut model = String::new();
@@ -5500,6 +5506,7 @@ mod tests {
             &mut saw,
             &mut text,
             &mut reasoning,
+            &mut reasoning_sig,
             &mut tc,
             &mut usage,
             &mut model,
@@ -5520,6 +5527,7 @@ mod tests {
         let mut saw = false;
         let mut text = "old".to_string();
         let mut reasoning = "old".to_string();
+        let mut reasoning_sig = String::new();
         let mut tc = vec![json!("old")];
         let mut usage = Map::new();
         let mut model = "old".to_string();
@@ -5528,6 +5536,7 @@ mod tests {
             &mut saw,
             &mut text,
             &mut reasoning,
+            &mut reasoning_sig,
             &mut tc,
             &mut usage,
             &mut model,
@@ -5546,6 +5555,7 @@ mod tests {
         let mut saw = false;
         let mut text = String::new();
         let mut reasoning = String::new();
+        let mut reasoning_sig = String::new();
         let mut tc = vec![];
         let mut usage = Map::new();
         let mut model = String::new();
@@ -5554,6 +5564,7 @@ mod tests {
             &mut saw,
             &mut text,
             &mut reasoning,
+            &mut reasoning_sig,
             &mut tc,
             &mut usage,
             &mut model,
@@ -5570,6 +5581,7 @@ mod tests {
         let mut saw = false;
         let mut text = String::new();
         let mut reasoning = String::new();
+        let mut reasoning_sig = String::new();
         let mut tc = vec![];
         let mut usage = Map::new();
         let mut model = String::new();
@@ -5578,6 +5590,7 @@ mod tests {
             &mut saw,
             &mut text,
             &mut reasoning,
+            &mut reasoning_sig,
             &mut tc,
             &mut usage,
             &mut model,
@@ -5594,6 +5607,7 @@ mod tests {
         let mut saw = false;
         let mut text = String::new();
         let mut reasoning = String::new();
+        let mut reasoning_sig = String::new();
         let mut tc = vec![];
         let mut usage = Map::new();
         let mut model = String::new();
@@ -5602,6 +5616,7 @@ mod tests {
             &mut saw,
             &mut text,
             &mut reasoning,
+            &mut reasoning_sig,
             &mut tc,
             &mut usage,
             &mut model,
@@ -5616,6 +5631,7 @@ mod tests {
         let mut saw = false;
         let mut text = String::new();
         let mut reasoning = String::new();
+        let mut reasoning_sig = String::new();
         let mut tc = vec![];
         let mut usage = Map::new();
         let mut model = String::new();
@@ -5624,6 +5640,7 @@ mod tests {
             &mut saw,
             &mut text,
             &mut reasoning,
+            &mut reasoning_sig,
             &mut tc,
             &mut usage,
             &mut model,
@@ -5638,6 +5655,7 @@ mod tests {
         let mut saw = false;
         let mut text = String::new();
         let mut reasoning = String::new();
+        let mut reasoning_sig = String::new();
         let mut tc = vec![];
         let mut usage = Map::new();
         let mut model = String::new();
@@ -5646,6 +5664,7 @@ mod tests {
             &mut saw,
             &mut text,
             &mut reasoning,
+            &mut reasoning_sig,
             &mut tc,
             &mut usage,
             &mut model,

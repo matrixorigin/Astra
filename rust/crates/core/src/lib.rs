@@ -401,7 +401,8 @@ mod tests {
             let mut headers = HeaderMap::new();
             headers.insert("authorization", header_val.parse().unwrap());
             assert_eq!(
-                bearer_token(&headers).ok(), Some(expected),
+                bearer_token(&headers).ok(),
+                Some(expected),
                 "header '{header_val}' should yield '{expected}'"
             );
         }

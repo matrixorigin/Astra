@@ -325,6 +325,10 @@ pub fn strip_stale_reasoning(messages: &mut [Value], provider: &str, model: &str
             {
                 // Replace with empty string (keep field for API compat).
                 msg["reasoning_content"] = Value::String(String::new());
+                // Signature is meaningless without reasoning text.
+                if let Some(obj) = msg.as_object_mut() {
+                    obj.remove("reasoning_signature");
+                }
             } else if msg.get("reasoning_content").is_none() && msg.get("tool_calls").is_some() {
                 // Assistant tool_call message from before thinking was enabled —
                 // add the field so the provider doesn't reject it.

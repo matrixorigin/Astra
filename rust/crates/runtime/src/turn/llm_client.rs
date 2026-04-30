@@ -246,6 +246,8 @@ fn is_tpm_exhaustion(error_text: &str) -> bool {
 pub(crate) struct LlmCallResult {
     pub full_text: String,
     pub reasoning: String,
+    /// Bedrock reasoning signature — must be passed back unmodified in multi-turn.
+    pub reasoning_signature: String,
     pub tool_calls: Vec<Value>,
     pub usage: Map<String, Value>,
     #[allow(dead_code)] // consumed by bridge_inprocess and explain telemetry
@@ -272,6 +274,7 @@ fn llm_result_details_json(result: &LlmCallResult) -> Option<String> {
     serde_json::to_string(&json!({
         "partial_full_text": result.full_text,
         "partial_reasoning": result.reasoning,
+        "reasoning_signature": result.reasoning_signature,
         "tool_calls": result.tool_calls,
         "usage": result.usage,
         "finish_reason": result.finish_reason,
@@ -641,7 +644,20 @@ fn build_bedrock_message_content(msg: &Value) -> Vec<Value> {
                 .unwrap_or_default()
         }
         "assistant" => {
-            let mut blocks = build_bedrock_text_content_blocks(msg.get("content"));
+            let mut blocks = Vec::new();
+            // Bedrock requires reasoningContent FIRST in the content array.
+            if let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str) {
+                if !rc.is_empty() {
+                    let mut reasoning_text = json!({"text": rc});
+                    if let Some(sig) = msg.get("reasoning_signature").and_then(Value::as_str) {
+                        if !sig.is_empty() {
+                            reasoning_text["signature"] = Value::String(sig.to_string());
+                        }
+                    }
+                    blocks.push(json!({"reasoningContent": {"reasoningText": reasoning_text}}));
+                }
+            }
+            blocks.extend(build_bedrock_text_content_blocks(msg.get("content")));
             blocks.extend(build_bedrock_tool_blocks(
                 msg.get("tool_calls").and_then(Value::as_array),
             ));
@@ -1753,6 +1769,7 @@ async fn collect_llm_stream(
         LlmCallResult {
             full_text: full_text.clone(),
             reasoning: reasoning.clone(),
+            reasoning_signature: String::new(),
             tool_calls,
             usage: usage.clone(),
             model_used: model_name.to_string(),
@@ -2000,6 +2017,7 @@ async fn collect_llm_stream(
     Ok(LlmCallResult {
         full_text,
         reasoning,
+        reasoning_signature: String::new(),
         tool_calls,
         usage,
         model_used: model_name.to_string(),
@@ -2185,6 +2203,7 @@ fn parse_bedrock_nonstream_response(
 ) -> LlmCallResult {
     let mut full_text = String::new();
     let mut reasoning = String::new();
+    let mut reasoning_signature = String::new();
     let mut tool_calls = Vec::new();
     let usage = v
         .get("usage")
@@ -2208,13 +2227,15 @@ fn parse_bedrock_nonstream_response(
             if let Some(text) = block.get("text").and_then(Value::as_str) {
                 full_text.push_str(text);
             }
-            if let Some(reasoning_text) = block
-                .get("reasoningContent")
-                .and_then(|content| content.get("reasoningText"))
-                .and_then(|reasoning_text| reasoning_text.get("text"))
-                .and_then(Value::as_str)
-            {
-                reasoning.push_str(reasoning_text);
+            if let Some(rc) = block.get("reasoningContent").and_then(Value::as_object) {
+                if let Some(rt) = rc.get("reasoningText").and_then(Value::as_object) {
+                    if let Some(t) = rt.get("text").and_then(Value::as_str) {
+                        reasoning.push_str(t);
+                    }
+                    if let Some(sig) = rt.get("signature").and_then(Value::as_str) {
+                        reasoning_signature.push_str(sig);
+                    }
+                }
             }
             if let Some(tool_use) = block.get("toolUse").and_then(Value::as_object) {
                 let id = tool_use
@@ -2241,6 +2262,7 @@ fn parse_bedrock_nonstream_response(
     LlmCallResult {
         full_text,
         reasoning,
+        reasoning_signature,
         tool_calls,
         usage,
         model_used: model_name.to_string(),
@@ -2323,6 +2345,7 @@ fn parse_openai_compatible_nonstream_response(
     LlmCallResult {
         full_text,
         reasoning,
+        reasoning_signature: String::new(),
         tool_calls,
         usage,
         model_used: model_name.to_string(),
@@ -5395,6 +5418,152 @@ mod tests {
         assert!(body.get("additionalModelRequestFields").is_none());
         // Temperature preserved
         assert_eq!(body["inferenceConfig"]["temperature"], 0.5);
+    }
+
+    #[test]
+    fn build_bedrock_body_includes_reasoning_content_on_assistant_message() {
+        let messages = vec![
+            json!({"role": "user", "content": "hello"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}],
+                "reasoning_content": "I should run bash",
+                "reasoning_signature": "sig_abc123"
+            }),
+            json!({"role": "tool", "tool_call_id": "tc1", "content": "done"}),
+            json!({"role": "user", "content": "thanks"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "us.anthropic.claude-sonnet-4-20250514-v1:0",
+            "bedrock",
+            Some(4096),
+            None,
+            true,
+            &ThinkingConfig::Off,
+        );
+        let bedrock_msgs = body["messages"].as_array().unwrap();
+        // First message is user "hello"
+        // Second is assistant with reasoningContent + toolUse
+        let assistant_msg = &bedrock_msgs[1];
+        assert_eq!(assistant_msg["role"], "assistant");
+        let content = assistant_msg["content"].as_array().unwrap();
+        // First block should be reasoningContent
+        assert!(content[0].get("reasoningContent").is_some());
+        let rc = &content[0]["reasoningContent"]["reasoningText"];
+        assert_eq!(rc["text"], "I should run bash");
+        assert_eq!(rc["signature"], "sig_abc123");
+        // Second block should be toolUse
+        assert!(content[1].get("toolUse").is_some());
+    }
+
+    /// Regression test using real Bedrock API response data.
+    /// Verifies that a multi-turn thinking + tool_use conversation produces
+    /// valid Bedrock request bodies that won't trigger the "signature: Field required" 400.
+    #[test]
+    fn build_bedrock_body_reasoning_roundtrip_real_signature() {
+        // Real signature captured from Bedrock converse API response
+        let real_signature = "EucBCkgIDRABGAIqQCjq2TSFiIiSlMoit+qcPnX9t83drZVVaoUyCag7HPkIAplllVNsRLaTzM6wl8n/qpOFbkkyrhwEa/STyGsDb9MSDMhIDhAFyvS1Z5oD7xoMq8EnICsA4bH25yXtIjDJvcoCxGdUU8BeKmUYjm4+6nLghgxhLZJpQL4WphleWcpr8w0PelHlkxs8G0fohDUqTQEEypAjDZqZhWt4I+h4ERKDZ/u1uW59Gs2NJWEcuFtTiKot3Kc+jJvH3Nn9Yp9iaJFbi4kakmwqdmpyxUrISklB/uqiJ0TXeN94CoAmGAE=";
+
+        let messages = vec![
+            json!({"role": "user", "content": "What is 2+2? Use the calculator tool."}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "tooluse_oOwbnKc4jO48ShtaXrOPcw", "type": "function", "function": {"name": "calculator", "arguments": "{\"expression\":\"2+2\"}"}}],
+                "reasoning_content": "The user wants me to calculate 2+2 using the calculator tool.",
+                "reasoning_signature": real_signature
+            }),
+            json!({"role": "tool", "tool_call_id": "tooluse_oOwbnKc4jO48ShtaXrOPcw", "content": "4"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[json!({
+                "type": "function",
+                "function": {
+                    "name": "calculator",
+                    "description": "Compute arithmetic",
+                    "parameters": {"type": "object", "properties": {"expression": {"type": "string"}}}
+                }
+            })],
+            "us.anthropic.claude-sonnet-4-6",
+            "bedrock",
+            Some(4096),
+            None,
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+        );
+
+        let bedrock_msgs = body["messages"].as_array().unwrap();
+        // assistant message (index 1) must have reasoningContent with signature
+        let assistant = &bedrock_msgs[1];
+        assert_eq!(assistant["role"], "assistant");
+        let content = assistant["content"].as_array().unwrap();
+
+        // Order must be: reasoningContent → toolUse (text is optional)
+        let rc_block = &content[0];
+        assert!(
+            rc_block.get("reasoningContent").is_some(),
+            "first block must be reasoningContent"
+        );
+        let rt = &rc_block["reasoningContent"]["reasoningText"];
+        assert_eq!(
+            rt["text"].as_str().unwrap(),
+            "The user wants me to calculate 2+2 using the calculator tool."
+        );
+        assert_eq!(
+            rt["signature"].as_str().unwrap(),
+            real_signature,
+            "signature must be preserved verbatim"
+        );
+
+        // toolUse block follows
+        let tool_block = content.iter().find(|b| b.get("toolUse").is_some());
+        assert!(tool_block.is_some(), "must have toolUse block");
+        assert_eq!(tool_block.unwrap()["toolUse"]["name"], "calculator");
+
+        // Verify thinking config is applied
+        assert!(body.get("additionalModelRequestFields").is_some());
+    }
+
+    /// Verify that stripped (empty) reasoning does NOT produce a reasoningContent block,
+    /// which would trigger Bedrock's "signature: Field required" 400 error.
+    #[test]
+    fn build_bedrock_body_empty_reasoning_omits_reasoning_block() {
+        let messages = vec![
+            json!({"role": "user", "content": "hello"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}],
+                "reasoning_content": ""
+            }),
+            json!({"role": "tool", "tool_call_id": "tc1", "content": "done"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "us.anthropic.claude-sonnet-4-6",
+            "bedrock",
+            Some(4096),
+            None,
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+        );
+        let bedrock_msgs = body["messages"].as_array().unwrap();
+        let assistant = &bedrock_msgs[1];
+        let content = assistant["content"].as_array().unwrap();
+        // No reasoningContent block when reasoning is empty
+        assert!(
+            !content.iter().any(|b| b.get("reasoningContent").is_some()),
+            "empty reasoning_content must NOT produce a reasoningContent block"
+        );
     }
 
     #[test]

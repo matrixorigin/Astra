@@ -271,6 +271,10 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             let rc = &turn_result.accum.reasoning_content;
             if !rc.is_empty() {
                 assistant_msg["reasoning_content"] = Value::String(rc.clone());
+                let sig = &turn_result.accum.reasoning_signature;
+                if !sig.is_empty() {
+                    assistant_msg["reasoning_signature"] = Value::String(sig.clone());
+                }
             } else if astra_turn_core::edge_ledger::history_has_reasoning(&state.messages) {
                 assistant_msg["reasoning_content"] = Value::String(String::new());
             }

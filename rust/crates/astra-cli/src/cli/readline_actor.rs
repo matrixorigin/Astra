@@ -172,4 +172,3 @@ fn readline_thread_main(
         }
     }
 }
-

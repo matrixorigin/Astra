@@ -18,6 +18,8 @@ pub struct ChatTurnSseAccum {
     pub full_text: String,
     /// Thinking / reasoning chunks (for models that stream reasoning separately).
     pub reasoning_content: String,
+    /// Bedrock reasoning signature — must be passed back unmodified in multi-turn.
+    pub reasoning_signature: String,
     pub tool_calls: Vec<Value>,
     /// Index from tool_call id -> position in `tool_calls` for O(1) merges.
     pub tool_call_id_index: std::collections::HashMap<String, usize>,
