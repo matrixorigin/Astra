@@ -82,12 +82,42 @@ pub(crate) async fn initialize_multi_agent_runtime(
     if let Some(session_id) = state.session_id.clone() {
         spawn_executor = spawn_executor.with_active_session_id(session_id);
     }
+    // Fork-cache observability: when ASTRA_FORK_CACHE_SINK=stderr
+    // is set, every spawned child that inherited a parent prefix
+    // emits one structured JSON line to stderr. Zero impact when
+    // the env var is unset. Gated separately from
+    // ASTRA_FORK_INHERIT_PREFIX so operators can turn observation
+    // on without enabling the inheritance behavior — useful for
+    // deploying the capture primitives in observe-only mode.
+    if matches!(
+        std::env::var("ASTRA_FORK_CACHE_SINK").as_deref(),
+        Ok("stderr") | Ok("STDERR")
+    ) {
+        let sink: std::sync::Arc<
+            dyn astra_turn_core::fork_cache_event::ForkCacheEventSink,
+        > = std::sync::Arc::new(
+            astra_turn_core::fork_cache_event::StderrForkCacheSink,
+        );
+        spawn_executor = spawn_executor.with_fork_cache_sink(sink);
+    }
+
+    // Install a PrefixCaptureSink on the spawner so captured parent
+    // prefixes can flow into child spawns. Gated by the
+    // ASTRA_FORK_INHERIT_PREFIX env var via the capture helper — if
+    // disabled, the store is present but stays empty (captures
+    // no-op), and resolves return Disabled.
+    let prefix_store: std::sync::Arc<
+        dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink,
+    > = std::sync::Arc::new(
+        astra_turn_core::fork_prefix_store::InMemoryPrefixStore::new(),
+    );
 
     state.agent_spawner = Some(std::sync::Arc::new(
         astra_runtime::orchestration::DynamicAgentSpawner::with_broadcaster(
             mailbox_router,
             progress_broadcaster,
         )
-        .with_executor(std::sync::Arc::new(spawn_executor)),
+        .with_executor(std::sync::Arc::new(spawn_executor))
+        .with_prefix_store(prefix_store),
     ));
 }

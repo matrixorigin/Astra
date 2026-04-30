@@ -455,19 +455,22 @@ impl DynamicAgentSpawner {
         // store is configured we skip even building the context
         // (saves a clone + RwLock write in the common path).
         let resolve_outcome = if let Some(store) = self.prefix_store.as_ref() {
+            // Infer the child's provider from the model string via
+            // the same normalization scheme PR 1 uses for capture
+            // (`ProviderKind::from_provider_hint`). Ensures the
+            // child's resolve context matches the provider that
+            // captured the parent prefix, so
+            // Anthropic-captured prefixes resolve for Anthropic
+            // children, OpenAI-captured for OpenAI, etc. Providers
+            // that astra doesn't yet wire-compatibly reconstruct
+            // for (OpenAI / Bedrock / Other) will still resolve
+            // against a matching capture and carry the prefix into
+            // SpawnRunConfig; executor-side consumption is gated
+            // by the sink the caller installs.
+            let child_provider = astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model);
             let resolve_ctx = SpawnResolveContext {
                 caller_run_id: Some(context.parent_run_id.clone()),
-                // Runtime providers are resolved by the executor
-                // layer; at this point we only know the model
-                // string. We treat the runtime as Anthropic by
-                // default because that's the only provider where
-                // cache inheritance is currently wire-compatible
-                // (OpenAI / Bedrock reconstructors land in PR 5).
-                // Non-Anthropic provider detection is a follow-up;
-                // until then, Anthropic-captured prefixes are the
-                // only ones that validate, and non-Anthropic
-                // executors will soft-fallback on ProviderMismatch.
-                child_provider: astra_turn_core::fork_prefix::ProviderKind::Anthropic,
+                child_provider,
                 child_model_id: model.clone(),
                 child_max_output_tokens: input.max_output_tokens,
             };

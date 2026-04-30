@@ -63,6 +63,40 @@ use sha2::{Digest, Sha256};
 /// cheap equality checks.
 pub type ContentHash = [u8; 32];
 
+/// Known non-Anthropic / non-OpenAI / non-Bedrock providers that
+/// astra talks OpenAI-protocol to. Order matters — first match wins,
+/// so put more-specific needles before more-general ones (e.g.
+/// "moonshot" before "kimi"; substring match would otherwise pick
+/// whichever comes first alphabetically).
+///
+/// Each entry is `(needle, normalized)`: the needle is
+/// substring-matched case-insensitively against the hint; the
+/// normalized label is what ends up in `ProviderKind::Other(...)`.
+/// Normalization collapses model variants (e.g. `deepseek-chat` and
+/// `deepseek-coder`) into one telemetry bucket.
+///
+/// **Changing this table changes identity hashes on every existing
+/// captured prefix whose model routed through the affected
+/// normalization.** Do NOT casually add or reorder entries.
+const KNOWN_OTHER_PROVIDERS: &[(&str, &str)] = &[
+    // Chinese OpenAI-compatible providers
+    ("deepseek", "deepseek"),
+    ("moonshot", "moonshot"),
+    ("kimi", "moonshot"), // kimi is moonshot's product name
+    ("glm", "zhipu"),
+    ("zhipu", "zhipu"),
+    ("dashscope", "dashscope"),
+    ("qwen", "dashscope"), // qwen is dashscope's model family
+    // Other OpenAI-compatible hosted services
+    ("groq", "groq"),
+    ("together", "together"),
+    ("mistral", "mistral"),
+    ("cohere", "cohere"),
+    ("gemini", "gemini"),
+    ("google", "gemini"),
+    ("ollama", "ollama"),
+];
+
 /// The LLM provider a `ForkPrefix` is bound to. Cache identity is
 /// provider-scoped: cached Anthropic bytes mean nothing to OpenAI and
 /// vice versa.
@@ -78,6 +112,67 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
+    /// Infer a [`ProviderKind`] from a provider-or-model hint string.
+    ///
+    /// Mirrors the shape of
+    /// `microcompact::ProviderCacheStrategy::from_provider_hint`, but
+    /// produces fine-grained variants instead of a binary
+    /// cache-capability classification.
+    ///
+    /// Known mappings (case-insensitive):
+    /// - `"claude*"` / `"anthropic*"`                  → Anthropic
+    /// - `"bedrock*"`                                  → Bedrock
+    /// - `"gpt*"` / `"openai*"` / `"o1*"` / `"o3*"`    → OpenAi
+    /// - known third-party names served over the
+    ///   OpenAI protocol (deepseek / kimi / moonshot /
+    ///   glm / zhipu / qwen / dashscope / groq /
+    ///   together / gemini / google / mistral / cohere
+    ///   / ollama)                                     → Other("<name>")
+    /// - anything else                                 → Other("<raw>")
+    ///
+    /// Invariants:
+    /// - Never panics.
+    /// - Empty input → `Other(String::new())`; callers that treat
+    ///   empty model names as a bug should check before calling.
+    /// - Substring match: `"glm-4"` and `"glm"` both produce
+    ///   `Other("glm")`; `"gpt-4o"` produces `OpenAi`. The
+    ///   normalisation is stable — changing it invalidates every
+    ///   captured prefix's `identity_hash`.
+    pub fn from_provider_hint(hint: &str) -> Self {
+        let lower = hint.to_ascii_lowercase();
+        if lower.contains("claude") || lower.contains("anthropic") {
+            return Self::Anthropic;
+        }
+        if lower.contains("bedrock") {
+            return Self::Bedrock;
+        }
+        // First-class OpenAI: real API + models the OpenAI host serves.
+        if lower.contains("openai")
+            || lower.starts_with("gpt-")
+            || lower.starts_with("gpt ")
+            || lower == "gpt"
+            || lower.starts_with("o1")
+            || lower.starts_with("o3")
+        {
+            return Self::OpenAi;
+        }
+        // Known non-Anthropic providers/models that speak OpenAI
+        // protocol but deserve a stable `Other(...)` tag for
+        // telemetry bucketing. The tag is what cache identity hashes
+        // — we normalize to the shortest recognisable name so that
+        // different model variants of the same provider share an
+        // identity bucket (e.g. `deepseek-chat` and `deepseek-coder`
+        // both tag as `deepseek`).
+        for (needle, normalized) in KNOWN_OTHER_PROVIDERS {
+            if lower.contains(needle) {
+                return Self::Other((*normalized).to_string());
+            }
+        }
+        // Unknown: tag with the raw string so distinct unknowns
+        // don't silently collapse into one bucket.
+        Self::Other(hint.to_string())
+    }
+
     /// Stable tag contributed to the cache-identity hash. Rename never.
     ///
     /// `Other(name)` is namespaced with an `other:` prefix so that a
@@ -903,6 +998,173 @@ mod tests {
         let p = sample_prefix(|a| a.provider = ProviderKind::Other("groq".into()));
         // Identity hash must not panic on unknown provider tag.
         let _ = p.identity_hash();
+    }
+
+    // --- from_provider_hint -----------------------------------------
+
+    #[test]
+    fn from_provider_hint_anthropic_family() {
+        assert_eq!(
+            ProviderKind::from_provider_hint("claude-opus-4-6"),
+            ProviderKind::Anthropic
+        );
+        assert_eq!(
+            ProviderKind::from_provider_hint("anthropic"),
+            ProviderKind::Anthropic
+        );
+        assert_eq!(
+            ProviderKind::from_provider_hint("CLAUDE-SONNET"),
+            ProviderKind::Anthropic,
+            "must be case-insensitive"
+        );
+    }
+
+    #[test]
+    fn from_provider_hint_openai_family() {
+        assert_eq!(
+            ProviderKind::from_provider_hint("gpt-4o"),
+            ProviderKind::OpenAi
+        );
+        assert_eq!(
+            ProviderKind::from_provider_hint("openai"),
+            ProviderKind::OpenAi
+        );
+        assert_eq!(
+            ProviderKind::from_provider_hint("o1-preview"),
+            ProviderKind::OpenAi
+        );
+        assert_eq!(
+            ProviderKind::from_provider_hint("o3-mini"),
+            ProviderKind::OpenAi
+        );
+    }
+
+    #[test]
+    fn from_provider_hint_bedrock() {
+        assert_eq!(
+            ProviderKind::from_provider_hint("bedrock"),
+            ProviderKind::Bedrock
+        );
+        assert_eq!(
+            ProviderKind::from_provider_hint("us.anthropic.claude-opus-4-6"),
+            ProviderKind::Anthropic,
+            "model name containing 'claude' wins over deployment prefix"
+        );
+    }
+
+    #[test]
+    fn from_provider_hint_chinese_providers_normalize() {
+        // deepseek variants all collapse to the same bucket.
+        assert_eq!(
+            ProviderKind::from_provider_hint("deepseek-chat"),
+            ProviderKind::Other("deepseek".into())
+        );
+        assert_eq!(
+            ProviderKind::from_provider_hint("deepseek-coder"),
+            ProviderKind::Other("deepseek".into())
+        );
+        // kimi and moonshot route to the same bucket — kimi is
+        // moonshot's product name.
+        assert_eq!(
+            ProviderKind::from_provider_hint("kimi-k2"),
+            ProviderKind::Other("moonshot".into())
+        );
+        assert_eq!(
+            ProviderKind::from_provider_hint("moonshot-v1-8k"),
+            ProviderKind::Other("moonshot".into())
+        );
+        // glm and zhipu both bucket as "zhipu".
+        assert_eq!(
+            ProviderKind::from_provider_hint("glm-4"),
+            ProviderKind::Other("zhipu".into())
+        );
+        assert_eq!(
+            ProviderKind::from_provider_hint("zhipu"),
+            ProviderKind::Other("zhipu".into())
+        );
+        // qwen + dashscope both bucket as "dashscope".
+        assert_eq!(
+            ProviderKind::from_provider_hint("qwen-plus"),
+            ProviderKind::Other("dashscope".into())
+        );
+    }
+
+    #[test]
+    fn from_provider_hint_other_hosted_providers() {
+        assert_eq!(
+            ProviderKind::from_provider_hint("groq"),
+            ProviderKind::Other("groq".into())
+        );
+        assert_eq!(
+            ProviderKind::from_provider_hint("together"),
+            ProviderKind::Other("together".into())
+        );
+        assert_eq!(
+            ProviderKind::from_provider_hint("mistral-large"),
+            ProviderKind::Other("mistral".into())
+        );
+        assert_eq!(
+            ProviderKind::from_provider_hint("cohere"),
+            ProviderKind::Other("cohere".into())
+        );
+        assert_eq!(
+            ProviderKind::from_provider_hint("gemini-2-flash"),
+            ProviderKind::Other("gemini".into())
+        );
+        assert_eq!(
+            ProviderKind::from_provider_hint("google"),
+            ProviderKind::Other("gemini".into()),
+            "google routes to gemini bucket"
+        );
+        assert_eq!(
+            ProviderKind::from_provider_hint("ollama"),
+            ProviderKind::Other("ollama".into())
+        );
+    }
+
+    #[test]
+    fn from_provider_hint_unknown_keeps_raw_string() {
+        // An unknown model/provider name survives verbatim so
+        // distinct unknowns don't silently collapse into one
+        // telemetry bucket — makes "new provider, didn't update the
+        // table" discoverable in dashboards.
+        assert_eq!(
+            ProviderKind::from_provider_hint("some-novel-provider-x"),
+            ProviderKind::Other("some-novel-provider-x".into())
+        );
+    }
+
+    #[test]
+    fn from_provider_hint_empty_input() {
+        // Empty input is a caller bug but must not panic. Returns
+        // Other("") so the caller sees a distinct bucket that
+        // stands out in telemetry.
+        assert_eq!(
+            ProviderKind::from_provider_hint(""),
+            ProviderKind::Other(String::new())
+        );
+    }
+
+    #[test]
+    fn from_provider_hint_identity_stability() {
+        // Tripwire: the mapping's identity_hash output must stay
+        // stable across refactors. We encode the expected behavior
+        // (hint → variant) to catch accidental regressions.
+        let cases = [
+            ("claude-3.5-sonnet", ProviderKind::Anthropic),
+            ("gpt-4o", ProviderKind::OpenAi),
+            ("bedrock", ProviderKind::Bedrock),
+            ("deepseek", ProviderKind::Other("deepseek".into())),
+            ("kimi", ProviderKind::Other("moonshot".into())),
+            ("glm-4", ProviderKind::Other("zhipu".into())),
+        ];
+        for (hint, expected) in cases {
+            assert_eq!(
+                ProviderKind::from_provider_hint(hint),
+                expected,
+                "hint {hint} must map to expected variant"
+            );
+        }
     }
 
     #[test]

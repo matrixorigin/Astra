@@ -250,6 +250,31 @@ impl ForkCacheEventSink for NoopForkCacheSink {
     }
 }
 
+/// Sink that writes each event to stderr as a single structured JSON
+/// line prefixed with `[fork-cache]`. Intended for live observation
+/// during development and for piping into `jq` / log collectors
+/// without needing a full observability backend.
+///
+/// Writes to stderr (not stdout) so it stays out of the way of CLI
+/// tools whose stdout is part of their contract. Each emission is
+/// one `println!` / `eprintln!` call — unbuffered enough that lines
+/// appear immediately after the child turn completes.
+///
+/// If JSON serialization fails (unreachable today — every field is
+/// serde-safe), falls back to `Debug` formatting so the line is
+/// still useful. Never panics.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StderrForkCacheSink;
+
+impl ForkCacheEventSink for StderrForkCacheSink {
+    fn emit(&self, event: ForkCacheEvent) {
+        let line = serde_json::to_string(&event).unwrap_or_else(|_| format!("{event:?}"));
+        // Use a stable prefix so `grep '^\[fork-cache\]'` pulls
+        // these lines out of mixed CLI output.
+        eprintln!("[fork-cache] {line}");
+    }
+}
+
 // ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
@@ -444,6 +469,23 @@ mod tests {
         sink.emit(ev);
         // No assertion — we merely verified no panic. Observability-
         // style tests shouldn't invent side effects to "prove" none.
+    }
+
+    #[test]
+    fn stderr_sink_emits_without_panic() {
+        // Cannot capture stderr cleanly in a unit test (would need
+        // gag or a pipe trick that's fragile on Windows). Minimum
+        // bar: the sink accepts an event and doesn't panic under
+        // the trait-object dispatch path.
+        let sink: Arc<dyn ForkCacheEventSink> = Arc::new(StderrForkCacheSink);
+        sink.emit(evaluate_fork_cache(
+            probe(10_000, 9_500),
+            ForkCacheThresholds::default(),
+        ));
+        sink.emit(evaluate_fork_cache(
+            probe(10_000, 0),
+            ForkCacheThresholds::default(),
+        ));
     }
 
     #[test]
