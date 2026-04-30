@@ -1,12 +1,13 @@
 #![allow(dead_code)]
-//! Config tool: get/set configuration settings.
+//! Config tool: show server-level output-limit settings.
 //!
-//! Reads/writes environment-based configuration. Extracted from edge_tools
-//! as a standalone function taking output limits as parameters.
+//! LLM model / API key / base URL are managed via the admin CLI against the server's
+//! `infra_llm_models` + `admin_config` tables. Use `astra-admin model list` and
+//! `astra-admin config list` to inspect them.
 
 use serde_json::{Value, json};
 
-/// Configuration query/set handler.
+/// Configuration query handler.
 ///
 /// `global_limit` and `tool_limit` are the current output limits in bytes.
 pub fn config_tool(global_limit: usize, tool_limit: usize, args: &Value) -> String {
@@ -14,14 +15,8 @@ pub fn config_tool(global_limit: usize, tool_limit: usize, args: &Value) -> Stri
         Some(s) => s,
         None => return json!({ "error": "Missing required parameter: setting" }).to_string(),
     };
-    let value = args.get("value").and_then(|v| v.as_str());
 
     let available = [
-        ("model", "Current model (env: MO_MODEL)"),
-        (
-            "api_key",
-            "API key status (env: MO_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY)",
-        ),
         (
             "output_limit",
             "Global output limit in bytes (env: MO_GLOBAL_OUTPUT_LIMIT)",
@@ -31,17 +26,12 @@ pub fn config_tool(global_limit: usize, tool_limit: usize, args: &Value) -> Stri
             "Per-tool output limit (env: MO_TOOL_OUTPUT_LIMIT)",
         ),
         (
-            "sandbox_mode",
-            "Sandbox mode: off, permissive, strict (env: MO_SANDBOX_MODE)",
+            "auto_approve",
+            "Auto-approve tools (env: ASTRA_CLI_AUTO_APPROVE)",
         ),
-        ("auto_approve", "Auto-approve tools (env: MO_AUTO_APPROVE)"),
         (
             "turn_limit",
-            "Max turns per conversation (env: MO_MAX_TURNS)",
-        ),
-        (
-            "plan_subtask_turn_limit",
-            "Max turns per plan subtask, 0=use turn_limit (env: MO_PLAN_SUBTASK_MAX_TURNS)",
+            "Max turns per conversation (env: ASTRA_CLI_MAX_TURNS)",
         ),
         ("list", "Show all available settings"),
     ];
@@ -56,145 +46,44 @@ pub fn config_tool(global_limit: usize, tool_limit: usize, args: &Value) -> Stri
     }
 
     match setting {
-        "model" => {
-            if let Some(v) = value {
-                json!({
-                    "note": format!("To change model, set MO_MODEL={} environment variable", v),
-                    "setting": "model",
-                    "hint": "Use env tool to set MO_MODEL"
-                })
-                .to_string()
-            } else {
-                let current = std::env::var("MO_MODEL").unwrap_or_else(|_| "default".to_string());
-                json!({ "setting": "model", "value": current }).to_string()
-            }
-        }
-        "api_key" => {
-            let has_mo = std::env::var("MO_API_KEY").is_ok();
-            let has_openai = std::env::var("OPENAI_API_KEY").is_ok();
-            let has_anthropic = std::env::var("ANTHROPIC_API_KEY").is_ok();
-            json!({
-                "setting": "api_key",
-                "status": {
-                    "MO_API_KEY": if has_mo { "set" } else { "not set" },
-                    "OPENAI_API_KEY": if has_openai { "set" } else { "not set" },
-                    "ANTHROPIC_API_KEY": if has_anthropic { "set" } else { "not set" }
-                }
-            })
-            .to_string()
-        }
-        "output_limit" => {
-            if value.is_some() {
-                json!({
-                    "note": "To change output limit, set MO_GLOBAL_OUTPUT_LIMIT environment variable",
-                    "setting": "output_limit"
-                })
-                .to_string()
-            } else {
-                json!({
-                    "setting": "output_limit",
-                    "value": global_limit,
-                    "env_var": "MO_GLOBAL_OUTPUT_LIMIT"
-                })
-                .to_string()
-            }
-        }
+        "output_limit" => json!({
+            "setting": "output_limit",
+            "value": global_limit,
+            "env_var": "MO_GLOBAL_OUTPUT_LIMIT"
+        })
+        .to_string(),
         "tool_output_limit" => json!({
             "setting": "tool_output_limit",
             "value": tool_limit,
             "env_var": "MO_TOOL_OUTPUT_LIMIT"
         })
         .to_string(),
-        "sandbox_mode" => {
-            let current =
-                std::env::var("MO_SANDBOX_MODE").unwrap_or_else(|_| "permissive".to_string());
-            if let Some(v) = value {
-                if !["off", "permissive", "strict"].contains(&v) {
-                    return json!({ "error": "sandbox_mode must be: off, permissive, or strict" })
-                        .to_string();
-                }
-                json!({
-                    "note": format!("To change sandbox mode, set MO_SANDBOX_MODE={}", v),
-                    "setting": "sandbox_mode",
-                    "current": current
-                })
-                .to_string()
-            } else {
-                json!({
-                    "setting": "sandbox_mode",
-                    "value": current,
-                    "options": ["off", "permissive", "strict"]
-                })
-                .to_string()
-            }
-        }
         "auto_approve" => {
-            let current = std::env::var("MO_AUTO_APPROVE").unwrap_or_else(|_| "false".to_string());
+            let current =
+                std::env::var("ASTRA_CLI_AUTO_APPROVE").unwrap_or_else(|_| "false".to_string());
             json!({
                 "setting": "auto_approve",
                 "value": current,
-                "env_var": "MO_AUTO_APPROVE"
+                "env_var": "ASTRA_CLI_AUTO_APPROVE"
             })
             .to_string()
         }
         "turn_limit" => {
-            let current = std::env::var("MO_MAX_TURNS").unwrap_or_else(|_| "50".to_string());
+            let current = std::env::var("ASTRA_CLI_MAX_TURNS").unwrap_or_else(|_| "50".to_string());
             json!({
                 "setting": "turn_limit",
                 "value": current,
-                "env_var": "MO_MAX_TURNS"
-            })
-            .to_string()
-        }
-        "plan_subtask_turn_limit" => {
-            let current =
-                std::env::var("MO_PLAN_SUBTASK_MAX_TURNS").unwrap_or_else(|_| "0".to_string());
-            let effective = astra_core::RuntimeLimits::global().effective_plan_subtask_turns();
-            json!({
-                "setting": "plan_subtask_turn_limit",
-                "value": current,
-                "effective": effective,
-                "env_var": "MO_PLAN_SUBTASK_MAX_TURNS"
+                "env_var": "ASTRA_CLI_MAX_TURNS"
             })
             .to_string()
         }
         _ => json!({
             "error": format!(
-                "Unknown setting: {}. Use setting='list' to see available settings.",
+                "Unknown setting: {}. Use setting='list' to see available settings. \
+                 LLM model settings live in the server DB — use `astra-admin model list` / `astra-admin config list`.",
                 setting
             )
         })
         .to_string(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn list_settings() {
-        let result = config_tool(100_000, 50_000, &json!({"setting": "list"}));
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert!(!parsed["available_settings"].as_array().unwrap().is_empty());
-    }
-
-    #[test]
-    fn get_output_limit() {
-        let result = config_tool(100_000, 50_000, &json!({"setting": "output_limit"}));
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["value"], 100_000);
-    }
-
-    #[test]
-    fn unknown_setting() {
-        let result = config_tool(100_000, 50_000, &json!({"setting": "nonexistent"}));
-        assert!(result.contains("Unknown setting"));
-    }
-
-    #[test]
-    fn missing_setting() {
-        let result = config_tool(100_000, 50_000, &json!({}));
-        assert!(result.contains("Missing required parameter"));
     }
 }

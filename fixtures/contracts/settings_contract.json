@@ -7,10 +7,9 @@
     "matrixone_database": "astra_runtime",
     "app_env": "development",
     "log_level": "DEBUG",
-    "secret_key": "dev-secret-key-change-in-production",
     "github_token": null,
-    "chat_turn_bridge_url": null,
-    "chat_turn_bridge_secret": "dev-bridge-secret-change-me"
+    "bridge_url": null,
+    "bridge_secret": "dev-bridge-secret-change-me"
   },
   "override_env": {
     "MATRIXONE_HOST": "matrixone.internal",
@@ -18,13 +17,12 @@
     "MATRIXONE_USER": "agent",
     "MATRIXONE_PASSWORD": "super-secret",
     "ASTRA_DATABASE": "agent_db",
-    "APP_ENV": "production",
-    "LOG_LEVEL": "INFO",
-    "SECRET_KEY": "prod-secret",
-    "JWT_SECRET_KEY": "override-jwt-secret-key-123456",
+    "ASTRA_APP_ENV": "production",
+    "ASTRA_LOG_LEVEL": "INFO",
+    "ASTRA_JWT_SECRET": "override-jwt-secret-key-123456",
     "GITHUB_TOKEN": "ghp_example",
-    "CHAT_TURN_BRIDGE_URL": "http://bridge.internal:9001/internal/chat/turn",
-    "CHAT_TURN_BRIDGE_SECRET": "bridge-secret-prod"
+    "ASTRA_BRIDGE_URL": "http://bridge.internal:9001/internal/chat/turn",
+    "ASTRA_BRIDGE_SECRET": "bridge-secret-prod"
   },
   "expected_override_settings": {
     "matrixone_host": "matrixone.internal",
@@ -34,9 +32,8 @@
     "matrixone_database": "agent_db",
     "app_env": "production",
     "log_level": "INFO",
-    "secret_key": "prod-secret",
     "github_token": "ghp_example",
-    "chat_turn_bridge_url": "http://bridge.internal:9001/internal/chat/turn",
-    "chat_turn_bridge_secret": "bridge-secret-prod"
+    "bridge_url": "http://bridge.internal:9001/internal/chat/turn",
+    "bridge_secret": "bridge-secret-prod"
   }
 }

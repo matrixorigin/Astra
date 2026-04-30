@@ -755,7 +755,7 @@ pub trait DomainAdapter: Send + Sync {
 | **TemplateAdapter** | Templates | Pull-only cache of plan templates; cloud authoritative; push disabled (`PushTrigger::Never`) | [`TemplateAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) |
 | **PreferenceAdapter** | Preferences | Bidirectional key/value sync over `user_preferences` via `MatrixOneTransport` | [`PreferenceAdapter`](../../rust/crates/runtime/src/sync_adapters.rs) |
 
-**Tests**: `services` crate includes [`multi_agent` unit tests](../../rust/crates/services/src/multi_agent.rs) (hold cache, TTL clamp, unconfigured services) and **ignored** MySQL integration tests in [`tests/multi_agent_integration.rs`](../../rust/crates/services/tests/multi_agent_integration.rs) (`ASTRA_MULTI_AGENT_IT=1`, `cargo test -p astra-services multi_agent_integration -- --ignored`).
+**Tests**: `services` crate includes [`multi_agent` unit tests](../../rust/crates/services/src/multi_agent.rs) (hold cache, TTL clamp, unconfigured services) and **ignored** MySQL integration tests in [`tests/multi_agent_integration.rs`](../../rust/crates/services/tests/multi_agent_integration.rs) (`ASTRA_TEST_DB_IT=1`, `cargo test -p astra-services multi_agent_integration -- --ignored`).
 
 ### 6.3 EventAdapter: Wire to Batch Ingestion
 

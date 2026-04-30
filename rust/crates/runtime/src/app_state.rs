@@ -74,6 +74,7 @@ pub struct AppState {
     pub(crate) admin_audit_reader: Arc<dyn AdminAuditReader>,
     pub(crate) admin_feedback_stats_reader: Arc<dyn AdminFeedbackStatsReader>,
     pub(crate) admin_user_role_manager: Arc<dyn AdminUserRoleManager>,
+    pub(crate) admin_config_service: Arc<dyn astra_services::AdminConfigService>,
     pub(crate) chat_turn_bridge:
         Option<Arc<crate::turn::bridge_inprocess::InProcessChatTurnBridge>>,
     pub(crate) chat_turn_bridge_secret: String,
@@ -181,6 +182,7 @@ impl AppState {
             admin_audit_reader: Arc::new(auth::UnconfiguredAdminAuditReader),
             admin_feedback_stats_reader: Arc::new(auth::UnconfiguredAdminFeedbackStatsReader),
             admin_user_role_manager: Arc::new(auth::UnconfiguredAdminUserRoleManager),
+            admin_config_service: Arc::new(astra_services::UnconfiguredAdminConfigService),
             chat_turn_bridge: None,
             chat_turn_bridge_secret: "dev-bridge-secret-change-me".to_string(),
             chat_turn_bridge_cache,
@@ -245,6 +247,14 @@ impl AppState {
 
     pub fn with_admin_authorizer(mut self, admin_authorizer: Arc<dyn AdminAuthorizer>) -> Self {
         self.admin_authorizer = admin_authorizer;
+        self
+    }
+
+    pub fn with_admin_config_service(
+        mut self,
+        admin_config_service: Arc<dyn astra_services::AdminConfigService>,
+    ) -> Self {
+        self.admin_config_service = admin_config_service;
         self
     }
 

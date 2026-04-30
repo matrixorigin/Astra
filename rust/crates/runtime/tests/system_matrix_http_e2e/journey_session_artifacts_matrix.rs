@@ -101,7 +101,7 @@ async fn chat_turn_full(
     auth: &str,
     payload: serde_json::Value,
 ) -> (StatusCode, String) {
-    let test_secret = std::env::var("ASTRA_BRIDGE_TEST_SECRET").expect("bridge test secret");
+    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
     let req = Request::builder()
         .method("POST")
         .uri("/chat/turn")
@@ -142,39 +142,13 @@ struct RawTransportServerHits {
     nonstream_hits: Arc<AtomicU32>,
 }
 
-struct StreamIdleEnvGuard {
-    prev_pre: Option<String>,
-    prev_post: Option<String>,
-}
+/// Stream idle timeout override was previously env-controlled; now hardcoded. This is a
+/// no-op placeholder so test call sites keep compiling. Callers should expect full-length
+/// timeouts (5 minutes) — the tests that used short overrides may take longer.
+struct StreamIdleEnvGuard;
 
-impl Drop for StreamIdleEnvGuard {
-    fn drop(&mut self) {
-        unsafe {
-            match self.prev_pre.take() {
-                Some(value) => std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", value),
-                None => std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS"),
-            }
-            match self.prev_post.take() {
-                Some(value) => std::env::set_var("MO_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS", value),
-                None => std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS"),
-            }
-        }
-    }
-}
-
-fn set_stream_idle_timeouts_for_test(pre_ms: u64, post_ms: u64) -> StreamIdleEnvGuard {
-    let guard = StreamIdleEnvGuard {
-        prev_pre: std::env::var("MO_STREAM_IDLE_TIMEOUT_MS").ok(),
-        prev_post: std::env::var("MO_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS").ok(),
-    };
-    unsafe {
-        std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", pre_ms.to_string());
-        std::env::set_var(
-            "MO_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS",
-            post_ms.to_string(),
-        );
-    }
-    guard
+fn set_stream_idle_timeouts_for_test(_pre_ms: u64, _post_ms: u64) -> StreamIdleEnvGuard {
+    StreamIdleEnvGuard
 }
 
 /// Asserts the number of non-stream fallback hits falls inside `min..=max`.
@@ -3252,7 +3226,7 @@ pub async fn run_bridge_client_disconnect_session_artifact_latest_and_download_r
     assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
-    let test_secret = std::env::var("ASTRA_BRIDGE_TEST_SECRET").expect("bridge test secret");
+    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
     let base_http = spawn_http_app_server(app.clone()).await;
     let addr = base_http.trim_start_matches("http://");
     let mut socket = tokio::net::TcpStream::connect(addr)

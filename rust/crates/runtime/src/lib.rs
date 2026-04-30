@@ -31,6 +31,7 @@ use crate::bridge::{
 
 // ── Internal modules: HTTP handlers (crate-visible only) ─────────────────────
 
+pub(crate) mod admin_config_handlers;
 pub(crate) mod agents;
 pub mod branches;
 pub(crate) mod context;

@@ -32,7 +32,7 @@ impl std::fmt::Debug for Profile {
 
 pub(super) fn credentials_path() -> PathBuf {
     // Allow tests to override the credentials path via env var to avoid polluting real credentials.
-    if let Ok(dir) = std::env::var("ASTRA_CREDENTIALS_DIR") {
+    if let Ok(dir) = std::env::var("ASTRA_CLI_CREDENTIALS_DIR") {
         return PathBuf::from(dir).join("credentials.json");
     }
     dirs::home_dir()

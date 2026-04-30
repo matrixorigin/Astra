@@ -5,7 +5,7 @@
 //!
 //! Run with:
 //! ```text
-//! ASTRA_DB_IT=1 cargo test -p astra-plan --test plan_repository_db_it -- --ignored
+//! ASTRA_TEST_DB_IT=1 cargo test -p astra-plan --test plan_repository_db_it -- --ignored
 //! ```
 //!
 //! Environment: `MATRIXONE_*` + `ASTRA_DATABASE` after `dotenvy` (same pattern
@@ -25,9 +25,9 @@ use uuid::Uuid;
 
 fn require_db_it_env() -> MatrixOneSettings {
     assert_eq!(
-        std::env::var("ASTRA_DB_IT").as_deref(),
+        std::env::var("ASTRA_TEST_DB_IT").as_deref(),
         Ok("1"),
-        "set ASTRA_DB_IT=1 for ignored plan_repository_db_it tests"
+        "set ASTRA_TEST_DB_IT=1 for ignored plan_repository_db_it tests"
     );
     dotenvy::dotenv().ok();
     MatrixOneSettings {
@@ -120,7 +120,7 @@ fn make_state_with_subtasks(owner: &str, goal: &str, ids: &[&str]) -> PlanModeSt
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn save_load_roundtrip_persists_goal_owner_and_subtasks() {
     let (repo, pool) = setup_repo().await;
     let user = format!("u-{}", Uuid::new_v4().simple());
@@ -147,7 +147,7 @@ async fn save_load_roundtrip_persists_goal_owner_and_subtasks() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn load_owned_returns_not_found_for_wrong_user_no_403_leak() {
     let (repo, pool) = setup_repo().await;
     let owner = format!("u-own-{}", Uuid::new_v4().simple());
@@ -175,7 +175,7 @@ async fn load_owned_returns_not_found_for_wrong_user_no_403_leak() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn concurrent_saves_at_same_expected_version_have_exactly_one_winner() {
     // Regression for the save() race: SELECT ... FOR UPDATE followed by an
     // UPSERT on a different pool connection released the row lock between the
@@ -248,7 +248,7 @@ async fn concurrent_saves_at_same_expected_version_have_exactly_one_winner() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn save_rejects_stale_expected_version_with_conflict() {
     let (repo, pool) = setup_repo().await;
     let user = format!("u-{}", Uuid::new_v4().simple());
@@ -296,7 +296,7 @@ async fn save_rejects_stale_expected_version_with_conflict() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn set_active_plan_enforces_single_session_invariant() {
     let (repo, pool) = setup_repo().await;
     let user = format!("u-{}", Uuid::new_v4().simple());
@@ -347,7 +347,7 @@ async fn set_active_plan_enforces_single_session_invariant() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn step_runs_are_append_only_and_list_in_recency_order() {
     let (repo, pool) = setup_repo().await;
     let user = format!("u-{}", Uuid::new_v4().simple());
@@ -432,7 +432,7 @@ async fn step_runs_are_append_only_and_list_in_recency_order() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn finalize_step_run_rejects_cross_plan_run_id() {
     // Security regression: finalize_step_run used to filter only on run_id.
     // A caller holding a run_id from plan B could finalize it even while
@@ -498,7 +498,7 @@ async fn finalize_step_run_rejects_cross_plan_run_id() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn record_completed_step_run_lands_row_already_finalized() {
     let (repo, pool) = setup_repo().await;
     let user = format!("u-1shot-{}", Uuid::new_v4().simple());
@@ -541,7 +541,7 @@ async fn record_completed_step_run_lands_row_already_finalized() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn delete_cascades_step_runs_and_clears_active_plan_id() {
     let (repo, pool) = setup_repo().await;
     let user = format!("u-{}", Uuid::new_v4().simple());
@@ -594,7 +594,7 @@ async fn delete_cascades_step_runs_and_clears_active_plan_id() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn list_for_user_reads_subtask_count_from_denormalized_column_not_plan_json() {
     // Regression / perf: list_for_user previously deserialized every plan_json
     // blob just to read subtasks.len(). That's an O(N × plan-size) JSON parse
@@ -645,7 +645,7 @@ async fn list_for_user_reads_subtask_count_from_denormalized_column_not_plan_jso
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn save_with_none_expected_version_on_existing_row_detects_concurrent_edit() {
     // Regression for the enter_plan_mode re-link race: calling save(..., None)
     // on an EXISTING row previously bumped the version unconditionally,
@@ -693,7 +693,7 @@ async fn save_with_none_expected_version_on_existing_row_detects_concurrent_edit
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn save_maintains_subtask_count_column_on_update() {
     // When subtasks grow/shrink between saves, the column must follow.
     let (repo, pool) = setup_repo().await;
@@ -737,7 +737,7 @@ async fn save_maintains_subtask_count_column_on_update() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn list_for_user_filters_by_session_and_phase() {
     let (repo, pool) = setup_repo().await;
     let user = format!("u-list-{}", Uuid::new_v4().simple());
@@ -828,7 +828,7 @@ async fn list_for_user_filters_by_session_and_phase() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn fork_plan_for_session_duplicates_plan_and_unlinks_parent() {
     use astra_plan::fork_plan_for_session;
 
@@ -912,7 +912,7 @@ async fn fork_plan_for_session_duplicates_plan_and_unlinks_parent() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn plan_resume_hint_for_session_returns_active_plans_digest() {
     use astra_plan::plan_resume_hint_for_session;
 
@@ -961,7 +961,7 @@ async fn plan_resume_hint_for_session_returns_active_plans_digest() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn fork_plan_for_session_twice_from_same_parent_produces_distinct_ids() {
     // Regression: fork_plan_for_session used generate_plan_id(parent.goal),
     // which is deterministic modulo a weak hash. Forking the same plan twice
@@ -1010,7 +1010,7 @@ async fn fork_plan_for_session_twice_from_same_parent_produces_distinct_ids() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn fork_plan_requires_parent_to_exist() {
     use astra_plan::fork_plan_for_session;
 
@@ -1022,7 +1022,7 @@ async fn fork_plan_requires_parent_to_exist() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn session_hint_round_trips_through_load() {
     let (repo, pool) = setup_repo().await;
     let user = format!("u-hint-{}", Uuid::new_v4().simple());
@@ -1053,7 +1053,7 @@ async fn session_hint_round_trips_through_load() {
 /// subtask itself is reset to pending — otherwise the audit chain says "still
 /// running" forever and future `list_step_runs` attempt counting breaks.
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn abort_open_step_runs_closes_unfinished_attempts_for_subtask() {
     let (repo, pool) = setup_repo().await;
     let user = format!("u-abort-{}", Uuid::new_v4().simple());
@@ -1156,7 +1156,7 @@ async fn abort_open_step_runs_closes_unfinished_attempts_for_subtask() {
 /// key. Prevents a race in `redo_step` where two concurrent calls compute the
 /// same `next_attempt` and both insert.
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn record_step_run_rejects_duplicate_plan_subtask_attempt_tuple() {
     let (repo, pool) = setup_repo().await;
     let user = format!("u-dup-{}", Uuid::new_v4().simple());
@@ -1217,7 +1217,7 @@ async fn record_step_run_rejects_duplicate_plan_subtask_attempt_tuple() {
 /// must return rows in a deterministic order so a client scrolling by limit
 /// never sees duplicates or skipped rows. Tiebreaker is `run_id` ascending.
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn list_step_runs_order_is_stable_on_identical_started_at() {
     let (repo, pool) = setup_repo().await;
     let user = format!("u-stab-{}", Uuid::new_v4().simple());
@@ -1285,7 +1285,7 @@ async fn list_step_runs_order_is_stable_on_identical_started_at() {
 /// attempt) uniqueness — otherwise the happy-path shortcut bypasses the new
 /// guard.
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn record_completed_step_run_rejects_duplicate_attempt_tuple() {
     let (repo, pool) = setup_repo().await;
     let user = format!("u-cdup-{}", Uuid::new_v4().simple());

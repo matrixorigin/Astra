@@ -1034,9 +1034,7 @@ impl ToolSelector for LlmToolSelector {
             }
             Err(e) => {
                 // LLM call failed — signal fallback
-                if std::env::var("MO_DEBUG_SKILLS").is_ok() {
-                    eprintln!("[DEBUG] LLM tool selection error: {}", e);
-                }
+                tracing::debug!(error = %e, "LLM tool selection error");
                 SelectionResult {
                     tool_names: vec![],
                     strategy: "llm_error",

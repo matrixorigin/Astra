@@ -558,7 +558,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     if (state.telemetry.observability_session.is_some() || state.skills.resolver.is_some())
         && state.telemetry.turn_trace_collector.is_none()
     {
-        let capture = std::env::var("MO_CAPTURE_TRACES")
+        let capture = std::env::var("ASTRA_CAPTURE_TRACES")
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(true);
         if capture {

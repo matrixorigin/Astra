@@ -60,12 +60,12 @@ pub(crate) const LLM_RETRY_BASE_MS: u64 = 1000;
 const TPM_EXHAUST_DELAY_MS: u64 = 60_000;
 /// Maximum retries for TPM exhaustion (longer recovery period).
 const TPM_MAX_RETRIES: u32 = 5;
-/// TCP connect timeout for LLM API requests (seconds). Override: `MO_LLM_CONNECT_TIMEOUT_S`.
+/// TCP connect timeout for LLM API requests (seconds). Override: `ASTRA_LLM_CONNECT_TIMEOUT_S`.
 const LLM_CONNECT_TIMEOUT_S: u64 = 30;
-/// Non-stream fallback hard timeout (seconds). Override: `MO_LLM_FALLBACK_TIMEOUT_S`.
+/// Non-stream fallback hard timeout (seconds). Override: `ASTRA_LLM_FALLBACK_TIMEOUT_S`.
 const LLM_FALLBACK_TIMEOUT_S: u64 = 120;
 /// Total budget across all retries + fallback for a single LLM call (seconds).
-/// Override: `MO_LLM_TOTAL_BUDGET_S`.
+/// Override: `ASTRA_LLM_TOTAL_BUDGET_S`.
 const LLM_TOTAL_BUDGET_S: u64 = 300;
 
 // ── Rate-Limit Cooldown ──────────────────────────────────────────────────────
@@ -388,29 +388,17 @@ pub(crate) use astra_core::net::apply_env_proxy;
 
 /// TCP connect timeout for LLM API requests.
 pub(crate) fn llm_connect_timeout() -> std::time::Duration {
-    let s = std::env::var("MO_LLM_CONNECT_TIMEOUT_S")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(LLM_CONNECT_TIMEOUT_S);
-    std::time::Duration::from_secs(s)
+    std::time::Duration::from_secs(LLM_CONNECT_TIMEOUT_S)
 }
 
 /// Hard timeout for the non-stream fallback request.
 pub(crate) fn llm_fallback_timeout() -> std::time::Duration {
-    let s = std::env::var("MO_LLM_FALLBACK_TIMEOUT_S")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(LLM_FALLBACK_TIMEOUT_S);
-    std::time::Duration::from_secs(s)
+    std::time::Duration::from_secs(LLM_FALLBACK_TIMEOUT_S)
 }
 
 /// Total budget across all retries + fallback for a single LLM call.
 pub(crate) fn llm_total_budget() -> std::time::Duration {
-    let s = std::env::var("MO_LLM_TOTAL_BUDGET_S")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(LLM_TOTAL_BUDGET_S);
-    std::time::Duration::from_secs(s)
+    std::time::Duration::from_secs(LLM_TOTAL_BUDGET_S)
 }
 
 #[cfg(test)]
@@ -3098,7 +3086,7 @@ mod tests {
         assert!(st.next().await.is_none());
     }
 
-    // ── serial(stream_idle_env): all tests below mutate MO_STREAM_IDLE_TIMEOUT_MS
+    // ── serial(stream_idle_env): all tests below mutate ASTRA_STREAM_IDLE_TIMEOUT_MS
     // which is read at startup and cached globally. Parallel execution causes
     // race conditions where one test's timeout value bleeds into another test's
     // LlmClient construction. Any new test that sets this env var MUST be tagged.
@@ -3106,7 +3094,7 @@ mod tests {
     #[tokio::test]
     #[serial(stream_idle_env)]
     async fn collect_llm_stream_surfaces_transport_error() {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
             let err = sample_reqwest_stream_error().await;
             let byte_stream = stream::iter(vec![Err(err)]);
             let started = Instant::now();
@@ -3130,7 +3118,7 @@ mod tests {
     #[tokio::test]
     #[serial(stream_idle_env)]
     async fn collect_llm_stream_transport_after_partial_carries_partial_result() {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
             let err = sample_reqwest_stream_error().await;
             let d1 = json!({"choices":[{"delta":{"content":"partial"}}]});
             let byte_stream =
@@ -3165,7 +3153,7 @@ mod tests {
     #[tokio::test]
     #[serial(stream_idle_env)]
     async fn collect_llm_stream_aggregates_delta_text_reasoning_usage() {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
             let d1 = json!({"choices":[{"delta":{"content":"Hi ","reasoning_content":"R"}}]});
             let d2 = json!({"choices":[{"delta":{"content":"there"}}]});
             let u = json!({"usage":{"prompt_tokens":3,"completion_tokens":4}});
@@ -3206,7 +3194,7 @@ mod tests {
     #[tokio::test]
     #[serial(stream_idle_env)]
     async fn collect_llm_stream_extracts_finish_reason_stop() {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
             let d1 = json!({"choices":[{"delta":{"content":"Hello"}}]});
             let done = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
             let body = format!("data: {d1}\n\ndata: {done}\n\n");
@@ -3230,7 +3218,7 @@ mod tests {
     #[tokio::test]
     #[serial(stream_idle_env)]
     async fn collect_llm_stream_extracts_finish_reason_length() {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
             let d1 = json!({"choices":[{"delta":{"content":"truncated"}}]});
             let done = json!({"choices":[{"delta":{},"finish_reason":"length"}]});
             let body = format!("data: {d1}\n\ndata: {done}\n\n");
@@ -3254,7 +3242,7 @@ mod tests {
     #[serial(stream_idle_env)]
     async fn collect_llm_stream_merges_tool_call_argument_chunks() {
         temp_env::async_with_vars(
-            [("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))],
+            [("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))],
             async {
                 let c1 = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"foo"}}]}}]});
                 let c2 = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\":\"bar\"}"}}]}}]});
@@ -3290,7 +3278,7 @@ mod tests {
     #[serial(stream_idle_env)]
     async fn stream_idle_timeout_triggers() {
         // Keep this test fast: override idle timeout to 1ms.
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("1"))], async {
+        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("1"))], async {
             // Stream that never yields any bytes (simulates a hung connection).
             let pending_stream = stream::pending::<Result<Bytes, reqwest::Error>>();
             let started = Instant::now();
@@ -3322,8 +3310,8 @@ mod tests {
     async fn stream_idle_timeout_after_partial_output_marks_progress() {
         temp_env::async_with_vars(
             [
-                ("MO_STREAM_IDLE_TIMEOUT_MS", Some("1")),
-                ("MO_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS", Some("1")),
+                ("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("1")),
+                ("ASTRA_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS", Some("1")),
             ],
             async {
                 let d1 = json!({"choices":[{"delta":{"content":"partial"}}]});
@@ -3357,7 +3345,7 @@ mod tests {
     #[tokio::test]
     #[serial(stream_idle_env)]
     async fn collect_llm_stream_respects_cancel_flag() {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
             let flag = Arc::new(AtomicBool::new(false));
             let flag_signal = flag.clone();
             let pending_stream = stream::pending::<Result<Bytes, reqwest::Error>>();
@@ -3387,7 +3375,7 @@ mod tests {
     #[tokio::test]
     #[serial(stream_idle_env)]
     async fn collect_llm_stream_respects_cancel_token() {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
             let token = CancellationToken::new();
             let token_for_stream = token.clone();
             let pending_stream = stream::pending::<Result<Bytes, reqwest::Error>>();
@@ -3417,7 +3405,7 @@ mod tests {
     #[tokio::test]
     #[serial(stream_idle_env)]
     async fn collect_llm_stream_flag_and_token_cancels_on_token() {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
             let flag = Arc::new(AtomicBool::new(false));
             let flag_for_join = flag.clone();
             let token = CancellationToken::new();
@@ -3688,7 +3676,7 @@ mod tests {
     #[tokio::test]
     #[serial(stream_idle_env)]
     async fn collect_llm_stream_decodes_lossy_utf8_inside_json_string() {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
             let mut v: Vec<u8> = Vec::new();
             v.extend_from_slice(br#"data: {"choices":[{"delta":{"content":"a"#);
             v.push(0xff);
@@ -3713,7 +3701,7 @@ mod tests {
     #[tokio::test]
     #[serial(stream_idle_env)]
     async fn call_llm_and_collect_retries_after_429_retry_after_zero() {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
             reset_rate_limit_cooldown_for_tests();
             let hits = Arc::new(AtomicU32::new(0));
             let app = Router::new()
@@ -3778,7 +3766,7 @@ mod tests {
     #[tokio::test]
     #[serial(stream_idle_env)]
     async fn call_llm_and_collect_retries_after_529_retry_after_zero() {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
             reset_rate_limit_cooldown_for_tests();
             let hits = Arc::new(AtomicU32::new(0));
             let app = Router::new()
@@ -3809,7 +3797,7 @@ mod tests {
     #[tokio::test]
     #[serial(stream_idle_env)]
     async fn call_llm_and_collect_retries_after_503_retry_after_zero() {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
             reset_rate_limit_cooldown_for_tests();
             let hits = Arc::new(AtomicU32::new(0));
             let app = Router::new()
@@ -3903,7 +3891,7 @@ mod tests {
     async fn output_escalation_e2e_length_then_stop() {
         // Verifies: first call returns finish_reason=length, second returns stop.
         // This is the data path used by server_loop_host's escalation loop.
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
             reset_rate_limit_cooldown_for_tests();
             let hits = Arc::new(AtomicU32::new(0));
             let app = Router::new()
@@ -3955,7 +3943,7 @@ mod tests {
     #[tokio::test]
     #[serial(stream_idle_env)]
     async fn finish_reason_stop_no_retry() {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
             reset_rate_limit_cooldown_for_tests();
             let hits = Arc::new(AtomicU32::new(0));
             async fn mock_stop(State(Hit(c)): State<Hit>) -> Response {
@@ -3998,7 +3986,7 @@ mod tests {
     #[serial(stream_idle_env)]
     async fn finish_reason_tool_calls_extracted() {
         temp_env::async_with_vars(
-            [("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))],
+            [("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))],
             async {
                 let d = json!({"choices":[{
                     "delta":{"tool_calls":[{"index":0,"id":"tc1","type":"function","function":{"name":"bash","arguments":"{}"}}]},
@@ -4214,7 +4202,7 @@ mod tests {
     #[tokio::test]
     #[serial(stream_idle_env)]
     async fn call_llm_and_collect_returns_context_window_error_kind() {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
             reset_rate_limit_cooldown_for_tests();
             let app = Router::new().route("/chat/completions", post(mock_400_context_window));
             let base = spawn_local_http_server(app).await;
@@ -4250,7 +4238,7 @@ mod tests {
     #[tokio::test]
     #[serial(stream_idle_env)]
     async fn call_llm_and_collect_returns_auth_error_kind() {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
             reset_rate_limit_cooldown_for_tests();
             let app = Router::new().route("/chat/completions", post(mock_401));
             let base = spawn_local_http_server(app).await;
@@ -5109,7 +5097,7 @@ mod tests {
     }
 
     async fn parse_fixture(name: &str) -> LlmCallResult {
-        temp_env::async_with_vars([("MO_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
+        temp_env::async_with_vars([("ASTRA_STREAM_IDLE_TIMEOUT_MS", Some("60000"))], async {
             let bytes = load_fixture(name);
             let stream = stream::iter(vec![Ok::<_, reqwest::Error>(bytes)]);
             collect_llm_stream(

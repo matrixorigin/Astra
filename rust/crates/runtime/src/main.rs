@@ -1,10 +1,11 @@
-use std::{env, net::SocketAddr};
+use std::net::SocketAddr;
+
+use astra_core::config::AppSettings;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr: SocketAddr = env::var("RUST_API_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8000".to_string())
-        .parse()?;
+    let settings = AppSettings::from_env()?;
+    let addr: SocketAddr = format!("{}:{}", settings.api.host, settings.api.port).parse()?;
 
     astra_runtime::serve(addr).await?;
     Ok(())

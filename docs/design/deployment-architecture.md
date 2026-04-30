@@ -293,7 +293,7 @@ Sync model:
 ```bash
 conda activate agent-engine
 make dev-start                       # MatrixOne + Redis in Docker
-RUST_API_ADDR=0.0.0.0:8000 astra-server  # API server (required, unless --local)
+ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=8000 astra-server  # API server (required, unless --local)
 astra-admin init                        # Init DB (via API after migration)
 astra chat                        # CLI → API Server → DB
 # OR: astra --local chat          # Dev shortcut: CLI → DB directly
@@ -718,8 +718,7 @@ class K8sJobBackend(JobBackend):
                             "resources": resources,
                             "envFrom": [{"configMapRef": {"name": "astra-config"}}],
                             "env": [
-                                {"name": "MATRIXONE_HOST", "value": "matrixone.astra.svc"},
-                                {"name": "REDIS_URL", "value": "redis://redis.astra.svc:6379"}
+                                {"name": "MATRIXONE_HOST", "value": "matrixone.astra.svc"}
                             ]
                         }],
                         # GPU node selector
@@ -902,8 +901,6 @@ spec:
         env:
         - name: MATRIXONE_HOST
           value: "matrixone.astra.svc.cluster.local"
-        - name: REDIS_URL
-          value: "redis://redis.astra.svc.cluster.local:6379"
         envFrom:
         - secretRef:
             name: astra-secrets
@@ -1232,7 +1229,7 @@ class DeploymentDetector:
 # Before: 手动启动各组件
 make dev-start       # MatrixOne + Redis
 astra-admin init        # Init DB
-RUST_API_ADDR=0.0.0.0:8000 astra-server # API
+ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=8000 astra-server # API
 
 # After: 一键全部拉起
 docker-compose up -d

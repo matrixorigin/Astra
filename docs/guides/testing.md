@@ -11,7 +11,7 @@ make test
 # Workspace + bridge hooks only (no online #[ignore] suites)
 make test-offline
 
-# Online #[ignore] suites only (exports ASTRA_SYSTEM_MATRIX_E2E=1 and ASTRA_MULTI_AGENT_IT=1)
+# Online #[ignore] suites only (exports ASTRA_TEST_DB_IT=1 and ASTRA_TEST_DB_IT=1)
 make test-online
 
 # Narrow contract smoke (HTTP + admin integration binaries; settings JSON via astra-core lib tests)
@@ -34,7 +34,7 @@ cargo check --manifest-path rust/Cargo.toml
 ## Where Tests Live
 
 - `rust/crates/runtime/tests/` — HTTP integration tests for `astra-runtime` (including `*_contract.rs`, `system_matrix_http_e2e/`, bridge E2E).
-- `rust/crates/services/tests/` — service-layer tests (e.g. `multi_agent_integration` with live DB when `ASTRA_MULTI_AGENT_IT=1`).
+- `rust/crates/services/tests/` — service-layer tests (e.g. `multi_agent_integration` with live DB when `ASTRA_TEST_DB_IT=1`).
 - `fixtures/contracts/` — JSON fixtures for contract tests that load shared request/response shapes.
 - `tests/fixtures/golden_sessions/` — golden session payloads for selected flows.
 - Capability ↔ route ↔ E2E mapping: [`docs/testing/system-e2e-matrix.md`](../testing/system-e2e-matrix.md).
@@ -43,13 +43,13 @@ cargo check --manifest-path rust/Cargo.toml
 ## Live MatrixOne system E2E
 
 ```bash
-ASTRA_SYSTEM_MATRIX_E2E=1 \
-ASTRA_BRIDGE_TEST_SECRET=system-matrix-e2e-secret \
+ASTRA_TEST_DB_IT=1 \
+ASTRA_TEST_BRIDGE_SECRET=system-matrix-e2e-secret \
 cargo test -p astra-runtime --test system_matrix_http_e2e --features bridge-e2e-hooks -- \
   --ignored --nocapture
 ```
 
-Requires the same environment as `astra-server`: `MATRIXONE_*`, `JWT_SECRET_KEY` / `SECRET_KEY`, `TOKEN_ENCRYPTION_KEY`, Redis, embedding settings per `astra_core::AppSettings::from_env`. Use a local `.env` if you use one for development. To isolate from production on one MatrixOne host, set **`ASTRA_DATABASE_PREFIX`** (effective DB = prefix + `ASTRA_DATABASE`). Optionally set **`ASTRA_AUTO_CREATE_DATABASE=1`** so the first `ensure_core_schema` (server or online tests) runs `CREATE DATABASE IF NOT EXISTS` for that effective name (bootstrap catalog defaults to `mysql`).
+Requires the same environment as `astra-server`: `MATRIXONE_*`, `ASTRA_JWT_SECRET` / ``, `ASTRA_TOKEN_ENCRYPTION_KEY`, Redis, embedding settings per `astra_core::AppSettings::from_env`. Use a local `.env` if you use one for development. To isolate from production on one MatrixOne host, set **`ASTRA_DATABASE_PREFIX`** (effective DB = prefix + `ASTRA_DATABASE`). Optionally set **`ASTRA_AUTO_CREATE_DATABASE=1`** so the first `ensure_core_schema` (server or online tests) runs `CREATE DATABASE IF NOT EXISTS` for that effective name (bootstrap catalog defaults to `mysql`).
 
 ## Recommended Workflow
 

@@ -1,7 +1,7 @@
 [Unit]
 Description=astra API Server
-After=network.target matrixone.service redis.service
-Wants=matrixone.service redis.service
+After=network.target matrixone.service
+Wants=matrixone.service
 
 [Service]
 Type=simple
@@ -9,7 +9,8 @@ User=astra
 Group=astra
 WorkingDirectory=/opt/astra
 EnvironmentFile=/opt/astra/.env
-Environment=RUST_API_ADDR=0.0.0.0:8000
+Environment=ASTRA_API_HOST=0.0.0.0
+Environment=ASTRA_API_PORT=8000
 ExecStart=/usr/local/bin/astra-rs-api-shell
 Restart=always
 RestartSec=10

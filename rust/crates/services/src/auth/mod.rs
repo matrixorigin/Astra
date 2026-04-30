@@ -346,23 +346,19 @@ impl TrustedMoiAuthService {
     }
 
     pub fn from_env() -> Result<Self, String> {
-        let raw_secret = std::env::var("TRUSTED_MOI_JWT_SECRET_KEY")
-            .or_else(|_| std::env::var("JWT_SECRET_KEY"))
-            .map_err(|_| {
-                "TRUSTED_MOI_JWT_SECRET_KEY (or JWT_SECRET_KEY fallback) must be set".to_string()
-            })?;
+        let raw_secret = std::env::var("ASTRA_EXTERNAL_JWT_SECRET")
+            .map_err(|_| "ASTRA_EXTERNAL_JWT_SECRET must be set".to_string())?;
 
-        let algorithm = std::env::var("TRUSTED_MOI_JWT_ALGORITHM")
-            .or_else(|_| std::env::var("JWT_ALGORITHM"))
-            .unwrap_or_else(|_| "HS256".to_string());
+        let algorithm =
+            std::env::var("ASTRA_EXTERNAL_JWT_ALGORITHM").unwrap_or_else(|_| "HS256".to_string());
 
-        let expected_issuer = std::env::var("TRUSTED_MOI_JWT_ISSUER")
+        let expected_issuer = std::env::var("ASTRA_EXTERNAL_JWT_ISSUER")
             .ok()
             .filter(|v| !v.is_empty());
-        let expected_audience = std::env::var("TRUSTED_MOI_JWT_AUDIENCE")
+        let expected_audience = std::env::var("ASTRA_EXTERNAL_JWT_AUDIENCE")
             .ok()
             .filter(|v| !v.is_empty());
-        let leeway_seconds = std::env::var("TRUSTED_MOI_JWT_LEEWAY_SECS")
+        let leeway_seconds = std::env::var("ASTRA_EXTERNAL_JWT_LEEWAY_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(30);
@@ -413,7 +409,7 @@ fn parse_trusted_moi_algorithm(algorithm: &str) -> Result<Algorithm, String> {
         "HS384" => Ok(Algorithm::HS384),
         "HS512" => Ok(Algorithm::HS512),
         _ => Err(format!(
-            "unsupported TRUSTED_MOI_JWT_ALGORITHM: {algorithm}"
+            "unsupported ASTRA_EXTERNAL_JWT_ALGORITHM: {algorithm}"
         )),
     }
 }
@@ -498,12 +494,8 @@ impl AuthService for DatabaseAuthService {
             ));
         }
 
-        let bcrypt_cost = std::env::var("ASTRA_BCRYPT_COST")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(bcrypt::DEFAULT_COST);
         let password_hash =
-            bcrypt_hash(request.password.as_str(), bcrypt_cost).map_err(internal_error)?;
+            bcrypt_hash(request.password.as_str(), bcrypt::DEFAULT_COST).map_err(internal_error)?;
         let user_id = Uuid::new_v4().to_string();
         let display_name = request.display_name.clone();
 

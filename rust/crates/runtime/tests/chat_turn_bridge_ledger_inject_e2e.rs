@@ -1,7 +1,7 @@
 //! Verify that `POST /chat/turn` with mock LLM returns tool_calls in `turn_complete`
 //! without executing tools server-side (single-call proxy: CLI drives the agentic loop).
 //!
-//! Requires crate feature `bridge-e2e-hooks` and env `ASTRA_BRIDGE_TEST_SECRET` (set below).
+//! Requires crate feature `bridge-e2e-hooks` and env `ASTRA_TEST_BRIDGE_SECRET` (set below).
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -32,7 +32,7 @@ fn ensure_bridge_test_secret_env() {
         // SAFETY: `set_var` is `unsafe` in Rust 2024; this integration test binary sets the secret
         // once (before test threads read it) so `bridge_e2e_hooks::authorized` matches the client header.
         unsafe {
-            std::env::set_var("ASTRA_BRIDGE_TEST_SECRET", "ledger-inject-e2e-secret");
+            std::env::set_var("ASTRA_TEST_BRIDGE_SECRET", "ledger-inject-e2e-secret");
         }
     });
 }

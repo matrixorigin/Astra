@@ -51,6 +51,19 @@ const ADMIN_COMMANDS: &[(&str, &str)] = &[
         "user revoke-role",
         "Revoke role from user  (e.g. user revoke-role <user> <role>)",
     ),
+    ("config list", "List admin config values"),
+    (
+        "config get",
+        "Get an admin config value  (e.g. config get reasoning_model_name)",
+    ),
+    (
+        "config set",
+        "Set an admin config value  (e.g. config set reasoning_model_name gpt-4o-mini)",
+    ),
+    (
+        "config unset",
+        "Delete an admin config value  (e.g. config unset reasoning_model_name)",
+    ),
     ("help", "Show this help"),
     ("exit", "Exit admin REPL"),
 ];
@@ -420,6 +433,54 @@ pub(crate) async fn run_interactive(api: &ThinClient, profile: Option<&str>) -> 
                 "{}",
                 format!("✓ Role '{role_name}' revoked from '{username}'").green()
             );
+            Ok(())
+        } else if line.eq("config list") {
+            let (_, _, _, token) = get_profile_and_token(profile)?;
+            let body = api
+                .get_bearer_path_query_text(&token, paths::ADMIN_CONFIG, &[])
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        } else if let Some(key) = line.strip_prefix("config get ") {
+            let (_, _, _, token) = get_profile_and_token(profile)?;
+            let body = api
+                .get_bearer_path_query_text(&token, &paths::admin_config_key(key.trim()), &[])
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        } else if let Some(rest) = line.strip_prefix("config set ") {
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let key = parts
+                .next()
+                .ok_or_else(|| "usage: config set <key> <value>".to_string())?
+                .trim();
+            let value = parts
+                .next()
+                .ok_or_else(|| "usage: config set <key> <value>".to_string())?
+                .trim();
+            if key.is_empty() || value.is_empty() {
+                return Err("usage: config set <key> <value>".to_string());
+            }
+            let (_, _, _, token) = get_profile_and_token(profile)?;
+            let body = api
+                .put_bearer_path_json_text(
+                    &token,
+                    &paths::admin_config_key(key),
+                    &serde_json::json!({ "value": value }),
+                )
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        } else if let Some(key) = line.strip_prefix("config unset ") {
+            let (_, _, _, token) = get_profile_and_token(profile)?;
+            let body = api
+                .delete_bearer_path_text(&token, &paths::admin_config_key(key.trim()))
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
             Ok(())
         } else {
             Err(format!(

@@ -1,7 +1,7 @@
 //! End-to-end integration tests for the hybrid session memory protocol (P1–P7).
 //!
 //! These tests exercise the full pipeline with real Memoria (no mocks, no LLM).
-//! Requires: `MEMORIA_BASE_URL` + `MEMORIA_MASTER_KEY` (or `MEMORIA_API_KEY`).
+//! Requires: `MEMORIA_BASE_URL` + `MEMORIA_MASTER_KEY`.
 //! Run with: `cargo test -p astra-runtime -- session_facts_e2e --ignored`
 
 use astra_runtime::prompts::CompactionTier;

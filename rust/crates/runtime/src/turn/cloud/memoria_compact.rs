@@ -72,16 +72,9 @@ pub enum SessionMemoryFileCombine {
 }
 
 impl SessionMemoryFileCombine {
-    /// Parse `ASTRA_SESSION_MEMORY_COMBINE` (`merge` | `fallback` | `true` | `1` | `both`).
+    /// Feature was previously env-gated; always None after cleanup.
     pub fn from_env() -> Self {
-        let Ok(raw) = std::env::var("ASTRA_SESSION_MEMORY_COMBINE") else {
-            return Self::None;
-        };
-        match raw.to_ascii_lowercase().as_str() {
-            "merge" | "1" | "true" | "yes" | "both" => Self::Merge,
-            "fallback" => Self::Fallback,
-            _ => Self::None,
-        }
+        Self::None
     }
 }
 
@@ -194,39 +187,19 @@ pub fn read_session_memory_file(path: &Path) -> Option<String> {
 /// Resolve the on-disk session memory file for crash/session recovery.
 ///
 /// Unlike [`resolve_session_memory_file_options`], this path selection is
-/// independent of `ASTRA_SESSION_MEMORY_COMBINE`: recovery should reuse an
-/// existing session-memory summary whenever it exists, even if normal compaction
-/// is not configured to merge it into prompts.
+/// Attempt to find an on-disk session memory file. Recovery path reuses existing session-memory
+/// summaries derived from the cwd + session_id (no env override after cleanup).
 pub fn resolve_resume_session_memory_file(session_id: &str, cwd: Option<&str>) -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("ASTRA_SESSION_MEMORY_FILE") {
-        return Some(PathBuf::from(path));
-    }
-
     let cwd = cwd.filter(|s| !s.is_empty())?;
     Some(claude_code_session_memory_path(cwd, session_id))
 }
 
-/// Resolve on-disk session memory path and combine mode from env + optional workspace cwd.
-///
-/// - `ASTRA_SESSION_MEMORY_FILE` → explicit file; if set, defaults combine mode to [`Merge`]
-///   when `ASTRA_SESSION_MEMORY_COMBINE` is unset.
-/// - Otherwise, when combine is `merge` or `fallback`, uses [`claude_code_session_memory_path`]
-///   if `cwd` is present.
+/// Resolve on-disk session memory path and combine mode. Env override removed; always None.
 pub fn resolve_session_memory_file_options(
     session_id: &str,
     cwd: Option<&str>,
 ) -> (Option<PathBuf>, SessionMemoryFileCombine) {
     let env_combine = SessionMemoryFileCombine::from_env();
-
-    if let Ok(p) = std::env::var("ASTRA_SESSION_MEMORY_FILE") {
-        let path = PathBuf::from(p);
-        let combine = if env_combine == SessionMemoryFileCombine::None {
-            SessionMemoryFileCombine::Merge
-        } else {
-            env_combine
-        };
-        return (Some(path), combine);
-    }
 
     if env_combine == SessionMemoryFileCombine::None {
         return (None, SessionMemoryFileCombine::None);
@@ -323,9 +296,7 @@ impl HttpMemoriaClient {
     pub fn from_env() -> Option<Self> {
         let base_url = std::env::var("MEMORIA_BASE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8100".to_string());
-        let api_key = std::env::var("MEMORIA_API_KEY")
-            .or_else(|_| std::env::var("MEMORIA_MASTER_KEY"))
-            .ok()?;
+        let api_key = std::env::var("MEMORIA_MASTER_KEY").ok()?;
         Some(Self::new(base_url, api_key))
     }
 }
@@ -1936,17 +1907,6 @@ mod tests {
                 .join("session-memory")
                 .join("summary.md")
         );
-    }
-
-    #[test]
-    fn resolve_resume_session_memory_file_prefers_explicit_override() {
-        let dir = tempfile::tempdir().unwrap();
-        let override_path = dir.path().join("override-summary.md");
-        let path = with_env_paths(
-            &[("ASTRA_SESSION_MEMORY_FILE", Some(override_path.as_path()))],
-            || resolve_resume_session_memory_file("sess-override", Some("/tmp/ignored")).unwrap(),
-        );
-        assert_eq!(path, override_path);
     }
 
     #[tokio::test]

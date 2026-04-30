@@ -129,9 +129,9 @@ make dev-start
 ## Environment Variables
 
 The `dev-init` command automatically:
-- Generates `TOKEN_ENCRYPTION_KEY` if missing
-- Generates `JWT_SECRET_KEY` if missing
-- Generates `CHAT_TURN_BRIDGE_SECRET` if missing or still using the template placeholder
+- Generates `ASTRA_TOKEN_ENCRYPTION_KEY` if missing
+- Generates `ASTRA_JWT_SECRET` if missing
+- Generates `ASTRA_BRIDGE_SECRET` if missing or still using the template placeholder
 
 ## Proxy Configuration
 

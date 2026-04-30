@@ -32,7 +32,7 @@ pub struct PromptCacheConfig {
 impl PromptCacheConfig {
     /// Latch config from environment and provider info. Call once at session start.
     pub fn latch(provider: &str, model_name: &str) -> Self {
-        let cache_enabled = !std::env::var("MO_PROMPT_CACHE_DISABLED")
+        let cache_enabled = !std::env::var("ASTRA_TEST_PROMPT_CACHE_DISABLED")
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         let provider_strategy =
             astra_turn_core::microcompact::ProviderCacheStrategy::from_provider_and_model(
@@ -531,7 +531,7 @@ mod tests {
     fn build_system_message_anthropic_has_cache_control() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
         let (msg, _, _) = build_system_message(
@@ -578,7 +578,7 @@ mod tests {
     fn build_system_message_cache_disabled_env() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::set_var("MO_PROMPT_CACHE_DISABLED", "1");
+            std::env::set_var("ASTRA_TEST_PROMPT_CACHE_DISABLED", "1");
         }
         let (msg, _, _) = build_system_message(
             &["bash"],
@@ -596,7 +596,7 @@ mod tests {
             "cache disabled should not annotate"
         );
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
     }
 
@@ -706,7 +706,7 @@ mod tests {
     fn latch_enables_anthropic_style_cache_for_bedrock_claude() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
         let cfg = PromptCacheConfig::latch("bedrock", "anthropic.claude-sonnet-4-20250514-v1:0");
         assert!(cfg.cache_enabled);
@@ -717,7 +717,7 @@ mod tests {
     fn latch_keeps_non_claude_bedrock_on_openai_style_cache() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
         let cfg = PromptCacheConfig::latch("bedrock", "us.amazon.nova-micro-v1:0");
         assert!(cfg.cache_enabled);

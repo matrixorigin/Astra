@@ -25,8 +25,6 @@ DB_HOST="${MATRIXONE_HOST:-localhost}"
 DB_PORT="${MATRIXONE_PORT:-6001}"
 DB_USER="${MATRIXONE_USER:-root}"
 DB_PASSWORD="${MATRIXONE_PASSWORD}"
-REDIS_HOST="${REDIS_HOST:-localhost}"
-REDIS_PORT="${REDIS_PORT:-6379}"
 
 echo "🏥 Health Check"
 echo "==============="
@@ -65,33 +63,10 @@ else
     DB_STATUS=0
 fi
 
-# Check Redis
-echo -n "Redis (${REDIS_HOST}:${REDIS_PORT}): "
-if command -v docker &> /dev/null && docker ps | grep -q redis; then
-    if docker exec redis redis-cli ping > /dev/null 2>&1; then
-        echo -e "${GREEN}✅ Connected${NC}"
-        REDIS_STATUS=0
-    else
-        echo -e "${RED}❌ Connection failed${NC}"
-        REDIS_STATUS=1
-    fi
-elif command -v redis-cli &> /dev/null; then
-    if redis-cli -h ${REDIS_HOST} -p ${REDIS_PORT} ping > /dev/null 2>&1; then
-        echo -e "${GREEN}✅ Connected${NC}"
-        REDIS_STATUS=0
-    else
-        echo -e "${RED}❌ Connection failed${NC}"
-        REDIS_STATUS=1
-    fi
-else
-    echo -e "${YELLOW}⚠️  Cannot check (redis-cli not found)${NC}"
-    REDIS_STATUS=0
-fi
-
 echo ""
 
 # Overall status
-TOTAL_STATUS=$((API_STATUS + DB_STATUS + REDIS_STATUS))
+TOTAL_STATUS=$((API_STATUS + DB_STATUS))
 
 if [ $TOTAL_STATUS -eq 0 ]; then
     echo -e "${GREEN}✅ All services healthy${NC}"

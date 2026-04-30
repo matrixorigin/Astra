@@ -17,8 +17,8 @@ docker compose --profile app up -d --build
 
 ## Required Configuration
 
-- `TOKEN_ENCRYPTION_KEY`
-- `JWT_SECRET_KEY`
+- `ASTRA_TOKEN_ENCRYPTION_KEY`
+- `ASTRA_JWT_SECRET`
 - MatrixOne connection settings
 - Redis connection settings
 - any model/provider secrets you actually use

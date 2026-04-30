@@ -354,10 +354,7 @@ impl Default for ReplState {
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
             total_session_cost: 0.0,
-            max_budget_limit: std::env::var("MO_MAX_BUDGET")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(0.0),
+            max_budget_limit: 0.0,
             cached_pricing: Default::default(),
             skill_dev: None,
             active_system_skills: Vec::new(),
@@ -369,7 +366,7 @@ impl Default for ReplState {
             journal: None,
             recent_tools: Vec::new(),
             perm_manager: PermissionManager::with_project(
-                std::env::var("ASTRA_AUTO_APPROVE")
+                std::env::var("ASTRA_CLI_AUTO_APPROVE")
                     .map(|v| v == "1")
                     .unwrap_or(false),
                 &std::env::current_dir().unwrap_or_default(),

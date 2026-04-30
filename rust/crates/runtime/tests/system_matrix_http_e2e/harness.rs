@@ -32,8 +32,8 @@ use uuid::Uuid;
 static E2E_ENV_INIT: OnceLock<()> = OnceLock::new();
 static SERVER_STATE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-const TRUSTED_MOI_E2E_SECRET: &str = "trusted_moi_system_e2e_secret_key_123456";
-const TRUSTED_MOI_E2E_EXP: u64 = 4_102_444_800; // 2100-01-01T00:00:00Z
+const EXTERNAL_JWT_E2E_SECRET: &str = "trusted_moi_system_e2e_secret_key_123456";
+const EXTERNAL_JWT_E2E_EXP: u64 = 4_102_444_800; // 2100-01-01T00:00:00Z
 
 fn server_state_env_lock() -> &'static Mutex<()> {
     SERVER_STATE_ENV_LOCK.get_or_init(|| Mutex::new(()))
@@ -41,16 +41,16 @@ fn server_state_env_lock() -> &'static Mutex<()> {
 
 pub fn require_system_e2e_env() {
     assert_eq!(
-        std::env::var("ASTRA_DB_IT").as_deref(),
+        std::env::var("ASTRA_TEST_DB_IT").as_deref(),
         Ok("1"),
-        "set ASTRA_DB_IT=1 to run this ignored test"
+        "set ASTRA_TEST_DB_IT=1 to run this ignored test"
     );
     E2E_ENV_INIT.get_or_init(|| {
-        let secret = std::env::var("ASTRA_BRIDGE_TEST_SECRET")
+        let secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET")
             .unwrap_or_else(|_| "system-matrix-e2e-secret".to_string());
         // SAFETY: set once before parallel test threads (idempotent for all E2E tests).
         unsafe {
-            std::env::set_var("ASTRA_BRIDGE_TEST_SECRET", &secret);
+            std::env::set_var("ASTRA_TEST_BRIDGE_SECRET", &secret);
         }
     });
 }
@@ -128,19 +128,19 @@ async fn build_state_with_mode(
     dotenvy::dotenv().ok();
 
     let prev_auth_mode = std::env::var("ASTRA_AUTH_MODE").ok();
-    let prev_trusted_secret = std::env::var("TRUSTED_MOI_JWT_SECRET_KEY").ok();
-    let prev_trusted_algorithm = std::env::var("TRUSTED_MOI_JWT_ALGORITHM").ok();
-    let prev_trusted_issuer = std::env::var("TRUSTED_MOI_JWT_ISSUER").ok();
-    let prev_trusted_audience = std::env::var("TRUSTED_MOI_JWT_AUDIENCE").ok();
-    let prev_trusted_leeway = std::env::var("TRUSTED_MOI_JWT_LEEWAY_SECS").ok();
+    let prev_trusted_secret = std::env::var("ASTRA_EXTERNAL_JWT_SECRET").ok();
+    let prev_trusted_algorithm = std::env::var("ASTRA_EXTERNAL_JWT_ALGORITHM").ok();
+    let prev_trusted_issuer = std::env::var("ASTRA_EXTERNAL_JWT_ISSUER").ok();
+    let prev_trusted_audience = std::env::var("ASTRA_EXTERNAL_JWT_AUDIENCE").ok();
+    let prev_trusted_leeway = std::env::var("ASTRA_EXTERNAL_JWT_LEEWAY_SECS").ok();
 
     if trusted_moi_mode {
         set_env_var_for_e2e("ASTRA_AUTH_MODE", "trusted_moi");
-        set_env_var_for_e2e("TRUSTED_MOI_JWT_SECRET_KEY", TRUSTED_MOI_E2E_SECRET);
-        set_env_var_for_e2e("TRUSTED_MOI_JWT_ALGORITHM", "HS256");
-        restore_env_var_for_e2e("TRUSTED_MOI_JWT_ISSUER", None);
-        restore_env_var_for_e2e("TRUSTED_MOI_JWT_AUDIENCE", None);
-        set_env_var_for_e2e("TRUSTED_MOI_JWT_LEEWAY_SECS", "30");
+        set_env_var_for_e2e("ASTRA_EXTERNAL_JWT_SECRET", EXTERNAL_JWT_E2E_SECRET);
+        set_env_var_for_e2e("ASTRA_EXTERNAL_JWT_ALGORITHM", "HS256");
+        restore_env_var_for_e2e("ASTRA_EXTERNAL_JWT_ISSUER", None);
+        restore_env_var_for_e2e("ASTRA_EXTERNAL_JWT_AUDIENCE", None);
+        set_env_var_for_e2e("ASTRA_EXTERNAL_JWT_LEEWAY_SECS", "30");
     } else {
         // Force local mode for this bootstrap path so service auth mode is deterministic.
         set_env_var_for_e2e("ASTRA_AUTH_MODE", "local_jwt");
@@ -152,11 +152,11 @@ async fn build_state_with_mode(
     let state = build_server_state(settings).await;
 
     restore_env_var_for_e2e("ASTRA_AUTH_MODE", prev_auth_mode);
-    restore_env_var_for_e2e("TRUSTED_MOI_JWT_SECRET_KEY", prev_trusted_secret);
-    restore_env_var_for_e2e("TRUSTED_MOI_JWT_ALGORITHM", prev_trusted_algorithm);
-    restore_env_var_for_e2e("TRUSTED_MOI_JWT_ISSUER", prev_trusted_issuer);
-    restore_env_var_for_e2e("TRUSTED_MOI_JWT_AUDIENCE", prev_trusted_audience);
-    restore_env_var_for_e2e("TRUSTED_MOI_JWT_LEEWAY_SECS", prev_trusted_leeway);
+    restore_env_var_for_e2e("ASTRA_EXTERNAL_JWT_SECRET", prev_trusted_secret);
+    restore_env_var_for_e2e("ASTRA_EXTERNAL_JWT_ALGORITHM", prev_trusted_algorithm);
+    restore_env_var_for_e2e("ASTRA_EXTERNAL_JWT_ISSUER", prev_trusted_issuer);
+    restore_env_var_for_e2e("ASTRA_EXTERNAL_JWT_AUDIENCE", prev_trusted_audience);
+    restore_env_var_for_e2e("ASTRA_EXTERNAL_JWT_LEEWAY_SECS", prev_trusted_leeway);
 
     (
         state
@@ -812,13 +812,13 @@ pub async fn bootstrap_trusted_moi() -> TrustedMoiBootstrapResult {
     let edge_agent_id = format!("edge-{suffix}");
 
     let token = build_hs256_jwt(
-        TRUSTED_MOI_E2E_SECRET,
+        EXTERNAL_JWT_E2E_SECRET,
         json!({
             "sub": user_id,
             "username": username,
             "email": email,
             "name": "Trusted Moi E2E",
-            "exp": TRUSTED_MOI_E2E_EXP
+            "exp": EXTERNAL_JWT_E2E_EXP
         }),
     );
     let auth_header = format!("Bearer {token}");

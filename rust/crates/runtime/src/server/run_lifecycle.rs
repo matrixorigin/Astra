@@ -4206,7 +4206,7 @@ mod tests {
         let settings = runtime_db_it_settings(database);
         let mut bootstrap = settings.clone();
         bootstrap.database =
-            std::env::var("MATRIXONE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
         let admin_pool = connect_matrixone(&bootstrap)
             .await
             .expect("connect bootstrap catalog");
@@ -4228,7 +4228,7 @@ mod tests {
     async fn drop_runtime_db(settings: &MatrixOneSettings) {
         let mut bootstrap = settings.clone();
         bootstrap.database =
-            std::env::var("MATRIXONE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
         let admin_pool = connect_matrixone(&bootstrap)
             .await
             .expect("connect bootstrap catalog for drop");

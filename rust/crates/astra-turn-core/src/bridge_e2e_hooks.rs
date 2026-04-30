@@ -1,6 +1,6 @@
 //! Opt-in **compile-time** hooks for full-stack bridge tests without a real LLM or MatrixOne model row.
 //!
-//! Enable with crate feature `bridge-e2e-hooks`. At runtime, set `ASTRA_BRIDGE_TEST_SECRET` to a
+//! Enable with crate feature `bridge-e2e-hooks`. At runtime, set `ASTRA_TEST_BRIDGE_SECRET` to a
 //! non-empty value and send the same value as header `x-mo-bridge-test-secret` on `POST /chat/turn`
 //! (forwarded to the in-process bridge). Body field `test_llm_rounds` is a JSON array of objects:
 //! `{ "full_text"?, "reasoning"?, "tool_calls"?, "usage"? }` — same shape as the internal
@@ -20,7 +20,7 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 pub fn authorized(headers: &HeaderMap) -> bool {
-    let Ok(expected) = std::env::var("ASTRA_BRIDGE_TEST_SECRET") else {
+    let Ok(expected) = std::env::var("ASTRA_TEST_BRIDGE_SECRET") else {
         return false;
     };
     if expected.is_empty() {

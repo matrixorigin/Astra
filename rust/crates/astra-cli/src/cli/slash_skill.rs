@@ -3216,18 +3216,12 @@ async fn upload_quality_report(
     }
 }
 
-/// Upload quality on REPL exit if opt-in enabled via ASTRA_QUALITY_UPLOAD=true.
+/// Upload quality on REPL exit — disabled (was opt-in via ASTRA_QUALITY_UPLOAD).
 pub(super) async fn maybe_upload_quality_on_exit(
-    api: &astra_thin_client::ThinClient,
-    tracker: &astra_skills::quality::SkillQualityTracker,
-    token: Option<&str>,
+    _api: &astra_thin_client::ThinClient,
+    _tracker: &astra_skills::quality::SkillQualityTracker,
+    _token: Option<&str>,
 ) {
-    if std::env::var("ASTRA_QUALITY_UPLOAD")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false)
-    {
-        upload_quality_report(api, tracker, token).await;
-    }
 }
 
 // ── Marketplace install/publish/uninstall ─────────────────────────────────

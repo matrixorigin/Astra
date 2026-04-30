@@ -2,7 +2,7 @@
 
 This document maps **user-visible capabilities** to **where they are tested**, so stub/JSON contract tests can be removed without losing the last line of defense. It extends [`system-e2e-matrix.md`](./system-e2e-matrix.md).
 
-Legend: **E2E** = `rust/crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_SYSTEM_MATRIX_E2E=1` (real MatrixOne + HTTP + `sqlx` where noted). **Stub** = `build_app(AppState::new(...))` with in-memory/stub services (no DB). **Unit** = `#[cfg(test)]` in crate sources or small integration tests without HTTP.
+Legend: **E2E** = `rust/crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_TEST_DB_IT=1` (real MatrixOne + HTTP + `sqlx` where noted). **Stub** = `build_app(AppState::new(...))` with in-memory/stub services (no DB). **Unit** = `#[cfg(test)]` in crate sources or small integration tests without HTTP.
 
 ## Configuration (`AppSettings`)
 
@@ -78,8 +78,8 @@ Legend: **E2E** = `rust/crates/runtime/tests/system_matrix_http_e2e/` with `ASTR
 
 | Test | Gate |
 |------|------|
-| `astra-services` `multi_agent_integration` | `ASTRA_MULTI_AGENT_IT=1` (PR CI when enabled in [`.github/workflows/test.yml`](../../.github/workflows/test.yml)) |
-| `astra-services` `team_persistence_integration` | `ASTRA_MULTI_AGENT_IT=1` + live MatrixOne (`#[ignore]`); see module doc in `rust/crates/services/tests/team_persistence_integration.rs` |
+| `astra-services` `multi_agent_integration` | `ASTRA_TEST_DB_IT=1` (PR CI when enabled in [`.github/workflows/test.yml`](../../.github/workflows/test.yml)) |
+| `astra-services` `team_persistence_integration` | `ASTRA_TEST_DB_IT=1` + live MatrixOne (`#[ignore]`); see module doc in `rust/crates/services/tests/team_persistence_integration.rs` |
 
 ## Team (`/teams/*`, orchestration, persistence)
 
@@ -96,4 +96,4 @@ Legend: **E2E** = `rust/crates/runtime/tests/system_matrix_http_e2e/` with `ASTR
 
 - Offline slice: `make test-offline` (workspace + bridge hooks; no online `#[ignore]` suites).
 - Full validation with MatrixOne: `make test` (`test-offline` then `test-online`) or run `make test-online` alone when you only need ignored suites.
-- Advanced: set `ASTRA_SYSTEM_MATRIX_E2E=1` / `ASTRA_MULTI_AGENT_IT=1` manually as in [`system-e2e-matrix.md`](./system-e2e-matrix.md).
+- Advanced: set `ASTRA_TEST_DB_IT=1` / `ASTRA_TEST_DB_IT=1` manually as in [`system-e2e-matrix.md`](./system-e2e-matrix.md).

@@ -1120,7 +1120,7 @@ pub async fn run_product_matrix_full_journey(
         }]
     });
 
-    let test_secret = std::env::var("ASTRA_BRIDGE_TEST_SECRET").expect("bridge test secret");
+    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
     let chat_req = Request::builder()
         .method("POST")
         .uri("/chat/turn")

@@ -7,7 +7,7 @@
 //!      shuffle the tool catalogue.
 //!   3. Tool description change (same tool name) changes the prefix hash
 //!      — descriptions are part of the tool schema fed to the LLM.
-//!   4. `MO_PROMPT_CACHE_DISABLED=true` (string, not just "1") is honoured.
+//!   4. `ASTRA_TEST_PROMPT_CACHE_DISABLED=true` (string, not just "1") is honoured.
 //!   5. Adding an assistant message preserves the system prefix hash.
 //!   6. Large message history still only attaches ONE cache breakpoint at
 //!      the tail (4-budget invariant under long histories).
@@ -93,7 +93,7 @@ fn count_cache_control(v: &Value) -> usize {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
 async fn anthropic_total_cache_breakpoints_respect_four_budget() {
-    unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED") };
+    unsafe { std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED") };
     let capture = Arc::new(Mutex::new(Vec::new()));
     let tools = vec![
         tool_named("bash", "Execute a bash command"),
@@ -131,7 +131,7 @@ async fn anthropic_total_cache_breakpoints_respect_four_budget() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
 async fn tool_order_swap_changes_prefix_hash() {
-    unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED") };
+    unsafe { std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED") };
     let capture_a = Arc::new(Mutex::new(Vec::new()));
     let capture_b = Arc::new(Mutex::new(Vec::new()));
 
@@ -167,7 +167,7 @@ async fn tool_order_swap_changes_prefix_hash() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
 async fn tool_description_change_changes_prefix_hash() {
-    unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED") };
+    unsafe { std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED") };
     let capture_a = Arc::new(Mutex::new(Vec::new()));
     let capture_b = Arc::new(Mutex::new(Vec::new()));
 
@@ -210,17 +210,17 @@ async fn tool_description_change_changes_prefix_hash() {
     );
 }
 
-// ── J-4: MO_PROMPT_CACHE_DISABLED=true (string) honoured ────────────────────
+// ── J-4: ASTRA_TEST_PROMPT_CACHE_DISABLED=true (string) honoured ────────────────────
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
 async fn cache_disabled_via_string_true_is_honoured() {
     struct EnvGuard;
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED") };
+            unsafe { std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED") };
         }
     }
-    unsafe { std::env::set_var("MO_PROMPT_CACHE_DISABLED", "true") };
+    unsafe { std::env::set_var("ASTRA_TEST_PROMPT_CACHE_DISABLED", "true") };
     let _g = EnvGuard;
 
     let capture = Arc::new(Mutex::new(Vec::new()));
@@ -251,7 +251,7 @@ async fn cache_disabled_via_string_true_is_honoured() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
 async fn adding_assistant_message_keeps_system_prefix_stable() {
-    unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED") };
+    unsafe { std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED") };
     let capture = Arc::new(Mutex::new(Vec::new()));
     let mut host = build_host_with_tools(
         vec![scripted_round("t1"), scripted_round("t2")],
@@ -284,7 +284,7 @@ async fn adding_assistant_message_keeps_system_prefix_stable() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
 async fn long_message_history_still_caps_message_breakpoints_at_one() {
-    unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED") };
+    unsafe { std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED") };
     let capture = Arc::new(Mutex::new(Vec::new()));
     let mut host = build_host_with_tools(
         vec![scripted_round("done")],
@@ -321,7 +321,7 @@ async fn long_message_history_still_caps_message_breakpoints_at_one() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
 async fn openai_provider_emits_no_cache_control_anywhere() {
-    unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED") };
+    unsafe { std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED") };
     let capture = Arc::new(Mutex::new(Vec::new()));
     let mut host = build_host_with_tools(
         vec![scripted_round("ok")],
@@ -352,7 +352,7 @@ async fn openai_provider_emits_no_cache_control_anywhere() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
 async fn claude_haiku_vs_sonnet_both_latch_anthropic() {
-    unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED") };
+    unsafe { std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED") };
     let cap_a = Arc::new(Mutex::new(Vec::new()));
     let cap_b = Arc::new(Mutex::new(Vec::new()));
 

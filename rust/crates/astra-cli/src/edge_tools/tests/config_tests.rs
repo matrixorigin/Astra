@@ -37,7 +37,12 @@ fn config_list_settings() {
                 .map(|s| s.to_string())
         })
         .collect();
-    for required in ["model", "api_key", "output_limit"] {
+    for required in [
+        "output_limit",
+        "tool_output_limit",
+        "auto_approve",
+        "turn_limit",
+    ] {
         assert!(
             surface.iter().any(|s| s == required),
             "expected canonical setting `{required}` in list — got: {surface:?}"
@@ -46,48 +51,13 @@ fn config_list_settings() {
 }
 
 #[test]
-fn config_get_model() {
+fn config_get_output_limit() {
     let exe = test_executor();
-    let result = exe.config_tool(&json!({ "setting": "model" }));
+    let result = exe.config_tool(&json!({ "setting": "output_limit" }));
     let parsed: Value = serde_json::from_str(&result).unwrap();
 
-    assert_eq!(parsed.get("setting").unwrap(), "model");
+    assert_eq!(parsed.get("setting").unwrap(), "output_limit");
     assert!(parsed.get("value").is_some());
-}
-
-#[test]
-fn config_get_api_key_status() {
-    let exe = test_executor();
-    let result = exe.config_tool(&json!({ "setting": "api_key" }));
-    let parsed: Value = serde_json::from_str(&result).unwrap();
-
-    // Security: must never leak actual key material in any form.
-    assert!(
-        !result.contains("sk-"),
-        "must not leak OpenAI-style key prefix"
-    );
-    assert!(
-        !result.to_lowercase().contains("bearer "),
-        "must not emit bearer-token shape"
-    );
-
-    assert_eq!(parsed["setting"], "api_key");
-    let status = parsed["status"]
-        .as_object()
-        .expect("status must be an object mapping provider env var → state");
-
-    // Must cover every canonical provider env var so the UI can render a full
-    // matrix, not just the one that happens to be set.
-    for key in ["MO_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"] {
-        let v = status
-            .get(key)
-            .and_then(|v| v.as_str())
-            .unwrap_or_else(|| panic!("status.{key} must be a string state — got: {parsed}"));
-        assert!(
-            v == "set" || v == "not set",
-            "status.{key} must be a canonical state ('set'/'not set') — got: {v:?}"
-        );
-    }
 }
 
 #[test]

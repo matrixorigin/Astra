@@ -48,7 +48,7 @@ async fn collect_full_sse_stream(
 
 /// Stream a chat, wait for the full stream to end, return (status, raw_body).
 async fn stream_chat_full(app: &axum::Router, auth: &str, payload: Value) -> (StatusCode, String) {
-    let test_secret = std::env::var("ASTRA_BRIDGE_TEST_SECRET").expect("bridge test secret");
+    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
     let req = Request::builder()
         .method("POST")
         .uri("/chat/stream")

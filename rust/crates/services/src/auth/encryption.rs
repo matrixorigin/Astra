@@ -14,9 +14,20 @@ pub struct FernetTokenEncryptor {
 
 impl FernetTokenEncryptor {
     pub fn from_env() -> Result<Self, String> {
-        let key_source = env::var("TOKEN_ENCRYPTION_KEY")
-            .map_err(|_| "TOKEN_ENCRYPTION_KEY environment variable must be set.".to_string())?;
-        Self::new(&key_source)
+        Self::from_key(None)
+    }
+
+    /// Create from an explicit key, or fall back to `ASTRA_TOKEN_ENCRYPTION_KEY` when `None`.
+    pub fn from_key(key: Option<&str>) -> Result<Self, String> {
+        match key {
+            Some(k) => Self::new(k),
+            None => {
+                let k = env::var("ASTRA_TOKEN_ENCRYPTION_KEY").map_err(|_| {
+                    "ASTRA_TOKEN_ENCRYPTION_KEY environment variable must be set.".to_string()
+                })?;
+                Self::new(&k)
+            }
+        }
     }
 
     pub fn new(secret_key: &str) -> Result<Self, String> {
@@ -121,6 +132,59 @@ mod tests {
     #[test]
     fn derive_fernet_key_differs_for_different_inputs() {
         assert_ne!(derive_fernet_key("key-a"), derive_fernet_key("key-b"));
+    }
+
+    // -- from_key --
+
+    #[test]
+    fn from_key_some_uses_provided_key() {
+        let enc = FernetTokenEncryptor::from_key(Some("my-explicit-key")).unwrap();
+        let expected = FernetTokenEncryptor::new("my-explicit-key").unwrap();
+        let ct = enc.encrypt("hello").unwrap();
+        assert_eq!(expected.decrypt(&ct).unwrap(), "hello");
+    }
+
+    #[test]
+    fn from_key_some_ignores_env_var() {
+        // Even if ASTRA_TOKEN_ENCRYPTION_KEY is absent, Some(key) must succeed.
+        // We remove the env var in this isolated test (no other test sets it concurrently
+        // because these tests don't depend on the env var).
+        let prev = std::env::var("ASTRA_TOKEN_ENCRYPTION_KEY").ok();
+        unsafe { std::env::remove_var("ASTRA_TOKEN_ENCRYPTION_KEY") };
+        let result = FernetTokenEncryptor::from_key(Some("standalone-key"));
+        // restore
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("ASTRA_TOKEN_ENCRYPTION_KEY", v) };
+        }
+        assert!(result.is_ok(), "from_key(Some) must not need env var");
+    }
+
+    #[test]
+    fn from_key_none_falls_back_to_env() {
+        let prev = std::env::var("ASTRA_TOKEN_ENCRYPTION_KEY").ok();
+        unsafe { std::env::set_var("ASTRA_TOKEN_ENCRYPTION_KEY", "env-key") };
+        let enc = FernetTokenEncryptor::from_key(None);
+        // restore
+        match prev {
+            Some(v) => unsafe { std::env::set_var("ASTRA_TOKEN_ENCRYPTION_KEY", v) },
+            None => unsafe { std::env::remove_var("ASTRA_TOKEN_ENCRYPTION_KEY") },
+        }
+        let enc = enc.unwrap();
+        let expected = FernetTokenEncryptor::new("env-key").unwrap();
+        let ct = enc.encrypt("world").unwrap();
+        assert_eq!(expected.decrypt(&ct).unwrap(), "world");
+    }
+
+    #[test]
+    fn from_key_none_without_env_fails() {
+        let prev = std::env::var("ASTRA_TOKEN_ENCRYPTION_KEY").ok();
+        unsafe { std::env::remove_var("ASTRA_TOKEN_ENCRYPTION_KEY") };
+        let result = FernetTokenEncryptor::from_key(None);
+        // restore
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("ASTRA_TOKEN_ENCRYPTION_KEY", v) };
+        }
+        assert!(result.is_err());
     }
 
     #[test]

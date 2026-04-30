@@ -57,10 +57,10 @@ astra-engine/
 
 ```bash
 # Development
-RUST_API_ADDR=0.0.0.0:8000 astra-server
+ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=8000 astra-server
 
 # Production
-RUST_API_ADDR=0.0.0.0:8000 astra-server
+ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=8000 astra-server
 ```
 
 Features: structured JSON logging, JWT auth, rate limiting (60 req/min), health checks, Prometheus metrics.
@@ -86,12 +86,20 @@ cd deployment/all-in-one && docker-compose --profile full up -d
 | `MATRIXONE_PORT` | `6001` | MatrixOne port |
 | `MATRIXONE_USER` | `root` | MatrixOne user |
 | `MATRIXONE_PASSWORD` | `111` | MatrixOne password |
-| `ASTRA_DATABASE` | `dev_agent` | Platform state database |
-| `REDIS_URL` | `redis://localhost:6379` | Redis URL |
-| `JWT_SECRET` | (required) | JWT signing secret |
-| `OPENAI_API_KEY` | (optional) | OpenAI provider |
-| `ANTHROPIC_API_KEY` | (optional) | Anthropic provider |
-| `GROQ_API_KEY` | (optional) | Groq provider |
+| `ASTRA_DATABASE` | `astra_runtime` | Platform state database |
+| `ASTRA_JWT_SECRET` | (required) | JWT signing secret |
+| `ASTRA_TOKEN_ENCRYPTION_KEY` | (required) | Fernet token encryption key |
+| `ASTRA_BRIDGE_SECRET` | (required) | Chat turn bridge secret |
+
+LLM provider configuration is managed server-side via the admin CLI, not env vars:
+
+```bash
+astra-admin model add gpt-4o-mini openai --api-key sk-... --base-url https://api.openai.com/v1
+astra-admin model check gpt-4o-mini                       # activate if reachable
+astra-admin config set reasoning_model_name gpt-4o-mini   # (optional) judge/summary model
+```
+
+Without an explicit reasoning model, the server picks the cheapest active model by `pricing.completion`.
 
 ## Database Initialization
 

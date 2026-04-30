@@ -1019,13 +1019,13 @@ fn permission_mode_roundtrip_parse() {
 
 #[test]
 fn repl_state_auto_approve_env_activates_auto_mode() {
-    // When ASTRA_AUTO_APPROVE=1, ReplState should start in Auto mode
+    // When ASTRA_CLI_AUTO_APPROVE=1, ReplState should start in Auto mode
     unsafe {
-        std::env::set_var("ASTRA_AUTO_APPROVE", "1");
+        std::env::set_var("ASTRA_CLI_AUTO_APPROVE", "1");
     }
     let state = ReplState::default();
     unsafe {
-        std::env::remove_var("ASTRA_AUTO_APPROVE");
+        std::env::remove_var("ASTRA_CLI_AUTO_APPROVE");
     }
     assert_eq!(
         state.perm_manager.mode(),

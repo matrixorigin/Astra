@@ -48,11 +48,13 @@ pub struct AppSettings {
     pub matrixone: MatrixOneSettings,
     pub application: ApplicationSettings,
     pub jwt: JwtSettings,
+    pub api: ApiSettings,
+    pub memoria: MemoriaSettings,
     pub github_token: Option<String>,
-    pub memoria_base_url: String,
-    pub memoria_master_key: Option<String>,
-    pub chat_turn_bridge_url: Option<String>,
-    pub chat_turn_bridge_secret: String,
+    pub bridge_url: Option<String>,
+    pub bridge_secret: String,
+    pub token_encryption_key: Option<String>,
+    pub database_bootstrap_catalog: String,
 }
 
 impl fmt::Debug for AppSettings {
@@ -61,17 +63,18 @@ impl fmt::Debug for AppSettings {
             .field("matrixone", &self.matrixone)
             .field("application", &self.application)
             .field("jwt", &self.jwt)
+            .field("api", &self.api)
+            .field("memoria", &self.memoria)
             .field(
                 "github_token",
                 &self.github_token.as_ref().map(|_| "[REDACTED]"),
             )
-            .field("memoria_base_url", &self.memoria_base_url)
+            .field("bridge_url", &self.bridge_url)
+            .field("bridge_secret", &"[REDACTED]")
             .field(
-                "memoria_master_key",
-                &self.memoria_master_key.as_ref().map(|_| "[REDACTED]"),
+                "token_encryption_key",
+                &self.token_encryption_key.as_ref().map(|_| "[REDACTED]"),
             )
-            .field("chat_turn_bridge_url", &self.chat_turn_bridge_url)
-            .field("chat_turn_bridge_secret", &"[REDACTED]")
             .finish()
     }
 }
@@ -98,25 +101,33 @@ impl AppSettings {
                 password: required_value(&lookup, "MATRIXONE_PASSWORD", "111")?,
                 database: resolve_database_name(&lookup),
             },
+            database_bootstrap_catalog: value_or_default(
+                &lookup,
+                "ASTRA_DATABASE_BOOTSTRAP_CATALOG",
+                "mysql",
+            ),
             application: ApplicationSettings {
-                app_env: value_or_default(&lookup, "APP_ENV", "development"),
-                log_level: value_or_default(&lookup, "LOG_LEVEL", "DEBUG"),
-                secret_key: required_value(
-                    &lookup,
-                    "SECRET_KEY",
-                    "dev-secret-key-change-in-production",
-                )?,
+                app_env: value_or_default(&lookup, "ASTRA_APP_ENV", "development"),
+                log_level: value_or_default(&lookup, "ASTRA_LOG_LEVEL", "DEBUG"),
             },
             jwt: JwtSettings::from_lookup(&lookup)?,
+            api: ApiSettings {
+                host: value_or_default(&lookup, "ASTRA_API_HOST", "0.0.0.0"),
+                port: parse_or_default(&lookup, "ASTRA_API_PORT", 8000)?,
+                cors_origins: optional_value(&lookup, "ASTRA_CORS_ORIGINS"),
+            },
+            memoria: MemoriaSettings {
+                base_url: value_or_default(&lookup, "MEMORIA_BASE_URL", DEFAULT_MEMORIA_URL),
+                master_key: optional_value(&lookup, "MEMORIA_MASTER_KEY"),
+            },
             github_token: optional_value(&lookup, "GITHUB_TOKEN"),
-            memoria_base_url: value_or_default(&lookup, "MEMORIA_BASE_URL", DEFAULT_MEMORIA_URL),
-            memoria_master_key: optional_value(&lookup, "MEMORIA_MASTER_KEY"),
-            chat_turn_bridge_url: optional_value(&lookup, "CHAT_TURN_BRIDGE_URL"),
-            chat_turn_bridge_secret: required_value(
+            bridge_url: optional_value(&lookup, "ASTRA_BRIDGE_URL"),
+            bridge_secret: required_value(
                 &lookup,
-                "CHAT_TURN_BRIDGE_SECRET",
+                "ASTRA_BRIDGE_SECRET",
                 "dev-bridge-secret-change-me",
             )?,
+            token_encryption_key: optional_value(&lookup, "ASTRA_TOKEN_ENCRYPTION_KEY"),
         })
     }
 }
@@ -168,7 +179,6 @@ impl MatrixOneSettings {
 pub struct ApplicationSettings {
     pub app_env: String,
     pub log_level: String,
-    pub secret_key: String,
 }
 
 impl fmt::Debug for ApplicationSettings {
@@ -176,7 +186,6 @@ impl fmt::Debug for ApplicationSettings {
         f.debug_struct("ApplicationSettings")
             .field("app_env", &self.app_env)
             .field("log_level", &self.log_level)
-            .field("secret_key", &"[REDACTED]")
             .finish()
     }
 }
@@ -218,21 +227,56 @@ impl JwtSettings {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let secret = required_value(lookup, "JWT_SECRET_KEY", "change-me-in-production")?;
+        let secret = required_value(lookup, "ASTRA_JWT_SECRET", "change-me-in-production")?;
         Ok(Self {
             secret_key: normalize_jwt_secret(&secret),
-            algorithm: value_or_default(lookup, "JWT_ALGORITHM", "HS256"),
+            algorithm: value_or_default(lookup, "ASTRA_JWT_ALGORITHM", "HS256"),
             access_token_expire_minutes: parse_or_default(
                 lookup,
-                "JWT_ACCESS_TOKEN_EXPIRE_MINUTES",
+                "ASTRA_JWT_ACCESS_TTL_MINUTES",
                 60_u32,
             )?,
             refresh_token_expire_days: parse_or_default(
                 lookup,
-                "JWT_REFRESH_TOKEN_EXPIRE_DAYS",
+                "ASTRA_JWT_REFRESH_TTL_DAYS",
                 7_u32,
             )?,
         })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiSettings {
+    pub host: String,
+    pub port: u16,
+    pub cors_origins: Option<String>,
+}
+
+impl fmt::Debug for ApiSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApiSettings")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("cors_origins", &self.cors_origins)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct MemoriaSettings {
+    pub base_url: String,
+    pub master_key: Option<String>,
+}
+
+impl fmt::Debug for MemoriaSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemoriaSettings")
+            .field("base_url", &self.base_url)
+            .field(
+                "master_key",
+                &self.master_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
     }
 }
 
@@ -371,12 +415,10 @@ mod tests {
         let development = ApplicationSettings {
             app_env: "development".into(),
             log_level: "DEBUG".into(),
-            secret_key: "secret".into(),
         };
         let production = ApplicationSettings {
             app_env: "production".into(),
             log_level: "INFO".into(),
-            secret_key: "secret".into(),
         };
 
         assert!(development.is_development());
@@ -395,7 +437,6 @@ mod tests {
             database: "agent".into(),
         };
 
-        // Default `database_url()` returns the masked form for safe logging.
         assert_eq!(
             settings.database_url(),
             "mysql://alice:[REDACTED]@db:3306/agent"
@@ -473,11 +514,11 @@ mod tests {
         );
         assert!(
             !debug_str.contains("memoria-master-key-xyz"),
-            "memoria_master_key should be redacted: {debug_str}"
+            "memoria master_key should be redacted: {debug_str}"
         );
         assert!(
             !debug_str.contains("dev-bridge-secret-change-me"),
-            "chat_turn_bridge_secret should be redacted: {debug_str}"
+            "bridge_secret should be redacted: {debug_str}"
         );
     }
 
@@ -520,7 +561,7 @@ mod tests {
 
     #[test]
     fn from_lookup_missing_required_keys_returns_error() {
-        let m = HashMap::new(); // no ASTRA_ALLOW_INSECURE_DEFAULTS
+        let m = HashMap::new();
         let result = AppSettings::from_map(&m);
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -533,9 +574,11 @@ mod tests {
     fn from_lookup_explicit_required_values_work() {
         let mut m = HashMap::new();
         m.insert("MATRIXONE_PASSWORD".into(), "testpw".into());
-        m.insert("SECRET_KEY".into(), "test-secret".into());
-        m.insert("JWT_SECRET_KEY".into(), "my-test-jwt-secret-key-123".into());
-        m.insert("CHAT_TURN_BRIDGE_SECRET".into(), "bridge-secret".into());
+        m.insert(
+            "ASTRA_JWT_SECRET".into(),
+            "my-test-jwt-secret-key-123".into(),
+        );
+        m.insert("ASTRA_BRIDGE_SECRET".into(), "bridge-secret".into());
         let result = AppSettings::from_map(&m);
         assert!(result.is_ok(), "explicit values should parse: {:?}", result);
         let settings = result.unwrap();
@@ -546,8 +589,7 @@ mod tests {
                 .starts_with("my-test-jwt-secret-key-123")
         );
         assert_eq!(settings.matrixone.password, "testpw");
-        assert_eq!(settings.application.secret_key, "test-secret");
-        assert_eq!(settings.chat_turn_bridge_secret, "bridge-secret");
+        assert_eq!(settings.bridge_secret, "bridge-secret");
     }
 
     #[test]
@@ -598,10 +640,9 @@ mod settings_contract_tests {
         matrixone_database: String,
         app_env: String,
         log_level: String,
-        secret_key: String,
         github_token: Option<String>,
-        chat_turn_bridge_url: Option<String>,
-        chat_turn_bridge_secret: String,
+        bridge_url: Option<String>,
+        bridge_secret: String,
     }
 
     fn load_contract() -> SettingsContract {
@@ -621,10 +662,9 @@ mod settings_contract_tests {
             matrixone_database: settings.matrixone.database,
             app_env: settings.application.app_env,
             log_level: settings.application.log_level,
-            secret_key: settings.application.secret_key,
             github_token: settings.github_token,
-            chat_turn_bridge_url: settings.chat_turn_bridge_url,
-            chat_turn_bridge_secret: settings.chat_turn_bridge_secret,
+            bridge_url: settings.bridge_url,
+            bridge_secret: settings.bridge_secret,
         }
     }
 

@@ -64,33 +64,6 @@ impl std::fmt::Debug for LlmConnParams {
     }
 }
 
-impl LlmConnParams {
-    /// Build from environment variables.
-    ///
-    /// Required: `MO_MODEL`, `MO_API_KEY`, `MO_BASE_URL`
-    /// Optional: `MO_LLM_PROVIDER` (default: "openai"), `MO_MAX_OUTPUT_TOKENS` (default: 4096)
-    pub fn from_env() -> Option<Self> {
-        let model_name = std::env::var("MO_MODEL").ok()?;
-        let api_key = std::env::var("MO_API_KEY").ok()?;
-        let base_url = std::env::var("MO_BASE_URL").ok()?;
-        if model_name.is_empty() || api_key.is_empty() || base_url.is_empty() {
-            return None;
-        }
-        let provider = std::env::var("MO_LLM_PROVIDER").unwrap_or_else(|_| "openai".to_string());
-        let max_output_tokens = std::env::var("MO_MAX_OUTPUT_TOKENS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4096);
-        Some(Self {
-            model_name,
-            api_key,
-            base_url,
-            provider,
-            max_output_tokens,
-        })
-    }
-}
-
 /// Abstraction over the LLM API for summary generation.
 /// Implemented by the real HTTP client and by mocks in tests.
 #[async_trait]

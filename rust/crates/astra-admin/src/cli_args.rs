@@ -35,6 +35,33 @@ pub(crate) enum Command {
     Prompt(PromptCmd),
     #[command(subcommand)]
     Feedback(FeedbackCmd),
+    #[command(subcommand)]
+    /// Manage server-wide admin configuration (e.g., reasoning model).
+    Config(ConfigCmd),
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ConfigCmd {
+    /// List all admin config keys and values.
+    List,
+    /// Read a single admin config value (e.g. `get reasoning_model`).
+    Get(ConfigKeyArgs),
+    /// Set an admin config value (e.g. `set reasoning_model gpt-4o-mini`).
+    Set(ConfigSetArgs),
+    /// Delete an admin config value.
+    #[command(visible_alias = "delete")]
+    Unset(ConfigKeyArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ConfigKeyArgs {
+    pub key: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ConfigSetArgs {
+    pub key: String,
+    pub value: String,
 }
 
 #[derive(Args, Debug)]

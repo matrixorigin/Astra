@@ -32,11 +32,10 @@ echo "Checking database..."
 
 # 5. Start API server
 echo "Starting API server..."
-echo "  Host: ${API_HOST:-0.0.0.0}"
-echo "  Port: ${API_PORT:-8000}"
-echo "  Workers: ${API_WORKERS:-4}"
+echo "  Host: ${ASTRA_API_HOST:-0.0.0.0}"
+echo "  Port: ${ASTRA_API_PORT:-8000}"
 
-RUST_API_ADDR="${API_HOST:-0.0.0.0}:${API_PORT:-8000}" \
+ASTRA_API_HOST="${ASTRA_API_HOST:-0.0.0.0}" ASTRA_API_PORT="${ASTRA_API_PORT:-8000}" \
     astra-server
 
 echo "✅ Deployment complete!"

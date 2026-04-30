@@ -1,12 +1,14 @@
-//! Session finalization and knowledge extraction.
+//! Session finalization.
 //!
 //! This module handles cleanup tasks when a REPL session ends:
 //! - Writing session end journal events
 //! - Finalizing workspace state
 //! - Ending observability sessions
-//! - Extracting learnings to `.astra/knowledge.md`
 //! - Triggering Memoria governance and consolidation
 //! - Clearing panic guards
+//!
+//! The session-end knowledge extraction feature (auto-append to `.astra/knowledge.md`) was
+//! removed during the env-var cleanup. The helper functions are retained for future use.
 
 use astra_services::session_journal;
 use crossterm::style::Stylize;
@@ -68,99 +70,11 @@ pub(super) async fn finalize_session(state: &ReplState) {
 // Session-end knowledge extraction → .astra/knowledge.md
 // ---------------------------------------------------------------------------
 
-/// Extract learnings from the session and append to `.astra/knowledge.md`.
-///
-/// This is opt-in: gated behind `MO_SESSION_KNOWLEDGE_EXTRACT_ON_END=true`.
-/// Returns `Option<JoinHandle>` — callers should await with timeout at exit.
+/// Extract learnings from the session (disabled — always no-op).
 pub(super) fn session_end_extract_learnings(
-    history: &[(String, String)],
+    _history: &[(String, String)],
 ) -> Option<tokio::task::JoinHandle<()>> {
-    // Gate: explicit opt-in required (involves extra LLM call)
-    if std::env::var("MO_SESSION_KNOWLEDGE_EXTRACT_ON_END")
-        .unwrap_or_default()
-        .to_lowercase()
-        != "true"
-    {
-        return None;
-    }
-
-    // Need LLM params and at least a few turns of history
-    let params = astra_turn_core::cloud_summary::LlmConnParams::from_env()?;
-    if history.len() < 3 {
-        return None;
-    }
-
-    // Convert history to messages for the prompt
-    let recent_messages: Vec<serde_json::Value> = history
-        .iter()
-        .rev()
-        .take(20)
-        .rev()
-        .flat_map(|(user, asst)| {
-            vec![
-                serde_json::json!({"role": "user", "content": user}),
-                serde_json::json!({"role": "assistant", "content": asst}),
-            ]
-        })
-        .collect();
-
-    // Build a summary of the conversation as "session memory" input.
-    // Include both user messages and truncated assistant responses to capture
-    // problem-solution pairs (most knowledge lives in assistant responses).
-    let session_summary = history
-        .iter()
-        .enumerate()
-        .map(|(i, (u, a))| {
-            let user_trunc: String = u.chars().take(200).collect();
-            let asst_trunc: String = a.chars().take(300).collect();
-            format!(
-                "Turn {}: User: {user_trunc}\n  Assistant: {asst_trunc}",
-                i + 1
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    Some(tokio::spawn(async move {
-        use astra_turn_core::cloud_session_memory_extract::{
-            build_learnings_extraction_prompt, parse_learnings_response,
-        };
-
-        let prompt = build_learnings_extraction_prompt(&session_summary, &recent_messages);
-
-        // Call LLM
-        let client = astra_turn_core::cloud_summary::HttpSummaryClient::new(
-            astra_turn_core::cloud_summary::LlmConnParams {
-                max_output_tokens: 2048,
-                ..params
-            },
-        );
-        use astra_turn_core::cloud_summary::SummaryLlmClient;
-        match client.summarize(&prompt).await {
-            Ok(resp) => {
-                if let Some(learnings) = parse_learnings_response(&resp.text) {
-                    if let Err(e) = append_to_knowledge_md(&learnings) {
-                        eprintln!(
-                            "  {} Failed to write .astra/knowledge.md: {e}",
-                            theme::icon_warn()
-                        );
-                    } else {
-                        let count = learnings
-                            .lines()
-                            .filter(|l| l.trim_start().starts_with("- "))
-                            .count();
-                        eprintln!(
-                            "{}",
-                            format!("  ⊕ {count} learnings saved to .astra/knowledge.md").dim()
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("  {} Knowledge extraction failed: {e}", theme::icon_warn());
-            }
-        }
-    }))
+    None
 }
 
 /// Await a knowledge extraction handle with timeout.
@@ -277,12 +191,8 @@ mod tests {
         std::fs::remove_file(&knowledge_path).ok();
     }
 
-    #[serial_test::serial]
     #[test]
-    fn session_end_extract_learnings_returns_none_without_env_var() {
-        unsafe {
-            std::env::remove_var("MO_SESSION_KNOWLEDGE_EXTRACT_ON_END");
-        }
+    fn session_end_extract_learnings_is_always_none() {
         let history: Vec<(String, String)> = vec![
             ("Q1".into(), "A1".into()),
             ("Q2".into(), "A2".into()),
@@ -290,7 +200,7 @@ mod tests {
         ];
         assert!(
             session_end_extract_learnings(&history).is_none(),
-            "Should return None when env var is not set"
+            "feature disabled — should always return None"
         );
     }
 

@@ -185,7 +185,7 @@ pub use astra_turn_core::compaction_types::CompactionTier;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompactConfig {
     /// Enable LLM-generated summary instead of pure truncation.
-    /// Defaults to `true`. Set `MO_COMPACT_SUMMARY_ENABLED=false` to disable.
+    /// Defaults to `true`. Set `ASTRA_COMPACT_SUMMARY_ENABLED=false` to disable.
     pub enable_summary: bool,
     /// Maximum tokens to generate for the summary.
     pub summary_token_budget: usize,
@@ -208,38 +208,9 @@ impl Default for CompactConfig {
 }
 
 impl CompactConfig {
-    /// Build config from environment variables.
-    ///
-    /// - `MO_COMPACT_SUMMARY_ENABLED` — "false" or "0" disables LLM summary (default: true)
-    /// - `MO_COMPACT_SUMMARY_MIN_TIER` — minimum tier: "trim", "compact", "aggressive" (default: compact)
-    /// - `MO_COMPACT_SUMMARY_TOKEN_BUDGET` — max output tokens for summary (default: 20000)
+    /// Build config using hardcoded defaults (no env overrides).
     pub fn from_env() -> Self {
-        let enable_summary = std::env::var("MO_COMPACT_SUMMARY_ENABLED")
-            .ok()
-            .map(|v| v != "false" && v != "0")
-            .unwrap_or(true);
-
-        let summary_min_tier = std::env::var("MO_COMPACT_SUMMARY_MIN_TIER")
-            .ok()
-            .and_then(|v| match v.to_lowercase().as_str() {
-                "trim" | "trimschemas" => Some(CompactionTier::TrimSchemas),
-                "compact" | "compacthistory" => Some(CompactionTier::CompactHistory),
-                "aggressive" | "aggressiveprune" => Some(CompactionTier::AggressivePrune),
-                _ => None,
-            })
-            .unwrap_or(CompactionTier::CompactHistory);
-
-        let summary_token_budget = std::env::var("MO_COMPACT_SUMMARY_TOKEN_BUDGET")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(20_000);
-
-        Self {
-            enable_summary,
-            summary_token_budget,
-            max_ptl_retries: 3,
-            summary_min_tier,
-        }
+        Self::default()
     }
 
     /// Returns true if LLM summary should be attempted for the given tier.

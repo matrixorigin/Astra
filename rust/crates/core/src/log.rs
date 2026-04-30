@@ -1,7 +1,7 @@
 //! Structured logging via [`tracing`] for consistent levels, targets, and fields.
 //!
 //! All agent-facing diagnostics use target **`astra.agent`** so operators can tune
-//! `RUST_LOG` (e.g. `astra.agent=debug`). Legacy **`MO_DEBUG=1`** makes [`agent_debug!`]
+//! `RUST_LOG` (e.g. `astra.agent=debug`). The `agent_debug!` macro
 //! echo stderr only while [`tracing::dispatcher::has_been_set`] is false (before
 //! `set_global_default`), avoiding duplicate lines once CLI or server logging installs a subscriber.
 
@@ -44,19 +44,10 @@ macro_rules! agent_info {
     };
 }
 
-/// Log a debug-level message with component tag.
-///
-/// [`tracing::debug!`] respects `RUST_LOG`. If **`MO_DEBUG`** is set and
-/// [`tracing::dispatcher::has_been_set`] is false, also prints one line to stderr
-/// (legacy CLIs with no global subscriber).
+/// Log a debug-level message with component tag. Respects `RUST_LOG`.
 #[macro_export]
 macro_rules! agent_debug {
     ($component:expr, $($arg:tt)*) => {{
-        if std::env::var("MO_DEBUG").is_ok()
-            && !$crate::tracing::dispatcher::has_been_set()
-        {
-            eprintln!("[{}] DEBUG: {}", $component, format!($($arg)*));
-        }
         $crate::tracing::debug!(
             target: "astra.agent",
             component = $component,

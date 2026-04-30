@@ -133,12 +133,12 @@ mod git_status {
 // ─── Tool execution ───────────────────────────────────────────────────────────
 
 /// Global output size limit. Individual tools may have tighter limits.
-/// Override with `MO_GLOBAL_OUTPUT_LIMIT` env var.
+/// Override with `ASTRA_GLOBAL_OUTPUT_LIMIT` env var.
 fn global_output_limit() -> usize {
     astra_core::RuntimeLimits::global().global_output_limit
 }
 /// Per-tool default output limit for tools without explicit truncation.
-/// Override with `MO_TOOL_OUTPUT_LIMIT` env var.
+/// Override with `ASTRA_TOOL_OUTPUT_LIMIT` env var.
 fn tool_output_limit() -> usize {
     astra_core::RuntimeLimits::global().tool_output_limit
 }

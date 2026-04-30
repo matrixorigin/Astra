@@ -248,7 +248,7 @@ async fn ensure_matrixone_database_exists(settings: &MatrixOneSettings) -> Resul
             )) as Box<dyn Error + Send + Sync>)
         })?;
     let catalog =
-        std::env::var("MATRIXONE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".to_string());
+        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".to_string());
     crate::snapshot_sql::validate_sql_identifier(&catalog, "matrixone bootstrap catalog").map_err(
         |e| {
             sqlx::Error::Configuration(Box::new(std::io::Error::new(
@@ -591,6 +591,19 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             INDEX idx_infra_llm_models_active_provider_name (is_active, provider, model_name)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Server-wide admin config KV store. Holds settings that the admin explicitly manages
+    // via `astra-admin config set/get/unset` (first key: `reasoning_model_name`).
+    query(
+        "CREATE TABLE IF NOT EXISTS admin_config (
+            config_key VARCHAR(100) PRIMARY KEY,
+            config_value TEXT NOT NULL,
+            updated_by VARCHAR(64) NULL,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
         )",
     )
     .execute(&pool)

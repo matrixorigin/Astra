@@ -130,16 +130,9 @@ fn build_bug_report(state: &ReplState) -> String {
     lines.push(String::new());
 
     // Redacted env vars — show presence but not values for sensitive ones.
-    let config_vars = [
-        ("MO_API_BASE", false),
-        ("MO_API_KEY", true),
-        ("MO_MODEL", false),
-        ("MO_MAX_TURNS", false),
-        ("MO_PLAN_SUBTASK_MAX_TURNS", false),
-        ("MO_MAX_TOOL_RETRIES", false),
-        ("MO_RETRY_BASE_MS", false),
-        ("MO_BUDGET_LIMIT", false),
-    ];
+    // LLM model / API key are stored server-side in infra_llm_models — inspect via
+    // `astra-admin model list` / `astra-admin config list`.
+    let config_vars = [("ASTRA_CLI_MAX_TURNS", false)];
     for (var, sensitive) in &config_vars {
         match std::env::var(var) {
             Ok(val) => {

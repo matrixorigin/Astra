@@ -70,12 +70,11 @@ async fn wait_for_full_capture_events(session_id: &str) -> Vec<Value> {
 }
 
 pub async fn run_stream_session_metadata_enables_full_llm_exchange_journaling() {
-    let Some(test_secret) = std::env::var("ASTRA_BRIDGE_TEST_SECRET").ok() else {
-        // Bridge journal test requires ASTRA_BRIDGE_TEST_SECRET == CHAT_TURN_BRIDGE_SECRET.
+    let Some(test_secret) = std::env::var("ASTRA_TEST_BRIDGE_SECRET").ok() else {
+        // Bridge journal test requires ASTRA_TEST_BRIDGE_SECRET == ASTRA_BRIDGE_SECRET.
         // Without it the bridge auth fails and no journal is written.
-        // Mark as explicitly skipped rather than silently passing.
         panic!(
-            "ASTRA_BRIDGE_TEST_SECRET not set — set it to the same value as CHAT_TURN_BRIDGE_SECRET to run this test"
+            "ASTRA_TEST_BRIDGE_SECRET not set — set it to the same value as ASTRA_BRIDGE_SECRET to run this test"
         );
     };
     let temp = tempdir().expect("tempdir");

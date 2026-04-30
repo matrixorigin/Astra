@@ -133,16 +133,7 @@ impl ToolExecutor {
         if category == "all" || category == "environment" {
             let mut env_info = serde_json::Map::new();
             let safe_vars = [
-                "PATH",
-                "HOME",
-                "USER",
-                "SHELL",
-                "TERM",
-                "LANG",
-                "PWD",
-                "RUST_LOG",
-                "MO_MODEL",
-                "MO_API_KEY", // show if set (not value)
+                "PATH", "HOME", "USER", "SHELL", "TERM", "LANG", "PWD", "RUST_LOG",
             ];
 
             for var in safe_vars {

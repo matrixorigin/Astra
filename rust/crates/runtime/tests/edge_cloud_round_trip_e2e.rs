@@ -39,7 +39,7 @@ static SECRET_INIT: OnceLock<()> = OnceLock::new();
 
 fn init_env() {
     SECRET_INIT.get_or_init(|| unsafe {
-        std::env::set_var("ASTRA_BRIDGE_TEST_SECRET", SECRET);
+        std::env::set_var("ASTRA_TEST_BRIDGE_SECRET", SECRET);
     });
 }
 

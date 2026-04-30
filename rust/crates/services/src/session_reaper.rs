@@ -161,12 +161,7 @@ pub fn spawn_session_reaper(
     pool: astra_core::SharedPool,
     cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
-    let reaper_interval = Duration::from_secs(
-        std::env::var("MO_REAPER_INTERVAL_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5 * 60), // default: 5 minutes
-    );
+    let reaper_interval = Duration::from_secs(5 * 60); // 5 minutes
 
     tokio::spawn(async move {
         let policy = SessionReaperPolicy::default();

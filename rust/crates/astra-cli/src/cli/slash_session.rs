@@ -4865,6 +4865,7 @@ fn derive_history_pairs_from_messages(messages: &[serde_json::Value]) -> Vec<(St
 
 async fn apply_restored_session(
     profile: Option<&str>,
+    api: &astra_thin_client::ThinClient,
     state: &mut ReplState,
     restored: RestoredSession,
 ) -> Result<(), String> {
@@ -5103,11 +5104,17 @@ async fn apply_restored_session(
             .matrix_runtime
             .as_ref()
             .and_then(|mc| mc.clone_ingestion_sender());
-        let cloud_judge = state
-            .matrix_runtime
-            .as_ref()
-            .and_then(|mc| mc.create_cloud_llm_judge())
-            .map(|j| std::sync::Arc::new(j) as std::sync::Arc<dyn astra_services::LlmJudge>);
+        // Verification judge runs server-side via server_proxy_judge; the server resolves
+        // the reasoning model via admin_config.reasoning_model_name → cheapest active
+        // fallback. No local cloud judge.
+        let cloud_judge: Option<std::sync::Arc<dyn astra_services::LlmJudge>> = None;
+        let server_proxy_judge: Option<std::sync::Arc<dyn astra_services::LlmJudge>> =
+            match get_profile_and_token(profile) {
+                Ok((_, _, _, token)) => Some(std::sync::Arc::new(
+                    durable_bridge::ServerProxyLlmJudge::new(api.clone(), token, None),
+                )),
+                Err(_) => None,
+            };
         let learning = build_learning_bridge(state);
 
         let lifecycle = if let Some(pool) = state
@@ -5123,7 +5130,7 @@ async fn apply_restored_session(
                 state.ingestion_user_id.as_deref(),
                 cloud_judge,
                 learning,
-                None,
+                server_proxy_judge,
             )
         } else {
             let session_dir =
@@ -5136,7 +5143,7 @@ async fn apply_restored_session(
                 state.ingestion_user_id.as_deref(),
                 cloud_judge,
                 learning,
-                None,
+                server_proxy_judge,
             )
         };
         state.durable_task_state = Some(durable_bridge::DurableTaskState {
@@ -5241,7 +5248,7 @@ pub(super) async fn restore_session_into_state(
                 "Session {session_id} has no resumable workspace/checkpoint state. Use /resume to inspect available sessions."
             )
         })?;
-    apply_restored_session(profile, state, restored).await
+    apply_restored_session(profile, api, state, restored).await
 }
 
 // ═══════════════════════════════════════════════════════════ Resume ═══════
@@ -5487,13 +5494,8 @@ pub(super) async fn handle_resume_command(
         Err(_) => arg.to_string(),
     };
 
-    // Preview session before confirming resume (unless --yes flag or interactive picker was used)
-    let skip_preview = std::env::var("ASTRA_RESUME_SKIP_PREVIEW")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(false);
-
     // Show preview if user explicitly typed a session ID (not from picker)
-    if !skip_preview && !arg.is_empty() {
+    if !arg.is_empty() {
         // Show session preview
         let ws = session_workspace::read_workspace(&session_id).ok();
         let peek = session_journal::peek_session_meta(&session_id);

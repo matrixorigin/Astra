@@ -99,9 +99,9 @@ pub(super) async fn handle_account_command(
                 p.memoria_api_key = Some(arg.to_string());
                 let _ = save_credentials(&creds);
                 // SAFETY: This runs during single-threaded REPL command processing.
-                // No concurrent threads read MEMORIA_API_KEY at this point.
+                // No concurrent threads read MEMORIA_MASTER_KEY at this point.
                 unsafe {
-                    std::env::set_var("MEMORIA_API_KEY", arg);
+                    std::env::set_var("MEMORIA_MASTER_KEY", arg);
                 }
                 cli_ok!("Memoria API key saved");
             }

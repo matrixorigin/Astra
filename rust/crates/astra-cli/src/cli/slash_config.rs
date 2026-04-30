@@ -228,7 +228,7 @@ fn show_sources() {
                 .max_history_tokens
                 .to_string()
                 .yellow(),
-            source_for("MO_MAX_HISTORY_TOKENS")
+            source_for("ASTRA_MAX_HISTORY_TOKENS")
         );
     }
 
@@ -241,7 +241,7 @@ fn show_sources() {
             "  • {} = {} [{}]",
             "compression.compression_threshold".cyan(),
             format!("{:.2}", final_config.compression.compression_threshold).yellow(),
-            source_for("MO_COMPRESSION_THRESHOLD")
+            source_for("ASTRA_COMPRESSION_THRESHOLD")
         );
     }
 
@@ -252,7 +252,7 @@ fn show_sources() {
             "  • {} = {} [{}]",
             "memory.retrieval_top_k".cyan(),
             final_config.memory.retrieval_top_k.to_string().yellow(),
-            source_for("MO_RETRIEVAL_TOP_K")
+            source_for("ASTRA_RETRIEVAL_TOP_K")
         );
     }
 
@@ -269,7 +269,7 @@ fn show_sources() {
                 .max_turn_input_tokens
                 .to_string()
                 .yellow(),
-            source_for("MO_MAX_TURN_INPUT_TOKENS")
+            source_for("ASTRA_MAX_TURN_INPUT_TOKENS")
         );
     }
 
@@ -284,7 +284,7 @@ fn show_sources() {
                 .capture_context_traces
                 .to_string()
                 .yellow(),
-            source_for("MO_CAPTURE_TRACES")
+            source_for("ASTRA_CAPTURE_TRACES")
         );
     }
 
@@ -336,17 +336,17 @@ fn show_paths() {
     // Environment variables
     println!("\n{}", "Environment Variables:".bold());
     let env_vars = [
-        ("MO_MAX_HISTORY_TOKENS", "compression.max_history_tokens"),
+        ("ASTRA_MAX_HISTORY_TOKENS", "compression.max_history_tokens"),
         (
-            "MO_COMPRESSION_THRESHOLD",
+            "ASTRA_COMPRESSION_THRESHOLD",
             "compression.compression_threshold",
         ),
-        ("MO_RETRIEVAL_TOP_K", "memory.retrieval_top_k"),
+        ("ASTRA_RETRIEVAL_TOP_K", "memory.retrieval_top_k"),
         (
-            "MO_MAX_TURN_INPUT_TOKENS",
+            "ASTRA_MAX_TURN_INPUT_TOKENS",
             "token_budget.max_turn_input_tokens",
         ),
-        ("MO_CAPTURE_TRACES", "telemetry.capture_context_traces"),
+        ("ASTRA_CAPTURE_TRACES", "telemetry.capture_context_traces"),
     ];
 
     for (var, config_path) in env_vars {
@@ -506,8 +506,8 @@ fn print_help() {
   /config diff                  See what's changed from defaults
 
 {env}
-  MO_MAX_HISTORY_TOKENS=50000   Override max history tokens
-  MO_CAPTURE_TRACES=1           Enable context assembly traces
+  ASTRA_MAX_HISTORY_TOKENS=50000   Override max history tokens
+  ASTRA_CAPTURE_TRACES=1           Enable context assembly traces
 "#,
         title = "Runtime Configuration Management".bold().cyan(),
         usage = "Usage:".bold(),

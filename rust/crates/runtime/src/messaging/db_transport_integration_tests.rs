@@ -1,13 +1,13 @@
 //! Database transport integration tests.
 //!
 //! These tests require a running MatrixOne/MySQL instance. They are gated
-//! behind the `MO_TEST_DB` environment variable:
+//! behind the `ASTRA_TEST_DB_URL` environment variable:
 //!
 //! ```sh
-//! MO_TEST_DB="mysql://root:111@127.0.0.1:6001/astra_test" cargo test -p astra-runtime db_transport_integration
+//! ASTRA_TEST_DB_URL="mysql://root:111@127.0.0.1:6001/astra_test" cargo test -p astra-runtime db_transport_integration
 //! ```
 //!
-//! If `MO_TEST_DB` is not set, all tests in this module are skipped.
+//! If `ASTRA_TEST_DB_URL` is not set, all tests in this module are skipped.
 
 #[cfg(test)]
 mod tests {
@@ -27,7 +27,7 @@ mod tests {
 
     /// Connect to test DB or skip the test.
     async fn test_pool() -> Option<sqlx::Pool<sqlx::MySql>> {
-        let url = match std::env::var("MO_TEST_DB") {
+        let url = match std::env::var("ASTRA_TEST_DB_URL") {
             Ok(u) => u,
             Err(_) => return None,
         };
@@ -55,7 +55,7 @@ mod tests {
     macro_rules! skip_without_db {
         ($pool:ident) => {
             let Some($pool) = test_pool().await else {
-                eprintln!("⚠ MO_TEST_DB not set, skipping");
+                eprintln!("⚠ ASTRA_TEST_DB_URL not set, skipping");
                 return;
             };
             ensure_schema(&$pool).await.expect("schema creation failed");

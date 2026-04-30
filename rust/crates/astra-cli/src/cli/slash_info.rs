@@ -1440,9 +1440,7 @@ pub(super) async fn handle_info_command(
             }
 
             // Memoria
-            let memoria_key_set = std::env::var("MEMORIA_API_KEY")
-                .or_else(|_| std::env::var("MEMORIA_MASTER_KEY"))
-                .is_ok();
+            let memoria_key_set = std::env::var("MEMORIA_MASTER_KEY").is_ok();
             if memoria_key_set {
                 let memoria_base = std::env::var("MEMORIA_BASE_URL")
                     .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
@@ -1481,7 +1479,7 @@ pub(super) async fn handle_info_command(
                     }
                 }
             } else {
-                rows.push((false, "memoria", "MEMORIA_API_KEY not set".to_string()));
+                rows.push((false, "memoria", "MEMORIA_MASTER_KEY not set".to_string()));
             }
 
             // Print table

@@ -27,9 +27,6 @@ fn command_usage_path() -> PathBuf {
     if let Some(path) = TEST_COMMAND_USAGE_DIR.with(|dir| dir.borrow().clone()) {
         return path.join("command-usage.json");
     }
-    if let Ok(dir) = std::env::var("ASTRA_COMMAND_USAGE_DIR") {
-        return PathBuf::from(dir).join("command-usage.json");
-    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".astra")

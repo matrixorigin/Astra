@@ -995,8 +995,8 @@ async fn main() {
         }
     };
 
-    // Set MEMORIA_API_KEY from credentials if not already set
-    if std::env::var("MEMORIA_API_KEY").is_err() {
+    // Set MEMORIA_MASTER_KEY from credentials if not already set
+    if std::env::var("MEMORIA_MASTER_KEY").is_err() {
         let creds = load_credentials();
         let name = profile_name(cli.profile.as_deref(), &creds);
         if let Some(key) = creds
@@ -1005,7 +1005,7 @@ async fn main() {
             .and_then(|p| p.memoria_api_key.as_deref())
         {
             unsafe {
-                std::env::set_var("MEMORIA_API_KEY", key);
+                std::env::set_var("MEMORIA_MASTER_KEY", key);
             }
         }
     }
@@ -1038,26 +1038,11 @@ async fn main() {
         command,
     } = cli;
 
-    // --startup-trace: enable startup timing
-    if startup_trace {
-        unsafe {
-            std::env::set_var("ASTRA_STARTUP_TRACE", "1");
-        }
-    }
-
-    // --bare: set env var for minimal mode
-    if bare {
-        unsafe {
-            std::env::set_var("ASTRA_BARE", "1");
-        }
-    }
-
-    // --no-instructions: disable .astra/instructions.md auto-loading
-    if no_instructions {
-        unsafe {
-            std::env::set_var("ASTRA_NO_INSTRUCTIONS", "1");
-        }
-    }
+    // --startup-trace / --bare / --verbose / --no-instructions: env-var propagation
+    // was removed during the env cleanup; these flags are now handled via local
+    // variables below (e.g. no_instructions is checked before merging project
+    // instructions into the system prompt).
+    let _ = (startup_trace, bare);
 
     if no_journal_content {
         unsafe {
@@ -1068,16 +1053,12 @@ async fn main() {
     // --max-turns: override via env var before RuntimeLimits singleton is initialized
     if let Some(turns) = max_turns {
         unsafe {
-            std::env::set_var("MO_MAX_TURNS", turns.to_string());
+            std::env::set_var("ASTRA_CLI_MAX_TURNS", turns.to_string());
         }
     }
 
-    // --max-budget: store the limit; enforcement happens in the REPL loop
-    if max_budget > 0.0 {
-        unsafe {
-            std::env::set_var("MO_MAX_BUDGET", max_budget.to_string());
-        }
-    }
+    // --max-budget: feature removed during env cleanup; arg silently ignored.
+    let _ = max_budget;
 
     // --system-prompt: support @file syntax to read from file
     let system_prompt = system_prompt.map(|sp| match resolve_system_prompt(sp) {
@@ -1112,7 +1093,7 @@ async fn main() {
             .collect();
         if !normalized.is_empty() {
             unsafe {
-                std::env::set_var("ASTRA_ALLOWED_TOOLS", normalized.join(","));
+                std::env::set_var("ASTRA_CLI_ALLOWED_TOOLS", normalized.join(","));
             }
         }
     }
@@ -1127,7 +1108,7 @@ async fn main() {
             .collect();
         if !normalized.is_empty() {
             unsafe {
-                std::env::set_var("ASTRA_DISALLOWED_TOOLS", normalized.join(","));
+                std::env::set_var("ASTRA_CLI_DISALLOWED_TOOLS", normalized.join(","));
             }
         }
     }
@@ -1144,21 +1125,18 @@ async fn main() {
             })
             .collect();
         unsafe {
-            std::env::set_var("ASTRA_ADD_DIRS", dirs.join(":"));
+            std::env::set_var("ASTRA_CLI_ADD_DIRS", dirs.join(":"));
         }
     }
 
-    // --yes (-y): set auto-approve mode for the interactive REPL
+    // --yes (-y): set auto-approve mode for the interactive REPL. ReplState::default()
+    // reads ASTRA_CLI_AUTO_APPROVE, so propagate the flag before REPL startup.
     if auto_approve {
         unsafe {
-            std::env::set_var("ASTRA_AUTO_APPROVE", "1");
+            std::env::set_var("ASTRA_CLI_AUTO_APPROVE", "1");
         }
     }
-    if verbose {
-        unsafe {
-            std::env::set_var("ASTRA_VERBOSE", "1");
-        }
-    }
+    let _ = verbose;
 
     // --mcp-config: load MCP server configs from files/JSON strings
     if !mcp_config.is_empty() {
@@ -1185,14 +1163,14 @@ async fn main() {
             std::process::exit(1);
         }
         unsafe {
-            std::env::set_var("ASTRA_SESSION_ID", sid);
+            std::env::set_var("ASTRA_CLI_SESSION_ID", sid);
         }
     }
 
     // --name: export session display name
     if let Some(ref name) = session_name {
         unsafe {
-            std::env::set_var("ASTRA_SESSION_NAME", name);
+            std::env::set_var("ASTRA_CLI_SESSION_NAME", name);
         }
     }
 
@@ -1300,7 +1278,7 @@ mod tests {
         base
     }
 
-    /// Guard that serializes tests touching ASTRA_CREDENTIALS_DIR.
+    /// Guard that serializes tests touching ASTRA_CLI_CREDENTIALS_DIR.
     /// Multiple async tests concurrently setting this env var is a data race;
     /// the guard ensures they execute sequentially.
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -1313,7 +1291,7 @@ mod tests {
     impl Drop for CredentialsGuard {
         fn drop(&mut self) {
             unsafe {
-                std::env::remove_var("ASTRA_CREDENTIALS_DIR");
+                std::env::remove_var("ASTRA_CLI_CREDENTIALS_DIR");
             }
         }
     }
@@ -1332,7 +1310,7 @@ mod tests {
         let lock = creds_lock();
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: protected by CREDS_LOCK; no concurrent set_var.
-        unsafe { std::env::set_var("ASTRA_CREDENTIALS_DIR", dir.path()) };
+        unsafe { std::env::set_var("ASTRA_CLI_CREDENTIALS_DIR", dir.path()) };
         CredentialsGuard {
             _lock: lock,
             _dir: dir,
@@ -4700,13 +4678,13 @@ total_tokens_out: 500
 
     #[test]
     fn repl_state_auto_approve_env_activates_auto_mode() {
-        // When ASTRA_AUTO_APPROVE=1, ReplState should start in Auto mode
+        // When ASTRA_CLI_AUTO_APPROVE=1, ReplState should start in Auto mode
         unsafe {
-            std::env::set_var("ASTRA_AUTO_APPROVE", "1");
+            std::env::set_var("ASTRA_CLI_AUTO_APPROVE", "1");
         }
         let state = ReplState::default();
         unsafe {
-            std::env::remove_var("ASTRA_AUTO_APPROVE");
+            std::env::remove_var("ASTRA_CLI_AUTO_APPROVE");
         }
         assert_eq!(
             state.perm_manager.mode(),

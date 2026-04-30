@@ -79,13 +79,26 @@ pub(super) async fn completions_handler(
         )
     })?;
     let pool_ref = state.shared_pool.as_ref().map(|sp| sp.get());
-    let resolved = astra_services::resolve_active_llm_model(
-        &matrixone,
-        &state.fernet_encryptor,
-        request.model.as_deref(),
-        pool_ref,
-    )
-    .await
+    // When the caller specifies a model, resolve that exact model (strict).
+    // When the caller omits the model (typical for judge / summary proxies), resolve via the
+    // admin-config `reasoning_model_name` override, falling back to the cheapest active model.
+    let resolved = if let Some(preferred) = request.model.as_deref().filter(|s| !s.is_empty()) {
+        astra_services::resolve_active_llm_model(
+            &matrixone,
+            &state.fernet_encryptor,
+            Some(preferred),
+            pool_ref,
+        )
+        .await
+    } else {
+        astra_services::resolve_reasoning_model(
+            &matrixone,
+            &state.fernet_encryptor,
+            state.admin_config_service.as_ref(),
+            pool_ref,
+        )
+        .await
+    }
     .map_err(|e| {
         error_response(
             StatusCode::SERVICE_UNAVAILABLE,

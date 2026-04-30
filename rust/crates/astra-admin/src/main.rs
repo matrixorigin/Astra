@@ -641,5 +641,45 @@ async fn main() -> Result<(), String> {
             print_json_or_raw(&body);
             Ok(())
         }
+        Command::Config(ConfigCmd::List) => {
+            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let body = api
+                .get_bearer_path_query_text(&token, paths::ADMIN_CONFIG, &[])
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        }
+        Command::Config(ConfigCmd::Get(args)) => {
+            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let body = api
+                .get_bearer_path_query_text(&token, &paths::admin_config_key(&args.key), &[])
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        }
+        Command::Config(ConfigCmd::Set(args)) => {
+            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let body = api
+                .put_bearer_path_json_text(
+                    &token,
+                    &paths::admin_config_key(&args.key),
+                    &serde_json::json!({ "value": args.value }),
+                )
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        }
+        Command::Config(ConfigCmd::Unset(args)) => {
+            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
+            let body = api
+                .delete_bearer_path_text(&token, &paths::admin_config_key(&args.key))
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        }
     }
 }

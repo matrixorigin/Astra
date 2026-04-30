@@ -28,28 +28,28 @@ update_or_add() {
     fi
 }
 
-if ! grep -q "^TOKEN_ENCRYPTION_KEY=" "$ENV_FILE" || grep -q "TOKEN_ENCRYPTION_KEY=.*CHANGE_ME" "$ENV_FILE"; then
+if ! grep -q "^ASTRA_TOKEN_ENCRYPTION_KEY=" "$ENV_FILE" || grep -q "ASTRA_TOKEN_ENCRYPTION_KEY=.*CHANGE_ME" "$ENV_FILE"; then
     KEY="$(openssl rand -base64 32 | tr -d '\n')"
-    update_or_add "TOKEN_ENCRYPTION_KEY" "$KEY"
-    echo "✅ Generated TOKEN_ENCRYPTION_KEY"
+    update_or_add "ASTRA_TOKEN_ENCRYPTION_KEY" "$KEY"
+    echo "✅ Generated ASTRA_TOKEN_ENCRYPTION_KEY"
 else
-    echo "✅ TOKEN_ENCRYPTION_KEY already configured"
+    echo "✅ ASTRA_TOKEN_ENCRYPTION_KEY already configured"
 fi
 
-if ! grep -q "^JWT_SECRET_KEY=" "$ENV_FILE" || grep -q "JWT_SECRET_KEY=.*CHANGE_ME" "$ENV_FILE"; then
+if ! grep -q "^ASTRA_JWT_SECRET=" "$ENV_FILE" || grep -q "ASTRA_JWT_SECRET=.*CHANGE_ME" "$ENV_FILE"; then
     JWT_KEY="$(openssl rand -hex 32)"
-    update_or_add "JWT_SECRET_KEY" "$JWT_KEY"
-    echo "✅ Generated JWT_SECRET_KEY"
+    update_or_add "ASTRA_JWT_SECRET" "$JWT_KEY"
+    echo "✅ Generated ASTRA_JWT_SECRET"
 else
-    echo "✅ JWT_SECRET_KEY already configured"
+    echo "✅ ASTRA_JWT_SECRET already configured"
 fi
 
-if ! grep -q "^CHAT_TURN_BRIDGE_SECRET=" "$ENV_FILE" || grep -Eq "^CHAT_TURN_BRIDGE_SECRET=(|your-chat-turn-bridge-secret.*)$" "$ENV_FILE"; then
+if ! grep -q "^ASTRA_BRIDGE_SECRET=" "$ENV_FILE" || grep -Eq "^ASTRA_BRIDGE_SECRET=(|your-bridge-secret.*)$" "$ENV_FILE"; then
     BRIDGE_KEY="$(openssl rand -hex 32)"
-    update_or_add "CHAT_TURN_BRIDGE_SECRET" "$BRIDGE_KEY"
-    echo "✅ Generated CHAT_TURN_BRIDGE_SECRET"
+    update_or_add "ASTRA_BRIDGE_SECRET" "$BRIDGE_KEY"
+    echo "✅ Generated ASTRA_BRIDGE_SECRET"
 else
-    echo "✅ CHAT_TURN_BRIDGE_SECRET already configured"
+    echo "✅ ASTRA_BRIDGE_SECRET already configured"
 fi
 
 # ── Optional: fast linker (mold) ──

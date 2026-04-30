@@ -194,11 +194,7 @@ fn build_resolved_active_llm_from_row(
                 QuirksData::default()
             }
         };
-        // Env var overrides DB config
-        std::env::var("MO_LLM_FALLBACK_MODEL")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .or(quirks.fallback_model)
+        quirks.fallback_model
     };
 
     Ok(ResolvedActiveLlmModel {
@@ -281,6 +277,117 @@ pub async fn resolve_active_llm_model(
         .ok_or_else(|| "No active LLM model configured. Run: astra-admin model add".to_string())?;
 
     build_resolved_active_llm_from_row(&row, encryptor)
+}
+
+/// Resolve the model used for reasoning / judge / summary tasks.
+///
+/// Resolution order:
+/// 1. If `admin_config.reasoning_model_name` is set, resolve that model (strict — errors
+///    if the named model is missing or inactive).
+/// 2. Otherwise, pick the cheapest active model by `pricing.completion` (falls back to
+///    lexicographic `model_name` ordering among rows with equal or missing pricing).
+/// 3. Otherwise, returns `Err`.
+pub async fn resolve_reasoning_model(
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    admin_config: &dyn crate::admin_config::AdminConfigService,
+    pool: Option<&sqlx::Pool<sqlx::MySql>>,
+) -> Result<ResolvedActiveLlmModel, String> {
+    // 1. Admin override
+    if let Some(name) = admin_config
+        .get(crate::admin_config::ADMIN_CONFIG_KEY_REASONING_MODEL)
+        .await?
+    {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            return resolve_active_llm_model(matrixone, encryptor, Some(trimmed), pool).await;
+        }
+    }
+
+    // 2. Cheapest active. MatrixOne JSON function support is uneven, so sort in Rust:
+    //    pull all active rows and pick the minimum completion price.
+    let ephemeral;
+    let pool: &sqlx::Pool<sqlx::MySql> = match pool {
+        Some(p) => p,
+        None => {
+            ephemeral = sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(1)
+                .connect(&matrixone.database_url_with_password())
+                .await
+                .map_err(|e| format!("DB connect: {e}"))?;
+            &ephemeral
+        }
+    };
+
+    let rows = sqlx::query(
+        "SELECT model_name, api_key_encrypted, base_url, provider, \
+                IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json, \
+                IFNULL(CAST(pricing AS CHAR), '{}') AS pricing_json \
+         FROM infra_llm_models WHERE is_active = 1",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("DB query reasoning: {e}"))?;
+
+    if rows.is_empty() {
+        return Err(
+            "No active LLM model configured. Run `astra-admin model add` then \
+             `astra-admin model check`, or `astra-admin config set reasoning_model <name>`."
+                .to_string(),
+        );
+    }
+
+    // Pick the row with the lowest completion price. See [`rank_cheapest_index`].
+    let entries: Vec<(String, String)> = rows
+        .iter()
+        .map(|row| {
+            let name: String = row.try_get("model_name").unwrap_or_default();
+            let pricing_json: String = row
+                .try_get("pricing_json")
+                .unwrap_or_else(|_| "{}".to_string());
+            (name, pricing_json)
+        })
+        .collect();
+    let best_idx = rank_cheapest_index(&entries);
+    build_resolved_active_llm_from_row(&rows[best_idx], encryptor)
+}
+
+/// Return the index of the cheapest entry by `pricing.completion`.
+///
+/// * Missing / unparseable pricing and `completion <= 0` are treated as `+infinity`,
+///   so they lose to any priced row.
+/// * Ties on price are broken by ascending `model_name` (so the result is deterministic).
+///
+/// Panics if `entries` is empty. Callers must ensure at least one entry.
+pub(crate) fn rank_cheapest_index(entries: &[(String, String)]) -> usize {
+    assert!(
+        !entries.is_empty(),
+        "rank_cheapest_index called with no entries"
+    );
+    let mut best_idx = 0;
+    let mut best_score = score_completion(&entries[0].1);
+    let mut best_name = entries[0].0.as_str();
+    for (idx, (name, pricing_json)) in entries.iter().enumerate().skip(1) {
+        let score = score_completion(pricing_json);
+        let cmp = score
+            .partial_cmp(&best_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| name.as_str().cmp(best_name));
+        if cmp == std::cmp::Ordering::Less {
+            best_idx = idx;
+            best_score = score;
+            best_name = name.as_str();
+        }
+    }
+    best_idx
+}
+
+fn score_completion(pricing_json: &str) -> f64 {
+    serde_json::from_str::<PricingData>(pricing_json)
+        .map(|p| p.completion)
+        .ok()
+        .filter(|c| *c > 0.0)
+        .unwrap_or(f64::INFINITY)
 }
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -1142,6 +1249,61 @@ impl From<ModelListItem> for ModelListItemResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- rank_cheapest_index --
+
+    fn entry(name: &str, completion: Option<f64>) -> (String, String) {
+        let json = match completion {
+            Some(c) => format!(r#"{{"completion": {c}}}"#),
+            None => "{}".to_string(),
+        };
+        (name.to_string(), json)
+    }
+
+    #[test]
+    fn rank_cheapest_picks_lowest_completion_price() {
+        let entries = vec![
+            entry("expensive", Some(0.06)),
+            entry("cheapest", Some(0.001)),
+            entry("middle", Some(0.015)),
+        ];
+        assert_eq!(rank_cheapest_index(&entries), 1);
+    }
+
+    #[test]
+    fn rank_cheapest_breaks_ties_by_name_ascending() {
+        let entries = vec![
+            entry("zzz", Some(0.01)),
+            entry("aaa", Some(0.01)),
+            entry("mmm", Some(0.01)),
+        ];
+        assert_eq!(rank_cheapest_index(&entries), 1, "aaa comes first");
+    }
+
+    #[test]
+    fn rank_cheapest_treats_missing_pricing_as_infinity() {
+        let entries = vec![entry("no_pricing", None), entry("priced", Some(0.5))];
+        assert_eq!(rank_cheapest_index(&entries), 1);
+    }
+
+    #[test]
+    fn rank_cheapest_treats_zero_as_infinity() {
+        // Zero or negative completion is treated as "unpriced" so it loses to any priced row.
+        let entries = vec![entry("zero_priced", Some(0.0)), entry("normal", Some(0.02))];
+        assert_eq!(rank_cheapest_index(&entries), 1);
+    }
+
+    #[test]
+    fn rank_cheapest_all_unpriced_falls_back_to_name_order() {
+        let entries = vec![entry("zebra", None), entry("alpha", None)];
+        assert_eq!(rank_cheapest_index(&entries), 1);
+    }
+
+    #[test]
+    fn rank_cheapest_single_entry() {
+        let entries = vec![entry("only", Some(0.003))];
+        assert_eq!(rank_cheapest_index(&entries), 0);
+    }
 
     // -- PricingData --
 

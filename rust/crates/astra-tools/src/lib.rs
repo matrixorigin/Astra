@@ -400,12 +400,12 @@ pub const APPROVAL_REQUIRED_TOOLS: &[&str] = &[
 
 // ─── Output management utilities ────────────────────────────────────────────
 
-/// Global output size limit. Override with `MO_GLOBAL_OUTPUT_LIMIT` env var.
+/// Global output size limit. Override with `ASTRA_GLOBAL_OUTPUT_LIMIT` env var.
 pub fn global_output_limit() -> usize {
     astra_core::RuntimeLimits::global().global_output_limit
 }
 
-/// Per-tool default output limit. Override with `MO_TOOL_OUTPUT_LIMIT` env var.
+/// Per-tool default output limit. Override with `ASTRA_TOOL_OUTPUT_LIMIT` env var.
 pub fn tool_output_limit() -> usize {
     astra_core::RuntimeLimits::global().tool_output_limit
 }

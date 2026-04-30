@@ -701,11 +701,9 @@ pub fn create_local_lifecycle_full(
     let _ = std::fs::create_dir_all(&contracts_dir);
     let mut lifecycle = LocalDurableTaskLifecycle::new(contracts_dir, work_dir.to_path_buf());
 
-    // Wire up LLM judge (priority: cloud > env-var HTTP > server proxy)
+    // Wire up LLM judge (priority: cloud > server proxy)
     if let Some(judge) = cloud_judge {
         lifecycle.set_llm_judge(judge);
-    } else if let Some(judge) = HttpLlmJudge::from_env() {
-        lifecycle.set_llm_judge(Arc::new(judge));
     } else if let Some(judge) = server_proxy_judge {
         lifecycle.set_llm_judge(judge);
     }
@@ -751,8 +749,6 @@ pub fn create_cloud_lifecycle_full(
 
     if let Some(judge) = cloud_judge {
         lifecycle.set_llm_judge(judge);
-    } else if let Some(judge) = HttpLlmJudge::from_env() {
-        lifecycle.set_llm_judge(Arc::new(judge));
     } else if let Some(judge) = server_proxy_judge {
         lifecycle.set_llm_judge(judge);
     }
@@ -777,116 +773,10 @@ pub fn create_cloud_lifecycle_full(
 }
 
 // ─── LLM Judge Implementation ────────────────────────────────────────────────
-
-/// Concrete [`LlmJudge`] that calls an OpenAI-compatible chat completions API.
-///
-/// Sends a structured prompt asking the LLM to evaluate a criterion and return
-/// a confidence score. Parses the response to extract a 0.0–1.0 score.
-pub struct HttpLlmJudge {
-    client: reqwest::Client,
-    api_key: String,
-    base_url: String,
-    model: String,
-}
-
-impl std::fmt::Debug for HttpLlmJudge {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HttpLlmJudge")
-            .field("api_key", &"[REDACTED]")
-            .field("base_url", &self.base_url)
-            .field("model", &self.model)
-            .finish()
-    }
-}
-
-impl HttpLlmJudge {
-    pub fn new(api_key: String, base_url: String, model: String) -> Self {
-        let client = build_client_for_url(&base_url);
-        Self {
-            client,
-            api_key,
-            base_url,
-            model,
-        }
-    }
-
-    /// Try to create from environment variables.
-    ///
-    /// Looks for `MO_LLM_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`,
-    /// `MO_LLM_BASE_URL` / `OPENAI_BASE_URL`, and `MO_LLM_MODEL`.
-    pub fn from_env() -> Option<Self> {
-        let api_key = std::env::var("MO_LLM_API_KEY")
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-            .ok()?;
-        let base_url = std::env::var("MO_LLM_BASE_URL")
-            .or_else(|_| std::env::var("OPENAI_BASE_URL"))
-            .unwrap_or_else(|_| "https://api.openai.com/v1".into());
-        let model = std::env::var("MO_LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
-        Some(Self::new(api_key, base_url, model))
-    }
-}
-
-#[async_trait::async_trait]
-impl astra_services::LlmJudge for HttpLlmJudge {
-    async fn evaluate(&self, prompt: &str, context: &str) -> Result<f64, String> {
-        let system_msg = serde_json::json!({
-            "role": "system",
-            "content": "You are a verification judge. Evaluate whether an acceptance criterion \
-                        is met based on the provided context. Respond with ONLY a JSON object: \
-                        {\"score\": <0.0-1.0>, \"reason\": \"<brief explanation>\"}. \
-                        Score 1.0 = fully met, 0.0 = not met at all."
-        });
-        let user_msg = serde_json::json!({
-            "role": "user",
-            "content": format!(
-                "Criterion: {prompt}\n\nContext:\n{context}\n\n\
-                 Evaluate and respond with {{\"score\": <0.0-1.0>, \"reason\": \"...\"}}."
-            )
-        });
-
-        let body = serde_json::json!({
-            "model": self.model,
-            "messages": [system_msg, user_msg],
-            "max_tokens": 200,
-            "temperature": 0.1,
-        });
-
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("LLM request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "LLM API error {status}: {}",
-                truncate_str(&text, 200)
-            ));
-        }
-
-        let json: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("LLM response parse failed: {e}"))?;
-
-        // Extract the assistant's response text
-        let content = json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("");
-
-        // Parse the score from the response
-        parse_judge_score(content)
-    }
-}
+//
+// The edge-side `HttpLlmJudge` was removed along with `ASTRA_LLM_*` env vars; verification
+// now delegates to [`ServerProxyLlmJudge`] (below), which calls `POST /v1/chat/completions`
+// so the server handles model resolution + API key decryption.
 
 /// Extract a 0.0–1.0 score from LLM judge response text.
 ///
@@ -2062,6 +1952,153 @@ mod tests {
         assert!(
             err.contains("Server proxy judge error"),
             "error should mention proxy: {err}"
+        );
+    }
+
+    // ─── Judge wiring tests ────────────────────────────────────────────────────
+
+    /// Fake LlmJudge that records calls and returns a fixed score.
+    struct FakeJudge {
+        score: f64,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeJudge {
+        fn new(score: f64) -> Arc<Self> {
+            Arc::new(Self {
+                score,
+                calls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmJudge for FakeJudge {
+        async fn evaluate(&self, prompt: &str, _context: &str) -> Result<f64, String> {
+            self.calls.lock().unwrap().push(prompt.to_string());
+            Ok(self.score)
+        }
+    }
+
+    /// When `cloud_judge` is None and `server_proxy_judge` is Some, the lifecycle
+    /// MUST use the proxy judge for LlmJudge criteria.
+    #[tokio::test]
+    async fn lifecycle_server_proxy_judge_is_invoked_for_llm_criteria() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let fake_judge = FakeJudge::new(0.9); // passes at threshold 0.7
+
+        let lifecycle = create_local_lifecycle_full(
+            &session_dir,
+            tmp.path(),
+            None,
+            Some("sess"),
+            Some("user"),
+            None, // cloud_judge: None
+            None,
+            Some(Arc::clone(&fake_judge) as Arc<dyn LlmJudge>), // server_proxy_judge
+        );
+
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "Feature".into(),
+                description: None,
+                depends_on: vec![],
+                status: TaskStatus::Pending,
+                effort: None,
+                files: vec![],
+                acceptance_checks: vec![VerifierKind::LlmJudge {
+                    prompt: "Is output complete?".into(),
+                    pass_threshold: 0.7,
+                }],
+            }],
+            notes: None,
+        };
+
+        let contract = lifecycle
+            .create_contract("user", "sess", "goal", &plan, TaskScope::default())
+            .await
+            .unwrap();
+
+        let mut durable = DurableTaskState {
+            contract,
+            lifecycle,
+            last_report: None,
+        };
+        let (passed, _) = on_subtask_complete(&mut durable, "s1").await;
+
+        assert!(passed, "Judge score 0.9 > 0.7 threshold → should pass");
+        assert_eq!(
+            fake_judge.call_count(),
+            1,
+            "Server proxy judge must be called exactly once for the LlmJudge criterion"
+        );
+    }
+
+    /// When both `cloud_judge` and `server_proxy_judge` are provided, `cloud_judge`
+    /// takes priority (it's the first in the wiring priority chain).
+    #[tokio::test]
+    async fn lifecycle_cloud_judge_takes_priority_over_server_proxy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let cloud_judge = FakeJudge::new(0.95);
+        let proxy_judge = FakeJudge::new(0.3); // below threshold — would fail
+
+        let lifecycle = create_local_lifecycle_full(
+            &session_dir,
+            tmp.path(),
+            None,
+            Some("sess"),
+            Some("user"),
+            Some(Arc::clone(&cloud_judge) as Arc<dyn LlmJudge>),
+            None,
+            Some(Arc::clone(&proxy_judge) as Arc<dyn LlmJudge>),
+        );
+
+        let plan = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "Feature".into(),
+                description: None,
+                depends_on: vec![],
+                status: TaskStatus::Pending,
+                effort: None,
+                files: vec![],
+                acceptance_checks: vec![VerifierKind::LlmJudge {
+                    prompt: "Quality check".into(),
+                    pass_threshold: 0.7,
+                }],
+            }],
+            notes: None,
+        };
+
+        let contract = lifecycle
+            .create_contract("user", "sess", "goal", &plan, TaskScope::default())
+            .await
+            .unwrap();
+
+        let mut durable = DurableTaskState {
+            contract,
+            lifecycle,
+            last_report: None,
+        };
+        let (passed, _) = on_subtask_complete(&mut durable, "s1").await;
+
+        assert!(passed, "Cloud judge 0.95 > 0.7 → should pass");
+        assert_eq!(cloud_judge.call_count(), 1, "Cloud judge must be called");
+        assert_eq!(
+            proxy_judge.call_count(),
+            0,
+            "Proxy judge must NOT be called when cloud judge wins"
         );
     }
 }

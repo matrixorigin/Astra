@@ -152,12 +152,11 @@ Store in ECS task definition or use Secrets Manager:
 ```json
 {
   "environment": [
-    {"name": "MATRIXONE_HOST", "value": "db.internal"},
-    {"name": "REDIS_HOST", "value": "redis.internal"}
+    {"name": "MATRIXONE_HOST", "value": "db.internal"}
   ],
   "secrets": [
-    {"name": "TOKEN_ENCRYPTION_KEY", "valueFrom": "arn:aws:secretsmanager:..."},
-    {"name": "JWT_SECRET_KEY", "valueFrom": "arn:aws:secretsmanager:..."}
+    {"name": "ASTRA_TOKEN_ENCRYPTION_KEY", "valueFrom": "arn:aws:secretsmanager:..."},
+    {"name": "ASTRA_JWT_SECRET", "valueFrom": "arn:aws:secretsmanager:..."}
   ]
 }
 ```

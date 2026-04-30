@@ -50,45 +50,13 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # ─── Cache ────────────────────────────────────────────────
-
-  redis:
-    image: redis:7.2-alpine
-    hostname: redis
-    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
-    volumes:
-      - redis-data:/data
-    networks:
-      - mo-net
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-    restart: always
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 2G
-        reservations:
-          cpus: '1'
-          memory: 1G
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
   # ─── API Server ───────────────────────────────────────────
 
   api:
     build:
       context: ../..
       dockerfile: Dockerfile
-    image: astra:${VERSION:-latest}
+    image: astra:latest
     environment:
       # Database
       - MATRIXONE_HOST=matrixone
@@ -97,67 +65,48 @@ services:
       - MATRIXONE_PASSWORD=${MATRIXONE_PASSWORD}
       - ASTRA_DATABASE=${ASTRA_DATABASE:-astra_runtime}
       - ASTRA_DATABASE_PREFIX=${ASTRA_DATABASE_PREFIX:-}
-      - MATRIXONE_POOL_SIZE=${MATRIXONE_POOL_SIZE:-20}
-      - MATRIXONE_MAX_OVERFLOW=${MATRIXONE_MAX_OVERFLOW:-10}
-      
-      # Redis
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_POOL_SIZE=${REDIS_POOL_SIZE:-50}
-      
-      # Security
-      - SECRET_KEY=${SECRET_KEY}
-      - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY}
-      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
-      - CHAT_TURN_BRIDGE_SECRET=${CHAT_TURN_BRIDGE_SECRET}
-      - JWT_ACCESS_TOKEN_EXPIRE_MINUTES=${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-30}
-      - JWT_REFRESH_TOKEN_EXPIRE_DAYS=${JWT_REFRESH_TOKEN_EXPIRE_DAYS:-7}
-      
-      # LLM
-      - LLM_PROVIDER=${LLM_PROVIDER}
-      - LLM_MODEL=${LLM_MODEL}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - LLM_TIMEOUT=${LLM_TIMEOUT:-60}
-      - LLM_MAX_RETRIES=${LLM_MAX_RETRIES:-3}
-      
+
+      # Auth / security
+      - ASTRA_JWT_SECRET=${ASTRA_JWT_SECRET}
+      - ASTRA_JWT_ALGORITHM=${ASTRA_JWT_ALGORITHM:-HS256}
+      - ASTRA_JWT_ACCESS_TTL_MINUTES=${ASTRA_JWT_ACCESS_TTL_MINUTES:-60}
+      - ASTRA_JWT_REFRESH_TTL_DAYS=${ASTRA_JWT_REFRESH_TTL_DAYS:-7}
+      - ASTRA_TOKEN_ENCRYPTION_KEY=${ASTRA_TOKEN_ENCRYPTION_KEY}
+      - ASTRA_BRIDGE_SECRET=${ASTRA_BRIDGE_SECRET}
+
+      # LLM models are configured server-side (infra_llm_models table) via
+      # `astra-admin model add/check`; no env vars needed.
+
+      # Memoria
+      - MEMORIA_BASE_URL=${MEMORIA_BASE_URL:-http://memoria:8100}
+      - MEMORIA_MASTER_KEY=${MEMORIA_MASTER_KEY}
+
       # API
-      - API_HOST=0.0.0.0
-      - API_PORT=8000
-      - API_WORKERS=${API_WORKERS:-4}
-      - API_RELOAD=false
-      - LOG_LEVEL=${LOG_LEVEL:-info}
-      - LOG_FORMAT=json
-      - CORS_ORIGINS=${CORS_ORIGINS:-*}
-      
-      # Features
-      - ENABLE_METRICS=${ENABLE_METRICS:-true}
-      - METRICS_PORT=9090
-      - ENABLE_RATE_LIMITING=${ENABLE_RATE_LIMITING:-true}
-      - RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE:-60}
-    
+      - ASTRA_API_HOST=0.0.0.0
+      - ASTRA_API_PORT=8000
+      - ASTRA_APP_ENV=${ASTRA_APP_ENV:-production}
+      - ASTRA_LOG_LEVEL=${ASTRA_LOG_LEVEL:-info}
+      - ASTRA_CORS_ORIGINS=${ASTRA_CORS_ORIGINS:-*}
+
     ports:
-      - "${API_PORT:-8000}:8000"
-      - "${METRICS_PORT:-9090}:9090"
-    
+      - "${ASTRA_API_PORT:-8000}:8000"
+
     networks:
       - mo-net
-    
+
     depends_on:
       matrixone:
         condition: service_healthy
-      redis:
-        condition: service_healthy
-    
+
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
-    
+
     restart: always
-    
+
     deploy:
       replicas: 3
       resources:
@@ -167,7 +116,7 @@ services:
         reservations:
           cpus: '1'
           memory: 2G
-    
+
     logging:
       driver: "json-file"
       options:
@@ -205,6 +154,4 @@ networks:
 
 volumes:
   mo-data:
-    driver: local
-  redis-data:
     driver: local

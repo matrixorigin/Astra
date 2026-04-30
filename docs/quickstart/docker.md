@@ -60,27 +60,23 @@ Create `.env` file with required variables:
 
 ```bash
 # Security
-TOKEN_ENCRYPTION_KEY=your-encryption-key-here
-JWT_SECRET_KEY=your-jwt-secret-here
+ASTRA_TOKEN_ENCRYPTION_KEY=your-encryption-key-here
+ASTRA_JWT_SECRET=your-jwt-secret-here
+ASTRA_BRIDGE_SECRET=your-bridge-secret-here
 
-# LLM Configuration
-LLM_PROVIDER=openai
-LLM_MODEL=gpt-4
-OPENAI_API_KEY=your-openai-key-here
+# LLM models are configured via the admin CLI after the server starts:
+#   astra-admin model add gpt-4o-mini openai --api-key sk-...
+#   astra-admin model check gpt-4o-mini
 
 # Database
 MATRIXONE_HOST=matrixone
 MATRIXONE_PORT=6001
 MATRIXONE_USER=root
 MATRIXONE_PASSWORD=111
-ASTRA_DATABASE=astra
-
-# Redis
-REDIS_HOST=redis
-REDIS_PORT=6379
+ASTRA_DATABASE=astra_runtime
 
 # API
-API_PORT=8000
+ASTRA_API_PORT=8000
 ```
 
 See [Configuration Reference](../reference/configuration.md) for all options.
@@ -90,7 +86,6 @@ See [Configuration Reference](../reference/configuration.md) for all options.
 The stack includes:
 
 - **matrixone**: Database (port 6001)
-- **redis**: Cache (port 6379)
 - **api**: REST API (port 8000)
 
 ## Docker Commands
@@ -181,9 +176,8 @@ docker-compose -f deployment/all-in-one/docker-compose.yml restart matrixone
 If ports are already in use, modify `.env`:
 
 ```bash
-API_PORT=8001
+ASTRA_API_PORT=8001
 MATRIXONE_PORT=6002
-REDIS_PORT=6380
 ```
 
 ### Clean Restart

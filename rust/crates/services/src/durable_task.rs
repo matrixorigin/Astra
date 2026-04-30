@@ -152,26 +152,13 @@ impl std::fmt::Debug for CloudLlmConfig {
 }
 
 impl CloudLlmConfig {
-    /// Try to create from environment variables with `MO_CLOUD_LLM_` prefix.
-    ///
-    /// Falls back to `MO_LLM_` / `OPENAI_` prefixes if cloud-specific vars aren't set.
-    pub fn from_env() -> Option<Self> {
-        let api_key = std::env::var("MO_CLOUD_LLM_API_KEY")
-            .or_else(|_| std::env::var("MO_LLM_API_KEY"))
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .ok()?;
-        let base_url = std::env::var("MO_CLOUD_LLM_BASE_URL")
-            .or_else(|_| std::env::var("MO_LLM_BASE_URL"))
-            .or_else(|_| std::env::var("OPENAI_BASE_URL"))
-            .unwrap_or_else(|_| "https://api.openai.com/v1".into());
-        let model = std::env::var("MO_CLOUD_LLM_MODEL")
-            .or_else(|_| std::env::var("MO_LLM_MODEL"))
-            .unwrap_or_else(|_| "gpt-4o-mini".into());
-        Some(Self {
-            api_key,
-            base_url,
-            model,
-        })
+    /// Build from an already-resolved active model (see [`resolve_reasoning_model`]).
+    pub fn from_resolved(resolved: crate::models::ResolvedActiveLlmModel) -> Self {
+        Self {
+            api_key: resolved.api_key,
+            base_url: resolved.base_url,
+            model: resolved.model_name,
+        }
     }
 }
 
@@ -3787,8 +3774,8 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         );
 
         let runner = self.make_runner();
-        // Per-subtask: use local verification (skips global_only & LlmJudge)
-        let report = runner.verify_subtask_local(&durable_st).await;
+        // Full verification — includes LlmJudge when a judge is wired; skips only global_only.
+        let report = runner.verify_subtask(&durable_st).await;
 
         let event_type = if report.all_required_passed {
             "verification_passed"
@@ -6303,11 +6290,18 @@ mod tests {
     // ─── CloudLlmConfig tests ────────────────────────────────────────────────
 
     #[test]
-    fn cloud_llm_config_from_env_requires_api_key() {
-        let config = CloudLlmConfig::from_env();
-        // We can't assert None because CI might have OPENAI_API_KEY set;
-        // just verify no panics.
-        let _ = config;
+    fn cloud_llm_config_from_resolved_roundtrip() {
+        let resolved = crate::models::ResolvedActiveLlmModel {
+            model_name: "gpt-4o-mini".into(),
+            api_key: "sk-test".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            provider: "openai".into(),
+            fallback_model: None,
+        };
+        let config = CloudLlmConfig::from_resolved(resolved);
+        assert_eq!(config.model, "gpt-4o-mini");
+        assert_eq!(config.api_key, "sk-test");
+        assert_eq!(config.base_url, "https://api.openai.com/v1");
     }
 
     #[test]

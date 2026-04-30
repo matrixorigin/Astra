@@ -8,15 +8,15 @@
 //! variables, allowing production tuning without recompilation.
 //!
 //! ```text
-//! MO_MAX_TURNS=150             # conversation turns per session
-//! MO_PLAN_SUBTASK_MAX_TURNS=0  # per-subtask turn budget (0 = use MO_MAX_TURNS)
-//! MO_TURN_TIMEOUT_S=300        # seconds before a turn is force-completed
-//! MO_GLOBAL_OUTPUT_LIMIT=200000 # combined tool output bytes
-//! MO_TOOL_OUTPUT_LIMIT=80000   # per-tool output bytes
-//! MO_MAX_TOOL_RETRIES=2        # transient-error retries per tool
-//! MO_RETRY_BASE_MS=500         # base backoff for retries (doubles each)
-//! MO_MAX_RETRIEVED=6           # memory/knowledge docs per turn
-//! MO_MAX_TURN_INPUT_TOKENS=80000 # max LLM input tokens per turn (0=unlimited)
+//! ASTRA_MAX_TURNS=150             # conversation turns per session
+//! ASTRA_PLAN_SUBTASK_MAX_TURNS=0  # per-subtask turn budget (0 = use ASTRA_MAX_TURNS)
+//! ASTRA_TURN_TIMEOUT_S=300        # seconds before a turn is force-completed
+//! ASTRA_GLOBAL_OUTPUT_LIMIT=200000 # combined tool output bytes
+//! ASTRA_TOOL_OUTPUT_LIMIT=80000   # per-tool output bytes
+//! ASTRA_MAX_TOOL_RETRIES=2        # transient-error retries per tool
+//! ASTRA_RETRY_BASE_MS=500         # base backoff for retries (doubles each)
+//! ASTRA_MAX_RETRIEVED=6           # memory/knowledge docs per turn
+//! ASTRA_MAX_TURN_INPUT_TOKENS=80000 # max LLM input tokens per turn (0=unlimited)
 //! ```
 
 use std::sync::OnceLock;
@@ -78,18 +78,21 @@ impl RuntimeLimits {
     pub fn from_env() -> Self {
         let d = Self::default();
         Self {
-            max_turns: env_parse("MO_MAX_TURNS", d.max_turns),
+            max_turns: env_parse("ASTRA_MAX_TURNS", d.max_turns),
             plan_subtask_max_turns: env_parse(
-                "MO_PLAN_SUBTASK_MAX_TURNS",
+                "ASTRA_PLAN_SUBTASK_MAX_TURNS",
                 d.plan_subtask_max_turns,
             ),
-            turn_timeout_s: env_parse("MO_TURN_TIMEOUT_S", d.turn_timeout_s),
-            global_output_limit: env_parse("MO_GLOBAL_OUTPUT_LIMIT", d.global_output_limit),
-            tool_output_limit: env_parse("MO_TOOL_OUTPUT_LIMIT", d.tool_output_limit),
-            max_tool_retries: env_parse("MO_MAX_TOOL_RETRIES", d.max_tool_retries),
-            retry_base_ms: env_parse("MO_RETRY_BASE_MS", d.retry_base_ms),
-            max_retrieved: env_parse("MO_MAX_RETRIEVED", d.max_retrieved),
-            max_turn_input_tokens: env_parse("MO_MAX_TURN_INPUT_TOKENS", d.max_turn_input_tokens),
+            turn_timeout_s: env_parse("ASTRA_TURN_TIMEOUT_S", d.turn_timeout_s),
+            global_output_limit: env_parse("ASTRA_GLOBAL_OUTPUT_LIMIT", d.global_output_limit),
+            tool_output_limit: env_parse("ASTRA_TOOL_OUTPUT_LIMIT", d.tool_output_limit),
+            max_tool_retries: env_parse("ASTRA_MAX_TOOL_RETRIES", d.max_tool_retries),
+            retry_base_ms: env_parse("ASTRA_RETRY_BASE_MS", d.retry_base_ms),
+            max_retrieved: env_parse("ASTRA_MAX_RETRIEVED", d.max_retrieved),
+            max_turn_input_tokens: env_parse(
+                "ASTRA_MAX_TURN_INPUT_TOKENS",
+                d.max_turn_input_tokens,
+            ),
         }
     }
 
@@ -169,7 +172,7 @@ mod tests {
     fn env_override_applies() {
         // We can't safely set env vars in parallel tests, but we can test
         // that env_parse falls back correctly on missing vars.
-        let val: usize = env_parse("MO_TEST_NONEXISTENT_LIMIT_XYZ", 42);
+        let val: usize = env_parse("ASTRA_TEST_NONEXISTENT_LIMIT_XYZ", 42);
         assert_eq!(val, 42);
     }
 

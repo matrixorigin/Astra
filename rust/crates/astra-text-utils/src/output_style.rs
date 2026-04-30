@@ -6,11 +6,9 @@
 //!
 //! # Usage
 //!
-//! Set `MO_OUTPUT_STYLE=concise` environment variable, or create a custom
-//! style file at `~/.astra/output-styles/my-style.md`.
+//! Custom styles live at `~/.astra/output-styles/my-style.md`.
 
 use std::collections::HashMap;
-use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -270,12 +268,9 @@ pub fn get_output_style(name: &str) -> Option<&'static OutputStyle> {
     })
 }
 
-/// Get the current output style from environment.
-///
-/// Reads `MO_OUTPUT_STYLE` environment variable.
+/// Get the current output style. Always returns None (no env-controlled style).
 pub fn current_output_style() -> Option<&'static OutputStyle> {
-    let style_name = env::var("MO_OUTPUT_STYLE").unwrap_or_default();
-    get_output_style(&style_name)
+    None
 }
 
 /// List all available output styles.

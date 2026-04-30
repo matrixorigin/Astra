@@ -47,7 +47,7 @@ pub(crate) async fn complete_repl_startup(
     let shutdown_signal_rx = subscribe_shutdown_signal();
 
     // --session-id: override with explicit session UUID
-    if let Ok(sid) = std::env::var("ASTRA_SESSION_ID") {
+    if let Ok(sid) = std::env::var("ASTRA_CLI_SESSION_ID") {
         state.session_id = Some(sid.clone());
         state.pending_recovery = None;
         eprintln!(
@@ -57,7 +57,7 @@ pub(crate) async fn complete_repl_startup(
     }
 
     // --name: set session display name
-    if let Ok(name) = std::env::var("ASTRA_SESSION_NAME") {
+    if let Ok(name) = std::env::var("ASTRA_CLI_SESSION_NAME") {
         state.session_name = Some(name);
     }
 
@@ -69,11 +69,8 @@ pub(crate) async fn complete_repl_startup(
         );
     }
 
-    // Load project instructions from .astra/instructions.md (unless --no-instructions)
-    let no_instructions = std::env::var("ASTRA_NO_INSTRUCTIONS")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    if !no_instructions && let Some(instructions) = discover_project_instructions() {
+    // Load project instructions from .astra/instructions.md
+    if let Some(instructions) = discover_project_instructions() {
         let lines = instructions.lines().count();
         eprintln!(
             "  {} {}",
@@ -86,15 +83,10 @@ pub(crate) async fn complete_repl_startup(
     // Session lifecycle maintenance: compress old journals and delete expired sessions.
     // Non-blocking, best-effort — errors are silently ignored.
     {
-        let ttl_days: u64 = std::env::var("ASTRA_SESSION_TTL_DAYS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30);
-        let compress_days: u64 = std::env::var("ASTRA_JOURNAL_COMPRESS_DAYS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(7);
-        let maint = session_journal::run_session_maintenance(ttl_days, compress_days);
+        const SESSION_TTL_DAYS: u64 = 30;
+        const JOURNAL_COMPRESS_DAYS: u64 = 7;
+        let maint =
+            session_journal::run_session_maintenance(SESSION_TTL_DAYS, JOURNAL_COMPRESS_DAYS);
         if maint.sessions_deleted > 0 || maint.journals_compressed > 0 {
             let mut parts = Vec::new();
             if maint.sessions_deleted > 0 {
@@ -238,7 +230,8 @@ pub(crate) async fn complete_repl_startup(
     }) {
         state.matrix_runtime = match SharedPool::new(&settings).await {
             Ok(pool) => {
-                let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+                let user_id =
+                    std::env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string());
                 let th =
                     std::sync::Arc::new(std::sync::Mutex::new(state.tool_health_entries.clone()));
                 let lease = std::sync::Arc::new(astra_services::TaskLeaseHoldCache::default());
@@ -272,7 +265,8 @@ pub(crate) async fn complete_repl_startup(
         };
         if let Some(ref mc) = state.matrix_runtime {
             let pool = mc.shared_pool().get().clone();
-            let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+            let user_id =
+                std::env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string());
             let mo_team_store = astra_services::team_persistence::MatrixOneTeamStore::new(pool);
             if let Err(e) = mo_team_store.ensure_builtins(&user_id).await {
                 eprintln!("  {} team store builtins: {e}", theme::icon_warn());

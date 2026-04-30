@@ -23,13 +23,13 @@ pub fn classify_error(error_str: &str) -> astra_core::ErrorKind {
 // ── Retry Policy ─────────────────────────────────────────────────────────────
 
 /// Maximum retries for transient errors on a single tool call.
-/// Override with `MO_MAX_TOOL_RETRIES` env var.
+/// Override with `ASTRA_MAX_TOOL_RETRIES` env var.
 pub fn max_tool_retries() -> usize {
     astra_core::RuntimeLimits::global().max_tool_retries
 }
 
 /// Base delay for retry backoff (milliseconds).
-/// Override with `MO_RETRY_BASE_MS` env var.
+/// Override with `ASTRA_RETRY_BASE_MS` env var.
 pub fn retry_base_ms() -> u64 {
     astra_core::RuntimeLimits::global().retry_base_ms
 }
@@ -201,7 +201,7 @@ pub fn build_recovery_message(
             );
             format!(
                 "⚠ {} failed with an unexpected error. Check the tool output and adjust; \
-                 enable MO_DEBUG=1 or RUST_LOG for a structured log line.",
+                 enable RUST_LOG=debug for a structured log line.",
                 tool_name
             )
         }

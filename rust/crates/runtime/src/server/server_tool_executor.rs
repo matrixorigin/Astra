@@ -32,7 +32,7 @@ use crate::tool_sandbox::{
 };
 use astra_turn_core::file_edit_journal::{EditType, FileEditJournal};
 
-const MO_CONNECT_TIMEOUT_SECS: u32 = 5;
+const ASTRA_CONNECT_TIMEOUT_SECS: u32 = 5;
 
 fn normalize_path(path: &Path) -> PathBuf {
     path.components()
@@ -953,7 +953,7 @@ fn mo_mysql_cmd(database: Option<&str>) -> Result<Command, String> {
         .arg(format!("-u{user}"))
         .env("MYSQL_PWD", &password)
         .arg(db)
-        .arg(format!("--connect-timeout={MO_CONNECT_TIMEOUT_SECS}"))
+        .arg(format!("--connect-timeout={ASTRA_CONNECT_TIMEOUT_SECS}"))
         .arg("--table");
     Ok(cmd)
 }

@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 // ─── MatrixOne connection helper ────────────────────────────────────────────
 
-const MO_CONNECT_TIMEOUT_SECS: u32 = 5;
+const ASTRA_CONNECT_TIMEOUT_SECS: u32 = 5;
 
 /// Cached account name — queried once via `SELECT current_account_name()`.
 fn mo_current_account() -> &'static str {
@@ -205,7 +205,7 @@ fn mo_mysql_cmd(database: Option<&str>) -> Result<Command, String> {
         .arg(format!("-u{}", user))
         .env("MYSQL_PWD", &password) // pass via env, not CLI (hidden from ps)
         .arg(&db)
-        .arg(format!("--connect-timeout={MO_CONNECT_TIMEOUT_SECS}"))
+        .arg(format!("--connect-timeout={ASTRA_CONNECT_TIMEOUT_SECS}"))
         .arg("--table"); // Pretty-print results
     Ok(cmd)
 }

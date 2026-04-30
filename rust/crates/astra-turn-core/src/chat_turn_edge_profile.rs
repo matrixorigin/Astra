@@ -17,16 +17,13 @@ pub fn read_git_branch_abbrev() -> Option<String> {
 pub fn memoria_env_for_edge_profile() -> (String, String) {
     let memoria_url = std::env::var("MEMORIA_BASE_URL")
         .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
-    let memoria_key = std::env::var("MEMORIA_API_KEY")
-        .ok()
-        .or_else(|| std::env::var("MEMORIA_MASTER_KEY").ok())
-        .unwrap_or_default();
+    let memoria_key = std::env::var("MEMORIA_MASTER_KEY").unwrap_or_default();
     (memoria_url, memoria_key)
 }
 
 /// Retrieval top_k from environment (same semantics as RuntimeConfig).
 fn retrieval_top_k_from_env() -> u32 {
-    std::env::var("MO_RETRIEVAL_TOP_K")
+    std::env::var("ASTRA_RETRIEVAL_TOP_K")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(5) // default same as RuntimeConfig
@@ -100,7 +97,7 @@ mod tests {
             env_ctx.contains("## Environment"),
             "environment_context should have section header"
         );
-        // retrieval_top_k is included (default 5 unless MO_RETRIEVAL_TOP_K set)
+        // retrieval_top_k is included (default 5 unless ASTRA_RETRIEVAL_TOP_K set)
         assert!(
             v.get("retrieval_top_k").is_some(),
             "should include retrieval_top_k"

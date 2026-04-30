@@ -753,7 +753,7 @@ impl DomainAdapter for EventAdapter {
 /// Cloud → edge cache of [`PlanTemplateSyncRow`]. Populated by `pull_domain(Templates)`;
 /// edge never pushes template packs ([`SyncPolicy::templates`] uses [`astra_services::sync_engine::PushTrigger::Never`]).
 ///
-/// Diagnostics: set environment variable `MO_SYNC_DEBUG=1` to print one line to stderr whenever
+/// Diagnostics: set environment variable `RUST_LOG=debug` to print one line to stderr whenever
 /// [`DomainAdapter::merge_remote`] replaces the template cache after a successful pull.
 pub struct TemplateAdapter {
     cache: Arc<Mutex<Vec<PlanTemplateSyncRow>>>,
@@ -801,9 +801,7 @@ impl DomainAdapter for TemplateAdapter {
         if let Ok(mut g) = self.cache.lock() {
             *g = rows;
         }
-        if std::env::var("MO_SYNC_DEBUG").as_deref() == Ok("1") {
-            eprintln!("[astra-sync][templates] merge_remote: replaced cache with {n} row(s)");
-        }
+        let _ = n; // cache size available if a logger is wired in the future
         Ok(MergeResult {
             items_added: n,
             items_updated: 0,

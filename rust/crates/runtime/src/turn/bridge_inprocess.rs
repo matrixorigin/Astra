@@ -4,7 +4,7 @@
 ///
 /// | Behavior | Implementation |
 /// |------------------------|------|
-/// | Long-lived stream "stall" / no chunks | [`super::llm_client::stream_idle_timeout`] on SSE `next()` (5 min default, `MO_STREAM_IDLE_TIMEOUT_MS`) |
+/// | Long-lived stream "stall" / no chunks | [`super::llm_client::stream_idle_timeout`] on SSE `next()` (5 min default, `ASTRA_STREAM_IDLE_TIMEOUT_MS`) |
 /// | Recover via one-shot completion | [`super::llm_client::call_llm_nonstream_fallback`] after idle in both `call_llm_and_collect` and [`call_llm_stream`] below |
 /// | User cancel clears in-flight work | HTTP `/chat/turn` passes `CancellationToken`; dropping the SSE body (client disconnect) cancels in-flight LLM byte/SSE consumption in-process |
 /// | Cooldown / 429 wait cannot ignore disconnect | [`super::llm_client::sleep_ms_or_llm_cancel`] on retry backoff + rate-limit waits in [`call_llm_stream`]; initial cooldown wait `select!`s [`wait_until_cancelled_or_pending`](super::llm_client::wait_until_cancelled_or_pending) in the bridge stream |
@@ -3467,7 +3467,7 @@ mod tests {
         }
         headers.insert(
             "x-mo-bridge-test-secret",
-            std::env::var("ASTRA_BRIDGE_TEST_SECRET")
+            std::env::var("ASTRA_TEST_BRIDGE_SECRET")
                 .expect("bridge test secret should be set")
                 .parse()
                 .unwrap(),
@@ -3757,7 +3757,7 @@ mod tests {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         // Ensure env var doesn't interfere
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
         let (msg, _, _) = build_system_message(
@@ -3809,7 +3809,7 @@ mod tests {
     fn build_system_message_session_scope_has_ttl_but_no_global_scope() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
         let (msg, _, _) = build_system_message(
@@ -3846,7 +3846,7 @@ mod tests {
     fn build_system_message_cache_disabled_env() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::set_var("MO_PROMPT_CACHE_DISABLED", "1");
+            std::env::set_var("ASTRA_TEST_PROMPT_CACHE_DISABLED", "1");
         }
 
         let (msg, _, _) = build_system_message(
@@ -3867,7 +3867,7 @@ mod tests {
         }
 
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
     }
 
@@ -3900,7 +3900,7 @@ mod tests {
     fn build_system_message_feedback_rules_in_dynamic_no_cache_control() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
         // Simulate dynamic_desc with accumulated feedback rules
@@ -4263,7 +4263,7 @@ mod tests {
     fn annotate_tool_schemas_for_caching_adds_cache_control() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
         let mut tools = vec![
@@ -4306,7 +4306,7 @@ mod tests {
     fn annotate_tool_schemas_only_last_tool() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
         // bash and read_file are pinned; github_list_prs is dynamic
@@ -4389,7 +4389,7 @@ mod tests {
     fn prompt_cache_config_latch_anthropic() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
         let cfg = PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514");
@@ -4408,7 +4408,7 @@ mod tests {
     fn prompt_cache_config_latch_openai() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
         let cfg = PromptCacheConfig::latch("openai", "gpt-4");
@@ -4423,7 +4423,7 @@ mod tests {
     fn prompt_cache_config_latch_unknown_provider() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
         let cfg = PromptCacheConfig::latch("my-custom-provider", "my-model");
@@ -4441,7 +4441,7 @@ mod tests {
     fn prompt_cache_config_env_disabled() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::set_var("MO_PROMPT_CACHE_DISABLED", "1");
+            std::env::set_var("ASTRA_TEST_PROMPT_CACHE_DISABLED", "1");
         }
 
         let cfg = PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514");
@@ -4455,7 +4455,7 @@ mod tests {
         );
 
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
     }
 
@@ -4463,7 +4463,7 @@ mod tests {
     fn prompt_cache_config_latch_idempotent() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
         let a = PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514");
@@ -4636,7 +4636,7 @@ mod tests {
     fn all_three_cache_layers_present_for_anthropic() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
         // Layer 1: System message with cache_control
@@ -4689,7 +4689,7 @@ mod tests {
     fn cache_disabled_strips_all_three_layers() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::set_var("MO_PROMPT_CACHE_DISABLED", "1");
+            std::env::set_var("ASTRA_TEST_PROMPT_CACHE_DISABLED", "1");
         }
 
         // Layer 1: system message
@@ -4731,7 +4731,7 @@ mod tests {
         );
 
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
     }
 
@@ -4741,7 +4741,7 @@ mod tests {
     fn message_breakpoint_skips_system_only() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
         let mut messages = vec![json!({"role": "system", "content": "sys prompt"})];
@@ -4771,7 +4771,7 @@ mod tests {
     fn message_breakpoint_array_content_appends_to_last_block() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
         let mut messages = vec![json!({
@@ -4942,7 +4942,7 @@ mod tests {
     fn anthropic_cache_breakpoints_within_limit() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
         // Worst case: many tools → many Session sections
@@ -4994,7 +4994,7 @@ mod tests {
     fn anthropic_scope_annotations_correct() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
         let (msg, _, _) = build_system_message(
@@ -5033,7 +5033,7 @@ mod tests {
     fn anthropic_global_prefix_stable_across_tool_sets() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
         let (msg1, _, _) = build_system_message(
@@ -5097,7 +5097,7 @@ mod tests {
     fn anthropic_session_prefix_stable_within_session() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
         // Simulate two turns in the same session (same tools, different profile)
@@ -5233,7 +5233,7 @@ mod tests {
     fn global_sections_contain_no_tool_names() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
         let tools = vec!["bash", "read_file", "memory_store", "git_diff"];
@@ -5282,7 +5282,7 @@ mod tests {
     fn task_type_change_preserves_global_prefix() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
-            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
         let tools = vec!["bash", "read_file"];
@@ -6055,7 +6055,7 @@ mod tests {
     async fn forward_persists_full_journal_request_and_response_when_session_capture_enabled() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
-        let _env = EnvVarGuard::set("ASTRA_BRIDGE_TEST_SECRET", "bridge-journal-secret");
+        let _env = EnvVarGuard::set("ASTRA_TEST_BRIDGE_SECRET", "bridge-journal-secret");
         let session_id = "00000000-0000-0000-0000-000000000129";
         let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
         let headers = bridge_test_headers(session_id, true);
@@ -6136,7 +6136,7 @@ mod tests {
     async fn forward_does_not_persist_full_journal_events_when_session_capture_disabled() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
-        let _env = EnvVarGuard::set("ASTRA_BRIDGE_TEST_SECRET", "bridge-journal-secret");
+        let _env = EnvVarGuard::set("ASTRA_TEST_BRIDGE_SECRET", "bridge-journal-secret");
         let session_id = "00000000-0000-0000-0000-000000000133";
         let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
         let mut headers = bridge_test_headers(session_id, true);
@@ -6206,7 +6206,7 @@ mod tests {
     async fn forward_persists_full_journal_rounds_from_round_index_across_same_session_turn() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
-        let _env = EnvVarGuard::set("ASTRA_BRIDGE_TEST_SECRET", "bridge-journal-secret");
+        let _env = EnvVarGuard::set("ASTRA_TEST_BRIDGE_SECRET", "bridge-journal-secret");
         let session_id = "00000000-0000-0000-0000-000000000132";
         let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
         let headers = bridge_test_headers(session_id, true);
@@ -6295,7 +6295,7 @@ mod tests {
      {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
-        let _env = EnvVarGuard::set("ASTRA_BRIDGE_TEST_SECRET", "bridge-journal-secret");
+        let _env = EnvVarGuard::set("ASTRA_TEST_BRIDGE_SECRET", "bridge-journal-secret");
         let session_id = "00000000-0000-0000-0000-000000000130";
         let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
         let headers = bridge_test_headers(session_id, true);
@@ -6365,7 +6365,7 @@ mod tests {
     async fn forward_persists_full_journal_context_with_reasoning_when_session_capture_enabled() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
-        let _env = EnvVarGuard::set("ASTRA_BRIDGE_TEST_SECRET", "bridge-journal-secret");
+        let _env = EnvVarGuard::set("ASTRA_TEST_BRIDGE_SECRET", "bridge-journal-secret");
         let session_id = "00000000-0000-0000-0000-000000000131";
         let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
         let headers = bridge_test_headers(session_id, false);

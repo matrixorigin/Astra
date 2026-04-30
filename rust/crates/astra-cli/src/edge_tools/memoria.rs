@@ -46,14 +46,11 @@ impl ToolExecutor {
         } else {
             let base = std::env::var("MEMORIA_BASE_URL")
                 .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
-            let key = match std::env::var("MEMORIA_API_KEY")
-                .ok()
-                .or_else(|| std::env::var("MEMORIA_MASTER_KEY").ok())
-            {
+            let key = match std::env::var("MEMORIA_MASTER_KEY").ok() {
                 Some(k) => k,
                 None => {
                     return json!({
-                            "error": "Memory unavailable: not connected to cloud and MEMORIA_API_KEY not set",
+                            "error": "Memory unavailable: not connected to cloud and MEMORIA_MASTER_KEY not set",
                             "hint": "Login with /login to enable cloud-backed memory with user isolation"
                         })
                         .to_string();
@@ -114,10 +111,7 @@ impl ToolExecutor {
         }
         let base = std::env::var("MEMORIA_BASE_URL")
             .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
-        let key = match std::env::var("MEMORIA_API_KEY")
-            .ok()
-            .or_else(|| std::env::var("MEMORIA_MASTER_KEY").ok())
-        {
+        let key = match std::env::var("MEMORIA_MASTER_KEY").ok() {
             Some(k) => k,
             None => return vec![], // No key = no Memoria
         };
@@ -171,10 +165,7 @@ impl ToolExecutor {
         }
         let base = std::env::var("MEMORIA_BASE_URL")
             .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
-        let key = match std::env::var("MEMORIA_API_KEY")
-            .ok()
-            .or_else(|| std::env::var("MEMORIA_MASTER_KEY").ok())
-        {
+        let key = match std::env::var("MEMORIA_MASTER_KEY").ok() {
             Some(k) => k,
             None => return,
         };
@@ -403,9 +394,7 @@ mod build_direct_request_tests {
 fn memoria_oneshot_client(timeout_secs: u64) -> Option<(reqwest::Client, String, String)> {
     let base = std::env::var("MEMORIA_BASE_URL")
         .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
-    let key = std::env::var("MEMORIA_API_KEY")
-        .ok()
-        .or_else(|| std::env::var("MEMORIA_MASTER_KEY").ok())?;
+    let key = std::env::var("MEMORIA_MASTER_KEY").ok()?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .no_proxy()

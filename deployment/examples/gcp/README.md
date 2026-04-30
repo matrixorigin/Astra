@@ -16,8 +16,8 @@ gcloud run deploy astra \
   --platform managed \
   --region us-central1 \
   --allow-unauthenticated \
-  --set-env-vars="MATRIXONE_HOST=DB_HOST,REDIS_HOST=REDIS_HOST" \
-  --set-secrets="TOKEN_ENCRYPTION_KEY=token-key:latest,JWT_SECRET_KEY=jwt-secret:latest"
+  --set-env-vars="MATRIXONE_HOST=DB_HOST" \
+  --set-secrets="ASTRA_TOKEN_ENCRYPTION_KEY=token-key:latest,ASTRA_JWT_SECRET=jwt-secret:latest"
 ```
 
 ### Architecture

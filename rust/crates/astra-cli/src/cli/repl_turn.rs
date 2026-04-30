@@ -1784,16 +1784,6 @@ pub(crate) trait SkillImproveLlm: Send + Sync {
     async fn complete(&self, system: &str, user: &str) -> Result<String, String>;
 }
 
-/// Adapter that exposes [`astra_services::CloudLlmJudge`] as [`SkillImproveLlm`].
-pub(crate) struct CloudJudgeLlm(pub std::sync::Arc<astra_services::CloudLlmJudge>);
-
-#[async_trait::async_trait]
-impl SkillImproveLlm for CloudJudgeLlm {
-    async fn complete(&self, system: &str, user: &str) -> Result<String, String> {
-        self.0.chat_completion(system, user, 2048, 0.2).await
-    }
-}
-
 /// Async variant of `check_skill_improvement_inner` with an optional LLM-driven
 /// rewrite path.
 ///
@@ -1806,15 +1796,10 @@ impl SkillImproveLlm for CloudJudgeLlm {
 /// 5. Otherwise fall back to the heuristic append ("Recent user feedback"
 ///    section) via [`check_skill_improvement_inner`].
 async fn check_skill_improvement_async(state: &mut ReplState) {
-    let llm: Option<Box<dyn SkillImproveLlm>> = state
-        .matrix_runtime
-        .as_ref()
-        .and_then(|rt| rt.create_cloud_llm_judge())
-        .map(|judge| {
-            let boxed: Box<dyn SkillImproveLlm> =
-                Box::new(CloudJudgeLlm(std::sync::Arc::new(judge)));
-            boxed
-        });
+    // LLM-driven skill improvement previously used CloudLlmJudge::from_env; after env cleanup
+    // it falls through to the heuristic append path below. TODO: wire a server-proxy LLM client
+    // here if skill auto-rewrite becomes a priority again.
+    let llm: Option<Box<dyn SkillImproveLlm>> = None;
 
     if let Some(llm) = llm {
         match try_llm_skill_improvement(state, llm.as_ref()).await {
@@ -2703,7 +2688,7 @@ fn build_manual_heavy_step_checkpoint(
         messages.push(serde_json::json!({ "role": "assistant", "content": a }));
     }
 
-    let max_turns = std::env::var("MO_MAX_TURNS")
+    let max_turns = std::env::var("ASTRA_CLI_MAX_TURNS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(50u32);

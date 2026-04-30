@@ -1,7 +1,6 @@
 //! Optional structured logging for the CLI (does not replace REPL / user-facing stderr).
 //!
-//! See [`crate::cli_args::Cli`] (`--diagnostic-log`, `--log-file`) and env vars `ASTRA_DIAGNOSTIC_LOG` /
-//! `ASTRA_LOG_FILE`.
+//! See [`crate::cli_args::Cli`] (`--diagnostic-log`, `--log-file`).
 
 use std::sync::OnceLock;
 
@@ -11,9 +10,9 @@ use tracing_appender::non_blocking::WorkerGuard;
 /// Keeps the [`WorkerGuard`] alive so the non-blocking writer flushes on process exit (drop on shutdown).
 static FILE_LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
-/// Initialize diagnostic logging once per process from parsed CLI + environment.
+/// Initialize diagnostic logging once per process from parsed CLI flags.
 ///
-/// **Priority:** `--log-file` → `ASTRA_LOG_FILE` → `--diagnostic-log` / `ASTRA_DIAGNOSTIC_LOG=1` (stderr only).
+/// **Priority:** `--log-file` → `--diagnostic-log` (stderr only).
 pub fn init_cli_observability(cli: &Cli) {
     static INIT: OnceLock<()> = OnceLock::new();
     INIT.get_or_init(|| {
@@ -22,12 +21,7 @@ pub fn init_cli_observability(cli: &Cli) {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(std::string::ToString::to_string)
-            .or_else(|| {
-                std::env::var("ASTRA_LOG_FILE")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-            });
+            .map(std::string::ToString::to_string);
 
         if let Some(ref path) = file_path {
             if let Err(e) = try_init_file_logging(path) {
@@ -36,9 +30,7 @@ pub fn init_cli_observability(cli: &Cli) {
             return;
         }
 
-        let want_stderr = cli.diagnostic_log
-            || std::env::var("ASTRA_DIAGNOSTIC_LOG").ok().as_deref() == Some("1");
-        if want_stderr {
+        if cli.diagnostic_log {
             let _ = astra_logging::init_from_env(
                 astra_logging::LogInitConfig::new(
                     "warn,astra.agent=info,astra.thin_client=info,astra.logging=info",

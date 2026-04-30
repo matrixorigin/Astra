@@ -28,7 +28,7 @@ pub(super) struct StreamingMarkdown {
     unstable_region: TerminalRegion,
     /// Last render timestamp (for time-based throttling in NO_FLICKER mode).
     last_render: Instant,
-    /// Whether NO_FLICKER mode is enabled (MO_NO_FLICKER=1).
+    /// Whether NO_FLICKER mode is enabled.
     no_flicker: bool,
 }
 
@@ -37,9 +37,6 @@ const NO_FLICKER_INTERVAL_MS: u64 = 50;
 
 impl StreamingMarkdown {
     pub(super) fn new(term_width: usize) -> Self {
-        let no_flicker = std::env::var("MO_NO_FLICKER")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
         Self {
             full_text: String::new(),
             stable_end: 0,
@@ -47,7 +44,7 @@ impl StreamingMarkdown {
             stable_region: TerminalRegion::new(),
             unstable_region: TerminalRegion::new(),
             last_render: Instant::now(),
-            no_flicker,
+            no_flicker: false,
         }
     }
 

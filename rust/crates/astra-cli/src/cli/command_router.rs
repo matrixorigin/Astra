@@ -196,12 +196,7 @@ fn render_bug_args(args: &BugArgs) -> String {
 }
 
 fn maybe_load_project_instructions(state: &mut ReplState) {
-    let no_instructions = std::env::var("ASTRA_NO_INSTRUCTIONS")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    if !no_instructions {
-        state.project_instructions = discover_project_instructions();
-    }
+    state.project_instructions = discover_project_instructions();
 }
 
 fn maybe_wire_delegation_engine(
@@ -242,10 +237,10 @@ async fn execute_repl_bridge_command(
     try_silent_auth(api, profile).await;
 
     let mut state = initialize_repl_state(profile, global_model);
-    if let Ok(sid) = std::env::var("ASTRA_SESSION_ID") {
+    if let Ok(sid) = std::env::var("ASTRA_CLI_SESSION_ID") {
         state.session_id = Some(sid);
     }
-    if let Ok(name) = std::env::var("ASTRA_SESSION_NAME") {
+    if let Ok(name) = std::env::var("ASTRA_CLI_SESSION_NAME") {
         state.session_name = Some(name);
     }
     maybe_load_project_instructions(&mut state);
@@ -1380,9 +1375,7 @@ pub(super) async fn run_print_mode(
         provider: None,
         explain: ExplainMode::Off,
         render_md: false,
-        verbose_mode: std::env::var("ASTRA_VERBOSE")
-            .map(|v| v == "1")
-            .unwrap_or(false),
+        verbose_mode: false,
         render_policy: crate::stream_render::RenderPolicy::Silent,
         selector: &*selector.0,
         unified_skill_registry: astra_runtime::skills::default_unified_registry(),

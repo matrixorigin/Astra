@@ -3,7 +3,7 @@
 //! promotions), and durable-task `resume_task` verification history reads.
 //!
 //! ```text
-//! ASTRA_DB_IT=1 cargo test -p astra-services --test services_db_integration -- --ignored
+//! ASTRA_TEST_DB_IT=1 cargo test -p astra-services --test services_db_integration -- --ignored
 //! ```
 //!
 //! Uses `MATRIXONE_*` after `dotenvy` (defaults match `.env.example`).
@@ -46,9 +46,9 @@ use uuid::Uuid;
 
 fn require_db_it_env() -> MatrixOneSettings {
     assert_eq!(
-        std::env::var("ASTRA_DB_IT").as_deref(),
+        std::env::var("ASTRA_TEST_DB_IT").as_deref(),
         Ok("1"),
-        "set ASTRA_DB_IT=1 for ignored services_db_integration tests"
+        "set ASTRA_TEST_DB_IT=1 for ignored services_db_integration tests"
     );
     dotenvy::dotenv().ok();
     MatrixOneSettings {
@@ -147,7 +147,7 @@ async fn cleanup_session_bundle(
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn skills_registry_index_list_order_and_get_skill_definition() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -223,7 +223,7 @@ async fn skills_registry_index_list_order_and_get_skill_definition() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -513,7 +513,7 @@ async fn cleanup_restore_fixture(
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn session_artifact_latest_and_list_use_stable_tiebreaker_for_tied_timestamps() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -595,7 +595,7 @@ async fn session_artifact_latest_and_list_use_stable_tiebreaker_for_tied_timesta
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -821,7 +821,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn cross_session_runtime_promotions_db_roundtrip() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -1036,7 +1036,7 @@ async fn cross_session_runtime_promotions_db_roundtrip() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn cross_session_mutations_db_roundtrip() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -1213,7 +1213,7 @@ async fn cross_session_mutations_db_roundtrip() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -1364,7 +1364,7 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn durable_task_resume_loads_verification_history_from_db() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -1505,7 +1505,7 @@ async fn durable_task_resume_loads_verification_history_from_db() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -1905,7 +1905,7 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn session_sync_log_prune_partitions_by_sync_type_on_live_matrixone() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -2027,7 +2027,7 @@ async fn session_sync_log_prune_partitions_by_sync_type_on_live_matrixone() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -2118,7 +2118,7 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn remote_composite_snapshot_index_restores_without_local_index_on_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -2268,7 +2268,7 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn restore_recent_tools_falls_back_to_legacy_turn_complete_metadata_on_live_matrixone() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -2353,7 +2353,7 @@ async fn restore_recent_tools_falls_back_to_legacy_turn_complete_metadata_on_liv
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -2443,7 +2443,7 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live_matrixone() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -2916,7 +2916,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_DB_IT=1 and live MatrixOne"]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn event_write_paths_reconcile_event_count_on_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -3094,7 +3094,7 @@ async fn event_write_paths_reconcile_event_count_on_live_matrixone() {
 }
 
 // ── At-most-once idempotency integration tests ───────────────────────────────
-// Gated by ASTRA_DB_IT=1. Document the end-to-end compare-before-reject
+// Gated by ASTRA_TEST_DB_IT=1. Document the end-to-end compare-before-reject
 // contract introduced by the idempotency audit (PR: fix/at-most-once-idempotency-audit).
 
 #[tokio::test]

@@ -57,14 +57,9 @@ pub(crate) fn discover_instructions_from_paths(
                 parts.push((project_path.display().to_string(), trimmed.to_string()));
             }
         }
-        // Project-level: .astra/knowledge.md (auto-generated learnings)
-        // Gated by MO_SESSION_KNOWLEDGE_INJECT (default: true). Allows users to disable
-        // cross-session knowledge injection independently of MO_SESSION_PROJECT_CONTEXT.
+        // Project-level: .astra/knowledge.md (auto-generated learnings).
         // Cap at 8KB to prevent unbounded token cost per turn.
-        let knowledge_inject = std::env::var("MO_SESSION_KNOWLEDGE_INJECT")
-            .map(|v| v != "0" && v.to_lowercase() != "false")
-            .unwrap_or(true);
-        if knowledge_inject {
+        {
             let knowledge_path = root.join(".astra").join("knowledge.md");
             if let Ok(content) = std::fs::read_to_string(&knowledge_path) {
                 let trimmed = content.trim();
@@ -88,7 +83,7 @@ pub(crate) fn discover_instructions_from_paths(
                     parts.push((knowledge_path.display().to_string(), capped.to_string()));
                 }
             }
-        } // knowledge_inject gate
+        }
     }
 
     // User-level: ~/.astra/instructions.md

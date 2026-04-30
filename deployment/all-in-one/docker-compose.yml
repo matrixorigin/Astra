@@ -61,16 +61,18 @@ services:
       - app
     command: ["astra-server"]
     ports:
-      - "${API_PORT:-8000}:8000"
+      - "${ASTRA_API_PORT:-8000}:8000"
     environment:
-      - RUST_API_ADDR=0.0.0.0:8000
-      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - ASTRA_API_HOST=0.0.0.0
+      - ASTRA_API_PORT=8000
+      - ASTRA_APP_ENV=${ASTRA_APP_ENV:-production}
       - MATRIXONE_HOST=matrixone
       - MATRIXONE_PORT=6001
       - ASTRA_DATABASE=${ASTRA_DATABASE:-astra_runtime}
       - ASTRA_DATABASE_PREFIX=${ASTRA_DATABASE_PREFIX:-}
-      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-}
-      - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY:-}
+      - ASTRA_JWT_SECRET=${ASTRA_JWT_SECRET:-}
+      - ASTRA_TOKEN_ENCRYPTION_KEY=${ASTRA_TOKEN_ENCRYPTION_KEY:-}
+      - ASTRA_BRIDGE_SECRET=${ASTRA_BRIDGE_SECRET:-}
     env_file:
       - path: ../../.env
         required: true

@@ -205,14 +205,13 @@ async fn ensure_durable_task_state(
     let session_id = state.session_id.as_deref().unwrap_or("unknown");
     let work_dir = std::env::current_dir().unwrap_or_default();
 
+    // Judge uses the server's reasoning model (via admin_config.reasoning_model_name →
+    // cheapest active fallback). Do NOT pass state.model: the chat model may be expensive,
+    // while the judge should use the cheap reasoning model.
     let server_proxy_judge: Option<std::sync::Arc<dyn astra_services::LlmJudge>> =
         if let (Some(a), Some(t)) = (api, token) {
             Some(std::sync::Arc::new(
-                durable_bridge::ServerProxyLlmJudge::new(
-                    a.clone(),
-                    t.to_string(),
-                    state.model.clone(),
-                ),
+                durable_bridge::ServerProxyLlmJudge::new(a.clone(), t.to_string(), None),
             ))
         } else {
             None
@@ -222,11 +221,9 @@ async fn ensure_durable_task_state(
         .matrix_runtime
         .as_ref()
         .and_then(|mc| mc.clone_ingestion_sender());
-    let cloud_judge = state
-        .matrix_runtime
-        .as_ref()
-        .and_then(|mc| mc.create_cloud_llm_judge())
-        .map(|j| std::sync::Arc::new(j) as std::sync::Arc<dyn astra_services::LlmJudge>);
+    // Judge runs server-side via server_proxy_judge (the server resolves the reasoning model
+    // from admin_config + infra_llm_models). No local cloud judge.
+    let cloud_judge: Option<std::sync::Arc<dyn astra_services::LlmJudge>> = None;
     let learning = build_learning_bridge(state);
 
     let lifecycle = if let Some(pool) = state

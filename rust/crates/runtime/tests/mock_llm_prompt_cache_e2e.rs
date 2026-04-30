@@ -235,7 +235,7 @@ async fn schema_churn_changes_cacheable_prefix_hash() {
 }
 
 // ── pc-disabled-flag ─────────────────────────────────────────────────────────
-// `MO_PROMPT_CACHE_DISABLED=1` must be honoured end-to-end: even with an
+// `ASTRA_TEST_PROMPT_CACHE_DISABLED=1` must be honoured end-to-end: even with an
 // Anthropic provider latched, no `cache_control` blocks may leak into the
 // system message or tool schemas, and `CapturedLlmRequest.cache_enabled`
 // must reflect the latched value. All cache-sensitive tests in this file
@@ -248,10 +248,10 @@ async fn cache_disabled_env_suppresses_all_annotations_end_to_end() {
     struct EnvGuard;
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED") };
+            unsafe { std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED") };
         }
     }
-    unsafe { std::env::set_var("MO_PROMPT_CACHE_DISABLED", "1") };
+    unsafe { std::env::set_var("ASTRA_TEST_PROMPT_CACHE_DISABLED", "1") };
     let _guard = EnvGuard;
 
     let capture = Arc::new(Mutex::new(Vec::new()));

@@ -110,7 +110,7 @@ pub(super) async fn try_cloud_pull(
         "starting MatrixOne learning pull"
     );
     let svc = MatrixOneSyncService::new(pool);
-    let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+    let user_id = std::env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string());
     match StateSyncService::pull_learning_versioned(&svc, &user_id, profile_name).await {
         Ok(Some(versioned)) => {
             // Parse snapshot to extract tool health before merging entities/patterns
@@ -166,7 +166,7 @@ pub(super) async fn try_cloud_push_versioned(
         Err(_) => return None,
     };
     let svc = MatrixOneSyncService::new(pool);
-    let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+    let user_id = std::env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string());
     let result = StateSyncService::push_learning_versioned(
         &svc,
         &user_id,
@@ -253,7 +253,7 @@ pub(super) async fn try_cloud_push_delta(
     };
 
     let svc = MatrixOneSyncService::new(pool);
-    let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+    let user_id = std::env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string());
 
     let result =
         StateSyncService::push_delta(&svc, &user_id, profile_name, &delta_json, expected_version)
@@ -312,7 +312,7 @@ pub(super) async fn try_cloud_pull_preferences(state: &mut ReplState) -> Vec<Str
         None => return Vec::new(),
     };
     let svc = MatrixOneSyncService::new(pool);
-    let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+    let user_id = std::env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string());
     match StateSyncService::pull_all_preferences(&svc, &user_id).await {
         Ok(prefs) if !prefs.is_empty() => {
             let keys: Vec<String> = prefs.iter().map(|(k, _)| k.clone()).collect();
@@ -371,7 +371,7 @@ pub(super) async fn try_cloud_push_preferences(state: &ReplState) {
         None => return,
     };
     let svc = MatrixOneSyncService::new(pool);
-    let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+    let user_id = std::env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string());
 
     // Collect blocked/deprioritized tools from health entries
     let blocked: Vec<String> = state

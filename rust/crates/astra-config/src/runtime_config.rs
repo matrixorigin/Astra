@@ -9,7 +9,7 @@
 //! 1. Built-in defaults
 //! 2. ~/.astra/config/runtime.toml (user level)
 //! 3. .astra/config/runtime.toml (project level)
-//! 4. Environment variables (MO_CONFIG_*)
+//! 4. Environment variables (ASTRA_CONFIG_*)
 //! 5. Runtime overrides (via API)
 
 use serde::{Deserialize, Serialize};
@@ -1803,27 +1803,27 @@ impl RuntimeConfig {
 
     /// Apply environment variable overrides.
     fn apply_env_overrides(&mut self) {
-        if let Ok(val) = std::env::var("MO_MAX_HISTORY_TOKENS")
+        if let Ok(val) = std::env::var("ASTRA_MAX_HISTORY_TOKENS")
             && let Ok(n) = val.parse()
         {
             self.compression.max_history_tokens = n;
         }
-        if let Ok(val) = std::env::var("MO_COMPRESSION_THRESHOLD")
+        if let Ok(val) = std::env::var("ASTRA_COMPRESSION_THRESHOLD")
             && let Ok(n) = val.parse()
         {
             self.compression.compression_threshold = n;
         }
-        if let Ok(val) = std::env::var("MO_RETRIEVAL_TOP_K")
+        if let Ok(val) = std::env::var("ASTRA_RETRIEVAL_TOP_K")
             && let Ok(n) = val.parse()
         {
             self.memory.retrieval_top_k = n;
         }
-        if let Ok(val) = std::env::var("MO_MAX_TURN_INPUT_TOKENS")
+        if let Ok(val) = std::env::var("ASTRA_MAX_TURN_INPUT_TOKENS")
             && let Ok(n) = val.parse()
         {
             self.token_budget.max_turn_input_tokens = n;
         }
-        if let Ok(val) = std::env::var("MO_CAPTURE_TRACES") {
+        if let Ok(val) = std::env::var("ASTRA_CAPTURE_TRACES") {
             self.telemetry.capture_context_traces = val == "1" || val.to_lowercase() == "true";
         }
     }
@@ -1935,13 +1935,13 @@ mod tests {
     #[test]
     fn test_env_override() {
         unsafe {
-            std::env::set_var("MO_MAX_HISTORY_TOKENS", "50000");
+            std::env::set_var("ASTRA_MAX_HISTORY_TOKENS", "50000");
         }
         let mut config = RuntimeConfig::default();
         config.apply_env_overrides();
         assert_eq!(config.compression.max_history_tokens, 50000);
         unsafe {
-            std::env::remove_var("MO_MAX_HISTORY_TOKENS");
+            std::env::remove_var("ASTRA_MAX_HISTORY_TOKENS");
         }
     }
 

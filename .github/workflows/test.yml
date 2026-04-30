@@ -184,11 +184,10 @@ jobs:
       MATRIXONE_USER: root
       MATRIXONE_PASSWORD: "111"
       ASTRA_AUTO_CREATE_DATABASE: "1"
-      JWT_SECRET_KEY: ci-jwt-secret-key-at-least-32-chars-long
-      SECRET_KEY: ci-app-secret-key-at-least-32-chars-long
-      TOKEN_ENCRYPTION_KEY: ci-token-encryption-key-at-least-32-chars
-      ASTRA_BRIDGE_TEST_SECRET: ci-chat-turn-bridge-secret-at-least-32-chars
-      CHAT_TURN_BRIDGE_SECRET: ci-chat-turn-bridge-secret-at-least-32-chars
+      ASTRA_JWT_SECRET: ci-jwt-secret-key-at-least-32-chars-long
+      ASTRA_TOKEN_ENCRYPTION_KEY: ci-token-encryption-key-at-least-32-chars
+      ASTRA_TEST_BRIDGE_SECRET: ci-chat-turn-bridge-secret-at-least-32-chars
+      ASTRA_BRIDGE_SECRET: ci-chat-turn-bridge-secret-at-least-32-chars
       MEMORIA_BASE_URL: http://localhost:8100
       MEMORIA_MASTER_KEY: ci-test-master-key
       MEMORIA_EMBEDDING_PROVIDER: openai
@@ -221,10 +220,8 @@ jobs:
         run: make dev-deps-wait
       - name: Run online tests
         env:
-          ASTRA_SYSTEM_MATRIX_E2E: "1"
-          ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS: "1"
-          ASTRA_MULTI_AGENT_IT: "1"
-          ASTRA_SERVICES_DB_IT: "1"
+          ASTRA_TEST_DB_IT: "1"
+          ASTRA_TEST_DB_IT_TEST_THREADS: "1"
         run: make test-online
       - name: Dump dependency logs
         if: failure()

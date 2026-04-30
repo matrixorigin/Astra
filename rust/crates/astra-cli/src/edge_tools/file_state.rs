@@ -347,9 +347,6 @@ impl ToolExecutor {
         path: &Path,
         requested: &ReadDedupKey,
     ) -> bool {
-        if std::env::var("MO_DEDUP_DISABLED").is_ok_and(|v| v == "1" || v == "true") {
-            return false;
-        }
         if matches!(requested, ReadDedupKey::Full) {
             return false;
         }
@@ -373,11 +370,7 @@ impl ToolExecutor {
     }
 
     /// Check if we can dedup a read (previous op was a full read, unchanged mtime).
-    /// Respects `MO_DEDUP_DISABLED=1` env var killswitch.
     pub(super) fn can_dedup_read(&self, path: &Path) -> bool {
-        if std::env::var("MO_DEDUP_DISABLED").is_ok_and(|v| v == "1" || v == "true") {
-            return false;
-        }
         let current_ts = Self::file_mtime_ms(path);
         if current_ts == 0 {
             return false;
@@ -398,9 +391,6 @@ impl ToolExecutor {
     /// subset of the union of all prior reads — the content is already in
     /// the conversation context.
     pub(super) fn is_range_already_read(&self, path: &Path, start: u64, end: u64) -> bool {
-        if std::env::var("MO_DEDUP_DISABLED").is_ok_and(|v| v == "1" || v == "true") {
-            return false;
-        }
         let current_ts = Self::file_mtime_ms(path);
         if current_ts == 0 {
             return false;

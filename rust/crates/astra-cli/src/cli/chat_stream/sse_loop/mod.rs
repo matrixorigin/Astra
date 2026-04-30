@@ -265,7 +265,7 @@ pub(crate) async fn stream_chat_sse(
     });
 
     // --add-dir: expand sandbox to include additional directories
-    if let Ok(dirs) = std::env::var("ASTRA_ADD_DIRS") {
+    if let Ok(dirs) = std::env::var("ASTRA_CLI_ADD_DIRS") {
         for dir in dirs.split(':').filter(|s| !s.is_empty()) {
             executor.expand_sandbox_path(PathBuf::from(dir));
         }
@@ -304,7 +304,7 @@ pub(crate) async fn stream_chat_sse(
 
     // --allowed-tools: if set, restrict to only the specified tools
     let mut initial_restricted: HashSet<String> =
-        if let Ok(allowed_csv) = std::env::var("ASTRA_ALLOWED_TOOLS") {
+        if let Ok(allowed_csv) = std::env::var("ASTRA_CLI_ALLOWED_TOOLS") {
             let allowed: HashSet<&str> = allowed_csv
                 .split(',')
                 .map(|s| s.trim())
@@ -324,7 +324,7 @@ pub(crate) async fn stream_chat_sse(
         };
 
     // --disallowed-tools: directly add to restricted set
-    if let Ok(denied_csv) = std::env::var("ASTRA_DISALLOWED_TOOLS") {
+    if let Ok(denied_csv) = std::env::var("ASTRA_CLI_DISALLOWED_TOOLS") {
         for name in denied_csv
             .split(',')
             .map(|s| s.trim())
@@ -438,15 +438,7 @@ pub(crate) async fn stream_chat_sse(
         ),
     };
 
-    let bare_mode = std::env::var("ASTRA_BARE")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    let hook_sets = if bare_mode {
-        // Bare mode: skip all hooks
-        astra_turn_core::stop_hooks_yaml::TurnHookSets::default()
-    } else {
-        detect_turn_hook_sets(&project_root, task_profile, p.is_plan_subtask)
-    };
+    let hook_sets = detect_turn_hook_sets(&project_root, task_profile, p.is_plan_subtask);
 
     // Build skill resolver — shared with sub-run executor for nested skill invocations.
     let skill_resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>> = {
@@ -495,12 +487,6 @@ pub(crate) async fn stream_chat_sse(
 
     let project_context: Option<String> = PROJECT_CONTEXT_CACHE
         .get_or_init(|| {
-            let p2_enabled = std::env::var("MO_SESSION_PROJECT_CONTEXT")
-                .map(|v| v != "0" && v.to_lowercase() != "false")
-                .unwrap_or(true);
-            if !p2_enabled {
-                return None;
-            }
             let git_root = std::process::Command::new("git")
                 .args(["rev-parse", "--show-toplevel"])
                 .current_dir(&project_root)
@@ -620,16 +606,8 @@ pub(crate) async fn stream_chat_sse(
             pinned: std::collections::HashSet::new(),
             discovered: discovered_skills,
             search: p.skill_search.clone(),
-            tool_event_hooks: if bare_mode {
-                Default::default()
-            } else {
-                astra_skills::hooks::load_tool_event_hooks(&project_root)
-            },
-            session_event_hooks: if bare_mode {
-                Default::default()
-            } else {
-                astra_skills::hooks::load_session_event_hooks(&project_root)
-            },
+            tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(&project_root),
+            session_event_hooks: astra_skills::hooks::load_session_event_hooks(&project_root),
             listing_message: None,
             invoked: std::collections::HashMap::new(),
             ..Default::default()

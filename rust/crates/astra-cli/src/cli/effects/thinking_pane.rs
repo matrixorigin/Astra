@@ -7,15 +7,11 @@ use super::super::terminal_region::{TerminalRegion, char_display_width};
 use crossterm::style::Stylize;
 use std::time::Instant;
 
-/// Max **content** rows for `thinking_delta` / `reasoning_delta` (`0` = spinner only).
-/// While under this cap the pane **grows downward** (no blank padding). Past the cap, the top
-/// folds away and a `... (N lines hidden above)` header appears above the tail.
+/// Max **content** rows for `thinking_delta` / `reasoning_delta`. While under this cap the pane
+/// **grows downward** (no blank padding). Past the cap, the top folds away and a
+/// `... (N lines hidden above)` header appears above the tail.
 pub fn thinking_viewport_rows() -> usize {
-    std::env::var("ASTRA_THINKING_VIEWPORT_LINES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .map(|n: usize| n.min(24))
-        .unwrap_or(6)
+    6
 }
 
 /// Thinking preview pane using TerminalRegion for flicker-free stdout rendering.

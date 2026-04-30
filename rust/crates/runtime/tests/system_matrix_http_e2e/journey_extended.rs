@@ -233,7 +233,7 @@ pub async fn run_chat_stream_session_info_smoke() {
     let session_id = ctx.session_id.clone();
 
     // Test /chat/stream with mock LLM via bridge e2e hooks
-    let test_secret = std::env::var("ASTRA_BRIDGE_TEST_SECRET").expect("bridge test secret");
+    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
     let body = json!({
         "message": "matrix e2e stream smoke",
         "session_id": session_id,
@@ -384,7 +384,7 @@ pub async fn run_edge_callback_http_boundary_failures() {
 pub async fn run_duplicate_tool_result_is_idempotent() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
-    let test_secret = std::env::var("ASTRA_BRIDGE_TEST_SECRET").expect("bridge test secret");
+    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
     let tool_output = "duplicate tool result ok";
     let payload = json!({
         "agent_id": "system-matrix-dup-tool-agent",
@@ -551,7 +551,7 @@ pub async fn run_duplicate_approval_response_is_idempotent() {
 pub async fn run_chat_turn_partial_batch_failure() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
-    let test_secret = std::env::var("ASTRA_BRIDGE_TEST_SECRET").expect("bridge test secret");
+    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
     let ok_output = "partial batch first ok";
     let err_output = "partial batch second failed";
     let payload = json!({
@@ -709,7 +709,7 @@ pub async fn run_chat_turn_partial_batch_failure() {
 pub async fn run_chat_turn_out_of_order_tool_results() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
-    let test_secret = std::env::var("ASTRA_BRIDGE_TEST_SECRET").expect("bridge test secret");
+    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
     let first_output = "race first ok";
     let second_output = "race second ok";
     let payload = json!({
@@ -869,7 +869,7 @@ pub async fn run_chat_turn_out_of_order_tool_results() {
 pub async fn run_same_session_concurrent_turns_isolated() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
-    let test_secret = std::env::var("ASTRA_BRIDGE_TEST_SECRET").expect("bridge test secret");
+    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
     let session_id = ctx.session_id.clone();
     let payload_a = json!({
         "agent_id": "system-matrix-overlap-agent",
@@ -1004,7 +1004,7 @@ pub async fn run_same_session_concurrent_turns_isolated() {
 pub async fn run_same_session_waiting_turn_overlap_isolated() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
-    let test_secret = std::env::var("ASTRA_BRIDGE_TEST_SECRET").expect("bridge test secret");
+    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
     let tool_output = "waiting overlap tool ok";
     let tool_turn_payload = json!({
         "agent_id": "system-matrix-overlap-agent",

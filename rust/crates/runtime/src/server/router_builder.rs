@@ -299,6 +299,17 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/models/{model_name}/check",
             post(models::check_model_handler),
         )
+        // Admin config (server-wide KV: reasoning_model_name, ...)
+        .route(
+            "/admin/config",
+            get(admin_config_handlers::list_admin_config_handler),
+        )
+        .route(
+            "/admin/config/{key}",
+            get(admin_config_handlers::get_admin_config_handler)
+                .put(admin_config_handlers::set_admin_config_handler)
+                .delete(admin_config_handlers::delete_admin_config_handler),
+        )
         // Jobs
         .route("/jobs", post(jobs::submit_job_handler))
         .route("/jobs/webhook", post(jobs::job_webhook_handler))

@@ -30,8 +30,7 @@ use serde_json::Value;
 /// thinking) can spend minutes in the reasoning phase **before** emitting any SSE
 /// chunk, it is impossible to distinguish a genuinely dead connection from a slow
 /// model at this stage. The 5-minute default matches
-/// [`STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS`] and is configurable via
-/// `MO_STREAM_IDLE_TIMEOUT_MS`.
+/// [`STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS`].
 pub const STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
 
 /// Idle timeout after at least one SSE chunk has been received.
@@ -42,25 +41,14 @@ pub const STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
 /// still catching genuinely stalled connections.
 pub const STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS: u64 = 300_000;
 
-/// Configurable stream idle timeout (pre-progress). Reads `MO_STREAM_IDLE_TIMEOUT_MS`
-/// env var, falling back to [`STREAM_IDLE_TIMEOUT_MS`] (300 s / 5 min).
+/// Stream idle timeout (pre-progress), fixed at [`STREAM_IDLE_TIMEOUT_MS`].
 pub fn stream_idle_timeout() -> std::time::Duration {
-    let ms = std::env::var("MO_STREAM_IDLE_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(STREAM_IDLE_TIMEOUT_MS);
-    std::time::Duration::from_millis(ms)
+    std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS)
 }
 
-/// Configurable stream idle timeout (post-progress). Reads
-/// `MO_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS` env var, falling back to
-/// [`STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS`] (300 s / 5 min).
+/// Stream idle timeout (post-progress), fixed at [`STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS`].
 pub fn stream_idle_timeout_after_progress() -> std::time::Duration {
-    let ms = std::env::var("MO_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS);
-    std::time::Duration::from_millis(ms)
+    std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS)
 }
 
 // ─── Data types ──────────────────────────────────────────────────────────────

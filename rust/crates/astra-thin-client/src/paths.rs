@@ -220,10 +220,16 @@ pub const ADMIN_TOKENS: &str = "/admin/tokens";
 pub const ADMIN_PROMPTS_OPTIMIZE: &str = "/admin/prompts/optimize";
 pub const ADMIN_FEEDBACK_STATS: &str = "/admin/feedback/stats";
 pub const ADMIN_FEEDBACK_EXPORT: &str = "/admin/feedback/export";
+pub const ADMIN_CONFIG: &str = "/admin/config";
 
 #[inline]
 pub fn model_check(model_name: &str) -> String {
     format!("/models/{model_name}/check")
+}
+
+#[inline]
+pub fn admin_config_key(key: &str) -> String {
+    format!("/admin/config/{key}")
 }
 
 #[inline]
@@ -351,6 +357,7 @@ mod tests {
             ADMIN_PROMPTS_OPTIMIZE,
             ADMIN_FEEDBACK_STATS,
             ADMIN_FEEDBACK_EXPORT,
+            ADMIN_CONFIG,
             AUDIT_SESSIONS,
             AUDIT_STATS,
             AUDIT_TOOLS,

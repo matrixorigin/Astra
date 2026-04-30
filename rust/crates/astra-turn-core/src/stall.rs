@@ -23,7 +23,7 @@ pub const SERVER_STALL_WINDOW: usize = 3;
 
 /// User-visible error prefix when the agentic loop exhausts the per-request remaining-turn budget.
 /// Call sites append the actual budget number, e.g. `format!("{} (budget: {} turns)", MSG, n)`.
-pub const CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG: &str = "Turn budget exhausted. To increase, set MO_MAX_TURNS (interactive) or MO_PLAN_SUBTASK_MAX_TURNS (plan subtasks).";
+pub const CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG: &str = "Turn budget exhausted. To increase, set ASTRA_MAX_TURNS (interactive) or ASTRA_PLAN_SUBTASK_MAX_TURNS (plan subtasks).";
 
 /// User-visible error when the legacy in-process bridge exhausts the tool-round budget.
 pub fn cli_agentic_tool_round_budget_abort_msg(current_limit: usize) -> String {

@@ -31,8 +31,10 @@ spec:
         - containerPort: {{ .Values.api.port }}
           name: http
         env:
-        - name: RUST_API_ADDR
-          value: "0.0.0.0:{{ .Values.api.port }}"
+        - name: ASTRA_API_HOST
+          value: "0.0.0.0"
+        - name: ASTRA_API_PORT
+          value: "{{ .Values.api.port }}"
         {{- if .Values.matrixone.enabled }}
         - name: MATRIXONE_HOST
           value: "{{ .Release.Name }}-matrixone.{{ .Values.namespace }}.svc.cluster.local"
@@ -42,13 +44,6 @@ spec:
         {{- end }}
         - name: MATRIXONE_PORT
           value: "{{ .Values.matrixone.external.port | default .Values.matrixone.port }}"
-        {{- if .Values.redis.enabled }}
-        - name: REDIS_URL
-          value: "redis://{{ .Release.Name }}-redis.{{ .Values.namespace }}.svc.cluster.local:{{ .Values.redis.port }}"
-        {{- else }}
-        - name: REDIS_URL
-          value: "{{ .Values.redis.external.url }}"
-        {{- end }}
         {{- range $key, $val := .Values.api.env }}
         - name: {{ $key }}
           value: "{{ $val }}"

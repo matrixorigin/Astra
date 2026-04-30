@@ -60,12 +60,9 @@ use crate::{
 
 use super::super::edge_executor::edge_executor_instance_id;
 
-/// Per-phase stderr timings for `/chat/turn`. Enable with `ASTRA_CHAT_TURN_TIMING=1`
-/// or `MO_DEBUG=1`.
+/// Per-phase stderr timings for `/chat/turn`. Disabled — use `RUST_LOG=debug` instead.
 pub(crate) fn chat_turn_timing_stderr_enabled() -> bool {
-    std::env::var("ASTRA_CHAT_TURN_TIMING")
-        .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        || std::env::var("MO_DEBUG").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    false
 }
 
 fn log_chat_turn_timing_phase(timing: bool, label: &str, mark: &mut Instant) {

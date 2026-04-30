@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod admin_config;
 pub mod agents;
 pub mod auth;
 pub mod branches;
@@ -56,6 +57,10 @@ pub use admin::{
     AdminInitializer, AdminTokenCreateRequestData, AdminTokenFilter, AdminTokenReader,
     AdminTokenRecord, AdminTokenWriter, AdminUserRoleManager, AdminUserRoleRecord,
     AdminUserRoleRequestData, AuthenticatedUser,
+};
+pub use admin_config::{
+    ADMIN_CONFIG_ALLOWED_KEYS, ADMIN_CONFIG_KEY_REASONING_MODEL, AdminConfigService,
+    DatabaseAdminConfigService, UnconfiguredAdminConfigService,
 };
 pub use agents::{
     AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,
@@ -136,7 +141,7 @@ pub use marketplace_stats::{
 pub use models::{
     DatabaseModelService, ModelCreateRequestData, ModelListItem, ModelRecord, ModelService,
     ModelUpdateRequestData, PricingData, QuirksData, ResolvedActiveLlmModel,
-    UnconfiguredModelService, resolve_active_llm_model,
+    UnconfiguredModelService, resolve_active_llm_model, resolve_reasoning_model,
 };
 pub use multi_agent::{
     DatabaseEdgeRegistryService, DatabaseTaskLeaseService, EdgeAgentRecord, EdgeRegistryService,

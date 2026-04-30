@@ -196,12 +196,7 @@ fn spawn_data_cleanup(
     use astra_services::RetentionPolicy;
     use std::time::Duration;
 
-    let cleanup_interval = Duration::from_secs(
-        std::env::var("MO_CLEANUP_INTERVAL_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6 * 3600), // default: 6 hours
-    );
+    let cleanup_interval = Duration::from_secs(6 * 3600); // 6 hours
 
     tokio::spawn(async move {
         let policy = RetentionPolicy::default();

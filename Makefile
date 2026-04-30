@@ -463,19 +463,19 @@ test-runtime-bridge-hooks:
 	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --features bridge-e2e-hooks
 
 # Ignored tests: opt-in via env vars (see `make test-online`). Enable with:
-#   ASTRA_DB_IT=1   -> all online/Matrix ignored integration tests (--ignored)
+#   ASTRA_TEST_DB_IT=1   -> all online/Matrix ignored integration tests (--ignored)
 
-# Optional serial Matrix E2E: ASTRA_DB_IT_TEST_THREADS=1 -> --test-threads=1
+# Optional serial Matrix E2E: ASTRA_TEST_DB_IT_TEST_THREADS=1 -> --test-threads=1
 .PHONY: test-ignored-integration
 test-ignored-integration:
-	@if [ "$${ASTRA_DB_IT:-}" != "1" ]; then \
-		echo "Note: no online/Matrix ignored suites selected. Use \`make test-online\` or set ASTRA_DB_IT=1."; \
+	@if [ "$${ASTRA_TEST_DB_IT:-}" != "1" ]; then \
+		echo "Note: no online/Matrix ignored suites selected. Use \`make test-online\` or set ASTRA_TEST_DB_IT=1."; \
 	fi
-	@if [ "$${ASTRA_DB_IT:-}" = "1" ]; then \
+	@if [ "$${ASTRA_TEST_DB_IT:-}" = "1" ]; then \
 		EXTRA_THREADS=""; \
-		if [ "$${ASTRA_DB_IT_TEST_THREADS:-}" = "1" ]; then \
+		if [ "$${ASTRA_TEST_DB_IT_TEST_THREADS:-}" = "1" ]; then \
 			EXTRA_THREADS="--test-threads=1"; \
-			echo "system_matrix_http_e2e: serial mode (ASTRA_DB_IT_TEST_THREADS=1)"; \
+			echo "system_matrix_http_e2e: serial mode (ASTRA_TEST_DB_IT_TEST_THREADS=1)"; \
 		else \
 			echo "Running system_matrix_http_e2e (ignored; parallel default; live DB + AppSettings::from_env)..."; \
 		fi; \
@@ -519,7 +519,7 @@ test-online:
 	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 		$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) -- --ignored; \
 	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
-		ASTRA_DB_IT=1 \
+		ASTRA_TEST_DB_IT=1 \
 		$(MAKE) test-ignored-integration
 	@if [ "$${ASTRA_SDK_ONLINE_E2E:-}" = "1" ]; then \
 		$(MAKE) test-sdk-online; \
@@ -555,7 +555,7 @@ test-sdk-online:
 	@cd packages/sdk && npm install --no-audit --no-fund --ignore-scripts
 	@bash -ec 'set -a; [ -f "$(CURDIR)/.env" ] && . "$(CURDIR)/.env"; set +a; \
 		export ASTRA_SDK_E2E=1; \
-		export ASTRA_SDK_BASE_URL="$${ASTRA_SDK_BASE_URL:-http://127.0.0.1:$${API_PORT:-8000}}"; \
+		export ASTRA_SDK_BASE_URL="$${ASTRA_SDK_BASE_URL:-http://127.0.0.1:$${ASTRA_API_PORT:-8000}}"; \
 		cd "$(CURDIR)/packages/sdk" && npm run test:integration:local && npm run test:online'
 
 .PHONY: test-contract

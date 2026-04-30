@@ -891,7 +891,7 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
 
     // Show active limits (system prompt, max-budget, permission mode)
     let mut limits = Vec::new();
-    if let Ok(max_turns) = std::env::var("MO_MAX_TURNS") {
+    if let Ok(max_turns) = std::env::var("ASTRA_CLI_MAX_TURNS") {
         limits.push(format!("max-turns: {}", max_turns));
     }
     if state.max_budget_limit > 0.0 {
@@ -954,12 +954,9 @@ fn print_startup_logo() {
     use std::time::Duration;
 
     let logo_lines = startup_logo_lines();
-    // Skip animation if ASTRA_STARTUP_TRACE or ASTRA_FAST_STARTUP is set
     let animated = crossterm::terminal::size().is_ok()
         && std::env::var("NO_COLOR").is_err()
-        && std::env::var("CI").is_err()
-        && std::env::var("ASTRA_STARTUP_TRACE").is_err()
-        && std::env::var("ASTRA_FAST_STARTUP").is_err();
+        && std::env::var("CI").is_err();
 
     if animated {
         let delay = Duration::from_millis(28);

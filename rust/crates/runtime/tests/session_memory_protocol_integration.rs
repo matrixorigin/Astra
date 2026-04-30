@@ -1,6 +1,6 @@
 //! Integration tests for Session Memory Protocol against real Memoria.
 //!
-//! Requires: `MEMORIA_BASE_URL` + `MEMORIA_MASTER_KEY` (or `MEMORIA_API_KEY`).
+//! Requires: `MEMORIA_BASE_URL` + `MEMORIA_MASTER_KEY`.
 //! Run with: `cargo test -p astra-runtime -- session_memory_protocol_integration --ignored`
 
 use astra_runtime::turn::cloud::memoria_compact::{

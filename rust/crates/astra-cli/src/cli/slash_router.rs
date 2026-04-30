@@ -488,15 +488,7 @@ pub(super) async fn handle_slash_command(
                 }
             }
             "reload" => {
-                let no_inst = std::env::var("ASTRA_NO_INSTRUCTIONS")
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
-                if no_inst {
-                    eprintln!(
-                        "  {} Instructions disabled (--no-instructions).",
-                        theme::icon_warn()
-                    );
-                } else if let Some(instructions) = discover_project_instructions() {
+                if let Some(instructions) = discover_project_instructions() {
                     let lines = instructions.lines().count();
                     state.project_instructions = Some(instructions);
                     eprintln!(

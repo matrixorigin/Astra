@@ -8,32 +8,31 @@ This document maps **user-visible capabilities** to **HTTP routes**, **persisten
 
 ```bash
 cd rust
-ASTRA_SYSTEM_MATRIX_E2E=1 \
-ASTRA_BRIDGE_TEST_SECRET=system-matrix-e2e-secret \
+ASTRA_TEST_DB_IT=1 \
+ASTRA_TEST_BRIDGE_SECRET=system-matrix-e2e-secret \
 cargo test -p astra-runtime --test system_matrix_http_e2e --features bridge-e2e-hooks -- \
   --ignored --nocapture
 ```
 
-Requires the same environment as `astra-server`: `MATRIXONE_*`, `JWT_SECRET_KEY` / `SECRET_KEY` and related keys via `astra_core::AppSettings::from_env`, etc. Use a local `.env` if you use one for development.
+Requires the same environment as `astra-server`: `MATRIXONE_*`, `ASTRA_JWT_SECRET` / `` and related keys via `astra_core::AppSettings::from_env`, etc. Use a local `.env` if you use one for development.
 
 ## Environment variables (对照表)
 
 | Variable | Role | Notes |
 |----------|------|--------|
-| `ASTRA_SYSTEM_MATRIX_E2E` | **Gate** | Must be `1` or ignored tests panic in `require_system_e2e_env` |
-| `ASTRA_BRIDGE_TEST_SECRET` | `/chat/turn` E2E | Injected before parallel runs; must match bridge hook expectations in full journey |
+| `ASTRA_TEST_DB_IT` | **Gate** | Must be `1` or ignored tests panic in `require_system_e2e_env` |
+| `ASTRA_TEST_BRIDGE_SECRET` | `/chat/turn` E2E | Injected before parallel runs; must match bridge hook expectations in full journey |
 | `MATRIXONE_HOST` | DB | Default `localhost` |
 | `MATRIXONE_PORT` | DB | Default `6001` |
 | `MATRIXONE_USER` | DB | Default `root` |
 | `MATRIXONE_PASSWORD` | DB | Default dev password in `astra_core::runtime_limits` if unset |
 | `ASTRA_DATABASE` | DB | Base name; default `astra_runtime` |
 | `ASTRA_DATABASE_PREFIX` | DB | Optional; effective DB = prefix + `ASTRA_DATABASE` (e.g. `test_` + `astra_runtime`) |
-| `JWT_SECRET_KEY` | Auth tokens | Default dev string if unset (not for production) |
-| `SECRET_KEY` | App crypto | Default dev string if unset |
-| `REDIS_HOST` / `REDIS_PORT` | Cache | Defaults `localhost` / `6379` |
-| `EMBEDDING_*` | Embeddings config | `EMBEDDING_DIM` may be required for unknown models (see `AppSettings`) |
-| `CHAT_TURN_BRIDGE_SECRET` | Bridge | Default dev string; align with deployment if using real bridge |
-| `ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS` | Makefile only | Set to `1` to run `system_matrix_http_e2e` with `--test-threads=1` (serial) |
+| `ASTRA_JWT_SECRET` | Auth tokens | Default dev string if unset (not for production) |
+| `ASTRA_TOKEN_ENCRYPTION_KEY` | Token encryption | Default dev string if unset |
+| `MEMORIA_EMBEDDING_*` | Embeddings config | `MEMORIA_EMBEDDING_DIM` may be required for unknown models |
+| `ASTRA_BRIDGE_SECRET` | Bridge | Default dev string; align with deployment if using real bridge |
+| `ASTRA_TEST_DB_IT_TEST_THREADS` | Makefile only | Set to `1` to run `system_matrix_http_e2e` with `--test-threads=1` (serial) |
 
 Evaluation **read** routes in the full journey use `x-user-id` without bearer (see `journey_full`). Other authenticated calls use the JWT from `bootstrap`.
 
@@ -41,7 +40,7 @@ Evaluation **read** routes in the full journey use `x-user-id` without bearer (s
 
 Ignored tests in `system_matrix_http_e2e` avoid overlap with the full journey (e.g. no separate “basic session” test that repeats the same list/get/close/resume steps).
 
-**Related (separate crate / gate):** `ASTRA_SERVICES_DB_IT=1` runs `cargo test -p astra-services --test services_db_integration -- --ignored` (MatrixOne): pagination clamps, `skills_registry` list/index, cross-session audit service paths, and `MatrixOneDurableTaskLifecycle::resume_task` verification history (see that test file’s module doc).
+**Related (separate crate / gate):** `ASTRA_TEST_DB_IT=1` runs `cargo test -p astra-services --test services_db_integration -- --ignored` (MatrixOne): pagination clamps, `skills_registry` list/index, cross-session audit service paths, and `MatrixOneDurableTaskLifecycle::resume_task` verification history (see that test file’s module doc).
 
 | Test name | File / module | Scope |
 |-----------|---------------|-------|
@@ -126,7 +125,7 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 
 ## CI
 
-- **PR** (`.github/workflows/test.yml`): MatrixOne + Redis service containers; single `make test` step with `ASTRA_SYSTEM_MATRIX_E2E`, `ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS`, and `ASTRA_MULTI_AGENT_IT` set for ignored **`system_matrix_http_e2e`** and **`multi_agent_integration`**. See also [`coverage-matrix.md`](./coverage-matrix.md).
+- **PR** (`.github/workflows/test.yml`): MatrixOne + Redis service containers; single `make test` step with `ASTRA_TEST_DB_IT`, `ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS`, and `ASTRA_TEST_DB_IT` set for ignored **`system_matrix_http_e2e`** and **`multi_agent_integration`**. See also [`coverage-matrix.md`](./coverage-matrix.md).
 - **Manual / nightly**: `.github/workflows/e2e-matrix-nightly.yml` — `workflow_dispatch` with optional **test name filter** (substring) to run a subset (e.g. `e2e_matrix_tasks`) or leave empty for all ignored tests in the binary.
 
 ## Router groups alignment

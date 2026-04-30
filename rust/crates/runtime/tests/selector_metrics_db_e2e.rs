@@ -46,7 +46,7 @@ async fn setup_pool(database: &str) -> (MatrixOneSettings, SharedPool) {
     settings.database = database.to_string();
     let mut bootstrap = settings.clone();
     bootstrap.database =
-        std::env::var("MATRIXONE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
     let admin_pool = connect_matrixone(&bootstrap)
         .await
         .expect("connect bootstrap catalog");
@@ -68,7 +68,7 @@ async fn setup_pool(database: &str) -> (MatrixOneSettings, SharedPool) {
 async fn drop_database(settings: &MatrixOneSettings) {
     let mut bootstrap = settings.clone();
     bootstrap.database =
-        std::env::var("MATRIXONE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
     let admin_pool = connect_matrixone(&bootstrap)
         .await
         .expect("connect bootstrap catalog for drop");

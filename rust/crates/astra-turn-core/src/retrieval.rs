@@ -16,7 +16,7 @@ const RETRIEVAL_HEADER: &str = "[Earlier relevant context from this session]\n";
 /// Freshness decay base: score *= DECAY_BASE^distance_from_end
 const DECAY_BASE: f64 = 0.95;
 /// Maximum number of top-scored messages to include in retrieval output.
-/// Override with `MO_MAX_RETRIEVED` env var.
+/// Override with `ASTRA_MAX_RETRIEVED` env var.
 fn max_retrieved() -> usize {
     astra_core::RuntimeLimits::global().max_retrieved
 }

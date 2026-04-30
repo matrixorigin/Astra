@@ -2,7 +2,7 @@ use super::*;
 
 /// Build the same [`AppState`] as production `astra-server` (MatrixOne, auth, in-process bridge, runs).
 ///
-/// Intended for **ignored** integration tests (`ASTRA_DB_IT=1`) that hit real HTTP
+/// Intended for **ignored** integration tests (`ASTRA_TEST_DB_IT=1`) that hit real HTTP
 /// routes and assert database rows. Load `.env` / secrets the same way as local server startup.
 pub async fn build_server_state(
     settings: AppSettings,
@@ -10,6 +10,11 @@ pub async fn build_server_state(
     ensure_core_schema(&settings.matrixone).await?;
     let shared_pool = SharedPool::new(&settings.matrixone).await?;
     let lease_hold_cache = Arc::new(TaskLeaseHoldCache::default());
+    // Build a single encryptor from settings (falls back to env var when not explicitly set).
+    let shared_encryptor = Arc::new(
+        FernetTokenEncryptor::from_key(settings.token_encryption_key.as_deref())
+            .map_err(Box::<dyn std::error::Error>::from)?,
+    );
     let auth_mode = std::env::var("ASTRA_AUTH_MODE")
         .unwrap_or_else(|_| "local_jwt".to_string())
         .trim()
@@ -59,10 +64,8 @@ pub async fn build_server_state(
         DatabaseDecisionService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))
     .with_model_service({
-        let encryptor =
-            Arc::new(FernetTokenEncryptor::from_env().map_err(Box::<dyn std::error::Error>::from)?);
         Arc::new(
-            DatabaseModelService::new(settings.matrixone.clone(), encryptor)
+            DatabaseModelService::new(settings.matrixone.clone(), Arc::clone(&shared_encryptor))
                 .with_pool(shared_pool.clone()),
         )
     })
@@ -106,15 +109,13 @@ pub async fn build_server_state(
         astra_services::DatabaseLlmTrustedDomainService::new(settings.matrixone.clone())
             .with_pool(shared_pool.clone()),
     ))
-    .with_fernet_encryptor(
-        FernetTokenEncryptor::from_env().map_err(Box::<dyn std::error::Error>::from)?,
-    )
+    .with_fernet_encryptor((*shared_encryptor).clone())
     .with_evaluation_service(Arc::new(
         DatabaseEvaluationService::new(settings.matrixone.clone())
             .with_pool(shared_pool.clone())
             .with_memoria_config(
-                settings.memoria_base_url.clone(),
-                settings.memoria_master_key.clone(),
+                settings.memoria.base_url.clone(),
+                settings.memoria.master_key.clone(),
             ),
     ))
     .with_introspection_service(Arc::new(
@@ -138,12 +139,12 @@ pub async fn build_server_state(
         DatabaseTurnHookDbWriter::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))
     .with_turn_reflection_lesson_writer(Arc::new(DatabaseTurnReflectionLessonWriter::new(
-        settings.memoria_base_url.clone(),
-        settings.memoria_master_key.clone(),
+        settings.memoria.base_url.clone(),
+        settings.memoria.master_key.clone(),
     )))
     .with_turn_observer_worker(Arc::new(DatabaseTurnObserverWorker::new(
-        settings.memoria_base_url.clone(),
-        settings.memoria_master_key.clone(),
+        settings.memoria.base_url.clone(),
+        settings.memoria.master_key.clone(),
     )))
     .with_turn_auxiliary_event_writer(Arc::new(
         DatabaseTurnAuxiliaryEventWriter::new(settings.matrixone.clone())
@@ -179,6 +180,10 @@ pub async fn build_server_state(
         DatabaseAdminUserRoleManager::new(settings.matrixone.clone())
             .with_pool(shared_pool.clone()),
     ))
+    .with_admin_config_service(Arc::new(
+        astra_services::DatabaseAdminConfigService::new(settings.matrixone.clone())
+            .with_pool(shared_pool.clone()),
+    ))
     .with_turn_learning_writer(learning_stack.writer.clone())
     .with_task_service(Arc::new(MatrixOneTaskService::from_shared(&shared_pool)))
     .with_edge_registry_service(Arc::new(DatabaseEdgeRegistryService::from_shared(
@@ -191,19 +196,17 @@ pub async fn build_server_state(
 
     // Wire in-process chat turn bridge.
     // Note: persist_tracker is wired after matrix_rt is created below.
-    let bridge_encryptor =
-        Arc::new(FernetTokenEncryptor::from_env().map_err(Box::<dyn std::error::Error>::from)?);
+    let bridge_encryptor = Arc::clone(&shared_encryptor);
     let bridge_edge_ledger = state.edge_callback_ledger.clone();
     let bridge_matrixone = settings.matrixone.clone();
     let bridge_pool = shared_pool.clone();
     let bridge_learning_writer = learning_stack.writer.clone();
-    let bridge_chat_turn_bridge_secret = settings.chat_turn_bridge_secret;
-    let state = state.with_memoria_config(settings.memoria_base_url, settings.memoria_master_key);
+    let bridge_chat_turn_bridge_secret = settings.bridge_secret;
+    let state = state.with_memoria_config(settings.memoria.base_url, settings.memoria.master_key);
 
     // Wire run lifecycle service: uses ServerAgenticLoopHost for agentic loops.
     // Attach RunEngine for durable persistence of run state.
-    let run_encryptor =
-        Arc::new(FernetTokenEncryptor::from_env().map_err(Box::<dyn std::error::Error>::from)?);
+    let run_encryptor = Arc::clone(&shared_encryptor);
     let run_store = Arc::new(astra_services::runs::InMemoryRunStateStore::default());
     let run_engine = crate::server::run_engine::RunEngine::new(run_store);
 
@@ -303,7 +306,7 @@ pub async fn build_server_state(
     // Wire team persistence store backed by MatrixOne.
     let team_store =
         astra_services::team_persistence::MatrixOneTeamStore::new(shared_pool.get().clone());
-    let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+    let user_id = std::env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string());
     if let Err(e) = team_store.ensure_builtins(&user_id).await {
         tracing::warn!(
             target: "astra_runtime::state_builder",

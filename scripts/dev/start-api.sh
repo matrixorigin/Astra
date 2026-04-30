@@ -47,8 +47,8 @@ cargo build -q --manifest-path rust/Cargo.toml -p astra-runtime --release --bin 
 echo "✅ Using $BIN_PATH"
 
 # Best-effort bridge autodiscovery for local dev.
-# Keeps explicit CHAT_TURN_BRIDGE_URL untouched when already configured.
-if [ -z "${CHAT_TURN_BRIDGE_URL:-}" ]; then
+# Keeps explicit ASTRA_BRIDGE_URL untouched when already configured.
+if [ -z "${ASTRA_BRIDGE_URL:-}" ]; then
     echo "Detecting chat turn bridge endpoint..."
     for candidate in \
         "http://127.0.0.1:3001/internal/chat/turn" \
@@ -59,7 +59,7 @@ if [ -z "${CHAT_TURN_BRIDGE_URL:-}" ]; then
         code=$(curl -s --noproxy '*' -m 2 -D "$header_file" -o "$resp_file" -w '%{http_code}' \
             -X POST "$candidate" \
             -H 'content-type: application/json' \
-            -H "x-mo-bridge-secret: ${CHAT_TURN_BRIDGE_SECRET:-}" \
+            -H "x-mo-bridge-secret: ${ASTRA_BRIDGE_SECRET:-}" \
             -d '{"messages":[{"role":"user","content":"ping"}]}' || true)
         ctype=$(grep -i '^content-type:' "$header_file" | head -1 | tr -d '\r' | cut -d' ' -f2- | tr '[:upper:]' '[:lower:]')
         body=$(cat "$resp_file" 2>/dev/null)
@@ -72,12 +72,12 @@ if [ -z "${CHAT_TURN_BRIDGE_URL:-}" ]; then
             continue
         fi
         if [ "$code" = "200" ] || [ "$code" = "401" ] || [ "$code" = "403" ] || [ "$code" = "422" ]; then
-            export CHAT_TURN_BRIDGE_URL="$candidate"
-            echo "✅ CHAT_TURN_BRIDGE_URL auto-set to $CHAT_TURN_BRIDGE_URL (probe status: $code, content-type: ${ctype:-unknown})"
+            export ASTRA_BRIDGE_URL="$candidate"
+            echo "✅ ASTRA_BRIDGE_URL auto-set to $ASTRA_BRIDGE_URL (probe status: $code, content-type: ${ctype:-unknown})"
             break
         fi
     done
-    if [ -z "${CHAT_TURN_BRIDGE_URL:-}" ]; then
+    if [ -z "${ASTRA_BRIDGE_URL:-}" ]; then
         echo "⚠️  No local chat-turn bridge detected; chat will return actionable bridge-disabled error."
     fi
 fi
@@ -105,7 +105,8 @@ start_detached env \
     HTTP_PROXY="${HTTP_PROXY:-${http_proxy:-}}" \
     ALL_PROXY="${ALL_PROXY:-${all_proxy:-}}" \
     NO_PROXY="${NO_PROXY:-${no_proxy:-}}" \
-    RUST_API_ADDR=0.0.0.0:8000 \
+    ASTRA_API_HOST=0.0.0.0 \
+    ASTRA_API_PORT=8000 \
     "$BIN_PATH"
 SETSID_PID=$DETACHED_PID
 sleep 1
