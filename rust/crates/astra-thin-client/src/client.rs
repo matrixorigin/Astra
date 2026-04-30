@@ -21,6 +21,36 @@ use crate::protocol::{
 };
 use crate::sse::SseParser;
 
+#[cfg(test)]
+thread_local! {
+    /// Test override: when `Some(ms)`, `sleep_between_attempts` uses this flat
+    /// value instead of the real `delay_secs`. Lets retry-logic tests run in
+    /// <100ms instead of waiting for real backoffs. Production ignores this.
+    static TEST_RETRY_SLEEP_OVERRIDE_MS: std::cell::RefCell<Option<u64>> =
+        const { std::cell::RefCell::new(None) };
+    /// Test probe: the last `delay_secs` `post_chat_turn_retry_429` decided to
+    /// wait for. Recorded regardless of the sleep override, so tests can
+    /// assert the policy (`Retry-After`, exponential) without relying on
+    /// wall-clock timing.
+    static TEST_LAST_RETRY_SLEEP_SECS: std::cell::RefCell<Option<u64>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Sleep `delay_secs` unless a `#[cfg(test)]` TLS override shortens it.
+/// Always records the *requested* delay to `TEST_LAST_RETRY_SLEEP_SECS` in
+/// test builds so assertions can inspect policy without relying on real time.
+async fn sleep_between_attempts(delay_secs: u64) {
+    #[cfg(test)]
+    {
+        TEST_LAST_RETRY_SLEEP_SECS.with(|c| *c.borrow_mut() = Some(delay_secs));
+        if let Some(ms) = TEST_RETRY_SLEEP_OVERRIDE_MS.with(|c| *c.borrow()) {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            return;
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+}
+
 /// Parse the `Retry-After` header value into seconds.
 /// Supports integer seconds format; ignores HTTP-date format.
 /// Clamps to [1, 120] seconds. Returns `None` on missing/unparseable.
@@ -762,7 +792,7 @@ impl ThinClient {
                             );
                             eprintln!("  ⏳ Rate limited (429), retrying in {delay_secs}s…");
                         }
-                        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                        sleep_between_attempts(delay_secs).await;
                         continue;
                     }
                     return Ok(resp);
@@ -781,7 +811,7 @@ impl ThinClient {
                             );
                             eprintln!("  ⏳ Transport error, retrying in {delay_secs}s… ({e})");
                         }
-                        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                        sleep_between_attempts(delay_secs).await;
                         last_err = Some(e);
                         continue;
                     }
@@ -1403,6 +1433,26 @@ mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Override `sleep_between_attempts` to `ms` for the duration of a test,
+    /// clearing the probe counter as it goes. Returns a guard that resets
+    /// both on drop.
+    fn set_test_retry_sleep_ms(ms: u64) -> impl Drop {
+        TEST_RETRY_SLEEP_OVERRIDE_MS.with(|c| *c.borrow_mut() = Some(ms));
+        TEST_LAST_RETRY_SLEEP_SECS.with(|c| *c.borrow_mut() = None);
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                TEST_RETRY_SLEEP_OVERRIDE_MS.with(|c| *c.borrow_mut() = None);
+                TEST_LAST_RETRY_SLEEP_SECS.with(|c| *c.borrow_mut() = None);
+            }
+        }
+        Guard
+    }
+
+    fn last_retry_sleep_secs() -> Option<u64> {
+        TEST_LAST_RETRY_SLEEP_SECS.with(|c| *c.borrow())
+    }
 
     #[tokio::test]
     async fn wiremock_chat_stream_parses_events() {
@@ -2054,6 +2104,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_429_succeeds_on_second_attempt() {
+        let _guard = set_test_retry_sleep_ms(0);
         let srv = MockServer::start().await;
         // First call → 429, second call → 200
         Mock::given(method("POST"))
@@ -2077,6 +2128,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 200);
+        // No Retry-After header → fell back to the default exponential backoff
+        // for attempt 0: `2u64 << 0` == 2s.
+        assert_eq!(last_retry_sleep_secs(), Some(2));
     }
 
     #[tokio::test]
@@ -2167,6 +2221,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_429_honours_retry_after_header() {
+        let _guard = set_test_retry_sleep_ms(0);
         let srv = MockServer::start().await;
         // First call → 429 with Retry-After: 1, second → 200
         Mock::given(method("POST"))
@@ -2187,18 +2242,17 @@ mod tests {
 
         let client = ThinClient::new(&srv.uri(), None).unwrap();
         let payload = serde_json::json!({"msg": "hello"});
-        let start = std::time::Instant::now();
         let resp = client
             .post_chat_turn_retry_429("t", &payload, 3, true)
             .await
             .unwrap();
-        let elapsed = start.elapsed();
         assert_eq!(resp.status().as_u16(), 200);
-        // Should wait ~1s (from Retry-After: 1), not 2s (default)
-        assert!(elapsed >= Duration::from_millis(900), "waited too little");
-        assert!(
-            elapsed < Duration::from_millis(1800),
-            "waited too long — Retry-After not honoured"
+        // The real invariant: the client picked the Retry-After value (1s),
+        // not the default exponential backoff for the first 429 (2s).
+        assert_eq!(
+            last_retry_sleep_secs(),
+            Some(1),
+            "Retry-After: 1 should be honoured over default exponential backoff"
         );
     }
 

@@ -1318,20 +1318,34 @@ const REMOTE_SKILL_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 fn remote_skill_http_client() -> &'static reqwest::Client {
     static REMOTE_SKILL_HTTP: OnceLock<reqwest::Client> = OnceLock::new();
     REMOTE_SKILL_HTTP.get_or_init(|| {
-        // Remote skill servers are typically local/intranet (or user-provided
-        // endpoints that should not be routed through the host's LLM proxy).
-        // Only turn/llm_client.rs honours env proxy vars; every other reqwest
-        // client in the runtime must call .no_proxy().
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            // audit-A4: remote skill URLs are attacker-controllable (via skill manifest).
-            // Without a timeout, a malicious skill server can hang the agent loop forever.
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+        build_remote_skill_http_client(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
+        )
     })
+}
+
+/// Build a reqwest client with the same security-relevant config as the
+/// cached `remote_skill_http_client` singleton, but with caller-supplied
+/// timeouts. Extracted so tests can verify the timeout policy fires without
+/// waiting the full 30s real wall-clock.
+fn build_remote_skill_http_client(
+    connect_timeout: std::time::Duration,
+    request_timeout: std::time::Duration,
+) -> reqwest::Client {
+    // Remote skill servers are typically local/intranet (or user-provided
+    // endpoints that should not be routed through the host's LLM proxy).
+    // Only turn/llm_client.rs honours env proxy vars; every other reqwest
+    // client in the runtime must call .no_proxy().
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        // audit-A4: remote skill URLs are attacker-controllable (via skill manifest).
+        // Without a timeout, a malicious skill server can hang the agent loop forever.
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 fn allow_private_remote_network() -> bool {
@@ -5689,7 +5703,13 @@ Normal.
             }
         });
 
-        let client = remote_skill_http_client();
+        // Use a test-only build of the same client with 200ms timeout so the
+        // black-hole behaviour surfaces within the per-case budget. Production
+        // `remote_skill_http_client()` keeps its 30s timeout.
+        let client = build_remote_skill_http_client(
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(200),
+        );
         let start = std::time::Instant::now();
         let result = client
             .get(format!("http://{addr}/v1/skill/invoke"))

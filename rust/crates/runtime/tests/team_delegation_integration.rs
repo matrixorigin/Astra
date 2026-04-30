@@ -513,7 +513,7 @@ async fn orchestrator_writes_start_then_complete_not_duplicate() {
 
 // ─── Budget Timeout Enforcement ─────────────────────────────────────────────
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn budget_timeout_aborts_slow_execution() {
     use astra_services::team_persistence::TeamBudget;
 

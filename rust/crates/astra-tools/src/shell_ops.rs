@@ -20,6 +20,11 @@ use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
 const GREP_TIMEOUT: Duration = Duration::from_secs(20);
 const GLOB_TIMEOUT: Duration = Duration::from_secs(15);
+/// Default `bash` timeout when the caller omits the `timeout` field.
+pub(crate) const DEFAULT_BASH_TIMEOUT_SECS: f64 = 120.0;
+/// Clamp bounds for the user-supplied `bash.timeout`.
+pub(crate) const BASH_TIMEOUT_MIN_SECS: f64 = 0.1;
+pub(crate) const BASH_TIMEOUT_MAX_SECS: f64 = 600.0;
 const GREP_DEFAULT_HEAD_LIMIT: usize = 100;
 const GLOB_DEFAULT_HEAD_LIMIT: usize = 100;
 const RAW_GREP_OUTPUT_LIMIT: usize = 30_000;
@@ -200,6 +205,16 @@ struct GrepRequest<'a> {
     multiline: bool,
 }
 
+/// Parse the `timeout` field for `execute_bash`: f64 seconds, defaulting to
+/// [`DEFAULT_BASH_TIMEOUT_SECS`] when missing, clamped to
+/// `[BASH_TIMEOUT_MIN_SECS, BASH_TIMEOUT_MAX_SECS]`.
+pub(crate) fn parse_bash_timeout_secs(args: &Value) -> f64 {
+    args.get("timeout")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS)
+        .clamp(BASH_TIMEOUT_MIN_SECS, BASH_TIMEOUT_MAX_SECS)
+}
+
 /// Execute a bash command with bounded partial-output capture.
 pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     let workspace_root = ctx.workspace_root.as_path();
@@ -207,11 +222,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
         Some(c) => c,
         None => return ToolResult::error("Error: Missing 'command' parameter".into()),
     };
-    let timeout_secs = args
-        .get("timeout")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(120.0)
-        .clamp(0.1, 600.0);
+    let timeout_secs = parse_bash_timeout_secs(args);
 
     if let Err(reason) = validate_execute_bash_command(command) {
         return ToolResult::error(reason);
@@ -3367,10 +3378,14 @@ printf 'probe.txt:1:needle\n'
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
 
+        // Use `exec sleep` so that when the timeout fires, bash *is* the sleep
+        // process — SIGKILL then frees the stdout pipe immediately. Without
+        // `exec`, bash's `sleep` child survives as an orphan and holds the
+        // pipe open for its full duration, adding ~1s of dead wait to the test.
         let result = execute_bash(
             &ctx,
             &serde_json::json!({
-                "command": "echo start; sleep 1; echo done",
+                "command": "echo start; exec sleep 5; echo done",
                 "timeout": 0.2
             }),
         )
@@ -3559,39 +3574,25 @@ printf 'probe.txt:1:needle\n'
 
     // ── bash timeout defaults ────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn bash_default_timeout_is_120s() {
-        // Verify the default timeout is 120s (not 30s) by checking a command
-        // that takes >30s but <120s completes successfully.
-        let dir = tempdir().unwrap();
-        let ctx = crate::ToolContext::test(dir.path());
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({"command": "sleep 35 && echo done"}),
-        )
-        .await;
-        assert!(
-            result.output.contains("done"),
-            "command should complete with 120s default timeout, got: {}",
-            result.output
-        );
+    #[test]
+    fn bash_default_timeout_is_120s() {
+        // Regression guard: missing `timeout` falls back to 120s.
+        let args = serde_json::json!({"command": "echo hi"});
+        assert_eq!(parse_bash_timeout_secs(&args), DEFAULT_BASH_TIMEOUT_SECS);
+        assert_eq!(DEFAULT_BASH_TIMEOUT_SECS, 120.0);
     }
 
-    #[tokio::test]
-    async fn bash_max_timeout_is_600s() {
-        // Verify timeout=500 is accepted (was clamped to 120 before)
-        let dir = tempdir().unwrap();
-        let ctx = crate::ToolContext::test(dir.path());
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({"command": "echo ok", "timeout": 500}),
-        )
-        .await;
-        assert!(
-            result.output.contains("ok"),
-            "timeout=500 should be accepted, got: {}",
-            result.output
-        );
+    #[test]
+    fn bash_max_timeout_is_600s() {
+        // Regression guard: high timeouts (e.g. 500s) pass through to the
+        // subprocess without being clamped down to the old 120s limit.
+        let args = serde_json::json!({"command": "echo ok", "timeout": 500});
+        assert_eq!(parse_bash_timeout_secs(&args), 500.0);
+
+        // Above the cap is clamped.
+        let args_big = serde_json::json!({"command": "echo ok", "timeout": 10_000});
+        assert_eq!(parse_bash_timeout_secs(&args_big), BASH_TIMEOUT_MAX_SECS);
+        assert_eq!(BASH_TIMEOUT_MAX_SECS, 600.0);
     }
 
     // ── background process warning ────────────────────────────────────────────

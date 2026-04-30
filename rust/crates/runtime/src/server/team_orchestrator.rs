@@ -1050,8 +1050,10 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn progress_callback_emits_intermediate_agent_states() {
+        // Virtual time collapses `SlowSubRunExecutor`'s 700ms sleep per agent
+        // to instant, dropping the test from ~1.4s real wait to a few ms.
         let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
         let phases = Arc::new(std::sync::Mutex::new(Vec::<ExecutionPhase>::new()));
         let phases_clone = phases.clone();

@@ -38,5 +38,7 @@ serde_json.workspace = true
 serial_test = "3"
 sqlx = { workspace = true, features = ["chrono"] }
 tempfile = "3"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+# `test-util` enables virtual-time `start_paused` so timeout/retry tests
+# don't wait real seconds.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util"] }
 uuid.workspace = true

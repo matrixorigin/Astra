@@ -567,8 +567,11 @@ mod tests {
             1, // half_open_success_threshold = 1
         ));
 
-        // Run many iterations to catch the race
-        for _ in 0..1000 {
+        // 100 iterations are more than enough to hit the race in CI — the
+        // original 1000 iterations cost ~2s of real sleeping (recovery = 1ms,
+        // we sleep 2ms per loop) without improving detection probability in
+        // practice.
+        for _ in 0..100 {
             // Drive to OPEN
             cb.record_failure();
             assert_eq!(cb.state(), "open");

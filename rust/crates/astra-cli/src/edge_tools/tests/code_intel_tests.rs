@@ -128,36 +128,69 @@ async fn find_definition_requires_symbol() {
     assert!(result.contains("Error"), "should require symbol: {result}");
 }
 
+/// Minimal Rust-project fixture covering the symbols these tests exercise.
+/// Using a small temp project instead of the whole monorepo drops each test
+/// from ~3.7s (scanning ~500 files of real code) to well under 100ms.
+fn find_definition_fixture() -> (tempfile::TempDir, ToolExecutor) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod executor;
+mod git_helpers;
+
+pub use executor::ToolExecutor;
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/executor.rs"),
+        r#"
+use crate::git_helpers::Language;
+
+pub struct ToolExecutor {
+    lang: Language,
+}
+
+impl ToolExecutor {
+    pub fn new() -> Self { Self { lang: Language::Rust } }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/git_helpers.rs"),
+        r#"
+pub enum Language { Rust, Python }
+
+pub fn git_status() {}
+pub fn git_stash() {}
+pub fn git_staged() {}
+"#,
+    )
+    .unwrap();
+    let executor = ToolExecutor::new(root);
+    (dir, executor)
+}
+
 #[tokio::test]
 async fn find_definition_in_repo() {
-    // Point at our own repo to find a known symbol
-    let root = {
-        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.pop();
-        p.pop(); // → repo root
-        p
-    };
-    let executor = ToolExecutor::new(root);
+    let (_dir, executor) = find_definition_fixture();
     let result = executor
         .execute("find_definition", &json!({"symbol": "ToolExecutor"}))
         .await;
-    // Should find our own struct definition
     assert!(
         result.contains("ToolExecutor"),
-        "should find ToolExecutor definition in own repo: {result}"
+        "should find ToolExecutor in fixture: {result}"
     );
 }
 
 #[tokio::test]
 async fn find_definition_regex_pattern() {
-    let root = {
-        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.pop();
-        p.pop();
-        p
-    };
-    let executor = ToolExecutor::new(root);
-    // Regex pattern should work
+    let (_dir, executor) = find_definition_fixture();
+    // git_st.* should match git_status, git_stash, git_staged
     let result = executor
         .execute("find_definition", &json!({"symbol": "git_st.*"}))
         .await;
@@ -169,29 +202,19 @@ async fn find_definition_regex_pattern() {
 
 #[tokio::test]
 async fn find_definition_import_aware_prioritizes_imported_file() {
-    // When `file` is provided and that file imports the symbol,
-    // definitions from the imported module should appear in the
-    // "Import-resolved" section.
-    let root = {
-        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.pop();
-        p.pop();
-        p
-    };
-    let executor = ToolExecutor::new(root);
-    // edge_tools.rs imports code_intel which defines Language, Symbol, etc.
-    // Search for "Language" with file=edge_tools.rs context
+    // executor.rs imports Language from git_helpers; with `file=src/executor.rs`,
+    // the Language definition should appear in the "Import-resolved" section.
+    let (_dir, executor) = find_definition_fixture();
     let result = executor
         .execute(
             "find_definition",
             &json!({
                 "symbol": "Language",
                 "language": "rust",
-                "file": "crates/astra-cli/src/edge_tools.rs"
+                "file": "src/executor.rs"
             }),
         )
         .await;
-    // Should find Language definition
     assert!(
         result.contains("Language"),
         "should find Language definition: {result}"
@@ -200,15 +223,7 @@ async fn find_definition_import_aware_prioritizes_imported_file() {
 
 #[tokio::test]
 async fn find_definition_without_file_still_works() {
-    // Without `file` parameter, find_definition should still work
-    // (backward compatibility)
-    let root = {
-        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.pop();
-        p.pop();
-        p
-    };
-    let executor = ToolExecutor::new(root);
+    let (_dir, executor) = find_definition_fixture();
     let result = executor
         .execute(
             "find_definition",
@@ -219,19 +234,11 @@ async fn find_definition_without_file_still_works() {
         result.contains("ToolExecutor"),
         "should find ToolExecutor without file param: {result}"
     );
-    // Without import resolution, all results are in main section (no "Import-resolved")
 }
 
 #[tokio::test]
 async fn find_definition_file_param_nonexistent_graceful() {
-    // Non-existent file should degrade gracefully (no import resolution)
-    let root = {
-        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.pop();
-        p.pop();
-        p
-    };
-    let executor = ToolExecutor::new(root);
+    let (_dir, executor) = find_definition_fixture();
     let result = executor
         .execute(
             "find_definition",
@@ -241,7 +248,6 @@ async fn find_definition_file_param_nonexistent_graceful() {
             }),
         )
         .await;
-    // Should still find results via regular scan
     assert!(
         result.contains("ToolExecutor") || result.contains("No definitions"),
         "should degrade gracefully: {result}"

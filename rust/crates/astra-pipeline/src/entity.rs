@@ -1068,13 +1068,15 @@ mod tests {
 
     #[test]
     fn entity_touch_updates_timestamp() {
+        // Timestamp granularity is 1 second (`duration_since(UNIX_EPOCH).as_secs()`).
+        // Instead of sleeping >1s, inject an obviously-old timestamp and verify
+        // that `touch()` replaces it with the current one.
         let mut entity = EntityKnowledge::new("test");
-        let old_ts = entity.last_observed_at;
-        std::thread::sleep(std::time::Duration::from_millis(1100)); // Wait >1 second
+        entity.last_observed_at = 0;
         entity.touch();
         assert!(
-            entity.last_observed_at > old_ts,
-            "touch() should update timestamp"
+            entity.last_observed_at > 0,
+            "touch() should set timestamp to now"
         );
     }
 }

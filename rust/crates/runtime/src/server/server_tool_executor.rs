@@ -4838,24 +4838,13 @@ esac
     #[tokio::test]
     async fn github_tools_delegate_to_default_executor() {
         let (exec, _dir) = test_executor();
+        // Invariant under test: github_* tools are routed to the default
+        // executor, not rejected as "server-mode-only". We pass an empty
+        // `repo` so we don't make a real GitHub round-trip — the routing
+        // decision happens before the network call.
         let result = exec
-            .execute_with_metadata(
-                "github_list_prs",
-                &json!({"repo": "matrixorigin/mo-agent-runtime"}),
-            )
+            .execute_with_metadata("github_list_prs", &json!({"repo": ""}))
             .await;
-        // Verify github tools delegate to default executor (not rejected as server-mode-only).
-        if result.is_error {
-            assert!(
-                result
-                    .output
-                    .contains("requires a configured GitHub client")
-                    || result.output.contains("rate limit")
-                    || result.output.contains("401"),
-                "unexpected error: {}",
-                result.output
-            );
-        }
         assert!(
             !result
                 .output

@@ -6164,8 +6164,11 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn fan_out_per_agent_timeout_enforced() {
+        // `start_paused = true` makes tokio time virtual: `tokio::time::sleep`
+        // and `tokio::time::timeout` advance the clock without real waits, so
+        // the test runs in <100ms instead of the real 1s timeout budget.
         let slow = Arc::new(SlowExecutor {
             delay: std::time::Duration::from_secs(5),
         });
@@ -6201,7 +6204,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn gate_retry_timeout_enforced() {
         let retry_slow = Arc::new(RetrySlowExecutor {
             retry_delay: std::time::Duration::from_secs(5),
@@ -6264,7 +6267,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn sequential_per_stage_timeout_enforced() {
         let slow = Arc::new(SlowExecutor {
             delay: std::time::Duration::from_secs(5),

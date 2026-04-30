@@ -290,8 +290,13 @@ async fn unhappy_denied_tool_is_not_speculated() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn complex_speculation_off_is_serial() {
+    // `start_paused = true` makes all tokio sleeps virtual, so the 500ms stream
+    // gap + 400ms tool delay no longer cost real time. The invariant under
+    // test (`elapsed >= stream_gap + tool_delay`) still holds because virtual
+    // time advances synchronously through each awaited `sleep`.
+    //
     // Equivalent script with speculation disabled: we simply don't invoke the
     // streaming executor in on_tool_call_complete. After the stream ends we
     // execute the tools sequentially ourselves and measure total time.
@@ -339,7 +344,10 @@ async fn complex_speculation_off_is_serial() {
     let mut host = NoSpecHost;
     let (mut chunks, _) = build_sse_chunks(stream_gap).await;
 
-    let t0 = Instant::now();
+    // Use `tokio::time::Instant` so elapsed tracks *virtual* time. With
+    // `start_paused = true`, `std::time::Instant::now()` doesn't advance
+    // through awaited sleeps, which would fail the lower-bound assertion.
+    let t0 = tokio::time::Instant::now();
     let (result, _abort) =
         consume_sse_stream(&mut chunks, &mut host, Duration::from_secs(10)).await;
     // Simulate the post-stream sequential batch: one tool after another.

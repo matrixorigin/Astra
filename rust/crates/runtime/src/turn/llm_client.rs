@@ -454,6 +454,43 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static TEST_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS: std::cell::RefCell<Option<std::time::Duration>> =
         const { std::cell::RefCell::new(None) };
+    // Retry-backoff override for tests: when `Some(ms)`, the between-attempts
+    // backoff (normally `LLM_RETRY_BASE_MS * 2^(attempt-1)` or TPM_EXHAUST_DELAY_MS)
+    // is replaced by this flat value. Lets retry-logic tests run in <100ms
+    // instead of waiting on real time.
+    static TEST_RETRY_BACKOFF_MS: std::cell::RefCell<Option<u64>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Compute the between-attempts backoff in ms. `attempt` is 1-indexed (the
+/// first retry after the initial failure has attempt=1).
+fn retry_backoff_ms(attempt: u32, tpm_exhausted: bool) -> u64 {
+    #[cfg(test)]
+    if let Some(ms) = TEST_RETRY_BACKOFF_MS.with(|c| *c.borrow()) {
+        return ms;
+    }
+    if tpm_exhausted {
+        TPM_EXHAUST_DELAY_MS
+    } else {
+        LLM_RETRY_BASE_MS * (1 << (attempt - 1))
+    }
+}
+
+/// Override the between-retry backoff to `ms` for the duration of a test.
+/// Without this, every retry incurs a real 1s/2s/4s sleep — with it,
+/// retry-logic tests run in <100ms. Returns a guard that clears the override
+/// on drop. `pub(crate)` so other runtime modules (e.g. server_loop_host
+/// end-to-end tests) can use the same knob.
+#[cfg(test)]
+pub(crate) fn set_test_retry_backoff_ms(ms: u64) -> impl Drop {
+    TEST_RETRY_BACKOFF_MS.with(|c| *c.borrow_mut() = Some(ms));
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            TEST_RETRY_BACKOFF_MS.with(|c| *c.borrow_mut() = None);
+        }
+    }
+    Guard
 }
 
 /// Apply HTTP(S)/ALL proxy env vars to a reqwest::ClientBuilder.
@@ -1549,11 +1586,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
         }
         if attempt > 0 {
             // Use longer delay for TPM exhaustion (60s) vs standard exponential (1s, 2s, 4s)
-            let delay = if tpm_exhaustion_detected {
-                TPM_EXHAUST_DELAY_MS
-            } else {
-                LLM_RETRY_BASE_MS * (1 << (attempt - 1))
-            };
+            let delay = retry_backoff_ms(attempt, tpm_exhaustion_detected);
             if tpm_exhaustion_detected {
                 astra_core::agent_warn!(
                     "llm",
@@ -3818,6 +3851,7 @@ mod tests {
     #[tokio::test]
     async fn call_llm_and_collect_retries_after_429_retry_after_zero() {
         reset_rate_limit_cooldown_for_tests();
+        let _backoff = set_test_retry_backoff_ms(0);
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
             .route("/chat/completions", post(mock_429_retry_zero_then_sse))
@@ -3879,6 +3913,7 @@ mod tests {
     #[tokio::test]
     async fn call_llm_and_collect_retries_after_529_retry_after_zero() {
         reset_rate_limit_cooldown_for_tests();
+        let _backoff = set_test_retry_backoff_ms(0);
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
             .route("/chat/completions", post(mock_529_retry_zero_then_sse))
@@ -3906,6 +3941,7 @@ mod tests {
     #[tokio::test]
     async fn call_llm_and_collect_retries_after_503_retry_after_zero() {
         reset_rate_limit_cooldown_for_tests();
+        let _backoff = set_test_retry_backoff_ms(0);
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
             .route("/chat/completions", post(mock_503_retry_zero_then_sse))
@@ -4250,6 +4286,7 @@ mod tests {
     #[tokio::test]
     async fn call_llm_and_collect_retries_stream_once_when_idle_before_output() {
         let _guard = set_test_stream_timeouts(10, None);
+        let _backoff = set_test_retry_backoff_ms(0);
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
             .route(

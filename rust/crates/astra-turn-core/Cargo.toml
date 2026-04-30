@@ -42,5 +42,8 @@ uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `test-util` enables `#[tokio::test(start_paused = true)]` / virtual time so
+# timing-dependent tests (streaming SSE gaps, tool-exec delays) don't burn
+# real seconds on every invocation.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 proptest = "1"

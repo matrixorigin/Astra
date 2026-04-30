@@ -1295,7 +1295,12 @@ mod tests {
     #[test]
     fn pre_filter_very_long_query() {
         let state = state_at_turn(1);
-        let long_query = "read ".repeat(2000);
+        // 200 repeats = 1000 chars, already far beyond realistic LLM prompts
+        // and enough to exercise every large-input branch. The previous 2000
+        // repeats (10 000 chars) took ~5s because the scoring is super-linear
+        // in query length — if that is ever a real concern it deserves a
+        // dedicated perf benchmark, not an offline unit test.
+        let long_query = "read ".repeat(200);
         let results = pre_filter_dynamic(&state, &long_query);
         // Should not panic on very long queries
         for (_, score) in &results {

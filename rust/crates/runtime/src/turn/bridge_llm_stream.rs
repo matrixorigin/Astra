@@ -34,6 +34,24 @@ const LLM_MAX_RETRIES: u32 = 3;
 /// Base delay between retries (doubles each attempt: 1s, 2s, 4s).
 const LLM_RETRY_BASE_MS: u64 = 1000;
 
+#[cfg(test)]
+thread_local! {
+    /// Test override for the between-retry backoff. Flat value in ms; when
+    /// `Some`, replaces the exponential `LLM_RETRY_BASE_MS * 2^(attempt-1)`.
+    /// See `set_test_retry_backoff_ms` in llm_client.rs for the matching
+    /// pattern used elsewhere in the runtime.
+    static TEST_BRIDGE_RETRY_BACKOFF_MS: std::cell::RefCell<Option<u64>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn bridge_retry_backoff_ms(attempt: u32) -> u64 {
+    #[cfg(test)]
+    if let Some(ms) = TEST_BRIDGE_RETRY_BACKOFF_MS.with(|c| *c.borrow()) {
+        return ms;
+    }
+    LLM_RETRY_BASE_MS * (1 << (attempt - 1))
+}
+
 /// Returns `true` if `name` looks like a valid tool function name.
 ///
 /// Rejects names that are:
@@ -257,7 +275,7 @@ async fn bedrock_stream_with_retry(
             ));
         }
         if attempt > 0 {
-            let delay = LLM_RETRY_BASE_MS * (1 << (attempt - 1));
+            let delay = bridge_retry_backoff_ms(attempt);
             sleep_ms_or_llm_cancel(delay, bridge_llm_cancel(&client_cancel))
                 .await
                 .map_err(|e| e.to_string())?;
@@ -415,7 +433,7 @@ pub(crate) async fn call_llm_stream(
         }
 
         if attempt > 0 {
-            let delay = LLM_RETRY_BASE_MS * (1 << (attempt - 1));
+            let delay = bridge_retry_backoff_ms(attempt);
             sleep_ms_or_llm_cancel(delay, bridge_llm_cancel(&client_cancel))
                 .await
                 .map_err(|e| e.to_string())?;
@@ -1297,10 +1315,13 @@ mod tests {
                     let _ = socket.read(&mut buf).await.unwrap_or(0);
                     let n = hits.fetch_add(1, Ordering::SeqCst);
                     if n == 0 {
-                        // First attempt → 429 Too Many Requests.
+                        // First attempt → 429 Too Many Requests with Retry-After: 0
+                        // so the cooldown's "wait before retry" collapses to 0ms.
+                        // Without this, the production default of 5s kicks in and
+                        // the test spends ~5s sleeping between attempts.
                         let body = "{\"message\":\"rate limited\"}";
                         let resp = format!(
-                            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
                         );
                         let _ = socket.write_all(resp.as_bytes()).await;
@@ -1415,8 +1436,18 @@ mod tests {
 
     #[tokio::test]
     async fn bedrock_streaming_retries_on_429_and_delivers_body() {
-        // Retry base delay is the compile-time `LLM_RETRY_BASE_MS` (1s).
-        // Total test time with one retry ≈ 1s sleep + network round-trips.
+        // Collapse the real 1s retry backoff to 0ms for this test; the
+        // invariant being checked is "after a 429 the client retries and the
+        // retry succeeds", not the absolute wait duration.
+        TEST_BRIDGE_RETRY_BACKOFF_MS.with(|c| *c.borrow_mut() = Some(0));
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_BRIDGE_RETRY_BACKOFF_MS.with(|c| *c.borrow_mut() = None);
+            }
+        }
+        let _reset = Reset;
+
         let hits = Arc::new(AtomicU32::new(0));
         let base_url = spawn_bedrock_retry_server(hits.clone()).await;
 

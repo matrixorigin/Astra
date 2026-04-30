@@ -1666,19 +1666,20 @@ mod tests {
 
     #[test]
     fn touch_updates_last_used_at() {
+        // Timestamp granularity is 1 second, so sleeping 1.1s to force a tick
+        // used to cost the test a full real second. Instead, inject an obviously
+        // old timestamp and verify that a subsequent `record_outcome` replaces
+        // it with `current_timestamp()` (which is always > 0).
         let mut lib = PatternLibrary::new();
         lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.8, None);
+        let key = lib.patterns.keys().next().cloned().unwrap();
+        lib.patterns.get_mut(&key).unwrap().last_used_at = 0;
 
-        let pattern = lib.patterns.values().next().unwrap();
-        let old_ts = pattern.last_used_at;
-        std::thread::sleep(std::time::Duration::from_millis(1100)); // Wait >1 second
-
-        // Touch via record_outcome
         lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.8, None);
-        let pattern = lib.patterns.values().next().unwrap();
+        let pattern = lib.patterns.get(&key).unwrap();
         assert!(
-            pattern.last_used_at > old_ts,
-            "touch() should update timestamp"
+            pattern.last_used_at > 0,
+            "record_outcome should set last_used_at to now"
         );
     }
 

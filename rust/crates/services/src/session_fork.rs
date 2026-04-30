@@ -248,9 +248,20 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
 mod tests {
     use super::*;
     use crate::session_journal::{
-        JournalEvent, JournalEventType, JournalWriter, journal_file_path, read_journal,
+        JournalDirGuard, JournalEvent, JournalEventType, JournalWriter, journal_file_path,
+        read_journal,
     };
     use crate::session_workspace;
+
+    /// Redirect journal + workspace I/O to a temp dir. Without this, every
+    /// fork test writes to the user's real `~/.astra/sessions`, adding
+    /// hundreds of ms of real disk work per test. Returns the guard + tempdir
+    /// (hold both for the test's lifetime).
+    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let guard = JournalDirGuard::new(tmp.path());
+        (tmp, guard)
+    }
 
     /// Create a test session with N turns in its journal + workspace.
     fn setup_test_session(session_id: &str, num_turns: u32) {
@@ -285,6 +296,7 @@ mod tests {
 
     #[test]
     fn fork_none_uses_latest_turn() {
+        let (_tmp, _guard) = isolated_sessions_dir();
         let parent_id = uuid::Uuid::new_v4().to_string();
         setup_test_session(&parent_id, 5);
 
@@ -312,6 +324,7 @@ mod tests {
 
     #[test]
     fn fork_at_turn_3_truncates_history() {
+        let (_tmp, _guard) = isolated_sessions_dir();
         let parent_id = uuid::Uuid::new_v4().to_string();
         setup_test_session(&parent_id, 5);
 
@@ -342,6 +355,7 @@ mod tests {
 
     #[test]
     fn fork_at_turn_0_creates_empty_session() {
+        let (_tmp, _guard) = isolated_sessions_dir();
         let parent_id = uuid::Uuid::new_v4().to_string();
         setup_test_session(&parent_id, 3);
 
@@ -371,6 +385,7 @@ mod tests {
 
     #[test]
     fn fork_beyond_max_turn_returns_error() {
+        let (_tmp, _guard) = isolated_sessions_dir();
         let parent_id = uuid::Uuid::new_v4().to_string();
         setup_test_session(&parent_id, 3);
 
@@ -395,6 +410,7 @@ mod tests {
 
     #[test]
     fn fork_at_max_turn_equals_none() {
+        let (_tmp, _guard) = isolated_sessions_dir();
         let parent_id = uuid::Uuid::new_v4().to_string();
         setup_test_session(&parent_id, 4);
 
@@ -430,6 +446,7 @@ mod tests {
 
     #[test]
     fn fork_preserves_lineage_with_correct_turn() {
+        let (_tmp, _guard) = isolated_sessions_dir();
         let parent_id = uuid::Uuid::new_v4().to_string();
         setup_test_session(&parent_id, 5);
 
@@ -458,6 +475,7 @@ mod tests {
 
     #[test]
     fn fork_copies_step_checkpoints() {
+        let (_tmp, _guard) = isolated_sessions_dir();
         let parent_id = uuid::Uuid::new_v4().to_string();
         setup_test_session(&parent_id, 3);
 

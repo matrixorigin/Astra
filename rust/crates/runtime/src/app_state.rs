@@ -653,10 +653,27 @@ pub struct ReqwestMemoriaForwarder {
 
 impl ReqwestMemoriaForwarder {
     pub fn new(base_url: String, master_key: String) -> Self {
+        Self::new_with_timeouts(
+            base_url,
+            master_key,
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
+        )
+    }
+
+    /// Build a forwarder with custom connect/request timeouts. Tests use this
+    /// to shorten the black-hole timeout from 30s → 200ms without changing
+    /// production defaults.
+    pub fn new_with_timeouts(
+        base_url: String,
+        master_key: String,
+        connect_timeout: std::time::Duration,
+        request_timeout: std::time::Duration,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .no_proxy()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(connect_timeout)
+            .timeout(request_timeout)
             .build()
             .expect("failed to build Memoria HTTP client");
         Self {
@@ -797,8 +814,14 @@ mod tests {
             }
         });
 
-        let forwarder =
-            ReqwestMemoriaForwarder::new(format!("http://{addr}"), "test-key".to_string());
+        // Use a 200ms request timeout so the black-hole behaviour manifests
+        // within the test budget; production still uses 30s.
+        let forwarder = ReqwestMemoriaForwarder::new_with_timeouts(
+            format!("http://{addr}"),
+            "test-key".to_string(),
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(200),
+        );
 
         let start = std::time::Instant::now();
         let result = forwarder

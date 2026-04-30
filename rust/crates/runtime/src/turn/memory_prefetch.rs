@@ -106,6 +106,28 @@ pub(crate) fn extract_entity_tokens(msg: &str) -> String {
     tokens.join(" ")
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test override: when `Some`, `fetch_memories` builds its HTTP client with
+    /// this (connect_timeout, request_timeout) tuple instead of the production
+    /// 5s/10s. Used by the black-hole timeout test to avoid burning 10s of real
+    /// wall-clock. Production ignores this.
+    static TEST_FETCH_MEMORIES_TIMEOUTS: std::cell::RefCell<
+        Option<(std::time::Duration, std::time::Duration)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+fn fetch_memories_timeouts() -> (std::time::Duration, std::time::Duration) {
+    #[cfg(test)]
+    if let Some(t) = TEST_FETCH_MEMORIES_TIMEOUTS.with(|c| *c.borrow()) {
+        return t;
+    }
+    (
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(10),
+    )
+}
+
 /// Fetch memories from Memoria HTTP API. Returns joined content string.
 async fn fetch_memories(
     base_url: &str,
@@ -114,10 +136,11 @@ async fn fetch_memories(
     user_id: &str,
     top_k: u32,
 ) -> String {
+    let (connect_timeout, request_timeout) = fetch_memories_timeouts();
     let client = reqwest::Client::builder()
         .no_proxy()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     let mut payload = serde_json::json!({"query": query, "top_k": top_k});
@@ -311,6 +334,22 @@ mod tests {
     /// instead of blocking the turn pipeline indefinitely.
     #[tokio::test]
     async fn fetch_memories_times_out_on_unresponsive_server() {
+        // Shorten the production 5s/10s timeouts to 500ms/200ms so the
+        // black-hole behaviour manifests within the per-case test budget.
+        TEST_FETCH_MEMORIES_TIMEOUTS.with(|c| {
+            *c.borrow_mut() = Some((
+                std::time::Duration::from_millis(500),
+                std::time::Duration::from_millis(200),
+            ));
+        });
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_FETCH_MEMORIES_TIMEOUTS.with(|c| *c.borrow_mut() = None);
+            }
+        }
+        let _reset = Reset;
+
         // Black-hole server: accepts connections, never responds.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

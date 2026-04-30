@@ -87,6 +87,9 @@ futures-util.workspace = true
 serial_test = "3"
 sqlx.workspace = true
 tempfile = "3"
+# `test-util` enables `#[tokio::test(start_paused = true)]` and `tokio::time::pause`
+# so timeout-enforcement tests can use virtual time.
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 tower.workspace = true

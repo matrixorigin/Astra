@@ -4951,6 +4951,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn execute_turn_persists_full_journal_error_response_when_session_capture_enabled() {
+        // Collapse llm_client's 1s/2s/4s exponential backoff so the retry
+        // loop behind a 500 upstream completes in tens of ms instead of 7s.
+        let _backoff = crate::turn::llm_client::set_test_retry_backoff_ms(0);
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "00000000-0000-0000-0000-000000000127";
