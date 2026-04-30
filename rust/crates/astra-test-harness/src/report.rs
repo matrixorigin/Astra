@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::criteria::CriterionResult;
+use crate::digest::DigestArtifact;
 use crate::runner::RunOutcome;
 use crate::session_capture::SessionCapture;
 
@@ -32,6 +33,19 @@ pub struct CaseRunReport {
     /// a copy-paste away. `None` in unit tests with fake executors.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reproducer: Option<String>,
+    /// Aggregated journal digest — populated on FAIL when a
+    /// DigestCollector is configured and the outcome carries a
+    /// session_id. Embeds turn counts, tokens, tool_calls, errors
+    /// so a reviewer sees the whole shape of the run without
+    /// running `astra journal digest` by hand.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub digest: Option<DigestArtifact>,
+    /// Error from the digest collector when it was attempted but
+    /// failed (bin missing, session not yet flushed, JSON parse
+    /// error). Kept as a string so the report surfaces the reason
+    /// without hiding it inside the case FAIL.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub digest_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -149,10 +163,61 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
             if let Some(repro) = run.reproducer.as_deref() {
                 s.push_str(&format!("    rerun:   {repro}\n"));
             }
+            if let Some(d) = &run.digest {
+                // Render compact summary lines from the digest JSON
+                // rather than dumping the whole blob. Reviewers get
+                // the numbers they need to triage without scrolling
+                // through structured data; full blob is in JSON format.
+                s.push_str("    digest:\n");
+                render_digest_summary(&d.json, &mut s);
+            }
+            if let Some(err) = run.digest_error.as_deref() {
+                s.push_str(&format!("    digest_error: {err}\n"));
+            }
         }
         s.push('\n');
     }
     s
+}
+
+/// Extract scannable lines from a `astra journal digest --focus summary`
+/// JSON blob. Defensive about missing fields — a schema change should
+/// shrink the rendered block, not panic the whole report.
+fn render_digest_summary(json: &serde_json::Value, out: &mut String) {
+    let aggr = json.get("aggregates");
+    if let Some(a) = aggr {
+        let get_u = |k: &str| a.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+        out.push_str(&format!(
+            "      turns={} tool_calls={} tool_failures={} errors={} compacts={} stalls={}\n",
+            get_u("turns"),
+            get_u("tool_calls"),
+            get_u("tool_failures"),
+            get_u("errors"),
+            get_u("compacts"),
+            get_u("stalls"),
+        ));
+        out.push_str(&format!(
+            "      tokens_in={} tokens_out={} duration_ms={}\n",
+            get_u("tokens_in"),
+            get_u("tokens_out"),
+            get_u("duration_ms"),
+        ));
+    }
+    if let Some(avg) = json.get("averages_per_turn") {
+        let get_f = |k: &str| avg.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        out.push_str(&format!(
+            "      avg_tokens_in={:.1} avg_tokens_out={:.1} avg_duration_ms={:.1}\n",
+            get_f("tokens_in"),
+            get_f("tokens_out"),
+            get_f("duration_ms"),
+        ));
+    }
+    // Point the reviewer at the full digest if they want more.
+    if let Some(id) = json.get("session_id").and_then(|v| v.as_str()) {
+        out.push_str(&format!(
+            "      full:  astra journal digest {id}\n"
+        ));
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -203,6 +268,8 @@ mod tests {
                 }],
                 session: None,
                 reproducer: None,
+                digest: None,
+                digest_error: None,
             }],
         }
     }
@@ -269,6 +336,51 @@ mod tests {
     }
 
     #[test]
+    fn text_report_renders_digest_summary_on_fail() {
+        use crate::digest::DigestArtifact;
+        let mut r = mk_report_passed();
+        r.runs[0].passed = false;
+        r.runs[0].digest = Some(DigestArtifact {
+            session_id: "sess".into(),
+            json: serde_json::json!({
+                "session_id": "sess",
+                "aggregates": {
+                    "turns": 3,
+                    "tool_calls": 5,
+                    "tool_failures": 1,
+                    "errors": 0,
+                    "compacts": 0,
+                    "stalls": 0,
+                    "tokens_in": 12000,
+                    "tokens_out": 450,
+                    "duration_ms": 8200,
+                },
+                "averages_per_turn": {
+                    "tokens_in": 4000.0,
+                    "tokens_out": 150.0,
+                    "duration_ms": 2733.33,
+                }
+            }),
+        });
+        let out = render(&r, Format::Text, false);
+        assert!(out.contains("digest:"));
+        assert!(out.contains("turns=3"));
+        assert!(out.contains("tool_calls=5"));
+        assert!(out.contains("tokens_in=12000"));
+        assert!(out.contains("avg_tokens_in=4000.0"));
+        assert!(out.contains("astra journal digest sess"));
+    }
+
+    #[test]
+    fn text_report_renders_digest_error_on_fail() {
+        let mut r = mk_report_passed();
+        r.runs[0].passed = false;
+        r.runs[0].digest_error = Some("digest timeout after 15s".into());
+        let out = render(&r, Format::Text, false);
+        assert!(out.contains("digest_error: digest timeout after 15s"));
+    }
+
+    #[test]
     fn suite_report_counters() {
         let mut r = mk_report_passed();
         r.runs.push(CaseRunReport {
@@ -279,6 +391,8 @@ mod tests {
             criteria: vec![],
             session: None,
             reproducer: None,
+            digest: None,
+            digest_error: None,
         });
         assert_eq!(r.total(), 2);
         assert_eq!(r.passed(), 1);

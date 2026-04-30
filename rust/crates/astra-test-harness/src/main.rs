@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use astra_test_harness::case::Case;
+use astra_test_harness::digest::AstraCliDigestCollector;
 use astra_test_harness::exec::AstraCliExecutor;
 use astra_test_harness::judger::{
     warn_if_same_family, AstraCliJudger, Judger, JudgerConfig, QuorumAgg, QuorumJudger,
@@ -84,6 +85,13 @@ struct Args {
     /// criteria across the whole suite.
     #[arg(long)]
     capture_session: bool,
+
+    /// Disable the on-FAIL journal digest auto-capture. By default the
+    /// harness shells out to `astra journal digest` for each failed
+    /// case and embeds the aggregate JSON in the report. Useful when
+    /// the digest subprocess is slow or the digest binary is missing.
+    #[arg(long)]
+    no_digest_on_fail: bool,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -151,10 +159,18 @@ async fn main() -> Result<()> {
         SessionCaptureMode::OnDebugLog
     };
 
+    // Digest collector: always construct, conditionally wire. Keeping
+    // the value out of scope when disabled lets the SuiteRunner see
+    // `None` and skip the subprocess per-FAIL.
+    let digest = AstraCliDigestCollector::new(args.astra_bin.clone());
+    let digest_collector: Option<&dyn astra_test_harness::digest::DigestCollector> =
+        if args.no_digest_on_fail { None } else { Some(&digest) };
+
     let runner = SuiteRunner {
         executor: &executor,
         judger: judger.as_ref(),
         session_loader: &session_loader,
+        digest_collector,
         runner_cfg,
         no_judger: args.no_judger,
         session_mode,

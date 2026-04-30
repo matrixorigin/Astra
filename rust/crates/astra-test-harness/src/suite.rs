@@ -16,6 +16,7 @@
 
 use crate::case::Case;
 use crate::criteria::{evaluate_deterministic_with_session, non_judger_all_pass, Criterion};
+use crate::digest::DigestCollector;
 use crate::exec::CaseExecutor;
 use crate::judger::{evaluate_judger, Judger};
 use crate::report::{CaseRunReport, SuiteReport};
@@ -64,6 +65,11 @@ pub struct SuiteRunner<'a> {
     pub executor: &'a dyn CaseExecutor,
     pub judger: &'a dyn Judger,
     pub session_loader: &'a dyn SessionLoader,
+    /// Optional digest collector. When set, the runner shells out
+    /// on FAIL to populate `CaseRunReport.digest`. `None` disables
+    /// digest collection entirely — used in unit tests and when the
+    /// caller doesn't want to pay the extra subprocess per FAIL.
+    pub digest_collector: Option<&'a dyn DigestCollector>,
     pub runner_cfg: RunnerConfig,
     pub no_judger: bool,
     pub session_mode: SessionCaptureMode,
@@ -135,6 +141,22 @@ impl<'a> SuiteRunner<'a> {
             if r.is_empty() { None } else { Some(r) }
         };
 
+        // Digest collection: only on FAIL + session_id present +
+        // collector configured. Errors go into `digest_error`, not
+        // the case's FAIL reason — collector failure shouldn't
+        // mask the actual diagnostic.
+        let (digest, digest_error) = if !passed
+            && let Some(collector) = self.digest_collector
+            && let Some(sid) = outcome.session_id.as_deref()
+        {
+            match collector.collect(sid).await {
+                Ok(a) => (Some(a), None),
+                Err(e) => (None, Some(e)),
+            }
+        } else {
+            (None, None)
+        };
+
         CaseRunReport {
             case_name: case.name.clone(),
             model: model.to_string(),
@@ -143,6 +165,8 @@ impl<'a> SuiteRunner<'a> {
             criteria: det,
             session,
             reproducer,
+            digest,
+            digest_error,
         }
     }
 }
@@ -230,6 +254,7 @@ mod tests {
             executor: &exec,
             judger: &judger,
             session_loader: &loader,
+            digest_collector: None,
             runner_cfg: cfg,
             no_judger: false,
             session_mode: SessionCaptureMode::Never,
@@ -279,6 +304,7 @@ mod tests {
             executor: &exec,
             judger: &judger,
             session_loader: &loader,
+            digest_collector: None,
             runner_cfg: cfg,
             no_judger: false,
             session_mode: SessionCaptureMode::Never,
@@ -316,6 +342,7 @@ mod tests {
             executor: &exec,
             judger: &judger,
             session_loader: &loader,
+            digest_collector: None,
             runner_cfg: cfg,
             no_judger: true,
             session_mode: SessionCaptureMode::Never,
@@ -345,6 +372,7 @@ mod tests {
             executor: &exec,
             judger: &judger,
             session_loader: &loader,
+            digest_collector: None,
             runner_cfg: cfg,
             no_judger: true,
             session_mode: SessionCaptureMode::Never,
@@ -383,6 +411,7 @@ mod tests {
             executor: &exec,
             judger: &judger,
             session_loader: &loader,
+            digest_collector: None,
             runner_cfg: cfg,
             no_judger: true,
             session_mode: SessionCaptureMode::OnDebugLog,
@@ -406,6 +435,7 @@ mod tests {
             executor: &exec,
             judger: &judger,
             session_loader: &loader,
+            digest_collector: None,
             runner_cfg: cfg,
             no_judger: true,
             session_mode: SessionCaptureMode::Never,
@@ -415,5 +445,128 @@ mod tests {
         let repro = report.runs[0].reproducer.as_deref().unwrap();
         assert!(repro.contains("fake executor"));
         assert!(repro.contains("c1"));
+    }
+
+    // ── Digest auto-capture (Item 3) ──
+
+    #[tokio::test]
+    async fn digest_collected_on_fail_only_with_session_id() {
+        use crate::digest::test_support::FakeDigestCollector;
+
+        let exec = FakeExecutor::new();
+        // Case c_fail will FAIL (criterion expects Read, outcome has none).
+        exec.seed("c_fail", "m", outcome_ok("m", "hello", &[]));
+        // Case c_pass will PASS; digest collector must NOT be called.
+        exec.seed("c_pass", "m", outcome_ok("m", "hello", &["Read"]));
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+
+        let digest = FakeDigestCollector::new();
+        digest.seed_ok(
+            "sess-m",
+            serde_json::json!({"aggregates": {"turns": 2}}),
+        );
+
+        let cfg = RunnerConfig::new(PathBuf::from("astra"))
+            .with_fallback_models(vec!["m".into()]);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: Some(&digest),
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+        };
+        let read_req = Criterion::ToolCalled {
+            name: "Read".into(),
+        };
+        let cases = vec![
+            case_with("c_fail", vec![read_req.clone()]),
+            case_with("c_pass", vec![read_req]),
+        ];
+        let report = runner.run_all(&cases).await;
+        assert_eq!(report.passed(), 1);
+        assert_eq!(report.failed(), 1);
+
+        // Collector was called exactly once, for the failing case.
+        let calls = digest.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], "sess-m");
+        drop(calls);
+
+        let fail_run = report.runs.iter().find(|r| !r.passed).unwrap();
+        assert!(fail_run.digest.is_some());
+        assert!(fail_run.digest_error.is_none());
+        let pass_run = report.runs.iter().find(|r| r.passed).unwrap();
+        assert!(pass_run.digest.is_none());
+    }
+
+    #[tokio::test]
+    async fn digest_error_surfaces_without_masking_case_fail() {
+        use crate::digest::test_support::FakeDigestCollector;
+
+        let exec = FakeExecutor::new();
+        exec.seed("c_fail", "m", outcome_ok("m", "hello", &[]));
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+
+        // Collector fails — digest subprocess unhappy for whatever reason.
+        let digest = FakeDigestCollector::new();
+        digest.seed_err("sess-m", "session file missing");
+
+        let cfg = RunnerConfig::new(PathBuf::from("astra"))
+            .with_fallback_models(vec!["m".into()]);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: Some(&digest),
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+        };
+        let cases = vec![case_with(
+            "c_fail",
+            vec![Criterion::ToolCalled {
+                name: "Read".into(),
+            }],
+        )];
+        let report = runner.run_all(&cases).await;
+        let run = &report.runs[0];
+        // Case still FAILs (digest failure doesn't mask the real signal).
+        assert!(!run.passed);
+        assert!(run.digest.is_none());
+        assert_eq!(run.digest_error.as_deref(), Some("session file missing"));
+    }
+
+    #[tokio::test]
+    async fn digest_skipped_entirely_when_collector_is_none() {
+        let exec = FakeExecutor::new();
+        exec.seed("c_fail", "m", outcome_ok("m", "hello", &[]));
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+
+        let cfg = RunnerConfig::new(PathBuf::from("astra"))
+            .with_fallback_models(vec!["m".into()]);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+        };
+        let cases = vec![case_with(
+            "c_fail",
+            vec![Criterion::ToolCalled {
+                name: "Read".into(),
+            }],
+        )];
+        let report = runner.run_all(&cases).await;
+        assert!(!report.runs[0].passed);
+        assert!(report.runs[0].digest.is_none());
+        assert!(report.runs[0].digest_error.is_none());
     }
 }

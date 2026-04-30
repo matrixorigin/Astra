@@ -40,6 +40,7 @@
 
 pub mod case;
 pub mod criteria;
+pub mod digest;
 pub mod exec;
 pub mod judger;
 pub mod report;
