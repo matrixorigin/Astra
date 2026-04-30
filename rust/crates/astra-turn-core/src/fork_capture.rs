@@ -129,10 +129,14 @@ pub fn restore_fork_flag_raw_for_tests(raw: u8) {
 
 /// Test-only: shared mutex that every test touching the feature
 /// flag must acquire. Lives here (at the definition site) so that
-/// tests in OTHER modules in the same crate — e.g. `fork_resolve` —
+/// tests in OTHER modules in the same crate — e.g. `fork_resolve`,
+/// and cross-crate callers like `astra-runtime::spawner` tests —
 /// share the same lock and don't race each other for flag state.
-#[cfg(test)]
-pub(crate) static FORK_FLAG_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+///
+/// `#[doc(hidden)] pub` because cross-crate test reuse requires
+/// `pub`, but this is NOT part of the stable API surface.
+#[doc(hidden)]
+pub static FORK_FLAG_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // ---------------------------------------------------------------------
 // Capture request + outcome types

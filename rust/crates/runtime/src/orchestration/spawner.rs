@@ -3,6 +3,10 @@
 use crate::messaging::SubRunInfo;
 use astra_messaging::router::AgentMailboxRouter;
 use astra_messaging::types::AgentAddress;
+use astra_turn_core::fork_prefix_store::PrefixCaptureSink;
+use astra_turn_core::fork_resolve::{
+    PrefixResolveOutcome, SpawnResolveContext, resolve_inherit_prefix,
+};
 use astra_turn_core::orchestration_context_cache::SharedContextCache;
 use astra_turn_core::orchestration_progress::{
     AgentProgressEvent, ProgressBroadcaster, ProgressEventType,
@@ -225,6 +229,19 @@ pub struct DynamicAgentSpawner {
     /// JoinSet tracking all in-flight background agent tasks for graceful shutdown drain.
     /// Shared across `clone_for_task` clones so every background handle lands here.
     background_tasks: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
+    /// Optional fork-prefix store for cache inheritance across
+    /// parent/child spawns. When `None` (default), spawn behavior is
+    /// identical to pre-fork-prefix builds — existing callers are
+    /// unaffected until they opt in via `with_prefix_store`.
+    prefix_store: Option<Arc<dyn PrefixCaptureSink>>,
+    /// Resolve outcomes keyed by spawned agent_id. Populated on every
+    /// spawn, including spawns that produced no inherit request
+    /// (they record `Disabled`) so telemetry / observability layers
+    /// can distinguish "nobody asked" from "asked but fell back".
+    /// Size-bounded implicitly by agent lifecycle: the CLI layer
+    /// should evict entries via `clear_prefix_resolve` when the
+    /// corresponding agent completes.
+    prefix_resolve_outcomes: Arc<RwLock<HashMap<String, PrefixResolveOutcome>>>,
 }
 
 impl DynamicAgentSpawner {
@@ -241,6 +258,8 @@ impl DynamicAgentSpawner {
                 astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            prefix_store: None,
+            prefix_resolve_outcomes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -262,6 +281,8 @@ impl DynamicAgentSpawner {
                 astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            prefix_store: None,
+            prefix_resolve_outcomes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -281,6 +302,8 @@ impl DynamicAgentSpawner {
                 astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            prefix_store: None,
+            prefix_resolve_outcomes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -288,6 +311,37 @@ impl DynamicAgentSpawner {
     pub fn with_executor(mut self, executor: Arc<dyn SpawnAgentExecutor>) -> Self {
         self.executor = Some(executor);
         self
+    }
+
+    /// Install a fork-prefix store. When set, `spawn` resolves any
+    /// `InheritPrefixSpec` in the request and records the outcome
+    /// for later query via `last_prefix_resolve`. When unset,
+    /// `spawn` behaves as if inherit_prefix were never requested —
+    /// fully backwards compatible with pre-fork-prefix callers.
+    pub fn with_prefix_store(mut self, store: Arc<dyn PrefixCaptureSink>) -> Self {
+        self.prefix_store = Some(store);
+        self
+    }
+
+    /// Query the resolve outcome recorded for a spawned agent.
+    /// Returns `None` if the agent was never spawned by this
+    /// spawner, or if its outcome has been cleared via
+    /// `clear_prefix_resolve`. Every successful `spawn` records
+    /// exactly one outcome, even in the no-inherit case (recorded
+    /// as `Disabled`).
+    pub async fn last_prefix_resolve(&self, agent_id: &str) -> Option<PrefixResolveOutcome> {
+        self.prefix_resolve_outcomes
+            .read()
+            .await
+            .get(agent_id)
+            .cloned()
+    }
+
+    /// Drop the recorded resolve outcome for an agent. CLI layers
+    /// should call this when the agent completes so the map
+    /// doesn't grow unbounded over a long-running runtime process.
+    pub async fn clear_prefix_resolve(&self, agent_id: &str) {
+        self.prefix_resolve_outcomes.write().await.remove(agent_id);
     }
 
     /// Enable journal persistence for agent lifecycle events.
@@ -347,6 +401,45 @@ impl DynamicAgentSpawner {
             .clone()
             .unwrap_or_else(|| agent_def.default_model.clone());
         let max_turns = input.max_turns.unwrap_or(agent_def.max_turns);
+
+        // 3b. Resolve fork-prefix inheritance before any side effects
+        // (mailbox, worktree, active_agents state). A hard-fail from
+        // `required=true` must NOT leave half-constructed state
+        // behind; soft-fallback recording only happens for spawns
+        // that are definitely going to succeed.
+        //
+        // The resolver itself is a pure function over a store; if no
+        // store is configured we skip even building the context
+        // (saves a clone + RwLock write in the common path).
+        let resolve_outcome = if let Some(store) = self.prefix_store.as_ref() {
+            let resolve_ctx = SpawnResolveContext {
+                caller_run_id: Some(context.parent_run_id.clone()),
+                // Runtime providers are resolved by the executor
+                // layer; at this point we only know the model
+                // string. We treat the runtime as Anthropic by
+                // default because that's the only provider where
+                // cache inheritance is currently wire-compatible
+                // (OpenAI / Bedrock reconstructors land in PR 5).
+                // Non-Anthropic provider detection is a follow-up;
+                // until then, Anthropic-captured prefixes are the
+                // only ones that validate, and non-Anthropic
+                // executors will soft-fallback on ProviderMismatch.
+                child_provider: astra_turn_core::fork_prefix::ProviderKind::Anthropic,
+                child_model_id: model.clone(),
+                child_max_output_tokens: input.max_output_tokens,
+            };
+            resolve_inherit_prefix(input.inherit_prefix.as_ref(), &resolve_ctx, store.as_ref())
+        } else {
+            // No store configured — inherit_prefix is silently
+            // ignored. Record Disabled so observability is uniform
+            // regardless of store presence.
+            PrefixResolveOutcome::Disabled
+        };
+        if let PrefixResolveOutcome::Failed { reason } = &resolve_outcome {
+            return Err(SpawnError::PrefixInheritanceRequired {
+                reason: format!("{reason:?}"),
+            });
+        }
 
         // 4. Register mailbox if named
         let mailbox = if input.name.is_some() {
@@ -421,6 +514,16 @@ impl DynamicAgentSpawner {
             .write()
             .await
             .insert(agent_id.clone(), state);
+
+        // 6b. Record the resolve outcome. We do this after the
+        // active_agents insert so any observer who sees the agent
+        // via `list_agents` can safely look up its resolve outcome
+        // without a race. Key is agent_id (not run_id) because
+        // callers see agent_id in `SpawnAgentOutput::Launched`.
+        self.prefix_resolve_outcomes
+            .write()
+            .await
+            .insert(agent_id.clone(), resolve_outcome);
 
         // 7. Emit started event
         let emitter = self.progress_broadcaster.for_agent(agent_id.clone());
@@ -729,6 +832,11 @@ impl DynamicAgentSpawner {
             completed_agents: Arc::clone(&self.completed_agents),
             // Share the same JoinSet so shutdown can drain tasks spawned by clones.
             background_tasks: Arc::clone(&self.background_tasks),
+            // Share prefix-store + resolve-outcomes map so clones
+            // see/write the same view. The store is an Arc<dyn ...>
+            // itself already, so cloning the Option just bumps refcount.
+            prefix_store: self.prefix_store.clone(),
+            prefix_resolve_outcomes: Arc::clone(&self.prefix_resolve_outcomes),
         }
     }
 
@@ -932,6 +1040,14 @@ pub enum SpawnError {
 
     #[error("Delegation failed: {0}")]
     DelegationFailed(String),
+
+    /// Fired when `inherit_prefix.required=true` but the resolver
+    /// could not attach a matching prefix (missing, incompatible,
+    /// or feature-disabled). Soft failures (`required=false`)
+    /// produce no error; they fall back to a fresh spawn and are
+    /// only visible via `last_prefix_resolve`.
+    #[error("Required prefix inheritance failed: {reason}")]
+    PrefixInheritanceRequired { reason: String },
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -1325,6 +1441,7 @@ mod tests {
             description: "Depth test".to_string(),
             prompt: "Run depth test".to_string(),
             agent_type: "explore".to_string(),
+            background: false, // drive the synchronous Completed path
             ..Default::default()
         };
 
@@ -1376,6 +1493,7 @@ mod tests {
             description: "Sync agent".to_string(),
             prompt: "Fail immediately".to_string(),
             agent_type: "explore".to_string(),
+            background: false, // drive the synchronous Failed path
             ..Default::default()
         };
 
@@ -1555,6 +1673,236 @@ mod tests {
             spawner.background_task_count(),
             0,
             "panicked background task must not leave zombie in JoinSet"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // PR 4.5 — prefix-inheritance wiring into the live spawner.
+    //
+    // These tests define the expected behavior:
+    // 1. No prefix_store configured → spawn unaffected (backwards
+    //    compatible; every existing test continues passing).
+    // 2. prefix_store + feature on + matching captured prefix →
+    //    spawn succeeds; resolve outcome queryable as `Resolved`.
+    // 3. prefix_store + feature on + missing prefix + required=true
+    //    → spawn returns SpawnError::PrefixInheritanceRequired.
+    // 4. prefix_store + feature on + missing prefix + required=false
+    //    → spawn succeeds; resolve outcome is `Fallback`.
+    // ---------------------------------------------------------------
+
+    use astra_turn_core::fork_capture::{
+        CaptureRequest, FORK_FLAG_TEST_MUTEX, capture_parent_prefix,
+        restore_fork_flag_raw_for_tests, set_fork_flag_for_tests,
+    };
+    use astra_turn_core::fork_prefix::{
+        CacheMode, ProviderKind, SystemBlock, ThinkingConfigSlice, ToolSchemaEntry,
+        hash_tool_schema,
+    };
+    use astra_turn_core::fork_prefix_store::{InMemoryPrefixStore, PrefixCaptureSink};
+    use astra_turn_core::fork_resolve::PrefixResolveOutcome;
+    use astra_turn_core::orchestration_spawn_tool::InheritPrefixSpec;
+
+    /// RAII guard copied from fork_capture tests: set flag to
+    /// `enabled` for the test duration, restore raw u8 on drop.
+    struct FlagGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev_raw: u8,
+    }
+    impl FlagGuard {
+        fn set(enabled: bool) -> Self {
+            let lock = FORK_FLAG_TEST_MUTEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev_raw = set_fork_flag_for_tests(enabled);
+            Self {
+                _lock: lock,
+                prev_raw,
+            }
+        }
+    }
+    impl Drop for FlagGuard {
+        fn drop(&mut self) {
+            restore_fork_flag_raw_for_tests(self.prev_raw);
+        }
+    }
+
+    fn wall_now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn capture_parent_for(store: &dyn PrefixCaptureSink, parent_run_id: &str, model: &str) {
+        let schema = serde_json::json!({"function": {"name": "bash"}});
+        let (bytes, hash) = hash_tool_schema(&schema);
+        let req = CaptureRequest {
+            parent_run_id: parent_run_id.to_string(),
+            parent_turn_seq: 1,
+            provider: ProviderKind::Anthropic,
+            model_id: model.to_string(),
+            thinking: Some(ThinkingConfigSlice {
+                enabled: false,
+                budget_tokens: 0,
+                kind: "disabled".into(),
+            }),
+            system_blocks: vec![SystemBlock {
+                bytes: b"sys".to_vec(),
+                has_cache_control: true,
+            }],
+            tool_schemas: vec![ToolSchemaEntry {
+                name: "bash".into(),
+                canonical_bytes: bytes,
+                hash,
+            }],
+            beta_headers: vec![],
+            canonical_prefix_bytes: b"canonical".to_vec(),
+            cache_mode: CacheMode::Write,
+            captured_at_secs: wall_now_secs(),
+            microcompact_fired_in_turn: false,
+        };
+        let _ = capture_parent_prefix(req, store);
+    }
+
+    fn parent_context(run_id: &str) -> SpawnContext {
+        SpawnContext {
+            parent_run_id: run_id.to_string(),
+            parent_agent_id: "parent".to_string(),
+            recursion_depth: 0,
+            working_dir: PathBuf::from("/tmp"),
+            inherited_permissions: None,
+            inherited_skills: vec![],
+        }
+    }
+
+    fn child_with_inherit(required: bool) -> SpawnAgentInput {
+        SpawnAgentInput {
+            description: "child".into(),
+            prompt: "work".into(),
+            agent_type: "explore".into(),
+            // Match the captured parent's model/thinking. Default
+            // "explore" agent uses whatever model is in agent_def —
+            // the test's captured prefix must match that model.
+            inherit_prefix: Some(InheritPrefixSpec {
+                from_run_id: None, // use caller's run id
+                required,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Extract the default model an "explore" agent uses. Tests need
+    /// to capture prefixes under this model name so validate_spawn
+    /// sees a match.
+    fn explore_agent_model(spawner: &DynamicAgentSpawner) -> String {
+        spawner
+            .agent_registry()
+            .get("explore")
+            .expect("explore agent must exist")
+            .default_model
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn spawn_without_prefix_store_is_backwards_compatible() {
+        // Existing callers that never configured a prefix_store must
+        // continue to work identically — this test pins the
+        // additive-only property. Even with inherit_prefix set in
+        // the input, spawn must succeed (prefix request silently
+        // has no effect without a store).
+        let _g = FlagGuard::set(true);
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let input = child_with_inherit(false);
+        let ctx = parent_context("parent-unused");
+        let result = spawner.spawn(input, &ctx).await;
+        assert!(
+            matches!(result, Ok(SpawnAgentOutput::Launched { .. })),
+            "spawn must succeed without store even when inherit_prefix is set, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_resolves_matching_captured_prefix() {
+        let _g = FlagGuard::set(true);
+        let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
+        let spawner = DynamicAgentSpawner::new(mock_router()).with_prefix_store(store.clone());
+        let model = explore_agent_model(&spawner);
+        capture_parent_for(&*store, "run-parent-A", &model);
+
+        let input = child_with_inherit(false);
+        let ctx = parent_context("run-parent-A");
+        let out = spawner.spawn(input, &ctx).await.unwrap();
+        let agent_id = match out {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected Launched, got {other:?}"),
+        };
+        let outcome = spawner
+            .last_prefix_resolve(&agent_id)
+            .await
+            .expect("outcome must be recorded for a spawn that requested inheritance");
+        assert!(
+            matches!(outcome, PrefixResolveOutcome::Resolved { .. }),
+            "expected Resolved, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_with_required_and_missing_prefix_hard_fails() {
+        let _g = FlagGuard::set(true);
+        let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
+        let spawner = DynamicAgentSpawner::new(mock_router()).with_prefix_store(store);
+        // No capture — store is empty.
+        let input = child_with_inherit(true); // required
+        let ctx = parent_context("run-no-capture");
+        let result = spawner.spawn(input, &ctx).await;
+        match result {
+            Err(SpawnError::PrefixInheritanceRequired { .. }) => {}
+            other => panic!("expected PrefixInheritanceRequired, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_with_optional_and_missing_prefix_falls_back() {
+        let _g = FlagGuard::set(true);
+        let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
+        let spawner = DynamicAgentSpawner::new(mock_router()).with_prefix_store(store);
+        let input = child_with_inherit(false); // not required
+        let ctx = parent_context("run-no-capture");
+        let out = spawner.spawn(input, &ctx).await.unwrap();
+        let agent_id = match out {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected Launched, got {other:?}"),
+        };
+        let outcome = spawner.last_prefix_resolve(&agent_id).await.unwrap();
+        assert!(
+            matches!(outcome, PrefixResolveOutcome::Fallback { .. }),
+            "expected Fallback, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_without_inherit_spec_records_disabled() {
+        // inherit_prefix=None → outcome should be Disabled, regardless
+        // of whether a store is configured or the flag is on.
+        let _g = FlagGuard::set(true);
+        let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
+        let spawner = DynamicAgentSpawner::new(mock_router()).with_prefix_store(store);
+        let input = SpawnAgentInput {
+            description: "child".into(),
+            prompt: "work".into(),
+            agent_type: "explore".into(),
+            ..Default::default()
+        };
+        let ctx = parent_context("run-parent");
+        let out = spawner.spawn(input, &ctx).await.unwrap();
+        let agent_id = match out {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected Launched, got {other:?}"),
+        };
+        let outcome = spawner.last_prefix_resolve(&agent_id).await.unwrap();
+        assert!(
+            matches!(outcome, PrefixResolveOutcome::Disabled),
+            "expected Disabled, got {outcome:?}"
         );
     }
 }
