@@ -3,6 +3,89 @@
 use super::{ReplState, agent_loader, delegate_subrun, spawn_subrun};
 use std::path::PathBuf;
 
+/// Build a fully-wired [`DynamicAgentSpawner`] without mutating a
+/// ReplState. Extracted from [`initialize_multi_agent_runtime`] so
+/// the one-shot `chat -m` code path can wire `spawn_agent` support
+/// into a `BasicCliChatContext` without constructing a full REPL
+/// state.
+///
+/// Applies the fork-prefix pipeline configuration from
+/// `RuntimeConfig.fork_prefix` in the same way the REPL path does:
+/// - syncs the process-global flag
+/// - installs the configured sink (Noop/Stderr) when enabled
+/// - always attaches an `InMemoryPrefixStore` (cheap; capture
+///   no-ops when the flag is off)
+///
+/// Returns only the spawner + mailbox_router the caller needs to
+/// hand to `SpawnAgentContext`. The delegation engine is NOT
+/// created here — REPL builds its own via
+/// `initialize_multi_agent_runtime` because the engine also wires
+/// parent agent routing. one-shot chat needs only spawn_agent.
+pub(crate) async fn build_one_shot_spawner(
+    api: &astra_thin_client::ThinClient,
+    token: String,
+    unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
+    perm_mode: super::permission_manager::PermissionMode,
+    skill_search: astra_core::SkillSearchSettings,
+    session_id: Option<String>,
+) -> std::sync::Arc<astra_runtime::orchestration::DynamicAgentSpawner> {
+    let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let skill_resolver = build_turn_skill_resolver(unified_skill_registry).await;
+
+    let tracker =
+        std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
+    let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
+    let mailbox_router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
+        transport,
+        tracker.clone(),
+    ));
+    let progress_broadcaster =
+        std::sync::Arc::new(astra_runtime::orchestration::ProgressBroadcaster::default());
+
+    let mut spawn_executor = spawn_subrun::CliSpawnAgentExecutor::new(
+        api.clone(),
+        token,
+        project_root,
+        perm_mode,
+        None,
+    )
+    .with_skill_resolver(skill_resolver)
+    .with_skill_search(skill_search);
+    if let Some(sid) = session_id {
+        spawn_executor = spawn_executor.with_active_session_id(sid);
+    }
+
+    let runtime_cfg = astra_config::runtime_config::RuntimeConfig::load();
+    let fork_cfg = &runtime_cfg.fork_prefix;
+    astra_turn_core::fork_capture::set_fork_inherit_prefix_enabled(fork_cfg.enabled);
+    if fork_cfg.enabled {
+        let sink: std::sync::Arc<
+            dyn astra_turn_core::fork_cache_event::ForkCacheEventSink,
+        > = match fork_cfg.sink {
+            astra_config::runtime_config::ForkCacheSinkKind::Noop => {
+                std::sync::Arc::new(astra_turn_core::fork_cache_event::NoopForkCacheSink)
+            }
+            astra_config::runtime_config::ForkCacheSinkKind::Stderr => {
+                std::sync::Arc::new(astra_turn_core::fork_cache_event::StderrForkCacheSink)
+            }
+        };
+        spawn_executor = spawn_executor.with_fork_cache_sink(sink);
+    }
+
+    let prefix_store: std::sync::Arc<
+        dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink,
+    > = std::sync::Arc::new(astra_turn_core::fork_prefix_store::InMemoryPrefixStore::new());
+
+    std::sync::Arc::new(
+        astra_runtime::orchestration::DynamicAgentSpawner::with_broadcaster(
+            mailbox_router,
+            progress_broadcaster,
+        )
+        .with_executor(std::sync::Arc::new(spawn_executor))
+        .with_prefix_store(prefix_store),
+    )
+}
+
 async fn build_turn_skill_resolver(
     unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
 ) -> Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>> {

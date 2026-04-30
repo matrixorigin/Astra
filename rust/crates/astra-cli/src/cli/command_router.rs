@@ -429,6 +429,12 @@ pub(super) async fn execute_cli_command(
                 selector: &*selector.0,
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 skill_search: &skill_search,
+                // Non-Chat (Message-style) path — legacy single-shot
+                // invocation without spawn_agent support. Keep
+                // pre-fix behavior; extend later if this path needs
+                // spawning too.
+                agent_spawner: None,
+                root_agent_id: None,
             };
             let sr = match stream_chat_sse(ChatTurnParams::basic_cli(
                 &chat_ctx,
@@ -835,6 +841,27 @@ pub(super) async fn execute_cli_command(
             } else {
                 crate::stream_render::RenderPolicy::Stream
             };
+
+            // Bug-A fix: build a DynamicAgentSpawner so `astra chat -m`
+            // can service spawn_agent tool calls, matching the REPL
+            // path. Without this, one-shot LLM invocations that try
+            // to spawn_agent hit "Agent spawning not available in
+            // this context." — discovered during real-world MiniMax
+            // verification. Mirrors the REPL's
+            // `initialize_multi_agent_runtime` wiring via the
+            // extracted `build_one_shot_spawner` helper so the
+            // fork-prefix pipeline is identically configured.
+            let root_agent_id = format!("root-{}", uuid::Uuid::new_v4());
+            let one_shot_spawner = super::agent_runtime::build_one_shot_spawner(
+                api,
+                token.clone(),
+                astra_runtime::skills::default_unified_registry().clone(),
+                pm.mode(),
+                skill_search.clone(),
+                session_id.clone(),
+            )
+            .await;
+
             let chat_ctx = crate::chat_stream::BasicCliChatContext {
                 api,
                 auth_profile: profile.as_deref(),
@@ -848,6 +875,8 @@ pub(super) async fn execute_cli_command(
                 selector: &*selector.0,
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 skill_search: &skill_search,
+                agent_spawner: Some(one_shot_spawner),
+                root_agent_id: Some(&root_agent_id),
             };
             let sr = match stream_chat_sse(ChatTurnParams::basic_cli(
                 &chat_ctx,
@@ -1399,6 +1428,9 @@ pub(super) async fn run_print_mode(
         selector: &*selector.0,
         unified_skill_registry: astra_runtime::skills::default_unified_registry(),
         skill_search: &skill_search,
+        // Print/headless mode — no spawn_agent support by design.
+        agent_spawner: None,
+        root_agent_id: None,
     };
 
     let sr = match stream_chat_sse(ChatTurnParams::basic_cli(
