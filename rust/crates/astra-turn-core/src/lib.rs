@@ -35,6 +35,7 @@ pub mod explain;
 pub mod explain_report_lines;
 pub mod file_edit_journal;
 pub mod followup_suggestion;
+pub mod fork_cache_event;
 pub mod fork_capture;
 pub mod fork_prefix;
 pub mod fork_prefix_store;
