@@ -387,9 +387,10 @@ dev-seed:
 build: build-release
 
 .PHONY: build-release
-build-release:
+build-release: sweep
 	@echo "Building Rust workspace (release)..."
 	@$(CARGO) build $(CARGO_MANIFEST_FLAG) --release
+	@touch $(RUST_TARGET_DIR)/.sweep-stamp
 	@echo "✅ Release artifacts: $(RUST_RELEASE_BIN_DIR)/"
 
 .PHONY: build-cli
@@ -432,6 +433,30 @@ clean-incremental:
 	@echo "Cleaning incremental compilation cache..."
 	@rm -rf $(RUST_TARGET_DIR)/debug/incremental
 	@echo "✅ Incremental cache removed"
+
+SWEEP_STAMP := $(RUST_TARGET_DIR)/.sweep-stamp
+
+.PHONY: sweep-stamp
+sweep-stamp:
+	@touch $(SWEEP_STAMP)
+
+.PHONY: sweep
+sweep:
+	@if [ -f $(SWEEP_STAMP) ]; then \
+		echo "Sweeping artifacts inactive since $$(stat -c '%y' $(SWEEP_STAMP) | cut -d. -f1)..."; \
+		find $(RUST_TARGET_DIR)/debug/incremental -maxdepth 1 -type d ! -newer $(SWEEP_STAMP) -exec rm -rf {} + 2>/dev/null || true; \
+		find $(RUST_TARGET_DIR)/debug/deps -type f ! -newer $(SWEEP_STAMP) -delete 2>/dev/null || true; \
+		find $(RUST_TARGET_DIR)/debug/.fingerprint -maxdepth 1 -type d ! -newer $(SWEEP_STAMP) -exec rm -rf {} + 2>/dev/null || true; \
+		find $(RUST_TARGET_DIR)/release/incremental -maxdepth 1 -type d ! -newer $(SWEEP_STAMP) -exec rm -rf {} + 2>/dev/null || true; \
+	else \
+		echo "No stamp found, sweeping artifacts older than 5 days..."; \
+		find $(RUST_TARGET_DIR)/debug/incremental -maxdepth 1 -type d -mtime +5 -exec rm -rf {} + 2>/dev/null || true; \
+		find $(RUST_TARGET_DIR)/debug/deps -type f -atime +5 -delete 2>/dev/null || true; \
+		find $(RUST_TARGET_DIR)/debug/.fingerprint -maxdepth 1 -type d -mtime +5 -exec rm -rf {} + 2>/dev/null || true; \
+		find $(RUST_TARGET_DIR)/release/incremental -maxdepth 1 -type d -mtime +5 -exec rm -rf {} + 2>/dev/null || true; \
+	fi
+	@echo "✅ Inactive artifacts removed"
+	@du -sh $(RUST_TARGET_DIR) 2>/dev/null || true
 
 # ============================================================================
 # Testing
