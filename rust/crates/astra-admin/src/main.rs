@@ -37,14 +37,14 @@ fn print_model_load_server_result(body: &str, model_name: &str) {
     } else if !active {
         println!("  connectivity: (not in response; run: astra-admin model check {model_name})");
     }
-    // Show inferred thinking capability (stored in quirks.supports_thinking at load time)
-    let supports_thinking = value
+    let thinking_mode = value
         .get("quirks")
-        .and_then(|q| q.get("supports_thinking"))
-        .and_then(serde_json::Value::as_bool);
-    match supports_thinking {
-        Some(true) => println!("  thinking: supported ✓"),
-        Some(false) => println!("  thinking: not supported"),
+        .and_then(|q| q.get("thinking_mode"))
+        .and_then(serde_json::Value::as_str);
+    match thinking_mode {
+        Some("controllable") => println!("  thinking: controllable (picker enabled) ✓"),
+        Some("native") => println!("  thinking: native (model thinks by default)"),
+        Some(other) => println!("  thinking: {other}"),
         None => {}
     }
     if !active {

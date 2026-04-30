@@ -5523,7 +5523,10 @@ mod tests {
             },
         );
 
-        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
         assert_eq!(body["output_config"], json!({"effort": "high"}));
         assert!(body.get("temperature").is_none());
     }

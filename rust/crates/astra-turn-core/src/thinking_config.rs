@@ -75,9 +75,13 @@ impl ThinkingConfig {
                 remove_temperature_from_inference_config(body);
             }
             Self::Adaptive { effort } => {
+                // Opus 4.7+ defaults display to "omitted" (thinking block present
+                // but text empty). Explicitly request "summarized" so the CLI can
+                // show a thinking preview.
                 body["additionalModelRequestFields"] = json!({
                     "thinking": {
-                        "type": "adaptive"
+                        "type": "adaptive",
+                        "display": "summarized"
                     },
                     "output_config": {
                         "effort": effort_str(*effort)
@@ -105,7 +109,8 @@ impl ThinkingConfig {
             }
             Self::Adaptive { effort } => {
                 body["thinking"] = json!({
-                    "type": "adaptive"
+                    "type": "adaptive",
+                    "display": "summarized"
                 });
                 body["output_config"] = json!({
                     "effort": effort_str(*effort)
@@ -438,30 +443,40 @@ pub struct ThinkingOption {
     pub is_default: bool,
 }
 
-/// Returns thinking options for a model based on its declared capability and provider.
+/// Returns thinking options for a model based on its declared `thinking_mode` and provider.
 ///
-/// - `supports_thinking = Some(true)`: provider-appropriate picker.
+/// - `thinking_mode = Some("controllable")`: provider-appropriate picker.
 ///   - `bedrock` / `anthropic` → adaptive (Low / High).
 ///   - `dashscope` / `aliyun` / `alibaba` → budget (on/off).
 ///   - other providers → adaptive reasoning (`reasoning_effort`).
-/// - `supports_thinking = Some(false)` or `None` → empty (no thinking picker).
-///
-/// Thinking capability is determined by the `thinking` tag in model config,
-/// not by model name heuristics.
+/// - `thinking_mode = Some("native")` → empty (model thinks by default, no picker).
+/// - `thinking_mode = None` → empty (no thinking support).
 pub fn thinking_options_with_capability(
     _model_name: &str,
     provider: Option<&str>,
-    supports_thinking: Option<bool>,
+    thinking_mode: Option<&str>,
 ) -> Vec<ThinkingOption> {
-    match supports_thinking {
-        Some(true) => {
+    match thinking_mode {
+        Some("controllable") => {
             if provider_uses_budget_thinking(provider) {
                 thinking_options_for_budget_thinking()
             } else {
                 thinking_options_for_adaptive_reasoning()
             }
         }
-        Some(false) | None => vec![],
+        // Known no-picker modes.
+        None | Some("native") => vec![],
+        // Unknown value — warn so operators notice typos in YAML/DB
+        // (e.g. "Controllable", "enabled") rather than silently disabling
+        // the picker.
+        Some(other) => {
+            tracing::warn!(
+                thinking_mode = %other,
+                provider = ?provider,
+                "unknown thinking_mode value; expected one of \"controllable\", \"native\", or null — picker disabled",
+            );
+            vec![]
+        }
     }
 }
 
@@ -567,7 +582,7 @@ mod tests {
 
         assert_eq!(
             body["additionalModelRequestFields"]["thinking"],
-            json!({"type": "adaptive"})
+            json!({"type": "adaptive", "display": "summarized"})
         );
         assert_eq!(
             body["additionalModelRequestFields"]["output_config"],
@@ -625,7 +640,10 @@ mod tests {
         }
         .apply_anthropic(&mut body);
 
-        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
         assert_eq!(body["output_config"], json!({"effort": "medium"}));
         assert!(body.get("temperature").is_none());
     }
@@ -684,8 +702,9 @@ mod tests {
     // ─── Model inference ────────────────────────────────────────────────
 
     #[test]
-    fn capability_true_dashscope_returns_budget() {
-        let opts = thinking_options_with_capability("qwen-plus", Some("dashscope"), Some(true));
+    fn controllable_dashscope_returns_budget() {
+        let opts =
+            thinking_options_with_capability("qwen-plus", Some("dashscope"), Some("controllable"));
         assert_eq!(opts.len(), 2);
         assert_eq!(opts[0].label, "Normal");
         assert_eq!(opts[1].label, "Thinking");
@@ -698,17 +717,13 @@ mod tests {
     }
 
     #[test]
-    fn capability_false_suppresses_thinking() {
-        let opts = thinking_options_with_capability(
-            "claude-sonnet-4-20250514",
-            Some("anthropic"),
-            Some(false),
-        );
+    fn native_mode_returns_empty() {
+        let opts = thinking_options_with_capability("glm-5.1", Some("openai"), Some("native"));
         assert!(opts.is_empty());
     }
 
     #[test]
-    fn capability_none_returns_empty() {
+    fn none_mode_returns_empty() {
         let opts = thinking_options_with_capability(
             "us.anthropic.claude-sonnet-4-6",
             Some("bedrock"),
@@ -718,11 +733,11 @@ mod tests {
     }
 
     #[test]
-    fn capability_true_bedrock_returns_adaptive() {
+    fn controllable_bedrock_returns_adaptive() {
         let opts = thinking_options_with_capability(
             "us.anthropic.claude-sonnet-4-6",
             Some("bedrock"),
-            Some(true),
+            Some("controllable"),
         );
         assert_eq!(opts.len(), 3);
         assert_eq!(opts[0].label, "Normal");
@@ -732,16 +747,19 @@ mod tests {
     }
 
     #[test]
-    fn capability_true_anthropic_returns_adaptive() {
-        let opts =
-            thinking_options_with_capability("claude-sonnet-4", Some("anthropic"), Some(true));
+    fn controllable_anthropic_returns_adaptive() {
+        let opts = thinking_options_with_capability(
+            "claude-sonnet-4",
+            Some("anthropic"),
+            Some("controllable"),
+        );
         assert_eq!(opts.len(), 3);
         assert_eq!(opts[2].label, "Thinking (High)");
     }
 
     #[test]
-    fn capability_true_openai_returns_adaptive() {
-        let opts = thinking_options_with_capability("gpt-5", Some("openai"), Some(true));
+    fn controllable_openai_returns_adaptive() {
+        let opts = thinking_options_with_capability("gpt-5", Some("openai"), Some("controllable"));
         assert_eq!(opts.len(), 3);
         assert_eq!(opts[2].label, "Thinking (High)");
     }
@@ -882,7 +900,7 @@ mod tests {
         cfg.apply_bedrock(&mut body);
         assert_eq!(
             body["additionalModelRequestFields"]["thinking"],
-            json!({"type": "adaptive"})
+            json!({"type": "adaptive", "display": "summarized"})
         );
         assert_eq!(
             body["additionalModelRequestFields"]["output_config"],
@@ -899,7 +917,10 @@ mod tests {
         };
         let mut body = json!({ "temperature": 0.5 });
         cfg.apply_anthropic(&mut body);
-        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
         assert_eq!(body["output_config"], json!({"effort": "high"}));
     }
 

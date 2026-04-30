@@ -36,15 +36,20 @@ fn model_list_entry_name(entry: &serde_json::Value) -> Option<&str> {
         .and_then(|v| v.as_str())
 }
 
-fn model_list_entry_supports_thinking(entry: &serde_json::Value) -> Option<bool> {
+fn model_list_entry_thinking_mode(entry: &serde_json::Value) -> Option<&str> {
+    // Flattened `thinking_mode` is the canonical shape emitted by the current
+    // /models response. The `quirks.thinking_mode` branch is a transitional
+    // fallback for older server builds still nesting the value inside quirks.
+    // TODO: remove the nested-quirks fallback once all deployments are past
+    // the flattened-response rollout.
     entry
-        .get("supports_thinking")
-        .and_then(|v| v.as_bool())
+        .get("thinking_mode")
+        .and_then(|v| v.as_str())
         .or_else(|| {
             entry
                 .get("quirks")
-                .and_then(|q| q.get("supports_thinking"))
-                .and_then(|v| v.as_bool())
+                .and_then(|q| q.get("thinking_mode"))
+                .and_then(|v| v.as_str())
         })
 }
 
@@ -174,13 +179,12 @@ pub(super) async fn handle_slash_command(
                             );
                         }
                     }
-                    let supports_thinking =
-                        selected_model.and_then(model_list_entry_supports_thinking);
+                    let thinking_mode = selected_model.and_then(model_list_entry_thinking_mode);
                     let provider = selected_model.and_then(model_list_entry_provider);
                     let opts = astra_turn_core::thinking_config::thinking_options_with_capability(
                         &chosen,
                         provider,
-                        supports_thinking,
+                        thinking_mode,
                     );
                     let model_with_suffix = if opts.is_empty() {
                         chosen.clone()
@@ -623,27 +627,33 @@ mod model_list_json_tests {
     }
 
     #[test]
-    fn reads_flattened_supports_thinking_from_model_list() {
-        let v = serde_json::json!({"name": "qwen", "supports_thinking": true});
-        assert_eq!(model_list_entry_supports_thinking(&v), Some(true));
+    fn reads_flattened_thinking_mode_from_model_list() {
+        let v = serde_json::json!({"name": "claude", "thinking_mode": "controllable"});
+        assert_eq!(model_list_entry_thinking_mode(&v), Some("controllable"));
     }
 
     #[test]
-    fn reads_nested_quirks_supports_thinking_for_legacy_detail_shapes() {
+    fn reads_nested_quirks_thinking_mode() {
         let v = serde_json::json!({
-            "name": "qwen",
-            "quirks": { "supports_thinking": false }
+            "name": "glm",
+            "quirks": { "thinking_mode": "native" }
         });
-        assert_eq!(model_list_entry_supports_thinking(&v), Some(false));
+        assert_eq!(model_list_entry_thinking_mode(&v), Some("native"));
     }
 
     #[test]
-    fn flattened_supports_thinking_wins_over_nested_quirks() {
+    fn flattened_thinking_mode_wins_over_nested_quirks() {
         let v = serde_json::json!({
-            "name": "qwen",
-            "supports_thinking": true,
-            "quirks": { "supports_thinking": false }
+            "name": "claude",
+            "thinking_mode": "controllable",
+            "quirks": { "thinking_mode": "native" }
         });
-        assert_eq!(model_list_entry_supports_thinking(&v), Some(true));
+        assert_eq!(model_list_entry_thinking_mode(&v), Some("controllable"));
+    }
+
+    #[test]
+    fn missing_thinking_mode_returns_none() {
+        let v = serde_json::json!({"name": "minimax"});
+        assert_eq!(model_list_entry_thinking_mode(&v), None);
     }
 }
