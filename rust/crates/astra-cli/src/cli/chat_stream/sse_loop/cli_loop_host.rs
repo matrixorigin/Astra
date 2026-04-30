@@ -515,19 +515,22 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        // G1 payload fill: `all_schemas` is exactly the tool list the
+        // CLI advertised to the LLM this turn, so it's the honest
+        // source for `tool_schemas`. `system_blocks` stays empty here
+        // because the CLI doesn't assemble the final system prompt
+        // locally — the server-side bridge does that. A future PR on
+        // the server host (G2) will populate system_blocks where the
+        // real bytes exist.
+        let tool_schemas = build_tool_schema_entries(&self.all_schemas);
         let req = astra_turn_core::fork_capture::CaptureRequest {
             parent_run_id,
             parent_turn_seq: self.repl_turn_index,
             provider,
             model_id,
             thinking: None,
-            // System prompts and tool schemas are not stashed on
-            // the host. Capture with empty placeholders — identity
-            // hashes won't collide because model_id + canonical
-            // messages bytes are unique per turn. Future step:
-            // plumb the real system/tools from payload assembly.
             system_blocks: vec![],
-            tool_schemas: vec![],
+            tool_schemas,
             beta_headers: vec![],
             canonical_prefix_bytes,
             cache_mode: astra_turn_core::fork_prefix::CacheMode::Write,
@@ -536,6 +539,37 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         };
         let _ = astra_turn_core::fork_capture::capture_parent_prefix(req, store.as_ref());
     }
+}
+
+/// Convert the CLI's OpenAI-style tool schema list into the
+/// `ToolSchemaEntry` shape the fork-prefix capture path expects.
+///
+/// OpenAI schemas look like `{"function": {"name": "...", ...}}`;
+/// Anthropic-style are `{"name": "...", ...}`. We handle both by
+/// preferring the nested name and falling back to the flat one.
+/// Entries without a detectable name are dropped — a nameless schema
+/// can't be attributed in `ForkCacheEvent::drift` anyway.
+pub(crate) fn build_tool_schema_entries(
+    schemas: &[serde_json::Value],
+) -> Vec<astra_turn_core::fork_prefix::ToolSchemaEntry> {
+    schemas
+        .iter()
+        .filter_map(|schema| {
+            let name = schema
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .or_else(|| schema.get("name").and_then(|n| n.as_str()))?
+                .to_string();
+            let (canonical_bytes, hash) =
+                astra_turn_core::fork_prefix::hash_tool_schema(schema);
+            Some(astra_turn_core::fork_prefix::ToolSchemaEntry {
+                name,
+                canonical_bytes,
+                hash,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -580,5 +614,85 @@ mod tests {
             derive_turn_interaction_mode(PermissionMode::Prompt, false, true, false, true),
             TurnInteractionMode::NonInteractive
         );
+    }
+
+    // ── G1: CaptureRequest payload completeness (system_blocks + tool_schemas) ─
+    //
+    // Regression for the `Known gaps` item in commit 45a3a39e9: the
+    // parent-turn capture was shipping `tool_schemas: vec![]`, which
+    // meant `ForkCacheEvent::drift` could never attribute per-tool
+    // schema churn. `build_tool_schema_entries` is the conversion
+    // helper used by `on_turn_completed`; these tests pin its
+    // behavior so a refactor can't regress the payload silently.
+
+    #[test]
+    fn build_tool_schema_entries_handles_openai_nested_shape() {
+        let schemas = vec![
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "spawn_agent",
+                    "description": "...",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            }),
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "Read",
+                    "parameters": {"type": "object"},
+                }
+            }),
+        ];
+        let entries = build_tool_schema_entries(&schemas);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "spawn_agent");
+        assert_eq!(entries[1].name, "Read");
+        // Hash + canonical bytes populated (no empty defaults).
+        assert!(!entries[0].canonical_bytes.is_empty());
+        assert_ne!(entries[0].hash, [0u8; 32]);
+    }
+
+    #[test]
+    fn build_tool_schema_entries_handles_anthropic_flat_shape() {
+        let schemas = vec![serde_json::json!({
+            "name": "Grep",
+            "input_schema": {"type": "object"},
+        })];
+        let entries = build_tool_schema_entries(&schemas);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Grep");
+    }
+
+    #[test]
+    fn build_tool_schema_entries_drops_nameless_schemas() {
+        // A schema without a detectable name can't be attributed in
+        // `ForkCacheEvent::drift`, so we skip it rather than invent
+        // a placeholder.
+        let schemas = vec![
+            serde_json::json!({"function": {"description": "no name"}}),
+            serde_json::json!({"description": "also no name"}),
+            serde_json::json!({"name": "ok_one"}),
+        ];
+        let entries = build_tool_schema_entries(&schemas);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "ok_one");
+    }
+
+    #[test]
+    fn build_tool_schema_entries_hashes_deterministic_regardless_of_key_order() {
+        // The canonical_json_bytes impl sorts keys, so two schemas
+        // that differ only in key order must hash identically.
+        // Critical: cache identity relies on this.
+        let a = serde_json::json!({
+            "function": {"name": "X", "parameters": {"a": 1, "b": 2}}
+        });
+        let b = serde_json::json!({
+            "function": {"parameters": {"b": 2, "a": 1}, "name": "X"}
+        });
+        let ea = build_tool_schema_entries(&[a]);
+        let eb = build_tool_schema_entries(&[b]);
+        assert_eq!(ea[0].hash, eb[0].hash);
+        assert_eq!(ea[0].canonical_bytes, eb[0].canonical_bytes);
     }
 }
