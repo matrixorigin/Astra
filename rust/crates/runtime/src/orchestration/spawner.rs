@@ -1013,12 +1013,7 @@ mod tests {
             description: "Test agent".to_string(),
             prompt: "Do a test".to_string(),
             agent_type: "explore".to_string(),
-            model: None,
-            background: true,
-            name: None,
-            max_turns: None,
-            isolated: false,
-            allowed_tools: None,
+            ..Default::default()
         };
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
@@ -1040,12 +1035,7 @@ mod tests {
             description: "Test".to_string(),
             prompt: "Test".to_string(),
             agent_type: "unknown-type".to_string(),
-            model: None,
-            background: true,
-            name: None,
-            max_turns: None,
-            isolated: false,
-            allowed_tools: None,
+            ..Default::default()
         };
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
@@ -1078,12 +1068,7 @@ mod tests {
                 description: format!("Agent {}", i),
                 prompt: "Test".to_string(),
                 agent_type: "explore".to_string(),
-                model: None,
-                background: true,
-                name: None,
-                max_turns: None,
-                isolated: false,
-                allowed_tools: None,
+                ..Default::default()
             };
             let _ = spawner.spawn(input, &context).await;
         }
@@ -1126,12 +1111,7 @@ mod tests {
             description: "Explore codebase".to_string(),
             prompt: "Explore".to_string(),
             agent_type: "explore".to_string(),
-            model: None,
-            background: true,
-            name: None,
-            max_turns: None,
-            isolated: false,
-            allowed_tools: None,
+            ..Default::default()
         };
         let result = spawner.spawn(input, &context).await.unwrap();
         assert!(matches!(result, SpawnAgentOutput::Launched { .. }));
@@ -1172,12 +1152,8 @@ mod tests {
             description: "Named agent".to_string(),
             prompt: "Send a message".to_string(),
             agent_type: "explore".to_string(),
-            model: None,
-            background: true,
             name: Some("named".to_string()),
-            max_turns: None,
-            isolated: false,
-            allowed_tools: None,
+            ..Default::default()
         };
 
         let agent_id = match spawner.spawn(input, &context).await.unwrap() {
@@ -1308,12 +1284,8 @@ mod tests {
             description: "Background agent".to_string(),
             prompt: "Finish immediately".to_string(),
             agent_type: "explore".to_string(),
-            model: None,
-            background: true,
             name: Some("bg".to_string()),
-            max_turns: None,
-            isolated: false,
-            allowed_tools: None,
+            ..Default::default()
         };
 
         let agent_id = match spawner.spawn(input, &context).await.unwrap() {
@@ -1353,12 +1325,7 @@ mod tests {
             description: "Depth test".to_string(),
             prompt: "Run depth test".to_string(),
             agent_type: "explore".to_string(),
-            model: None,
-            background: false,
-            name: None,
-            max_turns: None,
-            isolated: false,
-            allowed_tools: None,
+            ..Default::default()
         };
 
         let result = spawner.spawn(input, &context).await.unwrap();
@@ -1381,12 +1348,7 @@ mod tests {
             description: "Depth reject".to_string(),
             prompt: "Should fail".to_string(),
             agent_type: "explore".to_string(),
-            model: None,
-            background: false,
-            name: None,
-            max_turns: None,
-            isolated: false,
-            allowed_tools: None,
+            ..Default::default()
         };
 
         let result = spawner.spawn(input, &context).await;
@@ -1414,12 +1376,7 @@ mod tests {
             description: "Sync agent".to_string(),
             prompt: "Fail immediately".to_string(),
             agent_type: "explore".to_string(),
-            model: None,
-            background: false,
-            name: None,
-            max_turns: None,
-            isolated: false,
-            allowed_tools: None,
+            ..Default::default()
         };
 
         let result = spawner.spawn(input, &context).await.unwrap();
@@ -1444,12 +1401,7 @@ mod tests {
             description: "Test with skills".to_string(),
             prompt: "Test".to_string(),
             agent_type: "explore".to_string(),
-            model: None,
-            background: true,
-            name: None,
-            max_turns: None,
-            isolated: false,
-            allowed_tools: None,
+            ..Default::default()
         };
         // Skills are stored in context and passed through — spawner launches successfully
         let result = spawner.spawn(input, &context).await.unwrap();
@@ -1541,12 +1493,7 @@ mod tests {
             description: "bg test".to_string(),
             prompt: "do it".to_string(),
             agent_type: "explore".to_string(),
-            model: None,
-            background: true,
-            name: None,
-            max_turns: None,
-            isolated: false,
-            allowed_tools: None,
+            ..Default::default()
         }
     }
 

@@ -38,6 +38,7 @@ pub mod followup_suggestion;
 pub mod fork_capture;
 pub mod fork_prefix;
 pub mod fork_prefix_store;
+pub mod fork_resolve;
 pub mod headless_tool_assembly;
 pub mod headless_tool_status_display;
 pub mod headless_tool_stderr_lines;

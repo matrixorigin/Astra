@@ -2309,12 +2309,7 @@ mod tests {
             description: "watch test agent".to_string(),
             prompt: "do nothing".to_string(),
             agent_type: "task".to_string(),
-            model: None,
-            background: true,
-            name: None,
-            max_turns: None,
-            isolated: false,
-            allowed_tools: None,
+            ..Default::default()
         };
 
         let output = spawner.spawn(input, &context).await.unwrap();

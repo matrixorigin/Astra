@@ -118,6 +118,22 @@ pub fn set_fork_flag_for_tests(enabled: bool) -> u8 {
     FORK_FLAG_CACHE.swap(if enabled { 2 } else { 1 }, Ordering::Relaxed)
 }
 
+/// Test-only: restore the raw u8 state (including the "unread" 0)
+/// previously returned from `set_fork_flag_for_tests`. Needed by
+/// test `FlagGuard::Drop` implementations that must roll back to a
+/// value the bool-only setter can't express.
+#[doc(hidden)]
+pub fn restore_fork_flag_raw_for_tests(raw: u8) {
+    FORK_FLAG_CACHE.store(raw, Ordering::Relaxed);
+}
+
+/// Test-only: shared mutex that every test touching the feature
+/// flag must acquire. Lives here (at the definition site) so that
+/// tests in OTHER modules in the same crate — e.g. `fork_resolve` —
+/// share the same lock and don't race each other for flag state.
+#[cfg(test)]
+pub(crate) static FORK_FLAG_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ---------------------------------------------------------------------
 // Capture request + outcome types
 // ---------------------------------------------------------------------
@@ -301,13 +317,10 @@ mod tests {
     use super::*;
     use crate::fork_prefix::hash_tool_schema;
     use crate::fork_prefix_store::InMemoryPrefixStore;
-    use std::sync::Mutex;
 
-    // Tests must serialize on the feature flag since it's process-
-    // global. Each test that touches the flag acquires this mutex
-    // so concurrent `cargo test` threads don't corrupt each other's
-    // flag state.
-    static FLAG_MUTEX: Mutex<()> = Mutex::new(());
+    // All feature-flag-touching tests (here and in fork_resolve)
+    // share the crate-global FORK_FLAG_TEST_MUTEX so they don't
+    // race each other for flag state.
 
     /// RAII guard: set flag to `enabled` for the test's duration,
     /// restore on drop. Using drop-restore (not just "set true then
@@ -320,7 +333,9 @@ mod tests {
 
     impl FlagGuard {
         fn set(enabled: bool) -> Self {
-            let lock = FLAG_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = FORK_FLAG_TEST_MUTEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let prev_raw = set_fork_flag_for_tests(enabled);
             Self {
                 _lock: lock,
@@ -590,7 +605,7 @@ mod tests {
         // in CI would silently flip tests that forgot to install a
         // FlagGuard. We verify the branch's behavior: state 0 MUST
         // return false.
-        let _lock = FLAG_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = FORK_FLAG_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prev = FORK_FLAG_CACHE.swap(0, Ordering::Relaxed);
         let observed = is_fork_inherit_prefix_enabled();
         // Restore before any panic-able assert, so later tests see

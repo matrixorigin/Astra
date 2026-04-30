@@ -159,7 +159,7 @@ pub struct ToolSchemaEntry {
 /// spawn. All variants are recoverable — callers fall back to a
 /// non-prefixed spawn and emit a telemetry event. None of these should
 /// ever panic.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum ForkValidationError {
     /// The child was spawned with a different provider than the captured
     /// prefix. Cross-provider reuse is meaningless.
