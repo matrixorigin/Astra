@@ -132,7 +132,26 @@ pub(crate) async fn initialize_multi_agent_runtime(
     let progress_broadcaster =
         std::sync::Arc::new(astra_runtime::orchestration::ProgressBroadcaster::default());
 
-    let delegate_executor = delegate_subrun::CliDelegateSubRunExecutor::new(
+    // Read fork-prefix config once for both executors so the
+    // delegate and spawn paths stay in lockstep on observability.
+    let runtime_cfg_for_delegate = astra_config::runtime_config::RuntimeConfig::load();
+    let fork_cfg_for_delegate = &runtime_cfg_for_delegate.fork_prefix;
+    let delegate_fork_cache_sink: Option<
+        std::sync::Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink>,
+    > = if fork_cfg_for_delegate.enabled {
+        Some(match fork_cfg_for_delegate.sink {
+            astra_config::runtime_config::ForkCacheSinkKind::Noop => {
+                std::sync::Arc::new(astra_turn_core::fork_cache_event::NoopForkCacheSink)
+            }
+            astra_config::runtime_config::ForkCacheSinkKind::Stderr => {
+                std::sync::Arc::new(astra_turn_core::fork_cache_event::StderrForkCacheSink)
+            }
+        })
+    } else {
+        None
+    };
+
+    let mut delegate_executor = delegate_subrun::CliDelegateSubRunExecutor::new(
         api.clone(),
         token.clone(),
         state.model.clone(),
@@ -143,6 +162,9 @@ pub(crate) async fn initialize_multi_agent_runtime(
     .with_skill_resolver(skill_resolver.clone())
     .with_skill_search(state.skill_search.clone())
     .with_progress_broadcaster(progress_broadcaster.clone());
+    if let Some(sink) = delegate_fork_cache_sink.clone() {
+        delegate_executor = delegate_executor.with_fork_cache_sink(sink);
+    }
 
     let engine = astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
         registry,
