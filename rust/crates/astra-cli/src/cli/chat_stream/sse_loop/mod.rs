@@ -404,6 +404,17 @@ pub(crate) async fn stream_chat_sse(
     // Snapshot approval overrides for checkpoint persistence.
     let initial_approval_overrides = p.perm_manager.export_session_overrides();
 
+    // Bug B step 3: share the spawner's prefix_store with the
+    // CLI host so on_turn_completed can write captured parent
+    // prefixes into the same map the DelegationEngine + spawner
+    // read from. Without shared state, a capture fires but lands
+    // in a different store than resolvers look at — delegate
+    // children always see None.
+    let prefix_store_for_host = p
+        .agent_spawner
+        .as_ref()
+        .and_then(|s| s.prefix_store().cloned());
+
     // ─── Build host + state ──────────────────────────────────────────────
     let mut host = CliAgenticLoopHost {
         api: p.api,
@@ -436,6 +447,7 @@ pub(crate) async fn stream_chat_sse(
         tool_cache: crate::stream_render::EdgeToolCache::new(
             resolved_tool_policy.max_identical_tool_calls,
         ),
+        prefix_store: prefix_store_for_host,
     };
 
     let hook_sets = detect_turn_hook_sets(&project_root, task_profile, p.is_plan_subtask);

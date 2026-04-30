@@ -366,6 +366,15 @@ impl DynamicAgentSpawner {
         self
     }
 
+    /// Read-only access to the installed prefix store. Exposed so
+    /// callers (e.g. the CLI loop host that captures parent turns)
+    /// can share the same Arc the spawner already holds, guaranteeing
+    /// captured prefixes are visible at spawn time. Returns `None`
+    /// when no store is wired.
+    pub fn prefix_store(&self) -> Option<&Arc<dyn PrefixCaptureSink>> {
+        self.prefix_store.as_ref()
+    }
+
     /// Query the resolve outcome recorded for a spawned agent.
     /// Returns `None` if the agent was never spawned by this
     /// spawner, or if its outcome has been cleared via
