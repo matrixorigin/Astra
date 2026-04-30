@@ -3055,12 +3055,46 @@ fn llm_capture_error_response(error: &astra_core::ClassifiedError) -> Value {
         "kind": error.kind.to_string(),
     });
     if let Some(details_json) = error.details_json.as_deref()
-        && let Ok(Value::Object(details)) = serde_json::from_str::<Value>(details_json)
+        && let Ok(Value::Object(mut details)) = serde_json::from_str::<Value>(details_json)
         && let Some(response_object) = response.as_object_mut()
     {
+        // Canonical-schema guarantee: error artifacts surface `usage` in the
+        // same shape as the success path (see `bridge_sse_helpers` and
+        // `turn::token_usage::TokenUsage::to_json_map`). If upstream details
+        // carried OpenAI-style keys (`prompt_tokens`/`completion_tokens`) we
+        // normalize here so downstream consumers have a single schema to
+        // reason about.
+        if let Some(Value::Object(raw_usage)) = details.get("usage").cloned() {
+            let canonical = normalize_usage_to_canonical(&raw_usage);
+            details.insert("usage".to_string(), Value::Object(canonical));
+        }
         response_object.extend(details);
     }
     response
+}
+
+/// Best-effort normalization of a provider-dialect `usage` object into the
+/// canonical token-usage schema. Returns the canonical map when recognizable
+/// tokens are present; otherwise returns the input untouched so we never
+/// drop fields we don't understand.
+fn normalize_usage_to_canonical(
+    raw: &serde_json::Map<String, Value>,
+) -> serde_json::Map<String, Value> {
+    // Pass-through when already canonical: presence of either `input_tokens`
+    // or `output_tokens` means the producer already normalized.
+    if raw.contains_key("input_tokens") || raw.contains_key("output_tokens") {
+        return raw.clone();
+    }
+    // Detect OpenAI dialect (prompt_tokens / completion_tokens / …).
+    if raw.contains_key("prompt_tokens") || raw.contains_key("completion_tokens") {
+        if let Some(canonical) = crate::turn::token_usage::extract_usage(
+            crate::turn::token_usage::UsageDialect::OpenAi,
+            raw,
+        ) {
+            return canonical.to_json_map();
+        }
+    }
+    raw.clone()
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -3233,6 +3267,80 @@ mod tests {
         assert_eq!(response["partial_full_text"].as_str(), Some("half answer"));
         assert_eq!(response["usage"]["input_tokens"].as_i64(), Some(10));
         assert_eq!(response["kind"].as_str(), Some("stream_transport"));
+    }
+
+    #[test]
+    fn llm_capture_error_response_normalizes_openai_usage_to_canonical() {
+        // Upstream details carry OpenAI-style `prompt_tokens`/`completion_tokens`.
+        // The captured artifact must present the canonical schema that the SSE
+        // path produces, so downstream consumers see one shape across success
+        // and failure.
+        let error = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::StreamTransport,
+            "boom",
+        )
+        .with_details_json(
+            json!({
+                "partial_full_text": "half",
+                "usage": { "prompt_tokens": 17, "completion_tokens": 3 }
+            })
+            .to_string(),
+        );
+        let response = llm_capture_error_response(&error);
+        assert_eq!(response["usage"]["input_tokens"].as_i64(), Some(17));
+        assert_eq!(response["usage"]["output_tokens"].as_i64(), Some(3));
+        assert!(
+            response["usage"].get("prompt_tokens").is_none(),
+            "canonical output must not retain the OpenAI-dialect `prompt_tokens` key",
+        );
+    }
+
+    #[test]
+    fn llm_capture_error_response_passes_through_canonical_usage_unchanged() {
+        // When details already speak the canonical dialect we must not touch
+        // them — double-normalization would zero out fields the OpenAI
+        // extractor doesn't know (`cached_input_tokens`, `cache_creation_tokens`).
+        let error = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::StreamTransport,
+            "boom",
+        )
+        .with_details_json(
+            json!({
+                "usage": {
+                    "input_tokens": 11,
+                    "cached_input_tokens": 2,
+                    "cache_creation_tokens": 1,
+                    "output_tokens": 4,
+                    "total_tokens": 18
+                }
+            })
+            .to_string(),
+        );
+        let response = llm_capture_error_response(&error);
+        assert_eq!(response["usage"]["input_tokens"].as_i64(), Some(11));
+        assert_eq!(response["usage"]["cached_input_tokens"].as_i64(), Some(2));
+        assert_eq!(response["usage"]["cache_creation_tokens"].as_i64(), Some(1));
+        assert_eq!(response["usage"]["output_tokens"].as_i64(), Some(4));
+    }
+
+    #[test]
+    fn llm_capture_error_response_leaves_unknown_usage_dialect_untouched() {
+        // If we cannot identify the dialect, preserve raw keys — dropping
+        // fields silently is worse than asking downstream code to
+        // defensively parse.
+        let error = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::StreamTransport,
+            "boom",
+        )
+        .with_details_json(
+            json!({
+                "usage": { "tokens_in": 7, "tokens_out": 2 }
+            })
+            .to_string(),
+        );
+        let response = llm_capture_error_response(&error);
+        assert_eq!(response["usage"]["tokens_in"].as_i64(), Some(7));
+        assert_eq!(response["usage"]["tokens_out"].as_i64(), Some(2));
     }
 
     #[test]

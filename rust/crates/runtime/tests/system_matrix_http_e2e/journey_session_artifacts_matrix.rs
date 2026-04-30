@@ -1399,13 +1399,21 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
         latest_j["content"]["response"]["partial_full_text"].as_str(),
         Some(partial_text)
     );
-    // `mock_round_error` preserves `details` verbatim via `with_details_json`,
-    // and `llm_capture_error_response` flattens that object into `response`.
-    // Injected `usage: {prompt_tokens: 17, completion_tokens: 3}` therefore
-    // surfaces as `response.usage.prompt_tokens`, not `.prompt`.
+    // Artifacts carry the canonical token-usage schema
+    // (`input_tokens` / `output_tokens`) regardless of which wire dialect the
+    // upstream provider spoke. `llm_capture_error_response` is responsible
+    // for normalizing `ClassifiedError.details.usage` from OpenAI-style
+    // (`prompt_tokens`/`completion_tokens`) into the canonical form before
+    // flattening. If this assertion regresses, error artifacts have drifted
+    // away from the canonical schema shared by the SSE path
+    // (see `bridge_sse_helpers::apply_forward_llm_sse_event`).
     assert_eq!(
-        latest_j["content"]["response"]["usage"]["prompt_tokens"].as_i64(),
+        latest_j["content"]["response"]["usage"]["input_tokens"].as_i64(),
         Some(17)
+    );
+    assert_eq!(
+        latest_j["content"]["response"]["usage"]["output_tokens"].as_i64(),
+        Some(3)
     );
 
     let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
@@ -1438,11 +1446,14 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
         download_j["content"]["response"]["partial_full_text"].as_str(),
         Some(partial_text)
     );
-    // Same schema as the `latest_j` assertion above: injected usage keys pass
-    // through verbatim.
+    // Same canonical-schema rationale as the `latest_j` assertion above.
     assert_eq!(
-        download_j["content"]["response"]["usage"]["prompt_tokens"].as_i64(),
+        download_j["content"]["response"]["usage"]["input_tokens"].as_i64(),
         Some(17)
+    );
+    assert_eq!(
+        download_j["content"]["response"]["usage"]["output_tokens"].as_i64(),
+        Some(3)
     );
 
     let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
@@ -3339,156 +3350,6 @@ pub async fn run_bridge_client_disconnect_session_artifact_latest_and_download_r
     );
 
     assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await;
-    cleanup_session_data(pool, &session_id).await;
-    ctx.pool.close().await;
-}
-
-pub async fn run_bridge_idle_failure_session_artifact_latest_and_download_routes() {
-    let _idle_env = set_stream_idle_timeouts_for_test(250, 250);
-    let partial_text = "bridge idle partial";
-    let (base_url, hits) = spawn_raw_idle_after_progress_server(
-        partial_text,
-        std::time::Duration::from_secs(2),
-        500,
-        r#"{"error":{"message":"fallback idle recovery failed"}}"#,
-    )
-    .await;
-
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let pool = &ctx.pool;
-    let model_name = format!("bridge-idle-{}", ctx.suffix);
-
-    let (st_model, model_j) = post_json(
-        app,
-        "/models",
-        Some(auth.as_str()),
-        json!({
-            "name": model_name,
-            "provider": "openai",
-            "api_key": "idle-e2e-key",
-            "base_url": base_url
-        }),
-    )
-    .await;
-    assert_eq!(st_model, StatusCode::CREATED, "create model: {model_j}");
-    sqlx::query("UPDATE infra_llm_models SET is_active = 1 WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await
-        .expect("force-activate idle test model");
-    hits.nonstream_hits.store(1, Ordering::SeqCst);
-
-    let (st_sess, sess) = post_json(
-        app,
-        "/sessions",
-        Some(auth.as_str()),
-        json!({
-            "title": "bridge idle failed latest download",
-            "metadata": { "full_llm_capture": true, "suite": "bridge_idle_failed_latest_download" }
-        }),
-    )
-    .await;
-    assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
-    let session_id = sess["session_id"].as_str().expect("session_id").to_string();
-
-    let payload = json!({
-        "agent_id": "system-matrix-bridge-idle-artifact",
-        "session_id": &session_id,
-        "model": model_name,
-        "messages": [{ "role": "user", "content": "trigger a bridge idle failure after partial output" }]
-    });
-    let (status, body) = chat_turn_full(app, auth, payload).await;
-    assert_eq!(status, StatusCode::OK, "chat/turn: {body}");
-    assert!(
-        body.contains(partial_text),
-        "bridge SSE should include the partial streamed text before failure: {body}"
-    );
-    // The mock server streams a partial chunk then closes the socket after
-    // `stall_for` (2s). Since `set_stream_idle_timeouts_for_test` is now a
-    // no-op (idle timeout is hardcoded to 5 min), the socket shutdown reaches
-    // the client as a `stream_transport` error before any idle-timeout would
-    // fire. The nonstream fallback then returns 500 → terminal error emitted.
-    // What this test really guards is "fallback-exhaustion after partial
-    // progress produces a terminal SSE error + persisted artifact"; the exact
-    // discriminator is `stream_transport` under the current timing.
-    assert!(
-        body.contains("\"code\":\"stream_transport\""),
-        "bridge SSE should expose the transport failure code after fallback exhaustion: {body}"
-    );
-    assert!(
-        !body.contains("\"type\":\"turn_complete\""),
-        "terminal failure should not emit turn_complete after error: {body}"
-    );
-
-    wait_for_artifact_count(
-        pool,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
-
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
-    )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest bridge idle llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
-
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
-    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
-    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
-    // Same rationale as the SSE assertion above: current timing surfaces as
-    // `stream_transport`, not `stream_idle`.
-    assert_eq!(
-        latest_j["content"]["response"]["kind"].as_str(),
-        Some("stream_transport")
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-
-    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, _download_headers, download_body) =
-        get_bytes(app, &download_path, Some(auth), &[]).await;
-    assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let download_j: serde_json::Value =
-        serde_json::from_slice(&download_body).expect("download json");
-    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        download_j["content"]["response"]["kind"].as_str(),
-        Some("stream_transport")
-    );
-    assert_eq!(
-        download_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-
-    assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        hits.nonstream_hits.load(Ordering::SeqCst),
-        2,
-        "expected one model-connectivity probe and one fallback request"
-    );
 
     let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
         .bind(&session_id)

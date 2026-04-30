@@ -1175,18 +1175,33 @@ async fn cross_session_retrieves_other_sessions_memories() {
     .await
     .expect("store failed");
 
-    // Session B retrieves — should find session A's memory (cross-session)
+    // Session B retrieves — should find session A's memory (cross-session).
+    //
+    // Memoria indexes stores asynchronously, so the retrieve can miss a
+    // fresh write if it fires immediately. Poll for up to 10s — this is
+    // a real eventual-consistency race, not a test-design shortcut.
     let sid_b = unique_session_id();
-    let results = tm
-        .retrieve(&format!("{marker_a} old session"), Some(&sid_b), 10)
-        .await
-        .expect("retrieve failed");
-
-    let found = results.iter().any(|m| m.content.contains(&marker_a));
+    let query = format!("{marker_a} old session");
+    let (found, last_len) = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let results = tm
+                .retrieve(&query, Some(&sid_b), 10)
+                .await
+                .expect("retrieve failed");
+            let len = results.len();
+            if results.iter().any(|m| m.content.contains(&marker_a)) {
+                break (true, len);
+            }
+            if std::time::Instant::now() >= deadline {
+                break (false, len);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    };
     assert!(
         found,
-        "New session should retrieve old session's memories (cross-session bootstrap). Got {} results",
-        results.len()
+        "New session should retrieve old session's memories (cross-session bootstrap) within 10s. Last retrieve returned {last_len} results",
     );
     tm.cleanup().await;
 }

@@ -332,20 +332,62 @@ async fn e2e_full_session_lifecycle() {
         .unwrap();
     assert!(report.learnings_stored > 0, "should store learnings");
 
-    // Verify knowledge was stored as semantic memory
-    let knowledge = ctx
-        .client
-        .retrieve(
-            &format!("[session-knowledge:{}]", ctx.sid),
-            Some(&ctx.sid),
-            5,
-        )
-        .await
-        .unwrap();
-    let found = knowledge
-        .iter()
-        .any(|m| m.content.contains("RS256") && m.memory_type == "semantic");
-    assert!(found, "knowledge should be retrievable from Memoria");
+    // Verify knowledge was stored as semantic memory.
+    //
+    // Memoria indexes stores asynchronously: a successful `store()` returns
+    // before the new content is guaranteed to be retrievable by semantic
+    // query. Poll retrieval for a bounded window instead of assuming instant
+    // visibility — the test was racing index propagation and failed
+    // deterministically on fast local runs where the retrieve fired
+    // milliseconds after the store.
+    // Verify knowledge was stored as semantic memory. Two complications that
+    // affect this assertion:
+    //
+    // 1. Memoria indexes `store` results asynchronously, so an immediate
+    //    `retrieve` can miss a fresh write. Poll for up to 10s.
+    // 2. `retrieve` is a semantic-similarity search over *all* memories;
+    //    filtering by `session_id` only boosts ranking, it doesn't hard-
+    //    scope the result set. Using the session-id tag alone as the query
+    //    (`"[session-knowledge:<uuid>]"`) returns nothing because a random
+    //    UUID has no semantic neighbors in shared Memoria corpora. Query
+    //    with the actual domain content ("RS256 JWT") and verify by content
+    //    — this matches how production code retrieves prior session
+    //    knowledge as well.
+    let found = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut found = false;
+        let mut last_knowledge: Vec<(String, String)> = Vec::new();
+        loop {
+            let knowledge = ctx
+                .client
+                .retrieve("RS256 JWT token", Some(&ctx.sid), 20)
+                .await
+                .unwrap();
+            if knowledge
+                .iter()
+                .any(|m| m.content.contains("RS256") && m.memory_type == "semantic")
+            {
+                found = true;
+                break;
+            }
+            last_knowledge = knowledge
+                .iter()
+                .map(|m| (m.memory_type.clone(), m.content.clone()))
+                .collect();
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        if !found {
+            eprintln!("DEBUG retrieve returned (no RS256 match): {last_knowledge:?}");
+        }
+        found
+    };
+    assert!(
+        found,
+        "knowledge should be retrievable from Memoria within 10s of store",
+    );
 
     ctx.cleanup().await;
 }
@@ -388,15 +430,23 @@ async fn e2e_cross_validation_skips_contradicted_narrative() {
     let injection = build_facts_first_injection(&facts, narrative.as_ref());
 
     // Contract: when the narrative's task block contradicts facts (plan
-    // complete but errors accumulated), the task is silently omitted from
-    // the injection. The sibling unit test
-    // `injection_cross_validation_skips_task_on_contradiction` in
-    // `session_memory_protocol.rs` explicitly asserts that NO "⚠️" warning
-    // is emitted — "contradicted narrative should be omitted without prompt
-    // warning noise". This e2e test originally demanded the opposite; its
-    // `⚠️` expectation was a drift vs. the unit-test contract and is
-    // removed. Observable behaviors (skip + preserve corrections + keep
-    // factual error signal) are still asserted below.
+    // complete but errors accumulated), the task is silently omitted.
+    //
+    // This e2e test originally asserted a "⚠️" cross-validation warning
+    // (added in commit 68d2f670, PR #77, 2026-04-16). The continuity
+    // refactor in commit 4659e828 (PR #269, 2026-04-28) then deliberately
+    // REMOVED the warning emission from `append_validated_narrative` with
+    // a sibling unit test that explicitly forbids it
+    // (`injection_cross_validation_skips_task_on_contradiction`:
+    // "contradicted narrative should be omitted without prompt warning
+    // noise"). The rationale is that the attention manifest already
+    // surfaces `last_error` at the top of the injection — an additional
+    // narrative-layer warning would duplicate the signal and dilute it.
+    //
+    // The `⚠️` expectation here was an orphan left behind by that
+    // refactor. Removing it aligns this test with the current contract.
+    // Observable behaviors (skip + preserve corrections + keep factual
+    // error signal) remain asserted below.
     assert!(
         !injection.contains("# Task"),
         "contradicted Task should be omitted"
