@@ -287,11 +287,13 @@ impl PrefixCaptureSink for InMemoryPrefixStore {
         // inside a single DashMap entry handle because dropping an
         // entry while holding its guard deadlocks — hence the two-step
         // pattern: clone the Arc, release the read guard, then
-        // conditionally call `remove`.
+        // conditionally call `remove_if`. The remove-time re-check is
+        // required: a concurrent writer may refresh this key between
+        // our stale read and the cleanup attempt.
         let maybe = self.entries.get(run_id).map(|e| e.value().clone());
         match maybe {
             Some(prefix) if self.is_stale(&prefix) => {
-                self.entries.remove(run_id);
+                self.entries.remove_if(run_id, |_, v| self.is_stale(v));
                 None
             }
             other => other,
@@ -359,6 +361,7 @@ mod tests {
         ToolSchemaEntry,
     };
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{mpsc, Mutex};
 
     /// Per-test controllable clock. Each test instantiates one so
     /// parallel test execution doesn't create inter-test timing races
@@ -565,6 +568,60 @@ mod tests {
             store.tracked_count(),
             0,
             "stale read must drop the entry as a side effect"
+        );
+    }
+
+    #[test]
+    fn get_prefix_does_not_drop_concurrently_refreshed_entry() {
+        // Regression test for the ABA window in `get_prefix`:
+        // 1. Reader observes an old stale entry.
+        // 2. Writer refreshes the same key before the stale reader deletes it.
+        // 3. Reader must not blindly remove the fresh replacement.
+        let now = Arc::new(AtomicU64::new(1_100));
+        let stale_checks = Arc::new(AtomicUsize::new(0));
+        let (stale_check_started_tx, stale_check_started_rx) = mpsc::channel();
+        let (allow_stale_check_tx, allow_stale_check_rx) = mpsc::channel();
+        let stale_check_started_tx = Arc::new(Mutex::new(Some(stale_check_started_tx)));
+        let allow_stale_check_rx = Arc::new(Mutex::new(allow_stale_check_rx));
+
+        let store = Arc::new(
+            InMemoryPrefixStore::with_config(PrefixStoreConfig {
+                ttl: Duration::from_secs(30),
+                max_entries: 16,
+            })
+            .with_time_source({
+                let now = now.clone();
+                let stale_checks = stale_checks.clone();
+                let stale_check_started_tx = stale_check_started_tx.clone();
+                let allow_stale_check_rx = allow_stale_check_rx.clone();
+                move || {
+                    if stale_checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                        if let Some(tx) = stale_check_started_tx.lock().unwrap().take() {
+                            tx.send(()).unwrap();
+                        }
+                        allow_stale_check_rx.lock().unwrap().recv().unwrap();
+                    }
+                    now.load(Ordering::SeqCst)
+                }
+            }),
+        );
+
+        store.record_prefix("E", make_prefix("E", 1_000));
+
+        let reader_store = store.clone();
+        let reader = std::thread::spawn(move || reader_store.get_prefix("E"));
+
+        stale_check_started_rx.recv().unwrap();
+        store.record_prefix("E", make_prefix("E", 1_100));
+        allow_stale_check_tx.send(()).unwrap();
+
+        assert!(
+            reader.join().unwrap().is_none(),
+            "reader saw the stale entry and must not return it"
+        );
+        assert!(
+            store.get_prefix("E").is_some(),
+            "fresh refresh must survive stale-reader cleanup"
         );
     }
 
