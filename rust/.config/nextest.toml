@@ -3,5 +3,15 @@ fail-fast = false
 
 [profile.ci]
 fail-fast = false
-slow-timeout = { period = "60s", terminate-after = 3 }
+slow-timeout = { period = "4s", terminate-after = 1 }
 failure-output = "immediate"
+
+# Per-case hard budget for `make test-offline` / `make test-online`. A case that
+# runs longer than `period` is terminated after `terminate-after` slow-periods
+# and counted as a FAIL. Defaults come from the Makefile; override the period
+# per-invocation with `make test-offline TEST_OFFLINE_TIMEOUT=2s`, etc.
+# (The Makefile feeds the value in via `--config profile.strict.slow-timeout…`.)
+[profile.strict]
+fail-fast = false
+failure-output = "immediate"
+slow-timeout = { period = "1s", terminate-after = 1 }

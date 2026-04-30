@@ -28,8 +28,8 @@ help:
 	@echo ""
 	@echo "Testing:"
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
-	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (typecheck, Jest+coverage+Mode A in-process, build)"
-	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (set ASTRA_SDK_ONLINE_E2E=1 + API to also run make test-sdk-online)"
+	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (fails any case > TEST_OFFLINE_TIMEOUT, default 1s; override: make test-offline TEST_OFFLINE_TIMEOUT=2s)"
+	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (fails any case > TEST_ONLINE_TIMEOUT, default 2s; override: make test-online TEST_ONLINE_TIMEOUT=4s; set ASTRA_SDK_ONLINE_E2E=1 + API for make test-sdk-online)"
 	@echo "  make test-live-llm      - Live LLM suite (real provider APIs from .models.yaml; one model per provider)"
 	@echo "  make test-contract      - Run contract tests (http/admin/config)"
 	@echo "  (also: test-sdk-offline, test-sdk-online — @astra/sdk; offline in test-offline; remote E2E opt-in on test-online)"
@@ -78,6 +78,22 @@ RUST_DEBUG_BIN_DIR := $(RUST_TARGET_DIR)/debug
 RUST_RELEASE_BIN_DIR := $(RUST_TARGET_DIR)/release
 API_SERVER_BIN := astra-server
 CLI_BINS := astra astra-admin
+
+# Per-test-case hard budget. Any case running longer than the budget is killed
+# and counted as FAIL (nextest profile `strict`, terminate-after=1). Override
+# as a make variable — no env vars:
+#   make test-offline TEST_OFFLINE_TIMEOUT=2s
+#   make test-online  TEST_ONLINE_TIMEOUT=4s
+TEST_OFFLINE_TIMEOUT ?= 1s
+TEST_ONLINE_TIMEOUT  ?= 2s
+
+# Wire the chosen budget into nextest's `strict` profile via --config overrides.
+NEXTEST_OFFLINE_FLAGS := --profile strict \
+	--config 'profile.strict.slow-timeout.period="$(TEST_OFFLINE_TIMEOUT)"' \
+	--config 'profile.strict.slow-timeout.terminate-after=1'
+NEXTEST_ONLINE_FLAGS := --profile strict \
+	--config 'profile.strict.slow-timeout.period="$(TEST_ONLINE_TIMEOUT)"' \
+	--config 'profile.strict.slow-timeout.terminate-after=1'
 
 # ============================================================================
 # Environment Setup
@@ -470,8 +486,10 @@ test-offline: test-workspace test-runtime-bridge-hooks test-sdk-offline
 
 .PHONY: test-workspace
 test-workspace:
-	@echo "Running Rust workspace tests (all members, default features)..."
-	@$(CARGO) test $(CARGO_MANIFEST_FLAG)
+	@echo "Running Rust workspace tests (nextest; per-case budget $(TEST_OFFLINE_TIMEOUT))..."
+	@cargo nextest run $(CARGO_MANIFEST_FLAG) --workspace $(NEXTEST_OFFLINE_FLAGS)
+	@echo "Running workspace doctests (cargo test --doc; not covered by nextest)..."
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG) --workspace --doc
 
 # Guard: server allowlist names ⊆ all_tool_schemas(), memory_* allowlist coverage,
 # DEFAULT_EXECUTOR_TOOL_NAMES ⊆ SERVER_EXECUTOR_TOOL_NAMES (manifest-path rust/Cargo.toml).
@@ -484,8 +502,9 @@ check-server-tool-schemas:
 # `required-features = ["bridge-e2e-hooks"]` (e.g. chat_turn_bridge_ledger_inject_e2e).
 .PHONY: test-runtime-bridge-hooks
 test-runtime-bridge-hooks:
-	@echo "Running astra-runtime tests with feature bridge-e2e-hooks..."
-	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --features bridge-e2e-hooks
+	@echo "Running astra-runtime tests with feature bridge-e2e-hooks (nextest; per-case budget $(TEST_OFFLINE_TIMEOUT))..."
+	@cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
+		--features bridge-e2e-hooks $(NEXTEST_OFFLINE_FLAGS)
 
 # Ignored tests: opt-in via env vars (see `make test-online`). Enable with:
 #   ASTRA_TEST_DB_IT=1   -> all online/Matrix ignored integration tests (--ignored)
@@ -497,28 +516,35 @@ test-ignored-integration:
 		echo "Note: no online/Matrix ignored suites selected. Use \`make test-online\` or set ASTRA_TEST_DB_IT=1."; \
 	fi
 	@if [ "$${ASTRA_TEST_DB_IT:-}" = "1" ]; then \
-		EXTRA_THREADS=""; \
+		JOBS_FLAG=""; \
 		if [ "$${ASTRA_TEST_DB_IT_TEST_THREADS:-}" = "1" ]; then \
-			EXTRA_THREADS="--test-threads=1"; \
+			JOBS_FLAG="-j 1"; \
 			echo "system_matrix_http_e2e: serial mode (ASTRA_TEST_DB_IT_TEST_THREADS=1)"; \
 		else \
 			echo "Running system_matrix_http_e2e (ignored; parallel default; live DB + AppSettings::from_env)..."; \
 		fi; \
-		$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --features bridge-e2e-hooks \
-			--test system_matrix_http_e2e -- --ignored $$EXTRA_THREADS --nocapture; \
+		cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --features bridge-e2e-hooks \
+			--test system_matrix_http_e2e --run-ignored only \
+			$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG --no-capture; \
 		\
 		echo "Running multi_agent_integration (ignored; live MatrixOne)..."; \
-		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-services --test multi_agent_integration -- --ignored; \
+		cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services --test multi_agent_integration \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG; \
 		echo "Running team_persistence_integration (ignored; live MatrixOne)..."; \
-		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-services --test team_persistence_integration -- --ignored; \
+		cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services --test team_persistence_integration \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG; \
 		echo "Running services_db_integration (ignored; live MatrixOne)..."; \
-		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-services --test services_db_integration -- --ignored; \
+		cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services --test services_db_integration \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG; \
 		echo "Running plan_sync_db_it (ignored; live MatrixOne)..."; \
-		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-services --test plan_sync_db_it -- --ignored; \
+		cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services --test plan_sync_db_it \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG; \
 		echo "Running plan_repository_db_it (ignored; live MatrixOne)..."; \
-		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-plan --test plan_repository_db_it -- --ignored; \
+		cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-plan --test plan_repository_db_it \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG; \
 		echo "Running plan_http_db_it (ignored; live MatrixOne)..."; \
-		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test plan_http_db_it -- --ignored; \
+		cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-runtime --test plan_http_db_it \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG; \
 	fi
 
 # Online (MatrixOne): opt-in #[ignore] integration binaries (see test-ignored-integration).
@@ -540,9 +566,10 @@ test-online:
 		-e "DROP DATABASE IF EXISTS $$TEST_DB; CREATE DATABASE $$TEST_DB;" 2>/dev/null || \
 	mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS --skip-ssl \
 		-e "DROP DATABASE IF EXISTS $$TEST_DB; CREATE DATABASE $$TEST_DB;" 2>/dev/null || true; \
-	echo "Running astra-runtime ignored unit tests (live DB; live-LLM suite gated by ASTRA_LIVE_LLM)..."; \
+	echo "Running astra-runtime ignored unit tests (live DB; nextest per-case budget $(TEST_ONLINE_TIMEOUT); live-LLM suite gated by ASTRA_LIVE_LLM)..."; \
 	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
-		$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) -- --ignored; \
+		cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS); \
 	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 		ASTRA_TEST_DB_IT=1 \
 		$(MAKE) test-ignored-integration
