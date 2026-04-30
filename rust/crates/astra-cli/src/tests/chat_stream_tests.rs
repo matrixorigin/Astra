@@ -3,7 +3,10 @@ use astra_services::session_journal::{self, JournalDirGuard, JournalEventType};
 
 // ── chat_stream (SSE agentic loop) ────────────────────────────────────
 
-fn sse_text_response(text: &str, session_id: &str) -> String {
+/// Build a canonical SSE response for the mock chat-turn endpoint. Exposed
+/// to sibling test modules (e.g. `resume_tests`) so they don't have to
+/// duplicate the payload literal.
+pub(super) fn sse_text_response(text: &str, session_id: &str) -> String {
     format!(
         "data: {{\"type\":\"session_info\",\"session_id\":\"{session_id}\"}}\n\n\
              data: {{\"type\":\"text_delta\",\"content\":\"{text}\"}}\n\n\

@@ -1,4 +1,5 @@
 use super::*;
+use super::chat_stream_tests::sse_text_response;
 use crate::cli_utils::{CredentialsFile, Profile, save_credentials};
 use axum::response::IntoResponse;
 use std::sync::{Mutex, MutexGuard, OnceLock};

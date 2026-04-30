@@ -106,16 +106,18 @@ pub fn tfidf_score(query_terms: &[String], tool_idx: usize) -> f64 {
 /// This is COMPLEMENTARY to TF-IDF — triggers capture multilingual synonyms
 /// and phrase patterns that TF-IDF might miss (e.g., "关注" → github tools).
 pub fn trigger_match_score(tool: &ToolMeta, query_lower: &str, query_chars: &[char]) -> f64 {
-    use astra_turn_core::tool_registry_state::word_boundary_match;
+    use astra_turn_core::tool_registry_state::{split_haystack_words, word_boundary_match_prepared};
 
+    let _ = query_chars; // legacy arg, retained for ABI stability with callers
     let mut best_score = 0.0;
-    let query_words: Vec<&str> = query_lower
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .filter(|w| !w.is_empty())
-        .collect();
+    // Split the haystack once and reuse across all triggers. The haystack
+    // split is O(haystack_len), which dominates for long user messages (see
+    // `SCORING_QUERY_BYTE_CAP` in this crate); re-doing it per trigger used
+    // to be the super-linear term behind the slow-test audit.
+    let query_words = split_haystack_words(query_lower);
 
     for trigger in tool.triggers {
-        if word_boundary_match(query_lower, query_chars, trigger) {
+        if word_boundary_match_prepared(query_lower, &query_words, trigger) {
             // Longer triggers = more specific = higher score
             let specificity = (trigger.chars().count() as f64 / 10.0).min(1.0);
             let score = 0.5 + 0.5 * specificity; // range: 0.5 – 1.0
@@ -711,18 +713,27 @@ fn pre_filter_dynamic_with_pressure_and_cooccurrence(
     result
 }
 
-/// Core pre-filter implementation.
-#[allow(clippy::too_many_arguments)]
-/// Cap the query length for scoring purposes. Triggers are short keywords;
-/// nothing past the first few hundred chars of a user message moves the
-/// needle for tool selection, and scanning longer queries is super-linear
-/// (every trigger in every tool re-splits the full haystack — a 10k-char
-/// query turns one `pre_filter_dynamic` call into millions of char
-/// comparisons).
-const SCORING_QUERY_CHAR_CAP: usize = 1024;
+/// Cap the query length (in **bytes**) for scoring purposes. Triggers are
+/// short keywords; nothing past the first few hundred characters of a user
+/// message moves the needle for tool selection, and scanning longer queries
+/// costs roughly O(query_len × tools × terms_per_query) — a raw 10 KB paste
+/// turns one `pre_filter_dynamic` call into multi-second CPU on debug
+/// builds.
+///
+/// Size rationale (2 KiB):
+/// - Covers the first ~2000 ASCII chars (more than any LLM trigger cares
+///   about).
+/// - ~1000 mixed-Latin chars.
+/// - ~680 pure-CJK chars (3 bytes per codepoint under UTF-8) — safely above
+///   realistic tool-selection prompts in Chinese.
+///
+/// If this ever needs raising, fix the per-query super-linear term first
+/// (dedup `query_terms` before feeding TF-IDF, cache the haystack split
+/// inside the per-tool loop) — then the cap can grow without paying CPU.
+const SCORING_QUERY_BYTE_CAP: usize = 2048;
 
-/// UTF-8-safe prefix: return `&s[..=cap]` but snapped down to a char boundary.
-/// `str::get` returns `None` inside a multibyte sequence, hence the snap.
+/// Return the longest prefix of `s` whose byte length ≤ `max_bytes`, snapped
+/// down to a UTF-8 character boundary. Never splits a multi-byte codepoint.
 fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
@@ -734,6 +745,8 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Core pre-filter implementation.
+#[allow(clippy::too_many_arguments)]
 fn pre_filter_dynamic_core(
     state: &ConversationState,
     query: &str,
@@ -752,7 +765,7 @@ fn pre_filter_dynamic_core(
     // Truncate first — downstream callees do O(haystack_len) work per trigger
     // per tool (~500 calls per scoring), so an un-truncated 10k-char paste
     // would burn seconds of CPU on every turn.
-    let query: &str = truncate_at_char_boundary(query, SCORING_QUERY_CHAR_CAP);
+    let query: &str = truncate_at_char_boundary(query, SCORING_QUERY_BYTE_CAP);
     let query_lower = query.to_lowercase();
     let query_chars: Vec<char> = query.chars().collect();
     let query_terms = tokenize(query);
@@ -1320,12 +1333,43 @@ mod tests {
     #[test]
     fn pre_filter_very_long_query() {
         // Regression guard: `pre_filter_dynamic_core` truncates via
-        // `SCORING_QUERY_CHAR_CAP` so even huge pastes (10 000+ chars) stay
+        // `SCORING_QUERY_BYTE_CAP` so even huge pastes (10 000+ chars) stay
         // cheap. Before truncation this test ran ~5s because every trigger
         // in every tool re-split the full haystack.
         let state = state_at_turn(1);
         let long_query = "read ".repeat(2000);
         let results = pre_filter_dynamic(&state, &long_query);
+        for (_, score) in &results {
+            assert!(*score >= 0.0 && *score <= 10.0);
+        }
+    }
+
+    #[test]
+    fn truncate_at_char_boundary_never_splits_codepoint() {
+        // ASCII: exactly at cap — keep all.
+        assert_eq!(truncate_at_char_boundary("abcd", 4), "abcd");
+        assert_eq!(truncate_at_char_boundary("abcd", 3), "abc");
+        // Multi-byte: cap inside a 3-byte CJK char snaps down.
+        // "中" is 3 bytes; at max_bytes=2 we must return "" (nothing fits).
+        assert_eq!(truncate_at_char_boundary("中国", 2), "");
+        // At max_bytes=3 one full char fits.
+        assert_eq!(truncate_at_char_boundary("中国", 3), "中");
+        // At max_bytes=5, one char fits (the second would cross byte 6).
+        assert_eq!(truncate_at_char_boundary("中国", 5), "中");
+        // Exactly at char boundary.
+        assert_eq!(truncate_at_char_boundary("中国", 6), "中国");
+    }
+
+    #[test]
+    fn pre_filter_long_cjk_query_is_bounded() {
+        // Regression guard: a long CJK query must also be bounded. With the
+        // previous 1024-byte cap only ~340 CJK chars passed through, which
+        // was a silent behaviour change for non-Latin prompts. The new
+        // 4096-byte cap keeps >1000 CJK chars.
+        let state = state_at_turn(1);
+        // "查询代码 " = 13 bytes (3×3-byte CJK + 1×ASCII space).
+        let long_cjk = "查询代码 ".repeat(2000);
+        let results = pre_filter_dynamic(&state, &long_cjk);
         for (_, score) in &results {
             assert!(*score >= 0.0 && *score <= 10.0);
         }

@@ -2045,18 +2045,24 @@ fn append_context_flags(cmd: &mut Command, before: Option<usize>, after: Option<
     }
 }
 
-/// Kill the child's entire process group (SIGKILL to -pgid), then reap.
-/// Falls back to `child.kill()` on non-unix platforms. Needed so orphaned
-/// grandchildren don't hold the stdio pipes open past the kill.
+/// Kill the child's entire process group (SIGKILL via `killpg(2)`) then
+/// reap. Needed so orphaned grandchildren don't hold the stdio pipes open
+/// past the kill — the child must have been spawned with
+/// `process_group(0)` for the pgid to equal its PID.
+///
+/// Uses a direct syscall (best-effort; failures are ignored because the
+/// child may already have exited and been reaped, in which case the pgid
+/// is gone). Falls back to `child.kill()` on non-unix platforms.
 async fn kill_process_group(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {
-            // `kill -9 -<pid>` signals the whole group. We spawn this through
-            // std::process because we just want a best-effort blast.
-            let _ = std::process::Command::new("kill")
-                .args(["-9", &format!("-{pid}")])
-                .output();
+            // Safety: `pid` came from `Child::id()` and the child is still
+            // owned by us (not reaped yet). The pgid equals the PID because
+            // we called `process_group(0)` before spawn. `killpg` is
+            // signal-safe.
+            let pgid = nix::unistd::Pid::from_raw(pid as i32);
+            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
         }
     }
     let _ = child.kill().await;

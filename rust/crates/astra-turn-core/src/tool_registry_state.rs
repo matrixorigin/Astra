@@ -346,6 +346,25 @@ fn contains_any(lower: &str, chars: &[char], patterns: &[&str]) -> bool {
 /// so keywords like "commit" match "commits", "committing", "committed".
 /// This is a UNIVERSAL rule — no per-keyword plural/tense additions needed.
 pub fn word_boundary_match(haystack: &str, _chars: &[char], needle: &str) -> bool {
+    let words = split_haystack_words(haystack);
+    word_boundary_match_prepared(haystack, &words, needle)
+}
+
+/// Tokenize `haystack` the same way [`word_boundary_match`] does internally:
+/// split on any non-alphanumeric char (underscore retained). Hot-path callers
+/// that match many needles against the same haystack should call this once
+/// and pass the result to [`word_boundary_match_prepared`] repeatedly —
+/// avoids re-splitting the haystack for every needle.
+pub fn split_haystack_words(haystack: &str) -> Vec<&str> {
+    haystack
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// Same semantics as [`word_boundary_match`] but takes pre-split haystack
+/// words so scoring loops don't re-split the query once per trigger.
+pub fn word_boundary_match_prepared(haystack: &str, words: &[&str], needle: &str) -> bool {
     let needle_lower = needle.to_lowercase();
 
     // CJK / non-ASCII needle: use simple substring matching
@@ -354,17 +373,16 @@ pub fn word_boundary_match(haystack: &str, _chars: &[char], needle: &str) -> boo
         return haystack.contains(&needle_lower);
     }
 
+    let multi_word_needle = needle_lower.contains(' ');
+
     // Tokenize haystack into words and check if any word stem-matches the needle
-    for word in haystack.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
-        if word.is_empty() {
-            continue;
-        }
+    for word in words {
         // Exact match
-        if word == needle_lower {
+        if *word == needle_lower {
             return true;
         }
         // Multi-word needle: fall back to substring boundary matching
-        if needle_lower.contains(' ') {
+        if multi_word_needle {
             if substring_boundary_match(haystack, &needle_lower) {
                 return true;
             }
@@ -376,7 +394,7 @@ pub fn word_boundary_match(haystack: &str, _chars: &[char], needle: &str) -> boo
         }
     }
     // Multi-word needle fallback (if the loop didn't catch it)
-    if needle_lower.contains(' ') {
+    if multi_word_needle {
         return substring_boundary_match(haystack, &needle_lower);
     }
     false

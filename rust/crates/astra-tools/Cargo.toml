@@ -36,8 +36,9 @@ tree-sitter-java = "0.23"
 tree-sitter-cpp = "0.23"
 tree-sitter-ruby = "0.23"
 
-# System (process control, file ops)
-nix = { version = "0.31.2", features = ["fs"] }
+# System (process control, file ops). `signal` gives us killpg(2) so we can
+# SIGKILL an entire process group without fork-execing `/usr/bin/kill`.
+nix = { version = "0.31.2", features = ["fs", "signal"] }
 dirs = "6.0.0"
 
 [dev-dependencies]

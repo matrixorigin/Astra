@@ -2548,19 +2548,7 @@ fn run_command_with_cleanup(
             Ok(None) => {
                 if std::time::Instant::now() > deadline {
                     // Kill entire process group (command + all children)
-                    #[cfg(unix)]
-                    {
-                        let pid = child.id();
-                        // Negative PID = kill process group via /bin/kill
-                        let _ = Command::new("kill")
-                            .args(["-9", &format!("-{pid}")])
-                            .output();
-                        let _ = child.kill();
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = child.kill();
-                    }
+                    sigkill_process_group(&mut child);
                     // Reap the zombie process to prevent resource leak
                     let _ = child.wait();
                     return Err(format!("Error: command timed out after {timeout_secs}s"));
@@ -2588,6 +2576,27 @@ const SIZE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 /// exits, we wait this long to drain stdout/stderr before giving up on
 /// orphaned background descendants keeping the pipes open.
 const BASH_PIPE_READ_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// SIGKILL the child's entire process group via `killpg(2)` (the child must
+/// have been spawned with `process_group(0)`), then SIGKILL the child
+/// directly as a belt-and-suspenders fallback. Uses a direct syscall
+/// instead of fork-execing `/usr/bin/kill` — cheaper and doesn't block
+/// a surrounding async runtime for the fork+exec latency.
+///
+/// Failures are silently ignored because the child may already have been
+/// reaped by the caller in a race; this helper is strictly best-effort.
+fn sigkill_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id();
+        // Safety: `child.id()` returns the OS PID of a not-yet-reaped child;
+        // `process_group(0)` at spawn guarantees pgid == pid. `killpg` is
+        // signal-safe and ignores ESRCH if the group has already exited.
+        let pgid = nix::unistd::Pid::from_raw(pid as i32);
+        let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+    }
+    let _ = child.kill();
+}
 
 /// Resolve the pipe-read timeout. Tests can shorten it via
 /// `set_test_bash_pipe_read_timeout` to avoid waiting the real 500ms.
@@ -2738,18 +2747,7 @@ fn run_command_streaming(
                         });
                     } else {
                         // Hard kill.
-                        #[cfg(unix)]
-                        {
-                            let pid = child.id();
-                            let _ = Command::new("kill")
-                                .args(["-9", &format!("-{pid}")])
-                                .output();
-                            let _ = child.kill();
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            let _ = child.kill();
-                        }
+                        sigkill_process_group(&mut child);
                         let _ = child.wait();
                         let _ = stdout_thread.join();
                         let _ = stderr_thread.join();
@@ -2805,18 +2803,7 @@ fn size_watchdog(
 
         // Kill if running too long.
         if start.elapsed() > max_duration {
-            #[cfg(unix)]
-            {
-                let pid = child.id();
-                let _ = Command::new("kill")
-                    .args(["-9", &format!("-{pid}")])
-                    .output();
-                let _ = child.kill();
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = child.kill();
-            }
+            sigkill_process_group(&mut child);
             let _ = child.wait();
             break;
         }
@@ -2907,20 +2894,9 @@ fn run_readonly_command_with_partial(
             }
             Ok(None) => {
                 if std::time::Instant::now() > deadline {
-                    #[cfg(unix)]
-                    {
-                        let pid = child.id();
-                        // Kill the entire process group (catches child processes).
-                        // Fall back to direct kill so child.wait() never blocks forever.
-                        let _ = Command::new("kill")
-                            .args(["-9", &format!("-{pid}")])
-                            .output();
-                        let _ = child.kill();
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = child.kill();
-                    }
+                    // Kill the entire process group (catches child processes).
+                    // Fall back to direct kill so child.wait() never blocks forever.
+                    sigkill_process_group(&mut child);
                     let _ = child.wait();
                     let _ = reader.join();
                     let _ = stderr_reader.join();
@@ -3117,19 +3093,7 @@ impl ToolExecutor {
                 Ok(None) => {
                     if std::time::Instant::now() > deadline {
                         // Kill entire process group (bash + all children)
-                        #[cfg(unix)]
-                        {
-                            let pid = child.id();
-                            // Negative PID = kill process group via /bin/kill
-                            let _ = Command::new("kill")
-                                .args(["-9", &format!("-{pid}")])
-                                .output();
-                            let _ = child.kill();
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            let _ = child.kill();
-                        }
+                        sigkill_process_group(&mut child);
                         // Reap the zombie process to prevent resource leak
                         let _ = child.wait();
                         return Err(format!("Error: command timed out after {timeout_secs}s"));
