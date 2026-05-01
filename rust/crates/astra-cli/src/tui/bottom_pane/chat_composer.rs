@@ -6,6 +6,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::Widget,
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::textarea::{TextArea, TextAreaAction};
 
@@ -58,9 +59,12 @@ impl ChatComposer {
         self.textarea.set_text(text);
     }
 
+    fn prefix_display_width(&self) -> u16 {
+        self.prompt_prefix.width() as u16
+    }
+
     pub fn desired_height(&self, width: u16) -> u16 {
-        let prefix_w = self.prompt_prefix.len() as u16;
-        let inner_w = width.saturating_sub(prefix_w);
+        let inner_w = width.saturating_sub(self.prefix_display_width());
         self.textarea.desired_height(inner_w)
     }
 
@@ -142,7 +146,7 @@ impl ChatComposer {
             &self.prompt_prefix,
             Style::default().add_modifier(ratatui::style::Modifier::BOLD),
         );
-        let prefix_width = self.prompt_prefix.len() as u16;
+        let prefix_width = self.prefix_display_width();
         let prefix_area = Rect::new(area.x, area.y, prefix_width.min(area.width), 1);
         Widget::render(Line::from(prefix), prefix_area, buf);
 
@@ -165,7 +169,7 @@ impl ChatComposer {
     }
 
     pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
-        let prefix_width = self.prompt_prefix.len() as u16;
+        let prefix_width = self.prefix_display_width();
         let text_area = Rect::new(
             area.x + prefix_width.min(area.width),
             area.y,

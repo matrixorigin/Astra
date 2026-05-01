@@ -5,6 +5,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::Widget,
 };
+use unicode_width::UnicodeWidthStr;
 
 pub(crate) struct Footer {
     pub model: Option<String>,
@@ -78,8 +79,8 @@ impl Footer {
         }
 
         // Compose: left ... padding ... right
-        let left_w: usize = left_parts.iter().map(|s| s.content.len()).sum();
-        let right_w: usize = right_parts.iter().map(|s| s.content.len()).sum();
+        let left_w: usize = left_parts.iter().map(|s| s.content.width()).sum();
+        let right_w: usize = right_parts.iter().map(|s| s.content.width()).sum();
         let padding = (area.width as usize).saturating_sub(left_w + right_w + 2); // +2 for trailing margin
 
         let mut all_spans = left_parts;

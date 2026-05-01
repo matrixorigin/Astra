@@ -102,17 +102,15 @@ impl BottomPane {
     }
 
     pub fn desired_height(&self, width: u16) -> u16 {
-        let content_h = if let Some(view) = self.active_view() {
-            view.desired_height(width)
-        } else {
-            self.composer.desired_height(width)
-        };
+        if let Some(view) = self.active_view() {
+            // Active view replaces composer + footer
+            return view.desired_height(width);
+        }
+        let content_h = self.composer.desired_height(width);
         let popup_h = self.popup_height();
         if popup_h > 0 {
-            // Codex style: composer + blank + popup (no footer)
             content_h + 1 + popup_h
         } else {
-            // Normal: composer + blank + footer
             content_h + 1 + 1
         }
     }
@@ -150,14 +148,18 @@ impl BottomPane {
             return BottomPaneAction::Consumed;
         }
 
-        // Esc: dismiss active view or slash popup
+        // Esc: dismiss active view or popup
         if key.code == KeyCode::Esc {
             if !self.view_stack.is_empty() {
                 self.view_stack.pop();
-                return BottomPaneAction::Consumed;
+                return BottomPaneAction::ViewCompleted(None);
             }
             if self.slash_popup.is_some() {
                 self.slash_popup = None;
+                return BottomPaneAction::Consumed;
+            }
+            if self.skill_popup.is_some() {
+                self.skill_popup = None;
                 return BottomPaneAction::Consumed;
             }
         }
@@ -187,6 +189,14 @@ impl BottomPane {
                         self.slash_popup = None;
                     }
                     return BottomPaneAction::Consumed;
+                }
+                KeyCode::Enter => {
+                    if let Some(cmd) = self.slash_popup.as_ref().and_then(|p| p.selected_command()) {
+                        let text = cmd.to_string();
+                        self.composer.clear_draft();
+                        self.slash_popup = None;
+                        return BottomPaneAction::SubmitInput(text);
+                    }
                 }
                 _ => {}
             }
@@ -231,71 +241,55 @@ impl BottomPane {
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
+        // Active view takes the full area (has its own footer hint)
+        if let Some(view) = self.active_view() {
+            view.render(area, buf);
+            return;
+        }
+
         let popup_h = self.popup_height();
-        let content_h = if let Some(view) = self.active_view() {
-            view.desired_height(area.width)
-        } else {
-            self.composer.desired_height(area.width)
-        };
+        let content_h = self.composer.desired_height(area.width);
 
         if popup_h > 0 {
-            // Popup mode: composer + blank + popup (no footer)
             let chunks = Layout::vertical([
                 Constraint::Length(content_h),
-                Constraint::Length(1),       // blank line
+                Constraint::Length(1),
                 Constraint::Length(popup_h),
             ])
             .split(area);
 
-            if let Some(view) = self.active_view() {
-                view.render(chunks[0], buf);
-            } else {
-                self.composer.render(chunks[0], buf);
-            }
-            // chunks[1] is blank
+            self.composer.render(chunks[0], buf);
             if let Some(ref popup) = self.slash_popup {
                 popup.render(chunks[2], buf);
             } else if let Some(ref popup) = self.skill_popup {
                 popup.render(chunks[2], buf);
             }
         } else {
-            // Normal: composer + blank + footer
             let chunks = Layout::vertical([
                 Constraint::Length(content_h),
-                Constraint::Length(1),       // blank line
-                Constraint::Length(1),       // footer
+                Constraint::Length(1),
+                Constraint::Length(1),
             ])
             .split(area);
 
-            if let Some(view) = self.active_view() {
-                view.render(chunks[0], buf);
-            } else {
-                self.composer.render(chunks[0], buf);
-            }
-            // chunks[1] is blank
+            self.composer.render(chunks[0], buf);
             self.footer.render(chunks[2], buf);
         }
     }
 
     pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
-        let content_h = if let Some(view) = self.active_view() {
-            view.desired_height(area.width)
-        } else {
-            self.composer.desired_height(area.width)
-        };
+        if let Some(view) = self.active_view() {
+            return view.cursor_pos(area);
+        }
 
-        // Composer is always at chunks[0]
+        let content_h = self.composer.desired_height(area.width);
         let chunks = Layout::vertical([
             Constraint::Length(content_h),
             Constraint::Min(0),
         ])
         .split(area);
 
-        if let Some(view) = self.active_view() {
-            view.cursor_pos(chunks[0])
-        } else {
-            self.composer.cursor_position(chunks[0])
-        }
+        self.composer.cursor_position(chunks[0])
     }
 }
 

@@ -107,7 +107,7 @@ impl SlashPopup {
 
             let name_w = 16;
             let padded_name = format!("{:<width$}", meta.name, width = name_w);
-            let desc_budget = (area.width as usize).saturating_sub(2 + name_w);
+            let desc_budget = (area.width as usize).saturating_sub(4 + name_w);
             let desc: String = meta.description.chars().take(desc_budget).collect();
 
             let line = Line::from(vec![

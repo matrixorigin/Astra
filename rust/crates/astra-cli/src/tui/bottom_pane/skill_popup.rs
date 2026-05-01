@@ -112,7 +112,7 @@ impl SkillPopup {
             let name_w = 18;
             let tag_w = tag.len() + 1;
             let padded_name = format!("{:<width$}", item.name, width = name_w);
-            let desc_budget = (area.width as usize).saturating_sub(2 + name_w + tag_w + 1);
+            let desc_budget = (area.width as usize).saturating_sub(4 + name_w + tag_w + 1);
             let desc: String = item.description.chars().take(desc_budget).collect();
 
             let line = Line::from(vec![
