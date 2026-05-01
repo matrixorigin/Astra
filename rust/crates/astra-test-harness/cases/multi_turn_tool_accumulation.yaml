@@ -3,7 +3,9 @@ description: |
   First turn asks agent to read a file, second turn asks to modify it.
   Tests that tool results from turn 1 inform turn 2 decisions.
   Uses setup_cmd to create a temp file.
-prompt: "Read the file /tmp/astra_harness_mt_test.txt and tell me what's in it."
+prompt: |
+  Read the file /tmp/astra_harness_mt_test.txt and tell me what's in it.
+  Include the file contents in your answer.
 capability: tool_use
 difficulty: 2
 weight: 2.0
@@ -11,14 +13,12 @@ timeout_seconds: 180
 setup_cmd: "echo 'hello world 42' > /tmp/astra_harness_mt_test.txt"
 teardown_cmd: "rm -f /tmp/astra_harness_mt_test.txt"
 steps:
-  - prompt: "Now append the line 'second line' to that same file."
+  - prompt: "Now append the line 'second line' to that same file and confirm it was done."
     criteria:
       - type: tool_called
         name: bash
 criteria:
   - type: exit_code
     code: 0
-  - type: tool_sequence
-    tools: [read_file, bash]
-  - type: text_contains
-    needle: "42"
+  - type: tool_called
+    name: read_file

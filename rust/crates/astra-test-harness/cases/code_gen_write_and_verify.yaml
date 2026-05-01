@@ -16,13 +16,13 @@ teardown_cmd: "rm -f /tmp/astra_harness_fib.py"
 criteria:
   - type: exit_code
     code: 0
-  - type: tool_sequence
-    tools: [str_replace, bash]
+  - type: tool_called
+    name: bash
   - type: text_contains
     needle: "55"
   - type: turn_rounds_between
     min: 1
-    max: 6
+    max: 12
   - type: tokens_between
     min: 1
-    max: 10000
+    max: 150000

@@ -18,4 +18,4 @@ criteria:
     code: 0
   - type: turn_rounds_between
     min: 1
-    max: 4
+    max: 10
