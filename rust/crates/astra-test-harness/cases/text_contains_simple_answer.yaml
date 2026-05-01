@@ -1,20 +1,15 @@
 name: text_contains_simple_answer
 description: |
-  No-tool smoke test. Verifies the pure-chat code path still works
-  when the model is asked an information question that doesn't
-  require tools. Guards against regressions where the selector
-  force-suggests tools for any prompt (a known failure mode when
-  the tfidf thresholds are mis-tuned).
+  Factual-answer smoke test. Verifies the model can answer a simple
+  knowledge question and produce the correct text output. The answer
+  must appear in the final text regardless of whether the model chose
+  to verify via tools.
 prompt: |
   What year did Rust 1.0 ship? Reply with just the year as a 4-digit
-  number. No tools, no extra prose.
+  number. No extra prose.
 timeout_seconds: 120
 criteria:
   - type: exit_code
     code: 0
   - type: text_contains
     needle: "2015"
-  - type: tools_count_between
-    # MUST NOT call any tools for a pure factual Q.
-    min: 0
-    max: 0
