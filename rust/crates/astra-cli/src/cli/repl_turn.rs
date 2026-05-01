@@ -896,7 +896,7 @@ async fn run_chat_turn(
     let obs_hub = state.observability_hub.clone();
     let obs_session = state.observability_session.clone();
 
-    tokio::select! {
+    let attempt = tokio::select! {
         result = stream_chat_sse(ChatTurnParams {
             api: ctx.api,
             token,
@@ -915,6 +915,7 @@ async fn run_chat_turn(
             recent_tools: &state.recent_tools,
             tool_health_entries: &state.tool_health_entries,
             session_lessons: &state.session_lessons,
+            latest_skill_diagnosis: state.latest_skill_diagnosis.as_ref(),
             unified_skill_registry: &state.unified_skill_registry,
             plan_only_chat: state.chat_plan_only && state.current_plan_subtask_id.is_none(),
             is_plan_subtask: state.current_plan_subtask_id.is_some(),
@@ -953,7 +954,65 @@ async fn run_chat_turn(
             eprintln!("\n{}", "  Interrupted.".dim());
             TurnAttempt::Interrupted
         }
+    };
+
+    // ─── P8: auto-invoke diagnostic skills at turn end ──────────────────────
+    // Compute SessionSignals from live observability, fire any triggered
+    // skills through the handler, stash the first diagnosis for the next
+    // turn's ToolExecutor seam. Best-effort: any failure at any step is
+    // logged and swallowed so an auto-invoke problem can never break the
+    // turn completion path.
+    maybe_run_auto_invoke(state).await;
+
+    attempt
+}
+
+/// Run the auto-invoke handler once per turn: compute signals, fire the
+/// gate, stash the first diagnosis in `state.latest_skill_diagnosis` for
+/// the next turn's prompt. Lazily creates the handler on first use so
+/// sessions that never trigger anything pay no cost.
+async fn maybe_run_auto_invoke(state: &mut ReplState) {
+    // Snapshot signals under a scoped read lock so we don't hold the
+    // observability lock across the await on maybe_fire.
+    let signals = match state
+        .observability_session
+        .as_ref()
+        .and_then(|arc| arc.read().ok())
+    {
+        Some(guard) => astra_runtime::auto_invoke_handler::compute_session_signals(Some(&*guard)),
+        None => astra_runtime::auto_invoke_handler::compute_session_signals(None),
+    };
+
+    // Fast-path: no signals worth even locking the handler for.
+    let default = astra_skills::auto_invoke::SessionSignals::default();
+    if signals == default {
+        return;
     }
+
+    // Lazy-create the handler on first use.
+    if state.auto_invoke_handler.is_none() {
+        let exec: std::sync::Arc<dyn astra_runtime::auto_invoke_handler::SkillExecutor> =
+            std::sync::Arc::new(astra_runtime::auto_invoke_handler::LoggingSkillExecutor);
+        state.auto_invoke_handler = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            astra_runtime::auto_invoke_handler::AutoInvokeHandler::new(exec),
+        )));
+    }
+
+    let handler = state
+        .auto_invoke_handler
+        .as_ref()
+        .expect("just constructed above")
+        .clone();
+    let mut guard = handler.lock().await;
+    let diagnoses = guard.maybe_fire(&signals, std::time::Instant::now()).await;
+    drop(guard);
+
+    // Use the first diagnosis. Multiple triggers in one turn (rare —
+    // cooldowns usually prevent this) are a future extension; for now we
+    // surface the highest-priority one (analyze_session if present, else
+    // optimize_prompt, else evaluate_session — the gate returns them in
+    // stall→pressure→corrections order).
+    state.latest_skill_diagnosis = diagnoses.into_iter().next();
 }
 
 /// Build a compact tool-call summary for cross-turn context continuity.
@@ -6072,6 +6131,92 @@ mod tests {
         assert!(
             !should_bootstrap_lessons(&state),
             "no matrix_runtime → no DAO → skip"
+        );
+    }
+
+    // ─── P8: maybe_run_auto_invoke ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn auto_invoke_noop_when_signals_are_zero() {
+        // No observability, no signals → handler should not even be
+        // instantiated; latest_skill_diagnosis must stay None.
+        let mut state = ReplState::default();
+        assert!(state.auto_invoke_handler.is_none());
+        assert!(state.latest_skill_diagnosis.is_none());
+
+        maybe_run_auto_invoke(&mut state).await;
+
+        assert!(
+            state.auto_invoke_handler.is_none(),
+            "zero-signals path must not construct a handler"
+        );
+        assert!(state.latest_skill_diagnosis.is_none());
+    }
+
+    #[tokio::test]
+    async fn auto_invoke_populates_latest_diagnosis_on_stall_signal() {
+        // Set up an ObservabilitySession with 3 stalls so the gate fires
+        // analyze_session. The LoggingSkillExecutor produces a valid
+        // diagnosis block. The run must stash it into
+        // state.latest_skill_diagnosis for the next turn.
+        let mut state = ReplState::default();
+        let session = std::sync::Arc::new(std::sync::RwLock::new(
+            astra_runtime::observability_integration::ObservabilitySession::new_simple(
+                "p8-turn-end",
+            ),
+        ));
+        {
+            let mut g = session.write().unwrap();
+            g.record_stall_event();
+            g.record_stall_event();
+            g.record_stall_event();
+        }
+        state.observability_session = Some(session);
+
+        maybe_run_auto_invoke(&mut state).await;
+
+        let diag = state
+            .latest_skill_diagnosis
+            .as_ref()
+            .expect("3 stalls must produce a diagnosis");
+        assert_eq!(diag.skill, "analyze_session");
+        assert_eq!(diag.cause, "consecutive_stalls");
+        // Handler must be cached for reuse next turn (cooldowns persist).
+        assert!(state.auto_invoke_handler.is_some());
+    }
+
+    #[tokio::test]
+    async fn auto_invoke_cooldown_prevents_refire_within_window() {
+        // Two consecutive calls with the same stall signal: first fires,
+        // second must be silenced by the gate's 60s cooldown. The cached
+        // handler is what makes this work — if we re-created it each turn
+        // the cooldown state would be lost.
+        let mut state = ReplState::default();
+        let session = std::sync::Arc::new(std::sync::RwLock::new(
+            astra_runtime::observability_integration::ObservabilitySession::new_simple(
+                "p8-cooldown",
+            ),
+        ));
+        {
+            let mut g = session.write().unwrap();
+            g.record_stall_event();
+            g.record_stall_event();
+            g.record_stall_event();
+        }
+        state.observability_session = Some(session);
+
+        maybe_run_auto_invoke(&mut state).await;
+        let first_diag = state.latest_skill_diagnosis.clone();
+        assert!(first_diag.is_some(), "first turn must fire");
+
+        // Second call: signals unchanged, but cooldown should block.
+        // (maybe_run_auto_invoke overwrites latest_skill_diagnosis with
+        // diagnoses.into_iter().next() — None if the handler returned
+        // nothing. So we expect it to become None.)
+        maybe_run_auto_invoke(&mut state).await;
+        assert!(
+            state.latest_skill_diagnosis.is_none(),
+            "second turn inside cooldown must clear the diagnosis slot"
         );
     }
 }

@@ -1752,6 +1752,7 @@ Follow these steps:
                 recent_tools: &[],
                 tool_health_entries: &[],
                 session_lessons: &state.session_lessons,
+                latest_skill_diagnosis: state.latest_skill_diagnosis.as_ref(),
                 unified_skill_registry: &state.unified_skill_registry,
                 plan_only_chat: false,
                 is_plan_subtask: false,

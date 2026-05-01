@@ -97,6 +97,57 @@ impl AutoInvokeHandler {
     }
 }
 
+/// Stub [`SkillExecutor`] that returns a canned `skill-diagnosis` block
+/// for every request without invoking an LLM. Useful as a default in
+/// session bootstrap so the auto-invoke loop exercises end-to-end (gate
+/// → executor → diagnosis parse → prompt injection) even before a real
+/// skill-invocation runner is wired in.
+///
+/// The generated headline + findings are deterministic functions of the
+/// trigger cause, so operators get a useful "system noticed you stalled
+/// N times" hint in the prompt without waiting for a cloud round-trip.
+/// When a real skill runner lands, callers swap this out for it.
+pub struct LoggingSkillExecutor;
+
+#[async_trait]
+impl SkillExecutor for LoggingSkillExecutor {
+    async fn run(&self, req: &AutoInvokeRequest) -> Option<String> {
+        use astra_skills::auto_invoke::AutoInvokeCause;
+        let (headline, finding) = match &req.cause {
+            AutoInvokeCause::ConsecutiveStalls { count } => (
+                format!("agent stalled {count} times this session"),
+                format!("pipeline detected {count} consecutive stall events"),
+            ),
+            AutoInvokeCause::BudgetPressure { level } => (
+                format!("budget pressure at {:.0}%", level * 100.0),
+                format!("context budget utilisation is {:.2}", level),
+            ),
+            AutoInvokeCause::RepeatedCorrections { count } => (
+                format!("user issued {count} corrections this session"),
+                format!("{count} distinct corrections recorded"),
+            ),
+        };
+        let cause_tag = req.cause.as_str();
+        // Hand-built JSON so the block stays valid when the cause tag
+        // or skill name changes without us forgetting to requote.
+        Some(format!(
+            "```skill-diagnosis\n\
+             {{\n  \
+             \"schema_version\": 1,\n  \
+             \"skill\": {skill},\n  \
+             \"cause\": \"{cause_tag}\",\n  \
+             \"headline\": {headline},\n  \
+             \"findings\": [{finding}],\n  \
+             \"recommended_action\": \"review the corresponding skill output for deeper analysis\"\n\
+             }}\n\
+             ```\n",
+            skill = serde_json::Value::String(req.skill.to_string()),
+            headline = serde_json::Value::String(headline),
+            finding = serde_json::Value::String(finding),
+        ))
+    }
+}
+
 /// Build [`SessionSignals`] from the live observability view the runtime
 /// already maintains. Designed as a single reconciliation point for the
 /// turn loop:
@@ -415,6 +466,105 @@ mod tests {
         let obs = ObservabilitySession::new_simple("s-p7b");
         let s = compute_session_signals(Some(&obs));
         assert_eq!(s.budget_pressure, 0.0);
+    }
+
+    // ── LoggingSkillExecutor ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn logging_executor_emits_parseable_diagnosis_for_each_cause() {
+        // Every cause must round-trip: the stub's reply must parse back
+        // into a SkillDiagnosis whose schema_version, skill, and cause
+        // match the request. Otherwise the loop emits noise the prompt
+        // renderer can't use.
+        let exec = LoggingSkillExecutor;
+        let cases = [
+            (
+                "analyze_session",
+                AutoInvokeCause::ConsecutiveStalls { count: 4 },
+                "consecutive_stalls",
+            ),
+            (
+                "optimize_prompt",
+                AutoInvokeCause::BudgetPressure { level: 0.92 },
+                "budget_pressure",
+            ),
+            (
+                "evaluate_session",
+                AutoInvokeCause::RepeatedCorrections { count: 5 },
+                "repeated_corrections",
+            ),
+        ];
+        for (skill, cause, tag) in cases {
+            let req = AutoInvokeRequest {
+                skill,
+                focus: "focus",
+                cause,
+            };
+            let reply = exec.run(&req).await.expect("executor must produce reply");
+            let diag = SkillDiagnosis::parse_from_skill_output(&reply)
+                .expect("reply must parse into diagnosis");
+            assert_eq!(diag.schema_version, SKILL_DIAGNOSIS_SCHEMA_VERSION);
+            assert_eq!(diag.skill, skill);
+            assert_eq!(diag.cause, tag);
+            assert!(!diag.headline.is_empty());
+            assert!(!diag.findings.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn logging_executor_headline_mentions_magnitude() {
+        // Operators rely on the headline to see the scale of the signal.
+        // Pin the contract so a future refactor doesn't silently strip
+        // the count / pressure number from the prompt.
+        let exec = LoggingSkillExecutor;
+        let stall = exec
+            .run(&AutoInvokeRequest {
+                skill: "analyze_session",
+                focus: "stalls",
+                cause: AutoInvokeCause::ConsecutiveStalls { count: 7 },
+            })
+            .await
+            .and_then(|r| SkillDiagnosis::parse_from_skill_output(&r))
+            .unwrap();
+        assert!(stall.headline.contains("7"), "got: {}", stall.headline);
+
+        let pressure = exec
+            .run(&AutoInvokeRequest {
+                skill: "optimize_prompt",
+                focus: "budget",
+                cause: AutoInvokeCause::BudgetPressure { level: 0.95 },
+            })
+            .await
+            .and_then(|r| SkillDiagnosis::parse_from_skill_output(&r))
+            .unwrap();
+        assert!(
+            pressure.headline.contains("95"),
+            "got: {}",
+            pressure.headline
+        );
+    }
+
+    #[tokio::test]
+    async fn logging_executor_wired_into_handler_closes_the_loop() {
+        // End-to-end: plug LoggingSkillExecutor into AutoInvokeHandler
+        // and confirm the gate → executor → parse → return pipeline
+        // actually produces valid diagnoses from real signals.
+        let exec: Arc<dyn SkillExecutor> = Arc::new(LoggingSkillExecutor);
+        let mut handler = AutoInvokeHandler::new(exec);
+
+        let mut signals = SessionSignals::default();
+        signals.consecutive_stalls = 3;
+        signals.recent_corrections = 3;
+
+        let out = handler.maybe_fire(&signals, Instant::now()).await;
+        let skills: std::collections::HashSet<&str> =
+            out.iter().map(|d| d.skill.as_str()).collect();
+        assert!(skills.contains("analyze_session"));
+        assert!(skills.contains("evaluate_session"));
+        for diag in &out {
+            assert_eq!(diag.schema_version, SKILL_DIAGNOSIS_SCHEMA_VERSION);
+            assert!(!diag.headline.is_empty());
+        }
     }
 
     #[tokio::test]

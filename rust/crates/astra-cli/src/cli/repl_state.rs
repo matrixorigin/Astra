@@ -281,6 +281,19 @@ pub(crate) struct ReplState {
     /// session's advice on every SelfModel snapshot.
     pub session_lessons: Vec<astra_runtime::self_model::LessonHint>,
 
+    /// P8: persistent auto-invoke handler. Owns the per-cause cooldowns
+    /// across turns of this session. Created lazily on first turn so
+    /// sessions that never trigger anything pay no cost.
+    pub auto_invoke_handler: Option<
+        std::sync::Arc<tokio::sync::Mutex<astra_runtime::auto_invoke_handler::AutoInvokeHandler>>,
+    >,
+
+    /// P8: most recent auto-invoke diagnosis, produced at the end of the
+    /// previous turn. Passed through to the next turn's ToolExecutor so
+    /// the LLM sees "the system already noticed X" in the prompt.
+    /// Cleared when no diagnosis is produced.
+    pub latest_skill_diagnosis: Option<astra_skills::auto_invoke::SkillDiagnosis>,
+
     // ── Observability (M1-M6) ──
     /// Global observability hub for M1-M6 integration (profiles, experiments, auto-tuning).
     /// Created at REPL startup, shared across sessions.
@@ -440,6 +453,8 @@ impl Default for ReplState {
             drift_user_corrections: Vec::new(),
             drift_original_query: None,
             session_lessons: Vec::new(),
+            auto_invoke_handler: None,
+            latest_skill_diagnosis: None,
             // Observability: hub is created at REPL startup, session on first turn
             observability_hub: None,
             observability_session: None,
