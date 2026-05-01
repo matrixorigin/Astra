@@ -415,6 +415,11 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
 
     async fn prune(&self, user_id: &str, max_age_days: u32) -> Result<u64, sqlx::Error> {
         let pool = self.get_pool().await?;
+        // All three prune steps run in a single transaction so callers
+        // never see a partial-prune intermediate state and the returned
+        // rows_affected count is semantically strong.
+        let mut tx = pool.begin().await?;
+
         let retired = query(
             "UPDATE agent_lessons \
              SET status = 'retired', updated_at = CURRENT_TIMESTAMP(6) \
@@ -423,15 +428,16 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
                AND negative_outcome_count > positive_outcome_count",
         )
         .bind(user_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await?;
+
         let stale = query(
             "DELETE FROM agent_lessons \
              WHERE user_id = ? AND updated_at < DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? DAY)",
         )
         .bind(user_id)
         .bind(i64::from(max_age_days))
-        .execute(&pool)
+        .execute(&mut *tx)
         .await?;
 
         // Row ceiling: keep at most MAX_LESSONS_PER_USER active rows per
@@ -450,9 +456,10 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         .bind(user_id)
         .bind(user_id)
         .bind(i64::from(MAX_LESSONS_PER_USER))
-        .execute(&pool)
+        .execute(&mut *tx)
         .await?;
 
+        tx.commit().await?;
         Ok(retired.rows_affected() + stale.rows_affected() + overflow.rows_affected())
     }
 
