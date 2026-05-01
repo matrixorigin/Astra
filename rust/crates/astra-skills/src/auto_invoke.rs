@@ -88,11 +88,11 @@ pub struct SessionSignals {
 // ── Thresholds & cooldowns (constants — intentionally not configurable yet) ─
 
 /// Minimum session stalls to fire `analyze_session`.
-pub const STALL_TRIGGER_COUNT: u32 = 3;
+pub const STALL_TRIGGER_COUNT: u32 = 5;
 /// Minimum budget pressure (`0.0..=1.0`) to fire `optimize_prompt`.
 pub const PRESSURE_TRIGGER_LEVEL: f64 = 0.85;
 /// Minimum user corrections in the window to fire `evaluate_session`.
-pub const CORRECTION_TRIGGER_COUNT: u32 = 3;
+pub const CORRECTION_TRIGGER_COUNT: u32 = 5;
 
 const STALL_COOLDOWN: Duration = Duration::from_secs(60);
 const PRESSURE_COOLDOWN: Duration = Duration::from_secs(120);
@@ -577,11 +577,11 @@ mod tests {
     fn stall_threshold_fires_analyze_session() {
         let mut gate = AutoInvokeGate::new();
         let now = Instant::now();
-        let out = gate.evaluate(&signals(3, 0.1, 0), now);
+        let out = gate.evaluate(&signals(5, 0.1, 0), now);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].skill, "analyze_session");
         assert_eq!(out[0].focus, "stalls");
-        assert_eq!(out[0].cause, AutoInvokeCause::SessionStalls { count: 3 });
+        assert_eq!(out[0].cause, AutoInvokeCause::SessionStalls { count: 5 });
     }
 
     #[test]
@@ -615,13 +615,13 @@ mod tests {
     fn correction_threshold_fires_evaluate_session() {
         let mut gate = AutoInvokeGate::new();
         let now = Instant::now();
-        let out = gate.evaluate(&signals(0, 0.1, 3), now);
+        let out = gate.evaluate(&signals(0, 0.1, 5), now);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].skill, "evaluate_session");
         assert_eq!(out[0].focus, "corrections");
         assert_eq!(
             out[0].cause,
-            AutoInvokeCause::RepeatedCorrections { count: 3 }
+            AutoInvokeCause::RepeatedCorrections { count: 5 }
         );
     }
 
@@ -629,7 +629,7 @@ mod tests {
     fn all_three_triggers_fire_in_one_evaluation() {
         let mut gate = AutoInvokeGate::new();
         let now = Instant::now();
-        let out = gate.evaluate(&signals(5, 0.95, 4), now);
+        let out = gate.evaluate(&signals(5, 0.95, 5), now);
         let names: Vec<&str> = out.iter().map(|r| r.skill).collect();
         assert_eq!(
             names,
@@ -641,19 +641,19 @@ mod tests {
     fn cooldown_prevents_refire_of_same_cause() {
         let mut gate = AutoInvokeGate::new();
         let t0 = Instant::now();
-        let first = gate.evaluate(&signals(3, 0.1, 0), t0);
+        let first = gate.evaluate(&signals(5, 0.1, 0), t0);
         assert_eq!(first.len(), 1);
 
         // Same moment, same cause — cooldown active.
-        let immediate = gate.evaluate(&signals(3, 0.1, 0), t0);
+        let immediate = gate.evaluate(&signals(5, 0.1, 0), t0);
         assert!(immediate.is_empty(), "must not refire inside cooldown");
 
         // Partway through cooldown — still blocked.
-        let mid = gate.evaluate(&signals(3, 0.1, 0), t0 + Duration::from_secs(59));
+        let mid = gate.evaluate(&signals(5, 0.1, 0), t0 + Duration::from_secs(59));
         assert!(mid.is_empty());
 
         // After cooldown — allowed again.
-        let later = gate.evaluate(&signals(3, 0.1, 0), t0 + STALL_COOLDOWN);
+        let later = gate.evaluate(&signals(5, 0.1, 0), t0 + STALL_COOLDOWN);
         assert_eq!(later.len(), 1);
     }
 
@@ -662,11 +662,11 @@ mod tests {
         // A stall fire must not silence pressure or correction causes.
         let mut gate = AutoInvokeGate::new();
         let t0 = Instant::now();
-        let first = gate.evaluate(&signals(3, 0.1, 0), t0);
+        let first = gate.evaluate(&signals(5, 0.1, 0), t0);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].skill, "analyze_session");
 
-        let second = gate.evaluate(&signals(3, 0.95, 3), t0);
+        let second = gate.evaluate(&signals(5, 0.95, 5), t0);
         // stalls are on cooldown (0s elapsed), but pressure & corrections are fresh
         let names: Vec<&str> = second.iter().map(|r| r.skill).collect();
         assert_eq!(names, vec!["optimize_prompt", "evaluate_session"]);
@@ -675,7 +675,7 @@ mod tests {
     #[test]
     fn cause_as_str_is_stable() {
         assert_eq!(
-            AutoInvokeCause::SessionStalls { count: 3 }.as_str(),
+            AutoInvokeCause::SessionStalls { count: 5 }.as_str(),
             "session_stalls"
         );
         assert_eq!(
@@ -683,7 +683,7 @@ mod tests {
             "budget_pressure"
         );
         assert_eq!(
-            AutoInvokeCause::RepeatedCorrections { count: 3 }.as_str(),
+            AutoInvokeCause::RepeatedCorrections { count: 5 }.as_str(),
             "repeated_corrections"
         );
     }
@@ -731,7 +731,7 @@ mod tests {
     #[test]
     fn diagnosis_truncate_preserves_utf8_boundaries() {
         // Multi-byte characters must not split: each '喵' is 3 bytes.
-        let cause = AutoInvokeCause::RepeatedCorrections { count: 3 };
+        let cause = AutoInvokeCause::RepeatedCorrections { count: 5 };
         let long: String = "喵".repeat(200);
         let diag = SkillDiagnosis::new("evaluate_session", &cause, long, [], None);
         // Must be valid UTF-8 (String roundtrip) and within char budget.
@@ -744,7 +744,7 @@ mod tests {
 
     #[test]
     fn diagnosis_render_prompt_block_has_stable_shape() {
-        let cause = AutoInvokeCause::SessionStalls { count: 3 };
+        let cause = AutoInvokeCause::SessionStalls { count: 5 };
         let diag = SkillDiagnosis::new(
             "analyze_session",
             &cause,

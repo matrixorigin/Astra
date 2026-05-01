@@ -985,7 +985,12 @@ async fn run_chat_turn(
     // turn's ToolExecutor seam. Best-effort: any failure at any step is
     // logged and swallowed so an auto-invoke problem can never break the
     // turn completion path.
-    maybe_run_auto_invoke(state).await;
+    // Skip auto-invoke on Ctrl+C — the user expects immediate return,
+    // and mutex acquisition + signal computation would add perceptible
+    // latency to the interrupt response path.
+    if !matches!(attempt, TurnAttempt::Interrupted) {
+        maybe_run_auto_invoke(state).await;
+    }
 
     attempt
 }
@@ -1030,8 +1035,11 @@ async fn maybe_run_auto_invoke(state: &mut ReplState) {
     }
 
     // Fast-path: no signals worth even locking the handler for.
+    // Also clear any stale diagnosis so it doesn't linger in the prompt
+    // for the rest of a healthy session.
     let default = astra_skills::auto_invoke::SessionSignals::default();
     if signals == default {
+        state.latest_skill_diagnosis = None;
         return;
     }
 
@@ -6222,6 +6230,8 @@ mod tests {
             g.record_stall_event();
             g.record_stall_event();
             g.record_stall_event();
+            g.record_stall_event();
+            g.record_stall_event();
         }
         state.observability_session = Some(session);
 
@@ -6251,6 +6261,8 @@ mod tests {
         ));
         {
             let mut g = session.write().unwrap();
+            g.record_stall_event();
+            g.record_stall_event();
             g.record_stall_event();
             g.record_stall_event();
             g.record_stall_event();
@@ -6287,6 +6299,8 @@ mod tests {
         ));
         {
             let mut g = session.write().unwrap();
+            g.record_stall_event();
+            g.record_stall_event();
             g.record_stall_event();
             g.record_stall_event();
             g.record_stall_event();

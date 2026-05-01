@@ -454,7 +454,7 @@ mod tests {
         ));
         let mut h = AutoInvokeHandler::new(exec.clone());
 
-        let out = h.maybe_fire(&signals(3, 0.1, 0), Instant::now()).await;
+        let out = h.maybe_fire(&signals(5, 0.1, 0), Instant::now()).await;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].skill, "analyze_session");
         assert_eq!(out[0].cause, "session_stalls");
@@ -466,7 +466,7 @@ mod tests {
         assert_eq!(calls[0].skill, "analyze_session");
         assert!(matches!(
             calls[0].cause,
-            AutoInvokeCause::SessionStalls { count: 3 }
+            AutoInvokeCause::SessionStalls { count: 5 }
         ));
     }
 
@@ -501,7 +501,7 @@ mod tests {
         );
         let mut h = AutoInvokeHandler::new(exec.clone());
 
-        let out = h.maybe_fire(&signals(5, 0.95, 4), Instant::now()).await;
+        let out = h.maybe_fire(&signals(5, 0.95, 5), Instant::now()).await;
         assert_eq!(out.len(), 3);
         let skills: Vec<&str> = out.iter().map(|d| d.skill.as_str()).collect();
         assert_eq!(
@@ -518,7 +518,7 @@ mod tests {
         let exec = Arc::new(StubExecutor::new().with("analyze_session", None));
         let mut h = AutoInvokeHandler::new(exec.clone());
 
-        let out = h.maybe_fire(&signals(3, 0.1, 0), Instant::now()).await;
+        let out = h.maybe_fire(&signals(5, 0.1, 0), Instant::now()).await;
         assert!(out.is_empty(), "None reply must be silently dropped");
         assert_eq!(
             exec.calls().len(),
@@ -537,7 +537,7 @@ mod tests {
         ));
         let mut h = AutoInvokeHandler::new(exec);
 
-        let out = h.maybe_fire(&signals(3, 0.1, 0), Instant::now()).await;
+        let out = h.maybe_fire(&signals(5, 0.1, 0), Instant::now()).await;
         assert!(out.is_empty());
     }
 
@@ -552,10 +552,10 @@ mod tests {
         let mut h = AutoInvokeHandler::new(exec.clone());
 
         let t0 = Instant::now();
-        let first = h.maybe_fire(&signals(3, 0.1, 0), t0).await;
+        let first = h.maybe_fire(&signals(5, 0.1, 0), t0).await;
         assert_eq!(first.len(), 1);
 
-        let second = h.maybe_fire(&signals(3, 0.1, 0), t0).await;
+        let second = h.maybe_fire(&signals(5, 0.1, 0), t0).await;
         assert!(second.is_empty(), "second fire inside cooldown must drop");
         assert_eq!(
             exec.calls().len(),
@@ -565,7 +565,7 @@ mod tests {
 
         // After cooldown elapses (60s for stalls), a new fire should go through.
         let third = h
-            .maybe_fire(&signals(3, 0.1, 0), t0 + Duration::from_secs(61))
+            .maybe_fire(&signals(5, 0.1, 0), t0 + Duration::from_secs(61))
             .await;
         assert_eq!(third.len(), 1);
         assert_eq!(exec.calls().len(), 2);
@@ -590,7 +590,7 @@ mod tests {
         );
         let mut h = AutoInvokeHandler::new(exec);
 
-        let out = h.maybe_fire(&signals(3, 0.95, 0), Instant::now()).await;
+        let out = h.maybe_fire(&signals(5, 0.95, 0), Instant::now()).await;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].skill, "optimize_prompt");
     }
@@ -721,8 +721,8 @@ mod tests {
         let mut handler = AutoInvokeHandler::new(exec);
 
         let mut signals = SessionSignals::default();
-        signals.session_stalls = 3;
-        signals.recent_corrections = 3;
+        signals.session_stalls = 5;
+        signals.recent_corrections = 5;
 
         let out = handler.maybe_fire(&signals, Instant::now()).await;
         let skills: std::collections::HashSet<&str> =
@@ -783,9 +783,11 @@ mod tests {
             DiagnosisSource::RealSkill,
         );
         let mut tracker = DiagnosisOutcomeTracker::new();
-        tracker.activate(diag, signals(3, 0.1, 0), 1);
-        assert!(tracker.evaluate_turn(&signals(4, 0.1, 0), 2).is_empty());
-        let outcomes = tracker.evaluate_turn(&signals(4, 0.1, 0), 3);
+        // Baseline: 5 stalls. Current: 6 stalls → delta 1 > 0, NOT ≤ 0 → not satisfied.
+        tracker.activate(diag, signals(5, 0.1, 0), 1);
+        assert!(tracker.evaluate_turn(&signals(6, 0.1, 0), 2).is_empty());
+        // After window (window_turns=2, elapsed=2) → Failed.
+        let outcomes = tracker.evaluate_turn(&signals(6, 0.1, 0), 3);
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].statuses, vec![DiagnosisCriterionStatus::Failed]);
     }
@@ -798,14 +800,14 @@ mod tests {
         // its own unit test above).
         use crate::observability_integration::ObservabilitySession;
         let mut obs = ObservabilitySession::new_simple("s-p7b-e2e");
-        obs.record_stall_event();
-        obs.record_stall_event();
-        obs.record_stall_event();
-        obs.user_corrections = vec![1, 2, 3];
+        for _ in 0..5 {
+            obs.record_stall_event();
+        }
+        obs.user_corrections = vec![1, 2, 3, 4, 5];
 
         let signals = compute_session_signals(Some(&obs));
-        assert!(signals.session_stalls >= 3);
-        assert!(signals.recent_corrections >= 3);
+        assert!(signals.session_stalls >= 5);
+        assert!(signals.recent_corrections >= 5);
 
         let exec = Arc::new(
             StubExecutor::new()
