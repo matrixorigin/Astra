@@ -76,6 +76,10 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) selector: &'a dyn ToolSelector,
     pub(crate) recent_tools: &'a [String],
     pub(crate) tool_health_entries: &'a [ToolHealthEntry],
+    /// P6 seam: cross-session lessons loaded once at session bootstrap.
+    /// Passed through to the ToolExecutor via `set_session_lessons` so
+    /// every SelfModel snapshot surfaces prior-session advice.
+    pub(crate) session_lessons: &'a [astra_runtime::self_model::LessonHint],
     /// Unified skill registry (single source of truth for all skill resolution).
     pub(crate) unified_skill_registry:
         &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
@@ -228,6 +232,7 @@ impl<'a> ChatTurnParams<'a> {
             selector: ctx.selector,
             recent_tools: &[],
             tool_health_entries: &[],
+            session_lessons: &[],
             unified_skill_registry: ctx.unified_skill_registry,
             plan_only_chat: false,
             is_plan_subtask: false,

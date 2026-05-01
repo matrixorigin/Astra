@@ -1237,6 +1237,7 @@ pub(super) async fn handle_info_command(
                 selector: &*selector.0,
                 recent_tools: &state.recent_tools,
                 tool_health_entries: &state.tool_health_entries,
+                session_lessons: &state.session_lessons,
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 plan_only_chat: false,
                 is_plan_subtask: false,

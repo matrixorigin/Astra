@@ -1748,6 +1748,7 @@ async fn plan_executor_task(
                     selector: &*selector,
                     recent_tools: &ctx.recent_tools,
                     tool_health_entries: &ctx.tool_health_entries,
+                    session_lessons: &[],
                     unified_skill_registry: &ctx.unified_skill_registry,
                     plan_only_chat: false,
                     is_plan_subtask: true,

@@ -275,6 +275,12 @@ pub(crate) struct ReplState {
     /// Original user query at session start (for drift baseline comparison).
     pub drift_original_query: Option<String>,
 
+    /// Cross-session lessons loaded once at first-turn bootstrap. Empty
+    /// until a turn runs with `matrix_runtime` + `ingestion_user_id` set.
+    /// Passed through to every turn's ToolExecutor so the LLM sees prior
+    /// session's advice on every SelfModel snapshot.
+    pub session_lessons: Vec<astra_runtime::self_model::LessonHint>,
+
     // ── Observability (M1-M6) ──
     /// Global observability hub for M1-M6 integration (profiles, experiments, auto-tuning).
     /// Created at REPL startup, shared across sessions.
@@ -433,6 +439,7 @@ impl Default for ReplState {
             drift_compressed_turns: Vec::new(),
             drift_user_corrections: Vec::new(),
             drift_original_query: None,
+            session_lessons: Vec::new(),
             // Observability: hub is created at REPL startup, session on first turn
             observability_hub: None,
             observability_session: None,

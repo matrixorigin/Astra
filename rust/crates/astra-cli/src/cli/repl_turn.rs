@@ -535,6 +535,15 @@ fn contains_any_token(haystack: &str, tokens: &[&str]) -> bool {
     tokens.iter().any(|token| haystack.contains(token))
 }
 
+/// First-turn gate for cross-session lesson loading (P6). Returns true when
+/// the cache is empty AND the session has a populated lesson source. Kept
+/// pure so a unit test can pin the trigger condition.
+fn should_bootstrap_lessons(state: &ReplState) -> bool {
+    state.session_lessons.is_empty()
+        && state.matrix_runtime.is_some()
+        && state.ingestion_user_id.is_some()
+}
+
 fn is_low_information_followup(line: &str) -> bool {
     if is_short_continuation_prompt(line) {
         return true;
@@ -834,6 +843,38 @@ async fn run_chat_turn(
         state.drift_original_query = Some(message.to_string());
     }
 
+    // ─── P6: bootstrap cross-session lessons on first turn ──────────────────
+    // Best-effort one-time fetch. Later turns no-op because the cache is
+    // populated. Guarded on matrix_runtime + ingestion_user_id so offline
+    // / unauthenticated sessions silently skip.
+    if should_bootstrap_lessons(state)
+        && let Some(ref mc) = state.matrix_runtime
+        && let Some(ref user_id) = state.ingestion_user_id
+    {
+        let svc = mc.agent_lessons_service();
+        match svc
+            .load_recent(
+                user_id,
+                "generic",
+                None,
+                astra_runtime::lesson_bootstrap::DEFAULT_SESSION_BOOTSTRAP_LIMIT,
+            )
+            .await
+        {
+            Ok(rows) => {
+                state.session_lessons = rows
+                    .iter()
+                    .map(astra_runtime::self_model::LessonHint::from_lesson)
+                    .collect();
+            }
+            Err(e) => tracing::warn!(
+                target: "repl_turn",
+                error = %e,
+                "agent_lessons::load_recent failed; starting without carried-over lessons",
+            ),
+        }
+    }
+
     // ─── Drift Tracking: Detect user corrections ────────────────────────────
     // If this message looks like a correction, record the current turn index.
     if detect_correction_signal(message) {
@@ -873,6 +914,7 @@ async fn run_chat_turn(
             selector: ctx.selector,
             recent_tools: &state.recent_tools,
             tool_health_entries: &state.tool_health_entries,
+            session_lessons: &state.session_lessons,
             unified_skill_registry: &state.unified_skill_registry,
             plan_only_chat: state.chat_plan_only && state.current_plan_subtask_id.is_none(),
             is_plan_subtask: state.current_plan_subtask_id.is_some(),
@@ -5977,6 +6019,59 @@ mod tests {
             result.interruption,
             Some(serde_json::json!({"kind": "budget_exhausted"})),
             "no-checkpoint path must preserve interruption from prev_state"
+        );
+    }
+
+    // ─── P6: should_bootstrap_lessons gate ──────────────────────────────────
+
+    #[test]
+    fn should_bootstrap_lessons_requires_matrix_and_user_id() {
+        // Fresh state → no matrix + no user → no bootstrap.
+        let state = ReplState::default();
+        assert!(
+            !should_bootstrap_lessons(&state),
+            "default state has no matrix/user; bootstrap must skip"
+        );
+    }
+
+    #[test]
+    fn should_bootstrap_lessons_skips_when_already_cached() {
+        // Simulate a successful prior bootstrap by populating the cache.
+        // We don't actually need a live matrix_runtime for this assertion —
+        // the gate checks session_lessons first.
+        let mut state = ReplState::default();
+        state.session_lessons = vec![astra_runtime::self_model::LessonHint {
+            kind: "tool_deprioritize".into(),
+            trigger_signal: "t".into(),
+            action: "a".into(),
+            workload_tag: None,
+        }];
+        state.ingestion_user_id = Some("u1".into());
+        // matrix_runtime still None, but cache non-empty should be enough.
+        assert!(
+            !should_bootstrap_lessons(&state),
+            "non-empty cache must skip re-bootstrap"
+        );
+    }
+
+    #[test]
+    fn should_bootstrap_lessons_skips_when_user_id_missing() {
+        let mut state = ReplState::default();
+        state.ingestion_user_id = None;
+        assert!(
+            !should_bootstrap_lessons(&state),
+            "no user_id → no attribution → skip"
+        );
+    }
+
+    #[test]
+    fn should_bootstrap_lessons_skips_when_matrix_runtime_missing() {
+        let mut state = ReplState::default();
+        state.ingestion_user_id = Some("u1".into());
+        // matrix_runtime stays None.
+        assert!(
+            !should_bootstrap_lessons(&state),
+            "no matrix_runtime → no DAO → skip"
         );
     }
 }
