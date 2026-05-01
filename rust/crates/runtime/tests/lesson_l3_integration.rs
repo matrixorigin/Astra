@@ -235,7 +235,48 @@ fn full_loop_lessons_are_prompt_ready() {
     }
 }
 
-// ── 6. Lifecycle: session-end lessons vs mid-session observations ──────
+// ── 6. Compact/detail content model ────────────────────────────────────
+
+#[test]
+fn compact_field_generated_for_long_actions() {
+    let hint = astra_services::LessonHint::from_lesson(&astra_services::Lesson {
+        id: "id".into(),
+        user_id: "u".into(),
+        persona: "p".into(),
+        workload_tag: None,
+        kind: LessonKind::ToolDeprioritize,
+        trigger_signal: "tool_failures:grep".into(),
+        action: "Use rg --glob '!node_modules' instead of grep -r. This repo has 280k files and grep times out on node_modules traversal every time.".into(),
+        confidence: 0.6,
+        hit_count: 0,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    });
+    assert!(hint.compact.is_some(), "long action should have compact");
+    let compact = hint.compact.unwrap();
+    assert!(compact.len() < hint.action.len(), "compact must be shorter");
+    assert!(compact.contains("rg"), "compact must contain key info");
+}
+
+#[test]
+fn short_action_has_no_compact() {
+    let hint = astra_services::LessonHint::from_lesson(&astra_services::Lesson {
+        id: "id".into(),
+        user_id: "u".into(),
+        persona: "p".into(),
+        workload_tag: None,
+        kind: LessonKind::PromptShape,
+        trigger_signal: "stall_events".into(),
+        action: "restate scope before tool calls".into(),
+        confidence: 0.6,
+        hit_count: 0,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    });
+    assert!(hint.compact.is_none(), "short action needs no compact");
+}
+
+// ── 7. Lifecycle: session-end lessons vs mid-session observations ──────
 
 #[test]
 fn session_end_lessons_are_semantic_t3_mid_session_would_be_working_t4() {
