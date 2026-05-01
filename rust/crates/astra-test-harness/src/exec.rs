@@ -614,4 +614,96 @@ mod tests {
         assert_eq!(out2.exit_code, -1);
         assert!(out2.text.contains("fake"));
     }
+
+    // ── ExternalCmdExecutor tests ──
+
+    fn simple_case() -> Case {
+        Case {
+            name: "ext".into(),
+            description: None,
+            prompt: "test prompt".into(),
+            models: Some(vec!["m".into()]),
+            criteria: vec![],
+            debug_log: false,
+            extra_cli_args: vec![],
+            timeout_seconds: 60,
+            capability: None,
+            difficulty: None,
+            weight: 1.0,
+            steps: vec![],
+            setup_cmd: None,
+            teardown_cmd: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn external_executor_happy_path() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let script = r#"cat <<'REPLY'
+{"text":"external-hello","exit_code":0,"session_id":"s1","tool_calls_count":2,"tools_used":["Read","Write"],"completion_tokens":10,"prompt_tokens":20}
+REPLY"#;
+        let exec = ExternalCmdExecutor::new(script, 10);
+        let out = exec.execute(&simple_case(), "m").await;
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(out.text, "external-hello");
+        assert_eq!(out.tools_used, vec!["Read", "Write"]);
+        assert!(out.duration_ms < 5000);
+    }
+
+    #[tokio::test]
+    async fn external_executor_receives_protocol_version_and_case_metadata() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        // Read stdin, verify it contains expected fields, return a
+        // signal via the text field.
+        let script = r#"
+INPUT=$(cat)
+OK="yes"
+echo "$INPUT" | grep -q '"protocol_version":"1.1"' || OK="no_protocol"
+echo "$INPUT" | grep -q '"model":"test-model"' || OK="no_model"
+echo "$INPUT" | grep -q '"case"' || OK="no_case"
+echo "{\"text\":\"$OK\"}"
+"#;
+        let exec = ExternalCmdExecutor::new(script, 10);
+        let out = exec.execute(&simple_case(), "test-model").await;
+        assert_eq!(
+            out.text, "yes",
+            "external executor must receive protocol_version, model, and case: got {:?}",
+            out.text
+        );
+    }
+
+    #[tokio::test]
+    async fn external_executor_empty_cmd_returns_error() {
+        let exec = ExternalCmdExecutor::new("  ", 10);
+        let out = exec.execute(&simple_case(), "m").await;
+        assert_eq!(out.exit_code, -1);
+        assert!(out.text.contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn external_executor_timeout_returns_124() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let exec = ExternalCmdExecutor::new("sleep 30", 1);
+        let start = std::time::Instant::now();
+        let out = exec.execute(&simple_case(), "m").await;
+        assert_eq!(out.exit_code, 124);
+        assert!(out.text.contains("timed out"));
+        assert!(start.elapsed().as_secs() <= 3);
+    }
+
+    #[tokio::test]
+    async fn external_executor_nonzero_exit() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let exec = ExternalCmdExecutor::new("echo '{}'; exit 42", 10);
+        let out = exec.execute(&simple_case(), "m").await;
+        assert_eq!(out.exit_code, 42);
+    }
 }

@@ -1172,4 +1172,118 @@ mod tests {
             &["claude-sonnet-4-6".into()],
         ));
     }
+
+    // ── ExternalCmdJudger tests ──
+
+    #[tokio::test]
+    async fn external_judger_happy_path() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let script = r#"echo '{"score": 0.85, "rationale": "looks good"}'"#;
+        let j = ExternalCmdJudger::new(script, 10);
+        let s = j
+            .score("is it good?", None, &dummy_outcome())
+            .await
+            .unwrap();
+        assert!((s.score - 0.85).abs() < 1e-9);
+        assert_eq!(s.rationale, "looks good");
+        assert_eq!(s.votes, vec![0.85]);
+    }
+
+    #[tokio::test]
+    async fn external_judger_clamps_out_of_range_score() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let script = r#"echo '{"score": 1.5, "rationale": "overconfident"}'"#;
+        let j = ExternalCmdJudger::new(script, 10);
+        let s = j.score("q", None, &dummy_outcome()).await.unwrap();
+        assert!((s.score - 1.0).abs() < 1e-9, "score must be clamped to 1.0");
+    }
+
+    #[tokio::test]
+    async fn external_judger_empty_cmd() {
+        let j = ExternalCmdJudger::new("", 10);
+        let err = j
+            .score("q", None, &dummy_outcome())
+            .await
+            .expect_err("empty cmd must fail");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn external_judger_nonzero_exit_is_error() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let script = r#"echo 'provider crashed' >&2; exit 1"#;
+        let j = ExternalCmdJudger::new(script, 10);
+        let err = j
+            .score("q", None, &dummy_outcome())
+            .await
+            .expect_err("non-zero exit must fail");
+        assert!(err.contains("provider crashed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn external_judger_invalid_json_is_error() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let script = r#"echo 'not json at all'"#;
+        let j = ExternalCmdJudger::new(script, 10);
+        let err = j
+            .score("q", None, &dummy_outcome())
+            .await
+            .expect_err("garbage stdout must fail");
+        assert!(err.contains("not valid JSON"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn external_judger_missing_score_field_is_error() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let script = r#"echo '{"rationale": "no score field"}'"#;
+        let j = ExternalCmdJudger::new(script, 10);
+        let err = j
+            .score("q", None, &dummy_outcome())
+            .await
+            .expect_err("missing score field must fail");
+        assert!(err.contains("score"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn external_judger_timeout() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let j = ExternalCmdJudger::new("sleep 30", 1);
+        let err = j
+            .score("q", None, &dummy_outcome())
+            .await
+            .expect_err("timeout must fail");
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn external_judger_receives_protocol_version() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        // Read stdin, check for protocol_version, output a valid score.
+        let script = r#"
+INPUT=$(cat)
+if echo "$INPUT" | grep -q '"protocol_version":"1.1"'; then
+  echo '{"score": 1.0, "rationale": "protocol ok"}'
+else
+  echo '{"score": 0.0, "rationale": "no protocol_version"}' >&2
+  exit 1
+fi
+"#;
+        let j = ExternalCmdJudger::new(script, 10);
+        let s = j.score("q", None, &dummy_outcome()).await.unwrap();
+        assert!((s.score - 1.0).abs() < 1e-9);
+    }
 }
