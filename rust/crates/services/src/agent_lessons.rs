@@ -650,7 +650,7 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
                 .await?;
             }
         } else {
-            query(
+            let insert_result = query(
                 "INSERT INTO agent_lesson_exposures \
                      (id, lesson_id, session_id, user_id, persona, workload_tag, adopted) \
                  VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -663,7 +663,17 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
             .bind(&exposure.workload_tag)
             .bind(exposure.adopted as i8)
             .execute(&pool)
-            .await?;
+            .await;
+            if let Err(e) = insert_result {
+                if e.as_database_error()
+                    .is_some_and(|db| db.message().contains("Duplicate entry"))
+                {
+                    // TOCTOU race — row was inserted between SELECT and INSERT.
+                    // Silently succeed: exposure already recorded.
+                } else {
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }
