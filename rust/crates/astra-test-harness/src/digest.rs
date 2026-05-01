@@ -53,11 +53,19 @@ impl AstraCliDigestCollector {
     pub fn new(astra_bin: impl Into<PathBuf>) -> Self {
         Self {
             astra_bin: astra_bin.into(),
-            // 15s is generous — digest is offline JSON aggregation of
-            // a local file. If it blows this, something is very wrong
-            // and we don't want to block the whole suite's wrap-up.
+            // 15s default is generous — digest is offline JSON
+            // aggregation of a local file. CI cold-start can burn
+            // this when tokio's cargo-warmed target/debug isn't
+            // cached; use `with_timeout` there.
             timeout_seconds: 15,
         }
+    }
+
+    /// Override the digest subprocess timeout. Useful on cold CI
+    /// hosts where 15s is tight, or in tests that want a fast-fail.
+    pub fn with_timeout(mut self, secs: u64) -> Self {
+        self.timeout_seconds = secs;
+        self
     }
 }
 
@@ -173,6 +181,47 @@ mod tests {
         assert!(res.is_err());
         let err = res.unwrap_err();
         assert!(err.starts_with("spawn digest"), "unexpected err: {err}");
+    }
+
+    #[test]
+    fn with_timeout_overrides_default() {
+        let c = AstraCliDigestCollector::new("/nonexistent/astra").with_timeout(42);
+        assert_eq!(c.timeout_seconds, 42);
+    }
+
+    #[tokio::test]
+    async fn with_timeout_honored_when_subprocess_hangs() {
+        // Need a bash shim that hangs so we can prove the override
+        // actually caps elapsed time. Skipped on platforms without
+        // /bin/sh.
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shim = tmp.path().join("fake-astra");
+        // `astra journal digest …` args are swallowed; the shim just
+        // sleeps indefinitely.
+        std::fs::write(&shim, "#!/bin/sh\nsleep 30\n").expect("write shim");
+        let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&shim, perms).unwrap();
+
+        let collector = AstraCliDigestCollector::new(shim).with_timeout(1);
+        let start = std::time::Instant::now();
+        let res = collector.collect("sess-hangs").await;
+        let elapsed = start.elapsed();
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err().contains("digest timeout after 1s"),
+            "error must name the configured timeout"
+        );
+        // 3s slack for CI noise; the point is the 1s override worked.
+        assert!(
+            elapsed.as_secs() <= 3,
+            "with_timeout(1) didn't cap elapsed — ran {}s",
+            elapsed.as_secs()
+        );
     }
 
     #[tokio::test]

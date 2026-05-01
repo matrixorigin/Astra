@@ -96,6 +96,35 @@ struct Args {
     /// the digest subprocess is slow or the digest binary is missing.
     #[arg(long)]
     no_digest_on_fail: bool,
+
+    /// Timeout (seconds) for the `astra journal digest` subprocess
+    /// the harness spawns on FAIL. Default 15s is fine on warmed-up
+    /// dev machines; cold CI containers running debug builds may
+    /// need 30-60.
+    #[arg(long, default_value_t = 15)]
+    digest_timeout: u64,
+}
+
+/// Unix: scan `$PATH` for an executable file with the given name.
+/// Windows callers would need to also try common extensions (`.exe`,
+/// `.bat`) — astra is Unix-only today so we don't.
+///
+/// Inlined to avoid pulling the `which` crate in for one callsite;
+/// this is the entirety of what we'd use there.
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    // `OS_PATH_SEPARATOR` would be `;` on Windows — mirror that if
+    // anyone ports the harness; on Unix it's `:`.
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Resolve the astra binary path. See the `--astra-bin` doc comment
@@ -123,7 +152,7 @@ fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
             return Ok(p);
         }
     }
-    if let Ok(found) = which::which("astra") {
+    if let Some(found) = find_on_path("astra") {
         eprintln!("[astra-test] using astra bin from PATH: {}", found.display());
         return Ok(found);
     }
@@ -219,7 +248,8 @@ async fn main() -> Result<()> {
     // Digest collector: always construct, conditionally wire. Keeping
     // the value out of scope when disabled lets the SuiteRunner see
     // `None` and skip the subprocess per-FAIL.
-    let digest = AstraCliDigestCollector::new(astra_bin.clone());
+    let digest =
+        AstraCliDigestCollector::new(astra_bin.clone()).with_timeout(args.digest_timeout);
     let digest_collector: Option<&dyn astra_test_harness::digest::DigestCollector> =
         if args.no_digest_on_fail { None } else { Some(&digest) };
 

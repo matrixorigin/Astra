@@ -77,13 +77,21 @@ impl CaseExecutor for AstraCliExecutor {
 }
 
 fn shell_escape(s: String) -> String {
-    // Simple single-quote escape: good enough for reproducer hints,
-    // not a security boundary (the prompt is user-authored YAML).
-    if s.contains('\'') || s.contains('\n') {
-        format!("\"{}\"", s.replace('"', "\\\""))
-    } else {
-        format!("'{s}'")
-    }
+    // POSIX single-quote escape: wrap in `'…'` and replace any inner
+    // `'` with `'\''` (close, escaped-quote, re-open). This produces
+    // a string that a POSIX shell ingests byte-for-byte — every other
+    // character is literal inside single quotes, including `"`, `$`,
+    // backticks, newlines. Our earlier "fall back to double quotes
+    // when the string has `'`" approach lost fidelity on mixed-quote
+    // prompts because inside `"…"` the shell still expands `$(…)`
+    // and backticks.
+    //
+    // Not a security boundary — cases are developer-authored YAML —
+    // but the reproducer promises "paste this into a shell to re-run"
+    // and it should actually work.
+    let empty = s.is_empty();
+    let escaped = s.replace('\'', "'\\''");
+    if empty { "''".to_string() } else { format!("'{escaped}'") }
 }
 
 async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> RunOutcome {
@@ -277,8 +285,46 @@ mod tests {
         assert!(repro.contains("--model"));
         assert!(repro.contains("qwen-flash"));
         assert!(repro.contains("--debug-log-tools"));
-        // The prompt has a single quote, so we fall back to double quotes.
-        assert!(repro.contains("\"say 'hello'\""));
+        // POSIX single-quote escape: `'say '\''hello'\'''` preserves
+        // the original bytes without relying on double-quote semantics
+        // (which would still expand $ and backticks). A prompt with
+        // apostrophes round-trips exactly.
+        assert!(
+            repro.contains(r"'say '\''hello'\'''"),
+            "POSIX single-quote escape expected: {repro}"
+        );
+    }
+
+    #[test]
+    fn shell_escape_mixed_quotes_and_metachars() {
+        // Prompt with single-quote, double-quote, dollar, backtick,
+        // newline. All five previously risked being either unescaped
+        // or getting expanded inside the old double-quote fallback.
+        let input = "mix 'a' \"b\" $(echo c) `d`\ne".to_string();
+        let got = shell_escape(input);
+        // Must open + close with a single quote (the posix wrapping
+        // idiom) so the shell reads everything else as literal.
+        assert!(got.starts_with('\''), "must start with single quote: {got}");
+        assert!(got.ends_with('\''), "must end with single quote: {got}");
+        // The two inner apostrophes are each turned into `'\''`.
+        assert!(got.contains(r"'\''"), "inner quotes must be POSIX-escaped: {got}");
+        // `$` and backticks must be present LITERALLY (no expansion)
+        // because single-quoted strings don't expand.
+        assert!(got.contains("$(echo c)"));
+        assert!(got.contains("`d`"));
+        assert!(got.contains('\n'));
+    }
+
+    #[test]
+    fn shell_escape_empty_string_is_valid_empty_quoted_literal() {
+        // Otherwise a `''` argument collapses into "nothing" on a
+        // shell line.
+        assert_eq!(shell_escape(String::new()), "''");
+    }
+
+    #[test]
+    fn shell_escape_simple_string_does_not_add_backslashes() {
+        assert_eq!(shell_escape("simple".to_string()), "'simple'");
     }
 
     // Regression: case timeout MUST kill the child process AND

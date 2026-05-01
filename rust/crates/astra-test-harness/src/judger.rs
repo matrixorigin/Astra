@@ -475,22 +475,39 @@ fn aggregate_scores(scores: &[f64], agg: QuorumAgg) -> f64 {
 /// warning than fabricate a mismatch.
 ///
 /// Returns `None` for unknown models; callers treat that as "can't tell".
+///
+/// # Adding a provider
+///
+/// Extend `FAMILY_TABLE` below. Entries are matched in order; if two
+/// substrings would collide (`opus` matching both an Anthropic model
+/// and a hypothetical `opus-mini` from another vendor), put the
+/// longer/more-specific needle first.
+///
+/// When the table hits ~20 entries or starts needing per-model
+/// metadata (context window, provider-route hints), lift it into a
+/// YAML/config file alongside the case suite. Keeping it in source
+/// now for two reasons: (1) tests have zero setup; (2) the denylist
+/// of rogue substring matches is visible in code review. Moving this
+/// to YAML before it needs that surface would add config-loading
+/// overhead without buying anything.
+const FAMILY_TABLE: &[(&str, &str)] = &[
+    ("claude", "anthropic"),
+    ("sonnet", "anthropic"),
+    ("opus", "anthropic"),
+    ("haiku", "anthropic"),
+    ("gpt", "openai"),
+    ("o1", "openai"),
+    ("o3", "openai"),
+    ("qwen", "alibaba"),
+    ("minimax", "minimax"),
+    ("deepseek", "deepseek"),
+    ("glm", "zhipu"),
+    ("gemini", "google"),
+];
+
 pub fn model_family(name: &str) -> Option<&'static str> {
     let n = name.to_ascii_lowercase();
-    for (needle, family) in &[
-        ("claude", "anthropic"),
-        ("sonnet", "anthropic"),
-        ("opus", "anthropic"),
-        ("haiku", "anthropic"),
-        ("gpt", "openai"),
-        ("o1", "openai"),
-        ("o3", "openai"),
-        ("qwen", "alibaba"),
-        ("minimax", "minimax"),
-        ("deepseek", "deepseek"),
-        ("glm", "zhipu"),
-        ("gemini", "google"),
-    ] {
+    for (needle, family) in FAMILY_TABLE {
         if n.contains(needle) {
             return Some(family);
         }

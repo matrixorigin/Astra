@@ -134,9 +134,15 @@ impl Case {
     }
 
     /// Load every `*.yaml` / `*.yml` in a directory. Non-YAML files
-    /// are skipped. Order is filesystem-order (stable on most FS).
+    /// are skipped. Result is sorted by case `name` for deterministic
+    /// suite-report ordering across filesystems and developer
+    /// machines — previously `read_dir` order was OS-dependent and
+    /// two developers could see different report orderings for the
+    /// same suite.
     pub fn load_dir(dir: &Path) -> Result<Vec<Case>, anyhow::Error> {
-        let mut out = Vec::new();
+        // Collect + sort the file paths first, so a parse error on a
+        // later file deterministically reports the same neighbour.
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
         for entry in std::fs::read_dir(dir)
             .map_err(|e| anyhow::anyhow!("read_dir {}: {e}", dir.display()))?
         {
@@ -149,8 +155,20 @@ impl Case {
             if ext != "yaml" && ext != "yml" {
                 continue;
             }
+            paths.push(path);
+        }
+        paths.sort();
+
+        let mut out: Vec<Case> = Vec::with_capacity(paths.len());
+        for path in paths {
             out.push(Case::from_path(&path)?);
         }
+        // Stable secondary sort by case name — the `paths.sort()`
+        // above is path-lexicographic, but a case file renamed without
+        // bumping the `name:` field would still place differently. Sort
+        // by the in-case name so the report order matches what a user
+        // sees at the top of each YAML.
+        out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
     }
 }
@@ -185,6 +203,24 @@ mod tests {
         std::fs::write(dir.path().join("readme.md"), "# notes\n").unwrap();
         let cases = Case::load_dir(dir.path()).unwrap();
         assert_eq!(cases.len(), 2);
+    }
+
+    #[test]
+    fn load_dir_returns_cases_sorted_by_name_for_reproducible_reports() {
+        // Filenames intentionally NOT in alphabetical name order so
+        // the sort has to do real work; case names also differ from
+        // filenames to exercise the secondary by-name sort.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("zzz.yaml"), "name: alpha\nprompt: p\n").unwrap();
+        std::fs::write(dir.path().join("aaa.yaml"), "name: charlie\nprompt: p\n").unwrap();
+        std::fs::write(dir.path().join("mmm.yaml"), "name: bravo\nprompt: p\n").unwrap();
+        let cases = Case::load_dir(dir.path()).unwrap();
+        let names: Vec<&str> = cases.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["alpha", "bravo", "charlie"],
+            "load_dir must sort by case name, not by filename; got {names:?}"
+        );
     }
 
     #[test]
