@@ -1,0 +1,32 @@
+name: fork_prefix_spawn_inherits
+description: |
+  Regression: spawn_agent with inherit_prefix exercises the fork-prefix
+  pipeline's capture-resolve-probe cycle. The parent captures its prefix
+  on turn_completed, the child resolves it via InMemoryPrefixStore.
+
+  This verifies the CLI-exercisable path for fork-prefix inheritance
+  (spawn_agent), not the server-side DelegationEngine (delegate tool).
+prompt: |
+  Use the spawn_agent tool to create a child agent. Enable prefix
+  inheritance by passing inherit_prefix. Give the child agent the ID
+  "child-delegate-G2" and ask it to reply with exactly "delegate-G2-ok".
+
+  Once the child replies, surface its exact reply in your final answer.
+  Do not use any other tools.
+debug_log: true
+timeout_seconds: 300
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: spawn_agent
+  - type: tools_count_between
+    min: 1
+    max: 6
+  - type: judger
+    question: |
+      Did the child agent reply with "delegate-G2-ok" (or close to it)?
+      Score 1.0 if the child's reply appeared in the final answer.
+      Score 0.4 if the spawn succeeded but the reply was garbled.
+      Score 0.0 if no spawn happened or the agent fabricated a result.
+    threshold: 0.7

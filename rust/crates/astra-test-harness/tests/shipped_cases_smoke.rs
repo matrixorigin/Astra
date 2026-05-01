@@ -117,24 +117,25 @@ fn fork_prefix_hit_e2e_tool_count_allows_model_retry() {
         astra_test_harness::criteria::Criterion::ToolsCountBetween { max, .. } => Some(*max),
         _ => None,
     });
+    let max = max
+        .expect("fork_prefix_hit_end_to_end is missing a tools_count_between criterion entirely");
     assert!(
-        max.unwrap_or(0) >= 6,
-        "fork_prefix_hit_end_to_end tools_count max={} is too strict; \
+        max >= 6,
+        "fork_prefix_hit_end_to_end tools_count max={max} is too strict; \
          models may retry spawn_agent. Needs >= 6.",
-        max.unwrap_or(0)
     );
 }
 
 #[test]
-fn fork_prefix_delegate_inherits_uses_spawn_agent_not_delegate() {
-    let case = Case::from_path(&shipped_cases_dir().join("fork_prefix_delegate_inherits.yaml"))
+fn fork_prefix_spawn_inherits_uses_spawn_agent_not_delegate() {
+    let case = Case::from_path(&shipped_cases_dir().join("fork_prefix_spawn_inherits.yaml"))
         .expect("load case");
     let requires_delegate = case.criteria.iter().any(|c| {
         matches!(c, astra_test_harness::criteria::Criterion::ToolCalled { name } if name == "delegate")
     });
     assert!(
         !requires_delegate,
-        "fork_prefix_delegate_inherits must not require tool_called: delegate. \
+        "fork_prefix_spawn_inherits must not require tool_called: delegate. \
          The delegate tool is not available in `astra chat` — it only exists \
          in the server-side DelegationEngine. Use spawn_agent instead."
     );
