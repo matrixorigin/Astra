@@ -17,7 +17,13 @@ use crate::runner::RunOutcome;
 use crate::session_capture::SessionCapture;
 
 /// One (case, model) pair's full result.
+///
+/// Serialized into `--format json` reports, so this struct is a
+/// de-facto public wire format. `#[non_exhaustive]` lets us add
+/// fields (new diagnostic hints, new counter buckets) without a
+/// SemVer break. External consumers must use `..` when matching.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CaseRunReport {
     pub case_name: String,
     pub model: String,

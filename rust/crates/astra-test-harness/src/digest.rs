@@ -30,6 +30,7 @@ use tokio::process::Command;
 /// stored as raw JSON for downstream consumption. Stored as `Value`
 /// so report formats can expose it without reshaping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DigestArtifact {
     pub session_id: String,
     pub json: serde_json::Value,

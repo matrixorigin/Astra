@@ -30,33 +30,29 @@ criteria:
     code: 0
   - type: tool_called
     name: spawn_agent
-  # Note: ThinkingBudgetConflict short-circuits the resolver via
-  # `PrefixResolveOutcome::Failed` rather than emitting a
-  # `[fork-cache]` event. So if the clamp triggers, no fork-cache
-  # line appears at all; if the clamp did NOT matter (provider
-  # happened to round the same way) we get a `hit`. Both are fine.
-  # Deterministic check: if a fork-cache event DID appear, outcome
-  # must be `hit` (a `miss` / `partial_drift` with a clamp-triggered
-  # divergence would mean the resolver missed the validation). This
-  # is "optional" semantics because we don't know a priori which
-  # branch the runtime will take.
-  - type: fork_cache_outcome
-    # If any event appears at all it must be a hit. If none appears
-    # (resolver rejected), the fork_cache_outcome check FAILs and we
-    # fall back to the judger below for evidence of soft-fallback.
-    expect: [hit]
-    # The criterion doesn't have an `optional` field yet; a future
-    # case-level `allow_fail` gate could cover this. For now rely on
-    # the judger when the resolver rejects.
+  # Note: ThinkingBudgetConflict takes a non-deterministic path. If the
+  # clamp actually triggers the resolver short-circuits via
+  # `PrefixResolveOutcome::Failed` and NO `[fork-cache]` event is
+  # emitted. If the provider happens to round the same way the clamp
+  # is moot and we see a `hit`. We can't pin either branch at
+  # case-load time, so no `fork_cache_outcome` criterion here —
+  # that would FAIL the clamp-triggered branch exactly when the
+  # resolver did the right thing. The judger below discriminates
+  # both branches by reading stderr + the agent's transcript.
   - type: judger
     question: |
-      Either (a) the fork_cache_outcome criterion above already
-      passed with a hit (clamp didn't matter), OR (b) no [fork-cache]
-      event appeared because the resolver caught the
-      ThinkingBudgetConflict and the child ran without inheritance.
-      For case (b), evidence of correct behavior is a spawn_agent
-      tool error surfaced in the agent's transcript and a final text
-      that either reports the child's reply (spawn retried without
-      inheritance) OR transparently acknowledges the fallback. Do
-      NOT reward a silent success claim.
+      The child's max_output_tokens is set to 256, which SHOULD force
+      a ThinkingBudgetConflict when the parent was running with a
+      larger thinking budget. Either:
+        (a) the stderr data fence contains a [fork-cache] event with
+            outcome=hit — meaning the clamp happened not to diverge
+            the cache key; the spawn succeeded with inheritance.
+        (b) NO [fork-cache] line appears; the resolver caught the
+            ThinkingBudgetConflict, the spawn_agent tool returned a
+            prefix-inheritance error, and the final text either
+            reports the child's reply (caller retried without
+            inheritance) OR transparently acknowledges the fallback.
+      Score 1.0 for either (a) or (b). Score 0.3 if the picture is
+      ambiguous. Score 0.0 if the agent fabricated a success claim
+      without evidence in the tool calls.
     threshold: 0.7

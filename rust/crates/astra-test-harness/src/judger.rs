@@ -37,6 +37,7 @@ use crate::runner::RunOutcome;
 /// vote values so a reviewer sees variance without digging into
 /// `full_rationale`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct JudgerScore {
     pub score: f64,
     pub rationale: String,
@@ -305,7 +306,23 @@ async fn run_judger_call(
         .map_err(|e| format!("judger wait: {e}"))?;
 
     let stdout_body = String::from_utf8_lossy(&output.stdout).to_string();
-    parse_score_from_response(&stdout_body)
+    let stderr_body = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.code();
+    parse_score_from_response(&stdout_body).map_err(|parse_err| {
+        // Carry the subprocess's stderr + exit code into the error
+        // the reviewer sees. Without this, "model refused" and
+        // "CLI crashed before producing output" both look like
+        // `no SCORE: line in judger response` — undiagnosable.
+        // Trim head+tail of stderr to keep the line bounded.
+        let stderr_preview = truncate_for_judger(stderr_body.trim(), 1_500);
+        if stderr_preview.is_empty() {
+            format!("{parse_err} (exit_code={exit_code:?}, stderr empty)")
+        } else {
+            format!(
+                "{parse_err} (exit_code={exit_code:?}; subprocess stderr:\n{stderr_preview})"
+            )
+        }
+    })
 }
 
 /// Extract `SCORE: <f>` from a judger response. We parse the
@@ -332,7 +349,17 @@ pub(crate) fn parse_score_from_response(stdout_body: &str) -> Result<JudgerScore
         .as_str()
         .parse()
         .map_err(|e| format!("parse score {:?}: {e}", captured.as_str()))?;
-    // Clamp in case the model returned >1.0.
+    // Clamp to [0.0, 1.0] — a judger returning 2.0 has misread the
+    // rubric (maybe confused 0–10 scale), and silently capping at
+    // 1.0 would make a miscalibrated run look like a clean pass.
+    // Surface the anomaly on stderr so the suite operator notices.
+    if !(0.0..=1.0).contains(&score) {
+        eprintln!(
+            "[astra-test] WARNING: judger returned out-of-range score {score}; \
+             clamped to [0.0, 1.0]. This usually means the judger model \
+             misread the rubric (e.g. scored on 0-10 instead of 0-1)."
+        );
+    }
     let clamped = score.clamp(0.0, 1.0);
     // Rationale = everything before the SCORE line, last sentence.
     let rationale = text
@@ -579,6 +606,53 @@ mod tests {
         let body = "whatever\nSCORE: 0.55";
         let s = parse_score_from_response(body).unwrap();
         assert!((s.score - 0.55).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn judger_error_includes_subprocess_stderr_and_exit_code() {
+        // Shim bin that prints to stderr + exits non-zero without
+        // producing a SCORE line. Before this fix, the error was just
+        // "no SCORE: line in judger response" — reviewers couldn't
+        // distinguish rate-limit from CLI-crash. Now the error
+        // carries the subprocess's stderr + exit_code so triage is
+        // one read away.
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shim = tmp.path().join("fake-astra");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\n\
+             echo 'rate limit exceeded: please retry in 30s' 1>&2\n\
+             exit 42\n",
+        )
+        .expect("write shim");
+        let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&shim, perms).unwrap();
+
+        let cfg = JudgerConfig::new(shim, "sonnet");
+        let j = AstraCliJudger::new(cfg);
+        let err = j
+            .score("question", None, &dummy_outcome())
+            .await
+            .expect_err("shim exits non-zero, so parse will fail");
+        // The original parse-failure message is preserved.
+        assert!(
+            err.contains("no SCORE:"),
+            "base parse error preserved: {err}"
+        );
+        // New surface: stderr from subprocess AND exit code.
+        assert!(
+            err.contains("rate limit exceeded"),
+            "subprocess stderr must flow into the error: {err}"
+        );
+        assert!(
+            err.contains("exit_code=Some(42)"),
+            "subprocess exit code must appear: {err}"
+        );
     }
 
     fn dummy_outcome() -> RunOutcome {

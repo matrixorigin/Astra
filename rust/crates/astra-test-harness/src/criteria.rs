@@ -422,6 +422,82 @@ fn parse_fork_cache_outcomes(stderr: &str) -> Vec<String> {
     outcomes
 }
 
+/// Reject a criterion whose bounds are internally inconsistent —
+/// typos in YAML (`min: 5, max: 2`, `threshold: 2.0`, empty expect
+/// list) otherwise turn into permanent-FAIL or permanent-PASS cases
+/// that look like real bugs. Return `Err` with the precise field
+/// name so the case author sees exactly what to change.
+///
+/// Called by `Case::from_path` at load time so the whole suite fails
+/// fast on a typo rather than at runtime.
+pub fn validate_criterion(c: &Criterion) -> Result<(), String> {
+    match c {
+        Criterion::ToolsCountBetween { min, max } => {
+            if min > max {
+                return Err(format!(
+                    "ToolsCountBetween: min ({min}) > max ({max}); case will always FAIL"
+                ));
+            }
+            Ok(())
+        }
+        Criterion::Judger { threshold, .. } => {
+            if !threshold.is_finite() || *threshold < 0.0 || *threshold > 1.0 {
+                return Err(format!(
+                    "Judger.threshold must be finite in [0.0, 1.0]; got {threshold}"
+                ));
+            }
+            Ok(())
+        }
+        Criterion::SessionEventCount { min, event_type, .. } => {
+            if *min == 0 {
+                return Err(format!(
+                    "SessionEventCount.min must be >= 1 (min=0 is trivially-true for \
+                     event_type={event_type:?}; did you mean >= 1?)"
+                ));
+            }
+            Ok(())
+        }
+        Criterion::ForkCacheOutcome { expect } => {
+            if expect.is_empty() {
+                return Err(
+                    "ForkCacheOutcome.expect must not be empty (no outcome would ever match)"
+                        .into(),
+                );
+            }
+            Ok(())
+        }
+        Criterion::StderrMatches { pattern } => {
+            // Compile-check the regex at load so a bad pattern fails
+            // parse, not every per-case evaluation.
+            Regex::new(pattern)
+                .map(|_| ())
+                .map_err(|e| format!("StderrMatches.pattern: invalid regex {pattern:?}: {e}"))
+        }
+        Criterion::ToolCalled { name } | Criterion::JournalToolCalled { name, .. } => {
+            if name.trim().is_empty() {
+                return Err("tool name must not be empty".into());
+            }
+            Ok(())
+        }
+        Criterion::TextContains { needle } => {
+            if needle.is_empty() {
+                return Err("TextContains.needle must not be empty".into());
+            }
+            Ok(())
+        }
+        Criterion::ExitCode { .. } => Ok(()),
+    }
+}
+
+/// Validate every criterion in a list. Returns the first offender's
+/// error with a 1-based index so the case author can find the line.
+pub fn validate_criteria(criteria: &[Criterion]) -> Result<(), String> {
+    for (i, c) in criteria.iter().enumerate() {
+        validate_criterion(c).map_err(|e| format!("criteria[{}]: {e}", i + 1))?;
+    }
+    Ok(())
+}
+
 /// True when every non-Judger criterion passed. Used by the runner
 /// to decide whether to even bother invoking the LLM judger — if a
 /// deterministic check already failed, the case is known-FAIL and
@@ -724,6 +800,96 @@ mod tests {
         let criteria = vec![Criterion::ExitCode { code: 0 }];
         let results: Vec<CriterionResult> = vec![];
         assert!(!non_judger_all_pass(&criteria, &results));
+    }
+
+    // ── validate_criterion / validate_criteria (R3 #2) ──
+
+    #[test]
+    fn validate_tools_count_between_rejects_inverted_range() {
+        let err = validate_criterion(&Criterion::ToolsCountBetween { min: 5, max: 2 })
+            .expect_err("min>max should fail");
+        assert!(err.contains("min (5) > max (2)"), "err = {err}");
+    }
+
+    #[test]
+    fn validate_tools_count_between_accepts_equal_bounds() {
+        // min == max means "exactly N calls" — a legitimate assertion.
+        assert!(validate_criterion(&Criterion::ToolsCountBetween { min: 3, max: 3 }).is_ok());
+    }
+
+    #[test]
+    fn validate_judger_rejects_out_of_range_threshold() {
+        for t in [-0.1, 1.5, f64::NAN, f64::INFINITY] {
+            let c = Criterion::Judger {
+                question: "q".into(),
+                threshold: t,
+                model: None,
+            };
+            assert!(
+                validate_criterion(&c).is_err(),
+                "threshold {t} should fail validation"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_judger_accepts_boundary_thresholds() {
+        for t in [0.0, 0.5, 1.0] {
+            let c = Criterion::Judger {
+                question: "q".into(),
+                threshold: t,
+                model: None,
+            };
+            assert!(validate_criterion(&c).is_ok(), "threshold {t} should pass");
+        }
+    }
+
+    #[test]
+    fn validate_session_event_count_rejects_min_zero() {
+        let err = validate_criterion(&Criterion::SessionEventCount {
+            event_type: "llm_round".into(),
+            min: 0,
+            optional: false,
+        })
+        .expect_err("min=0 is trivially-true — should reject");
+        assert!(err.contains("min must be >= 1"));
+    }
+
+    #[test]
+    fn validate_fork_cache_outcome_rejects_empty_expect() {
+        let err = validate_criterion(&Criterion::ForkCacheOutcome { expect: vec![] })
+            .expect_err("empty expect should fail");
+        assert!(err.contains("must not be empty"));
+    }
+
+    #[test]
+    fn validate_stderr_matches_rejects_bad_regex() {
+        let err = validate_criterion(&Criterion::StderrMatches { pattern: "(".into() })
+            .expect_err("bad regex should fail at load");
+        assert!(err.contains("invalid regex"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_tool_name_and_empty_needle() {
+        assert!(validate_criterion(&Criterion::ToolCalled { name: "   ".into() }).is_err());
+        assert!(validate_criterion(&Criterion::JournalToolCalled {
+            name: "".into(),
+            optional: false
+        })
+        .is_err());
+        assert!(validate_criterion(&Criterion::TextContains { needle: "".into() }).is_err());
+    }
+
+    #[test]
+    fn validate_criteria_reports_one_based_index_for_first_offender() {
+        let criteria = vec![
+            Criterion::ExitCode { code: 0 },
+            Criterion::ToolsCountBetween { min: 5, max: 2 },
+            Criterion::ExitCode { code: 1 }, // would also pass validation
+        ];
+        let err = validate_criteria(&criteria).expect_err("second criterion is bad");
+        assert!(err.contains("criteria[2]"), "1-based index expected: {err}");
+        assert!(err.contains("min (5) > max (2)"));
     }
 
     // ── ForkCacheOutcome tests ──

@@ -122,13 +122,51 @@ pub(crate) fn validate_extra_cli_args(args: &[String]) -> Result<(), String> {
 impl Case {
     /// Load a case from a YAML file on disk.
     pub fn from_path(path: &Path) -> Result<Self, anyhow::Error> {
+        // Cheap size guard so a pathological YAML (or a wrong file
+        // type accidentally named `.yaml`) doesn't turn into an OOM.
+        // 10 MiB is generous — the largest real case in the suite
+        // fits in 3 KiB.
+        const MAX_CASE_BYTES: u64 = 10 * 1024 * 1024;
+        if let Ok(meta) = std::fs::metadata(path)
+            && meta.len() > MAX_CASE_BYTES
+        {
+            anyhow::bail!(
+                "{}: {} bytes exceeds the {} MiB case size cap — is this really a YAML case?",
+                path.display(),
+                meta.len(),
+                MAX_CASE_BYTES / (1024 * 1024),
+            );
+        }
         let src = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
-        let case: Case = serde_yaml_ng::from_str(&src)
-            .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
+        let case: Case = serde_yaml_ng::from_str(&src).map_err(|e| {
+            let msg = e.to_string();
+            // Unknown-variant errors from serde look like
+            //   `criteria[N].type: unknown variant 'xyz', expected one of …`
+            // Point the case author at the README + the right
+            // Criterion reference so the fix path is obvious.
+            if msg.contains("unknown variant") {
+                anyhow::anyhow!(
+                    "parse {}: {msg}\n\
+                     (see rust/crates/astra-test-harness/README.md \
+                     'Criteria types' for the current list — a recent \
+                     rename may have deprecated the old name)",
+                    path.display(),
+                )
+            } else {
+                anyhow::anyhow!("parse {}: {msg}", path.display())
+            }
+        })?;
         // Fail fast on reserved-flag abuse so a typo in one case
         // doesn't silently poison an entire suite run.
         validate_extra_cli_args(&case.extra_cli_args)
+            .map_err(|e| anyhow::anyhow!("case {}: {e}", path.display()))?;
+        // Reject criteria with internally-inconsistent bounds
+        // (min>max, threshold>1.0, empty expect lists, bad regex).
+        // A case author's YAML typo would otherwise turn into a
+        // permanent-FAIL / permanent-PASS that looks like a real
+        // regression.
+        crate::criteria::validate_criteria(&case.criteria)
             .map_err(|e| anyhow::anyhow!("case {}: {e}", path.display()))?;
         Ok(case)
     }
@@ -277,6 +315,62 @@ mod tests {
         // denylist but is not a real flag. Removing dead entries
         // keeps the error message actionable for cases that hit it.
         assert!(!RESERVED_CLI_ARGS.contains(&"--approve-all"));
+    }
+
+    #[test]
+    fn unknown_criterion_variant_error_points_at_readme() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("c.yaml");
+        std::fs::write(
+            &path,
+            "name: c\nprompt: p\ncriteria:\n  - type: fork_cache_class\n    expect: [hit]\n",
+        )
+        .unwrap();
+        let err = Case::from_path(&path).expect_err("old type name must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown variant"),
+            "serde's well-shaped error is preserved: {msg}"
+        );
+        assert!(
+            msg.contains("fork_cache_class"),
+            "offending name must appear: {msg}"
+        );
+        assert!(
+            msg.contains("README.md"),
+            "remediation hint must appear: {msg}"
+        );
+    }
+
+    #[test]
+    fn oversize_case_file_rejected_before_read() {
+        // A YAML "file" of many megabytes is almost certainly a typo
+        // (someone pointed at a log / binary). Cap protects against
+        // OOM on shared suite dirs.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("huge.yaml");
+        // Write just over 10 MiB of padding — invalid YAML inside
+        // doesn't matter because the size guard fires first.
+        let big = vec![b'a'; 10 * 1024 * 1024 + 1];
+        std::fs::write(&path, &big).unwrap();
+        let err = Case::from_path(&path).expect_err("oversize must reject");
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    #[test]
+    fn criteria_bounds_validated_at_load() {
+        // End-to-end of R3 #2: a YAML with a bad-bounds criterion
+        // must fail at parse time, not at evaluation time.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bad.yaml");
+        std::fs::write(
+            &path,
+            "name: c\nprompt: p\ncriteria:\n  - type: tools_count_between\n    min: 5\n    max: 2\n",
+        )
+        .unwrap();
+        let err = Case::from_path(&path).expect_err("inverted bounds must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("min (5) > max (2)"), "{msg}");
     }
 
     #[test]

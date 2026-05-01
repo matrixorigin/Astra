@@ -29,7 +29,14 @@ pub struct JournalEvent {
 }
 
 /// Loaded session with minimal summary counters the report uses.
+///
+/// `#[non_exhaustive]`: this struct serializes into `--format json`
+/// reports so external consumers may deserialize it. New fields
+/// (event counts by category, journal-file size, schema version)
+/// should be additive without a SemVer break. In-crate construction
+/// is unaffected; downstream callers must use `..` when matching.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SessionCapture {
     pub session_id: String,
     pub journal_path: PathBuf,
@@ -120,14 +127,68 @@ pub fn load_session(session_id: &str) -> Option<SessionCapture> {
     None
 }
 
+/// Maximum journal file size the loader will read. Long-running
+/// sessions with tens of thousands of events can legitimately blow
+/// past the legacy default; the cap guards against a pathological
+/// case pulling a 1GB jsonl into memory + cloning it into every
+/// CaseRunReport. Override with
+/// `load_session_from_path_with_caps` when a suite needs bigger.
+pub const DEFAULT_MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Maximum events the loader will retain. Beyond this we truncate
+/// from the tail (most recent) so observability events the criteria
+/// care about — `[fork-cache]` lines, `ToolCallCompleted` at the end
+/// of the run — are kept even for very long sessions.
+pub const DEFAULT_MAX_EVENTS: usize = 100_000;
+
 /// Load a session journal from an explicit path — test seam. Detects
 /// both layouts: lines with `type` (legacy) and lines with
 /// `event_type` (step-events) both populate `event_type` so criteria
 /// don't need to know which layout they got.
+///
+/// Uses `DEFAULT_MAX_JOURNAL_BYTES` + `DEFAULT_MAX_EVENTS` caps.
+/// For custom caps, see `load_session_from_path_with_caps`.
 pub fn load_session_from_path(session_id: &str, path: &Path) -> Option<SessionCapture> {
+    load_session_from_path_with_caps(
+        session_id,
+        path,
+        DEFAULT_MAX_JOURNAL_BYTES,
+        DEFAULT_MAX_EVENTS,
+    )
+}
+
+/// Cap-configurable version of [`load_session_from_path`] — useful
+/// for tests that want to exercise the truncation paths without
+/// materializing 64 MiB of jsonl.
+pub fn load_session_from_path_with_caps(
+    session_id: &str,
+    path: &Path,
+    max_bytes: u64,
+    max_events: usize,
+) -> Option<SessionCapture> {
+    // Size pre-check: refuse to even try reading a file larger than
+    // the cap. A pathological jsonl (wrong file, infinite loop bug)
+    // otherwise OOMs via `read_to_string`. Reporting a zero-event
+    // capture would mask the anomaly, so we emit a visible stderr
+    // warning and return None (callers already treat that as
+    // "session unavailable" which now fails criteria strictly).
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.len() > max_bytes
+    {
+        eprintln!(
+            "[astra-test] WARNING: session {} journal {} bytes exceeds \
+             {}-byte cap; skipping load. Raise with \
+             load_session_from_path_with_caps or investigate the runaway.",
+            session_id,
+            meta.len(),
+            max_bytes,
+        );
+        return None;
+    }
     let body = std::fs::read_to_string(path).ok()?;
-    let mut events = Vec::with_capacity(128);
+    let mut events: Vec<JournalEvent> = Vec::with_capacity(128);
     let mut skipped: u32 = 0;
+    let mut truncated_from_tail: u32 = 0;
     for line in body.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -141,6 +202,14 @@ pub fn load_session_from_path(session_id: &str, path: &Path) -> Option<SessionCa
                     .or_else(|| v.get("event_type").and_then(|t| t.as_str()))
                     .unwrap_or("")
                     .to_string();
+                if events.len() >= max_events {
+                    // Ring-buffer-ish: drop oldest to make room for
+                    // newest. Observability criteria (`[fork-cache]`,
+                    // ToolCallCompleted near the end) care about the
+                    // tail more than the head.
+                    events.remove(0);
+                    truncated_from_tail = truncated_from_tail.saturating_add(1);
+                }
                 events.push(JournalEvent {
                     event_type,
                     raw: v,
@@ -148,6 +217,13 @@ pub fn load_session_from_path(session_id: &str, path: &Path) -> Option<SessionCa
             }
             Err(_) => skipped = skipped.saturating_add(1),
         }
+    }
+    if truncated_from_tail > 0 {
+        eprintln!(
+            "[astra-test] WARNING: session {session_id} journal truncated to most-recent \
+             {max_events} events ({truncated_from_tail} older events dropped). \
+             Criteria that look for early events may need the uncapped loader."
+        );
     }
     Some(SessionCapture {
         session_id: session_id.to_string(),
@@ -224,5 +300,62 @@ mod tests {
         assert!(tools.contains(&"Read".to_string()));
         assert!(tools.contains(&"Grep".to_string()));
         assert_eq!(tools.len(), 2);
+    }
+
+    // ── Caps (R3 #6) ──
+
+    #[test]
+    fn load_session_rejects_journal_exceeding_byte_cap() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("big.jsonl");
+        // 2 KiB of content; cap at 1 KiB.
+        let body = vec![b'{'; 2048];
+        std::fs::write(&path, body).unwrap();
+        // 1024-byte cap, plenty of events allowed.
+        let cap = load_session_from_path_with_caps("big", &path, 1024, 1_000);
+        assert!(
+            cap.is_none(),
+            "oversize journal must return None so callers see session-unavailable"
+        );
+    }
+
+    #[test]
+    fn load_session_truncates_tail_when_event_cap_exceeded() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("many.jsonl");
+        // 500 events; cap at 10. Most recent 10 should be kept.
+        let lines: Vec<String> = (0..500)
+            .map(|i| format!(r#"{{"type":"evt","seq":{i}}}"#))
+            .collect();
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let cap =
+            load_session_from_path_with_caps("many", &path, u64::MAX, 10).expect("load");
+        assert_eq!(cap.events.len(), 10);
+        // First retained event should be the 491st (0-indexed 490)
+        // since the ring-buffer drops oldest. Check by seq field.
+        let first_seq = cap.events[0].raw.get("seq").and_then(|v| v.as_u64());
+        assert_eq!(
+            first_seq,
+            Some(490),
+            "tail-window must keep newest events; got first={first_seq:?}"
+        );
+        let last_seq = cap.events[9].raw.get("seq").and_then(|v| v.as_u64());
+        assert_eq!(last_seq, Some(499));
+    }
+
+    #[test]
+    fn load_session_under_caps_behaves_as_before() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("small.jsonl");
+        let body = [
+            r#"{"type":"a"}"#,
+            r#"{"type":"b"}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, body).unwrap();
+        let cap = load_session_from_path_with_caps("small", &path, 1024, 100).unwrap();
+        assert_eq!(cap.events.len(), 2);
+        assert_eq!(cap.skipped_lines, 0);
     }
 }

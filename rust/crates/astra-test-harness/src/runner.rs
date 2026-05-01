@@ -20,7 +20,15 @@ use crate::case::Case;
 /// Captured outcome of one `astra chat` subprocess run. Fields
 /// mirror what `astra chat --json` prints on stdout, plus captured
 /// stderr and timing.
+///
+/// `#[non_exhaustive]` is load-bearing: this struct is serialized
+/// into `--format json` reports, so external consumers pattern-match
+/// and / or deserialize it. We reserve the right to add fields (new
+/// token buckets, new timing breakdowns, new observability tags)
+/// without a SemVer breakage. In-crate construction is unaffected;
+/// downstream crates must use `..` in struct patterns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RunOutcome {
     pub model: String,
     pub exit_code: i32,
@@ -99,10 +107,28 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
             .and_then(|x| x.as_str())
             .map(str::to_string),
         run_id: v.get("run_id").and_then(|x| x.as_str()).map(str::to_string),
-        tool_calls_count: v
-            .get("tool_calls_count")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0) as u32,
+        tool_calls_count: {
+            // The JSON envelope reports tool_calls_count as u64 but
+            // `ToolsCountBetween` compares against u32. A pathological
+            // runaway agent exceeding u32::MAX would wrap silently;
+            // saturate + warn so the anomaly is visible instead of
+            // quietly causing a "tool_calls_count=0" FAIL message
+            // that reads like a missing-tool bug.
+            let raw = v
+                .get("tool_calls_count")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
+            if raw > u32::MAX as u64 {
+                eprintln!(
+                    "[astra-test] WARNING: tool_calls_count {raw} exceeds u32::MAX \
+                     ({}); saturating. Almost certainly a runaway loop.",
+                    u32::MAX
+                );
+                u32::MAX
+            } else {
+                raw as u32
+            }
+        },
         tools_used: v
             .get("tools_used")
             .and_then(|x| x.as_array())
