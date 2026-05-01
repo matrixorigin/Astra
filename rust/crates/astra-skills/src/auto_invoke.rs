@@ -360,10 +360,15 @@ impl SkillDiagnosis {
     pub fn render_prompt_block(&self) -> String {
         use std::fmt::Write;
         let mut s = String::with_capacity(256);
+        let synthetic_tag = if self.source == DiagnosisSource::SyntheticFallback {
+            " (synthetic hint)"
+        } else {
+            ""
+        };
         let _ = writeln!(
             s,
-            "⚙ Auto-diagnosis [{}] (cause: {}): {}",
-            self.skill, self.cause, self.headline
+            "⚙ Auto-diagnosis [{}]{} (cause: {}): {}",
+            self.skill, synthetic_tag, self.cause, self.headline
         );
         for finding in &self.findings {
             let _ = writeln!(s, "  - {finding}");
@@ -476,7 +481,7 @@ fn default_criterion_for_cause(cause: &AutoInvokeCause) -> DiagnosisCriterion {
             metric: DiagnosisMetric::BudgetPressure,
             operator: DiagnosisOperator::Lte,
             threshold: PRESSURE_TRIGGER_LEVEL,
-            window_turns: 3,
+            window_turns: 5,
             description: "budget pressure drops below the auto-invoke threshold".into(),
         },
         AutoInvokeCause::RepeatedCorrections { .. } => DiagnosisCriterion {

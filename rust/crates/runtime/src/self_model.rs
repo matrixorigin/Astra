@@ -1084,30 +1084,86 @@ impl SelfModel {
         }
 
         // ── Cross-session lessons (from agent_lessons) ──
+        // Tool-specific lessons (ToolDeprioritize/ToolBoost) are only rendered
+        // when the referenced tool is in the current capabilities. General
+        // lessons (PromptShape, PostconditionPattern, ErrorRecovery) always
+        // render. This avoids wasting prompt tokens on "deprioritize grep"
+        // when the current task doesn't involve grep.
         if !self.lessons.is_empty() {
             const MAX_SHOWN: usize = 5;
-            let total = self.lessons.len();
-            s.push_str("📚 Lessons from prior sessions:\n");
-            for l in self.lessons.iter().take(MAX_SHOWN) {
-                let scope = l
-                    .workload_tag
-                    .as_deref()
-                    .map(|t| format!(" @{t}"))
-                    .unwrap_or_default();
-                let _ = writeln!(
-                    s,
-                    "  - [{}{}] {} — {}",
-                    l.kind, scope, l.trigger_signal, l.action
-                );
-            }
-            if total > MAX_SHOWN {
-                let _ = writeln!(s, "  … {} more", total - MAX_SHOWN);
+            let tool_set: std::collections::HashSet<&str> = self
+                .capabilities
+                .tool_names
+                .iter()
+                .map(String::as_str)
+                .collect();
+            // Filter relevant + dedup conflicting tool advice (e.g.,
+            // ToolDeprioritize("grep") + ToolBoost("grep")). Lessons are
+            // pre-sorted by confidence DESC, so the first occurrence for
+            // a tool name wins.
+            let mut seen_tools: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let relevant: Vec<&LessonHint> = self
+                .lessons
+                .iter()
+                .filter(|l| is_lesson_relevant(l, &tool_set))
+                .filter(|l| {
+                    if let Some(tool) = extract_tool_from_trigger(&l.trigger_signal) {
+                        seen_tools.insert(tool.to_string())
+                    } else {
+                        true // non-tool lessons always pass
+                    }
+                })
+                .collect();
+            if !relevant.is_empty() {
+                let total = relevant.len();
+                s.push_str("📚 Lessons from prior sessions:\n");
+                for l in relevant.iter().take(MAX_SHOWN) {
+                    let scope = l
+                        .workload_tag
+                        .as_deref()
+                        .map(|t| format!(" @{t}"))
+                        .unwrap_or_default();
+                    let _ = writeln!(
+                        s,
+                        "  - [{}{}] {} — {}",
+                        l.kind, scope, l.trigger_signal, l.action
+                    );
+                }
+                if total > MAX_SHOWN {
+                    let _ = writeln!(s, "  … {} more", total - MAX_SHOWN);
+                }
             }
         }
 
         s
     }
+}
 
+/// Extract the tool name from a trigger_signal like "tool_failures:grep".
+/// Returns None for non-tool-specific triggers.
+fn extract_tool_from_trigger(trigger: &str) -> Option<&str> {
+    trigger.split_once(':').map(|(_, tool)| tool)
+}
+
+/// Tool-specific lesson kinds whose trigger_signal encodes a tool name
+/// as `"tool_failures:<name>"` or similar. These are only relevant when
+/// the named tool is in the current session's capability set.
+fn is_lesson_relevant(l: &LessonHint, tool_set: &std::collections::HashSet<&str>) -> bool {
+    match l.kind.as_str() {
+        "tool_deprioritize" | "tool_boost" => {
+            // Extract tool name from "tool_failures:<name>" or "tool_boost:<name>".
+            if let Some((_prefix, tool_name)) = l.trigger_signal.split_once(':') {
+                tool_set.is_empty() || tool_set.contains(tool_name)
+            } else {
+                true // unrecognized format → render defensively
+            }
+        }
+        _ => true, // general lessons always render
+    }
+}
+
+impl SelfModel {
     /// Render detailed self-model as structured text for get_agent_info responses.
     pub fn to_detailed_text(&self) -> String {
         let mut s = String::with_capacity(4096);

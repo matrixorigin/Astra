@@ -425,7 +425,7 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
             "UPDATE agent_lessons \
              SET status = 'retired', updated_at = CURRENT_TIMESTAMP(6) \
              WHERE user_id = ? AND status = 'active' \
-               AND negative_outcome_count >= 3 \
+               AND negative_outcome_count >= 5 \
                AND negative_outcome_count > positive_outcome_count",
         )
         .bind(user_id)
@@ -544,7 +544,7 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
                          WHEN confidence + ? < 0.1 THEN 0.1 \
                          ELSE confidence + ? END, \
                      status = CASE \
-                         WHEN negative_outcome_count >= 3 \
+                         WHEN negative_outcome_count >= 5 \
                               AND negative_outcome_count > positive_outcome_count \
                          THEN 'retired' ELSE status END, \
                      updated_at = CURRENT_TIMESTAMP(6) \

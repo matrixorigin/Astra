@@ -232,3 +232,77 @@ fn self_model_serde_roundtrip_preserves_lessons() {
     assert_eq!(back.lessons.len(), 1);
     assert_eq!(back.lessons[0].workload_tag.as_deref(), Some("x"));
 }
+
+// ── E: Relevance filtering — tool-specific lessons gate on tool_names ────────
+
+fn model_with_tools(tools: &[&str]) -> SelfModel {
+    let mut sm = minimal_self_model();
+    sm.capabilities.tool_names = tools.iter().map(|s| s.to_string()).collect();
+    sm
+}
+
+#[test]
+fn tool_deprioritize_lesson_hidden_when_tool_not_in_capabilities() {
+    // "deprioritize grep" should NOT appear when grep is not available.
+    let sm = model_with_tools(&["bash", "read_file"]).with_lessons(vec![lesson(
+        "tool_deprioritize",
+        "tool_failures:grep",
+        "avoid grep",
+        None,
+    )]);
+    let rendered = sm.to_system_prompt_section();
+    assert!(
+        !rendered.contains("tool_failures:grep"),
+        "grep lesson should be hidden when grep is not in tool_names, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn tool_deprioritize_lesson_shown_when_tool_in_capabilities() {
+    let sm = model_with_tools(&["grep", "bash"]).with_lessons(vec![lesson(
+        "tool_deprioritize",
+        "tool_failures:grep",
+        "avoid grep",
+        None,
+    )]);
+    let rendered = sm.to_system_prompt_section();
+    assert!(
+        rendered.contains("tool_failures:grep"),
+        "grep lesson should be shown when grep is in tool_names, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn prompt_shape_lesson_always_shown_regardless_of_tools() {
+    // Non-tool lessons (PromptShape, PostconditionPattern, ErrorRecovery)
+    // are general advice — always rendered.
+    let sm = model_with_tools(&["bash"]).with_lessons(vec![lesson(
+        "prompt_shape",
+        "stall_events",
+        "restate scope",
+        None,
+    )]);
+    let rendered = sm.to_system_prompt_section();
+    assert!(
+        rendered.contains("stall_events"),
+        "prompt_shape lesson must always render, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn mixed_lessons_filter_correctly() {
+    let sm = model_with_tools(&["rg"]).with_lessons(vec![
+        lesson(
+            "tool_deprioritize",
+            "tool_failures:grep",
+            "avoid grep",
+            None,
+        ), // grep NOT available → hidden
+        lesson("tool_deprioritize", "tool_failures:rg", "avoid rg", None), // rg available → shown
+        lesson("prompt_shape", "stall_events", "restate scope", None),     // always shown
+    ]);
+    let rendered = sm.to_system_prompt_section();
+    assert!(!rendered.contains("tool_failures:grep"));
+    assert!(rendered.contains("tool_failures:rg"));
+    assert!(rendered.contains("stall_events"));
+}
