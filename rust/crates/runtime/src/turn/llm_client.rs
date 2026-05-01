@@ -517,19 +517,42 @@ pub(crate) use astra_core::net::apply_env_proxy;
 // Tests for `apply_env_proxy` live with its authoritative implementation in
 // `astra_core::net`. Do not duplicate them here.
 
-/// TCP connect timeout for LLM API requests.
+/// Resolve an LLM duration-in-seconds constant, consulting its env-var
+/// override and falling back to the compile-time default. Used by
+/// `LLM_CONNECT_TIMEOUT_S`, `LLM_FALLBACK_TIMEOUT_S`, and
+/// `LLM_TOTAL_BUDGET_S`. Operators set these to lower values in
+/// degraded conditions (tight SLOs) or raise them for slow providers;
+/// the const defaults are the production baseline.
+fn llm_secs_from_env(var: &str, default_secs: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(default_secs)
+}
+
+/// TCP connect timeout for LLM API requests. Override: `ASTRA_LLM_CONNECT_TIMEOUT_S`.
 pub(crate) fn llm_connect_timeout() -> std::time::Duration {
-    std::time::Duration::from_secs(LLM_CONNECT_TIMEOUT_S)
+    std::time::Duration::from_secs(llm_secs_from_env(
+        "ASTRA_LLM_CONNECT_TIMEOUT_S",
+        LLM_CONNECT_TIMEOUT_S,
+    ))
 }
 
-/// Hard timeout for the non-stream fallback request.
+/// Hard timeout for the non-stream fallback request. Override: `ASTRA_LLM_FALLBACK_TIMEOUT_S`.
 pub(crate) fn llm_fallback_timeout() -> std::time::Duration {
-    std::time::Duration::from_secs(LLM_FALLBACK_TIMEOUT_S)
+    std::time::Duration::from_secs(llm_secs_from_env(
+        "ASTRA_LLM_FALLBACK_TIMEOUT_S",
+        LLM_FALLBACK_TIMEOUT_S,
+    ))
 }
 
-/// Total budget across all retries + fallback for a single LLM call.
+/// Total budget across all retries + fallback for a single LLM call. Override: `ASTRA_LLM_TOTAL_BUDGET_S`.
 pub(crate) fn llm_total_budget() -> std::time::Duration {
-    std::time::Duration::from_secs(LLM_TOTAL_BUDGET_S)
+    std::time::Duration::from_secs(llm_secs_from_env(
+        "ASTRA_LLM_TOTAL_BUDGET_S",
+        LLM_TOTAL_BUDGET_S,
+    ))
 }
 
 #[cfg(test)]
