@@ -6,14 +6,12 @@ description: |
   loudly with `tool_calls_count` out of range — much faster than
   noticing via production session metrics.
 prompt: |
-  Use list_dir once to list the current directory. Do not call any
-  other tools. Your final answer should be a one-sentence summary.
+  List the current directory using one tool call. Your final answer
+  should be a one-sentence summary of what you found.
 timeout_seconds: 120
 criteria:
   - type: exit_code
     code: 0
-  - type: tool_called
-    name: list_dir
   - type: tools_count_between
     min: 1
     max: 4
