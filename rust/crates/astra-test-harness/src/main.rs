@@ -143,7 +143,7 @@ struct Args {
     summarize_model: Option<String>,
 
     /// Timeout for the summarizer LLM call in seconds.
-    #[arg(long, default_value_t = 120)]
+    #[arg(long, default_value_t = 180)]
     summarize_timeout: u64,
 }
 
