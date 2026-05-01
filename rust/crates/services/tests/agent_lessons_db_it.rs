@@ -303,3 +303,169 @@ async fn validate_rejects_invalid_input_before_sql() {
     // Err path uses sqlx::Error::Protocol to surface validation failures.
     assert!(format!("{err}").contains("action"));
 }
+
+// ── R2: exposure / outcome / retirement / prune ceiling DB IT ────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn record_exposure_upsert_is_idempotent() {
+    let user_id = format!("test-al-{}", Uuid::new_v4());
+    let svc = service().await;
+    let stored = svc.record(new_lesson(&user_id, None)).await.unwrap();
+
+    let exposure = astra_services::LessonExposure {
+        lesson_id: stored.id.clone(),
+        session_id: "sess-1".into(),
+        user_id: user_id.clone(),
+        persona: "generic".into(),
+        workload_tag: None,
+        adopted: false,
+    };
+    // First call: insert.
+    svc.record_exposure(exposure.clone()).await.unwrap();
+    // Second call: upsert (ON DUPLICATE KEY UPDATE).
+    svc.record_exposure(exposure).await.unwrap();
+    // Must not fail; table must have exactly one row for this lesson+session.
+
+    cleanup(&user_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn record_outcome_updates_confidence_and_status() {
+    let user_id = format!("test-al-{}", Uuid::new_v4());
+    let svc = service().await;
+    let stored = svc.record(new_lesson(&user_id, None)).await.unwrap();
+    let initial_confidence = stored.confidence;
+
+    // Expose the lesson.
+    svc.record_exposure(astra_services::LessonExposure {
+        lesson_id: stored.id.clone(),
+        session_id: "sess-outcome".into(),
+        user_id: user_id.clone(),
+        persona: "generic".into(),
+        workload_tag: None,
+        adopted: false,
+    })
+    .await
+    .unwrap();
+
+    // Record a positive outcome.
+    svc.record_outcome(astra_services::LessonOutcome {
+        session_id: "sess-outcome".into(),
+        user_id: user_id.clone(),
+        stall_events: 0,
+        user_corrections: 0,
+        tool_failures: 0,
+        unmet_postconditions: 0,
+        diagnosis_criteria_met: 1,
+        diagnosis_criteria_failed: 0,
+    })
+    .await
+    .unwrap();
+
+    // Lesson confidence should have increased.
+    let lessons = svc
+        .load_recent(&user_id, "generic", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(lessons.len(), 1);
+    assert!(
+        lessons[0].confidence > initial_confidence,
+        "positive outcome should increase confidence: {} vs {}",
+        lessons[0].confidence,
+        initial_confidence
+    );
+
+    cleanup(&user_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn negative_outcomes_can_retire_a_lesson() {
+    let user_id = format!("test-al-{}", Uuid::new_v4());
+    let svc = service().await;
+    let stored = svc.record(new_lesson(&user_id, None)).await.unwrap();
+
+    // 3 negative outcome sessions to hit the retirement threshold
+    // (negative_outcome_count >= 3 AND > positive_outcome_count).
+    for i in 0..3 {
+        let sid = format!("sess-neg-{i}");
+        svc.record_exposure(astra_services::LessonExposure {
+            lesson_id: stored.id.clone(),
+            session_id: sid.clone(),
+            user_id: user_id.clone(),
+            persona: "generic".into(),
+            workload_tag: None,
+            adopted: false,
+        })
+        .await
+        .unwrap();
+        svc.record_outcome(astra_services::LessonOutcome {
+            session_id: sid,
+            user_id: user_id.clone(),
+            stall_events: 5,
+            user_corrections: 3,
+            tool_failures: 2,
+            unmet_postconditions: 1,
+            diagnosis_criteria_met: 0,
+            diagnosis_criteria_failed: 2,
+        })
+        .await
+        .unwrap();
+    }
+
+    // After 3 negative outcomes the lesson should be retired and no longer
+    // returned by load_recent (which filters status='active').
+    let lessons = svc
+        .load_recent(&user_id, "generic", None, 10)
+        .await
+        .unwrap();
+    assert!(
+        lessons.is_empty(),
+        "lesson should be retired after 3 negative outcomes; got {} active lessons",
+        lessons.len()
+    );
+
+    cleanup(&user_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn prune_ceiling_keeps_at_most_max_lessons_per_user() {
+    let user_id = format!("test-al-ceiling-{}", Uuid::new_v4());
+    let svc = service().await;
+
+    // Insert more than MAX_LESSONS_PER_USER distinct lessons.
+    // Use different trigger_signals to bypass upsert dedup.
+    let ceiling = astra_services::agent_lessons::MAX_LESSONS_PER_USER as usize;
+    let overshoot = ceiling + 20;
+    for i in 0..overshoot {
+        let mut n = new_lesson(&user_id, None);
+        n.trigger_signal = format!("tool_failures:tool_{i}");
+        svc.record(n).await.unwrap();
+    }
+
+    // Before prune: should have overshoot rows.
+    let before = svc
+        .load_recent(&user_id, "generic", None, overshoot as u32 + 10)
+        .await
+        .unwrap();
+    assert_eq!(before.len(), overshoot);
+
+    // Prune with generous age (0 = no age deletion), ceiling should kick in.
+    let deleted = svc.prune(&user_id, 99999).await.unwrap();
+    assert!(deleted > 0, "overflow rows should be deleted");
+
+    let after = svc
+        .load_recent(&user_id, "generic", None, overshoot as u32 + 10)
+        .await
+        .unwrap();
+    assert!(
+        after.len() <= ceiling,
+        "active lessons should be ≤ {ceiling} after prune ceiling; got {}",
+        after.len()
+    );
+
+    cleanup(&user_id).await;
+}

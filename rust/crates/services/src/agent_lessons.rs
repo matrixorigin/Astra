@@ -518,7 +518,10 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
                 "UPDATE agent_lessons \
                  SET positive_outcome_count = positive_outcome_count + ?, \
                      negative_outcome_count = negative_outcome_count + ?, \
-                     confidence = LEAST(0.95, GREATEST(0.1, confidence + ?)), \
+                     confidence = CASE \
+                         WHEN confidence + ? > 0.95 THEN 0.95 \
+                         WHEN confidence + ? < 0.1 THEN 0.1 \
+                         ELSE confidence + ? END, \
                      status = CASE \
                          WHEN negative_outcome_count >= 3 \
                               AND negative_outcome_count > positive_outcome_count \
@@ -528,7 +531,9 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
             )
             .bind(pos_inc)
             .bind(neg_inc)
-            .bind(if good { 0.05f64 } else { -0.1f64 })
+            .bind(if good { 0.05f64 } else { -0.1f64 }) // confidence + ? > 0.95
+            .bind(if good { 0.05f64 } else { -0.1f64 }) // confidence + ? < 0.1
+            .bind(if good { 0.05f64 } else { -0.1f64 }) // ELSE confidence + ?
             .bind(&lesson_id)
             .execute(&pool)
             .await?;
