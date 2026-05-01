@@ -189,8 +189,15 @@ pub(crate) fn fold_events_into_tree(
                     tool_calls: 0,
                     children: Vec::new(),
                 };
-                root.children.push(node);
-                by_run_id.insert(run_id, root.children.len() - 1);
+                match by_run_id.entry(run_id) {
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        skipped = skipped.saturating_add(1);
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        root.children.push(node);
+                        e.insert(root.children.len() - 1);
+                    }
+                }
             }
             JournalEventType::DelegationSubRunCompleted => {
                 let run_id = ev
@@ -494,6 +501,31 @@ mod tests {
             root.self_completion_tokens, 100,
             "self_completion must be root's own Turn tokens only"
         );
+    }
+
+    #[test]
+    fn duplicate_run_id_in_started_events_counts_as_skipped() {
+        // Two DelegationSubRunStarted with the same run_id: the second
+        // must NOT silently overwrite the first's index in by_run_id.
+        // Instead, increment skipped so the operator notices the
+        // journal anomaly.
+        let events = vec![
+            sub_started("t1", "run-DUP", "coder", "first task"),
+            sub_started("t2", "run-DUP", "reviewer", "second task"),
+            sub_completed("t3", "run-DUP", 100, 10, 1),
+        ];
+        let (root, _, skipped) = fold_events_into_tree("sess-1", &events);
+        assert!(
+            skipped >= 1,
+            "duplicate run_id must be counted as skipped, got skipped={skipped}"
+        );
+        // Only the first child with that run_id should exist.
+        assert_eq!(
+            root.children.len(),
+            1,
+            "duplicate run_id must not create a second child"
+        );
+        assert_eq!(root.children[0].label, "coder");
     }
 
     #[test]

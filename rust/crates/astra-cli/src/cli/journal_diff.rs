@@ -153,7 +153,8 @@ fn event_counts(events: &[JournalEvent]) -> BTreeMap<String, u32> {
     let mut out: BTreeMap<String, u32> = BTreeMap::new();
     for e in events {
         let k = event_type_str(&e.event_type);
-        *out.entry(k).or_insert(0) += 1;
+        let count = out.entry(k).or_insert(0);
+        *count = count.saturating_add(1);
     }
     out
 }
@@ -190,11 +191,17 @@ fn tool_sequence(events: &[JournalEvent]) -> Vec<String> {
 }
 
 fn has_final_text(events: &[JournalEvent]) -> bool {
-    events.iter().any(|e| {
-        e.assistant_output
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
-    })
+    events
+        .iter()
+        .rev()
+        .find(|e| {
+            matches!(
+                e.event_type,
+                JournalEventType::Turn | JournalEventType::LlmRound
+            )
+        })
+        .and_then(|e| e.assistant_output.as_deref())
+        .is_some_and(|s| !s.trim().is_empty())
 }
 
 /// Serde variant name as a stable string. Goes through the
@@ -217,9 +224,13 @@ fn event_type_str(t: &JournalEventType) -> String {
 pub fn render_text(diff: &JournalDiff) -> String {
     let mut s = String::new();
     s.push_str(&format!(
-        "=== journal diff ===\n  A: {}\n  B: {}\n\n",
+        "=== journal diff ===\n  A: {}\n  B: {}\n",
         diff.a_session, diff.b_session
     ));
+    if diff.a_session == diff.b_session {
+        s.push_str("  ⚠ Warning: A and B resolve to the same session — diff will be zero.\n");
+    }
+    s.push('\n');
 
     s.push_str("token totals  (A → B,  Δ = B - A)\n");
     s.push_str(&format!(
@@ -416,5 +427,37 @@ mod tests {
         let d = diff_events("a", "b", &a, &b);
         let txt = render_text(&d);
         assert!(txt.contains("(no differences)"));
+    }
+
+    #[test]
+    fn has_final_text_checks_last_event_not_any() {
+        // A run that produced output early but crashed (last event has
+        // no assistant_output) should report false — the "final" text
+        // is what the user sees, not an intermediate turn.
+        let a = vec![
+            evt(json!({"type":"turn","ts":"t1","session_id":"a","assistant_output":"early output"})),
+            evt(json!({"type":"turn","ts":"t2","session_id":"a"})),
+        ];
+        let b: Vec<JournalEvent> = vec![];
+        let d = diff_events("a", "b", &a, &b);
+        assert!(
+            !d.a_has_final_text,
+            "has_final_text must check the LAST event with potential output, \
+             not any event. A run whose last turn has no output crashed."
+        );
+    }
+
+    #[test]
+    fn run_diff_warns_when_both_sessions_resolve_to_same_id() {
+        let d = diff_events("sess-X", "sess-X", &[], &[]);
+        assert_eq!(
+            d.a_session, d.b_session,
+            "sanity: sessions are the same"
+        );
+        let txt = render_text(&d);
+        assert!(
+            txt.contains("warning") || txt.contains("Warning") || txt.contains("same session"),
+            "render_text must warn when A and B are the same session; got:\n{txt}"
+        );
     }
 }
