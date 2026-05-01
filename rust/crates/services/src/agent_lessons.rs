@@ -499,13 +499,11 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
             ));
         }
         let pool = self.get_pool().await?;
-        let negative = outcome.stall_events
-            + outcome.user_corrections
-            + outcome.tool_failures
-            + outcome.unmet_postconditions
-            + outcome.diagnosis_criteria_failed;
-        let positive = outcome.diagnosis_criteria_met;
-        let good = positive >= negative;
+
+        // Weighted confidence delta: diagnosis-specific criteria (direct
+        // evidence of THIS lesson's usefulness) weigh more than session-
+        // wide noise (stalls, corrections — correlative but not causal).
+        let confidence_delta = compute_confidence_delta(&outcome);
         let exposures = query(
             "SELECT lesson_id FROM agent_lesson_exposures \
              WHERE session_id = ? AND user_id = ? AND outcome_recorded_at IS NULL",
@@ -516,7 +514,11 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         .await?;
         for row in &exposures {
             let lesson_id: String = row.try_get("lesson_id")?;
-            let (pos_inc, neg_inc) = if good { (1i64, 0i64) } else { (0i64, 1i64) };
+            let (pos_inc, neg_inc) = if confidence_delta >= 0.0 {
+                (1i64, 0i64)
+            } else {
+                (0i64, 1i64)
+            };
             // Note: MySQL evaluates SET clauses left-to-right, so by the
             // time the CASE is reached, positive/negative_outcome_count
             // already hold the incremented values. We must NOT add the
@@ -538,9 +540,9 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
             )
             .bind(pos_inc)
             .bind(neg_inc)
-            .bind(if good { 0.05f64 } else { -0.1f64 }) // confidence + ? > 0.95
-            .bind(if good { 0.05f64 } else { -0.1f64 }) // confidence + ? < 0.1
-            .bind(if good { 0.05f64 } else { -0.1f64 }) // ELSE confidence + ?
+            .bind(confidence_delta) // confidence + ? > 0.95
+            .bind(confidence_delta) // confidence + ? < 0.1
+            .bind(confidence_delta) // ELSE confidence + ?
             .bind(&lesson_id)
             .execute(&pool)
             .await?;
@@ -697,6 +699,49 @@ pub const AGENT_LESSON_EXPOSURES_DDL: &str = "CREATE TABLE IF NOT EXISTS agent_l
     INDEX idx_lesson_exposure_session (session_id, user_id),
     INDEX idx_lesson_exposure_lesson (lesson_id)
 )";
+
+// ── Confidence scoring ──────────────────────────────────────────────────────
+
+/// Weight for diagnosis-specific criteria (direct evidence of THIS
+/// lesson's effectiveness). Higher than noise because diagnosis criteria
+/// are machine-checked postconditions, not ambient session signals.
+const DIAGNOSIS_WEIGHT: f64 = 3.0;
+
+/// Weight for session-wide noise signals (stalls, corrections, tool
+/// failures, unmet postconditions). These are correlative — a stall
+/// might have nothing to do with this lesson — so they contribute less.
+const NOISE_WEIGHT: f64 = 1.0;
+
+/// Maximum absolute confidence change per outcome. Keeps the score from
+/// swinging wildly on a single session.
+const MAX_CONFIDENCE_STEP: f64 = 0.1;
+
+/// Compute a bounded confidence delta from a session outcome.
+///
+/// Positive → lesson helped (confidence goes up).
+/// Negative → lesson didn't help (confidence goes down).
+/// Zero → ambiguous session (no confidence change).
+///
+/// The weighting ensures diagnosis-specific criteria (met/failed) dominate
+/// over ambient session noise (stalls, corrections). This means a lesson
+/// whose postcondition was explicitly verified as met will gain confidence
+/// even if the session had some stalls elsewhere.
+#[must_use]
+pub fn compute_confidence_delta(outcome: &LessonOutcome) -> f64 {
+    let diagnosis_score = outcome.diagnosis_criteria_met as f64 * DIAGNOSIS_WEIGHT
+        - outcome.diagnosis_criteria_failed as f64 * DIAGNOSIS_WEIGHT;
+
+    let noise_negative = (outcome.stall_events
+        + outcome.user_corrections
+        + outcome.tool_failures
+        + outcome.unmet_postconditions) as f64;
+
+    let total_weight = DIAGNOSIS_WEIGHT + NOISE_WEIGHT;
+    let raw = (diagnosis_score - noise_negative * NOISE_WEIGHT) / total_weight.max(1.0);
+
+    // Bounded learning rate: scale raw score to a small step, clamped.
+    (raw * 0.05).clamp(-MAX_CONFIDENCE_STEP, MAX_CONFIDENCE_STEP)
+}
 
 // ── Tests (pure logic) ──────────────────────────────────────────────────────
 
@@ -873,5 +918,97 @@ mod tests {
         assert_eq!(without_frac.format("%H:%M:%S").to_string(), "12:34:56");
 
         assert!(parse_mysql_datetime("not a date").is_err());
+    }
+
+    // ── R4: weighted confidence scoring ─────────────────────────────────────
+
+    fn outcome(
+        criteria_met: u32,
+        criteria_failed: u32,
+        stalls: u32,
+        corrections: u32,
+        tool_failures: u32,
+        unmet: u32,
+    ) -> LessonOutcome {
+        LessonOutcome {
+            session_id: "s".into(),
+            user_id: "u".into(),
+            stall_events: stalls,
+            user_corrections: corrections,
+            tool_failures,
+            unmet_postconditions: unmet,
+            diagnosis_criteria_met: criteria_met,
+            diagnosis_criteria_failed: criteria_failed,
+        }
+    }
+
+    #[test]
+    fn confidence_delta_positive_when_criteria_met_dominates() {
+        // 2 criteria met, no noise → strong positive signal.
+        let d = compute_confidence_delta(&outcome(2, 0, 0, 0, 0, 0));
+        assert!(d > 0.0, "criteria_met should yield positive delta, got {d}");
+    }
+
+    #[test]
+    fn confidence_delta_negative_when_criteria_failed_dominates() {
+        // 0 met, 2 failed → strong negative signal.
+        let d = compute_confidence_delta(&outcome(0, 2, 0, 0, 0, 0));
+        assert!(
+            d < 0.0,
+            "criteria_failed should yield negative delta, got {d}"
+        );
+    }
+
+    #[test]
+    fn confidence_delta_diagnosis_outweighs_noise() {
+        // 1 criterion met (weight 3) vs 2 stalls (weight 1 each).
+        // diagnosis_score = 3.0, noise = -2.0
+        // raw = (3.0 - 2.0) / 4.0 = 0.25 → clamped 0.05 * 0.25 = 0.0125
+        let d = compute_confidence_delta(&outcome(1, 0, 2, 0, 0, 0));
+        assert!(d > 0.0, "1 met criterion should outweigh 2 stalls, got {d}");
+    }
+
+    #[test]
+    fn confidence_delta_pure_noise_is_negative() {
+        // No criteria, just session noise → negative.
+        let d = compute_confidence_delta(&outcome(0, 0, 3, 2, 1, 0));
+        assert!(d < 0.0, "pure noise should yield negative delta, got {d}");
+    }
+
+    #[test]
+    fn confidence_delta_is_bounded() {
+        // Extreme values must not exceed MAX_CONFIDENCE_STEP.
+        let extreme_pos = compute_confidence_delta(&outcome(100, 0, 0, 0, 0, 0));
+        assert!(
+            extreme_pos <= MAX_CONFIDENCE_STEP + f64::EPSILON,
+            "positive delta must be bounded: {extreme_pos}"
+        );
+        let extreme_neg = compute_confidence_delta(&outcome(0, 100, 50, 50, 50, 50));
+        assert!(
+            extreme_neg >= -MAX_CONFIDENCE_STEP - f64::EPSILON,
+            "negative delta must be bounded: {extreme_neg}"
+        );
+    }
+
+    #[test]
+    fn confidence_delta_zero_outcome_is_zero() {
+        // Empty outcome → no signal → no change.
+        let d = compute_confidence_delta(&outcome(0, 0, 0, 0, 0, 0));
+        assert!(
+            d.abs() < f64::EPSILON,
+            "empty outcome should be ~0, got {d}"
+        );
+    }
+
+    #[test]
+    fn confidence_delta_mixed_signals_balance() {
+        // 1 met (weight 3) + 3 noise (weight 1 each) ≈ balanced.
+        // diagnosis_score = 3.0, noise = -3.0
+        // raw = (3.0 - 3.0) / 4.0 = 0.0
+        let d = compute_confidence_delta(&outcome(1, 0, 1, 1, 1, 0));
+        assert!(
+            d.abs() < 0.01,
+            "balanced signals should be near zero, got {d}"
+        );
     }
 }
