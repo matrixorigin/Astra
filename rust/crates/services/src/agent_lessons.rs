@@ -194,13 +194,13 @@ impl NewLesson {
         if self.trigger_signal.is_empty() {
             return Err("trigger_signal must not be empty");
         }
-        if self.trigger_signal.chars().count() > MAX_TRIGGER_SIGNAL_LEN {
+        if self.trigger_signal.len() > MAX_TRIGGER_SIGNAL_LEN {
             return Err("trigger_signal exceeds MAX_TRIGGER_SIGNAL_LEN");
         }
         if self.action.is_empty() {
             return Err("action must not be empty");
         }
-        if self.action.chars().count() > MAX_ACTION_LEN {
+        if self.action.len() > MAX_ACTION_LEN {
             return Err("action exceeds MAX_ACTION_LEN");
         }
         if let Some(c) = self.confidence
@@ -436,7 +436,7 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         // TTL (7 days) because tool issues are often transient and a stale
         // "avoid grep" from a week-old resource-limit event can cripple the
         // agent. General lessons use the caller's max_age_days (typically 30).
-        let _tool_stale = query(
+        let tool_stale = query(
             "DELETE FROM agent_lessons \
              WHERE user_id = ? AND kind IN ('tool_deprioritize', 'tool_boost') \
                AND updated_at < DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 7 DAY)",
@@ -485,7 +485,10 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         .await?;
 
         tx.commit().await?;
-        Ok(retired.rows_affected() + stale.rows_affected() + overflow.rows_affected())
+        Ok(retired.rows_affected()
+            + tool_stale.rows_affected()
+            + stale.rows_affected()
+            + overflow.rows_affected())
     }
 
     async fn record_exposure(&self, exposure: LessonExposure) -> Result<(), sqlx::Error> {
@@ -699,7 +702,7 @@ pub const AGENT_LESSONS_DDL: &str = "CREATE TABLE IF NOT EXISTS agent_lessons (
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     INDEX idx_agent_lessons_scope (user_id, persona, workload_tag, updated_at),
-    INDEX idx_agent_lessons_user_created (user_id, created_at),
+    INDEX idx_agent_lessons_user_updated (user_id, updated_at),
     UNIQUE KEY uniq_agent_lesson_content \
         (user_id, persona, workload_key, kind, trigger_signal)
 )";
@@ -875,7 +878,7 @@ mod tests {
             "created_at DATETIME(6)",
             "updated_at DATETIME(6)",
             "idx_agent_lessons_scope",
-            "idx_agent_lessons_user_created",
+            "idx_agent_lessons_user_updated",
         ] {
             assert!(
                 AGENT_LESSONS_DDL.contains(required),
@@ -1069,5 +1072,48 @@ mod tests {
         let d = compute_confidence_delta(&extreme);
         assert!(d.is_finite(), "must not be NaN/inf with u32::MAX inputs");
         assert!(d.abs() <= MAX_CONFIDENCE_STEP + f64::EPSILON);
+    }
+
+    #[test]
+    fn validate_uses_byte_length_not_char_count() {
+        // CJK chars are 3 bytes each in UTF-8. 86 CJK chars = 258 bytes > 255.
+        let cjk = "工".repeat(86);
+        assert_eq!(cjk.chars().count(), 86); // well under 255 chars
+        assert!(cjk.len() > MAX_TRIGGER_SIGNAL_LEN); // but overflows byte budget
+
+        let mut n = valid_new();
+        n.trigger_signal = cjk;
+        assert!(
+            n.validate().is_err(),
+            "multibyte trigger_signal must be rejected by byte-length check"
+        );
+    }
+
+    #[test]
+    fn validate_action_byte_length_boundary() {
+        // 342 CJK chars × 3 bytes = 1026 > 1024.
+        let cjk = "字".repeat(342);
+        assert!(cjk.len() > MAX_ACTION_LEN);
+
+        let mut n = valid_new();
+        n.action = cjk;
+        assert!(
+            n.validate().is_err(),
+            "multibyte action must be rejected by byte-length check"
+        );
+    }
+
+    #[test]
+    fn ddl_index_matches_prune_query_pattern() {
+        // prune() uses WHERE user_id = ? AND updated_at < ... so the index
+        // must be (user_id, updated_at), not (user_id, created_at).
+        assert!(
+            AGENT_LESSONS_DDL.contains("idx_agent_lessons_user_updated (user_id, updated_at)"),
+            "DDL must index (user_id, updated_at) for prune queries"
+        );
+        assert!(
+            !AGENT_LESSONS_DDL.contains("idx_agent_lessons_user_created"),
+            "old (user_id, created_at) index must not exist — no query uses it"
+        );
     }
 }

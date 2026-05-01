@@ -417,6 +417,11 @@ impl From<String> for ClassifiedError {
 /// Used exclusively for external tool output (bash, MCP tools) where we don't
 /// control the error format. All other errors are constructed with the correct
 /// [`ErrorKind`] at their source.
+///
+/// **Priority order matters** — more specific patterns first:
+/// ResourceLimit > DatabaseError > ToolTimeout > Network > Auth >
+/// ToolUnavailable > ToolInvalidArgs > ToolNotFound > Unknown.
+/// Do not reorder blocks without verifying all tests still pass.
 #[must_use]
 pub fn classify_tool_output(error_str: &str) -> ErrorKind {
     let lower = error_str.to_lowercase();

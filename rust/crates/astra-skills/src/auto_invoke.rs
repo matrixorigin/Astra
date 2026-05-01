@@ -416,6 +416,12 @@ impl SkillDiagnosis {
 
         let schema = value.get("schema_version").and_then(|v| v.as_u64())?;
         if schema != u64::from(SKILL_DIAGNOSIS_SCHEMA_VERSION) {
+            tracing::warn!(
+                target: "auto_invoke",
+                expected = SKILL_DIAGNOSIS_SCHEMA_VERSION,
+                actual = schema,
+                "skill diagnosis schema version mismatch — ignoring block",
+            );
             return None;
         }
         let skill = value.get("skill").and_then(|v| v.as_str())?.to_string();
@@ -507,8 +513,14 @@ fn parse_cause_tag(tag: &str) -> Option<AutoInvokeCause> {
     }
 }
 
+/// Upper bound on `window_turns` to prevent unbounded state retention.
+pub const MAX_WINDOW_TURNS: u32 = 50;
+
 fn criterion_is_valid(c: &DiagnosisCriterion) -> bool {
-    c.threshold.is_finite() && c.window_turns > 0 && !c.description.trim().is_empty()
+    c.threshold.is_finite()
+        && c.window_turns > 0
+        && c.window_turns <= MAX_WINDOW_TURNS
+        && !c.description.trim().is_empty()
 }
 
 fn criterion_key(c: &DiagnosisCriterion) -> String {
@@ -790,5 +802,45 @@ mod tests {
         let json = serde_json::to_string(&diag).unwrap();
         let back: SkillDiagnosis = serde_json::from_str(&json).unwrap();
         assert_eq!(diag, back);
+    }
+
+    fn skill_diag_json(window_turns: u32) -> String {
+        format!(
+            r#"```skill-diagnosis
+{{
+  "schema_version": 2,
+  "skill": "analyze_session",
+  "cause": "session_stalls",
+  "headline": "test",
+  "findings": ["f"],
+  "success_criteria": [{{
+    "metric": "session_stalls_delta",
+    "operator": "lte",
+    "threshold": 0.0,
+    "window_turns": {window_turns},
+    "description": "no more stalls"
+  }}],
+  "source": "synthetic_fallback"
+}}
+```"#
+        )
+    }
+
+    #[test]
+    fn criterion_window_turns_upper_bound() {
+        let raw = skill_diag_json(MAX_WINDOW_TURNS + 1);
+        assert!(
+            SkillDiagnosis::parse_from_skill_output(&raw).is_none(),
+            "window_turns > MAX_WINDOW_TURNS must be rejected"
+        );
+    }
+
+    #[test]
+    fn criterion_window_turns_at_boundary_accepted() {
+        let raw = skill_diag_json(MAX_WINDOW_TURNS);
+        assert!(
+            SkillDiagnosis::parse_from_skill_output(&raw).is_some(),
+            "window_turns == MAX_WINDOW_TURNS must be accepted"
+        );
     }
 }

@@ -258,6 +258,12 @@ pub fn summarise_from_runtime(
 /// Transient infrastructure error kinds that should NOT produce
 /// ToolDeprioritize lessons. These are environmental failures, not
 /// evidence that the tool itself is broken.
+///
+/// Differs from [`astra_core::ErrorKind::is_retryable`]: that method
+/// controls immediate retry (network/rate-limit/server-error only),
+/// while this function controls **lesson suppression** (wider: also
+/// includes `auth` and `resource_limit` because a bad token or fork
+/// bomb is not the tool's fault).
 fn is_transient_error_kind(tag: &str) -> bool {
     matches!(
         tag,
@@ -733,6 +739,9 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
 
+    // In-memory stub. Does NOT simulate: UNIQUE KEY upsert-on-collision,
+    // confidence clamping, status filtering, or ordering by confidence DESC.
+    // Use agent_lessons_db_it.rs for integration tests that need those.
     struct StubPersistSvc {
         lessons: StdMutex<Vec<Lesson>>,
         next_id: StdMutex<u32>,

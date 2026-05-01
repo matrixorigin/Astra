@@ -12,6 +12,7 @@
 
 use astra_services::session_journal;
 use crossterm::style::Stylize;
+use futures_util::FutureExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -47,82 +48,19 @@ pub(super) async fn finalize_session(state: &ReplState) {
     // 3c. P3.2 seam: persist cross-session lessons derived from this session.
     //     Best-effort: silent no-op if MatrixOne / user_id is unavailable,
     //     or if the session didn't run long enough to collect signals.
+    //     Wrapped in catch_unwind so a panic here cannot prevent the
+    //     critical cleanup steps below (ingestion flush, panic guard).
     if state.turn > 0
         && let Some(ref mc) = state.matrix_runtime
         && let Some(ref user_id) = state.ingestion_user_id
     {
-        let svc = mc.agent_lessons_service();
-        // Build the summary under a scoped read lock so the summarise call
-        // doesn't hold the lock across the persist await. ObservabilitySession
-        // isn't Clone, so `summarise_from_runtime` runs inside the guard.
-        // Lock poisoning degrades silently to tool-health-only.
-        let summary = match state
-            .observability_session
-            .as_ref()
-            .and_then(|arc| arc.read().ok())
-        {
-            Some(guard) => astra_runtime::lesson_extractor::summarise_from_runtime(
-                &state.tool_health_entries,
-                Some(&*guard),
-            ),
-            None => astra_runtime::lesson_extractor::summarise_from_runtime(
-                &state.tool_health_entries,
-                None,
-            ),
-        };
-        let tool_failures: u32 = summary.tool_failures.values().copied().sum();
-        // Run inline — it's a handful of SQL upserts, bounded by the
-        // number of distilled lessons (≤ ~5 in practice). We deliberately
-        // await rather than fire-and-forget so the ingestion shutdown in
-        // step 4 doesn't race with the lesson writes.
-        let _ = astra_runtime::lesson_extractor::persist_session_lessons(
-            svc.clone(),
-            &summary,
-            user_id,
-            "generic",
-            None,
-        )
-        .await;
-        // Rehabilitate: if tools were successfully used this session,
-        // refresh their ToolDeprioritize lessons' updated_at so they
-        // stay alive through the 7-day tool TTL while the weighted
-        // outcome system naturally adjusts confidence.
-        astra_runtime::lesson_extractor::weaken_rehabilitated_tools(
-            svc.clone(),
-            &summary,
-            user_id,
-            "generic",
-            None,
-        )
-        .await;
-        if let Some(ref session_id) = state.session_id
-            && let Err(e) = svc
-                .record_outcome(astra_services::LessonOutcome {
-                    session_id: session_id.clone(),
-                    user_id: user_id.clone(),
-                    stall_events: summary.stall_events,
-                    user_corrections: summary.user_corrections.len() as u32,
-                    tool_failures,
-                    unmet_postconditions: summary.unmet_postconditions,
-                    diagnosis_criteria_met: state.diagnosis_criteria_met,
-                    diagnosis_criteria_failed: state.diagnosis_criteria_failed,
-                })
-                .await
-        {
-            tracing::warn!(
+        let result = std::panic::AssertUnwindSafe(persist_lessons_best_effort(state, mc, user_id))
+            .catch_unwind()
+            .await;
+        if result.is_err() {
+            tracing::error!(
                 target: "session_cleanup",
-                session_id = session_id,
-                user_id = user_id,
-                error = %e,
-                "failed to record lesson exposure outcomes; continuing cleanup",
-            );
-        }
-        if let Err(e) = svc.prune(user_id, 30).await {
-            tracing::warn!(
-                target: "session_cleanup",
-                user_id = user_id,
-                error = %e,
-                "failed to prune stale agent lessons; continuing cleanup",
+                "lesson extraction panicked; continuing with critical cleanup",
             );
         }
     }
@@ -145,6 +83,92 @@ pub(super) async fn finalize_session(state: &ReplState) {
     .await;
     // 6. Clear panic guard
     clear_panic_guard();
+}
+
+// ---------------------------------------------------------------------------
+// Lesson extraction — isolated from finalize_session so a panic cannot
+// prevent the critical cleanup steps (ingestion flush, panic guard clear).
+// ---------------------------------------------------------------------------
+
+async fn persist_lessons_best_effort(
+    state: &ReplState,
+    mc: &astra_runtime::MatrixCloudRuntime,
+    user_id: &str,
+) {
+    let svc = mc.agent_lessons_service();
+    // Build the summary under a scoped read lock so the summarise call
+    // doesn't hold the lock across the persist await. ObservabilitySession
+    // isn't Clone, so `summarise_from_runtime` runs inside the guard.
+    let summary = match state
+        .observability_session
+        .as_ref()
+        .and_then(|arc| match arc.read() {
+            Ok(guard) => Some(guard),
+            Err(_poison) => {
+                tracing::warn!(
+                    target: "session_cleanup",
+                    "observability_session lock poisoned; \
+                     lesson extraction will omit stall/correction signals",
+                );
+                None
+            }
+        }) {
+        Some(guard) => astra_runtime::lesson_extractor::summarise_from_runtime(
+            &state.tool_health_entries,
+            Some(&*guard),
+        ),
+        None => astra_runtime::lesson_extractor::summarise_from_runtime(
+            &state.tool_health_entries,
+            None,
+        ),
+    };
+    let tool_failures: u32 = summary.tool_failures.values().copied().sum();
+    let _ = astra_runtime::lesson_extractor::persist_session_lessons(
+        svc.clone(),
+        &summary,
+        user_id,
+        "generic",
+        None,
+    )
+    .await;
+    astra_runtime::lesson_extractor::weaken_rehabilitated_tools(
+        svc.clone(),
+        &summary,
+        user_id,
+        "generic",
+        None,
+    )
+    .await;
+    if let Some(ref session_id) = state.session_id
+        && let Err(e) = svc
+            .record_outcome(astra_services::LessonOutcome {
+                session_id: session_id.clone(),
+                user_id: user_id.to_string(),
+                stall_events: summary.stall_events,
+                user_corrections: summary.user_corrections.len() as u32,
+                tool_failures,
+                unmet_postconditions: summary.unmet_postconditions,
+                diagnosis_criteria_met: state.diagnosis_criteria_met,
+                diagnosis_criteria_failed: state.diagnosis_criteria_failed,
+            })
+            .await
+    {
+        tracing::warn!(
+            target: "session_cleanup",
+            session_id = session_id,
+            user_id = user_id,
+            error = %e,
+            "failed to record lesson exposure outcomes; continuing cleanup",
+        );
+    }
+    if let Err(e) = svc.prune(user_id, 30).await {
+        tracing::warn!(
+            target: "session_cleanup",
+            user_id = user_id,
+            error = %e,
+            "failed to prune stale agent lessons; continuing cleanup",
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
