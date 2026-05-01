@@ -9,9 +9,9 @@ use astra_core::{
 
 use super::scoring::{
     DEGRADATION_DELTA, QUALITY_DEGRADED, QUALITY_GOOD, TOKEN_CHAR_RATIO, analyze_context_health,
-    billable_input_from_canonical, compaction_effectiveness, compaction_forecast, compute_trend,
-    memory_recall_final_score, memory_recall_score, parse_relevance_scores, parse_token_usage,
-    pollution_ratio, relevance_quality, zone_balance,
+    billable_input_from_canonical, compaction_effectiveness, compaction_forecast, compute_drift,
+    compute_trend, memory_recall_final_score, memory_recall_score, parse_relevance_scores,
+    parse_token_usage, pollution_ratio, relevance_quality, zone_balance,
 };
 use super::{
     EpisodicStats, IntrospectionService, MemoryIntrospectionResponse, ProceduralStats,
@@ -802,6 +802,194 @@ impl IntrospectionService for DatabaseIntrospectionService {
                 "merge": {"candidates": ranking.len(), "ms": 0},
             },
             "ranking": ranking,
+        }))
+    }
+
+    async fn get_decision_trace(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        last_n: i32,
+    ) -> ServiceResult<Value> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        self.verify_session_owner(&pool, session_id, user_id)
+            .await?;
+        let last_n = last_n.clamp(1, 200);
+
+        let rows = query(
+            "SELECT decision_id, event_id, decision_type, model_used, \
+                    IFNULL(CAST(decision_output AS CHAR), '{}') AS output_json, \
+                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+             FROM ctx_decision_audits \
+             WHERE session_id = ? \
+             ORDER BY created_at DESC LIMIT ?",
+        )
+        .bind(session_id)
+        .bind(i64::from(last_n))
+        .fetch_all(&pool)
+        .await
+        .map_err(internal_error)?;
+
+        let decisions: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                let output_json: String = r.try_get("output_json").unwrap_or_else(|_| "{}".into());
+                let output: Value =
+                    serde_json::from_str(&output_json).unwrap_or(Value::Object(Default::default()));
+                serde_json::json!({
+                    "decision_id": r.try_get::<String, _>("decision_id").unwrap_or_default(),
+                    "event_id": r.try_get::<String, _>("event_id").unwrap_or_default(),
+                    "decision_type": r.try_get::<String, _>("decision_type").unwrap_or_default(),
+                    "model_used": r.try_get::<Option<String>, _>("model_used").unwrap_or(None),
+                    "created_at": r.try_get::<String, _>("created_at").unwrap_or_default(),
+                    "output": output,
+                })
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "schema_version": 1,
+            "session_id": session_id,
+            "user_id": user_id,
+            "last_n": last_n,
+            "decisions": decisions,
+        }))
+    }
+
+    async fn get_tool_history(
+        &self,
+        user_id: &str,
+        tool: &str,
+        window_hours: i32,
+    ) -> ServiceResult<Value> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let window_hours = window_hours.clamp(1, 24 * 30); // up to 30 days
+
+        // Counts across the user's sessions within the rolling window.
+        // We match on both `skill_name` (the canonical path) and
+        // `meta_tool_name` (free-form) so older rows still show up.
+        let agg = query(
+            "SELECT \
+               COUNT(*) AS total_calls, \
+               SUM(CASE WHEN event_type IN ('error', 'tool_error') \
+                        OR event_type LIKE '%error%' \
+                        OR event_type LIKE '%fail%' THEN 1 ELSE 0 END) AS fail_count \
+             FROM agent_events \
+             WHERE user_id = ? \
+               AND (skill_name = ? OR meta_tool_name = ?) \
+               AND created_at >= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? HOUR)",
+        )
+        .bind(user_id)
+        .bind(tool)
+        .bind(tool)
+        .bind(i64::from(window_hours))
+        .fetch_one(&pool)
+        .await
+        .map_err(internal_error)?;
+
+        let total_calls: i64 = agg.try_get("total_calls").unwrap_or(0);
+        let fail_count: i64 = agg.try_get("fail_count").unwrap_or(0);
+        let ok_count = (total_calls - fail_count).max(0);
+        let success_rate = if total_calls > 0 {
+            (ok_count as f64) / (total_calls as f64)
+        } else {
+            0.0
+        };
+
+        let failures = query(
+            "SELECT session_id, \
+                    SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 200) AS error_preview, \
+                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+             FROM agent_events \
+             WHERE user_id = ? \
+               AND (skill_name = ? OR meta_tool_name = ?) \
+               AND (event_type IN ('error', 'tool_error') \
+                    OR event_type LIKE '%error%' OR event_type LIKE '%fail%') \
+               AND created_at >= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? HOUR) \
+             ORDER BY created_at DESC LIMIT 10",
+        )
+        .bind(user_id)
+        .bind(tool)
+        .bind(tool)
+        .bind(i64::from(window_hours))
+        .fetch_all(&pool)
+        .await
+        .map_err(internal_error)?;
+
+        let recent_failures: Vec<Value> = failures
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "session_id": r.try_get::<String, _>("session_id").unwrap_or_default(),
+                    "error_preview": r.try_get::<String, _>("error_preview").unwrap_or_default(),
+                    "created_at": r.try_get::<String, _>("created_at").unwrap_or_default(),
+                })
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "schema_version": 1,
+            "user_id": user_id,
+            "tool": tool,
+            "window_hours": window_hours,
+            "total_calls": total_calls,
+            "ok_count": ok_count,
+            "fail_count": fail_count,
+            "success_rate": success_rate,
+            "recent_failures": recent_failures,
+        }))
+    }
+
+    async fn get_drift_check(&self, user_id: &str, session_id: &str) -> ServiceResult<Value> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        self.verify_session_owner(&pool, session_id, user_id)
+            .await?;
+
+        // Original intent: earliest user-facing event.
+        let first = query(
+            "SELECT SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 240) AS preview \
+             FROM agent_events \
+             WHERE session_id = ? AND (event_type = 'user_query' OR event_type = 'user_message') \
+             ORDER BY created_at ASC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)?;
+
+        let original_intent: String = first
+            .as_ref()
+            .and_then(|r| r.try_get::<String, _>("preview").ok())
+            .unwrap_or_default();
+
+        // Current focus: last non-error event.
+        let last = query(
+            "SELECT SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 240) AS preview \
+             FROM agent_events \
+             WHERE session_id = ? \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)?;
+
+        let current_focus: String = last
+            .as_ref()
+            .and_then(|r| r.try_get::<String, _>("preview").ok())
+            .unwrap_or_default();
+
+        let (drift_score, drift_level, signals) = compute_drift(&original_intent, &current_focus);
+
+        Ok(serde_json::json!({
+            "schema_version": 1,
+            "user_id": user_id,
+            "session_id": session_id,
+            "original_intent_preview": original_intent,
+            "current_focus_preview": current_focus,
+            "drift_score": drift_score,
+            "drift_level": drift_level,
+            "signals": signals,
         }))
     }
 }

@@ -638,6 +638,79 @@ pub fn parse_relevance_scores(raw: &str) -> HashMap<String, f64> {
         .collect()
 }
 
+/// Drift score + categorical level + surfaceable signals for a session.
+///
+/// Treats the agent's "focus" as drifting from the original user intent to
+/// whatever event most recently wrote to the journal. Compares token sets
+/// via Jaccard distance — cheap, deterministic, and decent for short
+/// English/Chinese text. `drift_score` is in `[0.0, 1.0]`; level bins
+/// follow the 0.2 / 0.5 / 0.8 cuts.
+///
+/// Signals populate from simple heuristics (scope widening, no overlap at
+/// all, short-original-long-current) so the LLM has something to read
+/// beyond the raw score.
+#[must_use]
+pub fn compute_drift(
+    original_intent: &str,
+    current_focus: &str,
+) -> (f64, &'static str, Vec<String>) {
+    let original_tokens = tokenise(original_intent);
+    let current_tokens = tokenise(current_focus);
+
+    if original_tokens.is_empty() || current_tokens.is_empty() {
+        // Nothing to compare against — report as aligned and let the LLM
+        // decide whether the session has just started.
+        return (0.0, "aligned", vec!["insufficient history".into()]);
+    }
+
+    let intersection: usize = original_tokens
+        .iter()
+        .filter(|t| current_tokens.contains(*t))
+        .count();
+    let union: usize = original_tokens
+        .iter()
+        .chain(current_tokens.iter())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        .max(1);
+
+    let jaccard = (intersection as f64) / (union as f64);
+    let drift = (1.0 - jaccard).clamp(0.0, 1.0);
+
+    let level = if drift < 0.2 {
+        "aligned"
+    } else if drift < 0.5 {
+        "mild"
+    } else if drift < 0.8 {
+        "moderate"
+    } else {
+        "high"
+    };
+
+    let mut signals = Vec::new();
+    if intersection == 0 {
+        signals.push("no token overlap with original intent".to_string());
+    }
+    if current_tokens.len() > original_tokens.len().saturating_mul(3) {
+        signals.push("current focus is much broader than original scope".to_string());
+    }
+    if original_tokens.len() > current_tokens.len().saturating_mul(3) {
+        signals.push("current focus is much narrower than original scope".to_string());
+    }
+
+    (drift, level, signals)
+}
+
+/// Lowercase + alphanumeric token segmentation. Deliberately simple; enough
+/// for Jaccard on short prompt previews without pulling in a stemmer.
+fn tokenise(s: &str) -> std::collections::HashSet<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 2)
+        .map(str::to_string)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -859,5 +932,77 @@ mod tests {
     fn test_recall_partial_match() {
         let score = memory_recall_final_score("hello foo", &["hello", "world"], 0.5, 15.0);
         assert!((score - 0.5).abs() < 0.001);
+    }
+
+    // ── compute_drift ──────────────────────────────────────────────────
+
+    #[test]
+    fn compute_drift_identical_is_fully_aligned() {
+        let (score, level, signals) = compute_drift("list all rust files", "list all rust files");
+        assert!((score - 0.0).abs() < f64::EPSILON);
+        assert_eq!(level, "aligned");
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn compute_drift_completely_unrelated_is_high() {
+        let (score, level, signals) =
+            compute_drift("list all rust files", "deploy the website to production");
+        assert!(score > 0.8, "expected high drift score, got {score}");
+        assert_eq!(level, "high");
+        assert!(signals.iter().any(|s| s.contains("no token overlap")));
+    }
+
+    #[test]
+    fn compute_drift_empty_inputs_return_aligned_with_signal() {
+        let (score, level, signals) = compute_drift("", "anything");
+        assert!((score - 0.0).abs() < f64::EPSILON);
+        assert_eq!(level, "aligned");
+        assert!(signals.iter().any(|s| s.contains("insufficient")));
+    }
+
+    #[test]
+    fn compute_drift_broader_scope_emits_signal() {
+        // original has 2 tokens, current has 7 → >3x → "broader" signal
+        let (_score, _level, signals) = compute_drift(
+            "list files",
+            "list all rust files in src and tests and examples",
+        );
+        assert!(
+            signals.iter().any(|s| s.contains("broader")),
+            "expected broader-scope signal in: {signals:?}"
+        );
+    }
+
+    #[test]
+    fn compute_drift_level_bins() {
+        // Partial overlap: 2/4 = 0.5 → drift 0.5 → moderate.
+        let (score, level, _) = compute_drift("alpha beta gamma delta", "alpha beta epsilon zeta");
+        assert!(
+            (0.5..0.8).contains(&score),
+            "score out of moderate bin: {score}"
+        );
+        assert_eq!(level, "moderate");
+
+        // Small overlap: 1/5 = 0.2 → drift 0.8 → high
+        let (score, level, _) = compute_drift("alpha beta gamma", "alpha delta epsilon");
+        assert!(score >= 0.8);
+        assert_eq!(level, "high");
+    }
+
+    #[test]
+    fn compute_drift_score_is_always_in_unit_interval() {
+        for (a, b) in [
+            ("a b c", "a b c"),
+            ("a", "z"),
+            ("", ""),
+            ("alpha beta", "alpha beta gamma delta"),
+        ] {
+            let (score, _, _) = compute_drift(a, b);
+            assert!(
+                (0.0..=1.0).contains(&score),
+                "score {score} out of [0,1] for ({a:?}, {b:?})"
+            );
+        }
     }
 }

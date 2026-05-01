@@ -80,6 +80,34 @@ pub struct MemoryRecallQuery {
     pub limit: i32,
 }
 
+// ── P2.1: LLM-facing introspection (decision trace / tool history / drift) ──
+
+fn default_decision_trace_last_n() -> i32 {
+    20
+}
+fn default_tool_history_window_hours() -> i32 {
+    24
+}
+
+#[derive(Deserialize)]
+pub struct DecisionTraceQuery {
+    pub session_id: String,
+    #[serde(default = "default_decision_trace_last_n")]
+    pub last_n: i32,
+}
+
+#[derive(Deserialize)]
+pub struct ToolHistoryQuery {
+    pub tool: String,
+    #[serde(default = "default_tool_history_window_hours")]
+    pub window_hours: i32,
+}
+
+#[derive(Deserialize)]
+pub struct DriftCheckQuery {
+    pub session_id: String,
+}
+
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 pub async fn get_memory_introspection_handler(
@@ -177,6 +205,45 @@ pub async fn get_memory_recall_handler(
     Ok(Json(resp))
 }
 
+pub async fn get_decision_trace_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<DecisionTraceQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let resp = state
+        .introspection_service
+        .get_decision_trace(&user.user_id, &params.session_id, params.last_n)
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn get_tool_history_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ToolHistoryQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let resp = state
+        .introspection_service
+        .get_tool_history(&user.user_id, &params.tool, params.window_hours)
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn get_drift_check_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<DriftCheckQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let resp = state
+        .introspection_service
+        .get_drift_check(&user.user_id, &params.session_id)
+        .await?;
+    Ok(Json(resp))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +290,27 @@ mod tests {
         let q: MemoryRecallQuery = serde_json::from_str(json).unwrap();
         assert_eq!(q.task_hint, "default");
         assert_eq!(q.limit, 10);
+    }
+
+    #[test]
+    fn decision_trace_query_defaults() {
+        let q: DecisionTraceQuery = serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
+        assert_eq!(q.session_id, "s1");
+        assert_eq!(q.last_n, 20);
+    }
+
+    #[test]
+    fn tool_history_query_defaults() {
+        let q: ToolHistoryQuery = serde_json::from_str(r#"{"tool":"grep"}"#).unwrap();
+        assert_eq!(q.tool, "grep");
+        assert_eq!(q.window_hours, 24);
+    }
+
+    #[test]
+    fn drift_check_query_requires_session_id() {
+        let bad = serde_json::from_str::<DriftCheckQuery>("{}");
+        assert!(bad.is_err());
+        let ok: DriftCheckQuery = serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
+        assert_eq!(ok.session_id, "s1");
     }
 }
