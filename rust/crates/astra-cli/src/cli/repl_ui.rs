@@ -2495,15 +2495,43 @@ mod tests {
         assert!(rows.iter().any(|(cmd, _)| *cmd == "/clear"));
     }
 
+    /// Isolate `command_usage` for a single test: point it at a fresh
+    /// tempdir and clear the in-memory cache. Without this, ranking tests
+    /// that call `filtered_slash_rows` secretly read the dev's real
+    /// `~/.astra/command-usage.json` via `usage_boost`, producing flakes
+    /// that depend on which commands the dev has used locally (e.g. if
+    /// `/explain` has been run more than `/exit`, it outranks `/exit`
+    /// and breaks the "prefix match wins for 'e'" assertion).
+    ///
+    /// Returns a `(TempDir, impl Drop)` pair — keep both alive for the
+    /// test body; the Drop guard resets the TLS override.
+    fn isolate_command_usage() -> (tempfile::TempDir, impl Drop) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        command_usage::set_test_dir(dir.path());
+        command_usage::reset_for_tests();
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                command_usage::clear_test_dir();
+                command_usage::reset_for_tests();
+            }
+        }
+        (dir, Guard)
+    }
+
     #[test]
+    #[serial_test::serial]
     fn filtered_rows_first_item_is_real_command() {
+        let (_dir, _guard) = isolate_command_usage();
         let rows = filtered_slash_rows(None);
         assert!(!rows.is_empty());
         assert!(rows[0].0.starts_with("/"), "first item should start with /");
     }
 
     #[test]
+    #[serial_test::serial]
     fn filtered_rows_prefix_query_prefers_command_name_matches() {
+        let (_dir, _guard) = isolate_command_usage();
         let rows = filtered_slash_rows(Some("e"));
         assert!(!rows.is_empty());
         assert_eq!(rows[0].0, "/exit");
@@ -2512,14 +2540,18 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn filtered_rows_fuzzy_query_matches_command_name() {
+        let (_dir, _guard) = isolate_command_usage();
         let rows = filtered_slash_rows(Some("hlp"));
         assert!(!rows.is_empty());
         assert_eq!(rows[0].0, "/help");
     }
 
     #[test]
+    #[serial_test::serial]
     fn filtered_rows_falls_back_to_description_search_when_no_prefix_match() {
+        let (_dir, _guard) = isolate_command_usage();
         let rows = filtered_slash_rows(Some("authenticate"));
         assert!(!rows.is_empty());
         assert_eq!(rows[0].0, "/login");
@@ -2528,18 +2560,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn filtered_rows_without_query_prioritize_recent_commands() {
-        let dir = tempfile::tempdir().unwrap();
-        command_usage::set_test_dir(dir.path());
-        command_usage::reset_for_tests();
+        let (_dir, _guard) = isolate_command_usage();
         for _ in 0..4 {
             command_usage::record_command_use("/session").unwrap();
         }
 
         let rows = filtered_slash_rows(None);
         assert_eq!(rows.first().map(|row| row.0), Some("/session"));
-
-        command_usage::clear_test_dir();
-        command_usage::reset_for_tests();
     }
 
     // ── Bug fix: picker cycling wraps around ──────────────────────────────

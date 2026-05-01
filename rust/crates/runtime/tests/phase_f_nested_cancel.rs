@@ -175,13 +175,25 @@ async fn nested_cancel_propagates_through_three_levels() {
     let token = Arc::new(CancellationToken::new());
     let req = fan_out("del-nested-1", vec!["w1", "w2"]);
 
-    // Cancel after depth-2 tasks have had time to reach the select! boundary.
-    // Use a generous delay so concurrent test execution does not starve the
-    // root tasks before they reach their cancel-await point.
+    // Wait for the executor to actually start at least one sub-run before
+    // cancelling — and only then give depth-1/2 tasks a small grace window
+    // to reach their `select!`. The previous version slept a fixed 500ms
+    // before cancelling, which flaked under load: if the 4-worker pool was
+    // busy, the root task wouldn't be scheduled before the sleep elapsed,
+    // we'd cancel a not-yet-started execution, and `started_at_root` stayed
+    // at 0. Polling `started_at_root` makes the wait load-invariant.
     let cancel_after = {
         let t = token.clone();
+        let started = exec.started_at_root.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while tokio::time::Instant::now() < deadline
+                && started.load(Ordering::SeqCst) == 0
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // Small grace window so depth-1/2 tasks reach `select!`.
+            tokio::time::sleep(Duration::from_millis(50)).await;
             t.cancel();
         })
     };
