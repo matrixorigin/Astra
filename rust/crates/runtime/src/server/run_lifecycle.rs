@@ -863,10 +863,11 @@ async fn persist_server_loop_core_events(
         return;
     }
 
-    let writer = match shared_pool {
-        Some(pool) => DatabaseTurnCoreEventWriter::new(matrixone.clone()).with_pool(pool.clone()),
-        None => DatabaseTurnCoreEventWriter::new(matrixone.clone()),
+    let Some(pool) = shared_pool else {
+        return;
     };
+
+    let writer = DatabaseTurnCoreEventWriter::new(matrixone.clone()).with_pool(pool.clone());
 
     let chain_id = server_loop_causal_chain_id("server-loop");
     let user_query_event_id = Uuid::now_v7().to_string();

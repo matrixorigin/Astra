@@ -187,9 +187,7 @@ async fn nested_cancel_propagates_through_three_levels() {
         let started = exec.started_at_root.clone();
         tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            while tokio::time::Instant::now() < deadline
-                && started.load(Ordering::SeqCst) == 0
-            {
+            while tokio::time::Instant::now() < deadline && started.load(Ordering::SeqCst) == 0 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             // Small grace window so depth-1/2 tasks reach `select!`.

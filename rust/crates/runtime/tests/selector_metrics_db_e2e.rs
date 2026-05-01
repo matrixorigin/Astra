@@ -57,8 +57,8 @@ async fn shared_setup() -> &'static (MatrixOneSettings, SharedPool) {
             let database = format!("selector_e2e_{}", Uuid::new_v4().simple());
             let mut settings = require_db_it_env();
             settings.database = database.clone();
-            let catalog =
-                std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+            let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+                .unwrap_or_else(|_| "mysql".into());
             let mut bootstrap = settings.clone();
             bootstrap.database = catalog.clone();
             let admin_pool = connect_matrixone(&bootstrap)
@@ -663,8 +663,7 @@ async fn selector_metric_e2e_trims_global_window_to_recent_rows() {
         if turn_number > 1 {
             insert_sql.push_str(", ");
         }
-        insert_sql
-            .push_str("(?, ?, ?, ?, 2, 1, 1, 0, 1, 'lexical', 1, 2, NULL, ?)");
+        insert_sql.push_str("(?, ?, ?, ?, 2, 1, 1, 0, 1, 'lexical', 1, 2, NULL, ?)");
         // Spread created_at 1 millisecond apart so turn 1 is oldest, turn 1000 newest.
         let created_at = base_created_at + chrono::Duration::milliseconds(turn_number);
         binds.push((Uuid::new_v4().to_string(), turn_number, created_at));

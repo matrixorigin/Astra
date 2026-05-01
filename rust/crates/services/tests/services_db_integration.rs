@@ -1941,9 +1941,7 @@ async fn session_sync_log_prune_partitions_by_sync_type_on_live_matrixone() {
         if i > 0 {
             bulk_sql.push_str(", ");
         }
-        bulk_sql.push_str(
-            "(?, ?, ?, 'context_trace', 'push', 128, 'success', NULL, NOW(6))",
-        );
+        bulk_sql.push_str("(?, ?, ?, 'context_trace', 'push', 128, 'success', NULL, NOW(6))");
     }
     let mut q = sqlx::query(&bulk_sql);
     for _ in 0..seed_count {

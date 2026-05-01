@@ -1183,10 +1183,7 @@ mod tests {
 
     #[test]
     fn stemming_past_tense_match() {
-        assert!(word_boundary_match(
-            "committed the fix yesterday",
-            "commit",
-        ));
+        assert!(word_boundary_match("committed the fix yesterday", "commit",));
     }
 
     #[test]

@@ -106,7 +106,9 @@ pub fn tfidf_score(query_terms: &[String], tool_idx: usize) -> f64 {
 /// This is COMPLEMENTARY to TF-IDF — triggers capture multilingual synonyms
 /// and phrase patterns that TF-IDF might miss (e.g., "关注" → github tools).
 pub fn trigger_match_score(tool: &ToolMeta, query_lower: &str) -> f64 {
-    use astra_turn_core::tool_registry_state::{split_haystack_words, word_boundary_match_prepared};
+    use astra_turn_core::tool_registry_state::{
+        split_haystack_words, word_boundary_match_prepared,
+    };
 
     let mut best_score = 0.0;
     // Split the haystack once and reuse across all triggers. The haystack
@@ -223,7 +225,9 @@ fn file_context_tool_boost(tool_name: &str, file_context: &[String]) -> f64 {
 }
 
 fn explicit_lsp_signal(query_lower: &str) -> bool {
-    use astra_turn_core::tool_registry_state::{split_haystack_words, word_boundary_match_prepared};
+    use astra_turn_core::tool_registry_state::{
+        split_haystack_words, word_boundary_match_prepared,
+    };
 
     const LSP_SIGNALS: &[&str] = &[
         "lsp",

@@ -2,131 +2,111 @@ use crate::*;
 
 #[derive(Clone, Debug)]
 pub struct DatabaseTurnSessionActivityWriter {
-    matrixone: MatrixOneSettings,
     pool: Option<SharedPool>,
 }
 
 #[derive(Clone, Debug)]
 pub struct DatabaseTurnToolEventWriter {
-    matrixone: MatrixOneSettings,
     pool: Option<SharedPool>,
 }
 
 #[derive(Clone, Debug)]
 pub struct DatabaseTurnHookDbWriter {
-    matrixone: MatrixOneSettings,
     pool: Option<SharedPool>,
 }
 
 #[derive(Clone, Debug)]
 pub struct DatabaseTurnAuxiliaryEventWriter {
-    matrixone: MatrixOneSettings,
     pool: Option<SharedPool>,
 }
 
 #[derive(Clone, Debug)]
 pub struct DatabaseTurnCoreEventWriter {
-    matrixone: MatrixOneSettings,
     pool: Option<SharedPool>,
 }
 
 impl DatabaseTurnSessionActivityWriter {
-    pub fn new(matrixone: MatrixOneSettings) -> Self {
-        Self {
-            matrixone,
-            pool: None,
-        }
+    pub fn new(_matrixone: MatrixOneSettings) -> Self {
+        Self { pool: None }
     }
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.pool = Some(pool);
         self
     }
 
-    async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+    fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, String> {
+        self.pool
+            .as_ref()
+            .map(|p| p.get().clone())
+            .ok_or_else(|| "shared pool not configured".to_string())
     }
 }
 
 impl DatabaseTurnToolEventWriter {
-    pub fn new(matrixone: MatrixOneSettings) -> Self {
-        Self {
-            matrixone,
-            pool: None,
-        }
+    pub fn new(_matrixone: MatrixOneSettings) -> Self {
+        Self { pool: None }
     }
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.pool = Some(pool);
         self
     }
 
-    async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+    fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, String> {
+        self.pool
+            .as_ref()
+            .map(|p| p.get().clone())
+            .ok_or_else(|| "shared pool not configured".to_string())
     }
 }
 
 impl DatabaseTurnHookDbWriter {
-    pub fn new(matrixone: MatrixOneSettings) -> Self {
-        Self {
-            matrixone,
-            pool: None,
-        }
+    pub fn new(_matrixone: MatrixOneSettings) -> Self {
+        Self { pool: None }
     }
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.pool = Some(pool);
         self
     }
 
-    async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+    fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, String> {
+        self.pool
+            .as_ref()
+            .map(|p| p.get().clone())
+            .ok_or_else(|| "shared pool not configured".to_string())
     }
 }
 
 impl DatabaseTurnAuxiliaryEventWriter {
-    pub fn new(matrixone: MatrixOneSettings) -> Self {
-        Self {
-            matrixone,
-            pool: None,
-        }
+    pub fn new(_matrixone: MatrixOneSettings) -> Self {
+        Self { pool: None }
     }
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.pool = Some(pool);
         self
     }
 
-    async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+    fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, String> {
+        self.pool
+            .as_ref()
+            .map(|p| p.get().clone())
+            .ok_or_else(|| "shared pool not configured".to_string())
     }
 }
 
 impl DatabaseTurnCoreEventWriter {
-    pub fn new(matrixone: MatrixOneSettings) -> Self {
-        Self {
-            matrixone,
-            pool: None,
-        }
+    pub fn new(_matrixone: MatrixOneSettings) -> Self {
+        Self { pool: None }
     }
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.pool = Some(pool);
         self
     }
 
-    async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        if let Some(ref p) = self.pool {
-            return Ok(p.get().clone());
-        }
-        connect_matrixone(&self.matrixone).await
+    fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, String> {
+        self.pool
+            .as_ref()
+            .map(|p| p.get().clone())
+            .ok_or_else(|| "shared pool not configured".to_string())
     }
 }
 
@@ -165,7 +145,7 @@ impl TurnCoreEventWriter for DatabaseTurnCoreEventWriter {
         {
             return Ok(TurnCorePersistOutcome::default());
         }
-        let pool = self.get_pool().await.map_err(|error| error.to_string())?;
+        let pool = self.get_pool()?;
         let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
         if let Some(event) = plan.user_query_event.as_ref() {
             insert_core_turn_event(&mut tx, event)
@@ -196,7 +176,7 @@ impl TurnToolEventWriter for DatabaseTurnToolEventWriter {
         if plan.events.is_empty() {
             return Ok(());
         }
-        let pool = self.get_pool().await.map_err(|error| error.to_string())?;
+        let pool = self.get_pool()?;
         let skill_versions = resolve_active_skill_versions(
             &pool,
             plan.events
@@ -231,7 +211,7 @@ impl TurnHookDbWriter for DatabaseTurnHookDbWriter {
         {
             return Ok(());
         }
-        let pool = self.get_pool().await.map_err(|error| error.to_string())?;
+        let pool = self.get_pool()?;
         let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
         if let Some(decision_audit) = plan.decision_audit.as_ref() {
             insert_turn_decision_audit(&mut tx, decision_audit)
@@ -399,7 +379,7 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
         if events.is_empty() {
             return Ok(());
         }
-        let pool = self.get_pool().await.map_err(|error| error.to_string())?;
+        let pool = self.get_pool()?;
         let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
         for event in events {
             let meta_tool_name = metadata_tool_name(event.metadata.as_ref());
@@ -454,7 +434,7 @@ impl TurnSessionActivityWriter for DatabaseTurnSessionActivityWriter {
         session_id: &str,
         plan: SessionActivityUpdatePlan,
     ) -> Result<(), String> {
-        let pool = self.get_pool().await.map_err(|error| error.to_string())?;
+        let pool = self.get_pool()?;
         // BUG FIX (Session 7875e355 diagnostic): Use COUNT(*) reconcile instead of
         // increment to prevent drift from concurrent requests or duplicate detection.
         // This matches the fix in event_ingestion.rs flush_batch() and services/events.rs.
@@ -584,5 +564,132 @@ mod tests {
     fn metadata_tool_name_non_string_value() {
         let v = json!({"tool_name": 42});
         assert!(metadata_tool_name(Some(&v)).is_none());
+    }
+
+    /// Verify that all Database*Writer structs fail instantly when no pool is
+    /// configured, rather than blocking on a 2s connect_matrixone() timeout.
+    #[tokio::test]
+    async fn no_pool_writers_fail_fast_without_timeout() {
+        use std::time::Instant;
+
+        let settings = MatrixOneSettings {
+            host: "127.0.0.1".into(),
+            port: 0,
+            user: "x".into(),
+            password: "x".into(),
+            database: "x".into(),
+        };
+
+        let start = Instant::now();
+
+        // CoreEventWriter
+        let w = DatabaseTurnCoreEventWriter::new(settings.clone());
+        let r = w
+            .persist(TurnCorePersistPlan {
+                user_query_event: Some(TurnCoreEventRecord {
+                    event_id: "e1".into(),
+                    user_id: "u".into(),
+                    session_id: "s".into(),
+                    agent_id: None,
+                    event_type: "user_query".into(),
+                    content: "hi".into(),
+                    parent_event_id: None,
+                    parent_event_ids: vec![],
+                    causal_chain_id: "c".into(),
+                    llm_model_used: None,
+                    token_usage: None,
+                    llm_params: None,
+                    reasoning_content: None,
+                }),
+                llm_response_event: None,
+                snapshot_link_plan: None,
+            })
+            .await;
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("not configured"));
+
+        // HookDbWriter
+        let w = DatabaseTurnHookDbWriter::new(settings.clone());
+        let r = w
+            .persist(TurnHookDbPersistPlan {
+                decision_audit: Some(TurnDecisionAuditRecord {
+                    decision_id: "d1".into(),
+                    event_id: "e2".into(),
+                    session_id: "s".into(),
+                    decision_type: "tool_selection".into(),
+                    decision_output: json!({}),
+                    model_used: None,
+                    context_capture_id: None,
+                }),
+                skill_selection: None,
+                skill_selector_metric: None,
+                implicit_feedback: None,
+                reflection_lesson: None,
+                reflection_mark: None,
+            })
+            .await;
+        assert!(r.is_err());
+
+        // ToolEventWriter
+        let w = DatabaseTurnToolEventWriter::new(settings.clone());
+        let r = w
+            .persist(TurnToolEventPersistPlan {
+                events: vec![TurnToolEventRecord {
+                    event_id: "e3".into(),
+                    user_id: "u".into(),
+                    session_id: "s".into(),
+                    agent_id: None,
+                    event_type: "tool_call".into(),
+                    content: "x".into(),
+                    parent_event_id: None,
+                    parent_event_ids: vec![],
+                    causal_chain_id: "c".into(),
+                    metadata: None,
+                    skill_name: None,
+                    skill_version: None,
+                    reasoning_content: None,
+                }],
+            })
+            .await;
+        assert!(r.is_err());
+
+        // AuxiliaryEventWriter
+        let w = DatabaseTurnAuxiliaryEventWriter::new(settings.clone());
+        let r = w
+            .persist_events(vec![TurnAuxiliaryEventRecord {
+                event_id: "e4".into(),
+                user_id: "u".into(),
+                session_id: "s".into(),
+                agent_id: None,
+                event_type: "aux".into(),
+                content: "x".into(),
+                parent_event_id: None,
+                parent_event_ids: vec![],
+                causal_chain_id: "c".into(),
+                metadata: None,
+                reasoning_content: None,
+            }])
+            .await;
+        assert!(r.is_err());
+
+        // SessionActivityWriter
+        let w = DatabaseTurnSessionActivityWriter::new(settings);
+        let r = w
+            .update_session_activity(
+                "s",
+                SessionActivityUpdatePlan {
+                    event_count_increment: 1,
+                    last_event_id: Some("e5".into()),
+                },
+            )
+            .await;
+        assert!(r.is_err());
+
+        // All 5 must complete in <100ms (previously each took 2s)
+        assert!(
+            start.elapsed().as_millis() < 100,
+            "no-pool writers took {}ms — should be instant",
+            start.elapsed().as_millis()
+        );
     }
 }

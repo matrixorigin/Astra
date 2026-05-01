@@ -2061,7 +2061,10 @@ async fn sigkill_process_group(child: &mut tokio::process::Child) {
                 let pgid = nix::unistd::Pid::from_raw(raw);
                 let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
             } else {
-                tracing::warn!(pid, "sigkill_process_group: PID exceeds i32::MAX, skipping killpg");
+                tracing::warn!(
+                    pid,
+                    "sigkill_process_group: PID exceeds i32::MAX, skipping killpg"
+                );
             }
         }
     }

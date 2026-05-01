@@ -280,7 +280,8 @@ async fn put_plan_with_stale_expected_version_returns_409() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, version) = seed_plan_with_subtasks(&app, &pool, "http-ver-conflict", &["a", "b"]).await;
+    let (plan_id, version) =
+        seed_plan_with_subtasks(&app, &pool, "http-ver-conflict", &["a", "b"]).await;
 
     // First edit with the correct version → 200.
     let (s, b) = request_json(
@@ -1147,7 +1148,8 @@ async fn rewind_cancels_open_step_runs_for_reset_subtasks() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, _) = seed_plan_with_subtasks(&app, &pool, "http-rewind-abort", &["a", "b", "c"]).await;
+    let (plan_id, _) =
+        seed_plan_with_subtasks(&app, &pool, "http-rewind-abort", &["a", "b", "c"]).await;
     let session_id = format!("sit-rewind-abort-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
 

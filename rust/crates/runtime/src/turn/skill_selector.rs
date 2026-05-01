@@ -528,15 +528,16 @@ fn overlap_count(query_tokens: &HashSet<String>, field_tokens: &[String]) -> usi
 }
 
 fn exact_signals(query_lower: &str, entry: &SelectorEntry) -> ExactSignals {
-    let name_hit = !entry.name_exact.is_empty()
-        && word_boundary_match(query_lower, &entry.name_exact);
+    let name_hit =
+        !entry.name_exact.is_empty() && word_boundary_match(query_lower, &entry.name_exact);
     let alias_hit = entry
         .alias_exact
         .iter()
         .any(|alias| !alias.is_empty() && word_boundary_match(query_lower, alias));
-    let trigger_hit = entry.trigger_exact.iter().any(|trigger| {
-        !trigger.is_empty() && word_boundary_match(query_lower, trigger)
-    });
+    let trigger_hit = entry
+        .trigger_exact
+        .iter()
+        .any(|trigger| !trigger.is_empty() && word_boundary_match(query_lower, trigger));
     ExactSignals {
         name_hit,
         alias_hit,

@@ -505,8 +505,8 @@ impl AuthService for DatabaseAuthService {
             ));
         }
 
-        let password_hash =
-            bcrypt_hash(request.password.as_str(), bcrypt_cost_from_env()).map_err(internal_error)?;
+        let password_hash = bcrypt_hash(request.password.as_str(), bcrypt_cost_from_env())
+            .map_err(internal_error)?;
         let user_id = Uuid::new_v4().to_string();
         let display_name = request.display_name.clone();
 

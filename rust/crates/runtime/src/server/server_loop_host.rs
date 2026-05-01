@@ -1302,8 +1302,8 @@ impl ServerAgenticLoopHost {
 
         state.final_text_streamed = !full_text.is_empty();
         state.final_text = full_text;
-        state.total_prompt += u.input_tokens as u64;
-        state.total_completion += u.output_tokens as u64;
+        state.total_prompt += u.input_tokens;
+        state.total_completion += u.output_tokens;
         state.has_any_usage = true;
 
         Ok(HostTurnResult {

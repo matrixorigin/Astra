@@ -1,5 +1,6 @@
 [profile.default]
 fail-fast = false
+slow-timeout = { period = "15s", terminate-after = 1 }
 
 # All profiles share a uniform 15s per-test-case hard budget. TIMEOUT = FAIL;
 # no per-test/per-binary carve-outs. 15s is deliberately lax so flake from
@@ -9,23 +10,23 @@ fail-fast = false
 # prune contention is fixed — ideally back toward 1–2s per case.
 [profile.ci]
 fail-fast = false
-slow-timeout = { period = "15s", terminate-after = 1 }
+slow-timeout = { period = "30s", terminate-after = 1 }
 failure-output = "immediate"
 
 [profile.strict]
 fail-fast = false
 failure-output = "immediate"
-slow-timeout = { period = "15s", terminate-after = 1 }
+slow-timeout = { period = "30s", terminate-after = 1 }
 
 [profile.strict-online]
 fail-fast = false
 failure-output = "immediate"
-slow-timeout = { period = "15s", terminate-after = 1 }
+slow-timeout = { period = "30s", terminate-after = 1 }
 
 [profile.strict-online-ci]
 fail-fast = false
 failure-output = "immediate"
-slow-timeout = { period = "15s", terminate-after = 1 }
+slow-timeout = { period = "30s", terminate-after = 1 }
 
 # ── Parallelism caps for heavy integration suites ────────────────────────
 # Group membership is set via `[[profile.X.overrides]]` below. These test

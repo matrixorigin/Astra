@@ -6,7 +6,7 @@
 //! # Per-binary schema-bootstrap cache
 //!
 //! `ensure_core_schema` runs every idempotent `CREATE TABLE IF NOT EXISTS`
-//! + `SELECT schema_migrations WHERE version = ?` check in the core catalog.
+//! and `SELECT schema_migrations WHERE version = ?` check in the core catalog.
 //! Solo cost is ~55ms — but MatrixOne serialises the schema DDL, so N
 //! concurrent callers each pay ~N × 55ms (measured: 16-wide → 915ms p95).
 //! Every `#[ignore]` integration test calls `setup_pool` in its prologue;

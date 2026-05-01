@@ -2593,7 +2593,10 @@ fn sigkill_process_group(child: &mut std::process::Child) {
             let pgid = nix::unistd::Pid::from_raw(raw);
             let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
         } else {
-            tracing::warn!(pid, "sigkill_process_group: PID exceeds i32::MAX, skipping killpg");
+            tracing::warn!(
+                pid,
+                "sigkill_process_group: PID exceeds i32::MAX, skipping killpg"
+            );
         }
     }
     let _ = child.kill();
@@ -6802,7 +6805,8 @@ mod tests {
         cmd.current_dir(dir.path());
 
         let (output, _stderr, exit_code, timed_out) =
-            super::run_readonly_command_with_partial(&mut cmd, 0.25).expect("should not return Err");
+            super::run_readonly_command_with_partial(&mut cmd, 0.25)
+                .expect("should not return Err");
         // Should have captured partial stdout before timeout
         assert!(
             output.contains("match_line_1"),
@@ -6947,7 +6951,8 @@ mod tests {
         cmd.current_dir(dir.path());
 
         let (output, _stderr, _, timed_out) =
-            super::run_readonly_command_with_partial(&mut cmd, 0.25).expect("should not return Err");
+            super::run_readonly_command_with_partial(&mut cmd, 0.25)
+                .expect("should not return Err");
         assert!(timed_out);
         assert!(
             output.contains("complete_line_1"),
@@ -7069,7 +7074,8 @@ mod tests {
         cmd.current_dir(dir.path());
 
         let (output, _stderr, _, timed_out) =
-            super::run_readonly_command_with_partial(&mut cmd, 0.25).expect("should not return Err");
+            super::run_readonly_command_with_partial(&mut cmd, 0.25)
+                .expect("should not return Err");
         assert!(timed_out);
         assert!(output.contains("needle_1"), "should have partial results");
         // The grep function would append the timeout note — verify the raw

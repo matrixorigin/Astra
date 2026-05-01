@@ -579,7 +579,10 @@ mod tests {
 
     #[test]
     fn word_boundary_stem_gerund() {
-        assert!(word_boundary_match("currently debugging the issue", "debug"));
+        assert!(word_boundary_match(
+            "currently debugging the issue",
+            "debug"
+        ));
     }
 
     #[test]
@@ -589,7 +592,10 @@ mod tests {
 
     #[test]
     fn word_boundary_multi_word_needle() {
-        assert!(word_boundary_match("open a pull request for this", "pull request"));
+        assert!(word_boundary_match(
+            "open a pull request for this",
+            "pull request"
+        ));
     }
 
     #[test]
