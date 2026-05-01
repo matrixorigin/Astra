@@ -278,8 +278,15 @@ fn evaluate_criterion(
         ),
         // ── Pending metrics: not yet in SessionSignals ──────────────
         // Fail-safe: stay Pending until window expires → Failed.
-        DiagnosisMetric::ToolCallCount => return DiagnosisCriterionStatus::Pending,
-        DiagnosisMetric::UnmetPostconditionsDelta => return DiagnosisCriterionStatus::Pending,
+        // MUST check window here (not early-return Pending) so the
+        // tracker can remove completed entries from `active`.
+        DiagnosisMetric::ToolCallCount | DiagnosisMetric::UnmetPostconditionsDelta => {
+            return if elapsed_turns >= c.window_turns {
+                DiagnosisCriterionStatus::Failed
+            } else {
+                DiagnosisCriterionStatus::Pending
+            };
+        }
     };
 
     if compare(observed, c.operator, c.threshold) {
@@ -862,18 +869,65 @@ mod tests {
                 "{metric:?} should be Pending within window"
             );
 
-            // After window → the tracker would call evaluate_criterion with
-            // elapsed >= window_turns. Since the metric is still Pending
-            // (never resolves), the Pending branch returns. But the
-            // TRACKER's retain logic treats all-non-Pending as complete.
-            // So let's verify the metric stays Pending even after window:
+            // After window expires → must transition to Failed so the
+            // tracker can remove the entry from `active`. Without this,
+            // the diagnosis would livelock in the active set forever.
             let after_window = evaluate_criterion(&criterion, &baseline, &current, 5);
             assert_eq!(
                 after_window,
-                DiagnosisCriterionStatus::Pending,
-                "{metric:?} should stay Pending (unwired), tracker resolves as Failed"
+                DiagnosisCriterionStatus::Failed,
+                "{metric:?} must become Failed after window expires"
             );
         }
+    }
+
+    #[test]
+    fn tracker_removes_entry_with_unwired_metric_after_window() {
+        // The load-bearing invariant: a diagnosis containing an unwired
+        // metric must NOT stay in the tracker's active set forever.
+        // After window_turns elapse, evaluate_turn must produce an
+        // outcome (with Failed status) and remove the entry.
+        use astra_skills::auto_invoke::{DiagnosisCriterion, DiagnosisMetric, DiagnosisOperator};
+
+        let mut tracker = DiagnosisOutcomeTracker::new();
+        let baseline = SessionSignals::default();
+
+        // Build a diagnosis with ONE unwired criterion.
+        let mut diag = SkillDiagnosis::new(
+            "test_skill",
+            &astra_skills::auto_invoke::AutoInvokeCause::SessionStalls { count: 3 },
+            "test",
+            Vec::<String>::new(),
+            None,
+        );
+        diag.success_criteria = vec![DiagnosisCriterion {
+            metric: DiagnosisMetric::ToolCallCount, // unwired
+            operator: DiagnosisOperator::Lte,
+            threshold: 5.0,
+            window_turns: 3,
+            description: "tool calls should decrease".into(),
+        }];
+
+        tracker.activate(diag, baseline, 0);
+
+        // Turn 1-2: within window → no outcome yet.
+        let outcomes = tracker.evaluate_turn(&baseline, 2);
+        assert!(outcomes.is_empty(), "within window → no outcome");
+
+        // Turn 4: past window → must produce outcome with Failed.
+        let outcomes = tracker.evaluate_turn(&baseline, 4);
+        assert_eq!(outcomes.len(), 1, "past window → must complete");
+        assert!(outcomes[0].complete);
+        assert!(
+            outcomes[0]
+                .statuses
+                .contains(&DiagnosisCriterionStatus::Failed),
+            "unwired metric must resolve as Failed"
+        );
+
+        // Active set must be empty now.
+        let again = tracker.evaluate_turn(&baseline, 5);
+        assert!(again.is_empty(), "entry must be removed after completion");
     }
 
     #[test]

@@ -322,6 +322,7 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON DUPLICATE KEY UPDATE \
                  hit_count = hit_count + 1, \
+                 action = VALUES(action), \
                  updated_at = CURRENT_TIMESTAMP(6)",
         )
         .bind(&id)
@@ -456,6 +457,18 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         .bind(user_id)
         .bind(user_id)
         .bind(i64::from(MAX_LESSONS_PER_USER))
+        .execute(&mut *tx)
+        .await?;
+
+        // Exposure retention: delete exposure rows older than max_age_days
+        // or orphaned (lesson_id no longer exists). Without this, the
+        // exposure table grows unboundedly — ~5K rows/day under heavy use.
+        let _exposure_stale = query(
+            "DELETE FROM agent_lesson_exposures \
+             WHERE user_id = ? AND created_at < DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? DAY)",
+        )
+        .bind(user_id)
+        .bind(i64::from(max_age_days))
         .execute(&mut *tx)
         .await?;
 
@@ -676,7 +689,7 @@ pub const AGENT_LESSONS_DDL: &str = "CREATE TABLE IF NOT EXISTS agent_lessons (
     INDEX idx_agent_lessons_scope (user_id, persona, workload_tag, updated_at),
     INDEX idx_agent_lessons_user_created (user_id, created_at),
     UNIQUE KEY uniq_agent_lesson_content \
-        (user_id, persona, workload_key, kind, trigger_signal, action)
+        (user_id, persona, workload_key, kind, trigger_signal)
 )";
 
 pub const AGENT_LESSON_EXPOSURES_DDL: &str = "CREATE TABLE IF NOT EXISTS agent_lesson_exposures (
