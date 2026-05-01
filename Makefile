@@ -522,41 +522,62 @@ test-ignored-integration:
 		else \
 			echo "Running system_matrix_http_e2e (ignored; parallel default; live DB + AppSettings::from_env)..."; \
 		fi; \
+		LOG_DIR=$${ASTRA_TEST_LOG_DIR:-/tmp/astra-test-online-$$$$}; \
+		mkdir -p $$LOG_DIR; \
 		FAILED=""; \
-		cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --features bridge-e2e-hooks \
+		( cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --features bridge-e2e-hooks \
 			--test system_matrix_http_e2e --run-ignored only \
-			$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG --no-capture \
-			|| FAILED="$$FAILED system_matrix_http_e2e"; \
+			$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG --no-capture 2>&1; echo "EXITCODE=$$?" ) \
+			| tee $$LOG_DIR/system_matrix_http_e2e.log; \
+		grep -q '^EXITCODE=0$$' $$LOG_DIR/system_matrix_http_e2e.log || FAILED="$$FAILED system_matrix_http_e2e"; \
 		echo "Running multi_agent_integration (ignored; live MatrixOne)..."; \
-		cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services --test multi_agent_integration \
-			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-			|| FAILED="$$FAILED multi_agent_integration"; \
+		( cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services --test multi_agent_integration \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG 2>&1; echo "EXITCODE=$$?" ) \
+			| tee $$LOG_DIR/multi_agent_integration.log; \
+		grep -q '^EXITCODE=0$$' $$LOG_DIR/multi_agent_integration.log || FAILED="$$FAILED multi_agent_integration"; \
 		echo "Running team_persistence_integration (ignored; live MatrixOne)..."; \
-		cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services --test team_persistence_integration \
-			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-			|| FAILED="$$FAILED team_persistence_integration"; \
+		( cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services --test team_persistence_integration \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG 2>&1; echo "EXITCODE=$$?" ) \
+			| tee $$LOG_DIR/team_persistence_integration.log; \
+		grep -q '^EXITCODE=0$$' $$LOG_DIR/team_persistence_integration.log || FAILED="$$FAILED team_persistence_integration"; \
 		echo "Running services_db_integration (ignored; live MatrixOne)..."; \
-		cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services --test services_db_integration \
-			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-			|| FAILED="$$FAILED services_db_integration"; \
+		( cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services --test services_db_integration \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG 2>&1; echo "EXITCODE=$$?" ) \
+			| tee $$LOG_DIR/services_db_integration.log; \
+		grep -q '^EXITCODE=0$$' $$LOG_DIR/services_db_integration.log || FAILED="$$FAILED services_db_integration"; \
 		echo "Running plan_sync_db_it (ignored; live MatrixOne)..."; \
-		cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services --test plan_sync_db_it \
-			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-			|| FAILED="$$FAILED plan_sync_db_it"; \
+		( cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services --test plan_sync_db_it \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG 2>&1; echo "EXITCODE=$$?" ) \
+			| tee $$LOG_DIR/plan_sync_db_it.log; \
+		grep -q '^EXITCODE=0$$' $$LOG_DIR/plan_sync_db_it.log || FAILED="$$FAILED plan_sync_db_it"; \
 		echo "Running plan_repository_db_it (ignored; live MatrixOne)..."; \
-		cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-plan --test plan_repository_db_it \
-			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-			|| FAILED="$$FAILED plan_repository_db_it"; \
+		( cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-plan --test plan_repository_db_it \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG 2>&1; echo "EXITCODE=$$?" ) \
+			| tee $$LOG_DIR/plan_repository_db_it.log; \
+		grep -q '^EXITCODE=0$$' $$LOG_DIR/plan_repository_db_it.log || FAILED="$$FAILED plan_repository_db_it"; \
 		echo "Running plan_http_db_it (ignored; live MatrixOne)..."; \
-		cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-runtime --test plan_http_db_it \
-			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-			|| FAILED="$$FAILED plan_http_db_it"; \
+		( cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-runtime --test plan_http_db_it \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG 2>&1; echo "EXITCODE=$$?" ) \
+			| tee $$LOG_DIR/plan_http_db_it.log; \
+		grep -q '^EXITCODE=0$$' $$LOG_DIR/plan_http_db_it.log || FAILED="$$FAILED plan_http_db_it"; \
 		echo ""; \
-		if [ -n "$$FAILED" ]; then \
-			echo "❌ test-ignored-integration: failed suites:$$FAILED"; \
+		if [ -z "$${ASTRA_TEST_LOG_DIR:-}" ]; then \
+			echo "─── test-ignored-integration summary ──────────────────────"; \
+			FAIL_LINES=$$(grep -hE '^[[:space:]]+(TIMEOUT|FAIL)' $$LOG_DIR/*.log 2>/dev/null | sort -u); \
+			if [ -n "$$FAIL_LINES" ]; then \
+				echo "$$FAIL_LINES"; \
+				echo ""; \
+			fi; \
+			if [ -n "$$FAILED" ]; then \
+				echo "❌ test-ignored-integration: failed suites:$$FAILED"; \
+				echo "   Per-suite logs: $$LOG_DIR/*.log"; \
+				exit 1; \
+			else \
+				echo "✅ test-ignored-integration: all 7 suites passed"; \
+				rm -rf $$LOG_DIR; \
+			fi; \
+		elif [ -n "$$FAILED" ]; then \
 			exit 1; \
-		else \
-			echo "✅ test-ignored-integration: all 7 suites passed"; \
 		fi; \
 	fi
 
@@ -580,21 +601,34 @@ test-online:
 	mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS --skip-ssl \
 		-e "DROP DATABASE IF EXISTS $$TEST_DB; CREATE DATABASE $$TEST_DB;" 2>/dev/null || true; \
 	echo "Running astra-runtime ignored unit tests (live DB; nextest profile=$(NEXTEST_ONLINE_PROFILE); live-LLM suite gated by ASTRA_LIVE_LLM)..."; \
+	LOG_DIR=$${ASTRA_TEST_LOG_DIR:-/tmp/astra-test-online-$$$$}; \
+	mkdir -p $$LOG_DIR; \
 	FAILED=""; \
-	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+	( ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 		cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
-			--run-ignored only $(NEXTEST_ONLINE_FLAGS) \
-			|| FAILED="$$FAILED astra-runtime-ignored"; \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) 2>&1; \
+		echo "EXITCODE=$$?" ) \
+		| tee $$LOG_DIR/astra-runtime-ignored.log; \
+	grep -q '^EXITCODE=0$$' $$LOG_DIR/astra-runtime-ignored.log || FAILED="$$FAILED astra-runtime-ignored"; \
 	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 		ASTRA_TEST_DB_IT=1 \
+		ASTRA_TEST_LOG_DIR=$$LOG_DIR \
 		$(MAKE) test-ignored-integration \
 		|| FAILED="$$FAILED test-ignored-integration"; \
 	echo ""; \
+	echo "═══ test-online summary ═══════════════════════════════════"; \
+	FAIL_LINES=$$(grep -hE '^[[:space:]]+(TIMEOUT|FAIL)' $$LOG_DIR/*.log 2>/dev/null | sort -u); \
+	if [ -n "$$FAIL_LINES" ]; then \
+		echo "$$FAIL_LINES"; \
+		echo ""; \
+	fi; \
 	if [ -n "$$FAILED" ]; then \
 		echo "❌ test-online: failed suites:$$FAILED"; \
+		echo "   Per-suite logs: $$LOG_DIR/*.log"; \
 		exit 1; \
 	else \
 		echo "✅ test-online: all online suites passed (nextest profile=$(NEXTEST_ONLINE_PROFILE))"; \
+		rm -rf $$LOG_DIR; \
 	fi
 	@if [ "$${ASTRA_SDK_ONLINE_E2E:-}" = "1" ]; then \
 		$(MAKE) test-sdk-online; \
