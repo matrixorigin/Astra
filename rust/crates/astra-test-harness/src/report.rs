@@ -374,6 +374,10 @@ mod tests {
             completion_tokens: 0,
             prompt_tokens: 0,
             duration_ms: 42,
+        turn_rounds: 0,
+        cache_hits: 0,
+        total_tool_calls: 0,
+        ttft_ms: 0,
         }
     }
 

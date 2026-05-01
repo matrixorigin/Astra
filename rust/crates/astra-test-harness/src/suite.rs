@@ -338,6 +338,10 @@ mod tests {
             completion_tokens: 0,
             prompt_tokens: 0,
             duration_ms: 12,
+            turn_rounds: 1,
+            cache_hits: 0,
+            total_tool_calls: tools.len() as u32,
+            ttft_ms: 0,
         }
     }
 

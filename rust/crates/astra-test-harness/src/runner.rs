@@ -41,6 +41,14 @@ pub struct RunOutcome {
     pub completion_tokens: u64,
     pub prompt_tokens: u64,
     pub duration_ms: u64,
+    /// Number of LLM round-trips (StepStarted events in step_events).
+    pub turn_rounds: u32,
+    /// Number of tool calls that hit the idempotency cache.
+    pub cache_hits: u32,
+    /// Total tool calls (for computing cache rate = cache_hits / total).
+    pub total_tool_calls: u32,
+    /// Time to first token in ms (from JSON envelope).
+    pub ttft_ms: u64,
 }
 
 impl RunOutcome {
@@ -165,6 +173,10 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
                 completion_tokens: 0,
                 prompt_tokens: 0,
                 duration_ms: 0,
+                turn_rounds: 0,
+                cache_hits: 0,
+                total_tool_calls: 0,
+                ttft_ms: 0,
             };
         }
     };
@@ -219,6 +231,10 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
             .unwrap_or(0),
         prompt_tokens: v.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
         duration_ms: 0,
+        turn_rounds: 0,
+        cache_hits: 0,
+        total_tool_calls: 0,
+        ttft_ms: v.get("ttft_ms").and_then(|x| x.as_u64()).unwrap_or(0),
     }
 }
 

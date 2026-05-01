@@ -139,6 +139,19 @@ pub enum Criterion {
     /// Example: `[read_file, str_replace]` passes for
     /// `[bash, read_file, bash, str_replace, bash]`.
     ToolSequence { tools: Vec<String> },
+
+    /// Passes when the number of LLM round-trips (turns) is within range.
+    /// Catches inefficient multi-turn loops where the agent should have
+    /// completed in fewer rounds.
+    TurnRoundsBetween { min: u32, max: u32 },
+
+    /// Passes when the tool cache hit rate >= threshold (0.0 to 1.0).
+    /// A high cache rate means the agent is efficiently reusing
+    /// idempotent tool results. Requires at least one tool call.
+    CacheRateAbove {
+        /// Minimum cache hit rate (0.0 = no caching required, 1.0 = all cached).
+        threshold: f64,
+    },
 }
 
 fn default_judger_threshold() -> f64 {
@@ -443,6 +456,43 @@ fn evaluate_one(
                 score: None,
             }
         }
+
+        Criterion::TurnRoundsBetween { min, max } => {
+            let rounds = outcome.turn_rounds;
+            let passed = rounds >= *min && rounds <= *max;
+            CriterionResult {
+                criterion: c.clone(),
+                passed,
+                detail: format!("turn_rounds={rounds}, expected {min}..={max}"),
+                full_detail: None,
+                score: None,
+            }
+        }
+
+        Criterion::CacheRateAbove { threshold } => {
+            if outcome.total_tool_calls == 0 {
+                CriterionResult {
+                    criterion: c.clone(),
+                    passed: true,
+                    detail: "no tool calls — cache rate N/A (skip-pass)".into(),
+                    full_detail: None,
+                    score: None,
+                }
+            } else {
+                let rate = outcome.cache_hits as f64 / outcome.total_tool_calls as f64;
+                let passed = rate >= *threshold;
+                CriterionResult {
+                    criterion: c.clone(),
+                    passed,
+                    detail: format!(
+                        "cache_rate={:.1}% ({}/{}), threshold={:.0}%",
+                        rate * 100.0, outcome.cache_hits, outcome.total_tool_calls, threshold * 100.0
+                    ),
+                    full_detail: None,
+                    score: None,
+                }
+            }
+        }
     }
 }
 
@@ -565,6 +615,18 @@ pub fn validate_criterion(c: &Criterion) -> Result<(), String> {
             }
             Ok(())
         }
+        Criterion::TurnRoundsBetween { min, max } => {
+            if min > max {
+                return Err(format!("TurnRoundsBetween: min ({min}) > max ({max})"));
+            }
+            Ok(())
+        }
+        Criterion::CacheRateAbove { threshold } => {
+            if !threshold.is_finite() || *threshold < 0.0 || *threshold > 1.0 {
+                return Err(format!("CacheRateAbove.threshold must be in [0.0, 1.0]; got {threshold}"));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -614,6 +676,10 @@ mod tests {
             completion_tokens: 0,
             prompt_tokens: 0,
             duration_ms: 0,
+        turn_rounds: 0,
+        cache_hits: 0,
+        total_tool_calls: 0,
+        ttft_ms: 0,
         }
     }
 
@@ -1171,3 +1237,61 @@ mod tests {
         assert!(r[0].detail.contains("matched 0/2"));
     }
 }
+
+    #[test]
+    fn turn_rounds_between_passes() {
+        let mut out = RunOutcome::new("m");
+        out.turn_rounds = 2;
+        let r = evaluate_deterministic(
+            &[Criterion::TurnRoundsBetween { min: 1, max: 3 }],
+            &out,
+        );
+        assert!(r[0].passed, "{}", r[0].detail);
+    }
+
+    #[test]
+    fn turn_rounds_between_fails_too_many() {
+        let mut out = RunOutcome::new("m");
+        out.turn_rounds = 10;
+        let r = evaluate_deterministic(
+            &[Criterion::TurnRoundsBetween { min: 1, max: 3 }],
+            &out,
+        );
+        assert!(!r[0].passed);
+        assert!(r[0].detail.contains("10"));
+    }
+
+    #[test]
+    fn cache_rate_above_passes() {
+        let mut out = RunOutcome::new("m");
+        out.total_tool_calls = 10;
+        out.cache_hits = 8;
+        let r = evaluate_deterministic(
+            &[Criterion::CacheRateAbove { threshold: 0.5 }],
+            &out,
+        );
+        assert!(r[0].passed, "{}", r[0].detail);
+    }
+
+    #[test]
+    fn cache_rate_above_fails() {
+        let mut out = RunOutcome::new("m");
+        out.total_tool_calls = 10;
+        out.cache_hits = 1;
+        let r = evaluate_deterministic(
+            &[Criterion::CacheRateAbove { threshold: 0.5 }],
+            &out,
+        );
+        assert!(!r[0].passed);
+        assert!(r[0].detail.contains("10.0%"));
+    }
+
+    #[test]
+    fn cache_rate_above_skip_passes_no_tools() {
+        let out = RunOutcome::new("m");
+        let r = evaluate_deterministic(
+            &[Criterion::CacheRateAbove { threshold: 0.9 }],
+            &out,
+        );
+        assert!(r[0].passed); // skip-pass when no tool calls
+    }
