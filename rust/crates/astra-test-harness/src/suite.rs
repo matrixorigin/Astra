@@ -197,7 +197,80 @@ impl<'a> SuiteRunner<'a> {
     }
 
     async fn run_one(&self, case: &Case, model: &str) -> CaseRunReport {
+        // Run setup command if specified.
+        if let Some(ref cmd) = case.setup_cmd {
+            let status = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .status()
+                .await;
+            if let Ok(s) = status
+                && !s.success()
+            {
+                eprintln!(
+                    "[astra-test] setup_cmd failed for case={}: exit {}",
+                    case.name,
+                    s.code().unwrap_or(-1)
+                );
+            }
+        }
+
         let mut outcome = self.executor.execute(case, model).await;
+
+        // Multi-turn: execute follow-up steps using the same session.
+        if !case.steps.is_empty()
+            && let Some(ref session_id) = outcome.session_id
+        {
+            for step in &case.steps {
+                let step_case = Case {
+                    name: format!("{}__step", case.name),
+                    description: None,
+                    prompt: step.prompt.clone(),
+                    models: Some(vec![model.to_string()]),
+                    criteria: vec![],
+                    debug_log: case.debug_log,
+                    extra_cli_args: {
+                        let mut args = case.extra_cli_args.clone();
+                        args.push("--session-id".into());
+                        args.push(session_id.clone());
+                        args
+                    },
+                    timeout_seconds: step.timeout_seconds.unwrap_or(case.timeout_seconds),
+                    capability: None,
+                    difficulty: None,
+                    weight: 1.0,
+                    steps: vec![],
+                    setup_cmd: None,
+                    teardown_cmd: None,
+                };
+                let step_outcome = self.executor.execute(&step_case, model).await;
+                // Merge step outcome into main outcome.
+                outcome.completion_tokens += step_outcome.completion_tokens;
+                outcome.prompt_tokens += step_outcome.prompt_tokens;
+                outcome.duration_ms += step_outcome.duration_ms;
+                outcome.tool_calls_count += step_outcome.tool_calls_count;
+                outcome.tools_used.extend(step_outcome.tools_used);
+                outcome.turn_rounds += step_outcome.turn_rounds;
+                outcome.total_tool_calls += step_outcome.total_tool_calls;
+                outcome.cache_hits += step_outcome.cache_hits;
+                // Last step's text/exit_code wins.
+                outcome.text = step_outcome.text;
+                outcome.exit_code = step_outcome.exit_code;
+                if !step_outcome.stderr.is_empty() {
+                    outcome.stderr.push('\n');
+                    outcome.stderr.push_str(&step_outcome.stderr);
+                }
+            }
+        }
+
+        // Run teardown command (always, even on failure).
+        if let Some(ref cmd) = case.teardown_cmd {
+            let _ = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .status()
+                .await;
+        }
 
         // Retry on 429 if enabled.
         if self.suite_cfg.retry_on_429 && is_rate_limited(&outcome) {
@@ -290,6 +363,8 @@ impl<'a> SuiteRunner<'a> {
             model: model.to_string(),
             passed,
             run_index: 0, // overwritten by caller
+            capability: case.capability.clone(),
+            weight: case.weight,
             outcome,
             criteria: det,
             session,
@@ -331,6 +406,12 @@ mod tests {
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 60,
+            capability: None,
+            difficulty: None,
+            weight: 1.0,
+            steps: vec![],
+            setup_cmd: None,
+            teardown_cmd: None,
         }
     }
 

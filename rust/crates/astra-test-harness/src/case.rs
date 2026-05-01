@@ -59,6 +59,88 @@ pub struct Case {
     /// Caps runaway models without silently skewing matrix totals.
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
+
+    /// Capability dimension this case tests. Used for aggregated
+    /// reporting by capability × model.
+    #[serde(default)]
+    pub capability: Option<Capability>,
+
+    /// Difficulty level 1–5. Higher = harder. Used for weighted scoring.
+    #[serde(default)]
+    pub difficulty: Option<u8>,
+
+    /// Scoring weight (default 1.0). Cases with higher weight
+    /// contribute more to the aggregate pass rate.
+    #[serde(default = "default_weight")]
+    pub weight: f64,
+
+    /// Multi-turn steps. When present, `prompt` is the first step
+    /// and `steps` contains follow-up turns. Each step has its own
+    /// prompt and optional criteria.
+    #[serde(default)]
+    pub steps: Vec<CaseStep>,
+
+    /// Shell command to run before the case (e.g., create temp files).
+    /// Runs in `working_dir` or CWD. Non-zero exit aborts the case.
+    #[serde(default)]
+    pub setup_cmd: Option<String>,
+
+    /// Shell command to run after the case (cleanup). Always runs,
+    /// even on failure.
+    #[serde(default)]
+    pub teardown_cmd: Option<String>,
+}
+
+/// A follow-up turn in a multi-turn case.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaseStep {
+    /// Prompt for this turn.
+    pub prompt: String,
+    /// Optional criteria evaluated after this step completes.
+    #[serde(default)]
+    pub criteria: Vec<super::criteria::Criterion>,
+    /// Optional per-step timeout override.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+}
+
+/// Capability dimension for aggregated reporting.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    ToolUse,
+    Delegation,
+    InstructionFollowing,
+    AntiHallucination,
+    Efficiency,
+    CodeGeneration,
+    Reasoning,
+    Memory,
+    Planning,
+    /// Catch-all for custom capabilities.
+    #[serde(untagged)]
+    Custom(String),
+}
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ToolUse => write!(f, "tool_use"),
+            Self::Delegation => write!(f, "delegation"),
+            Self::InstructionFollowing => write!(f, "instruction_following"),
+            Self::AntiHallucination => write!(f, "anti_hallucination"),
+            Self::Efficiency => write!(f, "efficiency"),
+            Self::CodeGeneration => write!(f, "code_generation"),
+            Self::Reasoning => write!(f, "reasoning"),
+            Self::Memory => write!(f, "memory"),
+            Self::Planning => write!(f, "planning"),
+            Self::Custom(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+fn default_weight() -> f64 {
+    1.0
 }
 
 fn default_timeout_seconds() -> u64 {

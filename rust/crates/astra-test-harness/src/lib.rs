@@ -38,6 +38,7 @@
 //! programmatically (custom criteria, custom judger backends)
 //! without building from the `astra-test` binary.
 
+pub mod artifacts;
 pub mod case;
 pub mod classify;
 pub mod criteria;

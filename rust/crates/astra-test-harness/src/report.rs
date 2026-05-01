@@ -16,6 +16,10 @@ use crate::digest::DigestArtifact;
 use crate::runner::RunOutcome;
 use crate::session_capture::SessionCapture;
 
+fn default_weight() -> f64 {
+    1.0
+}
+
 /// One (case, model) pair's full result.
 ///
 /// Serialized into `--format json` reports, so this struct is a
@@ -32,6 +36,12 @@ pub struct CaseRunReport {
     /// Always 0 for single-run mode.
     #[serde(default)]
     pub run_index: u32,
+    /// Capability dimension from case metadata.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub capability: Option<crate::case::Capability>,
+    /// Scoring weight from case metadata.
+    #[serde(default = "default_weight")]
+    pub weight: f64,
     pub outcome: RunOutcome,
     pub criteria: Vec<CriterionResult>,
     /// Optional session journal dump — only present when
@@ -305,6 +315,29 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         s.push('\n');
     }
 
+    // Capability × model aggregation
+    let has_capabilities = report.runs.iter().any(|r| r.capability.is_some());
+    if has_capabilities {
+        use std::collections::BTreeMap;
+        s.push_str("=== capability × model ===\n");
+        // (capability_str, model) → (weighted_pass, total_weight)
+        let mut cap_groups: BTreeMap<(String, &str), (f64, f64)> = BTreeMap::new();
+        for r in &report.runs {
+            if let Some(ref cap) = r.capability {
+                let entry = cap_groups.entry((cap.to_string(), &r.model)).or_default();
+                entry.1 += r.weight;
+                if r.passed {
+                    entry.0 += r.weight;
+                }
+            }
+        }
+        for ((cap, model), (wp, tw)) in &cap_groups {
+            let pct = if *tw > 0.0 { wp / tw * 100.0 } else { 0.0 };
+            s.push_str(&format!("  {cap} × {model}: {pct:.0}%\n"));
+        }
+        s.push('\n');
+    }
+
     s
 }
 
@@ -405,6 +438,8 @@ mod tests {
                 model: "m".into(),
                 passed: true,
                 run_index: 0,
+                capability: None,
+                weight: 1.0,
                 outcome: mk_outcome(),
                 criteria: vec![CriterionResult {
                     criterion: Criterion::ToolCalled {
@@ -603,6 +638,8 @@ mod tests {
             model: "m".into(),
             passed: false,
             run_index: 0,
+            capability: None,
+            weight: 1.0,
             outcome: mk_outcome(),
             criteria: vec![],
             session: None,
@@ -692,6 +729,8 @@ mod tests {
                 model: "m".into(),
                 passed: true,
                 run_index: 0,
+                capability: None,
+                weight: 1.0,
                 outcome: {
                     let mut o = RunOutcome::new("m");
                     o.duration_ms = 5000;
@@ -720,6 +759,8 @@ mod tests {
             model: "m".into(),
             passed,
             run_index: 0,
+            capability: None,
+            weight: 1.0,
             outcome: RunOutcome::new("m"),
             criteria: vec![],
             failure_class: None,

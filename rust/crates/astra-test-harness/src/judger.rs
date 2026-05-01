@@ -561,6 +561,122 @@ pub fn warn_if_same_family(judger_model: &str, tested_models: &[String]) -> bool
     true
 }
 
+// ── External command judger adapter ──────────────────────────────────
+
+/// Judger that pipes `{question, outcome}` JSON to an external process
+/// on stdin and reads `{score, rationale}` JSON from stdout.
+///
+/// Usage: `--judger-cmd "python3 my_judge.py"`
+///
+/// The external process receives:
+/// ```json
+/// {"question": "...", "outcome": {"text": "...", "stderr": "...", ...}}
+/// ```
+/// And must return:
+/// ```json
+/// {"score": 0.85, "rationale": "..."}
+/// ```
+pub struct ExternalCmdJudger {
+    cmd: String,
+    timeout_seconds: u64,
+}
+
+impl ExternalCmdJudger {
+    pub fn new(cmd: impl Into<String>, timeout_seconds: u64) -> Self {
+        Self {
+            cmd: cmd.into(),
+            timeout_seconds,
+        }
+    }
+}
+
+#[async_trait]
+impl Judger for ExternalCmdJudger {
+    async fn score(
+        &self,
+        question: &str,
+        _model_override: Option<&str>,
+        outcome: &RunOutcome,
+    ) -> Result<JudgerScore, String> {
+        use tokio::process::Command;
+
+        let input = serde_json::json!({
+            "question": question,
+            "outcome": {
+                "text": outcome.text,
+                "stderr": outcome.stderr,
+                "exit_code": outcome.exit_code,
+                "tools_used": outcome.tools_used,
+                "tool_calls_count": outcome.tool_calls_count,
+                "completion_tokens": outcome.completion_tokens,
+                "prompt_tokens": outcome.prompt_tokens,
+                "duration_ms": outcome.duration_ms,
+                "turn_rounds": outcome.turn_rounds,
+            }
+        });
+
+        let parts: Vec<&str> = self.cmd.split_whitespace().collect();
+        let (program, args) = parts
+            .split_first()
+            .ok_or_else(|| "judger-cmd is empty".to_string())?;
+
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn judger-cmd {}: {e}", self.cmd))?;
+
+        // Write input
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let payload = serde_json::to_vec(&input).unwrap();
+            stdin
+                .write_all(&payload)
+                .await
+                .map_err(|e| format!("write to judger stdin: {e}"))?;
+            drop(stdin);
+        }
+
+        let timeout = std::time::Duration::from_secs(self.timeout_seconds);
+        let output = tokio::time::timeout(timeout, child.wait_with_output())
+            .await
+            .map_err(|_| format!("judger-cmd timed out after {}s", self.timeout_seconds))?
+            .map_err(|e| format!("judger-cmd wait: {e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "judger-cmd exited {}: {}",
+                output.status,
+                stderr.chars().take(500).collect::<String>()
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let v: serde_json::Value = serde_json::from_str(stdout.trim())
+            .map_err(|e| format!("judger-cmd stdout not valid JSON: {e}"))?;
+
+        let score = v
+            .get("score")
+            .and_then(|s| s.as_f64())
+            .ok_or("judger-cmd output missing 'score' field")?;
+        let rationale = v
+            .get("rationale")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        Ok(JudgerScore {
+            score,
+            rationale: rationale.clone(),
+            full_rationale: rationale,
+            votes: vec![score],
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

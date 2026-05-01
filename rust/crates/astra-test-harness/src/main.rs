@@ -10,7 +10,8 @@ use astra_test_harness::case::Case;
 use astra_test_harness::digest::AstraCliDigestCollector;
 use astra_test_harness::exec::AstraCliExecutor;
 use astra_test_harness::judger::{
-    AstraCliJudger, Judger, JudgerConfig, QuorumAgg, QuorumJudger, warn_if_same_family,
+    AstraCliJudger, ExternalCmdJudger, Judger, JudgerConfig, QuorumAgg, QuorumJudger,
+    warn_if_same_family,
 };
 use astra_test_harness::preflight::run_preflight;
 use astra_test_harness::report::{Format, render};
@@ -108,6 +109,22 @@ struct Args {
     /// Retry rate-limited (429) cases once after backoff.
     #[arg(long)]
     retry_on_429: bool,
+
+    /// External judger command. Receives {question, outcome} JSON on
+    /// stdin, returns {score, rationale} JSON on stdout.
+    /// Overrides --judger-model when set.
+    #[arg(long, value_name = "CMD")]
+    judger_cmd: Option<String>,
+
+    /// External executor command. Receives case JSON on stdin,
+    /// returns RunOutcome JSON on stdout. Overrides built-in astra executor.
+    #[arg(long, value_name = "CMD")]
+    executor_cmd: Option<String>,
+
+    /// Directory to persist per-case artifacts (stdout, stderr, report, digest).
+    /// Layout: <dir>/<case>/<model>/<run_index>/
+    #[arg(long, value_name = "DIR")]
+    artifacts_dir: Option<PathBuf>,
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -252,13 +269,23 @@ async fn main() -> Result<()> {
         timeout_seconds: args.judger_timeout,
     };
 
-    let executor = AstraCliExecutor::new(runner_cfg.clone());
+    let executor: Box<dyn astra_test_harness::exec::CaseExecutor> =
+        if let Some(ref cmd) = args.executor_cmd {
+            Box::new(astra_test_harness::exec::ExternalCmdExecutor::new(
+                cmd.clone(),
+                180,
+            ))
+        } else {
+            Box::new(AstraCliExecutor::new(runner_cfg.clone()))
+        };
     let cli_judger = AstraCliJudger::new(judger_cfg);
     let quorum_agg: QuorumAgg = args
         .judger_agg
         .parse()
         .map_err(|e: String| anyhow::anyhow!(e))?;
-    let judger: Box<dyn Judger> = if args.judger_n > 1 {
+    let judger: Box<dyn Judger> = if let Some(ref cmd) = args.judger_cmd {
+        Box::new(ExternalCmdJudger::new(cmd.clone(), args.judger_timeout))
+    } else if args.judger_n > 1 {
         Box::new(QuorumJudger::new(cli_judger, args.judger_n, quorum_agg))
     } else {
         Box::new(cli_judger)
@@ -299,7 +326,7 @@ async fn main() -> Result<()> {
     };
 
     let runner = SuiteRunner {
-        executor: &executor,
+        executor: executor.as_ref(),
         judger: judger.as_ref(),
         session_loader: &session_loader,
         digest_collector,
@@ -310,6 +337,18 @@ async fn main() -> Result<()> {
     };
 
     let suite = runner.run_all(&cases).await;
+
+    // Persist artifacts if requested.
+    if let Some(ref dir) = args.artifacts_dir {
+        for run in &suite.runs {
+            if let Err(e) = astra_test_harness::artifacts::persist_artifacts(dir, run) {
+                eprintln!(
+                    "[astra-test] WARNING: failed to write artifacts for {} × {}: {e}",
+                    run.case_name, run.model
+                );
+            }
+        }
+    }
 
     let fmt: Format = args
         .format

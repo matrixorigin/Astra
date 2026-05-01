@@ -224,6 +224,125 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
     }
 }
 
+// ── External command executor adapter ────────────────────────────────
+
+/// Executor that delegates case execution to an external process.
+///
+/// Usage: `--executor-cmd "python3 my_agent.py"`
+///
+/// The external process receives the case JSON on stdin:
+/// ```json
+/// {"name": "...", "prompt": "...", "model": "...", "timeout_seconds": 180}
+/// ```
+/// And must return a RunOutcome-compatible JSON on stdout:
+/// ```json
+/// {"exit_code": 0, "text": "...", "tools_used": [...], ...}
+/// ```
+pub struct ExternalCmdExecutor {
+    cmd: String,
+    timeout_seconds: u64,
+}
+
+impl ExternalCmdExecutor {
+    pub fn new(cmd: impl Into<String>, timeout_seconds: u64) -> Self {
+        Self {
+            cmd: cmd.into(),
+            timeout_seconds,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CaseExecutor for ExternalCmdExecutor {
+    async fn execute(&self, case: &Case, model: &str) -> RunOutcome {
+        use tokio::process::Command;
+
+        let input = serde_json::json!({
+            "name": case.name,
+            "prompt": case.prompt,
+            "model": model,
+            "timeout_seconds": case.timeout_seconds,
+            "extra_cli_args": case.extra_cli_args,
+        });
+
+        let parts: Vec<&str> = self.cmd.split_whitespace().collect();
+        let Some((program, args)) = parts.split_first() else {
+            return RunOutcome {
+                model: model.into(),
+                exit_code: -1,
+                text: "executor-cmd is empty".into(),
+                ..Default::default()
+            };
+        };
+
+        let start = std::time::Instant::now();
+        let child = Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => {
+                return RunOutcome {
+                    model: model.into(),
+                    exit_code: -1,
+                    text: format!("spawn executor-cmd {}: {e}", self.cmd),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
+            }
+        };
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let payload = serde_json::to_vec(&input).unwrap();
+            let _ = stdin.write_all(&payload).await;
+            drop(stdin);
+        }
+
+        let timeout = std::time::Duration::from_secs(self.timeout_seconds);
+        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                return RunOutcome {
+                    model: model.into(),
+                    exit_code: -1,
+                    text: format!("executor-cmd wait: {e}"),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
+            }
+            Err(_) => {
+                return RunOutcome {
+                    model: model.into(),
+                    exit_code: 124,
+                    text: format!("executor-cmd timed out after {}s", self.timeout_seconds),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let mut out = parse_json_outcome(&stdout, model);
+        out.stderr = stderr;
+        out.exit_code = output.status.code().unwrap_or(-1);
+        out.duration_ms = start.elapsed().as_millis() as u64;
+        out
+    }
+
+    fn reproducer(&self, case: &Case, model: &str) -> String {
+        format!(
+            "echo '{{\"name\":\"{}\",\"prompt\":\"...\",\"model\":\"{}\"}}' | {}",
+            case.name, model, self.cmd
+        )
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     //! Fake executor/judger helpers shared by suite + integration tests.
@@ -310,6 +429,12 @@ mod tests {
             debug_log: false,
             extra_cli_args: vec!["--verbose".into()],
             timeout_seconds: 60,
+            capability: None,
+            difficulty: None,
+            weight: 1.0,
+            steps: vec![],
+            setup_cmd: None,
+            teardown_cmd: None,
         };
         let repro = exec.reproducer(&case, "qwen-flash");
         assert!(repro.contains("/usr/local/bin/astra"));
@@ -395,6 +520,12 @@ mod tests {
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 1,
+            capability: None,
+            difficulty: None,
+            weight: 1.0,
+            steps: vec![],
+            setup_cmd: None,
+            teardown_cmd: None,
         };
         let start = std::time::Instant::now();
         let outcome = exec.execute(&case, "ignored").await;
@@ -457,6 +588,12 @@ mod tests {
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 60,
+            capability: None,
+            difficulty: None,
+            weight: 1.0,
+            steps: vec![],
+            setup_cmd: None,
+            teardown_cmd: None,
         };
         let out = fe.execute(&case, "qwen-flash").await;
         assert_eq!(out.text, "hello");

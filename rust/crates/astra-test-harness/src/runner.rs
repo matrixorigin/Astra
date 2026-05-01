@@ -297,6 +297,12 @@ mod tests {
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 180,
+            capability: None,
+            difficulty: None,
+            weight: 1.0,
+            steps: vec![],
+            setup_cmd: None,
+            teardown_cmd: None,
         };
         let cfg = RunnerConfig::new("astra").with_fallback_models(vec!["sonnet".into()]);
         assert_eq!(resolve_models(&case, &cfg).unwrap(), vec!["opus"]);
@@ -313,6 +319,12 @@ mod tests {
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 180,
+            capability: None,
+            difficulty: None,
+            weight: 1.0,
+            steps: vec![],
+            setup_cmd: None,
+            teardown_cmd: None,
         };
         let cfg = RunnerConfig::new("astra")
             .with_fallback_models(vec!["sonnet".into(), "minimax".into()]);
@@ -331,6 +343,12 @@ mod tests {
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 180,
+            capability: None,
+            difficulty: None,
+            weight: 1.0,
+            steps: vec![],
+            setup_cmd: None,
+            teardown_cmd: None,
         };
         let cfg = RunnerConfig::new("astra");
         assert!(resolve_models(&case, &cfg).is_err());
