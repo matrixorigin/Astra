@@ -527,54 +527,63 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
             ));
         }
         let pool = self.get_pool().await?;
+        let mut tx = pool.begin().await?;
 
-        // Weighted confidence delta: diagnosis-specific criteria (direct
-        // evidence of THIS lesson's usefulness) weigh more than session-
-        // wide noise (stalls, corrections — correlative but not causal).
         let confidence_delta = compute_confidence_delta(&outcome);
-        let exposures = query(
-            "SELECT lesson_id FROM agent_lesson_exposures \
-             WHERE session_id = ? AND user_id = ? AND outcome_recorded_at IS NULL",
+        let (pos_inc, neg_inc): (i64, i64) = if confidence_delta >= 0.0 {
+            (1, 0)
+        } else {
+            (0, 1)
+        };
+
+        // Bulk confidence + counter update: one UPDATE hitting all lessons
+        // exposed in this session, eliminating the N+1 loop.
+        let updated = query(
+            "UPDATE agent_lessons \
+             SET positive_outcome_count = positive_outcome_count + ?, \
+                 negative_outcome_count = negative_outcome_count + ?, \
+                 confidence = CASE \
+                     WHEN confidence + ? > 0.95 THEN 0.95 \
+                     WHEN confidence + ? < 0.1 THEN 0.1 \
+                     ELSE confidence + ? END, \
+                 updated_at = CURRENT_TIMESTAMP(6) \
+             WHERE id IN ( \
+                 SELECT lesson_id FROM agent_lesson_exposures \
+                 WHERE session_id = ? AND user_id = ? \
+                   AND outcome_recorded_at IS NULL \
+             )",
+        )
+        .bind(pos_inc)
+        .bind(neg_inc)
+        .bind(confidence_delta)
+        .bind(confidence_delta)
+        .bind(confidence_delta)
+        .bind(&outcome.session_id)
+        .bind(&outcome.user_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Retirement pass: separate statement so it reads the already-
+        // committed counters. This avoids dependence on MySQL's left-to-
+        // right SET evaluation order (MatrixOne follows standard SQL
+        // where all SET expressions see pre-update values).
+        query(
+            "UPDATE agent_lessons \
+             SET status = 'retired', updated_at = CURRENT_TIMESTAMP(6) \
+             WHERE status = 'active' \
+               AND negative_outcome_count >= 5 \
+               AND negative_outcome_count > positive_outcome_count \
+               AND id IN ( \
+                   SELECT lesson_id FROM agent_lesson_exposures \
+                   WHERE session_id = ? AND user_id = ? \
+               )",
         )
         .bind(&outcome.session_id)
         .bind(&outcome.user_id)
-        .fetch_all(&pool)
+        .execute(&mut *tx)
         .await?;
-        for row in &exposures {
-            let lesson_id: String = row.try_get("lesson_id")?;
-            let (pos_inc, neg_inc) = if confidence_delta >= 0.0 {
-                (1i64, 0i64)
-            } else {
-                (0i64, 1i64)
-            };
-            // Note: MySQL evaluates SET clauses left-to-right, so by the
-            // time the CASE is reached, positive/negative_outcome_count
-            // already hold the incremented values. We must NOT add the
-            // increment again in the CASE condition.
-            query(
-                "UPDATE agent_lessons \
-                 SET positive_outcome_count = positive_outcome_count + ?, \
-                     negative_outcome_count = negative_outcome_count + ?, \
-                     confidence = CASE \
-                         WHEN confidence + ? > 0.95 THEN 0.95 \
-                         WHEN confidence + ? < 0.1 THEN 0.1 \
-                         ELSE confidence + ? END, \
-                     status = CASE \
-                         WHEN negative_outcome_count >= 5 \
-                              AND negative_outcome_count > positive_outcome_count \
-                         THEN 'retired' ELSE status END, \
-                     updated_at = CURRENT_TIMESTAMP(6) \
-                 WHERE id = ?",
-            )
-            .bind(pos_inc)
-            .bind(neg_inc)
-            .bind(confidence_delta) // confidence + ? > 0.95
-            .bind(confidence_delta) // confidence + ? < 0.1
-            .bind(confidence_delta) // ELSE confidence + ?
-            .bind(&lesson_id)
-            .execute(&pool)
-            .await?;
-        }
+
+        // Mark exposures as recorded so retry won't double-apply deltas.
         query(
             "UPDATE agent_lesson_exposures \
              SET outcome_recorded_at = CURRENT_TIMESTAMP(6), \
@@ -591,9 +600,11 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         .bind(i64::from(outcome.diagnosis_criteria_failed))
         .bind(&outcome.session_id)
         .bind(&outcome.user_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(exposures.len() as u64)
+
+        tx.commit().await?;
+        Ok(updated.rows_affected())
     }
 }
 

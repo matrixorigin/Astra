@@ -54,6 +54,14 @@ pub struct SessionSummary {
 }
 
 // ── Thresholds (test-pinned; bump deliberately) ─────────────────────────────
+//
+// These are **post-session** thresholds for persisting durable lessons.
+// They are deliberately lower than the **in-session** auto-invoke
+// thresholds in `astra_skills::auto_invoke` (STALL_TRIGGER_COUNT=5,
+// CORRECTION_TRIGGER_COUNT=5). Rationale: auto-invoke fires a
+// diagnostic mid-session (high cost, interrupts flow), so it needs a
+// higher bar. Lesson extraction runs once at session end (zero runtime
+// cost), so it can be more sensitive.
 
 /// A tool must fail at least this many times to warrant a
 /// ToolDeprioritize lesson.

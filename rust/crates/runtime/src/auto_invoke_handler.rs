@@ -122,7 +122,7 @@ impl SkillExecutor for SyntheticSkillDiagnosisExecutor {
                 format!("pipeline detected {count} session stall events"),
                 "session_stalls_delta",
                 "lte",
-                "0.0",
+                0.0,
                 "session stalls stop increasing after this hint",
             ),
             AutoInvokeCause::BudgetPressure { level } => (
@@ -130,7 +130,7 @@ impl SkillExecutor for SyntheticSkillDiagnosisExecutor {
                 format!("context budget utilisation is {:.2}", level),
                 "budget_pressure",
                 "lte",
-                "0.85",
+                0.85,
                 "budget pressure returns below the auto-invoke threshold",
             ),
             AutoInvokeCause::RepeatedCorrections { count } => (
@@ -138,38 +138,27 @@ impl SkillExecutor for SyntheticSkillDiagnosisExecutor {
                 format!("{count} distinct corrections recorded"),
                 "corrections_delta",
                 "lte",
-                "0.0",
+                0.0,
                 "new user corrections stop increasing",
             ),
         };
-        let cause_tag = req.cause.as_str();
-        // Hand-built JSON so the block stays valid when the cause tag
-        // or skill name changes without us forgetting to requote.
-        Some(format!(
-            "```skill-diagnosis\n\
-             {{\n  \
-             \"schema_version\": {schema_version},\n  \
-              \"skill\": {skill},\n  \
-              \"cause\": \"{cause_tag}\",\n  \
-              \"headline\": {headline},\n  \
-              \"findings\": [{finding}],\n  \
-             \"recommended_action\": \"review the corresponding skill output for deeper analysis\",\n  \
-             \"success_criteria\": [{{\n    \
-             \"metric\": \"{metric}\",\n    \
-             \"operator\": \"{operator}\",\n    \
-             \"threshold\": {threshold},\n    \
-             \"window_turns\": 3,\n    \
-             \"description\": {description}\n  \
-             }}],\n  \
-             \"source\": \"synthetic_fallback\"\n\
-              }}\n\
-              ```\n",
-            schema_version = SKILL_DIAGNOSIS_SCHEMA_VERSION,
-            skill = serde_json::Value::String(req.skill.to_string()),
-            headline = serde_json::Value::String(headline),
-            finding = serde_json::Value::String(finding),
-            description = serde_json::Value::String(description.to_string()),
-        ))
+        let payload = serde_json::json!({
+            "schema_version": SKILL_DIAGNOSIS_SCHEMA_VERSION,
+            "skill": req.skill,
+            "cause": req.cause.as_str(),
+            "headline": headline,
+            "findings": [finding],
+            "recommended_action": "review the corresponding skill output for deeper analysis",
+            "success_criteria": [{
+                "metric": metric,
+                "operator": operator,
+                "threshold": threshold,
+                "window_turns": 3,
+                "description": description,
+            }],
+            "source": "synthetic_fallback",
+        });
+        Some(format!("```skill-diagnosis\n{}\n```\n", payload))
     }
 }
 
@@ -1108,5 +1097,42 @@ fn tracker_mixed_satisfied_and_failed_criteria() {
         outcomes[0]
             .statuses
             .contains(&DiagnosisCriterionStatus::Failed)
+    );
+}
+
+/// Verify the Arc<Mutex<AutoInvokeHandler>> pattern used at runtime
+/// doesn't deadlock or lose results under concurrent access.
+#[tokio::test]
+async fn concurrent_access_via_arc_mutex() {
+    let exec: Arc<dyn SkillExecutor> = Arc::new(SyntheticSkillDiagnosisExecutor);
+    let handler = Arc::new(tokio::sync::Mutex::new(AutoInvokeHandler::new(exec)));
+
+    let stall_signals = astra_skills::auto_invoke::SessionSignals {
+        session_stalls: 5,
+        budget_pressure: 0.0,
+        recent_corrections: 0,
+        corrections_window: 10,
+    };
+
+    // Spawn 4 tasks that all try to fire concurrently.
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let h = handler.clone();
+        let s = stall_signals;
+        handles.push(tokio::spawn(async move {
+            let mut guard = h.lock().await;
+            guard.maybe_fire(&s, std::time::Instant::now()).await
+        }));
+    }
+    let mut total_diagnoses = 0usize;
+    for jh in handles {
+        total_diagnoses += jh.await.unwrap().len();
+    }
+    // Exactly 1 should fire (the first to acquire the lock); the rest
+    // hit the cooldown. Tokio Mutex is fair, so ordering is deterministic
+    // within the test, but the invariant is: at most 1 fire per cooldown.
+    assert_eq!(
+        total_diagnoses, 1,
+        "cooldown must prevent duplicate fires under concurrent access"
     );
 }

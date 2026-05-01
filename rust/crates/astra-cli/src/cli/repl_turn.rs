@@ -1002,12 +1002,17 @@ async fn run_chat_turn(
 async fn maybe_run_auto_invoke(state: &mut ReplState) {
     // Snapshot signals under a scoped read lock so we don't hold the
     // observability lock across the await on maybe_fire.
-    let signals = match state
-        .observability_session
-        .as_ref()
-        .and_then(|arc| arc.read().ok())
-    {
-        Some(guard) => astra_runtime::auto_invoke_handler::compute_session_signals(Some(&*guard)),
+    let signals = match state.observability_session.as_ref() {
+        Some(arc) => match arc.read() {
+            Ok(guard) => astra_runtime::auto_invoke_handler::compute_session_signals(Some(&*guard)),
+            Err(_poison) => {
+                tracing::warn!(
+                    target: "auto_invoke",
+                    "observability_session lock poisoned; auto-invoke signals degraded",
+                );
+                astra_runtime::auto_invoke_handler::compute_session_signals(None)
+            }
+        },
         None => astra_runtime::auto_invoke_handler::compute_session_signals(None),
     };
 
