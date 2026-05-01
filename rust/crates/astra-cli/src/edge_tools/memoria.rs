@@ -468,3 +468,41 @@ pub async fn memoria_consolidate_fire_and_forget() {
         eprintln!("[memoria] consolidation trigger failed: {e}");
     }
 }
+
+/// Store extracted lessons in Memoria as L3 durable memory
+/// (Session Memory Protocol §6.2). Best-effort, fire-and-forget.
+pub async fn memoria_store_lessons_fire_and_forget(
+    lessons: Vec<astra_runtime::lesson_synthesizer::ExtractedLesson>,
+    session_id: Option<String>,
+) {
+    if lessons.is_empty() {
+        return;
+    }
+    let Some((client, base, key)) = memoria_oneshot_client(5) else {
+        return;
+    };
+    for lesson in &lessons {
+        let mut payload = json!({
+            "content": lesson.content,
+            "memory_type": lesson.memory_type,
+            "trust_tier": lesson.trust_tier,
+        });
+        if let Some(ref sid) = session_id {
+            payload["session_id"] = json!(sid);
+        }
+        if let Err(e) = client
+            .post(format!("{base}/v1/memories"))
+            .header("Authorization", format!("Bearer {key}"))
+            .json(&payload)
+            .send()
+            .await
+        {
+            tracing::debug!(
+                target: "memoria",
+                error = %e,
+                "failed to store lesson in Memoria; continuing",
+            );
+            break;
+        }
+    }
+}

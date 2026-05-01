@@ -73,7 +73,36 @@ pub(super) async fn finalize_session(state: &ReplState) {
             }
         }
     }
-    // 3d. End observability only after session-derived lessons/outcomes have
+    // 3d. L3 knowledge backflow: extract learnings from L1b narrative
+    //     and store in Memoria as durable semantic/episodic memory
+    //     (Session Memory Protocol §6.2). Fire-and-forget.
+    if state.turn > 0 {
+        let narrative = state.session_id.as_deref().and_then(|sid| {
+            let cwd = std::env::current_dir().ok()?;
+            let path = astra_runtime::resolve_resume_session_memory_file(sid, Some(cwd.to_str()?))?;
+            let raw = astra_runtime::read_session_memory_file(&path)?;
+            astra_runtime::turn::cloud::session_memory_protocol::SessionMemory::parse(&raw)
+        });
+
+        let mut all_lessons =
+            astra_runtime::lesson_synthesizer::extract_learnings_for_backflow(narrative.as_ref());
+
+        if let Some(episodic) = astra_runtime::lesson_synthesizer::build_episodic_summary(
+            state.session_id.as_deref().unwrap_or("unknown"),
+            state.turn,
+            narrative.as_ref(),
+        ) {
+            all_lessons.push(episodic);
+        }
+
+        if !all_lessons.is_empty() {
+            tokio::spawn(edge_tools::memoria::memoria_store_lessons_fire_and_forget(
+                all_lessons,
+                state.session_id.clone(),
+            ));
+        }
+    }
+    // 3e. End observability only after session-derived lessons/outcomes have
     // been persisted so the lifecycle boundary matches the data flow.
     if let (Some(hub), Some(session_id)) = (&state.observability_hub, &state.session_id) {
         let _ = hub.end_session(session_id);
