@@ -409,7 +409,7 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
             .await?;
         } else {
             let confidence = new.confidence.unwrap_or(DEFAULT_LESSON_CONFIDENCE);
-            query(
+            let insert_result = query(
                 "INSERT INTO agent_lessons \
                      (id, user_id, persona, workload_tag, workload_key, kind, \
                       trigger_signal, action, confidence) \
@@ -425,7 +425,18 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
             .bind(&new.action)
             .bind(confidence)
             .execute(&pool)
-            .await?;
+            .await;
+            if let Err(e) = insert_result {
+                if e.as_database_error()
+                    .is_some_and(|db| db.message().contains("Duplicate entry"))
+                {
+                    // TOCTOU race: another writer inserted between our
+                    // SELECT and INSERT. The row exists now — fall through
+                    // to fetch_by_content which will find it.
+                } else {
+                    return Err(e);
+                }
+            }
         }
 
         fetch_by_content(&pool, &new).await
