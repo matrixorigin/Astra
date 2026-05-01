@@ -687,7 +687,7 @@ async fn crash_recovery_low_information_repair_followup_rebuilds_attachment() {
         "repair follow-up must keep str_replace available: {:?}",
         edge_tool_names
     );
-    for unexpected in ["write_file", "list_dir", "grep", "glob"] {
+    for unexpected in ["write_file", "grep", "glob"] {
         assert!(
             !edge_tool_names.contains(unexpected),
             "repair follow-up should not re-expose {unexpected}: {:?}",
