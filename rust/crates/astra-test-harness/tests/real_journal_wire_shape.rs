@@ -221,6 +221,132 @@ fn step_events_fixture_counts_and_tool_match() {
     );
 }
 
+// ── Universal "a turn completed" event across layouts ──
+//
+// The two shipped cases `crash_robustness_journal_parseable` and
+// `journal_vs_envelope_tool_list_consistency` asserted
+// `session_event_count { event_type: llm_round, min: 1 }`, but real
+// `astra chat --json` runs write ONLY the step-events layout
+// (`<id>/step_events.jsonl` — no `<id>.jsonl`), so `llm_round` count
+// is always 0 and the criterion falsely fails.
+//
+// `StepCompleted` is the step-events analogue: every turn that reaches
+// the end writes exactly one. These tests pin that contract so a
+// future runtime change to step-events cannot silently break the
+// criterion again.
+
+#[test]
+fn step_completed_is_present_in_step_events_fixture() {
+    // The step-events fixture has one complete turn → exactly one
+    // `StepCompleted`. This is what the two shipped cases should
+    // actually count.
+    let cap = load_session_from_path(
+        "fixture-sess-step",
+        &fixture_path("fixture_realistic_step_events.jsonl"),
+    )
+    .expect("fixture should load");
+    assert_eq!(
+        cap.count_events("StepCompleted"),
+        1,
+        "StepCompleted must be present on the step-events layout so \
+         shipped criteria can count it. Events: {:?}",
+        cap.events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn session_event_count_step_completed_passes_on_step_events_layout() {
+    // The substantive TDD assertion: with the YAMLs updated to count
+    // `StepCompleted` (per the fix below), the criterion PASSES on a
+    // step-events-only session that previously counted 0 `llm_round`.
+    let cap = load_session_from_path(
+        "fixture-sess-step",
+        &fixture_path("fixture_realistic_step_events.jsonl"),
+    )
+    .expect("fixture should load");
+    let outcome = RunOutcome::new("fixture-model").with_session_id("fixture-sess-step");
+
+    let pass = evaluate_deterministic_with_session(
+        &[Criterion::SessionEventCount {
+            event_type: "StepCompleted".into(),
+            min: 1,
+            optional: false,
+        }],
+        &outcome,
+        Some(&cap),
+    );
+    assert!(
+        pass[0].passed,
+        "StepCompleted count >= 1 must PASS on step-events layout: {}",
+        pass[0].detail
+    );
+}
+
+#[test]
+fn session_event_count_llm_round_still_fails_on_step_events_only() {
+    // Negative assertion: the old criterion (`llm_round`) correctly
+    // reports 0 on a step-events-only session. This test both
+    // documents the bug we fixed in the YAMLs AND guards against a
+    // regression where someone adds an alias that would make the
+    // wrong criterion silently succeed.
+    let cap = load_session_from_path(
+        "fixture-sess-step",
+        &fixture_path("fixture_realistic_step_events.jsonl"),
+    )
+    .expect("fixture should load");
+    let outcome = RunOutcome::new("fixture-model").with_session_id("fixture-sess-step");
+
+    let res = evaluate_deterministic_with_session(
+        &[Criterion::SessionEventCount {
+            event_type: "llm_round".into(),
+            min: 1,
+            optional: false,
+        }],
+        &outcome,
+        Some(&cap),
+    );
+    assert!(
+        !res[0].passed,
+        "llm_round count on step-events-only session must FAIL (proves \
+         step_events and legacy layouts have disjoint event_type values): {}",
+        res[0].detail
+    );
+    assert!(
+        res[0].detail.contains("count=0"),
+        "detail should report count=0 to make the diagnosis obvious: {}",
+        res[0].detail
+    );
+}
+
+// ── Shipped-case contract: the two formerly-broken cases must now
+// reference `StepCompleted`, not `llm_round`. A grep-based check is
+// cheap, deterministic, and catches a regression where someone
+// reintroduces the old criterion.
+
+#[test]
+fn shipped_cases_no_longer_count_llm_round() {
+    let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cases = [
+        "crash_robustness_journal_parseable.yaml",
+        "journal_vs_envelope_tool_list_consistency.yaml",
+    ];
+    for name in cases {
+        let body = std::fs::read_to_string(crate_root.join("cases").join(name))
+            .unwrap_or_else(|e| panic!("read {name}: {e}"));
+        assert!(
+            !body.contains("event_type: llm_round"),
+            "{name} must not count `llm_round` — real `astra chat` runs \
+             produce only the step-events layout. Use `StepCompleted` \
+             instead. Body:\n{body}"
+        );
+        assert!(
+            body.contains("event_type: StepCompleted"),
+            "{name} must count `StepCompleted` so the criterion works \
+             against the step-events layout real runs produce. Body:\n{body}"
+        );
+    }
+}
+
 // ── Cross-layout merge: both legacy + step_events for the same session ──
 
 #[test]
