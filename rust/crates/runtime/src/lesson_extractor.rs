@@ -35,6 +35,11 @@ pub struct SessionSummary {
     /// ToolDeprioritize lessons for these — it would be wrong to teach
     /// the agent to avoid `grep` because the network was flaky.
     pub transient_failure_tools: std::collections::HashSet<String>,
+    /// Tools with failures in the aggregate count but NO detailed outcome
+    /// records. We can't tell if these are transient or inherent, so the
+    /// extractor skips them — better to miss a lesson than to falsely
+    /// block a tool for a week.
+    pub undetermined_failure_tools: std::collections::HashSet<String>,
     /// Number of stall events the pipeline detected.
     pub stall_events: u32,
     /// User-correction snippets recorded during the session.
@@ -92,6 +97,7 @@ pub fn extract_lessons(
         .filter(|&(name, c)| {
             *c >= TOOL_FAILURE_LESSON_THRESHOLD
                 && !summary.transient_failure_tools.contains(name.as_str())
+                && !summary.undetermined_failure_tools.contains(name.as_str())
         })
         .collect();
     tools.sort_by_key(|(name, _)| name.as_str());
@@ -180,6 +186,11 @@ pub fn summarise_from_runtime(
 ) -> SessionSummary {
     let mut tool_failures = HashMap::new();
     let mut transient_failure_tools = std::collections::HashSet::new();
+    // Tools with failures in the aggregate count but NO detailed outcome
+    // records — we can't classify these as inherent or transient, so we
+    // err on the safe side: skip lesson creation rather than risk a false
+    // ToolDeprioritize that blocks the tool for days.
+    let mut undetermined_failure_tools = std::collections::HashSet::new();
 
     for entry in tool_health {
         if entry.total_failures > 0 {
@@ -193,7 +204,12 @@ pub fn summarise_from_runtime(
             .flat_map(|cache| cache.outcomes.iter())
             .filter(|o| !o.success)
             .collect();
-        if !failed_outcomes.is_empty() {
+        if failed_outcomes.is_empty() {
+            // No outcome data → can't classify → undetermined → skip.
+            if entry.total_failures > 0 {
+                undetermined_failure_tools.insert(entry.name.clone());
+            }
+        } else {
             let transient_count = failed_outcomes
                 .iter()
                 .filter(|o| {
@@ -231,6 +247,7 @@ pub fn summarise_from_runtime(
     SessionSummary {
         tool_failures,
         transient_failure_tools,
+        undetermined_failure_tools,
         stall_events,
         user_corrections,
         unmet_postconditions,
@@ -596,6 +613,27 @@ mod tests {
 
     use astra_pipeline::ToolHealthEntry;
 
+    /// ToolHealthEntry with inherent failure outcomes (tool_timeout).
+    /// Use this when the test goes through `summarise_from_runtime` so the
+    /// transient/undetermined filter doesn't suppress the tool.
+    fn health_inherent(name: &str, failures: usize, total: usize) -> ToolHealthEntry {
+        use astra_pipeline::tool_health_types::{ToolOutcome, ToolOutcomeCacheEntry};
+        let mut entry = health(name, failures, total);
+        entry.recent_outcomes = vec![ToolOutcomeCacheEntry {
+            signature: format!("{name} *"),
+            outcomes: (0..failures)
+                .map(|_| ToolOutcome {
+                    success: false,
+                    latency_ms: 0,
+                    result_hash: 0,
+                    at_epoch: 0,
+                    failure_category: Some("tool_timeout".into()),
+                })
+                .collect(),
+        }];
+        entry
+    }
+
     fn health(name: &str, failures: usize, total: usize) -> ToolHealthEntry {
         ToolHealthEntry {
             name: name.into(),
@@ -673,7 +711,7 @@ mod tests {
         // Full stack: observability counters → summary → extractor must
         // produce ToolDeprioritize + PromptShape (stalls) + PostconditionPattern.
         use crate::observability_integration::ObservabilitySession;
-        let entries = vec![health("grep", 3, 5)];
+        let entries = vec![health_inherent("grep", 3, 5)];
         let mut obs = ObservabilitySession::new_simple("s-p7a-e2e");
         obs.record_stall_event();
         obs.record_stall_event();
@@ -860,7 +898,7 @@ mod tests {
         // must yield the right LessonKinds without the caller doing any
         // hand-rolling.
         use crate::observability_integration::ObservabilitySession;
-        let entries = vec![health("grep", 3, 5), health("bash", 2, 10)];
+        let entries = vec![health_inherent("grep", 3, 5), health("bash", 2, 10)];
         let mut obs = ObservabilitySession::new_simple("s-end-to-end");
         obs.recent_correction_excerpts = vec!["a".into(), "b".into()];
 
@@ -1047,5 +1085,95 @@ mod tests {
                 "{inherent} must NOT be classified as transient"
             );
         }
+    }
+
+    // ── Safety boundary tests ───────────────────────────────────────────────
+
+    #[test]
+    fn undetermined_failure_tool_does_not_produce_lesson() {
+        // Tool has failures in aggregate count but NO detailed outcome
+        // records (outcomes rolled off ring buffer). Must NOT create a
+        // lesson — we don't know if failures were transient or inherent.
+        let entry = health("grep", 5, 8); // health() creates empty recent_outcomes
+        let summary = summarise_from_runtime(&[entry], None);
+        assert!(
+            summary.undetermined_failure_tools.contains("grep"),
+            "tool with empty outcomes must be undetermined"
+        );
+        let lessons = extract_lessons(&summary, "u", "p", None);
+        assert!(
+            !lessons.iter().any(|l| l.trigger_signal.contains("grep")),
+            "undetermined tool must NOT produce a lesson"
+        );
+    }
+
+    #[test]
+    fn fifty_percent_transient_boundary_classifies_as_transient() {
+        use astra_pipeline::tool_health_types::{ToolOutcome, ToolOutcomeCacheEntry};
+        // 2 transient + 2 inherent = 50% → ≥50% rule → transient.
+        let entry = ToolHealthEntry {
+            name: "grep".into(),
+            total_calls: 6,
+            total_failures: 4,
+            failure_rate: 0.67,
+            last_updated_epoch: 0,
+            recent_outcomes: vec![ToolOutcomeCacheEntry {
+                signature: "grep *".into(),
+                outcomes: vec![
+                    ToolOutcome {
+                        success: false,
+                        latency_ms: 0,
+                        result_hash: 0,
+                        at_epoch: 0,
+                        failure_category: Some("resource_limit".into()),
+                    },
+                    ToolOutcome {
+                        success: false,
+                        latency_ms: 0,
+                        result_hash: 0,
+                        at_epoch: 0,
+                        failure_category: Some("network".into()),
+                    },
+                    ToolOutcome {
+                        success: false,
+                        latency_ms: 0,
+                        result_hash: 0,
+                        at_epoch: 0,
+                        failure_category: Some("tool_timeout".into()),
+                    },
+                    ToolOutcome {
+                        success: false,
+                        latency_ms: 0,
+                        result_hash: 0,
+                        at_epoch: 0,
+                        failure_category: Some("tool_invalid_args".into()),
+                    },
+                ],
+            }],
+        };
+        let summary = summarise_from_runtime(&[entry], None);
+        assert!(
+            summary.transient_failure_tools.contains("grep"),
+            "50% transient must classify as transient (safe side)"
+        );
+    }
+
+    #[test]
+    fn rehabilitation_threshold_boundary() {
+        // Exactly 3 successes (threshold) → rehabilitated.
+        let entry = health("grep", 2, 5); // 5 total, 2 failures → 3 successes
+        let summary = summarise_from_runtime(&[entry], None);
+        assert!(
+            summary.rehabilitated_tools.contains("grep"),
+            "exactly 3 successes must qualify for rehabilitation"
+        );
+
+        // 2 successes → NOT rehabilitated.
+        let entry = health("rg", 3, 5); // 5 total, 3 failures → 2 successes
+        let summary = summarise_from_runtime(&[entry], None);
+        assert!(
+            !summary.rehabilitated_tools.contains("rg"),
+            "2 successes must NOT qualify for rehabilitation"
+        );
     }
 }
