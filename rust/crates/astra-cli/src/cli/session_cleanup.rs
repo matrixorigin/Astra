@@ -58,10 +58,24 @@ pub(super) async fn finalize_session(state: &ReplState) {
         && let Some(ref user_id) = state.ingestion_user_id
     {
         let svc = mc.agent_lessons_service();
-        let summary = astra_runtime::lesson_extractor::summarise_from_runtime(
-            &state.tool_health_entries,
-            None,
-        );
+        // Build the summary under a scoped read lock so the summarise call
+        // doesn't hold the lock across the persist await. ObservabilitySession
+        // isn't Clone, so `summarise_from_runtime` runs inside the guard.
+        // Lock poisoning degrades silently to tool-health-only.
+        let summary = match state
+            .observability_session
+            .as_ref()
+            .and_then(|arc| arc.read().ok())
+        {
+            Some(guard) => astra_runtime::lesson_extractor::summarise_from_runtime(
+                &state.tool_health_entries,
+                Some(&*guard),
+            ),
+            None => astra_runtime::lesson_extractor::summarise_from_runtime(
+                &state.tool_health_entries,
+                None,
+            ),
+        };
         // Run inline — it's a handful of SQL upserts, bounded by the
         // number of distilled lessons (≤ ~5 in practice). We deliberately
         // await rather than fire-and-forget so the ingestion shutdown in

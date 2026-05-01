@@ -181,22 +181,14 @@ pub fn summarise_from_runtime(
         }
     }
 
-    let (user_corrections, unmet_postconditions) = match obs {
-        None => (Vec::new(), 0),
+    let (user_corrections, unmet_postconditions, stall_events) = match obs {
+        None => (Vec::new(), 0, 0),
         Some(session) => (
             session.recent_correction_excerpts.clone(),
-            // Unmet postconditions are tracked per-turn; the session-level
-            // total is currently not collected on ObservabilitySession, so
-            // we degrade to zero. Once the observability layer exposes a
-            // cumulative count this line flips to the real value.
-            0,
+            session.unmet_postcondition_count,
+            session.stall_event_count,
         ),
     };
-
-    // Stalls aren't cumulatively tracked on ObservabilitySession either;
-    // they're emitted as journal events at detection time. Leave at zero
-    // until that signal is surfaced here.
-    let stall_events = 0;
 
     SessionSummary {
         tool_failures,
@@ -477,6 +469,43 @@ mod tests {
         let s = summarise_from_runtime(&[], Some(&obs));
         assert_eq!(s.user_corrections.len(), 2);
         assert!(s.user_corrections.iter().any(|c| c.contains("rg")));
+    }
+
+    #[test]
+    fn summarise_propagates_stall_and_unmet_counts_from_observability() {
+        // P7a: the two new counters must flow through to the extractor so
+        // session-end can emit PromptShape / PostconditionPattern lessons.
+        use crate::observability_integration::ObservabilitySession;
+        let mut obs = ObservabilitySession::new_simple("s-p7a");
+        obs.record_stall_event();
+        obs.record_stall_event();
+        obs.record_stall_event();
+        obs.record_unmet_postconditions(5);
+
+        let s = summarise_from_runtime(&[], Some(&obs));
+        assert_eq!(s.stall_events, 3);
+        assert_eq!(s.unmet_postconditions, 5);
+    }
+
+    #[test]
+    fn summarise_with_stalls_and_unmet_yields_all_lesson_kinds_end_to_end() {
+        // Full stack: observability counters → summary → extractor must
+        // produce ToolDeprioritize + PromptShape (stalls) + PostconditionPattern.
+        use crate::observability_integration::ObservabilitySession;
+        let entries = vec![health("grep", 3, 5)];
+        let mut obs = ObservabilitySession::new_simple("s-p7a-e2e");
+        obs.record_stall_event();
+        obs.record_stall_event();
+        obs.record_stall_event();
+        obs.record_unmet_postconditions(4);
+
+        let summary = summarise_from_runtime(&entries, Some(&obs));
+        let lessons = extract_lessons(&summary, "u1", "generic", None);
+
+        let kinds: std::collections::HashSet<LessonKind> = lessons.iter().map(|l| l.kind).collect();
+        assert!(kinds.contains(&LessonKind::ToolDeprioritize));
+        assert!(kinds.contains(&LessonKind::PromptShape));
+        assert!(kinds.contains(&LessonKind::PostconditionPattern));
     }
 
     // ── persist_session_lessons ─────────────────────────────────────────────
