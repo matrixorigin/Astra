@@ -211,6 +211,7 @@ jobs:
       - name: Start dependencies
         run: make dev-deps-up
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
