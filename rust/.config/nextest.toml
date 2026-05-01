@@ -79,6 +79,7 @@ test-group = "db_scoped_trim"
 filter = """
 package(astra-plan) and binary(plan_repository_db_it)
  or package(astra-runtime) and binary(system_matrix_http_e2e)
+ or package(astra-runtime) and binary(selector_metrics_db_e2e)
  or test(/migration_dedupe_removes_duplicate_attempt_tuples/)
 """
 test-group = "integration_e2e"
