@@ -1224,3 +1224,28 @@ async fn concurrent_access_via_arc_mutex() {
         "cooldown must prevent duplicate fires under concurrent access"
     );
 }
+
+#[tokio::test]
+async fn per_session_cap_stops_firing_after_max() {
+    let exec: Arc<dyn SkillExecutor> = Arc::new(SyntheticSkillDiagnosisExecutor);
+    let mut handler = AutoInvokeHandler::new(exec);
+
+    let stall_signals = astra_skills::auto_invoke::SessionSignals {
+        session_stalls: 5,
+        budget_pressure: 0.0,
+        recent_corrections: 0,
+        corrections_window: 10,
+    };
+
+    let mut total = 0u32;
+    for i in 0..(MAX_FIRES_PER_SESSION + 5) {
+        // Advance time past cooldown so the gate would fire every call.
+        let now = std::time::Instant::now() + std::time::Duration::from_secs(120) * i;
+        let diags = handler.maybe_fire(&stall_signals, now).await;
+        total += diags.len() as u32;
+    }
+    assert_eq!(
+        total, MAX_FIRES_PER_SESSION,
+        "handler must stop after MAX_FIRES_PER_SESSION invocations"
+    );
+}

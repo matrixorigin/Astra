@@ -66,7 +66,7 @@ pub use admin_config::{
 pub use agent_lessons::{
     AGENT_LESSON_EXPOSURES_DDL, AGENT_LESSONS_DDL, AgentLessonsService, DEFAULT_LESSON_CONFIDENCE,
     DatabaseAgentLessonsService, Lesson, LessonExposure, LessonHint, LessonKind, LessonOutcome,
-    NewLesson, UnconfiguredAgentLessonsService,
+    NewLesson, UnconfiguredAgentLessonsService, sanitize_for_prompt,
 };
 pub use agents::{
     AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,

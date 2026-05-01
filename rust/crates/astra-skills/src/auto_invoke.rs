@@ -358,6 +358,7 @@ impl SkillDiagnosis {
     /// the output shape.
     #[must_use]
     pub fn render_prompt_block(&self) -> String {
+        use astra_services::sanitize_for_prompt;
         use std::fmt::Write;
         let mut s = String::with_capacity(256);
         let synthetic_tag = if self.source == DiagnosisSource::SyntheticFallback {
@@ -368,13 +369,16 @@ impl SkillDiagnosis {
         let _ = writeln!(
             s,
             "⚙ Auto-diagnosis [{}]{} (cause: {}): {}",
-            self.skill, synthetic_tag, self.cause, self.headline
+            sanitize_for_prompt(&self.skill),
+            synthetic_tag,
+            sanitize_for_prompt(&self.cause),
+            sanitize_for_prompt(&self.headline),
         );
         for finding in &self.findings {
-            let _ = writeln!(s, "  - {finding}");
+            let _ = writeln!(s, "  - {}", sanitize_for_prompt(finding));
         }
         if let Some(ref action) = self.recommended_action {
-            let _ = writeln!(s, "  → {action}");
+            let _ = writeln!(s, "  → {}", sanitize_for_prompt(action));
         }
         for criterion in &self.success_criteria {
             let _ = writeln!(
@@ -384,7 +388,7 @@ impl SkillDiagnosis {
                 criterion.operator,
                 criterion.threshold,
                 criterion.window_turns,
-                criterion.description
+                sanitize_for_prompt(&criterion.description),
             );
         }
         let _ = writeln!(s, "  source: {:?}", self.source);

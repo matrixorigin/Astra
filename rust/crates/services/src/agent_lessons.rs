@@ -46,6 +46,7 @@ use uuid::Uuid;
 /// Stable string tags (snake_case) so DB rows and JSON are self-describing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum LessonKind {
     /// Avoid this tool for this scope — it failed or was slow last time.
     ToolDeprioritize,
@@ -139,13 +140,30 @@ impl LessonHint {
     }
 }
 
-/// Strip control characters from DB-stored content before prompt injection.
-/// Defense-in-depth: current lesson content is server-generated, but this
-/// barrier prevents future code paths from accidentally injecting raw
-/// LLM/user content into the system prompt.
-fn sanitize_for_prompt(s: &str) -> String {
+/// Strip control characters, zero-width Unicode, and bidirectional
+/// overrides from content before prompt injection. Covers:
+/// - C0/C1 control codes (is_control) except newline
+/// - Zero-width spaces/joiners (U+200B–U+200F)
+/// - Bidi overrides and isolates (U+2028–U+202F)
+/// - Word joiners and invisible separators (U+2060–U+2064)
+/// - BOM (U+FEFF)
+///
+/// Public so `SkillDiagnosis::render_prompt_block` can reuse it for
+/// LLM-generated findings/headlines.
+pub fn sanitize_for_prompt(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_control() || *c == '\n')
+        .filter(|c| {
+            if c.is_control() && *c != '\n' {
+                return false;
+            }
+            !matches!(
+                *c,
+                '\u{200B}'..='\u{200F}'
+                    | '\u{2028}'..='\u{202F}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{FEFF}'
+            )
+        })
         .collect()
 }
 
@@ -410,7 +428,21 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
             }
         };
 
-        rows.into_iter().map(row_to_lesson).collect()
+        let mut lessons = Vec::with_capacity(rows.len());
+        for row in rows {
+            match row_to_lesson(row) {
+                Ok(l) => lessons.push(l),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "agent_lessons",
+                        error = %e,
+                        "skipping lesson row with unrecognised kind; \
+                         binary may be older than the DB schema",
+                    );
+                }
+            }
+        }
+        Ok(lessons)
     }
 
     async fn record_hit(&self, lesson_id: &str) -> Result<i64, sqlx::Error> {
@@ -447,6 +479,15 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
+
+        // Delete all retired rows immediately. Without this, the
+        // retirement UPDATE refreshes updated_at, so the age-based
+        // DELETE below would let retired rows survive another 30 days.
+        let retired_deleted =
+            query("DELETE FROM agent_lessons WHERE user_id = ? AND status = 'retired'")
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
 
         // Tool-specific lessons (ToolDeprioritize/ToolBoost) get a shorter
         // TTL (7 days) because tool issues are often transient and a stale
@@ -502,6 +543,7 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
 
         tx.commit().await?;
         Ok(retired.rows_affected()
+            + retired_deleted.rows_affected()
             + tool_stale.rows_affected()
             + stale.rows_affected()
             + overflow.rows_affected())
@@ -1112,6 +1154,27 @@ mod tests {
         assert!(clean.contains('\n'), "newlines must be preserved");
         assert!(clean.contains("normal text"));
         assert!(clean.contains("line two"));
+    }
+
+    #[test]
+    fn sanitize_for_prompt_strips_zero_width_and_bidi_chars() {
+        let dirty = "before\u{200B}zero\u{200D}width\u{200E}after";
+        let clean = sanitize_for_prompt(dirty);
+        assert_eq!(clean, "beforezerowidthafter");
+
+        let bidi = "normal\u{202E}reversed\u{202C}text";
+        let clean = sanitize_for_prompt(bidi);
+        assert!(!clean.contains('\u{202E}'));
+        assert!(!clean.contains('\u{202C}'));
+
+        let separators = "line\u{2028}para\u{2029}end";
+        let clean = sanitize_for_prompt(separators);
+        assert!(!clean.contains('\u{2028}'));
+        assert!(!clean.contains('\u{2029}'));
+
+        let bom_and_joiners = "\u{FEFF}start\u{2060}mid\u{2064}end";
+        let clean = sanitize_for_prompt(bom_and_joiners);
+        assert_eq!(clean, "startmidend");
     }
 
     #[test]
