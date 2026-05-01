@@ -387,9 +387,9 @@ async fn negative_outcomes_can_retire_a_lesson() {
     let svc = service().await;
     let stored = svc.record(new_lesson(&user_id, None)).await.unwrap();
 
-    // 3 negative outcome sessions to hit the retirement threshold
-    // (negative_outcome_count >= 3 AND > positive_outcome_count).
-    for i in 0..3 {
+    // 5 negative outcome sessions to hit the retirement threshold
+    // (negative_outcome_count >= 5 AND > positive_outcome_count).
+    for i in 0..5 {
         let sid = format!("sess-neg-{i}");
         svc.record_exposure(astra_services::LessonExposure {
             lesson_id: stored.id.clone(),
@@ -415,7 +415,7 @@ async fn negative_outcomes_can_retire_a_lesson() {
         .unwrap();
     }
 
-    // After 3 negative outcomes the lesson should be retired and no longer
+    // After 5 negative outcomes the lesson should be retired and no longer
     // returned by load_recent (which filters status='active').
     let lessons = svc
         .load_recent(&user_id, "generic", None, 10)

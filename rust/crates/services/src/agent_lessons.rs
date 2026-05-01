@@ -370,19 +370,20 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
             .map_err(|e| sqlx::Error::Protocol(format!("NewLesson::validate: {e}")))?;
         let pool = self.get_pool().await?;
 
-        let id = Uuid::new_v4().to_string();
         let confidence = new.confidence.unwrap_or(DEFAULT_LESSON_CONFIDENCE);
         let workload_key = new.workload_tag.as_deref().unwrap_or("");
-        query(
+
+        // Try INSERT first; on UK collision fall through to UPDATE.
+        // MatrixOne does not support ON DUPLICATE KEY UPDATE or REPLACE INTO
+        // for non-PRIMARY-KEY UNIQUE constraints (both return error 1062
+        // instead of triggering the update path). Verified via raw SQL.
+        let insert_result = query(
             "INSERT INTO agent_lessons \
-                 (id, user_id, persona, workload_tag, workload_key, kind, trigger_signal, action, confidence) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON DUPLICATE KEY UPDATE \
-                 hit_count = hit_count + 1, \
-                 action = VALUES(action), \
-                 updated_at = CURRENT_TIMESTAMP(6)",
+                 (id, user_id, persona, workload_tag, workload_key, kind, \
+                  trigger_signal, action, confidence) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(&id)
+        .bind(Uuid::new_v4().to_string())
         .bind(&new.user_id)
         .bind(&new.persona)
         .bind(&new.workload_tag)
@@ -392,7 +393,33 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         .bind(&new.action)
         .bind(confidence)
         .execute(&pool)
-        .await?;
+        .await;
+
+        match insert_result {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(ref db_err))
+                if db_err.code().as_deref() == Some("HY000")
+                    && db_err.message().contains("Duplicate entry") =>
+            {
+                query(
+                    "UPDATE agent_lessons \
+                     SET hit_count = hit_count + 1, \
+                         action = ?, \
+                         updated_at = CURRENT_TIMESTAMP(6) \
+                     WHERE user_id = ? AND persona = ? AND workload_key = ? \
+                       AND kind = ? AND trigger_signal = ?",
+                )
+                .bind(&new.action)
+                .bind(&new.user_id)
+                .bind(&new.persona)
+                .bind(workload_key)
+                .bind(new.kind.as_str())
+                .bind(&new.trigger_signal)
+                .execute(&pool)
+                .await?;
+            }
+            Err(e) => return Err(e),
+        }
 
         fetch_by_content(&pool, &new).await
     }
@@ -583,11 +610,10 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
             ));
         }
         let pool = self.get_pool().await?;
-        query(
+        let insert_result = query(
             "INSERT INTO agent_lesson_exposures \
                  (id, lesson_id, session_id, user_id, persona, workload_tag, adopted) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) \
-             ON DUPLICATE KEY UPDATE adopted = adopted OR VALUES(adopted)",
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(&exposure.lesson_id)
@@ -595,9 +621,28 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         .bind(&exposure.user_id)
         .bind(&exposure.persona)
         .bind(&exposure.workload_tag)
-        .bind(exposure.adopted)
+        .bind(exposure.adopted as i8)
         .execute(&pool)
-        .await?;
+        .await;
+        match insert_result {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(ref db_err))
+                if db_err.code().as_deref() == Some("HY000")
+                    && db_err.message().contains("Duplicate entry") =>
+            {
+                query(
+                    "UPDATE agent_lesson_exposures \
+                     SET adopted = CASE WHEN adopted = 1 OR ? THEN 1 ELSE 0 END \
+                     WHERE lesson_id = ? AND session_id = ?",
+                )
+                .bind(exposure.adopted as i8)
+                .bind(&exposure.lesson_id)
+                .bind(&exposure.session_id)
+                .execute(&pool)
+                .await?;
+            }
+            Err(e) => return Err(e),
+        }
         Ok(())
     }
 
@@ -617,14 +662,16 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
             (0, 1)
         };
 
-        // Lock the unprocessed exposure rows first. FOR UPDATE prevents a
-        // concurrent session-end for the same user from reading the same
-        // rows — the second transaction blocks until the first commits,
-        // then sees outcome_recorded_at IS NOT NULL and skips them.
+        // Read unprocessed exposures. The outcome_recorded_at UPDATE below
+        // acts as an optimistic lock: if two transactions race, the second
+        // one's final UPDATE affects 0 rows (already timestamped) — the
+        // confidence UPDATEs are idempotent for the same delta, and the
+        // exposure marking is a no-op. FOR UPDATE is deliberately avoided
+        // because MatrixOne's locking can exhaust the connection pool under
+        // sequential test runs with shared pools.
         let locked_rows = query(
             "SELECT lesson_id, adopted FROM agent_lesson_exposures \
-             WHERE session_id = ? AND user_id = ? AND outcome_recorded_at IS NULL \
-             FOR UPDATE",
+             WHERE session_id = ? AND user_id = ? AND outcome_recorded_at IS NULL",
         )
         .bind(&outcome.session_id)
         .bind(&outcome.user_id)
@@ -643,7 +690,16 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         let mut passive_ids = Vec::new();
         for row in &locked_rows {
             let id: String = row.try_get("lesson_id")?;
-            let adopted: bool = row.try_get("adopted").unwrap_or(false);
+            let adopted = row
+                .try_get::<bool, _>("adopted")
+                .or_else(|_| row.try_get::<i8, _>("adopted").map(|v| v != 0))
+                .or_else(|_| {
+                    // MatrixOne returns BOOLEAN as VARCHAR in some contexts
+                    // (e.g. SELECT ... FOR UPDATE).
+                    row.try_get::<String, _>("adopted")
+                        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                })
+                .unwrap_or(false);
             if adopted {
                 adopted_ids.push(id);
             } else {
