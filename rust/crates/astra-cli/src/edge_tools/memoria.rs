@@ -434,6 +434,59 @@ fn memoria_oneshot_client(timeout_secs: u64) -> Option<(reqwest::Client, String,
     Some((client, base, key))
 }
 
+/// Retrieve procedural/semantic lessons from Memoria for session bootstrap.
+/// Returns LessonHint-compatible structs. Best-effort: returns empty vec
+/// on any error (circuit breaker, timeout, parse failure).
+pub async fn memoria_retrieve_lessons(top_k: u64) -> Vec<astra_runtime::self_model::LessonHint> {
+    let Some((client, base, key)) = memoria_oneshot_client(3) else {
+        return Vec::new();
+    };
+    let payload = json!({
+        "query": "LESSON CORRECTION ANTIPATTERN procedural learnings",
+        "top_k": top_k,
+        "min_confidence": 0.3,
+    });
+    let resp = match client
+        .post(format!("{base}/v1/memories/retrieve"))
+        .header("Authorization", format!("Bearer {key}"))
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let text = match resp.text().await {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let memories = match value.get("memories").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+    memories
+        .iter()
+        .filter_map(|m| {
+            let content = m.get("content")?.as_str()?;
+            let memory_type = m.get("memory_type")?.as_str()?;
+            if !matches!(memory_type, "semantic" | "procedural") {
+                return None;
+            }
+            let kind = astra_services::LessonKind::PromptShape;
+            Some(astra_runtime::self_model::LessonHint {
+                kind,
+                trigger_signal: "memoria".into(),
+                action: astra_services::sanitize_for_prompt(content),
+                workload_tag: None,
+            })
+        })
+        .collect()
+}
+
 /// Fire-and-forget: trigger Memoria governance (quarantine low-confidence,
 /// clean stale data). Called at session end. Server has 1-hour cooldown.
 pub async fn memoria_governance_fire_and_forget() {

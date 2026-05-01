@@ -91,6 +91,40 @@ pub async fn attach_session_lessons(
     }
 }
 
+/// Merge lessons from the local DAO (agent_lessons) with supplementary
+/// lessons retrieved from Memoria. Deduplicates by action content
+/// similarity: if a Memoria lesson's action is a substring of (or equal
+/// to) a local lesson's action, the local version is kept (has structured
+/// confidence). Memoria-only lessons are appended after local ones.
+///
+/// The merged result replaces whatever is on the SelfModel.
+pub fn merge_local_and_memoria_lessons(
+    local: Vec<LessonHint>,
+    memoria: Vec<LessonHint>,
+) -> Vec<LessonHint> {
+    if memoria.is_empty() {
+        return local;
+    }
+    if local.is_empty() {
+        return memoria;
+    }
+
+    let local_actions: std::collections::HashSet<String> =
+        local.iter().map(|l| l.action.to_lowercase()).collect();
+
+    let mut merged = local;
+    for m in memoria {
+        let m_lower = m.action.to_lowercase();
+        let is_dup = local_actions
+            .iter()
+            .any(|la| la.contains(&m_lower) || m_lower.contains(la.as_str()));
+        if !is_dup {
+            merged.push(m);
+        }
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,5 +318,60 @@ mod tests {
     async fn default_limit_is_six() {
         // Pinned so future tuning is intentional, not accidental.
         assert_eq!(DEFAULT_SESSION_BOOTSTRAP_LIMIT, 6);
+    }
+
+    // ── merge_local_and_memoria_lessons ────────────────────────────────────
+
+    fn hint(action: &str) -> LessonHint {
+        LessonHint {
+            kind: LessonKind::PromptShape,
+            trigger_signal: "test".into(),
+            action: action.into(),
+            workload_tag: None,
+        }
+    }
+
+    #[test]
+    fn merge_empty_memoria_returns_local() {
+        let local = vec![hint("use rg")];
+        let merged = merge_local_and_memoria_lessons(local.clone(), vec![]);
+        assert_eq!(merged, local);
+    }
+
+    #[test]
+    fn merge_empty_local_returns_memoria() {
+        let memoria = vec![hint("use rg from Memoria")];
+        let merged = merge_local_and_memoria_lessons(vec![], memoria.clone());
+        assert_eq!(merged, memoria);
+    }
+
+    #[test]
+    fn merge_deduplicates_by_action_substring() {
+        let local = vec![hint("use rg instead of grep")];
+        let memoria = vec![hint("use rg")]; // substring of local
+        let merged = merge_local_and_memoria_lessons(local, memoria);
+        assert_eq!(merged.len(), 1, "duplicate should be deduped");
+        assert_eq!(merged[0].action, "use rg instead of grep");
+    }
+
+    #[test]
+    fn merge_keeps_unique_memoria_lessons() {
+        let local = vec![hint("use rg instead of grep")];
+        let memoria = vec![
+            hint("use rg"),                              // dup
+            hint("always run make check before commit"), // unique
+        ];
+        let merged = merge_local_and_memoria_lessons(local, memoria);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].action, "use rg instead of grep");
+        assert_eq!(merged[1].action, "always run make check before commit");
+    }
+
+    #[test]
+    fn merge_is_case_insensitive() {
+        let local = vec![hint("Use RG instead of grep")];
+        let memoria = vec![hint("use rg instead of grep")];
+        let merged = merge_local_and_memoria_lessons(local, memoria);
+        assert_eq!(merged.len(), 1);
     }
 }

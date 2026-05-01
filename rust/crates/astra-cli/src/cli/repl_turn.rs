@@ -538,6 +538,15 @@ fn contains_any_token(haystack: &str, tokens: &[&str]) -> bool {
 /// First-turn gate for cross-session lesson loading (P6). Returns true when
 /// the cache is empty AND the session has a populated lesson source. Kept
 /// pure so a unit test can pin the trigger condition.
+async fn memoria_lesson_fallback(state: &mut ReplState) {
+    state.session_lessons = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        super::edge_tools::memoria::memoria_retrieve_lessons(5),
+    )
+    .await
+    .unwrap_or_default();
+}
+
 fn should_bootstrap_lessons(state: &ReplState) -> bool {
     !state.session_lessons_loaded
         && state.matrix_runtime.is_some()
@@ -888,20 +897,38 @@ async fn run_chat_turn(
                         }
                     }
                 }
-                state.session_lessons = rows
+                let local_lessons: Vec<astra_runtime::self_model::LessonHint> = rows
                     .iter()
                     .map(astra_runtime::self_model::LessonHint::from_lesson)
                     .collect();
+                // Supplement with Memoria-sourced lessons (L3 knowledge backflow).
+                // Best-effort: 3s timeout, empty vec on failure.
+                let memoria_lessons = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    super::edge_tools::memoria::memoria_retrieve_lessons(3),
+                )
+                .await
+                .unwrap_or_default();
+                state.session_lessons =
+                    astra_runtime::lesson_bootstrap::merge_local_and_memoria_lessons(
+                        local_lessons,
+                        memoria_lessons,
+                    );
             }
-            Ok(Err(e)) => tracing::warn!(
-                target: "repl_turn",
-                error = %e,
-                "agent_lessons::load_recent failed; starting without carried-over lessons",
-            ),
-            Err(_elapsed) => tracing::warn!(
-                target: "repl_turn",
-                "agent_lessons::load_recent timed out after 3s; starting without lessons",
-            ),
+            err => {
+                match err {
+                    Ok(Err(e)) => tracing::warn!(
+                        target: "repl_turn",
+                        error = %e,
+                        "agent_lessons::load_recent failed; trying Memoria fallback",
+                    ),
+                    _ => tracing::warn!(
+                        target: "repl_turn",
+                        "agent_lessons::load_recent timed out after 3s; trying Memoria fallback",
+                    ),
+                }
+                memoria_lesson_fallback(state).await;
+            }
         }
     }
 
