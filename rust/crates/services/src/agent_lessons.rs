@@ -208,6 +208,25 @@ impl DatabaseAgentLessonsService {
         self
     }
 
+    /// Pool-only convenience constructor for callers that already hold a
+    /// live [`SharedPool`] and don't want to thread [`MatrixOneSettings`]
+    /// around solely for the fallback reconnect path. The fallback is
+    /// unreachable while `pool` stays healthy, so the placeholder settings
+    /// are never actually consumed.
+    #[must_use]
+    pub fn from_pool(pool: SharedPool) -> Self {
+        Self {
+            matrixone: MatrixOneSettings {
+                host: String::new(),
+                port: 0,
+                user: String::new(),
+                password: String::new(),
+                database: String::new(),
+            },
+            pool: Some(pool),
+        }
+    }
+
     async fn get_pool(&self) -> Result<Pool<MySql>, sqlx::Error> {
         if let Some(ref p) = self.pool {
             return Ok(p.get().clone());
@@ -582,6 +601,21 @@ mod tests {
             let pruned = svc.prune("u", 30).await.unwrap();
             assert_eq!(pruned, 0);
         });
+    }
+
+    #[test]
+    fn from_pool_constructor_compiles_without_settings() {
+        // Type-level smoke: `DatabaseAgentLessonsService::from_pool` is the
+        // ergonomic seam for runtime callers that already hold a
+        // SharedPool (e.g., via MatrixCloudRuntime). This test simply
+        // asserts the function exists and returns the right type without
+        // connecting to a DB.
+        fn _accepts_service(_svc: DatabaseAgentLessonsService) {}
+        // Compile-time check only — we don't actually call this function.
+        #[allow(dead_code)]
+        fn _caller(pool: SharedPool) {
+            _accepts_service(DatabaseAgentLessonsService::from_pool(pool));
+        }
     }
 
     #[test]

@@ -50,6 +50,27 @@ pub(super) async fn finalize_session(state: &ReplState) {
     // 3b. Trigger Memoria governance + consolidation (best-effort with timeout)
     let gov_handle = tokio::spawn(edge_tools::memoria::memoria_governance_fire_and_forget());
     let con_handle = tokio::spawn(edge_tools::memoria::memoria_consolidate_fire_and_forget());
+    // 3c. P3.2 seam: persist cross-session lessons derived from this session.
+    //     Best-effort: silent no-op if MatrixOne / user_id is unavailable,
+    //     or if the session didn't run long enough to collect signals.
+    if state.turn > 0
+        && let Some(ref mc) = state.matrix_runtime
+        && let Some(ref user_id) = state.ingestion_user_id
+    {
+        let svc = mc.agent_lessons_service();
+        let summary = astra_runtime::lesson_extractor::summarise_from_runtime(
+            &state.tool_health_entries,
+            None,
+        );
+        // Run inline — it's a handful of SQL upserts, bounded by the
+        // number of distilled lessons (≤ ~5 in practice). We deliberately
+        // await rather than fire-and-forget so the ingestion shutdown in
+        // step 4 doesn't race with the lesson writes.
+        let _ = astra_runtime::lesson_extractor::persist_session_lessons(
+            svc, &summary, user_id, "generic", None,
+        )
+        .await;
+    }
     // 4. Graceful ingestion shutdown: await worker flush
     if let Some(mc) = state.matrix_runtime.as_ref() {
         mc.shutdown_ingestion_and_wait().await;

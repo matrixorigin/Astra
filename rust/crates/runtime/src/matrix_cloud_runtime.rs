@@ -203,6 +203,17 @@ impl MatrixCloudRuntime {
         &self.sync_service
     }
 
+    /// Build a cross-session-lessons service backed by this runtime's
+    /// [`SharedPool`]. Convenience for callers at session start/end that
+    /// want to load or record lessons without having to thread
+    /// [`astra_core::MatrixOneSettings`] through their code.
+    #[must_use]
+    pub fn agent_lessons_service(&self) -> Arc<dyn astra_services::AgentLessonsService> {
+        Arc::new(astra_services::DatabaseAgentLessonsService::from_pool(
+            self.shared_pool.clone(),
+        ))
+    }
+
     /// Snapshot of ingestion stats (events received/flushed/errors + overflow).
     pub fn ingestion_stats(&self) -> Option<astra_services::event_ingestion::IngestionStats> {
         self.ingestion_stats.lock().ok().map(|s| s.clone())
