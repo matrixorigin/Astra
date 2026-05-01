@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod admin_config;
+pub mod agent_lessons;
 pub mod agents;
 pub mod auth;
 pub mod branches;
@@ -61,6 +62,10 @@ pub use admin::{
 pub use admin_config::{
     ADMIN_CONFIG_ALLOWED_KEYS, ADMIN_CONFIG_KEY_REASONING_MODEL, AdminConfigService,
     DatabaseAdminConfigService, UnconfiguredAdminConfigService,
+};
+pub use agent_lessons::{
+    AGENT_LESSONS_DDL, AgentLessonsService, DEFAULT_LESSON_CONFIDENCE,
+    DatabaseAgentLessonsService, Lesson, LessonKind, NewLesson, UnconfiguredAgentLessonsService,
 };
 pub use agents::{
     AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,
