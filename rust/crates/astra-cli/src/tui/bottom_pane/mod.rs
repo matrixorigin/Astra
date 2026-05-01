@@ -9,6 +9,9 @@ use footer::Footer;
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
+    style::{Color, Style},
+    text::{Line, Span},
+    widgets::Widget,
 };
 use view::{BottomPaneView, CancellationEvent};
 
@@ -60,7 +63,8 @@ impl BottomPane {
         } else {
             self.composer.desired_height(width)
         };
-        content_h + 1 // +1 for footer
+        // top separator (1) + content + bottom separator (1) + footer (1)
+        1 + content_h + 1 + 1
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> BottomPaneAction {
@@ -143,34 +147,58 @@ impl BottomPane {
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
-        let content_h = area.height.saturating_sub(1);
+        let content_h = if let Some(view) = self.active_view() {
+            view.desired_height(area.width)
+        } else {
+            self.composer.desired_height(area.width)
+        };
         let chunks = Layout::vertical([
-            Constraint::Length(content_h),
-            Constraint::Length(1),
+            Constraint::Length(1),         // top separator
+            Constraint::Length(content_h), // composer / view
+            Constraint::Length(1),         // bottom separator
+            Constraint::Length(1),         // footer
         ])
         .split(area);
 
+        Self::render_separator(chunks[0], buf);
+
         if let Some(view) = self.active_view() {
-            view.render(chunks[0], buf);
+            view.render(chunks[1], buf);
         } else {
-            self.composer.render(chunks[0], buf);
+            self.composer.render(chunks[1], buf);
         }
 
-        self.footer.render(chunks[1], buf);
+        Self::render_separator(chunks[2], buf);
+        self.footer.render(chunks[3], buf);
+    }
+
+    fn render_separator(area: Rect, buf: &mut Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let dim = Style::default().fg(Color::DarkGray);
+        let line = "─".repeat(area.width as usize);
+        Widget::render(Line::from(Span::styled(line, dim)), area, buf);
     }
 
     pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
-        let content_h = area.height.saturating_sub(1);
+        let content_h = if let Some(view) = self.active_view() {
+            view.desired_height(area.width)
+        } else {
+            self.composer.desired_height(area.width)
+        };
         let chunks = Layout::vertical([
+            Constraint::Length(1),
             Constraint::Length(content_h),
+            Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(area);
 
         if let Some(view) = self.active_view() {
-            view.cursor_pos(chunks[0])
+            view.cursor_pos(chunks[1])
         } else {
-            self.composer.cursor_position(chunks[0])
+            self.composer.cursor_position(chunks[1])
         }
     }
 }

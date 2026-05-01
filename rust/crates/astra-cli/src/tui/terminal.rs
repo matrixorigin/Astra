@@ -64,10 +64,11 @@ impl TerminalGuard {
         self.pending_history.extend(lines);
     }
 
-    /// Draw the viewport. Follows the Codex draw sequence:
-    /// 1. Update inline viewport (scroll if needed)
-    /// 2. Flush pending history lines above viewport
-    /// 3. Render active UI into viewport
+    /// Draw the viewport — matches Codex tui.rs::draw() sequence:
+    /// 1. update_inline_viewport (scroll if height changed, clear if viewport moved)
+    /// 2. flush_pending_history (insert above viewport)
+    /// 3. invalidate_viewport only when needed (viewport moved or Zellij flush)
+    /// 4. terminal.draw (diff buffer + ClearToEnd handles stale content per-row)
     pub fn draw(
         &mut self,
         height: u16,
@@ -76,34 +77,34 @@ impl TerminalGuard {
         stdout().sync_update(|_| {
             let terminal = &mut self.terminal;
 
-            // 1. Update viewport position
-            let mut needs_repaint =
+            let mut needs_full_repaint =
                 Self::update_inline_viewport(terminal, height, self.is_zellij)?;
 
-            // 2. Flush history
-            needs_repaint |= Self::flush_pending_history(
+            needs_full_repaint |= Self::flush_pending_history(
                 terminal,
                 &mut self.pending_history,
                 self.is_zellij,
             )?;
 
-            if needs_repaint {
+            if needs_full_repaint {
                 terminal.invalidate_viewport();
-                // Also clear any stale content below viewport on physical terminal
-                let vp = terminal.viewport_area;
-                queue!(
-                    terminal.backend_mut(),
-                    cursor::MoveTo(0, vp.bottom()),
-                    Print("\x1b[J"), // ED: clear from cursor to end of screen
-                )?;
-                std::io::Write::flush(terminal.backend_mut())?;
             }
 
-            // 3. Render
             terminal.draw(draw_fn)
         })?
     }
 
+    /// Force a clear+redraw of the viewport. Use after operations that
+    /// modify terminal content outside ratatui's knowledge (e.g. insert_history
+    /// in non-Zellij mode where we rely on ClearToEnd in the diff).
+    #[allow(dead_code)]
+    pub fn force_clear_viewport(&mut self) -> io::Result<()> {
+        self.terminal.clear()
+    }
+
+    /// Matches Codex tui.rs::update_inline_viewport():
+    /// If viewport would extend past screen bottom, scroll content above it up.
+    /// If viewport area changed, clear old area and set new one.
     fn update_inline_viewport(
         terminal: &mut CustomTerminal,
         height: u16,
@@ -115,12 +116,9 @@ impl TerminalGuard {
         area.width = size.width;
         let mut needs_full_repaint = false;
 
-
-        // If viewport would extend past bottom, scroll content above it up
         if area.bottom() > size.height {
             let scroll_by = area.bottom() - size.height;
             if is_zellij {
-                // Zellij: emit newlines at screen bottom
                 queue!(
                     terminal.backend_mut(),
                     cursor::MoveTo(0, size.height.saturating_sub(1))
@@ -128,17 +126,16 @@ impl TerminalGuard {
                 for _ in 0..scroll_by {
                     queue!(terminal.backend_mut(), Print("\n"))?;
                 }
+                needs_full_repaint = true;
             } else {
-                // Standard: scroll content above viewport UP to make room below
-                // Set scroll region to rows above viewport, then Scroll Up
-                let region_bottom = area.top(); // top of current viewport
+                let region_bottom = area.top();
                 if region_bottom > 0 {
                     queue!(
                         terminal.backend_mut(),
-                        Print(format!("\x1b[1;{}r", region_bottom)), // Set scroll region
+                        Print(format!("\x1b[1;{}r", region_bottom)),
                         cursor::MoveTo(0, 0),
-                        Print(format!("\x1b[{}S", scroll_by)), // Scroll Up n lines
-                        Print("\x1b[r"), // Reset scroll region
+                        Print(format!("\x1b[{}S", scroll_by)),
+                        Print("\x1b[r"),
                     )?;
                 }
             }
@@ -146,19 +143,8 @@ impl TerminalGuard {
         }
 
         if area != terminal.viewport_area {
-            // Clear from min(old_top, new_top) to screen bottom BEFORE moving viewport
-            // This prevents stale viewport content from leaking into scrollback
-            let previous_area = terminal.viewport_area;
-            let clear_y = previous_area.y.min(area.y);
-            queue!(
-                terminal.backend_mut(),
-                cursor::MoveTo(0, clear_y),
-                Print("\x1b[J"), // ED: clear to end of screen
-            )?;
-            std::io::Write::flush(terminal.backend_mut())?;
-
+            terminal.clear()?;
             terminal.set_viewport_area(area);
-            terminal.invalidate_viewport();
             needs_full_repaint = true;
         }
 

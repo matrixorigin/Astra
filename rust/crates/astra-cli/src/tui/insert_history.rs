@@ -1,14 +1,24 @@
 use std::io::{self, Write};
 
-use crossterm::{cursor, queue, style::Print};
+use crossterm::{
+    cursor::MoveTo,
+    queue,
+    style::{
+        Attribute, Color as CColor, Colors, Print, SetAttribute, SetBackgroundColor, SetColors,
+        SetForegroundColor,
+    },
+    terminal::{Clear, ClearType},
+};
 use ratatui::backend::Backend;
+use ratatui::layout::Size;
+use ratatui::style::Modifier;
 use ratatui::text::Line;
 use unicode_width::UnicodeWidthStr;
 
 use super::custom_terminal;
 
 /// Insert history lines above the viewport into terminal scrollback.
-/// Follows Codex's insert_history pattern exactly.
+/// Matches Codex insert_history.rs Standard/Zellij paths.
 pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
     terminal: &mut custom_terminal::Terminal<B>,
     lines: &[Line<'_>],
@@ -18,16 +28,22 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
         return Ok(());
     }
 
+    let screen_size = terminal.backend().size().unwrap_or(Size::new(0, 0));
     let area = terminal.viewport_area;
-    let screen_size = terminal.size()?;
+    let last_cursor_pos = terminal.last_known_cursor_pos;
     let wrap_width = area.width.max(1) as usize;
+    let mut should_update_area = false;
 
-    // Pre-wrap lines
+    // Pre-wrap lines (simple width-based wrapping)
     let mut wrapped: Vec<&Line<'_>> = Vec::new();
     let mut wrapped_rows: u16 = 0;
     for line in lines {
         let w: usize = line.spans.iter().map(|s| s.content.width()).sum();
-        let rows = if w == 0 { 1 } else { ((w + wrap_width - 1) / wrap_width) as u16 };
+        let rows = if w == 0 {
+            1
+        } else {
+            ((w + wrap_width - 1) / wrap_width) as u16
+        };
         wrapped_rows += rows;
         wrapped.push(line);
     }
@@ -37,8 +53,6 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
     }
 
     let writer = terminal.backend_mut();
-    let mut should_update_area = false;
-    let mut new_area = area;
 
     if is_zellij {
         // Zellij mode: emit newlines at bottom, write at absolute positions
@@ -47,137 +61,177 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
         let scroll_up = wrapped_rows.saturating_sub(shift_down);
 
         if scroll_up > 0 {
-            queue!(writer, cursor::MoveTo(0, screen_size.height.saturating_sub(1)))?;
+            queue!(
+                writer,
+                MoveTo(0, screen_size.height.saturating_sub(1))
+            )?;
             for _ in 0..scroll_up {
                 queue!(writer, Print("\n"))?;
             }
         }
 
+        let mut new_area = area;
         if shift_down > 0 {
             new_area.y += shift_down;
             should_update_area = true;
         }
 
         let cursor_top = area.top().saturating_sub(scroll_up + shift_down);
-        queue!(writer, cursor::MoveTo(0, cursor_top))?;
+        queue!(writer, MoveTo(0, cursor_top))?;
 
         for (i, line) in wrapped.iter().enumerate() {
             if i > 0 {
                 queue!(writer, Print("\r\n"))?;
             }
-            write_history_line(writer, line, wrap_width)?;
+            queue!(writer, Clear(ClearType::UntilNewLine))?;
+            write_history_line(writer, line)?;
+        }
+
+        // Restore cursor position
+        queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
+        Write::flush(writer)?;
+
+        let _ = writer;
+        if should_update_area {
+            terminal.set_viewport_area(new_area);
+        }
+        if wrapped_rows > 0 {
+            terminal.note_history_rows_inserted(wrapped_rows);
         }
     } else {
-        // Standard mode: use scroll regions (matching Codex insert_history.rs)
+        // Standard mode — matches Codex insert_history.rs Standard path:
         //
-        // Step 1: If viewport is near bottom, push it down by scrolling region above it
-        if wrapped_rows > 0 && area.top() > 0 {
-            let scroll_amount = wrapped_rows;
+        // 1. If there's room below the viewport, set scroll region from
+        //    viewport_top to screen_bottom and RI to push viewport down.
+        // 2. Set scroll region to [1..new_viewport_top] (above viewport only).
+        // 3. Write history lines within that protected region.
+        // 4. Reset scroll region and restore cursor.
 
-            // Clear viewport content BEFORE scroll, so stale composer/footer
-            // text doesn't leak into scrollback when RI pushes it down
-            for row in area.top()..area.bottom() {
-                queue!(writer, cursor::MoveTo(0, row), Print("\x1b[2K"))?;
-            }
+        let mut new_area = area;
+        let cursor_top = if area.bottom() < screen_size.height {
+            let scroll_amount = wrapped_rows.min(screen_size.height - area.bottom());
 
-            // Set scroll region to cover viewport top to screen bottom
             let top_1based = area.top() + 1;
-            queue!(writer, Print(format!("\x1b[{};{}r", top_1based, screen_size.height)))?;
-            queue!(writer, cursor::MoveTo(0, area.top()))?;
+            // Scroll region: viewport_top to screen_bottom. RI pushes content down.
+            queue!(
+                writer,
+                Print(format!("\x1b[{};{}r", top_1based, screen_size.height))
+            )?;
+            queue!(writer, MoveTo(0, area.top()))?;
             for _ in 0..scroll_amount {
-                queue!(writer, Print("\x1bM"))?; // Reverse Index: push content down
+                queue!(writer, Print("\x1bM"))?; // Reverse Index
             }
             queue!(writer, Print("\x1b[r"))?; // Reset scroll region
 
-            new_area.y = new_area.y.saturating_add(scroll_amount).min(screen_size.height);
+            let ct = area.top().saturating_sub(1);
+            new_area.y += scroll_amount;
             should_update_area = true;
-        }
+            ct
+        } else {
+            area.top().saturating_sub(1)
+        };
 
-        // Step 2: Write new lines into the gap above the new viewport position
+        // Set scroll region to rows ABOVE the viewport only.
+        // This protects viewport content from being affected by our writes.
         if new_area.top() > 0 {
-            let cursor_top = new_area.top().saturating_sub(wrapped_rows).max(0);
-            queue!(writer, cursor::MoveTo(0, cursor_top))?;
+            queue!(
+                writer,
+                Print(format!("\x1b[1;{}r", new_area.top()))
+            )?;
 
-            for (i, line) in wrapped.iter().enumerate() {
-                if i > 0 {
-                    queue!(writer, Print("\r\n"))?;
-                }
-                write_history_line(writer, line, wrap_width)?;
+            queue!(writer, MoveTo(0, cursor_top))?;
+
+            for line in &wrapped {
+                queue!(writer, Print("\r\n"))?;
+                queue!(writer, Clear(ClearType::UntilNewLine))?;
+                write_history_line(writer, line)?;
             }
+
+            queue!(writer, Print("\x1b[r"))?; // Reset scroll region
         }
-    }
 
-    Write::flush(writer)?;
+        // Restore cursor position
+        queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
+        Write::flush(writer)?;
 
-    if should_update_area {
-        terminal.set_viewport_area(new_area);
-    }
-    if wrapped_rows > 0 {
-        terminal.note_history_rows_inserted(wrapped_rows);
+        let _ = writer;
+        if should_update_area {
+            terminal.set_viewport_area(new_area);
+        }
+        if wrapped_rows > 0 {
+            terminal.note_history_rows_inserted(wrapped_rows);
+        }
     }
 
     Ok(())
 }
 
-fn write_history_line(writer: &mut impl Write, line: &Line<'_>, _wrap_width: usize) -> io::Result<()> {
+fn write_history_line(writer: &mut impl Write, line: &Line<'_>) -> io::Result<()> {
+    // Set line-level colors
+    queue!(
+        writer,
+        SetColors(Colors::new(
+            line.style
+                .fg
+                .map(Into::into)
+                .unwrap_or(CColor::Reset),
+            line.style
+                .bg
+                .map(Into::into)
+                .unwrap_or(CColor::Reset),
+        ))
+    )?;
+
+    // Write spans with style
     for span in &line.spans {
-        let ansi = build_ansi_style(&span.style);
-        if !ansi.is_empty() {
-            queue!(writer, Print(&ansi))?;
-        }
-        queue!(writer, Print(&span.content))?;
-        if !ansi.is_empty() {
-            queue!(writer, Print("\x1b[0m"))?;
-        }
+        let merged = span.style.patch(line.style);
+        write_styled_span(writer, &span.content, &merged)?;
     }
+
+    // Reset attributes after line
+    queue!(
+        writer,
+        SetForegroundColor(CColor::Reset),
+        SetBackgroundColor(CColor::Reset),
+        SetAttribute(Attribute::Reset),
+    )?;
+
     Ok(())
 }
 
-fn build_ansi_style(style: &ratatui::style::Style) -> String {
-    let mut codes = Vec::new();
+fn write_styled_span(
+    writer: &mut impl Write,
+    content: &str,
+    style: &ratatui::style::Style,
+) -> io::Result<()> {
+    // Apply modifiers
+    if style.add_modifier.contains(Modifier::BOLD) {
+        queue!(writer, SetAttribute(Attribute::Bold))?;
+    }
+    if style.add_modifier.contains(Modifier::DIM) {
+        queue!(writer, SetAttribute(Attribute::Dim))?;
+    }
+    if style.add_modifier.contains(Modifier::ITALIC) {
+        queue!(writer, SetAttribute(Attribute::Italic))?;
+    }
+    if style.add_modifier.contains(Modifier::UNDERLINED) {
+        queue!(writer, SetAttribute(Attribute::Underlined))?;
+    }
+
+    // Apply colors
     if let Some(fg) = style.fg {
-        if let Some(c) = color_to_ansi_fg(fg) { codes.push(c); }
+        queue!(writer, SetForegroundColor(fg.into()))?;
     }
     if let Some(bg) = style.bg {
-        if let Some(c) = color_to_ansi_bg(bg) { codes.push(c); }
+        queue!(writer, SetBackgroundColor(bg.into()))?;
     }
-    if style.add_modifier.contains(ratatui::style::Modifier::BOLD) { codes.push("1".into()); }
-    if style.add_modifier.contains(ratatui::style::Modifier::DIM) { codes.push("2".into()); }
-    if style.add_modifier.contains(ratatui::style::Modifier::ITALIC) { codes.push("3".into()); }
-    if style.add_modifier.contains(ratatui::style::Modifier::UNDERLINED) { codes.push("4".into()); }
-    if codes.is_empty() { String::new() } else { format!("\x1b[{}m", codes.join(";")) }
-}
 
-fn color_to_ansi_fg(color: ratatui::style::Color) -> Option<String> {
-    use ratatui::style::Color;
-    match color {
-        Color::Black => Some("30".into()), Color::Red => Some("31".into()),
-        Color::Green => Some("32".into()), Color::Yellow => Some("33".into()),
-        Color::Blue => Some("34".into()), Color::Magenta => Some("35".into()),
-        Color::Cyan => Some("36".into()), Color::Gray => Some("37".into()),
-        Color::DarkGray => Some("90".into()), Color::LightRed => Some("91".into()),
-        Color::LightGreen => Some("92".into()), Color::LightYellow => Some("93".into()),
-        Color::LightBlue => Some("94".into()), Color::LightMagenta => Some("95".into()),
-        Color::LightCyan => Some("96".into()), Color::White => Some("97".into()),
-        Color::Rgb(r, g, b) => Some(format!("38;2;{r};{g};{b}")),
-        Color::Indexed(i) => Some(format!("38;5;{i}")),
-        _ => None,
-    }
-}
+    queue!(writer, Print(content))?;
 
-fn color_to_ansi_bg(color: ratatui::style::Color) -> Option<String> {
-    use ratatui::style::Color;
-    match color {
-        Color::Black => Some("40".into()), Color::Red => Some("41".into()),
-        Color::Green => Some("42".into()), Color::Yellow => Some("43".into()),
-        Color::Blue => Some("44".into()), Color::Magenta => Some("45".into()),
-        Color::Cyan => Some("46".into()), Color::Gray => Some("47".into()),
-        Color::DarkGray => Some("100".into()), Color::LightRed => Some("101".into()),
-        Color::LightGreen => Some("102".into()), Color::LightYellow => Some("103".into()),
-        Color::LightBlue => Some("104".into()), Color::LightMagenta => Some("105".into()),
-        Color::LightCyan => Some("106".into()), Color::White => Some("107".into()),
-        Color::Rgb(r, g, b) => Some(format!("48;2;{r};{g};{b}")),
-        Color::Indexed(i) => Some(format!("48;5;{i}")),
-        _ => None,
+    // Reset modifiers (but keep line-level colors)
+    if !style.add_modifier.is_empty() {
+        queue!(writer, SetAttribute(Attribute::Reset))?;
     }
+
+    Ok(())
 }

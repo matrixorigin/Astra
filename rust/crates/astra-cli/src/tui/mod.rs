@@ -46,6 +46,39 @@ use tokio_stream::StreamExt;
 use event::{TuiEvent, TuiEventStream};
 use frame_requester::FrameRequester;
 
+/// Flush a completed cell to terminal scrollback with trailing blank lines.
+fn flush_cell_to_scrollback(
+    guard: &mut TerminalGuard,
+    cell: Box<dyn ChatCell>,
+    width: u16,
+) {
+    let lines = cell.display_lines(width);
+    if !lines.is_empty() {
+        let mut hist = Vec::new();
+        hist.extend(lines);
+        hist.push(ratatui::text::Line::default());
+        hist.push(ratatui::text::Line::default());
+        guard.queue_history_lines(hist);
+    }
+}
+
+/// Finalize the stream controller: flush pending text, drain all ticks,
+/// and update the active AssistantChatCell with final lines.
+fn finalize_stream_controller(
+    sc: &mut Option<StreamController>,
+    active_cell: &mut Option<Box<dyn ChatCell>>,
+) {
+    if let Some(mut controller) = sc.take() {
+        controller.flush_pending();
+        while controller.tick().is_some() {}
+        if let Some(cell) = active_cell {
+            if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() {
+                ac.update_rendered_lines(controller.emitted_lines().to_vec());
+            }
+        }
+    }
+}
+
 pub(crate) async fn run_tui_repl(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
@@ -113,21 +146,16 @@ pub(crate) async fn run_tui_repl(
                     TuiEvent::Key(key) => {
                         match bottom_pane.handle_key(key) {
                             BottomPaneAction::SubmitInput(text) if active_cell.is_none() => {
-                                // User message → scrollback immediately
                                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                 let user_lines = UserChatCell::new(text.clone()).display_lines(w);
-                                let mut hist = Vec::new();
-                                hist.extend(user_lines);
-                                guard.queue_history_lines(hist);
+                                guard.queue_history_lines(user_lines);
 
-                                // Flush user message + draw immediately so it appears before turn starts
                                 do_draw(&mut guard, &active_cell, &mut bottom_pane)?;
 
                                 if text.starts_with('/') {
                                     let sys = SystemChatCell::info(format!("Slash: {text} (use line mode)"));
                                     guard.queue_history_lines(sys.display_lines(w));
                                 } else {
-                                    // Start active assistant cell + turn (pre-start thinking for Working display)
                                     let mut ac = AssistantChatCell::from_rendered(vec![]);
                                     ac.start_thinking();
                                     active_cell = Some(Box::new(ac));
@@ -164,7 +192,8 @@ pub(crate) async fn run_tui_repl(
                                                     }
                                                 }
                                                 Some(ae) = tui_rx.recv() => {
-                                                    handle_app_event(ae, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester);
+                                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                                    handle_app_event(ae, &mut guard, w, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester);
                                                     let _ = do_draw(&mut guard, &active_cell, &mut bottom_pane);
                                                 }
                                                 _ = &mut itick => {
@@ -176,39 +205,24 @@ pub(crate) async fn run_tui_repl(
                                         r
                                     };
 
-                                    // Drop per-turn sender so bridge sends TurnComplete
                                     state.tui_stream_event_tx = None;
 
                                     // Drain remaining events
+                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                     loop {
                                         match tui_rx.recv().await {
                                             Some(TuiAppEvent::TurnComplete) | None => break,
-                                            Some(ae) => handle_app_event(ae, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester),
+                                            Some(ae) => handle_app_event(ae, &mut guard, w, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester),
                                         }
                                     }
 
-                                    // Final flush of stream controller
-                                    if let Some(mut sc) = stream_controller.take() {
-                                        sc.flush_pending();
-                                        while let Some(_) = sc.tick() {}
-                                        if let Some(cell) = &mut active_cell {
-                                            if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() {
-                                                ac.update_rendered_lines(sc.emitted_lines().to_vec());
-                                            }
-                                        }
-                                    }
+                                    // Finalize stream controller
+                                    finalize_stream_controller(&mut stream_controller, &mut active_cell);
 
-                                    // Flush active cell → scrollback
+                                    // Flush final active cell → scrollback
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                     if let Some(cell) = active_cell.take() {
-                                        let lines = cell.display_lines(w);
-                                        if !lines.is_empty() {
-                                            let mut hist = Vec::new();
-                                            hist.extend(lines);
-                                            hist.push(ratatui::text::Line::default()); // blank after response
-                                            hist.push(ratatui::text::Line::default()); // Codex has 2 blank lines
-                                            guard.queue_history_lines(hist);
-                                        }
+                                        flush_cell_to_scrollback(&mut guard, cell, w);
                                     }
 
                                     bottom_pane.set_task_status(TaskStatus::Idle);
@@ -247,7 +261,8 @@ pub(crate) async fn run_tui_repl(
                 }
             }
             Some(ae) = tui_rx.recv() => {
-                handle_app_event(ae, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester);
+                let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                handle_app_event(ae, &mut guard, w, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester);
             }
             _ = &mut tick => {
                 drain_tick(&mut stream_controller, &mut active_cell, &frame_requester);
@@ -268,15 +283,10 @@ fn do_draw(
 
     bottom_pane.pre_draw_tick(std::time::Instant::now());
 
-    // Build the layout exactly like Codex ChatWidget::as_renderable():
-    // flex.push(1, active_cell.inset(tlbr(1,0,0,0)))  ← active cell with top inset
-    // flex.push(0, bottom_pane.inset(tlbr(1,0,0,0)))  ← bottom pane with top inset
     let width = guard.terminal.size().map(|s| s.width).unwrap_or(80);
 
-    // Build active cell renderable
     let ac_renderable: RenderableItem<'_> = match active_cell {
         Some(cell) => {
-            // Wrap cell display in a simple struct that implements Renderable
             let lines = cell.display_lines(width);
             let text = ratatui::text::Text::from(lines);
             let para = ratatui::widgets::Paragraph::new(text);
@@ -286,14 +296,13 @@ fn do_draw(
         None => RenderableItem::Owned(Box::new(())),
     };
 
-    // Build bottom pane renderable
     let bp_renderable = BottomPaneRenderable(bottom_pane);
     let bp_item = RenderableItem::Owned(Box::new(bp_renderable) as Box<dyn Renderable>)
         .inset(Insets::tlbr(1, 0, 0, 0));
 
     let mut flex = FlexRenderable::new();
-    flex.push(1, ac_renderable);  // active cell: flex=1
-    flex.push(0, bp_item);        // bottom pane: flex=0
+    flex.push(1, ac_renderable);
+    flex.push(0, bp_item);
 
     let total_h = flex.desired_height(width);
 
@@ -302,7 +311,6 @@ fn do_draw(
         Clear.render(area, frame.buffer_mut());
         flex.render(area, frame.buffer_mut());
 
-        // Set cursor from bottom_pane
         if let Some((x, y)) = flex.cursor_pos(area) {
             frame.set_cursor_position((x, y));
         }
@@ -310,8 +318,12 @@ fn do_draw(
     Ok(())
 }
 
+/// Handle a TUI app event. When a cell transition occurs (tool→assistant or
+/// assistant→tool), the previous cell is flushed to scrollback automatically.
 fn handle_app_event(
     ev: TuiAppEvent,
+    guard: &mut TerminalGuard,
+    width: u16,
     sc: &mut Option<StreamController>,
     active_cell: &mut Option<Box<dyn ChatCell>>,
     bottom_pane: &mut BottomPane,
@@ -319,6 +331,21 @@ fn handle_app_event(
 ) {
     match ev {
         TuiAppEvent::Token(text) => {
+            // If active cell is a ToolChatCell, flush it to scrollback and
+            // start a new AssistantChatCell for the text that follows.
+            let need_new_assistant = active_cell
+                .as_ref()
+                .map(|c| c.as_any_ref().is::<ToolChatCell>())
+                .unwrap_or(false);
+            if need_new_assistant {
+                if let Some(cell) = active_cell.take() {
+                    flush_cell_to_scrollback(guard, cell, width);
+                }
+                let ac = AssistantChatCell::from_rendered(vec![]);
+                *active_cell = Some(Box::new(ac));
+                *sc = Some(StreamController::new(Some(width as usize)));
+            }
+
             if let Some(cell) = active_cell {
                 if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() {
                     if ac.is_thinking() { ac.finish_thinking(); }
@@ -326,7 +353,7 @@ fn handle_app_event(
             }
             if let Some(s) = sc {
                 s.push_delta(&text);
-                if let Some(_) = s.tick() {
+                if s.tick().is_some() {
                     if let Some(cell) = active_cell {
                         if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() {
                             ac.update_rendered_lines(s.emitted_lines().to_vec());
@@ -338,20 +365,43 @@ fn handle_app_event(
             fr.schedule_frame();
         }
         TuiAppEvent::ThinkingStarted => {
-            if let Some(cell) = active_cell {
-                if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() { ac.start_thinking(); }
+            // If active cell is a tool, flush it first
+            let is_tool = active_cell
+                .as_ref()
+                .map(|c| c.as_any_ref().is::<ToolChatCell>())
+                .unwrap_or(false);
+            if is_tool {
+                if let Some(cell) = active_cell.take() {
+                    flush_cell_to_scrollback(guard, cell, width);
+                }
+            }
+
+            // Create assistant cell if none exists
+            if active_cell.is_none() {
+                let mut ac = AssistantChatCell::from_rendered(vec![]);
+                ac.start_thinking();
+                *active_cell = Some(Box::new(ac));
+                *sc = Some(StreamController::new(Some(width as usize)));
+            } else if let Some(cell) = active_cell {
+                if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() {
+                    ac.start_thinking();
+                }
             }
             fr.schedule_frame();
         }
         TuiAppEvent::ThinkingChunk(text) => {
             if let Some(cell) = active_cell {
-                if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() { ac.push_thinking_chunk(&text); }
+                if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() {
+                    ac.push_thinking_chunk(&text);
+                }
             }
             fr.schedule_frame();
         }
         TuiAppEvent::ThinkingStopped => {
             if let Some(cell) = active_cell {
-                if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() { ac.finish_thinking(); }
+                if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() {
+                    ac.finish_thinking();
+                }
             }
             fr.schedule_frame();
         }
@@ -364,6 +414,12 @@ fn handle_app_event(
             fr.schedule_frame();
         }
         TuiAppEvent::ToolStarted { name, description } => {
+            // Flush current cell (assistant text before tool) to scrollback
+            finalize_stream_controller(sc, active_cell);
+            if let Some(cell) = active_cell.take() {
+                flush_cell_to_scrollback(guard, cell, width);
+            }
+
             *active_cell = Some(Box::new(ToolChatCell::new_running(name.clone(), description)));
             bottom_pane.set_task_status(TaskStatus::ToolExecuting { name, started_at: std::time::Instant::now() });
             fr.schedule_frame();
@@ -390,8 +446,7 @@ fn drain_tick(
     fr: &FrameRequester,
 ) {
     if let Some(s) = sc {
-        // Pure newline-gated: only drain lines that have been committed via \n
-        if let Some(_) = s.tick() {
+        if s.tick().is_some() {
             if let Some(cell) = active_cell {
                 if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() {
                     ac.update_rendered_lines(s.emitted_lines().to_vec());
@@ -404,12 +459,10 @@ fn drain_tick(
 
 use ratatui::widgets::Widget;
 
-/// Wrapper to make BottomPane implement Renderable for FlexRenderable composition.
 struct BottomPaneRenderable<'a>(&'a mut BottomPane);
 
 impl<'a> render::renderable::Renderable for BottomPaneRenderable<'a> {
     fn render(&self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
-        // BottomPane::render takes &self, but we have &mut — just use &*self.0
         self.0.render(area, buf);
     }
     fn desired_height(&self, width: u16) -> u16 {

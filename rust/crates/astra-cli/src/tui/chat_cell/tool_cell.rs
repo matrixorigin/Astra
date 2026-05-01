@@ -72,6 +72,7 @@ impl ToolChatCell {
 
 impl ChatCell for ToolChatCell {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+    fn as_any_ref(&self) -> &dyn std::any::Any { self }
 
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let dim = Style::default().dim();
