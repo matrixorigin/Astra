@@ -119,9 +119,9 @@ pub(crate) fn diff_events(
     let a_tokens = token_totals(a_events);
     let b_tokens = token_totals(b_events);
     let token_deltas = TokenDeltas {
-        prompt: b_tokens.prompt as i64 - a_tokens.prompt as i64,
-        completion: b_tokens.completion as i64 - a_tokens.completion as i64,
-        total: b_tokens.total as i64 - a_tokens.total as i64,
+        prompt: saturating_delta(a_tokens.prompt, b_tokens.prompt),
+        completion: saturating_delta(a_tokens.completion, b_tokens.completion),
+        total: saturating_delta(a_tokens.total, b_tokens.total),
     };
 
     JournalDiff {
@@ -140,6 +140,13 @@ pub(crate) fn diff_events(
         a_has_final_text: has_final_text(a_events),
         b_has_final_text: has_final_text(b_events),
     }
+}
+
+fn saturating_delta(a: u64, b: u64) -> i64 {
+    let a_i: i128 = a as i128;
+    let b_i: i128 = b as i128;
+    let d = b_i - a_i;
+    d.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
 fn event_counts(events: &[JournalEvent]) -> BTreeMap<String, u32> {
@@ -385,6 +392,21 @@ mod tests {
         assert!(txt.contains("100 → 120"));
         assert!(txt.contains("(Δ 20)"));
         assert!(txt.contains("both runs produced output"));
+    }
+
+    #[test]
+    fn token_delta_saturates_on_large_u64_instead_of_wrapping() {
+        // u64 values above i64::MAX must not wrap to negative on cast.
+        let big = (i64::MAX as u64) + 1000;
+        let a = vec![evt(json!({"type":"turn","ts":"t","session_id":"a","tokens_in":big,"tokens_out":0}))];
+        let b = vec![evt(json!({"type":"turn","ts":"t","session_id":"b","tokens_in":0,"tokens_out":0}))];
+        let d = diff_events("a", "b", &a, &b);
+        // Delta should be clamped, not wrapped to a positive number.
+        assert!(
+            d.token_deltas.prompt <= 0,
+            "prompt delta must not wrap positive; got {}",
+            d.token_deltas.prompt
+        );
     }
 
     #[test]

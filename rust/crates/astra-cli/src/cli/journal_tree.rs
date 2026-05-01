@@ -65,12 +65,18 @@ pub struct DelegationNode {
     /// Task summary (truncated). Free-form from the delegation call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
-    /// Aggregated prompt tokens on the sub-run.
+    /// Aggregated prompt tokens on the sub-run (includes children for root).
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub prompt_tokens: u64,
-    /// Aggregated completion tokens on the sub-run.
+    /// Aggregated completion tokens on the sub-run (includes children for root).
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub completion_tokens: u64,
+    /// Root's own prompt tokens (Turn/LlmRound only, excludes children).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub self_prompt_tokens: u64,
+    /// Root's own completion tokens (Turn/LlmRound only, excludes children).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub self_completion_tokens: u64,
     /// Tool invocations on this sub-run.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub tool_calls: u32,
@@ -111,6 +117,8 @@ pub(crate) fn fold_events_into_tree(
         task: None,
         prompt_tokens: 0,
         completion_tokens: 0,
+        self_prompt_tokens: 0,
+        self_completion_tokens: 0,
         tool_calls: 0,
         children: Vec::new(),
     };
@@ -176,6 +184,8 @@ pub(crate) fn fold_events_into_tree(
                     task,
                     prompt_tokens: 0,
                     completion_tokens: 0,
+                    self_prompt_tokens: 0,
+                    self_completion_tokens: 0,
                     tool_calls: 0,
                     children: Vec::new(),
                 };
@@ -214,6 +224,10 @@ pub(crate) fn fold_events_into_tree(
             _ => { /* ignore: irrelevant for the tree view */ }
         }
     }
+
+    // Snapshot root's own tokens before roll-up.
+    root.self_prompt_tokens = root.prompt_tokens;
+    root.self_completion_tokens = root.completion_tokens;
 
     // Roll-up aggregation into the root for a quick summary.
     for child in &root.children {
@@ -454,6 +468,32 @@ mod tests {
         assert!(txt.contains("agent_type=coder"));
         assert!(txt.contains("task=\"refactor\""));
         assert!(txt.contains("started=2026-04-30T10:00:01Z ended=2026-04-30T10:00:10Z"));
+    }
+
+    #[test]
+    fn tree_root_exposes_self_tokens_separate_from_total() {
+        // Root accumulates its own Turn tokens AND rolls up children.
+        // Consumers need to distinguish "root's own work" from "total
+        // including delegation". self_prompt_tokens / self_completion_tokens
+        // must reflect ONLY the root's Turn/LlmRound events.
+        let events = vec![
+            turn_event("t1", 1000, 100, "sonnet"),
+            sub_started("t2", "run-A", "coder", "task"),
+            sub_completed("t3", "run-A", 2000, 300, 4),
+        ];
+        let (root, _, _) = fold_events_into_tree("sess-1", &events);
+        // Total = root own + children
+        assert_eq!(root.prompt_tokens, 3000, "total prompt = 1000 + 2000");
+        assert_eq!(root.completion_tokens, 400, "total completion = 100 + 300");
+        // Self = root own only
+        assert_eq!(
+            root.self_prompt_tokens, 1000,
+            "self_prompt must be root's own Turn tokens only"
+        );
+        assert_eq!(
+            root.self_completion_tokens, 100,
+            "self_completion must be root's own Turn tokens only"
+        );
     }
 
     #[test]
