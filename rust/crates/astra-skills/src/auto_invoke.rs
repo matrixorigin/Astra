@@ -181,13 +181,35 @@ impl AutoInvokeGate {
 pub const SKILL_DIAGNOSIS_SCHEMA_VERSION: u32 = 2;
 
 /// Machine-checkable telemetry metric a diagnosis expects to improve.
+///
+/// ## Wiring status
+///
+/// Each variant is either **wired** (the runtime populates
+/// [`SessionSignals`] with the value and `evaluate_criterion` computes a
+/// real Satisfied/Failed verdict) or **pending** (the runtime does not yet
+/// surface this signal, so `evaluate_criterion` returns `Pending` until
+/// the window elapses and then marks it `Failed` — fail-safe).
+///
+/// | Variant | Wired? | Source |
+/// |---------|--------|--------|
+/// | `SessionStallsDelta` | **Yes** | `ObservabilitySession::stall_event_count` → `compute_session_signals` |
+/// | `BudgetPressure` | **Yes** | latest `ContextAssemblyTrace::token_budget.budget_pressure` |
+/// | `CorrectionsDelta` | **Yes** | `ObservabilitySession::user_corrections.len()` |
+/// | `ToolCallCount` | **Pending** | not yet surfaced in `SessionSignals`; evaluates as `Pending` |
+/// | `UnmetPostconditionsDelta` | **Pending** | `ObservabilitySession::unmet_postcondition_count` exists but not yet in `SessionSignals` |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosisMetric {
+    /// Delta of session stall count since diagnosis injection. **Wired.**
     SessionStallsDelta,
+    /// Current budget pressure (0.0–1.0). **Wired.**
     BudgetPressure,
+    /// Total tool calls in window. **Pending: not yet in SessionSignals.**
     ToolCallCount,
+    /// Delta of user correction count since diagnosis injection. **Wired.**
     CorrectionsDelta,
+    /// Delta of unmet postcondition count. **Pending: signal exists on
+    /// ObservabilitySession but not yet forwarded to SessionSignals.**
     UnmetPostconditionsDelta,
 }
 
@@ -559,10 +581,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].skill, "analyze_session");
         assert_eq!(out[0].focus, "stalls");
-        assert_eq!(
-            out[0].cause,
-            AutoInvokeCause::SessionStalls { count: 3 }
-        );
+        assert_eq!(out[0].cause, AutoInvokeCause::SessionStalls { count: 3 });
     }
 
     #[test]

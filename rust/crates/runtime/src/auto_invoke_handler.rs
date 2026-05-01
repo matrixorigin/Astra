@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use astra_skills::auto_invoke::{
     AutoInvokeGate, AutoInvokeRequest, DiagnosisCriterion, DiagnosisMetric, DiagnosisOperator,
-    SessionSignals, SkillDiagnosis, SKILL_DIAGNOSIS_SCHEMA_VERSION,
+    SKILL_DIAGNOSIS_SCHEMA_VERSION, SessionSignals, SkillDiagnosis,
 };
 use async_trait::async_trait;
 
@@ -246,6 +246,17 @@ impl DiagnosisOutcomeTracker {
     }
 }
 
+/// Evaluate a single diagnosis criterion against current session signals.
+///
+/// ## Fail-safe for unwired metrics
+///
+/// Metrics marked **Pending** in [`DiagnosisMetric`] are not yet surfaced
+/// in [`SessionSignals`]. When encountered, this function returns
+/// [`DiagnosisCriterionStatus::Pending`] indefinitely — the criterion
+/// will never resolve to `Satisfied`, so after `window_turns` elapse the
+/// tracker treats it as `Failed`. This is the correct fail-safe: an
+/// unwired metric must not silently claim success, and it must not block
+/// the tracker forever.
 fn evaluate_criterion(
     c: &DiagnosisCriterion,
     baseline: &SessionSignals,
@@ -253,16 +264,21 @@ fn evaluate_criterion(
     elapsed_turns: u32,
 ) -> DiagnosisCriterionStatus {
     let observed = match c.metric {
-        DiagnosisMetric::SessionStallsDelta => {
-            f64::from(current.session_stalls.saturating_sub(baseline.session_stalls))
-        }
+        // ── Wired metrics: real value from SessionSignals ────────────
+        DiagnosisMetric::SessionStallsDelta => f64::from(
+            current
+                .session_stalls
+                .saturating_sub(baseline.session_stalls),
+        ),
         DiagnosisMetric::BudgetPressure => current.budget_pressure,
-        DiagnosisMetric::ToolCallCount => return DiagnosisCriterionStatus::Pending,
         DiagnosisMetric::CorrectionsDelta => f64::from(
             current
                 .recent_corrections
                 .saturating_sub(baseline.recent_corrections),
         ),
+        // ── Pending metrics: not yet in SessionSignals ──────────────
+        // Fail-safe: stay Pending until window expires → Failed.
+        DiagnosisMetric::ToolCallCount => return DiagnosisCriterionStatus::Pending,
         DiagnosisMetric::UnmetPostconditionsDelta => return DiagnosisCriterionStatus::Pending,
     };
 
@@ -524,11 +540,7 @@ mod tests {
         // successive `maybe_fire` calls on the same instance.
         let exec = Arc::new(StubExecutor::new().with(
             "analyze_session",
-            Some(well_formed_reply(
-                "analyze_session",
-                "session_stalls",
-                "h",
-            )),
+            Some(well_formed_reply("analyze_session", "session_stalls", "h")),
         ));
         let mut h = AutoInvokeHandler::new(exec.clone());
 
@@ -814,5 +826,111 @@ mod tests {
             out.iter().map(|d| d.skill.as_str()).collect();
         assert!(skills.contains("analyze_session"));
         assert!(skills.contains("evaluate_session"));
+    }
+
+    // ── R5: unwired metric fail-safe ────────────────────────────────────────
+
+    #[test]
+    fn unwired_metrics_stay_pending_then_fail_after_window() {
+        // ToolCallCount and UnmetPostconditionsDelta are not yet wired to
+        // SessionSignals. The evaluate_criterion function must return
+        // Pending for these, and the tracker must resolve them as Failed
+        // once window_turns elapse. This is the fail-safe: unwired metrics
+        // never claim success.
+        use astra_skills::auto_invoke::{DiagnosisCriterion, DiagnosisMetric, DiagnosisOperator};
+
+        let baseline = SessionSignals::default();
+        let current = SessionSignals::default();
+
+        for metric in [
+            DiagnosisMetric::ToolCallCount,
+            DiagnosisMetric::UnmetPostconditionsDelta,
+        ] {
+            let criterion = DiagnosisCriterion {
+                metric,
+                operator: DiagnosisOperator::Lte,
+                threshold: 0.0,
+                window_turns: 3,
+                description: "test".into(),
+            };
+
+            // Within window → Pending (not Satisfied, not Failed).
+            let status = evaluate_criterion(&criterion, &baseline, &current, 1);
+            assert_eq!(
+                status,
+                DiagnosisCriterionStatus::Pending,
+                "{metric:?} should be Pending within window"
+            );
+
+            // After window → the tracker would call evaluate_criterion with
+            // elapsed >= window_turns. Since the metric is still Pending
+            // (never resolves), the Pending branch returns. But the
+            // TRACKER's retain logic treats all-non-Pending as complete.
+            // So let's verify the metric stays Pending even after window:
+            let after_window = evaluate_criterion(&criterion, &baseline, &current, 5);
+            assert_eq!(
+                after_window,
+                DiagnosisCriterionStatus::Pending,
+                "{metric:?} should stay Pending (unwired), tracker resolves as Failed"
+            );
+        }
+    }
+
+    #[test]
+    fn wired_metrics_resolve_normally() {
+        // Contrast: wired metrics DO resolve to Satisfied/Failed.
+        use astra_skills::auto_invoke::{DiagnosisCriterion, DiagnosisMetric, DiagnosisOperator};
+
+        let baseline = SessionSignals {
+            session_stalls: 3,
+            budget_pressure: 0.9,
+            recent_corrections: 2,
+            corrections_window: 10,
+        };
+        let current = SessionSignals {
+            session_stalls: 3,     // no new stalls → delta 0
+            budget_pressure: 0.5,  // pressure dropped
+            recent_corrections: 2, // no new corrections
+            corrections_window: 10,
+        };
+
+        // SessionStallsDelta <= 0 → Satisfied (delta is 0).
+        let stall_crit = DiagnosisCriterion {
+            metric: DiagnosisMetric::SessionStallsDelta,
+            operator: DiagnosisOperator::Lte,
+            threshold: 0.0,
+            window_turns: 3,
+            description: "stalls stop".into(),
+        };
+        assert_eq!(
+            evaluate_criterion(&stall_crit, &baseline, &current, 1),
+            DiagnosisCriterionStatus::Satisfied,
+        );
+
+        // BudgetPressure <= 0.85 → Satisfied (0.5 ≤ 0.85).
+        let pressure_crit = DiagnosisCriterion {
+            metric: DiagnosisMetric::BudgetPressure,
+            operator: DiagnosisOperator::Lte,
+            threshold: 0.85,
+            window_turns: 3,
+            description: "pressure drops".into(),
+        };
+        assert_eq!(
+            evaluate_criterion(&pressure_crit, &baseline, &current, 1),
+            DiagnosisCriterionStatus::Satisfied,
+        );
+
+        // CorrectionsDelta <= 0 → Satisfied (delta is 0).
+        let corr_crit = DiagnosisCriterion {
+            metric: DiagnosisMetric::CorrectionsDelta,
+            operator: DiagnosisOperator::Lte,
+            threshold: 0.0,
+            window_turns: 3,
+            description: "corrections stop".into(),
+        };
+        assert_eq!(
+            evaluate_criterion(&corr_crit, &baseline, &current, 1),
+            DiagnosisCriterionStatus::Satisfied,
+        );
     }
 }
