@@ -125,6 +125,12 @@ struct Args {
     /// Layout: <dir>/<case>/<model>/<run_index>/
     #[arg(long, value_name = "DIR")]
     artifacts_dir: Option<PathBuf>,
+
+    /// Profile name for astra credentials. When preflight auto-registers
+    /// it writes to "harness-auto" by default; this flag lets you pick
+    /// a different profile to avoid clobbering active user credentials.
+    #[arg(long, value_name = "PROFILE")]
+    profile: Option<String>,
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -236,20 +242,23 @@ async fn main() -> Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    // Pre-flight checks
+    // Pre-flight checks — verify all unique models in the matrix, not just the first.
     if !args.skip_preflight {
-        let preflight_models = if let Some(ref forced) = args.force_model {
+        let preflight_models: Vec<String> = if let Some(ref forced) = args.force_model {
             vec![forced.clone()]
-        } else if !fallback_models.is_empty() {
-            vec![fallback_models[0].clone()]
         } else {
-            // Try first case's model list
-            cases
-                .first()
-                .and_then(|c| c.models.as_ref())
-                .and_then(|m| m.first().cloned())
-                .into_iter()
-                .collect()
+            let mut all_models: Vec<String> = Vec::new();
+            for case in &cases {
+                if let Some(ref ms) = case.models {
+                    all_models.extend(ms.iter().cloned());
+                }
+            }
+            if all_models.is_empty() {
+                all_models = fallback_models.clone();
+            }
+            all_models.sort();
+            all_models.dedup();
+            all_models
         };
         match run_preflight(&astra_bin, &preflight_models).await {
             Ok(_) => {}
@@ -262,6 +271,7 @@ async fn main() -> Result<()> {
     let mut runner_cfg =
         RunnerConfig::new(astra_bin.clone()).with_fallback_models(fallback_models.clone());
     runner_cfg.working_dir = args.working_dir.clone();
+    runner_cfg.profile = args.profile.clone();
 
     let judger_cfg = JudgerConfig {
         astra_bin: astra_bin.clone(),

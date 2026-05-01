@@ -610,9 +610,24 @@ test-contract:
 #
 # Runs the YAML cases at rust/crates/astra-test-harness/cases against
 # a fallback model list. Requires a running API server + fresh login.
-# Override MODELS for a quick single-model smoke:
-#     make test-harness MODELS=qwen-flash
-# Override CASES to point at a different suite directory.
+#
+# Variables:
+#   MODELS       — fallback model list (default: qwen-flash)
+#   CASES        — path to suite directory
+#   FILTER       — glob pattern to select cases (e.g. "fork_*")
+#   FORCE_MODEL  — override all case-level models with this one
+#   PARALLEL     — concurrency (default: 1)
+#   RUNS         — repeat each (case, model) pair N times (default: 1)
+#   JUDGER       — judger model (default: same as MODELS)
+#   SKIP_JUDGER  — set to 1 to skip the LLM judger step
+#   PROFILE      — astra credential profile name
+#   ARTIFACTS    — directory to persist per-case artifacts
+#   FORMAT       — output format: text or json (default: text)
+#
+# Examples:
+#   make test-harness MODELS=qwen-flash
+#   make test-harness FILTER="fork_*" PARALLEL=4 RUNS=3
+#   make test-harness MODELS=claude-sonnet-4-6 JUDGER=qwen-flash
 # ----------------------------------------------------------------------------
 .PHONY: test-harness
 test-harness:
@@ -621,13 +636,28 @@ test-harness:
 	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-test-harness --release
 	@MODELS="$${MODELS:-qwen-flash}"; \
 	CASES="$${CASES:-rust/crates/astra-test-harness/cases}"; \
+	FILTER="$${FILTER:-}"; \
+	FORCE_MODEL="$${FORCE_MODEL:-}"; \
+	PARALLEL="$${PARALLEL:-1}"; \
+	RUNS="$${RUNS:-1}"; \
 	JUDGER="$${JUDGER:-$$MODELS}"; \
-	echo "  cases=$$CASES models=$$MODELS judger=$$JUDGER"; \
-	./rust/target/release/astra-test \
-		--suite $$CASES \
-		--models $$MODELS \
-		--judger-model $$JUDGER \
-		--no-judger
+	SKIP_JUDGER="$${SKIP_JUDGER:-}"; \
+	PROFILE="$${PROFILE:-}"; \
+	ARTIFACTS="$${ARTIFACTS:-}"; \
+	FORMAT="$${FORMAT:-text}"; \
+	echo "  cases=$$CASES models=$$MODELS judger=$$JUDGER parallel=$$PARALLEL runs=$$RUNS"; \
+	ARGS="--suite $$CASES --models $$MODELS --format $$FORMAT"; \
+	[ -n "$$FILTER" ] && ARGS="$$ARGS --filter $$FILTER"; \
+	[ -n "$$FORCE_MODEL" ] && ARGS="$$ARGS --force-model $$FORCE_MODEL"; \
+	ARGS="$$ARGS --parallel $$PARALLEL --runs $$RUNS"; \
+	[ -n "$$PROFILE" ] && ARGS="$$ARGS --profile $$PROFILE"; \
+	[ -n "$$ARTIFACTS" ] && ARGS="$$ARGS --artifacts-dir $$ARTIFACTS"; \
+	if [ -n "$$SKIP_JUDGER" ]; then \
+		ARGS="$$ARGS --no-judger"; \
+	else \
+		ARGS="$$ARGS --judger-model $$JUDGER"; \
+	fi; \
+	./rust/target/release/astra-test $$ARGS
 
 # ============================================================================
 # Code Quality

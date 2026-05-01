@@ -18,6 +18,7 @@ pub enum FailureClass {
     InfraTimeout,
     InfraProviderError { provider: String },
     InfraRateLimit,
+    PlatformSetupFailed,
     ModelInstructionFollowing,
     ModelCapability,
     Unknown,
@@ -30,6 +31,7 @@ impl fmt::Display for FailureClass {
             Self::InfraTimeout => write!(f, "InfraTimeout"),
             Self::InfraProviderError { provider } => write!(f, "InfraProviderError({provider})"),
             Self::InfraRateLimit => write!(f, "InfraRateLimit"),
+            Self::PlatformSetupFailed => write!(f, "PlatformSetupFailed"),
             Self::ModelInstructionFollowing => write!(f, "ModelInstructionFollowing"),
             Self::ModelCapability => write!(f, "ModelCapability"),
             Self::Unknown => write!(f, "Unknown"),
@@ -117,6 +119,9 @@ pub fn suggested_action(class: &FailureClass) -> &'static str {
             "Provider returned an error; check provider status page or retry later"
         }
         FailureClass::InfraRateLimit => "Back off and retry, or request a rate-limit increase",
+        FailureClass::PlatformSetupFailed => {
+            "Case setup_cmd failed; check the command and working directory"
+        }
         FailureClass::ModelInstructionFollowing => {
             "Model ignored constraints; consider a stronger model or refine the prompt"
         }

@@ -601,6 +601,7 @@ impl Judger for ExternalCmdJudger {
         use tokio::process::Command;
 
         let input = serde_json::json!({
+            "protocol_version": "1.1",
             "question": question,
             "outcome": {
                 "text": outcome.text,
@@ -658,10 +659,17 @@ impl Judger for ExternalCmdJudger {
         let v: serde_json::Value = serde_json::from_str(stdout.trim())
             .map_err(|e| format!("judger-cmd stdout not valid JSON: {e}"))?;
 
-        let score = v
+        let raw_score = v
             .get("score")
             .and_then(|s| s.as_f64())
-            .ok_or("judger-cmd output missing 'score' field")?;
+            .ok_or("judger-cmd output missing numeric 'score' field")?;
+        if !(0.0..=1.0).contains(&raw_score) {
+            eprintln!(
+                "[astra-test] WARNING: external judger returned out-of-range score {raw_score}; \
+                 clamped to [0.0, 1.0]"
+            );
+        }
+        let score = raw_score.clamp(0.0, 1.0);
         let rationale = v
             .get("rationale")
             .and_then(|s| s.as_str())

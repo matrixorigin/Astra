@@ -96,7 +96,10 @@ pub struct Case {
 pub struct CaseStep {
     /// Prompt for this turn.
     pub prompt: String,
-    /// Optional criteria evaluated after this step completes.
+    /// Per-step criteria are not yet evaluated. This field is parsed
+    /// for forward-compatibility but ignored at runtime. A load-time
+    /// warning surfaces when non-empty so case authors aren't misled
+    /// into thinking their step criteria are enforced.
     #[serde(default)]
     pub criteria: Vec<super::criteria::Criterion>,
     /// Optional per-step timeout override.
@@ -262,6 +265,16 @@ impl Case {
         // regression.
         crate::criteria::validate_criteria(&case.criteria)
             .map_err(|e| anyhow::anyhow!("case {}: {e}", path.display()))?;
+        for (i, step) in case.steps.iter().enumerate() {
+            if !step.criteria.is_empty() {
+                eprintln!(
+                    "[astra-test] WARNING: case {}: steps[{i}].criteria is not yet evaluated \
+                     at runtime — these criteria will be ignored. Move them to the top-level \
+                     criteria list or remove them to avoid confusion.",
+                    case.name,
+                );
+            }
+        }
         Ok(case)
     }
 

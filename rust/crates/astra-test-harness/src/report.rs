@@ -42,8 +42,14 @@ pub struct CaseRunReport {
     /// Scoring weight from case metadata.
     #[serde(default = "default_weight")]
     pub weight: f64,
+    /// Difficulty level from case metadata.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub difficulty: Option<u8>,
     pub outcome: RunOutcome,
     pub criteria: Vec<CriterionResult>,
+    /// Step-level results for multi-turn cases. Empty for single-turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<StepResult>,
     /// Optional session journal dump — only present when
     /// `debug_log: true` on the case or `--capture-session` on the CLI.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -71,9 +77,27 @@ pub struct CaseRunReport {
     pub failure_class: Option<crate::classify::FailureClass>,
 }
 
+/// Result of a single step in a multi-turn case.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepResult {
+    pub step_index: u32,
+    pub prompt: String,
+    pub outcome: RunOutcome,
+    pub duration_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SuiteReport {
     pub runs: Vec<CaseRunReport>,
+    /// ISO 8601 timestamp when the suite run started.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub started_at: Option<String>,
+    /// ISO 8601 timestamp when the suite run ended.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ended_at: Option<String>,
+    /// Real wall-clock time in milliseconds (not sum of per-case durations).
+    #[serde(default)]
+    pub wall_time_ms: u64,
 }
 
 impl SuiteReport {
@@ -158,11 +182,16 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         .iter()
         .map(|r| r.outcome.completion_tokens)
         .sum();
-    let total_dur: u64 = report.runs.iter().map(|r| r.outcome.duration_ms).sum();
-    let wall_secs = total_dur / 1000;
+    let sum_dur: u64 = report.runs.iter().map(|r| r.outcome.duration_ms).sum();
+    let wall_ms = if report.wall_time_ms > 0 {
+        report.wall_time_ms
+    } else {
+        sum_dur
+    };
+    let wall_secs = wall_ms / 1000;
 
     s.push_str(&format!(
-        "total={} passed={} failed={} | tokens: {}in/{}out | wall: {}m{}s\n\n",
+        "total={} passed={} failed={} | tokens: {}in/{}out | wall: {}m{}s (sum: {}m{}s)\n\n",
         report.total(),
         report.passed(),
         report.failed(),
@@ -170,6 +199,8 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         total_completion,
         wall_secs / 60,
         wall_secs % 60,
+        sum_dur / 1000 / 60,
+        sum_dur / 1000 % 60,
     ));
     for run in &report.runs {
         let marker = if run.passed { "PASS" } else { "FAIL" };
@@ -220,6 +251,23 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                     "    stderr: {}\n",
                     truncate(&run.outcome.stderr, 500)
                 ));
+            }
+        }
+        // Step-level results for multi-turn cases.
+        for step in &run.steps {
+            s.push_str(&format!(
+                "    step[{}]: dur={}ms tokens={}in/{}out tools={}\n",
+                step.step_index,
+                step.duration_ms,
+                step.outcome.prompt_tokens,
+                step.outcome.completion_tokens,
+                step.outcome.tool_calls_count,
+            ));
+            if verbose || !run.passed {
+                let text_preview = truncate(&step.outcome.text, 200);
+                if !text_preview.is_empty() {
+                    s.push_str(&format!("      text: {text_preview}\n"));
+                }
             }
         }
         if let Some(cap) = &run.session {
@@ -338,6 +386,30 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         s.push('\n');
     }
 
+    // Capability × difficulty × model aggregation
+    let has_difficulty = report.runs.iter().any(|r| r.difficulty.is_some());
+    if has_capabilities && has_difficulty {
+        use std::collections::BTreeMap;
+        s.push_str("=== capability × difficulty × model ===\n");
+        let mut cap_diff_groups: BTreeMap<(String, u8, &str), (f64, f64)> = BTreeMap::new();
+        for r in &report.runs {
+            if let (Some(cap), Some(diff)) = (&r.capability, r.difficulty) {
+                let entry = cap_diff_groups
+                    .entry((cap.to_string(), diff, &r.model))
+                    .or_default();
+                entry.1 += r.weight;
+                if r.passed {
+                    entry.0 += r.weight;
+                }
+            }
+        }
+        for ((cap, diff, model), (wp, tw)) in &cap_diff_groups {
+            let pct = if *tw > 0.0 { wp / tw * 100.0 } else { 0.0 };
+            s.push_str(&format!("  {cap} × d{diff} × {model}: {pct:.0}%\n"));
+        }
+        s.push('\n');
+    }
+
     s
 }
 
@@ -440,6 +512,7 @@ mod tests {
                 run_index: 0,
                 capability: None,
                 weight: 1.0,
+                difficulty: None,
                 outcome: mk_outcome(),
                 criteria: vec![CriterionResult {
                     criterion: Criterion::ToolCalled {
@@ -450,12 +523,14 @@ mod tests {
                     full_detail: None,
                     score: None,
                 }],
+                steps: vec![],
                 session: None,
                 reproducer: None,
                 digest: None,
                 digest_error: None,
                 failure_class: None,
             }],
+            ..Default::default()
         }
     }
 
@@ -640,8 +715,10 @@ mod tests {
             run_index: 0,
             capability: None,
             weight: 1.0,
+            difficulty: None,
             outcome: mk_outcome(),
             criteria: vec![],
+            steps: vec![],
             session: None,
             reproducer: None,
             digest: None,
@@ -731,18 +808,21 @@ mod tests {
                 run_index: 0,
                 capability: None,
                 weight: 1.0,
+                difficulty: None,
                 outcome: {
                     let mut o = RunOutcome::new("m");
                     o.duration_ms = 5000;
                     o
                 },
                 criteria: vec![],
+                steps: vec![],
                 failure_class: None,
                 session: None,
                 reproducer: None,
                 digest: None,
                 digest_error: None,
             }],
+            ..Default::default()
         };
         let out = render_text(&r, false);
         assert!(
@@ -761,8 +841,10 @@ mod tests {
             run_index: 0,
             capability: None,
             weight: 1.0,
+            difficulty: None,
             outcome: RunOutcome::new("m"),
             criteria: vec![],
+            steps: vec![],
             failure_class: None,
             session: None,
             reproducer: None,
@@ -771,6 +853,7 @@ mod tests {
         };
         let r = SuiteReport {
             runs: vec![make_run(true), make_run(true), make_run(false)],
+            ..Default::default()
         };
         let out = render_text(&r, false);
         assert!(

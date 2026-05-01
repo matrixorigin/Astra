@@ -13,8 +13,8 @@ use crate::criteria::{Criterion, evaluate_deterministic_with_session, non_judger
 use crate::digest::DigestCollector;
 use crate::exec::CaseExecutor;
 use crate::judger::{Judger, evaluate_judger};
-use crate::report::{CaseRunReport, SuiteReport};
-use crate::runner::{RunnerConfig, resolve_models};
+use crate::report::{CaseRunReport, StepResult, SuiteReport};
+use crate::runner::{RunOutcome, RunnerConfig, resolve_models};
 use crate::session_capture::{SessionCapture, load_session};
 
 /// What to do with session journals.
@@ -88,6 +88,9 @@ pub struct SuiteRunner<'a> {
 impl<'a> SuiteRunner<'a> {
     /// Run every (case × model) pair with concurrency control and circuit breaker.
     pub async fn run_all(&self, cases: &[Case]) -> SuiteReport {
+        let wall_start = std::time::Instant::now();
+        let started_at = chrono::Utc::now().to_rfc3339();
+
         // Build the work items: (case, model, run_index) triples.
         let mut work: Vec<(&Case, String, u32)> = Vec::new();
         for case in cases {
@@ -109,7 +112,10 @@ impl<'a> SuiteRunner<'a> {
         let aborted = Arc::new(AtomicBool::new(false));
         let consecutive_infra = Arc::new(AtomicUsize::new(0));
 
-        let mut suite = SuiteReport::default();
+        let mut suite = SuiteReport {
+            started_at: Some(started_at),
+            ..Default::default()
+        };
 
         if self.suite_cfg.parallel <= 1 {
             // Serial path: simpler, preserves ordering, supports circuit breaker inline.
@@ -160,6 +166,8 @@ impl<'a> SuiteRunner<'a> {
             });
         }
 
+        suite.wall_time_ms = wall_start.elapsed().as_millis() as u64;
+        suite.ended_at = Some(chrono::Utc::now().to_rfc3339());
         suite
     }
 
@@ -197,33 +205,55 @@ impl<'a> SuiteRunner<'a> {
     }
 
     async fn run_one(&self, case: &Case, model: &str) -> CaseRunReport {
-        // Run setup command if specified.
+        // Run setup command if specified. Non-zero exit aborts the case.
         if let Some(ref cmd) = case.setup_cmd {
-            let status = tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(cmd)
-                .status()
-                .await;
-            if let Ok(s) = status
-                && !s.success()
-            {
+            let mut setup_cmd = tokio::process::Command::new("sh");
+            if let Some(ref wd) = self.runner_cfg.working_dir {
+                setup_cmd.current_dir(wd);
+            }
+            setup_cmd.arg("-c").arg(cmd);
+            let status = setup_cmd.status().await;
+            let failed = match &status {
+                Ok(s) => !s.success(),
+                Err(_) => true,
+            };
+            if failed {
+                let exit = status.as_ref().ok().and_then(|s| s.code()).unwrap_or(-1);
                 eprintln!(
-                    "[astra-test] setup_cmd failed for case={}: exit {}",
-                    case.name,
-                    s.code().unwrap_or(-1)
+                    "[astra-test] setup_cmd failed for case={}; aborting (exit {})",
+                    case.name, exit
                 );
+                return CaseRunReport {
+                    case_name: case.name.clone(),
+                    model: model.to_string(),
+                    passed: false,
+                    run_index: 0,
+                    capability: case.capability.clone(),
+                    weight: case.weight,
+                    difficulty: case.difficulty,
+                    outcome: RunOutcome::new(model)
+                        .with_text(format!("setup_cmd failed: exit {exit}")),
+                    criteria: vec![],
+                    steps: vec![],
+                    session: None,
+                    reproducer: None,
+                    digest: None,
+                    digest_error: None,
+                    failure_class: Some(crate::classify::FailureClass::PlatformSetupFailed),
+                };
             }
         }
 
         let mut outcome = self.executor.execute(case, model).await;
+        let mut step_results: Vec<StepResult> = Vec::new();
 
         // Multi-turn: execute follow-up steps using the same session.
         if !case.steps.is_empty()
             && let Some(ref session_id) = outcome.session_id
         {
-            for step in &case.steps {
+            for (idx, step) in case.steps.iter().enumerate() {
                 let step_case = Case {
-                    name: format!("{}__step", case.name),
+                    name: format!("{}__step{}", case.name, idx),
                     description: None,
                     prompt: step.prompt.clone(),
                     models: Some(vec![model.to_string()]),
@@ -244,6 +274,14 @@ impl<'a> SuiteRunner<'a> {
                     teardown_cmd: None,
                 };
                 let step_outcome = self.executor.execute(&step_case, model).await;
+
+                step_results.push(StepResult {
+                    step_index: idx as u32,
+                    prompt: step.prompt.clone(),
+                    outcome: step_outcome.clone(),
+                    duration_ms: step_outcome.duration_ms,
+                });
+
                 // Merge step outcome into main outcome.
                 outcome.completion_tokens += step_outcome.completion_tokens;
                 outcome.prompt_tokens += step_outcome.prompt_tokens;
@@ -265,11 +303,12 @@ impl<'a> SuiteRunner<'a> {
 
         // Run teardown command (always, even on failure).
         if let Some(ref cmd) = case.teardown_cmd {
-            let _ = tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(cmd)
-                .status()
-                .await;
+            let mut teardown_cmd = tokio::process::Command::new("sh");
+            if let Some(ref wd) = self.runner_cfg.working_dir {
+                teardown_cmd.current_dir(wd);
+            }
+            teardown_cmd.arg("-c").arg(cmd);
+            let _ = teardown_cmd.status().await;
         }
 
         // Retry on 429 if enabled.
@@ -365,8 +404,10 @@ impl<'a> SuiteRunner<'a> {
             run_index: 0, // overwritten by caller
             capability: case.capability.clone(),
             weight: case.weight,
+            difficulty: case.difficulty,
             outcome,
             criteria: det,
+            steps: step_results,
             session,
             reproducer,
             digest,

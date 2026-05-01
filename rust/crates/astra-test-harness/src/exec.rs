@@ -258,11 +258,21 @@ impl CaseExecutor for ExternalCmdExecutor {
         use tokio::process::Command;
 
         let input = serde_json::json!({
-            "name": case.name,
-            "prompt": case.prompt,
+            "protocol_version": "1.1",
+            "case": {
+                "name": case.name,
+                "description": case.description,
+                "prompt": case.prompt,
+                "capability": case.capability,
+                "difficulty": case.difficulty,
+                "weight": case.weight,
+                "setup_cmd": case.setup_cmd,
+                "teardown_cmd": case.teardown_cmd,
+                "timeout_seconds": case.timeout_seconds,
+                "extra_cli_args": case.extra_cli_args,
+            },
             "model": model,
-            "timeout_seconds": case.timeout_seconds,
-            "extra_cli_args": case.extra_cli_args,
+            "run_index": 0,
         });
 
         let parts: Vec<&str> = self.cmd.split_whitespace().collect();
