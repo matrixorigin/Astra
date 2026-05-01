@@ -1486,6 +1486,8 @@ async fn durable_task_resume_loads_verification_history_from_db() {
 async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let audit = flusher.writer.clone();
 
     let user_id = Uuid::new_v4().to_string();
     let session_a = Uuid::new_v4().to_string();
@@ -1538,6 +1540,7 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
         3,
         Some("feature/cloud-sync"),
         Some("gpt-5.4"),
+        &audit,
     )
     .await
     .expect("push session state A");
@@ -1551,6 +1554,7 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
         2,
         Some("legacy-fallback"),
         None,
+        &audit,
     )
     .await
     .expect("push session state B");
@@ -1564,6 +1568,7 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
         0,
         Some("feature/cloud-sync"),
         Some("gpt-5.4"),
+        &audit,
     )
     .await
     .expect("clear session state A plan fields");
@@ -1724,10 +1729,10 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
         explanations: vec!["trace-b".into()],
     };
 
-    push_context_trace_signal_to_cloud(&pool, &session_a, &user_id, &trace_a)
+    push_context_trace_signal_to_cloud(&pool, &session_a, &user_id, &trace_a, &audit)
         .await
         .expect("push trace A");
-    push_context_trace_signal_to_cloud(&pool, &session_b, &user_id, &trace_b)
+    push_context_trace_signal_to_cloud(&pool, &session_b, &user_id, &trace_b, &audit)
         .await
         .expect("push trace B");
 
@@ -1844,6 +1849,11 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
     assert_eq!(listed_b.model.as_deref(), Some("claude-sonnet-4.5"));
     assert_eq!(listed_b.git_branch.as_deref(), Some("legacy-fallback"));
 
+    // Flush audit entries before checking sync_log counts.
+    drop(audit);
+    flusher.shutdown.cancel();
+    let _ = flusher.join_handle.await;
+
     let session_a_state_syncs: i64 = sqlx::query(
         "SELECT COUNT(*) AS c FROM session_sync_log \
          WHERE session_id = ? AND sync_type = 'session_state' AND status = 'success'",
@@ -1883,9 +1893,11 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn session_sync_log_prune_partitions_by_sync_type_on_live_matrixone() {
+async fn session_sync_log_async_audit_flusher_writes_per_type_on_live_matrixone() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let audit = flusher.writer.clone();
 
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
@@ -1902,6 +1914,7 @@ async fn session_sync_log_prune_partitions_by_sync_type_on_live_matrixone() {
         0,
         Some("feature/prune"),
         Some("gpt-5.4"),
+        &audit,
     )
     .await
     .expect("push session state");
@@ -1920,17 +1933,15 @@ async fn session_sync_log_prune_partitions_by_sync_type_on_live_matrixone() {
             error_count: 0,
             contract_state_json: None,
         },
+        &audit,
     )
     .await
     .expect("push checkpoint");
 
     // Bulk-seed 199 rows directly into `session_sync_log` (matching the
-    // schema that `push_context_trace_signal_to_cloud` would write) — each
-    // call through the production path is 2 DB round-trips + a prune DELETE,
-    // so 205 sequential pushes cost ~3.7s and contending parallel pushes are
-    // even worse (they collide on the same `(user_id, status, sync_type)`
-    // prune lock). The final 6 pushes still go through the production API so
-    // the prune path gets exercised end-to-end under known conditions.
+    // schema that `push_context_trace_signal_to_cloud` would write).
+    // The final 6 pushes go through the production API so the async audit
+    // flusher batches and writes audit entries alongside the seeded rows.
     let seed_count = 199_i64;
     let mut bulk_sql = String::from(
         "INSERT INTO session_sync_log \
@@ -1973,10 +1984,15 @@ async fn session_sync_log_prune_partitions_by_sync_type_on_live_matrixone() {
             timing: None,
             explanations: vec![format!("trace-{idx}")],
         };
-        push_context_trace_signal_to_cloud(&pool, &session_id, &user_id, &trace)
+        push_context_trace_signal_to_cloud(&pool, &session_id, &user_id, &trace, &audit)
             .await
             .expect("push context trace");
     }
+
+    // Flush audit entries before checking sync_log counts.
+    drop(audit);
+    flusher.shutdown.cancel();
+    let _ = flusher.join_handle.await;
 
     let session_state_count: i64 = sqlx::query(
         "SELECT COUNT(*) AS c FROM session_sync_log \
@@ -2019,15 +2035,17 @@ async fn session_sync_log_prune_partitions_by_sync_type_on_live_matrixone() {
     .try_get("c")
     .expect("total success sync count");
 
-    assert_eq!(session_state_count, 1);
-    assert_eq!(checkpoint_count, 1);
+    assert_eq!(session_state_count, 1, "1 push_session_state = 1 audit row");
+    assert_eq!(checkpoint_count, 1, "1 push_checkpoint = 1 audit row");
+    // 199 bulk-seeded + 6 from push_context_trace_signal_to_cloud
     assert_eq!(
-        context_trace_count, 200,
-        "context_trace sync logs should prune to the success retain limit"
+        context_trace_count, 205,
+        "199 seeded + 6 pushed = 205 context_trace audit rows"
     );
+    // 1 session_state + 1 checkpoint + 205 context_trace
     assert_eq!(
-        total_success_count, 202,
-        "high-volume context_trace success logs must not evict rarer sync types"
+        total_success_count, 207,
+        "total success audit rows = 1 + 1 + 205"
     );
 
     cleanup_restore_fixture(&pool, &user_id, &[session_id]).await;
@@ -2129,6 +2147,8 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
 async fn remote_composite_snapshot_index_restores_without_local_index_on_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let audit = flusher.writer.clone();
 
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
@@ -2153,6 +2173,7 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
         0,
         Some("feature/remote-composite"),
         Some("gpt-5.4"),
+        &audit,
     )
     .await
     .expect("push session state");
@@ -2171,6 +2192,7 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
             error_count: 0,
             contract_state_json: Some(r#"{"mode":"remote-composite"}"#.into()),
         },
+        &audit,
     )
     .await
     .expect("push checkpoint");
@@ -2279,6 +2301,8 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
 async fn restore_recent_tools_falls_back_to_legacy_turn_complete_metadata_on_live_matrixone() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let audit = flusher.writer.clone();
 
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
@@ -2295,6 +2319,7 @@ async fn restore_recent_tools_falls_back_to_legacy_turn_complete_metadata_on_liv
         0,
         Some("feature/legacy-tools"),
         Some("gpt-5.4"),
+        &audit,
     )
     .await
     .expect("push session state");
@@ -2364,6 +2389,8 @@ async fn restore_recent_tools_falls_back_to_legacy_turn_complete_metadata_on_liv
 async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let audit = flusher.writer.clone();
 
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
@@ -2389,7 +2416,7 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
         explanations: vec!["missing row".into()],
     };
 
-    push_context_trace_signal_to_cloud(&pool, &session_id, &user_id, &trace)
+    push_context_trace_signal_to_cloud(&pool, &session_id, &user_id, &trace, &audit)
         .await
         .expect("push context trace");
 
@@ -2434,6 +2461,11 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
         Some("turn-missing-row")
     );
 
+    // Flush audit entries before checking sync_log counts.
+    drop(audit);
+    flusher.shutdown.cancel();
+    let _ = flusher.join_handle.await;
+
     let context_trace_syncs: i64 = sqlx::query(
         "SELECT COUNT(*) AS c FROM session_sync_log \
          WHERE session_id = ? AND sync_type = 'context_trace' AND status = 'success'",
@@ -2454,6 +2486,8 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
 async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live_matrixone() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let audit = flusher.writer.clone();
 
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
@@ -2592,6 +2626,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             error_count: 0,
             contract_state_json: None,
         },
+        &audit,
     )
     .await
     .expect("push ordinary checkpoint");
@@ -2613,6 +2648,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             serde_json::json!({"kind":"rate_limited","resumable":true}),
             serde_json::json!({"attempt_count":1,"cumulative_tokens_freed":50,"last_was_insufficient":false}),
         ),
+        &audit,
     )
     .await
     .expect("push first step checkpoint");
@@ -2646,6 +2682,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             serde_json::json!({"kind":"rate_limited","resumable":true}),
             serde_json::json!({"attempt_count":2,"cumulative_tokens_freed":120,"last_was_insufficient":false}),
         ),
+        &audit,
     )
     .await
     .expect("update step checkpoint");
@@ -2669,6 +2706,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             serde_json::json!({"kind":"context_window","resumable":true}),
             serde_json::json!({"attempt_count":1,"cumulative_tokens_freed":80,"last_was_insufficient":true}),
         ),
+        &audit,
     )
     .await
     .expect("push heavy-only step checkpoint");
@@ -2704,6 +2742,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             serde_json::json!({"kind":"legacy_resume","resumable":true}),
             serde_json::json!({"attempt_count":3,"cumulative_tokens_freed":64,"last_was_insufficient":false}),
         ),
+        &audit,
     )
     .await
     .expect("push legacy heavy step checkpoint");
@@ -2895,6 +2934,11 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             .and_then(serde_json::Value::as_u64),
         Some(3)
     );
+
+    // Flush audit entries before checking sync_log counts.
+    drop(audit);
+    flusher.shutdown.cancel();
+    let _ = flusher.join_handle.await;
 
     let sync_successes = sqlx::query(
         "SELECT COUNT(*) AS c FROM session_sync_log \
@@ -3235,7 +3279,8 @@ async fn it_push_learning_versioned_idempotent_insert_returns_ok() {
     let (shared_pool, settings) = setup_pool_and_settings().await;
     let raw_pool = shared_pool.get().clone();
     let _ = settings; // used for pool setup; MatrixOneSyncService takes a raw pool
-    let svc = MatrixOneSyncService::new(raw_pool.clone());
+    let flusher = astra_services::state_sync::spawn_audit_flusher(raw_pool.clone());
+    let svc = MatrixOneSyncService::new(raw_pool.clone(), flusher.writer.clone());
     let user_id = format!("it-sync-user-{}", Uuid::new_v4().simple());
     let profile = "default";
     let snapshot = r#"{"entities":[],"patterns":[]}"#;

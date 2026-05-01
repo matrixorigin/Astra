@@ -109,11 +109,13 @@ pub(super) async fn try_cloud_pull(
         operation = "pull_learning",
         "starting MatrixOne learning pull"
     );
-    let svc = MatrixOneSyncService::new(pool);
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let svc = MatrixOneSyncService::new(pool, flusher.writer.clone());
     let user_id = std::env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string());
-    match StateSyncService::pull_learning_versioned(&svc, &user_id, profile_name).await {
+    let out = StateSyncService::pull_learning_versioned(&svc, &user_id, profile_name).await;
+    drain_ephemeral_audit(svc, flusher).await;
+    match out {
         Ok(Some(versioned)) => {
-            // Parse snapshot to extract tool health before merging entities/patterns
             let cloud_health = serde_json::from_str::<LearningSnapshot>(&versioned.json)
                 .map(|s| s.tool_health)
                 .unwrap_or_default();
@@ -144,6 +146,18 @@ pub(super) async fn try_cloud_pull(
     }
 }
 
+/// Shut down an ephemeral audit flusher: drop all senders, cancel the token,
+/// and await the flusher task so the final batch is flushed to DB.
+async fn drain_ephemeral_audit(
+    svc: MatrixOneSyncService,
+    flusher: astra_services::state_sync::AuditFlusherHandle,
+) {
+    drop(svc);
+    drop(flusher.writer);
+    flusher.shutdown.cancel();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), flusher.join_handle).await;
+}
+
 /// Push learning state to cloud with optimistic locking.
 /// Returns the new cloud version if successful, or None on conflict/failure.
 /// On conflict, the caller should pull fresh data and retry.
@@ -165,7 +179,8 @@ pub(super) async fn try_cloud_push_versioned(
         Ok(j) => j,
         Err(_) => return None,
     };
-    let svc = MatrixOneSyncService::new(pool);
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let svc = MatrixOneSyncService::new(pool, flusher.writer.clone());
     let user_id = std::env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string());
     let result = StateSyncService::push_learning_versioned(
         &svc,
@@ -178,6 +193,7 @@ pub(super) async fn try_cloud_push_versioned(
         expected_version,
     )
     .await;
+    drain_ephemeral_audit(svc, flusher).await;
 
     if result.is_conflict {
         eprintln!(
@@ -252,12 +268,14 @@ pub(super) async fn try_cloud_push_delta(
         None => return None,
     };
 
-    let svc = MatrixOneSyncService::new(pool);
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let svc = MatrixOneSyncService::new(pool, flusher.writer.clone());
     let user_id = std::env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string());
 
     let result =
         StateSyncService::push_delta(&svc, &user_id, profile_name, &delta_json, expected_version)
             .await;
+    drain_ephemeral_audit(svc, flusher).await;
 
     if result.is_conflict {
         eprintln!(
@@ -311,9 +329,12 @@ pub(super) async fn try_cloud_pull_preferences(state: &mut ReplState) -> Vec<Str
         Some(p) => p,
         None => return Vec::new(),
     };
-    let svc = MatrixOneSyncService::new(pool);
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let svc = MatrixOneSyncService::new(pool, flusher.writer.clone());
     let user_id = std::env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string());
-    match StateSyncService::pull_all_preferences(&svc, &user_id).await {
+    let out = StateSyncService::pull_all_preferences(&svc, &user_id).await;
+    drain_ephemeral_audit(svc, flusher).await;
+    match out {
         Ok(prefs) if !prefs.is_empty() => {
             let keys: Vec<String> = prefs.iter().map(|(k, _)| k.clone()).collect();
             for (key, value) in &prefs {
@@ -326,7 +347,6 @@ pub(super) async fn try_cloud_pull_preferences(state: &mut ReplState) -> Vec<Str
                         };
                     }
                     pref_keys::BLOCKED_TOOLS => {
-                        // Merge cloud-persisted blocked tools into tool_health_entries
                         if let Ok(tools) = serde_json::from_str::<Vec<String>>(value) {
                             let existing: std::collections::HashSet<String> = state
                                 .tool_health_entries
@@ -356,7 +376,7 @@ pub(super) async fn try_cloud_pull_preferences(state: &mut ReplState) -> Vec<Str
             );
             keys
         }
-        Ok(_) => Vec::new(), // no cloud prefs yet
+        Ok(_) => Vec::new(),
         Err(e) => {
             eprintln!("{}", format!("  ⚠ Preference pull skipped: {e}").dim());
             Vec::new()
@@ -370,10 +390,10 @@ pub(super) async fn try_cloud_push_preferences(state: &ReplState) {
         Some(p) => p,
         None => return,
     };
-    let svc = MatrixOneSyncService::new(pool);
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let svc = MatrixOneSyncService::new(pool, flusher.writer.clone());
     let user_id = std::env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string());
 
-    // Collect blocked/deprioritized tools from health entries
     let blocked: Vec<String> = state
         .tool_health_entries
         .iter()
@@ -389,7 +409,7 @@ pub(super) async fn try_cloud_push_preferences(state: &ReplState) {
     for (key, value) in &prefs {
         let _ = svc.push_preference(&user_id, key, value).await;
     }
-    // Silently succeed — only warn on failure
+    drain_ephemeral_audit(svc, flusher).await;
 }
 
 // ═══════════════════════════════════════════ Journal Helpers ═══════════════════════

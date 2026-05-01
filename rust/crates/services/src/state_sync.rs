@@ -43,10 +43,13 @@ const MAX_RETRIES: u32 = 3;
 const INITIAL_BACKOFF_MS: u64 = 100;
 /// Maximum backoff delay (exponential backoff caps at this value).
 const MAX_BACKOFF_MS: u64 = 2000;
-/// Retain only a bounded tail of successful sync audit rows per user.
-const SYNC_LOG_SUCCESS_RETAIN: usize = 200;
-/// Retain a smaller bounded tail of error rows per user.
-const SYNC_LOG_ERROR_RETAIN: usize = 50;
+/// Bounded channel capacity for the async audit writer. If the channel is full,
+/// audit entries are dropped (acceptable — audit is observability, not business logic).
+const AUDIT_CHANNEL_CAPACITY: usize = 256;
+/// Flush audit entries after this many accumulate.
+const AUDIT_FLUSH_BATCH_SIZE: usize = 64;
+/// Flush audit entries after this duration even if batch is not full.
+const AUDIT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 // ─── Learning snapshot idempotency classifier ───────────────────────────────
 
@@ -135,29 +138,149 @@ fn decompress_json_payload(encoded: &str) -> Result<String, String> {
     Ok(json)
 }
 
-/// Returns the retention limit for sync logs based on status.
-/// Exposed for checkpoint sync to reuse the same pruning policy.
-pub(crate) fn sync_log_retain_limit(status: &str) -> Option<usize> {
-    match status {
-        "success" => Some(SYNC_LOG_SUCCESS_RETAIN),
-        "error" => Some(SYNC_LOG_ERROR_RETAIN),
-        _ => None,
+// ─── Async Audit Writer ────────────────────────────────────────────────────
+
+/// A single audit row destined for `session_sync_log`. Fire-and-forget.
+pub struct SyncAuditEntry {
+    pub user_id: String,
+    pub session_id: String,
+    pub sync_type: String,
+    pub direction: SyncDirection,
+    pub payload_size: usize,
+    pub status: String,
+    pub error_message: Option<String>,
+}
+
+/// Non-blocking handle for emitting audit entries into a bounded channel.
+/// If the channel is full the entry is silently dropped — audit is best-effort.
+#[derive(Clone)]
+pub struct SyncAuditWriter {
+    tx: tokio::sync::mpsc::Sender<SyncAuditEntry>,
+}
+
+impl SyncAuditWriter {
+    pub fn log(&self, entry: SyncAuditEntry) {
+        match self.tx.try_send(entry) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(dropped)) => {
+                tracing::warn!(
+                    target: "astra_services::audit",
+                    session_id = %dropped.session_id,
+                    sync_type = %dropped.sync_type,
+                    "sync audit channel full, entry dropped"
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(dropped)) => {
+                tracing::error!(
+                    target: "astra_services::audit",
+                    session_id = %dropped.session_id,
+                    sync_type = %dropped.sync_type,
+                    "sync audit channel closed (flusher dead?), entry dropped"
+                );
+            }
+        }
     }
 }
 
-/// SQL query to prune old sync logs keeping the most recent N entries.
-/// Exposed for checkpoint sync to reuse the same pruning policy.
-pub(crate) fn build_sync_log_prune_query() -> &'static str {
-    "DELETE FROM session_sync_log \
-     WHERE user_id = ? AND status = ? AND sync_type = ? \
-       AND sync_id NOT IN ( \
-            SELECT sync_id FROM ( \
-                SELECT sync_id FROM session_sync_log \
-                WHERE user_id = ? AND status = ? AND sync_type = ? \
-                ORDER BY created_at DESC \
-                LIMIT ? \
-            ) AS keepers \
-        )"
+/// Handle returned by [`spawn_audit_flusher`]. Groups the writer, shutdown
+/// token, and background task join handle.
+pub struct AuditFlusherHandle {
+    pub writer: SyncAuditWriter,
+    pub shutdown: tokio_util::sync::CancellationToken,
+    pub join_handle: tokio::task::JoinHandle<()>,
+}
+
+/// Spawn the audit flusher background task.
+///
+/// Clean shutdown: call `handle.shutdown.cancel()`, then `.await handle.join_handle`.
+pub fn spawn_audit_flusher(pool: sqlx::Pool<sqlx::MySql>) -> AuditFlusherHandle {
+    let (tx, rx) = tokio::sync::mpsc::channel(AUDIT_CHANNEL_CAPACITY);
+    let token = tokio_util::sync::CancellationToken::new();
+    let join_handle = tokio::spawn(run_audit_flusher(rx, pool, token.clone()));
+    AuditFlusherHandle {
+        writer: SyncAuditWriter { tx },
+        shutdown: token,
+        join_handle,
+    }
+}
+
+async fn run_audit_flusher(
+    mut rx: tokio::sync::mpsc::Receiver<SyncAuditEntry>,
+    pool: sqlx::Pool<sqlx::MySql>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let mut buf: Vec<SyncAuditEntry> = Vec::with_capacity(AUDIT_FLUSH_BATCH_SIZE);
+    loop {
+        let deadline = tokio::time::sleep(AUDIT_FLUSH_INTERVAL);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                entry = rx.recv() => {
+                    match entry {
+                        Some(e) => {
+                            buf.push(e);
+                            if buf.len() >= AUDIT_FLUSH_BATCH_SIZE { break; }
+                        }
+                        None => {
+                            flush_audit_batch(&pool, &mut buf).await;
+                            return;
+                        }
+                    }
+                }
+                _ = &mut deadline => { break; }
+                _ = shutdown.cancelled() => {
+                    while let Ok(e) = rx.try_recv() {
+                        buf.push(e);
+                    }
+                    flush_audit_batch(&pool, &mut buf).await;
+                    return;
+                }
+            }
+        }
+        flush_audit_batch(&pool, &mut buf).await;
+    }
+}
+
+async fn flush_audit_batch(pool: &sqlx::Pool<sqlx::MySql>, buf: &mut Vec<SyncAuditEntry>) {
+    if buf.is_empty() {
+        return;
+    }
+    let mut sql = String::from(
+        "INSERT INTO session_sync_log \
+         (sync_id, user_id, session_id, sync_type, sync_direction, \
+          payload_size, status, error_message, created_at) VALUES ",
+    );
+    for (i, _) in buf.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str("(?, ?, ?, ?, ?, ?, ?, ?, NOW())");
+    }
+    let mut q = sqlx::query(&sql);
+    for entry in buf.iter() {
+        let dir_str = match entry.direction {
+            SyncDirection::Push => "push",
+            SyncDirection::Pull => "pull",
+        };
+        q = q
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&entry.user_id)
+            .bind(&entry.session_id)
+            .bind(&entry.sync_type)
+            .bind(dir_str)
+            .bind(entry.payload_size as i64)
+            .bind(&entry.status)
+            .bind(entry.error_message.as_deref());
+    }
+    if let Err(e) = q.execute(pool).await {
+        tracing::warn!(
+            target: "astra_services::audit",
+            batch_size = buf.len(),
+            error = %e,
+            "failed to flush sync audit batch"
+        );
+    }
+    buf.clear();
 }
 
 // ─── Sync Types ─────────────────────────────────────────────────────────────
@@ -658,20 +781,20 @@ impl StateSyncService for LocalOnlySyncService {
 /// Tables used:
 /// - `learning_snapshots` — cross-session learning state
 /// - `user_preferences` — user settings
-/// - `session_sync_log` — audit trail
+/// - `session_sync_log` — audit trail (written via async `SyncAuditWriter`)
 pub struct MatrixOneSyncService {
     pool: sqlx::Pool<sqlx::MySql>,
+    audit: SyncAuditWriter,
 }
 
 impl MatrixOneSyncService {
-    /// Create from an existing connection pool.
-    pub fn new(pool: sqlx::Pool<sqlx::MySql>) -> Self {
-        Self { pool }
+    /// Create from an existing connection pool and shared audit writer.
+    pub fn new(pool: sqlx::Pool<sqlx::MySql>, audit: SyncAuditWriter) -> Self {
+        Self { pool, audit }
     }
 
-    /// Log a sync operation to the audit table.
     #[allow(clippy::too_many_arguments)]
-    async fn log_sync(
+    fn log_sync(
         &self,
         user_id: &str,
         session_id: &str,
@@ -681,54 +804,15 @@ impl MatrixOneSyncService {
         status: &str,
         error_msg: Option<&str>,
     ) {
-        let dir_str = match direction {
-            SyncDirection::Push => "push",
-            SyncDirection::Pull => "pull",
-        };
-        let inserted = sqlx::query(
-            "INSERT INTO session_sync_log \
-             (sync_id, user_id, session_id, sync_type, sync_direction, payload_size, status, error_message, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())",
-        )
-        .bind(uuid::Uuid::new_v4().to_string())
-        .bind(user_id)
-        .bind(session_id)
-        .bind(sync_type)
-        .bind(dir_str)
-        .bind(payload_size as i64)
-        .bind(status)
-        .bind(error_msg)
-        .execute(&self.pool)
-        .await;
-
-        if inserted.is_ok()
-            && let Some(retain) = sync_log_retain_limit(status)
-        {
-            self.prune_sync_logs(user_id, sync_type, status, retain)
-                .await;
-        }
-    }
-
-    async fn prune_sync_logs(&self, user_id: &str, sync_type: &str, status: &str, retain: usize) {
-        if let Err(e) = sqlx::query(build_sync_log_prune_query())
-            .bind(user_id)
-            .bind(status)
-            .bind(sync_type)
-            .bind(user_id)
-            .bind(status)
-            .bind(sync_type)
-            .bind(retain as i64)
-            .execute(&self.pool)
-            .await
-        {
-            tracing::warn!(
-                target: "astra_services::state_sync",
-                user_id = %user_id,
-                sync_type = %sync_type,
-                error = %e,
-                "failed to prune sync logs"
-            );
-        }
+        self.audit.log(SyncAuditEntry {
+            user_id: user_id.to_string(),
+            session_id: session_id.to_string(),
+            sync_type: sync_type.to_string(),
+            direction,
+            payload_size,
+            status: status.to_string(),
+            error_message: error_msg.map(|s| s.to_string()),
+        });
     }
 }
 
@@ -791,8 +875,7 @@ impl StateSyncService for MatrixOneSyncService {
                                 compressed_snapshot.len(),
                                 "success",
                                 None,
-                            )
-                            .await;
+                            );
                             return SyncResult::ok_with_version(
                                 SyncDirection::Push,
                                 "learning",
@@ -811,8 +894,7 @@ impl StateSyncService for MatrixOneSyncService {
                                 0,
                                 "conflict",
                                 Some(&format!("expected version {ver}")),
-                            )
-                            .await;
+                            );
                             return SyncResult::conflict(
                                 SyncDirection::Push,
                                 "learning",
@@ -844,8 +926,7 @@ impl StateSyncService for MatrixOneSyncService {
                                 0,
                                 "error",
                                 Some(&msg),
-                            )
-                            .await;
+                            );
                             return SyncResult::err(SyncDirection::Push, "learning", msg);
                         }
                     }
@@ -886,8 +967,7 @@ impl StateSyncService for MatrixOneSyncService {
                                 compressed_snapshot.len(),
                                 "success",
                                 None,
-                            )
-                            .await;
+                            );
                             return SyncResult::ok_with_version(
                                 SyncDirection::Push,
                                 "learning",
@@ -933,8 +1013,7 @@ impl StateSyncService for MatrixOneSyncService {
                                         compressed_snapshot.len(),
                                         "success",
                                         None,
-                                    )
-                                    .await;
+                                    );
                                     return SyncResult::ok_with_version(
                                         SyncDirection::Push,
                                         "learning",
@@ -951,8 +1030,7 @@ impl StateSyncService for MatrixOneSyncService {
                                     0,
                                     "conflict",
                                     Some(&msg),
-                                )
-                                .await;
+                                );
                                 return SyncResult::conflict(
                                     SyncDirection::Push,
                                     "learning",
@@ -981,8 +1059,7 @@ impl StateSyncService for MatrixOneSyncService {
                                 0,
                                 "error",
                                 Some(&msg),
-                            )
-                            .await;
+                            );
                             return SyncResult::err(SyncDirection::Push, "learning", msg);
                         }
                     }
@@ -1036,8 +1113,7 @@ impl StateSyncService for MatrixOneSyncService {
                         json.len(),
                         "success",
                         None,
-                    )
-                    .await;
+                    );
                     return Ok(Some(VersionedSnapshot {
                         json: decompressed,
                         version,
@@ -2124,24 +2200,10 @@ mod tests {
     }
 
     #[test]
-    fn sync_log_retention_limits_are_bounded() {
-        assert_eq!(
-            sync_log_retain_limit("success"),
-            Some(SYNC_LOG_SUCCESS_RETAIN)
-        );
-        assert_eq!(sync_log_retain_limit("error"), Some(SYNC_LOG_ERROR_RETAIN));
-        assert_eq!(sync_log_retain_limit("pending"), None);
-    }
-
-    #[test]
-    fn prune_query_keeps_latest_rows_for_user_status_and_sync_type() {
-        let query = build_sync_log_prune_query();
-
-        assert!(query.contains("DELETE FROM session_sync_log"));
-        assert!(query.contains("WHERE user_id = ? AND status = ? AND sync_type = ?"));
-        assert!(query.contains("SELECT sync_id FROM session_sync_log"));
-        assert!(query.contains("ORDER BY created_at DESC"));
-        assert!(query.contains("LIMIT ?"));
+    fn audit_constants_are_reasonable() {
+        assert_eq!(AUDIT_CHANNEL_CAPACITY, 256);
+        assert_eq!(AUDIT_FLUSH_BATCH_SIZE, 64);
+        assert_eq!(AUDIT_FLUSH_INTERVAL, std::time::Duration::from_secs(1));
     }
 
     #[tokio::test]
@@ -2476,5 +2538,157 @@ mod tests {
         assert_eq!(h1, h2);
         let h3 = sha256_bytes("world");
         assert_ne!(h1, h3);
+    }
+
+    // ── SyncAuditWriter / flusher tests ──
+
+    fn make_entry(i: usize) -> SyncAuditEntry {
+        SyncAuditEntry {
+            user_id: format!("u{i}"),
+            session_id: "s1".into(),
+            sync_type: "test".into(),
+            direction: SyncDirection::Push,
+            payload_size: i,
+            status: "success".into(),
+            error_message: None,
+        }
+    }
+
+    fn dummy_pool() -> sqlx::Pool<sqlx::MySql> {
+        sqlx::pool::PoolOptions::<sqlx::MySql>::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(1))
+            .connect_lazy("mysql://invalid:x@127.0.0.1:1/none")
+            .expect("lazy pool")
+    }
+
+    #[test]
+    fn audit_writer_log_is_nonblocking_when_channel_full() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let writer = SyncAuditWriter { tx };
+        writer.log(make_entry(1));
+        writer.log(make_entry(2)); // channel full — must not block
+    }
+
+    #[test]
+    fn audit_writer_log_handles_closed_channel_without_panic() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let writer = SyncAuditWriter { tx };
+        drop(rx);
+        writer.log(make_entry(1)); // Closed — error! log, no panic
+    }
+
+    #[tokio::test]
+    async fn flusher_exits_on_channel_close_with_1_entry() {
+        let pool = dummy_pool();
+        let token = tokio_util::sync::CancellationToken::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        tx.send(make_entry(0)).await.unwrap();
+        drop(tx);
+
+        let jh = tokio::spawn(run_audit_flusher(rx, pool, token));
+        tokio::time::timeout(std::time::Duration::from_secs(5), jh)
+            .await
+            .expect("flusher should exit within 5s")
+            .expect("flusher should not panic");
+    }
+
+    #[tokio::test]
+    async fn flusher_exits_on_channel_close_with_exact_batch() {
+        let pool = dummy_pool();
+        let token = tokio_util::sync::CancellationToken::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        for i in 0..AUDIT_FLUSH_BATCH_SIZE {
+            tx.send(make_entry(i)).await.unwrap();
+        }
+        drop(tx);
+
+        let jh = tokio::spawn(run_audit_flusher(rx, pool, token));
+        tokio::time::timeout(std::time::Duration::from_secs(5), jh)
+            .await
+            .expect("flusher should exit within 5s")
+            .expect("flusher should not panic");
+    }
+
+    #[tokio::test]
+    async fn flusher_exits_on_channel_close_with_batch_plus_one() {
+        let pool = dummy_pool();
+        let token = tokio_util::sync::CancellationToken::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        for i in 0..AUDIT_FLUSH_BATCH_SIZE + 1 {
+            tx.send(make_entry(i)).await.unwrap();
+        }
+        drop(tx);
+
+        let jh = tokio::spawn(run_audit_flusher(rx, pool, token));
+        tokio::time::timeout(std::time::Duration::from_secs(5), jh)
+            .await
+            .expect("flusher should exit within 5s")
+            .expect("flusher should not panic");
+    }
+
+    #[tokio::test]
+    async fn flusher_exits_on_cancel_with_senders_alive() {
+        let pool = dummy_pool();
+        let token = tokio_util::sync::CancellationToken::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        for i in 0..5 {
+            tx.send(make_entry(i)).await.unwrap();
+        }
+
+        let jh = tokio::spawn(run_audit_flusher(rx, pool, token.clone()));
+        token.cancel();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), jh)
+            .await
+            .expect("flusher should exit within 5s after cancel")
+            .expect("flusher should not panic");
+        // tx is still alive — exit was caused by cancellation, not channel close.
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn flusher_flushes_partial_batch_on_timeout() {
+        let pool = dummy_pool();
+        let token = tokio_util::sync::CancellationToken::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        tx.send(make_entry(0)).await.unwrap();
+
+        let jh = tokio::spawn(run_audit_flusher(rx, pool, token));
+        // Wait past the flush interval, then close to let flusher exit.
+        tokio::time::sleep(AUDIT_FLUSH_INTERVAL + std::time::Duration::from_millis(100)).await;
+        drop(tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), jh)
+            .await
+            .expect("flusher should exit within 5s")
+            .expect("flusher should not panic");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flusher_shutdown_drain_collects_buffered_entries() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SyncAuditEntry>(128);
+        let token = tokio_util::sync::CancellationToken::new();
+        for i in 0..10 {
+            tx.send(make_entry(i)).await.unwrap();
+        }
+        // Read one via recv to prove entries are pending.
+        let first = rx.recv().await.unwrap();
+        token.cancel();
+        // Simulate the flusher's cancellation drain path.
+        let mut buf = vec![first];
+        while let Ok(e) = rx.try_recv() {
+            buf.push(e);
+        }
+        assert_eq!(buf.len(), 10, "all 10 entries must be collected");
+    }
+
+    #[test]
+    fn audit_flusher_handle_struct_fields_accessible() {
+        fn _assert_fields(h: AuditFlusherHandle) {
+            let _w: SyncAuditWriter = h.writer;
+            let _s: tokio_util::sync::CancellationToken = h.shutdown;
+            let _j: tokio::task::JoinHandle<()> = h.join_handle;
+        }
     }
 }

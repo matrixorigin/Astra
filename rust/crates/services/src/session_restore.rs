@@ -1358,12 +1358,12 @@ pub async fn push_checkpoint_to_cloud(
     session_id: &str,
     user_id: &str,
     checkpoint: &super::session_checkpoint::Checkpoint,
+    audit: &crate::state_sync::SyncAuditWriter,
 ) -> Result<(), String> {
     let checkpoint_id = uuid::Uuid::new_v4().to_string();
     let tools_json =
         serde_json::to_string(&checkpoint.tools_used).unwrap_or_else(|_| "[]".to_string());
 
-    // Calculate payload_size for sync log (estimate based on serialized fields)
     let payload_size = checkpoint.title.len()
         + checkpoint.summary.len()
         + tools_json.len()
@@ -1372,14 +1372,13 @@ pub async fn push_checkpoint_to_cloud(
             .as_ref()
             .map_or(0, |s| s.len());
 
-    // Helper: log sync result (success or failure) and propagate result
-    let log_and_return = |result: Result<(), String>, size: usize| async move {
-        let (status, error_msg) = match &result {
+    let log_result = |result: &Result<(), String>, size: usize| {
+        let (status, error_msg) = match result {
             Ok(()) => ("success", None),
             Err(e) => ("error", Some(e.as_str())),
         };
-        let _ = log_checkpoint_sync(
-            pool,
+        log_checkpoint_sync(
+            audit,
             user_id,
             session_id,
             "checkpoint",
@@ -1387,9 +1386,7 @@ pub async fn push_checkpoint_to_cloud(
             size,
             status,
             error_msg,
-        )
-        .await;
-        result
+        );
     };
 
     let updated = match sqlx::query(
@@ -1413,8 +1410,9 @@ pub async fn push_checkpoint_to_cloud(
     {
         Ok(u) => u,
         Err(e) => {
-            let err = format!("push_checkpoint update: {e}");
-            return log_and_return(Err(err), payload_size).await;
+            let err = Err(format!("push_checkpoint update: {e}"));
+            log_result(&err, payload_size);
+            return err;
         }
     };
 
@@ -1461,79 +1459,45 @@ pub async fn push_checkpoint_to_cloud(
                 .execute(pool)
                 .await
                 {
-                    let err = format!("push_checkpoint retry update: {e}");
-                    return log_and_return(Err(err), payload_size).await;
+                    let err = Err(format!("push_checkpoint retry update: {e}"));
+                    log_result(&err, payload_size);
+                    return err;
                 }
             } else {
-                let err = format!("push_checkpoint insert: {e}");
-                return log_and_return(Err(err), payload_size).await;
+                let err = Err(format!("push_checkpoint insert: {e}"));
+                log_result(&err, payload_size);
+                return err;
             }
         }
     }
 
-    log_and_return(Ok(()), payload_size).await
+    log_result(&Ok(()), payload_size);
+    Ok(())
 }
 
-/// Log session sync activity to session_sync_log for audit trail.
-/// This helps diagnose sync issues like Session 7875e355 where cloud work reached
-/// MatrixOne through some paths but left no sync-log breadcrumb.
-async fn log_session_sync(
-    pool: &sqlx::Pool<sqlx::MySql>,
+fn log_session_sync(
+    audit: &crate::state_sync::SyncAuditWriter,
     user_id: &str,
     session_id: &str,
     sync_type: &str,
     payload_size: usize,
     status: &str,
     error_msg: Option<&str>,
-) -> Result<(), String> {
-    let inserted = sqlx::query(
-        "INSERT INTO session_sync_log \
-         (sync_id, user_id, session_id, sync_type, sync_direction, payload_size, status, error_message, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())",
-    )
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(user_id)
-    .bind(session_id)
-    .bind(sync_type)
-    .bind("push")
-    .bind(payload_size as i64)
-    .bind(status)
-    .bind(error_msg)
-    .execute(pool)
-    .await
-    .map_err(|e| format!("log_session_sync: {e}"))?;
-
-    // Apply retention pruning using the same policy as state_sync.
-    // This prevents unbounded sync_log growth for long-running sessions.
-    if inserted.rows_affected() > 0
-        && let Some(retain) = crate::state_sync::sync_log_retain_limit(status)
-        && let Err(e) = sqlx::query(crate::state_sync::build_sync_log_prune_query())
-            .bind(user_id)
-            .bind(status)
-            .bind(sync_type)
-            .bind(user_id)
-            .bind(status)
-            .bind(sync_type)
-            .bind(retain as i64)
-            .execute(pool)
-            .await
-    {
-        tracing::warn!(
-            target: "astra_services::session_restore",
-            user_id = %user_id,
-            sync_type = %sync_type,
-            error = %e,
-            "failed to prune sync logs"
-        );
-    }
-
-    Ok(())
+) {
+    audit.log(crate::state_sync::SyncAuditEntry {
+        user_id: user_id.to_string(),
+        session_id: session_id.to_string(),
+        sync_type: sync_type.to_string(),
+        direction: crate::state_sync::SyncDirection::Push,
+        payload_size,
+        status: status.to_string(),
+        error_message: error_msg.map(|s| s.to_string()),
+    });
 }
 
-/// Log checkpoint sync with checkpoint-number context preserved in the error field.
 #[allow(clippy::too_many_arguments)]
-async fn log_checkpoint_sync(
-    pool: &sqlx::Pool<sqlx::MySql>,
+fn log_checkpoint_sync(
+    audit: &crate::state_sync::SyncAuditWriter,
     user_id: &str,
     session_id: &str,
     sync_type: &str,
@@ -1541,18 +1505,17 @@ async fn log_checkpoint_sync(
     payload_size: usize,
     status: &str,
     error_msg: Option<&str>,
-) -> Result<(), String> {
+) {
     let error_with_number = error_msg.map(|e| format!("[checkpoint #{}] {}", checkpoint_number, e));
     log_session_sync(
-        pool,
+        audit,
         user_id,
         session_id,
         sync_type,
         payload_size,
         status,
         error_with_number.as_deref().or(error_msg),
-    )
-    .await
+    );
 }
 
 /// Push a Step Protocol checkpoint to MatrixOne with full state_json.
@@ -1569,17 +1532,19 @@ pub async fn push_step_checkpoint_to_cloud(
     title: &str,
     tools_json: &str,
     state_json: &str,
+    audit: &crate::state_sync::SyncAuditWriter,
 ) -> Result<(), String> {
     let checkpoint_id = uuid::Uuid::new_v4().to_string();
     let cloud_number = cloud_step_checkpoint_number(checkpoint_number)?;
     let payload_size = title.len() + tier.len() + tools_json.len() + state_json.len();
-    let log_and_return = |result: Result<(), String>, size: usize| async move {
-        let (status, error_msg) = match &result {
+
+    let log_result = |result: &Result<(), String>, size: usize| {
+        let (status, error_msg) = match result {
             Ok(()) => ("success", None),
             Err(e) => ("error", Some(e.as_str())),
         };
-        let _ = log_checkpoint_sync(
-            pool,
+        log_checkpoint_sync(
+            audit,
             user_id,
             session_id,
             "step_checkpoint",
@@ -1587,9 +1552,7 @@ pub async fn push_step_checkpoint_to_cloud(
             size,
             status,
             error_msg,
-        )
-        .await;
-        result
+        );
     };
 
     let updated = match sqlx::query(
@@ -1609,8 +1572,9 @@ pub async fn push_step_checkpoint_to_cloud(
     {
         Ok(updated) => updated,
         Err(e) => {
-            let err = format!("push_step_checkpoint update: {e}");
-            return log_and_return(Err(err), payload_size).await;
+            let err = Err(format!("push_step_checkpoint update: {e}"));
+            log_result(&err, payload_size);
+            return err;
         }
     };
 
@@ -1650,17 +1614,20 @@ pub async fn push_step_checkpoint_to_cloud(
                 .execute(pool)
                 .await
                 {
-                    let err = format!("push_step_checkpoint retry update: {err}");
-                    return log_and_return(Err(err), payload_size).await;
+                    let err = Err(format!("push_step_checkpoint retry update: {err}"));
+                    log_result(&err, payload_size);
+                    return err;
                 }
             } else {
-                let err = format!("push_step_checkpoint insert: {e}");
-                return log_and_return(Err(err), payload_size).await;
+                let err = Err(format!("push_step_checkpoint insert: {e}"));
+                log_result(&err, payload_size);
+                return err;
             }
         }
     }
 
-    log_and_return(Ok(()), payload_size).await
+    log_result(&Ok(()), payload_size);
+    Ok(())
 }
 
 /// Pull the latest Heavy step checkpoint JSON from MatrixOne for session recovery.
@@ -1707,6 +1674,7 @@ pub async fn push_session_state_to_cloud(
     plan_execution_rounds: usize,
     git_branch: Option<&str>,
     model: Option<&str>,
+    audit: &crate::state_sync::SyncAuditWriter,
 ) -> Result<(), String> {
     use sqlx::Row;
 
@@ -1734,25 +1702,8 @@ pub async fn push_session_state_to_cloud(
         model,
     );
     let payload_size = metadata_json.len();
-    let log_and_return = |result: Result<(), String>, size: usize| async move {
-        let (status, error_msg) = match &result {
-            Ok(()) => ("success", None),
-            Err(e) => ("error", Some(e.as_str())),
-        };
-        let _ = log_session_sync(
-            pool,
-            user_id,
-            session_id,
-            "session_state",
-            size,
-            status,
-            error_msg,
-        )
-        .await;
-        result
-    };
 
-    match sqlx::query(
+    let result = match sqlx::query(
         "INSERT INTO agent_sessions \
          (session_id, user_id, status, metadata, created_at, updated_at, last_active_at) \
          VALUES (?, ?, 'active', ?, NOW(), NOW(), NOW()) \
@@ -1765,12 +1716,23 @@ pub async fn push_session_state_to_cloud(
     .execute(pool)
     .await
     {
-        Ok(_) => log_and_return(Ok(()), payload_size).await,
-        Err(e) => {
-            let err = format!("push_session_state: {e}");
-            log_and_return(Err(err), payload_size).await
-        }
-    }
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("push_session_state: {e}")),
+    };
+    let (status, error_msg) = match &result {
+        Ok(()) => ("success", None),
+        Err(e) => ("error", Some(e.as_str())),
+    };
+    log_session_sync(
+        audit,
+        user_id,
+        session_id,
+        "session_state",
+        payload_size,
+        status,
+        error_msg,
+    );
+    result
 }
 
 /// Push a structured context-trace signal as a first-class cloud event.
@@ -1779,6 +1741,7 @@ pub async fn push_context_trace_signal_to_cloud(
     session_id: &str,
     user_id: &str,
     signal: &super::session_workspace::ContextTraceSignal,
+    audit: &crate::state_sync::SyncAuditWriter,
 ) -> Result<(), String> {
     let metadata_json = serde_json::to_string(signal)
         .map_err(|e| format!("serialize context_trace_signal: {e}"))?;
@@ -1795,22 +1758,21 @@ pub async fn push_context_trace_signal_to_cloud(
         }
     };
     let payload_size = metadata_json.len() + content.len();
-    let log_and_return = |result: Result<(), String>, size: usize| async move {
-        let (status, error_msg) = match &result {
+
+    let log_result = |result: &Result<(), String>| {
+        let (status, error_msg) = match result {
             Ok(()) => ("success", None),
             Err(e) => ("error", Some(e.as_str())),
         };
-        let _ = log_session_sync(
-            pool,
+        log_session_sync(
+            audit,
             user_id,
             session_id,
             "context_trace",
-            size,
+            payload_size,
             status,
             error_msg,
-        )
-        .await;
-        result
+        );
     };
 
     if let Err(e) = sqlx::query(
@@ -1841,15 +1803,19 @@ pub async fn push_context_trace_signal_to_cloud(
     .execute(pool)
     .await
     {
-        let err = format!("push_context_trace_signal: {e}");
-        return log_and_return(Err(err), payload_size).await;
+        let err = Err(format!("push_context_trace_signal: {e}"));
+        log_result(&err);
+        return err;
     }
 
     if let Err(e) = reconcile_session_event_count(pool, session_id, user_id).await {
-        return log_and_return(Err(e), payload_size).await;
+        let err = Err(e);
+        log_result(&err);
+        return err;
     }
 
-    log_and_return(Ok(()), payload_size).await
+    log_result(&Ok(()));
+    Ok(())
 }
 
 async fn reconcile_session_event_count(

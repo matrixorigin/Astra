@@ -86,6 +86,9 @@ pub struct MatrixCloudRuntime {
     /// Phase 3: dirty task IDs pending sync, shared with [`TaskAdapter`].
     pub task_dirty: Arc<Mutex<HashSet<String>>>,
     edge_agent_id: Arc<str>,
+    audit_writer: astra_services::state_sync::SyncAuditWriter,
+    audit_flusher_shutdown: tokio_util::sync::CancellationToken,
+    audit_flusher_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl MatrixCloudRuntime {
@@ -111,7 +114,11 @@ impl MatrixCloudRuntime {
         let pool = shared_pool.get().clone();
         let (sender, ingestion_shutdown, ingestion_stats, ingestion_jh) =
             event_ingestion::EventIngestionWorker::spawn(pool.clone(), IngestionConfig::default());
-        let sync_svc = Arc::new(MatrixOneSyncService::new(pool));
+        let audit_flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+        let sync_svc = Arc::new(MatrixOneSyncService::new(
+            pool,
+            audit_flusher.writer.clone(),
+        ));
         let transport: Arc<dyn CloudTransport> = Arc::new(MatrixOneTransport::new(
             sync_svc,
             profile.to_string(),
@@ -165,6 +172,9 @@ impl MatrixCloudRuntime {
             task_mirror,
             task_dirty,
             edge_agent_id,
+            audit_writer: audit_flusher.writer,
+            audit_flusher_shutdown: audit_flusher.shutdown,
+            audit_flusher_handle: Mutex::new(Some(audit_flusher.join_handle)),
         }
     }
 
@@ -181,6 +191,10 @@ impl MatrixCloudRuntime {
     }
     pub fn shared_pool(&self) -> &SharedPool {
         &self.shared_pool
+    }
+
+    pub fn audit_writer(&self) -> &astra_services::state_sync::SyncAuditWriter {
+        &self.audit_writer
     }
 
     /// Snapshot of ingestion stats (events received/flushed/errors + overflow).
@@ -265,6 +279,8 @@ impl MatrixCloudRuntime {
             }
         }
 
+        // Drain session sync tasks FIRST — they hold audit writer clones that
+        // must be dropped before we can close the audit channel.
         let mut session_sync_tasks = self
             .session_sync_tasks
             .lock()
@@ -289,6 +305,31 @@ impl MatrixCloudRuntime {
                     astra_core::agent_warn!(
                         "session_sync",
                         "session sync drain timed out after {INGESTION_SHUTDOWN_TIMEOUT:?}, some sync sidecars may be lost"
+                    );
+                }
+            }
+        }
+
+        // Signal the audit flusher to drain and exit. CancellationToken is
+        // level-triggered — stays cancelled once cancelled, so the flusher sees
+        // it regardless of poll timing. Works even though SyncAuditWriter clones
+        // inside Arc<MatrixOneSyncService> keep the channel open.
+        self.audit_flusher_shutdown.cancel();
+        let audit_handle = self
+            .audit_flusher_handle
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take());
+        if let Some(jh) = audit_handle {
+            match tokio::time::timeout(INGESTION_SHUTDOWN_TIMEOUT, jh).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    astra_core::agent_warn!("audit_flusher", "audit flusher join failed: {e}");
+                }
+                Err(_) => {
+                    astra_core::agent_warn!(
+                        "audit_flusher",
+                        "audit flusher drain timed out after {INGESTION_SHUTDOWN_TIMEOUT:?}"
                     );
                 }
             }

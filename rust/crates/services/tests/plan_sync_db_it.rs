@@ -79,7 +79,8 @@ async fn scalar_i64(pool: &sqlx::Pool<sqlx::MySql>, sql: &str, bind: &str) -> i6
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn push_plans_pack_upserts_plans_and_steps() {
     let pool = setup_pool().await;
-    let svc = MatrixOneSyncService::new(pool.clone());
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
     let user = format!("u-push-{}", Uuid::new_v4().simple());
     let plan_id = format!("psync-push-{}", Uuid::new_v4().simple());
     cleanup(&pool, &plan_id).await;
@@ -118,7 +119,8 @@ async fn push_plans_pack_upserts_plans_and_steps() {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn push_plans_pack_rejects_stale_version_optimistically() {
     let pool = setup_pool().await;
-    let svc = MatrixOneSyncService::new(pool.clone());
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
     let user = format!("u-stale-{}", Uuid::new_v4().simple());
     let plan_id = format!("psync-stale-{}", Uuid::new_v4().simple());
     cleanup(&pool, &plan_id).await;
@@ -194,7 +196,8 @@ async fn push_plans_pack_rejects_stale_version_optimistically() {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn push_plans_pack_drops_cross_user_plans() {
     let pool = setup_pool().await;
-    let svc = MatrixOneSyncService::new(pool.clone());
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
     let alice = format!("u-alice-{}", Uuid::new_v4().simple());
     let mallory = format!("u-mallory-{}", Uuid::new_v4().simple());
     let alice_plan = format!("psync-alice-{}", Uuid::new_v4().simple());
@@ -239,7 +242,8 @@ async fn push_plans_pack_drops_cross_user_plans() {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn push_plans_pack_step_runs_are_idempotent_on_replay() {
     let pool = setup_pool().await;
-    let svc = MatrixOneSyncService::new(pool.clone());
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
     let user = format!("u-idem-{}", Uuid::new_v4().simple());
     let plan_id = format!("psync-idem-{}", Uuid::new_v4().simple());
     // `run_id` is the PRIMARY KEY on `plan_step_runs` — it's the identity the
@@ -308,7 +312,8 @@ async fn push_plans_pack_step_runs_are_idempotent_on_replay() {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn push_plans_pack_rejects_orphan_step_runs() {
     let pool = setup_pool().await;
-    let svc = MatrixOneSyncService::new(pool.clone());
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
     let user = format!("u-orph-{}", Uuid::new_v4().simple());
     let ghost_plan = format!("psync-ghost-{}", Uuid::new_v4().simple());
     cleanup(&pool, &ghost_plan).await;
@@ -347,7 +352,8 @@ async fn push_plans_pack_scales_to_fifty_plans_without_n_plus_one() {
     // operation completes under a realistic LAN-latency budget, plus that all
     // the same correctness invariants still hold.
     let pool = setup_pool().await;
-    let svc = MatrixOneSyncService::new(pool.clone());
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
     let user = format!("u-perf-{}", Uuid::new_v4().simple());
     let prefix = format!("psync-perf-{}-", Uuid::new_v4().simple());
     cleanup(&pool, &prefix).await;
@@ -459,7 +465,8 @@ async fn push_plans_pack_preserves_edge_step_run_timestamps() {
     // Otherwise audit chains for offline work collapse to the moment of
     // reconnection.
     let pool = setup_pool().await;
-    let svc = MatrixOneSyncService::new(pool.clone());
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
     let user = format!("u-ts-{}", Uuid::new_v4().simple());
     let plan_id = format!("psync-ts-{}", Uuid::new_v4().simple());
     cleanup(&pool, &plan_id).await;
@@ -536,7 +543,8 @@ async fn push_plans_pack_preserves_edge_step_run_timestamps() {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn pull_plans_pack_returns_user_scoped_plans_and_runs() {
     let pool = setup_pool().await;
-    let svc = MatrixOneSyncService::new(pool.clone());
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
     let user = format!("u-pull-{}", Uuid::new_v4().simple());
     let other_user = format!("u-other-{}", Uuid::new_v4().simple());
     let plan_id = format!("psync-pull-{}", Uuid::new_v4().simple());
@@ -597,7 +605,8 @@ async fn pull_plans_pack_returns_user_scoped_plans_and_runs() {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn push_plans_pack_rejects_step_run_with_inverted_timestamps() {
     let pool = setup_pool().await;
-    let svc = MatrixOneSyncService::new(pool.clone());
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
     let user = format!("u-inv-{}", Uuid::new_v4().simple());
     let plan_id = format!("pit-inv-{}", Uuid::new_v4().simple());
     let session_id = format!("sit-inv-{}", Uuid::new_v4().simple());
@@ -643,7 +652,8 @@ async fn push_plans_pack_rejects_step_run_with_inverted_timestamps() {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn push_plans_pack_rejects_step_run_with_out_of_range_timestamps() {
     let pool = setup_pool().await;
-    let svc = MatrixOneSyncService::new(pool.clone());
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
     let user = format!("u-oor-{}", Uuid::new_v4().simple());
     let plan_id = format!("pit-oor-{}", Uuid::new_v4().simple());
     let session_id = format!("sit-oor-{}", Uuid::new_v4().simple());
@@ -837,7 +847,8 @@ async fn migration_dedupe_removes_duplicate_attempt_tuples() {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn push_plans_pack_rejects_step_run_with_oversized_error_string() {
     let pool = setup_pool().await;
-    let svc = MatrixOneSyncService::new(pool.clone());
+    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
+    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
     let user = format!("u-big-{}", Uuid::new_v4().simple());
     let plan_id = format!("pit-big-{}", Uuid::new_v4().simple());
     let session_id = format!("sit-big-{}", Uuid::new_v4().simple());

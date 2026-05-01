@@ -1118,6 +1118,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                 if let Some(ref mc) = state.matrix_runtime {
                     let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
                     let pool = mc.shared_pool().get().clone();
+                    let audit = mc.audit_writer().clone();
                     let sid_owned = sid.to_string();
                     let user_id_owned = user_id.to_string();
                     let cp_clone = cp.clone();
@@ -1128,6 +1129,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                             &sid_owned,
                             &user_id_owned,
                             &cp_clone,
+                            &audit,
                         )
                         .await
                         {
@@ -1156,6 +1158,7 @@ fn commit_turn_journal_workspace_and_sidecars(
             {
                 let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
                 let pool = mc.shared_pool().get().clone();
+                let audit = mc.audit_writer().clone();
                 let sid_owned = sid.to_string();
                 let user_id_owned = user_id.to_string();
                 let cp_number = result
@@ -1163,7 +1166,6 @@ fn commit_turn_journal_workspace_and_sidecars(
                     .as_ref()
                     .map(|s| s.checkpoints)
                     .unwrap_or(0);
-                // Extract metadata from the checkpoint for column storage
                 let (tier, turn, title, tools_json): (String, u32, String, String) = match step_cp {
                     astra_pipeline::step_protocol::StepCheckpoint::Light(l) => (
                         "light".to_string(),
@@ -1193,6 +1195,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                         &title,
                         &tools_json,
                         &state_json,
+                        &audit,
                     )
                     .await
                     {
@@ -1209,6 +1212,7 @@ fn commit_turn_journal_workspace_and_sidecars(
             {
                 let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
                 let pool = mc.shared_pool().get().clone();
+                let audit = mc.audit_writer().clone();
                 let sid_owned = sid.to_string();
                 let user_id_owned = user_id.to_string();
                 let trace_signal = trace_signal.clone();
@@ -1219,6 +1223,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                             &sid_owned,
                             &user_id_owned,
                             &trace_signal,
+                            &audit,
                         )
                         .await
                     {
@@ -1238,6 +1243,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                 )
             {
                 let pool = mc.shared_pool().get().clone();
+                let audit = mc.audit_writer().clone();
                 let sid_owned = sid.to_string();
                 let user_id = state
                     .ingestion_user_id
@@ -1265,6 +1271,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                         rounds,
                         git_branch.as_deref(),
                         model.as_deref(),
+                        &audit,
                     )
                     .await
                     {
@@ -2858,11 +2865,13 @@ fn spawn_manual_checkpoint_cloud_uploads(
         .to_string();
     let user_id_step = user_id.clone();
     let pool = mc.shared_pool().get().clone();
+    let audit = mc.audit_writer().clone();
+    let audit2 = audit.clone();
     let sid_owned = sid.to_string();
     let cp_clone = session_cp.clone();
     mc.spawn_session_sync_task(async move {
         if let Err(e) = astra_services::session_restore::push_checkpoint_to_cloud(
-            &pool, &sid_owned, &user_id, &cp_clone,
+            &pool, &sid_owned, &user_id, &cp_clone, &audit,
         )
         .await
         {
@@ -2887,6 +2896,7 @@ fn spawn_manual_checkpoint_cloud_uploads(
             &title_owned,
             &tools_json,
             &state_json,
+            &audit2,
         )
         .await
         {

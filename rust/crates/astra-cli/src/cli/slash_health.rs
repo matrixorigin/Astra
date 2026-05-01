@@ -153,6 +153,7 @@ pub(super) async fn handle_health_command(arg: &str, state: &ReplState) {
         Some(mc) => {
             let svc = astra_services::state_sync::MatrixOneSyncService::new(
                 mc.shared_pool().get().clone(),
+                mc.audit_writer().clone(),
             );
             let sync_status = astra_services::state_sync::StateSyncService::status(&svc).await;
             display_sync_status(&sync_status);

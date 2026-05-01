@@ -151,17 +151,26 @@ Delete entirely:
 - `SYNC_LOG_SUCCESS_RETAIN` / `SYNC_LOG_ERROR_RETAIN`
 - `prune_sync_logs()` method
 
-Retention is handled solely by `storage::run_cleanup()` which already does:
+Retention is handled solely by `storage::cleanup_expired_data()` which does:
 ```sql
 DELETE FROM session_sync_log WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) LIMIT ?
 ```
-This is the correct mechanism — time-based, batched, runs on a schedule (not per-write).
+This runs on a periodic schedule (default policy: `sync_log_days = 30`), batched
+with `LIMIT 1000` to avoid long-running locks. Not a DB-level TTL — it is an
+application-level cleanup task invoked by the runtime's maintenance loop.
 
 ### 7. Graceful shutdown
 
-The API server's shutdown sequence must:
-1. Drop all `SyncAuditWriter` clones (closes channel sender)
-2. Await the flusher `JoinHandle` (drains remaining buffer)
+Runtime (`MatrixCloudRuntime`):
+1. Drain `session_sync_tasks` (drops CLI-spawned audit writer clones)
+2. Cancel `CancellationToken` (level-triggered — the flusher sees it immediately)
+3. Await the flusher `JoinHandle` (drains remaining buffer via `try_recv`)
+
+CLI ephemeral paths (`cloud_sync.rs`):
+1. Drop `MatrixOneSyncService` (drops its writer clone)
+2. Drop the `AuditFlusherHandle.writer` (drops the spawn-time clone)
+3. Cancel the `CancellationToken`
+4. Await the `JoinHandle` with 5s timeout
 
 This ensures no audit entries are lost on clean shutdown.
 
