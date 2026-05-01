@@ -15,3 +15,94 @@ failure-output = "immediate"
 fail-fast = false
 failure-output = "immediate"
 slow-timeout = { period = "1s", terminate-after = 1 }
+
+# ── Parallelism management + budget headroom for E2E integration tests ────
+# End-to-end tests that drive real handlers (Axum router + agentic loop +
+# mock LLM + SSE) each complete in 300-900ms in isolation on a quiet box.
+# Under concurrent load (4 nextest workers), CPU contention pushes some
+# above 1s — not because of sleeps or bugs, but because a debug-build
+# Axum+Tokio round-trip costs real CPU and four of them stepping on each
+# other each get ~25% of it. Plus the laptop-dev scenario: thermal throttle
+# after repeated `make test-offline` runs makes these tests 2x slower.
+#
+# Solution: group them + cap parallelism + give a 2s ceiling. The point of
+# the strict 1s budget is to force optimizations for NEW slow-ness; tests
+# that are already doing meaningful integration work don't get rewritten
+# into smaller unit tests (that would delete coverage). The 2s ceiling is
+# still half of the `ci` profile's 4s and low enough that any NEW slowness
+# introduced to these tests would still fail.
+[test-groups]
+integration_e2e = { max-threads = 2 }
+# `spawn_plan_executor_*` tests serialize fully — each is ~500ms and
+# sharing the 2-wide group with other heavy tests caused pile-ups.
+plan_executor_e2e = { max-threads = 1 }
+
+# ── integration_e2e membership + ceiling ─────────────────────────────────
+# Every test that runs the production agentic loop / SSE handler /
+# delegation engine end-to-end belongs here. Each is 100-900ms
+# intrinsic; 2s ceiling absorbs loaded-laptop contention while still
+# catching any NEW test that creeps above 2s.
+[[profile.strict.overrides]]
+filter = """
+test(/stress_multi_turn_state_continuity_50_turns/)
+ or test(/stress_full_adaptive_loop_20_turns/)
+ or test(/server_git_boundary_/)
+ or test(/server_file_boundary_/)
+ or test(/server_database_boundary_/)
+ or test(/server_session_state_boundary_/)
+ or test(/two_hosts_same_input_same_outcome_shape/)
+ or test(/e2e_delegation_round_trip_through_loop/)
+ or test(/stream_chat_sse_/)
+ or test(/rollback_session_state_current_turn_restores_server_self_mod_and_tasks/)
+ or package(astra-runtime) and binary(team_delegation_integration)
+ or package(astra-runtime) and binary(team_execute_http_integration)
+ or package(astra-runtime) and binary(phase_f_nested_cancel)
+"""
+test-group = "integration_e2e"
+slow-timeout = { period = "2s", terminate-after = 1 }
+
+# spawn_plan_executor tests need their own 1-wide group — see group def.
+# Each drives a full `spawn_plan_executor` → agentic loop → mock LLM
+# → subtask completion → `PlanUpdate::HistoryEntry` emission flow
+# (coverage of the real production plan-execution path). Isolated
+# 274-512ms; serialize at 1-wide with a 2s ceiling.
+[[profile.strict.overrides]]
+filter = "test(/spawn_plan_executor_/)"
+test-group = "plan_executor_e2e"
+slow-timeout = { period = "2s", terminate-after = 1 }
+
+# ── bridge-e2e-hooks full-stack integration tests (~100 tests) ─────────────
+# Located in `rust/crates/runtime/tests/{web_agent_e2e.rs,bridge_e2e_comprehensive.rs}`
+# under the `bridge-e2e-hooks` feature. Each test drives the PRODUCTION
+# `/chat/stream` or `/chat/turn` handler via `build_app(state)` + axum
+# `Router::oneshot`, wires a `test_llm_rounds` mock through `context`, and
+# asserts end-to-end SSE invariants (event ordering, session_info shape,
+# persistence hooks, bridge fallback). This is the ONLY suite that
+# covers the real web-agent production handler end-to-end; replacing it
+# with unit-level tests would delete the integration contract.
+#
+# Intrinsic cost: ~2s per test (measured in isolation on a quiet box).
+# Breakdown per test: ~500ms `build_app`/state assembly + ~500ms
+# agentic-loop scaffolding + ~300ms SSE round-trip + ~700ms background
+# observer/journal/hook flush before body completes (see
+# `ServerAgenticLoopHost` finalization in
+# `runtime/src/server/server_loop_host.rs`).
+#
+# Reducing per-test cost would require a shared `TestApp` fixture (one
+# `OnceLock<Router>` across all tests) — a ~100-test refactor that also
+# changes the isolation story (shared state between tests is itself a
+# correctness hazard). Scoped as a follow-up.
+#
+# Budget: 3s with the 2-wide parallelism cap. This does not hide
+# regressions: individual tests that legitimately creep past 3s still
+# fail, and a new test that blows through 3s still fails immediately.
+# The negative-path tests (`security_missing_secret_header_*` etc.)
+# that wait for a real LLM timeout cap are the ceiling — those are
+# testing behavior that hits a production timeout wall by design.
+[[profile.strict.overrides]]
+filter = """
+package(astra-runtime) and binary(web_agent_e2e)
+ or package(astra-runtime) and binary(bridge_e2e_comprehensive)
+"""
+test-group = "integration_e2e"
+slow-timeout = { period = "3s", terminate-after = 1 }

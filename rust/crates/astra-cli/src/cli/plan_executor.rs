@@ -3193,7 +3193,10 @@ All acceptance checks pass:
                 break;
             }
             if !drained_any {
-                sleep(Duration::from_millis(25)).await;
+                // 1ms poll (was 25ms) — mock LLM emits events on sub-ms
+                // latency, so the tight poll avoids accumulating ~25ms×N
+                // idle waits per test under parallel load.
+                sleep(Duration::from_millis(1)).await;
             }
         }
 
@@ -3259,7 +3262,10 @@ All acceptance checks pass:
                 break;
             }
             if !drained_any {
-                sleep(Duration::from_millis(25)).await;
+                // 1ms poll (was 25ms) — mock LLM emits events on sub-ms
+                // latency, so the tight poll avoids accumulating ~25ms×N
+                // idle waits per test under parallel load.
+                sleep(Duration::from_millis(1)).await;
             }
         }
 
@@ -3300,6 +3306,10 @@ All acceptance checks pass:
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut saw_tagged_turn_error = false;
 
+        // 25ms was the original poll; under parallel load four of these
+        // tests would each wait ~20 iterations and tip over 1s. 1ms keeps
+        // the test responsive to the mock LLM's emission latency without
+        // hogging CPU (try_recv is a non-blocking channel check).
         while Instant::now() < deadline {
             let mut drained_any = false;
             while let Some(update) = handle.try_recv() {
@@ -3317,7 +3327,7 @@ All acceptance checks pass:
                 break;
             }
             if !drained_any {
-                sleep(Duration::from_millis(25)).await;
+                sleep(Duration::from_millis(1)).await;
             }
         }
 
@@ -3388,7 +3398,10 @@ All acceptance checks pass:
                 break;
             }
             if !drained_any {
-                sleep(Duration::from_millis(25)).await;
+                // 1ms poll (was 25ms) — mock LLM emits events on sub-ms
+                // latency, so the tight poll avoids accumulating ~25ms×N
+                // idle waits per test under parallel load.
+                sleep(Duration::from_millis(1)).await;
             }
         }
 
