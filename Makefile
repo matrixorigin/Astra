@@ -523,28 +523,42 @@ test-ignored-integration:
 		else \
 			echo "Running system_matrix_http_e2e (ignored; parallel default; live DB + AppSettings::from_env)..."; \
 		fi; \
+		FAILED=""; \
 		cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --features bridge-e2e-hooks \
 			--test system_matrix_http_e2e --run-ignored only \
-			$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG --no-capture; \
-		\
+			$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG --no-capture \
+			|| FAILED="$$FAILED system_matrix_http_e2e"; \
 		echo "Running multi_agent_integration (ignored; live MatrixOne)..."; \
 		cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services --test multi_agent_integration \
-			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG; \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
+			|| FAILED="$$FAILED multi_agent_integration"; \
 		echo "Running team_persistence_integration (ignored; live MatrixOne)..."; \
 		cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services --test team_persistence_integration \
-			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG; \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
+			|| FAILED="$$FAILED team_persistence_integration"; \
 		echo "Running services_db_integration (ignored; live MatrixOne)..."; \
 		cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services --test services_db_integration \
-			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG; \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
+			|| FAILED="$$FAILED services_db_integration"; \
 		echo "Running plan_sync_db_it (ignored; live MatrixOne)..."; \
 		cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services --test plan_sync_db_it \
-			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG; \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
+			|| FAILED="$$FAILED plan_sync_db_it"; \
 		echo "Running plan_repository_db_it (ignored; live MatrixOne)..."; \
 		cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-plan --test plan_repository_db_it \
-			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG; \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
+			|| FAILED="$$FAILED plan_repository_db_it"; \
 		echo "Running plan_http_db_it (ignored; live MatrixOne)..."; \
 		cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-runtime --test plan_http_db_it \
-			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG; \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
+			|| FAILED="$$FAILED plan_http_db_it"; \
+		echo ""; \
+		if [ -n "$$FAILED" ]; then \
+			echo "❌ test-ignored-integration: failed suites:$$FAILED"; \
+			exit 1; \
+		else \
+			echo "✅ test-ignored-integration: all 7 suites passed"; \
+		fi; \
 	fi
 
 # Online (MatrixOne): opt-in #[ignore] integration binaries (see test-ignored-integration).
@@ -567,12 +581,22 @@ test-online:
 	mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS --skip-ssl \
 		-e "DROP DATABASE IF EXISTS $$TEST_DB; CREATE DATABASE $$TEST_DB;" 2>/dev/null || true; \
 	echo "Running astra-runtime ignored unit tests (live DB; nextest per-case budget $(TEST_ONLINE_TIMEOUT); live-LLM suite gated by ASTRA_LIVE_LLM)..."; \
+	FAILED=""; \
 	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 		cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
-			--run-ignored only $(NEXTEST_ONLINE_FLAGS); \
+			--run-ignored only $(NEXTEST_ONLINE_FLAGS) \
+			|| FAILED="$$FAILED astra-runtime-ignored"; \
 	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 		ASTRA_TEST_DB_IT=1 \
-		$(MAKE) test-ignored-integration
+		$(MAKE) test-ignored-integration \
+		|| FAILED="$$FAILED test-ignored-integration"; \
+	echo ""; \
+	if [ -n "$$FAILED" ]; then \
+		echo "❌ test-online: failed suites:$$FAILED"; \
+		exit 1; \
+	else \
+		echo "✅ test-online: all online suites passed (online per-case budget $(TEST_ONLINE_TIMEOUT))"; \
+	fi
 	@if [ "$${ASTRA_SDK_ONLINE_E2E:-}" = "1" ]; then \
 		$(MAKE) test-sdk-online; \
 	else \
