@@ -350,6 +350,29 @@ body {
 .sel-tag .tag-x:hover { opacity: 1; }
 @keyframes tagIn { from { opacity: 0; transform: scale(0.85); } }
 
+/* ── Model override info note ── */
+.model-override-note {
+  display: none;
+  margin-top: 6px;
+  padding: 5px 8px;
+  border-radius: var(--radius-xs);
+  background: rgba(234,179,8,0.08);
+  border: 1px solid rgba(234,179,8,0.15);
+  font-size: 11px;
+  color: var(--yellow);
+  line-height: 1.4;
+}
+.model-override-note.visible { display: block; }
+/* ── Model provider group label ── */
+.model-provider-label {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--dim);
+  font-weight: 700;
+  padding: 6px 8px 2px;
+}
+
 /* ── Custom model input row ── */
 .custom-model-row {
   display: flex; gap: 6px; margin-top: 8px;
@@ -1169,6 +1192,7 @@ input[type="range"]::-moz-range-thumb {
         </div>
         <div class="sb-check-list" id="modelList"></div>
         <div class="selected-tags" id="modelTags"></div>
+        <div class="model-override-note" id="modelOverrideNote">Selected models will override case-specific model lists</div>
         <div class="custom-model-row">
           <input type="text" id="customModelIn" placeholder="custom model..." />
           <button type="button" id="addModelBtn">Add</button>
@@ -1336,6 +1360,8 @@ const S = {
 
   // All known model names (presets + server + custom)
   allModels: [],
+  // Rich model registry from /api/models: [{ name, provider, is_active, description, context_window }]
+  modelRegistry: [],
 
   // Run state
   total: 0,
@@ -1474,28 +1500,77 @@ $('detailOverlay').addEventListener('click', closeDetailPanel);
 /* ================================================================
    Models: Build & Render
    ================================================================ */
+// S.modelRegistry holds rich model objects from /api/models: { name, provider, is_active, description, context_window }
+// Falls back to S.config.available_models + PRESETS when /api/models is unavailable.
+
 function buildModelList() {
   const set = new Set();
   PRESETS.forEach(m => set.add(m));
   (S.config.available_models || []).forEach(m => set.add(m));
+  // Include models from the registry that may not be in config
+  (S.modelRegistry || []).forEach(rm => set.add(rm.name));
   S.allModels = [...set];
 }
 
 function renderModelList() {
   const container = $('modelList');
   container.innerHTML = '';
+
+  // Build provider-grouped view if we have registry data
+  const registry = S.modelRegistry || [];
+  const registryByName = {};
+  for (const rm of registry) registryByName[rm.name] = rm;
+
+  // Group models by provider
+  const groups = {};
   for (const m of S.allModels) {
-    const checked = S.selectedModels.has(m);
-    const item = document.createElement('div');
-    item.className = 'sb-check-item' + (checked ? ' checked' : '');
-    item.innerHTML = `<span class="ck">${CHECK_SVG}</span><span class="item-label" title="${esc(m)}">${esc(m)}</span>`;
-    item.addEventListener('click', () => {
-      if (S.selectedModels.has(m)) S.selectedModels.delete(m);
-      else S.selectedModels.add(m);
-      renderModelList();
-      renderModelTags();
-    });
-    container.appendChild(item);
+    const rm = registryByName[m];
+    const provider = (rm && rm.provider) ? rm.provider : 'Other';
+    if (!groups[provider]) groups[provider] = [];
+    groups[provider].push(m);
+  }
+
+  // Sort provider groups: named providers first (alphabetically), 'Other' last
+  const providerKeys = Object.keys(groups).sort((a, b) => {
+    if (a === 'Other') return 1;
+    if (b === 'Other') return -1;
+    return a.localeCompare(b);
+  });
+
+  for (const provider of providerKeys) {
+    // Only show provider label if there are multiple providers
+    if (providerKeys.length > 1 || provider !== 'Other') {
+      const label = document.createElement('div');
+      label.className = 'model-provider-label';
+      label.textContent = provider;
+      container.appendChild(label);
+    }
+
+    for (const m of groups[provider]) {
+      const checked = S.selectedModels.has(m);
+      const rm = registryByName[m];
+      const item = document.createElement('div');
+      item.className = 'sb-check-item' + (checked ? ' checked' : '');
+      let titleText = m;
+      if (rm && rm.description) titleText += ' — ' + rm.description;
+      if (rm && rm.context_window) titleText += ' (' + formatTok(rm.context_window) + ' ctx)';
+      item.innerHTML = `<span class="ck">${CHECK_SVG}</span><span class="item-label" title="${esc(titleText)}">${esc(m)}</span>`;
+      item.addEventListener('click', () => {
+        if (S.selectedModels.has(m)) S.selectedModels.delete(m);
+        else S.selectedModels.add(m);
+        renderModelList();
+        renderModelTags();
+        updateModelOverrideNote();
+      });
+      container.appendChild(item);
+    }
+  }
+}
+
+function updateModelOverrideNote() {
+  const note = $('modelOverrideNote');
+  if (note) {
+    note.classList.toggle('visible', S.selectedModels.size > 0);
   }
 }
 
@@ -1511,6 +1586,7 @@ function renderModelTags() {
       S.selectedModels.delete(m);
       renderModelList();
       renderModelTags();
+      updateModelOverrideNote();
     });
     container.appendChild(tag);
   }
@@ -1520,11 +1596,13 @@ $('modelSelectAll').addEventListener('click', () => {
   S.allModels.forEach(m => S.selectedModels.add(m));
   renderModelList();
   renderModelTags();
+  updateModelOverrideNote();
 });
 $('modelSelectNone').addEventListener('click', () => {
   S.selectedModels.clear();
   renderModelList();
   renderModelTags();
+  updateModelOverrideNote();
 });
 $('addModelBtn').addEventListener('click', addCustomModel);
 $('customModelIn').addEventListener('keydown', e => { if (e.key === 'Enter') addCustomModel(); });
@@ -1536,6 +1614,7 @@ function addCustomModel() {
   S.selectedModels.add(v);
   renderModelList();
   renderModelTags();
+  updateModelOverrideNote();
   $('customModelIn').value = '';
 }
 
@@ -2121,20 +2200,42 @@ function updateChatModelSelector() {
    Init: Load Config + Cases
    ================================================================ */
 function loadConfig() {
-  fetch('/api/config')
+  // Fetch /api/models first (or in parallel), then /api/config.
+  // /api/models provides rich model data; /api/config is the fallback.
+  const modelsPromise = fetch('/api/models')
+    .then(r => r.json())
+    .then(data => {
+      S.modelRegistry = data.models || [];
+    })
+    .catch(() => {
+      // /api/models not available — fall back to config.available_models
+      S.modelRegistry = [];
+    });
+
+  const configPromise = fetch('/api/config')
     .then(r => r.json())
     .then(data => {
       S.config = data;
       S.judgerModel = data.judger_model || '';
       $('judgerModelIn').value = S.judgerModel;
-
-      buildModelList();
-      (data.available_models || []).forEach(m => S.selectedModels.add(m));
-      renderModelList();
-      renderModelTags();
-      updateChatModelSelector();
     })
     .catch(e => toast('Failed to load config: ' + e.message));
+
+  // Wait for both, then build the model list
+  Promise.all([modelsPromise, configPromise]).then(() => {
+    buildModelList();
+    // Auto-select active models from registry, or fall back to config.available_models
+    const activeFromRegistry = S.modelRegistry.filter(m => m.is_active).map(m => m.name);
+    if (activeFromRegistry.length > 0) {
+      activeFromRegistry.forEach(m => S.selectedModels.add(m));
+    } else {
+      (S.config.available_models || []).forEach(m => S.selectedModels.add(m));
+    }
+    renderModelList();
+    renderModelTags();
+    updateModelOverrideNote();
+    updateChatModelSelector();
+  });
 
   fetch('/api/cases')
     .then(r => r.json())
@@ -2186,6 +2287,26 @@ function connect() {
 
 function handleEvent(ev) {
   switch (ev.type) {
+
+    case 'run_reset': {
+      // Clear all previous run state before a new run begins
+      S.runs = [];
+      S.completed = 0;
+      S.passed = 0;
+      S.failed = 0;
+      S.runningSet.clear();
+      S.suiteReport = null;
+      S.total = 0;
+      S.startTime = null;
+      S.cancelled = false;
+
+      // Clear timeline DOM
+      $('timeline').innerHTML = '<div class="empty-msg" id="timelineEmpty">Waiting for results...</div>';
+
+      // Reset progress counters
+      updateProgress();
+      break;
+    }
 
     case 'suite_started': {
       S.total = ev.total_cases || 0;
