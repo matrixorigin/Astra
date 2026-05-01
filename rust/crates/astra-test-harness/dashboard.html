@@ -1083,6 +1083,17 @@ input[type="range"]::-moz-range-thumb {
 }
 .chat-input:focus { border-color: var(--accent); }
 .chat-input::placeholder { color: var(--dim); }
+.chat-mode-toggle {
+  display: flex; border-radius: 6px; overflow: hidden;
+  border: 1px solid var(--border); flex-shrink: 0;
+}
+.chat-mode-btn {
+  padding: 6px 12px; font-size: 11px; font-weight: 600;
+  background: transparent; color: var(--muted); border: none;
+  cursor: pointer; font-family: var(--font); transition: all 0.15s;
+}
+.chat-mode-btn.active { background: var(--accent); color: #fff; }
+.chat-mode-btn:not(.active):hover { color: var(--text); }
 .chat-send-btn {
   padding: 8px 16px;
   background: var(--gradient);
@@ -1704,6 +1715,10 @@ body.sidebar-collapsed .main-scroll { padding-left: 32px; }
         <select class="chat-model-select" id="chatModel">
           <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
         </select>
+        <div class="chat-mode-toggle" id="chatModeToggle">
+          <button class="chat-mode-btn active" data-mode="chat" type="button">Chat</button>
+          <button class="chat-mode-btn" data-mode="orchestrate" type="button">Run</button>
+        </div>
         <input type="text" class="chat-input" id="chatInput"
                placeholder="Why did case X fail? Compare sonnet vs minimax..." />
         <button class="chat-send-btn" id="chatSend" type="button">
@@ -2662,17 +2677,37 @@ function hideTypingIndicator() {
   $('chatTyping').classList.remove('visible');
 }
 
+// Chat mode: 'chat' (talk to astra) or 'orchestrate' (astra plans a run)
+let chatMode = 'chat';
+document.querySelectorAll('.chat-mode-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    chatMode = btn.dataset.mode;
+    document.querySelectorAll('.chat-mode-btn').forEach(b => b.classList.toggle('active', b === btn));
+    chatInput.placeholder = chatMode === 'orchestrate'
+      ? 'Compare sonnet and minimax on delegation cases...'
+      : 'Why did case X fail? Analyze the results...';
+  });
+});
+
 function sendChat() {
   const msg = chatInput.value.trim();
   if (!msg) return;
 
   chatInput.value = '';
-  addChatMsg('user', msg);
+  addChatMsg('user', chatMode === 'orchestrate' ? '🚀 ' + msg : msg);
 
   const model = $('chatModel').value;
   chatSend.disabled = true;
   showTypingIndicator();
 
+  if (chatMode === 'orchestrate') {
+    sendOrchestrate(msg, model);
+  } else {
+    sendChatMessage(msg, model);
+  }
+}
+
+function sendChatMessage(msg, model) {
   const body = { message: msg, model };
   if (S.chatSessionId) body.session_id = S.chatSessionId;
 
@@ -2693,6 +2728,69 @@ function sendChat() {
       }
     })
     .catch(e => { hideTypingIndicator(); addChatMsg('error', 'Request failed: ' + e.message); })
+    .finally(() => { chatSend.disabled = false; });
+}
+
+function sendOrchestrate(instruction, model) {
+  addChatMsg('assistant', '🤔 Planning your test run...');
+
+  fetch('/api/orchestrate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ instruction, model }),
+  })
+    .then(r => r.json())
+    .then(data => {
+      hideTypingIndicator();
+      if (data.error) {
+        addChatMsg('error', data.error + (data.raw ? '\n\nRaw: ' + data.raw : ''));
+      } else if (data.plan) {
+        const p = data.plan;
+        const models = (p.models || []).join(', ');
+        const cases = (p.cases || []);
+        const explanation = p.explanation || '';
+        addChatMsg('assistant',
+          `**Plan ready!**\n\n` +
+          `- **Models:** ${models}\n` +
+          `- **Cases:** ${cases.length} selected\n` +
+          `- **Parallel:** ${p.parallel || 2}\n` +
+          (explanation ? `- **Why:** ${explanation}\n` : '') +
+          `\nClick **Execute** to run this plan.`
+        );
+        // Add execute button
+        const lastMsg = document.querySelector('.chat-messages .chat-msg:last-child');
+        if (lastMsg) {
+          const btn = document.createElement('button');
+          btn.textContent = '▶ Execute Plan';
+          btn.style.cssText = 'margin-top:8px;padding:8px 16px;border-radius:6px;background:var(--accent);color:#fff;border:none;cursor:pointer;font-weight:600;font-family:var(--font);font-size:13px;';
+          btn.addEventListener('click', () => {
+            btn.disabled = true;
+            btn.textContent = 'Starting...';
+            // Apply plan to sidebar and trigger run
+            S.selectedModels = new Set(p.models || []);
+            S.selectedCases = new Set(p.cases || []);
+            renderModelList(); renderModelTags(); renderCaseList();
+            // Trigger the run
+            const runBody = {
+              models: p.models || [],
+              cases: p.cases || [],
+              parallel: p.parallel || 2,
+              no_judger: S.noJudger || false,
+            };
+            fetch('/api/run', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(runBody),
+            }).then(r => r.json()).then(d => {
+              if (d.error) addChatMsg('error', d.error);
+              else addChatMsg('assistant', '✅ Run started! Watch the timeline above.');
+            }).catch(e => addChatMsg('error', 'Run failed: ' + e.message));
+          });
+          lastMsg.appendChild(btn);
+        }
+      }
+    })
+    .catch(e => { hideTypingIndicator(); addChatMsg('error', 'Orchestrate failed: ' + e.message); })
     .finally(() => { chatSend.disabled = false; });
 }
 

@@ -140,6 +140,7 @@ impl DashboardServer {
             .route("/api/cancel", post(cancel_handler))
             .route("/api/login", post(login_handler))
             .route("/api/chat", post(chat_handler))
+            .route("/api/orchestrate", post(orchestrate_handler))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
@@ -378,10 +379,44 @@ async fn chat_handler(
     use tokio::process::Command;
 
     let model = req.model.as_deref().unwrap_or("claude-sonnet-4-6");
+
+    // Build context about available cases + models so astra can reason
+    // about the harness and give actionable advice.
+    let cases_summary = crate::case::Case::load_dir(&state.config.suite_dir)
+        .map(|cs| {
+            cs.iter()
+                .map(|c| {
+                    format!(
+                        "- {} (cap={}, d={}, steps={})",
+                        c.name,
+                        c.capability
+                            .as_ref()
+                            .map(|cap| cap.to_string())
+                            .unwrap_or("-".into()),
+                        c.difficulty.unwrap_or(0),
+                        c.steps.len()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+
+    let system_ctx = format!(
+        "You are an expert test engineer analyzing astra-test-harness results.\n\
+         Available test cases:\n{cases_summary}\n\n\
+         Suite directory: {}\n\
+         When the user asks about test results, failures, or comparisons, \
+         give specific, actionable analysis citing case names and metrics.",
+        state.config.suite_dir.display()
+    );
+
+    let full_message = format!("[System context]\n{system_ctx}\n\n[User]\n{}", req.message);
+
     let mut cmd = Command::new(&state.config.astra_bin);
     cmd.arg("chat")
         .arg("-m")
-        .arg(&req.message)
+        .arg(&full_message)
         .arg("--model")
         .arg(model)
         .arg("--json")
@@ -419,6 +454,107 @@ async fn chat_handler(
             "stderr": stderr.trim().to_string(),
             "exit_code": exit_code,
         }))
+    }
+}
+
+/// Mode B: astra-orchestrated run. User provides a natural language
+/// instruction like "compare sonnet and minimax on delegation cases".
+/// Astra interprets it and returns a run plan (models + cases).
+#[derive(Debug, Deserialize)]
+struct OrchestrateRequest {
+    instruction: String,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+async fn orchestrate_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OrchestrateRequest>,
+) -> Json<serde_json::Value> {
+    let cases = crate::case::Case::load_dir(&state.config.suite_dir)
+        .map(|cs| {
+            cs.iter()
+                .map(|c| {
+                    format!(
+                        "{}|{}|{}",
+                        c.name,
+                        c.capability
+                            .as_ref()
+                            .map(|cap| cap.to_string())
+                            .unwrap_or("-".into()),
+                        c.difficulty.unwrap_or(0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+
+    let admin_bin = state.config.astra_bin.with_file_name("astra-admin");
+    let models_list = tokio::process::Command::new(&admin_bin)
+        .args(["model", "list"])
+        .env("NO_PROXY", "localhost,127.0.0.1")
+        .env("no_proxy", "localhost,127.0.0.1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .ok()
+        .and_then(|o| {
+            serde_json::from_str::<Vec<serde_json::Value>>(&String::from_utf8_lossy(&o.stdout)).ok()
+        })
+        .map(|ms| {
+            ms.iter()
+                .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+
+    let prompt = format!(
+        "You are a test harness planner. Given an instruction, output ONLY a JSON object with:\n\
+         - \"models\": array of model name strings to test\n\
+         - \"cases\": array of case name strings to run\n\
+         - \"parallel\": number (1-8)\n\
+         - \"explanation\": one sentence explaining your selection\n\n\
+         Available models: {models_list}\n\n\
+         Available cases (name|capability|difficulty):\n{cases}\n\n\
+         Instruction: {}\n\n\
+         Output ONLY the JSON, no markdown fences.",
+        req.instruction
+    );
+
+    let model = req.model.as_deref().unwrap_or("claude-sonnet-4-6");
+    let output = tokio::process::Command::new(&state.config.astra_bin)
+        .args(["chat", "-m", &prompt, "--model", model, "--json", "-y"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+
+    match output {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let text = serde_json::from_str::<serde_json::Value>(stdout.trim())
+                .ok()
+                .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
+                .unwrap_or_else(|| stdout.trim().to_string());
+
+            // Try to parse the plan JSON from the text.
+            let plan_text = text
+                .trim()
+                .trim_start_matches("```json")
+                .trim_start_matches("```")
+                .trim_end_matches("```")
+                .trim();
+            if let Ok(plan) = serde_json::from_str::<serde_json::Value>(plan_text) {
+                Json(serde_json::json!({"plan": plan}))
+            } else {
+                Json(serde_json::json!({"error": "Could not parse plan", "raw": text}))
+            }
+        }
+        Err(e) => Json(serde_json::json!({"error": format!("orchestrate: {e}")})),
     }
 }
 
