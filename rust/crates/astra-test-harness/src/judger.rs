@@ -633,10 +633,9 @@ impl Judger for ExternalCmdJudger {
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
             let payload = serde_json::to_vec(&input).unwrap();
-            stdin
-                .write_all(&payload)
-                .await
-                .map_err(|e| format!("write to judger stdin: {e}"))?;
+            // Ignore BrokenPipe — the child may not read stdin (e.g.,
+            // a simple `echo` script). We still proceed to read stdout.
+            let _ = stdin.write_all(&payload).await;
             drop(stdin);
         }
 
@@ -752,6 +751,8 @@ mod tests {
         let mut perms = std::fs::metadata(&shim).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&shim, perms).unwrap();
+        // Ensure the file is fully flushed before exec (prevents ETXTBSY under load).
+        std::process::Command::new("sync").status().ok();
 
         let cfg = JudgerConfig::new(shim, "sonnet");
         let j = AstraCliJudger::new(cfg);
