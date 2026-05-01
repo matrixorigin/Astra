@@ -127,8 +127,10 @@ pub(crate) async fn run_tui_repl(
                                     let sys = SystemChatCell::info(format!("Slash: {text} (use line mode)"));
                                     guard.queue_history_lines(sys.display_lines(w));
                                 } else {
-                                    // Start active assistant cell + turn
-                                    active_cell = Some(Box::new(AssistantChatCell::from_rendered(vec![])));
+                                    // Start active assistant cell + turn (pre-start thinking for Working display)
+                                    let mut ac = AssistantChatCell::from_rendered(vec![]);
+                                    ac.start_thinking();
+                                    active_cell = Some(Box::new(ac));
                                     stream_controller = Some(StreamController::new(Some(w as usize)));
                                     bottom_pane.set_task_status(TaskStatus::WaitingModel);
 

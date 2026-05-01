@@ -24,7 +24,7 @@ impl ChatCell for UserChatCell {
         let bg = user_message_style();
 
         let mut lines = Vec::new();
-        lines.push(Line::styled("", bg)); // blank line above
+        // No top blank — the FlexRenderable inset handles spacing above
 
         for (i, text_line) in self.message.lines().enumerate() {
             let prefix = if i == 0 {
@@ -47,7 +47,7 @@ impl ChatCell for UserChatCell {
             );
         }
 
-        lines.push(Line::styled("", bg)); // blank line below
+        lines.push(Line::styled("", bg)); // blank line below (Codex has 2 blank lines after user)
         lines
     }
 }

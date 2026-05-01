@@ -68,36 +68,36 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
             write_history_line(writer, line, wrap_width)?;
         }
     } else {
-        // Standard mode: use scroll regions
-        let scroll_amount = wrapped_rows.min(screen_size.height.saturating_sub(area.bottom()));
-
-        if area.bottom() < screen_size.height && scroll_amount > 0 {
-            // Set scroll region to above viewport, reverse index to make room
+        // Standard mode: use scroll regions (matching Codex insert_history.rs)
+        //
+        // Step 1: If viewport is near bottom, push it down by scrolling region above it
+        if wrapped_rows > 0 && area.top() > 0 {
+            let scroll_amount = wrapped_rows;
+            // Set scroll region to cover viewport top to screen bottom
             let top_1based = area.top() + 1;
             queue!(writer, Print(format!("\x1b[{};{}r", top_1based, screen_size.height)))?;
             queue!(writer, cursor::MoveTo(0, area.top()))?;
             for _ in 0..scroll_amount {
-                queue!(writer, Print("\x1bM"))?; // Reverse Index
+                queue!(writer, Print("\x1bM"))?; // Reverse Index: push content down
             }
             queue!(writer, Print("\x1b[r"))?; // Reset scroll region
 
-            new_area.y += scroll_amount;
+            new_area.y = new_area.y.saturating_add(scroll_amount).min(screen_size.height);
             should_update_area = true;
         }
 
-        let cursor_top = new_area.top().saturating_sub(1);
-        // Set scroll region to area above new viewport
-        queue!(writer, Print(format!("\x1b[1;{}r", new_area.top())))?;
-        queue!(writer, cursor::MoveTo(0, cursor_top))?;
+        // Step 2: Write new lines into the gap above the new viewport position
+        if new_area.top() > 0 {
+            let cursor_top = new_area.top().saturating_sub(wrapped_rows).max(0);
+            queue!(writer, cursor::MoveTo(0, cursor_top))?;
 
-        for (i, line) in wrapped.iter().enumerate() {
-            if i > 0 {
-                queue!(writer, Print("\r\n"))?;
+            for (i, line) in wrapped.iter().enumerate() {
+                if i > 0 {
+                    queue!(writer, Print("\r\n"))?;
+                }
+                write_history_line(writer, line, wrap_width)?;
             }
-            write_history_line(writer, line, wrap_width)?;
         }
-
-        queue!(writer, Print("\x1b[r"))?; // Reset scroll region
     }
 
     Write::flush(writer)?;
