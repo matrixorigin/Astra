@@ -429,7 +429,7 @@ When auto-invoked by [`AutoInvokeGate`](../../rust/crates/astra-skills/src/auto_
 ````markdown
 ```skill-diagnosis
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "skill": "optimize_prompt",
   "cause": "budget_pressure",
   "headline": "system prompt at 87% pressure — tool schemas dominate",
@@ -437,17 +437,29 @@ When auto-invoked by [`AutoInvokeGate`](../../rust/crates/astra-skills/src/auto_
     "12K tokens of tool schemas, ~30% are never called in this scenario",
     "reasoning_content persists across 5 turns without pruning"
   ],
-  "recommended_action": "trim tool list to top-8 by recent use; drop stale reasoning_content"
+  "recommended_action": "trim tool list to top-8 by recent use; drop stale reasoning_content",
+  "success_criteria": [
+    {
+      "metric": "budget_pressure",
+      "operator": "lte",
+      "threshold": 0.85,
+      "window_turns": 3,
+      "description": "budget pressure returns below the auto-invoke threshold"
+    }
+  ],
+  "source": "real_skill"
 }
 ```
 ````
 
 **Contract (enforced by `SkillDiagnosis::parse_from_skill_output`):**
 
-- `schema_version` must be `1`.
-- `cause` must be one of `consecutive_stalls` | `budget_pressure` | `repeated_corrections`.
+- `schema_version` must be `2`.
+- `cause` must be one of `session_stalls` | `budget_pressure` | `repeated_corrections`.
 - `skill` should match `optimize_prompt`.
 - `headline` ≤160 chars; `findings` ≤5 × ≤160 chars; `recommended_action` optional ≤160 chars.
+- `success_criteria` is required and non-empty; use known metric/operator tags with finite thresholds and positive windows.
+- `source` must be `real_skill` for actual skill output.
 - Last block wins if multiple are present.
 
 Keep the human-readable optimization report above the block for the interactive user.

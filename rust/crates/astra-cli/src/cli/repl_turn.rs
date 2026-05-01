@@ -862,6 +862,29 @@ async fn run_chat_turn(
             .await
         {
             Ok(rows) => {
+                if let Some(session_id) = state.session_id.as_deref() {
+                    for lesson in &rows {
+                        if let Err(e) = svc
+                            .record_exposure(astra_services::LessonExposure {
+                                lesson_id: lesson.id.clone(),
+                                session_id: session_id.to_string(),
+                                user_id: user_id.clone(),
+                                persona: "generic".to_string(),
+                                workload_tag: lesson.workload_tag.clone(),
+                                adopted: false,
+                            })
+                            .await
+                        {
+                            tracing::warn!(
+                                target: "repl_turn",
+                                lesson_id = %lesson.id,
+                                session_id = session_id,
+                                error = %e,
+                                "agent_lessons::record_exposure failed; continuing bootstrap",
+                            );
+                        }
+                    }
+                }
                 state.session_lessons = rows
                     .iter()
                     .map(astra_runtime::self_model::LessonHint::from_lesson)
@@ -992,7 +1015,9 @@ async fn maybe_run_auto_invoke(state: &mut ReplState) {
     // Lazy-create the handler on first use.
     if state.auto_invoke_handler.is_none() {
         let exec: std::sync::Arc<dyn astra_runtime::auto_invoke_handler::SkillExecutor> =
-            std::sync::Arc::new(astra_runtime::auto_invoke_handler::LoggingSkillExecutor);
+            std::sync::Arc::new(
+                astra_runtime::auto_invoke_handler::SyntheticSkillDiagnosisExecutor,
+            );
         state.auto_invoke_handler = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
             astra_runtime::auto_invoke_handler::AutoInvokeHandler::new(exec),
         )));
@@ -6156,7 +6181,7 @@ mod tests {
     #[tokio::test]
     async fn auto_invoke_populates_latest_diagnosis_on_stall_signal() {
         // Set up an ObservabilitySession with 3 stalls so the gate fires
-        // analyze_session. The LoggingSkillExecutor produces a valid
+        // analyze_session. The SyntheticSkillDiagnosisExecutor produces a valid
         // diagnosis block. The run must stash it into
         // state.latest_skill_diagnosis for the next turn.
         let mut state = ReplState::default();
@@ -6180,7 +6205,7 @@ mod tests {
             .as_ref()
             .expect("3 stalls must produce a diagnosis");
         assert_eq!(diag.skill, "analyze_session");
-        assert_eq!(diag.cause, "consecutive_stalls");
+        assert_eq!(diag.cause, "session_stalls");
         // Handler must be cached for reuse next turn (cooldowns persist).
         assert!(state.auto_invoke_handler.is_some());
     }

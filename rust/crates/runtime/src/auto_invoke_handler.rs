@@ -24,7 +24,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use astra_skills::auto_invoke::{
-    AutoInvokeGate, AutoInvokeRequest, SessionSignals, SkillDiagnosis,
+    AutoInvokeGate, AutoInvokeRequest, DiagnosisCriterion, DiagnosisMetric, DiagnosisOperator,
+    SessionSignals, SkillDiagnosis, SKILL_DIAGNOSIS_SCHEMA_VERSION,
 };
 use async_trait::async_trait;
 
@@ -97,7 +98,7 @@ impl AutoInvokeHandler {
     }
 }
 
-/// Stub [`SkillExecutor`] that returns a canned `skill-diagnosis` block
+/// Synthetic [`SkillExecutor`] that returns a canned `skill-diagnosis` block
 /// for every request without invoking an LLM. Useful as a default in
 /// session bootstrap so the auto-invoke loop exercises end-to-end (gate
 /// → executor → diagnosis parse → prompt injection) even before a real
@@ -106,25 +107,39 @@ impl AutoInvokeHandler {
 /// The generated headline + findings are deterministic functions of the
 /// trigger cause, so operators get a useful "system noticed you stalled
 /// N times" hint in the prompt without waiting for a cloud round-trip.
-/// When a real skill runner lands, callers swap this out for it.
-pub struct LoggingSkillExecutor;
+/// Real skill runners should be preferred in production; this executor marks
+/// every diagnosis as `synthetic_fallback` so downstream prompts and outcome
+/// tracking know it was advisory canned telemetry.
+pub struct SyntheticSkillDiagnosisExecutor;
 
 #[async_trait]
-impl SkillExecutor for LoggingSkillExecutor {
+impl SkillExecutor for SyntheticSkillDiagnosisExecutor {
     async fn run(&self, req: &AutoInvokeRequest) -> Option<String> {
         use astra_skills::auto_invoke::AutoInvokeCause;
-        let (headline, finding) = match &req.cause {
-            AutoInvokeCause::ConsecutiveStalls { count } => (
+        let (headline, finding, metric, operator, threshold, description) = match &req.cause {
+            AutoInvokeCause::SessionStalls { count } => (
                 format!("agent stalled {count} times this session"),
-                format!("pipeline detected {count} consecutive stall events"),
+                format!("pipeline detected {count} session stall events"),
+                "session_stalls_delta",
+                "lte",
+                "0.0",
+                "session stalls stop increasing after this hint",
             ),
             AutoInvokeCause::BudgetPressure { level } => (
                 format!("budget pressure at {:.0}%", level * 100.0),
                 format!("context budget utilisation is {:.2}", level),
+                "budget_pressure",
+                "lte",
+                "0.85",
+                "budget pressure returns below the auto-invoke threshold",
             ),
             AutoInvokeCause::RepeatedCorrections { count } => (
                 format!("user issued {count} corrections this session"),
                 format!("{count} distinct corrections recorded"),
+                "corrections_delta",
+                "lte",
+                "0.0",
+                "new user corrections stop increasing",
             ),
         };
         let cause_tag = req.cause.as_str();
@@ -133,18 +148,141 @@ impl SkillExecutor for LoggingSkillExecutor {
         Some(format!(
             "```skill-diagnosis\n\
              {{\n  \
-             \"schema_version\": 1,\n  \
-             \"skill\": {skill},\n  \
-             \"cause\": \"{cause_tag}\",\n  \
-             \"headline\": {headline},\n  \
-             \"findings\": [{finding}],\n  \
-             \"recommended_action\": \"review the corresponding skill output for deeper analysis\"\n\
-             }}\n\
-             ```\n",
+             \"schema_version\": {schema_version},\n  \
+              \"skill\": {skill},\n  \
+              \"cause\": \"{cause_tag}\",\n  \
+              \"headline\": {headline},\n  \
+              \"findings\": [{finding}],\n  \
+             \"recommended_action\": \"review the corresponding skill output for deeper analysis\",\n  \
+             \"success_criteria\": [{{\n    \
+             \"metric\": \"{metric}\",\n    \
+             \"operator\": \"{operator}\",\n    \
+             \"threshold\": {threshold},\n    \
+             \"window_turns\": 3,\n    \
+             \"description\": {description}\n  \
+             }}],\n  \
+             \"source\": \"synthetic_fallback\"\n\
+              }}\n\
+              ```\n",
+            schema_version = SKILL_DIAGNOSIS_SCHEMA_VERSION,
             skill = serde_json::Value::String(req.skill.to_string()),
             headline = serde_json::Value::String(headline),
             finding = serde_json::Value::String(finding),
+            description = serde_json::Value::String(description.to_string()),
         ))
+    }
+}
+
+/// Evaluation status for a previously injected diagnosis criterion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosisCriterionStatus {
+    Pending,
+    Satisfied,
+    Failed,
+}
+
+/// Outcome of evaluating an active diagnosis after a turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosisOutcome {
+    pub skill: String,
+    pub cause: String,
+    pub statuses: Vec<DiagnosisCriterionStatus>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveDiagnosis {
+    diagnosis: SkillDiagnosis,
+    baseline: SessionSignals,
+    injected_turn: u32,
+}
+
+/// Pure per-session tracker for machine-checkable diagnosis postconditions.
+#[derive(Debug, Default, Clone)]
+pub struct DiagnosisOutcomeTracker {
+    active: Vec<ActiveDiagnosis>,
+}
+
+impl DiagnosisOutcomeTracker {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn activate(&mut self, diagnosis: SkillDiagnosis, baseline: SessionSignals, turn: u32) {
+        self.active.push(ActiveDiagnosis {
+            diagnosis,
+            baseline,
+            injected_turn: turn,
+        });
+    }
+
+    pub fn evaluate_turn(&mut self, signals: &SessionSignals, turn: u32) -> Vec<DiagnosisOutcome> {
+        let mut outcomes = Vec::new();
+        self.active.retain(|active| {
+            let elapsed = turn.saturating_sub(active.injected_turn);
+            let statuses: Vec<_> = active
+                .diagnosis
+                .success_criteria
+                .iter()
+                .map(|c| evaluate_criterion(c, &active.baseline, signals, elapsed))
+                .collect();
+            let complete = statuses
+                .iter()
+                .all(|s| *s != DiagnosisCriterionStatus::Pending);
+            if complete {
+                outcomes.push(DiagnosisOutcome {
+                    skill: active.diagnosis.skill.clone(),
+                    cause: active.diagnosis.cause.clone(),
+                    statuses,
+                    complete,
+                });
+                false
+            } else {
+                true
+            }
+        });
+        outcomes
+    }
+}
+
+fn evaluate_criterion(
+    c: &DiagnosisCriterion,
+    baseline: &SessionSignals,
+    current: &SessionSignals,
+    elapsed_turns: u32,
+) -> DiagnosisCriterionStatus {
+    let observed = match c.metric {
+        DiagnosisMetric::SessionStallsDelta => {
+            f64::from(current.session_stalls.saturating_sub(baseline.session_stalls))
+        }
+        DiagnosisMetric::BudgetPressure => current.budget_pressure,
+        DiagnosisMetric::ToolCallCount => return DiagnosisCriterionStatus::Pending,
+        DiagnosisMetric::CorrectionsDelta => f64::from(
+            current
+                .recent_corrections
+                .saturating_sub(baseline.recent_corrections),
+        ),
+        DiagnosisMetric::UnmetPostconditionsDelta => return DiagnosisCriterionStatus::Pending,
+    };
+
+    if compare(observed, c.operator, c.threshold) {
+        return DiagnosisCriterionStatus::Satisfied;
+    }
+    if elapsed_turns >= c.window_turns {
+        DiagnosisCriterionStatus::Failed
+    } else {
+        DiagnosisCriterionStatus::Pending
+    }
+}
+
+fn compare(lhs: f64, op: DiagnosisOperator, rhs: f64) -> bool {
+    match op {
+        DiagnosisOperator::Lt => lhs < rhs,
+        DiagnosisOperator::Lte => lhs <= rhs,
+        DiagnosisOperator::Eq => (lhs - rhs).abs() < f64::EPSILON,
+        DiagnosisOperator::Gte => lhs >= rhs,
+        DiagnosisOperator::Gt => lhs > rhs,
     }
 }
 
@@ -158,7 +296,7 @@ impl SkillExecutor for LoggingSkillExecutor {
 /// ```
 ///
 /// Mapping:
-/// - `consecutive_stalls` → `obs.stall_event_count`. This is cumulative,
+/// - `session_stalls` → `obs.stall_event_count`. This is cumulative,
 ///   not literally "consecutive" — but the per-cause cooldown in
 ///   `AutoInvokeGate` ensures the stall skill fires at most once per
 ///   60-second window regardless, so treating the cumulative count as
@@ -190,7 +328,7 @@ pub fn compute_session_signals(
     let recent_corrections = u32::try_from(session.user_corrections.len()).unwrap_or(u32::MAX);
 
     SessionSignals {
-        consecutive_stalls: session.stall_event_count,
+        session_stalls: session.stall_event_count,
         budget_pressure,
         recent_corrections,
         corrections_window: 10,
@@ -200,7 +338,9 @@ pub fn compute_session_signals(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_skills::auto_invoke::{AutoInvokeCause, SKILL_DIAGNOSIS_SCHEMA_VERSION};
+    use astra_skills::auto_invoke::{
+        AutoInvokeCause, DiagnosisSource, SKILL_DIAGNOSIS_SCHEMA_VERSION,
+    };
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -208,7 +348,7 @@ mod tests {
 
     fn signals(stalls: u32, pressure: f64, corrections: u32) -> SessionSignals {
         SessionSignals {
-            consecutive_stalls: stalls,
+            session_stalls: stalls,
             budget_pressure: pressure,
             recent_corrections: corrections,
             corrections_window: 10,
@@ -216,11 +356,18 @@ mod tests {
     }
 
     fn well_formed_reply(skill: &str, cause: &str, headline: &str) -> String {
+        let (metric, threshold) = match cause {
+            "budget_pressure" => ("budget_pressure", "0.85"),
+            "repeated_corrections" => ("corrections_delta", "0.0"),
+            _ => ("session_stalls_delta", "0.0"),
+        };
         format!(
             "# Analysis\n\nSome prose.\n\n```skill-diagnosis\n{{\n  \
-             \"schema_version\": 1,\n  \"skill\": \"{skill}\",\n  \
+             \"schema_version\": 2,\n  \"skill\": \"{skill}\",\n  \
              \"cause\": \"{cause}\",\n  \"headline\": \"{headline}\",\n  \
-             \"findings\": [],\n  \"recommended_action\": \"try rg\"\n}}\n```\n",
+             \"findings\": [],\n  \"recommended_action\": \"try rg\",\n  \
+             \"success_criteria\": [{{\"metric\":\"{metric}\",\"operator\":\"lte\",\"threshold\":{threshold},\"window_turns\":3,\"description\":\"criterion\"}}],\n  \
+             \"source\": \"real_skill\"\n}}\n```\n",
         )
     }
 
@@ -278,7 +425,7 @@ mod tests {
             "analyze_session",
             Some(well_formed_reply(
                 "analyze_session",
-                "consecutive_stalls",
+                "session_stalls",
                 "agent looped on grep",
             )),
         ));
@@ -287,7 +434,7 @@ mod tests {
         let out = h.maybe_fire(&signals(3, 0.1, 0), Instant::now()).await;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].skill, "analyze_session");
-        assert_eq!(out[0].cause, "consecutive_stalls");
+        assert_eq!(out[0].cause, "session_stalls");
         assert_eq!(out[0].schema_version, SKILL_DIAGNOSIS_SCHEMA_VERSION);
         assert_eq!(out[0].headline, "agent looped on grep");
 
@@ -296,7 +443,7 @@ mod tests {
         assert_eq!(calls[0].skill, "analyze_session");
         assert!(matches!(
             calls[0].cause,
-            AutoInvokeCause::ConsecutiveStalls { count: 3 }
+            AutoInvokeCause::SessionStalls { count: 3 }
         ));
     }
 
@@ -308,7 +455,7 @@ mod tests {
                     "analyze_session",
                     Some(well_formed_reply(
                         "analyze_session",
-                        "consecutive_stalls",
+                        "session_stalls",
                         "stalls found",
                     )),
                 )
@@ -379,7 +526,7 @@ mod tests {
             "analyze_session",
             Some(well_formed_reply(
                 "analyze_session",
-                "consecutive_stalls",
+                "session_stalls",
                 "h",
             )),
         ));
@@ -446,7 +593,7 @@ mod tests {
         obs.record_stall_event();
 
         let s = compute_session_signals(Some(&obs));
-        assert_eq!(s.consecutive_stalls, 3);
+        assert_eq!(s.session_stalls, 3);
     }
 
     #[test]
@@ -468,20 +615,20 @@ mod tests {
         assert_eq!(s.budget_pressure, 0.0);
     }
 
-    // ── LoggingSkillExecutor ────────────────────────────────────────────────
+    // ── SyntheticSkillDiagnosisExecutor ────────────────────────────────────
 
     #[tokio::test]
-    async fn logging_executor_emits_parseable_diagnosis_for_each_cause() {
+    async fn synthetic_executor_emits_parseable_diagnosis_for_each_cause() {
         // Every cause must round-trip: the stub's reply must parse back
         // into a SkillDiagnosis whose schema_version, skill, and cause
         // match the request. Otherwise the loop emits noise the prompt
         // renderer can't use.
-        let exec = LoggingSkillExecutor;
+        let exec = SyntheticSkillDiagnosisExecutor;
         let cases = [
             (
                 "analyze_session",
-                AutoInvokeCause::ConsecutiveStalls { count: 4 },
-                "consecutive_stalls",
+                AutoInvokeCause::SessionStalls { count: 4 },
+                "session_stalls",
             ),
             (
                 "optimize_prompt",
@@ -506,22 +653,24 @@ mod tests {
             assert_eq!(diag.schema_version, SKILL_DIAGNOSIS_SCHEMA_VERSION);
             assert_eq!(diag.skill, skill);
             assert_eq!(diag.cause, tag);
+            assert_eq!(diag.source, DiagnosisSource::SyntheticFallback);
+            assert!(!diag.success_criteria.is_empty());
             assert!(!diag.headline.is_empty());
             assert!(!diag.findings.is_empty());
         }
     }
 
     #[tokio::test]
-    async fn logging_executor_headline_mentions_magnitude() {
+    async fn synthetic_executor_headline_mentions_magnitude() {
         // Operators rely on the headline to see the scale of the signal.
         // Pin the contract so a future refactor doesn't silently strip
         // the count / pressure number from the prompt.
-        let exec = LoggingSkillExecutor;
+        let exec = SyntheticSkillDiagnosisExecutor;
         let stall = exec
             .run(&AutoInvokeRequest {
                 skill: "analyze_session",
                 focus: "stalls",
-                cause: AutoInvokeCause::ConsecutiveStalls { count: 7 },
+                cause: AutoInvokeCause::SessionStalls { count: 7 },
             })
             .await
             .and_then(|r| SkillDiagnosis::parse_from_skill_output(&r))
@@ -545,15 +694,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logging_executor_wired_into_handler_closes_the_loop() {
-        // End-to-end: plug LoggingSkillExecutor into AutoInvokeHandler
+    async fn synthetic_executor_wired_into_handler_closes_the_loop() {
+        // End-to-end: plug SyntheticSkillDiagnosisExecutor into AutoInvokeHandler
         // and confirm the gate → executor → parse → return pipeline
         // actually produces valid diagnoses from real signals.
-        let exec: Arc<dyn SkillExecutor> = Arc::new(LoggingSkillExecutor);
+        let exec: Arc<dyn SkillExecutor> = Arc::new(SyntheticSkillDiagnosisExecutor);
         let mut handler = AutoInvokeHandler::new(exec);
 
         let mut signals = SessionSignals::default();
-        signals.consecutive_stalls = 3;
+        signals.session_stalls = 3;
         signals.recent_corrections = 3;
 
         let out = handler.maybe_fire(&signals, Instant::now()).await;
@@ -563,8 +712,63 @@ mod tests {
         assert!(skills.contains("evaluate_session"));
         for diag in &out {
             assert_eq!(diag.schema_version, SKILL_DIAGNOSIS_SCHEMA_VERSION);
+            assert_eq!(diag.source, DiagnosisSource::SyntheticFallback);
             assert!(!diag.headline.is_empty());
         }
+    }
+
+    #[test]
+    fn diagnosis_outcome_tracker_succeeds_when_budget_pressure_drops() {
+        let cause = AutoInvokeCause::BudgetPressure { level: 0.95 };
+        let diag = SkillDiagnosis::new_with_criteria(
+            "optimize_prompt",
+            &cause,
+            "budget high",
+            [],
+            [DiagnosisCriterion {
+                metric: DiagnosisMetric::BudgetPressure,
+                operator: DiagnosisOperator::Lte,
+                threshold: 0.85,
+                window_turns: 3,
+                description: "pressure below threshold".into(),
+            }],
+            Some("trim prompt".into()),
+            DiagnosisSource::RealSkill,
+        );
+        let mut tracker = DiagnosisOutcomeTracker::new();
+        tracker.activate(diag, signals(0, 0.95, 0), 10);
+        let outcomes = tracker.evaluate_turn(&signals(0, 0.80, 0), 11);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].statuses,
+            vec![DiagnosisCriterionStatus::Satisfied]
+        );
+    }
+
+    #[test]
+    fn diagnosis_outcome_tracker_fails_when_window_expires() {
+        let cause = AutoInvokeCause::SessionStalls { count: 3 };
+        let diag = SkillDiagnosis::new_with_criteria(
+            "analyze_session",
+            &cause,
+            "stalls",
+            [],
+            [DiagnosisCriterion {
+                metric: DiagnosisMetric::SessionStallsDelta,
+                operator: DiagnosisOperator::Lte,
+                threshold: 0.0,
+                window_turns: 2,
+                description: "no more stalls".into(),
+            }],
+            None,
+            DiagnosisSource::RealSkill,
+        );
+        let mut tracker = DiagnosisOutcomeTracker::new();
+        tracker.activate(diag, signals(3, 0.1, 0), 1);
+        assert!(tracker.evaluate_turn(&signals(4, 0.1, 0), 2).is_empty());
+        let outcomes = tracker.evaluate_turn(&signals(4, 0.1, 0), 3);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].statuses, vec![DiagnosisCriterionStatus::Failed]);
     }
 
     #[tokio::test]
@@ -581,7 +785,7 @@ mod tests {
         obs.user_corrections = vec![1, 2, 3];
 
         let signals = compute_session_signals(Some(&obs));
-        assert!(signals.consecutive_stalls >= 3);
+        assert!(signals.session_stalls >= 3);
         assert!(signals.recent_corrections >= 3);
 
         let exec = Arc::new(
@@ -590,7 +794,7 @@ mod tests {
                     "analyze_session",
                     Some(well_formed_reply(
                         "analyze_session",
-                        "consecutive_stalls",
+                        "session_stalls",
                         "stalls",
                     )),
                 )

@@ -17,7 +17,7 @@
 //!
 //! ## Thresholds
 //!
-//! * **≥3 consecutive stalls** → invoke `analyze_session` (cooldown 60s)
+//! * **≥3 session stalls** → invoke `analyze_session` (cooldown 60s)
 //! * **budget pressure > 0.85** → invoke `optimize_prompt` (cooldown 120s)
 //! * **≥3 user corrections in the trailing window** → invoke
 //!   `evaluate_session --focus corrections` (cooldown 180s)
@@ -26,6 +26,7 @@
 //! through every diagnostic in one turn.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 // ── Request shape ────────────────────────────────────────────────────────────
@@ -34,8 +35,8 @@ use std::time::{Duration, Instant};
 /// the triggering context.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AutoInvokeCause {
-    /// `count` consecutive stalls observed.
-    ConsecutiveStalls { count: u32 },
+    /// `count` stall events observed in this session.
+    SessionStalls { count: u32 },
     /// Budget pressure (0.0-1.0) exceeded the threshold.
     BudgetPressure { level: f64 },
     /// `count` user corrections in the trailing window.
@@ -47,7 +48,7 @@ impl AutoInvokeCause {
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::ConsecutiveStalls { .. } => "consecutive_stalls",
+            Self::SessionStalls { .. } => "session_stalls",
             Self::BudgetPressure { .. } => "budget_pressure",
             Self::RepeatedCorrections { .. } => "repeated_corrections",
         }
@@ -73,8 +74,8 @@ pub struct AutoInvokeRequest {
 /// corrections) — this struct is just the minimal view the gate needs.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SessionSignals {
-    /// Number of stalls seen since the last non-stall turn.
-    pub consecutive_stalls: u32,
+    /// Number of stall events seen in this session.
+    pub session_stalls: u32,
     /// Current budget pressure, `0.0..=1.0`.
     pub budget_pressure: f64,
     /// Count of user corrections in the trailing `corrections_window` turns.
@@ -86,7 +87,7 @@ pub struct SessionSignals {
 
 // ── Thresholds & cooldowns (constants — intentionally not configurable yet) ─
 
-/// Minimum consecutive stalls to fire `analyze_session`.
+/// Minimum session stalls to fire `analyze_session`.
 pub const STALL_TRIGGER_COUNT: u32 = 3;
 /// Minimum budget pressure (`0.0..=1.0`) to fire `optimize_prompt`.
 pub const PRESSURE_TRIGGER_LEVEL: f64 = 0.85;
@@ -123,14 +124,14 @@ impl AutoInvokeGate {
     pub fn evaluate(&mut self, signals: &SessionSignals, now: Instant) -> Vec<AutoInvokeRequest> {
         let mut out = Vec::new();
 
-        if signals.consecutive_stalls >= STALL_TRIGGER_COUNT
+        if signals.session_stalls >= STALL_TRIGGER_COUNT
             && Self::cooldown_elapsed(self.last_stall_fire, now, STALL_COOLDOWN)
         {
             out.push(AutoInvokeRequest {
                 skill: "analyze_session",
                 focus: "stalls",
-                cause: AutoInvokeCause::ConsecutiveStalls {
-                    count: signals.consecutive_stalls,
+                cause: AutoInvokeCause::SessionStalls {
+                    count: signals.session_stalls,
                 },
             });
             self.last_stall_fire = Some(now);
@@ -177,7 +178,48 @@ impl AutoInvokeGate {
 
 /// Current schema version for [`SkillDiagnosis`]. Bump when fields are
 /// renamed / removed so downstream LLM prompts can gate behaviour on it.
-pub const SKILL_DIAGNOSIS_SCHEMA_VERSION: u32 = 1;
+pub const SKILL_DIAGNOSIS_SCHEMA_VERSION: u32 = 2;
+
+/// Machine-checkable telemetry metric a diagnosis expects to improve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosisMetric {
+    SessionStallsDelta,
+    BudgetPressure,
+    ToolCallCount,
+    CorrectionsDelta,
+    UnmetPostconditionsDelta,
+}
+
+/// Comparison operator used by a [`DiagnosisCriterion`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosisOperator {
+    Lt,
+    Lte,
+    Eq,
+    Gte,
+    Gt,
+}
+
+/// Provenance of a diagnosis. Synthetic fallback must be explicit so prompt
+/// users do not mistake a canned runtime hint for real skill execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosisSource {
+    RealSkill,
+    SyntheticFallback,
+}
+
+/// A bounded criterion the runtime can evaluate in later turns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiagnosisCriterion {
+    pub metric: DiagnosisMetric,
+    pub operator: DiagnosisOperator,
+    pub threshold: f64,
+    pub window_turns: u32,
+    pub description: String,
+}
 
 /// Output of an auto-invoked diagnostic skill, shaped for consumption by
 /// [`SelfModel`]'s prompt renderer.
@@ -189,7 +231,7 @@ pub const SKILL_DIAGNOSIS_SCHEMA_VERSION: u32 = 1;
 /// pre-summarising into short bullets (≤160 chars each) and returning at
 /// most [`MAX_FINDINGS`] entries. The gate / caller enforces these caps
 /// via [`SkillDiagnosis::new`], which truncates overflow.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkillDiagnosis {
     /// Schema version. Always [`SKILL_DIAGNOSIS_SCHEMA_VERSION`] for
     /// newly-minted diagnoses; older values are preserved on deserialization
@@ -206,6 +248,10 @@ pub struct SkillDiagnosis {
     pub findings: Vec<String>,
     /// Optional recommended next action from the skill.
     pub recommended_action: Option<String>,
+    /// Machine-checkable success criteria evaluated after injection.
+    pub success_criteria: Vec<DiagnosisCriterion>,
+    /// Whether this came from a real skill run or a synthetic fallback.
+    pub source: DiagnosisSource,
 }
 
 /// Max chars kept for `SkillDiagnosis::headline`.
@@ -214,6 +260,10 @@ pub const MAX_HEADLINE_LEN: usize = 160;
 pub const MAX_FINDING_LEN: usize = 160;
 /// Max number of `SkillDiagnosis::findings` entries.
 pub const MAX_FINDINGS: usize = 5;
+/// Max number of postconditions retained per diagnosis.
+pub const MAX_SUCCESS_CRITERIA: usize = 5;
+/// Max chars kept per criterion description.
+pub const MAX_CRITERION_DESCRIPTION_LEN: usize = 160;
 
 impl SkillDiagnosis {
     /// Construct a diagnosis, truncating overflowing fields to the caps
@@ -227,6 +277,44 @@ impl SkillDiagnosis {
         findings: impl IntoIterator<Item = String>,
         recommended_action: Option<String>,
     ) -> Self {
+        Self::new_with_criteria(
+            skill,
+            cause,
+            headline,
+            findings,
+            [default_criterion_for_cause(cause)],
+            recommended_action,
+            DiagnosisSource::RealSkill,
+        )
+    }
+
+    /// Construct a diagnosis with explicit postconditions and source.
+    #[must_use]
+    pub fn new_with_criteria(
+        skill: impl Into<String>,
+        cause: &AutoInvokeCause,
+        headline: impl Into<String>,
+        findings: impl IntoIterator<Item = String>,
+        success_criteria: impl IntoIterator<Item = DiagnosisCriterion>,
+        recommended_action: Option<String>,
+        source: DiagnosisSource,
+    ) -> Self {
+        let mut seen = HashSet::new();
+        let success_criteria = success_criteria
+            .into_iter()
+            .filter_map(|mut c| {
+                if !criterion_is_valid(&c) {
+                    return None;
+                }
+                let key = criterion_key(&c);
+                if !seen.insert(key) {
+                    return None;
+                }
+                c.description = truncate_chars(c.description, MAX_CRITERION_DESCRIPTION_LEN);
+                Some(c)
+            })
+            .take(MAX_SUCCESS_CRITERIA)
+            .collect();
         Self {
             schema_version: SKILL_DIAGNOSIS_SCHEMA_VERSION,
             skill: skill.into(),
@@ -238,6 +326,8 @@ impl SkillDiagnosis {
                 .take(MAX_FINDINGS)
                 .collect(),
             recommended_action: recommended_action.map(|a| truncate_chars(a, MAX_FINDING_LEN)),
+            success_criteria,
+            source,
         }
     }
 
@@ -259,6 +349,18 @@ impl SkillDiagnosis {
         if let Some(ref action) = self.recommended_action {
             let _ = writeln!(s, "  → {action}");
         }
+        for criterion in &self.success_criteria {
+            let _ = writeln!(
+                s,
+                "  ✓ {:?} {:?} {} within {} turns — {}",
+                criterion.metric,
+                criterion.operator,
+                criterion.threshold,
+                criterion.window_turns,
+                criterion.description
+            );
+        }
+        let _ = writeln!(s, "  source: {:?}", self.source);
         s
     }
 
@@ -274,7 +376,8 @@ impl SkillDiagnosis {
     ///   * missing block
     ///   * malformed JSON
     ///   * `schema_version` other than [`SKILL_DIAGNOSIS_SCHEMA_VERSION`]
-    ///   * missing required fields (`skill`, `cause`, `headline`)
+    ///   * missing required fields (`skill`, `cause`, `headline`,
+    ///     `success_criteria`, `source`)
     ///   * unknown `cause` tag (must match `AutoInvokeCause::as_str`)
     ///
     /// Oversized fields are truncated by running the parsed payload
@@ -305,16 +408,62 @@ impl SkillDiagnosis {
             .get("recommended_action")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        let criteria_value = value.get("success_criteria")?.clone();
+        let criteria_raw: Vec<DiagnosisCriterion> = serde_json::from_value(criteria_value).ok()?;
+        if criteria_raw.is_empty() {
+            return None;
+        }
+        if criteria_raw.iter().any(|c| !criterion_is_valid(c)) {
+            return None;
+        }
+        let mut seen = HashSet::new();
+        if criteria_raw.iter().any(|c| !seen.insert(criterion_key(c))) {
+            return None;
+        }
+        let source_value = value.get("source")?.clone();
+        let source: DiagnosisSource = serde_json::from_value(source_value).ok()?;
 
         // Run through `new` so caps are enforced even when the skill emits
         // oversized payloads.
-        Some(Self::new(
+        let diag = Self::new_with_criteria(
             skill,
             &cause,
             headline,
             findings,
+            criteria_raw,
             recommended_action,
-        ))
+            source,
+        );
+        if diag.success_criteria.is_empty() {
+            return None;
+        }
+        Some(diag)
+    }
+}
+
+fn default_criterion_for_cause(cause: &AutoInvokeCause) -> DiagnosisCriterion {
+    match cause {
+        AutoInvokeCause::SessionStalls { .. } => DiagnosisCriterion {
+            metric: DiagnosisMetric::SessionStallsDelta,
+            operator: DiagnosisOperator::Lte,
+            threshold: 0.0,
+            window_turns: 3,
+            description: "stall count does not increase after applying the diagnosis".into(),
+        },
+        AutoInvokeCause::BudgetPressure { .. } => DiagnosisCriterion {
+            metric: DiagnosisMetric::BudgetPressure,
+            operator: DiagnosisOperator::Lte,
+            threshold: PRESSURE_TRIGGER_LEVEL,
+            window_turns: 3,
+            description: "budget pressure drops below the auto-invoke threshold".into(),
+        },
+        AutoInvokeCause::RepeatedCorrections { .. } => DiagnosisCriterion {
+            metric: DiagnosisMetric::CorrectionsDelta,
+            operator: DiagnosisOperator::Lte,
+            threshold: 0.0,
+            window_turns: 3,
+            description: "new user corrections stop increasing".into(),
+        },
     }
 }
 
@@ -324,11 +473,22 @@ impl SkillDiagnosis {
 /// rebuild with zero/0.0 and accept any three known tags.
 fn parse_cause_tag(tag: &str) -> Option<AutoInvokeCause> {
     match tag {
-        "consecutive_stalls" => Some(AutoInvokeCause::ConsecutiveStalls { count: 0 }),
+        "session_stalls" => Some(AutoInvokeCause::SessionStalls { count: 0 }),
         "budget_pressure" => Some(AutoInvokeCause::BudgetPressure { level: 0.0 }),
         "repeated_corrections" => Some(AutoInvokeCause::RepeatedCorrections { count: 0 }),
         _ => None,
     }
+}
+
+fn criterion_is_valid(c: &DiagnosisCriterion) -> bool {
+    c.threshold.is_finite() && c.window_turns > 0 && !c.description.trim().is_empty()
+}
+
+fn criterion_key(c: &DiagnosisCriterion) -> String {
+    format!(
+        "{:?}:{:?}:{:.6}:{}",
+        c.metric, c.operator, c.threshold, c.window_turns
+    )
 }
 
 /// Locate the **last** fenced code block whose info-string equals `tag` and
@@ -376,7 +536,7 @@ mod tests {
 
     fn signals(stalls: u32, pressure: f64, corrections: u32) -> SessionSignals {
         SessionSignals {
-            consecutive_stalls: stalls,
+            session_stalls: stalls,
             budget_pressure: pressure,
             recent_corrections: corrections,
             corrections_window: 10,
@@ -401,7 +561,7 @@ mod tests {
         assert_eq!(out[0].focus, "stalls");
         assert_eq!(
             out[0].cause,
-            AutoInvokeCause::ConsecutiveStalls { count: 3 }
+            AutoInvokeCause::SessionStalls { count: 3 }
         );
     }
 
@@ -496,8 +656,8 @@ mod tests {
     #[test]
     fn cause_as_str_is_stable() {
         assert_eq!(
-            AutoInvokeCause::ConsecutiveStalls { count: 3 }.as_str(),
-            "consecutive_stalls"
+            AutoInvokeCause::SessionStalls { count: 3 }.as_str(),
+            "session_stalls"
         );
         assert_eq!(
             AutoInvokeCause::BudgetPressure { level: 0.9 }.as_str(),
@@ -513,7 +673,7 @@ mod tests {
 
     #[test]
     fn diagnosis_has_schema_version_and_stable_cause_tag() {
-        let cause = AutoInvokeCause::ConsecutiveStalls { count: 4 };
+        let cause = AutoInvokeCause::SessionStalls { count: 4 };
         let diag = SkillDiagnosis::new(
             "analyze_session",
             &cause,
@@ -522,9 +682,10 @@ mod tests {
             Some("switch to rg or narrow scope".to_string()),
         );
         assert_eq!(diag.schema_version, SKILL_DIAGNOSIS_SCHEMA_VERSION);
-        assert_eq!(diag.schema_version, 1);
+        assert_eq!(diag.schema_version, 2);
         assert_eq!(diag.skill, "analyze_session");
-        assert_eq!(diag.cause, "consecutive_stalls");
+        assert_eq!(diag.cause, "session_stalls");
+        assert!(!diag.success_criteria.is_empty());
     }
 
     #[test]
@@ -564,7 +725,7 @@ mod tests {
 
     #[test]
     fn diagnosis_render_prompt_block_has_stable_shape() {
-        let cause = AutoInvokeCause::ConsecutiveStalls { count: 3 };
+        let cause = AutoInvokeCause::SessionStalls { count: 3 };
         let diag = SkillDiagnosis::new(
             "analyze_session",
             &cause,
@@ -577,7 +738,7 @@ mod tests {
         );
         let rendered = diag.render_prompt_block();
         assert!(rendered.starts_with(
-            "⚙ Auto-diagnosis [analyze_session] (cause: consecutive_stalls): stuck on grep"
+            "⚙ Auto-diagnosis [analyze_session] (cause: session_stalls): stuck on grep"
         ));
         assert!(rendered.contains("  - grep timed out on large repo"));
         assert!(rendered.contains("  - tried 3×"));

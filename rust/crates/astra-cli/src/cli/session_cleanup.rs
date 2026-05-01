@@ -39,12 +39,6 @@ pub(super) async fn finalize_session(state: &ReplState) {
             astra_services::session_workspace::finalize_workspace_on_end(sid);
         }
     }
-    // 2b. End observability session and collect summary
-    if let (Some(hub), Some(session_id)) = (&state.observability_hub, &state.session_id) {
-        // End the session silently — summary is collected but not displayed
-        // (could be exposed via /telemetry command in future)
-        let _ = hub.end_session(session_id);
-    }
     // 3. Session-end knowledge extraction (opt-in, async with timeout)
     let knowledge_handle = session_end_extract_learnings(&state.history);
     // 3b. Trigger Memoria governance + consolidation (best-effort with timeout)
@@ -76,14 +70,50 @@ pub(super) async fn finalize_session(state: &ReplState) {
                 None,
             ),
         };
+        let tool_failures: u32 = summary.tool_failures.values().copied().sum();
         // Run inline — it's a handful of SQL upserts, bounded by the
         // number of distilled lessons (≤ ~5 in practice). We deliberately
         // await rather than fire-and-forget so the ingestion shutdown in
         // step 4 doesn't race with the lesson writes.
         let _ = astra_runtime::lesson_extractor::persist_session_lessons(
-            svc, &summary, user_id, "generic", None,
+            svc.clone(), &summary, user_id, "generic", None,
         )
         .await;
+        if let Some(ref session_id) = state.session_id
+            && let Err(e) = svc
+                .record_outcome(astra_services::LessonOutcome {
+                    session_id: session_id.clone(),
+                    user_id: user_id.clone(),
+                    stall_events: summary.stall_events,
+                    user_corrections: summary.user_corrections.len() as u32,
+                    tool_failures,
+                    unmet_postconditions: summary.unmet_postconditions,
+                    diagnosis_criteria_met: 0,
+                    diagnosis_criteria_failed: 0,
+                })
+                .await
+        {
+            tracing::warn!(
+                target: "session_cleanup",
+                session_id = session_id,
+                user_id = user_id,
+                error = %e,
+                "failed to record lesson exposure outcomes; continuing cleanup",
+            );
+        }
+        if let Err(e) = svc.prune(user_id, 30).await {
+            tracing::warn!(
+                target: "session_cleanup",
+                user_id = user_id,
+                error = %e,
+                "failed to prune stale agent lessons; continuing cleanup",
+            );
+        }
+    }
+    // 3d. End observability only after session-derived lessons/outcomes have
+    // been persisted so the lifecycle boundary matches the data flow.
+    if let (Some(hub), Some(session_id)) = (&state.observability_hub, &state.session_id) {
+        let _ = hub.end_session(session_id);
     }
     // 4. Graceful ingestion shutdown: await worker flush
     if let Some(mc) = state.matrix_runtime.as_ref() {

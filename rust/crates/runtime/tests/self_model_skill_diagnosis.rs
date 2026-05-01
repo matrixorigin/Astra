@@ -59,7 +59,7 @@ fn minimal_self_model() -> SelfModel {
 }
 
 fn sample_diagnosis() -> SkillDiagnosis {
-    let cause = AutoInvokeCause::ConsecutiveStalls { count: 4 };
+    let cause = AutoInvokeCause::SessionStalls { count: 4 };
     SkillDiagnosis::new(
         "analyze_session",
         &cause,
@@ -81,7 +81,7 @@ fn attached_skill_diagnosis_is_visible_on_the_struct() {
     let got = sm.skill_diagnosis.as_ref().expect("diagnosis attached");
     assert_eq!(got.schema_version, SKILL_DIAGNOSIS_SCHEMA_VERSION);
     assert_eq!(got.skill, "analyze_session");
-    assert_eq!(got.cause, "consecutive_stalls");
+    assert_eq!(got.cause, "session_stalls");
     assert_eq!(got, &diag);
 }
 
@@ -101,7 +101,7 @@ fn prompt_renders_auto_diagnosis_block() {
         "expected auto-diagnosis header in prompt, got:\n{rendered}"
     );
     assert!(
-        rendered.contains("(cause: consecutive_stalls)"),
+        rendered.contains("(cause: session_stalls)"),
         "expected cause tag in header, got:\n{rendered}"
     );
     assert!(
@@ -158,6 +158,6 @@ fn self_model_serde_roundtrip_preserves_skill_diagnosis() {
     );
     assert_eq!(
         back.skill_diagnosis.as_ref().map(|d| d.cause.clone()),
-        Some("consecutive_stalls".to_string())
+        Some("session_stalls".to_string())
     );
 }

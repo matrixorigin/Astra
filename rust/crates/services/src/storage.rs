@@ -1424,6 +1424,9 @@ pub async fn ensure_core_schema(
     query(crate::agent_lessons::AGENT_LESSONS_DDL)
         .execute(&pool)
         .await?;
+    query(crate::agent_lessons::AGENT_LESSON_EXPOSURES_DDL)
+        .execute(&pool)
+        .await?;
 
     // ─── Schema migration tracking ──────────────────────────────────────────────
 

@@ -369,27 +369,39 @@ When the skill is **auto-invoked** by the runtime's [`AutoInvokeGate`](../../rus
 ````markdown
 ```skill-diagnosis
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "skill": "analyze_session",
-  "cause": "consecutive_stalls",
+  "cause": "session_stalls",
   "headline": "agent looping on grep in src/",
   "findings": [
     "grep invoked 4× with identical args (turns 5-8)",
     "no new matches since turn 3"
   ],
-  "recommended_action": "switch to rg or narrow scope to src/"
+  "recommended_action": "switch to rg or narrow scope to src/",
+  "success_criteria": [
+    {
+      "metric": "session_stalls_delta",
+      "operator": "lte",
+      "threshold": 0.0,
+      "window_turns": 3,
+      "description": "session stalls stop increasing after the recommendation"
+    }
+  ],
+  "source": "real_skill"
 }
 ```
 ````
 
 **Contract (enforced by `SkillDiagnosis::parse_from_skill_output`):**
 
-- `schema_version` must be `1`. Unknown versions are dropped.
-- `cause` must be one of `consecutive_stalls` | `budget_pressure` | `repeated_corrections`.
+- `schema_version` must be `2`. Unknown versions are dropped.
+- `cause` must be one of `session_stalls` | `budget_pressure` | `repeated_corrections`.
 - `skill` should match `analyze_session` (the invoking skill's name).
 - `headline` is one sentence, ≤160 chars.
 - `findings` is a list of ≤5 short bullets, each ≤160 chars.
 - `recommended_action` is optional; ≤160 chars.
+- `success_criteria` is required and non-empty; each criterion must use a known metric/operator, finite numeric threshold, positive `window_turns`, and concise description.
+- `source` must be `real_skill` for actual skill output. The runtime reserves `synthetic_fallback` for canned non-LLM diagnoses.
 - Overflow is truncated silently by the parser — prefer concise output.
 - If multiple blocks appear, **the last one wins**.
 

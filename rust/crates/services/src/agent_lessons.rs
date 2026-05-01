@@ -116,6 +116,31 @@ pub struct NewLesson {
     pub confidence: Option<f64>,
 }
 
+/// A lesson was shown to a session. Exposure is separate from usefulness:
+/// loading a lesson is not counted as success until an outcome is recorded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LessonExposure {
+    pub lesson_id: String,
+    pub session_id: String,
+    pub user_id: String,
+    pub persona: String,
+    pub workload_tag: Option<String>,
+    pub adopted: bool,
+}
+
+/// Session-end outcome attached to all unresolved exposures in a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LessonOutcome {
+    pub session_id: String,
+    pub user_id: String,
+    pub stall_events: u32,
+    pub user_corrections: u32,
+    pub tool_failures: u32,
+    pub unmet_postconditions: u32,
+    pub diagnosis_criteria_met: u32,
+    pub diagnosis_criteria_failed: u32,
+}
+
 /// Default confidence score for a freshly-recorded lesson.
 pub const DEFAULT_LESSON_CONFIDENCE: f64 = 0.6;
 /// Max `trigger_signal` length, enforced by `NewLesson::validate`.
@@ -186,6 +211,19 @@ pub trait AgentLessonsService: Send + Sync {
     /// Delete rows whose `updated_at` is older than `max_age_days`. Returns
     /// the deleted row count.
     async fn prune(&self, user_id: &str, max_age_days: u32) -> Result<u64, sqlx::Error>;
+
+    /// Record that a lesson was exposed to a session. Does not imply the
+    /// lesson helped.
+    async fn record_exposure(&self, exposure: LessonExposure) -> Result<(), sqlx::Error> {
+        let _ = exposure;
+        Ok(())
+    }
+
+    /// Record session outcome for exposed lessons and update confidence.
+    async fn record_outcome(&self, outcome: LessonOutcome) -> Result<u64, sqlx::Error> {
+        let _ = outcome;
+        Ok(0)
+    }
 }
 
 // ── DB implementation ───────────────────────────────────────────────────────
@@ -242,48 +280,22 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
             .map_err(|e| sqlx::Error::Protocol(format!("NewLesson::validate: {e}")))?;
         let pool = self.get_pool().await?;
 
-        // Upsert-by-content: look for a matching row first.
-        let existing = query(
-            "SELECT id FROM agent_lessons \
-             WHERE user_id = ? AND persona = ? \
-               AND ((workload_tag IS NULL AND ? IS NULL) OR workload_tag = ?) \
-               AND kind = ? AND trigger_signal = ? AND action = ? \
-             LIMIT 1",
-        )
-        .bind(&new.user_id)
-        .bind(&new.persona)
-        .bind(&new.workload_tag)
-        .bind(&new.workload_tag)
-        .bind(new.kind.as_str())
-        .bind(&new.trigger_signal)
-        .bind(&new.action)
-        .fetch_optional(&pool)
-        .await?;
-
-        if let Some(row) = existing {
-            let id: String = row.try_get("id")?;
-            query(
-                "UPDATE agent_lessons \
-                 SET hit_count = hit_count + 1, updated_at = CURRENT_TIMESTAMP(6) \
-                 WHERE id = ?",
-            )
-            .bind(&id)
-            .execute(&pool)
-            .await?;
-            return fetch_by_id(&pool, &id).await;
-        }
-
         let id = Uuid::new_v4().to_string();
         let confidence = new.confidence.unwrap_or(DEFAULT_LESSON_CONFIDENCE);
+        let workload_key = new.workload_tag.as_deref().unwrap_or("");
         query(
             "INSERT INTO agent_lessons \
-                 (id, user_id, persona, workload_tag, kind, trigger_signal, action, confidence) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 (id, user_id, persona, workload_tag, workload_key, kind, trigger_signal, action, confidence) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON DUPLICATE KEY UPDATE \
+                 hit_count = hit_count + 1, \
+                 updated_at = CURRENT_TIMESTAMP(6)",
         )
         .bind(&id)
         .bind(&new.user_id)
         .bind(&new.persona)
         .bind(&new.workload_tag)
+        .bind(workload_key)
         .bind(new.kind.as_str())
         .bind(&new.trigger_signal)
         .bind(&new.action)
@@ -291,7 +303,7 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         .execute(&pool)
         .await?;
 
-        fetch_by_id(&pool, &id).await
+        fetch_by_content(&pool, &new).await
     }
 
     async fn load_recent(
@@ -314,8 +326,9 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
                             CAST(updated_at AS CHAR) AS updated_at \
                      FROM agent_lessons \
                      WHERE user_id = ? AND persona = ? AND workload_tag IS NULL \
-                     ORDER BY updated_at DESC \
-                     LIMIT ?",
+                       AND status = 'active' \
+                      ORDER BY confidence DESC, updated_at DESC, id ASC \
+                      LIMIT ?",
                 )
                 .bind(user_id)
                 .bind(persona)
@@ -331,12 +344,15 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
                             CAST(updated_at AS CHAR) AS updated_at \
                      FROM agent_lessons \
                      WHERE user_id = ? AND persona = ? \
-                       AND (workload_tag = ? OR workload_tag IS NULL) \
-                     ORDER BY updated_at DESC \
-                     LIMIT ?",
+                        AND (workload_tag = ? OR workload_tag IS NULL) \
+                        AND status = 'active' \
+                      ORDER BY CASE WHEN workload_tag = ? THEN 0 ELSE 1 END, \
+                               confidence DESC, updated_at DESC, id ASC \
+                      LIMIT ?",
                 )
                 .bind(user_id)
                 .bind(persona)
+                .bind(tag)
                 .bind(tag)
                 .bind(i64::from(limit))
                 .fetch_all(&pool)
@@ -366,8 +382,17 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
 
     async fn prune(&self, user_id: &str, max_age_days: u32) -> Result<u64, sqlx::Error> {
         let pool = self.get_pool().await?;
-        // Interval arithmetic via DATE_SUB — portable across MySQL/MatrixOne.
-        let res = query(
+        let retired = query(
+            "UPDATE agent_lessons \
+             SET status = 'retired', updated_at = CURRENT_TIMESTAMP(6) \
+             WHERE user_id = ? AND status = 'active' \
+               AND negative_outcome_count >= 3 \
+               AND negative_outcome_count > positive_outcome_count",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await?;
+        let stale = query(
             "DELETE FROM agent_lessons \
              WHERE user_id = ? AND updated_at < DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? DAY)",
         )
@@ -375,19 +400,124 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         .bind(i64::from(max_age_days))
         .execute(&pool)
         .await?;
-        Ok(res.rows_affected())
+        Ok(retired.rows_affected() + stale.rows_affected())
+    }
+
+    async fn record_exposure(&self, exposure: LessonExposure) -> Result<(), sqlx::Error> {
+        if exposure.lesson_id.is_empty()
+            || exposure.session_id.is_empty()
+            || exposure.user_id.is_empty()
+            || exposure.persona.is_empty()
+        {
+            return Err(sqlx::Error::Protocol(
+                "LessonExposure required fields must not be empty".into(),
+            ));
+        }
+        let pool = self.get_pool().await?;
+        query(
+            "INSERT INTO agent_lesson_exposures \
+                 (id, lesson_id, session_id, user_id, persona, workload_tag, adopted) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             ON DUPLICATE KEY UPDATE adopted = adopted OR VALUES(adopted)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&exposure.lesson_id)
+        .bind(&exposure.session_id)
+        .bind(&exposure.user_id)
+        .bind(&exposure.persona)
+        .bind(&exposure.workload_tag)
+        .bind(exposure.adopted)
+        .execute(&pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn record_outcome(&self, outcome: LessonOutcome) -> Result<u64, sqlx::Error> {
+        if outcome.session_id.is_empty() || outcome.user_id.is_empty() {
+            return Err(sqlx::Error::Protocol(
+                "LessonOutcome session_id/user_id must not be empty".into(),
+            ));
+        }
+        let pool = self.get_pool().await?;
+        let negative = outcome.stall_events
+            + outcome.user_corrections
+            + outcome.tool_failures
+            + outcome.unmet_postconditions
+            + outcome.diagnosis_criteria_failed;
+        let positive = outcome.diagnosis_criteria_met;
+        let good = positive >= negative;
+        let exposures = query(
+            "SELECT lesson_id FROM agent_lesson_exposures \
+             WHERE session_id = ? AND user_id = ? AND outcome_recorded_at IS NULL",
+        )
+        .bind(&outcome.session_id)
+        .bind(&outcome.user_id)
+        .fetch_all(&pool)
+        .await?;
+        for row in &exposures {
+            let lesson_id: String = row.try_get("lesson_id")?;
+            let (pos_inc, neg_inc) = if good { (1i64, 0i64) } else { (0i64, 1i64) };
+            query(
+                "UPDATE agent_lessons \
+                 SET positive_outcome_count = positive_outcome_count + ?, \
+                     negative_outcome_count = negative_outcome_count + ?, \
+                     confidence = LEAST(0.95, GREATEST(0.1, confidence + ?)), \
+                     status = CASE \
+                         WHEN negative_outcome_count + ? >= 3 \
+                              AND negative_outcome_count + ? > positive_outcome_count + ? \
+                         THEN 'retired' ELSE status END, \
+                     updated_at = CURRENT_TIMESTAMP(6) \
+                 WHERE id = ?",
+            )
+            .bind(pos_inc)
+            .bind(neg_inc)
+            .bind(if good { 0.05f64 } else { -0.1f64 })
+            .bind(neg_inc)
+            .bind(neg_inc)
+            .bind(pos_inc)
+            .bind(&lesson_id)
+            .execute(&pool)
+            .await?;
+        }
+        query(
+            "UPDATE agent_lesson_exposures \
+             SET outcome_recorded_at = CURRENT_TIMESTAMP(6), \
+                 stall_events = ?, user_corrections = ?, tool_failures = ?, \
+                 unmet_postconditions = ?, diagnosis_criteria_met = ?, \
+                 diagnosis_criteria_failed = ? \
+             WHERE session_id = ? AND user_id = ? AND outcome_recorded_at IS NULL",
+        )
+        .bind(i64::from(outcome.stall_events))
+        .bind(i64::from(outcome.user_corrections))
+        .bind(i64::from(outcome.tool_failures))
+        .bind(i64::from(outcome.unmet_postconditions))
+        .bind(i64::from(outcome.diagnosis_criteria_met))
+        .bind(i64::from(outcome.diagnosis_criteria_failed))
+        .bind(&outcome.session_id)
+        .bind(&outcome.user_id)
+        .execute(&pool)
+        .await?;
+        Ok(exposures.len() as u64)
     }
 }
 
-async fn fetch_by_id(pool: &Pool<MySql>, id: &str) -> Result<Lesson, sqlx::Error> {
+async fn fetch_by_content(pool: &Pool<MySql>, new: &NewLesson) -> Result<Lesson, sqlx::Error> {
     let row = query(
         "SELECT id, user_id, persona, workload_tag, kind, trigger_signal, action, \
                 confidence, hit_count, \
                 CAST(created_at AS CHAR) AS created_at, \
                 CAST(updated_at AS CHAR) AS updated_at \
-         FROM agent_lessons WHERE id = ?",
+         FROM agent_lessons \
+         WHERE user_id = ? AND persona = ? AND workload_key = ? \
+           AND kind = ? AND trigger_signal = ? AND action = ? \
+         LIMIT 1",
     )
-    .bind(id)
+    .bind(&new.user_id)
+    .bind(&new.persona)
+    .bind(new.workload_tag.as_deref().unwrap_or(""))
+    .bind(new.kind.as_str())
+    .bind(&new.trigger_signal)
+    .bind(&new.action)
     .fetch_one(pool)
     .await?;
     row_to_lesson(row)
@@ -464,15 +594,42 @@ pub const AGENT_LESSONS_DDL: &str = "CREATE TABLE IF NOT EXISTS agent_lessons (
     user_id VARCHAR(64) NOT NULL,
     persona VARCHAR(64) NOT NULL,
     workload_tag VARCHAR(64) NULL,
+    workload_key VARCHAR(64) NOT NULL DEFAULT '',
     kind VARCHAR(32) NOT NULL,
     trigger_signal VARCHAR(255) NOT NULL,
     action TEXT NOT NULL,
     confidence DOUBLE NOT NULL DEFAULT 0.6,
     hit_count BIGINT NOT NULL DEFAULT 0,
+    status VARCHAR(16) NOT NULL DEFAULT 'active',
+    positive_outcome_count BIGINT NOT NULL DEFAULT 0,
+    negative_outcome_count BIGINT NOT NULL DEFAULT 0,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     INDEX idx_agent_lessons_scope (user_id, persona, workload_tag, updated_at),
-    INDEX idx_agent_lessons_user_created (user_id, created_at)
+    INDEX idx_agent_lessons_user_created (user_id, created_at),
+    UNIQUE KEY uniq_agent_lesson_content \
+        (user_id, persona, workload_key, kind, trigger_signal, action)
+)";
+
+pub const AGENT_LESSON_EXPOSURES_DDL: &str = "CREATE TABLE IF NOT EXISTS agent_lesson_exposures (
+    id VARCHAR(64) PRIMARY KEY,
+    lesson_id VARCHAR(64) NOT NULL,
+    session_id VARCHAR(64) NOT NULL,
+    user_id VARCHAR(64) NOT NULL,
+    persona VARCHAR(64) NOT NULL,
+    workload_tag VARCHAR(64) NULL,
+    adopted BOOLEAN NOT NULL DEFAULT FALSE,
+    exposed_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    outcome_recorded_at DATETIME(6) NULL,
+    stall_events INT NOT NULL DEFAULT 0,
+    user_corrections INT NOT NULL DEFAULT 0,
+    tool_failures INT NOT NULL DEFAULT 0,
+    unmet_postconditions INT NOT NULL DEFAULT 0,
+    diagnosis_criteria_met INT NOT NULL DEFAULT 0,
+    diagnosis_criteria_failed INT NOT NULL DEFAULT 0,
+    UNIQUE KEY uniq_lesson_session_exposure (lesson_id, session_id),
+    INDEX idx_lesson_exposure_session (session_id, user_id),
+    INDEX idx_lesson_exposure_lesson (lesson_id)
 )";
 
 // ── Tests (pure logic) ──────────────────────────────────────────────────────
@@ -574,6 +731,10 @@ mod tests {
             "action TEXT NOT NULL",
             "confidence DOUBLE",
             "hit_count BIGINT",
+            "status VARCHAR(16)",
+            "positive_outcome_count BIGINT",
+            "negative_outcome_count BIGINT",
+            "uniq_agent_lesson_content",
             "created_at DATETIME(6)",
             "updated_at DATETIME(6)",
             "idx_agent_lessons_scope",
@@ -582,6 +743,25 @@ mod tests {
             assert!(
                 AGENT_LESSONS_DDL.contains(required),
                 "DDL missing: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn exposure_ddl_defines_outcome_columns_and_unique_session_key() {
+        for required in [
+            "agent_lesson_exposures",
+            "lesson_id VARCHAR(64) NOT NULL",
+            "session_id VARCHAR(64) NOT NULL",
+            "outcome_recorded_at DATETIME(6) NULL",
+            "diagnosis_criteria_met INT",
+            "diagnosis_criteria_failed INT",
+            "uniq_lesson_session_exposure",
+            "idx_lesson_exposure_session",
+        ] {
+            assert!(
+                AGENT_LESSON_EXPOSURES_DDL.contains(required),
+                "exposure DDL missing: {required}"
             );
         }
     }

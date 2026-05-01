@@ -8,7 +8,7 @@
 //! fenced JSON block (```skill-diagnosis ... ```) on auto-invoke.
 //!
 //! This contract locks down the parser's behaviour against:
-//!   • well-formed responses (schema=1, all fields)
+//!   • well-formed responses (schema=2, all fields)
 //!   • responses missing the block entirely (→ None, no panic)
 //!   • responses where a stray preamble precedes the block
 //!   • responses where multiple blocks appear (→ last valid one wins)
@@ -31,15 +31,25 @@ Recommend narrowing scope or switching to `rg`.
 
 ```skill-diagnosis
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "skill": "analyze_session",
-  "cause": "consecutive_stalls",
+  "cause": "session_stalls",
   "headline": "agent looping on grep in deep subtree",
   "findings": [
     "grep invoked 4× with identical args",
     "no new matches since turn 3"
   ],
-  "recommended_action": "switch to rg or narrow scope to src/"
+  "recommended_action": "switch to rg or narrow scope to src/",
+  "success_criteria": [
+    {
+      "metric": "session_stalls_delta",
+      "operator": "lte",
+      "threshold": 0.0,
+      "window_turns": 3,
+      "description": "session stalls stop increasing"
+    }
+  ],
+  "source": "real_skill"
 }
 ```
 "#;
@@ -47,7 +57,8 @@ Recommend narrowing scope or switching to `rg`.
     let diag = SkillDiagnosis::parse_from_skill_output(output).expect("should parse");
     assert_eq!(diag.schema_version, SKILL_DIAGNOSIS_SCHEMA_VERSION);
     assert_eq!(diag.skill, "analyze_session");
-    assert_eq!(diag.cause, "consecutive_stalls");
+    assert_eq!(diag.cause, "session_stalls");
+    assert_eq!(diag.success_criteria.len(), 1);
     assert_eq!(diag.headline, "agent looping on grep in deep subtree");
     assert_eq!(diag.findings.len(), 2);
     assert_eq!(diag.findings[0], "grep invoked 4× with identical args");
@@ -62,11 +73,21 @@ fn parses_block_with_no_recommended_action() {
     let output = r#"
 ```skill-diagnosis
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "skill": "evaluate_session",
   "cause": "repeated_corrections",
   "headline": "user re-scoped 5× in 8 turns",
-  "findings": ["scope drift"]
+  "findings": ["scope drift"],
+  "success_criteria": [
+    {
+      "metric": "corrections_delta",
+      "operator": "lte",
+      "threshold": 0.0,
+      "window_turns": 3,
+      "description": "new corrections stop increasing"
+    }
+  ],
+  "source": "real_skill"
 }
 ```
 "#;
@@ -107,7 +128,7 @@ fn returns_none_when_schema_version_is_unsupported() {
 {
   "schema_version": 99,
   "skill": "analyze_session",
-  "cause": "consecutive_stalls",
+  "cause": "session_stalls",
   "headline": "stub",
   "findings": []
 }
@@ -121,7 +142,7 @@ fn returns_none_when_required_fields_missing() {
     let output = r#"
 ```skill-diagnosis
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "headline": "incomplete"
 }
 ```
@@ -139,9 +160,9 @@ fn multiple_blocks_use_the_last_one() {
     let output = r#"
 ```skill-diagnosis
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "skill": "analyze_session",
-  "cause": "consecutive_stalls",
+  "cause": "session_stalls",
   "headline": "first guess",
   "findings": []
 }
@@ -151,11 +172,21 @@ More analysis follows.
 
 ```skill-diagnosis
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "skill": "analyze_session",
-  "cause": "consecutive_stalls",
+  "cause": "session_stalls",
   "headline": "final guess",
-  "findings": ["definitive finding"]
+  "findings": ["definitive finding"],
+  "success_criteria": [
+    {
+      "metric": "session_stalls_delta",
+      "operator": "lte",
+      "threshold": 0.0,
+      "window_turns": 3,
+      "description": "session stalls stop increasing"
+    }
+  ],
+  "source": "real_skill"
 }
 ```
 "#;
@@ -177,15 +208,26 @@ fn oversized_fields_are_truncated_by_parser() {
         r#"
 ```skill-diagnosis
 {{
-  "schema_version": 1,
-  "skill": "optimize_prompt",
-  "cause": "budget_pressure",
-  "headline": "{}",
-  "findings": [{findings_json}]
-}}
+   "schema_version": 2,
+   "skill": "optimize_prompt",
+   "cause": "budget_pressure",
+   "headline": "{}",
+   "findings": [{findings_json}],
+   "success_criteria": [
+     {{
+       "metric": "budget_pressure",
+       "operator": "lte",
+       "threshold": 0.85,
+       "window_turns": 3,
+       "description": "{}"
+     }}
+   ],
+   "source": "real_skill"
+ }}
 ```
 "#,
         "y".repeat(500),
+        "z".repeat(500),
     );
     let diag = SkillDiagnosis::parse_from_skill_output(&output).expect("parse");
     assert!(diag.headline.chars().count() <= astra_skills::auto_invoke::MAX_HEADLINE_LEN);
@@ -203,7 +245,7 @@ fn returns_none_when_cause_tag_is_unknown() {
     let output = r#"
 ```skill-diagnosis
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "skill": "analyze_session",
   "cause": "cosmic_rays",
   "headline": "hmm",
@@ -259,11 +301,21 @@ Some findings:
 
 ```skill-diagnosis
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "skill": "analyze_session",
-  "cause": "consecutive_stalls",
+  "cause": "session_stalls",
   "headline": "found it",
-  "findings": []
+  "findings": [],
+  "success_criteria": [
+    {
+      "metric": "session_stalls_delta",
+      "operator": "lte",
+      "threshold": 0.0,
+      "window_turns": 3,
+      "description": "session stalls stop increasing"
+    }
+  ],
+  "source": "real_skill"
 }
 ```
 

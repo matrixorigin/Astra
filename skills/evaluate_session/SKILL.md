@@ -166,7 +166,7 @@ When auto-invoked by [`AutoInvokeGate`](../../rust/crates/astra-skills/src/auto_
 ````markdown
 ```skill-diagnosis
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "skill": "evaluate_session",
   "cause": "repeated_corrections",
   "headline": "user re-scoped 5× in 8 turns — systematic scope drift",
@@ -174,17 +174,29 @@ When auto-invoked by [`AutoInvokeGate`](../../rust/crates/astra-skills/src/auto_
     "corrections cluster on file-scope selection",
     "agent defaults to whole-repo greps"
   ],
-  "recommended_action": "prompt agent to restate user's scope before tool calls"
+  "recommended_action": "prompt agent to restate user's scope before tool calls",
+  "success_criteria": [
+    {
+      "metric": "corrections_delta",
+      "operator": "lte",
+      "threshold": 0.0,
+      "window_turns": 3,
+      "description": "new user corrections stop increasing"
+    }
+  ],
+  "source": "real_skill"
 }
 ```
 ````
 
 **Contract (enforced by `SkillDiagnosis::parse_from_skill_output`):**
 
-- `schema_version` must be `1`.
-- `cause` must be one of `consecutive_stalls` | `budget_pressure` | `repeated_corrections`.
+- `schema_version` must be `2`.
+- `cause` must be one of `session_stalls` | `budget_pressure` | `repeated_corrections`.
 - `skill` should match `evaluate_session`.
 - `headline` ≤160 chars; `findings` ≤5 × ≤160 chars; `recommended_action` optional ≤160 chars.
+- `success_criteria` is required and non-empty; use known metric/operator tags with finite thresholds and positive windows.
+- `source` must be `real_skill` for actual skill output.
 - Last block wins if multiple are present.
 
 Keep the human-readable evaluation above the block for the interactive user.

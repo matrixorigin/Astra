@@ -539,7 +539,7 @@ async fn set_skill_diagnosis_feeds_build_self_model_snapshot() {
     // `build_self_model_snapshot` must pass it through so the next turn's
     // LLM sees "the system already looked at this and noticed X".
     let (exe, _session) = executor_with_session();
-    let cause = astra_skills::auto_invoke::AutoInvokeCause::ConsecutiveStalls { count: 3 };
+    let cause = astra_skills::auto_invoke::AutoInvokeCause::SessionStalls { count: 3 };
     let diag = astra_skills::auto_invoke::SkillDiagnosis::new(
         "analyze_session",
         &cause,

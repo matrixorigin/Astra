@@ -220,18 +220,31 @@ pub async fn persist_session_lessons(
 
     let mut persisted = 0usize;
     for lesson in lessons {
+        let kind = lesson.kind.as_str();
+        let trigger_preview = truncate_log_field(&lesson.trigger_signal, 96);
         match svc.record(lesson).await {
             Ok(_) => persisted += 1,
             Err(e) => tracing::warn!(
                 target: "lesson_extractor",
                 user_id = user_id,
                 persona = persona,
+                kind = kind,
+                trigger = %trigger_preview,
                 error = %e,
                 "failed to persist lesson; skipping",
             ),
         }
     }
     persisted
+}
+
+fn truncate_log_field(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 #[cfg(test)]
