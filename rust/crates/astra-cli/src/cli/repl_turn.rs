@@ -538,6 +538,64 @@ fn contains_any_token(haystack: &str, tokens: &[&str]) -> bool {
 /// First-turn gate for cross-session lesson loading (P6). Returns true when
 /// the cache is empty AND the session has a populated lesson source. Kept
 /// pure so a unit test can pin the trigger condition.
+/// Run the lesson checkpointer against the current session signals.
+/// If new lessons are produced, fire-and-forget write them to both
+/// agent_lessons (local) and Memoria (L3). Never blocks the turn.
+fn maybe_checkpoint_lessons(state: &mut ReplState) {
+    let summary = match state
+        .observability_session
+        .as_ref()
+        .and_then(|arc| arc.read().ok())
+    {
+        Some(guard) => astra_runtime::lesson_extractor::summarise_from_runtime(
+            &state.tool_health_entries,
+            Some(&*guard),
+        ),
+        None => astra_runtime::lesson_extractor::summarise_from_runtime(
+            &state.tool_health_entries,
+            None,
+        ),
+    };
+
+    let delta = state.lesson_checkpointer.maybe_checkpoint(
+        &summary,
+        state.turn,
+        state.ingestion_user_id.as_deref().unwrap_or("unknown"),
+        "generic",
+        None,
+    );
+
+    if delta.is_empty() {
+        return;
+    }
+
+    // Write to agent_lessons (local cache) — fire-and-forget.
+    if let Some(ref mc) = state.matrix_runtime {
+        let svc = mc.agent_lessons_service();
+        let delta_clone = delta.clone();
+        tokio::spawn(async move {
+            for lesson in delta_clone {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), svc.record(lesson))
+                    .await;
+            }
+        });
+    }
+
+    // Write to Memoria (L3 durable) — fire-and-forget.
+    let memoria_lessons: Vec<astra_runtime::lesson_synthesizer::ExtractedLesson> = delta
+        .into_iter()
+        .map(|l| astra_runtime::lesson_synthesizer::ExtractedLesson {
+            memory_type: "procedural",
+            content: format!("💡 LESSON: {}", l.action),
+            trust_tier: "T3",
+        })
+        .collect();
+    let sid = state.session_id.clone();
+    tokio::spawn(
+        super::edge_tools::memoria::memoria_store_lessons_fire_and_forget(memoria_lessons, sid),
+    );
+}
+
 async fn memoria_lesson_fallback(state: &mut ReplState) {
     state.session_lessons = tokio::time::timeout(
         std::time::Duration::from_secs(3),
@@ -943,6 +1001,11 @@ async fn run_chat_turn(
         // only drift_user_corrections was recorded and no signal was ever
         // produced for user corrections in the production path.
         emit_user_correction_signal(state, message).await;
+
+        // Incremental lesson checkpoint: user correction is a high-value
+        // breakpoint — extract any new lessons NOW rather than waiting for
+        // session end. Fire-and-forget: never blocks the user's turn.
+        maybe_checkpoint_lessons(state);
     }
 
     // Create a cancellation token that can interrupt SSE streaming mid-flight.

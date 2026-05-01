@@ -72,6 +72,7 @@ pub mod evolution;
 pub mod guardrail_tuning;
 pub mod introspection;
 pub mod lesson_bootstrap;
+pub mod lesson_checkpoint;
 pub mod lesson_extractor;
 pub mod lesson_synthesizer;
 pub mod matrix_cloud_runtime;

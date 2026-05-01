@@ -283,6 +283,10 @@ pub(crate) struct ReplState {
     /// Set after the first bootstrap attempt regardless of result count.
     /// Prevents per-turn DB calls for new users with zero lessons.
     pub session_lessons_loaded: bool,
+    /// Incremental lesson extraction at natural breakpoints (corrections,
+    /// stalls, plan completion). Tracks which lessons have already been
+    /// recorded this session to prevent double-recording.
+    pub lesson_checkpointer: astra_runtime::lesson_checkpoint::LessonCheckpointer,
 
     /// P8: persistent auto-invoke handler. Owns the per-cause cooldowns
     /// across turns of this session. Created lazily on first turn so
@@ -469,6 +473,7 @@ impl Default for ReplState {
             drift_original_query: None,
             session_lessons: Vec::new(),
             session_lessons_loaded: false,
+            lesson_checkpointer: astra_runtime::lesson_checkpoint::LessonCheckpointer::new(),
             auto_invoke_handler: None,
             latest_skill_diagnosis: None,
             diagnosis_outcome_tracker:
