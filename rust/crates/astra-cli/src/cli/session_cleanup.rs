@@ -10,6 +10,7 @@
 //! The session-end knowledge extraction feature (auto-append to `.astra/knowledge.md`) was
 //! removed during the env-var cleanup. The helper functions are retained for future use.
 
+use astra_services::session_artifact_store::SessionArtifactStore;
 use astra_services::session_journal;
 use crossterm::style::Stylize;
 use futures_util::FutureExt;
@@ -78,9 +79,19 @@ pub(super) async fn finalize_session(state: &ReplState) {
     //     (Session Memory Protocol §6.2). Fire-and-forget.
     if state.turn > 0 {
         let narrative = state.session_id.as_deref().and_then(|sid| {
-            let cwd = std::env::current_dir().ok()?;
-            let path = astra_runtime::resolve_resume_session_memory_file(sid, Some(cwd.to_str()?))?;
-            let raw = astra_runtime::read_session_memory_file(&path)?;
+            // Try astra's own artifact path first, then Claude Code compat path.
+            let raw = astra_services::local_session_artifact_store()
+                .session_path(sid, "session-memory.md")
+                .ok()
+                .and_then(|p| astra_runtime::read_session_memory_file(&p))
+                .or_else(|| {
+                    let cwd = std::env::current_dir().ok()?;
+                    let path = astra_runtime::resolve_resume_session_memory_file(
+                        sid,
+                        Some(cwd.to_str()?),
+                    )?;
+                    astra_runtime::read_session_memory_file(&path)
+                })?;
             astra_runtime::turn::cloud::session_memory_protocol::SessionMemory::parse(&raw)
         });
 
