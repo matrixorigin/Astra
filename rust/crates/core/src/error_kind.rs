@@ -56,6 +56,16 @@ pub enum ErrorKind {
     /// OOM, disk full, fork exhaustion, too many open files.
     ResourceLimit,
 
+    // ── Domain ───────────────────────────────────────
+    /// MatrixOne / SQLx failure: SQL syntax, deadlock, pool exhausted,
+    /// connection lost mid-query. Distinct from `Network` because the fix
+    /// lives in the query / schema / pool layer, not network infra.
+    DatabaseError,
+    /// Agent-side stall: repeated identical tool calls, no progress gradient,
+    /// infinite replan. Not a transport or tool error — the remedy is rewind
+    /// or model switch.
+    Stall,
+
     // ── Client-side ──────────────────────────────────
     /// User Ctrl-C, cancel token, or API cancellation.
     Cancelled,
@@ -85,6 +95,8 @@ impl ErrorKind {
             Self::ToolTimeout => "tool_timeout",
             Self::ToolUnavailable => "tool_unavailable",
             Self::ResourceLimit => "resource_limit",
+            Self::DatabaseError => "database_error",
+            Self::Stall => "stall",
             Self::Cancelled => "cancelled",
             Self::Unknown => "unknown",
         }
@@ -191,8 +203,102 @@ impl ErrorKind {
                  This tool is BLOCKED for the rest of this session. \
                  Reduce system load or try a different approach."
             }
+            Self::DatabaseError => {
+                "Database query failed (SQL syntax, deadlock, or pool). \
+                 Do NOT retry with the same query. Inspect the error and \
+                 adjust the query or schema usage."
+            }
+            Self::Stall => {
+                "Agent loop detected — same action repeated without progress. \
+                 Do NOT repeat the last action. Try a different tool, widen the \
+                 context, or hand control back to the user."
+            }
             Self::Cancelled => "Operation was cancelled by the user.",
             Self::Unknown => "An unexpected error occurred. Check the error output and adjust.",
+        }
+    }
+
+    /// Operator-facing remediation hint (distinct from [`Self::guidance`]).
+    ///
+    /// `guidance` is for the LLM — tells the model what to *do* next inside
+    /// the turn. `diagnosis_hint` is for the human operator reviewing a
+    /// session postmortem — tells them what *system-level fix* to apply
+    /// (update config, re-login, raise ulimits, switch model, etc.).
+    #[must_use]
+    pub fn diagnosis_hint(self) -> &'static str {
+        match self {
+            Self::RateLimit => "Reduce parallel tool calls or raise the provider rate-limit quota.",
+            Self::ServerError => {
+                "Transient provider issue. If it persists, switch model or provider."
+            }
+            Self::Auth => {
+                "Re-authenticate with `/login`. Check token expiry. \
+                 Verify API credentials in environment variables."
+            }
+            Self::ContextWindow => {
+                "Prompt is too large. Compact history, trim tool schemas, \
+                 or switch to a larger-context model."
+            }
+            Self::InvalidRequest => {
+                "Request assembly bug or stale tool schema. Inspect the provider \
+                 payload and fix at the source — do not retry blindly."
+            }
+            Self::StreamIdle => {
+                "Model stalled mid-stream. If recurring, switch model or reduce input size."
+            }
+            Self::StreamTransport => {
+                "Transport dropped mid-stream. Check network stability; if persistent, \
+                 change model endpoint or provider."
+            }
+            Self::BudgetExhausted => {
+                "Extend the turn/session budget, or break the task into smaller goals."
+            }
+            Self::ToolRoundsExhausted => {
+                "Raise the per-turn tool-round cap, or restructure the task so fewer \
+                 tool calls are needed."
+            }
+            Self::Network => {
+                "Check network connectivity and proxy settings. Verify \
+                 `NO_PROXY=localhost,127.0.0.1` for local services. \
+                 Confirm target service is running."
+            }
+            Self::ToolNotFound => {
+                "Agent guessed wrong paths. Use `list_dir` before `read_file`/`grep`. \
+                 Confirm the workspace context is accurate."
+            }
+            Self::ToolInvalidArgs => {
+                "Model is calling tools with wrong parameters. This may improve with \
+                 a better model, clearer system prompt, or stricter tool schemas."
+            }
+            Self::ToolTimeout => {
+                "Tool scope is too broad. Break the operation into smaller chunks \
+                 or raise the tool timeout if genuinely long-running."
+            }
+            Self::ToolUnavailable => {
+                "Install or configure the missing tool, or remove it from the skill \
+                 manifest so the agent does not pick it."
+            }
+            Self::ResourceLimit => {
+                "Check system limits: `ulimit -u` (max procs), `ulimit -n` (open files). \
+                 Kill orphan processes: `ps aux | grep defunct`. May need to restart \
+                 the system or increase limits."
+            }
+            Self::DatabaseError => {
+                "Check MatrixOne connectivity and SQL syntax. Use CAST for DATETIME \
+                 columns, MIN/MAX for non-grouped columns. For deadlocks, reorder \
+                 transactions or shrink their scope."
+            }
+            Self::Stall => {
+                "Agent is stuck in a loop. Try `/rewind` to go back, or switch to \
+                 a different model with `/model`. Break complex tasks into smaller steps."
+            }
+            Self::Cancelled => {
+                "User cancelled — no action needed unless cancellations are unexpected."
+            }
+            Self::Unknown => {
+                "Review the error samples to identify the pattern, then add a \
+                 classifier rule in `classify_tool_output`."
+            }
         }
     }
 }
@@ -223,6 +329,8 @@ impl ErrorKind {
             "tool_timeout" => Some(Self::ToolTimeout),
             "tool_unavailable" => Some(Self::ToolUnavailable),
             "resource_limit" => Some(Self::ResourceLimit),
+            "database_error" => Some(Self::DatabaseError),
+            "stall" => Some(Self::Stall),
             "cancelled" => Some(Self::Cancelled),
             "unknown" => Some(Self::Unknown),
             _ => None,
@@ -336,6 +444,19 @@ pub fn classify_tool_output(error_str: &str) -> ErrorKind {
     // Workspace read-before-write — classify as invalid args
     if is_workspace_read_before_write(&lower) {
         return ErrorKind::ToolInvalidArgs;
+    }
+
+    // Database errors — MatrixOne / SQLx. Must come before Network because
+    // "connection pool timed out" reads like a network issue but the fix
+    // lives in the DB layer (pool config, slow queries, deadlocks).
+    if lower.contains("sql syntax error")
+        || lower.contains("error returned from database")
+        || lower.contains("sqlx")
+        || lower.contains("deadlock")
+        || lower.contains("connection pool timed out")
+        || (lower.contains("column") && lower.contains("group by"))
+    {
+        return ErrorKind::DatabaseError;
     }
 
     // Local command timeout — different from network timeout
@@ -466,28 +587,32 @@ mod tests {
 
     // ── ErrorKind basics ──
 
+    /// Every ErrorKind variant. Keep in sync when adding new variants.
+    const ALL_VARIANTS: &[ErrorKind] = &[
+        ErrorKind::RateLimit,
+        ErrorKind::ServerError,
+        ErrorKind::Auth,
+        ErrorKind::ContextWindow,
+        ErrorKind::InvalidRequest,
+        ErrorKind::StreamIdle,
+        ErrorKind::StreamTransport,
+        ErrorKind::BudgetExhausted,
+        ErrorKind::ToolRoundsExhausted,
+        ErrorKind::Network,
+        ErrorKind::ToolNotFound,
+        ErrorKind::ToolInvalidArgs,
+        ErrorKind::ToolTimeout,
+        ErrorKind::ToolUnavailable,
+        ErrorKind::ResourceLimit,
+        ErrorKind::DatabaseError,
+        ErrorKind::Stall,
+        ErrorKind::Cancelled,
+        ErrorKind::Unknown,
+    ];
+
     #[test]
     fn as_str_roundtrip() {
-        // Verify serde roundtrip for all variants
-        for kind in [
-            ErrorKind::RateLimit,
-            ErrorKind::ServerError,
-            ErrorKind::Auth,
-            ErrorKind::ContextWindow,
-            ErrorKind::InvalidRequest,
-            ErrorKind::StreamIdle,
-            ErrorKind::StreamTransport,
-            ErrorKind::BudgetExhausted,
-            ErrorKind::ToolRoundsExhausted,
-            ErrorKind::Network,
-            ErrorKind::ToolNotFound,
-            ErrorKind::ToolInvalidArgs,
-            ErrorKind::ToolTimeout,
-            ErrorKind::ToolUnavailable,
-            ErrorKind::ResourceLimit,
-            ErrorKind::Cancelled,
-            ErrorKind::Unknown,
-        ] {
+        for &kind in ALL_VARIANTS {
             let json = serde_json::to_string(&kind).unwrap();
             let back: ErrorKind = serde_json::from_str(&json).unwrap();
             assert_eq!(kind, back, "roundtrip failed for {kind:?}");
@@ -524,27 +649,7 @@ mod tests {
 
     #[test]
     fn guidance_non_empty() {
-        // ALL 17 variants must have non-empty guidance
-        let all = [
-            ErrorKind::RateLimit,
-            ErrorKind::ServerError,
-            ErrorKind::Auth,
-            ErrorKind::ContextWindow,
-            ErrorKind::InvalidRequest,
-            ErrorKind::StreamIdle,
-            ErrorKind::StreamTransport,
-            ErrorKind::BudgetExhausted,
-            ErrorKind::ToolRoundsExhausted,
-            ErrorKind::Network,
-            ErrorKind::ToolNotFound,
-            ErrorKind::ToolInvalidArgs,
-            ErrorKind::ToolTimeout,
-            ErrorKind::ToolUnavailable,
-            ErrorKind::ResourceLimit,
-            ErrorKind::Cancelled,
-            ErrorKind::Unknown,
-        ];
-        for kind in all {
+        for &kind in ALL_VARIANTS {
             assert!(!kind.guidance().is_empty(), "empty guidance for {kind:?}");
             assert!(!kind.as_str().is_empty(), "empty as_str for {kind:?}");
         }
@@ -559,39 +664,14 @@ mod tests {
 
     #[test]
     fn retry_delay_all_retryable_variants() {
-        // Every retryable variant must return Some for attempt 0
-        for kind in [
-            ErrorKind::RateLimit,
-            ErrorKind::ServerError,
-            ErrorKind::StreamIdle,
-            ErrorKind::StreamTransport,
-            ErrorKind::Network,
-        ] {
-            assert!(
-                kind.retry_delay_ms(0).is_some(),
-                "retryable {kind:?} should have delay"
-            );
-        }
-        // Every non-retryable variant must return None
-        for kind in [
-            ErrorKind::Auth,
-            ErrorKind::ContextWindow,
-            ErrorKind::InvalidRequest,
-            ErrorKind::BudgetExhausted,
-            ErrorKind::ToolRoundsExhausted,
-            ErrorKind::ToolNotFound,
-            ErrorKind::ToolInvalidArgs,
-            ErrorKind::ToolTimeout,
-            ErrorKind::ToolUnavailable,
-            ErrorKind::ResourceLimit,
-            ErrorKind::Cancelled,
-            ErrorKind::Unknown,
-        ] {
-            assert_eq!(
-                kind.retry_delay_ms(0),
-                None,
-                "non-retryable {kind:?} should have no delay"
-            );
+        for &kind in ALL_VARIANTS {
+            match kind.retry_delay_ms(0) {
+                Some(_) => assert!(
+                    kind.is_retryable(),
+                    "non-retryable {kind:?} returned a delay"
+                ),
+                None => assert!(!kind.is_retryable(), "retryable {kind:?} returned no delay"),
+            }
         }
     }
 
@@ -769,5 +849,103 @@ mod tests {
         let fb = err.llm_feedback();
         assert!(fb.contains("[unknown]"));
         assert!(fb.contains("→"));
+    }
+
+    // ── P0.1 TDD: ErrorKind becomes the single taxonomy ─────────────────
+    //
+    // New variants: DatabaseError (MatrixOne/SQLx), Stall (agent looped).
+    // New method: diagnosis_hint() — operator-facing fix, distinct from
+    // guidance() which is LLM-facing.
+
+    #[test]
+    fn database_error_variant_exists() {
+        let k = ErrorKind::DatabaseError;
+        assert_eq!(k.as_str(), "database_error");
+        assert_eq!(ErrorKind::parse_tag("database_error"), Some(k));
+        assert!(!k.is_retryable(), "DB errors must not auto-retry blindly");
+        assert!(k.retry_delay_ms(0).is_none());
+    }
+
+    #[test]
+    fn stall_variant_exists() {
+        let k = ErrorKind::Stall;
+        assert_eq!(k.as_str(), "stall");
+        assert_eq!(ErrorKind::parse_tag("stall"), Some(k));
+        assert!(!k.is_retryable(), "stall must not auto-retry");
+    }
+
+    #[test]
+    fn classify_tool_output_sql_errors_map_to_database_error() {
+        // DB detection previously lived in services/src/reflect.rs. Now the
+        // single classifier owns it.
+        for s in [
+            "SQL syntax error: column must appear in GROUP BY",
+            "error returned from database: deadlock found",
+            "sqlx: connection pool timed out",
+            "deadlock detected on table x",
+        ] {
+            assert_eq!(
+                classify_tool_output(s),
+                ErrorKind::DatabaseError,
+                "classify_tool_output({s:?}) should be DatabaseError"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnosis_hint_exists_for_every_variant() {
+        for &kind in ALL_VARIANTS {
+            assert!(
+                !kind.diagnosis_hint().is_empty(),
+                "empty diagnosis_hint for {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnosis_hint_targets_operators_specifically() {
+        // ResourceLimit → ulimit / process limits
+        assert!(
+            ErrorKind::ResourceLimit
+                .diagnosis_hint()
+                .to_lowercase()
+                .contains("ulimit")
+        );
+        // Auth → re-authentication / credentials
+        let auth = ErrorKind::Auth.diagnosis_hint().to_lowercase();
+        assert!(auth.contains("login") || auth.contains("credential") || auth.contains("token"));
+        // DatabaseError → MatrixOne / SQL schema / connectivity
+        let db = ErrorKind::DatabaseError.diagnosis_hint().to_lowercase();
+        assert!(db.contains("matrixone") || db.contains("sql") || db.contains("connect"));
+        // Stall → rewind / model switch / loop
+        let stall = ErrorKind::Stall.diagnosis_hint().to_lowercase();
+        assert!(stall.contains("rewind") || stall.contains("model") || stall.contains("loop"));
+    }
+
+    #[test]
+    fn diagnosis_hint_is_distinct_from_guidance_for_operator_variants() {
+        for kind in [
+            ErrorKind::ResourceLimit,
+            ErrorKind::Auth,
+            ErrorKind::DatabaseError,
+            ErrorKind::Stall,
+        ] {
+            assert_ne!(
+                kind.diagnosis_hint(),
+                kind.guidance(),
+                "diagnosis_hint must differ from guidance for {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn as_str_roundtrip_covers_new_variants() {
+        for kind in [ErrorKind::DatabaseError, ErrorKind::Stall] {
+            let s = kind.as_str();
+            assert_eq!(ErrorKind::parse_tag(s), Some(kind));
+            let json = serde_json::to_string(&kind).unwrap();
+            let back: ErrorKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(kind, back);
+        }
     }
 }

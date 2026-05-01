@@ -173,7 +173,7 @@ pub use astra_services::{
         UnconfiguredTaskLeaseService,
     },
     reflect::{
-        DatabaseReflectService, Diagnosis, ErrorClass, ReflectReport, ReflectService,
+        DatabaseReflectService, Diagnosis, ReflectReport, ReflectService,
         UnconfiguredReflectService,
     },
     replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService},
