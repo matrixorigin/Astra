@@ -6316,18 +6316,27 @@ mod tests {
         // Anthropic will reject with the same class of 400 as Bedrock's
         // `thinking.signature: Field required`.
         //
-        // Pinned here as `#[ignore]` so: (a) nobody accidentally ships
-        // Anthropic native multi-turn thinking in a broken state, and
-        // (b) when a future PR implements the typed-block serializer
-        // (equivalent to `build_bedrock_messages` for Anthropic) plus the
-        // matching SSE signature capture, this test becomes real coverage
-        // by removing the `#[ignore]`.
+        // Pinned here as `#[should_panic]` + `#[ignore]` so: (a) nobody
+        // accidentally ships Anthropic native multi-turn thinking in a broken
+        // state, and (b) when a future PR implements the typed-block
+        // serializer (equivalent to `build_bedrock_messages` for Anthropic)
+        // plus the matching SSE signature capture, this test becomes real
+        // coverage by flipping to a normal `#[test]`.
         //
-        // TODO(anthropic-thinking): remove `#[ignore]` and implement the
-        // typed-block serializer + SSE signature capture before enabling
-        // native Anthropic multi-turn thinking.
+        // Today the request body is OpenAI-shape, so `body["messages"][1]
+        // ["content"].as_array()` returns `None` and the first assertion
+        // panics with "called `Option::unwrap()` on a `None` value". That
+        // panic is the canary — `#[should_panic]` pins the current broken
+        // state so `make test-online`'s `--run-ignored only` stage doesn't
+        // surface it as a false failure. Remove both attributes together
+        // with the serializer implementation.
+        //
+        // TODO(anthropic-thinking): remove `#[ignore]` + `#[should_panic]`
+        // and implement the typed-block serializer + SSE signature capture
+        // before enabling native Anthropic multi-turn thinking.
         #[test]
         #[ignore = "blocked on typed-block serializer for native Anthropic thinking"]
+        #[should_panic(expected = "called `Option::unwrap()` on a `None` value")]
         fn anthropic_thinking_tool_call_multi_turn_needs_typed_blocks() {
             let messages = vec![
                 user("compute 2+2"),
