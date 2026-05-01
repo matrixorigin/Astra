@@ -117,20 +117,18 @@ where
         }
         serde_json::Value::String(s) => {
             let trimmed = s.trim();
-            if trimmed.is_empty()
-                || trimmed == "{}"
-                || trimmed.eq_ignore_ascii_case("default")
-            {
+            if trimmed.is_empty() || trimmed == "{}" || trimmed.eq_ignore_ascii_case("default") {
                 // Model meant "opt in with defaults"; give them that.
                 Ok(Some(InheritPrefixSpec::default()))
             } else {
                 // Try to parse the string AS JSON so payloads like
                 // `"{\"required\": true}"` (also observed) still work.
-                let parsed: serde_json::Value = serde_json::from_str(trimmed)
-                    .map_err(|_| Error::custom(format!(
+                let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|_| {
+                    Error::custom(format!(
                         "inherit_prefix string \"{s}\" is not a recognized shorthand \
                          (allowed: \"\" / \"{{}}\" / \"default\") nor a JSON object literal"
-                    )))?;
+                    ))
+                })?;
                 if parsed.is_object() {
                     serde_json::from_value::<InheritPrefixSpec>(parsed)
                         .map(Some)
@@ -153,7 +151,6 @@ where
         ))),
     }
 }
-
 
 impl Default for SpawnAgentInput {
     /// Mirror the serde `#[serde(default ...)]` defaults so struct
@@ -411,10 +408,9 @@ mod tests {
     #[test]
     fn inherit_prefix_accepts_empty_object_string() {
         // The observed MiniMax bug shape.
-        let input: SpawnAgentInput = serde_json::from_str(
-            r#"{"description":"d","prompt":"p","inherit_prefix":"{}"}"#,
-        )
-        .unwrap();
+        let input: SpawnAgentInput =
+            serde_json::from_str(r#"{"description":"d","prompt":"p","inherit_prefix":"{}"}"#)
+                .unwrap();
         let spec = input
             .inherit_prefix
             .expect("\"{}\" must produce a default InheritPrefixSpec, not None");
@@ -424,20 +420,18 @@ mod tests {
 
     #[test]
     fn inherit_prefix_accepts_empty_string() {
-        let input: SpawnAgentInput = serde_json::from_str(
-            r#"{"description":"d","prompt":"p","inherit_prefix":""}"#,
-        )
-        .unwrap();
+        let input: SpawnAgentInput =
+            serde_json::from_str(r#"{"description":"d","prompt":"p","inherit_prefix":""}"#)
+                .unwrap();
         assert!(input.inherit_prefix.is_some());
     }
 
     #[test]
     fn inherit_prefix_accepts_default_keyword() {
         // Natural-language shorthand some models emit.
-        let input: SpawnAgentInput = serde_json::from_str(
-            r#"{"description":"d","prompt":"p","inherit_prefix":"default"}"#,
-        )
-        .unwrap();
+        let input: SpawnAgentInput =
+            serde_json::from_str(r#"{"description":"d","prompt":"p","inherit_prefix":"default"}"#)
+                .unwrap();
         assert!(input.inherit_prefix.is_some());
     }
 
@@ -454,10 +448,9 @@ mod tests {
 
     #[test]
     fn inherit_prefix_accepts_null() {
-        let input: SpawnAgentInput = serde_json::from_str(
-            r#"{"description":"d","prompt":"p","inherit_prefix":null}"#,
-        )
-        .unwrap();
+        let input: SpawnAgentInput =
+            serde_json::from_str(r#"{"description":"d","prompt":"p","inherit_prefix":null}"#)
+                .unwrap();
         assert!(input.inherit_prefix.is_none());
     }
 
@@ -467,9 +460,7 @@ mod tests {
         // default — operators might intend something provider-
         // specific we don't know about. Hard-fail so they notice.
         for bad in ["yes", "on", "enabled", "1", "prefix"] {
-            let json = format!(
-                r#"{{"description":"d","prompt":"p","inherit_prefix":"{bad}"}}"#
-            );
+            let json = format!(r#"{{"description":"d","prompt":"p","inherit_prefix":"{bad}"}}"#);
             let out: Result<SpawnAgentInput, _> = serde_json::from_str(&json);
             assert!(
                 out.is_err(),
@@ -482,9 +473,7 @@ mod tests {
     #[test]
     fn inherit_prefix_rejects_numbers_arrays_bools() {
         for bad in [r#"123"#, r#"true"#, r#"[]"#] {
-            let json = format!(
-                r#"{{"description":"d","prompt":"p","inherit_prefix":{bad}}}"#
-            );
+            let json = format!(r#"{{"description":"d","prompt":"p","inherit_prefix":{bad}}}"#);
             let out: Result<SpawnAgentInput, _> = serde_json::from_str(&json);
             assert!(
                 out.is_err(),
@@ -500,10 +489,10 @@ mod tests {
         // field allows..." rewording produces near-zero uptake in
         // practice. The word "RECOMMENDED" is the dominant signal.
         let schema = spawn_agent_schema();
-        let ip_desc = schema["function"]["parameters"]["properties"]
-            ["inherit_prefix"]["description"]
-            .as_str()
-            .unwrap();
+        let ip_desc =
+            schema["function"]["parameters"]["properties"]["inherit_prefix"]["description"]
+                .as_str()
+                .unwrap();
         assert!(
             ip_desc.contains("RECOMMENDED"),
             "inherit_prefix description must carry an explicit \

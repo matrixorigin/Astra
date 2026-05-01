@@ -1945,10 +1945,7 @@ impl RuntimeConfig {
         // via `ASTRA_FORK_INHERIT_PREFIX=0`.
         if let Ok(val) = std::env::var("ASTRA_FORK_INHERIT_PREFIX") {
             let normalized = val.trim().to_ascii_lowercase();
-            self.fork_prefix.enabled = matches!(
-                normalized.as_str(),
-                "1" | "true" | "on" | "yes"
-            );
+            self.fork_prefix.enabled = matches!(normalized.as_str(), "1" | "true" | "on" | "yes");
         }
     }
 

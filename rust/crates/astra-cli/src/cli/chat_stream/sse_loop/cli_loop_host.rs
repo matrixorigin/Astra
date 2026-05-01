@@ -585,5 +585,4 @@ mod tests {
             TurnInteractionMode::NonInteractive
         );
     }
-
 }

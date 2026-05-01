@@ -42,8 +42,7 @@ use astra_turn_core::fork_capture::{
     restore_fork_flag_raw_for_tests, set_fork_flag_for_tests,
 };
 use astra_turn_core::fork_prefix::{
-    CacheMode, ProviderKind, SystemBlock, ThinkingConfigSlice, ToolSchemaEntry,
-    hash_tool_schema,
+    CacheMode, ProviderKind, SystemBlock, ThinkingConfigSlice, ToolSchemaEntry, hash_tool_schema,
 };
 use astra_turn_core::fork_prefix_store::{InMemoryPrefixStore, PrefixCaptureSink};
 use astra_turn_core::orchestration_spawn_tool::InheritPrefixSpec;
@@ -111,7 +110,10 @@ struct MockProbingExecutor {
 }
 
 impl MockProbingExecutor {
-    fn new(observed: u64, sink: Arc<dyn ForkCacheEventSink>) -> (Self, Arc<Mutex<Option<Option<InheritedChildPrefix>>>>) {
+    fn new(
+        observed: u64,
+        sink: Arc<dyn ForkCacheEventSink>,
+    ) -> (Self, Arc<Mutex<Option<Option<InheritedChildPrefix>>>>) {
         let captured = Arc::new(Mutex::new(None));
         (
             Self {

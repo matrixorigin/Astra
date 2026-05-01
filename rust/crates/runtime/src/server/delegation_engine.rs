@@ -1145,8 +1145,7 @@ pub struct DelegationEngine {
     /// this store (Bug B step 2). When absent, the delegate path
     /// behaves as pre-fork-prefix — `inherited_prefix` stays None
     /// and the child runs fresh.
-    prefix_store:
-        Option<Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
+    prefix_store: Option<Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
 }
 
 impl DelegationEngine {
@@ -1994,8 +1993,8 @@ impl DelegationEngine {
             // match spawn_agent: on miss or mismatch the child
             // runs fresh, no hard error.
             let delegate_model = profile.model_override.as_deref().unwrap_or("");
-            let inherited_prefix = self
-                .resolve_inherited_prefix_for_delegate(&request.parent_run_id, delegate_model);
+            let inherited_prefix =
+                self.resolve_inherited_prefix_for_delegate(&request.parent_run_id, delegate_model);
 
             configs.push(SubRunConfig {
                 run_id: sub_run_id,
@@ -2279,13 +2278,11 @@ impl DelegationEngine {
                                         HashMap::new(),
                                     )
                                 });
-                            let delegate_model =
-                                profile.model_override.as_deref().unwrap_or("");
-                            let inherited_prefix = self
-                                .resolve_inherited_prefix_for_delegate(
-                                    &request.parent_run_id,
-                                    delegate_model,
-                                );
+                            let delegate_model = profile.model_override.as_deref().unwrap_or("");
+                            let inherited_prefix = self.resolve_inherited_prefix_for_delegate(
+                                &request.parent_run_id,
+                                delegate_model,
+                            );
                             SubRunConfig {
                                 run_id: uuid::Uuid::new_v4().to_string(),
                                 agent_profile: profile,
@@ -2477,7 +2474,7 @@ impl DelegationEngine {
                 checkpoint_gate: None,
                 mailbox,
                 cancel_token: Some(child_cancel),
-            inherited_prefix: None,
+                inherited_prefix: None,
             };
 
             let exec_result = match per_stage_timeout {
@@ -2585,7 +2582,7 @@ impl DelegationEngine {
                         checkpoint_gate: None,
                         mailbox: None,
                         cancel_token: cancel_for_retry.clone(),
-                    inherited_prefix: None,
+                        inherited_prefix: None,
                     },
                 )
                 .await
@@ -2768,7 +2765,7 @@ impl DelegationEngine {
                 checkpoint_gate: None,
                 mailbox: prod_mailbox,
                 cancel_token: cancel_token.cloned(),
-            inherited_prefix: None,
+                inherited_prefix: None,
             };
             let prod_exec = match per_round_timeout {
                 Some(dur) => {
@@ -2870,7 +2867,7 @@ impl DelegationEngine {
                         checkpoint_gate: None,
                         mailbox: None,
                         cancel_token: cancel_for_retry.clone(),
-                    inherited_prefix: None,
+                        inherited_prefix: None,
                     },
                 )
                 .await
@@ -2974,7 +2971,7 @@ impl DelegationEngine {
                 checkpoint_gate: None,
                 mailbox: rev_mailbox,
                 cancel_token: cancel_token.cloned(),
-            inherited_prefix: None,
+                inherited_prefix: None,
             };
             let rev_exec = match per_round_timeout {
                 Some(dur) => {
@@ -3208,7 +3205,7 @@ impl DelegationEngine {
                 checkpoint_gate: None,
                 mailbox: fork_mailbox,
                 cancel_token: cancel_token.cloned(),
-            inherited_prefix: None,
+                inherited_prefix: None,
             };
 
             let executor = self.executor.clone();
@@ -4588,7 +4585,7 @@ mod tests {
             checkpoint_gate: None,
             mailbox: None,
             cancel_token: None,
-        inherited_prefix: None,
+            inherited_prefix: None,
         };
 
         let result = executor.execute(config).await.unwrap();

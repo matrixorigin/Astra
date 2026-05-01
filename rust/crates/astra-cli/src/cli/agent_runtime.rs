@@ -42,15 +42,10 @@ pub(crate) async fn build_one_shot_spawner(
     let progress_broadcaster =
         std::sync::Arc::new(astra_runtime::orchestration::ProgressBroadcaster::default());
 
-    let mut spawn_executor = spawn_subrun::CliSpawnAgentExecutor::new(
-        api.clone(),
-        token,
-        project_root,
-        perm_mode,
-        None,
-    )
-    .with_skill_resolver(skill_resolver)
-    .with_skill_search(skill_search);
+    let mut spawn_executor =
+        spawn_subrun::CliSpawnAgentExecutor::new(api.clone(), token, project_root, perm_mode, None)
+            .with_skill_resolver(skill_resolver)
+            .with_skill_search(skill_search);
     if let Some(sid) = session_id {
         spawn_executor = spawn_executor.with_active_session_id(sid);
     }
@@ -59,22 +54,20 @@ pub(crate) async fn build_one_shot_spawner(
     let fork_cfg = &runtime_cfg.fork_prefix;
     astra_turn_core::fork_capture::set_fork_inherit_prefix_enabled(fork_cfg.enabled);
     if fork_cfg.enabled {
-        let sink: std::sync::Arc<
-            dyn astra_turn_core::fork_cache_event::ForkCacheEventSink,
-        > = match fork_cfg.sink {
-            astra_config::runtime_config::ForkCacheSinkKind::Noop => {
-                std::sync::Arc::new(astra_turn_core::fork_cache_event::NoopForkCacheSink)
-            }
-            astra_config::runtime_config::ForkCacheSinkKind::Stderr => {
-                std::sync::Arc::new(astra_turn_core::fork_cache_event::StderrForkCacheSink)
-            }
-        };
+        let sink: std::sync::Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink> =
+            match fork_cfg.sink {
+                astra_config::runtime_config::ForkCacheSinkKind::Noop => {
+                    std::sync::Arc::new(astra_turn_core::fork_cache_event::NoopForkCacheSink)
+                }
+                astra_config::runtime_config::ForkCacheSinkKind::Stderr => {
+                    std::sync::Arc::new(astra_turn_core::fork_cache_event::StderrForkCacheSink)
+                }
+            };
         spawn_executor = spawn_executor.with_fork_cache_sink(sink);
     }
 
-    let prefix_store: std::sync::Arc<
-        dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink,
-    > = std::sync::Arc::new(astra_turn_core::fork_prefix_store::InMemoryPrefixStore::new());
+    let prefix_store: std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink> =
+        std::sync::Arc::new(astra_turn_core::fork_prefix_store::InMemoryPrefixStore::new());
 
     std::sync::Arc::new(
         astra_runtime::orchestration::DynamicAgentSpawner::with_broadcaster(
@@ -171,11 +164,8 @@ pub(crate) async fn initialize_multi_agent_runtime(
     // step 2: without shared state, a prefix captured on a parent
     // turn (recorded into the spawner's store) would be invisible
     // to the delegate path — defeating the purpose.
-    let prefix_store: std::sync::Arc<
-        dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink,
-    > = std::sync::Arc::new(
-        astra_turn_core::fork_prefix_store::InMemoryPrefixStore::new(),
-    );
+    let prefix_store: std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink> =
+        std::sync::Arc::new(astra_turn_core::fork_prefix_store::InMemoryPrefixStore::new());
 
     let engine = astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
         registry,
@@ -219,16 +209,15 @@ pub(crate) async fn initialize_multi_agent_runtime(
     // path is the right place to call it exactly once.
     astra_turn_core::fork_capture::set_fork_inherit_prefix_enabled(fork_cfg.enabled);
     if fork_cfg.enabled {
-        let sink: std::sync::Arc<
-            dyn astra_turn_core::fork_cache_event::ForkCacheEventSink,
-        > = match fork_cfg.sink {
-            astra_config::runtime_config::ForkCacheSinkKind::Noop => {
-                std::sync::Arc::new(astra_turn_core::fork_cache_event::NoopForkCacheSink)
-            }
-            astra_config::runtime_config::ForkCacheSinkKind::Stderr => {
-                std::sync::Arc::new(astra_turn_core::fork_cache_event::StderrForkCacheSink)
-            }
-        };
+        let sink: std::sync::Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink> =
+            match fork_cfg.sink {
+                astra_config::runtime_config::ForkCacheSinkKind::Noop => {
+                    std::sync::Arc::new(astra_turn_core::fork_cache_event::NoopForkCacheSink)
+                }
+                astra_config::runtime_config::ForkCacheSinkKind::Stderr => {
+                    std::sync::Arc::new(astra_turn_core::fork_cache_event::StderrForkCacheSink)
+                }
+            };
         spawn_executor = spawn_executor.with_fork_cache_sink(sink);
     }
 

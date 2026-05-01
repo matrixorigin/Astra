@@ -355,11 +355,11 @@ fn wall_clock_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::fork_prefix::{
-        hash_tool_schema, CacheMode, ForkPrefix, ProviderKind, SystemBlock, ThinkingConfigSlice,
-        ToolSchemaEntry,
+        CacheMode, ForkPrefix, ProviderKind, SystemBlock, ThinkingConfigSlice, ToolSchemaEntry,
+        hash_tool_schema,
     };
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    use std::sync::{mpsc, Mutex};
+    use std::sync::{Mutex, mpsc};
 
     /// Per-test controllable clock. Each test instantiates one so
     /// parallel test execution doesn't create inter-test timing races

@@ -476,7 +476,8 @@ impl DynamicAgentSpawner {
             // against a matching capture and carry the prefix into
             // SpawnRunConfig; executor-side consumption is gated
             // by the sink the caller installs.
-            let child_provider = astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model);
+            let child_provider =
+                astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model);
             let resolve_ctx = SpawnResolveContext {
                 caller_run_id: Some(context.parent_run_id.clone()),
                 child_provider,

@@ -605,7 +605,9 @@ mod tests {
         // in CI would silently flip tests that forgot to install a
         // FlagGuard. We verify the branch's behavior: state 0 MUST
         // return false.
-        let _lock = FORK_FLAG_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = FORK_FLAG_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev = FORK_FLAG_CACHE.swap(0, Ordering::Relaxed);
         let observed = is_fork_inherit_prefix_enabled();
         // Restore before any panic-able assert, so later tests see

@@ -147,10 +147,7 @@ impl ForkCacheThresholds {
         // a zero (both are invalid). Clippy's
         // `neg_cmp_op_on_partial_ord` lint flags the negated form.
         if self.miss_floor <= 0.0 {
-            return Err(format!(
-                "miss_floor must be > 0.0, got {}",
-                self.miss_floor
-            ));
+            return Err(format!("miss_floor must be > 0.0, got {}", self.miss_floor));
         }
         if self.hit_threshold <= self.miss_floor {
             return Err(format!(
@@ -186,7 +183,10 @@ pub struct ForkCacheProbe {
 /// arithmetic so a zero-expected probe can't divide by zero
 /// (that case is classified based on observed alone:
 /// observed > 0 → ExceededExpected; observed == 0 → Miss).
-pub fn evaluate_fork_cache(probe: ForkCacheProbe, thresholds: ForkCacheThresholds) -> ForkCacheEvent {
+pub fn evaluate_fork_cache(
+    probe: ForkCacheProbe,
+    thresholds: ForkCacheThresholds,
+) -> ForkCacheEvent {
     let ratio = if probe.expected_cache_read_tokens == 0 {
         // Undefined mathematically; encode the degenerate case as
         // 0.0 so the ratio field is still finite in serialized
@@ -492,8 +492,14 @@ mod tests {
     fn collect_sink_captures_emissions_in_order() {
         let sink = Arc::new(CollectSink::default());
         let out = sink.clone() as Arc<dyn ForkCacheEventSink>;
-        out.emit(evaluate_fork_cache(probe(100, 100), ForkCacheThresholds::default()));
-        out.emit(evaluate_fork_cache(probe(100, 0), ForkCacheThresholds::default()));
+        out.emit(evaluate_fork_cache(
+            probe(100, 100),
+            ForkCacheThresholds::default(),
+        ));
+        out.emit(evaluate_fork_cache(
+            probe(100, 0),
+            ForkCacheThresholds::default(),
+        ));
 
         let events = sink.0.lock().unwrap();
         assert_eq!(events.len(), 2);

@@ -108,7 +108,12 @@ fn build_sample_request(parent_run_id: &str, model: &str, budget_tokens: u32) ->
         thinking: Some(ThinkingConfigSlice {
             enabled: budget_tokens > 0,
             budget_tokens,
-            kind: if budget_tokens > 0 { "enabled" } else { "disabled" }.into(),
+            kind: if budget_tokens > 0 {
+                "enabled"
+            } else {
+                "disabled"
+            }
+            .into(),
         }),
         system_blocks: vec![SystemBlock {
             bytes: b"you are a careful assistant".to_vec(),
@@ -239,15 +244,9 @@ fn evict_during_resolve_produces_not_found_fallback_not_failed() {
     let sink: &dyn PrefixCaptureSink = store.as_ref();
 
     // Capture run-A.
-    let _ = capture_parent_prefix(
-        build_sample_request("run-A", "claude-opus-4-6", 0),
-        sink,
-    );
+    let _ = capture_parent_prefix(build_sample_request("run-A", "claude-opus-4-6", 0), sink);
     // Capture run-B — evicts run-A (max_entries=1).
-    let _ = capture_parent_prefix(
-        build_sample_request("run-B", "claude-opus-4-6", 0),
-        sink,
-    );
+    let _ = capture_parent_prefix(build_sample_request("run-B", "claude-opus-4-6", 0), sink);
 
     // Now resolver sees no prefix for run-A.
     let spec = InheritPrefixSpec {
@@ -363,7 +362,10 @@ fn miss_event_fires_when_provider_returns_zero_cache_read() {
         provider: prefix.provider.clone(),
     };
     let event = evaluate_fork_cache(probe, ForkCacheThresholds::default());
-    assert_eq!(event.prefix_id, prefix_id, "prefix_id round-trips to Miss event");
+    assert_eq!(
+        event.prefix_id, prefix_id,
+        "prefix_id round-trips to Miss event"
+    );
     assert_eq!(event.outcome, ForkCacheOutcome::Miss);
 }
 
@@ -410,14 +412,8 @@ fn two_parents_in_store_resolve_independently() {
     let store = InMemoryPrefixStore::new();
     let sink: &dyn PrefixCaptureSink = &store;
 
-    let pa = capture_parent_prefix(
-        build_sample_request("run-A", "claude-opus-4-6", 0),
-        sink,
-    );
-    let pb = capture_parent_prefix(
-        build_sample_request("run-B", "claude-opus-4-6", 0),
-        sink,
-    );
+    let pa = capture_parent_prefix(build_sample_request("run-A", "claude-opus-4-6", 0), sink);
+    let pb = capture_parent_prefix(build_sample_request("run-B", "claude-opus-4-6", 0), sink);
     let pa_id = match pa {
         ForkCaptureOutcome::Captured { prefix_id, .. } => prefix_id,
         _ => panic!(),
@@ -466,10 +462,7 @@ fn prefix_id_present_in_all_five_flow_stages() {
     let sink: &dyn PrefixCaptureSink = &store;
 
     // Stage 1 — capture emits it.
-    let cap = capture_parent_prefix(
-        build_sample_request("run-X", "claude-opus-4-6", 0),
-        sink,
-    );
+    let cap = capture_parent_prefix(build_sample_request("run-X", "claude-opus-4-6", 0), sink);
     let id = match cap {
         ForkCaptureOutcome::Captured { prefix_id, .. } => prefix_id,
         _ => panic!(),

@@ -595,8 +595,7 @@ pub struct ServerAgenticLoopHost {
     /// cacheable prefix so delegate / spawn_agent sub-runs routed
     /// through the server-side DelegationEngine can inherit it. Mirrors
     /// the CLI-side wiring in `CliAgenticLoopHost::prefix_store`.
-    prefix_store:
-        Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
+    prefix_store: Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
     /// Tool schemas advertised to the LLM this turn — used to populate
     /// `CaptureRequest.tool_schemas` for per-tool drift attribution.
     /// Updated by `execute_turn` each round.
@@ -636,8 +635,7 @@ pub struct ServerAgenticLoopHostBuilder {
     #[cfg(feature = "bridge-e2e-hooks")]
     shared_dedup_state: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
     /// Optional fork-prefix store for parent-turn capture (G2).
-    prefix_store:
-        Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
+    prefix_store: Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
 }
 
 impl ServerAgenticLoopHostBuilder {
@@ -2962,10 +2960,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         &self.valid_tools
     }
 
-    fn on_turn_completed(
-        &mut self,
-        state: &crate::turn::agentic_loop_host::AgenticLoopState,
-    ) {
+    fn on_turn_completed(&mut self, state: &crate::turn::agentic_loop_host::AgenticLoopState) {
         // G2: server-side parent capture. Mirrors the CLI host's
         // `on_turn_completed`, so delegate / spawn_agent sub-runs
         // routed through the server DelegationEngine can inherit the
@@ -2980,8 +2975,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             _ => return,
         };
         let model_id = self.model_override.clone().unwrap_or_default();
-        let provider =
-            astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model_id);
+        let provider = astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model_id);
         let Ok(canonical_prefix_bytes) = serde_json::to_vec(&state.messages) else {
             return;
         };
@@ -2996,9 +2990,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // the canonical byte form. A follow-up can thread the
         // system_msgs Vec<Value> through the same stash path if the
         // telemetry attribution need arises.
-        let tool_schemas = astra_turn_core::fork_prefix::build_tool_schema_entries(
-            &self.last_turn_tool_schemas,
-        );
+        let tool_schemas =
+            astra_turn_core::fork_prefix::build_tool_schema_entries(&self.last_turn_tool_schemas);
         let req = astra_turn_core::fork_capture::CaptureRequest {
             parent_run_id,
             parent_turn_seq: state.llm_rounds_completed,
@@ -5783,11 +5776,7 @@ mod tests {
             let mut state = state_with_run("whatever");
             state.current_run_id = None; // simulate pre-run state
             host.on_turn_completed(&state);
-            assert_eq!(
-                store.tracked_count(),
-                0,
-                "missing run_id must skip capture"
-            );
+            assert_eq!(store.tracked_count(), 0, "missing run_id must skip capture");
         }
     }
 }

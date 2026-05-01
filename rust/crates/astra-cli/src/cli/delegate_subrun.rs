@@ -120,8 +120,7 @@ pub(crate) struct CliDelegateSubRunExecutor {
     /// `inherited_prefix: None` and no event ever fires. The sink
     /// is accepted here so the follow-up wire-up PR only touches
     /// the engine, not the executor.
-    fork_cache_sink:
-        Option<Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink>>,
+    fork_cache_sink: Option<Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink>>,
 }
 
 impl CliDelegateSubRunExecutor {
@@ -290,8 +289,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             // the spawn_agent path.
             inherited_prefix: config.inherited_prefix.clone(),
             fork_cache_sink: self.fork_cache_sink.clone(),
-            fork_cache_probe_state:
-                astra_runtime::orchestration::ForkCacheProbeState::new(),
+            fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
         };
 
         // Build system message from agent profile.

@@ -84,14 +84,12 @@ pub(crate) struct SubRunHost {
     /// by `on_turn_completed` on the first successful ingested turn
     /// to emit a single [`ForkCacheEvent`]. `None` means the child
     /// wasn't asked to inherit — no probe runs.
-    pub(crate) inherited_prefix:
-        Option<astra_runtime::orchestration::InheritedChildPrefix>,
+    pub(crate) inherited_prefix: Option<astra_runtime::orchestration::InheritedChildPrefix>,
     /// Sink for fork-cache events. Shares lifetime with the
     /// executor. When `None` no probe fires — the executor simply
     /// didn't plumb one through (harmless, telemetry is off).
-    pub(crate) fork_cache_sink: Option<
-        std::sync::Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink>,
-    >,
+    pub(crate) fork_cache_sink:
+        Option<std::sync::Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink>>,
     /// One-shot state tracking whether the first-turn probe has
     /// already fired. The hook is called every turn; we only want
     /// to emit one event per child spawn.
@@ -489,8 +487,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             // driven. Leave empty.
             inherited_prefix: None,
             fork_cache_sink: None,
-            fork_cache_probe_state:
-                astra_runtime::orchestration::ForkCacheProbeState::new(),
+            fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
         };
 
         let messages = vec![

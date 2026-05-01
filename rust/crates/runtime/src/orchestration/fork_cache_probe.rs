@@ -232,10 +232,7 @@ mod tests {
             &sink,
         );
         assert_eq!(sink.0.lock().unwrap().len(), 1);
-        assert_eq!(
-            sink.0.lock().unwrap()[0].outcome,
-            ForkCacheOutcome::Miss
-        );
+        assert_eq!(sink.0.lock().unwrap()[0].outcome, ForkCacheOutcome::Miss);
     }
 
     #[test]

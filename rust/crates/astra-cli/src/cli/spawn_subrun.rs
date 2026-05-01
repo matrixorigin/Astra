@@ -47,8 +47,7 @@ pub struct CliSpawnAgentExecutor {
     /// executor still forwards `inherited_prefix` so child messages
     /// prepend the parent prefix — but no ForkCacheEvent is emitted.
     /// Zero-cost when unset.
-    fork_cache_sink:
-        Option<Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink>>,
+    fork_cache_sink: Option<Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink>>,
 }
 
 impl CliSpawnAgentExecutor {
@@ -159,8 +158,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             ),
             inherited_prefix: config.inherited_prefix.clone(),
             fork_cache_sink: self.fork_cache_sink.clone(),
-            fork_cache_probe_state:
-                astra_runtime::orchestration::ForkCacheProbeState::new(),
+            fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
         };
 
         // Build system message from agent type definition

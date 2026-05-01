@@ -2138,9 +2138,9 @@ mod tests {
     use astra_services::session_journal::ToolCallRecord;
 
     use super::*;
-    use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
     use crate::observability_integration::ObservabilityHub;
     use crate::turn::agentic_loop_host::tests::{MockHost, make_state, text_result};
+    use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 
     #[test]
     fn circuit_breaker_introspection_message_uses_actual_read_only_streak() {

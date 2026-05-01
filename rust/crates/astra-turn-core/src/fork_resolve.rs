@@ -40,9 +40,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::fork_capture::is_fork_inherit_prefix_enabled;
-use crate::fork_prefix::{
-    ForkPrefix, ForkValidationError, ProviderKind, SpawnValidationContext,
-};
+use crate::fork_prefix::{ForkPrefix, ForkValidationError, ProviderKind, SpawnValidationContext};
 use crate::fork_prefix_store::PrefixCaptureSink;
 use crate::orchestration_spawn_tool::InheritPrefixSpec;
 
@@ -473,10 +471,11 @@ mod tests {
         let out = resolve_inherit_prefix(Some(&spec), &ctx, &store);
         match out {
             PrefixResolveOutcome::Fallback {
-                reason: ResolveFailure::Incompatible {
-                    reason: ForkValidationError::ProviderMismatch { .. },
-                    ..
-                },
+                reason:
+                    ResolveFailure::Incompatible {
+                        reason: ForkValidationError::ProviderMismatch { .. },
+                        ..
+                    },
             } => {}
             other => panic!("expected Fallback{{Incompatible(ProviderMismatch)}}, got {other:?}"),
         }
@@ -495,10 +494,11 @@ mod tests {
         let out = resolve_inherit_prefix(Some(&spec), &ctx, &store);
         match out {
             PrefixResolveOutcome::Failed {
-                reason: ResolveFailure::Incompatible {
-                    reason: ForkValidationError::ModelMismatch { .. },
-                    ..
-                },
+                reason:
+                    ResolveFailure::Incompatible {
+                        reason: ForkValidationError::ModelMismatch { .. },
+                        ..
+                    },
             } => {}
             other => panic!("expected Failed{{Incompatible(ModelMismatch)}}, got {other:?}"),
         }
@@ -517,14 +517,15 @@ mod tests {
         let out = resolve_inherit_prefix(Some(&spec), &ctx, &store);
         match out {
             PrefixResolveOutcome::Fallback {
-                reason: ResolveFailure::Incompatible {
-                    reason: ForkValidationError::ThinkingBudgetConflict { .. },
-                    ..
-                },
+                reason:
+                    ResolveFailure::Incompatible {
+                        reason: ForkValidationError::ThinkingBudgetConflict { .. },
+                        ..
+                    },
             } => {}
-            other => panic!(
-                "expected Fallback{{Incompatible(ThinkingBudgetConflict)}}, got {other:?}"
-            ),
+            other => {
+                panic!("expected Fallback{{Incompatible(ThinkingBudgetConflict)}}, got {other:?}")
+            }
         }
     }
 

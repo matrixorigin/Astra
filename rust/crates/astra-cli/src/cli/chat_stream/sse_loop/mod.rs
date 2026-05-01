@@ -1052,8 +1052,8 @@ hooks:
     #[test]
     fn maybe_pin_spawn_agent_schema_adds_pinned_entry_when_spawner_wired() {
         use super::maybe_pin_spawn_agent_schema;
-        use astra_runtime::tool_registry::ToolRegistry;
         use crate::edge_tools;
+        use astra_runtime::tool_registry::ToolRegistry;
 
         let mut registry = ToolRegistry::new(edge_tools::all_tool_schemas());
         let initial_pinned: std::collections::HashSet<String> = registry
@@ -1083,8 +1083,8 @@ hooks:
     #[test]
     fn maybe_pin_spawn_agent_schema_is_noop_without_spawner() {
         use super::maybe_pin_spawn_agent_schema;
-        use astra_runtime::tool_registry::ToolRegistry;
         use crate::edge_tools;
+        use astra_runtime::tool_registry::ToolRegistry;
 
         let mut registry = ToolRegistry::new(edge_tools::all_tool_schemas());
         let before: std::collections::HashSet<String> = registry

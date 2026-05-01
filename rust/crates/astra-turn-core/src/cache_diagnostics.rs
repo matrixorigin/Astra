@@ -1212,8 +1212,7 @@ mod tests {
         );
 
         // B breaks — system prompt changed for B.
-        let b_second =
-            det.record_turn_for_source("B", snap("prompt-B-v2", &tools, "m"), None);
+        let b_second = det.record_turn_for_source("B", snap("prompt-B-v2", &tools, "m"), None);
         assert!(
             matches!(
                 b_second.as_ref().map(|e| &e.reason),
@@ -1261,7 +1260,8 @@ mod tests {
             "oldest source should have been evicted"
         );
         assert!(
-            det.snapshot_for_source(&format!("s{:02}", MAX_TRACKED_SOURCES + 2)).is_some(),
+            det.snapshot_for_source(&format!("s{:02}", MAX_TRACKED_SOURCES + 2))
+                .is_some(),
             "newest source must still be tracked"
         );
     }

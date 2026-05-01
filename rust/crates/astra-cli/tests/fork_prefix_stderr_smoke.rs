@@ -15,8 +15,8 @@ use astra_turn_core::fork_cache_event::{
     ForkCacheEventSink, ForkCacheThresholds, StderrForkCacheSink,
 };
 use astra_turn_core::fork_capture::{
-    CaptureRequest, ForkCaptureOutcome, capture_parent_prefix,
-    restore_fork_flag_raw_for_tests, set_fork_flag_for_tests,
+    CaptureRequest, ForkCaptureOutcome, capture_parent_prefix, restore_fork_flag_raw_for_tests,
+    set_fork_flag_for_tests,
 };
 use astra_turn_core::fork_prefix::{
     CacheMode, ProviderKind, SystemBlock, ThinkingConfigSlice, ToolSchemaEntry, hash_tool_schema,
@@ -79,7 +79,9 @@ fn stderr_sink_end_to_end_smoke() {
 
     // Retrieve + verify the stored ForkPrefix — simulates what a
     // spawn would hand to the executor.
-    let stored = store.get_prefix("run-smoke").expect("captured prefix present");
+    let stored = store
+        .get_prefix("run-smoke")
+        .expect("captured prefix present");
     assert_eq!(stored.prefix_id, prefix_id);
 
     // Simulate executor.on_turn_completed: build an inherited and

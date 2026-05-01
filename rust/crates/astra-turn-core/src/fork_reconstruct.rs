@@ -82,18 +82,12 @@ pub enum ReconstructError {
     /// wire format is `{"role":..., "content":...}`; non-objects
     /// (nulls, strings, numbers) signal a captured garbage state.
     #[error("prefix message at index {index} is not an object (got {kind})")]
-    NonObjectElement {
-        index: usize,
-        kind: &'static str,
-    },
+    NonObjectElement { index: usize, kind: &'static str },
     /// A child suffix element is not a JSON object. Caught here, at
     /// the reconstruction boundary, so downstream payload builders
     /// don't have to guard per-index.
     #[error("child suffix message at index {index} is not an object (got {kind})")]
-    NonObjectChildElement {
-        index: usize,
-        kind: &'static str,
-    },
+    NonObjectChildElement { index: usize, kind: &'static str },
 }
 
 /// Reconstruct the child's first-request `messages` array from a
@@ -113,8 +107,10 @@ pub fn reconstruct_messages(
     child_suffix: Vec<Value>,
 ) -> Result<ReconstructedMessages, ReconstructError> {
     let bytes: &[u8] = prefix.canonical_prefix_bytes().as_ref();
-    let value: Value = serde_json::from_slice(bytes)
-        .map_err(|e| ReconstructError::MalformedPrefixJson { detail: e.to_string() })?;
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|e| ReconstructError::MalformedPrefixJson {
+            detail: e.to_string(),
+        })?;
 
     let mut prefix_msgs = match value {
         Value::Array(arr) => arr,
@@ -320,10 +316,7 @@ mod tests {
         // Reconstructor catches malformed suffix at the boundary so
         // downstream payload builders don't have to.
         let prefix = prefix_with_bytes(b"[]".to_vec());
-        let suffix = vec![
-            json!({"role": "user"}),
-            json!("oops not an object"),
-        ];
+        let suffix = vec![json!({"role": "user"}), json!("oops not an object")];
         match reconstruct_messages(&prefix, suffix).unwrap_err() {
             ReconstructError::NonObjectChildElement { index, kind } => {
                 assert_eq!(index, 1);

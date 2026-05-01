@@ -1209,7 +1209,8 @@ mod tests {
         // This test fails as a tripwire if someone accidentally drops
         // the prefix or picks a conflicting literal for a new variant.
         let other = sample_prefix(|a| a.provider = ProviderKind::Other("groq".into()));
-        let as_if_first_class = sample_prefix(|a| a.provider = ProviderKind::Other("other:groq".into()));
+        let as_if_first_class =
+            sample_prefix(|a| a.provider = ProviderKind::Other("other:groq".into()));
         // Collision check: a pathological `Other("other:groq")` would
         // currently produce tag `"other:other:groq"` — different from
         // any hypothetical first-class `"groq"`. Good.
