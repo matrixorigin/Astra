@@ -863,4 +863,76 @@ mod tests {
         assert!(out.contains("2/3"), "missing 2/3 count: {out}");
         assert!(out.contains("67%"), "missing percentage: {out}");
     }
+
+    #[test]
+    fn render_text_shows_capability_aggregation() {
+        let make = |cap, passed| CaseRunReport {
+            case_name: "c".into(),
+            model: "m".into(),
+            passed,
+            run_index: 0,
+            capability: Some(cap),
+            weight: 1.0,
+            difficulty: None,
+            outcome: RunOutcome::new("m"),
+            criteria: vec![],
+            steps: vec![],
+            failure_class: None,
+            session: None,
+            reproducer: None,
+            digest: None,
+            digest_error: None,
+        };
+        let r = SuiteReport {
+            runs: vec![
+                make(crate::case::Capability::ToolUse, true),
+                make(crate::case::Capability::ToolUse, false),
+            ],
+            ..Default::default()
+        };
+        let out = render_text(&r, false);
+        assert!(
+            out.contains("capability × model"),
+            "missing cap section: {out}"
+        );
+        assert!(out.contains("tool_use × m: 50%"), "wrong pct: {out}");
+    }
+
+    #[test]
+    fn render_text_shows_difficulty_aggregation() {
+        let make = |diff, passed| CaseRunReport {
+            case_name: "c".into(),
+            model: "m".into(),
+            passed,
+            run_index: 0,
+            capability: Some(crate::case::Capability::Reasoning),
+            weight: 1.0,
+            difficulty: Some(diff),
+            outcome: RunOutcome::new("m"),
+            criteria: vec![],
+            steps: vec![],
+            failure_class: None,
+            session: None,
+            reproducer: None,
+            digest: None,
+            digest_error: None,
+        };
+        let r = SuiteReport {
+            runs: vec![make(1, true), make(3, false)],
+            ..Default::default()
+        };
+        let out = render_text(&r, false);
+        assert!(
+            out.contains("capability × difficulty × model"),
+            "missing cap×diff section: {out}"
+        );
+        assert!(
+            out.contains("reasoning × d1 × m: 100%"),
+            "d1 should be 100%: {out}"
+        );
+        assert!(
+            out.contains("reasoning × d3 × m: 0%"),
+            "d3 should be 0%: {out}"
+        );
+    }
 }

@@ -151,7 +151,17 @@ pub enum Criterion {
     CacheRateAbove {
         /// Minimum cache hit rate (0.0 = no caching required, 1.0 = all cached).
         threshold: f64,
+        /// Minimum number of tool calls required for the criterion to
+        /// apply. When the agent makes fewer calls than this, the
+        /// criterion FAILs instead of skip-passing. Default 1 — set
+        /// higher if the case expects a specific tool-call volume.
+        #[serde(default = "default_cache_min_calls")]
+        min_calls: u32,
     },
+}
+
+fn default_cache_min_calls() -> u32 {
+    1
 }
 
 fn default_judger_threshold() -> f64 {
@@ -408,7 +418,9 @@ fn evaluate_one(
         },
 
         Criterion::TokensBetween { min, max } => {
-            let total = outcome.prompt_tokens + outcome.completion_tokens;
+            let total = outcome
+                .prompt_tokens
+                .saturating_add(outcome.completion_tokens);
             let passed = total >= *min && total <= *max;
             CriterionResult {
                 criterion: c.clone(),
@@ -472,9 +484,28 @@ fn evaluate_one(
             }
         }
 
-        Criterion::CacheRateAbove { threshold } => {
+        Criterion::CacheRateAbove {
+            threshold,
+            min_calls,
+        } => {
+            let effective_calls = if outcome.total_tool_calls > 0 {
+                outcome.total_tool_calls
+            } else {
+                outcome.tool_calls_count
+            };
+            if effective_calls < *min_calls {
+                return CriterionResult {
+                    criterion: c.clone(),
+                    passed: false,
+                    detail: format!(
+                        "too few tool calls: {effective_calls} < min_calls={min_calls} \
+                         (cache rate requires at least {min_calls} calls)"
+                    ),
+                    full_detail: None,
+                    score: None,
+                };
+            }
             if outcome.total_tool_calls == 0 && outcome.tool_calls_count == 0 {
-                // Genuinely no tool calls — cache rate is N/A.
                 CriterionResult {
                     criterion: c.clone(),
                     passed: true,
@@ -636,6 +667,11 @@ pub fn validate_criterion(c: &Criterion) -> Result<(), String> {
             if tools.is_empty() {
                 return Err("ToolSequence.tools must not be empty".into());
             }
+            for (i, t) in tools.iter().enumerate() {
+                if t.trim().is_empty() {
+                    return Err(format!("ToolSequence.tools[{i}] must not be empty"));
+                }
+            }
             Ok(())
         }
         Criterion::TurnRoundsBetween { min, max } => {
@@ -644,7 +680,7 @@ pub fn validate_criterion(c: &Criterion) -> Result<(), String> {
             }
             Ok(())
         }
-        Criterion::CacheRateAbove { threshold } => {
+        Criterion::CacheRateAbove { threshold, .. } => {
             if !threshold.is_finite() || *threshold < 0.0 || *threshold > 1.0 {
                 return Err(format!(
                     "CacheRateAbove.threshold must be in [0.0, 1.0]; got {threshold}"
@@ -1294,7 +1330,13 @@ fn cache_rate_above_passes() {
     let mut out = RunOutcome::new("m");
     out.total_tool_calls = 10;
     out.cache_hits = 8;
-    let r = evaluate_deterministic(&[Criterion::CacheRateAbove { threshold: 0.5 }], &out);
+    let r = evaluate_deterministic(
+        &[Criterion::CacheRateAbove {
+            threshold: 0.5,
+            min_calls: 1,
+        }],
+        &out,
+    );
     assert!(r[0].passed, "{}", r[0].detail);
 }
 
@@ -1303,16 +1345,42 @@ fn cache_rate_above_fails() {
     let mut out = RunOutcome::new("m");
     out.total_tool_calls = 10;
     out.cache_hits = 1;
-    let r = evaluate_deterministic(&[Criterion::CacheRateAbove { threshold: 0.5 }], &out);
+    let r = evaluate_deterministic(
+        &[Criterion::CacheRateAbove {
+            threshold: 0.5,
+            min_calls: 1,
+        }],
+        &out,
+    );
     assert!(!r[0].passed);
     assert!(r[0].detail.contains("10.0%"));
 }
 
 #[test]
-fn cache_rate_above_skip_passes_no_tools() {
+fn cache_rate_above_fails_when_no_tools_and_min_calls_set() {
     let out = RunOutcome::new("m");
-    let r = evaluate_deterministic(&[Criterion::CacheRateAbove { threshold: 0.9 }], &out);
-    assert!(r[0].passed); // skip-pass when no tool calls
+    let r = evaluate_deterministic(
+        &[Criterion::CacheRateAbove {
+            threshold: 0.9,
+            min_calls: 1,
+        }],
+        &out,
+    );
+    assert!(!r[0].passed, "min_calls=1 with 0 tool calls must FAIL");
+    assert!(r[0].detail.contains("too few tool calls"));
+}
+
+#[test]
+fn cache_rate_above_skip_passes_no_tools_when_min_calls_zero() {
+    let out = RunOutcome::new("m");
+    let r = evaluate_deterministic(
+        &[Criterion::CacheRateAbove {
+            threshold: 0.9,
+            min_calls: 0,
+        }],
+        &out,
+    );
+    assert!(r[0].passed, "min_calls=0 with no tools should skip-pass");
 }
 
 #[test]
@@ -1320,7 +1388,13 @@ fn cache_rate_above_fails_when_step_events_missing() {
     let mut out = RunOutcome::new("m");
     out.tool_calls_count = 3; // envelope says tools were called
     out.total_tool_calls = 0; // but step_events weren't parsed
-    let r = evaluate_deterministic(&[Criterion::CacheRateAbove { threshold: 0.5 }], &out);
+    let r = evaluate_deterministic(
+        &[Criterion::CacheRateAbove {
+            threshold: 0.5,
+            min_calls: 1,
+        }],
+        &out,
+    );
     assert!(!r[0].passed);
     assert!(r[0].detail.contains("step_events missing"));
 }

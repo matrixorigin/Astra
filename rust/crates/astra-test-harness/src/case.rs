@@ -142,6 +142,33 @@ impl std::fmt::Display for Capability {
     }
 }
 
+const KNOWN_CAPABILITIES: &[&str] = &[
+    "tool_use",
+    "delegation",
+    "instruction_following",
+    "anti_hallucination",
+    "efficiency",
+    "code_generation",
+    "reasoning",
+    "memory",
+    "planning",
+];
+
+fn validate_capability(cap: &Capability) -> Result<(), String> {
+    if let Capability::Custom(s) = cap {
+        let lower = s.to_ascii_lowercase();
+        for known in KNOWN_CAPABILITIES {
+            if lower == *known && s != *known {
+                return Err(format!(
+                    "capability {s:?} looks like a typo of built-in {known:?} \
+                     (wrong case). Use {known:?} or a clearly different custom name"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn default_weight() -> f64 {
     1.0
 }
@@ -182,16 +209,20 @@ pub(crate) const RESERVED_CLI_ARGS: &[&str] = &[
     // `prompt:`; allowing --system-prompt would bypass the judger's
     // anti-gaming preamble assumptions.
     "--system-prompt",
+    // Session ID — the harness manages --session-id for multi-turn
+    // steps; a case overriding it would break session continuation.
+    "--session-id",
 ];
 
 /// Validate that `args` does not contain any reserved flag. Returns
-/// the first offender so the error message is precise. Exact-string
-/// match: a user that really needs `--model-prefix` (hypothetical)
-/// isn't blocked.
+/// the first offender so the error message is precise. Matches both
+/// exact form (`--model`) and `=` syntax (`--model=gpt-4`) so the
+/// denylist cannot be bypassed by appending `=value`.
 pub(crate) fn validate_extra_cli_args(args: &[String]) -> Result<(), String> {
     for a in args {
+        let flag_part = a.split('=').next().unwrap_or(a);
         for r in RESERVED_CLI_ARGS {
-            if a == r {
+            if flag_part == *r {
                 return Err(format!(
                     "reserved CLI flag {a:?} in extra_cli_args — the harness \
                      manages this flag; pick a different mechanism (adjust \
@@ -251,6 +282,22 @@ impl Case {
         // the child even runs. A YAML typo turns the whole suite into
         // "harness hang". Require at least 1 second; realistic cases
         // want tens or hundreds.
+        if let Some(ref cap) = case.capability {
+            validate_capability(cap)
+                .map_err(|e| anyhow::anyhow!("case {}: {e}", path.display()))?;
+        }
+        if !case.weight.is_finite() || case.weight < 0.0 {
+            anyhow::bail!(
+                "case {}: weight must be finite and >= 0.0 (got {})",
+                path.display(),
+                case.weight,
+            );
+        }
+        if let Some(d) = case.difficulty
+            && !(1..=5).contains(&d)
+        {
+            anyhow::bail!("case {}: difficulty must be 1–5 (got {d})", path.display(),);
+        }
         if case.timeout_seconds == 0 {
             anyhow::bail!(
                 "case {}: timeout_seconds must be >= 1 (got 0 — every case would \
@@ -506,5 +553,99 @@ mod tests {
     fn validate_extra_cli_args_accepts_empty_and_unknown() {
         assert!(validate_extra_cli_args(&[]).is_ok());
         assert!(validate_extra_cli_args(&["--whatever".into()]).is_ok());
+    }
+
+    #[test]
+    fn reserved_flag_bypass_via_equals_syntax_rejected() {
+        for bypass in [
+            "--model=gpt-4",
+            "--message=hello",
+            "--json=true",
+            "--permission-mode=auto",
+            "--system-prompt=override",
+            "--session-id=hijack",
+        ] {
+            let err = validate_extra_cli_args(&[bypass.into()]);
+            assert!(
+                err.is_err(),
+                "{bypass:?} should be rejected (= syntax bypass)"
+            );
+        }
+    }
+
+    #[test]
+    fn non_reserved_flag_with_equals_accepted() {
+        assert!(validate_extra_cli_args(&["--verbose=true".into()]).is_ok());
+        assert!(validate_extra_cli_args(&["--explain=yes".into()]).is_ok());
+    }
+
+    #[test]
+    fn negative_weight_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bad.yaml");
+        std::fs::write(&path, "name: c\nprompt: p\nweight: -1.0\n").unwrap();
+        let err = Case::from_path(&path).expect_err("negative weight must fail");
+        assert!(err.to_string().contains("weight"), "{err}");
+    }
+
+    #[test]
+    fn difficulty_out_of_range_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bad.yaml");
+        std::fs::write(&path, "name: c\nprompt: p\ndifficulty: 200\n").unwrap();
+        let err = Case::from_path(&path).expect_err("difficulty 200 must fail");
+        assert!(err.to_string().contains("difficulty"), "{err}");
+    }
+
+    #[test]
+    fn difficulty_zero_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bad.yaml");
+        std::fs::write(&path, "name: c\nprompt: p\ndifficulty: 0\n").unwrap();
+        let err = Case::from_path(&path).expect_err("difficulty 0 must fail");
+        assert!(err.to_string().contains("difficulty"), "{err}");
+    }
+
+    #[test]
+    fn capability_typo_warns_on_near_miss() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("typo.yaml");
+        std::fs::write(&path, "name: c\nprompt: p\ncapability: Tool_Use\n").unwrap();
+        let err = Case::from_path(&path).expect_err("near-miss capability must fail");
+        assert!(
+            err.to_string().contains("Tool_Use") && err.to_string().contains("tool_use"),
+            "error should suggest the correct variant: {err}"
+        );
+    }
+
+    #[test]
+    fn capability_known_variant_accepted() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ok.yaml");
+        std::fs::write(&path, "name: c\nprompt: p\ncapability: tool_use\n").unwrap();
+        let c = Case::from_path(&path).expect("known capability");
+        assert_eq!(c.capability, Some(Capability::ToolUse));
+    }
+
+    #[test]
+    fn capability_truly_custom_accepted() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ok.yaml");
+        std::fs::write(&path, "name: c\nprompt: p\ncapability: my_special_cap\n").unwrap();
+        let c = Case::from_path(&path).expect("custom capability");
+        assert_eq!(
+            c.capability,
+            Some(Capability::Custom("my_special_cap".into()))
+        );
+    }
+
+    #[test]
+    fn valid_weight_and_difficulty_accepted() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ok.yaml");
+        std::fs::write(&path, "name: c\nprompt: p\nweight: 2.5\ndifficulty: 3\n").unwrap();
+        let c = Case::from_path(&path).expect("valid weight+difficulty");
+        assert!((c.weight - 2.5).abs() < f64::EPSILON);
+        assert_eq!(c.difficulty, Some(3));
     }
 }

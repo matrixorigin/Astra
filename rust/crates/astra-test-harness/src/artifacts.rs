@@ -21,19 +21,33 @@ pub fn persist_artifacts(base_dir: &Path, report: &CaseRunReport) -> std::io::Re
     std::fs::write(dir.join("stdout.txt"), &report.outcome.text)?;
     std::fs::write(dir.join("stderr.txt"), &report.outcome.stderr)?;
 
-    let report_json = serde_json::to_string_pretty(report).unwrap_or_default();
+    let report_json = serde_json::to_string_pretty(report).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("report.json serialize failed: {e}"),
+        )
+    })?;
     std::fs::write(dir.join("report.json"), report_json)?;
 
     if let Some(ref digest) = report.digest {
-        let digest_json = serde_json::to_string_pretty(&digest.json).unwrap_or_default();
+        let digest_json = serde_json::to_string_pretty(&digest.json).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("digest.json serialize failed: {e}"),
+            )
+        })?;
         std::fs::write(dir.join("digest.json"), digest_json)?;
     }
 
     Ok(())
 }
 
-/// Sanitize a string for use as a directory name.
+/// Sanitize a string for use as a directory name. Returns "_" for
+/// empty strings to avoid creating a directory with an empty name.
 fn sanitize(s: &str) -> String {
+    if s.is_empty() {
+        return "_".to_string();
+    }
     s.chars()
         .map(|c| {
             if c.is_alphanumeric() || c == '-' || c == '_' {
@@ -78,5 +92,16 @@ mod tests {
         assert!(tmp.join("test_case/my_model/0/report.json").exists());
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sanitize_empty_string_returns_underscore() {
+        assert_eq!(super::sanitize(""), "_");
+    }
+
+    #[test]
+    fn sanitize_special_chars() {
+        assert_eq!(super::sanitize("a/b.c"), "a_b_c");
+        assert_eq!(super::sanitize("hello"), "hello");
     }
 }

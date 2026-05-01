@@ -616,13 +616,13 @@ impl Judger for ExternalCmdJudger {
             }
         });
 
-        let parts: Vec<&str> = self.cmd.split_whitespace().collect();
-        let (program, args) = parts
-            .split_first()
-            .ok_or_else(|| "judger-cmd is empty".to_string())?;
+        if self.cmd.trim().is_empty() {
+            return Err("judger-cmd is empty".to_string());
+        }
 
-        let mut child = Command::new(program)
-            .args(args)
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&self.cmd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

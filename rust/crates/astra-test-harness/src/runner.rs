@@ -163,7 +163,7 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
             }
             return RunOutcome {
                 model: model.into(),
-                exit_code: 0,
+                exit_code: -1,
                 text: trimmed.to_string(),
                 stderr: String::new(),
                 session_id: None,
@@ -284,6 +284,10 @@ mod tests {
         let out = parse_json_outcome("not json", "m");
         assert_eq!(out.text, "not json");
         assert_eq!(out.tool_calls_count, 0);
+        assert_eq!(
+            out.exit_code, -1,
+            "fallback must signal anomaly via exit_code=-1"
+        );
     }
 
     #[test]

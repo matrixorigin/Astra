@@ -242,7 +242,8 @@ pub fn load_session_from_path_with_caps(
         return None;
     }
     let body = std::fs::read_to_string(path).ok()?;
-    let mut events: Vec<JournalEvent> = Vec::with_capacity(128);
+    let mut events: std::collections::VecDeque<JournalEvent> =
+        std::collections::VecDeque::with_capacity(128);
     let mut skipped: u32 = 0;
     let mut dropped_from_head: u32 = 0;
     for line in body.lines() {
@@ -259,13 +260,10 @@ pub fn load_session_from_path_with_caps(
                     .unwrap_or("")
                     .to_string();
                 if events.len() >= max_events {
-                    // Ring-buffer: drop the head (oldest event) so
-                    // the tail (newest events — where `[fork-cache]`
-                    // and closing `ToolCallCompleted` live) survives.
-                    events.remove(0);
+                    events.pop_front();
                     dropped_from_head = dropped_from_head.saturating_add(1);
                 }
-                events.push(JournalEvent { event_type, raw: v });
+                events.push_back(JournalEvent { event_type, raw: v });
             }
             Err(_) => skipped = skipped.saturating_add(1),
         }
@@ -280,7 +278,7 @@ pub fn load_session_from_path_with_caps(
     Some(SessionCapture {
         session_id: session_id.to_string(),
         journal_path: path.to_path_buf(),
-        events,
+        events: events.into(),
         skipped_lines: skipped,
     })
 }
@@ -494,6 +492,33 @@ mod tests {
         assert_eq!(cap.events.len(), 2);
         assert_eq!(cap.skipped_lines, 0);
     }
+
+    #[test]
+    fn step_event_stats_rejects_oversize_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("step_events.jsonl");
+        let big = vec![b'x'; 2048];
+        std::fs::write(&path, &big).unwrap();
+        let result = super::load_step_event_stats_from_path(&path, 1024);
+        assert!(result.is_none(), "oversize step_events must return None");
+    }
+
+    #[test]
+    fn step_event_stats_parses_within_cap() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("step_events.jsonl");
+        let body = [
+            r#"{"event_type":"StepStarted"}"#,
+            r#"{"event_type":"ToolCallCompleted","payload":{"tool_name":"Read","cached":true}}"#,
+            r#"{"event_type":"ToolCallCompleted","payload":{"tool_name":"Write","cached":false}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, &body).unwrap();
+        let stats = super::load_step_event_stats_from_path(&path, 1024 * 1024).unwrap();
+        assert_eq!(stats.turn_rounds, 1);
+        assert_eq!(stats.total_tool_calls, 2);
+        assert_eq!(stats.cache_hits, 1);
+    }
 }
 
 /// Metrics extracted from `step_events.jsonl`.
@@ -504,14 +529,33 @@ pub struct StepEventStats {
     pub total_tool_calls: u32,
 }
 
+/// Maximum step_events.jsonl file size the stats loader will read.
+/// Guards against a pathological file OOM-ing the harness process.
+pub const DEFAULT_MAX_STEP_EVENTS_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Parse `~/.astra/sessions/<session_id>/step_events.jsonl` and extract
 /// turn rounds and cache hit counts. Returns `None` if the file doesn't
-/// exist or is unreadable.
+/// exist, is unreadable, or exceeds the size cap.
 pub fn load_step_event_stats(session_id: &str) -> Option<StepEventStats> {
     let path = default_sessions_dir()
         .join(session_id)
         .join("step_events.jsonl");
-    let content = std::fs::read_to_string(&path).ok()?;
+    load_step_event_stats_from_path(&path, DEFAULT_MAX_STEP_EVENTS_BYTES)
+}
+
+/// Cap-configurable version — test seam.
+pub fn load_step_event_stats_from_path(path: &Path, max_bytes: u64) -> Option<StepEventStats> {
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.len() > max_bytes
+    {
+        eprintln!(
+            "[astra-test] WARNING: step_events {} bytes exceeds {}-byte cap; skipping stats.",
+            meta.len(),
+            max_bytes,
+        );
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
     let mut stats = StepEventStats::default();
     for line in content.lines() {
         if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) {

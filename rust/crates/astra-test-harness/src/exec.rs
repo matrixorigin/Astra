@@ -275,19 +275,19 @@ impl CaseExecutor for ExternalCmdExecutor {
             "run_index": 0,
         });
 
-        let parts: Vec<&str> = self.cmd.split_whitespace().collect();
-        let Some((program, args)) = parts.split_first() else {
+        if self.cmd.trim().is_empty() {
             return RunOutcome {
                 model: model.into(),
                 exit_code: -1,
                 text: "executor-cmd is empty".into(),
                 ..Default::default()
             };
-        };
+        }
 
         let start = std::time::Instant::now();
-        let child = Command::new(program)
-            .args(args)
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(&self.cmd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

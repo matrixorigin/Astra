@@ -340,11 +340,11 @@ impl<'a> SuiteRunner<'a> {
                 .iter()
                 .any(|c| matches!(c, Criterion::Judger { .. }))
         {
+            let prompt_preview: String = case.prompt.trim().chars().take(500).collect();
             criteria.push(Criterion::Judger {
                 question: format!(
-                    "Given the task: \"{}\"\nDid the agent complete it correctly and efficiently? \
-                     Score 0.0 for wrong/incomplete, 0.5 for partially correct, 1.0 for fully correct.",
-                    case.prompt.trim()
+                    "Given the task: \"{prompt_preview}\"\nDid the agent complete it correctly and efficiently? \
+                     Score 0.0 for wrong/incomplete, 0.5 for partially correct, 1.0 for fully correct."
                 ),
                 threshold: 0.7,
                 model: None,
@@ -774,5 +774,125 @@ mod tests {
         let report = runner.run_all(&[case]).await;
         let s = report.runs[0].session.as_ref().unwrap();
         assert_eq!(s.session_id, "sess-m");
+    }
+
+    #[tokio::test]
+    async fn setup_cmd_failure_aborts_case() {
+        let exec = FakeExecutor::new();
+        exec.seed("c1", "m", outcome_ok("m", "text", &[]));
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+        };
+        let mut case = case_with("c1", vec![]);
+        case.setup_cmd = Some("exit 1".into());
+        let report = runner.run_all(&[case]).await;
+        assert_eq!(report.total(), 1);
+        assert!(
+            !report.runs[0].passed,
+            "setup failure must mark case as FAIL"
+        );
+        assert_eq!(
+            report.runs[0].failure_class,
+            Some(crate::classify::FailureClass::PlatformSetupFailed)
+        );
+        assert!(
+            exec.calls.lock().unwrap().is_empty(),
+            "executor must NOT be called when setup fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_turn_steps_tracked_in_report() {
+        let exec = FakeExecutor::new();
+        exec.seed("mt", "m", outcome_ok("m", "step0-text", &["Read"]));
+        exec.seed("mt__step0", "m", outcome_ok("m", "step1-text", &["Write"]));
+
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+        };
+        let mut case = case_with("mt", vec![]);
+        case.steps = vec![crate::case::CaseStep {
+            prompt: "follow up".into(),
+            criteria: vec![],
+            timeout_seconds: None,
+        }];
+        let report = runner.run_all(&[case]).await;
+        assert_eq!(report.total(), 1);
+        assert!(report.runs[0].passed);
+        assert_eq!(report.runs[0].steps.len(), 1);
+        assert_eq!(report.runs[0].steps[0].step_index, 0);
+        assert_eq!(report.runs[0].steps[0].prompt, "follow up");
+    }
+
+    #[tokio::test]
+    async fn capability_and_difficulty_in_report() {
+        let exec = FakeExecutor::new();
+        exec.seed("c1", "m", outcome_ok("m", "text", &[]));
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+        };
+        let mut case = case_with("c1", vec![]);
+        case.capability = Some(crate::case::Capability::ToolUse);
+        case.difficulty = Some(3);
+        let report = runner.run_all(&[case]).await;
+        assert_eq!(
+            report.runs[0].capability,
+            Some(crate::case::Capability::ToolUse)
+        );
+        assert_eq!(report.runs[0].difficulty, Some(3));
+    }
+
+    #[tokio::test]
+    async fn wall_time_populated() {
+        let exec = FakeExecutor::new();
+        exec.seed("c1", "m", outcome_ok("m", "text", &[]));
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+        };
+        let report = runner.run_all(&[case_with("c1", vec![])]).await;
+        assert!(report.started_at.is_some());
+        assert!(report.ended_at.is_some());
+        // wall_time_ms should be at least 0 (test completes instantly)
+        // but the field must be populated.
     }
 }

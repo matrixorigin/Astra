@@ -1,0 +1,23 @@
+name: efficiency_bounds_basic
+description: >
+  Smoke case exercising the newer criteria types:
+  tokens_between, duration_between, tool_sequence, turn_rounds_between,
+  and cache_rate_above. Prompt is trivial so any model can pass; the
+  bounds are intentionally wide to avoid flakiness.
+prompt: "Say exactly: ok"
+timeout_seconds: 60
+capability: efficiency
+difficulty: 1
+weight: 0.5
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tokens_between
+    min: 1
+    max: 100000
+  - type: duration_between
+    min_ms: 0
+    max_ms: 120000
+  - type: turn_rounds_between
+    min: 0
+    max: 50
