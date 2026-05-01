@@ -469,3 +469,93 @@ async fn prune_ceiling_keeps_at_most_max_lessons_per_user() {
 
     cleanup(&user_id).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn adopted_lesson_gets_stronger_confidence_delta_than_passive() {
+    let user_id = format!("test-al-adopted-{}", Uuid::new_v4());
+    let svc = service().await;
+
+    let mut n1 = new_lesson(&user_id, None);
+    n1.trigger_signal = "tool_failures:grep".into();
+    n1.confidence = Some(0.6);
+    let adopted_lesson = svc.record(n1).await.unwrap();
+
+    let mut n2 = new_lesson(&user_id, None);
+    n2.trigger_signal = "tool_failures:rg".into();
+    n2.confidence = Some(0.6);
+    let passive_lesson = svc.record(n2).await.unwrap();
+
+    let session_id = format!("sess-adopted-{}", Uuid::new_v4());
+
+    svc.record_exposure(astra_services::LessonExposure {
+        lesson_id: adopted_lesson.id.clone(),
+        session_id: session_id.clone(),
+        user_id: user_id.clone(),
+        persona: "generic".into(),
+        workload_tag: None,
+        adopted: true,
+    })
+    .await
+    .unwrap();
+
+    svc.record_exposure(astra_services::LessonExposure {
+        lesson_id: passive_lesson.id.clone(),
+        session_id: session_id.clone(),
+        user_id: user_id.clone(),
+        persona: "generic".into(),
+        workload_tag: None,
+        adopted: false,
+    })
+    .await
+    .unwrap();
+
+    let updated = svc
+        .record_outcome(astra_services::LessonOutcome {
+            session_id,
+            user_id: user_id.clone(),
+            stall_events: 0,
+            user_corrections: 0,
+            tool_failures: 0,
+            unmet_postconditions: 0,
+            diagnosis_criteria_met: 2,
+            diagnosis_criteria_failed: 0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated, 2, "both lessons should be updated");
+
+    let lessons = svc
+        .load_recent(&user_id, "generic", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(lessons.len(), 2);
+
+    let adopted = lessons
+        .iter()
+        .find(|l| l.trigger_signal == "tool_failures:grep")
+        .expect("adopted lesson");
+    let passive = lessons
+        .iter()
+        .find(|l| l.trigger_signal == "tool_failures:rg")
+        .expect("passive lesson");
+
+    assert!(
+        adopted.confidence > passive.confidence,
+        "adopted ({}) must get stronger delta than passive ({})",
+        adopted.confidence,
+        passive.confidence
+    );
+    assert!(adopted.confidence > 0.6, "adopted must increase from 0.6");
+    assert!(passive.confidence > 0.6, "passive must increase from 0.6");
+
+    let adopted_delta = adopted.confidence - 0.6;
+    let passive_delta = passive.confidence - 0.6;
+    let ratio = adopted_delta / passive_delta;
+    assert!(
+        (ratio - 2.0).abs() < 0.1,
+        "adopted delta should be ~2x passive; ratio = {ratio:.3}"
+    );
+
+    cleanup(&user_id).await;
+}

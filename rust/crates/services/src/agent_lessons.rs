@@ -838,6 +838,7 @@ pub const AGENT_LESSONS_DDL: &str = "CREATE TABLE IF NOT EXISTS agent_lessons (
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     INDEX idx_agent_lessons_scope (user_id, persona, workload_tag, updated_at),
     INDEX idx_agent_lessons_user_updated (user_id, updated_at),
+    INDEX idx_agent_lessons_status (status),
     UNIQUE KEY uniq_agent_lesson_content \
         (user_id, persona, workload_key, kind, trigger_signal)
 )";
@@ -1014,6 +1015,7 @@ mod tests {
             "updated_at DATETIME(6)",
             "idx_agent_lessons_scope",
             "idx_agent_lessons_user_updated",
+            "idx_agent_lessons_status",
         ] {
             assert!(
                 AGENT_LESSONS_DDL.contains(required),
