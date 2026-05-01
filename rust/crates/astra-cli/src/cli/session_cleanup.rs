@@ -54,14 +54,23 @@ pub(super) async fn finalize_session(state: &ReplState) {
         && let Some(ref mc) = state.matrix_runtime
         && let Some(ref user_id) = state.ingestion_user_id
     {
-        let result = std::panic::AssertUnwindSafe(persist_lessons_best_effort(state, mc, user_id))
-            .catch_unwind()
-            .await;
-        if result.is_err() {
-            tracing::error!(
-                target: "session_cleanup",
-                "lesson extraction panicked; continuing with critical cleanup",
-            );
+        let lesson_fut =
+            std::panic::AssertUnwindSafe(persist_lessons_best_effort(state, mc, user_id))
+                .catch_unwind();
+        match tokio::time::timeout(Duration::from_secs(5), lesson_fut).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_panic)) => {
+                tracing::error!(
+                    target: "session_cleanup",
+                    "lesson extraction panicked; continuing with critical cleanup",
+                );
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: "session_cleanup",
+                    "lesson extraction timed out after 5s; continuing cleanup",
+                );
+            }
         }
     }
     // 3d. End observability only after session-derived lessons/outcomes have

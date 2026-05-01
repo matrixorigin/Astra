@@ -564,9 +564,10 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         .await?;
 
         // Retirement pass: separate statement so it reads the already-
-        // committed counters. This avoids dependence on MySQL's left-to-
-        // right SET evaluation order (MatrixOne follows standard SQL
-        // where all SET expressions see pre-update values).
+        // updated counters from the first UPDATE (visible within the same
+        // transaction). This avoids dependence on MySQL's left-to-right
+        // SET evaluation order (MatrixOne follows standard SQL where all
+        // SET expressions in a single UPDATE see pre-update values).
         query(
             "UPDATE agent_lessons \
              SET status = 'retired', updated_at = CURRENT_TIMESTAMP(6) \

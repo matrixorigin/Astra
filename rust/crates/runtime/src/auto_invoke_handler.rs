@@ -1100,6 +1100,79 @@ fn tracker_mixed_satisfied_and_failed_criteria() {
     );
 }
 
+/// Two overlapping diagnoses: stall resolves immediately (delta=0 is
+/// Satisfied), budget stays Pending until window expires → Failed.
+/// Verify they are removed independently without interfering.
+#[test]
+fn tracker_overlapping_diagnoses_independent_lifecycle() {
+    use astra_skills::auto_invoke::*;
+
+    let mut tracker = DiagnosisOutcomeTracker::new();
+
+    // Diagnosis A: stall criterion (window=3). Stall delta will be 0
+    // when session_stalls doesn't increase → immediately Satisfied.
+    let diag_a = SkillDiagnosis::new(
+        "analyze_session",
+        &AutoInvokeCause::SessionStalls { count: 5 },
+        "stalls detected",
+        vec!["stall observation".into()],
+        None,
+    );
+    // Diagnosis B: budget criterion (window=5). Budget stays above
+    // threshold → eventually Failed when window expires.
+    let diag_b = SkillDiagnosis::new(
+        "optimize_prompt",
+        &AutoInvokeCause::BudgetPressure { level: 0.9 },
+        "budget pressure",
+        vec!["pressure observation".into()],
+        None,
+    );
+
+    let baseline = SessionSignals {
+        session_stalls: 5,
+        budget_pressure: 0.9,
+        recent_corrections: 0,
+        corrections_window: 10,
+    };
+
+    tracker.activate(diag_a, baseline, 10);
+    tracker.activate(diag_b, baseline, 10);
+
+    // Turn 11: stalls stay at 5 (delta=0, Satisfied), budget still 0.9
+    // (above 0.85, Pending). A completes; B survives.
+    let signals_11 = SessionSignals {
+        session_stalls: 5,
+        budget_pressure: 0.9,
+        ..baseline
+    };
+    let outcomes = tracker.evaluate_turn(&signals_11, 11);
+    assert_eq!(outcomes.len(), 1, "only stall diagnosis should complete");
+    assert_eq!(outcomes[0].skill, "analyze_session");
+    assert!(
+        outcomes[0]
+            .statuses
+            .contains(&DiagnosisCriterionStatus::Satisfied)
+    );
+
+    // Turn 14 (4 turns elapsed): budget still high, still within window.
+    let outcomes = tracker.evaluate_turn(&signals_11, 14);
+    assert!(outcomes.is_empty(), "budget diagnosis still pending");
+
+    // Turn 15 (5 turns elapsed): window_turns=5 expires → budget Failed.
+    let outcomes = tracker.evaluate_turn(&signals_11, 15);
+    assert_eq!(outcomes.len(), 1, "budget diagnosis should fail-complete");
+    assert_eq!(outcomes[0].skill, "optimize_prompt");
+    assert!(
+        outcomes[0]
+            .statuses
+            .contains(&DiagnosisCriterionStatus::Failed)
+    );
+
+    // Both removed — tracker empty.
+    let outcomes = tracker.evaluate_turn(&signals_11, 16);
+    assert!(outcomes.is_empty(), "both diagnoses removed");
+}
+
 /// Verify the Arc<Mutex<AutoInvokeHandler>> pattern used at runtime
 /// doesn't deadlock or lose results under concurrent access.
 #[tokio::test]

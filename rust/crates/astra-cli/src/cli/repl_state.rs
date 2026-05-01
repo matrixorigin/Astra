@@ -283,10 +283,9 @@ pub(crate) struct ReplState {
 
     /// P8: persistent auto-invoke handler. Owns the per-cause cooldowns
     /// across turns of this session. Created lazily on first turn so
-    /// sessions that never trigger anything pay no cost.
-    pub auto_invoke_handler: Option<
-        std::sync::Arc<tokio::sync::Mutex<astra_runtime::auto_invoke_handler::AutoInvokeHandler>>,
-    >,
+    /// sessions that never trigger anything pay no cost. The REPL is
+    /// single-threaded per session so no Arc/Mutex needed.
+    pub auto_invoke_handler: Option<astra_runtime::auto_invoke_handler::AutoInvokeHandler>,
 
     /// P8: most recent auto-invoke diagnosis, produced at the end of the
     /// previous turn. Passed through to the next turn's ToolExecutor so

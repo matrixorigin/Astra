@@ -1054,19 +1054,18 @@ async fn maybe_run_auto_invoke(state: &mut ReplState) {
             std::sync::Arc::new(
                 astra_runtime::auto_invoke_handler::SyntheticSkillDiagnosisExecutor,
             );
-        state.auto_invoke_handler = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+        state.auto_invoke_handler = Some(
             astra_runtime::auto_invoke_handler::AutoInvokeHandler::new(exec),
-        )));
+        );
     }
 
     let handler = state
         .auto_invoke_handler
-        .as_ref()
-        .expect("just constructed above")
-        .clone();
-    let mut guard = handler.lock().await;
-    let diagnoses = guard.maybe_fire(&signals, std::time::Instant::now()).await;
-    drop(guard);
+        .as_mut()
+        .expect("just constructed above");
+    let diagnoses = handler
+        .maybe_fire(&signals, std::time::Instant::now())
+        .await;
 
     // Use the first diagnosis. Activate it in the tracker so its
     // success_criteria are evaluated on subsequent turns.
