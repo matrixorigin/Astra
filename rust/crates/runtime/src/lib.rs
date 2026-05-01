@@ -64,6 +64,7 @@ pub(crate) use storage::{
 // ── Public modules: runtime core ─────────────────────────────────────────────
 
 mod app_state;
+pub mod auto_invoke_handler;
 pub mod bash_intent;
 pub mod bridge;
 pub mod evaluation;
