@@ -275,11 +275,21 @@ impl<'a> SuiteRunner<'a> {
                 };
                 let step_outcome = self.executor.execute(&step_case, model).await;
 
+                // Evaluate step-level criteria against this step's outcome.
+                let step_criteria_results = if !step.criteria.is_empty() {
+                    evaluate_deterministic_with_session(&step.criteria, &step_outcome, None)
+                } else {
+                    vec![]
+                };
+                let step_passed = step_criteria_results.iter().all(|r| r.passed);
+
                 step_results.push(StepResult {
                     step_index: idx as u32,
                     prompt: step.prompt.clone(),
                     outcome: step_outcome.clone(),
                     duration_ms: step_outcome.duration_ms,
+                    criteria: step_criteria_results,
+                    passed: step_passed,
                 });
 
                 // Merge step outcome into main outcome.
@@ -370,7 +380,8 @@ impl<'a> SuiteRunner<'a> {
             }
         }
 
-        let passed = det.iter().all(|c| c.passed);
+        let steps_passed = step_results.iter().all(|s| s.passed);
+        let passed = det.iter().all(|c| c.passed) && steps_passed;
 
         // Classify failure.
         let failure_class = if !passed {
@@ -842,6 +853,46 @@ mod tests {
         assert_eq!(report.runs[0].steps.len(), 1);
         assert_eq!(report.runs[0].steps[0].step_index, 0);
         assert_eq!(report.runs[0].steps[0].prompt, "follow up");
+    }
+
+    #[tokio::test]
+    async fn step_criteria_evaluated_and_fail_propagates() {
+        let exec = FakeExecutor::new();
+        exec.seed("mt", "m", outcome_ok("m", "step0-text", &["bash"]));
+        // Step outcome has no tools — step criterion tool_called will fail.
+        exec.seed("mt__step0", "m", outcome_ok("m", "step1-no-tools", &[]));
+
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+        };
+        let mut case = case_with("mt", vec![]);
+        case.steps = vec![crate::case::CaseStep {
+            prompt: "do something with bash".into(),
+            criteria: vec![crate::criteria::Criterion::ToolCalled {
+                name: "bash".into(),
+            }],
+            timeout_seconds: None,
+        }];
+        let report = runner.run_all(&[case]).await;
+        assert_eq!(report.total(), 1);
+        // Step criterion fails → overall case fails.
+        assert!(
+            !report.runs[0].passed,
+            "step criteria failure must propagate"
+        );
+        assert!(!report.runs[0].steps[0].passed);
+        assert_eq!(report.runs[0].steps[0].criteria.len(), 1);
+        assert!(!report.runs[0].steps[0].criteria[0].passed);
     }
 
     #[tokio::test]

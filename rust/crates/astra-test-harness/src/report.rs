@@ -84,6 +84,16 @@ pub struct StepResult {
     pub prompt: String,
     pub outcome: RunOutcome,
     pub duration_ms: u64,
+    /// Criteria results for this step. Empty if the step has no criteria.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub criteria: Vec<CriterionResult>,
+    /// Whether all step criteria passed.
+    #[serde(default = "default_true")]
+    pub passed: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

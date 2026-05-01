@@ -96,10 +96,8 @@ pub struct Case {
 pub struct CaseStep {
     /// Prompt for this turn.
     pub prompt: String,
-    /// Per-step criteria are not yet evaluated. This field is parsed
-    /// for forward-compatibility but ignored at runtime. A load-time
-    /// warning surfaces when non-empty so case authors aren't misled
-    /// into thinking their step criteria are enforced.
+    /// Per-step criteria evaluated against this step's outcome.
+    /// If any step criterion fails, the overall case FAILs.
     #[serde(default)]
     pub criteria: Vec<super::criteria::Criterion>,
     /// Optional per-step timeout override.
@@ -108,8 +106,11 @@ pub struct CaseStep {
 }
 
 /// Capability dimension for aggregated reporting.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
+///
+/// Known variants use snake_case. Custom capabilities MUST use the
+/// `"custom:my_name"` prefix — bare unknown strings are rejected at
+/// load time so typos don't silently pass.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Capability {
     ToolUse,
     Delegation,
@@ -120,9 +121,51 @@ pub enum Capability {
     Reasoning,
     Memory,
     Planning,
-    /// Catch-all for custom capabilities.
-    #[serde(untagged)]
+    /// Custom capability — YAML must use `"custom:my_name"` syntax.
     Custom(String),
+}
+
+impl<'de> serde::Deserialize<'de> for Capability {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "tool_use" => Ok(Self::ToolUse),
+            "delegation" => Ok(Self::Delegation),
+            "instruction_following" => Ok(Self::InstructionFollowing),
+            "anti_hallucination" => Ok(Self::AntiHallucination),
+            "efficiency" => Ok(Self::Efficiency),
+            "code_generation" => Ok(Self::CodeGeneration),
+            "reasoning" => Ok(Self::Reasoning),
+            "memory" => Ok(Self::Memory),
+            "planning" => Ok(Self::Planning),
+            other if other.starts_with("custom:") => {
+                let name = other.strip_prefix("custom:").unwrap().to_string();
+                if name.is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "capability 'custom:' requires a name after the colon",
+                    ));
+                }
+                Ok(Self::Custom(name))
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "unknown capability {other:?}. Known: {}. \
+                 For custom capabilities use \"custom:my_name\" syntax.",
+                KNOWN_CAPABILITIES.join(", ")
+            ))),
+        }
+    }
+}
+
+impl serde::Serialize for Capability {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
 }
 
 impl std::fmt::Display for Capability {
@@ -137,7 +180,7 @@ impl std::fmt::Display for Capability {
             Self::Reasoning => write!(f, "reasoning"),
             Self::Memory => write!(f, "memory"),
             Self::Planning => write!(f, "planning"),
-            Self::Custom(s) => write!(f, "{s}"),
+            Self::Custom(s) => write!(f, "custom:{s}"),
         }
     }
 }
@@ -153,21 +196,6 @@ const KNOWN_CAPABILITIES: &[&str] = &[
     "memory",
     "planning",
 ];
-
-fn validate_capability(cap: &Capability) -> Result<(), String> {
-    if let Capability::Custom(s) = cap {
-        let lower = s.to_ascii_lowercase();
-        for known in KNOWN_CAPABILITIES {
-            if lower == *known && s != *known {
-                return Err(format!(
-                    "capability {s:?} looks like a typo of built-in {known:?} \
-                     (wrong case). Use {known:?} or a clearly different custom name"
-                ));
-            }
-        }
-    }
-    Ok(())
-}
 
 fn default_weight() -> f64 {
     1.0
@@ -282,10 +310,6 @@ impl Case {
         // the child even runs. A YAML typo turns the whole suite into
         // "harness hang". Require at least 1 second; realistic cases
         // want tens or hundreds.
-        if let Some(ref cap) = case.capability {
-            validate_capability(cap)
-                .map_err(|e| anyhow::anyhow!("case {}: {e}", path.display()))?;
-        }
         if !case.weight.is_finite() || case.weight < 0.0 {
             anyhow::bail!(
                 "case {}: weight must be finite and >= 0.0 (got {})",
@@ -313,13 +337,9 @@ impl Case {
         crate::criteria::validate_criteria(&case.criteria)
             .map_err(|e| anyhow::anyhow!("case {}: {e}", path.display()))?;
         for (i, step) in case.steps.iter().enumerate() {
-            if !step.criteria.is_empty() {
-                eprintln!(
-                    "[astra-test] WARNING: case {}: steps[{i}].criteria is not yet evaluated \
-                     at runtime — these criteria will be ignored. Move them to the top-level \
-                     criteria list or remove them to avoid confusion.",
-                    case.name,
-                );
+            // Validate step criteria at load time.
+            if let Err(e) = crate::criteria::validate_criteria(&step.criteria) {
+                anyhow::bail!("case {}: steps[{i}].{e}", path.display(),);
             }
         }
         Ok(case)
@@ -613,8 +633,8 @@ mod tests {
         std::fs::write(&path, "name: c\nprompt: p\ncapability: Tool_Use\n").unwrap();
         let err = Case::from_path(&path).expect_err("near-miss capability must fail");
         assert!(
-            err.to_string().contains("Tool_Use") && err.to_string().contains("tool_use"),
-            "error should suggest the correct variant: {err}"
+            err.to_string().contains("unknown capability"),
+            "error should reject unknown variant: {err}"
         );
     }
 
@@ -631,11 +651,27 @@ mod tests {
     fn capability_truly_custom_accepted() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("ok.yaml");
-        std::fs::write(&path, "name: c\nprompt: p\ncapability: my_special_cap\n").unwrap();
+        std::fs::write(
+            &path,
+            "name: c\nprompt: p\ncapability: \"custom:my_special_cap\"\n",
+        )
+        .unwrap();
         let c = Case::from_path(&path).expect("custom capability");
         assert_eq!(
             c.capability,
             Some(Capability::Custom("my_special_cap".into()))
+        );
+    }
+
+    #[test]
+    fn capability_bare_unknown_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bad.yaml");
+        std::fs::write(&path, "name: c\nprompt: p\ncapability: fast_response\n").unwrap();
+        let err = Case::from_path(&path).expect_err("bare unknown must fail");
+        assert!(
+            err.to_string().contains("unknown capability"),
+            "should reject: {err}"
         );
     }
 
