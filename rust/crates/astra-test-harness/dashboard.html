@@ -8,38 +8,40 @@
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
 <style>
 /* ================================================================
-   CSS Reset & Custom Properties
+   Reset & Custom Properties
    ================================================================ */
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
 :root {
-  --bg: #06080f;
-  --bg-subtle: #0a0e1a;
-  --card: rgba(15, 23, 42, 0.8);
-  --card-hover: rgba(15, 23, 42, 0.95);
-  --border: rgba(59, 130, 246, 0.15);
-  --border-strong: rgba(59, 130, 246, 0.3);
+  --bg: #080c18;
+  --bg-raised: #0c1222;
+  --bg-surface: rgba(14, 22, 42, 0.75);
+  --bg-surface-hover: rgba(18, 28, 52, 0.9);
+  --bg-inset: rgba(0, 0, 0, 0.25);
+  --border: rgba(59, 130, 246, 0.12);
+  --border-strong: rgba(59, 130, 246, 0.28);
+  --border-subtle: rgba(255, 255, 255, 0.04);
   --accent: #3b82f6;
   --accent2: #8b5cf6;
   --green: #22c55e;
-  --green-dim: rgba(34, 197, 94, 0.15);
+  --green-dim: rgba(34, 197, 94, 0.12);
   --red: #ef4444;
-  --red-dim: rgba(239, 68, 68, 0.15);
+  --red-dim: rgba(239, 68, 68, 0.12);
   --yellow: #eab308;
-  --yellow-dim: rgba(234, 179, 8, 0.15);
-  --blue-dim: rgba(59, 130, 246, 0.15);
+  --yellow-dim: rgba(234, 179, 8, 0.12);
+  --blue-dim: rgba(59, 130, 246, 0.1);
   --text: #e2e8f0;
   --text-secondary: #94a3b8;
   --muted: #64748b;
-  --font: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
-  --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', Menlo, Consolas, monospace;
+  --dim: #475569;
+  --font: 'Inter', system-ui, -apple-system, sans-serif;
+  --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', Menlo, monospace;
   --radius: 12px;
   --radius-sm: 8px;
   --radius-xs: 6px;
-  --shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
-  --shadow-lg: 0 8px 40px rgba(0, 0, 0, 0.4);
-  --transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-  --spring: 0.35s cubic-bezier(.34, 1.56, .64, 1);
+  --sidebar-w: 280px;
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --spring: cubic-bezier(0.34, 1.56, 0.64, 1);
   --gradient: linear-gradient(135deg, var(--accent), var(--accent2));
 }
 
@@ -55,548 +57,722 @@ body {
 }
 
 /* ================================================================
-   Animated Background Mesh
+   Animated Background
    ================================================================ */
-.bg-mesh {
-  position: fixed;
-  inset: 0;
-  z-index: 0;
-  overflow: hidden;
-  pointer-events: none;
+.bg-canvas {
+  position: fixed; inset: 0; z-index: 0;
+  pointer-events: none; overflow: hidden;
 }
-.bg-mesh::before, .bg-mesh::after {
+.bg-canvas::before, .bg-canvas::after {
   content: '';
   position: absolute;
   border-radius: 50%;
-  filter: blur(120px);
-  opacity: 0.07;
-  animation: meshFloat 20s ease-in-out infinite alternate;
+  filter: blur(140px);
+  opacity: 0.06;
+  animation: meshDrift 25s ease-in-out infinite alternate;
 }
-.bg-mesh::before {
-  width: 600px; height: 600px;
+.bg-canvas::before {
+  width: 700px; height: 700px;
   background: var(--accent);
-  top: -200px; left: -100px;
+  top: -250px; left: -150px;
 }
-.bg-mesh::after {
-  width: 500px; height: 500px;
+.bg-canvas::after {
+  width: 600px; height: 600px;
   background: var(--accent2);
-  bottom: -200px; right: -100px;
-  animation-delay: -10s;
+  bottom: -250px; right: -150px;
+  animation-delay: -12s;
   animation-direction: alternate-reverse;
 }
-@keyframes meshFloat {
+.bg-canvas .mesh-extra {
+  position: absolute;
+  width: 400px; height: 400px;
+  border-radius: 50%;
+  filter: blur(120px);
+  opacity: 0.04;
+  background: linear-gradient(135deg, #06b6d4, #8b5cf6);
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  animation: meshPulse 18s ease-in-out infinite;
+}
+@keyframes meshDrift {
   0%   { transform: translate(0, 0) scale(1); }
-  33%  { transform: translate(80px, 40px) scale(1.1); }
-  66%  { transform: translate(-40px, 80px) scale(0.95); }
-  100% { transform: translate(40px, -40px) scale(1.05); }
+  33%  { transform: translate(60px, 30px) scale(1.08); }
+  66%  { transform: translate(-30px, 60px) scale(0.95); }
+  100% { transform: translate(30px, -30px) scale(1.04); }
+}
+@keyframes meshPulse {
+  0%, 100% { opacity: 0.04; transform: translate(-50%, -50%) scale(1); }
+  50%      { opacity: 0.07; transform: translate(-50%, -50%) scale(1.15); }
 }
 
 /* ================================================================
-   Layout
+   Layout: Sidebar + Main
    ================================================================ */
-.app { position: relative; z-index: 1; }
-.container { max-width: 1440px; margin: 0 auto; padding: 24px 32px; }
-@media (max-width: 900px) { .container { padding: 16px; } }
+.app-layout {
+  position: relative; z-index: 1;
+  display: flex; min-height: 100vh;
+}
 
-/* ================================================================
-   Toast Notifications
-   ================================================================ */
-.toast-container {
-  position: fixed;
-  top: 16px;
-  right: 16px;
-  z-index: 200;
+/* Sidebar */
+.sidebar {
+  width: var(--sidebar-w);
+  flex-shrink: 0;
+  background: var(--bg-raised);
+  border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  height: 100vh;
+  position: sticky;
+  top: 0;
+  overflow: hidden;
+  transition: transform 0.3s var(--ease), opacity 0.3s var(--ease);
 }
-.toast {
-  background: var(--card);
+.sidebar-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 20px 16px 16px;
+}
+.sidebar-bottom {
+  padding: 12px 16px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-raised);
+}
+
+/* Main area */
+.main-area {
+  flex: 1;
+  min-width: 0;
+  padding: 28px 32px;
+}
+
+/* Mobile collapse */
+.sidebar-overlay {
+  display: none;
+  position: fixed; inset: 0; z-index: 90;
+  background: rgba(0,0,0,0.5);
+  backdrop-filter: blur(4px);
+}
+.mobile-toggle {
+  display: none;
+  position: fixed; top: 12px; left: 12px; z-index: 100;
+  width: 36px; height: 36px;
+  border-radius: var(--radius-xs);
+  background: var(--bg-surface);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 12px 16px;
-  font-size: 13px;
   color: var(--text);
-  backdrop-filter: blur(16px);
-  box-shadow: var(--shadow);
-  max-width: 380px;
-  animation: toastIn 0.3s var(--spring) both;
-  display: flex;
-  align-items: center;
-  gap: 8px;
+  font-size: 18px;
+  cursor: pointer;
+  align-items: center; justify-content: center;
+  backdrop-filter: blur(12px);
 }
-.toast.error { border-color: rgba(239, 68, 68, 0.4); }
-.toast.error::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--red); flex-shrink: 0; }
-.toast.info::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
-.toast.removing { animation: toastOut 0.2s ease-in both; }
-@keyframes toastIn { from { opacity: 0; transform: translateX(100px); } to { opacity: 1; transform: translateX(0); } }
-@keyframes toastOut { from { opacity: 1; transform: translateX(0); } to { opacity: 0; transform: translateX(100px); } }
+
+@media (max-width: 900px) {
+  .sidebar {
+    position: fixed; left: 0; top: 0; z-index: 95;
+    transform: translateX(-100%);
+  }
+  .sidebar.open { transform: translateX(0); }
+  .sidebar-overlay.open { display: block; }
+  .mobile-toggle { display: flex; }
+  .main-area { padding: 16px; padding-top: 56px; }
+}
 
 /* ================================================================
-   Connection Status
+   Sidebar: Logo & Connection
    ================================================================ */
-.conn-dot {
-  width: 8px; height: 8px; border-radius: 50%;
-  display: inline-block;
-  margin-right: 6px;
-  vertical-align: middle;
+.sidebar-logo {
+  display: flex; align-items: center; gap: 10px;
+  margin-bottom: 20px;
 }
-.conn-dot.connected { background: var(--green); box-shadow: 0 0 8px var(--green); }
-.conn-dot.connecting { background: var(--yellow); animation: pulse 1.5s infinite; }
-.conn-dot.error { background: var(--red); }
-
-/* ================================================================
-   Header
-   ================================================================ */
-header {
-  padding: 48px 0 16px;
-  text-align: center;
-}
-.logo {
-  font-size: 32px;
-  font-weight: 900;
-  letter-spacing: -1px;
+.sidebar-logo .logo-text {
+  font-size: 20px; font-weight: 800;
+  letter-spacing: -0.5px;
   background: var(--gradient);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
 }
-.logo span {
-  font-weight: 500;
-  opacity: 0.7;
+.conn-indicator {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11px; color: var(--muted);
+  margin-bottom: 20px;
 }
-.subtitle {
-  color: var(--muted);
-  font-size: 14px;
-  margin-top: 4px;
+.conn-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  flex-shrink: 0;
 }
+.conn-dot.connected { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.conn-dot.connecting { background: var(--yellow); animation: pulse 1.5s infinite; }
+.conn-dot.disconnected { background: var(--red); }
 
 /* ================================================================
-   Phase 1: Configuration Panel
+   Sidebar: Section Styling
    ================================================================ */
-.config-panel {
-  max-width: 720px;
-  margin: 32px auto;
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
+.sb-section {
+  margin-bottom: 18px;
 }
-.config-card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 24px;
-  backdrop-filter: blur(16px);
+.sb-section-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 8px;
 }
-.config-card h3 {
-  font-size: 11px;
+.sb-section-title {
+  font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 1.5px;
   color: var(--muted);
-  margin-bottom: 12px;
+  font-weight: 700;
 }
-.config-info {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  color: var(--text-secondary);
-  font-family: var(--mono);
-  padding: 8px 12px;
-  background: rgba(0,0,0,0.3);
+.sb-section-actions {
+  display: flex; gap: 4px;
+}
+.sb-section-actions button {
+  font-size: 10px;
+  color: var(--accent);
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-family: var(--font);
+  padding: 2px 4px;
+  border-radius: 3px;
+  transition: background 0.15s;
+}
+.sb-section-actions button:hover {
+  background: var(--blue-dim);
+}
+
+/* Model & Case lists */
+.sb-check-list {
+  display: flex; flex-direction: column; gap: 2px;
+  max-height: 200px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.sb-check-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 8px;
   border-radius: var(--radius-xs);
+  cursor: pointer;
+  transition: background 0.15s;
+  font-size: 13px;
+  user-select: none;
+  color: var(--text-secondary);
+}
+.sb-check-item:hover {
+  background: rgba(255,255,255,0.03);
+}
+.sb-check-item.checked {
+  color: var(--text);
+}
+.sb-check-item .ck {
+  width: 15px; height: 15px;
+  border-radius: 4px;
+  border: 1.5px solid var(--dim);
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  transition: all 0.15s;
+  font-size: 9px; color: #fff;
+}
+.sb-check-item.checked .ck {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.sb-check-item .ck svg {
+  width: 10px; height: 10px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.sb-check-item.checked .ck svg {
+  opacity: 1;
+}
+.sb-check-item .item-label {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.sb-check-item .item-meta {
+  display: flex; gap: 4px; align-items: center; flex-shrink: 0;
+}
 
-/* Model chips */
-.chip-container {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 8px;
+/* Tags (selected models) */
+.selected-tags {
+  display: flex; flex-wrap: wrap; gap: 4px;
+  margin-top: 6px;
 }
-.chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 14px;
-  border-radius: 20px;
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: all var(--transition);
-  border: 1px solid var(--border);
-  background: rgba(0,0,0,0.2);
-  color: var(--text-secondary);
-  user-select: none;
-}
-.chip:hover { border-color: var(--border-strong); }
-.chip.active {
-  background: var(--blue-dim);
-  border-color: var(--accent);
-  color: var(--text);
-}
-.chip .chip-x {
-  width: 14px; height: 14px;
-  display: flex; align-items: center; justify-content: center;
-  border-radius: 50%;
+.sel-tag {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 3px 8px;
+  border-radius: 12px;
   font-size: 11px;
-  opacity: 0.5;
-  transition: opacity var(--transition);
+  font-weight: 500;
+  background: var(--blue-dim);
+  border: 1px solid rgba(59,130,246,0.2);
+  color: var(--accent);
+  animation: tagIn 0.2s var(--spring) both;
 }
-.chip:hover .chip-x { opacity: 1; }
+.sel-tag .tag-x {
+  cursor: pointer;
+  opacity: 0.5;
+  font-size: 13px;
+  line-height: 1;
+  transition: opacity 0.15s;
+}
+.sel-tag .tag-x:hover { opacity: 1; }
+@keyframes tagIn { from { opacity: 0; transform: scale(0.85); } }
 
 /* Custom model input */
-.model-input-row {
-  display: flex;
-  gap: 8px;
-  margin-top: 8px;
+.custom-model-row {
+  display: flex; gap: 6px; margin-top: 8px;
 }
-.model-input-row input {
+.custom-model-row input {
   flex: 1;
-  padding: 8px 12px;
-  background: rgba(0,0,0,0.3);
+  min-width: 0;
+  padding: 6px 10px;
+  background: var(--bg-inset);
   border: 1px solid var(--border);
   border-radius: var(--radius-xs);
   color: var(--text);
-  font-size: 13px;
-  font-family: var(--font);
-  outline: none;
-  transition: border-color var(--transition);
-}
-.model-input-row input:focus { border-color: var(--accent); }
-.model-input-row input::placeholder { color: var(--muted); }
-.model-input-row button {
-  padding: 8px 16px;
-  background: rgba(59,130,246,0.1);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-xs);
-  color: var(--accent);
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all var(--transition);
-}
-.model-input-row button:hover { background: rgba(59,130,246,0.2); border-color: var(--accent); }
-
-/* Filter input */
-.filter-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-.filter-row input {
-  flex: 1;
-  padding: 10px 14px;
-  background: rgba(0,0,0,0.3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  color: var(--text);
-  font-size: 14px;
+  font-size: 12px;
   font-family: var(--mono);
   outline: none;
-  transition: border-color var(--transition);
+  transition: border-color 0.15s;
 }
-.filter-row input:focus { border-color: var(--accent); }
-.filter-row input::placeholder { color: var(--muted); }
-.filter-count {
-  font-size: 13px;
-  color: var(--muted);
-  white-space: nowrap;
-  min-width: 80px;
-  text-align: right;
-}
-
-/* Advanced settings */
-.advanced-toggle {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  color: var(--muted);
+.custom-model-row input:focus { border-color: var(--accent); }
+.custom-model-row input::placeholder { color: var(--dim); }
+.custom-model-row button {
+  padding: 6px 12px;
+  background: var(--blue-dim);
+  border: 1px solid rgba(59,130,246,0.2);
+  border-radius: var(--radius-xs);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
   cursor: pointer;
-  user-select: none;
-  border: none;
-  background: none;
-  padding: 0;
+  font-family: var(--font);
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.custom-model-row button:hover { background: rgba(59,130,246,0.2); }
+
+/* Search input in sidebar */
+.sb-search {
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  color: var(--text);
+  font-size: 12px;
+  font-family: var(--font);
+  outline: none;
+  transition: border-color 0.15s;
+  margin-bottom: 6px;
+}
+.sb-search:focus { border-color: var(--accent); }
+.sb-search::placeholder { color: var(--dim); }
+
+/* Capability filter pills */
+.cap-pills {
+  display: flex; flex-wrap: wrap; gap: 4px;
+  margin-bottom: 6px;
+}
+.cap-pill {
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  transition: all 0.15s;
   font-family: var(--font);
 }
-.advanced-toggle:hover { color: var(--text-secondary); }
-.advanced-toggle .arrow {
-  transition: transform var(--transition);
-  font-size: 10px;
-}
-.advanced-toggle .arrow.open { transform: rotate(90deg); }
-.advanced-body {
-  display: none;
-  margin-top: 16px;
-  padding-top: 16px;
-  border-top: 1px solid var(--border);
-}
-.advanced-body.open { display: block; }
-
-.setting-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 8px 0;
-}
-.setting-row label {
-  font-size: 13px;
-  color: var(--text-secondary);
-}
-.setting-row .setting-value {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+.cap-pill:hover { border-color: var(--border-strong); color: var(--text-secondary); }
+.cap-pill.active {
+  background: var(--blue-dim);
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
-/* Slider */
+/* Case meta badges inline */
+.case-cap-badge {
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  background: rgba(139,92,246,0.12);
+  color: #a78bfa;
+}
+.case-diff-stars {
+  font-size: 9px;
+  color: var(--yellow);
+  letter-spacing: -1px;
+}
+.case-steps-dot {
+  width: 5px; height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+/* Settings row */
+.sb-setting {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 0;
+}
+.sb-setting label {
+  font-size: 12px; color: var(--text-secondary);
+}
+.sb-setting .setting-val {
+  display: flex; align-items: center; gap: 6px;
+}
+.sb-setting .val-num {
+  font-size: 13px; font-weight: 700; min-width: 16px; text-align: center;
+}
+
+/* Range slider */
 input[type="range"] {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 140px;
-  height: 4px;
+  -webkit-appearance: none; appearance: none;
+  width: 100px; height: 3px;
   background: var(--border);
   border-radius: 2px;
   outline: none;
 }
 input[type="range"]::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 16px; height: 16px;
+  width: 14px; height: 14px;
   border-radius: 50%;
   background: var(--accent);
   cursor: pointer;
-  transition: transform var(--spring);
+  transition: transform 0.2s var(--spring);
 }
 input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.2); }
+input[type="range"]::-moz-range-thumb {
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  border: none;
+}
 
 /* Toggle switch */
 .toggle {
-  width: 40px; height: 22px;
-  background: rgba(0,0,0,0.4);
-  border-radius: 11px;
+  width: 36px; height: 20px;
+  border-radius: 10px;
   position: relative;
   cursor: pointer;
   border: 1px solid var(--border);
-  transition: all var(--transition);
+  background: var(--bg-inset);
+  transition: all 0.2s;
+  flex-shrink: 0;
 }
-.toggle.active { background: rgba(59,130,246,0.3); border-color: var(--accent); }
+.toggle.on { background: rgba(59,130,246,0.25); border-color: var(--accent); }
 .toggle::after {
   content: '';
   position: absolute;
   top: 2px; left: 2px;
-  width: 16px; height: 16px;
+  width: 14px; height: 14px;
   border-radius: 50%;
-  background: var(--muted);
-  transition: all var(--spring);
+  background: var(--dim);
+  transition: all 0.2s var(--spring);
 }
-.toggle.active::after { left: 20px; background: var(--accent); }
-
-.judger-model-select {
-  padding: 6px 10px;
-  background: rgba(0,0,0,0.3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-xs);
-  color: var(--text);
-  font-size: 13px;
-  font-family: var(--mono);
-  outline: none;
-}
-.judger-model-select:focus { border-color: var(--accent); }
+.toggle.on::after { left: 18px; background: var(--accent); }
 
 /* Run button */
 .run-btn {
   width: 100%;
-  padding: 16px;
+  padding: 12px;
   border: none;
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   background: var(--gradient);
   color: #fff;
-  font-size: 16px;
+  font-size: 14px;
   font-weight: 700;
   font-family: var(--font);
   cursor: pointer;
-  transition: all var(--spring);
+  transition: all 0.2s var(--spring);
   position: relative;
   overflow: hidden;
-  letter-spacing: 0.5px;
+  letter-spacing: 0.3px;
 }
-.run-btn:hover:not(:disabled) { transform: scale(1.02); box-shadow: 0 0 30px rgba(59,130,246,0.3); }
-.run-btn:active:not(:disabled) { transform: scale(0.98); }
-.run-btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-  transform: none;
-  box-shadow: none;
+.run-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 20px rgba(59,130,246,0.3);
 }
-.run-btn.ready {
-  animation: btnGlow 2s ease-in-out infinite;
+.run-btn:active:not(:disabled) { transform: translateY(0); }
+.run-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.run-btn.glow {
+  animation: btnGlow 2.5s ease-in-out infinite;
 }
 @keyframes btnGlow {
-  0%, 100% { box-shadow: 0 0 20px rgba(59, 130, 246, 0.2); }
-  50% { box-shadow: 0 0 40px rgba(59, 130, 246, 0.4), 0 0 60px rgba(139, 92, 246, 0.2); }
+  0%, 100% { box-shadow: 0 0 15px rgba(59,130,246,0.2); }
+  50%      { box-shadow: 0 0 30px rgba(59,130,246,0.35), 0 0 50px rgba(139,92,246,0.15); }
 }
 
 /* ================================================================
-   Phase 2: Running View
+   Main: Welcome / Idle State
    ================================================================ */
-.running-view { display: none; }
+.view-idle, .view-running, .view-results {
+  display: none;
+  animation: viewFadeIn 0.25s ease both;
+}
+.view-idle.active, .view-running.active, .view-results.active {
+  display: block;
+}
+@keyframes viewFadeIn { from { opacity: 0; } to { opacity: 1; } }
 
-/* Progress ring */
-.progress-ring-container {
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  padding: 32px 0;
-  position: relative;
-}
-.progress-ring-wrap {
-  position: relative;
-  width: 180px;
-  height: 180px;
-}
-.progress-ring-wrap svg {
-  transform: rotate(-90deg);
-  width: 180px;
-  height: 180px;
-}
-.progress-ring-bg {
-  fill: none;
-  stroke: rgba(59, 130, 246, 0.1);
-  stroke-width: 8;
-}
-.progress-ring-fg {
-  fill: none;
-  stroke: url(#progressGradient);
-  stroke-width: 8;
-  stroke-linecap: round;
-  transition: stroke-dashoffset 0.6s cubic-bezier(0.4, 0, 0.2, 1);
-}
-.progress-ring-center {
-  position: absolute;
-  inset: 0;
+.welcome {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
+  min-height: 60vh;
+  text-align: center;
+  padding: 40px 20px;
 }
-.progress-ring-pct {
-  font-size: 42px;
-  font-weight: 900;
+.welcome .w-logo {
+  font-size: 48px; font-weight: 900;
+  background: var(--gradient);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  letter-spacing: -1.5px;
+  margin-bottom: 16px;
+}
+.welcome .w-subtitle {
+  font-size: 16px;
+  color: var(--muted);
+  max-width: 400px;
+  line-height: 1.6;
+}
+.welcome .w-steps {
+  margin-top: 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  text-align: left;
+}
+.welcome .w-step {
+  display: flex; align-items: center; gap: 12px;
+  font-size: 14px; color: var(--text-secondary);
+}
+.welcome .w-step-num {
+  width: 28px; height: 28px;
+  border-radius: 50%;
+  background: var(--blue-dim);
+  border: 1px solid rgba(59,130,246,0.2);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+/* ================================================================
+   Main: Running View
+   ================================================================ */
+.run-header {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  margin-bottom: 28px;
+  flex-wrap: wrap;
+}
+.progress-ring-wrap {
+  position: relative;
+  width: 140px; height: 140px;
+  flex-shrink: 0;
+}
+.progress-ring-wrap svg {
+  transform: rotate(-90deg);
+  width: 140px; height: 140px;
+}
+.progress-ring-bg {
+  fill: none;
+  stroke: rgba(59,130,246,0.08);
+  stroke-width: 7;
+}
+.progress-ring-fg {
+  fill: none;
+  stroke: url(#pgGrad);
+  stroke-width: 7;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.5s var(--ease);
+}
+.progress-ring-center {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+}
+.ring-pct {
+  font-size: 34px; font-weight: 900;
   background: var(--gradient);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
 }
-.progress-ring-label {
-  font-size: 12px;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 1px;
+.ring-label {
+  font-size: 10px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 1px;
 }
 
 /* Live counters */
-.live-counters {
-  display: flex;
-  justify-content: center;
-  gap: 32px;
-  margin: 16px 0 32px;
-  flex-wrap: wrap;
+.live-stats {
+  display: flex; gap: 20px; flex-wrap: wrap;
 }
-.live-counter {
+.lstat {
   text-align: center;
-  min-width: 80px;
 }
-.live-counter .lc-value {
-  font-size: 28px;
-  font-weight: 800;
+.lstat .ls-val {
+  font-size: 24px; font-weight: 800;
 }
-.live-counter .lc-label {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 1px;
-  color: var(--muted);
-  margin-top: 2px;
+.lstat .ls-lbl {
+  font-size: 10px; text-transform: uppercase;
+  letter-spacing: 0.8px; color: var(--muted); margin-top: 1px;
 }
-.live-counter.pass .lc-value { color: var(--green); }
-.live-counter.fail .lc-value { color: var(--red); }
-.live-counter.running .lc-value { color: var(--accent); }
-.live-counter.remaining .lc-value { color: var(--muted); }
+.lstat.pass .ls-val { color: var(--green); }
+.lstat.fail .ls-val { color: var(--red); }
+.lstat.active .ls-val { color: var(--accent); }
+.lstat.remain .ls-val { color: var(--dim); }
 
-.running-spinner {
+/* Waiting hint */
+.waiting-hint {
+  text-align: center;
+  padding: 32px 16px;
+  font-size: 14px;
+  color: var(--muted);
+  animation: pulse 2s infinite;
+}
+
+/* Running spinner inline */
+.spin-icon {
   display: inline-block;
-  width: 14px; height: 14px;
+  width: 12px; height: 12px;
   border: 2px solid transparent;
   border-top-color: var(--accent);
   border-radius: 50%;
-  animation: spin 0.8s linear infinite;
+  animation: spin 0.7s linear infinite;
   vertical-align: middle;
-  margin-left: 4px;
+  margin-left: 3px;
 }
 
 /* ================================================================
-   Case Cards Grid (shared between Phase 2 & 3)
+   Model Comparison Table (shared running + results)
+   ================================================================ */
+.section-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  color: var(--muted);
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+.dtable {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  background: var(--bg-surface);
+  border-radius: var(--radius);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  backdrop-filter: blur(12px);
+}
+.dtable th {
+  padding: 10px 14px;
+  text-align: left;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--muted);
+  background: rgba(0,0,0,0.2);
+  font-weight: 700;
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.15s;
+  white-space: nowrap;
+}
+.dtable th:hover { color: var(--text-secondary); }
+.dtable th.sorted { color: var(--accent); }
+.dtable th .sa {
+  font-size: 8px; margin-left: 3px;
+  opacity: 0; transition: opacity 0.15s;
+}
+.dtable th.sorted .sa { opacity: 1; }
+.dtable td {
+  padding: 10px 14px;
+  border-top: 1px solid var(--border-subtle);
+  font-size: 13px;
+}
+.dtable tr:hover td { background: rgba(59,130,246,0.03); }
+.rate-pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-weight: 700;
+  font-size: 12px;
+  color: #fff;
+}
+
+/* ================================================================
+   Case Cards Grid
    ================================================================ */
 .case-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 10px;
 }
 @media (max-width: 800px) { .case-grid { grid-template-columns: 1fr; } }
 
 .case-card {
-  background: var(--card);
+  background: var(--bg-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 16px 16px 16px 20px;
+  padding: 14px 14px 14px 18px;
   cursor: pointer;
-  transition: all var(--transition);
+  transition: all 0.2s var(--ease);
   backdrop-filter: blur(8px);
-  animation: cardSlideIn 0.4s cubic-bezier(.34, 1.56, .64, 1) both;
   position: relative;
+  animation: cardIn 0.35s var(--spring) both;
 }
 .case-card::before {
   content: '';
   position: absolute;
-  left: 0; top: 12px; bottom: 12px;
+  left: 0; top: 10px; bottom: 10px;
   width: 3px;
   border-radius: 2px;
-  transition: background var(--transition);
+  transition: background 0.2s;
 }
 .case-card.pass::before { background: var(--green); }
 .case-card.fail::before { background: var(--red); }
 .case-card.running::before { background: var(--accent); animation: pulse 1.5s infinite; }
 .case-card:hover {
   border-color: var(--border-strong);
-  transform: translateY(-2px);
-  box-shadow: var(--shadow);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 24px rgba(0,0,0,0.25);
 }
-.case-card .cc-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 8px;
+@keyframes cardIn {
+  from { opacity: 0; transform: translateX(-12px) scale(0.98); }
+  to   { opacity: 1; transform: translateX(0) scale(1); }
 }
-.case-card .cc-name {
-  font-weight: 600;
-  font-size: 14px;
-  word-break: break-word;
+
+.cc-head {
+  display: flex; justify-content: space-between; align-items: flex-start; gap: 8px;
 }
-.case-card .cc-model {
-  font-size: 12px;
-  color: var(--muted);
-  font-family: var(--mono);
-  margin-top: 2px;
+.cc-name {
+  font-weight: 600; font-size: 13px; word-break: break-word;
+}
+.cc-model-tag {
+  font-size: 11px; color: var(--muted); font-family: var(--mono); margin-top: 2px;
 }
 .badge {
-  padding: 3px 10px;
+  padding: 2px 8px;
   border-radius: 4px;
-  font-size: 10px;
+  font-size: 9px;
   font-weight: 800;
-  letter-spacing: 0.8px;
+  letter-spacing: 0.6px;
   text-transform: uppercase;
   flex-shrink: 0;
 }
@@ -605,529 +781,426 @@ input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.2); }
 .badge.running { background: var(--blue-dim); color: var(--accent); }
 
 .cc-metrics {
-  display: flex;
-  gap: 14px;
-  margin-top: 10px;
-  font-size: 12px;
-  color: var(--text-secondary);
+  display: flex; gap: 12px; margin-top: 8px;
+  font-size: 11px; color: var(--text-secondary);
+  flex-wrap: wrap;
 }
-.cc-metrics .metric {
-  display: flex;
-  align-items: center;
-  gap: 4px;
+.cc-metrics .m {
+  display: flex; align-items: center; gap: 3px;
 }
-.cc-metrics .metric-icon { opacity: 0.6; font-size: 11px; }
+.cc-metrics .m-icon { opacity: 0.5; font-size: 10px; }
 
 /* Expandable detail */
 .cc-detail {
   display: none;
-  margin-top: 14px;
-  padding-top: 14px;
+  margin-top: 12px;
+  padding-top: 12px;
   border-top: 1px solid var(--border);
-  font-size: 13px;
+  font-size: 12px;
 }
 .case-card.expanded .cc-detail { display: block; animation: fadeIn 0.2s ease; }
 
-.cc-detail .criteria-list { display: flex; flex-direction: column; gap: 4px; }
-.criterion-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 4px 0;
+.criteria-list { display: flex; flex-direction: column; gap: 3px; }
+.crit-row {
+  display: flex; align-items: flex-start; gap: 7px;
+  padding: 3px 0;
 }
-.criterion-dot {
-  width: 8px; height: 8px;
+.crit-dot {
+  width: 7px; height: 7px;
   border-radius: 50%;
   flex-shrink: 0;
-  margin-top: 5px;
+  margin-top: 4px;
 }
-.criterion-dot.ok { background: var(--green); }
-.criterion-dot.fail { background: var(--red); }
-.criterion-text { color: var(--text-secondary); line-height: 1.4; }
+.crit-dot.ok { background: var(--green); }
+.crit-dot.no { background: var(--red); }
+.crit-text { color: var(--text-secondary); line-height: 1.4; }
 
-/* Score bar */
-.score-bar-container {
-  margin-top: 8px;
-}
-.score-bar-label {
-  font-size: 11px;
-  color: var(--muted);
-  margin-bottom: 4px;
-}
+.score-bar-wrap { margin-top: 4px; }
+.score-bar-lbl { font-size: 10px; color: var(--muted); margin-bottom: 2px; }
 .score-bar {
-  height: 6px;
-  background: rgba(0,0,0,0.3);
-  border-radius: 3px;
-  overflow: hidden;
-  position: relative;
+  height: 4px; background: rgba(0,0,0,0.3);
+  border-radius: 2px; overflow: hidden;
 }
 .score-bar-fill {
-  height: 100%;
-  border-radius: 3px;
-  transition: width 0.5s ease;
+  height: 100%; border-radius: 2px;
+  transition: width 0.4s ease;
 }
 
-/* Copyable fields */
-.copyable {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-family: var(--mono);
-  font-size: 11px;
-  background: rgba(59, 130, 246, 0.08);
-  padding: 4px 8px;
-  border-radius: 4px;
-  cursor: pointer;
-  user-select: all;
-  transition: background var(--transition);
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.copyable:hover { background: rgba(59, 130, 246, 0.15); }
-.copyable::after {
-  content: 'copy';
-  font-size: 9px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: var(--accent);
-  opacity: 0;
-  transition: opacity var(--transition);
-  font-family: var(--font);
-  flex-shrink: 0;
-}
-.copyable:hover::after { opacity: 1; }
-
-.cc-detail pre {
-  background: rgba(0,0,0,0.3);
-  padding: 10px 14px;
-  border-radius: var(--radius-xs);
-  overflow-x: auto;
-  font-family: var(--mono);
-  font-size: 12px;
-  margin: 8px 0;
-  white-space: pre-wrap;
-  word-break: break-all;
-  color: var(--text-secondary);
-  max-height: 300px;
-  overflow-y: auto;
-}
-.cc-detail .detail-label {
-  font-size: 11px;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  margin-top: 10px;
-  margin-bottom: 4px;
-}
-.cc-detail .detail-section {
-  margin-top: 10px;
+.detail-section { margin-top: 8px; }
+.detail-label {
+  font-size: 10px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.5px;
+  margin-bottom: 3px;
 }
 
-/* Step results */
 .step-card {
-  background: rgba(0,0,0,0.2);
+  background: rgba(0,0,0,0.15);
   border-radius: var(--radius-xs);
-  padding: 8px 12px;
-  margin: 4px 0;
-  font-size: 12px;
+  padding: 7px 10px;
+  margin: 3px 0;
+  font-size: 11px;
 }
-.step-card .step-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
+.step-card .step-hdr {
+  display: flex; justify-content: space-between;
   color: var(--text-secondary);
 }
 .step-card .step-prompt {
-  margin-top: 4px;
-  color: var(--muted);
-  font-style: italic;
+  margin-top: 3px; color: var(--muted); font-style: italic;
 }
-.step-criteria { margin-top: 6px; }
 
-/* Collapsible output */
-.collapsible-trigger {
-  display: flex;
-  align-items: center;
-  gap: 4px;
+.copyable {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-family: var(--mono); font-size: 10px;
+  background: rgba(59,130,246,0.06);
+  padding: 3px 7px; border-radius: 3px;
+  cursor: pointer; user-select: all;
+  transition: background 0.15s;
+  max-width: 100%; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.copyable:hover { background: rgba(59,130,246,0.12); }
+
+.cc-detail pre {
+  background: rgba(0,0,0,0.25);
+  padding: 8px 12px;
+  border-radius: var(--radius-xs);
+  overflow-x: auto;
+  font-family: var(--mono);
   font-size: 11px;
-  color: var(--muted);
-  cursor: pointer;
-  user-select: none;
-  border: none;
-  background: none;
-  padding: 2px 0;
-  font-family: var(--font);
+  margin: 6px 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text-secondary);
+  max-height: 250px;
+  overflow-y: auto;
 }
-.collapsible-trigger:hover { color: var(--text-secondary); }
-.collapsible-trigger .caret {
-  font-size: 8px;
-  transition: transform var(--transition);
+
+.collapse-btn {
+  display: flex; align-items: center; gap: 4px;
+  font-size: 10px; color: var(--muted);
+  cursor: pointer; user-select: none;
+  border: none; background: none;
+  padding: 2px 0; font-family: var(--font);
 }
-.collapsible-trigger .caret.open { transform: rotate(90deg); }
-.collapsible-content { display: none; }
-.collapsible-content.open { display: block; }
+.collapse-btn:hover { color: var(--text-secondary); }
+.collapse-btn .caret {
+  font-size: 7px; transition: transform 0.15s;
+}
+.collapse-btn .caret.open { transform: rotate(90deg); }
+.collapse-content { display: none; }
+.collapse-content.open { display: block; }
 
 /* ================================================================
-   Phase 3: Results Summary
+   Results: Summary Header
    ================================================================ */
-.results-view { display: none; }
-
-.summary-header {
+.results-summary {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 48px;
-  padding: 40px 0;
+  gap: 40px;
+  padding: 32px 0;
   flex-wrap: wrap;
 }
-.summary-big-rate {
+.big-rate {
   text-align: center;
 }
-.summary-big-rate .big-pct {
-  font-size: 72px;
-  font-weight: 900;
-  line-height: 1;
+.big-rate .big-pct {
+  font-size: 64px; font-weight: 900; line-height: 1;
 }
-.summary-big-rate .big-label {
-  font-size: 13px;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 1px;
-  margin-top: 4px;
+.big-rate .big-lbl {
+  font-size: 12px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 1px; margin-top: 4px;
 }
 .summary-stats {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+  display: flex; flex-direction: column; gap: 10px;
 }
-.summary-stat {
-  display: flex;
-  align-items: center;
-  gap: 10px;
+.sum-stat {
+  display: flex; align-items: center; gap: 8px;
 }
-.summary-stat .ss-dot {
-  width: 10px; height: 10px;
-  border-radius: 50%;
+.sum-stat .dot {
+  width: 8px; height: 8px; border-radius: 50%;
 }
-.summary-stat .ss-dot.green { background: var(--green); }
-.summary-stat .ss-dot.red { background: var(--red); }
-.summary-stat .ss-dot.blue { background: var(--accent); }
-.summary-stat .ss-value {
-  font-size: 18px;
-  font-weight: 700;
-}
-.summary-stat .ss-label {
-  font-size: 13px;
-  color: var(--muted);
-}
+.sum-stat .dot.g { background: var(--green); }
+.sum-stat .dot.r { background: var(--red); }
+.sum-stat .dot.b { background: var(--accent); }
+.sum-stat .sv { font-size: 16px; font-weight: 700; }
+.sum-stat .sl { font-size: 12px; color: var(--muted); }
 
-/* Sortable table */
-.section { margin: 32px 0; }
-.section-title {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 1.5px;
-  color: var(--muted);
-  margin-bottom: 16px;
-  font-weight: 600;
+/* Results filter bar */
+.result-filters {
+  display: flex; gap: 8px; margin-bottom: 14px;
+  flex-wrap: wrap; align-items: center;
 }
-
-.data-table {
-  width: 100%;
-  border-collapse: separate;
-  border-spacing: 0;
-  background: var(--card);
-  border-radius: var(--radius);
-  overflow: hidden;
-  border: 1px solid var(--border);
-  backdrop-filter: blur(8px);
-}
-.data-table th {
-  padding: 12px 16px;
-  text-align: left;
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 1px;
-  color: var(--muted);
-  background: rgba(0,0,0,0.2);
-  font-weight: 600;
-  cursor: pointer;
-  user-select: none;
-  transition: color var(--transition);
-  white-space: nowrap;
-}
-.data-table th:hover { color: var(--text-secondary); }
-.data-table th.sorted { color: var(--accent); }
-.data-table th .sort-arrow {
-  display: inline-block;
-  margin-left: 4px;
-  font-size: 9px;
-  opacity: 0;
-  transition: opacity var(--transition);
-}
-.data-table th.sorted .sort-arrow { opacity: 1; }
-.data-table td {
-  padding: 12px 16px;
-  border-top: 1px solid var(--border);
-  font-size: 14px;
-}
-.data-table tr:hover td { background: rgba(59, 130, 246, 0.03); }
-.rate-pill {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 4px;
-  font-weight: 700;
-  font-size: 13px;
-}
-
-/* Filters for case list */
-.filter-bar {
-  display: flex;
-  gap: 10px;
-  margin-bottom: 16px;
-  flex-wrap: wrap;
-  align-items: center;
-}
-.filter-bar select, .filter-bar input {
-  padding: 8px 12px;
-  background: rgba(0,0,0,0.3);
+.result-filters select, .result-filters input {
+  padding: 7px 10px;
+  background: var(--bg-inset);
   border: 1px solid var(--border);
   border-radius: var(--radius-xs);
   color: var(--text);
-  font-size: 13px;
+  font-size: 12px;
   font-family: var(--font);
   outline: none;
-  transition: border-color var(--transition);
+  transition: border-color 0.15s;
 }
-.filter-bar select:focus, .filter-bar input:focus { border-color: var(--accent); }
-.filter-bar select option { background: var(--bg-subtle); }
+.result-filters select:focus, .result-filters input:focus { border-color: var(--accent); }
+.result-filters select option { background: var(--bg-raised); }
+.result-filters .rf-search {
+  flex: 1; min-width: 140px;
+}
 
 /* ================================================================
-   Utility & Animations
+   Toast Notifications
    ================================================================ */
-@keyframes cardSlideIn {
-  from { opacity: 0; transform: translateY(16px) scale(0.98); }
-  to   { opacity: 1; transform: translateY(0) scale(1); }
+.toast-container {
+  position: fixed; top: 14px; right: 14px;
+  z-index: 200;
+  display: flex; flex-direction: column; gap: 6px;
 }
+.toast {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  font-size: 12px;
+  color: var(--text);
+  backdrop-filter: blur(16px);
+  box-shadow: 0 4px 24px rgba(0,0,0,0.35);
+  max-width: 360px;
+  animation: toastIn 0.25s var(--spring) both;
+  display: flex; align-items: center; gap: 7px;
+}
+.toast.error { border-color: rgba(239,68,68,0.35); }
+.toast.error::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--red); flex-shrink: 0; }
+.toast.info::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
+.toast.removing { animation: toastOut 0.2s ease-in both; }
+@keyframes toastIn { from { opacity: 0; transform: translateX(80px); } to { opacity: 1; transform: translateX(0); } }
+@keyframes toastOut { from { opacity: 1; } to { opacity: 0; transform: translateX(80px); } }
+
+/* ================================================================
+   Empty state
+   ================================================================ */
+.empty-msg {
+  text-align: center; padding: 40px 16px;
+  color: var(--muted); font-size: 13px;
+}
+
+/* ================================================================
+   Utility Animations
+   ================================================================ */
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-@keyframes countUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 
 .hidden { display: none !important; }
 
 /* Scrollbar */
-::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.14); }
 
-/* Empty state */
-.empty-state {
-  text-align: center;
-  padding: 60px 20px;
-  color: var(--muted);
-}
-.empty-state .es-icon {
-  font-size: 40px;
-  opacity: 0.2;
-  margin-bottom: 12px;
-}
-.empty-state p { font-size: 14px; }
+/* Section spacing */
+.sec { margin-top: 24px; }
 </style>
 </head>
 <body>
-<div class="bg-mesh"></div>
-<div class="toast-container" id="toastContainer"></div>
 
-<div class="app">
-<div class="container">
+<div class="bg-canvas"><div class="mesh-extra"></div></div>
+<div class="toast-container" id="toasts"></div>
 
-  <!-- ============================================================
-       Header
-       ============================================================ -->
-  <header>
-    <div class="logo">astra-test</div>
-    <div class="subtitle" id="subtitle">
-      <span class="conn-dot connecting" id="connDot"></span>
-      <span id="subtitleText">connecting...</span>
-    </div>
-  </header>
+<!-- Mobile toggle -->
+<button class="mobile-toggle" id="mobileToggle" type="button">&#9776;</button>
+<div class="sidebar-overlay" id="sidebarOverlay"></div>
+
+<div class="app-layout">
 
   <!-- ============================================================
-       Phase 1: Configuration
+       Sidebar
        ============================================================ -->
-  <div id="configPhase" class="config-panel">
-    <!-- Suite info card -->
-    <div class="config-card">
-      <h3>Suite Directory</h3>
-      <div class="config-info" id="suiteDir">loading...</div>
-    </div>
-
-    <!-- Model selector -->
-    <div class="config-card">
-      <h3>Models</h3>
-      <div class="chip-container" id="modelChips"></div>
-      <div class="model-input-row">
-        <input type="text" id="customModelInput" placeholder="Add custom model name..." />
-        <button id="addModelBtn" type="button">Add</button>
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-scroll">
+      <!-- Logo + Connection -->
+      <div class="sidebar-logo">
+        <div class="logo-text">astra-test</div>
       </div>
-    </div>
-
-    <!-- Case filter -->
-    <div class="config-card">
-      <h3>Case Filter</h3>
-      <div class="filter-row">
-        <input type="text" id="caseFilterInput" placeholder="* (glob pattern, e.g. spawn_*)" />
-        <div class="filter-count" id="filterCount">-- cases</div>
+      <div class="conn-indicator">
+        <span class="conn-dot connecting" id="connDot"></span>
+        <span id="connText">connecting...</span>
       </div>
-    </div>
 
-    <!-- Advanced settings -->
-    <div class="config-card">
-      <button class="advanced-toggle" id="advancedToggle" type="button">
-        <span class="arrow" id="advancedArrow">&#9654;</span>
-        Advanced Settings
-      </button>
-      <div class="advanced-body" id="advancedBody">
-        <div class="setting-row">
-          <label>Parallel Workers</label>
-          <div class="setting-value">
-            <input type="range" id="parallelSlider" min="1" max="8" value="2" />
-            <span id="parallelValue" style="font-size:14px;font-weight:700;min-width:20px;text-align:center">2</span>
+      <!-- Models Section -->
+      <div class="sb-section">
+        <div class="sb-section-header">
+          <span class="sb-section-title">Models</span>
+          <div class="sb-section-actions">
+            <button type="button" id="modelSelectAll">All</button>
+            <button type="button" id="modelSelectNone">None</button>
           </div>
         </div>
-        <div class="setting-row">
-          <label>Enable Judger</label>
-          <div class="setting-value">
-            <div class="toggle active" id="judgerToggle"></div>
+        <div class="sb-check-list" id="modelList"></div>
+        <div class="selected-tags" id="modelTags"></div>
+        <div class="custom-model-row">
+          <input type="text" id="customModelIn" placeholder="custom model..." />
+          <button type="button" id="addModelBtn">Add</button>
+        </div>
+      </div>
+
+      <!-- Cases Section -->
+      <div class="sb-section">
+        <div class="sb-section-header">
+          <span class="sb-section-title">Cases <span id="casesCount" style="color:var(--dim)"></span></span>
+          <div class="sb-section-actions">
+            <button type="button" id="caseSelectAll">All</button>
+            <button type="button" id="caseSelectNone">None</button>
           </div>
         </div>
-        <div class="setting-row" id="judgerModelRow">
+        <input type="text" class="sb-search" id="caseSearch" placeholder="Search cases..." />
+        <div class="cap-pills" id="capPills"></div>
+        <div class="sb-check-list" id="caseList" style="max-height:260px"></div>
+      </div>
+
+      <!-- Settings Section -->
+      <div class="sb-section">
+        <div class="sb-section-header">
+          <span class="sb-section-title">Settings</span>
+        </div>
+        <div class="sb-setting">
+          <label>Parallel</label>
+          <div class="setting-val">
+            <input type="range" id="parallelSlider" min="1" max="16" value="2" />
+            <span class="val-num" id="parallelVal">2</span>
+          </div>
+        </div>
+        <div class="sb-setting">
+          <label>Judger</label>
+          <div class="setting-val">
+            <div class="toggle on" id="judgerToggle"></div>
+          </div>
+        </div>
+        <div class="sb-setting" id="judgerModelRow">
           <label>Judger Model</label>
-          <div class="setting-value">
-            <input type="text" class="judger-model-select" id="judgerModelInput" />
+          <div class="setting-val">
+            <input type="text" class="sb-search" id="judgerModelIn" style="width:120px;margin-bottom:0" />
           </div>
         </div>
       </div>
     </div>
 
-    <!-- Run button -->
-    <button class="run-btn ready" id="runBtn" type="button">
-      Run Suite
-    </button>
-  </div>
+    <!-- Run Button at bottom -->
+    <div class="sidebar-bottom">
+      <button class="run-btn glow" id="runBtn" type="button">Run Suite</button>
+    </div>
+  </aside>
 
   <!-- ============================================================
-       Phase 2: Running
+       Main Content Area
        ============================================================ -->
-  <div id="runningPhase" class="running-view">
-    <!-- SVG progress ring -->
-    <div class="progress-ring-container">
-      <div class="progress-ring-wrap">
-        <svg viewBox="0 0 180 180">
-          <defs>
-            <linearGradient id="progressGradient" x1="0%" y1="0%" x2="100%" y2="0%">
-              <stop offset="0%" stop-color="var(--accent)" />
-              <stop offset="100%" stop-color="var(--accent2)" />
-            </linearGradient>
-          </defs>
-          <circle class="progress-ring-bg" cx="90" cy="90" r="82" />
-          <circle class="progress-ring-fg" id="progressRing" cx="90" cy="90" r="82"
-                  stroke-dasharray="515.22" stroke-dashoffset="515.22" />
-        </svg>
-        <div class="progress-ring-center">
-          <div class="progress-ring-pct" id="ringPct">0%</div>
-          <div class="progress-ring-label">complete</div>
+  <main class="main-area">
+
+    <!-- Idle / Welcome -->
+    <div class="view-idle active" id="viewIdle">
+      <div class="welcome">
+        <div class="w-logo">astra-test</div>
+        <div class="w-subtitle">
+          Agent evaluation harness. Select models and cases in the sidebar, then click Run Suite.
+        </div>
+        <div class="w-steps">
+          <div class="w-step"><span class="w-step-num">1</span> Select one or more models to evaluate</div>
+          <div class="w-step"><span class="w-step-num">2</span> Choose which test cases to run</div>
+          <div class="w-step"><span class="w-step-num">3</span> Click Run Suite and watch results stream in</div>
         </div>
       </div>
     </div>
 
-    <!-- Live counters -->
-    <div class="live-counters">
-      <div class="live-counter pass">
-        <div class="lc-value" id="lcPassed">0</div>
-        <div class="lc-label">Passed</div>
+    <!-- Running -->
+    <div class="view-running" id="viewRunning">
+      <!-- Progress header -->
+      <div class="run-header">
+        <div class="progress-ring-wrap">
+          <svg viewBox="0 0 140 140">
+            <defs>
+              <linearGradient id="pgGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" stop-color="var(--accent)" />
+                <stop offset="100%" stop-color="var(--accent2)" />
+              </linearGradient>
+            </defs>
+            <circle class="progress-ring-bg" cx="70" cy="70" r="62" />
+            <circle class="progress-ring-fg" id="ringFg" cx="70" cy="70" r="62"
+                    stroke-dasharray="389.56" stroke-dashoffset="389.56" />
+          </svg>
+          <div class="progress-ring-center">
+            <div class="ring-pct" id="ringPct">0%</div>
+            <div class="ring-label">complete</div>
+          </div>
+        </div>
+        <div class="live-stats">
+          <div class="lstat pass"><div class="ls-val" id="lsPassed">0</div><div class="ls-lbl">Passed</div></div>
+          <div class="lstat fail"><div class="ls-val" id="lsFailed">0</div><div class="ls-lbl">Failed</div></div>
+          <div class="lstat active"><div class="ls-val" id="lsActive">0</div><div class="ls-lbl">Active</div></div>
+          <div class="lstat remain"><div class="ls-val" id="lsRemain">0</div><div class="ls-lbl">Remaining</div></div>
+        </div>
       </div>
-      <div class="live-counter fail">
-        <div class="lc-value" id="lcFailed">0</div>
-        <div class="lc-label">Failed</div>
+
+      <!-- Waiting hint -->
+      <div class="waiting-hint" id="waitingHint" style="display:none">Waiting for first result...</div>
+
+      <!-- Live model comparison -->
+      <div class="sec" id="liveModelSec" style="display:none">
+        <div class="section-label">Model Comparison (Live)</div>
+        <table class="dtable" id="liveModelTable">
+          <thead><tr>
+            <th>Model</th><th>Pass</th><th>Rate</th>
+            <th>Tok/Pass</th><th>Dur/Pass</th><th>Turns/Pass</th>
+          </tr></thead>
+          <tbody id="liveModelBody"></tbody>
+        </table>
       </div>
-      <div class="live-counter running">
-        <div class="lc-value" id="lcRunning">0<span class="running-spinner"></span></div>
-        <div class="lc-label">Running</div>
-      </div>
-      <div class="live-counter remaining">
-        <div class="lc-value" id="lcRemaining">0</div>
-        <div class="lc-label">Remaining</div>
+
+      <!-- Live case cards -->
+      <div class="sec">
+        <div class="section-label">Cases</div>
+        <div class="case-grid" id="liveGrid"></div>
+        <div class="empty-msg" id="liveEmpty">Cases will appear here as they complete</div>
       </div>
     </div>
 
-    <!-- Live model comparison (top) -->
-    <div class="section" id="liveModelSection" style="display:none">
-      <div class="section-title">Model Comparison (Live)</div>
-      <table class="data-table" id="liveModelTable">
-        <thead><tr>
-          <th>Model</th><th>Pass</th><th>Rate</th>
-          <th>Tok/Pass</th><th>Dur/Pass</th><th>Turns/Pass</th>
-        </tr></thead>
-        <tbody id="liveModelBody"></tbody>
-      </table>
-    </div>
+    <!-- Results -->
+    <div class="view-results" id="viewResults">
+      <div class="results-summary" id="resultsSummary"></div>
 
-    <!-- Live case cards -->
-    <div class="section">
-      <div class="section-title">Cases</div>
-      <div class="case-grid" id="liveCaseGrid"></div>
-      <div class="empty-state" id="liveEmptyState">
-        <div class="es-icon">&#9881;</div>
-        <p>Cases will appear here as they complete</p>
+      <!-- Model comparison (sortable) -->
+      <div class="sec" id="resultModelSec" style="display:none">
+        <div class="section-label">Model Comparison</div>
+        <table class="dtable" id="resultModelTable">
+          <thead><tr>
+            <th data-col="model">Model <span class="sa"></span></th>
+            <th data-col="rate">Pass Rate <span class="sa"></span></th>
+            <th data-col="tokPass">Tok/Pass <span class="sa"></span></th>
+            <th data-col="durPass">Dur/Pass <span class="sa"></span></th>
+            <th data-col="turnsPass">Turns/Pass <span class="sa"></span></th>
+          </tr></thead>
+          <tbody id="resultModelBody"></tbody>
+        </table>
+      </div>
+
+      <!-- Filtered case list -->
+      <div class="sec">
+        <div class="section-label">Case Results</div>
+        <div class="result-filters" id="resultFilters">
+          <select id="rfModel"><option value="">All Models</option></select>
+          <select id="rfStatus">
+            <option value="">All Statuses</option>
+            <option value="pass">Passed</option>
+            <option value="fail">Failed</option>
+          </select>
+          <select id="rfCap"><option value="">All Capabilities</option></select>
+          <input type="text" class="rf-search" id="rfSearch" placeholder="Search cases..." />
+        </div>
+        <div class="case-grid" id="resultGrid"></div>
       </div>
     </div>
-  </div>
 
-  <!-- ============================================================
-       Phase 3: Results
-       ============================================================ -->
-  <div id="resultsPhase" class="results-view">
-    <!-- Summary header -->
-    <div class="summary-header" id="summaryHeader"></div>
-
-    <!-- Model comparison table (sortable) -->
-    <div class="section" id="resultModelSection" style="display:none">
-      <div class="section-title">Model Comparison</div>
-      <table class="data-table" id="resultModelTable">
-        <thead><tr>
-          <th data-col="model">Model <span class="sort-arrow"></span></th>
-          <th data-col="rate">Pass Rate <span class="sort-arrow"></span></th>
-          <th data-col="tokPass">Tok/Pass <span class="sort-arrow"></span></th>
-          <th data-col="durPass">Dur/Pass <span class="sort-arrow"></span></th>
-          <th data-col="turnsPass">Turns/Pass <span class="sort-arrow"></span></th>
-        </tr></thead>
-        <tbody id="resultModelBody"></tbody>
-      </table>
-    </div>
-
-    <!-- Filtered case list -->
-    <div class="section">
-      <div class="section-title">Case Results</div>
-      <div class="filter-bar" id="resultFilterBar">
-        <select id="resultModelFilter"><option value="">All Models</option></select>
-        <select id="resultStatusFilter">
-          <option value="">All Statuses</option>
-          <option value="pass">Passed</option>
-          <option value="fail">Failed</option>
-        </select>
-        <select id="resultCapabilityFilter"><option value="">All Capabilities</option></select>
-        <input type="text" id="resultSearchInput" placeholder="Search cases..." style="flex:1;min-width:160px" />
-      </div>
-      <div class="case-grid" id="resultCaseGrid"></div>
-    </div>
-  </div>
-
-</div>
+  </main>
 </div>
 
 <!-- ================================================================
@@ -1138,42 +1211,52 @@ input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.2); }
    State
    ================================================================ */
 const S = {
-  phase: 'config',     // 'config' | 'running' | 'results'
+  phase: 'idle',       // 'idle' | 'running' | 'results'
   ws: null,
   connected: false,
+  reconnectTimer: null,
 
-  // Config data from server
+  // Config from server
   config: { suite_dir: '', available_models: [], judger_model: '' },
-  cases: [],
+  allCases: [],        // from /api/cases
 
   // User selections
-  selectedModels: [],
-  filter: '',
+  selectedModels: new Set(),
+  selectedCases: new Set(),
+  capFilter: '',       // capability filter for case list
+  caseSearch: '',      // text search for case list
+
+  // Settings
   parallel: 2,
   noJudger: false,
   judgerModel: '',
+
+  // All known model names (presets + server + custom)
+  allModels: [],
 
   // Run state
   total: 0,
   completed: 0,
   passed: 0,
   failed: 0,
-  runningSet: new Map(),  // key -> { case_name, model }
-  runs: [],               // CaseRunReport[]
+  runningSet: new Map(),
+  runs: [],
   startTime: null,
-  wallTimer: null,
   suiteReport: null,
+  waitingTimer: null,
 
   // Results sort
-  modelSortCol: 'rate',
-  modelSortAsc: false,
+  sortCol: 'rate',
+  sortAsc: false,
 };
+
+const PRESETS = ['claude-sonnet-4-6', 'MiniMax-M2.7', 'qwen-flash', 'deepseek-chat', 'gpt-4o'];
 
 /* ================================================================
    DOM Helpers
    ================================================================ */
-const $ = (id) => document.getElementById(id);
-const esc = (s) => { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; };
+const $ = id => document.getElementById(id);
+const esc = s => { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; };
 const trunc = (s, n) => s && s.length > n ? s.slice(0, n) + '...' : (s || '');
 
 function formatDur(ms) {
@@ -1181,8 +1264,8 @@ function formatDur(ms) {
   if (ms < 1000) return ms + 'ms';
   if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
   const m = Math.floor(ms / 60000);
-  const s = Math.floor((ms % 60000) / 1000);
-  return m + 'm' + s + 's';
+  const sec = Math.floor((ms % 60000) / 1000);
+  return m + 'm' + sec + 's';
 }
 
 function formatTok(n) {
@@ -1199,128 +1282,228 @@ function normModel(m) {
   return m;
 }
 
+function rateColor(rate) {
+  if (rate >= 80) return 'rgba(34,197,94,0.8)';
+  if (rate >= 50) return 'rgba(234,179,8,0.8)';
+  return 'rgba(239,68,68,0.8)';
+}
+
+function rateFg(rate) {
+  if (rate >= 80) return 'var(--green)';
+  if (rate >= 50) return 'var(--yellow)';
+  return 'var(--red)';
+}
+
+function diffStars(d) {
+  if (!d || d < 1) return '';
+  const n = Math.min(d, 5);
+  return '★'.repeat(n);
+}
+
+const CHECK_SVG = '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6l2.5 2.5 4.5-5"/></svg>';
+
 /* ================================================================
-   Toast Notifications
+   Toast
    ================================================================ */
 function toast(msg, type) {
   type = type || 'error';
   const el = document.createElement('div');
   el.className = 'toast ' + type;
   el.textContent = msg;
-  $('toastContainer').appendChild(el);
+  $('toasts').appendChild(el);
   setTimeout(() => {
     el.classList.add('removing');
-    setTimeout(() => el.remove(), 300);
-  }, 5000);
-}
-
-/* ================================================================
-   Glob Matching (for live filter count)
-   ================================================================ */
-function globToRegex(pattern) {
-  if (!pattern || pattern === '*') return null;
-  const re = pattern
-    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    .replace(/\*/g, '.*')
-    .replace(/\?/g, '.');
-  try { return new RegExp('^' + re + '$'); } catch { return null; }
-}
-
-function matchingCaseCount() {
-  const re = globToRegex($('caseFilterInput').value.trim());
-  if (!re) return S.cases.length;
-  return S.cases.filter(c => re.test(c.name)).length;
+    setTimeout(() => el.remove(), 250);
+  }, 4000);
 }
 
 /* ================================================================
    Phase Management
    ================================================================ */
-function setPhase(phase) {
-  S.phase = phase;
-  $('configPhase').style.display = phase === 'config' ? '' : 'none';
-  $('runningPhase').style.display = phase === 'running' ? '' : 'none';
-  $('resultsPhase').style.display = phase === 'results' ? '' : 'none';
+function setPhase(p) {
+  S.phase = p;
+  $('viewIdle').classList.toggle('active', p === 'idle');
+  $('viewRunning').classList.toggle('active', p === 'running');
+  $('viewResults').classList.toggle('active', p === 'results');
 }
 
 /* ================================================================
-   Phase 1: Configuration
+   Mobile Sidebar
    ================================================================ */
-function initConfig() {
-  // Fetch config
-  fetch('/api/config')
-    .then(r => r.json())
-    .then(data => {
-      S.config = data;
-      $('suiteDir').textContent = data.suite_dir || '(unknown)';
-      S.selectedModels = [...(data.available_models || [])];
-      S.judgerModel = data.judger_model || '';
-      $('judgerModelInput').value = S.judgerModel;
-      renderModelChips();
-    })
-    .catch(e => toast('Failed to load config: ' + e.message));
+$('mobileToggle').addEventListener('click', () => {
+  $('sidebar').classList.toggle('open');
+  $('sidebarOverlay').classList.toggle('open');
+});
+$('sidebarOverlay').addEventListener('click', () => {
+  $('sidebar').classList.remove('open');
+  $('sidebarOverlay').classList.remove('open');
+});
 
-  // Fetch cases
-  fetch('/api/cases')
-    .then(r => r.json())
-    .then(data => {
-      S.cases = data.cases || [];
-      updateFilterCount();
-    })
-    .catch(e => toast('Failed to load cases: ' + e.message));
+/* ================================================================
+   Models: Build & Render
+   ================================================================ */
+function buildModelList() {
+  const set = new Set();
+  PRESETS.forEach(m => set.add(m));
+  (S.config.available_models || []).forEach(m => set.add(m));
+  S.allModels = [...set];
 }
 
-function renderModelChips() {
-  const container = $('modelChips');
+function renderModelList() {
+  const container = $('modelList');
   container.innerHTML = '';
-  const allModels = new Set([...S.config.available_models, ...S.selectedModels]);
-  for (const m of allModels) {
-    const chip = document.createElement('div');
-    chip.className = 'chip' + (S.selectedModels.includes(m) ? ' active' : '');
-    chip.innerHTML = esc(m) + '<span class="chip-x">&times;</span>';
-    chip.addEventListener('click', () => {
-      const idx = S.selectedModels.indexOf(m);
-      if (idx >= 0) S.selectedModels.splice(idx, 1);
-      else S.selectedModels.push(m);
-      renderModelChips();
+  for (const m of S.allModels) {
+    const checked = S.selectedModels.has(m);
+    const item = document.createElement('div');
+    item.className = 'sb-check-item' + (checked ? ' checked' : '');
+    item.innerHTML = `<span class="ck">${CHECK_SVG}</span><span class="item-label" title="${esc(m)}">${esc(m)}</span>`;
+    item.addEventListener('click', () => {
+      if (S.selectedModels.has(m)) S.selectedModels.delete(m);
+      else S.selectedModels.add(m);
+      renderModelList();
+      renderModelTags();
     });
-    container.appendChild(chip);
+    container.appendChild(item);
   }
 }
 
-function updateFilterCount() {
-  const count = matchingCaseCount();
-  $('filterCount').textContent = count + ' case' + (count !== 1 ? 's' : '');
+function renderModelTags() {
+  const container = $('modelTags');
+  container.innerHTML = '';
+  for (const m of S.selectedModels) {
+    const tag = document.createElement('span');
+    tag.className = 'sel-tag';
+    tag.innerHTML = `${esc(m)}<span class="tag-x">&times;</span>`;
+    tag.querySelector('.tag-x').addEventListener('click', (e) => {
+      e.stopPropagation();
+      S.selectedModels.delete(m);
+      renderModelList();
+      renderModelTags();
+    });
+    container.appendChild(tag);
+  }
 }
 
-// Event listeners for config phase
-$('caseFilterInput').addEventListener('input', updateFilterCount);
+$('modelSelectAll').addEventListener('click', () => {
+  S.allModels.forEach(m => S.selectedModels.add(m));
+  renderModelList();
+  renderModelTags();
+});
+$('modelSelectNone').addEventListener('click', () => {
+  S.selectedModels.clear();
+  renderModelList();
+  renderModelTags();
+});
+$('addModelBtn').addEventListener('click', addCustomModel);
+$('customModelIn').addEventListener('keydown', e => { if (e.key === 'Enter') addCustomModel(); });
+
+function addCustomModel() {
+  const v = $('customModelIn').value.trim();
+  if (!v) return;
+  if (!S.allModels.includes(v)) S.allModels.push(v);
+  S.selectedModels.add(v);
+  renderModelList();
+  renderModelTags();
+  $('customModelIn').value = '';
+}
+
+/* ================================================================
+   Cases: Build & Render
+   ================================================================ */
+function getCapabilities() {
+  const caps = new Set();
+  S.allCases.forEach(c => { if (c.capability) caps.add(c.capability); });
+  return [...caps].sort();
+}
+
+function renderCapPills() {
+  const container = $('capPills');
+  container.innerHTML = '';
+  const caps = getCapabilities();
+  // "All" pill
+  const allPill = document.createElement('button');
+  allPill.className = 'cap-pill' + (!S.capFilter ? ' active' : '');
+  allPill.textContent = 'All';
+  allPill.type = 'button';
+  allPill.addEventListener('click', () => { S.capFilter = ''; renderCapPills(); renderCaseList(); });
+  container.appendChild(allPill);
+
+  for (const cap of caps) {
+    const pill = document.createElement('button');
+    pill.className = 'cap-pill' + (S.capFilter === cap ? ' active' : '');
+    pill.textContent = cap;
+    pill.type = 'button';
+    pill.addEventListener('click', () => {
+      S.capFilter = S.capFilter === cap ? '' : cap;
+      renderCapPills();
+      renderCaseList();
+    });
+    container.appendChild(pill);
+  }
+}
+
+function filteredCases() {
+  let list = S.allCases;
+  if (S.capFilter) list = list.filter(c => c.capability === S.capFilter);
+  if (S.caseSearch) {
+    const q = S.caseSearch.toLowerCase();
+    list = list.filter(c => c.name.toLowerCase().includes(q) || (c.description || '').toLowerCase().includes(q));
+  }
+  return list;
+}
+
+function renderCaseList() {
+  const container = $('caseList');
+  container.innerHTML = '';
+  const cases = filteredCases();
+  const selCount = [...S.selectedCases].filter(n => S.allCases.some(c => c.name === n)).length;
+  $('casesCount').textContent = '(' + selCount + '/' + S.allCases.length + ')';
+
+  for (const c of cases) {
+    const checked = S.selectedCases.has(c.name);
+    const item = document.createElement('div');
+    item.className = 'sb-check-item' + (checked ? ' checked' : '');
+
+    let metaHtml = '';
+    if (c.capability) metaHtml += `<span class="case-cap-badge">${esc(c.capability)}</span>`;
+    if (c.difficulty) metaHtml += `<span class="case-diff-stars">${diffStars(c.difficulty)}</span>`;
+    if (c.has_steps) metaHtml += `<span class="case-steps-dot" title="Multi-step"></span>`;
+
+    item.innerHTML = `<span class="ck">${CHECK_SVG}</span><span class="item-label" title="${esc(c.description || c.name)}">${esc(c.name)}</span><span class="item-meta">${metaHtml}</span>`;
+    item.addEventListener('click', () => {
+      if (S.selectedCases.has(c.name)) S.selectedCases.delete(c.name);
+      else S.selectedCases.add(c.name);
+      renderCaseList();
+    });
+    container.appendChild(item);
+  }
+}
+
+$('caseSelectAll').addEventListener('click', () => {
+  filteredCases().forEach(c => S.selectedCases.add(c.name));
+  renderCaseList();
+});
+$('caseSelectNone').addEventListener('click', () => {
+  filteredCases().forEach(c => S.selectedCases.delete(c.name));
+  renderCaseList();
+});
+$('caseSearch').addEventListener('input', () => {
+  S.caseSearch = $('caseSearch').value.trim();
+  renderCaseList();
+});
+
+/* ================================================================
+   Settings Bindings
+   ================================================================ */
 $('parallelSlider').addEventListener('input', () => {
   S.parallel = +$('parallelSlider').value;
-  $('parallelValue').textContent = S.parallel;
+  $('parallelVal').textContent = S.parallel;
 });
 $('judgerToggle').addEventListener('click', () => {
   S.noJudger = !S.noJudger;
-  $('judgerToggle').classList.toggle('active', !S.noJudger);
-  $('judgerModelRow').style.opacity = S.noJudger ? '0.4' : '1';
+  $('judgerToggle').classList.toggle('on', !S.noJudger);
+  $('judgerModelRow').style.opacity = S.noJudger ? '0.35' : '1';
 });
-$('advancedToggle').addEventListener('click', () => {
-  const open = $('advancedBody').classList.toggle('open');
-  $('advancedArrow').classList.toggle('open', open);
-});
-$('addModelBtn').addEventListener('click', addCustomModel);
-$('customModelInput').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') addCustomModel();
-});
-
-function addCustomModel() {
-  const val = $('customModelInput').value.trim();
-  if (!val) return;
-  if (!S.selectedModels.includes(val)) {
-    S.selectedModels.push(val);
-    renderModelChips();
-  }
-  $('customModelInput').value = '';
-}
 
 /* ================================================================
    Run Button
@@ -1328,23 +1511,46 @@ function addCustomModel() {
 $('runBtn').addEventListener('click', startRun);
 
 function startRun() {
-  if (S.selectedModels.length === 0) {
+  if (S.selectedModels.size === 0) {
     toast('Select at least one model', 'error');
+    return;
+  }
+  if (S.selectedCases.size === 0 && S.allCases.length > 0) {
+    toast('Select at least one case', 'error');
     return;
   }
 
   $('runBtn').disabled = true;
-  $('runBtn').classList.remove('ready');
+  $('runBtn').classList.remove('glow');
   $('runBtn').textContent = 'Starting...';
 
   const body = {
-    models: S.selectedModels,
+    models: [...S.selectedModels],
     parallel: S.parallel,
     no_judger: S.noJudger,
   };
-  const filterVal = $('caseFilterInput').value.trim();
-  if (filterVal && filterVal !== '*') body.filter = filterVal;
-  const jm = $('judgerModelInput').value.trim();
+
+  // Build filter from selected cases
+  // If all cases are selected, no filter needed
+  if (S.selectedCases.size < S.allCases.length && S.selectedCases.size > 0) {
+    const names = [...S.selectedCases];
+    // Use glob pattern: join with commas or send as filter
+    // The API uses filter as a glob pattern; since we have individual names,
+    // we can join them with commas or use a regex-like approach.
+    // For the API: if it's a simple glob, we send individual names joined.
+    // Actually the API takes a glob pattern. For individual selection, the
+    // best approach is to send a pattern that matches exactly those names.
+    // We can create a pattern like: {name1,name2,name3}
+    // But safer: if filter supports comma-separated or we send them as-is.
+    // Let's use brace expansion syntax which some glob implementations support.
+    if (names.length === 1) {
+      body.filter = names[0];
+    } else {
+      body.filter = '{' + names.join(',') + '}';
+    }
+  }
+
+  const jm = $('judgerModelIn').value.trim();
   if (jm && jm !== S.config.judger_model) body.judger_model = jm;
 
   fetch('/api/run', {
@@ -1356,57 +1562,58 @@ function startRun() {
     .then(data => {
       if (data.error) {
         toast(data.error, 'error');
-        $('runBtn').disabled = false;
-        $('runBtn').classList.add('ready');
-        $('runBtn').textContent = 'Run Suite';
+        resetRunBtn();
       }
-      // suite_started event via WS will trigger phase switch
+      // suite_started via WS will trigger phase switch
     })
     .catch(e => {
       toast('Run request failed: ' + e.message, 'error');
-      $('runBtn').disabled = false;
-      $('runBtn').classList.add('ready');
-      $('runBtn').textContent = 'Run Suite';
+      resetRunBtn();
     });
 }
 
-/* ================================================================
-   Phase 2: Running — Updates
-   ================================================================ */
-const CIRCUMFERENCE = 2 * Math.PI * 82; // ~515.22
+function resetRunBtn() {
+  $('runBtn').disabled = false;
+  $('runBtn').classList.add('glow');
+  $('runBtn').textContent = 'Run Suite';
+}
 
-function updateRunningView() {
+/* ================================================================
+   Running View: Updates
+   ================================================================ */
+const CIRC = 2 * Math.PI * 62; // ~389.56
+
+function updateRunning() {
   const pct = S.total > 0 ? Math.round((S.completed / S.total) * 100) : 0;
   $('ringPct').textContent = pct + '%';
-  const offset = CIRCUMFERENCE - (CIRCUMFERENCE * pct / 100);
-  $('progressRing').setAttribute('stroke-dashoffset', offset);
+  $('ringFg').setAttribute('stroke-dashoffset', CIRC - (CIRC * pct / 100));
 
-  $('lcPassed').textContent = S.passed;
-  $('lcFailed').textContent = S.failed;
-  const runningCount = S.runningSet.size;
-  $('lcRunning').innerHTML = runningCount + '<span class="running-spinner"></span>';
-  $('lcRemaining').textContent = Math.max(0, S.total - S.completed - runningCount);
+  $('lsPassed').textContent = S.passed;
+  $('lsFailed').textContent = S.failed;
+  const active = S.runningSet.size;
+  $('lsActive').innerHTML = active + (active > 0 ? '<span class="spin-icon"></span>' : '');
+  $('lsRemain').textContent = Math.max(0, S.total - S.completed - active);
 
   updateLiveModelTable();
 }
 
 function updateLiveModelTable() {
-  const models = computeModelStats();
-  const sorted = Object.entries(models).sort((a, b) =>
+  const stats = modelStats();
+  const entries = Object.entries(stats).sort((a, b) =>
     (b[1].pass / Math.max(b[1].total, 1)) - (a[1].pass / Math.max(a[1].total, 1))
   );
-  if (sorted.length < 2) {
-    $('liveModelSection').style.display = 'none';
+  if (entries.length < 2) {
+    $('liveModelSec').style.display = 'none';
     return;
   }
-  $('liveModelSection').style.display = '';
-  $('liveModelBody').innerHTML = sorted.map(([name, s]) => {
+  $('liveModelSec').style.display = '';
+  $('liveModelBody').innerHTML = entries.map(([name, s]) => {
     const rate = Math.round(s.pass / Math.max(s.total, 1) * 100);
     const p = Math.max(s.pass, 1);
     return `<tr>
       <td style="font-weight:600">${esc(name)}</td>
       <td>${s.pass}/${s.total}</td>
-      <td><span class="rate-pill" style="background:${rateColor(rate)};color:#fff">${rate}%</span></td>
+      <td><span class="rate-pill" style="background:${rateColor(rate)}">${rate}%</span></td>
       <td>${formatTok(Math.round(s.passTok / p))}</td>
       <td>${formatDur(Math.round(s.passDur / p))}</td>
       <td>${(s.passTurns / p).toFixed(1)}</td>
@@ -1414,12 +1621,12 @@ function updateLiveModelTable() {
   }).join('');
 }
 
-function computeModelStats() {
-  const models = {};
+function modelStats() {
+  const out = {};
   for (const r of S.runs) {
     const m = normModel(r.model);
-    if (!models[m]) models[m] = { pass: 0, total: 0, passTok: 0, passDur: 0, passTurns: 0, passTools: 0, allTok: 0, allDur: 0 };
-    const s = models[m];
+    if (!out[m]) out[m] = { pass: 0, total: 0, passTok: 0, passDur: 0, passTurns: 0, allTok: 0, allDur: 0 };
+    const s = out[m];
     s.total++;
     const tok = (r.outcome.prompt_tokens || 0) + (r.outcome.completion_tokens || 0);
     s.allTok += tok;
@@ -1429,242 +1636,179 @@ function computeModelStats() {
       s.passTok += tok;
       s.passDur += r.outcome.duration_ms || 0;
       s.passTurns += r.outcome.turn_rounds || 0;
-      s.passTools += r.outcome.tool_calls_count || 0;
     }
   }
-  return models;
-}
-
-function rateColor(rate) {
-  if (rate >= 80) return 'rgba(34, 197, 94, 0.8)';
-  if (rate >= 50) return 'rgba(234, 179, 8, 0.8)';
-  return 'rgba(239, 68, 68, 0.8)';
-}
-
-function rateFg(rate) {
-  if (rate >= 80) return 'var(--green)';
-  if (rate >= 50) return 'var(--yellow)';
-  return 'var(--red)';
+  return out;
 }
 
 /* ================================================================
-   Case Card Builder (shared)
+   Case Card Builder
    ================================================================ */
-function buildCaseCard(report, index) {
+function buildCaseCard(report, idx) {
   const card = document.createElement('div');
   const status = report.passed ? 'pass' : 'fail';
   card.className = 'case-card ' + status;
-  card.style.animationDelay = (index * 50) + 'ms';
+  card.style.animationDelay = (idx * 50) + 'ms';
 
   const tok = (report.outcome.prompt_tokens || 0) + (report.outcome.completion_tokens || 0);
 
-  // Criteria HTML
+  // Criteria
   const criteriaHtml = (report.criteria || []).map(c => {
     let extra = '';
     if (c.score != null) {
       const pct = Math.round(c.score * 100);
-      const color = c.score >= 0.7 ? 'var(--green)' : c.score >= 0.4 ? 'var(--yellow)' : 'var(--red)';
-      extra = `<div class="score-bar-container">
-        <div class="score-bar-label">Score: ${c.score.toFixed(2)}</div>
-        <div class="score-bar"><div class="score-bar-fill" style="width:${pct}%;background:${color}"></div></div>
-      </div>`;
+      const col = c.score >= 0.7 ? 'var(--green)' : c.score >= 0.4 ? 'var(--yellow)' : 'var(--red)';
+      extra = `<div class="score-bar-wrap"><div class="score-bar-lbl">Score: ${c.score.toFixed(2)}</div><div class="score-bar"><div class="score-bar-fill" style="width:${pct}%;background:${col}"></div></div></div>`;
     }
-    return `<div class="criterion-row">
-      <div class="criterion-dot ${c.passed ? 'ok' : 'fail'}"></div>
-      <div class="criterion-text">${esc(c.detail)}${extra}</div>
-    </div>`;
+    return `<div class="crit-row"><div class="crit-dot ${c.passed ? 'ok' : 'no'}"></div><div class="crit-text">${esc(c.detail)}${extra}</div></div>`;
   }).join('');
 
-  // Steps HTML
+  // Steps
   const stepsHtml = (report.steps || []).map(step => {
-    const stepCriteria = (step.criteria || []).map(c =>
-      `<div class="criterion-row" style="margin-left:8px">
-        <div class="criterion-dot ${c.passed ? 'ok' : 'fail'}"></div>
-        <div class="criterion-text" style="font-size:12px">${esc(c.detail)}</div>
-      </div>`
+    const sc = (step.criteria || []).map(c =>
+      `<div class="crit-row" style="margin-left:6px"><div class="crit-dot ${c.passed ? 'ok' : 'no'}"></div><div class="crit-text" style="font-size:11px">${esc(c.detail)}</div></div>`
     ).join('');
     return `<div class="step-card">
-      <div class="step-header">
-        <span>Step ${step.step_index}</span>
-        <span>${formatDur(step.duration_ms)}</span>
-      </div>
-      <div class="step-prompt">${esc(trunc(step.prompt, 120))}</div>
-      ${step.outcome && step.outcome.text ? `<div style="margin-top:4px;font-size:11px;color:var(--muted)">${esc(trunc(step.outcome.text, 200))}</div>` : ''}
-      ${stepCriteria ? `<div class="step-criteria">${stepCriteria}</div>` : ''}
+      <div class="step-hdr"><span>Step ${step.step_index}</span><span>${formatDur(step.duration_ms)}</span></div>
+      <div class="step-prompt">${esc(trunc(step.prompt, 100))}</div>
+      ${step.outcome && step.outcome.text ? `<div style="margin-top:3px;font-size:10px;color:var(--muted)">${esc(trunc(step.outcome.text, 180))}</div>` : ''}
+      ${sc}
     </div>`;
   }).join('');
 
   // Session ID
   const sid = report.outcome.session_id;
-  const sessionHtml = sid
-    ? `<div class="detail-section"><div class="detail-label">Session ID</div><div class="copyable" data-copy="${esc(sid)}">${esc(sid)}</div></div>`
-    : '';
+  const sidHtml = sid ? `<div class="detail-section"><div class="detail-label">Session ID</div><div class="copyable" data-copy="${esc(sid)}">${esc(sid)}</div></div>` : '';
 
   // Reproducer
   const reproHtml = report.reproducer
-    ? `<div class="detail-section"><div class="detail-label">Reproducer</div><pre class="copyable" data-copy="${esc(report.reproducer)}" style="display:block;cursor:pointer;max-width:100%">${esc(report.reproducer)}</pre></div>`
+    ? `<div class="detail-section"><div class="detail-label">Reproducer</div><pre class="copyable" data-copy="${esc(report.reproducer)}" style="display:block;cursor:pointer">${esc(report.reproducer)}</pre></div>`
     : '';
 
   // Failure class
-  const failClassHtml = report.failure_class
+  const fcHtml = report.failure_class
     ? `<div class="detail-section" style="color:var(--red)"><div class="detail-label">Failure Class</div>${esc(typeof report.failure_class === 'string' ? report.failure_class : JSON.stringify(report.failure_class))}</div>`
     : '';
 
-  // Output text (collapsible)
-  const outputText = report.outcome.text;
-  const outputHtml = outputText
+  // Output (collapsible)
+  const outText = report.outcome.text;
+  const uid = 'out_' + idx + '_' + Date.now();
+  const outHtml = outText
     ? `<div class="detail-section">
-        <button class="collapsible-trigger" data-target="output-${index}">
-          <span class="caret">&#9654;</span> Output (${outputText.length} chars)
-        </button>
-        <div class="collapsible-content" id="output-${index}">
-          <pre>${esc(trunc(outputText, 2000))}</pre>
-        </div>
+        <button class="collapse-btn" data-tgt="${uid}" type="button"><span class="caret">&#9654;</span> Output (${outText.length} chars)</button>
+        <div class="collapse-content" id="${uid}"><pre>${esc(trunc(outText, 2000))}</pre></div>
       </div>`
     : '';
 
-  // Capability / difficulty badges
+  // Meta badges
   let metaBadges = '';
-  if (report.capability) metaBadges += `<span class="metric"><span class="metric-icon">&#9670;</span>${esc(typeof report.capability === 'string' ? report.capability : '')}</span>`;
-  if (report.difficulty) metaBadges += `<span class="metric"><span class="metric-icon">d</span>${report.difficulty}</span>`;
+  if (report.capability) metaBadges += `<span class="m"><span class="m-icon">&#9670;</span>${esc(typeof report.capability === 'string' ? report.capability : '')}</span>`;
+  if (report.difficulty) metaBadges += `<span class="m"><span class="m-icon">d</span>${report.difficulty}</span>`;
 
   card.innerHTML = `
-    <div class="cc-header">
+    <div class="cc-head">
       <div>
         <div class="cc-name">${esc(report.case_name)}</div>
-        <div class="cc-model">${esc(normModel(report.model))}</div>
+        <div class="cc-model-tag">${esc(normModel(report.model))}</div>
       </div>
       <span class="badge ${status}">${report.passed ? 'PASS' : 'FAIL'}</span>
     </div>
     <div class="cc-metrics">
-      <span class="metric"><span class="metric-icon">&#9201;</span>${formatDur(report.outcome.duration_ms || 0)}</span>
-      <span class="metric"><span class="metric-icon">&#9671;</span>${formatTok(tok)} tok</span>
-      <span class="metric"><span class="metric-icon">&#8634;</span>${report.outcome.turn_rounds || 0} turns</span>
-      <span class="metric"><span class="metric-icon">&#9881;</span>${report.outcome.tool_calls_count || 0} tools</span>
+      <span class="m"><span class="m-icon">&#9201;</span>${formatDur(report.outcome.duration_ms || 0)}</span>
+      <span class="m"><span class="m-icon">&#9671;</span>${formatTok(tok)} tok</span>
+      <span class="m"><span class="m-icon">&#8634;</span>${report.outcome.turn_rounds || 0} turns</span>
+      <span class="m"><span class="m-icon">&#9881;</span>${report.outcome.tool_calls_count || 0} tools</span>
       ${metaBadges}
     </div>
     <div class="cc-detail">
-      ${criteriaHtml ? `<div class="criteria-list">${criteriaHtml}</div>` : ''}
-      ${stepsHtml ? `<div class="detail-section"><div class="detail-label">Steps</div>${stepsHtml}</div>` : ''}
-      ${sessionHtml}
-      ${reproHtml}
-      ${failClassHtml}
-      ${outputHtml}
+      ${criteriaHtml ? '<div class="criteria-list">' + criteriaHtml + '</div>' : ''}
+      ${stepsHtml ? '<div class="detail-section"><div class="detail-label">Steps</div>' + stepsHtml + '</div>' : ''}
+      ${sidHtml}${reproHtml}${fcHtml}${outHtml}
     </div>`;
 
-  card.addEventListener('click', (e) => {
-    // Don't toggle if clicking on copyable elements or collapsible triggers
-    if (e.target.closest('.copyable') || e.target.closest('.collapsible-trigger')) return;
+  // Toggle expand
+  card.addEventListener('click', e => {
+    if (e.target.closest('.copyable') || e.target.closest('.collapse-btn')) return;
     card.classList.toggle('expanded');
   });
 
-  // Copyable handler
+  // Copy handler
   card.querySelectorAll('.copyable').forEach(el => {
     el.addEventListener('click', () => {
       const text = el.dataset.copy || el.textContent;
       navigator.clipboard.writeText(text).then(
-        () => toast('Copied to clipboard', 'info'),
+        () => toast('Copied', 'info'),
         () => {}
       );
     });
   });
 
-  // Collapsible handler
-  card.querySelectorAll('.collapsible-trigger').forEach(btn => {
-    btn.addEventListener('click', (e) => {
+  // Collapse handler
+  card.querySelectorAll('.collapse-btn').forEach(btn => {
+    btn.addEventListener('click', e => {
       e.stopPropagation();
-      const targetId = btn.dataset.target;
-      const content = card.querySelector('#' + targetId);
-      if (!content) return;
-      const isOpen = content.classList.toggle('open');
-      btn.querySelector('.caret').classList.toggle('open', isOpen);
+      const tgt = card.querySelector('#' + btn.dataset.tgt);
+      if (!tgt) return;
+      const open = tgt.classList.toggle('open');
+      btn.querySelector('.caret').classList.toggle('open', open);
     });
   });
 
   return card;
 }
 
-function addRunningCard(report) {
-  $('liveEmptyState').style.display = 'none';
-  const card = buildCaseCard(report, S.completed);
-  $('liveCaseGrid').appendChild(card);
-}
-
 /* ================================================================
-   Phase 3: Results Rendering
+   Results View
    ================================================================ */
 function renderResults() {
   setPhase('results');
 
-  // Animated pass rate
   const rate = S.completed > 0 ? S.passed / S.completed * 100 : 0;
   const wallMs = S.suiteReport ? S.suiteReport.wall_time_ms : (S.startTime ? Date.now() - S.startTime : 0);
 
-  $('summaryHeader').innerHTML = `
-    <div class="summary-big-rate">
-      <div class="big-pct" id="animatedRate" style="color:${rateFg(rate)}">0%</div>
-      <div class="big-label">Pass Rate</div>
+  $('resultsSummary').innerHTML = `
+    <div class="big-rate">
+      <div class="big-pct" id="animRate" style="color:${rateFg(rate)}">0%</div>
+      <div class="big-lbl">Pass Rate</div>
     </div>
     <div class="summary-stats">
-      <div class="summary-stat">
-        <div class="ss-dot green"></div>
-        <div class="ss-value">${S.passed}</div>
-        <div class="ss-label">passed</div>
-      </div>
-      <div class="summary-stat">
-        <div class="ss-dot red"></div>
-        <div class="ss-value">${S.failed}</div>
-        <div class="ss-label">failed</div>
-      </div>
-      <div class="summary-stat">
-        <div class="ss-dot blue"></div>
-        <div class="ss-value">${S.completed}</div>
-        <div class="ss-label">total</div>
-      </div>
-      <div class="summary-stat">
-        <div class="ss-dot blue" style="opacity:0.4"></div>
-        <div class="ss-value">${formatDur(wallMs)}</div>
-        <div class="ss-label">wall time</div>
-      </div>
+      <div class="sum-stat"><div class="dot g"></div><div class="sv">${S.passed}</div><div class="sl">passed</div></div>
+      <div class="sum-stat"><div class="dot r"></div><div class="sv">${S.failed}</div><div class="sl">failed</div></div>
+      <div class="sum-stat"><div class="dot b"></div><div class="sv">${S.completed}</div><div class="sl">total</div></div>
+      <div class="sum-stat"><div class="dot b" style="opacity:0.4"></div><div class="sv">${formatDur(wallMs)}</div><div class="sl">wall time</div></div>
     </div>`;
 
-  // Animate the pass rate count
-  animateCount($('animatedRate'), 0, Math.round(rate), 800, '%');
-
-  // Model comparison table
+  animateCount($('animRate'), 0, Math.round(rate), 700, '%');
   renderResultModelTable();
-
-  // Populate filter dropdowns
   populateResultFilters();
-
-  // Render all case cards
   renderResultCases();
+
+  // Re-enable run button
+  resetRunBtn();
 }
 
 function animateCount(el, from, to, duration, suffix) {
   const start = performance.now();
   function step(now) {
-    const progress = Math.min((now - start) / duration, 1);
-    const eased = 1 - Math.pow(1 - progress, 3); // ease-out cubic
-    const current = Math.round(from + (to - from) * eased);
-    el.textContent = current + (suffix || '');
-    if (progress < 1) requestAnimationFrame(step);
+    const p = Math.min((now - start) / duration, 1);
+    const eased = 1 - Math.pow(1 - p, 3);
+    el.textContent = Math.round(from + (to - from) * eased) + (suffix || '');
+    if (p < 1) requestAnimationFrame(step);
   }
   requestAnimationFrame(step);
 }
 
 function renderResultModelTable() {
-  const models = computeModelStats();
-  const entries = Object.entries(models);
+  const stats = modelStats();
+  const entries = Object.entries(stats);
   if (entries.length < 2) {
-    $('resultModelSection').style.display = 'none';
+    $('resultModelSec').style.display = 'none';
     return;
   }
-  $('resultModelSection').style.display = '';
+  $('resultModelSec').style.display = '';
 
-  // Sort
-  const col = S.modelSortCol;
-  const asc = S.modelSortAsc;
+  const col = S.sortCol;
+  const asc = S.sortAsc;
   entries.sort((a, b) => {
     let va, vb;
     const sa = a[1], sb = b[1];
@@ -1680,11 +1824,10 @@ function renderResultModelTable() {
     return asc ? va - vb : vb - va;
   });
 
-  // Highlight sorted column
   $('resultModelTable').querySelectorAll('th').forEach(th => {
     const isThis = th.dataset.col === col;
     th.classList.toggle('sorted', isThis);
-    const arrow = th.querySelector('.sort-arrow');
+    const arrow = th.querySelector('.sa');
     if (arrow) arrow.textContent = isThis ? (asc ? '▲' : '▼') : '';
   });
 
@@ -1693,7 +1836,7 @@ function renderResultModelTable() {
     const p = Math.max(s.pass, 1);
     return `<tr>
       <td style="font-weight:600">${esc(name)}</td>
-      <td><span class="rate-pill" style="background:${rateColor(rate)};color:#fff">${rate}%</span> <span style="color:var(--muted);font-size:12px">${s.pass}/${s.total}</span></td>
+      <td><span class="rate-pill" style="background:${rateColor(rate)}">${rate}%</span> <span style="color:var(--muted);font-size:11px">${s.pass}/${s.total}</span></td>
       <td>${formatTok(Math.round(s.passTok / p))}</td>
       <td>${formatDur(Math.round(s.passDur / p))}</td>
       <td>${(s.passTurns / p).toFixed(1)}</td>
@@ -1701,13 +1844,12 @@ function renderResultModelTable() {
   }).join('');
 }
 
-// Sortable headers
-$('resultModelTable').addEventListener('click', (e) => {
+$('resultModelTable').addEventListener('click', e => {
   const th = e.target.closest('th[data-col]');
   if (!th) return;
   const col = th.dataset.col;
-  if (S.modelSortCol === col) S.modelSortAsc = !S.modelSortAsc;
-  else { S.modelSortCol = col; S.modelSortAsc = col === 'model'; }
+  if (S.sortCol === col) S.sortAsc = !S.sortAsc;
+  else { S.sortCol = col; S.sortAsc = col === 'model'; }
   renderResultModelTable();
 });
 
@@ -1715,90 +1857,115 @@ function populateResultFilters() {
   const modelSet = new Set(S.runs.map(r => normModel(r.model)));
   const capSet = new Set(S.runs.filter(r => r.capability).map(r => typeof r.capability === 'string' ? r.capability : ''));
 
-  const mf = $('resultModelFilter');
+  const mf = $('rfModel');
   mf.innerHTML = '<option value="">All Models</option>';
-  for (const m of [...modelSet].sort()) {
-    mf.innerHTML += `<option value="${esc(m)}">${esc(m)}</option>`;
-  }
+  for (const m of [...modelSet].sort()) mf.innerHTML += `<option value="${esc(m)}">${esc(m)}</option>`;
 
-  const cf = $('resultCapabilityFilter');
+  const cf = $('rfCap');
   cf.innerHTML = '<option value="">All Capabilities</option>';
-  for (const c of [...capSet].sort()) {
-    if (c) cf.innerHTML += `<option value="${esc(c)}">${esc(c)}</option>`;
-  }
+  for (const c of [...capSet].sort()) if (c) cf.innerHTML += `<option value="${esc(c)}">${esc(c)}</option>`;
 }
 
 function renderResultCases() {
-  const modelFilter = $('resultModelFilter').value;
-  const statusFilter = $('resultStatusFilter').value;
-  const capFilter = $('resultCapabilityFilter').value;
-  const search = $('resultSearchInput').value.toLowerCase().trim();
+  const mf = $('rfModel').value;
+  const sf = $('rfStatus').value;
+  const cf = $('rfCap').value;
+  const q = $('rfSearch').value.toLowerCase().trim();
 
-  const grid = $('resultCaseGrid');
+  const grid = $('resultGrid');
   grid.innerHTML = '';
 
-  let idx = 0;
-  // Sort: failures first, then by case name
   const sorted = [...S.runs].sort((a, b) => {
     if (a.passed !== b.passed) return a.passed ? 1 : -1;
     return a.case_name.localeCompare(b.case_name);
   });
 
+  let idx = 0;
   for (const r of sorted) {
     const m = normModel(r.model);
-    if (modelFilter && m !== modelFilter) continue;
-    if (statusFilter === 'pass' && !r.passed) continue;
-    if (statusFilter === 'fail' && r.passed) continue;
-    const rCap = typeof r.capability === 'string' ? r.capability : '';
-    if (capFilter && rCap !== capFilter) continue;
-    if (search && !r.case_name.toLowerCase().includes(search) && !m.toLowerCase().includes(search)) continue;
-
+    if (mf && m !== mf) continue;
+    if (sf === 'pass' && !r.passed) continue;
+    if (sf === 'fail' && r.passed) continue;
+    const rc = typeof r.capability === 'string' ? r.capability : '';
+    if (cf && rc !== cf) continue;
+    if (q && !r.case_name.toLowerCase().includes(q) && !m.toLowerCase().includes(q)) continue;
     grid.appendChild(buildCaseCard(r, idx++));
   }
 
   if (idx === 0) {
-    grid.innerHTML = '<div class="empty-state"><div class="es-icon">&#128269;</div><p>No cases match the current filters</p></div>';
+    grid.innerHTML = '<div class="empty-msg">No cases match the current filters</div>';
   }
 }
 
-// Filter event listeners
-$('resultModelFilter').addEventListener('change', renderResultCases);
-$('resultStatusFilter').addEventListener('change', renderResultCases);
-$('resultCapabilityFilter').addEventListener('change', renderResultCases);
-$('resultSearchInput').addEventListener('input', renderResultCases);
+$('rfModel').addEventListener('change', renderResultCases);
+$('rfStatus').addEventListener('change', renderResultCases);
+$('rfCap').addEventListener('change', renderResultCases);
+$('rfSearch').addEventListener('input', renderResultCases);
+
+/* ================================================================
+   Init: Load Config + Cases
+   ================================================================ */
+function loadConfig() {
+  fetch('/api/config')
+    .then(r => r.json())
+    .then(data => {
+      S.config = data;
+      S.judgerModel = data.judger_model || '';
+      $('judgerModelIn').value = S.judgerModel;
+
+      buildModelList();
+      // Select available_models by default
+      (data.available_models || []).forEach(m => S.selectedModels.add(m));
+      renderModelList();
+      renderModelTags();
+    })
+    .catch(e => toast('Failed to load config: ' + e.message));
+
+  fetch('/api/cases')
+    .then(r => r.json())
+    .then(data => {
+      S.allCases = data.cases || [];
+      // Select all cases by default
+      S.allCases.forEach(c => S.selectedCases.add(c.name));
+      renderCapPills();
+      renderCaseList();
+    })
+    .catch(e => toast('Failed to load cases: ' + e.message));
+}
 
 /* ================================================================
    WebSocket
    ================================================================ */
 function connect() {
-  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(`${protocol}//${location.host}/ws`);
+  if (S.reconnectTimer) { clearTimeout(S.reconnectTimer); S.reconnectTimer = null; }
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${proto}//${location.host}/ws`);
   S.ws = ws;
 
   ws.onopen = () => {
     S.connected = true;
     $('connDot').className = 'conn-dot connected';
-    $('subtitleText').textContent = 'connected';
-    // Load config after connection
-    initConfig();
+    $('connText').textContent = 'connected';
+    loadConfig();
   };
 
   ws.onclose = () => {
     S.connected = false;
     if (S.phase !== 'results') {
-      $('connDot').className = 'conn-dot error';
-      $('subtitleText').textContent = 'disconnected - reconnecting...';
-      setTimeout(connect, 2000);
+      $('connDot').className = 'conn-dot disconnected';
+      $('connText').textContent = 'reconnecting...';
+      S.reconnectTimer = setTimeout(connect, 2000);
     }
   };
 
   ws.onerror = () => {
     S.connected = false;
-    $('connDot').className = 'conn-dot error';
-    $('subtitleText').textContent = 'connection error';
+    $('connDot').className = 'conn-dot disconnected';
+    $('connText').textContent = 'error';
   };
 
-  ws.onmessage = (e) => {
+  ws.onmessage = e => {
     let ev;
     try { ev = JSON.parse(e.data); } catch { return; }
     handleEvent(ev);
@@ -1819,26 +1986,27 @@ function handleEvent(ev) {
       S.suiteReport = null;
 
       setPhase('running');
-      $('subtitleText').textContent = (ev.models || []).join(' vs ') + ' — ' + ev.total_cases + ' cases';
-      $('liveCaseGrid').innerHTML = '';
-      $('liveEmptyState').style.display = '';
+      $('connText').textContent = (ev.models || []).join(' vs ') + ' — ' + ev.total_cases + ' cases';
+      $('liveGrid').innerHTML = '';
+      $('liveEmpty').style.display = '';
+      $('waitingHint').style.display = 'none';
 
-      updateRunningView();
+      updateRunning();
 
-      // Start wall clock timer
-      if (S.wallTimer) clearInterval(S.wallTimer);
-      S.wallTimer = setInterval(() => {
-        if (S.phase === 'running' && S.startTime) {
-          // Timer is just for display — actual wall time comes from suite_completed
+      // Show waiting hint after 5s if no results
+      if (S.waitingTimer) clearTimeout(S.waitingTimer);
+      S.waitingTimer = setTimeout(() => {
+        if (S.phase === 'running' && S.completed === 0) {
+          $('waitingHint').style.display = '';
         }
-      }, 500);
+      }, 5000);
       break;
     }
 
     case 'case_started': {
       const key = ev.case_name + '/' + ev.model + '/' + (ev.run_index || 0);
       S.runningSet.set(key, { case_name: ev.case_name, model: ev.model });
-      updateRunningView();
+      updateRunning();
       break;
     }
 
@@ -1849,16 +2017,21 @@ function handleEvent(ev) {
       if (r.passed) S.passed++; else S.failed++;
       const key = r.case_name + '/' + r.model + '/' + (r.run_index || 0);
       S.runningSet.delete(key);
-      addRunningCard(r);
-      updateRunningView();
+
+      // Hide waiting hint
+      if (S.waitingTimer) { clearTimeout(S.waitingTimer); S.waitingTimer = null; }
+      $('waitingHint').style.display = 'none';
+
+      $('liveEmpty').style.display = 'none';
+      $('liveGrid').appendChild(buildCaseCard(r, S.completed));
+      updateRunning();
       break;
     }
 
     case 'suite_completed': {
       S.suiteReport = ev.report || {};
-      if (S.wallTimer) { clearInterval(S.wallTimer); S.wallTimer = null; }
-      // Small delay for visual effect before showing results
-      setTimeout(renderResults, 400);
+      if (S.waitingTimer) { clearTimeout(S.waitingTimer); S.waitingTimer = null; }
+      setTimeout(renderResults, 350);
       break;
     }
 
@@ -1872,7 +2045,7 @@ function handleEvent(ev) {
 /* ================================================================
    Boot
    ================================================================ */
-setPhase('config');
+setPhase('idle');
 connect();
 </script>
 </body>
