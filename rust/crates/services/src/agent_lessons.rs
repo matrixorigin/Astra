@@ -370,55 +370,62 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
             .map_err(|e| sqlx::Error::Protocol(format!("NewLesson::validate: {e}")))?;
         let pool = self.get_pool().await?;
 
-        let confidence = new.confidence.unwrap_or(DEFAULT_LESSON_CONFIDENCE);
         let workload_key = new.workload_tag.as_deref().unwrap_or("");
 
-        // Try INSERT first; on UK collision fall through to UPDATE.
-        // MatrixOne does not support ON DUPLICATE KEY UPDATE or REPLACE INTO
-        // for non-PRIMARY-KEY UNIQUE constraints (both return error 1062
-        // instead of triggering the update path). Verified via raw SQL.
-        let insert_result = query(
-            "INSERT INTO agent_lessons \
-                 (id, user_id, persona, workload_tag, workload_key, kind, \
-                  trigger_signal, action, confidence) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        // SELECT-first upsert. MatrixOne does not support ON DUPLICATE KEY
+        // UPDATE or REPLACE INTO for non-PK UNIQUE constraints (both return
+        // error 1062). The UK still exists as a data-integrity safety net
+        // and an index for the UPDATE/SELECT WHERE clause.
+        let existing = query(
+            "SELECT id FROM agent_lessons \
+             WHERE user_id = ? AND persona = ? AND workload_key = ? \
+               AND kind = ? AND trigger_signal = ? \
+             LIMIT 1",
         )
-        .bind(Uuid::new_v4().to_string())
         .bind(&new.user_id)
         .bind(&new.persona)
-        .bind(&new.workload_tag)
         .bind(workload_key)
         .bind(new.kind.as_str())
         .bind(&new.trigger_signal)
-        .bind(&new.action)
-        .bind(confidence)
-        .execute(&pool)
-        .await;
+        .fetch_optional(&pool)
+        .await?;
 
-        match insert_result {
-            Ok(_) => {}
-            Err(sqlx::Error::Database(ref db_err))
-                if db_err.code().as_deref() == Some("HY000")
-                    && db_err.message().contains("Duplicate entry") =>
-            {
-                query(
-                    "UPDATE agent_lessons \
-                     SET hit_count = hit_count + 1, \
-                         action = ?, \
-                         updated_at = CURRENT_TIMESTAMP(6) \
-                     WHERE user_id = ? AND persona = ? AND workload_key = ? \
-                       AND kind = ? AND trigger_signal = ?",
-                )
-                .bind(&new.action)
-                .bind(&new.user_id)
-                .bind(&new.persona)
-                .bind(workload_key)
-                .bind(new.kind.as_str())
-                .bind(&new.trigger_signal)
-                .execute(&pool)
-                .await?;
-            }
-            Err(e) => return Err(e),
+        if existing.is_some() {
+            query(
+                "UPDATE agent_lessons \
+                 SET hit_count = hit_count + 1, \
+                     action = ?, \
+                     updated_at = CURRENT_TIMESTAMP(6) \
+                 WHERE user_id = ? AND persona = ? AND workload_key = ? \
+                   AND kind = ? AND trigger_signal = ?",
+            )
+            .bind(&new.action)
+            .bind(&new.user_id)
+            .bind(&new.persona)
+            .bind(workload_key)
+            .bind(new.kind.as_str())
+            .bind(&new.trigger_signal)
+            .execute(&pool)
+            .await?;
+        } else {
+            let confidence = new.confidence.unwrap_or(DEFAULT_LESSON_CONFIDENCE);
+            query(
+                "INSERT INTO agent_lessons \
+                     (id, user_id, persona, workload_tag, workload_key, kind, \
+                      trigger_signal, action, confidence) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&new.user_id)
+            .bind(&new.persona)
+            .bind(&new.workload_tag)
+            .bind(workload_key)
+            .bind(new.kind.as_str())
+            .bind(&new.trigger_signal)
+            .bind(&new.action)
+            .bind(confidence)
+            .execute(&pool)
+            .await?;
         }
 
         fetch_by_content(&pool, &new).await
@@ -610,38 +617,42 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
             ));
         }
         let pool = self.get_pool().await?;
-        let insert_result = query(
-            "INSERT INTO agent_lesson_exposures \
-                 (id, lesson_id, session_id, user_id, persona, workload_tag, adopted) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        let existing = query(
+            "SELECT id FROM agent_lesson_exposures \
+             WHERE lesson_id = ? AND session_id = ? LIMIT 1",
         )
-        .bind(Uuid::new_v4().to_string())
         .bind(&exposure.lesson_id)
         .bind(&exposure.session_id)
-        .bind(&exposure.user_id)
-        .bind(&exposure.persona)
-        .bind(&exposure.workload_tag)
-        .bind(exposure.adopted as i8)
-        .execute(&pool)
-        .await;
-        match insert_result {
-            Ok(_) => {}
-            Err(sqlx::Error::Database(ref db_err))
-                if db_err.code().as_deref() == Some("HY000")
-                    && db_err.message().contains("Duplicate entry") =>
-            {
+        .fetch_optional(&pool)
+        .await?;
+
+        if existing.is_some() {
+            if exposure.adopted {
                 query(
                     "UPDATE agent_lesson_exposures \
-                     SET adopted = CASE WHEN adopted = 1 OR ? THEN 1 ELSE 0 END \
+                     SET adopted = 1 \
                      WHERE lesson_id = ? AND session_id = ?",
                 )
-                .bind(exposure.adopted as i8)
                 .bind(&exposure.lesson_id)
                 .bind(&exposure.session_id)
                 .execute(&pool)
                 .await?;
             }
-            Err(e) => return Err(e),
+        } else {
+            query(
+                "INSERT INTO agent_lesson_exposures \
+                     (id, lesson_id, session_id, user_id, persona, workload_tag, adopted) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&exposure.lesson_id)
+            .bind(&exposure.session_id)
+            .bind(&exposure.user_id)
+            .bind(&exposure.persona)
+            .bind(&exposure.workload_tag)
+            .bind(exposure.adopted as i8)
+            .execute(&pool)
+            .await?;
         }
         Ok(())
     }
