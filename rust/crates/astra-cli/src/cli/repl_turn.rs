@@ -1006,6 +1006,29 @@ async fn maybe_run_auto_invoke(state: &mut ReplState) {
         None => astra_runtime::auto_invoke_handler::compute_session_signals(None),
     };
 
+    // R1: evaluate active diagnosis postconditions BEFORE gating on
+    // default signals, because the tracker may have pending criteria
+    // even when no new signals fired this turn.
+    let outcomes = state
+        .diagnosis_outcome_tracker
+        .evaluate_turn(&signals, state.turn);
+    for outcome in &outcomes {
+        let met = outcome
+            .statuses
+            .iter()
+            .filter(|s| {
+                **s == astra_runtime::auto_invoke_handler::DiagnosisCriterionStatus::Satisfied
+            })
+            .count() as u32;
+        let failed = outcome
+            .statuses
+            .iter()
+            .filter(|s| **s == astra_runtime::auto_invoke_handler::DiagnosisCriterionStatus::Failed)
+            .count() as u32;
+        state.diagnosis_criteria_met = state.diagnosis_criteria_met.saturating_add(met);
+        state.diagnosis_criteria_failed = state.diagnosis_criteria_failed.saturating_add(failed);
+    }
+
     // Fast-path: no signals worth even locking the handler for.
     let default = astra_skills::auto_invoke::SessionSignals::default();
     if signals == default {
@@ -1032,12 +1055,16 @@ async fn maybe_run_auto_invoke(state: &mut ReplState) {
     let diagnoses = guard.maybe_fire(&signals, std::time::Instant::now()).await;
     drop(guard);
 
-    // Use the first diagnosis. Multiple triggers in one turn (rare —
-    // cooldowns usually prevent this) are a future extension; for now we
-    // surface the highest-priority one (analyze_session if present, else
-    // optimize_prompt, else evaluate_session — the gate returns them in
-    // stall→pressure→corrections order).
-    state.latest_skill_diagnosis = diagnoses.into_iter().next();
+    // Use the first diagnosis. Activate it in the tracker so its
+    // success_criteria are evaluated on subsequent turns.
+    if let Some(diag) = diagnoses.into_iter().next() {
+        state
+            .diagnosis_outcome_tracker
+            .activate(diag.clone(), signals, state.turn);
+        state.latest_skill_diagnosis = Some(diag);
+    } else {
+        state.latest_skill_diagnosis = None;
+    }
 }
 
 /// Build a compact tool-call summary for cross-turn context continuity.
@@ -6243,5 +6270,65 @@ mod tests {
             state.latest_skill_diagnosis.is_none(),
             "second turn inside cooldown must clear the diagnosis slot"
         );
+    }
+
+    // ─── R1: DiagnosisOutcomeTracker wiring ─────────────────────────────────
+
+    #[tokio::test]
+    async fn diagnosis_outcome_tracker_accumulates_met_failed() {
+        // Setup: session with 3 stalls → auto-invoke fires → diagnosis
+        // activated with success_criteria. Then simulate stall count
+        // staying flat (criterion "session_stalls_delta <= 0" satisfied).
+        let mut state = ReplState::default();
+        let session = std::sync::Arc::new(std::sync::RwLock::new(
+            astra_runtime::observability_integration::ObservabilitySession::new_simple(
+                "r1-tracker",
+            ),
+        ));
+        {
+            let mut g = session.write().unwrap();
+            g.record_stall_event();
+            g.record_stall_event();
+            g.record_stall_event();
+        }
+        state.observability_session = Some(session.clone());
+
+        // Turn N: diagnosis fires and is activated in the tracker.
+        state.turn = 5;
+        maybe_run_auto_invoke(&mut state).await;
+        let diag = state
+            .latest_skill_diagnosis
+            .as_ref()
+            .expect("should have fired");
+        assert!(
+            !diag.success_criteria.is_empty(),
+            "synthetic executor must produce criteria"
+        );
+
+        // Turn N+1..N+3: signals stay flat (no new stalls), so the
+        // "session_stalls_delta <= 0" criterion should become Satisfied
+        // once window_turns elapse.
+        for t in 6..=10 {
+            state.turn = t;
+            maybe_run_auto_invoke(&mut state).await;
+        }
+
+        // After enough turns, the tracker should have evaluated and
+        // accumulated met/failed counts.
+        let total = state.diagnosis_criteria_met + state.diagnosis_criteria_failed;
+        assert!(
+            total > 0,
+            "tracker must have evaluated at least one criterion; \
+             met={}, failed={}",
+            state.diagnosis_criteria_met,
+            state.diagnosis_criteria_failed
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnosis_criteria_start_at_zero() {
+        let state = ReplState::default();
+        assert_eq!(state.diagnosis_criteria_met, 0);
+        assert_eq!(state.diagnosis_criteria_failed, 0);
     }
 }

@@ -294,6 +294,19 @@ pub(crate) struct ReplState {
     /// Cleared when no diagnosis is produced.
     pub latest_skill_diagnosis: Option<astra_skills::auto_invoke::SkillDiagnosis>,
 
+    /// R1: tracks active diagnosis postconditions across turns. When a
+    /// diagnosis fires, its success_criteria are registered here. On each
+    /// subsequent turn, evaluate_turn checks whether the criteria are met.
+    /// Session cleanup reads the accumulated met/failed counts for the
+    /// LessonOutcome record.
+    pub diagnosis_outcome_tracker: astra_runtime::auto_invoke_handler::DiagnosisOutcomeTracker,
+
+    /// R1: cumulative met/failed diagnosis criteria for the session.
+    /// Incremented by `maybe_run_auto_invoke` when tracker completes a
+    /// diagnosis evaluation. Written to `LessonOutcome` at session end.
+    pub diagnosis_criteria_met: u32,
+    pub diagnosis_criteria_failed: u32,
+
     // ── Observability (M1-M6) ──
     /// Global observability hub for M1-M6 integration (profiles, experiments, auto-tuning).
     /// Created at REPL startup, shared across sessions.
@@ -455,6 +468,10 @@ impl Default for ReplState {
             session_lessons: Vec::new(),
             auto_invoke_handler: None,
             latest_skill_diagnosis: None,
+            diagnosis_outcome_tracker:
+                astra_runtime::auto_invoke_handler::DiagnosisOutcomeTracker::new(),
+            diagnosis_criteria_met: 0,
+            diagnosis_criteria_failed: 0,
             // Observability: hub is created at REPL startup, session on first turn
             observability_hub: None,
             observability_session: None,

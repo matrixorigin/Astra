@@ -76,7 +76,11 @@ pub(super) async fn finalize_session(state: &ReplState) {
         // await rather than fire-and-forget so the ingestion shutdown in
         // step 4 doesn't race with the lesson writes.
         let _ = astra_runtime::lesson_extractor::persist_session_lessons(
-            svc.clone(), &summary, user_id, "generic", None,
+            svc.clone(),
+            &summary,
+            user_id,
+            "generic",
+            None,
         )
         .await;
         if let Some(ref session_id) = state.session_id
@@ -88,8 +92,8 @@ pub(super) async fn finalize_session(state: &ReplState) {
                     user_corrections: summary.user_corrections.len() as u32,
                     tool_failures,
                     unmet_postconditions: summary.unmet_postconditions,
-                    diagnosis_criteria_met: 0,
-                    diagnosis_criteria_failed: 0,
+                    diagnosis_criteria_met: state.diagnosis_criteria_met,
+                    diagnosis_criteria_failed: state.diagnosis_criteria_failed,
                 })
                 .await
         {
