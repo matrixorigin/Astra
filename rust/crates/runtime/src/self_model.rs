@@ -97,6 +97,49 @@ pub struct SelfModel {
     /// already looked at this and noticed X".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_diagnosis: Option<astra_skills::auto_invoke::SkillDiagnosis>,
+    /// Cross-session lessons carried over from prior sessions with the same
+    /// `(user_id, persona, workload_tag)` scope (see
+    /// `astra_services::agent_lessons`). Bounded projection of the DAO's
+    /// `Lesson` rows — only the fields the LLM needs for prompt reasoning.
+    /// Empty when no prior lessons apply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lessons: Vec<LessonHint>,
+}
+
+/// Prompt-bound projection of a persisted `agent_lessons` row.
+///
+/// Intentionally drops `id`, `confidence`, `hit_count`, and timestamps —
+/// the LLM should read the *advice*, not the metadata. Callers that need
+/// to track adoption (for `record_hit`) keep the `id` out-of-band.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LessonHint {
+    /// Lesson classification tag (`tool_deprioritize`, `prompt_shape`, …).
+    /// Uses `LessonKind::as_str()` so tags match the DB form exactly.
+    pub kind: String,
+    /// What triggered the lesson originally
+    /// (e.g. `"3 consecutive stalls on grep"`).
+    pub trigger_signal: String,
+    /// Advice for the current session
+    /// (e.g. `"deprioritize grep for regex-heavy tasks"`).
+    pub action: String,
+    /// Optional workload scope: `None` → general lesson;
+    /// `Some(tag)` → specific workload bucket the lesson applies to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_tag: Option<String>,
+}
+
+impl LessonHint {
+    /// Build a hint from an `agent_lessons::Lesson`, dropping metadata the
+    /// prompt renderer does not need.
+    #[must_use]
+    pub fn from_lesson(l: &astra_services::Lesson) -> Self {
+        Self {
+            kind: l.kind.as_str().to_string(),
+            trigger_signal: l.trigger_signal.clone(),
+            action: l.action.clone(),
+            workload_tag: l.workload_tag.clone(),
+        }
+    }
 }
 
 /// A single unmet postcondition, typed for prompt rendering and audit.
@@ -548,6 +591,7 @@ impl SelfModel {
             low_confidence_tools: Vec::new(),
             unmet_postconditions: Vec::new(),
             skill_diagnosis: None,
+            lessons: Vec::new(),
         }
     }
 
@@ -661,6 +705,16 @@ impl SelfModel {
         diag: Option<astra_skills::auto_invoke::SkillDiagnosis>,
     ) -> Self {
         self.skill_diagnosis = diag;
+        self
+    }
+
+    /// Attach cross-session lessons retrieved via
+    /// `astra_services::AgentLessonsService::load_recent` at session
+    /// bootstrap. The lessons are rendered as a bounded prompt block so the
+    /// LLM carries prior learning forward. Empty input clears any
+    /// previously-attached set.
+    pub fn with_lessons(mut self, lessons: Vec<LessonHint>) -> Self {
+        self.lessons = lessons;
         self
     }
 }
@@ -1059,6 +1113,28 @@ impl SelfModel {
         // ── Auto-invoked diagnostic skill output ──
         if let Some(ref diag) = self.skill_diagnosis {
             s.push_str(&diag.render_prompt_block());
+        }
+
+        // ── Cross-session lessons (from agent_lessons) ──
+        if !self.lessons.is_empty() {
+            const MAX_SHOWN: usize = 5;
+            let total = self.lessons.len();
+            s.push_str("📚 Lessons from prior sessions:\n");
+            for l in self.lessons.iter().take(MAX_SHOWN) {
+                let scope = l
+                    .workload_tag
+                    .as_deref()
+                    .map(|t| format!(" @{t}"))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    s,
+                    "  - [{}{}] {} — {}",
+                    l.kind, scope, l.trigger_signal, l.action
+                );
+            }
+            if total > MAX_SHOWN {
+                let _ = writeln!(s, "  … {} more", total - MAX_SHOWN);
+            }
         }
 
         s
