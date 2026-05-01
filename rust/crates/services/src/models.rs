@@ -279,6 +279,12 @@ pub fn resolve_model_alias<'a>(
 /// Error surface for [`resolve_model_alias`]. Preserved so the
 /// DB-layer caller can distinguish "no such model" from "ambiguous"
 /// and render a helpful message to the LLM / user.
+///
+/// The `candidates` vector always carries the FULL list a caller
+/// might want to process programmatically. The `Display` impl
+/// truncates to [`MODEL_ALIAS_ERROR_CANDIDATE_CAP`] for readability
+/// — rendering 200 model names in a stderr line is a debugging
+/// anti-feature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelAliasResolutionError {
     Empty,
@@ -292,6 +298,26 @@ pub enum ModelAliasResolutionError {
     },
 }
 
+/// Max number of candidate names the `Display` impl will render
+/// inline. Beyond this, the rendered string shows the first
+/// `MODEL_ALIAS_ERROR_CANDIDATE_CAP` entries and suffixes
+/// `... and N more`. Chosen to keep a single-line log readable
+/// while still being useful (20 model names ≈ 400-600 chars,
+/// within most log collectors' line limits).
+pub const MODEL_ALIAS_ERROR_CANDIDATE_CAP: usize = 20;
+
+fn render_truncated_candidates(
+    candidates: &[String],
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    if candidates.len() <= MODEL_ALIAS_ERROR_CANDIDATE_CAP {
+        return write!(f, "{candidates:?}");
+    }
+    let head = &candidates[..MODEL_ALIAS_ERROR_CANDIDATE_CAP];
+    let remaining = candidates.len() - MODEL_ALIAS_ERROR_CANDIDATE_CAP;
+    write!(f, "{head:?} ... and {remaining} more")
+}
+
 impl std::fmt::Display for ModelAliasResolutionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -299,27 +325,62 @@ impl std::fmt::Display for ModelAliasResolutionError {
             Self::NotFound {
                 requested,
                 candidates,
-            } => write!(
-                f,
-                "Model '{requested}' is not configured on this server \
-                 (no exact or substring match in infra_llm_models). \
-                 Registered active models: {candidates:?}. Omit the \
-                 model override or choose one of the registered names."
-            ),
+            } => {
+                write!(
+                    f,
+                    "Model '{requested}' is not configured on this server \
+                     (no exact or substring match in infra_llm_models). \
+                     Registered active models: "
+                )?;
+                render_truncated_candidates(candidates, f)?;
+                write!(
+                    f,
+                    ". Omit the model override or choose one of the registered names."
+                )
+            }
             Self::Ambiguous {
                 requested,
                 candidates,
-            } => write!(
-                f,
-                "Model '{requested}' is ambiguous — matches multiple \
-                 registered models: {candidates:?}. Use a more specific \
-                 name."
-            ),
+            } => {
+                write!(
+                    f,
+                    "Model '{requested}' is ambiguous — matches multiple \
+                     registered models: "
+                )?;
+                render_truncated_candidates(candidates, f)?;
+                write!(f, ". Use a more specific name.")
+            }
         }
     }
 }
 
 impl std::error::Error for ModelAliasResolutionError {}
+
+/// Format the error message for a requested model that was found
+/// (via exact or alias match) but has `is_active = 0`. If the alias
+/// resolver canonicalized the name, both forms are surfaced so the
+/// reader can see what happened; otherwise only one mention appears.
+///
+/// Extracted from [`resolve_active_llm_model`] so the message can
+/// be unit-tested without the DB path. The pre-alias behavior used
+/// the original requested name in the error even when the DB row
+/// was keyed on the resolved canonical form — misleading when the
+/// two disagree.
+pub fn format_inactive_model_error(requested: &str, canonical: &str) -> String {
+    if requested == canonical {
+        format!(
+            "Model '{canonical}' is inactive (connectivity failed or disabled). \
+             Run `astra-admin model check {canonical}` or pick an active model; \
+             the server will not substitute another model."
+        )
+    } else {
+        format!(
+            "Model '{requested}' (resolved to canonical '{canonical}') is inactive \
+             (connectivity failed or disabled). Run `astra-admin model check {canonical}` \
+             or pick an active model; the server will not substitute another model."
+        )
+    }
+}
 
 /// Resolve the active LLM model from the database for in-process / server-side callers.
 ///
@@ -358,7 +419,7 @@ pub async fn resolve_active_llm_model(
     if let Some(name) = pref {
         // Try exact match first — the fast path. If the LLM supplied
         // the fully-qualified name it resolves in one query.
-        let row = sqlx::query(
+        let exact_row = sqlx::query(
             "SELECT model_name, api_key_encrypted, base_url, provider, \
                     IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json, is_active \
              FROM infra_llm_models WHERE model_name = ? LIMIT 1",
@@ -374,8 +435,14 @@ pub async fn resolve_active_llm_model(
         // a deterministic substring / case-insensitive match against
         // active rows lets those calls succeed without forcing every
         // case author to retrain the prompt. Ambiguity still errors.
-        let row = match row {
-            Some(r) => r,
+        //
+        // Track canonical name separately so the `is_active` error
+        // message below can name BOTH the requested alias and the
+        // resolved form when they differ — without this, a reader
+        // would see "Model 'claude-sonnet' is inactive" even though
+        // the DB row is keyed on the full bedrock name.
+        let (row, canonical) = match exact_row {
+            Some(r) => (r, name.to_string()),
             None => {
                 let active_names: Vec<String> = sqlx::query_scalar::<_, String>(
                     "SELECT model_name FROM infra_llm_models WHERE is_active = 1",
@@ -385,21 +452,25 @@ pub async fn resolve_active_llm_model(
                 .map_err(|e| format!("DB query: {e}"))?;
 
                 match resolve_model_alias(name, &active_names) {
-                    Ok(canonical) => sqlx::query(
-                        "SELECT model_name, api_key_encrypted, base_url, provider, \
-                                IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json, is_active \
-                         FROM infra_llm_models WHERE model_name = ? LIMIT 1",
-                    )
-                    .bind(canonical)
-                    .fetch_optional(pool)
-                    .await
-                    .map_err(|e| format!("DB query: {e}"))?
-                    .ok_or_else(|| {
-                        format!(
-                            "alias resolver returned '{canonical}' but no row exists \
-                             — concurrent delete?"
+                    Ok(canonical_ref) => {
+                        let canonical = canonical_ref.to_string();
+                        let r = sqlx::query(
+                            "SELECT model_name, api_key_encrypted, base_url, provider, \
+                                    IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json, is_active \
+                             FROM infra_llm_models WHERE model_name = ? LIMIT 1",
                         )
-                    })?,
+                        .bind(&canonical)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(|e| format!("DB query: {e}"))?
+                        .ok_or_else(|| {
+                            format!(
+                                "alias resolver returned '{canonical}' but no row exists \
+                                 — concurrent delete?"
+                            )
+                        })?;
+                        (r, canonical)
+                    }
                     Err(e) => return Err(e.to_string()),
                 }
             }
@@ -407,10 +478,7 @@ pub async fn resolve_active_llm_model(
 
         let is_active_int: i16 = row.try_get("is_active").unwrap_or(0);
         if is_active_int == 0 {
-            return Err(format!(
-                "Model '{name}' is inactive (connectivity failed or disabled). \
-                 Run `astra-admin model check {name}` or pick an active model; the server will not substitute another model."
-            ));
+            return Err(format_inactive_model_error(name, &canonical));
         }
 
         return build_resolved_active_llm_from_row(&row, encryptor);
@@ -1540,6 +1608,128 @@ mod tests {
             hit, "qwen-flash",
             "exact match must win over substring ambiguity"
         );
+    }
+
+    #[test]
+    fn alias_not_found_truncates_large_candidate_lists() {
+        // Review nit: an error string listing 200 model names is a
+        // debugging nightmare. Cap at MODEL_ALIAS_ERROR_CANDIDATE_CAP
+        // with a "... N more" suffix in the Display form, so logs stay
+        // scannable but nothing is lost (the full list is still on
+        // the variant for programmatic callers).
+        let active: Vec<String> = (0..50).map(|i| format!("model-{i}")).collect();
+        let err = resolve_model_alias("nonexistent-xyz", &active).unwrap_err();
+        match &err {
+            ModelAliasResolutionError::NotFound { candidates, .. } => {
+                // The variant itself MUST carry every candidate —
+                // programmatic callers might want them all. Truncation
+                // is a rendering concern.
+                assert_eq!(
+                    candidates.len(),
+                    50,
+                    "variant preserves full list; truncation is Display-only"
+                );
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        let rendered = err.to_string();
+        // Render should cap the visible list and indicate truncation.
+        // Pick a threshold the caller can grep: \"...\" followed by a
+        // count. We don't pin the exact cap value here — that belongs
+        // in a separate assertion below — only that truncation happens
+        // and is disclosed.
+        assert!(
+            rendered.contains("...") && rendered.contains("more"),
+            "rendered NotFound with 50 candidates must disclose truncation: {rendered}"
+        );
+        // The rendered string must NOT contain `model-49` when the cap
+        // fires. `model-0`..`model-{CAP-1}` should be visible.
+        assert!(
+            !rendered.contains("model-49"),
+            "last entry must be truncated when exceeding cap: {rendered}"
+        );
+        assert!(
+            rendered.contains("model-0"),
+            "head of list must remain visible: {rendered}"
+        );
+    }
+
+    #[test]
+    fn inactive_error_names_both_requested_and_resolved_when_different() {
+        // Review nit: when alias resolution maps `claude-sonnet` →
+        // `us.anthropic.claude-sonnet-4-6` and the resolved row is
+        // later found inactive (e.g. admin deactivated between the
+        // alias query and the row refetch — a narrow TOCTOU window),
+        // the error message should name BOTH the requested alias and
+        // the canonical name so a reviewer can see what actually
+        // happened. The earlier message claimed the short form was
+        // inactive, which is misleading because the short form isn't
+        // what the DB row is keyed on.
+        let msg = format_inactive_model_error("claude-sonnet", "us.anthropic.claude-sonnet-4-6");
+        assert!(
+            msg.contains("claude-sonnet"),
+            "msg names the requested alias: {msg}"
+        );
+        assert!(
+            msg.contains("us.anthropic.claude-sonnet-4-6"),
+            "msg names the canonical: {msg}"
+        );
+        assert!(
+            msg.contains("inactive"),
+            "msg explains the failure mode: {msg}"
+        );
+        assert!(
+            msg.contains("astra-admin model check"),
+            "msg points at the diagnostic command: {msg}"
+        );
+    }
+
+    #[test]
+    fn inactive_error_does_not_duplicate_when_requested_equals_canonical() {
+        // When no alias resolution happened (exact-match path) the
+        // `requested` and `canonical` arguments are equal. Don't
+        // pollute the message with "resolved to the same name".
+        let name = "us.anthropic.claude-sonnet-4-6";
+        let msg = format_inactive_model_error(name, name);
+        // Count occurrences — exactly one mention of the name.
+        let n = msg.matches(name).count();
+        assert_eq!(
+            n, 2,
+            "expected name twice (in the 'Model X' and 'astra-admin model check X' parts), \
+             got {n}: {msg}"
+        );
+        assert!(
+            !msg.contains("resolved to"),
+            "no alias resolution happened, message must not claim one: {msg}"
+        );
+    }
+
+    #[test]
+    fn alias_not_found_below_cap_renders_full_list() {
+        // Inverse guard: if the candidate list fits under the cap, the
+        // render must not pretend truncation happened (that would be
+        // misleading).
+        let active = names(&[
+            "qwen-flash",
+            "MiniMax-M2.7",
+            "us.anthropic.claude-sonnet-4-6",
+        ]);
+        let err = resolve_model_alias("gpt-5", &active).unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains("more"),
+            "under-cap list must not imply truncation: {rendered}"
+        );
+        for n in [
+            "qwen-flash",
+            "MiniMax-M2.7",
+            "us.anthropic.claude-sonnet-4-6",
+        ] {
+            assert!(
+                rendered.contains(n),
+                "under-cap list must include {n}: {rendered}"
+            );
+        }
     }
 
     // -- rank_cheapest_index --
