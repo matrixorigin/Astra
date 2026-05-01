@@ -335,16 +335,6 @@ impl<'a> SuiteRunner<'a> {
             }
         }
 
-        // Run teardown command (always, even on failure).
-        if let Some(ref cmd) = case.teardown_cmd {
-            let mut teardown_cmd = tokio::process::Command::new("sh");
-            if let Some(ref wd) = self.runner_cfg.working_dir {
-                teardown_cmd.current_dir(wd);
-            }
-            teardown_cmd.arg("-c").arg(cmd);
-            let _ = teardown_cmd.status().await;
-        }
-
         // Retry on 429 if enabled.
         if self.suite_cfg.retry_on_429 && is_rate_limited(&outcome) {
             eprintln!(
@@ -446,6 +436,29 @@ impl<'a> SuiteRunner<'a> {
         } else {
             (None, None)
         };
+
+        // Run teardown AFTER criteria evaluation so the judger can
+        // still verify artifacts (files, DB state) created during the
+        // case. Previously teardown ran before the judger, destroying
+        // evidence that the judger tried to independently verify.
+        if let Some(ref cmd) = case.teardown_cmd {
+            let mut teardown_cmd = tokio::process::Command::new("sh");
+            if let Some(ref wd) = self.runner_cfg.working_dir {
+                teardown_cmd.current_dir(wd);
+            }
+            teardown_cmd.arg("-c").arg(cmd);
+            let _ = teardown_cmd.status().await;
+        }
+
+        // Progress: emit per-case result to stderr so long runs show
+        // streaming progress even when stdout is buffered.
+        let marker = if passed { "PASS" } else { "FAIL" };
+        eprintln!(
+            "[astra-test] [{marker}] {case} × {model} ({dur}ms)",
+            case = case.name,
+            model = model,
+            dur = outcome.duration_ms,
+        );
 
         CaseRunReport {
             case_name: case.name.clone(),

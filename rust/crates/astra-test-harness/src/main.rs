@@ -145,6 +145,11 @@ struct Args {
     /// Timeout for the summarizer LLM call in seconds.
     #[arg(long, default_value_t = 180)]
     summarize_timeout: u64,
+
+    /// Save the full JSON report to a file for post-run introspection
+    /// by AI agents or dashboards.
+    #[arg(long, value_name = "PATH")]
+    report_file: Option<PathBuf>,
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -379,6 +384,27 @@ async fn main() -> Result<()> {
         .parse()
         .map_err(|e: String| anyhow::anyhow!(e))?;
     println!("{}", render(&suite, fmt, args.verbose));
+
+    // Save JSON report for post-run introspection.
+    if let Some(ref path) = args.report_file {
+        let json = astra_test_harness::report::render(
+            &suite,
+            astra_test_harness::report::Format::Json,
+            false,
+        );
+        if let Err(e) = std::fs::write(path, &json) {
+            eprintln!(
+                "[astra-test] WARNING: failed to write report to {}: {e}",
+                path.display()
+            );
+        } else {
+            eprintln!(
+                "[astra-test] report saved to {} ({} bytes)",
+                path.display(),
+                json.len()
+            );
+        }
+    }
 
     // Optional LLM summary.
     let want_summary = args.summarize || args.summarize_model.is_some();
