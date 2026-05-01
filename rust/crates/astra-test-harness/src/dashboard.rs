@@ -138,6 +138,7 @@ impl DashboardServer {
             .route("/api/cases", get(cases_handler))
             .route("/api/run", post(run_handler))
             .route("/api/cancel", post(cancel_handler))
+            .route("/api/login", post(login_handler))
             .route("/api/chat", post(chat_handler))
             .with_state(state);
 
@@ -312,6 +313,52 @@ async fn cancel_handler(State(state): State<AppState>) -> Json<serde_json::Value
         Json(serde_json::json!({"status": "cancelled"}))
     } else {
         Json(serde_json::json!({"error": "No run in progress"}))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+async fn login_handler(
+    State(state): State<AppState>,
+    Json(req): Json<LoginRequest>,
+) -> Json<serde_json::Value> {
+    let admin_bin = state.config.astra_bin.with_file_name("astra-admin");
+    let output = tokio::process::Command::new(&admin_bin)
+        .args([
+            "login",
+            "--username",
+            &req.username,
+            "--password",
+            &req.password,
+        ])
+        .env("NO_PROXY", "localhost,127.0.0.1")
+        .env("no_proxy", "localhost,127.0.0.1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+    match output {
+        Ok(o) if o.status.success() => {
+            Json(serde_json::json!({"status": "ok", "message": "Logged in successfully"}))
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let detail = if stderr.contains("Invalid") {
+                "Invalid username or password"
+            } else {
+                "Login failed"
+            };
+            Json(serde_json::json!({
+                "error": detail,
+                "detail": format!("{} {}", stdout.trim(), stderr.trim()).trim().to_string(),
+            }))
+        }
+        Err(e) => Json(serde_json::json!({"error": format!("spawn: {e}")})),
     }
 }
 
