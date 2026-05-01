@@ -90,6 +90,13 @@ pub struct SelfModel {
     /// its own free-text plan.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmet_postconditions: Vec<UnmetPostCondition>,
+    /// Output of the most recent auto-invoked diagnostic skill
+    /// ([`astra_skills::auto_invoke::SkillDiagnosis`]). Stays attached until
+    /// a fresh auto-invoke replaces it or the caller explicitly clears.
+    /// Rendered as a bounded prompt block so the LLM sees "the system
+    /// already looked at this and noticed X".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_diagnosis: Option<astra_skills::auto_invoke::SkillDiagnosis>,
 }
 
 /// A single unmet postcondition, typed for prompt rendering and audit.
@@ -540,6 +547,7 @@ impl SelfModel {
             outcome_bias: std::collections::BTreeMap::new(),
             low_confidence_tools: Vec::new(),
             unmet_postconditions: Vec::new(),
+            skill_diagnosis: None,
         }
     }
 
@@ -639,6 +647,20 @@ impl SelfModel {
         diff: crate::turn::agentic_stage_bridge::SkillDiffEntry,
     ) -> Self {
         self.skill_diff = Some(diff);
+        self
+    }
+
+    /// Attach the most recent auto-invoked diagnostic skill output. The
+    /// diagnosis is rendered into the self-awareness section on the next
+    /// turn so the LLM can read what the system already concluded.
+    ///
+    /// Passing `None` clears any previously-attached diagnosis — stale
+    /// diagnoses must not linger once the triggering condition has cleared.
+    pub fn with_skill_diagnosis(
+        mut self,
+        diag: Option<astra_skills::auto_invoke::SkillDiagnosis>,
+    ) -> Self {
+        self.skill_diagnosis = diag;
         self
     }
 }
@@ -1032,6 +1054,11 @@ impl SelfModel {
             if total > MAX_SHOWN {
                 let _ = writeln!(s, "  … {} more", total - MAX_SHOWN);
             }
+        }
+
+        // ── Auto-invoked diagnostic skill output ──
+        if let Some(ref diag) = self.skill_diagnosis {
+            s.push_str(&diag.render_prompt_block());
         }
 
         s
