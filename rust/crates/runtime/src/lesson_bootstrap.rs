@@ -20,6 +20,29 @@ use crate::self_model::{LessonHint, SelfModel};
 /// "… N more" overflow marker is accurate.
 pub const DEFAULT_SESSION_BOOTSTRAP_LIMIT: u32 = 6;
 
+/// Outcome of session-bootstrap lesson loading. Callers that want to
+/// surface a user-visible indicator when learning is degraded can
+/// inspect this instead of guessing from the lesson count alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LessonBootstrapStatus {
+    /// Lessons loaded successfully (possibly zero if none exist yet).
+    Loaded,
+    /// DAO call failed — session started without carried-over lessons.
+    /// Cross-session learning is effectively disabled for this session.
+    DaoFailed,
+    /// No DAO was provided (e.g., no MatrixOne configured). Learning
+    /// was never attempted.
+    Unconfigured,
+}
+
+/// Return type from [`attach_session_lessons`].
+pub struct LessonBootstrapResult {
+    pub model: SelfModel,
+    pub status: LessonBootstrapStatus,
+    /// Number of lessons attached (0 on failure or when none exist).
+    pub lesson_count: usize,
+}
+
 /// Attach cross-session lessons for `(user_id, persona, workload_tag)` to
 /// a freshly-constructed SelfModel. Intended to be called once per new
 /// session, immediately after the base SelfModel is built.
@@ -30,7 +53,8 @@ pub const DEFAULT_SESSION_BOOTSTRAP_LIMIT: u32 = 6;
 ///
 /// DAO errors are swallowed (log-only) — lesson loading is best-effort.
 /// A failure in cross-session memory must never block a new session from
-/// starting. Callers that need hard guarantees can call the DAO directly.
+/// starting. The [`LessonBootstrapResult::status`] tells the caller
+/// whether learning is healthy so it can surface a hint if desired.
 pub async fn attach_session_lessons(
     model: SelfModel,
     svc: Arc<dyn AgentLessonsService>,
@@ -38,7 +62,7 @@ pub async fn attach_session_lessons(
     persona: &str,
     workload_tag: Option<&str>,
     limit: u32,
-) -> SelfModel {
+) -> LessonBootstrapResult {
     let lessons = match svc.load_recent(user_id, persona, workload_tag, limit).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -50,12 +74,21 @@ pub async fn attach_session_lessons(
                 error = %e,
                 "load_recent failed; starting session without carried-over lessons",
             );
-            return model;
+            return LessonBootstrapResult {
+                model,
+                status: LessonBootstrapStatus::DaoFailed,
+                lesson_count: 0,
+            };
         }
     };
 
+    let count = lessons.len();
     let hints: Vec<LessonHint> = lessons.iter().map(LessonHint::from_lesson).collect();
-    model.with_lessons(hints)
+    LessonBootstrapResult {
+        model: model.with_lessons(hints),
+        status: LessonBootstrapStatus::Loaded,
+        lesson_count: count,
+    }
 }
 
 #[cfg(test)]
@@ -178,7 +211,7 @@ mod tests {
             sample_lesson(LessonKind::ToolDeprioritize, "grep stalls", "switch to rg"),
             sample_lesson(LessonKind::PromptShape, "scope drift", "restate scope"),
         ]));
-        let model = attach_session_lessons(
+        let result = attach_session_lessons(
             minimal_self_model(),
             svc.clone(),
             "u1",
@@ -188,9 +221,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(model.lessons.len(), 2);
-        assert_eq!(model.lessons[0].kind, "tool_deprioritize");
-        assert_eq!(model.lessons[0].action, "switch to rg");
+        assert_eq!(result.status, LessonBootstrapStatus::Loaded);
+        assert_eq!(result.lesson_count, 2);
+        assert_eq!(result.model.lessons.len(), 2);
+        assert_eq!(result.model.lessons[0].kind, "tool_deprioritize");
+        assert_eq!(result.model.lessons[0].action, "switch to rg");
     }
 
     #[tokio::test]
@@ -215,12 +250,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dao_failure_is_swallowed_and_returns_base_model() {
+    async fn dao_failure_returns_dao_failed_status() {
         let svc = Arc::new(StubLessons::failing());
         let base = minimal_self_model();
-        let model = attach_session_lessons(base, svc, "u1", "generic", None, 5).await;
+        let result = attach_session_lessons(base, svc, "u1", "generic", None, 5).await;
+        assert_eq!(result.status, LessonBootstrapStatus::DaoFailed);
+        assert_eq!(result.lesson_count, 0);
         assert!(
-            model.lessons.is_empty(),
+            result.model.lessons.is_empty(),
             "DAO failure must not corrupt the model; lessons vec must stay empty",
         );
     }
@@ -228,10 +265,12 @@ mod tests {
     #[tokio::test]
     async fn empty_result_set_yields_no_lessons() {
         let svc = Arc::new(StubLessons::with_rows(Vec::new()));
-        let model =
+        let result =
             attach_session_lessons(minimal_self_model(), svc, "u1", "generic", None, 5).await;
-        assert!(model.lessons.is_empty());
-        let rendered = model.to_system_prompt_section();
+        assert_eq!(result.status, LessonBootstrapStatus::Loaded);
+        assert_eq!(result.lesson_count, 0);
+        assert!(result.model.lessons.is_empty());
+        let rendered = result.model.to_system_prompt_section();
         assert!(
             !rendered.contains("Lessons from prior sessions"),
             "empty lessons must produce no prompt block"

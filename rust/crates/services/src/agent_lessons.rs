@@ -103,6 +103,36 @@ pub struct Lesson {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Prompt-bound projection of a persisted [`Lesson`].
+///
+/// Intentionally drops `id`, `confidence`, `hit_count`, and timestamps —
+/// the LLM should read the *advice*, not the metadata. Callers that need
+/// to track adoption (for `record_hit`) keep the `id` out-of-band.
+///
+/// Canonical home: this crate (next to [`Lesson`]). Runtime re-exports it
+/// for backwards-compat so existing code that imports from `self_model`
+/// continues to compile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LessonHint {
+    pub kind: String,
+    pub trigger_signal: String,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_tag: Option<String>,
+}
+
+impl LessonHint {
+    #[must_use]
+    pub fn from_lesson(l: &Lesson) -> Self {
+        Self {
+            kind: l.kind.as_str().to_string(),
+            trigger_signal: l.trigger_signal.clone(),
+            action: l.action.clone(),
+            workload_tag: l.workload_tag.clone(),
+        }
+    }
+}
+
 /// Payload for `record`. Id / timestamps are assigned by the DAO.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewLesson {
@@ -480,14 +510,18 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         for row in &exposures {
             let lesson_id: String = row.try_get("lesson_id")?;
             let (pos_inc, neg_inc) = if good { (1i64, 0i64) } else { (0i64, 1i64) };
+            // Note: MySQL evaluates SET clauses left-to-right, so by the
+            // time the CASE is reached, positive/negative_outcome_count
+            // already hold the incremented values. We must NOT add the
+            // increment again in the CASE condition.
             query(
                 "UPDATE agent_lessons \
                  SET positive_outcome_count = positive_outcome_count + ?, \
                      negative_outcome_count = negative_outcome_count + ?, \
                      confidence = LEAST(0.95, GREATEST(0.1, confidence + ?)), \
                      status = CASE \
-                         WHEN negative_outcome_count + ? >= 3 \
-                              AND negative_outcome_count + ? > positive_outcome_count + ? \
+                         WHEN negative_outcome_count >= 3 \
+                              AND negative_outcome_count > positive_outcome_count \
                          THEN 'retired' ELSE status END, \
                      updated_at = CURRENT_TIMESTAMP(6) \
                  WHERE id = ?",
@@ -495,9 +529,6 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
             .bind(pos_inc)
             .bind(neg_inc)
             .bind(if good { 0.05f64 } else { -0.1f64 })
-            .bind(neg_inc)
-            .bind(neg_inc)
-            .bind(pos_inc)
             .bind(&lesson_id)
             .execute(&pool)
             .await?;

@@ -64,9 +64,9 @@ pub use admin_config::{
     DatabaseAdminConfigService, UnconfiguredAdminConfigService,
 };
 pub use agent_lessons::{
-    AGENT_LESSON_EXPOSURES_DDL, AGENT_LESSONS_DDL, AgentLessonsService,
-    DEFAULT_LESSON_CONFIDENCE, DatabaseAgentLessonsService, Lesson, LessonExposure, LessonKind,
-    LessonOutcome, NewLesson, UnconfiguredAgentLessonsService,
+    AGENT_LESSON_EXPOSURES_DDL, AGENT_LESSONS_DDL, AgentLessonsService, DEFAULT_LESSON_CONFIDENCE,
+    DatabaseAgentLessonsService, Lesson, LessonExposure, LessonHint, LessonKind, LessonOutcome,
+    NewLesson, UnconfiguredAgentLessonsService,
 };
 pub use agents::{
     AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,

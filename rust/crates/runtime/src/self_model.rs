@@ -106,41 +106,9 @@ pub struct SelfModel {
     pub lessons: Vec<LessonHint>,
 }
 
-/// Prompt-bound projection of a persisted `agent_lessons` row.
-///
-/// Intentionally drops `id`, `confidence`, `hit_count`, and timestamps —
-/// the LLM should read the *advice*, not the metadata. Callers that need
-/// to track adoption (for `record_hit`) keep the `id` out-of-band.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct LessonHint {
-    /// Lesson classification tag (`tool_deprioritize`, `prompt_shape`, …).
-    /// Uses `LessonKind::as_str()` so tags match the DB form exactly.
-    pub kind: String,
-    /// What triggered the lesson originally
-    /// (e.g. `"3 consecutive stalls on grep"`).
-    pub trigger_signal: String,
-    /// Advice for the current session
-    /// (e.g. `"deprioritize grep for regex-heavy tasks"`).
-    pub action: String,
-    /// Optional workload scope: `None` → general lesson;
-    /// `Some(tag)` → specific workload bucket the lesson applies to.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workload_tag: Option<String>,
-}
-
-impl LessonHint {
-    /// Build a hint from an `agent_lessons::Lesson`, dropping metadata the
-    /// prompt renderer does not need.
-    #[must_use]
-    pub fn from_lesson(l: &astra_services::Lesson) -> Self {
-        Self {
-            kind: l.kind.as_str().to_string(),
-            trigger_signal: l.trigger_signal.clone(),
-            action: l.action.clone(),
-            workload_tag: l.workload_tag.clone(),
-        }
-    }
-}
+// Re-export from canonical location (services::agent_lessons) so existing
+// `use astra_runtime::self_model::LessonHint` imports continue to compile.
+pub use astra_services::LessonHint;
 
 /// A single unmet postcondition, typed for prompt rendering and audit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
