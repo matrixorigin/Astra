@@ -734,7 +734,8 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     struct StubPersistSvc {
-        recorded: StdMutex<Vec<NewLesson>>,
+        lessons: StdMutex<Vec<Lesson>>,
+        next_id: StdMutex<u32>,
         /// When true, every record call returns a synthetic DAO error.
         fail_all: bool,
         /// When Some, only record calls whose trigger matches get an error.
@@ -744,27 +745,30 @@ mod tests {
     impl StubPersistSvc {
         fn happy() -> Self {
             Self {
-                recorded: StdMutex::new(Vec::new()),
+                lessons: StdMutex::new(Vec::new()),
+                next_id: StdMutex::new(0),
                 fail_all: false,
                 fail_on_trigger_contains: None,
             }
         }
         fn failing() -> Self {
             Self {
-                recorded: StdMutex::new(Vec::new()),
+                lessons: StdMutex::new(Vec::new()),
+                next_id: StdMutex::new(0),
                 fail_all: true,
                 fail_on_trigger_contains: None,
             }
         }
         fn partial_failure(marker: &'static str) -> Self {
             Self {
-                recorded: StdMutex::new(Vec::new()),
+                lessons: StdMutex::new(Vec::new()),
+                next_id: StdMutex::new(0),
                 fail_all: false,
                 fail_on_trigger_contains: Some(marker),
             }
         }
         fn recorded_count(&self) -> usize {
-            self.recorded.lock().unwrap().len()
+            self.lessons.lock().unwrap().len()
         }
     }
 
@@ -779,9 +783,11 @@ mod tests {
             {
                 return Err(sqlx::Error::Protocol("selective failure".into()));
             }
-            self.recorded.lock().unwrap().push(new.clone());
-            Ok(Lesson {
-                id: "stub".into(),
+            let mut id_guard = self.next_id.lock().unwrap();
+            let id = format!("stub-{}", *id_guard);
+            *id_guard += 1;
+            let lesson = Lesson {
+                id,
                 user_id: new.user_id,
                 persona: new.persona,
                 workload_tag: new.workload_tag,
@@ -792,7 +798,9 @@ mod tests {
                 hit_count: 0,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
-            })
+            };
+            self.lessons.lock().unwrap().push(lesson.clone());
+            Ok(lesson)
         }
 
         async fn load_recent(
@@ -800,17 +808,24 @@ mod tests {
             _: &str,
             _: &str,
             _: Option<&str>,
-            _: u32,
+            limit: u32,
         ) -> Result<Vec<Lesson>, sqlx::Error> {
-            unreachable!("not called by persist tests")
+            let guard = self.lessons.lock().unwrap();
+            Ok(guard.iter().take(limit as usize).cloned().collect())
         }
 
-        async fn record_hit(&self, _: &str) -> Result<i64, sqlx::Error> {
-            unreachable!("not called by persist tests")
+        async fn record_hit(&self, lesson_id: &str) -> Result<i64, sqlx::Error> {
+            let mut guard = self.lessons.lock().unwrap();
+            if let Some(l) = guard.iter_mut().find(|l| l.id == lesson_id) {
+                l.hit_count += 1;
+                Ok(l.hit_count as i64)
+            } else {
+                Err(sqlx::Error::RowNotFound)
+            }
         }
 
         async fn prune(&self, _: &str, _: u32) -> Result<u64, sqlx::Error> {
-            unreachable!("not called by persist tests")
+            Ok(0)
         }
     }
 
@@ -861,7 +876,7 @@ mod tests {
 
         let n = persist_session_lessons(svc.clone(), &summary, "u1", "generic", None).await;
         assert_eq!(n, 2, "rg and stall lessons should persist");
-        let recorded = svc.recorded.lock().unwrap();
+        let recorded = svc.lessons.lock().unwrap();
         assert_eq!(recorded.len(), 2);
         // The grep lesson must not be in the recorded set.
         assert!(recorded.iter().all(|r| !r.trigger_signal.contains("grep")));
@@ -883,7 +898,7 @@ mod tests {
         )
         .await;
 
-        let recorded = svc.recorded.lock().unwrap();
+        let recorded = svc.lessons.lock().unwrap();
         assert!(!recorded.is_empty());
         for l in recorded.iter() {
             assert_eq!(l.user_id, "u1");
@@ -1174,6 +1189,91 @@ mod tests {
         assert!(
             !summary.rehabilitated_tools.contains("rg"),
             "2 successes must NOT qualify for rehabilitation"
+        );
+    }
+
+    // ── weaken_rehabilitated_tools ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn weaken_refreshes_matching_deprioritize_lessons() {
+        // Setup: DAO has a ToolDeprioritize lesson for "grep".
+        // Summary says "grep" is rehabilitated (used successfully).
+        // weaken_rehabilitated_tools must call record_hit on that lesson.
+        let svc = Arc::new(StubPersistSvc::happy());
+        // Seed the DAO with a lesson for grep via record().
+        let stored = svc
+            .record(NewLesson {
+                user_id: "u1".into(),
+                persona: "generic".into(),
+                workload_tag: None,
+                kind: LessonKind::ToolDeprioritize,
+                trigger_signal: "tool_failures:grep".into(),
+                action: "avoid grep".into(),
+                confidence: Some(0.5),
+            })
+            .await
+            .unwrap();
+
+        let mut summary = base_summary();
+        summary.rehabilitated_tools.insert("grep".into());
+
+        weaken_rehabilitated_tools(svc.clone(), &summary, "u1", "generic", None).await;
+
+        // Verify record_hit was called: the stub's record() was called once
+        // (for the initial insert) and then record_hit should have been called
+        // for the rehabilitation. Check that the lesson's hit_count was
+        // incremented via the DAO.
+        let loaded = svc.load_recent("u1", "generic", None, 10).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, stored.id);
+        // StubPersistSvc's record_hit increments hit_count.
+        assert!(
+            loaded[0].hit_count > 0,
+            "record_hit must have been called for the rehabilitated lesson"
+        );
+    }
+
+    #[tokio::test]
+    async fn weaken_skips_non_deprioritize_lessons() {
+        let svc = Arc::new(StubPersistSvc::happy());
+        // Seed with a PromptShape lesson (not tool-specific).
+        svc.record(NewLesson {
+            user_id: "u1".into(),
+            persona: "generic".into(),
+            workload_tag: None,
+            kind: LessonKind::PromptShape,
+            trigger_signal: "stall_events".into(),
+            action: "restate scope".into(),
+            confidence: Some(0.5),
+        })
+        .await
+        .unwrap();
+
+        let mut summary = base_summary();
+        summary.rehabilitated_tools.insert("grep".into());
+
+        weaken_rehabilitated_tools(svc.clone(), &summary, "u1", "generic", None).await;
+
+        // PromptShape lesson should NOT have its hit_count bumped.
+        let loaded = svc.load_recent("u1", "generic", None, 10).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].hit_count, 0,
+            "non-tool lesson must not be touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn weaken_empty_rehabilitated_is_noop() {
+        let svc = Arc::new(StubPersistSvc::happy());
+        let summary = base_summary(); // rehabilitated_tools is empty
+        weaken_rehabilitated_tools(svc.clone(), &summary, "u1", "generic", None).await;
+        // No panic, no calls — function is a no-op.
+        assert!(
+            svc.load_recent("u1", "generic", None, 10)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }
