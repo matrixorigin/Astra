@@ -154,6 +154,14 @@ pub(crate) async fn stream_chat_sse(
 ) -> Result<StreamResult, crate::TurnFailure> {
     let start = Instant::now();
     let root_agent_id = p.root_agent_id.unwrap_or("main");
+    // Stable run_id for this turn — shared by:
+    //   1. state.current_run_id (so on_turn_completed captures the
+    //      parent prefix keyed on this id)
+    //   2. SpawnAgentContext.run_id (so the spawner's resolver looks
+    //      up the same key)
+    // Pre-fix these were different ("ephemeral" vs None), so the
+    // parent capture never happened and fork-cache probes were dead.
+    let parent_turn_run_id = format!("run-{}", uuid::Uuid::new_v4());
     let term_width = terminal_width_usize();
     // Capture the model id up front for later `resolve_for_model` calls —
     // `p.model` (Option<&str>) gets consumed into `host.model` below.
@@ -235,10 +243,18 @@ pub(crate) async fn stream_chat_sse(
         } else {
             ex
         };
-        // Wire spawn_agent tool context when spawner is available
+        // Wire spawn_agent tool context when spawner is available.
+        // The run_id MUST match what state.current_run_id uses so that
+        // on_turn_completed captures the parent prefix under the same
+        // key the spawner resolves against. Previously this was
+        // p.session_id.unwrap_or("ephemeral") — a mismatch that made
+        // on_turn_completed early-return (current_run_id = None) and
+        // the spawner look up "ephemeral" in the prefix store, finding
+        // nothing. Generating a stable UUID here and threading it into
+        // both sites closes the gap.
         if let Some(ref spawner) = p.agent_spawner {
             let spawn_ctx = edge_tools::agent_spawning::SpawnAgentContext {
-                run_id: p.session_id.unwrap_or("ephemeral").to_string(),
+                run_id: parent_turn_run_id.clone(),
                 agent_id: root_agent_id.to_string(),
                 recursion_depth: 0,
                 working_dir: project_root.clone(),
@@ -537,7 +553,7 @@ pub(crate) async fn stream_chat_sse(
         messages,
         tool_results: Vec::new(),
         current_session_id,
-        current_run_id: None,
+        current_run_id: Some(parent_turn_run_id.clone()),
         recursion_depth: 0,
         final_text: String::new(),
         final_text_streamed: false,
