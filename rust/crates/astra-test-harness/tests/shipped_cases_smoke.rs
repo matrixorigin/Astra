@@ -1,0 +1,139 @@
+//! Shipped-case smoke tests.
+//!
+//! Preventive regression for the R2/R3/R4 pattern: rename a criterion
+//! (or change a required field), and the shipped `cases/*.yaml` files
+//! silently stop loading — but the crate still compiles and unit
+//! tests pass, because unit tests use synthetic YAML. Only a
+//! "load every shipped case" test surfaces the drift.
+//!
+//! These tests run at integration scope so they exercise the same
+//! `Case::load_dir` path CI uses, against the actual YAML files the
+//! repo ships.
+
+use std::path::PathBuf;
+
+use astra_test_harness::case::Case;
+
+fn shipped_cases_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cases")
+}
+
+#[test]
+fn every_shipped_case_yaml_loads_cleanly() {
+    // If a rename (criterion variant, reserved flag, serde tag)
+    // lands without updating every YAML, `Case::load_dir` returns
+    // an Err with the offending file and line. That's the signal
+    // this test is designed to surface at PR time rather than at
+    // "deploy + run" time.
+    let dir = shipped_cases_dir();
+    let cases = Case::load_dir(&dir).unwrap_or_else(|e| {
+        panic!(
+            "Case::load_dir({}) failed. If you renamed a Criterion variant, \
+             a reserved-flag entry, or a required field, every shipped \
+             cases/*.yaml must be updated in the same PR. Error: {e:#}",
+            dir.display()
+        )
+    });
+
+    // Sanity guard — we expect at least the fork_prefix + behavior +
+    // selector + text cases. If this drops sharply, someone deleted
+    // a pack without updating the guard.
+    assert!(
+        cases.len() >= 10,
+        "shipped suite has {} cases; below the minimum sanity count of 10. \
+         Did someone delete cases without updating this guard?",
+        cases.len()
+    );
+
+    // Every case must have a prompt and a non-empty name. Loader
+    // already requires them via serde, but this is defense-in-depth
+    // for the "someone added a default" pattern.
+    for c in &cases {
+        assert!(!c.name.trim().is_empty(), "case with empty name loaded");
+        assert!(
+            !c.prompt.trim().is_empty(),
+            "case {} has an empty prompt — models will see no instruction",
+            c.name
+        );
+    }
+}
+
+#[test]
+fn shipped_case_names_are_unique() {
+    // Duplicate `name:` in two different YAML files would make the
+    // report ambiguous and `astra-test` would happily run both.
+    // Catch the duplicate at case-load time.
+    let cases = Case::load_dir(&shipped_cases_dir()).expect("load_dir");
+    let mut names: Vec<&str> = cases.iter().map(|c| c.name.as_str()).collect();
+    names.sort();
+    let before_dedup = names.len();
+    names.dedup();
+    let after_dedup = names.len();
+    assert_eq!(
+        before_dedup, after_dedup,
+        "duplicate case names in shipped suite: {:?} reduced to {:?} after dedup",
+        before_dedup, after_dedup
+    );
+}
+
+#[test]
+fn shipped_cases_reference_only_known_criterion_variants() {
+    // Positive sanity: when the serde tag on `Criterion` changes
+    // (say, `fork_cache_outcome` → `fork_cache_class_v2`), every
+    // case using the old tag fails to deserialize. `every_shipped_case_
+    // yaml_loads_cleanly` above would already catch that. This test
+    // adds an explicit-names check so a rename that kept the new
+    // name in use is surfaced with a clearer error.
+    //
+    // Ground truth: the YAML `type:` values currently shipped. If
+    // this list drifts the first test already fails; this test just
+    // names the expected vocabulary for greppers.
+    let known = [
+        "exit_code",
+        "tool_called",
+        "tools_count_between",
+        "stderr_matches",
+        "text_contains",
+        "session_event_count",
+        "journal_tool_called",
+        "fork_cache_outcome",
+        "judger",
+    ];
+    // Concatenate every shipped YAML body and grep for `type:` tag
+    // occurrences at column-1-after-indent. Cheap + doesn't require
+    // reparsing.
+    let dir = shipped_cases_dir();
+    for entry in std::fs::read_dir(&dir).expect("read_dir") {
+        let entry = entry.expect("entry");
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yaml")
+            && path.extension().and_then(|e| e.to_str()) != Some("yml")
+        {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path).expect("read");
+        for (lineno, line) in body.lines().enumerate() {
+            // Match `- type: <name>` or `type: <name>` inside a list item.
+            let trimmed = line.trim_start_matches(|c: char| c.is_whitespace() || c == '-').trim();
+            let Some(rest) = trimmed.strip_prefix("type:") else {
+                continue;
+            };
+            let tag: String = rest
+                .trim()
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if tag.is_empty() {
+                continue;
+            }
+            assert!(
+                known.contains(&tag.as_str()),
+                "{}:{} references unknown criterion tag {tag:?}. \
+                 Known vocabulary: {known:?}. Update the test if the \
+                 Criterion enum gained a legitimate new variant.",
+                path.file_name().unwrap().to_string_lossy(),
+                lineno + 1,
+            );
+        }
+    }
+}

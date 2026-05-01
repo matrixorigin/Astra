@@ -92,20 +92,43 @@ impl std::str::FromStr for Format {
 /// so tests can assert on the output without touching stdout.
 pub fn render(report: &SuiteReport, fmt: Format, verbose: bool) -> String {
     match fmt {
-        // Serialize-failure is unreachable today — every field in
-        // `SuiteReport` / its transitive types is serde-safe — but a
-        // future field addition could break that invariant silently.
-        // Emit a structured error blob instead of an empty string so
-        // CI consumers parsing the output see a clear failure rather
-        // than a mystery zero-byte file.
-        Format::Json => serde_json::to_string_pretty(report).unwrap_or_else(|e| {
-            format!(
-                "{{\n  \"error\": \"SuiteReport JSON render failed: {}\"\n}}",
-                e.to_string().replace('"', "\\\"")
-            )
-        }),
+        Format::Json => render_json(report),
         Format::Text => render_text(report, verbose),
     }
+}
+
+/// Serialize the report to pretty JSON. On serialize failure —
+/// unreachable today because every field in `SuiteReport` and its
+/// transitive types is serde-safe, but a future field addition
+/// could break that invariant — return a structured error blob so
+/// CI consumers parsing the output see a diagnosable failure
+/// rather than a zero-byte file.
+///
+/// Extracted as a pub(crate) helper so tests can exercise the
+/// fallback branch by going through `format_render_error` directly;
+/// the branch itself is genuinely hard to trip with a real report.
+pub(crate) fn render_json(report: &SuiteReport) -> String {
+    serde_json::to_string_pretty(report).unwrap_or_else(|e| format_render_error(&e.to_string()))
+}
+
+/// Format the JSON-render fallback body. Separated from `render_json`
+/// so a test can feed a synthetic error message in without having to
+/// force `serde_json::to_string_pretty` to fail (there is no safe way
+/// to construct a `SuiteReport` whose serde fails today). Callers
+/// must pass a human-readable error; this helper handles quoting so
+/// the result is always valid JSON.
+pub(crate) fn format_render_error(reason: &str) -> String {
+    // JSON string quoting: escape `\` first, then `"`, then newlines
+    // which would otherwise make the emitted body invalid. Minimal
+    // escape — enough that the output passes a `serde_json::from_str`
+    // round-trip. Non-ASCII bytes are fine inside JSON strings.
+    let escaped = reason
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    format!("{{\n  \"error\": \"SuiteReport JSON render failed: {escaped}\"\n}}")
 }
 
 fn render_text(report: &SuiteReport, verbose: bool) -> String {
@@ -510,5 +533,67 @@ mod tests {
         assert_eq!(r.total(), 2);
         assert_eq!(r.passed(), 1);
         assert_eq!(r.failed(), 1);
+    }
+
+    // ── JSON render fallback (R5 nit a) ──
+    //
+    // `render_json` returns a structured error blob on serialize
+    // failure instead of an empty string. The failure path itself is
+    // unreachable today (every `SuiteReport` field is serde-safe),
+    // so the tests exercise `format_render_error` directly — it's
+    // the pure body of the fallback.
+
+    #[test]
+    fn render_error_body_is_valid_json_and_names_reason() {
+        let out = format_render_error("something specific broke");
+        // Must parse — the whole point of returning a structured blob
+        // instead of an empty string is that CI consumers can keep
+        // using their JSON parser.
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .expect("error body must be valid JSON so downstream parsers can see it");
+        let err = parsed
+            .get("error")
+            .and_then(|v| v.as_str())
+            .expect("error field must be a string");
+        assert!(
+            err.contains("something specific broke"),
+            "reason must flow through into the `error` field: {err}"
+        );
+        assert!(
+            err.starts_with("SuiteReport JSON render failed:"),
+            "prefix identifies the call site for greppers: {err}"
+        );
+    }
+
+    #[test]
+    fn render_error_escapes_quotes_newlines_and_backslashes() {
+        // Regression guard: a reason containing JSON-hostile chars
+        // (a reviewer pasting a stack trace with tabs + quotes +
+        // backslashes on Windows paths) must still produce valid JSON.
+        let nasty = "bad: \"quoted\" \\path\\ with\nnewline and\ttab";
+        let out = format_render_error(nasty);
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .expect("escaping must keep the body valid JSON even for nasty input");
+        let err = parsed
+            .get("error")
+            .and_then(|v| v.as_str())
+            .expect("error string");
+        // Payload round-trips byte-for-byte through the JSON unescape.
+        assert!(err.contains("\"quoted\""), "quote survived: {err}");
+        assert!(err.contains("\\path\\"), "backslashes survived: {err}");
+        assert!(err.contains('\n'), "newline survived: {err}");
+        assert!(err.contains('\t'), "tab survived: {err}");
+    }
+
+    #[test]
+    fn render_empty_report_is_valid_json_passed_zero_failed_zero() {
+        // Smoke: a zero-case report still round-trips through the
+        // public `render(..., Format::Json, …)` surface (happy path,
+        // not the fallback) — sanity check that the extraction into
+        // `render_json` didn't break the primary path.
+        let r = SuiteReport::default();
+        let out = render(&r, Format::Json, false);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(parsed.get("runs").and_then(|v| v.as_array()).map(|a| a.len()), Some(0));
     }
 }
