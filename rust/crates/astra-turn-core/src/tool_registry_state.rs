@@ -351,10 +351,12 @@ pub fn word_boundary_match(haystack: &str, _chars: &[char], needle: &str) -> boo
 }
 
 /// Tokenize `haystack` the same way [`word_boundary_match`] does internally:
-/// split on any non-alphanumeric char (underscore retained). Hot-path callers
-/// that match many needles against the same haystack should call this once
-/// and pass the result to [`word_boundary_match_prepared`] repeatedly —
-/// avoids re-splitting the haystack for every needle.
+/// split on any non-ASCII-alphanumeric char (underscore retained) and drop
+/// empties. CJK characters act as separators — match the original
+/// ASCII-word-boundary semantics exactly. Hot-path callers that match many
+/// needles against the same haystack should call this once and pass the
+/// result to [`word_boundary_match_prepared`] repeatedly, avoiding the
+/// O(haystack_len) resplit per needle.
 pub fn split_haystack_words(haystack: &str) -> Vec<&str> {
     haystack
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
