@@ -1,11 +1,5 @@
 //! Live dashboard: embedded HTTP + WebSocket server for real-time
 //! test progress visualization and run control.
-//!
-//! `--live-dashboard [PORT]` starts an axum server at `GET /` that
-//! serves a single-page control console. The console can:
-//! - List available cases and models via REST API
-//! - Trigger runs with custom configuration via `POST /api/run`
-//! - Stream real-time results over `GET /ws`
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,6 +11,7 @@ use axum::response::{Html, IntoResponse, Json};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast};
+use tokio_util::sync::CancellationToken;
 
 use crate::report::{CaseRunReport, SuiteReport};
 
@@ -88,7 +83,6 @@ impl Serialize for DashboardEvent {
 
 // ── Server configuration ────────────────────────────────────────────
 
-/// Immutable config the dashboard needs to discover cases and run them.
 #[derive(Clone)]
 pub struct DashboardConfig {
     pub suite_dir: PathBuf,
@@ -102,6 +96,7 @@ struct AppState {
     tx: broadcast::Sender<DashboardEvent>,
     config: Arc<DashboardConfig>,
     running: Arc<Mutex<bool>>,
+    cancel_token: Arc<Mutex<Option<CancellationToken>>>,
 }
 
 // ── Server ──────────────────────────────────────────────────────────
@@ -129,6 +124,7 @@ impl DashboardServer {
             tx: self.tx,
             config: self.config,
             running: Arc::new(Mutex::new(false)),
+            cancel_token: Arc::new(Mutex::new(None)),
         };
         let app = Router::new()
             .route("/", get(index_handler))
@@ -136,6 +132,8 @@ impl DashboardServer {
             .route("/api/config", get(config_handler))
             .route("/api/cases", get(cases_handler))
             .route("/api/run", post(run_handler))
+            .route("/api/cancel", post(cancel_handler))
+            .route("/api/chat", post(chat_handler))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
@@ -184,7 +182,6 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
     }
 }
 
-/// Return available configuration for the UI.
 async fn config_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "suite_dir": state.config.suite_dir.display().to_string(),
@@ -193,7 +190,6 @@ async fn config_handler(State(state): State<AppState>) -> Json<serde_json::Value
     }))
 }
 
-/// Return the list of available case names (from the suite directory).
 async fn cases_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     match crate::case::Case::load_dir(&state.config.suite_dir) {
         Ok(cases) => {
@@ -218,10 +214,12 @@ async fn cases_handler(State(state): State<AppState>) -> Json<serde_json::Value>
     }
 }
 
-/// Run request from the UI.
+/// Run request — supports both glob filter and explicit case list.
 #[derive(Debug, Deserialize)]
 struct RunRequest {
     models: Vec<String>,
+    #[serde(default)]
+    cases: Vec<String>,
     #[serde(default)]
     filter: Option<String>,
     #[serde(default = "default_parallel")]
@@ -236,8 +234,6 @@ fn default_parallel() -> usize {
     2
 }
 
-/// Trigger a test run from the dashboard UI. Non-blocking: spawns
-/// the run on a background task and streams results over WS.
 async fn run_handler(
     State(state): State<AppState>,
     Json(req): Json<RunRequest>,
@@ -250,12 +246,16 @@ async fn run_handler(
         *running = true;
     }
 
+    let token = CancellationToken::new();
+    *state.cancel_token.lock().await = Some(token.clone());
+
     let config = state.config.clone();
     let tx = state.tx.clone();
     let running_flag = state.running.clone();
+    let cancel_token_slot = state.cancel_token.clone();
 
     tokio::spawn(async move {
-        let result = execute_run(config, tx.clone(), req).await;
+        let result = execute_run(config, tx.clone(), req, token).await;
         if let Err(e) = result {
             eprintln!("[astra-test] dashboard run error: {e}");
             let _ = tx.send(DashboardEvent::SuiteCompleted {
@@ -263,9 +263,74 @@ async fn run_handler(
             });
         }
         *running_flag.lock().await = false;
+        *cancel_token_slot.lock().await = None;
     });
 
     Json(serde_json::json!({"status": "started"}))
+}
+
+async fn cancel_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let token = state.cancel_token.lock().await;
+    if let Some(ref t) = *token {
+        t.cancel();
+        Json(serde_json::json!({"status": "cancelled"}))
+    } else {
+        Json(serde_json::json!({"error": "No run in progress"}))
+    }
+}
+
+/// Simple chat endpoint — sends a message to astra and returns the response.
+#[derive(Debug, Deserialize)]
+struct ChatRequest {
+    message: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+async fn chat_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ChatRequest>,
+) -> Json<serde_json::Value> {
+    use tokio::process::Command;
+
+    let model = req.model.as_deref().unwrap_or("claude-sonnet-4-6");
+    let mut cmd = Command::new(&state.config.astra_bin);
+    cmd.arg("chat")
+        .arg("-m")
+        .arg(&req.message)
+        .arg("--model")
+        .arg(model)
+        .arg("--json")
+        .arg("-y");
+    if let Some(ref sid) = req.session_id {
+        cmd.arg("--session-id").arg(sid);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output()).await
+    {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return Json(serde_json::json!({"error": format!("spawn: {e}")}));
+        }
+        Err(_) => {
+            return Json(serde_json::json!({"error": "chat timed out after 120s"}));
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+        Json(v)
+    } else {
+        Json(serde_json::json!({
+            "text": stdout.trim().to_string(),
+            "exit_code": output.status.code().unwrap_or(-1),
+        }))
+    }
 }
 
 /// Execute a full test run (called on a background task).
@@ -273,6 +338,7 @@ async fn execute_run(
     config: Arc<DashboardConfig>,
     tx: broadcast::Sender<DashboardEvent>,
     req: RunRequest,
+    _cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     use crate::case::Case;
     use crate::digest::AstraCliDigestCollector;
@@ -282,7 +348,13 @@ async fn execute_run(
     use crate::suite::{DiskSessionLoader, SessionCaptureMode, SuiteConfig, SuiteRunner};
 
     let mut cases = Case::load_dir(&config.suite_dir)?;
-    if let Some(ref pattern) = req.filter {
+
+    // Filter: explicit case list takes priority, then glob pattern.
+    if !req.cases.is_empty() {
+        let selected: std::collections::HashSet<&str> =
+            req.cases.iter().map(|s| s.as_str()).collect();
+        cases.retain(|c| selected.contains(c.name.as_str()));
+    } else if let Some(ref pattern) = req.filter {
         let re_str = format!(
             "^{}$",
             regex::escape(pattern)
@@ -292,6 +364,10 @@ async fn execute_run(
         if let Ok(re) = regex::Regex::new(&re_str) {
             cases.retain(|c| re.is_match(&c.name));
         }
+    }
+
+    if cases.is_empty() {
+        anyhow::bail!("no cases matched the selection");
     }
 
     let fallback_models = req.models.clone();

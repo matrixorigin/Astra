@@ -13,13 +13,13 @@
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
 :root {
-  --bg: #080c18;
-  --bg-raised: #0c1222;
-  --bg-surface: rgba(14, 22, 42, 0.75);
-  --bg-surface-hover: rgba(18, 28, 52, 0.9);
-  --bg-inset: rgba(0, 0, 0, 0.25);
-  --border: rgba(59, 130, 246, 0.12);
-  --border-strong: rgba(59, 130, 246, 0.28);
+  --bg: #06080f;
+  --bg-raised: #0a0e1a;
+  --bg-surface: rgba(15, 23, 42, 0.6);
+  --bg-surface-hover: rgba(20, 30, 55, 0.8);
+  --bg-inset: rgba(0, 0, 0, 0.3);
+  --border: rgba(100, 150, 255, 0.1);
+  --border-strong: rgba(100, 150, 255, 0.25);
   --border-subtle: rgba(255, 255, 255, 0.04);
   --accent: #3b82f6;
   --accent2: #8b5cf6;
@@ -40,6 +40,7 @@
   --radius-sm: 8px;
   --radius-xs: 6px;
   --sidebar-w: 280px;
+  --detail-w: 420px;
   --ease: cubic-bezier(0.4, 0, 0.2, 1);
   --spring: cubic-bezier(0.34, 1.56, 0.64, 1);
   --gradient: linear-gradient(135deg, var(--accent), var(--accent2));
@@ -57,63 +58,63 @@ body {
 }
 
 /* ================================================================
-   Animated Background
+   Animated Background — 3 slow-moving gradient mesh circles
    ================================================================ */
 .bg-canvas {
   position: fixed; inset: 0; z-index: 0;
   pointer-events: none; overflow: hidden;
 }
-.bg-canvas::before, .bg-canvas::after {
-  content: '';
+.bg-orb {
   position: absolute;
   border-radius: 50%;
   filter: blur(140px);
-  opacity: 0.06;
-  animation: meshDrift 25s ease-in-out infinite alternate;
+  will-change: transform;
 }
-.bg-canvas::before {
+.bg-orb-1 {
   width: 700px; height: 700px;
   background: var(--accent);
+  opacity: 0.06;
   top: -250px; left: -150px;
+  animation: orbDrift1 28s ease-in-out infinite alternate;
 }
-.bg-canvas::after {
+.bg-orb-2 {
   width: 600px; height: 600px;
   background: var(--accent2);
+  opacity: 0.05;
   bottom: -250px; right: -150px;
-  animation-delay: -12s;
-  animation-direction: alternate-reverse;
+  animation: orbDrift2 24s ease-in-out infinite alternate;
 }
-.bg-canvas .mesh-extra {
-  position: absolute;
-  width: 400px; height: 400px;
-  border-radius: 50%;
-  filter: blur(120px);
-  opacity: 0.04;
+.bg-orb-3 {
+  width: 450px; height: 450px;
   background: linear-gradient(135deg, #06b6d4, #8b5cf6);
-  top: 50%; left: 50%;
-  transform: translate(-50%, -50%);
-  animation: meshPulse 18s ease-in-out infinite;
+  opacity: 0.04;
+  top: 40%; left: 45%;
+  animation: orbDrift3 20s ease-in-out infinite;
 }
-@keyframes meshDrift {
+@keyframes orbDrift1 {
   0%   { transform: translate(0, 0) scale(1); }
-  33%  { transform: translate(60px, 30px) scale(1.08); }
-  66%  { transform: translate(-30px, 60px) scale(0.95); }
-  100% { transform: translate(30px, -30px) scale(1.04); }
+  50%  { transform: translate(80px, 40px) scale(1.1); }
+  100% { transform: translate(-40px, 80px) scale(0.95); }
 }
-@keyframes meshPulse {
-  0%, 100% { opacity: 0.04; transform: translate(-50%, -50%) scale(1); }
-  50%      { opacity: 0.07; transform: translate(-50%, -50%) scale(1.15); }
+@keyframes orbDrift2 {
+  0%   { transform: translate(0, 0) scale(1); }
+  50%  { transform: translate(-60px, -50px) scale(1.08); }
+  100% { transform: translate(50px, -40px) scale(0.96); }
+}
+@keyframes orbDrift3 {
+  0%, 100% { transform: translate(-50%, -50%) scale(1); opacity: 0.04; }
+  50%      { transform: translate(-50%, -50%) scale(1.2); opacity: 0.06; }
 }
 
 /* ================================================================
-   Layout: Sidebar + Main
+   Layout: Sidebar + Main + Detail Panel
    ================================================================ */
 .app-layout {
   position: relative; z-index: 1;
   display: flex; min-height: 100vh;
 }
 
-/* Sidebar */
+/* ── Sidebar ── */
 .sidebar {
   width: var(--sidebar-w);
   flex-shrink: 0;
@@ -125,7 +126,8 @@ body {
   position: sticky;
   top: 0;
   overflow: hidden;
-  transition: transform 0.3s var(--ease), opacity 0.3s var(--ease);
+  z-index: 10;
+  transition: transform 0.3s var(--ease);
 }
 .sidebar-scroll {
   flex: 1;
@@ -137,19 +139,55 @@ body {
   padding: 12px 16px 16px;
   border-top: 1px solid var(--border);
   background: var(--bg-raised);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
-/* Main area */
+/* ── Main area ── */
 .main-area {
   flex: 1;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 0;
+}
+.main-scroll {
+  flex: 1;
   padding: 28px 32px;
+  overflow-y: auto;
 }
 
-/* Mobile collapse */
+/* ── Detail panel (slides in from right) ── */
+.detail-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: var(--detail-w);
+  height: 100vh;
+  background: var(--bg-raised);
+  border-left: 1px solid var(--border);
+  z-index: 50;
+  overflow-y: auto;
+  transform: translateX(100%);
+  transition: transform 0.3s var(--ease);
+  box-shadow: -8px 0 40px rgba(0,0,0,0.4);
+}
+.detail-panel.open {
+  transform: translateX(0);
+}
+.detail-overlay {
+  display: none;
+  position: fixed; inset: 0; z-index: 45;
+  background: rgba(0,0,0,0.3);
+  backdrop-filter: blur(2px);
+}
+.detail-overlay.open { display: block; }
+
+/* ── Mobile ── */
 .sidebar-overlay {
   display: none;
-  position: fixed; inset: 0; z-index: 90;
+  position: fixed; inset: 0; z-index: 8;
   background: rgba(0,0,0,0.5);
   backdrop-filter: blur(4px);
 }
@@ -166,7 +204,6 @@ body {
   align-items: center; justify-content: center;
   backdrop-filter: blur(12px);
 }
-
 @media (max-width: 900px) {
   .sidebar {
     position: fixed; left: 0; top: 0; z-index: 95;
@@ -175,7 +212,8 @@ body {
   .sidebar.open { transform: translateX(0); }
   .sidebar-overlay.open { display: block; }
   .mobile-toggle { display: flex; }
-  .main-area { padding: 16px; padding-top: 56px; }
+  .main-scroll { padding: 16px; padding-top: 56px; }
+  .detail-panel { width: 100%; }
 }
 
 /* ================================================================
@@ -185,8 +223,15 @@ body {
   display: flex; align-items: center; gap: 10px;
   margin-bottom: 20px;
 }
+.sidebar-logo .logo-icon {
+  width: 28px; height: 28px;
+  background: var(--gradient);
+  border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px; font-weight: 900; color: #fff;
+}
 .sidebar-logo .logo-text {
-  font-size: 20px; font-weight: 800;
+  font-size: 18px; font-weight: 800;
   letter-spacing: -0.5px;
   background: var(--gradient);
   -webkit-background-clip: text;
@@ -209,9 +254,7 @@ body {
 /* ================================================================
    Sidebar: Section Styling
    ================================================================ */
-.sb-section {
-  margin-bottom: 18px;
-}
+.sb-section { margin-bottom: 18px; }
 .sb-section-header {
   display: flex; align-items: center; justify-content: space-between;
   margin-bottom: 8px;
@@ -237,11 +280,9 @@ body {
   border-radius: 3px;
   transition: background 0.15s;
 }
-.sb-section-actions button:hover {
-  background: var(--blue-dim);
-}
+.sb-section-actions button:hover { background: var(--blue-dim); }
 
-/* Model & Case lists */
+/* ── Checkbox list items ── */
 .sb-check-list {
   display: flex; flex-direction: column; gap: 2px;
   max-height: 200px;
@@ -258,12 +299,8 @@ body {
   user-select: none;
   color: var(--text-secondary);
 }
-.sb-check-item:hover {
-  background: rgba(255,255,255,0.03);
-}
-.sb-check-item.checked {
-  color: var(--text);
-}
+.sb-check-item:hover { background: rgba(255,255,255,0.03); }
+.sb-check-item.checked { color: var(--text); }
 .sb-check-item .ck {
   width: 15px; height: 15px;
   border-radius: 4px;
@@ -279,24 +316,18 @@ body {
 }
 .sb-check-item .ck svg {
   width: 10px; height: 10px;
-  opacity: 0;
-  transition: opacity 0.15s;
+  opacity: 0; transition: opacity 0.15s;
 }
-.sb-check-item.checked .ck svg {
-  opacity: 1;
-}
+.sb-check-item.checked .ck svg { opacity: 1; }
 .sb-check-item .item-label {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .sb-check-item .item-meta {
   display: flex; gap: 4px; align-items: center; flex-shrink: 0;
 }
 
-/* Tags (selected models) */
+/* ── Selected model tags ── */
 .selected-tags {
   display: flex; flex-wrap: wrap; gap: 4px;
   margin-top: 6px;
@@ -305,39 +336,33 @@ body {
   display: inline-flex; align-items: center; gap: 4px;
   padding: 3px 8px;
   border-radius: 12px;
-  font-size: 11px;
-  font-weight: 500;
+  font-size: 11px; font-weight: 500;
   background: var(--blue-dim);
   border: 1px solid rgba(59,130,246,0.2);
   color: var(--accent);
   animation: tagIn 0.2s var(--spring) both;
 }
 .sel-tag .tag-x {
-  cursor: pointer;
-  opacity: 0.5;
-  font-size: 13px;
-  line-height: 1;
+  cursor: pointer; opacity: 0.5;
+  font-size: 13px; line-height: 1;
   transition: opacity 0.15s;
 }
 .sel-tag .tag-x:hover { opacity: 1; }
 @keyframes tagIn { from { opacity: 0; transform: scale(0.85); } }
 
-/* Custom model input */
+/* ── Custom model input row ── */
 .custom-model-row {
   display: flex; gap: 6px; margin-top: 8px;
 }
 .custom-model-row input {
-  flex: 1;
-  min-width: 0;
+  flex: 1; min-width: 0;
   padding: 6px 10px;
   background: var(--bg-inset);
   border: 1px solid var(--border);
   border-radius: var(--radius-xs);
   color: var(--text);
-  font-size: 12px;
-  font-family: var(--mono);
-  outline: none;
-  transition: border-color 0.15s;
+  font-size: 12px; font-family: var(--mono);
+  outline: none; transition: border-color 0.15s;
 }
 .custom-model-row input:focus { border-color: var(--accent); }
 .custom-model-row input::placeholder { color: var(--dim); }
@@ -347,16 +372,14 @@ body {
   border: 1px solid rgba(59,130,246,0.2);
   border-radius: var(--radius-xs);
   color: var(--accent);
-  font-size: 11px;
-  font-weight: 600;
-  cursor: pointer;
-  font-family: var(--font);
+  font-size: 11px; font-weight: 600;
+  cursor: pointer; font-family: var(--font);
   transition: all 0.15s;
   white-space: nowrap;
 }
 .custom-model-row button:hover { background: rgba(59,130,246,0.2); }
 
-/* Search input in sidebar */
+/* ── Search input ── */
 .sb-search {
   width: 100%;
   padding: 6px 10px;
@@ -364,16 +387,14 @@ body {
   border: 1px solid var(--border);
   border-radius: var(--radius-xs);
   color: var(--text);
-  font-size: 12px;
-  font-family: var(--font);
-  outline: none;
-  transition: border-color 0.15s;
+  font-size: 12px; font-family: var(--font);
+  outline: none; transition: border-color 0.15s;
   margin-bottom: 6px;
 }
 .sb-search:focus { border-color: var(--accent); }
 .sb-search::placeholder { color: var(--dim); }
 
-/* Capability filter pills */
+/* ── Capability filter pills ── */
 .cap-pills {
   display: flex; flex-wrap: wrap; gap: 4px;
   margin-bottom: 6px;
@@ -381,8 +402,7 @@ body {
 .cap-pill {
   padding: 2px 8px;
   border-radius: 10px;
-  font-size: 10px;
-  font-weight: 600;
+  font-size: 10px; font-weight: 600;
   cursor: pointer;
   border: 1px solid var(--border);
   background: transparent;
@@ -397,106 +417,84 @@ body {
   color: var(--accent);
 }
 
-/* Case meta badges inline */
+/* ── Case meta badges ── */
 .case-cap-badge {
-  padding: 1px 6px;
-  border-radius: 3px;
-  font-size: 9px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.3px;
-  background: rgba(139,92,246,0.12);
-  color: #a78bfa;
+  padding: 1px 6px; border-radius: 3px;
+  font-size: 9px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.3px;
 }
-.case-diff-stars {
-  font-size: 9px;
-  color: var(--yellow);
-  letter-spacing: -1px;
+.case-cap-badge.reasoning { background: rgba(139,92,246,0.15); color: #a78bfa; }
+.case-cap-badge.tool_use { background: rgba(59,130,246,0.15); color: #60a5fa; }
+.case-cap-badge.delegation { background: rgba(6,182,212,0.15); color: #22d3ee; }
+.case-cap-badge.coding { background: rgba(34,197,94,0.15); color: #4ade80; }
+.case-cap-badge.default { background: rgba(148,163,184,0.12); color: #94a3b8; }
+.case-diff-dots {
+  display: flex; gap: 2px; align-items: center;
 }
-.case-steps-dot {
-  width: 5px; height: 5px;
-  border-radius: 50%;
-  background: var(--accent);
+.case-diff-dot {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--dim);
+}
+.case-diff-dot.filled { background: var(--yellow); }
+.case-steps-icon {
+  font-size: 10px; color: var(--accent); opacity: 0.7;
 }
 
-/* Settings row */
+/* ── Settings ── */
 .sb-setting {
   display: flex; align-items: center; justify-content: space-between;
   padding: 6px 0;
 }
-.sb-setting label {
-  font-size: 12px; color: var(--text-secondary);
-}
-.sb-setting .setting-val {
-  display: flex; align-items: center; gap: 6px;
-}
+.sb-setting label { font-size: 12px; color: var(--text-secondary); }
+.sb-setting .setting-val { display: flex; align-items: center; gap: 6px; }
 .sb-setting .val-num {
   font-size: 13px; font-weight: 700; min-width: 16px; text-align: center;
 }
 
-/* Range slider */
+/* ── Range slider ── */
 input[type="range"] {
   -webkit-appearance: none; appearance: none;
   width: 100px; height: 3px;
-  background: var(--border);
-  border-radius: 2px;
-  outline: none;
+  background: var(--border); border-radius: 2px; outline: none;
 }
 input[type="range"]::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 14px; height: 14px;
-  border-radius: 50%;
-  background: var(--accent);
-  cursor: pointer;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--accent); cursor: pointer;
   transition: transform 0.2s var(--spring);
 }
 input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.2); }
 input[type="range"]::-moz-range-thumb {
-  width: 14px; height: 14px;
-  border-radius: 50%;
-  background: var(--accent);
-  cursor: pointer;
-  border: none;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--accent); cursor: pointer; border: none;
 }
 
-/* Toggle switch */
+/* ── Toggle switch ── */
 .toggle {
-  width: 36px; height: 20px;
-  border-radius: 10px;
-  position: relative;
-  cursor: pointer;
+  width: 36px; height: 20px; border-radius: 10px;
+  position: relative; cursor: pointer;
   border: 1px solid var(--border);
   background: var(--bg-inset);
-  transition: all 0.2s;
-  flex-shrink: 0;
+  transition: all 0.2s; flex-shrink: 0;
 }
 .toggle.on { background: rgba(59,130,246,0.25); border-color: var(--accent); }
 .toggle::after {
-  content: '';
-  position: absolute;
+  content: ''; position: absolute;
   top: 2px; left: 2px;
-  width: 14px; height: 14px;
-  border-radius: 50%;
-  background: var(--dim);
-  transition: all 0.2s var(--spring);
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--dim); transition: all 0.2s var(--spring);
 }
 .toggle.on::after { left: 18px; background: var(--accent); }
 
-/* Run button */
+/* ── Buttons ── */
 .run-btn {
-  width: 100%;
-  padding: 12px;
-  border: none;
-  border-radius: var(--radius-sm);
+  width: 100%; padding: 12px;
+  border: none; border-radius: var(--radius-sm);
   background: var(--gradient);
-  color: #fff;
-  font-size: 14px;
-  font-weight: 700;
-  font-family: var(--font);
-  cursor: pointer;
+  color: #fff; font-size: 14px; font-weight: 700;
+  font-family: var(--font); cursor: pointer;
   transition: all 0.2s var(--spring);
-  position: relative;
-  overflow: hidden;
+  position: relative; overflow: hidden;
   letter-spacing: 0.3px;
 }
 .run-btn:hover:not(:disabled) {
@@ -505,34 +503,36 @@ input[type="range"]::-moz-range-thumb {
 }
 .run-btn:active:not(:disabled) { transform: translateY(0); }
 .run-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-.run-btn.glow {
-  animation: btnGlow 2.5s ease-in-out infinite;
-}
+.run-btn.glow { animation: btnGlow 2.5s ease-in-out infinite; }
 @keyframes btnGlow {
   0%, 100% { box-shadow: 0 0 15px rgba(59,130,246,0.2); }
   50%      { box-shadow: 0 0 30px rgba(59,130,246,0.35), 0 0 50px rgba(139,92,246,0.15); }
 }
 
-/* ================================================================
-   Main: Welcome / Idle State
-   ================================================================ */
-.view-idle, .view-running, .view-results {
+.cancel-btn {
+  width: 100%; padding: 10px;
+  border: 1px solid rgba(239,68,68,0.3);
+  border-radius: var(--radius-sm);
+  background: rgba(239,68,68,0.08);
+  color: var(--red); font-size: 13px; font-weight: 600;
+  font-family: var(--font); cursor: pointer;
+  transition: all 0.15s;
   display: none;
-  animation: viewFadeIn 0.25s ease both;
 }
-.view-idle.active, .view-running.active, .view-results.active {
-  display: block;
-}
+.cancel-btn:hover { background: rgba(239,68,68,0.15); border-color: rgba(239,68,68,0.5); }
+.cancel-btn.visible { display: block; }
+
+/* ================================================================
+   Welcome / Idle State
+   ================================================================ */
+.view-section { display: none; animation: viewFadeIn 0.3s ease both; }
+.view-section.active { display: block; }
 @keyframes viewFadeIn { from { opacity: 0; } to { opacity: 1; } }
 
 .welcome {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  min-height: 60vh;
-  text-align: center;
-  padding: 40px 20px;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  min-height: 60vh; text-align: center; padding: 40px 20px;
 }
 .welcome .w-logo {
   font-size: 48px; font-weight: 900;
@@ -540,65 +540,53 @@ input[type="range"]::-moz-range-thumb {
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
-  letter-spacing: -1.5px;
-  margin-bottom: 16px;
+  letter-spacing: -1.5px; margin-bottom: 16px;
 }
 .welcome .w-subtitle {
-  font-size: 16px;
-  color: var(--muted);
-  max-width: 400px;
-  line-height: 1.6;
+  font-size: 16px; color: var(--muted);
+  max-width: 400px; line-height: 1.6;
 }
 .welcome .w-steps {
   margin-top: 32px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  text-align: left;
+  display: flex; flex-direction: column; gap: 12px; text-align: left;
 }
 .welcome .w-step {
   display: flex; align-items: center; gap: 12px;
   font-size: 14px; color: var(--text-secondary);
 }
 .welcome .w-step-num {
-  width: 28px; height: 28px;
-  border-radius: 50%;
+  width: 28px; height: 28px; border-radius: 50%;
   background: var(--blue-dim);
   border: 1px solid rgba(59,130,246,0.2);
   display: flex; align-items: center; justify-content: center;
-  font-size: 12px; font-weight: 700;
-  color: var(--accent);
+  font-size: 12px; font-weight: 700; color: var(--accent);
   flex-shrink: 0;
 }
 
 /* ================================================================
-   Main: Running View
+   Running View: Progress Header
    ================================================================ */
 .run-header {
-  display: flex;
-  align-items: center;
-  gap: 24px;
-  margin-bottom: 28px;
-  flex-wrap: wrap;
+  display: flex; align-items: center;
+  gap: 24px; margin-bottom: 28px; flex-wrap: wrap;
 }
 .progress-ring-wrap {
   position: relative;
-  width: 140px; height: 140px;
-  flex-shrink: 0;
+  width: 120px; height: 120px; flex-shrink: 0;
 }
 .progress-ring-wrap svg {
   transform: rotate(-90deg);
-  width: 140px; height: 140px;
+  width: 120px; height: 120px;
 }
 .progress-ring-bg {
   fill: none;
   stroke: rgba(59,130,246,0.08);
-  stroke-width: 7;
+  stroke-width: 6;
 }
 .progress-ring-fg {
   fill: none;
   stroke: url(#pgGrad);
-  stroke-width: 7;
+  stroke-width: 6;
   stroke-linecap: round;
   transition: stroke-dashoffset 0.5s var(--ease);
 }
@@ -608,29 +596,24 @@ input[type="range"]::-moz-range-thumb {
   align-items: center; justify-content: center;
 }
 .ring-pct {
-  font-size: 34px; font-weight: 900;
+  font-size: 28px; font-weight: 900;
   background: var(--gradient);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
 }
 .ring-label {
-  font-size: 10px; color: var(--muted);
+  font-size: 9px; color: var(--muted);
   text-transform: uppercase; letter-spacing: 1px;
 }
 
-/* Live counters */
 .live-stats {
   display: flex; gap: 20px; flex-wrap: wrap;
 }
-.lstat {
-  text-align: center;
-}
-.lstat .ls-val {
-  font-size: 24px; font-weight: 800;
-}
+.lstat { text-align: center; }
+.lstat .ls-val { font-size: 22px; font-weight: 800; }
 .lstat .ls-lbl {
-  font-size: 10px; text-transform: uppercase;
+  font-size: 9px; text-transform: uppercase;
   letter-spacing: 0.8px; color: var(--muted); margin-top: 1px;
 }
 .lstat.pass .ls-val { color: var(--green); }
@@ -638,16 +621,6 @@ input[type="range"]::-moz-range-thumb {
 .lstat.active .ls-val { color: var(--accent); }
 .lstat.remain .ls-val { color: var(--dim); }
 
-/* Waiting hint */
-.waiting-hint {
-  text-align: center;
-  padding: 32px 16px;
-  font-size: 14px;
-  color: var(--muted);
-  animation: pulse 2s infinite;
-}
-
-/* Running spinner inline */
 .spin-icon {
   display: inline-block;
   width: 12px; height: 12px;
@@ -660,293 +633,438 @@ input[type="range"]::-moz-range-thumb {
 }
 
 /* ================================================================
-   Model Comparison Table (shared running + results)
+   Timeline
    ================================================================ */
-.section-label {
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 1.5px;
-  color: var(--muted);
-  font-weight: 700;
-  margin-bottom: 12px;
-}
-.dtable {
-  width: 100%;
-  border-collapse: separate;
-  border-spacing: 0;
-  background: var(--bg-surface);
-  border-radius: var(--radius);
-  overflow: hidden;
-  border: 1px solid var(--border);
-  backdrop-filter: blur(12px);
-}
-.dtable th {
-  padding: 10px 14px;
-  text-align: left;
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.8px;
-  color: var(--muted);
-  background: rgba(0,0,0,0.2);
-  font-weight: 700;
-  cursor: pointer;
-  user-select: none;
-  transition: color 0.15s;
-  white-space: nowrap;
-}
-.dtable th:hover { color: var(--text-secondary); }
-.dtable th.sorted { color: var(--accent); }
-.dtable th .sa {
-  font-size: 8px; margin-left: 3px;
-  opacity: 0; transition: opacity 0.15s;
-}
-.dtable th.sorted .sa { opacity: 1; }
-.dtable td {
-  padding: 10px 14px;
-  border-top: 1px solid var(--border-subtle);
-  font-size: 13px;
-}
-.dtable tr:hover td { background: rgba(59,130,246,0.03); }
-.rate-pill {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 4px;
-  font-weight: 700;
-  font-size: 12px;
-  color: #fff;
-}
-
-/* ================================================================
-   Case Cards Grid
-   ================================================================ */
-.case-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
-  gap: 10px;
-}
-@media (max-width: 800px) { .case-grid { grid-template-columns: 1fr; } }
-
-.case-card {
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 14px 14px 14px 18px;
-  cursor: pointer;
-  transition: all 0.2s var(--ease);
-  backdrop-filter: blur(8px);
+.timeline {
   position: relative;
-  animation: cardIn 0.35s var(--spring) both;
+  padding-left: 32px;
+  min-height: 100px;
 }
-.case-card::before {
+/* The vertical line */
+.timeline::before {
   content: '';
   position: absolute;
-  left: 0; top: 10px; bottom: 10px;
-  width: 3px;
-  border-radius: 2px;
-  transition: background 0.2s;
-}
-.case-card.pass::before { background: var(--green); }
-.case-card.fail::before { background: var(--red); }
-.case-card.running::before { background: var(--accent); animation: pulse 1.5s infinite; }
-.case-card:hover {
-  border-color: var(--border-strong);
-  transform: translateY(-1px);
-  box-shadow: 0 4px 24px rgba(0,0,0,0.25);
-}
-@keyframes cardIn {
-  from { opacity: 0; transform: translateX(-12px) scale(0.98); }
-  to   { opacity: 1; transform: translateX(0) scale(1); }
+  left: 11px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: linear-gradient(to bottom, var(--accent), var(--accent2), var(--accent));
+  border-radius: 1px;
+  opacity: 0.3;
 }
 
-.cc-head {
+/* Timeline node (glowing dot on the line) */
+.tl-node {
+  position: relative;
+  margin-bottom: 12px;
+  animation: nodeSlideIn 0.4s var(--ease) both;
+}
+.tl-node::before {
+  content: '';
+  position: absolute;
+  left: -27px;
+  top: 14px;
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 8px rgba(59,130,246,0.4);
+  z-index: 2;
+}
+.tl-node.pass::before { background: var(--green); box-shadow: 0 0 8px rgba(34,197,94,0.4); }
+.tl-node.fail::before { background: var(--red); box-shadow: 0 0 8px rgba(239,68,68,0.4); }
+.tl-node.running::before { background: var(--accent); animation: pulse 1.5s infinite; }
+.tl-node.report::before {
+  background: var(--accent2);
+  box-shadow: 0 0 12px rgba(139,92,246,0.5);
+  width: 12px; height: 12px;
+  left: -28px; top: 13px;
+}
+
+@keyframes nodeSlideIn {
+  from { opacity: 0; transform: translateX(-16px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+/* Timeline group (for parallel cards at same position) */
+.tl-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+/* ── Case Card (used on timeline) ── */
+.tl-card {
+  flex: 1;
+  min-width: 280px;
+  max-width: 500px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  cursor: pointer;
+  transition: all 0.2s var(--ease);
+  backdrop-filter: blur(12px);
+  position: relative;
+}
+.tl-card:hover {
+  transform: scale(1.03);
+  border-color: var(--border-strong);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.3), 0 0 0 1px rgba(100,150,255,0.12);
+}
+
+.tl-card .cc-head {
   display: flex; justify-content: space-between; align-items: flex-start; gap: 8px;
 }
-.cc-name {
+.tl-card .cc-name {
   font-weight: 600; font-size: 13px; word-break: break-word;
 }
-.cc-model-tag {
+.tl-card .cc-model-tag {
   font-size: 11px; color: var(--muted); font-family: var(--mono); margin-top: 2px;
 }
 .badge {
-  padding: 2px 8px;
-  border-radius: 4px;
-  font-size: 9px;
-  font-weight: 800;
-  letter-spacing: 0.6px;
-  text-transform: uppercase;
+  padding: 2px 8px; border-radius: 4px;
+  font-size: 9px; font-weight: 800;
+  letter-spacing: 0.6px; text-transform: uppercase;
   flex-shrink: 0;
 }
 .badge.pass { background: var(--green-dim); color: var(--green); }
 .badge.fail { background: var(--red-dim); color: var(--red); }
 .badge.running { background: var(--blue-dim); color: var(--accent); }
+.badge.cancelled { background: var(--yellow-dim); color: var(--yellow); }
 
-.cc-metrics {
+.tl-card .cc-metrics {
   display: flex; gap: 12px; margin-top: 8px;
-  font-size: 11px; color: var(--text-secondary);
-  flex-wrap: wrap;
+  font-size: 11px; color: var(--text-secondary); flex-wrap: wrap;
 }
-.cc-metrics .m {
+.tl-card .cc-metrics .m {
   display: flex; align-items: center; gap: 3px;
 }
-.cc-metrics .m-icon { opacity: 0.5; font-size: 10px; }
+.tl-card .cc-metrics .m-icon { opacity: 0.5; font-size: 10px; }
 
-/* Expandable detail */
-.cc-detail {
-  display: none;
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid var(--border);
-  font-size: 12px;
+/* ── Report card (at end of timeline) ── */
+.tl-card.report-card {
+  background: linear-gradient(135deg, rgba(59,130,246,0.08), rgba(139,92,246,0.08));
+  border-color: rgba(139,92,246,0.2);
+  max-width: 600px;
 }
-.case-card.expanded .cc-detail { display: block; animation: fadeIn 0.2s ease; }
+.tl-card.report-card:hover {
+  border-color: rgba(139,92,246,0.4);
+  box-shadow: 0 8px 32px rgba(139,92,246,0.15);
+}
 
-.criteria-list { display: flex; flex-direction: column; gap: 3px; }
+/* ================================================================
+   Detail Panel Content
+   ================================================================ */
+.detail-panel-inner {
+  padding: 24px;
+}
+.detail-close {
+  position: absolute; top: 16px; right: 16px;
+  width: 32px; height: 32px; border-radius: 50%;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-size: 18px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.15s;
+  z-index: 2;
+}
+.detail-close:hover { background: rgba(255,255,255,0.05); color: var(--text); }
+
+.detail-badge-big {
+  display: inline-flex; padding: 6px 16px;
+  border-radius: var(--radius-sm);
+  font-size: 14px; font-weight: 800;
+  letter-spacing: 1px; text-transform: uppercase;
+  margin-bottom: 16px;
+}
+.detail-badge-big.pass { background: var(--green-dim); color: var(--green); }
+.detail-badge-big.fail { background: var(--red-dim); color: var(--red); }
+
+.detail-title {
+  font-size: 18px; font-weight: 700; margin-bottom: 4px;
+}
+.detail-model {
+  font-size: 13px; color: var(--muted); font-family: var(--mono);
+  margin-bottom: 16px;
+}
+
+.detail-stats {
+  display: flex; gap: 16px; flex-wrap: wrap;
+  margin-bottom: 20px;
+  padding: 12px;
+  background: var(--bg-inset);
+  border-radius: var(--radius-sm);
+}
+.detail-stat {
+  text-align: center;
+}
+.detail-stat .ds-val { font-size: 16px; font-weight: 700; }
+.detail-stat .ds-lbl { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+
+.detail-section { margin-bottom: 16px; }
+.detail-label {
+  font-size: 10px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 1px;
+  margin-bottom: 6px; font-weight: 700;
+}
+
+/* Criteria list in detail panel */
+.criteria-list { display: flex; flex-direction: column; gap: 4px; }
 .crit-row {
-  display: flex; align-items: flex-start; gap: 7px;
-  padding: 3px 0;
+  display: flex; align-items: flex-start; gap: 8px;
+  padding: 4px 0;
 }
 .crit-dot {
-  width: 7px; height: 7px;
-  border-radius: 50%;
-  flex-shrink: 0;
-  margin-top: 4px;
+  width: 8px; height: 8px; border-radius: 50%;
+  flex-shrink: 0; margin-top: 4px;
 }
 .crit-dot.ok { background: var(--green); }
 .crit-dot.no { background: var(--red); }
-.crit-text { color: var(--text-secondary); line-height: 1.4; }
+.crit-text { color: var(--text-secondary); line-height: 1.4; font-size: 13px; }
 
-.score-bar-wrap { margin-top: 4px; }
-.score-bar-lbl { font-size: 10px; color: var(--muted); margin-bottom: 2px; }
-.score-bar {
-  height: 4px; background: rgba(0,0,0,0.3);
-  border-radius: 2px; overflow: hidden;
+/* Judger score bar */
+.score-bar-wrap { margin-top: 6px; }
+.score-bar-lbl { font-size: 11px; color: var(--text-secondary); margin-bottom: 3px; }
+.score-bar-outer {
+  height: 6px; background: rgba(0,0,0,0.3);
+  border-radius: 3px; overflow: hidden;
 }
 .score-bar-fill {
-  height: 100%; border-radius: 2px;
+  height: 100%; border-radius: 3px;
   transition: width 0.4s ease;
 }
 
-.detail-section { margin-top: 8px; }
-.detail-label {
-  font-size: 10px; color: var(--muted);
-  text-transform: uppercase; letter-spacing: 0.5px;
-  margin-bottom: 3px;
+/* Copyable element */
+.copyable-row {
+  display: flex; align-items: center; gap: 6px;
+  margin-top: 4px;
 }
+.copyable-text {
+  font-family: var(--mono); font-size: 12px;
+  background: var(--bg-inset);
+  padding: 6px 10px; border-radius: var(--radius-xs);
+  flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+}
+.copy-btn {
+  padding: 6px 10px; border-radius: var(--radius-xs);
+  background: var(--blue-dim);
+  border: 1px solid rgba(59,130,246,0.15);
+  color: var(--accent); font-size: 11px; font-weight: 600;
+  cursor: pointer; font-family: var(--font);
+  transition: all 0.15s; white-space: nowrap;
+}
+.copy-btn:hover { background: rgba(59,130,246,0.2); }
 
+/* Code block */
+.code-block {
+  position: relative;
+  background: rgba(0,0,0,0.3);
+  padding: 10px 14px; border-radius: var(--radius-xs);
+  overflow-x: auto; font-family: var(--mono); font-size: 11px;
+  white-space: pre-wrap; word-break: break-all;
+  color: var(--text-secondary);
+  max-height: 250px; overflow-y: auto;
+  margin-top: 4px;
+  border: 1px solid var(--border);
+}
+.code-block .code-copy {
+  position: absolute; top: 6px; right: 6px;
+  padding: 3px 8px; border-radius: 4px;
+  background: var(--bg-inset); border: 1px solid var(--border);
+  color: var(--muted); font-size: 10px; cursor: pointer;
+  font-family: var(--font); transition: all 0.15s;
+  opacity: 0;
+}
+.code-block:hover .code-copy { opacity: 1; }
+.code-block .code-copy:hover { color: var(--text); border-color: var(--border-strong); }
+
+/* Step cards in detail panel */
 .step-card {
-  background: rgba(0,0,0,0.15);
-  border-radius: var(--radius-xs);
-  padding: 7px 10px;
-  margin: 3px 0;
-  font-size: 11px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px; margin-top: 8px;
 }
-.step-card .step-hdr {
-  display: flex; justify-content: space-between;
-  color: var(--text-secondary);
+.step-hdr {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 4px;
 }
-.step-card .step-prompt {
-  margin-top: 3px; color: var(--muted); font-style: italic;
+.step-hdr .step-idx {
+  font-size: 11px; font-weight: 700; color: var(--text-secondary);
 }
-
-.copyable {
-  display: inline-flex; align-items: center; gap: 4px;
-  font-family: var(--mono); font-size: 10px;
-  background: rgba(59,130,246,0.06);
-  padding: 3px 7px; border-radius: 3px;
-  cursor: pointer; user-select: all;
-  transition: background 0.15s;
-  max-width: 100%; overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap;
+.step-hdr .step-dur { font-size: 11px; color: var(--muted); }
+.step-prompt {
+  font-size: 12px; color: var(--muted); font-style: italic;
+  margin-bottom: 4px;
 }
-.copyable:hover { background: rgba(59,130,246,0.12); }
-
-.cc-detail pre {
-  background: rgba(0,0,0,0.25);
-  padding: 8px 12px;
-  border-radius: var(--radius-xs);
-  overflow-x: auto;
-  font-family: var(--mono);
-  font-size: 11px;
-  margin: 6px 0;
-  white-space: pre-wrap;
-  word-break: break-all;
-  color: var(--text-secondary);
-  max-height: 250px;
-  overflow-y: auto;
+.step-outcome-text {
+  font-size: 11px; color: var(--text-secondary);
+  margin-bottom: 4px;
 }
 
-.collapse-btn {
-  display: flex; align-items: center; gap: 4px;
-  font-size: 10px; color: var(--muted);
+/* Collapsible sections in detail */
+.collapse-toggle {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--text-secondary);
   cursor: pointer; user-select: none;
   border: none; background: none;
-  padding: 2px 0; font-family: var(--font);
+  padding: 4px 0; font-family: var(--font);
+  transition: color 0.15s;
 }
-.collapse-btn:hover { color: var(--text-secondary); }
-.collapse-btn .caret {
-  font-size: 7px; transition: transform 0.15s;
+.collapse-toggle:hover { color: var(--text); }
+.collapse-toggle .caret {
+  font-size: 8px; transition: transform 0.15s;
+  display: inline-block;
 }
-.collapse-btn .caret.open { transform: rotate(90deg); }
-.collapse-content { display: none; }
-.collapse-content.open { display: block; }
+.collapse-toggle .caret.open { transform: rotate(90deg); }
+.collapse-body { display: none; margin-top: 4px; }
+.collapse-body.open { display: block; }
 
 /* ================================================================
-   Results: Summary Header
+   Report Panel (shown in detail panel or as modal)
    ================================================================ */
-.results-summary {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 40px;
-  padding: 32px 0;
-  flex-wrap: wrap;
+.report-table {
+  width: 100%;
+  border-collapse: separate; border-spacing: 0;
+  background: var(--bg-surface);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  font-size: 13px;
 }
-.big-rate {
-  text-align: center;
+.report-table th {
+  padding: 8px 12px; text-align: left;
+  font-size: 10px; text-transform: uppercase;
+  letter-spacing: 0.8px; color: var(--muted);
+  background: rgba(0,0,0,0.2); font-weight: 700;
 }
-.big-rate .big-pct {
-  font-size: 64px; font-weight: 900; line-height: 1;
+.report-table td {
+  padding: 8px 12px;
+  border-top: 1px solid var(--border-subtle);
 }
-.big-rate .big-lbl {
-  font-size: 12px; color: var(--muted);
-  text-transform: uppercase; letter-spacing: 1px; margin-top: 4px;
+.rate-pill {
+  display: inline-block; padding: 2px 8px;
+  border-radius: 4px; font-weight: 700;
+  font-size: 12px; color: #fff;
 }
-.summary-stats {
-  display: flex; flex-direction: column; gap: 10px;
-}
-.sum-stat {
-  display: flex; align-items: center; gap: 8px;
-}
-.sum-stat .dot {
-  width: 8px; height: 8px; border-radius: 50%;
-}
-.sum-stat .dot.g { background: var(--green); }
-.sum-stat .dot.r { background: var(--red); }
-.sum-stat .dot.b { background: var(--accent); }
-.sum-stat .sv { font-size: 16px; font-weight: 700; }
-.sum-stat .sl { font-size: 12px; color: var(--muted); }
 
-/* Results filter bar */
-.result-filters {
-  display: flex; gap: 8px; margin-bottom: 14px;
-  flex-wrap: wrap; align-items: center;
+/* Summary stats row in report */
+.report-summary {
+  display: flex; gap: 24px; flex-wrap: wrap;
+  margin-bottom: 16px;
 }
-.result-filters select, .result-filters input {
-  padding: 7px 10px;
+.report-stat { text-align: center; }
+.report-stat .rs-val { font-size: 28px; font-weight: 900; line-height: 1; }
+.report-stat .rs-lbl {
+  font-size: 10px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.8px; margin-top: 4px;
+}
+
+/* ================================================================
+   Ask Astra Chat Panel (bottom)
+   ================================================================ */
+.chat-panel {
+  border-top: 1px solid var(--border);
+  background: var(--bg-raised);
+  transition: height 0.3s var(--ease);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.chat-panel.collapsed { height: 40px !important; }
+.chat-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 16px;
+  cursor: pointer;
+  user-select: none;
+  flex-shrink: 0;
+}
+.chat-header-left {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; font-weight: 600; color: var(--text-secondary);
+}
+.chat-header-left .chat-icon { font-size: 15px; }
+.chat-collapse-btn {
+  font-size: 16px; color: var(--muted);
+  background: none; border: none; cursor: pointer;
+  transition: transform 0.2s;
+  font-family: var(--font);
+}
+.chat-panel.collapsed .chat-collapse-btn { transform: rotate(180deg); }
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 16px 8px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.chat-msg {
+  max-width: 80%;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  line-height: 1.5;
+  animation: chatMsgIn 0.2s ease both;
+}
+@keyframes chatMsgIn { from { opacity: 0; transform: translateY(6px); } }
+.chat-msg.user {
+  align-self: flex-end;
+  background: var(--blue-dim);
+  border: 1px solid rgba(59,130,246,0.2);
+  color: var(--text);
+}
+.chat-msg.assistant {
+  align-self: flex-start;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+}
+.chat-msg.error {
+  align-self: flex-start;
+  background: var(--red-dim);
+  border: 1px solid rgba(239,68,68,0.2);
+  color: var(--red);
+  font-size: 12px;
+}
+.chat-input-row {
+  display: flex; gap: 8px;
+  padding: 8px 16px 12px;
+  flex-shrink: 0;
+}
+.chat-model-select {
+  padding: 8px 10px;
   background: var(--bg-inset);
   border: 1px solid var(--border);
   border-radius: var(--radius-xs);
   color: var(--text);
-  font-size: 12px;
-  font-family: var(--font);
+  font-size: 12px; font-family: var(--font);
+  outline: none; width: 140px; flex-shrink: 0;
+}
+.chat-model-select option { background: var(--bg-raised); }
+.chat-input {
+  flex: 1;
+  padding: 8px 12px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  color: var(--text);
+  font-size: 13px; font-family: var(--font);
   outline: none;
   transition: border-color 0.15s;
 }
-.result-filters select:focus, .result-filters input:focus { border-color: var(--accent); }
-.result-filters select option { background: var(--bg-raised); }
-.result-filters .rf-search {
-  flex: 1; min-width: 140px;
+.chat-input:focus { border-color: var(--accent); }
+.chat-input::placeholder { color: var(--dim); }
+.chat-send-btn {
+  padding: 8px 16px;
+  background: var(--gradient);
+  border: none; border-radius: var(--radius-xs);
+  color: #fff; font-size: 13px; font-weight: 600;
+  cursor: pointer; font-family: var(--font);
+  transition: all 0.15s; white-space: nowrap;
 }
+.chat-send-btn:hover { box-shadow: 0 2px 12px rgba(59,130,246,0.3); }
+.chat-send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* ================================================================
    Toast Notifications
@@ -961,8 +1079,7 @@ input[type="range"]::-moz-range-thumb {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 10px 14px;
-  font-size: 12px;
-  color: var(--text);
+  font-size: 12px; color: var(--text);
   backdrop-filter: blur(16px);
   box-shadow: 0 4px 24px rgba(0,0,0,0.35);
   max-width: 360px;
@@ -977,20 +1094,11 @@ input[type="range"]::-moz-range-thumb {
 @keyframes toastOut { from { opacity: 1; } to { opacity: 0; transform: translateX(80px); } }
 
 /* ================================================================
-   Empty state
-   ================================================================ */
-.empty-msg {
-  text-align: center; padding: 40px 16px;
-  color: var(--muted); font-size: 13px;
-}
-
-/* ================================================================
-   Utility Animations
+   Utility
    ================================================================ */
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-
 .hidden { display: none !important; }
 
 /* Scrollbar */
@@ -999,18 +1107,39 @@ input[type="range"]::-moz-range-thumb {
 ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.14); }
 
-/* Section spacing */
+.empty-msg {
+  text-align: center; padding: 40px 16px;
+  color: var(--muted); font-size: 13px;
+}
+.section-label {
+  font-size: 10px; text-transform: uppercase;
+  letter-spacing: 1.5px; color: var(--muted);
+  font-weight: 700; margin-bottom: 12px;
+}
 .sec { margin-top: 24px; }
 </style>
 </head>
 <body>
 
-<div class="bg-canvas"><div class="mesh-extra"></div></div>
+<!-- Background mesh -->
+<div class="bg-canvas">
+  <div class="bg-orb bg-orb-1"></div>
+  <div class="bg-orb bg-orb-2"></div>
+  <div class="bg-orb bg-orb-3"></div>
+</div>
+
 <div class="toast-container" id="toasts"></div>
 
-<!-- Mobile toggle -->
+<!-- Mobile sidebar toggle -->
 <button class="mobile-toggle" id="mobileToggle" type="button">&#9776;</button>
 <div class="sidebar-overlay" id="sidebarOverlay"></div>
+
+<!-- Detail panel (slides in from right) -->
+<div class="detail-overlay" id="detailOverlay"></div>
+<div class="detail-panel" id="detailPanel">
+  <button class="detail-close" id="detailClose" type="button">&times;</button>
+  <div class="detail-panel-inner" id="detailContent"></div>
+</div>
 
 <div class="app-layout">
 
@@ -1021,6 +1150,7 @@ input[type="range"]::-moz-range-thumb {
     <div class="sidebar-scroll">
       <!-- Logo + Connection -->
       <div class="sidebar-logo">
+        <div class="logo-icon">A</div>
         <div class="logo-text">astra-test</div>
       </div>
       <div class="conn-indicator">
@@ -1034,7 +1164,7 @@ input[type="range"]::-moz-range-thumb {
           <span class="sb-section-title">Models</span>
           <div class="sb-section-actions">
             <button type="button" id="modelSelectAll">All</button>
-            <button type="button" id="modelSelectNone">None</button>
+            <button type="button" id="modelSelectNone">Clear</button>
           </div>
         </div>
         <div class="sb-check-list" id="modelList"></div>
@@ -1051,7 +1181,7 @@ input[type="range"]::-moz-range-thumb {
           <span class="sb-section-title">Cases <span id="casesCount" style="color:var(--dim)"></span></span>
           <div class="sb-section-actions">
             <button type="button" id="caseSelectAll">All</button>
-            <button type="button" id="caseSelectNone">None</button>
+            <button type="button" id="caseSelectNone">Clear</button>
           </div>
         </div>
         <input type="text" class="sb-search" id="caseSearch" placeholder="Search cases..." />
@@ -1086,9 +1216,10 @@ input[type="range"]::-moz-range-thumb {
       </div>
     </div>
 
-    <!-- Run Button at bottom -->
+    <!-- Run/Cancel buttons at bottom -->
     <div class="sidebar-bottom">
       <button class="run-btn glow" id="runBtn" type="button">Run Suite</button>
+      <button class="cancel-btn" id="cancelBtn" type="button">Cancel Run</button>
     </div>
   </aside>
 
@@ -1096,110 +1227,82 @@ input[type="range"]::-moz-range-thumb {
        Main Content Area
        ============================================================ -->
   <main class="main-area">
+    <div class="main-scroll" id="mainScroll">
 
-    <!-- Idle / Welcome -->
-    <div class="view-idle active" id="viewIdle">
-      <div class="welcome">
-        <div class="w-logo">astra-test</div>
-        <div class="w-subtitle">
-          Agent evaluation harness. Select models and cases in the sidebar, then click Run Suite.
-        </div>
-        <div class="w-steps">
-          <div class="w-step"><span class="w-step-num">1</span> Select one or more models to evaluate</div>
-          <div class="w-step"><span class="w-step-num">2</span> Choose which test cases to run</div>
-          <div class="w-step"><span class="w-step-num">3</span> Click Run Suite and watch results stream in</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Running -->
-    <div class="view-running" id="viewRunning">
-      <!-- Progress header -->
-      <div class="run-header">
-        <div class="progress-ring-wrap">
-          <svg viewBox="0 0 140 140">
-            <defs>
-              <linearGradient id="pgGrad" x1="0%" y1="0%" x2="100%" y2="0%">
-                <stop offset="0%" stop-color="var(--accent)" />
-                <stop offset="100%" stop-color="var(--accent2)" />
-              </linearGradient>
-            </defs>
-            <circle class="progress-ring-bg" cx="70" cy="70" r="62" />
-            <circle class="progress-ring-fg" id="ringFg" cx="70" cy="70" r="62"
-                    stroke-dasharray="389.56" stroke-dashoffset="389.56" />
-          </svg>
-          <div class="progress-ring-center">
-            <div class="ring-pct" id="ringPct">0%</div>
-            <div class="ring-label">complete</div>
+      <!-- Idle / Welcome -->
+      <div class="view-section active" id="viewIdle">
+        <div class="welcome">
+          <div class="w-logo">astra-test</div>
+          <div class="w-subtitle">
+            Agent evaluation harness. Select models and cases in the sidebar, then click Run Suite.
+          </div>
+          <div class="w-steps">
+            <div class="w-step"><span class="w-step-num">1</span> Select one or more models to evaluate</div>
+            <div class="w-step"><span class="w-step-num">2</span> Choose which test cases to run</div>
+            <div class="w-step"><span class="w-step-num">3</span> Click Run Suite and watch results stream in</div>
           </div>
         </div>
-        <div class="live-stats">
-          <div class="lstat pass"><div class="ls-val" id="lsPassed">0</div><div class="ls-lbl">Passed</div></div>
-          <div class="lstat fail"><div class="ls-val" id="lsFailed">0</div><div class="ls-lbl">Failed</div></div>
-          <div class="lstat active"><div class="ls-val" id="lsActive">0</div><div class="ls-lbl">Active</div></div>
-          <div class="lstat remain"><div class="ls-val" id="lsRemain">0</div><div class="ls-lbl">Remaining</div></div>
+      </div>
+
+      <!-- Running (timeline view) -->
+      <div class="view-section" id="viewRunning">
+        <!-- Progress header -->
+        <div class="run-header">
+          <div class="progress-ring-wrap">
+            <svg viewBox="0 0 120 120">
+              <defs>
+                <linearGradient id="pgGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                  <stop offset="0%" stop-color="var(--accent)" />
+                  <stop offset="100%" stop-color="var(--accent2)" />
+                </linearGradient>
+              </defs>
+              <circle class="progress-ring-bg" cx="60" cy="60" r="54" />
+              <circle class="progress-ring-fg" id="ringFg" cx="60" cy="60" r="54"
+                      stroke-dasharray="339.29" stroke-dashoffset="339.29" />
+            </svg>
+            <div class="progress-ring-center">
+              <div class="ring-pct" id="ringPct">0%</div>
+              <div class="ring-label">complete</div>
+            </div>
+          </div>
+          <div class="live-stats">
+            <div class="lstat pass"><div class="ls-val" id="lsPassed">0</div><div class="ls-lbl">Passed</div></div>
+            <div class="lstat fail"><div class="ls-val" id="lsFailed">0</div><div class="ls-lbl">Failed</div></div>
+            <div class="lstat active"><div class="ls-val" id="lsActive">0</div><div class="ls-lbl">Active</div></div>
+            <div class="lstat remain"><div class="ls-val" id="lsRemain">0</div><div class="ls-lbl">Remaining</div></div>
+          </div>
+        </div>
+
+        <!-- Timeline -->
+        <div class="sec">
+          <div class="section-label">Timeline</div>
+          <div class="timeline" id="timeline">
+            <div class="empty-msg" id="timelineEmpty">Waiting for results...</div>
+          </div>
         </div>
       </div>
 
-      <!-- Waiting hint -->
-      <div class="waiting-hint" id="waitingHint" style="display:none">Waiting for first result...</div>
-
-      <!-- Live model comparison -->
-      <div class="sec" id="liveModelSec" style="display:none">
-        <div class="section-label">Model Comparison (Live)</div>
-        <table class="dtable" id="liveModelTable">
-          <thead><tr>
-            <th>Model</th><th>Pass</th><th>Rate</th>
-            <th>Tok/Pass</th><th>Dur/Pass</th><th>Turns/Pass</th>
-          </tr></thead>
-          <tbody id="liveModelBody"></tbody>
-        </table>
-      </div>
-
-      <!-- Live case cards -->
-      <div class="sec">
-        <div class="section-label">Cases</div>
-        <div class="case-grid" id="liveGrid"></div>
-        <div class="empty-msg" id="liveEmpty">Cases will appear here as they complete</div>
-      </div>
     </div>
 
-    <!-- Results -->
-    <div class="view-results" id="viewResults">
-      <div class="results-summary" id="resultsSummary"></div>
-
-      <!-- Model comparison (sortable) -->
-      <div class="sec" id="resultModelSec" style="display:none">
-        <div class="section-label">Model Comparison</div>
-        <table class="dtable" id="resultModelTable">
-          <thead><tr>
-            <th data-col="model">Model <span class="sa"></span></th>
-            <th data-col="rate">Pass Rate <span class="sa"></span></th>
-            <th data-col="tokPass">Tok/Pass <span class="sa"></span></th>
-            <th data-col="durPass">Dur/Pass <span class="sa"></span></th>
-            <th data-col="turnsPass">Turns/Pass <span class="sa"></span></th>
-          </tr></thead>
-          <tbody id="resultModelBody"></tbody>
-        </table>
-      </div>
-
-      <!-- Filtered case list -->
-      <div class="sec">
-        <div class="section-label">Case Results</div>
-        <div class="result-filters" id="resultFilters">
-          <select id="rfModel"><option value="">All Models</option></select>
-          <select id="rfStatus">
-            <option value="">All Statuses</option>
-            <option value="pass">Passed</option>
-            <option value="fail">Failed</option>
-          </select>
-          <select id="rfCap"><option value="">All Capabilities</option></select>
-          <input type="text" class="rf-search" id="rfSearch" placeholder="Search cases..." />
+    <!-- Ask Astra chat panel (bottom) -->
+    <div class="chat-panel collapsed" id="chatPanel">
+      <div class="chat-header" id="chatHeader">
+        <div class="chat-header-left">
+          <span class="chat-icon">&#128172;</span>
+          <span>Ask Astra</span>
         </div>
-        <div class="case-grid" id="resultGrid"></div>
+        <button class="chat-collapse-btn" type="button">&#9660;</button>
+      </div>
+      <div class="chat-messages" id="chatMessages"></div>
+      <div class="chat-input-row">
+        <select class="chat-model-select" id="chatModel">
+          <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
+        </select>
+        <input type="text" class="chat-input" id="chatInput"
+               placeholder="Why did case X fail? Compare sonnet vs minimax..." />
+        <button class="chat-send-btn" id="chatSend" type="button">Send</button>
       </div>
     </div>
-
   </main>
 </div>
 
@@ -1218,13 +1321,13 @@ const S = {
 
   // Config from server
   config: { suite_dir: '', available_models: [], judger_model: '' },
-  allCases: [],        // from /api/cases
+  allCases: [],
 
   // User selections
   selectedModels: new Set(),
   selectedCases: new Set(),
-  capFilter: '',       // capability filter for case list
-  caseSearch: '',      // text search for case list
+  capFilter: '',
+  caseSearch: '',
 
   // Settings
   parallel: 2,
@@ -1240,14 +1343,22 @@ const S = {
   passed: 0,
   failed: 0,
   runningSet: new Map(),
-  runs: [],
+  runs: [],           // completed CaseRunReports
   startTime: null,
   suiteReport: null,
   waitingTimer: null,
+  cancelled: false,
 
-  // Results sort
-  sortCol: 'rate',
-  sortAsc: false,
+  // Timeline batch: accumulate cards arriving in quick succession
+  tlBatchTimer: null,
+  tlBatchQueue: [],
+
+  // Chat
+  chatSessionId: null,
+  chatHistory: [],     // { role, text }
+
+  // Detail panel state
+  detailOpen: false,
 };
 
 const PRESETS = ['claude-sonnet-4-6', 'MiniMax-M2.7', 'qwen-flash', 'deepseek-chat', 'gpt-4o'];
@@ -1294,10 +1405,11 @@ function rateFg(rate) {
   return 'var(--red)';
 }
 
-function diffStars(d) {
-  if (!d || d < 1) return '';
-  const n = Math.min(d, 5);
-  return '★'.repeat(n);
+function capBadgeClass(cap) {
+  if (!cap) return 'default';
+  const lc = String(cap).toLowerCase().replace(/\s+/g, '_');
+  const known = ['reasoning', 'tool_use', 'delegation', 'coding'];
+  return known.includes(lc) ? lc : 'default';
 }
 
 const CHECK_SVG = '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6l2.5 2.5 4.5-5"/></svg>';
@@ -1324,7 +1436,8 @@ function setPhase(p) {
   S.phase = p;
   $('viewIdle').classList.toggle('active', p === 'idle');
   $('viewRunning').classList.toggle('active', p === 'running');
-  $('viewResults').classList.toggle('active', p === 'results');
+  // Cancel button visibility
+  $('cancelBtn').classList.toggle('visible', p === 'running');
 }
 
 /* ================================================================
@@ -1338,6 +1451,25 @@ $('sidebarOverlay').addEventListener('click', () => {
   $('sidebar').classList.remove('open');
   $('sidebarOverlay').classList.remove('open');
 });
+
+/* ================================================================
+   Detail Panel
+   ================================================================ */
+function openDetailPanel(html) {
+  $('detailContent').innerHTML = html;
+  $('detailPanel').classList.add('open');
+  $('detailOverlay').classList.add('open');
+  S.detailOpen = true;
+}
+
+function closeDetailPanel() {
+  $('detailPanel').classList.remove('open');
+  $('detailOverlay').classList.remove('open');
+  S.detailOpen = false;
+}
+
+$('detailClose').addEventListener('click', closeDetailPanel);
+$('detailOverlay').addEventListener('click', closeDetailPanel);
 
 /* ================================================================
    Models: Build & Render
@@ -1420,7 +1552,6 @@ function renderCapPills() {
   const container = $('capPills');
   container.innerHTML = '';
   const caps = getCapabilities();
-  // "All" pill
   const allPill = document.createElement('button');
   allPill.className = 'cap-pill' + (!S.capFilter ? ' active' : '');
   allPill.textContent = 'All';
@@ -1465,9 +1596,19 @@ function renderCaseList() {
     item.className = 'sb-check-item' + (checked ? ' checked' : '');
 
     let metaHtml = '';
-    if (c.capability) metaHtml += `<span class="case-cap-badge">${esc(c.capability)}</span>`;
-    if (c.difficulty) metaHtml += `<span class="case-diff-stars">${diffStars(c.difficulty)}</span>`;
-    if (c.has_steps) metaHtml += `<span class="case-steps-dot" title="Multi-step"></span>`;
+    if (c.capability) {
+      metaHtml += `<span class="case-cap-badge ${capBadgeClass(c.capability)}">${esc(c.capability)}</span>`;
+    }
+    if (c.difficulty) {
+      let dots = '';
+      for (let i = 1; i <= 5; i++) {
+        dots += `<span class="case-diff-dot${i <= c.difficulty ? ' filled' : ''}"></span>`;
+      }
+      metaHtml += `<span class="case-diff-dots">${dots}</span>`;
+    }
+    if (c.has_steps) {
+      metaHtml += `<span class="case-steps-icon" title="Multi-turn">&#8644;</span>`;
+    }
 
     item.innerHTML = `<span class="ck">${CHECK_SVG}</span><span class="item-label" title="${esc(c.description || c.name)}">${esc(c.name)}</span><span class="item-meta">${metaHtml}</span>`;
     item.addEventListener('click', () => {
@@ -1506,9 +1647,10 @@ $('judgerToggle').addEventListener('click', () => {
 });
 
 /* ================================================================
-   Run Button
+   Run + Cancel Buttons
    ================================================================ */
 $('runBtn').addEventListener('click', startRun);
+$('cancelBtn').addEventListener('click', cancelRun);
 
 function startRun() {
   if (S.selectedModels.size === 0) {
@@ -1523,6 +1665,7 @@ function startRun() {
   $('runBtn').disabled = true;
   $('runBtn').classList.remove('glow');
   $('runBtn').textContent = 'Starting...';
+  S.cancelled = false;
 
   const body = {
     models: [...S.selectedModels],
@@ -1530,24 +1673,9 @@ function startRun() {
     no_judger: S.noJudger,
   };
 
-  // Build filter from selected cases
-  // If all cases are selected, no filter needed
+  // Send explicit case names when not all are selected
   if (S.selectedCases.size < S.allCases.length && S.selectedCases.size > 0) {
-    const names = [...S.selectedCases];
-    // Use glob pattern: join with commas or send as filter
-    // The API uses filter as a glob pattern; since we have individual names,
-    // we can join them with commas or use a regex-like approach.
-    // For the API: if it's a simple glob, we send individual names joined.
-    // Actually the API takes a glob pattern. For individual selection, the
-    // best approach is to send a pattern that matches exactly those names.
-    // We can create a pattern like: {name1,name2,name3}
-    // But safer: if filter supports comma-separated or we send them as-is.
-    // Let's use brace expansion syntax which some glob implementations support.
-    if (names.length === 1) {
-      body.filter = names[0];
-    } else {
-      body.filter = '{' + names.join(',') + '}';
-    }
+    body.cases = [...S.selectedCases];
   }
 
   const jm = $('judgerModelIn').value.trim();
@@ -1564,7 +1692,6 @@ function startRun() {
         toast(data.error, 'error');
         resetRunBtn();
       }
-      // suite_started via WS will trigger phase switch
     })
     .catch(e => {
       toast('Run request failed: ' + e.message, 'error');
@@ -1572,18 +1699,39 @@ function startRun() {
     });
 }
 
+function cancelRun() {
+  $('cancelBtn').textContent = 'Cancelling...';
+  $('cancelBtn').disabled = true;
+  S.cancelled = true;
+  fetch('/api/cancel', { method: 'POST' })
+    .then(r => r.json())
+    .then(data => {
+      if (data.status === 'cancelled') {
+        toast('Run cancelled', 'info');
+      } else if (data.error) {
+        toast(data.error, 'error');
+      }
+    })
+    .catch(e => toast('Cancel failed: ' + e.message, 'error'))
+    .finally(() => {
+      $('cancelBtn').textContent = 'Cancel Run';
+      $('cancelBtn').disabled = false;
+    });
+}
+
 function resetRunBtn() {
   $('runBtn').disabled = false;
   $('runBtn').classList.add('glow');
   $('runBtn').textContent = 'Run Suite';
+  $('cancelBtn').classList.remove('visible');
 }
 
 /* ================================================================
-   Running View: Updates
+   Running View: Progress Updates
    ================================================================ */
-const CIRC = 2 * Math.PI * 62; // ~389.56
+const CIRC = 2 * Math.PI * 54; // ~339.29
 
-function updateRunning() {
+function updateProgress() {
   const pct = S.total > 0 ? Math.round((S.completed / S.total) * 100) : 0;
   $('ringPct').textContent = pct + '%';
   $('ringFg').setAttribute('stroke-dashoffset', CIRC - (CIRC * pct / 100));
@@ -1593,34 +1741,228 @@ function updateRunning() {
   const active = S.runningSet.size;
   $('lsActive').innerHTML = active + (active > 0 ? '<span class="spin-icon"></span>' : '');
   $('lsRemain').textContent = Math.max(0, S.total - S.completed - active);
-
-  updateLiveModelTable();
 }
 
-function updateLiveModelTable() {
+/* ================================================================
+   Timeline: Card Rendering
+   ================================================================ */
+function addTimelineCard(report, idx) {
+  const tl = $('timeline');
+  $('timelineEmpty').style.display = 'none';
+
+  const status = report.passed ? 'pass' : 'fail';
+  const tok = (report.outcome.prompt_tokens || 0) + (report.outcome.completion_tokens || 0);
+
+  const node = document.createElement('div');
+  node.className = 'tl-node ' + status;
+  node.style.animationDelay = (idx * 40) + 'ms';
+
+  const card = document.createElement('div');
+  card.className = 'tl-card';
+  card.innerHTML = `
+    <div class="cc-head">
+      <div>
+        <div class="cc-name">${esc(report.case_name)}</div>
+        <div class="cc-model-tag">${esc(normModel(report.model))}</div>
+      </div>
+      <span class="badge ${status}">${report.passed ? 'PASS' : 'FAIL'}</span>
+    </div>
+    <div class="cc-metrics">
+      <span class="m"><span class="m-icon">&#9201;</span>${formatDur(report.outcome.duration_ms || 0)}</span>
+      <span class="m"><span class="m-icon">&#9671;</span>${formatTok(tok)} tok</span>
+      <span class="m"><span class="m-icon">&#8634;</span>${report.outcome.turn_rounds || 0} turns</span>
+      <span class="m"><span class="m-icon">&#9881;</span>${report.outcome.tool_calls_count || 0} tools</span>
+    </div>`;
+
+  // Click to open detail panel
+  card.addEventListener('click', () => openCaseDetail(report));
+
+  node.appendChild(card);
+  tl.appendChild(node);
+}
+
+/* ================================================================
+   Case Detail Panel Content
+   ================================================================ */
+function openCaseDetail(report) {
+  const status = report.passed ? 'pass' : 'fail';
+  const tok = (report.outcome.prompt_tokens || 0) + (report.outcome.completion_tokens || 0);
+
+  let html = '';
+
+  // Big badge
+  html += `<div class="detail-badge-big ${status}">${report.passed ? 'PASS' : 'FAIL'}</div>`;
+
+  // Title + model
+  html += `<div class="detail-title">${esc(report.case_name)}</div>`;
+  html += `<div class="detail-model">${esc(normModel(report.model))}</div>`;
+
+  // Stats row
+  html += `<div class="detail-stats">
+    <div class="detail-stat"><div class="ds-val">${formatDur(report.outcome.duration_ms || 0)}</div><div class="ds-lbl">Duration</div></div>
+    <div class="detail-stat"><div class="ds-val">${formatTok(tok)}</div><div class="ds-lbl">Tokens</div></div>
+    <div class="detail-stat"><div class="ds-val">${report.outcome.turn_rounds || 0}</div><div class="ds-lbl">Turns</div></div>
+    <div class="detail-stat"><div class="ds-val">${report.outcome.tool_calls_count || 0}</div><div class="ds-lbl">Tools</div></div>
+  </div>`;
+
+  // Criteria
+  if (report.criteria && report.criteria.length > 0) {
+    html += `<div class="detail-section"><div class="detail-label">Criteria</div><div class="criteria-list">`;
+    for (const c of report.criteria) {
+      html += `<div class="crit-row"><div class="crit-dot ${c.passed ? 'ok' : 'no'}"></div><div class="crit-text">${esc(c.detail)}`;
+      if (c.score != null) {
+        const pct = Math.round(c.score * 100);
+        const col = c.score >= 0.7 ? 'var(--green)' : c.score >= 0.4 ? 'var(--yellow)' : 'var(--red)';
+        html += `<div class="score-bar-wrap"><div class="score-bar-lbl">Score: ${c.score.toFixed(2)}</div><div class="score-bar-outer"><div class="score-bar-fill" style="width:${pct}%;background:${col}"></div></div></div>`;
+      }
+      html += `</div></div>`;
+    }
+    html += `</div></div>`;
+  }
+
+  // Session ID
+  const sid = report.outcome.session_id;
+  if (sid) {
+    html += `<div class="detail-section"><div class="detail-label">Session ID</div>
+      <div class="copyable-row">
+        <div class="copyable-text" id="dpSid">${esc(sid)}</div>
+        <button class="copy-btn" type="button" data-copy="${esc(sid)}">Copy</button>
+      </div></div>`;
+  }
+
+  // Reproducer
+  if (report.reproducer) {
+    html += `<div class="detail-section"><div class="detail-label">Reproducer</div>
+      <div class="code-block"><button class="code-copy" type="button" data-copy="${esc(report.reproducer)}">Copy</button>${esc(report.reproducer)}</div></div>`;
+  }
+
+  // Failure class
+  if (report.failure_class) {
+    const fcText = typeof report.failure_class === 'string' ? report.failure_class : JSON.stringify(report.failure_class);
+    html += `<div class="detail-section"><div class="detail-label" style="color:var(--red)">Failure Class</div>
+      <div style="font-size:13px;color:var(--red)">${esc(fcText)}</div></div>`;
+  }
+
+  // Steps (multi-turn)
+  if (report.steps && report.steps.length > 0) {
+    html += `<div class="detail-section"><div class="detail-label">Steps (${report.steps.length})</div>`;
+    for (const step of report.steps) {
+      const sBadge = step.passed !== false ? 'pass' : 'fail';
+      html += `<div class="step-card">
+        <div class="step-hdr">
+          <span class="step-idx">Step ${step.step_index} <span class="badge ${sBadge}" style="font-size:8px">${step.passed !== false ? 'PASS' : 'FAIL'}</span></span>
+          <span class="step-dur">${formatDur(step.duration_ms)}</span>
+        </div>`;
+      if (step.prompt) html += `<div class="step-prompt">${esc(trunc(step.prompt, 150))}</div>`;
+      if (step.outcome && step.outcome.text) html += `<div class="step-outcome-text">${esc(trunc(step.outcome.text, 200))}</div>`;
+      if (step.criteria && step.criteria.length > 0) {
+        html += '<div class="criteria-list" style="margin-top:6px">';
+        for (const c of step.criteria) {
+          html += `<div class="crit-row"><div class="crit-dot ${c.passed ? 'ok' : 'no'}"></div><div class="crit-text" style="font-size:12px">${esc(c.detail)}</div></div>`;
+        }
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+
+  // Output (collapsible)
+  const outText = report.outcome.text;
+  if (outText) {
+    const uid = 'dp_out_' + Date.now();
+    html += `<div class="detail-section">
+      <button class="collapse-toggle" type="button" data-tgt="${uid}">
+        <span class="caret">&#9654;</span> Output (${outText.length} chars)
+      </button>
+      <div class="collapse-body" id="${uid}">
+        <div class="code-block"><button class="code-copy" type="button" data-copy="${esc(outText)}">Copy</button>${esc(trunc(outText, 3000))}</div>
+      </div>
+    </div>`;
+  }
+
+  openDetailPanel(html);
+  bindDetailEvents();
+}
+
+function openReportDetail() {
   const stats = modelStats();
   const entries = Object.entries(stats).sort((a, b) =>
     (b[1].pass / Math.max(b[1].total, 1)) - (a[1].pass / Math.max(a[1].total, 1))
   );
-  if (entries.length < 2) {
-    $('liveModelSec').style.display = 'none';
-    return;
+
+  const totalPass = S.passed;
+  const totalFail = S.failed;
+  const totalAll = S.completed;
+  const rate = totalAll > 0 ? Math.round(totalPass / totalAll * 100) : 0;
+  const wallMs = S.suiteReport ? S.suiteReport.wall_time_ms : (S.startTime ? Date.now() - S.startTime : 0);
+
+  let html = '';
+
+  // Title
+  html += `<div class="detail-badge-big" style="background:linear-gradient(135deg, var(--blue-dim), rgba(139,92,246,0.12)); color: var(--accent2)">REPORT</div>`;
+  html += `<div class="detail-title">Suite Complete</div>`;
+  html += `<div class="detail-model" style="margin-bottom:20px">${S.completed} cases across ${entries.length} model${entries.length !== 1 ? 's' : ''}</div>`;
+
+  // Summary stats
+  html += `<div class="report-summary">
+    <div class="report-stat"><div class="rs-val" style="color:${rateFg(rate)}">${rate}%</div><div class="rs-lbl">Pass Rate</div></div>
+    <div class="report-stat"><div class="rs-val" style="color:var(--green)">${totalPass}</div><div class="rs-lbl">Passed</div></div>
+    <div class="report-stat"><div class="rs-val" style="color:var(--red)">${totalFail}</div><div class="rs-lbl">Failed</div></div>
+    <div class="report-stat"><div class="rs-val">${formatDur(wallMs)}</div><div class="rs-lbl">Wall Time</div></div>
+  </div>`;
+
+  // Model comparison table
+  if (entries.length > 0) {
+    html += `<div class="detail-section"><div class="detail-label">Model Comparison</div>
+      <table class="report-table"><thead><tr>
+        <th>Model</th><th>Rate</th><th>Tok/Pass</th><th>Dur/Pass</th><th>Turns/Pass</th>
+      </tr></thead><tbody>`;
+    for (const [name, s] of entries) {
+      const r = Math.round(s.pass / Math.max(s.total, 1) * 100);
+      const p = Math.max(s.pass, 1);
+      html += `<tr>
+        <td style="font-weight:600">${esc(name)}</td>
+        <td><span class="rate-pill" style="background:${rateColor(r)}">${r}%</span> <span style="color:var(--muted);font-size:11px">${s.pass}/${s.total}</span></td>
+        <td>${formatTok(Math.round(s.passTok / p))}</td>
+        <td>${formatDur(Math.round(s.passDur / p))}</td>
+        <td>${(s.passTurns / p).toFixed(1)}</td>
+      </tr>`;
+    }
+    html += '</tbody></table></div>';
   }
-  $('liveModelSec').style.display = '';
-  $('liveModelBody').innerHTML = entries.map(([name, s]) => {
-    const rate = Math.round(s.pass / Math.max(s.total, 1) * 100);
-    const p = Math.max(s.pass, 1);
-    return `<tr>
-      <td style="font-weight:600">${esc(name)}</td>
-      <td>${s.pass}/${s.total}</td>
-      <td><span class="rate-pill" style="background:${rateColor(rate)}">${rate}%</span></td>
-      <td>${formatTok(Math.round(s.passTok / p))}</td>
-      <td>${formatDur(Math.round(s.passDur / p))}</td>
-      <td>${(s.passTurns / p).toFixed(1)}</td>
-    </tr>`;
-  }).join('');
+
+  openDetailPanel(html);
+  bindDetailEvents();
 }
 
+function bindDetailEvents() {
+  // Copy buttons
+  $('detailContent').querySelectorAll('.copy-btn, .code-copy').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const text = btn.dataset.copy || '';
+      navigator.clipboard.writeText(text).then(
+        () => { btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = 'Copy', 1500); },
+        () => {}
+      );
+    });
+  });
+
+  // Collapse toggles
+  $('detailContent').querySelectorAll('.collapse-toggle').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const tgt = document.getElementById(btn.dataset.tgt);
+      if (!tgt) return;
+      const open = tgt.classList.toggle('open');
+      btn.querySelector('.caret').classList.toggle('open', open);
+    });
+  });
+}
+
+/* ================================================================
+   Model Stats Helper
+   ================================================================ */
 function modelStats() {
   const out = {};
   for (const r of S.runs) {
@@ -1642,265 +1984,138 @@ function modelStats() {
 }
 
 /* ================================================================
-   Case Card Builder
+   Timeline: Add Report Node at End
    ================================================================ */
-function buildCaseCard(report, idx) {
-  const card = document.createElement('div');
-  const status = report.passed ? 'pass' : 'fail';
-  card.className = 'case-card ' + status;
-  card.style.animationDelay = (idx * 50) + 'ms';
+function addReportNode() {
+  const tl = $('timeline');
 
-  const tok = (report.outcome.prompt_tokens || 0) + (report.outcome.completion_tokens || 0);
+  const stats = modelStats();
+  const entries = Object.entries(stats);
+  const rate = S.completed > 0 ? Math.round(S.passed / S.completed * 100) : 0;
+  const wallMs = S.suiteReport ? S.suiteReport.wall_time_ms : (S.startTime ? Date.now() - S.startTime : 0);
 
-  // Criteria
-  const criteriaHtml = (report.criteria || []).map(c => {
-    let extra = '';
-    if (c.score != null) {
-      const pct = Math.round(c.score * 100);
-      const col = c.score >= 0.7 ? 'var(--green)' : c.score >= 0.4 ? 'var(--yellow)' : 'var(--red)';
-      extra = `<div class="score-bar-wrap"><div class="score-bar-lbl">Score: ${c.score.toFixed(2)}</div><div class="score-bar"><div class="score-bar-fill" style="width:${pct}%;background:${col}"></div></div></div>`;
+  const node = document.createElement('div');
+  node.className = 'tl-node report';
+  node.style.animationDelay = '100ms';
+
+  // Build a mini summary inside the report card
+  let tableHtml = '';
+  if (entries.length > 1) {
+    tableHtml = '<table class="report-table" style="margin-top:10px;font-size:12px"><thead><tr><th>Model</th><th>Rate</th></tr></thead><tbody>';
+    for (const [name, s] of entries.sort((a, b) => (b[1].pass / Math.max(b[1].total, 1)) - (a[1].pass / Math.max(a[1].total, 1)))) {
+      const r = Math.round(s.pass / Math.max(s.total, 1) * 100);
+      tableHtml += `<tr><td>${esc(name)}</td><td><span class="rate-pill" style="background:${rateColor(r)};font-size:11px">${r}%</span> <span style="color:var(--muted);font-size:10px">${s.pass}/${s.total}</span></td></tr>`;
     }
-    return `<div class="crit-row"><div class="crit-dot ${c.passed ? 'ok' : 'no'}"></div><div class="crit-text">${esc(c.detail)}${extra}</div></div>`;
-  }).join('');
+    tableHtml += '</tbody></table>';
+  }
 
-  // Steps
-  const stepsHtml = (report.steps || []).map(step => {
-    const sc = (step.criteria || []).map(c =>
-      `<div class="crit-row" style="margin-left:6px"><div class="crit-dot ${c.passed ? 'ok' : 'no'}"></div><div class="crit-text" style="font-size:11px">${esc(c.detail)}</div></div>`
-    ).join('');
-    return `<div class="step-card">
-      <div class="step-hdr"><span>Step ${step.step_index}</span><span>${formatDur(step.duration_ms)}</span></div>
-      <div class="step-prompt">${esc(trunc(step.prompt, 100))}</div>
-      ${step.outcome && step.outcome.text ? `<div style="margin-top:3px;font-size:10px;color:var(--muted)">${esc(trunc(step.outcome.text, 180))}</div>` : ''}
-      ${sc}
-    </div>`;
-  }).join('');
+  const statusText = S.cancelled ? 'Cancelled' : 'Complete';
 
-  // Session ID
-  const sid = report.outcome.session_id;
-  const sidHtml = sid ? `<div class="detail-section"><div class="detail-label">Session ID</div><div class="copyable" data-copy="${esc(sid)}">${esc(sid)}</div></div>` : '';
-
-  // Reproducer
-  const reproHtml = report.reproducer
-    ? `<div class="detail-section"><div class="detail-label">Reproducer</div><pre class="copyable" data-copy="${esc(report.reproducer)}" style="display:block;cursor:pointer">${esc(report.reproducer)}</pre></div>`
-    : '';
-
-  // Failure class
-  const fcHtml = report.failure_class
-    ? `<div class="detail-section" style="color:var(--red)"><div class="detail-label">Failure Class</div>${esc(typeof report.failure_class === 'string' ? report.failure_class : JSON.stringify(report.failure_class))}</div>`
-    : '';
-
-  // Output (collapsible)
-  const outText = report.outcome.text;
-  const uid = 'out_' + idx + '_' + Date.now();
-  const outHtml = outText
-    ? `<div class="detail-section">
-        <button class="collapse-btn" data-tgt="${uid}" type="button"><span class="caret">&#9654;</span> Output (${outText.length} chars)</button>
-        <div class="collapse-content" id="${uid}"><pre>${esc(trunc(outText, 2000))}</pre></div>
-      </div>`
-    : '';
-
-  // Meta badges
-  let metaBadges = '';
-  if (report.capability) metaBadges += `<span class="m"><span class="m-icon">&#9670;</span>${esc(typeof report.capability === 'string' ? report.capability : '')}</span>`;
-  if (report.difficulty) metaBadges += `<span class="m"><span class="m-icon">d</span>${report.difficulty}</span>`;
-
+  const card = document.createElement('div');
+  card.className = 'tl-card report-card';
   card.innerHTML = `
     <div class="cc-head">
       <div>
-        <div class="cc-name">${esc(report.case_name)}</div>
-        <div class="cc-model-tag">${esc(normModel(report.model))}</div>
+        <div class="cc-name" style="font-size:15px">Suite ${statusText}</div>
+        <div class="cc-model-tag">${S.completed} cases | ${formatDur(wallMs)} wall time</div>
       </div>
-      <span class="badge ${status}">${report.passed ? 'PASS' : 'FAIL'}</span>
+      <span style="font-size:28px;font-weight:900;color:${rateFg(rate)}">${rate}%</span>
     </div>
-    <div class="cc-metrics">
-      <span class="m"><span class="m-icon">&#9201;</span>${formatDur(report.outcome.duration_ms || 0)}</span>
-      <span class="m"><span class="m-icon">&#9671;</span>${formatTok(tok)} tok</span>
-      <span class="m"><span class="m-icon">&#8634;</span>${report.outcome.turn_rounds || 0} turns</span>
-      <span class="m"><span class="m-icon">&#9881;</span>${report.outcome.tool_calls_count || 0} tools</span>
-      ${metaBadges}
+    <div class="cc-metrics" style="margin-top:6px">
+      <span class="m" style="color:var(--green)"><span class="m-icon">&#10003;</span>${S.passed} passed</span>
+      <span class="m" style="color:var(--red)"><span class="m-icon">&#10007;</span>${S.failed} failed</span>
     </div>
-    <div class="cc-detail">
-      ${criteriaHtml ? '<div class="criteria-list">' + criteriaHtml + '</div>' : ''}
-      ${stepsHtml ? '<div class="detail-section"><div class="detail-label">Steps</div>' + stepsHtml + '</div>' : ''}
-      ${sidHtml}${reproHtml}${fcHtml}${outHtml}
-    </div>`;
+    ${tableHtml}`;
 
-  // Toggle expand
-  card.addEventListener('click', e => {
-    if (e.target.closest('.copyable') || e.target.closest('.collapse-btn')) return;
-    card.classList.toggle('expanded');
-  });
+  card.style.cursor = 'pointer';
+  card.addEventListener('click', openReportDetail);
 
-  // Copy handler
-  card.querySelectorAll('.copyable').forEach(el => {
-    el.addEventListener('click', () => {
-      const text = el.dataset.copy || el.textContent;
-      navigator.clipboard.writeText(text).then(
-        () => toast('Copied', 'info'),
-        () => {}
-      );
-    });
-  });
+  node.appendChild(card);
+  tl.appendChild(node);
 
-  // Collapse handler
-  card.querySelectorAll('.collapse-btn').forEach(btn => {
-    btn.addEventListener('click', e => {
-      e.stopPropagation();
-      const tgt = card.querySelector('#' + btn.dataset.tgt);
-      if (!tgt) return;
-      const open = tgt.classList.toggle('open');
-      btn.querySelector('.caret').classList.toggle('open', open);
-    });
-  });
-
-  return card;
-}
-
-/* ================================================================
-   Results View
-   ================================================================ */
-function renderResults() {
-  setPhase('results');
-
-  const rate = S.completed > 0 ? S.passed / S.completed * 100 : 0;
-  const wallMs = S.suiteReport ? S.suiteReport.wall_time_ms : (S.startTime ? Date.now() - S.startTime : 0);
-
-  $('resultsSummary').innerHTML = `
-    <div class="big-rate">
-      <div class="big-pct" id="animRate" style="color:${rateFg(rate)}">0%</div>
-      <div class="big-lbl">Pass Rate</div>
-    </div>
-    <div class="summary-stats">
-      <div class="sum-stat"><div class="dot g"></div><div class="sv">${S.passed}</div><div class="sl">passed</div></div>
-      <div class="sum-stat"><div class="dot r"></div><div class="sv">${S.failed}</div><div class="sl">failed</div></div>
-      <div class="sum-stat"><div class="dot b"></div><div class="sv">${S.completed}</div><div class="sl">total</div></div>
-      <div class="sum-stat"><div class="dot b" style="opacity:0.4"></div><div class="sv">${formatDur(wallMs)}</div><div class="sl">wall time</div></div>
-    </div>`;
-
-  animateCount($('animRate'), 0, Math.round(rate), 700, '%');
-  renderResultModelTable();
-  populateResultFilters();
-  renderResultCases();
-
-  // Re-enable run button
   resetRunBtn();
 }
 
-function animateCount(el, from, to, duration, suffix) {
-  const start = performance.now();
-  function step(now) {
-    const p = Math.min((now - start) / duration, 1);
-    const eased = 1 - Math.pow(1 - p, 3);
-    el.textContent = Math.round(from + (to - from) * eased) + (suffix || '');
-    if (p < 1) requestAnimationFrame(step);
+/* ================================================================
+   Chat Panel
+   ================================================================ */
+const chatPanel = $('chatPanel');
+const chatHeader = $('chatHeader');
+const chatInput = $('chatInput');
+const chatSend = $('chatSend');
+const chatMessages = $('chatMessages');
+
+chatHeader.addEventListener('click', () => {
+  chatPanel.classList.toggle('collapsed');
+  if (!chatPanel.classList.contains('collapsed')) {
+    // Expand to a reasonable height
+    chatPanel.style.height = '280px';
+    chatInput.focus();
+  } else {
+    chatPanel.style.height = '';
   }
-  requestAnimationFrame(step);
-}
-
-function renderResultModelTable() {
-  const stats = modelStats();
-  const entries = Object.entries(stats);
-  if (entries.length < 2) {
-    $('resultModelSec').style.display = 'none';
-    return;
-  }
-  $('resultModelSec').style.display = '';
-
-  const col = S.sortCol;
-  const asc = S.sortAsc;
-  entries.sort((a, b) => {
-    let va, vb;
-    const sa = a[1], sb = b[1];
-    const pa = Math.max(sa.pass, 1), pb = Math.max(sb.pass, 1);
-    switch (col) {
-      case 'model': va = a[0]; vb = b[0]; return asc ? va.localeCompare(vb) : vb.localeCompare(va);
-      case 'rate': va = sa.pass / Math.max(sa.total, 1); vb = sb.pass / Math.max(sb.total, 1); break;
-      case 'tokPass': va = sa.passTok / pa; vb = sb.passTok / pb; break;
-      case 'durPass': va = sa.passDur / pa; vb = sb.passDur / pb; break;
-      case 'turnsPass': va = sa.passTurns / pa; vb = sb.passTurns / pb; break;
-      default: va = 0; vb = 0;
-    }
-    return asc ? va - vb : vb - va;
-  });
-
-  $('resultModelTable').querySelectorAll('th').forEach(th => {
-    const isThis = th.dataset.col === col;
-    th.classList.toggle('sorted', isThis);
-    const arrow = th.querySelector('.sa');
-    if (arrow) arrow.textContent = isThis ? (asc ? '▲' : '▼') : '';
-  });
-
-  $('resultModelBody').innerHTML = entries.map(([name, s]) => {
-    const rate = Math.round(s.pass / Math.max(s.total, 1) * 100);
-    const p = Math.max(s.pass, 1);
-    return `<tr>
-      <td style="font-weight:600">${esc(name)}</td>
-      <td><span class="rate-pill" style="background:${rateColor(rate)}">${rate}%</span> <span style="color:var(--muted);font-size:11px">${s.pass}/${s.total}</span></td>
-      <td>${formatTok(Math.round(s.passTok / p))}</td>
-      <td>${formatDur(Math.round(s.passDur / p))}</td>
-      <td>${(s.passTurns / p).toFixed(1)}</td>
-    </tr>`;
-  }).join('');
-}
-
-$('resultModelTable').addEventListener('click', e => {
-  const th = e.target.closest('th[data-col]');
-  if (!th) return;
-  const col = th.dataset.col;
-  if (S.sortCol === col) S.sortAsc = !S.sortAsc;
-  else { S.sortCol = col; S.sortAsc = col === 'model'; }
-  renderResultModelTable();
 });
 
-function populateResultFilters() {
-  const modelSet = new Set(S.runs.map(r => normModel(r.model)));
-  const capSet = new Set(S.runs.filter(r => r.capability).map(r => typeof r.capability === 'string' ? r.capability : ''));
+chatSend.addEventListener('click', sendChat);
+chatInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+});
 
-  const mf = $('rfModel');
-  mf.innerHTML = '<option value="">All Models</option>';
-  for (const m of [...modelSet].sort()) mf.innerHTML += `<option value="${esc(m)}">${esc(m)}</option>`;
+function sendChat() {
+  const msg = chatInput.value.trim();
+  if (!msg) return;
 
-  const cf = $('rfCap');
-  cf.innerHTML = '<option value="">All Capabilities</option>';
-  for (const c of [...capSet].sort()) if (c) cf.innerHTML += `<option value="${esc(c)}">${esc(c)}</option>`;
+  chatInput.value = '';
+  addChatMsg('user', msg);
+
+  const model = $('chatModel').value;
+  chatSend.disabled = true;
+
+  const body = { message: msg, model };
+  if (S.chatSessionId) body.session_id = S.chatSessionId;
+
+  fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) {
+        addChatMsg('error', data.error);
+      } else {
+        const text = data.text || JSON.stringify(data);
+        addChatMsg('assistant', text);
+        if (data.session_id) S.chatSessionId = data.session_id;
+      }
+    })
+    .catch(e => addChatMsg('error', 'Request failed: ' + e.message))
+    .finally(() => { chatSend.disabled = false; });
 }
 
-function renderResultCases() {
-  const mf = $('rfModel').value;
-  const sf = $('rfStatus').value;
-  const cf = $('rfCap').value;
-  const q = $('rfSearch').value.toLowerCase().trim();
-
-  const grid = $('resultGrid');
-  grid.innerHTML = '';
-
-  const sorted = [...S.runs].sort((a, b) => {
-    if (a.passed !== b.passed) return a.passed ? 1 : -1;
-    return a.case_name.localeCompare(b.case_name);
-  });
-
-  let idx = 0;
-  for (const r of sorted) {
-    const m = normModel(r.model);
-    if (mf && m !== mf) continue;
-    if (sf === 'pass' && !r.passed) continue;
-    if (sf === 'fail' && r.passed) continue;
-    const rc = typeof r.capability === 'string' ? r.capability : '';
-    if (cf && rc !== cf) continue;
-    if (q && !r.case_name.toLowerCase().includes(q) && !m.toLowerCase().includes(q)) continue;
-    grid.appendChild(buildCaseCard(r, idx++));
-  }
-
-  if (idx === 0) {
-    grid.innerHTML = '<div class="empty-msg">No cases match the current filters</div>';
-  }
+function addChatMsg(role, text) {
+  S.chatHistory.push({ role, text });
+  const el = document.createElement('div');
+  el.className = 'chat-msg ' + role;
+  el.textContent = text;
+  chatMessages.appendChild(el);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
-$('rfModel').addEventListener('change', renderResultCases);
-$('rfStatus').addEventListener('change', renderResultCases);
-$('rfCap').addEventListener('change', renderResultCases);
-$('rfSearch').addEventListener('input', renderResultCases);
+// Populate chat model selector from known models
+function updateChatModelSelector() {
+  const sel = $('chatModel');
+  const current = sel.value;
+  sel.innerHTML = '';
+  const models = new Set(['claude-sonnet-4-6', ...S.allModels]);
+  for (const m of models) {
+    const opt = document.createElement('option');
+    opt.value = m;
+    opt.textContent = m;
+    sel.appendChild(opt);
+  }
+  if (models.has(current)) sel.value = current;
+}
 
 /* ================================================================
    Init: Load Config + Cases
@@ -1914,10 +2129,10 @@ function loadConfig() {
       $('judgerModelIn').value = S.judgerModel;
 
       buildModelList();
-      // Select available_models by default
       (data.available_models || []).forEach(m => S.selectedModels.add(m));
       renderModelList();
       renderModelTags();
+      updateChatModelSelector();
     })
     .catch(e => toast('Failed to load config: ' + e.message));
 
@@ -1925,7 +2140,6 @@ function loadConfig() {
     .then(r => r.json())
     .then(data => {
       S.allCases = data.cases || [];
-      // Select all cases by default
       S.allCases.forEach(c => S.selectedCases.add(c.name));
       renderCapPills();
       renderCaseList();
@@ -1952,11 +2166,9 @@ function connect() {
 
   ws.onclose = () => {
     S.connected = false;
-    if (S.phase !== 'results') {
-      $('connDot').className = 'conn-dot disconnected';
-      $('connText').textContent = 'reconnecting...';
-      S.reconnectTimer = setTimeout(connect, 2000);
-    }
+    $('connDot').className = 'conn-dot disconnected';
+    $('connText').textContent = 'reconnecting...';
+    S.reconnectTimer = setTimeout(connect, 2000);
   };
 
   ws.onerror = () => {
@@ -1984,29 +2196,28 @@ function handleEvent(ev) {
       S.runningSet.clear();
       S.startTime = Date.now();
       S.suiteReport = null;
+      S.cancelled = false;
 
       setPhase('running');
       $('connText').textContent = (ev.models || []).join(' vs ') + ' — ' + ev.total_cases + ' cases';
-      $('liveGrid').innerHTML = '';
-      $('liveEmpty').style.display = '';
-      $('waitingHint').style.display = 'none';
+      $('timeline').innerHTML = '<div class="empty-msg" id="timelineEmpty">Waiting for results...</div>';
 
-      updateRunning();
+      updateProgress();
 
-      // Show waiting hint after 5s if no results
       if (S.waitingTimer) clearTimeout(S.waitingTimer);
       S.waitingTimer = setTimeout(() => {
         if (S.phase === 'running' && S.completed === 0) {
-          $('waitingHint').style.display = '';
+          const emp = $('timelineEmpty');
+          if (emp) emp.textContent = 'Running first case... this may take a moment';
         }
-      }, 5000);
+      }, 8000);
       break;
     }
 
     case 'case_started': {
       const key = ev.case_name + '/' + ev.model + '/' + (ev.run_index || 0);
       S.runningSet.set(key, { case_name: ev.case_name, model: ev.model });
-      updateRunning();
+      updateProgress();
       break;
     }
 
@@ -2018,20 +2229,23 @@ function handleEvent(ev) {
       const key = r.case_name + '/' + r.model + '/' + (r.run_index || 0);
       S.runningSet.delete(key);
 
-      // Hide waiting hint
       if (S.waitingTimer) { clearTimeout(S.waitingTimer); S.waitingTimer = null; }
-      $('waitingHint').style.display = 'none';
 
-      $('liveEmpty').style.display = 'none';
-      $('liveGrid').appendChild(buildCaseCard(r, S.completed));
-      updateRunning();
+      addTimelineCard(r, S.completed);
+      updateProgress();
       break;
     }
 
     case 'suite_completed': {
       S.suiteReport = ev.report || {};
+      S.runningSet.clear();
       if (S.waitingTimer) { clearTimeout(S.waitingTimer); S.waitingTimer = null; }
-      setTimeout(renderResults, 350);
+
+      // Slight delay so the last case card finishes its animation
+      setTimeout(() => {
+        addReportNode();
+        updateProgress();
+      }, 400);
       break;
     }
 

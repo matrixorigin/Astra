@@ -160,12 +160,11 @@ struct Args {
 
 fn resolve_suite_dir(explicit: &std::path::Path, astra_bin: &std::path::Path) -> PathBuf {
     if !explicit.as_os_str().is_empty() && explicit.is_dir() {
-        return explicit.to_path_buf();
+        return std::fs::canonicalize(explicit).unwrap_or_else(|_| explicit.to_path_buf());
     }
-    // Auto-detect: look for the cases/ directory relative to the astra binary
-    // or the current working directory.
+    let astra_abs = std::fs::canonicalize(astra_bin).unwrap_or_else(|_| astra_bin.to_path_buf());
     for base in [
-        astra_bin
+        astra_abs
             .parent()
             .and_then(|p| p.parent())
             .and_then(|p| p.parent())
