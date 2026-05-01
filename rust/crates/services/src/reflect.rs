@@ -44,6 +44,10 @@ pub struct SessionOverview {
 /// P0.1 we kept a parallel `ErrorClass` enum here; that duplication caused
 /// ambiguity for any consumer that also looked at upstream `ErrorKind`
 /// tags. Single source of truth now lives in `astra_core`.
+///
+/// **Wire format change**: `category` serializes as `snake_case`
+/// (`"resource_limit"`) instead of the old `PascalCase` (`"ResourceLimit"`).
+/// This is intentional — all enum tags in the codebase use snake_case.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Diagnosis {
     pub category: astra_core::ErrorKind,

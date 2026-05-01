@@ -594,9 +594,39 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
             (0, 1)
         };
 
-        // Bulk confidence + counter update: one UPDATE hitting all lessons
-        // exposed in this session, eliminating the N+1 loop.
-        let updated = query(
+        // Lock the unprocessed exposure rows first. FOR UPDATE prevents a
+        // concurrent session-end for the same user from reading the same
+        // rows — the second transaction blocks until the first commits,
+        // then sees outcome_recorded_at IS NOT NULL and skips them.
+        let locked_rows = query(
+            "SELECT lesson_id FROM agent_lesson_exposures \
+             WHERE session_id = ? AND user_id = ? AND outcome_recorded_at IS NULL \
+             FOR UPDATE",
+        )
+        .bind(&outcome.session_id)
+        .bind(&outcome.user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let lesson_ids: Vec<String> = locked_rows
+            .iter()
+            .filter_map(|r| r.try_get::<String, _>("lesson_id").ok())
+            .collect();
+
+        if lesson_ids.is_empty() {
+            tx.commit().await?;
+            return Ok(0);
+        }
+
+        // Build a placeholder list for the IN clause: (?, ?, ...)
+        let placeholders = lesson_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Bulk confidence + counter update.
+        let update_sql = format!(
             "UPDATE agent_lessons \
              SET positive_outcome_count = positive_outcome_count + ?, \
                  negative_outcome_count = negative_outcome_count + ?, \
@@ -605,42 +635,34 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
                      WHEN confidence + ? < 0.1 THEN 0.1 \
                      ELSE confidence + ? END, \
                  updated_at = CURRENT_TIMESTAMP(6) \
-             WHERE id IN ( \
-                 SELECT lesson_id FROM agent_lesson_exposures \
-                 WHERE session_id = ? AND user_id = ? \
-                   AND outcome_recorded_at IS NULL \
-             )",
-        )
-        .bind(pos_inc)
-        .bind(neg_inc)
-        .bind(confidence_delta)
-        .bind(confidence_delta)
-        .bind(confidence_delta)
-        .bind(&outcome.session_id)
-        .bind(&outcome.user_id)
-        .execute(&mut *tx)
-        .await?;
+             WHERE id IN ({placeholders})"
+        );
+        let mut q = query(&update_sql)
+            .bind(pos_inc)
+            .bind(neg_inc)
+            .bind(confidence_delta)
+            .bind(confidence_delta)
+            .bind(confidence_delta);
+        for id in &lesson_ids {
+            q = q.bind(id);
+        }
+        let updated = q.execute(&mut *tx).await?;
 
-        // Retirement pass: separate statement so it reads the already-
-        // updated counters from the first UPDATE (visible within the same
-        // transaction). This avoids dependence on MySQL's left-to-right
-        // SET evaluation order (MatrixOne follows standard SQL where all
-        // SET expressions in a single UPDATE see pre-update values).
-        query(
+        // Retirement pass: separate statement reads the already-updated
+        // counters (visible within the same transaction).
+        let retire_sql = format!(
             "UPDATE agent_lessons \
              SET status = 'retired', updated_at = CURRENT_TIMESTAMP(6) \
              WHERE status = 'active' \
                AND negative_outcome_count >= 5 \
                AND negative_outcome_count > positive_outcome_count \
-               AND id IN ( \
-                   SELECT lesson_id FROM agent_lesson_exposures \
-                   WHERE session_id = ? AND user_id = ? \
-               )",
-        )
-        .bind(&outcome.session_id)
-        .bind(&outcome.user_id)
-        .execute(&mut *tx)
-        .await?;
+               AND id IN ({placeholders})"
+        );
+        let mut q = query(&retire_sql);
+        for id in &lesson_ids {
+            q = q.bind(id);
+        }
+        q.execute(&mut *tx).await?;
 
         // Mark exposures as recorded so retry won't double-apply deltas.
         query(
@@ -667,6 +689,10 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
     }
 }
 
+/// Fetch a lesson by its UNIQUE KEY columns. The query matches exactly
+/// the UNIQUE KEY `(user_id, persona, workload_key, kind, trigger_signal)`
+/// — `action` is deliberately excluded because the UK doesn't include it
+/// and the action text may change between upserts.
 async fn fetch_by_content(pool: &Pool<MySql>, new: &NewLesson) -> Result<Lesson, sqlx::Error> {
     let row = query(
         "SELECT id, user_id, persona, workload_tag, kind, trigger_signal, action, \
@@ -675,7 +701,7 @@ async fn fetch_by_content(pool: &Pool<MySql>, new: &NewLesson) -> Result<Lesson,
                 CAST(updated_at AS CHAR) AS updated_at \
          FROM agent_lessons \
          WHERE user_id = ? AND persona = ? AND workload_key = ? \
-           AND kind = ? AND trigger_signal = ? AND action = ? \
+           AND kind = ? AND trigger_signal = ? \
          LIMIT 1",
     )
     .bind(&new.user_id)
@@ -683,7 +709,6 @@ async fn fetch_by_content(pool: &Pool<MySql>, new: &NewLesson) -> Result<Lesson,
     .bind(new.workload_tag.as_deref().unwrap_or(""))
     .bind(new.kind.as_str())
     .bind(&new.trigger_signal)
-    .bind(&new.action)
     .fetch_one(pool)
     .await?;
     row_to_lesson(row)
