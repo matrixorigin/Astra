@@ -163,20 +163,31 @@ fn resolve_suite_dir(explicit: &std::path::Path, astra_bin: &std::path::Path) ->
         return std::fs::canonicalize(explicit).unwrap_or_else(|_| explicit.to_path_buf());
     }
     let astra_abs = std::fs::canonicalize(astra_bin).unwrap_or_else(|_| astra_bin.to_path_buf());
-    for base in [
-        astra_abs
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf()),
-        std::env::current_dir().ok(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let candidate = base.join("rust/crates/astra-test-harness/cases");
+    // Walk up from the astra binary to find the repo root containing the cases dir.
+    // Binary is at <repo>/rust/target/release/astra, so check each ancestor.
+    let mut dir = astra_abs.as_path();
+    while let Some(parent) = dir.parent() {
+        let candidate = parent.join("rust/crates/astra-test-harness/cases");
         if candidate.is_dir() {
             return candidate;
+        }
+        // Also check if parent IS the rust/ dir (cwd might be there).
+        let candidate2 = parent.join("crates/astra-test-harness/cases");
+        if candidate2.is_dir() {
+            return candidate2;
+        }
+        dir = parent;
+    }
+    // Fallback: try relative to cwd.
+    if let Ok(cwd) = std::env::current_dir() {
+        for suffix in [
+            "rust/crates/astra-test-harness/cases",
+            "crates/astra-test-harness/cases",
+        ] {
+            let candidate = cwd.join(suffix);
+            if candidate.is_dir() {
+                return candidate;
+            }
         }
     }
     PathBuf::from("rust/crates/astra-test-harness/cases")

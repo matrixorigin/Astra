@@ -19,6 +19,7 @@ use crate::report::{CaseRunReport, SuiteReport};
 
 #[derive(Debug, Clone)]
 pub enum DashboardEvent {
+    RunReset,
     SuiteStarted {
         total_cases: usize,
         models: Vec<String>,
@@ -41,6 +42,11 @@ impl Serialize for DashboardEvent {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         match self {
+            Self::RunReset => {
+                let mut m = s.serialize_map(Some(1))?;
+                m.serialize_entry("type", "run_reset")?;
+                m.end()
+            }
             Self::SuiteStarted {
                 total_cases,
                 models,
@@ -99,8 +105,6 @@ struct AppState {
     cancel_token: Arc<Mutex<Option<CancellationToken>>>,
 }
 
-// ── Server ──────────────────────────────────────────────────────────
-
 pub struct DashboardServer {
     tx: broadcast::Sender<DashboardEvent>,
     config: Arc<DashboardConfig>,
@@ -130,6 +134,7 @@ impl DashboardServer {
             .route("/", get(index_handler))
             .route("/ws", get(ws_handler))
             .route("/api/config", get(config_handler))
+            .route("/api/models", get(models_handler))
             .route("/api/cases", get(cases_handler))
             .route("/api/run", post(run_handler))
             .route("/api/cancel", post(cancel_handler))
@@ -190,6 +195,34 @@ async fn config_handler(State(state): State<AppState>) -> Json<serde_json::Value
     }))
 }
 
+/// List all registered models by calling `astra-admin model list`.
+async fn models_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let admin_bin = state.config.astra_bin.with_file_name("astra-admin");
+    let output = tokio::process::Command::new(&admin_bin)
+        .args(["model", "list"])
+        .env("NO_PROXY", "localhost,127.0.0.1")
+        .env("no_proxy", "localhost,127.0.0.1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+    match output {
+        Ok(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            if let Ok(models) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+                Json(serde_json::json!({"models": models}))
+            } else {
+                Json(serde_json::json!({"models": [], "error": "parse failed"}))
+            }
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            Json(serde_json::json!({"models": [], "error": stderr.trim()}))
+        }
+        Err(e) => Json(serde_json::json!({"models": [], "error": e.to_string()})),
+    }
+}
+
 async fn cases_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     match crate::case::Case::load_dir(&state.config.suite_dir) {
         Ok(cases) => {
@@ -205,6 +238,7 @@ async fn cases_handler(State(state): State<AppState>) -> Json<serde_json::Value>
                         "timeout_seconds": c.timeout_seconds,
                         "has_steps": !c.steps.is_empty(),
                         "criteria_count": c.criteria.len(),
+                        "has_own_models": c.models.is_some(),
                     })
                 })
                 .collect();
@@ -214,7 +248,6 @@ async fn cases_handler(State(state): State<AppState>) -> Json<serde_json::Value>
     }
 }
 
-/// Run request — supports both glob filter and explicit case list.
 #[derive(Debug, Deserialize)]
 struct RunRequest {
     models: Vec<String>,
@@ -249,6 +282,9 @@ async fn run_handler(
     let token = CancellationToken::new();
     *state.cancel_token.lock().await = Some(token.clone());
 
+    // Reset frontend state before starting a new run.
+    let _ = state.tx.send(DashboardEvent::RunReset);
+
     let config = state.config.clone();
     let tx = state.tx.clone();
     let running_flag = state.running.clone();
@@ -279,7 +315,6 @@ async fn cancel_handler(State(state): State<AppState>) -> Json<serde_json::Value
     }
 }
 
-/// Simple chat endpoint — sends a message to astra and returns the response.
 #[derive(Debug, Deserialize)]
 struct ChatRequest {
     message: String,
@@ -314,26 +349,33 @@ async fn chat_handler(
     let output = match tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output()).await
     {
         Ok(Ok(o)) => o,
-        Ok(Err(e)) => {
-            return Json(serde_json::json!({"error": format!("spawn: {e}")}));
-        }
-        Err(_) => {
-            return Json(serde_json::json!({"error": "chat timed out after 120s"}));
-        }
+        Ok(Err(e)) => return Json(serde_json::json!({"error": format!("spawn: {e}")})),
+        Err(_) => return Json(serde_json::json!({"error": "chat timed out after 120s"})),
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    if exit_code == 3 {
+        return Json(serde_json::json!({
+            "error": "Authentication failed — credentials may have expired. Run: astra-admin login",
+            "exit_code": 3,
+        }));
+    }
+
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
         Json(v)
     } else {
         Json(serde_json::json!({
             "text": stdout.trim().to_string(),
-            "exit_code": output.status.code().unwrap_or(-1),
+            "stderr": stderr.trim().to_string(),
+            "exit_code": exit_code,
         }))
     }
 }
 
-/// Execute a full test run (called on a background task).
+/// Execute a full test run.
 async fn execute_run(
     config: Arc<DashboardConfig>,
     tx: broadcast::Sender<DashboardEvent>,
@@ -349,7 +391,7 @@ async fn execute_run(
 
     let mut cases = Case::load_dir(&config.suite_dir)?;
 
-    // Filter: explicit case list takes priority, then glob pattern.
+    // Filter by explicit case names, then glob.
     if !req.cases.is_empty() {
         let selected: std::collections::HashSet<&str> =
             req.cases.iter().map(|s| s.as_str()).collect();
@@ -368,6 +410,14 @@ async fn execute_run(
 
     if cases.is_empty() {
         anyhow::bail!("no cases matched the selection");
+    }
+
+    // Override case-level models with user's selection so cases
+    // with hardcoded `models:` don't run unexpected models.
+    if !req.models.is_empty() {
+        for case in &mut cases {
+            case.models = Some(req.models.clone());
+        }
     }
 
     let fallback_models = req.models.clone();
