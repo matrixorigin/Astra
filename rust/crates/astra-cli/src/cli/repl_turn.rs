@@ -1247,6 +1247,9 @@ fn commit_turn_journal_workspace_and_sidecars(
     learning_snap: &ReplTurnLearningSnapshot,
     turn_start: Instant,
 ) {
+    // Capture stall flag before entering the journal borrow scope.
+    let has_stalls = !result.stall_events.is_empty();
+
     if let Some(journal) = state.journal.as_ref() {
         // Flush turn observability events (llm_round, tool timing) before the turn summary.
         if !result.turn_observability_events.is_empty() {
@@ -1609,6 +1612,13 @@ fn commit_turn_journal_workspace_and_sidecars(
         // inconsistent token counts. The summary is already captured in the
         // main checkpoint's `cp.summary` when the interval fires, so we
         // skip the duplicate event.
+    }
+
+    // Incremental lesson checkpoint: stall events signal that the agent
+    // struggled — extract any new lessons NOW. Runs outside the journal
+    // borrow scope so it can take &mut state.
+    if has_stalls {
+        maybe_checkpoint_lessons(state);
     }
 }
 
