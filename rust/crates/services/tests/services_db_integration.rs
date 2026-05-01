@@ -1924,7 +1924,39 @@ async fn session_sync_log_prune_partitions_by_sync_type_on_live_matrixone() {
     .await
     .expect("push checkpoint");
 
-    for idx in 0..205 {
+    // Bulk-seed 199 rows directly into `session_sync_log` (matching the
+    // schema that `push_context_trace_signal_to_cloud` would write) — each
+    // call through the production path is 2 DB round-trips + a prune DELETE,
+    // so 205 sequential pushes cost ~3.7s and contending parallel pushes are
+    // even worse (they collide on the same `(user_id, status, sync_type)`
+    // prune lock). The final 6 pushes still go through the production API so
+    // the prune path gets exercised end-to-end under known conditions.
+    let seed_count = 199_i64;
+    let mut bulk_sql = String::from(
+        "INSERT INTO session_sync_log \
+         (sync_id, user_id, session_id, sync_type, sync_direction, payload_size, \
+          status, error_message, created_at) VALUES ",
+    );
+    for i in 0..seed_count {
+        if i > 0 {
+            bulk_sql.push_str(", ");
+        }
+        bulk_sql.push_str(
+            "(?, ?, ?, 'context_trace', 'push', 128, 'success', NULL, NOW(6))",
+        );
+    }
+    let mut q = sqlx::query(&bulk_sql);
+    for _ in 0..seed_count {
+        q = q
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&user_id)
+            .bind(&session_id);
+    }
+    q.execute(&pool)
+        .await
+        .expect("bulk-seed context_trace sync_log rows");
+
+    for idx in seed_count..205 {
         let trace = ContextTraceSignal {
             turn_id: format!("turn-{idx}"),
             captured_at: Some(format!("2026-09-03T10:{:02}:00Z", idx % 60)),

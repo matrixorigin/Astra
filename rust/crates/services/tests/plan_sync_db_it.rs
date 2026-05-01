@@ -86,7 +86,7 @@ async fn push_plans_pack_upserts_plans_and_steps() {
 
     let pack = serde_json::json!({
         "plans": [row_for(&user, &plan_id, 1, "from edge")],
-        "step_runs": [step_for(&plan_id, "runA", "sess-edge", 1)],
+        "step_runs": [step_for(&plan_id, &format!("runA-{}", Uuid::new_v4().simple()), "sess-edge", 1)],
     })
     .to_string();
 
@@ -242,6 +242,14 @@ async fn push_plans_pack_step_runs_are_idempotent_on_replay() {
     let svc = MatrixOneSyncService::new(pool.clone());
     let user = format!("u-idem-{}", Uuid::new_v4().simple());
     let plan_id = format!("psync-idem-{}", Uuid::new_v4().simple());
+    // `run_id` is the PRIMARY KEY on `plan_step_runs` — it's the identity the
+    // idempotent INSERT IGNORE keys off of. Give every test invocation its
+    // own run-id prefix so prior test runs that leak rows (crash mid-test,
+    // or the shared-DB setup we moved to) can't trip the "skipped=2" count.
+    let suffix = Uuid::new_v4().simple().to_string();
+    let run_1 = format!("run-idem-1-{suffix}");
+    let run_2 = format!("run-idem-2-{suffix}");
+    let run_3 = format!("run-idem-3-{suffix}");
     cleanup(&pool, &plan_id).await;
 
     // Seed the plan so step-runs have an owner row to attach to.
@@ -256,8 +264,8 @@ async fn push_plans_pack_step_runs_are_idempotent_on_replay() {
     let first = serde_json::json!({
         "plans": [],
         "step_runs": [
-            step_for(&plan_id, "run-idem-1", "s1", 1),
-            step_for(&plan_id, "run-idem-2", "s1", 2),
+            step_for(&plan_id, &run_1, "s1", 1),
+            step_for(&plan_id, &run_2, "s1", 2),
         ]
     })
     .to_string();
@@ -273,9 +281,9 @@ async fn push_plans_pack_step_runs_are_idempotent_on_replay() {
     let second = serde_json::json!({
         "plans": [],
         "step_runs": [
-            step_for(&plan_id, "run-idem-1", "s1", 1),  // duplicate
-            step_for(&plan_id, "run-idem-2", "s1", 2),  // duplicate
-            step_for(&plan_id, "run-idem-3", "s1", 3),  // new
+            step_for(&plan_id, &run_1, "s1", 1),  // duplicate
+            step_for(&plan_id, &run_2, "s1", 2),  // duplicate
+            step_for(&plan_id, &run_3, "s1", 3),  // new
         ]
     })
     .to_string();
@@ -284,7 +292,7 @@ async fn push_plans_pack_step_runs_are_idempotent_on_replay() {
     assert_eq!(s["step_runs_applied"], 1, "only new row applied");
     assert_eq!(s["step_runs_skipped"], 2, "two duplicates ignored");
 
-    // DB holds exactly 3 rows.
+    // DB holds exactly 3 rows for this plan.
     let total = scalar_i64(
         &pool,
         "SELECT COUNT(*) FROM plan_step_runs WHERE plan_id = ?",
@@ -308,7 +316,7 @@ async fn push_plans_pack_rejects_orphan_step_runs() {
     // Step run pointing at a plan_id that doesn't exist.
     let pack = serde_json::json!({
         "plans": [],
-        "step_runs": [step_for(&ghost_plan, "orphan-1", "sess", 1)]
+        "step_runs": [step_for(&ghost_plan, &format!("orphan-{}", Uuid::new_v4().simple()), "sess", 1)]
     })
     .to_string();
     let result = svc.push_plans_pack(&user, &pack).await.expect("push");
@@ -355,7 +363,9 @@ async fn push_plans_pack_scales_to_fifty_plans_without_n_plus_one() {
         for r in 0..RUNS_PER_PLAN {
             step_runs.push(step_for(
                 &plan_id,
-                &format!("run-{i}-{r}"),
+                // run_id is the PK — must be unique across all test runs
+                // sharing a DB (OnceCell bootstrap).
+                &format!("{prefix}run-{i}-{r}"),
                 &format!("sess-{i}"),
                 r as i32 + 1,
             ));
@@ -372,7 +382,7 @@ async fn push_plans_pack_scales_to_fifty_plans_without_n_plus_one() {
     ));
     step_runs.push(step_for(
         &format!("{prefix}ghost"),
-        "orphan-run",
+        &format!("{prefix}orphan-run"),
         "sess-x",
         1,
     ));
@@ -537,7 +547,7 @@ async fn pull_plans_pack_returns_user_scoped_plans_and_runs() {
     // Seed user's plan + step-run via push.
     let seed = serde_json::json!({
         "plans": [row_for(&user, &plan_id, 1, "mine")],
-        "step_runs": [step_for(&plan_id, "run-pull-1", "sess-pull", 1)]
+        "step_runs": [step_for(&plan_id, &format!("run-pull-{}", Uuid::new_v4().simple()), "sess-pull", 1)]
     })
     .to_string();
     svc.push_plans_pack(&user, &seed).await.unwrap();
@@ -682,10 +692,37 @@ async fn push_plans_pack_rejects_step_run_with_out_of_range_timestamps() {
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn migration_dedupe_removes_duplicate_attempt_tuples() {
-    let pool = setup_pool().await;
+    // This test mutates the shared schema (drops the UNIQUE index, injects
+    // duplicates, re-runs migrations). Running against the shared `common::
+    // setup_pool()` pool would race with sibling tests — while the index is
+    // dropped, other concurrent tests could insert what they think is a
+    // valid row but which becomes a "duplicate" once the index comes back.
+    // So we carve out a private MatrixOne database for this test only.
+    use astra_core::{SharedPool, connect_matrixone};
+    let private_db = format!("plan_sync_mig_{}", Uuid::new_v4().simple());
+    let mut settings = require_db_it_env();
+    settings.database = private_db.clone();
+    let catalog =
+        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+    let mut bootstrap = settings.clone();
+    bootstrap.database = catalog.clone();
+    let admin_pool = connect_matrixone(&bootstrap)
+        .await
+        .expect("connect bootstrap catalog");
+    sqlx::query(&format!("CREATE DATABASE IF NOT EXISTS `{private_db}`"))
+        .execute(&admin_pool)
+        .await
+        .expect("create private migration-test database");
+    admin_pool.close().await;
+    ensure_core_schema(&settings, &catalog)
+        .await
+        .expect("ensure_core_schema on private DB");
+    let shared = SharedPool::new(&settings).await.expect("SharedPool::new");
+    let pool = shared.get().clone();
+
     let plan_id = format!("pit-mig-{}", Uuid::new_v4().simple());
     let user = format!("u-mig-{}", Uuid::new_v4().simple());
-    cleanup(&pool, &plan_id).await;
+    // No need to `cleanup(&pool, &plan_id)` — fresh DB.
 
     // Drop the UNIQUE so we can inject duplicates that mimic a pre-v8 DB.
     // May or may not be present depending on the DB's migration state;
@@ -743,9 +780,6 @@ async fn migration_dedupe_removes_duplicate_attempt_tuples() {
         .await
         .unwrap();
 
-    let settings = require_db_it_env();
-    let catalog =
-        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
     ensure_core_schema(&settings, &catalog)
         .await
         .expect("migrations must succeed even with pre-existing duplicates");
@@ -786,7 +820,15 @@ async fn migration_dedupe_removes_duplicate_attempt_tuples() {
     // so we don't re-probe MatrixOne's UNIQUE enforcement here — this test
     // owns the dedupe + migration invariant only.
 
-    cleanup(&pool, &plan_id).await;
+    // Teardown: drop the private DB so we don't accumulate state across runs.
+    shared.close().await;
+    let admin_pool = connect_matrixone(&bootstrap)
+        .await
+        .expect("connect bootstrap catalog for drop");
+    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS `{private_db}`"))
+        .execute(&admin_pool)
+        .await;
+    admin_pool.close().await;
 }
 
 /// `error` and `artifact_ref` are TEXT/VARCHAR columns — unbounded client

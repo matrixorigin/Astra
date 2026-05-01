@@ -66,16 +66,28 @@ fn require_db_it_env() -> Option<MatrixOneSettings> {
     })
 }
 
+/// Per-binary cached schema-bootstrap + pool. `ensure_core_schema` is
+/// ~55ms solo on MatrixOne but serialises under concurrency — 16 parallel
+/// callers ≈ 915ms p95. Without this cache, running all 22 tests in
+/// parallel (default nextest) made each test's setup blow the 2s strict
+/// budget just waiting on the schema lock.
+static SHARED_SETUP: tokio::sync::OnceCell<SharedPool> = tokio::sync::OnceCell::const_new();
+
 /// Returns `None` when the env gate refuses (`ASTRA_TEST_DB_IT != "1"`).
 /// Call sites pattern-match and `return;` to skip cleanly.
 async fn setup_app() -> Option<(Router, sqlx::Pool<sqlx::MySql>)> {
     let settings = require_db_it_env()?;
-    let catalog =
-        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
-    ensure_core_schema(&settings, &catalog)
+    let shared = SHARED_SETUP
+        .get_or_init(|| async {
+            let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+                .unwrap_or_else(|_| "mysql".into());
+            ensure_core_schema(&settings, &catalog)
+                .await
+                .expect("ensure_core_schema; is MatrixOne up?");
+            SharedPool::new(&settings).await.expect("SharedPool::new")
+        })
         .await
-        .expect("ensure_core_schema; is MatrixOne up?");
-    let shared = SharedPool::new(&settings).await.expect("SharedPool::new");
+        .clone();
     let pool = shared.get().clone();
     let state = AppState::new(ServiceInfo::default(), Arc::new(HealthyStub))
         .with_auth_service(Arc::new(astra_services::auth::StubAuthService))

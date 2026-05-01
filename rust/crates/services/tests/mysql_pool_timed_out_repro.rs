@@ -24,9 +24,14 @@ async fn pool_timed_out_when_exhausted() {
         settings.user, settings.host, settings.port, settings.database
     );
 
+    // Pool of 2; acquire_timeout short enough that a 3rd concurrent query
+    // deterministically surfaces `PoolTimedOut`. We only need to PROVE the
+    // timeout fires — not wait for the two occupying queries to finish — so
+    // the tasks sleep for 2s (just enough to outlive the 500ms acquire timeout
+    // plus the 150ms warm-up) and we `abort` them after the assertion.
     let pool = MySqlPoolOptions::new()
         .max_connections(2)
-        .acquire_timeout(Duration::from_millis(800))
+        .acquire_timeout(Duration::from_millis(500))
         .connect(&url)
         .await
         .expect("MySqlPoolOptions::connect");
@@ -34,19 +39,16 @@ async fn pool_timed_out_when_exhausted() {
     let pool_cl = pool.clone();
     let t1 = tokio::spawn(async move {
         let mut c = pool_cl.acquire().await.expect("acquire slot 1");
-        sqlx::query("SELECT SLEEP(3)")
-            .execute(&mut *c)
-            .await
-            .expect("SLEEP in task 1");
+        // Ignore result — this is aborted from the parent as soon as the
+        // PoolTimedOut assertion passes, so the SLEEP may error with
+        // "connection reset" and that's fine.
+        let _ = sqlx::query("SELECT SLEEP(2)").execute(&mut *c).await;
     });
 
     let pool_c2 = pool.clone();
     let t2 = tokio::spawn(async move {
         let mut c = pool_c2.acquire().await.expect("acquire slot 2");
-        sqlx::query("SELECT SLEEP(3)")
-            .execute(&mut *c)
-            .await
-            .expect("SLEEP in task 2");
+        let _ = sqlx::query("SELECT SLEEP(2)").execute(&mut *c).await;
     });
 
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -61,6 +63,7 @@ async fn pool_timed_out_when_exhausted() {
         "expected PoolTimedOut, got {err:?}"
     );
 
-    let _ = t1.await;
-    let _ = t2.await;
+    // Assertion passed — no need to sit through the remaining ~1.4s of SLEEP.
+    t1.abort();
+    t2.abort();
 }

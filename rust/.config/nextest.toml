@@ -51,6 +51,12 @@ integration_e2e = { max-threads = 2 }
 # `spawn_plan_executor_*` tests serialize fully — each is ~500ms and
 # sharing the 2-wide group with other heavy tests caused pile-ups.
 plan_executor_e2e = { max-threads = 1 }
+# Per-test-DB teardown (CREATE DATABASE + ensure_core_schema + DROP DATABASE)
+# is MatrixOne-bound and doesn't benefit from concurrency — parallel drops on
+# the same instance just contend. These two tests can't share a DB (they
+# assert global `COUNT(*)` invariants). Serialise them in their own 1-wide
+# group so they don't steal slots from `integration_e2e` either.
+db_scoped_trim = { max-threads = 1 }
 
 # ── integration_e2e membership + ceiling ─────────────────────────────────
 # Every test that runs the production agentic loop / SSE handler /
@@ -97,13 +103,48 @@ slow-timeout = { period = "2s", terminate-after = 1 }
 # Intrinsic cost breakdown (measured): ~600ms schema bootstrap + ~70ms
 # bulk-insert of 1000 preload rows + ~30ms 3×production-persist (each trims)
 # + ~5ms assertions + ~400ms `DROP DATABASE` teardown. Total ~1.1–1.9s in
-# isolation, with the DROP DATABASE dominating the tail. We can't share DB
-# here (COUNT(*) invariant), and we can't skip teardown (builds up stale
-# databases indefinitely). The 2-wide cap prevents the test's bulk insert
-# from contending with a sibling test's DROP DATABASE.
+# isolation, with the DROP DATABASE dominating the tail. Put in its own
+# 1-wide `db_scoped_trim` group with a 3s ceiling — doesn't steal slots
+# from `integration_e2e` (where `system_matrix_http_e2e`'s 59 tests live).
 [[profile.strict-online.overrides]]
 filter = "test(/selector_metric_e2e_trims_global_window_to_recent_rows/)"
+test-group = "db_scoped_trim"
+slow-timeout = { period = "3s", terminate-after = 1 }
+
+# ── plan_repository_db_it parallelism cap (online) ────────────────────────
+# All 22 tests in this binary setup the shared `CloudPlanRepository` against
+# a shared MatrixOne DB via `common::setup_pool()`. Each is 100–140ms
+# isolated, but 22 tests × other binaries all sharing one MatrixOne at
+# default nextest parallelism (24 CPUs) causes DB lock contention on the
+# shared schema — some tests saw 2s+. Cap at 2-wide `integration_e2e` and
+# 3s ceiling; intrinsic solo cost stays well under 2s.
+[[profile.strict-online.overrides]]
+filter = "package(astra-plan) and binary(plan_repository_db_it)"
 test-group = "integration_e2e"
+slow-timeout = { period = "3s", terminate-after = 1 }
+
+# ── plan_sync_db_it::migration_dedupe (online) ────────────────────────────
+# Asserts that migrations 7 (dedupe) + 8 (add UNIQUE) run in order and leave
+# exactly one row per attempt tuple. Re-runs `ensure_core_schema` inside the
+# test body (after planting duplicates), so it pays the schema-check tax
+# twice. 0.2s solo, 2s+ under contention from other ignored integration
+# tests. Cap at 3s with `integration_e2e` parallelism.
+[[profile.strict-online.overrides]]
+filter = "test(/migration_dedupe_removes_duplicate_attempt_tuples/)"
+test-group = "integration_e2e"
+slow-timeout = { period = "3s", terminate-after = 1 }
+
+# ── server_loop hook_events E2E (online) ─────────────────────────────────
+# Same pattern as `selector_metric_e2e_trims_*`: per-test MatrixOne
+# database + full `ensure_core_schema` + `DROP DATABASE` teardown. 0.8s
+# solo, but `DROP DATABASE` on MatrixOne is consistently slow (~300–800ms)
+# and contends with sibling binaries running `make test-online`. Can't
+# share the DB — this is the only test using `setup_runtime_db_pool` in
+# this binary, and the 1-line summary assertion takes `sample_size(1)`
+# globally. 1-wide `db_scoped_trim` group, 3s ceiling.
+[[profile.strict-online.overrides]]
+filter = "test(/persist_server_loop_hook_events_e2e_persists_selector_metric/)"
+test-group = "db_scoped_trim"
 slow-timeout = { period = "3s", terminate-after = 1 }
 
 # ── system_matrix_http_e2e parallelism cap (online) ──────────────────────

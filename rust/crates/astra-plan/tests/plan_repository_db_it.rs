@@ -43,14 +43,29 @@ fn require_db_it_env() -> MatrixOneSettings {
     }
 }
 
+/// Per-binary cached schema-bootstrap + pool. `ensure_core_schema` costs
+/// ~55ms solo on MatrixOne but serialises under concurrency (16 parallel
+/// callers ≈ 915ms p95), because MatrixOne locks DDL globally during
+/// `CREATE TABLE IF NOT EXISTS`. Every #[ignore] test here calls
+/// `setup_repo` in its prologue; running the 22 tests in parallel (default
+/// nextest) without this cache turned each test's setup into ~1–2s of
+/// schema-lock waiting. Tests are UUID-scoped so sharing the pool is
+/// isolation-safe.
+static SHARED_SETUP: tokio::sync::OnceCell<SharedPool> = tokio::sync::OnceCell::const_new();
+
 async fn setup_repo() -> (CloudPlanRepository, sqlx::Pool<sqlx::MySql>) {
-    let settings = require_db_it_env();
-    let catalog =
-        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
-    ensure_core_schema(&settings, &catalog)
+    let shared = SHARED_SETUP
+        .get_or_init(|| async {
+            let settings = require_db_it_env();
+            let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+                .unwrap_or_else(|_| "mysql".into());
+            ensure_core_schema(&settings, &catalog)
+                .await
+                .expect("ensure_core_schema; is MatrixOne up?");
+            SharedPool::new(&settings).await.expect("SharedPool::new")
+        })
         .await
-        .expect("ensure_core_schema; is MatrixOne up?");
-    let shared = SharedPool::new(&settings).await.expect("SharedPool::new");
+        .clone();
     let pool = shared.get().clone();
     let repo = CloudPlanRepository::new(pool.clone());
     (repo, pool)
