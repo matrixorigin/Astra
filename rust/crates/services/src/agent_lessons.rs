@@ -58,6 +58,9 @@ pub enum LessonKind {
     PostconditionPattern,
     /// A recovery recipe for a specific error signature.
     ErrorRecovery,
+    /// A positive pattern learned from successful outcomes — the agent
+    /// discovered something that works well for this user/project.
+    SkillAcquired,
 }
 
 impl std::fmt::Display for LessonKind {
@@ -75,6 +78,7 @@ impl LessonKind {
             Self::PromptShape => "prompt_shape",
             Self::PostconditionPattern => "postcondition_pattern",
             Self::ErrorRecovery => "error_recovery",
+            Self::SkillAcquired => "skill_acquired",
         }
     }
 
@@ -85,6 +89,7 @@ impl LessonKind {
             "prompt_shape" => Some(Self::PromptShape),
             "postcondition_pattern" => Some(Self::PostconditionPattern),
             "error_recovery" => Some(Self::ErrorRecovery),
+            "skill_acquired" => Some(Self::SkillAcquired),
             _ => None,
         }
     }
