@@ -435,14 +435,20 @@ fn memoria_oneshot_client(timeout_secs: u64) -> Option<(reqwest::Client, String,
 }
 
 /// Retrieve procedural/semantic lessons from Memoria for session bootstrap.
+/// `context_query` should be derived from the user's first message — this
+/// produces much better semantic retrieval than keyword stuffing.
 /// Returns LessonHint-compatible structs. Best-effort: returns empty vec
 /// on any error (circuit breaker, timeout, parse failure).
-pub async fn memoria_retrieve_lessons(top_k: u64) -> Vec<astra_runtime::self_model::LessonHint> {
+pub async fn memoria_retrieve_lessons(
+    top_k: u64,
+    context_query: Option<&str>,
+) -> Vec<astra_runtime::self_model::LessonHint> {
     let Some((client, base, key)) = memoria_oneshot_client(3) else {
         return Vec::new();
     };
+    let query = context_query.unwrap_or("reusable lessons and corrections from prior sessions");
     let payload = json!({
-        "query": "LESSON CORRECTION ANTIPATTERN procedural learnings",
+        "query": query,
         "top_k": top_k,
         "min_confidence": 0.3,
     });
@@ -522,8 +528,9 @@ pub async fn memoria_consolidate_fire_and_forget() {
     }
 }
 
-/// Store extracted lessons in Memoria as L3 durable memory
-/// (Session Memory Protocol §6.2). Best-effort, fire-and-forget.
+/// Store extracted lessons in Memoria as L3 durable memory using the
+/// batch endpoint (Session Memory Protocol §6.2). Single HTTP call for
+/// up to 100 lessons. Best-effort, fire-and-forget.
 pub async fn memoria_store_lessons_fire_and_forget(
     lessons: Vec<astra_runtime::lesson_synthesizer::ExtractedLesson>,
     session_id: Option<String>,
@@ -534,28 +541,33 @@ pub async fn memoria_store_lessons_fire_and_forget(
     let Some((client, base, key)) = memoria_oneshot_client(5) else {
         return;
     };
-    for lesson in &lessons {
-        let mut payload = json!({
-            "content": lesson.content,
-            "memory_type": lesson.memory_type,
-            "trust_tier": lesson.trust_tier,
-        });
-        if let Some(ref sid) = session_id {
-            payload["session_id"] = json!(sid);
-        }
-        if let Err(e) = client
-            .post(format!("{base}/v1/memories"))
-            .header("Authorization", format!("Bearer {key}"))
-            .json(&payload)
-            .send()
-            .await
-        {
-            tracing::debug!(
-                target: "memoria",
-                error = %e,
-                "failed to store lesson in Memoria; continuing",
-            );
-            break;
-        }
+    let memories: Vec<serde_json::Value> = lessons
+        .iter()
+        .map(|l| {
+            let mut m = json!({
+                "content": l.content,
+                "memory_type": l.memory_type,
+                "trust_tier": l.trust_tier,
+            });
+            if let Some(ref sid) = session_id {
+                m["session_id"] = json!(sid);
+            }
+            m
+        })
+        .collect();
+
+    if let Err(e) = client
+        .post(format!("{base}/v1/memories/batch"))
+        .header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "memories": memories }))
+        .send()
+        .await
+    {
+        tracing::debug!(
+            target: "memoria",
+            count = lessons.len(),
+            error = %e,
+            "batch lesson store failed",
+        );
     }
 }

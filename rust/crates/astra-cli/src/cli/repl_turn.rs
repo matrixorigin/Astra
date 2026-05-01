@@ -581,13 +581,16 @@ fn maybe_checkpoint_lessons(state: &mut ReplState) {
         });
     }
 
-    // Write to Memoria (L3 durable) — fire-and-forget.
+    // Write to Memoria as `working` memory (session-scoped, T4).
+    // Mid-session observations are provisional — they get promoted to
+    // `semantic` T3 at session end if the L1b narrative confirms them.
+    // Inspired by V2's focus/importance lifecycle.
     let memoria_lessons: Vec<astra_runtime::lesson_synthesizer::ExtractedLesson> = delta
         .into_iter()
         .map(|l| astra_runtime::lesson_synthesizer::ExtractedLesson {
-            memory_type: "procedural",
+            memory_type: "working",
             content: format!("💡 LESSON: {}", l.action),
-            trust_tier: "T3",
+            trust_tier: "T4",
         })
         .collect();
     let sid = state.session_id.clone();
@@ -599,7 +602,7 @@ fn maybe_checkpoint_lessons(state: &mut ReplState) {
 async fn memoria_lesson_fallback(state: &mut ReplState) {
     state.session_lessons = tokio::time::timeout(
         std::time::Duration::from_secs(3),
-        super::edge_tools::memoria::memoria_retrieve_lessons(5),
+        super::edge_tools::memoria::memoria_retrieve_lessons(5, None),
     )
     .await
     .unwrap_or_default();
@@ -963,7 +966,7 @@ async fn run_chat_turn(
                 // Best-effort: 3s timeout, empty vec on failure.
                 let memoria_lessons = tokio::time::timeout(
                     std::time::Duration::from_secs(3),
-                    super::edge_tools::memoria::memoria_retrieve_lessons(3),
+                    super::edge_tools::memoria::memoria_retrieve_lessons(3, Some(message)),
                 )
                 .await
                 .unwrap_or_default();

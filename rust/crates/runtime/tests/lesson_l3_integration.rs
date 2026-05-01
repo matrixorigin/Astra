@@ -153,9 +153,7 @@ fn synthesis_quality_gate_accepts_only_specific_lessons() {
         "consider alternatives to grep"
     ));
     assert!(!is_synthesized_lesson_acceptable("tighten the plan"));
-    assert!(!is_synthesized_lesson_acceptable(
-        "maybe use rg instead"
-    ));
+    assert!(!is_synthesized_lesson_acceptable("maybe use rg instead"));
     assert!(!is_synthesized_lesson_acceptable("x".repeat(5).as_str()));
 
     // Specific, actionable → accepted
@@ -230,4 +228,33 @@ fn full_loop_lessons_are_prompt_ready() {
             );
         }
     }
+}
+
+// ── 6. Lifecycle: session-end lessons vs mid-session observations ──────
+
+#[test]
+fn session_end_lessons_are_semantic_t3_mid_session_would_be_working_t4() {
+    // Session-end backflow: Corrections → T2, Learnings → T3, all semantic.
+    // These are validated by the full session's L1b narrative.
+    let narrative = astra_runtime::turn::cloud::session_memory_protocol::SessionMemory::parse(
+        "[session-memory:v1]\n# User Corrections\n- Use rg not grep\n# Learnings\n- Repo has 280k files\n"
+    ).unwrap();
+
+    let session_end_lessons = lesson_synthesizer::extract_learnings_for_backflow(Some(&narrative));
+    for l in &session_end_lessons {
+        assert_eq!(
+            l.memory_type, "semantic",
+            "session-end lessons are durable semantic memories"
+        );
+        assert!(
+            l.trust_tier == "T2" || l.trust_tier == "T3",
+            "session-end trust: {} (expected T2 or T3)",
+            l.trust_tier
+        );
+    }
+
+    // Episodic summary is also a durable memory.
+    let episodic = lesson_synthesizer::build_episodic_summary("s", 10, Some(&narrative)).unwrap();
+    assert_eq!(episodic.memory_type, "episodic");
+    assert_eq!(episodic.trust_tier, "T3");
 }
