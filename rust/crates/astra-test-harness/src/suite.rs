@@ -86,7 +86,11 @@ impl<'a> SuiteRunner<'a> {
             let models = match resolve_models(case, &self.runner_cfg) {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("[skip] case {:?}: {e}", case.name);
+                    // Unified `[astra-test]` prefix so all harness
+                    // self-logging lines are greppable + visually
+                    // distinct from astra's `[fork-cache]` /
+                    // `[selector]` observability.
+                    eprintln!("[astra-test] skip case {:?}: {e}", case.name);
                     continue;
                 }
             };

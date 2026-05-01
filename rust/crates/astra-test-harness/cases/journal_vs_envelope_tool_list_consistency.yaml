@@ -1,14 +1,16 @@
 name: journal_vs_envelope_tool_list_consistency
 description: |
-  Cross-validation: the CLI JSON envelope's `tools_used` should
-  match the journal's ToolCallCompleted events. A disagreement means
-  the envelope is missing tools emitted inside sub-agent runs — a
-  known class of bug that the harness can now catch automatically
-  since it loads both data sources.
+  Cross-validation: the CLI JSON envelope's `tools_used` should match
+  the tool names nested in the journal's `llm_round.tool_calls`
+  array. A disagreement means the envelope is missing tools emitted
+  inside sub-agent runs — a known class of bug that the harness now
+  catches automatically since it loads both data sources.
 
   We exercise a prompt that triggers at least one tool call. The
-  `tool_called` criterion reads from the envelope; `journal_tool_called`
-  reads from the journal. Both must agree on the same tool name.
+  `tool_called` criterion reads from the envelope;
+  `journal_tool_called` walks the journal (which supports legacy
+  `llm_round.tool_calls[]` as well as step-events
+  `ToolCallCompleted`). Both must agree on the same tool name.
 prompt: |
   Use the list_dir tool to list the current directory. Then briefly
   describe what you saw in one sentence.
@@ -21,6 +23,10 @@ criteria:
     name: list_dir
   - type: journal_tool_called
     name: list_dir
+  # `llm_round` is universal in the legacy jsonl; `ToolCallCompleted`
+  # only appears when the step-events layout is enabled. Assert on
+  # the universal event type so this case runs cleanly against any
+  # session.
   - type: session_event_count
-    event_type: ToolCallCompleted
+    event_type: llm_round
     min: 1

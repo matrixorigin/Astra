@@ -77,7 +77,28 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
     let trimmed = stdout.trim();
     let v: serde_json::Value = match serde_json::from_str(trimmed) {
         Ok(v) => v,
-        Err(_) => {
+        Err(parse_err) => {
+            // `astra chat --json` printed something that isn't JSON.
+            // Usual causes: the child printed a panic backtrace, a
+            // deprecation notice, or hit an error before the JSON
+            // envelope. Returning `exit_code: 0` on top of garbage
+            // would let that garbage sail past every criterion, so
+            // surface the anomaly on stderr where the reviewer can
+            // see it — the caller subsequently overwrites exit_code
+            // with the real process status.
+            //
+            // Skip the warning when stdout is empty: the usual cause
+            // is a child that errored early and printed only to
+            // stderr (credential failure, missing binary). Printing
+            // "parse fallback" on every such run drowns the real
+            // stderr error in harness noise.
+            if !trimmed.is_empty() {
+                let preview: String = trimmed.chars().take(160).collect();
+                eprintln!(
+                    "[astra-test] WARNING: stdout from astra chat --json was not valid JSON \
+                     ({parse_err}); falling back to raw-text mode. Preview: {preview:?}"
+                );
+            }
             return RunOutcome {
                 model: model.into(),
                 exit_code: 0,

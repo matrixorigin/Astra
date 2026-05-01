@@ -168,11 +168,17 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                     s.push_str(&format!(
                         "    journal: ~/.astra/sessions/{id}.jsonl\n"
                     ));
+                    // Filter to llm_round events first, then project
+                    // out the nested tool_calls[].name. Without the
+                    // `select(.type==\"llm_round\")` the hint would
+                    // mix tool names with `null` from every
+                    // llm_request_full / llm_response_full line that
+                    // has no tool_calls.
                     s.push_str(&format!(
-                        "    hint:    jq -r '.tool_calls[]?.name' ~/.astra/sessions/{id}.jsonl\n"
+                        "    hint:    jq -r 'select(.type==\"llm_round\") | .tool_calls[]?.name' ~/.astra/sessions/{id}.jsonl\n"
                     ));
                     s.push_str(&format!(
-                        "    hint-steps: jq -r '.event_type + \" \" + .payload.tool_name' ~/.astra/sessions/{id}/step_events.jsonl 2>/dev/null\n"
+                        "    hint-steps: jq -r 'select(.event_type==\"ToolCallCompleted\") | .payload.tool_name' ~/.astra/sessions/{id}/step_events.jsonl 2>/dev/null\n"
                     ));
                 } else {
                     // Report the anomaly so the reviewer sees SOMETHING,

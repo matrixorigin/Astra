@@ -277,14 +277,14 @@ mod tests {
             models: None,
             criteria: vec![],
             debug_log: false,
-            extra_cli_args: vec!["--debug-log-tools".into()],
+            extra_cli_args: vec!["--verbose".into()],
             timeout_seconds: 60,
         };
         let repro = exec.reproducer(&case, "qwen-flash");
         assert!(repro.contains("/usr/local/bin/astra"));
         assert!(repro.contains("--model"));
         assert!(repro.contains("qwen-flash"));
-        assert!(repro.contains("--debug-log-tools"));
+        assert!(repro.contains("--verbose"));
         // POSIX single-quote escape: `'say '\''hello'\'''` preserves
         // the original bytes without relying on double-quote semantics
         // (which would still expand $ and backticks). A prompt with

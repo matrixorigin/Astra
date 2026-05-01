@@ -79,7 +79,7 @@ criteria:
     name: spawn_agent
   - type: stderr_matches
     pattern: '\[fork-cache\]'
-  - type: fork_cache_class
+  - type: fork_cache_outcome
     expect: [hit]
   - type: judger
     question: Did the child's reply appear in the final answer?
@@ -95,7 +95,7 @@ criteria:
 | `tools_count_between { min, max }` | `tool_calls_count` inclusive |
 | `stderr_matches { pattern }` | multi-line regex on stderr |
 | `text_contains { needle }` | substring in final text |
-| `fork_cache_class { expect }` | `[fork-cache]` event class ∈ `expect` |
+| `fork_cache_outcome { expect }` | `[fork-cache]` event `outcome` ∈ `expect` (one of `hit`, `partial_drift`, `miss`, `exceeded_expected`) |
 | `session_event_count { event_type, min, optional }` | journal has ≥ `min` events of that type |
 | `journal_tool_called { name, optional }` | tool name appears in journal `tool_calls` |
 | `judger { question, threshold, model }` | LLM scores ≥ threshold |
@@ -116,8 +116,16 @@ Enable capture by either:
 ### Reserved CLI flags
 
 `extra_cli_args` supports pass-through flags like `--explain`, but
-rejects at case-load time any flag the harness manages (`-m`,
-`--message`, `--model`, `--json`, `-y`, `--approve-all`, `--quiet`).
+rejects at case-load time any flag the harness manages:
+
+- Prompt / input: `-m`, `--message`, `--stdin`
+- Model selection: `--model`
+- Output format: `--json`, `--quiet`
+- Tool approval: `-y`, `--yes`, `--auto-approve`
+- Permission mode: `--permission-mode` (silently expands auth)
+- System prompt: `--system-prompt` (bypasses judger anti-gaming preamble)
+
+The authoritative list lives in `RESERVED_CLI_ARGS` in `src/case.rs`.
 
 ## Judger
 
@@ -180,6 +188,8 @@ Session capture:
 
 Digest:
   --no-digest-on-fail          disable on-FAIL digest auto-capture
+  --digest-timeout <SEC>       digest subprocess timeout (default 15s; raise
+                               to 30-60 on cold CI)
 ```
 
 ## Execution model: serial

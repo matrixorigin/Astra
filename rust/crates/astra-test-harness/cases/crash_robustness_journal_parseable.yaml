@@ -21,7 +21,10 @@ criteria:
   # The harness's SessionCapture exposes `skipped_lines` in its
   # debug string but not as a direct criterion. We proxy by asking
   # for a strictly positive event count — if the journal were
-  # unparseable we'd see 0 events.
+  # unparseable we'd see 0 events. `llm_round` is universal in
+  # `~/.astra/sessions/<id>.jsonl` (every turn records one);
+  # `ToolCallCompleted` only fires in the step-events layout and is
+  # absent on many run types.
   - type: session_event_count
-    event_type: ToolCallCompleted
+    event_type: llm_round
     min: 1

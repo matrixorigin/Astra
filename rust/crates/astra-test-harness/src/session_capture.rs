@@ -56,38 +56,65 @@ impl SessionCapture {
             .count()
     }
 
-    /// Distinct tool names seen in the journal. Journal is the source
-    /// of truth — `RunOutcome.tools_used` (from the CLI envelope) can
-    /// miss tools emitted inside sub-agent runs.
+    /// Distinct tool names seen in the journal. Journal is the
+    /// source of truth — `RunOutcome.tools_used` (from the CLI
+    /// envelope) can miss tools emitted inside sub-agent runs.
     ///
-    /// Supports three journal shapes seen in the wild:
-    /// - legacy `tool_invocation` events with `metadata.tool_name`
-    /// - legacy `tool_invocation` events with top-level `tool_name`
-    /// - step-events `ToolCallCompleted` events with `payload.tool_name`
+    /// Names are returned in first-seen order and de-duplicated. The
+    /// loader supports all four shapes we've seen in real
+    /// `~/.astra/sessions/` files:
+    ///
+    /// 1. **Legacy `llm_round`** events with a nested
+    ///    `tool_calls: [{name, ok, ms, ...}]` array. This is the
+    ///    dominant shape on `~/.astra/sessions/<id>.jsonl` — most
+    ///    sessions on disk use it.
+    /// 2. Step-events `ToolCallCompleted` with `payload.tool_name`
+    ///    (live under `<id>/step_events.jsonl`).
+    /// 3. Hypothetical `tool_invocation` events with
+    ///    `metadata.tool_name` (kept for forward compat).
+    /// 4. Hypothetical `tool_invocation` with flat `tool_name` field.
+    ///
+    /// Until we verified against real journals (R4 review), the
+    /// method silently missed shape #1 and returned empty lists on
+    /// every real session. That was the root cause of
+    /// `JournalToolCalled` never matching in practice.
     pub fn tools_invoked(&self) -> Vec<String> {
-        let mut out = Vec::new();
+        let mut out: Vec<String> = Vec::new();
+        let push_unique = |name: &str, out: &mut Vec<String>| {
+            if !name.is_empty() && !out.iter().any(|x: &String| x == name) {
+                out.push(name.to_string());
+            }
+        };
         for e in &self.events {
-            let is_tool_event =
-                e.event_type == "tool_invocation" || e.event_type == "ToolCallCompleted";
-            if !is_tool_event {
+            // Shape 1: legacy llm_round with nested tool_calls array.
+            if e.event_type == "llm_round"
+                && let Some(calls) = e.raw.get("tool_calls").and_then(|v| v.as_array())
+            {
+                for c in calls {
+                    if let Some(name) = c.get("name").and_then(|n| n.as_str()) {
+                        push_unique(name, &mut out);
+                    }
+                }
                 continue;
             }
-            let name = e
-                .raw
-                .get("payload")
-                .and_then(|p| p.get("tool_name"))
-                .and_then(|n| n.as_str())
-                .or_else(|| {
-                    e.raw
-                        .get("metadata")
-                        .and_then(|m| m.get("tool_name"))
-                        .and_then(|n| n.as_str())
-                })
-                .or_else(|| e.raw.get("tool_name").and_then(|n| n.as_str()));
-            if let Some(name) = name
-                && !out.iter().any(|x: &String| x == name)
-            {
-                out.push(name.to_string());
+            // Shape 2: step-events ToolCallCompleted.
+            // Shapes 3/4: tool_invocation with nested or flat name.
+            if e.event_type == "ToolCallCompleted" || e.event_type == "tool_invocation" {
+                let name = e
+                    .raw
+                    .get("payload")
+                    .and_then(|p| p.get("tool_name"))
+                    .and_then(|n| n.as_str())
+                    .or_else(|| {
+                        e.raw
+                            .get("metadata")
+                            .and_then(|m| m.get("tool_name"))
+                            .and_then(|n| n.as_str())
+                    })
+                    .or_else(|| e.raw.get("tool_name").and_then(|n| n.as_str()));
+                if let Some(name) = name {
+                    push_unique(name, &mut out);
+                }
             }
         }
         out
@@ -103,28 +130,56 @@ pub fn default_sessions_dir() -> PathBuf {
     }
 }
 
-/// Load a session journal by id. Tries two layouts in order:
+/// Load a session journal by id. Merges both layouts when both
+/// exist:
 ///
-/// 1. Legacy: `~/.astra/sessions/<id>.jsonl` with `type` discriminator.
-/// 2. Current: `~/.astra/sessions/<id>/step_events.jsonl` with
-///    `event_type` discriminator (step events for the structured-step
-///    pipeline).
+/// 1. Legacy: `~/.astra/sessions/<id>.jsonl` with `type`
+///    discriminator. Carries `llm_round` (nested tool_calls),
+///    `llm_request_full`, `llm_response_full`, `turn`, etc.
+/// 2. Step-events: `~/.astra/sessions/<id>/step_events.jsonl` with
+///    `event_type` discriminator. Carries `StepCreated`,
+///    `StepStarted`, `ToolCallCompleted`, `StepEvaluated`,
+///    `StepCompleted`.
+///
+/// Both files are complementary — legacy has token and tool_call
+/// detail, step_events has per-step lifecycle. Prior to the R4 fix
+/// this function returned early on the legacy path, so any criterion
+/// asking for a step_events-only event (`ToolCallCompleted`) never
+/// matched on any real session.
 ///
 /// Returns `None` only if neither file exists. Malformed lines are
-/// counted in `skipped_lines` — never an error.
+/// counted in `skipped_lines` — never an error. The returned
+/// `journal_path` points at whichever file existed (legacy
+/// preferred for backward-compatible user-facing hints); the actual
+/// events are the union.
 pub fn load_session(session_id: &str) -> Option<SessionCapture> {
     let dir = default_sessions_dir();
     let legacy = dir.join(format!("{session_id}.jsonl"));
-    if legacy.is_file()
-        && let Some(cap) = load_session_from_path(session_id, &legacy)
-    {
-        return Some(cap);
-    }
     let step_events = dir.join(session_id).join("step_events.jsonl");
-    if step_events.is_file() {
-        return load_session_from_path(session_id, &step_events);
+
+    let legacy_cap = if legacy.is_file() {
+        load_session_from_path(session_id, &legacy)
+    } else {
+        None
+    };
+    let step_cap = if step_events.is_file() {
+        load_session_from_path(session_id, &step_events)
+    } else {
+        None
+    };
+
+    match (legacy_cap, step_cap) {
+        (None, None) => None,
+        (Some(c), None) | (None, Some(c)) => Some(c),
+        (Some(mut legacy_c), Some(step_c)) => {
+            // Legacy's path wins as the primary identifier (the jq
+            // hint points there); events are the union.
+            legacy_c.events.extend(step_c.events);
+            legacy_c.skipped_lines =
+                legacy_c.skipped_lines.saturating_add(step_c.skipped_lines);
+            Some(legacy_c)
+        }
     }
-    None
 }
 
 /// Maximum journal file size the loader will read. Long-running
@@ -300,6 +355,93 @@ mod tests {
         assert!(tools.contains(&"Read".to_string()));
         assert!(tools.contains(&"Grep".to_string()));
         assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn tools_invoked_walks_legacy_llm_round_nested_tool_calls() {
+        // R4 Blocker regression. Real `~/.astra/sessions/<id>.jsonl`
+        // files emit `llm_round` events with a nested
+        // `tool_calls: [{name, ok, ms, ...}]` array — NOT top-level
+        // `tool_invocation`. Before this fix, `tools_invoked()`
+        // returned empty on every real session so
+        // `journal_tool_called` criteria could never match.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.jsonl");
+        let body = [
+            r#"{"type":"llm_request_full","session_id":"s","turn":1}"#,
+            r#"{"type":"llm_round","session_id":"s","turn":1,"tool_calls":[{"name":"read_file","ok":true,"ms":12},{"name":"list_dir","ok":true,"ms":8}]}"#,
+            r#"{"type":"llm_round","session_id":"s","turn":2,"tool_calls":[{"name":"list_dir","ok":true,"ms":3}]}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, body).unwrap();
+
+        let cap = load_session_from_path("legacy", &path).unwrap();
+        let tools = cap.tools_invoked();
+        // Both names surfaced, de-duplicated, first-seen order.
+        assert_eq!(
+            tools,
+            vec!["read_file".to_string(), "list_dir".to_string()],
+            "tools must walk llm_round.tool_calls[] in first-seen order"
+        );
+    }
+
+    #[test]
+    fn load_session_merges_both_layouts_when_both_exist() {
+        // R4 Blocker follow-up: when both `<id>.jsonl` and
+        // `<id>/step_events.jsonl` exist, the loader must return the
+        // UNION of events. Previously it returned the legacy file
+        // only, which made step-events-only event types
+        // (`ToolCallCompleted`) unmatchable on any session that also
+        // had legacy output (all of them).
+        use std::env;
+        let dir = tempdir().unwrap();
+        // Redirect HOME so `default_sessions_dir` points at our tmp.
+        // Safe: single-threaded #[test]; restored after.
+        let prev_home = env::var_os("HOME");
+        // SAFETY: single-threaded test context; restored immediately
+        // after the load. A compile-time `#[serial_test]` would be
+        // better but adding a crate for one test is overkill.
+        unsafe {
+            env::set_var("HOME", dir.path());
+        }
+        let sessions = dir.path().join(".astra").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let sid = "merge-test";
+        // Legacy: llm_round with one nested tool_call.
+        std::fs::write(
+            sessions.join(format!("{sid}.jsonl")),
+            r#"{"type":"llm_round","session_id":"merge-test","turn":1,"tool_calls":[{"name":"read_file","ok":true,"ms":5}]}"#,
+        )
+        .unwrap();
+        // Step-events: one ToolCallCompleted with a DIFFERENT tool.
+        let step_dir = sessions.join(sid);
+        std::fs::create_dir_all(&step_dir).unwrap();
+        std::fs::write(
+            step_dir.join("step_events.jsonl"),
+            r#"{"event_type":"ToolCallCompleted","payload":{"tool_name":"list_dir"}}"#,
+        )
+        .unwrap();
+
+        let cap = load_session(sid).expect("both layouts must load");
+        let tools = cap.tools_invoked();
+
+        // Restore HOME before asserts so a panic doesn't leak the override.
+        unsafe {
+            match prev_home {
+                Some(h) => env::set_var("HOME", h),
+                None => env::remove_var("HOME"),
+            }
+        }
+
+        assert!(
+            tools.contains(&"read_file".to_string()),
+            "legacy tool must survive merge: {tools:?}"
+        );
+        assert!(
+            tools.contains(&"list_dir".to_string()),
+            "step-events tool must survive merge: {tools:?}"
+        );
     }
 
     // ── Caps (R3 #6) ──

@@ -161,6 +161,18 @@ impl Case {
         // doesn't silently poison an entire suite run.
         validate_extra_cli_args(&case.extra_cli_args)
             .map_err(|e| anyhow::anyhow!("case {}: {e}", path.display()))?;
+        // `timeout_seconds: 0` collapses `Duration::from_secs(0)` —
+        // every case would instantly report synthetic exit 124 before
+        // the child even runs. A YAML typo turns the whole suite into
+        // "harness hang". Require at least 1 second; realistic cases
+        // want tens or hundreds.
+        if case.timeout_seconds == 0 {
+            anyhow::bail!(
+                "case {}: timeout_seconds must be >= 1 (got 0 — every case would \
+                 time out before the child runs)",
+                path.display(),
+            );
+        }
         // Reject criteria with internally-inconsistent bounds
         // (min>max, threshold>1.0, empty expect lists, bad regex).
         // A case author's YAML typo would otherwise turn into a
@@ -195,17 +207,19 @@ impl Case {
             }
             paths.push(path);
         }
+        // Path sort is load-order only: if `Case::from_path` errors
+        // on one of the files, path-sorting makes the error
+        // deterministic across filesystems ("every dev sees the same
+        // first-failing file"). The authoritative report-order sort
+        // happens on `out` after parsing, by in-case `name:` — a
+        // YAML renamed without bumping `name:` shouldn't shift its
+        // report row.
         paths.sort();
 
         let mut out: Vec<Case> = Vec::with_capacity(paths.len());
         for path in paths {
             out.push(Case::from_path(&path)?);
         }
-        // Stable secondary sort by case name — the `paths.sort()`
-        // above is path-lexicographic, but a case file renamed without
-        // bumping the `name:` field would still place differently. Sort
-        // by the in-case name so the report order matches what a user
-        // sees at the top of each YAML.
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
     }
@@ -358,6 +372,19 @@ mod tests {
     }
 
     #[test]
+    fn timeout_seconds_zero_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bad.yaml");
+        std::fs::write(
+            &path,
+            "name: c\nprompt: p\ntimeout_seconds: 0\n",
+        )
+        .unwrap();
+        let err = Case::from_path(&path).expect_err("timeout_seconds=0 must fail");
+        assert!(err.to_string().contains("timeout_seconds must be >= 1"));
+    }
+
+    #[test]
     fn criteria_bounds_validated_at_load() {
         // End-to-end of R3 #2: a YAML with a bad-bounds criterion
         // must fail at parse time, not at evaluation time.
@@ -379,13 +406,13 @@ mod tests {
         let path = dir.path().join("ok.yaml");
         std::fs::write(
             &path,
-            "name: c\nprompt: p\nextra_cli_args: [\"--debug-log-tools\", \"--explain\"]\n",
+            "name: c\nprompt: p\nextra_cli_args: [\"--verbose\", \"--explain\"]\n",
         )
         .unwrap();
         let c = Case::from_path(&path).expect("non-reserved flags should be accepted");
         assert_eq!(
             c.extra_cli_args,
-            vec!["--debug-log-tools".to_string(), "--explain".to_string()]
+            vec!["--verbose".to_string(), "--explain".to_string()]
         );
     }
 
