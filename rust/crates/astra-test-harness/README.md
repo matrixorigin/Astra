@@ -227,6 +227,14 @@ not implementation difficulty.
    harness loads the session's local journal (via session_id from
    the JSON output) and makes it available to criteria evaluators.
 
+## Extending the harness
+
+See [HACKING.md](HACKING.md) for the "verify against real journals
+before writing a session-based criterion" checklist and the list of
+pitfalls caught in review. Skipping that step produced four review
+rounds' worth of drift; the integration tests under
+`tests/real_journal_wire_shape.rs` are the canonical guard.
+
 ## Related
 
 - `astra journal digest` — stable aggregate metrics for a session.

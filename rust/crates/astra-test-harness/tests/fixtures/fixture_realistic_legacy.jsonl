@@ -1,0 +1,11 @@
+{"type":"session_start","ts":"2026-05-01T00:00:00Z","session_id":"fixture-sess-legacy"}
+{"type":"context_assembly_recorded","ts":"2026-05-01T00:00:01Z","session_id":"fixture-sess-legacy","turn":1}
+{"type":"llm_request_full","ts":"2026-05-01T00:00:02Z","session_id":"fixture-sess-legacy","turn":1,"model":"fixture-model"}
+{"type":"llm_round","ts":"2026-05-01T00:00:03Z","session_id":"fixture-sess-legacy","turn":1,"agentic_step":0,"model":"fixture-model","tokens_in":1200,"tokens_out":80,"tool_calls":[{"name":"git_diff","ok":true,"ms":42}]}
+{"type":"llm_response_full","ts":"2026-05-01T00:00:04Z","session_id":"fixture-sess-legacy","turn":1}
+{"type":"llm_round","ts":"2026-05-01T00:00:05Z","session_id":"fixture-sess-legacy","turn":1,"agentic_step":1,"model":"fixture-model","tokens_in":1500,"tokens_out":40,"tool_calls":[{"name":"git_diff","ok":true,"ms":18}]}
+{"type":"llm_round","ts":"2026-05-01T00:00:06Z","session_id":"fixture-sess-legacy","turn":1,"agentic_step":2,"model":"fixture-model","tokens_in":1800,"tokens_out":60,"tool_calls":[{"name":"git_log","ok":true,"ms":31}]}
+{"type":"llm_round","ts":"2026-05-01T00:00:07Z","session_id":"fixture-sess-legacy","turn":1,"agentic_step":3,"model":"fixture-model","tokens_in":2100,"tokens_out":220}
+{"type":"turn","ts":"2026-05-01T00:00:08Z","session_id":"fixture-sess-legacy","turn":1,"tokens_in":6600,"tokens_out":400}
+{"type":"turn_evaluation","ts":"2026-05-01T00:00:09Z","session_id":"fixture-sess-legacy","turn":1}
+{"type":"session_end","ts":"2026-05-01T00:00:10Z","session_id":"fixture-sess-legacy"}

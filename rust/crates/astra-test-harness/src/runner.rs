@@ -27,7 +27,7 @@ use crate::case::Case;
 /// token buckets, new timing breakdowns, new observability tags)
 /// without a SemVer breakage. In-crate construction is unaffected;
 /// downstream crates must use `..` in struct patterns.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[non_exhaustive]
 pub struct RunOutcome {
     pub model: String,
@@ -41,6 +41,55 @@ pub struct RunOutcome {
     pub completion_tokens: u64,
     pub prompt_tokens: u64,
     pub duration_ms: u64,
+}
+
+impl RunOutcome {
+    /// Public constructor that external callers (integration tests,
+    /// embedders) can use without fighting `#[non_exhaustive]`.
+    /// Starts from defaults and sets `model`. Override additional
+    /// fields with the dedicated `with_*` setters since
+    /// `#[non_exhaustive]` prevents struct-update syntax from other
+    /// crates.
+    ///
+    /// ```
+    /// use astra_test_harness::runner::RunOutcome;
+    /// let out = RunOutcome::new("my-model")
+    ///     .with_exit_code(42)
+    ///     .with_session_id("sess-x");
+    /// # let _ = out;
+    /// ```
+    pub fn new(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_exit_code(mut self, code: i32) -> Self {
+        self.exit_code = code;
+        self
+    }
+
+    pub fn with_text(mut self, text: impl Into<String>) -> Self {
+        self.text = text.into();
+        self
+    }
+
+    pub fn with_stderr(mut self, stderr: impl Into<String>) -> Self {
+        self.stderr = stderr.into();
+        self
+    }
+
+    pub fn with_session_id(mut self, id: impl Into<String>) -> Self {
+        self.session_id = Some(id.into());
+        self
+    }
+
+    pub fn with_tools_used(mut self, tools: Vec<String>) -> Self {
+        self.tool_calls_count = tools.len() as u32;
+        self.tools_used = tools;
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
