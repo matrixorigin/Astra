@@ -102,6 +102,10 @@ pub struct RunnerConfig {
     /// Optional shared working directory — harness runs from here
     /// so relative paths in cases (if ever added) are stable.
     pub working_dir: Option<PathBuf>,
+    /// Optional profile name passed as `--profile <name>` to astra
+    /// subprocesses. Set by preflight auto-register to isolate
+    /// harness credentials from the user's active profile.
+    pub profile: Option<String>,
 }
 
 impl RunnerConfig {
@@ -110,6 +114,7 @@ impl RunnerConfig {
             astra_bin: astra_bin.into(),
             fallback_models: Vec::new(),
             working_dir: None,
+            profile: None,
         }
     }
     pub fn with_fallback_models(mut self, models: Vec<String>) -> Self {

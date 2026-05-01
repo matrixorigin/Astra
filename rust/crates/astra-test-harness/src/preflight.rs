@@ -192,24 +192,51 @@ async fn try_auto_register(astra_bin: &Path) -> bool {
 }
 
 /// Write fresh credentials to ~/.astra/credentials.json.
+/// Only writes to the default profile when no valid token exists,
+/// to avoid clobbering an active user session.
 fn write_credentials(access_token: &str, refresh_token: &str) -> bool {
     let home = match std::env::var("HOME") {
         Ok(h) => h,
         Err(_) => return false,
     };
     let creds_path = std::path::Path::new(&home).join(".astra/credentials.json");
-    let creds = serde_json::json!({
-        "current_profile": "default",
-        "profiles": {
-            "default": {
+
+    // Load existing credentials.
+    let mut creds: serde_json::Value = std::fs::read_to_string(&creds_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({"profiles": {}}));
+
+    // Only write if the default profile has no access_token.
+    // If user already has credentials, don't overwrite — they should re-login.
+    let has_existing_token = creds
+        .get("profiles")
+        .and_then(|p| p.get("default"))
+        .and_then(|d| d.get("access_token"))
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| !t.is_empty());
+
+    if has_existing_token {
+        return false;
+    }
+
+    // No existing credentials — safe to write default profile.
+    if let Some(profiles) = creds.get_mut("profiles").and_then(|p| p.as_object_mut()) {
+        profiles.insert(
+            "default".to_string(),
+            serde_json::json!({
                 "username": "harness-auto",
                 "access_token": access_token,
                 "refresh_token": refresh_token,
                 "last_session_id": null,
                 "memoria_api_key": null
-            }
-        }
-    });
+            }),
+        );
+    }
+    if creds.get("current_profile").is_none() {
+        creds["current_profile"] = serde_json::json!("default");
+    }
+
     std::fs::write(&creds_path, serde_json::to_string_pretty(&creds).unwrap_or_default()).is_ok()
 }
 

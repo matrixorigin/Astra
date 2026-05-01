@@ -219,8 +219,11 @@ async fn main() -> Result<()> {
                 .into_iter()
                 .collect()
         };
-        if let Err(e) = run_preflight(&astra_bin, &preflight_models).await {
-            anyhow::bail!("pre-flight check failed: {e}\n  (use --skip-preflight to bypass)");
+        match run_preflight(&astra_bin, &preflight_models).await {
+            Ok(_) => {}
+            Err(e) => {
+                anyhow::bail!("pre-flight check failed: {e}\n  (use --skip-preflight to bypass)");
+            }
         }
     }
 

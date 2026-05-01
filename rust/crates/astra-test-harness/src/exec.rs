@@ -105,6 +105,9 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
 
     let start = Instant::now();
     let mut cmd = Command::new(&cfg.astra_bin);
+    if let Some(ref profile) = cfg.profile {
+        cmd.arg("--profile").arg(profile);
+    }
     cmd.arg("chat")
         .arg("-m")
         .arg(&case.prompt)
