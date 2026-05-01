@@ -1,0 +1,20 @@
+name: multi_turn_error_correction
+description: |
+  Agent makes a tool call in turn 1, user points out an issue in turn 2.
+  Tests that the agent can correct itself using session context.
+prompt: "What is 2+2? Answer with just the number."
+capability: instruction_following
+difficulty: 1
+weight: 1.0
+timeout_seconds: 120
+steps:
+  - prompt: "Actually, I meant what is 2+2+2? Give me just the number."
+    criteria:
+      - type: text_contains
+        needle: "6"
+criteria:
+  - type: exit_code
+    code: 0
+  - type: turn_rounds_between
+    min: 1
+    max: 4

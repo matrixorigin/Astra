@@ -1,0 +1,24 @@
+name: planning_decompose_task
+description: |
+  Give the agent a complex task and verify it decomposes into steps
+  rather than attempting everything in one shot.
+prompt: |
+  I need you to: 1) check if /tmp exists, 2) create a file
+  /tmp/astra_plan_test.txt with content "step1 done", 3) read it back
+  to confirm, 4) delete it. Do all steps and report each result.
+capability: planning
+difficulty: 2
+weight: 1.5
+timeout_seconds: 180
+teardown_cmd: "rm -f /tmp/astra_plan_test.txt"
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tools_count_between
+    min: 3
+    max: 10
+  - type: text_contains
+    needle: "step1 done"
+  - type: turn_rounds_between
+    min: 1
+    max: 6

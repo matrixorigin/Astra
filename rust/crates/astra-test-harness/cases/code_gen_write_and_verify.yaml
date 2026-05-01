@@ -1,0 +1,28 @@
+name: code_gen_write_and_verify
+description: |
+  Ask the agent to write code to a file and then verify it compiles.
+  Tests the full code generation workflow with tool use.
+prompt: |
+  Write a Python script at /tmp/astra_harness_fib.py that defines a
+  function fibonacci(n) returning the nth Fibonacci number (0-indexed,
+  so fibonacci(0)=0, fibonacci(1)=1, fibonacci(10)=55). Then run it
+  with python3 -c "from astra_harness_fib import fibonacci; print(fibonacci(10))"
+  and confirm the output is 55.
+capability: code_generation
+difficulty: 3
+weight: 2.0
+timeout_seconds: 180
+teardown_cmd: "rm -f /tmp/astra_harness_fib.py"
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_sequence
+    tools: [str_replace, bash]
+  - type: text_contains
+    needle: "55"
+  - type: turn_rounds_between
+    min: 1
+    max: 6
+  - type: tokens_between
+    min: 1
+    max: 10000

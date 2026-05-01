@@ -1,0 +1,24 @@
+name: reasoning_multi_step_logic
+description: |
+  A logic puzzle requiring multi-step reasoning without tools.
+  Tests pure reasoning capability.
+prompt: |
+  A farmer has a fox, a chicken, and a bag of grain. He needs to cross
+  a river in a boat that can only carry him and one item. If left alone,
+  the fox will eat the chicken, and the chicken will eat the grain.
+  What is the minimum number of crossings needed? Just give the number.
+capability: reasoning
+difficulty: 3
+weight: 1.0
+timeout_seconds: 60
+criteria:
+  - type: exit_code
+    code: 0
+  - type: text_contains
+    needle: "7"
+  - type: tokens_between
+    min: 1
+    max: 3000
+  - type: turn_rounds_between
+    min: 1
+    max: 3

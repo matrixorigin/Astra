@@ -1,0 +1,24 @@
+name: multi_turn_instruction_refinement
+description: |
+  Agent receives a vague task, then a clarification. Tests that the
+  agent incorporates follow-up instructions without re-doing work.
+prompt: "Create a Rust function called 'greet' that takes a name parameter."
+capability: instruction_following
+difficulty: 3
+weight: 2.0
+timeout_seconds: 180
+steps:
+  - prompt: "Now make it return a String instead of printing, and add a doc comment."
+    criteria:
+      - type: text_contains
+        needle: "///"
+      - type: text_contains
+        needle: "-> String"
+criteria:
+  - type: exit_code
+    code: 0
+  - type: text_contains
+    needle: "greet"
+  - type: tokens_between
+    min: 1
+    max: 8000

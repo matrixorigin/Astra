@@ -1,0 +1,24 @@
+name: multi_turn_delegation_followup
+description: |
+  Turn 1 spawns a sub-agent. Turn 2 asks about the sub-agent's result.
+  Tests that delegation results persist in session context.
+prompt: |
+  Spawn a sub-agent with task "Calculate 17*23 and report the answer".
+  Tell me what it says.
+capability: delegation
+difficulty: 3
+weight: 2.0
+timeout_seconds: 240
+steps:
+  - prompt: "What was the numerical result the sub-agent gave you?"
+    criteria:
+      - type: text_contains
+        needle: "391"
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: spawn_agent
+  - type: turn_rounds_between
+    min: 1
+    max: 8

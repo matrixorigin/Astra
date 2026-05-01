@@ -1,0 +1,21 @@
+name: multi_turn_context_retention
+description: |
+  Verify the agent retains context across turns in the same session.
+  First turn establishes a fact, second turn asks about it.
+  Tests session continuation via --session-id.
+prompt: "Remember this: the secret code is ALPHA-7742. Just acknowledge."
+capability: memory
+difficulty: 2
+weight: 1.5
+timeout_seconds: 120
+steps:
+  - prompt: "What was the secret code I told you earlier?"
+    criteria:
+      - type: text_contains
+        needle: "ALPHA-7742"
+criteria:
+  - type: exit_code
+    code: 0
+  - type: turn_rounds_between
+    min: 1
+    max: 4
