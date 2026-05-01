@@ -111,6 +111,7 @@ impl<'a> SuiteRunner<'a> {
         let semaphore = Arc::new(Semaphore::new(self.suite_cfg.parallel));
         let aborted = Arc::new(AtomicBool::new(false));
         let consecutive_infra = Arc::new(AtomicUsize::new(0));
+        let total_auth_failures = Arc::new(AtomicUsize::new(0));
 
         let mut suite = SuiteReport {
             started_at: Some(started_at),
@@ -126,7 +127,12 @@ impl<'a> SuiteRunner<'a> {
                 }
                 let mut report = self.run_one(case, &model).await;
                 report.run_index = run_index;
-                self.update_circuit_breaker(&report, &consecutive_infra, &aborted);
+                self.update_circuit_breaker(
+                    &report,
+                    &consecutive_infra,
+                    &aborted,
+                    &total_auth_failures,
+                );
                 suite.runs.push(report);
             }
         } else {
@@ -139,6 +145,7 @@ impl<'a> SuiteRunner<'a> {
                     let sem = semaphore.clone();
                     let aborted = aborted.clone();
                     let consecutive_infra = consecutive_infra.clone();
+                    let total_auth_failures = total_auth_failures.clone();
                     async move {
                         if aborted.load(Ordering::Relaxed) {
                             return None;
@@ -149,7 +156,12 @@ impl<'a> SuiteRunner<'a> {
                         }
                         let mut report = self.run_one(case, &model).await;
                         report.run_index = run_index;
-                        self.update_circuit_breaker(&report, &consecutive_infra, &aborted);
+                        self.update_circuit_breaker(
+                            &report,
+                            &consecutive_infra,
+                            &aborted,
+                            &total_auth_failures,
+                        );
                         Some(report)
                     }
                 })
@@ -176,12 +188,24 @@ impl<'a> SuiteRunner<'a> {
         report: &CaseRunReport,
         consecutive_infra: &AtomicUsize,
         aborted: &AtomicBool,
+        total_auth_failures: &AtomicUsize,
     ) {
         if report.passed {
             consecutive_infra.store(0, Ordering::Relaxed);
             return;
         }
         if let Some(ref class) = report.failure_class {
+            if matches!(class, FailureClass::InfraAuth) {
+                let auth_count = total_auth_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                if auth_count == 2 {
+                    eprintln!(
+                        "[astra-test] WARNING: {auth_count} auth failures — credentials \
+                         may have expired mid-run. Remaining cases against this provider \
+                         will likely fail. Consider aborting (Ctrl-C) and re-running with \
+                         fresh credentials."
+                    );
+                }
+            }
             let is_infra = matches!(
                 class,
                 FailureClass::InfraAuth
@@ -350,12 +374,27 @@ impl<'a> SuiteRunner<'a> {
                 .iter()
                 .any(|c| matches!(c, Criterion::Judger { .. }))
         {
-            let prompt_preview: String = case.prompt.trim().chars().take(500).collect();
-            criteria.push(Criterion::Judger {
-                question: format!(
-                    "Given the task: \"{prompt_preview}\"\nDid the agent complete it correctly and efficiently? \
+            let question = if case.steps.is_empty() {
+                let preview: String = case.prompt.trim().chars().take(500).collect();
+                format!(
+                    "Given the task: \"{preview}\"\nDid the agent complete it correctly and efficiently? \
                      Score 0.0 for wrong/incomplete, 0.5 for partially correct, 1.0 for fully correct."
-                ),
+                )
+            } else {
+                let initial: String = case.prompt.trim().chars().take(300).collect();
+                let last_step = &case.steps.last().unwrap().prompt;
+                let followup: String = last_step.trim().chars().take(300).collect();
+                format!(
+                    "This is a multi-turn conversation.\n\
+                     Initial task: \"{initial}\"\n\
+                     Follow-up instruction: \"{followup}\"\n\
+                     The agent's final response should address the FOLLOW-UP instruction \
+                     (which may refine or change the original task).\n\
+                     Score 0.0 for wrong/incomplete, 0.5 for partially correct, 1.0 for fully correct."
+                )
+            };
+            criteria.push(Criterion::Judger {
+                question,
                 threshold: 0.7,
                 model: None,
             });
@@ -945,5 +984,104 @@ mod tests {
         assert!(report.ended_at.is_some());
         // wall_time_ms should be at least 0 (test completes instantly)
         // but the field must be populated.
+    }
+
+    #[tokio::test]
+    async fn auto_judger_uses_last_step_prompt_for_multi_turn() {
+        let exec = FakeExecutor::new();
+        exec.seed("mt", "m", outcome_ok("m", "step0", &[]));
+        exec.seed("mt__step0", "m", outcome_ok("m", "6", &[]));
+
+        struct CaptureJudger {
+            questions: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl Judger for CaptureJudger {
+            async fn score(
+                &self,
+                q: &str,
+                _m: Option<&str>,
+                _o: &RunOutcome,
+            ) -> Result<crate::judger::JudgerScore, String> {
+                self.questions.lock().unwrap().push(q.to_string());
+                Ok(crate::judger::JudgerScore {
+                    score: 1.0,
+                    rationale: "ok".into(),
+                    full_rationale: "ok".into(),
+                    votes: vec![],
+                })
+            }
+        }
+        let judger = CaptureJudger {
+            questions: std::sync::Mutex::new(vec![]),
+        };
+        let loader = NoopSessionLoader;
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: false,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+        };
+        let mut case = case_with("mt", vec![]);
+        case.prompt = "What is 2+2? Answer with just the number.".into();
+        case.steps = vec![crate::case::CaseStep {
+            prompt: "Actually what is 2+2+2?".into(),
+            criteria: vec![],
+            timeout_seconds: None,
+        }];
+        let _ = runner.run_all(&[case]).await;
+        let questions = judger.questions.lock().unwrap();
+        assert_eq!(questions.len(), 1);
+        let q = &questions[0];
+        assert!(
+            q.contains("2+2+2"),
+            "auto-judger question must reference the LAST step prompt, not the initial: {q}"
+        );
+        assert!(
+            q.contains("multi-turn") || q.contains("Follow-up"),
+            "auto-judger should indicate this is multi-turn: {q}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_failure_warning_on_non_consecutive_failures() {
+        let exec = FakeExecutor::new();
+        // c0: auth fail, c1: pass, c2: auth fail → total=2, warning expected
+        exec.seed("c0", "m", RunOutcome::new("m").with_exit_code(3));
+        exec.seed("c1", "m", outcome_ok("m", "ok", &[]));
+        exec.seed("c2", "m", RunOutcome::new("m").with_exit_code(3));
+
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig {
+                circuit_breaker_threshold: 10, // high so consecutive breaker doesn't fire
+                ..Default::default()
+            },
+        };
+        let cases = vec![
+            case_with("c0", vec![Criterion::ExitCode { code: 0 }]),
+            case_with("c1", vec![]),
+            case_with("c2", vec![Criterion::ExitCode { code: 0 }]),
+        ];
+        let report = runner.run_all(&cases).await;
+        // c0 and c2 fail (auth), c1 passes
+        assert_eq!(report.failed(), 2);
+        assert_eq!(report.passed(), 1);
+        // The warning was printed to stderr (we can't capture eprintln
+        // easily, but the auth counter logic is exercised).
     }
 }

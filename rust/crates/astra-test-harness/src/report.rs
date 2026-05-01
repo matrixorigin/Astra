@@ -374,8 +374,12 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         s.push('\n');
     }
 
-    // Collect distinct models.
-    let models: BTreeSet<&str> = report.runs.iter().map(|r| r.model.as_str()).collect();
+    // Collect distinct models (normalized for display).
+    let models: BTreeSet<&str> = report
+        .runs
+        .iter()
+        .map(|r| normalize_model_display(&r.model))
+        .collect();
     let multi_model = models.len() > 1;
 
     // ── Model comparison (multi-dimensional, always shown when > 1 model) ──
@@ -393,7 +397,7 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         }
         let mut stats: BTreeMap<&str, ModelStats> = BTreeMap::new();
         for r in &report.runs {
-            let e = stats.entry(&r.model).or_default();
+            let e = stats.entry(normalize_model_display(&r.model)).or_default();
             e.total += 1;
             let tok = r.outcome.prompt_tokens + r.outcome.completion_tokens;
             e.all_tokens += tok;
@@ -449,7 +453,9 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         let mut cap_groups: BTreeMap<(String, &str), (f64, f64)> = BTreeMap::new();
         for r in &report.runs {
             if let Some(ref cap) = r.capability {
-                let entry = cap_groups.entry((cap.to_string(), &r.model)).or_default();
+                let entry = cap_groups
+                    .entry((cap.to_string(), normalize_model_display(&r.model)))
+                    .or_default();
                 entry.1 += r.weight;
                 if r.passed {
                     entry.0 += r.weight;
@@ -469,11 +475,12 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         s.push_str("=== difficulty curve ===\n");
         // (difficulty, model) → (weighted_pass, weighted_total)
         let mut diff_groups: BTreeMap<(u8, &str), (f64, f64)> = BTreeMap::new();
-        // Also aggregate across all models for single-model view.
         let mut diff_all: BTreeMap<u8, (f64, f64)> = BTreeMap::new();
         for r in &report.runs {
             if let Some(d) = r.difficulty {
-                let entry = diff_groups.entry((d, &r.model)).or_default();
+                let entry = diff_groups
+                    .entry((d, normalize_model_display(&r.model)))
+                    .or_default();
                 entry.1 += r.weight;
                 if r.passed {
                     entry.0 += r.weight;
@@ -505,7 +512,9 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         let mut cdm: BTreeMap<(String, u8, &str), (f64, f64)> = BTreeMap::new();
         for r in &report.runs {
             if let (Some(cap), Some(diff)) = (&r.capability, r.difficulty) {
-                let entry = cdm.entry((cap.to_string(), diff, &r.model)).or_default();
+                let entry = cdm
+                    .entry((cap.to_string(), diff, normalize_model_display(&r.model)))
+                    .or_default();
                 entry.1 += r.weight;
                 if r.passed {
                     entry.0 += r.weight;
@@ -576,6 +585,23 @@ fn is_safe_session_id(id: &str) -> bool {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Strip provider-route prefixes for display grouping.
+/// `us.anthropic.claude-sonnet-4-6` → `claude-sonnet-4-6`
+fn normalize_model_display(model: &str) -> &str {
+    for prefix in [
+        "us.anthropic.",
+        "eu.anthropic.",
+        "ap.anthropic.",
+        "us.amazon.",
+        "eu.amazon.",
+    ] {
+        if let Some(rest) = model.strip_prefix(prefix) {
+            return rest;
+        }
+    }
+    model
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1176,6 +1202,53 @@ mod tests {
         assert!(
             out.contains("difficulty"),
             "should show difficulty section:\n{out}"
+        );
+    }
+
+    #[test]
+    fn normalize_model_display_strips_known_prefixes() {
+        assert_eq!(
+            normalize_model_display("us.anthropic.claude-sonnet-4-6"),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(
+            normalize_model_display("eu.anthropic.claude-opus-4-7"),
+            "claude-opus-4-7"
+        );
+        assert_eq!(normalize_model_display("MiniMax-M2.7"), "MiniMax-M2.7");
+        assert_eq!(normalize_model_display("qwen-flash"), "qwen-flash");
+    }
+
+    #[test]
+    fn model_comparison_collapses_provider_variants() {
+        // us.anthropic.claude-sonnet-4-6 and claude-sonnet-4-6 should merge
+        let r = SuiteReport {
+            runs: vec![
+                mk_run("c1", "claude-sonnet-4-6", true, None, None, 1.0, 100, 10, 5),
+                mk_run(
+                    "c2",
+                    "us.anthropic.claude-sonnet-4-6",
+                    true,
+                    None,
+                    None,
+                    1.0,
+                    200,
+                    20,
+                    10,
+                ),
+                mk_run("c1", "MiniMax-M2.7", false, None, None, 1.0, 300, 30, 15),
+            ],
+            ..Default::default()
+        };
+        let out = render_text(&r, false);
+        assert!(
+            out.contains("model comparison"),
+            "multi-model must show comparison:\n{out}"
+        );
+        // Should show claude-sonnet-4-6 with 2/2 (collapsed), not two separate entries
+        assert!(
+            out.contains("claude-sonnet-4-6: pass=2/2"),
+            "provider variants must collapse in comparison table: {out}"
         );
     }
 

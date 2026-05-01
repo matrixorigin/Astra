@@ -68,7 +68,7 @@ impl JudgerConfig {
         Self {
             astra_bin: astra_bin.into(),
             default_model: default_model.into(),
-            timeout_seconds: 60,
+            timeout_seconds: 120,
         }
     }
 }

@@ -67,7 +67,7 @@ struct Args {
     judger_model: String,
 
     /// Judger timeout in seconds.
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 120)]
     judger_timeout: u64,
 
     /// Run the judger N times and aggregate.
