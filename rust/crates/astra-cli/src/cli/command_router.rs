@@ -26,6 +26,19 @@ impl From<ExitCode> for i32 {
     }
 }
 
+/// Load conversation messages from a session's latest heavy checkpoint.
+/// Used by one-shot mode (`-m "..." --session-id <id>`) to provide
+/// conversation history that the model needs for multi-turn continuity.
+///
+/// Returns `None` if the session has no checkpoint (first turn) or
+/// the checkpoint is unreadable.
+fn load_session_messages_for_continuation(session_id: &str) -> Option<Vec<serde_json::Value>> {
+    match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(session_id) {
+        Ok(Some(cp)) if !cp.messages.is_empty() => Some(cp.messages),
+        _ => None,
+    }
+}
+
 /// Prepend system prompt to user message when `--system-prompt` is set.
 fn apply_system_prompt(message: &str, system_prompt: Option<&str>) -> String {
     match system_prompt {
@@ -409,6 +422,9 @@ pub(super) async fn execute_cli_command(
             let message = apply_system_prompt(&raw_message, system_prompt.as_deref());
             let (mut creds, name, _, token) = get_profile_and_token(profile.as_deref())?;
             let session_id = validated_resumable_last_session_id(api, profile.as_deref()).await;
+            let mut continuation_messages = session_id
+                .as_deref()
+                .and_then(load_session_messages_for_continuation);
             let selector = create_tool_selector(api, profile.as_deref());
             let mut pm = PermissionManager::with_project(
                 auto_approve,
@@ -436,13 +452,15 @@ pub(super) async fn execute_cli_command(
                 agent_spawner: None,
                 root_agent_id: None,
             };
-            let sr = match stream_chat_sse(ChatTurnParams::basic_cli(
+            let mut params = ChatTurnParams::basic_cli(
                 &chat_ctx,
                 &token,
                 session_id.as_deref(),
                 &mut pm,
                 &mut skill_qt,
-            ))
+            );
+            params.pre_loaded_messages = continuation_messages.take();
+            let sr = match stream_chat_sse(params)
             .await
             {
                 Ok(sr) => sr,
@@ -806,6 +824,10 @@ pub(super) async fn execute_cli_command(
                 Some(session_id) => Some(session_id),
                 None => validated_resumable_last_session_id(api, profile.as_deref()).await,
             };
+            // Load previous conversation for multi-turn continuity.
+            let mut continuation_messages = session_id
+                .as_deref()
+                .and_then(load_session_messages_for_continuation);
             let is_tty = terminal::size().is_ok();
             let selector = create_tool_selector(api, profile.as_deref());
             let mut pm = {
@@ -885,13 +907,15 @@ pub(super) async fn execute_cli_command(
                 agent_spawner: Some(one_shot_spawner),
                 root_agent_id: Some(&root_agent_id),
             };
-            let sr = match stream_chat_sse(ChatTurnParams::basic_cli(
+            let mut params = ChatTurnParams::basic_cli(
                 &chat_ctx,
                 &token,
                 session_id.as_deref(),
                 &mut pm,
                 &mut skill_qt,
-            ))
+            );
+            params.pre_loaded_messages = continuation_messages.take();
+            let sr = match stream_chat_sse(params)
             .await
             {
                 Ok(sr) => sr,
@@ -1440,6 +1464,9 @@ pub(super) async fn run_print_mode(
 
     let (mut creds, name, _, token) = get_profile_and_token(profile)?;
     let session_id = validated_resumable_last_session_id(api, profile).await;
+    let mut continuation_messages = session_id
+        .as_deref()
+        .and_then(load_session_messages_for_continuation);
     let selector = create_tool_selector(api, profile);
     let mut pm = PermissionManager::with_project(
         true, // print mode is headless, always auto-approve
@@ -1466,13 +1493,15 @@ pub(super) async fn run_print_mode(
         root_agent_id: None,
     };
 
-    let sr = match stream_chat_sse(ChatTurnParams::basic_cli(
+    let mut params = ChatTurnParams::basic_cli(
         &chat_ctx,
         &token,
         session_id.as_deref(),
         &mut pm,
         &mut skill_qt,
-    ))
+    );
+    params.pre_loaded_messages = continuation_messages.take();
+    let sr = match stream_chat_sse(params)
     .await
     {
         Ok(sr) => sr,
@@ -3311,5 +3340,75 @@ mod api_url_config_tests {
         let target = dir.path().join("nested").join("capture.json");
         write_downloaded_capture(&target, br#"{"ok":true}"#).unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), r#"{"ok":true}"#);
+    }
+}
+
+#[cfg(test)]
+mod session_continuation_tests {
+    use serde_json::json;
+
+    /// Regression test: `--session-id` in one-shot mode must load previous
+    /// messages from the session's heavy checkpoint. Before the fix, messages
+    /// were always empty — the model couldn't see prior conversation turns.
+    #[test]
+    fn load_session_messages_returns_checkpoint_messages() {
+        let session_id = format!("test-session-cont-{}", uuid::Uuid::new_v4());
+
+        // Write a heavy checkpoint to the standard sessions dir.
+        let home = dirs::home_dir().unwrap();
+        let cp_dir = home
+            .join(".astra/sessions")
+            .join(&session_id)
+            .join("step_checkpoints");
+        std::fs::create_dir_all(&cp_dir).unwrap();
+
+        // Use the same format as a real checkpoint (read from step_protocol.rs).
+        // The key insight: serde will skip unknown fields with #[serde(default)],
+        // so we only need the required fields.
+        let checkpoint_json = r#"{
+            "Heavy": {
+                "light": {
+                    "protocol_version": 1,
+                    "cursor": {"phase": "Done", "slots": [], "parallel": false, "wait_trigger": null, "sub_step": null},
+                    "step_id": "s1",
+                    "task_id": "t1",
+                    "agent_id": "astra-cli",
+                    "progress": 1.0,
+                    "total_tokens": 100,
+                    "created_at": 1700000000
+                },
+                "messages": [
+                    {"role": "user", "content": "Remember: code is ZEBRA-99"},
+                    {"role": "assistant", "content": "OK, noted."}
+                ],
+                "budget_remaining_tokens": 100000,
+                "budget_remaining_rounds": 50,
+                "blocked_tools": [],
+                "recent_tools": []
+            }
+        }"#;
+        std::fs::write(cp_dir.join("000002-heavy.json"), checkpoint_json).unwrap();
+
+        // The function under test: load messages for session continuation.
+        let messages = super::load_session_messages_for_continuation(&session_id);
+
+        // Cleanup
+        let home = dirs::home_dir().unwrap();
+        let _ = std::fs::remove_dir_all(home.join(".astra/sessions").join(&session_id));
+
+        // Assert: must return the 2 messages from the checkpoint.
+        let messages = messages.expect("should load messages from checkpoint");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "Remember: code is ZEBRA-99");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "OK, noted.");
+    }
+
+    #[test]
+    fn load_session_messages_returns_none_for_missing_session() {
+        let messages =
+            super::load_session_messages_for_continuation("nonexistent-session-xyz-42");
+        assert!(messages.is_none());
     }
 }
