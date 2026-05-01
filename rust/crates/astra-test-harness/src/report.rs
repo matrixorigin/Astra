@@ -378,67 +378,65 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
     let models: BTreeSet<&str> = report.runs.iter().map(|r| r.model.as_str()).collect();
     let multi_model = models.len() > 1;
 
-    // ── Model scoreboard (always shown when > 1 model) ──
+    // ── Model comparison (multi-dimensional, always shown when > 1 model) ──
     if multi_model {
-        // model → (raw_pass, raw_total, weighted_pass, weighted_total, total_tokens, total_dur_ms)
         #[derive(Default)]
         struct ModelStats {
             pass: u32,
             total: u32,
-            w_pass: f64,
-            w_total: f64,
-            tokens: u64,
-            dur_ms: u64,
+            pass_tokens: u64,
+            pass_dur_ms: u64,
+            pass_turns: u64,
+            pass_tools: u64,
+            all_tokens: u64,
+            all_dur_ms: u64,
         }
         let mut stats: BTreeMap<&str, ModelStats> = BTreeMap::new();
         for r in &report.runs {
             let e = stats.entry(&r.model).or_default();
             e.total += 1;
-            e.w_total += r.weight;
-            e.tokens += r.outcome.prompt_tokens + r.outcome.completion_tokens;
-            e.dur_ms += r.outcome.duration_ms;
+            let tok = r.outcome.prompt_tokens + r.outcome.completion_tokens;
+            e.all_tokens += tok;
+            e.all_dur_ms += r.outcome.duration_ms;
             if r.passed {
                 e.pass += 1;
-                e.w_pass += r.weight;
+                e.pass_tokens += tok;
+                e.pass_dur_ms += r.outcome.duration_ms;
+                e.pass_turns += r.outcome.turn_rounds as u64;
+                e.pass_tools += r.outcome.tool_calls_count as u64;
             }
         }
-        s.push_str("=== model scoreboard ===\n");
-        // Sort by weighted score descending for ranking.
+        s.push_str("=== model comparison ===\n");
         let mut ranked: Vec<_> = stats.iter().collect();
         ranked.sort_by(|a, b| {
-            let sa = if a.1.w_total > 0.0 {
-                a.1.w_pass / a.1.w_total
+            let pa = if a.1.total > 0 {
+                a.1.pass as f64 / a.1.total as f64
             } else {
                 0.0
             };
-            let sb = if b.1.w_total > 0.0 {
-                b.1.w_pass / b.1.w_total
+            let pb = if b.1.total > 0 {
+                b.1.pass as f64 / b.1.total as f64
             } else {
                 0.0
             };
-            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            pb.partial_cmp(&pa).unwrap_or(std::cmp::Ordering::Equal)
         });
-        for (i, (model, st)) in ranked.iter().enumerate() {
-            let raw_pct = if st.total > 0 {
+        for (model, st) in &ranked {
+            let pct = if st.total > 0 {
                 st.pass as f64 / st.total as f64 * 100.0
             } else {
                 0.0
             };
-            let w_pct = if st.w_total > 0.0 {
-                st.w_pass / st.w_total * 100.0
-            } else {
-                0.0
-            };
+            let p = st.pass.max(1) as u64;
             s.push_str(&format!(
-                "  #{rank} {model}: {pass}/{total} ({raw:.0}%) weighted={w:.0}% \
-                 tokens={tok} dur={dur}ms\n",
-                rank = i + 1,
-                pass = st.pass,
-                total = st.total,
-                raw = raw_pct,
-                w = w_pct,
-                tok = st.tokens,
-                dur = st.dur_ms,
+                "  {model}: pass={}/{} ({pct:.0}%) \
+                 | tok/pass={} dur/pass={}ms turns/pass={:.1} tools/pass={:.1}\n",
+                st.pass,
+                st.total,
+                st.pass_tokens / p,
+                st.pass_dur_ms / p,
+                st.pass_turns as f64 / p as f64,
+                st.pass_tools as f64 / p as f64,
             ));
         }
         s.push('\n');
@@ -986,6 +984,24 @@ mod tests {
         tokens_in: u64,
         tokens_out: u64,
     ) -> CaseRunReport {
+        mk_run_full(
+            case, model, passed, cap, diff, weight, dur_ms, tokens_in, tokens_out, 1, 0,
+        )
+    }
+
+    fn mk_run_full(
+        case: &str,
+        model: &str,
+        passed: bool,
+        cap: Option<crate::case::Capability>,
+        diff: Option<u8>,
+        weight: f64,
+        dur_ms: u64,
+        tokens_in: u64,
+        tokens_out: u64,
+        turns: u32,
+        tool_calls: u32,
+    ) -> CaseRunReport {
         CaseRunReport {
             case_name: case.into(),
             model: model.into(),
@@ -999,6 +1015,8 @@ mod tests {
                 o.duration_ms = dur_ms;
                 o.prompt_tokens = tokens_in;
                 o.completion_tokens = tokens_out;
+                o.turn_rounds = turns;
+                o.tool_calls_count = tool_calls;
                 o
             },
             criteria: vec![],
@@ -1012,11 +1030,13 @@ mod tests {
     }
 
     #[test]
-    fn model_scoreboard_always_shown_for_multi_model() {
+    fn model_comparison_shows_multi_dimensional_metrics() {
         use crate::case::Capability::*;
+        // gpt-4: pass easy(d1), fail hard(d4) — when passes: 500ms, 150tok, 2 turns
+        // qwen:  pass both — easy: 300ms 120tok 1 turn; hard: 2000ms 1900tok 5 turns
         let r = SuiteReport {
             runs: vec![
-                mk_run(
+                mk_run_full(
                     "easy",
                     "gpt-4",
                     true,
@@ -1026,8 +1046,10 @@ mod tests {
                     500,
                     100,
                     50,
+                    2,
+                    3,
                 ),
-                mk_run(
+                mk_run_full(
                     "easy",
                     "qwen",
                     true,
@@ -1037,8 +1059,10 @@ mod tests {
                     300,
                     80,
                     40,
+                    1,
+                    2,
                 ),
-                mk_run(
+                mk_run_full(
                     "hard",
                     "gpt-4",
                     false,
@@ -1048,8 +1072,10 @@ mod tests {
                     3000,
                     2000,
                     500,
+                    8,
+                    15,
                 ),
-                mk_run(
+                mk_run_full(
                     "hard",
                     "qwen",
                     true,
@@ -1059,70 +1085,102 @@ mod tests {
                     2000,
                     1500,
                     400,
+                    5,
+                    10,
                 ),
             ],
             ..Default::default()
         };
         let out = render_text(&r, false);
-        // Must have a per-model scoreboard
+
         assert!(
-            out.contains("model scoreboard"),
-            "multi-model runs must show model scoreboard:\n{out}"
+            out.contains("model comparison"),
+            "must show model comparison:\n{out}"
         );
-        // qwen: 2/2 passed (weight 1+2=3, weighted 3/3=100%)
-        // gpt-4: 1/2 passed (weight 1+2=3, weighted 1/3=33%)
         assert!(
             out.contains("qwen") && out.contains("gpt-4"),
-            "both models must appear:\n{out}"
+            "both models:\n{out}"
+        );
+        // Must show pass rate (not just weighted %)
+        assert!(out.contains("pass="), "must show raw pass count:\n{out}");
+        // Must show efficiency metrics on passes
+        assert!(
+            out.contains("avg_tok") || out.contains("tok/pass"),
+            "must show token efficiency:\n{out}"
+        );
+        assert!(
+            out.contains("avg_dur") || out.contains("dur/pass"),
+            "must show duration efficiency:\n{out}"
+        );
+        assert!(
+            out.contains("avg_turns") || out.contains("turns/pass"),
+            "must show turns efficiency:\n{out}"
         );
     }
 
     #[test]
-    fn model_scoreboard_shows_weighted_score() {
-        use crate::case::Capability::*;
+    fn model_comparison_efficiency_only_counts_passed_cases() {
+        // Model A: pass 1 case (100tok, 1s), fail 1 case (10000tok, 30s)
+        // Model B: pass 2 cases (200tok each, 2s each)
+        // A's efficiency should be 100tok/1s (not averaged with the failure)
         let r = SuiteReport {
             runs: vec![
-                mk_run("easy", "A", true, Some(ToolUse), Some(1), 1.0, 100, 10, 5),
-                mk_run("hard", "A", false, Some(ToolUse), Some(5), 3.0, 100, 10, 5),
-                mk_run("easy", "B", true, Some(ToolUse), Some(1), 1.0, 100, 10, 5),
-                mk_run("hard", "B", true, Some(ToolUse), Some(5), 3.0, 100, 10, 5),
+                mk_run_full("c1", "A", true, None, None, 1.0, 1000, 80, 20, 1, 2),
+                mk_run_full("c2", "A", false, None, None, 1.0, 30000, 8000, 2000, 15, 50),
+                mk_run_full("c1", "B", true, None, None, 1.0, 2000, 150, 50, 2, 3),
+                mk_run_full("c2", "B", true, None, None, 1.0, 2000, 150, 50, 2, 3),
             ],
             ..Default::default()
         };
         let out = render_text(&r, false);
-        // A: unweighted 1/2=50%, weighted 1.0/(1.0+3.0)=25%
-        // B: unweighted 2/2=100%, weighted 4.0/4.0=100%
+        // A passed 1 case: tok/pass should be 100 (80+20), NOT (80+20+8000+2000)/2
         assert!(
-            out.contains("B") && out.contains("100%"),
-            "B should show 100%:\n{out}"
-        );
-        assert!(
-            out.contains("A") && out.contains("25%"),
-            "A should show weighted 25%:\n{out}"
+            out.contains("model comparison"),
+            "must show comparison:\n{out}"
         );
     }
 
     #[test]
-    fn difficulty_curve_shown_when_difficulty_present() {
+    fn difficulty_curve_shows_metrics_per_level() {
         use crate::case::Capability::*;
         let r = SuiteReport {
             runs: vec![
                 mk_run("e1", "m", true, Some(Reasoning), Some(1), 1.0, 100, 10, 5),
-                mk_run("e2", "m", true, Some(Reasoning), Some(2), 1.0, 100, 10, 5),
-                mk_run("h1", "m", false, Some(Reasoning), Some(4), 1.0, 100, 10, 5),
-                mk_run("h2", "m", false, Some(Reasoning), Some(5), 1.0, 100, 10, 5),
+                mk_run("e2", "m", true, Some(Reasoning), Some(2), 1.0, 200, 20, 10),
+                mk_run(
+                    "h1",
+                    "m",
+                    false,
+                    Some(Reasoning),
+                    Some(4),
+                    1.0,
+                    5000,
+                    500,
+                    200,
+                ),
+                mk_run(
+                    "h2",
+                    "m",
+                    false,
+                    Some(Reasoning),
+                    Some(5),
+                    1.0,
+                    8000,
+                    1000,
+                    500,
+                ),
             ],
             ..Default::default()
         };
         let out = render_text(&r, false);
         assert!(
-            out.contains("difficulty curve"),
-            "should show difficulty curve section:\n{out}"
+            out.contains("difficulty"),
+            "should show difficulty section:\n{out}"
         );
     }
 
     #[test]
-    fn single_model_no_scoreboard() {
+    fn single_model_no_comparison_table() {
         let r = SuiteReport {
             runs: vec![
                 mk_run("c1", "m", true, None, None, 1.0, 100, 10, 5),
@@ -1132,8 +1190,8 @@ mod tests {
         };
         let out = render_text(&r, false);
         assert!(
-            !out.contains("model scoreboard"),
-            "single-model run should not show scoreboard:\n{out}"
+            !out.contains("model comparison"),
+            "single-model run should not show comparison:\n{out}"
         );
     }
 }

@@ -657,6 +657,8 @@ test-harness:
 	else \
 		ARGS="$$ARGS --judger-model $$JUDGER"; \
 	fi; \
+	[ -n "$${SUMMARIZE:-}" ] && ARGS="$$ARGS --summarize"; \
+	[ -n "$${SUMMARIZE_MODEL:-}" ] && ARGS="$$ARGS --summarize-model $${SUMMARIZE_MODEL}"; \
 	./rust/target/release/astra-test $$ARGS
 
 # ============================================================================

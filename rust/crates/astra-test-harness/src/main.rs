@@ -131,6 +131,20 @@ struct Args {
     /// a different profile to avoid clobbering active user credentials.
     #[arg(long, value_name = "PROFILE")]
     profile: Option<String>,
+
+    /// Run an LLM-powered post-run summary analyzing cross-model
+    /// performance, capability gaps, and efficiency patterns.
+    /// Uses the judger model by default; override with --summarize-model.
+    #[arg(long)]
+    summarize: bool,
+
+    /// Model to use for the post-run summary. Implies --summarize.
+    #[arg(long, value_name = "MODEL")]
+    summarize_model: Option<String>,
+
+    /// Timeout for the summarizer LLM call in seconds.
+    #[arg(long, default_value_t = 120)]
+    summarize_timeout: u64,
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -365,6 +379,31 @@ async fn main() -> Result<()> {
         .parse()
         .map_err(|e: String| anyhow::anyhow!(e))?;
     println!("{}", render(&suite, fmt, args.verbose));
+
+    // Optional LLM summary.
+    let want_summary = args.summarize || args.summarize_model.is_some();
+    if want_summary {
+        let summary_model = args
+            .summarize_model
+            .as_deref()
+            .unwrap_or(&args.judger_model);
+        eprintln!("[astra-test] generating LLM summary (model={summary_model})...");
+        match astra_test_harness::summarizer::summarize(
+            &astra_bin,
+            summary_model,
+            &suite,
+            args.summarize_timeout,
+        )
+        .await
+        {
+            Ok(text) => {
+                println!("\n=== LLM summary ===\n{text}\n");
+            }
+            Err(e) => {
+                eprintln!("[astra-test] WARNING: summarizer failed: {e}");
+            }
+        }
+    }
 
     if suite.failed() > 0 {
         std::process::exit(1);
