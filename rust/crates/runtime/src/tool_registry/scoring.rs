@@ -223,7 +223,7 @@ fn file_context_tool_boost(tool_name: &str, file_context: &[String]) -> f64 {
 }
 
 fn explicit_lsp_signal(query_lower: &str) -> bool {
-    use astra_turn_core::tool_registry_state::word_boundary_match;
+    use astra_turn_core::tool_registry_state::{split_haystack_words, word_boundary_match_prepared};
 
     const LSP_SIGNALS: &[&str] = &[
         "lsp",
@@ -295,9 +295,10 @@ fn explicit_lsp_signal(query_lower: &str) -> bool {
         "调用层次",
     ];
 
+    let words = split_haystack_words(query_lower);
     LSP_SIGNALS
         .iter()
-        .any(|signal| word_boundary_match(query_lower, signal))
+        .any(|signal| word_boundary_match_prepared(query_lower, &words, signal))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -718,17 +719,18 @@ fn pre_filter_dynamic_with_pressure_and_cooccurrence(
 /// turns one `pre_filter_dynamic` call into multi-second CPU on debug
 /// builds.
 ///
-/// Size rationale (2 KiB):
-/// - Covers the first ~2000 ASCII chars (more than any LLM trigger cares
+/// Size rationale (4 KiB):
+/// - Covers the first ~4000 ASCII chars (more than any LLM trigger cares
 ///   about).
-/// - ~1000 mixed-Latin chars.
-/// - ~680 pure-CJK chars (3 bytes per codepoint under UTF-8) — safely above
-///   realistic tool-selection prompts in Chinese.
+/// - ~2000 mixed-Latin chars.
+/// - ~1360 pure-CJK chars (3 bytes per codepoint under UTF-8) — comfortably
+///   above realistic tool-selection prompts in Chinese, even with pasted
+///   code snippets.
 ///
 /// If this ever needs raising, fix the per-query super-linear term first
 /// (dedup `query_terms` before feeding TF-IDF, cache the haystack split
 /// inside the per-tool loop) — then the cap can grow without paying CPU.
-const SCORING_QUERY_BYTE_CAP: usize = 2048;
+const SCORING_QUERY_BYTE_CAP: usize = 4096;
 
 /// Return the longest prefix of `s` whose byte length ≤ `max_bytes`, snapped
 /// down to a UTF-8 character boundary. Never splits a multi-byte codepoint.

@@ -2056,17 +2056,13 @@ fn append_context_flags(cmd: &mut Command, before: Option<usize>, after: Option<
 async fn sigkill_process_group(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
-        if let Some(pid) = child.id()
-            && let Ok(raw) = i32::try_from(pid)
-        {
-            // `pid` came from `Child::id()` on a not-yet-reaped child; the
-            // pgid equals the PID because we called `process_group(0)`
-            // before spawn. `killpg` is signal-safe and ignores ESRCH if
-            // the group has already exited. We skip the call entirely if
-            // the PID ever exceeds `i32::MAX` (would silently wrap to a
-            // negative value and target the wrong group).
-            let pgid = nix::unistd::Pid::from_raw(raw);
-            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+        if let Some(pid) = child.id() {
+            if let Ok(raw) = i32::try_from(pid) {
+                let pgid = nix::unistd::Pid::from_raw(raw);
+                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+            } else {
+                tracing::warn!(pid, "sigkill_process_group: PID exceeds i32::MAX, skipping killpg");
+            }
         }
     }
     let _ = child.kill().await;
@@ -3627,6 +3623,25 @@ printf 'probe.txt:1:needle\n'
         let args_big = serde_json::json!({"command": "echo ok", "timeout": 10_000});
         assert_eq!(parse_bash_timeout_secs(&args_big), BASH_TIMEOUT_MAX_SECS);
         assert_eq!(BASH_TIMEOUT_MAX_SECS, 600.0);
+    }
+
+    #[tokio::test]
+    async fn bash_default_timeout_allows_short_commands_end_to_end() {
+        // End-to-end proof that the default timeout (120s) doesn't clamp
+        // commands shorter than it. Costs ~200ms real time (not 35s like the
+        // old test that slept 35s to prove >30s worked).
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "sleep 0.1 && echo done"}),
+        )
+        .await;
+        assert!(
+            result.output.contains("done"),
+            "command should complete under default timeout, got: {}",
+            result.output
+        );
     }
 
     // ── background process warning ────────────────────────────────────────────

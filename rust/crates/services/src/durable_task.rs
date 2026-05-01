@@ -4802,14 +4802,36 @@ mod tests {
         assert!(report.results.iter().all(|r| r.passed));
     }
 
-    // Note: timeout-behaviour coverage for `run_criterion` lives in
-    // `llm_judge_timeout_returns_failure_with_error`, which drives the same
-    // `tokio::time::timeout(...)` wrapper via the LlmJudge verifier using a
-    // pure async sleep (virtual-time friendly). Testing the Command variant
-    // here would need a real subprocess that hangs for ≥1s — the runner uses
-    // `spawn_blocking`, so kill-on-drop doesn't apply and the test would pay
-    // the full subprocess duration on runtime drain. The command-path timeout
-    // is still covered end-to-end by the online integration suite.
+    // Command-path timeout: `timeout_sec: 0` means `Duration::from_secs(0)`
+    // which fires the `tokio::time::timeout` wrapper before `spawn_blocking`
+    // can complete. This exercises the Err(Elapsed) → "verification timed out"
+    // path without waiting for a real subprocess. Uses `start_paused = true`
+    // so the zero-duration timeout fires synchronously before the blocking
+    // task is polled, and the runtime doesn't wait for the orphaned task.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn verification_command_timeout_returns_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let runner = VerificationRunner::new(tmp.path().to_path_buf());
+
+        let criterion = VerificationCriterion {
+            id: "cmd-timeout".into(),
+            description: "should timeout".into(),
+            verifier: VerifierKind::Command {
+                cmd: "echo fast".into(),
+                expected_exit: 0,
+            },
+            required: true,
+            timeout_sec: 0, // instant timeout
+            global_only: false,
+        };
+        let result = runner.run_criterion(&criterion).await;
+        assert!(!result.passed);
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("timed out"),
+            "expected 'timed out' error, got: {:?}",
+            result.error
+        );
+    }
 
     #[test]
     fn delivery_report_serde() {

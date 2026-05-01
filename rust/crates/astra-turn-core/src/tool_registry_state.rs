@@ -95,10 +95,14 @@ impl ConversationState {
         // count (not byte count) — see `is_conversational_msg`,
         // `is_followup_msg`. Built once and reused.
         let chars: Vec<char> = msg_lower.chars().collect();
+        // Pre-split the haystack once for all `contains_any` calls (avoids
+        // O(patterns) redundant splits — see `word_boundary_match_prepared`).
+        let words = split_haystack_words(&msg_lower);
 
         let mut state = Self {
             references_history: contains_any(
                 &msg_lower,
+                &words,
                 &[
                     "前一个",
                     "上一轮",
@@ -119,6 +123,7 @@ impl ConversationState {
             ),
             is_analytical: contains_any(
                 &msg_lower,
+                &words,
                 &[
                     "分析",
                     "评估",
@@ -143,6 +148,7 @@ impl ConversationState {
             ),
             is_fetch: contains_any(
                 &msg_lower,
+                &words,
                 &[
                     "查看",
                     "列出",
@@ -172,6 +178,7 @@ impl ConversationState {
             ),
             is_mutate: contains_any(
                 &msg_lower,
+                &words,
                 &[
                     "创建",
                     "修改",
@@ -201,6 +208,7 @@ impl ConversationState {
             is_conversational: is_conversational_msg(&msg_lower, &chars),
             is_git: contains_any(
                 &msg_lower,
+                &words,
                 &[
                     "git", "diff", "commit", "branch", "merge", "rebase", "stash", "提交", "分支",
                     "合并",
@@ -208,6 +216,7 @@ impl ConversationState {
             ),
             is_github: contains_any(
                 &msg_lower,
+                &words,
                 &[
                     "github",
                     "pr",
@@ -225,6 +234,7 @@ impl ConversationState {
             is_followup: is_followup_msg(&msg_lower, &chars, turn_count),
             is_memory: contains_any(
                 &msg_lower,
+                &words,
                 &[
                     "记忆",
                     "memory",
@@ -325,14 +335,14 @@ fn is_followup_msg(lower: &str, chars: &[char], turn_count: u32) -> bool {
     false
 }
 
-fn contains_any(lower: &str, patterns: &[&str]) -> bool {
+fn contains_any(lower: &str, words: &[&str], patterns: &[&str]) -> bool {
     patterns.iter().any(|p| {
         if p.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
             // CJK: direct substring match
             lower.contains(p)
         } else {
-            // ASCII: word-boundary-aware
-            word_boundary_match(lower, p)
+            // ASCII: word-boundary-aware (reuse pre-split words)
+            word_boundary_match_prepared(lower, words, p)
         }
     })
 }
@@ -532,9 +542,10 @@ fn is_conversational_msg(lower: &str, chars: &[char]) -> bool {
     }
     // ASCII: word-boundary-aware match to avoid false positives
     // (e.g., "this" matching "hi", "tokenbudget" matching "ok")
+    let words = split_haystack_words(lower);
     conversational_en
         .iter()
-        .any(|p| word_boundary_match(lower, p))
+        .any(|p| word_boundary_match_prepared(lower, &words, p))
 }
 
 #[cfg(test)]
