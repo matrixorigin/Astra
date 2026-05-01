@@ -48,26 +48,18 @@ pub fn require_system_e2e_env() {
     E2E_ENV_INIT.get_or_init(|| {
         let secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET")
             .unwrap_or_else(|_| "system-matrix-e2e-secret".to_string());
-        // SAFETY: set once before parallel test threads (idempotent for all E2E tests).
+        // SAFETY: These tests MUST run under nextest (per-process isolation).
+        // Under `cargo test` with shared threads this is technically UB on
+        // Rust 2024 edition. OnceLock guarantees this block runs exactly once
+        // before any test logic reads the env vars.
         unsafe {
             std::env::set_var("ASTRA_TEST_BRIDGE_SECRET", &secret);
-            // Collapse retry backoff for rate-limit / transient-error tests that
-            // intentionally exhaust retries. Production default is 1s base (grows
-            // 1s→2s→4s), so 3 retries cost ~7s wall time — blowing the strict-online
-            // per-case budget. E2E harness sets `10ms` so retry exhaustion tests
-            // assert the same error-surface behavior but finish in <100ms.
             if std::env::var_os("ASTRA_LLM_RETRY_BASE_MS").is_none() {
                 std::env::set_var("ASTRA_LLM_RETRY_BASE_MS", "10");
             }
-            // Rate-limit mocks without `Retry-After` fall back to `DEFAULT_RETRY_AFTER_MS`
-            // (5s). Two rate-limit-failure E2E tests retry 3x, costing ~15s wall time each.
-            // Override to 10ms so they assert error-surface behavior in <100ms.
             if std::env::var_os("ASTRA_DEFAULT_RETRY_AFTER_MS").is_none() {
                 std::env::set_var("ASTRA_DEFAULT_RETRY_AFTER_MS", "10");
             }
-            // Same reasoning for bcrypt: production default (cost=12) is ~250ms per
-            // hash on debug builds — E2E bootstrap hashes twice (register + login),
-            // so we collapse to cost=4 (~5ms) when the env var is unset.
             if std::env::var_os("ASTRA_BCRYPT_COST").is_none() {
                 std::env::set_var("ASTRA_BCRYPT_COST", "4");
             }

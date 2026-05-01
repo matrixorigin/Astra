@@ -96,8 +96,12 @@ mod effects;
 mod followup_suggestion;
 #[path = "cli/idle_agent_messages.rs"]
 mod idle_agent_messages;
+#[path = "cli/journal_diff.rs"]
+mod journal_diff;
 #[path = "cli/journal_digest.rs"]
 mod journal_digest;
+#[path = "cli/journal_tree.rs"]
+mod journal_tree;
 #[path = "cli/mock_llm.rs"]
 mod mock_llm;
 #[path = "cli/permission_manager.rs"]

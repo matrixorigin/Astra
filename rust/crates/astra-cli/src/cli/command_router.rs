@@ -1351,6 +1351,16 @@ pub(super) async fn execute_cli_command(
             Ok(ExitCode::Success)
         }
 
+        Some(Command::Journal(JournalCmd::Tree(args))) => {
+            journal_tree::run_tree(&args)?;
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Journal(JournalCmd::Diff(args))) => {
+            journal_diff::run_diff(&args)?;
+            Ok(ExitCode::Success)
+        }
+
         // ── MCP server management (offline, no server needed) ──────────
         Some(Command::Mcp(mcp_cmd)) => {
             execute_mcp_command(mcp_cmd)?;

@@ -12,13 +12,16 @@ use bcrypt::{hash as bcrypt_hash, verify as bcrypt_verify};
 
 /// Resolve bcrypt cost from `ASTRA_BCRYPT_COST`, falling back to `bcrypt::DEFAULT_COST` (12).
 /// Tests set a low cost (e.g. `4`) to avoid multi-hundred-millisecond hashing in debug builds;
-/// production leaves the env var unset.
+/// production leaves the env var unset. Cached after first read via OnceLock.
 fn bcrypt_cost_from_env() -> u32 {
-    std::env::var("ASTRA_BCRYPT_COST")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|c| (4..=bcrypt::DEFAULT_COST).contains(c))
-        .unwrap_or(bcrypt::DEFAULT_COST)
+    static COST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *COST.get_or_init(|| {
+        std::env::var("ASTRA_BCRYPT_COST")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|c| (4..=bcrypt::DEFAULT_COST).contains(c))
+            .unwrap_or(bcrypt::DEFAULT_COST)
+    })
 }
 use chrono::{Duration as ChronoDuration, Utc};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};

@@ -618,8 +618,11 @@ async fn persist_runtime_promotion_events(
     if promotions.is_empty() {
         return;
     }
-    // Skip when no shared pool — avoids blocking on connect_matrixone() in tests.
     let Some(pool) = shared_pool else {
+        tracing::debug!(
+            session_id,
+            "runtime promotion persistence skipped: shared_pool not configured"
+        );
         return;
     };
 
@@ -864,6 +867,10 @@ async fn persist_server_loop_core_events(
     }
 
     let Some(pool) = shared_pool else {
+        tracing::debug!(
+            session_id,
+            "persistence skipped: shared_pool not configured"
+        );
         return;
     };
 

@@ -979,6 +979,36 @@ pub(crate) struct AuditToolsArgs {
 pub(crate) enum JournalCmd {
     /// Print a deterministic digest of a local session journal (JSON or text)
     Digest(JournalDigestArgs),
+    /// Render the delegation / sub-run tree for a session (ASCII or JSON)
+    Tree(JournalTreeArgs),
+    /// Compare two session journals on tool sequence, token totals, event counts
+    Diff(JournalDiffArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct JournalTreeArgs {
+    /// Session id, unique prefix, `last`, or omit for most recent local journal
+    #[arg(value_name = "SESSION")]
+    pub session_id: Option<String>,
+    /// Same meaning as positional SESSION (positional wins if both are set)
+    #[arg(long = "session", value_name = "SESSION")]
+    pub session: Option<String>,
+    /// Output format: text (default) or json
+    #[arg(long, default_value = "text")]
+    pub format: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct JournalDiffArgs {
+    /// First session id (or unique prefix / `last`).
+    #[arg(value_name = "A")]
+    pub a: String,
+    /// Second session id (or unique prefix / `last`).
+    #[arg(value_name = "B")]
+    pub b: String,
+    /// Output format: text (default) or json
+    #[arg(long, default_value = "text")]
+    pub format: String,
 }
 
 #[derive(Args, Debug)]

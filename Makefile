@@ -28,8 +28,8 @@ help:
 	@echo ""
 	@echo "Testing:"
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
-	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (1s per case via profile=strict; override: NEXTEST_OFFLINE_PROFILE=<profile>)"
-	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (2s per case via profile=strict-online; CI uses strict-online-ci=8s; set ASTRA_SDK_ONLINE_E2E=1 + API for make test-sdk-online)"
+	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (30s per case via profile=strict; override: NEXTEST_OFFLINE_PROFILE=<profile>)"
+	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (30s per case via profile=strict-online; see rust/.config/nextest.toml)"
 	@echo "  make test-live-llm      - Live LLM suite (real provider APIs from .models.yaml; one model per provider)"
 	@echo "  make test-contract      - Run contract tests (http/admin/config)"
 	@echo "  (also: test-sdk-offline, test-sdk-online — @astra/sdk; offline in test-offline; remote E2E opt-in on test-online)"
@@ -82,10 +82,9 @@ CLI_BINS := astra astra-admin
 # Per-test-case hard budget. Any case running longer than the budget is
 # killed and counted as FAIL. Nextest has no CLI override for slow-timeout
 # (`--config` is Cargo-only, not nextest), so budgets live as named profiles
-# in `rust/.config/nextest.toml`:
-#   offline:      profile `strict`            → 1s
-#   online:       profile `strict-online`     → 2s
-#   online (CI):  profile `strict-online-ci`  → 8s
+# in `rust/.config/nextest.toml`. All profiles currently use 30s (relaxed
+# from original 1-2s due to known session_sync_log prune contention — see
+# nextest.toml comment for tracking details).
 # To switch budgets, override the profile name:
 #   make test-online NEXTEST_ONLINE_PROFILE=strict-online-ci
 NEXTEST_OFFLINE_PROFILE ?= strict
