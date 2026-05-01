@@ -122,6 +122,23 @@ pub enum Criterion {
         #[serde(default)]
         model: Option<String>,
     },
+
+    /// Passes when total tokens (prompt + completion) is within range.
+    /// Catches token efficiency regressions — a case that used to cost
+    /// 500 tokens suddenly costing 5000 means something broke.
+    TokensBetween { min: u64, max: u64 },
+
+    /// Passes when wall-clock duration (ms) is within range.
+    /// Catches latency regressions and hung subprocesses that
+    /// complete just under the timeout.
+    DurationBetween { min_ms: u64, max_ms: u64 },
+
+    /// Passes when the tools_used list contains the given names
+    /// as an ordered subsequence. Does NOT require exact match —
+    /// extra tools between the expected ones are allowed.
+    /// Example: `[read_file, str_replace]` passes for
+    /// `[bash, read_file, bash, str_replace, bash]`.
+    ToolSequence { tools: Vec<String> },
 }
 
 fn default_judger_threshold() -> f64 {
@@ -376,6 +393,56 @@ fn evaluate_one(
             full_detail: None,
             score: None,
         },
+
+        Criterion::TokensBetween { min, max } => {
+            let total = outcome.prompt_tokens + outcome.completion_tokens;
+            let passed = total >= *min && total <= *max;
+            CriterionResult {
+                criterion: c.clone(),
+                passed,
+                detail: format!("tokens_total={total}, expected {min}..={max}"),
+                full_detail: None,
+                score: None,
+            }
+        }
+
+        Criterion::DurationBetween { min_ms, max_ms } => {
+            let dur = outcome.duration_ms;
+            let passed = dur >= *min_ms && dur <= *max_ms;
+            CriterionResult {
+                criterion: c.clone(),
+                passed,
+                detail: format!("duration={dur}ms, expected {min_ms}..={max_ms}ms"),
+                full_detail: None,
+                score: None,
+            }
+        }
+
+        Criterion::ToolSequence { tools } => {
+            // Check if `tools` is an ordered subsequence of `outcome.tools_used`.
+            let mut iter = outcome.tools_used.iter();
+            let mut matched = 0;
+            for expected in tools {
+                if iter.any(|t| t == expected) {
+                    matched += 1;
+                }
+            }
+            let passed = matched == tools.len();
+            CriterionResult {
+                criterion: c.clone(),
+                passed,
+                detail: if passed {
+                    format!("tool sequence {:?} found", tools)
+                } else {
+                    format!(
+                        "tool sequence {:?} NOT found (matched {}/{}, actual: {:?})",
+                        tools, matched, tools.len(), outcome.tools_used
+                    )
+                },
+                full_detail: None,
+                score: None,
+            }
+        }
     }
 }
 
@@ -480,6 +547,24 @@ pub fn validate_criterion(c: &Criterion) -> Result<(), String> {
             Ok(())
         }
         Criterion::ExitCode { .. } => Ok(()),
+        Criterion::TokensBetween { min, max } => {
+            if min > max {
+                return Err(format!("TokensBetween: min ({min}) > max ({max})"));
+            }
+            Ok(())
+        }
+        Criterion::DurationBetween { min_ms, max_ms } => {
+            if min_ms > max_ms {
+                return Err(format!("DurationBetween: min_ms ({min_ms}) > max_ms ({max_ms})"));
+            }
+            Ok(())
+        }
+        Criterion::ToolSequence { tools } => {
+            if tools.is_empty() {
+                return Err("ToolSequence.tools must not be empty".into());
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1002,5 +1087,87 @@ mod tests {
             &out,
         );
         assert!(r[0].passed);
+    }
+
+    #[test]
+    fn tokens_between_passes_in_range() {
+        let mut out = RunOutcome::new("m");
+        out.prompt_tokens = 100;
+        out.completion_tokens = 200;
+        let r = evaluate_deterministic(
+            &[Criterion::TokensBetween { min: 200, max: 400 }],
+            &out,
+        );
+        assert!(r[0].passed, "{}", r[0].detail);
+    }
+
+    #[test]
+    fn tokens_between_fails_over_max() {
+        let mut out = RunOutcome::new("m");
+        out.prompt_tokens = 5000;
+        out.completion_tokens = 5000;
+        let r = evaluate_deterministic(
+            &[Criterion::TokensBetween { min: 0, max: 1000 }],
+            &out,
+        );
+        assert!(!r[0].passed);
+        assert!(r[0].detail.contains("10000"));
+    }
+
+    #[test]
+    fn duration_between_passes_in_range() {
+        let mut out = RunOutcome::new("m");
+        out.duration_ms = 5000;
+        let r = evaluate_deterministic(
+            &[Criterion::DurationBetween { min_ms: 1000, max_ms: 10000 }],
+            &out,
+        );
+        assert!(r[0].passed);
+    }
+
+    #[test]
+    fn duration_between_fails_too_slow() {
+        let mut out = RunOutcome::new("m");
+        out.duration_ms = 60000;
+        let r = evaluate_deterministic(
+            &[Criterion::DurationBetween { min_ms: 0, max_ms: 30000 }],
+            &out,
+        );
+        assert!(!r[0].passed);
+        assert!(r[0].detail.contains("60000"));
+    }
+
+    #[test]
+    fn tool_sequence_passes_subsequence() {
+        let out = RunOutcome::new("m")
+            .with_tools_used(vec!["bash".into(), "read_file".into(), "bash".into(), "str_replace".into()]);
+        let r = evaluate_deterministic(
+            &[Criterion::ToolSequence { tools: vec!["read_file".into(), "str_replace".into()] }],
+            &out,
+        );
+        assert!(r[0].passed, "{}", r[0].detail);
+    }
+
+    #[test]
+    fn tool_sequence_fails_wrong_order() {
+        let out = RunOutcome::new("m")
+            .with_tools_used(vec!["str_replace".into(), "read_file".into()]);
+        let r = evaluate_deterministic(
+            &[Criterion::ToolSequence { tools: vec!["read_file".into(), "str_replace".into()] }],
+            &out,
+        );
+        assert!(!r[0].passed);
+    }
+
+    #[test]
+    fn tool_sequence_fails_missing_tool() {
+        let out = RunOutcome::new("m")
+            .with_tools_used(vec!["bash".into()]);
+        let r = evaluate_deterministic(
+            &[Criterion::ToolSequence { tools: vec!["read_file".into(), "str_replace".into()] }],
+            &out,
+        );
+        assert!(!r[0].passed);
+        assert!(r[0].detail.contains("matched 0/2"));
     }
 }

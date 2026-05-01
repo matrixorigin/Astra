@@ -215,11 +215,26 @@ impl<'a> SuiteRunner<'a> {
         };
 
         // Evaluate criteria.
-        let mut det =
-            evaluate_deterministic_with_session(&case.criteria, &outcome, session.as_ref());
+        // Auto-attach a default judger criterion when the case has none
+        // and judger is enabled. This ensures every case gets a quality check.
+        let mut criteria = case.criteria.clone();
+        if !self.no_judger && !criteria.iter().any(|c| matches!(c, Criterion::Judger { .. })) {
+            criteria.push(Criterion::Judger {
+                question: format!(
+                    "Given the task: \"{}\"\nDid the agent complete it correctly and efficiently? \
+                     Score 0.0 for wrong/incomplete, 0.5 for partially correct, 1.0 for fully correct.",
+                    case.prompt.trim()
+                ),
+                threshold: 0.7,
+                model: None,
+            });
+        }
 
-        if !self.no_judger && non_judger_all_pass(&case.criteria, &det) {
-            for (i, c) in case.criteria.iter().enumerate() {
+        let mut det =
+            evaluate_deterministic_with_session(&criteria, &outcome, session.as_ref());
+
+        if !self.no_judger && non_judger_all_pass(&criteria, &det) {
+            for (i, c) in criteria.iter().enumerate() {
                 if let Criterion::Judger { .. } = c
                     && let Some(res) = evaluate_judger(self.judger, c, &outcome).await
                 {
@@ -227,7 +242,7 @@ impl<'a> SuiteRunner<'a> {
                 }
             }
         } else if self.no_judger {
-            for (i, c) in case.criteria.iter().enumerate() {
+            for (i, c) in criteria.iter().enumerate() {
                 if let Criterion::Judger { .. } = c {
                     det[i].passed = true;
                     det[i].detail = "judger skipped (--no-judger)".into();
