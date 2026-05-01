@@ -47,7 +47,8 @@ impl ChatCell for UserChatCell {
             );
         }
 
-        lines.push(Line::styled("", bg)); // blank line below (Codex has 2 blank lines after user)
+        lines.push(Line::styled("", bg)); // blank line 1 below
+        lines.push(Line::default());     // blank line 2 below (Codex has 2 blank lines after user)
         lines
     }
 }

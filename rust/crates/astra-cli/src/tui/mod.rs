@@ -205,6 +205,8 @@ pub(crate) async fn run_tui_repl(
                                         if !lines.is_empty() {
                                             let mut hist = Vec::new();
                                             hist.extend(lines);
+                                            hist.push(ratatui::text::Line::default()); // blank after response
+                                            hist.push(ratatui::text::Line::default()); // Codex has 2 blank lines
                                             guard.queue_history_lines(hist);
                                         }
                                     }

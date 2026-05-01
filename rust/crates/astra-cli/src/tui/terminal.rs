@@ -136,6 +136,20 @@ impl TerminalGuard {
         }
 
         if area != terminal.viewport_area {
+            // If viewport shrank, clear the gap between old and new viewport tops
+            // to remove stale rendered content
+            let old_top = terminal.viewport_area.top();
+            let new_top = area.top();
+            if new_top > old_top {
+                // Viewport moved down (shrank) — clear rows old_top..new_top
+                for row in old_top..new_top {
+                    queue!(
+                        terminal.backend_mut(),
+                        cursor::MoveTo(0, row),
+                        Print("\x1b[2K"), // Clear entire line
+                    )?;
+                }
+            }
             terminal.clear()?;
             terminal.set_viewport_area(area);
         }
