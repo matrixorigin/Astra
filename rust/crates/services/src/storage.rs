@@ -1419,15 +1419,6 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    // ─── Agent lessons (cross-session self-learning) ────────────────────────────
-
-    query(crate::agent_lessons::AGENT_LESSONS_DDL)
-        .execute(&pool)
-        .await?;
-    query(crate::agent_lessons::AGENT_LESSON_EXPOSURES_DDL)
-        .execute(&pool)
-        .await?;
-
     // ─── Schema migration tracking ──────────────────────────────────────────────
 
     query(
