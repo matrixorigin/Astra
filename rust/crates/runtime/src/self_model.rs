@@ -1083,14 +1083,23 @@ impl SelfModel {
             s.push_str(&diag.render_prompt_block());
         }
 
-        // ── Cross-session lessons (from agent_lessons) ──
-        // Tool-specific lessons (ToolDeprioritize/ToolBoost) are only rendered
-        // when the referenced tool is in the current capabilities. General
-        // lessons (PromptShape, PostconditionPattern, ErrorRecovery) always
-        // render. This avoids wasting prompt tokens on "deprioritize grep"
-        // when the current task doesn't involve grep.
+        // ── Cross-session lessons (from Memoria L3) ──
+        // Pressure-adaptive: under high pressure, show fewer lessons with
+        // compact text. Under low pressure, show more with full detail.
         if !self.lessons.is_empty() {
-            const MAX_SHOWN: usize = 5;
+            let pressure = self
+                .state
+                .token_budget
+                .as_ref()
+                .map(|b| b.pressure)
+                .unwrap_or(0.0);
+            let (max_shown, use_compact) = if pressure > 0.75 {
+                (2, true)
+            } else if pressure > 0.5 {
+                (3, true)
+            } else {
+                (5, false)
+            };
             let tool_set: std::collections::HashSet<&str> = self
                 .capabilities
                 .tool_names
@@ -1118,21 +1127,25 @@ impl SelfModel {
             if !relevant.is_empty() {
                 let total = relevant.len();
                 s.push_str("📚 Lessons from prior sessions:\n");
-                for l in relevant.iter().take(MAX_SHOWN) {
+                for l in relevant.iter().take(max_shown) {
                     let scope = l
                         .workload_tag
                         .as_deref()
                         .map(|t| format!(" @{t}"))
                         .unwrap_or_default();
-                    let display_text = l.compact.as_deref().unwrap_or(&l.action);
+                    let display_text = if use_compact {
+                        l.compact.as_deref().unwrap_or(&l.action)
+                    } else {
+                        &l.action
+                    };
                     let _ = writeln!(
                         s,
                         "  - [{}{}] {} — {}",
                         l.kind, scope, l.trigger_signal, display_text
                     );
                 }
-                if total > MAX_SHOWN {
-                    let _ = writeln!(s, "  … {} more", total - MAX_SHOWN);
+                if total > max_shown {
+                    let _ = writeln!(s, "  … {} more", total - max_shown);
                 }
             }
         }

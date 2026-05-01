@@ -569,22 +569,9 @@ fn maybe_checkpoint_lessons(state: &mut ReplState) {
         return;
     }
 
-    // Write to agent_lessons (local cache) — fire-and-forget.
-    if let Some(ref mc) = state.matrix_runtime {
-        let svc = mc.agent_lessons_service();
-        let delta_clone = delta.clone();
-        tokio::spawn(async move {
-            for lesson in delta_clone {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), svc.record(lesson))
-                    .await;
-            }
-        });
-    }
-
     // Write to Memoria as `working` memory (session-scoped, T4).
     // Mid-session observations are provisional — they get promoted to
     // `semantic` T3 at session end if the L1b narrative confirms them.
-    // Inspired by V2's focus/importance lifecycle.
     let memoria_lessons: Vec<astra_runtime::lesson_synthesizer::ExtractedLesson> = delta
         .into_iter()
         .map(|l| astra_runtime::lesson_synthesizer::ExtractedLesson {
@@ -599,19 +586,8 @@ fn maybe_checkpoint_lessons(state: &mut ReplState) {
     );
 }
 
-async fn memoria_lesson_fallback(state: &mut ReplState) {
-    state.session_lessons = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        super::edge_tools::memoria::memoria_retrieve_lessons(5, None),
-    )
-    .await
-    .unwrap_or_default();
-}
-
 fn should_bootstrap_lessons(state: &ReplState) -> bool {
     !state.session_lessons_loaded
-        && state.matrix_runtime.is_some()
-        && state.ingestion_user_id.is_some()
 }
 
 fn is_low_information_followup(line: &str) -> bool {
@@ -913,84 +889,17 @@ async fn run_chat_turn(
         state.drift_original_query = Some(message.to_string());
     }
 
-    // ─── P6: bootstrap cross-session lessons on first turn ──────────────────
-    // Best-effort one-time fetch. Later turns no-op because the cache is
-    // populated. Guarded on matrix_runtime + ingestion_user_id so offline
-    // / unauthenticated sessions silently skip.
-    if should_bootstrap_lessons(state)
-        && let Some(ref mc) = state.matrix_runtime
-        && let Some(ref user_id) = state.ingestion_user_id
-    {
+    // ─── Bootstrap cross-session lessons from Memoria on first turn ────────
+    // Memoria is the single source of truth for lessons (Session Memory
+    // Protocol L3). agent_lessons table is no longer used for bootstrap.
+    if should_bootstrap_lessons(state) {
         state.session_lessons_loaded = true;
-        let svc = mc.agent_lessons_service();
-        let load_result = tokio::time::timeout(
+        state.session_lessons = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            svc.load_recent(
-                user_id,
-                "generic",
-                None,
-                astra_runtime::lesson_bootstrap::DEFAULT_SESSION_BOOTSTRAP_LIMIT,
-            ),
+            super::edge_tools::memoria::memoria_retrieve_lessons(6, Some(message)),
         )
-        .await;
-        match load_result {
-            Ok(Ok(rows)) => {
-                if let Some(session_id) = state.session_id.as_deref() {
-                    for lesson in &rows {
-                        if let Err(e) = svc
-                            .record_exposure(astra_services::LessonExposure {
-                                lesson_id: lesson.id.clone(),
-                                session_id: session_id.to_string(),
-                                user_id: user_id.clone(),
-                                persona: "generic".to_string(),
-                                workload_tag: lesson.workload_tag.clone(),
-                                adopted: false,
-                            })
-                            .await
-                        {
-                            tracing::warn!(
-                                target: "repl_turn",
-                                lesson_id = %lesson.id,
-                                session_id = session_id,
-                                error = %e,
-                                "agent_lessons::record_exposure failed; continuing bootstrap",
-                            );
-                        }
-                    }
-                }
-                let local_lessons: Vec<astra_runtime::self_model::LessonHint> = rows
-                    .iter()
-                    .map(astra_runtime::self_model::LessonHint::from_lesson)
-                    .collect();
-                // Supplement with Memoria-sourced lessons (L3 knowledge backflow).
-                // Best-effort: 3s timeout, empty vec on failure.
-                let memoria_lessons = tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    super::edge_tools::memoria::memoria_retrieve_lessons(3, Some(message)),
-                )
-                .await
-                .unwrap_or_default();
-                state.session_lessons =
-                    astra_runtime::lesson_bootstrap::merge_local_and_memoria_lessons(
-                        local_lessons,
-                        memoria_lessons,
-                    );
-            }
-            err => {
-                match err {
-                    Ok(Err(e)) => tracing::warn!(
-                        target: "repl_turn",
-                        error = %e,
-                        "agent_lessons::load_recent failed; trying Memoria fallback",
-                    ),
-                    _ => tracing::warn!(
-                        target: "repl_turn",
-                        "agent_lessons::load_recent timed out after 3s; trying Memoria fallback",
-                    ),
-                }
-                memoria_lesson_fallback(state).await;
-            }
-        }
+        .await
+        .unwrap_or_default();
     }
 
     // ─── Drift Tracking: Detect user corrections ────────────────────────────
@@ -6265,46 +6174,21 @@ mod tests {
     // ─── P6: should_bootstrap_lessons gate ──────────────────────────────────
 
     #[test]
-    fn should_bootstrap_lessons_requires_matrix_and_user_id() {
-        // Fresh state → no matrix + no user → no bootstrap.
+    fn should_bootstrap_lessons_true_on_fresh_state() {
         let state = ReplState::default();
         assert!(
-            !should_bootstrap_lessons(&state),
-            "default state has no matrix/user; bootstrap must skip"
+            should_bootstrap_lessons(&state),
+            "fresh state should bootstrap from Memoria"
         );
     }
 
     #[test]
     fn should_bootstrap_lessons_skips_when_already_loaded() {
-        // Once the flag is set (after first attempt), bootstrap must not
-        // re-fire even if the lesson cache is empty (new user, zero rows).
         let mut state = ReplState::default();
         state.session_lessons_loaded = true;
-        state.ingestion_user_id = Some("u1".into());
         assert!(
             !should_bootstrap_lessons(&state),
-            "loaded flag must prevent re-bootstrap regardless of cache contents"
-        );
-    }
-
-    #[test]
-    fn should_bootstrap_lessons_skips_when_user_id_missing() {
-        let mut state = ReplState::default();
-        state.ingestion_user_id = None;
-        assert!(
-            !should_bootstrap_lessons(&state),
-            "no user_id → no attribution → skip"
-        );
-    }
-
-    #[test]
-    fn should_bootstrap_lessons_skips_when_matrix_runtime_missing() {
-        let mut state = ReplState::default();
-        state.ingestion_user_id = Some("u1".into());
-        // matrix_runtime stays None.
-        assert!(
-            !should_bootstrap_lessons(&state),
-            "no matrix_runtime → no DAO → skip"
+            "loaded flag must prevent re-bootstrap"
         );
     }
 
