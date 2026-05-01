@@ -1373,6 +1373,28 @@ pub(super) fn resolve_slash_command(input: &str) -> Result<&'static str, Vec<&'s
     command_registry::resolve_command(input)
 }
 
+/// Return help text as plain lines (for TUI inline rendering).
+pub(super) fn format_help_lines() -> Vec<String> {
+    let mut lines = Vec::new();
+    for group in crate::command_registry::CommandGroup::ALL {
+        let commands: Vec<_> = crate::command_registry::commands_by_group(*group)
+            .filter(|m| !m.is_alias && !m.name.contains(' '))
+            .collect();
+        if commands.is_empty() { continue; }
+        lines.push(String::new());
+        lines.push(format!("  {} {}", group.icon(), group.title()));
+        for meta in commands {
+            let cmd_with_hint = if let Some(hint) = meta.arg_hint {
+                format!("{} {}", meta.name, hint)
+            } else {
+                meta.name.to_string()
+            };
+            lines.push(format!("    {:<30}  {}", cmd_with_hint, meta.description));
+        }
+    }
+    lines
+}
+
 pub(super) fn print_slash_commands(query: Option<&str>) {
     let filter = query
         .map(str::trim)

@@ -54,6 +54,10 @@ impl ChatComposer {
         self.draft = None;
     }
 
+    pub fn set_text(&mut self, text: &str) {
+        self.textarea.set_text(text);
+    }
+
     pub fn desired_height(&self, width: u16) -> u16 {
         let prefix_w = self.prompt_prefix.len() as u16;
         let inner_w = width.saturating_sub(prefix_w);

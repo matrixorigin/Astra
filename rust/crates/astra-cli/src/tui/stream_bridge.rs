@@ -47,12 +47,13 @@ fn map_stream_event(event: StreamEvent) -> TuiAppEvent {
         }
         StreamEvent::ToolCompleted {
             name,
+            description,
             status,
             duration_ms,
             output_summary,
-            ..
         } => TuiAppEvent::ToolCompleted {
             name,
+            description,
             status,
             duration_ms,
             output_summary,

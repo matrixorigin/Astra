@@ -169,6 +169,60 @@ impl TerminalGuard {
 
         Ok(is_zellij)
     }
+
+    /// Temporarily leave TUI mode, run a closure, then restore.
+    /// Matches Codex tui.rs::with_restored() — used for slash commands
+    /// that do interactive I/O (inquire, eprintln, etc.).
+    pub async fn with_restored<F, Fut, T>(&mut self, f: F) -> io::Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        // Clear viewport area before leaving TUI so the old composer/footer
+        // doesn't remain visible while the slash command runs.
+        let area = self.terminal.viewport_area;
+        if area.height > 0 {
+            queue!(
+                self.terminal.backend_mut(),
+                cursor::MoveTo(0, area.top()),
+                Print("\x1b[J"), // ED: clear from viewport top to screen bottom
+            )?;
+            std::io::Write::flush(self.terminal.backend_mut())?;
+        }
+
+        // Position cursor at viewport top and show it
+        execute!(
+            stdout(),
+            cursor::MoveTo(0, area.top()),
+            cursor::Show
+        )?;
+
+        // Leave TUI modes
+        disable_raw_mode()?;
+        execute!(stdout(), DisableBracketedPaste)?;
+
+        // Run the user's closure
+        let result = f().await;
+
+        // Restore TUI modes
+        enable_raw_mode()?;
+        execute!(stdout(), EnableBracketedPaste)?;
+
+        // Flush stale terminal input
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe { nix::libc::tcflush(std::io::stdin().as_raw_fd(), nix::libc::TCIFLUSH); }
+        }
+
+        // Clear the screen area where the slash command output was,
+        // then force full repaint. The viewport position may have shifted
+        // due to slash output scrolling the terminal.
+        self.terminal.clear()?;
+        self.terminal.invalidate_viewport();
+
+        Ok(result)
+    }
 }
 
 impl Drop for TerminalGuard {

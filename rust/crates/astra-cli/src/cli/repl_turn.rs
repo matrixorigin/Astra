@@ -893,7 +893,7 @@ async fn run_chat_turn(
             cancel_token: Some(cancel_token),
             plan_assemble_line_release: None,
             stream_event_tx: state.tui_stream_event_tx.clone(),
-            approval_request_tx: None,
+            approval_request_tx: state.tui_approval_request_tx.clone(),
             mcp_manager: Some(state.mcp_manager.clone()),
             skill_search: &state.skill_search,
             skill_quality_tracker: &mut state.skill_quality_tracker,

@@ -584,6 +584,31 @@ pub(super) async fn handle_slash_command(
     Ok(false)
 }
 
+/// Fetch active model names from the API (for TUI inline selection).
+pub(super) async fn fetch_model_list(
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let tok = token.ok_or_else(|| "Not logged in".to_string())?;
+    let body = api.get_models_text(tok).await.map_err(|e| format!("{e}"))?;
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let models = value
+        .as_array()
+        .cloned()
+        .or_else(|| value.get("models").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_default();
+    Ok(models
+        .iter()
+        .filter_map(|m| {
+            let name = model_list_entry_name(m)?;
+            if !model_list_entry_is_active(m) {
+                return None;
+            }
+            Some(name.to_string())
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod model_list_json_tests {
     use super::*;

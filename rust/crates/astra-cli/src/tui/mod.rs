@@ -91,6 +91,11 @@ pub(crate) async fn run_tui_repl(
     use crate::repl_startup::complete_repl_startup;
     use crate::startup_trace::StartupTracer;
 
+    // ── Ensure terminal is in sane state before startup output ────────
+    // Previous astra crashes may leave terminal in raw mode, causing
+    // startup eprintln output to lose carriage returns.
+    let _ = crossterm::terminal::disable_raw_mode();
+
     // ── Business initialization BEFORE entering TUI ─────────────────────
     let mut tracer = StartupTracer::new();
     crate::repl_runtime::try_silent_auth(api, profile).await;
@@ -105,17 +110,15 @@ pub(crate) async fn run_tui_repl(
     let startup = complete_repl_startup(&mut state, &mut tracer, api, profile, resume_session_id, no_instructions).await?;
     tracer.finish();
 
-    // ── Hard gate ────────────────────────────────────────────────────────
-    if state.perm_manager.mode() == crate::permission_manager::PermissionMode::Prompt {
-        eprintln!("TUI mode does not yet support interactive tool approval.\nUse `astra --tui --yes` or drop `--tui`.");
-        return Ok(());
-    }
-
     // ── TUI mode overrides ──────────────────────────────────────────────
     let (tui_tx, mut tui_rx) = stream_bridge::create_channels();
     state.tui_render_policy = Some(crate::stream_render::RenderPolicy::Silent);
     let mut tui_cancel_token = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
     state.tui_cancel_token = Some(tui_cancel_token.clone());
+
+    // Approval channel: tool approval requests from SSE host → TUI overlay
+    let (approval_tx, mut approval_rx) = tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::ApprovalRequest>();
+    state.tui_approval_request_tx = Some(approval_tx);
 
     // ── Enter TUI ───────────────────────────────────────────────────────
     let mut guard = TerminalGuard::init().map_err(|e| format!("TUI init failed: {e}"))?;
@@ -129,6 +132,21 @@ pub(crate) async fn run_tui_repl(
     }
     if let Some(ref sid) = state.session_id {
         bottom_pane.footer.session_id = Some(sid[..8.min(sid.len())].to_string());
+    }
+
+    // Load skill items for $ mention popup
+    {
+        let manifests = state.unified_skill_registry.all_manifests();
+        let skill_items: Vec<bottom_pane::skill_popup::SkillItem> = manifests
+            .into_iter()
+            .filter(|m| m.user_invocable)
+            .map(|m| bottom_pane::skill_popup::SkillItem {
+                name: m.name.clone(),
+                description: m.description.clone(),
+                source: format!("{:?}", m.source),
+            })
+            .collect();
+        bottom_pane.set_skill_items(skill_items);
     }
 
     let mut active_cell: Option<Box<dyn ChatCell>> = None;
@@ -153,8 +171,38 @@ pub(crate) async fn run_tui_repl(
                                 do_draw(&mut guard, &active_cell, &mut bottom_pane)?;
 
                                 if text.starts_with('/') {
-                                    let sys = SystemChatCell::info(format!("Slash: {text} (use line mode)"));
-                                    guard.queue_history_lines(sys.display_lines(w));
+                                    let slash_action = dispatch_slash_inline(
+                                        &text, api, profile, &mut state, &startup, &mut guard, &mut bottom_pane, w,
+                                    ).await;
+                                    match slash_action {
+                                        SlashAction::Handled => {}
+                                        SlashAction::Exit => { break 'main Ok(()); }
+                                        SlashAction::Fallback => {
+                                            // Complex commands: temporarily leave TUI
+                                            let slash_text = text.clone();
+                                            let slash_result = guard.with_restored(|| async {
+                                                let token = crate::repl_runtime::current_access_token(profile);
+                                                crate::slash_router::handle_slash_command(
+                                                    &slash_text, api, profile, &mut state,
+                                                    token.as_deref(), &*startup.selector,
+                                                ).await
+                                            }).await;
+                                            match slash_result {
+                                                Ok(Ok(true)) => { break 'main Ok(()); }
+                                                Ok(Ok(false)) => {}
+                                                Ok(Err(e)) => {
+                                                    let err = SystemChatCell::error(e);
+                                                    guard.queue_history_lines(err.display_lines(w));
+                                                }
+                                                Err(e) => {
+                                                    let err = SystemChatCell::error(format!("Terminal restore failed: {e}"));
+                                                    guard.queue_history_lines(err.display_lines(w));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.clone()); }
+                                    if let Some(ref s) = state.session_id { bottom_pane.footer.session_id = Some(s[..8.min(s.len())].to_string()); }
                                 } else {
                                     let mut ac = AssistantChatCell::from_rendered(vec![]);
                                     ac.start_thinking();
@@ -180,9 +228,16 @@ pub(crate) async fn run_tui_repl(
                                                 Some(tev) = event_stream.next() => {
                                                     match tev {
                                                         TuiEvent::Key(k) => {
-                                                            use crossterm::event::{KeyCode, KeyModifiers};
-                                                            if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
-                                                                tui_cancel_token.cancel();
+                                                            // If an approval overlay is active, route keys to it
+                                                            if bottom_pane.has_active_view() {
+                                                                let _ = bottom_pane.handle_key(k);
+                                                                frame_requester.schedule_frame();
+                                                                let _ = do_draw(&mut guard, &active_cell, &mut bottom_pane);
+                                                            } else {
+                                                                use crossterm::event::{KeyCode, KeyModifiers};
+                                                                if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+                                                                    tui_cancel_token.cancel();
+                                                                }
                                                             }
                                                         }
                                                         TuiEvent::Resize | TuiEvent::Draw => {
@@ -194,6 +249,19 @@ pub(crate) async fn run_tui_repl(
                                                 Some(ae) = tui_rx.recv() => {
                                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                                     handle_app_event(ae, &mut guard, w, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester);
+                                                    let _ = do_draw(&mut guard, &active_cell, &mut bottom_pane);
+                                                }
+                                                Some(req) = approval_rx.recv() => {
+                                                    use bottom_pane::approval_overlay::ApprovalOverlay;
+                                                    let overlay = ApprovalOverlay::new(
+                                                        req.tool,
+                                                        req.header,
+                                                        req.detail,
+                                                        req.reason,
+                                                        req.response_tx,
+                                                    );
+                                                    bottom_pane.push_view(Box::new(overlay));
+                                                    frame_requester.schedule_frame();
                                                     let _ = do_draw(&mut guard, &active_cell, &mut bottom_pane);
                                                 }
                                                 _ = &mut itick => {
@@ -242,6 +310,14 @@ pub(crate) async fn run_tui_repl(
                                 }
                             }
                             BottomPaneAction::SubmitInput(_) => {}
+                            BottomPaneAction::ViewCompleted(result) => {
+                                if let Some(name) = result {
+                                    handle_view_result(
+                                        &name, &mut state, &mut guard, &mut bottom_pane,
+                                    );
+                                    bottom_pane.sync_popups();
+                                }
+                            }
                             BottomPaneAction::Interrupt | BottomPaneAction::Quit => { break 'main Ok(()); }
                             BottomPaneAction::Consumed => {}
                             BottomPaneAction::Escalate(_) => {}
@@ -424,10 +500,10 @@ fn handle_app_event(
             bottom_pane.set_task_status(TaskStatus::ToolExecuting { name, started_at: std::time::Instant::now() });
             fr.schedule_frame();
         }
-        TuiAppEvent::ToolCompleted { name: _, status, duration_ms, output_summary } => {
+        TuiAppEvent::ToolCompleted { name: _, description, status, duration_ms, output_summary } => {
             if let Some(cell) = active_cell {
                 if let Some(tc) = cell.as_any_mut().downcast_mut::<ToolChatCell>() {
-                    tc.complete(&status, duration_ms, output_summary);
+                    tc.complete(&status, duration_ms, description, output_summary);
                 }
             }
             fr.schedule_frame();
@@ -472,3 +548,141 @@ impl<'a> render::renderable::Renderable for BottomPaneRenderable<'a> {
         self.0.cursor_position(area)
     }
 }
+
+// ── View result handling ───────────────────────────────────────────────────
+
+fn handle_view_result(
+    name: &str,
+    state: &mut crate::repl_state::ReplState,
+    guard: &mut TerminalGuard,
+    bottom_pane: &mut BottomPane,
+) {
+    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+
+    // Skill menu actions
+    if name == "List skills" {
+        // Insert $ into composer to trigger skill mention popup
+        bottom_pane.composer.set_text("$");
+        return;
+    }
+    if name == "Skill info" {
+        let msg = SystemChatCell::info("Use /skill info <name> for skill details".into());
+        guard.queue_history_lines(msg.display_lines(w));
+        return;
+    }
+
+    // Check if it's a skill name → insert $name into composer
+    if state.unified_skill_registry.get_manifest(name).is_some() {
+        bottom_pane.composer.set_text(&format!("${name} "));
+        return;
+    }
+
+    // Otherwise treat as model selection
+    state.model = Some(name.to_string());
+    bottom_pane.footer.model = Some(name.to_string());
+    let msg = SystemChatCell::info(format!("Model set to: {name}"));
+    guard.queue_history_lines(msg.display_lines(w));
+}
+
+// ── Inline slash dispatch ──────────────────────────────────────────────────
+
+enum SlashAction {
+    Handled,
+    Exit,
+    Fallback,
+}
+
+async fn dispatch_slash_inline(
+    text: &str,
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    state: &mut crate::repl_state::ReplState,
+    _startup: &crate::repl_startup::ReplStartupArtifacts,
+    guard: &mut TerminalGuard,
+    bottom_pane: &mut BottomPane,
+    w: u16,
+) -> SlashAction {
+    let cmd = text.split_whitespace().next().unwrap_or(text);
+    let _args = text[cmd.len()..].trim();
+
+    match cmd {
+        "/exit" | "/quit" => SlashAction::Exit,
+
+        "/help" | "/commands" => {
+            let lines = crate::repl_ui::format_help_lines();
+            guard.queue_history_lines(
+                lines.into_iter().map(|s| {
+                    ratatui::text::Line::from(ratatui::text::Span::styled(
+                        s, ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
+                    ))
+                }).collect(),
+            );
+            SlashAction::Handled
+        }
+
+        "/model" => {
+            let token = crate::repl_runtime::current_access_token(profile);
+            match crate::slash_router::fetch_model_list(api, token.as_deref()).await {
+                Ok(models) => {
+                    use bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
+                    let current = state.model.clone().unwrap_or_default();
+                    let items: Vec<SelectionItem> = models.into_iter().map(|m| {
+                        let is_current = m == current;
+                        SelectionItem { name: m, description: None, is_current }
+                    }).collect();
+                    if items.is_empty() {
+                        let err = SystemChatCell::info("No models available".into());
+                        guard.queue_history_lines(err.display_lines(w));
+                    } else {
+                        let view = ListSelectionView::new(items, Some("Select model:".into()));
+                        bottom_pane.push_view(Box::new(view));
+                    }
+                    SlashAction::Handled
+                }
+                Err(e) => {
+                    let err = SystemChatCell::error(format!("Failed to fetch models: {e}"));
+                    guard.queue_history_lines(err.display_lines(w));
+                    SlashAction::Handled
+                }
+            }
+        }
+
+        "/skill" | "/skills" => {
+            use bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
+            let skill_count = state.unified_skill_registry.all_manifests()
+                .iter().filter(|m| m.user_invocable).count();
+            let items = vec![
+                SelectionItem {
+                    name: "List skills".into(),
+                    description: Some(format!("Tip: press $ to open this list directly. ({skill_count} skills)")),
+                    is_current: false,
+                },
+                SelectionItem {
+                    name: "Skill info".into(),
+                    description: Some("Show details of a specific skill".into()),
+                    is_current: false,
+                },
+            ];
+            let view = ListSelectionView::new(items, Some("Skills — choose an action:".into()));
+            bottom_pane.push_view(Box::new(view));
+            SlashAction::Handled
+        }
+
+        "/stats" | "/info" => {
+            let info = format!(
+                "Session: {} | Model: {} | Tokens: {}↑ {}↓ | Cost: ${:.4}",
+                state.session_id.as_deref().unwrap_or("<none>"),
+                state.model.as_deref().unwrap_or("<unset>"),
+                state.total_prompt_tokens,
+                state.total_completion_tokens,
+                state.total_session_cost,
+            );
+            let cell = SystemChatCell::info(info);
+            guard.queue_history_lines(cell.display_lines(w));
+            SlashAction::Handled
+        }
+
+        _ => SlashAction::Fallback,
+    }
+}
+

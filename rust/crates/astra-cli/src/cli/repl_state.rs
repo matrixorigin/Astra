@@ -318,6 +318,9 @@ pub(crate) struct ReplState {
     /// External cancellation token for TUI Ctrl+C interrupt.
     /// When set, `run_chat_turn` monitors this alongside its own ctrl_c handler.
     pub tui_cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
+    /// When set, tool approval requests are sent through this channel
+    /// instead of using interactive inquire prompts.
+    pub tui_approval_request_tx: Option<crate::chat_stream::ApprovalRequestTx>,
 }
 
 impl Default for ReplState {
@@ -465,6 +468,7 @@ impl Default for ReplState {
             tui_render_policy: None,
             tui_stream_event_tx: None,
             tui_cancel_token: None,
+            tui_approval_request_tx: None,
         }
     }
 }

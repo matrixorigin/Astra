@@ -34,13 +34,16 @@ impl ToolChatCell {
         }
     }
 
-    pub fn complete(&mut self, status_str: &str, duration_ms: u64, output_summary: Option<String>) {
+    pub fn complete(&mut self, status_str: &str, duration_ms: u64, description: String, output_summary: Option<String>) {
         self.status = if status_str == "success" {
             ToolStatus::Success
         } else {
             ToolStatus::Failed
         };
         self.duration_ms = Some(duration_ms);
+        if !description.is_empty() {
+            self.description = description;
+        }
         self.output_summary = output_summary;
     }
 
@@ -78,13 +81,19 @@ impl ChatCell for ToolChatCell {
         let dim = Style::default().dim();
         let w = width as usize;
 
-        // Header: • Running tool_name (0.3s)
-        let header = Line::from(vec![
-            self.bullet(),
-            Span::styled(format!("{} ", self.title_text()), Style::default().bold()),
-            Span::raw(self.name.clone()),
-            Span::styled(format!(" ({})", self.elapsed_str()), dim),
-        ]);
+        let header = if self.status == ToolStatus::Running {
+            let text = format!("{} {} ({})", self.title_text(), self.name, self.elapsed_str());
+            let mut spans = vec![self.bullet()];
+            spans.extend(crate::tui::shimmer::shimmer_spans(&text));
+            Line::from(spans)
+        } else {
+            Line::from(vec![
+                self.bullet(),
+                Span::styled(format!("{} ", self.title_text()), Style::default().bold()),
+                Span::raw(self.name.clone()),
+                Span::styled(format!(" ({})", self.elapsed_str()), dim),
+            ])
+        };
 
         let mut lines = vec![header];
 
