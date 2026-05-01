@@ -224,7 +224,10 @@ mod tests {
         assert_eq!(result.status, LessonBootstrapStatus::Loaded);
         assert_eq!(result.lesson_count, 2);
         assert_eq!(result.model.lessons.len(), 2);
-        assert_eq!(result.model.lessons[0].kind, "tool_deprioritize");
+        assert_eq!(
+            result.model.lessons[0].kind,
+            astra_services::LessonKind::ToolDeprioritize
+        );
         assert_eq!(result.model.lessons[0].action, "switch to rg");
     }
 

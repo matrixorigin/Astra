@@ -59,6 +59,12 @@ pub enum LessonKind {
     ErrorRecovery,
 }
 
+impl std::fmt::Display for LessonKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl LessonKind {
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -114,7 +120,7 @@ pub struct Lesson {
 /// continues to compile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LessonHint {
-    pub kind: String,
+    pub kind: LessonKind,
     pub trigger_signal: String,
     pub action: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,12 +131,22 @@ impl LessonHint {
     #[must_use]
     pub fn from_lesson(l: &Lesson) -> Self {
         Self {
-            kind: l.kind.as_str().to_string(),
-            trigger_signal: l.trigger_signal.clone(),
-            action: l.action.clone(),
+            kind: l.kind,
+            trigger_signal: sanitize_for_prompt(&l.trigger_signal),
+            action: sanitize_for_prompt(&l.action),
             workload_tag: l.workload_tag.clone(),
         }
     }
+}
+
+/// Strip control characters from DB-stored content before prompt injection.
+/// Defense-in-depth: current lesson content is server-generated, but this
+/// barrier prevents future code paths from accidentally injecting raw
+/// LLM/user content into the system prompt.
+fn sanitize_for_prompt(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .collect()
 }
 
 /// Payload for `record`. Id / timestamps are assigned by the DAO.
@@ -1084,6 +1100,51 @@ mod tests {
         let d = compute_confidence_delta(&extreme);
         assert!(d.is_finite(), "must not be NaN/inf with u32::MAX inputs");
         assert!(d.abs() <= MAX_CONFIDENCE_STEP + f64::EPSILON);
+    }
+
+    #[test]
+    fn sanitize_for_prompt_strips_control_chars() {
+        let dirty = "normal text\x00\x01\x1b[31minjection\x1b[0m\nline two";
+        let clean = sanitize_for_prompt(dirty);
+        assert!(!clean.contains('\x00'));
+        assert!(!clean.contains('\x01'));
+        assert!(!clean.contains('\x1b'));
+        assert!(clean.contains('\n'), "newlines must be preserved");
+        assert!(clean.contains("normal text"));
+        assert!(clean.contains("line two"));
+    }
+
+    #[test]
+    fn lesson_hint_from_lesson_uses_enum_kind() {
+        let lesson = Lesson {
+            id: "id".into(),
+            user_id: "u".into(),
+            persona: "p".into(),
+            workload_tag: None,
+            kind: LessonKind::ToolDeprioritize,
+            trigger_signal: "tool_failures:grep".into(),
+            action: "avoid grep".into(),
+            confidence: 0.6,
+            hit_count: 0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let hint = LessonHint::from_lesson(&lesson);
+        assert_eq!(hint.kind, LessonKind::ToolDeprioritize);
+        assert_eq!(hint.kind.as_str(), "tool_deprioritize");
+    }
+
+    #[test]
+    fn lesson_kind_display_matches_as_str() {
+        for kind in [
+            LessonKind::ToolDeprioritize,
+            LessonKind::ToolBoost,
+            LessonKind::PromptShape,
+            LessonKind::PostconditionPattern,
+            LessonKind::ErrorRecovery,
+        ] {
+            assert_eq!(format!("{kind}"), kind.as_str());
+        }
     }
 
     #[test]

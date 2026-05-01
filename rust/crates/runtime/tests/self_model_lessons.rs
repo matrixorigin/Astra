@@ -54,7 +54,8 @@ fn minimal_self_model() -> SelfModel {
 
 fn lesson(kind: &str, trigger: &str, action: &str, tag: Option<&str>) -> LessonHint {
     LessonHint {
-        kind: kind.to_string(),
+        kind: astra_services::LessonKind::parse_tag(kind)
+            .unwrap_or(astra_services::LessonKind::PromptShape),
         trigger_signal: trigger.to_string(),
         action: action.to_string(),
         workload_tag: tag.map(str::to_string),
@@ -201,7 +202,7 @@ fn from_lesson_projects_only_prompt_relevant_fields() {
         updated_at: Utc::now(),
     };
     let hint = LessonHint::from_lesson(&persisted);
-    assert_eq!(hint.kind, "error_recovery");
+    assert_eq!(hint.kind, astra_services::LessonKind::ErrorRecovery);
     assert_eq!(hint.trigger_signal, "repeated EACCES on scratch dir");
     assert_eq!(hint.action, "ensure chmod before write");
     assert_eq!(hint.workload_tag.as_deref(), Some("debug"));

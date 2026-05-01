@@ -507,13 +507,13 @@ async fn set_session_lessons_feeds_build_self_model_snapshot() {
     let (exe, _session) = executor_with_session();
     let lessons = vec![
         astra_runtime::self_model::LessonHint {
-            kind: "tool_deprioritize".into(),
+            kind: astra_services::LessonKind::ToolDeprioritize,
             trigger_signal: "3 stalls on grep".into(),
             action: "switch to rg".into(),
             workload_tag: None,
         },
         astra_runtime::self_model::LessonHint {
-            kind: "prompt_shape".into(),
+            kind: astra_services::LessonKind::PromptShape,
             trigger_signal: "repeated scope drift".into(),
             action: "restate scope before tool call".into(),
             workload_tag: Some("code-review".into()),

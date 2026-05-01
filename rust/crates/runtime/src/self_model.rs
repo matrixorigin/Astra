@@ -1150,16 +1150,15 @@ fn extract_tool_from_trigger(trigger: &str) -> Option<&str> {
 /// as `"tool_failures:<name>"` or similar. These are only relevant when
 /// the named tool is in the current session's capability set.
 fn is_lesson_relevant(l: &LessonHint, tool_set: &std::collections::HashSet<&str>) -> bool {
-    match l.kind.as_str() {
-        "tool_deprioritize" | "tool_boost" => {
-            // Extract tool name from "tool_failures:<name>" or "tool_boost:<name>".
+    match l.kind {
+        astra_services::LessonKind::ToolDeprioritize | astra_services::LessonKind::ToolBoost => {
             if let Some((_prefix, tool_name)) = l.trigger_signal.split_once(':') {
                 tool_set.is_empty() || tool_set.contains(tool_name)
             } else {
-                true // unrecognized format → render defensively
+                true
             }
         }
-        _ => true, // general lessons always render
+        _ => true,
     }
 }
 
