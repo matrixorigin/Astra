@@ -54,7 +54,16 @@ pub(crate) fn redact_provider_secrets(s: &str) -> String {
 /// Maximum retries for transient LLM errors (429, 5xx, network).
 pub(crate) const LLM_MAX_RETRIES: u32 = 3;
 /// Base delay between retries (doubles each attempt: 1s, 2s, 4s).
+/// Override: `ASTRA_LLM_RETRY_BASE_MS` (e.g. `10` in E2E tests that
+/// intentionally exhaust retries to assert error-surface behavior).
 pub(crate) const LLM_RETRY_BASE_MS: u64 = 1000;
+
+fn llm_retry_base_ms() -> u64 {
+    std::env::var("ASTRA_LLM_RETRY_BASE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(LLM_RETRY_BASE_MS)
+}
 /// Extended delay for TPM (tokens per minute) exhaustion (60 seconds).
 /// TPM limits typically reset after 60 seconds, so we wait longer.
 const TPM_EXHAUST_DELAY_MS: u64 = 60_000;
@@ -472,7 +481,7 @@ fn retry_backoff_ms(attempt: u32, tpm_exhausted: bool) -> u64 {
     if tpm_exhausted {
         TPM_EXHAUST_DELAY_MS
     } else {
-        LLM_RETRY_BASE_MS * (1 << (attempt - 1))
+        llm_retry_base_ms() * (1 << (attempt - 1))
     }
 }
 

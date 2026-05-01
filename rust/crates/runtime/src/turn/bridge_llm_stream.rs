@@ -49,7 +49,11 @@ fn bridge_retry_backoff_ms(attempt: u32) -> u64 {
     if let Some(ms) = TEST_BRIDGE_RETRY_BACKOFF_MS.with(|c| *c.borrow()) {
         return ms;
     }
-    LLM_RETRY_BASE_MS * (1 << (attempt - 1))
+    let base = std::env::var("ASTRA_LLM_RETRY_BASE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(LLM_RETRY_BASE_MS);
+    base * (1 << (attempt - 1))
 }
 
 /// Returns `true` if `name` looks like a valid tool function name.

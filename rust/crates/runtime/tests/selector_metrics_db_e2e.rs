@@ -37,47 +37,45 @@ fn require_db_it_env() -> MatrixOneSettings {
     }
 }
 
-fn test_database_name() -> String {
-    format!("selector_e2e_{}", Uuid::new_v4().simple())
-}
+/// Shared test DB across the 4 selector-metric tests in this binary.
+///
+/// Each test used to create its own MatrixOne database + run
+/// `ensure_core_schema` (full migration sweep) + `SharedPool::new` + drop the
+/// database on teardown. Under `make test-online`'s strict per-case budget
+/// that added up to >2s per test — pure setup overhead, no production signal.
+///
+/// Tests are already session-scoped (`session_id = "selector-e2e-<uuid>"`),
+/// and every table they touch (`skill_selector_turn_metrics`,
+/// `skill_selection_events`, `ctx_decision_audits`) filters by `session_id`,
+/// so sharing one database is isolation-safe. Setup runs once per binary.
+static SHARED_SETUP: tokio::sync::OnceCell<(MatrixOneSettings, SharedPool)> =
+    tokio::sync::OnceCell::const_new();
 
-async fn setup_pool(database: &str) -> (MatrixOneSettings, SharedPool) {
-    let mut settings = require_db_it_env();
-    settings.database = database.to_string();
-    let catalog =
-        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
-    let mut bootstrap = settings.clone();
-    bootstrap.database = catalog.clone();
-    let admin_pool = connect_matrixone(&bootstrap)
+async fn shared_setup() -> &'static (MatrixOneSettings, SharedPool) {
+    SHARED_SETUP
+        .get_or_init(|| async {
+            let database = format!("selector_e2e_{}", Uuid::new_v4().simple());
+            let mut settings = require_db_it_env();
+            settings.database = database.clone();
+            let catalog =
+                std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+            let mut bootstrap = settings.clone();
+            bootstrap.database = catalog.clone();
+            let admin_pool = connect_matrixone(&bootstrap)
+                .await
+                .expect("connect bootstrap catalog");
+            sqlx::query(&format!("CREATE DATABASE IF NOT EXISTS `{database}`"))
+                .execute(&admin_pool)
+                .await
+                .expect("create shared selector-e2e database");
+            admin_pool.close().await;
+            ensure_core_schema(&settings, &catalog)
+                .await
+                .expect("ensure_core_schema; is MatrixOne up?");
+            let pool = SharedPool::new(&settings).await.expect("SharedPool::new");
+            (settings, pool)
+        })
         .await
-        .expect("connect bootstrap catalog");
-    sqlx::query(&format!(
-        "CREATE DATABASE IF NOT EXISTS `{}`",
-        settings.database
-    ))
-    .execute(&admin_pool)
-    .await
-    .expect("create test database");
-    admin_pool.close().await;
-    ensure_core_schema(&settings, &catalog)
-        .await
-        .expect("ensure_core_schema; is MatrixOne up?");
-    let pool = SharedPool::new(&settings).await.expect("SharedPool::new");
-    (settings, pool)
-}
-
-async fn drop_database(settings: &MatrixOneSettings) {
-    let mut bootstrap = settings.clone();
-    bootstrap.database =
-        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
-    let admin_pool = connect_matrixone(&bootstrap)
-        .await
-        .expect("connect bootstrap catalog for drop");
-    sqlx::query(&format!("DROP DATABASE IF EXISTS `{}`", settings.database))
-        .execute(&admin_pool)
-        .await
-        .expect("drop test database");
-    admin_pool.close().await;
 }
 
 async fn cleanup_session_rows(pool: &sqlx::Pool<MySql>, session_id: &str) {
@@ -386,8 +384,9 @@ impl TurnObserverWorker for NoopObserverWorker {
 #[tokio::test]
 #[ignore = "requires live MatrixOne"]
 async fn selector_metric_e2e_persists_and_summarizes_recent_turns() {
-    let database = test_database_name();
-    let (settings, shared_pool) = setup_pool(&database).await;
+    let (settings, shared_pool) = shared_setup().await;
+    let settings = settings.clone();
+    let shared_pool = shared_pool.clone();
     let pool = shared_pool.get().clone();
     let session_id = format!("selector-e2e-{}", Uuid::new_v4());
     let user_id = format!("selector-user-{}", Uuid::new_v4());
@@ -483,15 +482,15 @@ async fn selector_metric_e2e_persists_and_summarizes_recent_turns() {
     assert_eq!(summary.overall.avg_best_chosen_rank, Some(1.5));
 
     cleanup_session_rows(&pool, &session_id).await;
-    shared_pool.close().await;
-    drop_database(&settings).await;
+    // shared setup — no close/drop; OnceCell owns the pool across tests in this binary
 }
 
 #[tokio::test]
 #[ignore = "requires live MatrixOne"]
 async fn selector_metric_e2e_excludes_text_only_turns_from_metrics() {
-    let database = test_database_name();
-    let (settings, shared_pool) = setup_pool(&database).await;
+    let (settings, shared_pool) = shared_setup().await;
+    let settings = settings.clone();
+    let shared_pool = shared_pool.clone();
     let pool = shared_pool.get().clone();
     let session_id = format!("selector-text-only-{}", Uuid::new_v4());
     let user_id = format!("selector-user-{}", Uuid::new_v4());
@@ -533,15 +532,15 @@ async fn selector_metric_e2e_excludes_text_only_turns_from_metrics() {
     assert_eq!(summary.sample_size(), 0);
 
     cleanup_session_rows(&pool, &session_id).await;
-    shared_pool.close().await;
-    drop_database(&settings).await;
+    // shared setup — no close/drop; OnceCell owns the pool across tests in this binary
 }
 
 #[tokio::test]
 #[ignore = "requires live MatrixOne"]
 async fn selector_metric_e2e_handles_multiskill_alias_partial_recall() {
-    let database = test_database_name();
-    let (settings, shared_pool) = setup_pool(&database).await;
+    let (settings, shared_pool) = shared_setup().await;
+    let settings = settings.clone();
+    let shared_pool = shared_pool.clone();
     let pool = shared_pool.get().clone();
     let session_id = format!("selector-multiskill-{}", Uuid::new_v4());
     let user_id = format!("selector-user-{}", Uuid::new_v4());
@@ -599,24 +598,95 @@ async fn selector_metric_e2e_handles_multiskill_alias_partial_recall() {
     assert_eq!(summary.overall.avg_best_chosen_rank, Some(2.0));
 
     cleanup_session_rows(&pool, &session_id).await;
-    shared_pool.close().await;
-    drop_database(&settings).await;
+    // shared setup — no close/drop; OnceCell owns the pool across tests in this binary
 }
 
 #[tokio::test]
 #[ignore = "requires live MatrixOne"]
 async fn selector_metric_e2e_trims_global_window_to_recent_rows() {
-    let database = test_database_name();
-    let (settings, shared_pool) = setup_pool(&database).await;
+    // This test asserts the global window trimming invariant: when total rows
+    // in `skill_selector_turn_metrics` exceed `SKILL_SELECTOR_RECENT_WINDOW_SIZE`
+    // (1000), the oldest rows get pruned by the trim step that fires inside
+    // `DatabaseTurnHookDbWriter::persist`. The table is not session-scoped at
+    // the trim layer — it's a global LRU, so the assertion reads `COUNT(*)`
+    // across all rows.
+    //
+    // Because this test inspects the **entire table**, it needs a dedicated
+    // database — unlike the other three tests in this binary which filter by
+    // `session_id` and can share `shared_setup()`. Also, naive 1003 iterations
+    // through `persist()` would trigger 1003 trim-sweeps (each a `DELETE … NOT
+    // IN (SELECT … LIMIT 1000)` over a growing table — ~O(N²) work). We
+    // instead bulk-insert the first 1000 rows directly (no trim), then call
+    // `persist()` three times so the production trim path runs *exactly three
+    // times*, proving it prunes when crossing the threshold.
+    let database = format!("selector_e2e_trim_{}", Uuid::new_v4().simple());
+    let mut settings = require_db_it_env();
+    settings.database = database.clone();
+    let catalog =
+        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+    let mut bootstrap = settings.clone();
+    bootstrap.database = catalog.clone();
+    let admin_pool = connect_matrixone(&bootstrap)
+        .await
+        .expect("connect bootstrap catalog");
+    sqlx::query(&format!("CREATE DATABASE IF NOT EXISTS `{database}`"))
+        .execute(&admin_pool)
+        .await
+        .expect("create trim-test database");
+    admin_pool.close().await;
+    ensure_core_schema(&settings, &catalog)
+        .await
+        .expect("ensure_core_schema; is MatrixOne up?");
+    let shared_pool = SharedPool::new(&settings).await.expect("SharedPool::new");
     let pool = shared_pool.get().clone();
+
     let session_id = format!("selector-trim-{}", Uuid::new_v4());
     let user_id = format!("selector-user-{}", Uuid::new_v4());
-    cleanup_session_rows(&pool, &session_id).await;
 
+    // Bulk-load 1000 rows (turn_number 1..=1000) via one multi-row INSERT —
+    // avoids 1000 individual trim sweeps while still populating the table to
+    // exactly the window boundary. Each row gets an explicit, increasing
+    // `created_at` so the trim's `ORDER BY created_at DESC` has a deterministic
+    // tiebreaker: earlier turn_numbers really are the oldest rows, matching
+    // the production model where each persist lands on `NOW(6)` sequentially.
+    let preload_rows = SKILL_SELECTOR_RECENT_WINDOW_SIZE;
+    let base_created_at = chrono::Utc::now() - chrono::Duration::seconds(preload_rows + 10);
+    let mut insert_sql = String::from(
+        "INSERT INTO skill_selector_turn_metrics \
+         (event_id, session_id, user_id, turn_number, visible_skill_count, chosen_skill_count, \
+          shortlisted_chosen_count, missed_chosen_count, best_chosen_rank, selector_tier, \
+          elapsed_ms, total_catalog_size, extra, created_at) VALUES ",
+    );
+    let mut binds: Vec<(String, i64, chrono::DateTime<chrono::Utc>)> =
+        Vec::with_capacity(preload_rows as usize);
+    for turn_number in 1..=preload_rows {
+        if turn_number > 1 {
+            insert_sql.push_str(", ");
+        }
+        insert_sql
+            .push_str("(?, ?, ?, ?, 2, 1, 1, 0, 1, 'lexical', 1, 2, NULL, ?)");
+        // Spread created_at 1 millisecond apart so turn 1 is oldest, turn 1000 newest.
+        let created_at = base_created_at + chrono::Duration::milliseconds(turn_number);
+        binds.push((Uuid::new_v4().to_string(), turn_number, created_at));
+    }
+    let mut q = sqlx::query(&insert_sql);
+    for (event_id, turn_number, created_at) in &binds {
+        q = q
+            .bind(event_id)
+            .bind(&session_id)
+            .bind(&user_id)
+            .bind(turn_number)
+            .bind(created_at);
+    }
+    q.execute(&pool).await.expect("bulk-insert preload rows");
+
+    // Persist three more turns through the production writer — each call fires
+    // the trim sweep exactly once. After three, the table should be at exactly
+    // `WINDOW_SIZE` rows with min_turn=4 (rows 1..=3 pruned).
     let hook_writer =
         DatabaseTurnHookDbWriter::new(settings.clone()).with_pool(shared_pool.clone());
     let total_turns = SKILL_SELECTOR_RECENT_WINDOW_SIZE + 3;
-    for turn_number in 1..=total_turns {
+    for turn_number in (SKILL_SELECTOR_RECENT_WINDOW_SIZE + 1)..=total_turns {
         hook_writer
             .persist(TurnHookDbPersistPlan {
                 skill_selector_metric: Some(TurnSkillSelectorMetricRecord {
@@ -669,7 +739,12 @@ async fn selector_metric_e2e_trims_global_window_to_recent_rows() {
     assert_eq!(summary.overall.hit_at_5_rate, 1.0);
     assert_eq!(summary.overall.shortlist_recall_rate, 1.0);
 
-    cleanup_session_rows(&pool, &session_id).await;
     shared_pool.close().await;
-    drop_database(&settings).await;
+    let admin_pool = connect_matrixone(&bootstrap)
+        .await
+        .expect("connect bootstrap catalog for drop");
+    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS `{database}`"))
+        .execute(&admin_pool)
+        .await;
+    admin_pool.close().await;
 }

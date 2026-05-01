@@ -44,6 +44,17 @@ const MODEL_FALLBACK_THRESHOLD: u64 = 3;
 /// magic constant to grep for — it's a policy choice.
 const DEFAULT_RETRY_AFTER_MS: u64 = 5_000;
 
+/// Resolve the fallback retry-after delay, consulting `ASTRA_DEFAULT_RETRY_AFTER_MS`
+/// first. E2E rate-limit tests set this to a small value (e.g. `10`) so their
+/// retry-exhaustion assertions finish in <100ms instead of waiting 3×5s of the
+/// production policy default. Unset = production default.
+fn default_retry_after_ms() -> u64 {
+    std::env::var("ASTRA_DEFAULT_RETRY_AFTER_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RETRY_AFTER_MS)
+}
+
 // ── State Constants ──────────────────────────────────────────────────────────
 
 const STATE_ACTIVE: u8 = 0;
@@ -270,7 +281,7 @@ impl RateLimitCooldown {
         // Below threshold: wait and retry. When the provider omitted the
         // `Retry-After` header we fall back to [`DEFAULT_RETRY_AFTER_MS`] —
         // see the constant's doc for why 5s and when to override.
-        let delay = retry_after_ms.unwrap_or(DEFAULT_RETRY_AFTER_MS);
+        let delay = retry_after_ms.unwrap_or_else(default_retry_after_ms);
         RateLimitAction::WaitAndRetry { delay_ms: delay }
     }
 

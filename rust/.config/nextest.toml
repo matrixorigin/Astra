@@ -86,6 +86,51 @@ filter = "test(/spawn_plan_executor_/)"
 test-group = "plan_executor_e2e"
 slow-timeout = { period = "2s", terminate-after = 1 }
 
+# ── selector_metric_e2e_trims_global_window_to_recent_rows ────────────────
+# Exercises the global LRU-trim invariant on `skill_selector_turn_metrics`:
+# when the table grows past `SKILL_SELECTOR_RECENT_WINDOW_SIZE` (1000), the
+# production trim step prunes oldest rows. Needs its own MatrixOne database
+# (the other three tests in `selector_metrics_db_e2e` are session-scoped and
+# share one via `shared_setup()`), because the assertion reads `COUNT(*)`
+# across the entire table — pollution from sibling tests would corrupt it.
+#
+# Intrinsic cost breakdown (measured): ~600ms schema bootstrap + ~70ms
+# bulk-insert of 1000 preload rows + ~30ms 3×production-persist (each trims)
+# + ~5ms assertions + ~400ms `DROP DATABASE` teardown. Total ~1.1–1.9s in
+# isolation, with the DROP DATABASE dominating the tail. We can't share DB
+# here (COUNT(*) invariant), and we can't skip teardown (builds up stale
+# databases indefinitely). The 2-wide cap prevents the test's bulk insert
+# from contending with a sibling test's DROP DATABASE.
+[[profile.strict-online.overrides]]
+filter = "test(/selector_metric_e2e_trims_global_window_to_recent_rows/)"
+test-group = "integration_e2e"
+slow-timeout = { period = "3s", terminate-after = 1 }
+
+# ── system_matrix_http_e2e parallelism cap (online) ──────────────────────
+# 59 E2E tests in `tests/system_matrix_http_e2e/` all drive the full prod
+# stack (Axum router + agentic loop + mock LLM + MatrixOne). Each is
+# 0.2–1.3s in isolation (bootstrap dominates: bcrypt hash+verify + pool
+# connect + register/login/refresh). When nextest's default machine-wide
+# parallelism runs ~24 of them concurrently against a single MatrixOne
+# instance, DB contention pushes p95 wall time from ~0.8s → 2.5s+ —
+# intrinsic rate is fine; only contention is the issue.
+#
+# Two `rate_limit_failure` tests are intrinsically longer (~1.9s and ~3.3s)
+# because they assert retry-exhaustion surface behavior: 3 retries × mock
+# 429 with no Retry-After header. The `ASTRA_LLM_RETRY_BASE_MS=10` +
+# `ASTRA_DEFAULT_RETRY_AFTER_MS=10` env overrides (set by the E2E harness)
+# collapse the per-retry wait from 1s→10ms, but the 4 stream hits + DB
+# artifact persistence + cooldown follow-up turn still total ~3s.
+#
+# Solution: 2-wide cap (same as offline `integration_e2e`) + 3s ceiling on
+# strict-online. Local: 2s default applies to most tests, 3s override to
+# this binary absorbs rate_limit_failure + contention. CI (8s baseline from
+# strict-online-ci) has plenty of headroom already.
+[[profile.strict-online.overrides]]
+filter = "package(astra-runtime) and binary(system_matrix_http_e2e)"
+test-group = "integration_e2e"
+slow-timeout = { period = "3s", terminate-after = 1 }
+
 # Note: online DB-backed binaries (`*_db_it`, `*_integration`) have their
 # budget driven by `TEST_ONLINE_TIMEOUT` in the Makefile (local default 2s,
 # CI 8s). No per-binary overrides here — otherwise those would re-clamp
