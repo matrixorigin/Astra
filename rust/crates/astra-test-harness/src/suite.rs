@@ -83,6 +83,7 @@ pub struct SuiteRunner<'a> {
     pub no_judger: bool,
     pub session_mode: SessionCaptureMode,
     pub suite_cfg: SuiteConfig,
+    pub dashboard_tx: Option<tokio::sync::broadcast::Sender<crate::dashboard::DashboardEvent>>,
 }
 
 impl<'a> SuiteRunner<'a> {
@@ -114,9 +115,24 @@ impl<'a> SuiteRunner<'a> {
         let total_auth_failures = Arc::new(AtomicUsize::new(0));
 
         let mut suite = SuiteReport {
-            started_at: Some(started_at),
+            started_at: Some(started_at.clone()),
             ..Default::default()
         };
+
+        if let Some(ref tx) = self.dashboard_tx {
+            use std::collections::BTreeSet;
+            let models: Vec<String> = work
+                .iter()
+                .map(|(_, m, _)| m.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let _ = tx.send(crate::dashboard::DashboardEvent::SuiteStarted {
+                total_cases: work.len(),
+                models,
+                started_at,
+            });
+        }
 
         if self.suite_cfg.parallel <= 1 {
             // Serial path: simpler, preserves ordering, supports circuit breaker inline.
@@ -124,6 +140,13 @@ impl<'a> SuiteRunner<'a> {
                 if aborted.load(Ordering::Relaxed) {
                     eprintln!("[astra-test] circuit breaker tripped — aborting remaining cases");
                     break;
+                }
+                if let Some(ref tx) = self.dashboard_tx {
+                    let _ = tx.send(crate::dashboard::DashboardEvent::CaseStarted {
+                        case_name: case.name.clone(),
+                        model: model.clone(),
+                        run_index,
+                    });
                 }
                 let mut report = self.run_one(case, &model).await;
                 report.run_index = run_index;
@@ -133,6 +156,11 @@ impl<'a> SuiteRunner<'a> {
                     &aborted,
                     &total_auth_failures,
                 );
+                if let Some(ref tx) = self.dashboard_tx {
+                    let _ = tx.send(crate::dashboard::DashboardEvent::CaseCompleted {
+                        report: Arc::new(report.clone()),
+                    });
+                }
                 suite.runs.push(report);
             }
         } else {
@@ -146,6 +174,7 @@ impl<'a> SuiteRunner<'a> {
                     let aborted = aborted.clone();
                     let consecutive_infra = consecutive_infra.clone();
                     let total_auth_failures = total_auth_failures.clone();
+                    let dashboard_tx = self.dashboard_tx.clone();
                     async move {
                         if aborted.load(Ordering::Relaxed) {
                             return None;
@@ -153,6 +182,13 @@ impl<'a> SuiteRunner<'a> {
                         let _permit = sem.acquire().await.ok()?;
                         if aborted.load(Ordering::Relaxed) {
                             return None;
+                        }
+                        if let Some(ref tx) = dashboard_tx {
+                            let _ = tx.send(crate::dashboard::DashboardEvent::CaseStarted {
+                                case_name: case.name.clone(),
+                                model: model.clone(),
+                                run_index,
+                            });
                         }
                         let mut report = self.run_one(case, &model).await;
                         report.run_index = run_index;
@@ -162,6 +198,11 @@ impl<'a> SuiteRunner<'a> {
                             &aborted,
                             &total_auth_failures,
                         );
+                        if let Some(ref tx) = dashboard_tx {
+                            let _ = tx.send(crate::dashboard::DashboardEvent::CaseCompleted {
+                                report: Arc::new(report.clone()),
+                            });
+                        }
                         Some(report)
                     }
                 })
@@ -180,6 +221,11 @@ impl<'a> SuiteRunner<'a> {
 
         suite.wall_time_ms = wall_start.elapsed().as_millis() as u64;
         suite.ended_at = Some(chrono::Utc::now().to_rfc3339());
+        if let Some(ref tx) = self.dashboard_tx {
+            let _ = tx.send(crate::dashboard::DashboardEvent::SuiteCompleted {
+                report: Arc::new(suite.clone()),
+            });
+        }
         suite
     }
 
@@ -586,6 +632,7 @@ mod tests {
             no_judger: true,
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
         };
         let cases = vec![case_with("c1", vec![])];
         let report = runner.run_all(&cases).await;
@@ -619,6 +666,7 @@ mod tests {
                 retry_on_429: false,
                 runs: 1,
             },
+            dashboard_tx: None,
         };
         let cases: Vec<Case> = (0..5)
             .map(|i| case_with(&format!("c{i}"), vec![Criterion::ExitCode { code: 0 }]))
@@ -646,6 +694,7 @@ mod tests {
             no_judger: true,
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
         };
         let cases = vec![case_with("c1", vec![Criterion::ExitCode { code: 0 }])];
         let report = runner.run_all(&cases).await;
@@ -695,6 +744,7 @@ mod tests {
             no_judger: false,
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
         };
         let j = Criterion::Judger {
             question: "q?".into(),
@@ -730,6 +780,7 @@ mod tests {
             no_judger: true,
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
         };
         let case = case_with(
             "c1",
@@ -759,6 +810,7 @@ mod tests {
             no_judger: true,
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
         };
         let cases = vec![case_with("c1", vec![])];
         let report = runner.run_all(&cases).await;
@@ -787,6 +839,7 @@ mod tests {
             no_judger: true,
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
         };
         let read_req = Criterion::ToolCalled {
             name: "Read".into(),
@@ -831,6 +884,7 @@ mod tests {
             no_judger: true,
             session_mode: SessionCaptureMode::OnDebugLog,
             suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
         };
         let mut case = case_with("dbg", vec![]);
         case.debug_log = true;
@@ -855,6 +909,7 @@ mod tests {
             no_judger: true,
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
         };
         let mut case = case_with("c1", vec![]);
         case.setup_cmd = Some("exit 1".into());
@@ -892,6 +947,7 @@ mod tests {
             no_judger: true,
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
         };
         let mut case = case_with("mt", vec![]);
         case.steps = vec![crate::case::CaseStep {
@@ -926,6 +982,7 @@ mod tests {
             no_judger: true,
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
         };
         let mut case = case_with("mt", vec![]);
         case.steps = vec![crate::case::CaseStep {
@@ -963,6 +1020,7 @@ mod tests {
             no_judger: true,
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
         };
         let mut case = case_with("c1", vec![]);
         case.capability = Some(crate::case::Capability::ToolUse);
@@ -991,6 +1049,7 @@ mod tests {
             no_judger: true,
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
         };
         let report = runner.run_all(&[case_with("c1", vec![])]).await;
         assert!(report.started_at.is_some());
@@ -1039,6 +1098,7 @@ mod tests {
             no_judger: false,
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
         };
         let mut case = case_with("mt", vec![]);
         case.prompt = "What is 2+2? Answer with just the number.".into();
@@ -1081,9 +1141,10 @@ mod tests {
             no_judger: true,
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig {
-                circuit_breaker_threshold: 10, // high so consecutive breaker doesn't fire
+                circuit_breaker_threshold: 10,
                 ..Default::default()
             },
+            dashboard_tx: None,
         };
         let cases = vec![
             case_with("c0", vec![Criterion::ExitCode { code: 0 }]),

@@ -534,6 +534,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum 0.8.9",
  "chrono",
  "clap",
  "futures",
@@ -544,6 +545,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tower-http",
 ]
 
 [[package]]

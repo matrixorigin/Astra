@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>astra-test dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0a0e1a;--card:#131a2e;--border:#1e293b;--accent:#3b82f6;--green:#22c55e;--red:#ef4444;--yellow:#eab308;--text:#e2e8f0;--muted:#64748b;--font:system-ui,-apple-system,'Segoe UI',sans-serif;--mono:'SF Mono',Menlo,Consolas,monospace}
+body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;overflow-x:hidden}
+.container{max-width:1400px;margin:0 auto;padding:24px}
+
+/* Connection banner */
+.conn{position:fixed;top:0;left:0;right:0;padding:8px 16px;text-align:center;font-size:13px;z-index:100;transition:all .3s}
+.conn.connecting{background:#1e293b;color:var(--yellow)}
+.conn.connected{background:var(--green);color:#000;transform:translateY(-100%);opacity:0}
+.conn.error{background:var(--red);color:#fff}
+
+/* Header */
+header{text-align:center;padding:48px 0 32px}
+header h1{font-size:28px;font-weight:700;letter-spacing:-0.5px;background:linear-gradient(135deg,var(--accent),#a855f7);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+header .subtitle{color:var(--muted);font-size:14px;margin-top:4px}
+
+/* Stats grid */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px;margin:24px 0}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;text-align:center;transition:transform .3s,box-shadow .3s}
+.stat:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,.3)}
+.stat .value{font-size:36px;font-weight:800;font-variant-numeric:tabular-nums}
+.stat .label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-top:4px}
+.stat.pass .value{color:var(--green)}
+.stat.fail .value{color:var(--red)}
+.stat.rate .value{color:var(--accent)}
+
+/* Progress bar */
+.progress-wrap{background:var(--card);border-radius:12px;padding:16px 20px;margin:16px 0;border:1px solid var(--border)}
+.progress-bar{height:8px;background:var(--border);border-radius:4px;overflow:hidden;margin-top:8px}
+.progress-fill{height:100%;background:linear-gradient(90deg,var(--accent),#a855f7);border-radius:4px;transition:width .5s cubic-bezier(.4,0,.2,1);width:0}
+.progress-label{display:flex;justify-content:space-between;font-size:13px;color:var(--muted)}
+
+/* Model comparison */
+.section{margin:32px 0}
+.section h2{font-size:18px;font-weight:600;margin-bottom:16px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;font-size:12px}
+.model-table{width:100%;border-collapse:separate;border-spacing:0;background:var(--card);border-radius:12px;overflow:hidden;border:1px solid var(--border)}
+.model-table th{padding:12px 16px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);background:rgba(0,0,0,.2)}
+.model-table td{padding:12px 16px;border-top:1px solid var(--border);font-variant-numeric:tabular-nums;font-size:14px}
+.model-table tr:hover td{background:rgba(59,130,246,.05)}
+
+/* Case cards */
+.cases{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px;margin-top:16px}
+.case-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;cursor:pointer;transition:all .3s;animation:slideUp .4s cubic-bezier(.4,0,.2,1) both}
+.case-card:hover{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),0 4px 16px rgba(59,130,246,.1)}
+.case-card.pass{border-left:3px solid var(--green)}
+.case-card.fail{border-left:3px solid var(--red)}
+.case-card .case-header{display:flex;justify-content:space-between;align-items:center}
+.case-card .case-name{font-weight:600;font-size:14px}
+.case-card .badge{padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:.5px}
+.case-card .badge.pass{background:rgba(34,197,94,.15);color:var(--green)}
+.case-card .badge.fail{background:rgba(239,68,68,.15);color:var(--red)}
+.case-card .case-model{font-size:12px;color:var(--muted);margin-top:4px;font-family:var(--mono)}
+.case-card .case-metrics{display:flex;gap:12px;margin-top:8px;font-size:12px;color:var(--muted)}
+.case-card .case-metrics span{display:flex;align-items:center;gap:4px}
+.case-card .detail{display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);font-size:13px}
+.case-card.expanded .detail{display:block}
+.case-card .detail pre{background:rgba(0,0,0,.3);padding:8px 12px;border-radius:6px;overflow-x:auto;font-family:var(--mono);font-size:12px;margin:6px 0;white-space:pre-wrap;word-break:break-all}
+.case-card .criterion{padding:4px 0;display:flex;align-items:center;gap:6px}
+.case-card .criterion .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.case-card .criterion .dot.ok{background:var(--green)}
+.case-card .criterion .dot.fail{background:var(--red)}
+
+/* Spinner for running cases */
+.spinner{display:inline-block;width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+
+/* Empty state */
+.empty{text-align:center;padding:80px 20px;color:var(--muted)}
+.empty .icon{font-size:48px;margin-bottom:16px;opacity:.3}
+.empty p{font-size:14px}
+
+/* Animations */
+@keyframes slideUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes countUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+</style>
+</head>
+<body>
+<div class="conn connecting" id="conn">Connecting to test runner...</div>
+<div class="container">
+  <header>
+    <h1>astra-test</h1>
+    <div class="subtitle" id="subtitle">waiting for suite to start...</div>
+  </header>
+
+  <div class="progress-wrap" id="progressWrap" style="display:none">
+    <div class="progress-label">
+      <span id="progressText">0 / 0</span>
+      <span id="progressPct">0%</span>
+    </div>
+    <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+  </div>
+
+  <div class="stats" id="stats" style="display:none">
+    <div class="stat pass"><div class="value" id="passCount">0</div><div class="label">passed</div></div>
+    <div class="stat fail"><div class="value" id="failCount">0</div><div class="label">failed</div></div>
+    <div class="stat rate"><div class="value" id="passRate">—</div><div class="label">pass rate</div></div>
+    <div class="stat"><div class="value" id="wallTime">—</div><div class="label">wall time</div></div>
+    <div class="stat"><div class="value" id="tokTotal">—</div><div class="label">tokens</div></div>
+  </div>
+
+  <div class="section" id="modelSection" style="display:none">
+    <h2>Model Comparison</h2>
+    <table class="model-table" id="modelTable">
+      <thead><tr>
+        <th>Model</th><th>Pass</th><th>Rate</th>
+        <th>Tok/Pass</th><th>Dur/Pass</th><th>Turns/Pass</th>
+      </tr></thead>
+      <tbody id="modelBody"></tbody>
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>Cases</h2>
+    <div class="cases" id="caseGrid"></div>
+    <div class="empty" id="emptyState">
+      <div class="icon">🧪</div>
+      <p>Cases will appear here as they complete</p>
+    </div>
+  </div>
+</div>
+
+<script>
+const state = {
+  total: 0, completed: 0, passed: 0, failed: 0,
+  models: [], runs: [], running: new Map(),
+  startTime: null, suiteComplete: false
+};
+
+function $(id) { return document.getElementById(id); }
+
+function formatDur(ms) {
+  if (ms < 1000) return ms + 'ms';
+  if (ms < 60000) return (ms/1000).toFixed(1) + 's';
+  return Math.floor(ms/60000) + 'm' + Math.floor((ms%60000)/1000) + 's';
+}
+function formatTok(n) {
+  if (n < 1000) return String(n);
+  if (n < 1e6) return (n/1000).toFixed(1) + 'k';
+  return (n/1e6).toFixed(1) + 'M';
+}
+function normModel(m) {
+  for (const p of ['us.anthropic.','eu.anthropic.','ap.anthropic.']) {
+    if (m.startsWith(p)) return m.slice(p.length);
+  }
+  return m;
+}
+
+function updateStats() {
+  $('passCount').textContent = state.passed;
+  $('failCount').textContent = state.failed;
+  const rate = state.completed > 0 ? Math.round(state.passed / state.completed * 100) : 0;
+  $('passRate').textContent = rate + '%';
+
+  const elapsed = state.startTime ? Date.now() - state.startTime : 0;
+  $('wallTime').textContent = formatDur(elapsed);
+
+  const totalTok = state.runs.reduce((s, r) => s + (r.outcome.prompt_tokens||0) + (r.outcome.completion_tokens||0), 0);
+  $('tokTotal').textContent = formatTok(totalTok);
+
+  $('progressText').textContent = state.completed + ' / ' + state.total;
+  const pct = state.total > 0 ? Math.round(state.completed / state.total * 100) : 0;
+  $('progressPct').textContent = pct + '%';
+  $('progressFill').style.width = pct + '%';
+
+  updateModelTable();
+}
+
+function updateModelTable() {
+  const models = {};
+  for (const r of state.runs) {
+    const m = normModel(r.model);
+    if (!models[m]) models[m] = { pass:0, total:0, passTok:0, passDur:0, passTurns:0 };
+    const s = models[m];
+    s.total++;
+    if (r.passed) {
+      s.pass++;
+      s.passTok += (r.outcome.prompt_tokens||0) + (r.outcome.completion_tokens||0);
+      s.passDur += r.outcome.duration_ms||0;
+      s.passTurns += r.outcome.turn_rounds||0;
+    }
+  }
+  const sorted = Object.entries(models).sort((a,b) => (b[1].pass/b[1].total) - (a[1].pass/a[1].total));
+  if (sorted.length < 2) { $('modelSection').style.display = 'none'; return; }
+  $('modelSection').style.display = '';
+  $('modelBody').innerHTML = sorted.map(([name, s]) => {
+    const rate = Math.round(s.pass / s.total * 100);
+    const p = Math.max(s.pass, 1);
+    const rateColor = rate >= 80 ? 'var(--green)' : rate >= 50 ? 'var(--yellow)' : 'var(--red)';
+    return `<tr>
+      <td style="font-weight:600">${name}</td>
+      <td>${s.pass}/${s.total}</td>
+      <td style="color:${rateColor};font-weight:700">${rate}%</td>
+      <td>${formatTok(Math.round(s.passTok/p))}</td>
+      <td>${formatDur(Math.round(s.passDur/p))}</td>
+      <td>${(s.passTurns/p).toFixed(1)}</td>
+    </tr>`;
+  }).join('');
+}
+
+function addCaseCard(report) {
+  $('emptyState').style.display = 'none';
+  const card = document.createElement('div');
+  card.className = 'case-card ' + (report.passed ? 'pass' : 'fail');
+  card.style.animationDelay = (state.completed * 30) + 'ms';
+  const tok = (report.outcome.prompt_tokens||0) + (report.outcome.completion_tokens||0);
+  const criteria = (report.criteria||[]).map(c =>
+    `<div class="criterion"><div class="dot ${c.passed?'ok':'fail'}"></div>${escHtml(c.detail)}</div>`
+  ).join('');
+  const sid = report.outcome.session_id;
+  const sessionHtml = sid ? `<div style="margin-top:8px"><span style="font-family:var(--mono);font-size:11px;background:rgba(59,130,246,.1);padding:2px 6px;border-radius:3px;user-select:all">${sid}</span></div>` : '';
+  const reproducerHtml = report.reproducer ? `<div style="margin-top:6px;font-size:11px;color:var(--muted)">rerun:</div><pre>${escHtml(report.reproducer)}</pre>` : '';
+  const stepsHtml = (report.steps||[]).map(s =>
+    `<div style="margin:4px 0;padding:4px 8px;background:rgba(0,0,0,.2);border-radius:4px;font-size:12px">
+      step[${s.step_index}] ${formatDur(s.duration_ms)} — ${escHtml(truncate(s.outcome?.text||'',120))}
+    </div>`
+  ).join('');
+  card.innerHTML = `
+    <div class="case-header">
+      <div>
+        <div class="case-name">${escHtml(report.case_name)}</div>
+        <div class="case-model">${escHtml(report.model)}</div>
+      </div>
+      <span class="badge ${report.passed?'pass':'fail'}">${report.passed?'PASS':'FAIL'}</span>
+    </div>
+    <div class="case-metrics">
+      <span>⏱ ${formatDur(report.outcome.duration_ms||0)}</span>
+      <span>📊 ${formatTok(tok)}</span>
+      <span>🔄 ${report.outcome.turn_rounds||0} turns</span>
+      <span>🔧 ${report.outcome.tool_calls_count||0} tools</span>
+    </div>
+    <div class="detail">
+      ${criteria}
+      ${stepsHtml}
+      ${sessionHtml}
+      ${reproducerHtml}
+      ${report.failure_class ? `<div style="margin-top:6px;color:var(--red);font-size:12px">class: ${escHtml(report.failure_class)}</div>` : ''}
+      ${report.outcome.text ? `<div style="margin-top:6px;font-size:11px;color:var(--muted)">output:</div><pre>${escHtml(truncate(report.outcome.text, 500))}</pre>` : ''}
+    </div>`;
+  card.onclick = () => card.classList.toggle('expanded');
+  $('caseGrid').appendChild(card);
+}
+
+function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function truncate(s, n) { return s.length > n ? s.slice(0, n) + '...' : s; }
+
+// WebSocket
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => {
+    $('conn').className = 'conn connected';
+    setTimeout(() => $('conn').style.display = 'none', 1000);
+  };
+  ws.onclose = () => {
+    if (!state.suiteComplete) {
+      $('conn').className = 'conn error';
+      $('conn').textContent = 'Disconnected — reconnecting...';
+      $('conn').style.display = '';
+      setTimeout(connect, 2000);
+    }
+  };
+  ws.onmessage = (e) => {
+    const ev = JSON.parse(e.data);
+    switch (ev.type) {
+      case 'suite_started':
+        state.total = ev.total_cases;
+        state.models = ev.models;
+        state.startTime = Date.now();
+        $('subtitle').textContent = ev.models.join(' vs ') + ' — ' + ev.total_cases + ' cases';
+        $('stats').style.display = '';
+        $('progressWrap').style.display = '';
+        updateStats();
+        // Keep wall time ticking
+        setInterval(() => {
+          if (!state.suiteComplete) {
+            const elapsed = Date.now() - state.startTime;
+            $('wallTime').textContent = formatDur(elapsed);
+          }
+        }, 500);
+        break;
+      case 'case_started':
+        state.running.set(ev.case_name + '/' + ev.model, true);
+        break;
+      case 'case_completed':
+        state.completed++;
+        state.runs.push(ev.report);
+        if (ev.report.passed) state.passed++; else state.failed++;
+        state.running.delete(ev.report.case_name + '/' + ev.report.model);
+        addCaseCard(ev.report);
+        updateStats();
+        break;
+      case 'suite_completed':
+        state.suiteComplete = true;
+        $('subtitle').textContent = 'Suite complete — ' + state.passed + '/' + state.completed + ' passed';
+        if (ev.report.wall_time_ms) $('wallTime').textContent = formatDur(ev.report.wall_time_ms);
+        break;
+    }
+  };
+}
+connect();
+</script>
+</body>
+</html>

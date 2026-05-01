@@ -150,6 +150,11 @@ struct Args {
     /// by AI agents or dashboards.
     #[arg(long, value_name = "PATH")]
     report_file: Option<PathBuf>,
+
+    /// Start a live dashboard server for real-time test visualization.
+    /// Opens http://localhost:PORT (default 9100) in your browser.
+    #[arg(long, value_name = "PORT", default_missing_value = "9100", num_args = 0..=1)]
+    live_dashboard: Option<u16>,
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -354,6 +359,20 @@ async fn main() -> Result<()> {
         runs: args.runs.max(1),
     };
 
+    let dashboard_tx = if let Some(port) = args.live_dashboard {
+        let server = astra_test_harness::dashboard::DashboardServer::new();
+        let tx = server.sender();
+        tokio::spawn(async move {
+            if let Err(e) = server.start(port).await {
+                eprintln!("[astra-test] dashboard error: {e}");
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        Some(tx)
+    } else {
+        None
+    };
+
     let runner = SuiteRunner {
         executor: executor.as_ref(),
         judger: judger.as_ref(),
@@ -363,6 +382,7 @@ async fn main() -> Result<()> {
         no_judger: args.no_judger,
         session_mode,
         suite_cfg,
+        dashboard_tx,
     };
 
     let suite = runner.run_all(&cases).await;
@@ -429,6 +449,12 @@ async fn main() -> Result<()> {
                 eprintln!("[astra-test] WARNING: summarizer failed: {e}");
             }
         }
+    }
+
+    if args.live_dashboard.is_some() {
+        eprintln!("[astra-test] dashboard still running — press Ctrl-C to exit.");
+        tokio::signal::ctrl_c().await.ok();
+        return Ok(());
     }
 
     if suite.failed() > 0 {
