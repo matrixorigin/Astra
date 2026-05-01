@@ -74,14 +74,11 @@ pub struct TokenDeltas {
 /// io / parse failures on either session; structural differences are
 /// always returned as Ok.
 pub fn compute_diff(a_session: &str, b_session: &str) -> Result<JournalDiff, String> {
-    let a_events = session_journal::read_journal(a_session).map_err(|e| format!("{a_session}: {e}"))?;
-    let b_events = session_journal::read_journal(b_session).map_err(|e| format!("{b_session}: {e}"))?;
-    Ok(diff_events(
-        a_session,
-        b_session,
-        &a_events,
-        &b_events,
-    ))
+    let a_events =
+        session_journal::read_journal(a_session).map_err(|e| format!("{a_session}: {e}"))?;
+    let b_events =
+        session_journal::read_journal(b_session).map_err(|e| format!("{b_session}: {e}"))?;
+    Ok(diff_events(a_session, b_session, &a_events, &b_events))
 }
 
 /// Pure fold: no filesystem IO. Exposed as pub(crate) for tests.
@@ -300,10 +297,15 @@ pub fn run_diff(args: &cli_args::JournalDiffArgs) -> Result<(), String> {
             Ok(())
         }
         "json" => {
-            println!("{}", serde_json::to_string_pretty(&diff).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&diff).unwrap_or_default()
+            );
             Ok(())
         }
-        other => Err(format!("invalid --format '{other}' (expected text or json)")),
+        other => Err(format!(
+            "invalid --format '{other}' (expected text or json)"
+        )),
     }
 }
 
@@ -318,9 +320,9 @@ mod tests {
 
     #[test]
     fn identical_journals_have_zero_deltas() {
-        let a = vec![
-            evt(json!({"type":"turn","ts":"t1","session_id":"a","tokens_in":100,"tokens_out":10,"assistant_output":"hello"})),
-        ];
+        let a = vec![evt(
+            json!({"type":"turn","ts":"t1","session_id":"a","tokens_in":100,"tokens_out":10,"assistant_output":"hello"}),
+        )];
         let b = a.clone();
         let d = diff_events("a", "b", &a, &b);
         assert_eq!(d.token_deltas.prompt, 0);
@@ -334,8 +336,12 @@ mod tests {
 
     #[test]
     fn token_deltas_are_signed_b_minus_a() {
-        let a = vec![evt(json!({"type":"turn","ts":"t","session_id":"a","tokens_in":1000,"tokens_out":50}))];
-        let b = vec![evt(json!({"type":"turn","ts":"t","session_id":"b","tokens_in":800,"tokens_out":80}))];
+        let a = vec![evt(
+            json!({"type":"turn","ts":"t","session_id":"a","tokens_in":1000,"tokens_out":50}),
+        )];
+        let b = vec![evt(
+            json!({"type":"turn","ts":"t","session_id":"b","tokens_in":800,"tokens_out":80}),
+        )];
         let d = diff_events("a", "b", &a, &b);
         assert_eq!(d.token_deltas.prompt, -200); // B used fewer prompt tokens
         assert_eq!(d.token_deltas.completion, 30);
@@ -384,9 +390,9 @@ mod tests {
 
     #[test]
     fn final_text_presence_is_reported_independently() {
-        let a = vec![
-            evt(json!({"type":"turn","ts":"t","session_id":"a","assistant_output":"done"})),
-        ];
+        let a = vec![evt(
+            json!({"type":"turn","ts":"t","session_id":"a","assistant_output":"done"}),
+        )];
         // B has a turn but no assistant output — crash / empty run.
         let b = vec![evt(json!({"type":"turn","ts":"t","session_id":"b"}))];
         let d = diff_events("a", "b", &a, &b);
@@ -396,8 +402,12 @@ mod tests {
 
     #[test]
     fn render_text_shows_token_arrows_and_sequence_diff() {
-        let a = vec![evt(json!({"type":"turn","ts":"t","session_id":"a","tokens_in":100,"tokens_out":10,"assistant_output":"x"}))];
-        let b = vec![evt(json!({"type":"turn","ts":"t","session_id":"b","tokens_in":120,"tokens_out":15,"assistant_output":"x"}))];
+        let a = vec![evt(
+            json!({"type":"turn","ts":"t","session_id":"a","tokens_in":100,"tokens_out":10,"assistant_output":"x"}),
+        )];
+        let b = vec![evt(
+            json!({"type":"turn","ts":"t","session_id":"b","tokens_in":120,"tokens_out":15,"assistant_output":"x"}),
+        )];
         let d = diff_events("a", "b", &a, &b);
         let txt = render_text(&d);
         assert!(txt.contains("100 → 120"));
@@ -409,8 +419,12 @@ mod tests {
     fn token_delta_saturates_on_large_u64_instead_of_wrapping() {
         // u64 values above i64::MAX must not wrap to negative on cast.
         let big = (i64::MAX as u64) + 1000;
-        let a = vec![evt(json!({"type":"turn","ts":"t","session_id":"a","tokens_in":big,"tokens_out":0}))];
-        let b = vec![evt(json!({"type":"turn","ts":"t","session_id":"b","tokens_in":0,"tokens_out":0}))];
+        let a = vec![evt(
+            json!({"type":"turn","ts":"t","session_id":"a","tokens_in":big,"tokens_out":0}),
+        )];
+        let b = vec![evt(
+            json!({"type":"turn","ts":"t","session_id":"b","tokens_in":0,"tokens_out":0}),
+        )];
         let d = diff_events("a", "b", &a, &b);
         // Delta should be clamped, not wrapped to a positive number.
         assert!(
@@ -435,7 +449,9 @@ mod tests {
         // no assistant_output) should report false — the "final" text
         // is what the user sees, not an intermediate turn.
         let a = vec![
-            evt(json!({"type":"turn","ts":"t1","session_id":"a","assistant_output":"early output"})),
+            evt(
+                json!({"type":"turn","ts":"t1","session_id":"a","assistant_output":"early output"}),
+            ),
             evt(json!({"type":"turn","ts":"t2","session_id":"a"})),
         ];
         let b: Vec<JournalEvent> = vec![];
@@ -450,10 +466,7 @@ mod tests {
     #[test]
     fn run_diff_warns_when_both_sessions_resolve_to_same_id() {
         let d = diff_events("sess-X", "sess-X", &[], &[]);
-        assert_eq!(
-            d.a_session, d.b_session,
-            "sanity: sessions are the same"
-        );
+        assert_eq!(d.a_session, d.b_session, "sanity: sessions are the same");
         let txt = render_text(&d);
         assert!(
             txt.contains("warning") || txt.contains("Warning") || txt.contains("same session"),

@@ -48,10 +48,42 @@ fn require_db_it_env() -> MatrixOneSettings {
 /// and every table they touch (`skill_selector_turn_metrics`,
 /// `skill_selection_events`, `ctx_decision_audits`) filters by `session_id`,
 /// so sharing one database is isolation-safe. Setup runs once per binary.
-static SHARED_SETUP: tokio::sync::OnceCell<(MatrixOneSettings, SharedPool)> =
-    tokio::sync::OnceCell::const_new();
+struct SharedSetup {
+    settings: MatrixOneSettings,
+    pool: SharedPool,
+    database: String,
+    catalog: String,
+}
 
-async fn shared_setup() -> &'static (MatrixOneSettings, SharedPool) {
+impl Drop for SharedSetup {
+    fn drop(&mut self) {
+        let catalog = self.catalog.clone();
+        let database = self.database.clone();
+        let mut bootstrap = self.settings.clone();
+        bootstrap.database = catalog;
+        // Best-effort teardown — fire-and-forget in a blocking spawn so
+        // the runtime doesn't have to be alive for the drop to attempt it.
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            if let Ok(rt) = rt {
+                rt.block_on(async {
+                    if let Ok(admin) = connect_matrixone(&bootstrap).await {
+                        let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS `{database}`"))
+                            .execute(&admin)
+                            .await;
+                        admin.close().await;
+                    }
+                });
+            }
+        });
+    }
+}
+
+static SHARED_SETUP: tokio::sync::OnceCell<SharedSetup> = tokio::sync::OnceCell::const_new();
+
+async fn shared_setup() -> &'static SharedSetup {
     SHARED_SETUP
         .get_or_init(|| async {
             let database = format!("selector_e2e_{}", Uuid::new_v4().simple());
@@ -73,7 +105,12 @@ async fn shared_setup() -> &'static (MatrixOneSettings, SharedPool) {
                 .await
                 .expect("ensure_core_schema; is MatrixOne up?");
             let pool = SharedPool::new(&settings).await.expect("SharedPool::new");
-            (settings, pool)
+            SharedSetup {
+                settings,
+                pool,
+                database,
+                catalog,
+            }
         })
         .await
 }
@@ -384,9 +421,9 @@ impl TurnObserverWorker for NoopObserverWorker {
 #[tokio::test]
 #[ignore = "requires live MatrixOne"]
 async fn selector_metric_e2e_persists_and_summarizes_recent_turns() {
-    let (settings, shared_pool) = shared_setup().await;
-    let settings = settings.clone();
-    let shared_pool = shared_pool.clone();
+    let setup = shared_setup().await;
+    let settings = setup.settings.clone();
+    let shared_pool = setup.pool.clone();
     let pool = shared_pool.get().clone();
     let session_id = format!("selector-e2e-{}", Uuid::new_v4());
     let user_id = format!("selector-user-{}", Uuid::new_v4());
@@ -482,15 +519,15 @@ async fn selector_metric_e2e_persists_and_summarizes_recent_turns() {
     assert_eq!(summary.overall.avg_best_chosen_rank, Some(1.5));
 
     cleanup_session_rows(&pool, &session_id).await;
-    // shared setup — no close/drop; OnceCell owns the pool across tests in this binary
+    // shared setup — Drop impl on SharedSetup handles DB teardown at process exit
 }
 
 #[tokio::test]
 #[ignore = "requires live MatrixOne"]
 async fn selector_metric_e2e_excludes_text_only_turns_from_metrics() {
-    let (settings, shared_pool) = shared_setup().await;
-    let settings = settings.clone();
-    let shared_pool = shared_pool.clone();
+    let setup = shared_setup().await;
+    let settings = setup.settings.clone();
+    let shared_pool = setup.pool.clone();
     let pool = shared_pool.get().clone();
     let session_id = format!("selector-text-only-{}", Uuid::new_v4());
     let user_id = format!("selector-user-{}", Uuid::new_v4());
@@ -532,15 +569,15 @@ async fn selector_metric_e2e_excludes_text_only_turns_from_metrics() {
     assert_eq!(summary.sample_size(), 0);
 
     cleanup_session_rows(&pool, &session_id).await;
-    // shared setup — no close/drop; OnceCell owns the pool across tests in this binary
+    // shared setup — Drop impl on SharedSetup handles DB teardown at process exit
 }
 
 #[tokio::test]
 #[ignore = "requires live MatrixOne"]
 async fn selector_metric_e2e_handles_multiskill_alias_partial_recall() {
-    let (settings, shared_pool) = shared_setup().await;
-    let settings = settings.clone();
-    let shared_pool = shared_pool.clone();
+    let setup = shared_setup().await;
+    let settings = setup.settings.clone();
+    let shared_pool = setup.pool.clone();
     let pool = shared_pool.get().clone();
     let session_id = format!("selector-multiskill-{}", Uuid::new_v4());
     let user_id = format!("selector-user-{}", Uuid::new_v4());
@@ -598,7 +635,7 @@ async fn selector_metric_e2e_handles_multiskill_alias_partial_recall() {
     assert_eq!(summary.overall.avg_best_chosen_rank, Some(2.0));
 
     cleanup_session_rows(&pool, &session_id).await;
-    // shared setup — no close/drop; OnceCell owns the pool across tests in this binary
+    // shared setup — Drop impl on SharedSetup handles DB teardown at process exit
 }
 
 #[tokio::test]

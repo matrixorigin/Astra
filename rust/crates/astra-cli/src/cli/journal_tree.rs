@@ -149,8 +149,7 @@ pub(crate) fn fold_events_into_tree(
                     root.model = Some(m.to_string());
                 }
             }
-            JournalEventType::DelegationSubRunStarted
-            | JournalEventType::DelegationStarted => {
+            JournalEventType::DelegationSubRunStarted | JournalEventType::DelegationStarted => {
                 seq = seq.saturating_add(1);
                 let run_id = ev
                     .metadata
@@ -239,8 +238,9 @@ pub(crate) fn fold_events_into_tree(
     // Roll-up aggregation into the root for a quick summary.
     for child in &root.children {
         root.prompt_tokens = root.prompt_tokens.saturating_add(child.prompt_tokens);
-        root.completion_tokens =
-            root.completion_tokens.saturating_add(child.completion_tokens);
+        root.completion_tokens = root
+            .completion_tokens
+            .saturating_add(child.completion_tokens);
         root.tool_calls = root.tool_calls.saturating_add(child.tool_calls);
     }
 
@@ -273,11 +273,7 @@ fn render_node_text(
     if is_root {
         out.push_str(&format!(
             "{} [{}] tokens={}/{} tool_calls={}\n",
-            node.label,
-            node.id,
-            node.prompt_tokens,
-            node.completion_tokens,
-            node.tool_calls
+            node.label, node.id, node.prompt_tokens, node.completion_tokens, node.tool_calls
         ));
     } else {
         let connector = if is_last { "└── " } else { "├── " };
@@ -341,10 +337,15 @@ pub fn run_tree(args: &cli_args::JournalTreeArgs) -> Result<(), String> {
                 "skipped_events": skipped,
                 "root": root,
             });
-            println!("{}", serde_json::to_string_pretty(&body).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&body).unwrap_or_default()
+            );
             Ok(())
         }
-        other => Err(format!("invalid --format '{other}' (expected text or json)")),
+        other => Err(format!(
+            "invalid --format '{other}' (expected text or json)"
+        )),
     }
 }
 
@@ -382,7 +383,13 @@ mod tests {
         serde_json::from_value(raw).expect("valid sub-run start")
     }
 
-    fn sub_completed(ts: &str, run_id: &str, prompt: u64, completion: u64, tools: u32) -> JournalEvent {
+    fn sub_completed(
+        ts: &str,
+        run_id: &str,
+        prompt: u64,
+        completion: u64,
+        tools: u32,
+    ) -> JournalEvent {
         let raw = json!({
             "type": "delegation_sub_run_completed",
             "ts": ts,
