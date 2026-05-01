@@ -1005,14 +1005,15 @@ fn merge_consecutive_same_role(messages: Vec<Value>) -> Vec<Value> {
     let mut merged: Vec<Value> = Vec::with_capacity(messages.len());
     for msg in messages {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or_default();
-        let can_merge = merged.last().is_some_and(|prev: &Value| {
-            prev.get("role").and_then(Value::as_str) == Some(role)
-        });
+        let can_merge = merged
+            .last()
+            .is_some_and(|prev: &Value| prev.get("role").and_then(Value::as_str) == Some(role));
         if can_merge {
             // Append content blocks to the previous message
             if let Some(new_content) = msg.get("content").and_then(Value::as_array) {
                 if let Some(prev) = merged.last_mut() {
-                    if let Some(prev_content) = prev.get_mut("content").and_then(Value::as_array_mut)
+                    if let Some(prev_content) =
+                        prev.get_mut("content").and_then(Value::as_array_mut)
                     {
                         prev_content.extend(new_content.iter().cloned());
                     }
@@ -5105,9 +5106,7 @@ mod tests {
             body.get("toolConfig").is_some(),
             "toolConfig should have placeholder: {body:#?}"
         );
-        assert_eq!(
-            body["toolConfig"]["tools"][0]["toolSpec"]["name"], "_noop"
-        );
+        assert_eq!(body["toolConfig"]["tools"][0]["toolSpec"]["name"], "_noop");
     }
 
     #[test]
@@ -6561,7 +6560,11 @@ mod tests {
             json!({"role": "user", "content": [{"type": "text", "text": "correction 2"}]}),
         ];
         let merged = merge_consecutive_same_role(messages);
-        assert_eq!(merged.len(), 3, "should merge 3 consecutive user msgs into 1");
+        assert_eq!(
+            merged.len(),
+            3,
+            "should merge 3 consecutive user msgs into 1"
+        );
         assert_eq!(merged[0]["role"], "user");
         assert_eq!(merged[1]["role"], "assistant");
         assert_eq!(merged[2]["role"], "user");
@@ -6613,7 +6616,11 @@ mod tests {
         assert_eq!(max_turns["type"], "integer");
         assert_eq!(max_turns["description"], "Max turns");
         // nested items should not have minItems
-        assert!(schema["properties"]["allowed_tools"].get("minItems").is_none());
+        assert!(
+            schema["properties"]["allowed_tools"]
+                .get("minItems")
+                .is_none()
+        );
         // "required" at top level must survive
         assert_eq!(schema["required"], json!(["max_turns"]));
     }

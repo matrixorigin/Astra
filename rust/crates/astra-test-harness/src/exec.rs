@@ -169,32 +169,12 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
             out.exit_code = output.status.code().unwrap_or(-1);
             out.duration_ms = start.elapsed().as_millis() as u64;
             // Extract turn_rounds and cache_hits from step_events if available.
-            if let Some(ref sid) = out.session_id {
-                let home = std::env::var("HOME").unwrap_or_default();
-                let events_path = std::path::Path::new(&home)
-                    .join(".astra/sessions")
-                    .join(sid)
-                    .join("step_events.jsonl");
-                if let Ok(content) = std::fs::read_to_string(&events_path) {
-                    for line in content.lines() {
-                        if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) {
-                            match ev.get("event_type").and_then(|e| e.as_str()) {
-                                Some("StepStarted") => out.turn_rounds += 1,
-                                Some("ToolCallCompleted") => {
-                                    out.total_tool_calls += 1;
-                                    if ev.get("payload")
-                                        .and_then(|p| p.get("cached"))
-                                        .and_then(|c| c.as_bool())
-                                        == Some(true)
-                                    {
-                                        out.cache_hits += 1;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
+            if let Some(ref sid) = out.session_id
+                && let Some(stats) = crate::session_capture::load_step_event_stats(sid)
+            {
+                out.turn_rounds = stats.turn_rounds;
+                out.cache_hits = stats.cache_hits;
+                out.total_tool_calls = stats.total_tool_calls;
             }
             out
         }
@@ -300,10 +280,10 @@ pub(crate) mod test_support {
                     completion_tokens: 0,
                     prompt_tokens: 0,
                     duration_ms: 0,
-                turn_rounds: 0,
-                cache_hits: 0,
-                total_tool_calls: 0,
-                ttft_ms: 0,
+                    turn_rounds: 0,
+                    cache_hits: 0,
+                    total_tool_calls: 0,
+                    ttft_ms: 0,
                 })
         }
         fn reproducer(&self, case: &Case, model: &str) -> String {
@@ -460,10 +440,10 @@ mod tests {
             completion_tokens: 0,
             prompt_tokens: 0,
             duration_ms: 0,
-        turn_rounds: 0,
-        cache_hits: 0,
-        total_tool_calls: 0,
-        ttft_ms: 0,
+            turn_rounds: 0,
+            cache_hits: 0,
+            total_tool_calls: 0,
+            ttft_ms: 0,
         };
         seed.exit_code = 0;
         fe.seed("c1", "qwen-flash", seed.clone());

@@ -330,7 +330,10 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         // resolved, this degenerates to the pre-fix 2-message layout.
         let messages = crate::spawn_subrun::build_child_messages(
             &system_prompt,
-            config.inherited_prefix.as_ref().map(|ip| ip.prefix_messages.as_slice()),
+            config
+                .inherited_prefix
+                .as_ref()
+                .map(|ip| ip.prefix_messages.as_slice()),
             &user_message,
         );
 

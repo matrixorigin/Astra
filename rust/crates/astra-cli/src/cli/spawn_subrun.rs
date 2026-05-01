@@ -22,7 +22,7 @@ use astra_runtime::{
     turn::tool_schema_prune::openai_tool_names_from_schemas,
     turn::turn_guard::TurnGuard,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::edge_tools;
 use super::permission_manager::PermissionMode;
@@ -68,7 +68,9 @@ pub(crate) fn build_child_messages(
         // prefix ends with user or tool role, inserting the child task
         // (also user) would create consecutive user messages → HTTP 400.
         // Insert a synthetic assistant bridge to maintain alternation.
-        let last_role = messages.iter().rev()
+        let last_role = messages
+            .iter()
+            .rev()
             .find_map(|m| m.get("role").and_then(|r| r.as_str()))
             .filter(|r| *r != "system");
         if matches!(last_role, Some("user") | Some("tool")) {
@@ -216,7 +218,10 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         // child turns, not for this first call).
         let messages = build_child_messages(
             &system_prompt,
-            config.inherited_prefix.as_ref().map(|ip| ip.prefix_messages.as_slice()),
+            config
+                .inherited_prefix
+                .as_ref()
+                .map(|ip| ip.prefix_messages.as_slice()),
             &config.task,
         );
 
@@ -563,9 +568,7 @@ mod tests {
     #[test]
     fn prefix_ending_with_user_or_tool_must_insert_assistant_bridge() {
         // Simulate the message construction logic from execute()
-        let prefix_messages = vec![
-            json!({"role": "user", "content": "original prompt"}),
-        ];
+        let prefix_messages = vec![json!({"role": "user", "content": "original prompt"})];
         let system_prompt = "You are a child agent.";
         let child_task = "Reply: inherited-ok";
 

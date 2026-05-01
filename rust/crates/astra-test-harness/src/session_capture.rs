@@ -495,3 +495,42 @@ mod tests {
         assert_eq!(cap.skipped_lines, 0);
     }
 }
+
+/// Metrics extracted from `step_events.jsonl`.
+#[derive(Debug, Default)]
+pub struct StepEventStats {
+    pub turn_rounds: u32,
+    pub cache_hits: u32,
+    pub total_tool_calls: u32,
+}
+
+/// Parse `~/.astra/sessions/<session_id>/step_events.jsonl` and extract
+/// turn rounds and cache hit counts. Returns `None` if the file doesn't
+/// exist or is unreadable.
+pub fn load_step_event_stats(session_id: &str) -> Option<StepEventStats> {
+    let path = default_sessions_dir()
+        .join(session_id)
+        .join("step_events.jsonl");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let mut stats = StepEventStats::default();
+    for line in content.lines() {
+        if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) {
+            match ev.get("event_type").and_then(|e| e.as_str()) {
+                Some("StepStarted") => stats.turn_rounds += 1,
+                Some("ToolCallCompleted") => {
+                    stats.total_tool_calls += 1;
+                    if ev
+                        .get("payload")
+                        .and_then(|p| p.get("cached"))
+                        .and_then(|c| c.as_bool())
+                        == Some(true)
+                    {
+                        stats.cache_hits += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Some(stats)
+}

@@ -28,6 +28,10 @@ pub struct CaseRunReport {
     pub case_name: String,
     pub model: String,
     pub passed: bool,
+    /// 0-based index when `--runs N` repeats the same case/model.
+    /// Always 0 for single-run mode.
+    #[serde(default)]
+    pub run_index: u32,
     pub outcome: RunOutcome,
     pub criteria: Vec<CriterionResult>,
     /// Optional session journal dump — only present when
@@ -139,7 +143,11 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
     s.push_str("=== astra-test suite report ===\n");
 
     let total_prompt: u64 = report.runs.iter().map(|r| r.outcome.prompt_tokens).sum();
-    let total_completion: u64 = report.runs.iter().map(|r| r.outcome.completion_tokens).sum();
+    let total_completion: u64 = report
+        .runs
+        .iter()
+        .map(|r| r.outcome.completion_tokens)
+        .sum();
     let total_dur: u64 = report.runs.iter().map(|r| r.outcome.duration_ms).sum();
     let wall_secs = total_dur / 1000;
 
@@ -155,13 +163,19 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
     ));
     for run in &report.runs {
         let marker = if run.passed { "PASS" } else { "FAIL" };
+        let run_suffix = if run.run_index > 0 {
+            format!(" run={}", run.run_index)
+        } else {
+            String::new()
+        };
         s.push_str(&format!(
-            "[{marker}] case={} model={} exit={} tools={} dur={}ms\n",
+            "[{marker}] case={} model={}{run_suffix} exit={} tools={} dur={}ms turns={}\n",
             run.case_name,
             run.model,
             run.outcome.exit_code,
             run.outcome.tool_calls_count,
-            run.outcome.duration_ms
+            run.outcome.duration_ms,
+            run.outcome.turn_rounds,
         ));
         if let Some(ref class) = run.failure_class {
             s.push_str(&format!(
@@ -259,7 +273,10 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
     // Pass rate summary when --runs > 1 (multiple runs per case×model).
     let has_repeats = {
         let mut seen = std::collections::HashSet::new();
-        report.runs.iter().any(|r| !seen.insert((&r.case_name, &r.model)))
+        report
+            .runs
+            .iter()
+            .any(|r| !seen.insert((&r.case_name, &r.model)))
     };
     if has_repeats {
         s.push_str("=== pass rate (flaky detection) ===\n");
@@ -374,10 +391,10 @@ mod tests {
             completion_tokens: 0,
             prompt_tokens: 0,
             duration_ms: 42,
-        turn_rounds: 0,
-        cache_hits: 0,
-        total_tool_calls: 0,
-        ttft_ms: 0,
+            turn_rounds: 0,
+            cache_hits: 0,
+            total_tool_calls: 0,
+            ttft_ms: 0,
         }
     }
 
@@ -387,6 +404,7 @@ mod tests {
                 case_name: "c1".into(),
                 model: "m".into(),
                 passed: true,
+                run_index: 0,
                 outcome: mk_outcome(),
                 criteria: vec![CriterionResult {
                     criterion: Criterion::ToolCalled {
@@ -584,13 +602,14 @@ mod tests {
             case_name: "c2".into(),
             model: "m".into(),
             passed: false,
+            run_index: 0,
             outcome: mk_outcome(),
             criteria: vec![],
             session: None,
             reproducer: None,
             digest: None,
             digest_error: None,
-                failure_class: None,
+            failure_class: None,
         });
         assert_eq!(r.total(), 2);
         assert_eq!(r.passed(), 1);
@@ -668,27 +687,29 @@ mod tests {
     #[test]
     fn render_text_shows_token_summary() {
         let r = SuiteReport {
-            runs: vec![
-                CaseRunReport {
-                    case_name: "a".into(),
-                    model: "m".into(),
-                    passed: true,
-                    outcome: {
-                        let mut o = RunOutcome::new("m");
-                        o.duration_ms = 5000;
-                        o
-                    },
-                    criteria: vec![],
-                    failure_class: None,
-                    session: None,
-                    reproducer: None,
-                    digest: None,
-                    digest_error: None,
+            runs: vec![CaseRunReport {
+                case_name: "a".into(),
+                model: "m".into(),
+                passed: true,
+                run_index: 0,
+                outcome: {
+                    let mut o = RunOutcome::new("m");
+                    o.duration_ms = 5000;
+                    o
                 },
-            ],
+                criteria: vec![],
+                failure_class: None,
+                session: None,
+                reproducer: None,
+                digest: None,
+                digest_error: None,
+            }],
         };
         let out = render_text(&r, false);
-        assert!(out.contains("tokens: 0in/0out"), "missing token summary: {out}");
+        assert!(
+            out.contains("tokens: 0in/0out"),
+            "missing token summary: {out}"
+        );
         assert!(out.contains("wall: 0m5s"), "missing wall time: {out}");
     }
 
@@ -698,6 +719,7 @@ mod tests {
             case_name: "flaky".into(),
             model: "m".into(),
             passed,
+            run_index: 0,
             outcome: RunOutcome::new("m"),
             criteria: vec![],
             failure_class: None,
@@ -710,7 +732,10 @@ mod tests {
             runs: vec![make_run(true), make_run(true), make_run(false)],
         };
         let out = render_text(&r, false);
-        assert!(out.contains("pass rate"), "missing pass rate section: {out}");
+        assert!(
+            out.contains("pass rate"),
+            "missing pass rate section: {out}"
+        );
         assert!(out.contains("2/3"), "missing 2/3 count: {out}");
         assert!(out.contains("67%"), "missing percentage: {out}");
     }

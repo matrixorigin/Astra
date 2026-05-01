@@ -163,6 +163,11 @@ fn shipped_cases_reference_only_known_criterion_variants() {
         "journal_tool_called",
         "fork_cache_outcome",
         "judger",
+        "tokens_between",
+        "duration_between",
+        "tool_sequence",
+        "turn_rounds_between",
+        "cache_rate_above",
     ];
     // Concatenate every shipped YAML body and grep for `type:` tag
     // occurrences at column-1-after-indent. Cheap + doesn't require

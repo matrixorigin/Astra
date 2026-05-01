@@ -1,8 +1,8 @@
 //! Suite orchestration with parallel execution, circuit breaker,
 //! failure classification, and retry on rate-limit.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
@@ -88,14 +88,14 @@ pub struct SuiteRunner<'a> {
 impl<'a> SuiteRunner<'a> {
     /// Run every (case × model) pair with concurrency control and circuit breaker.
     pub async fn run_all(&self, cases: &[Case]) -> SuiteReport {
-        // Build the work items: (case, model) pairs × runs.
-        let mut work: Vec<(&Case, String)> = Vec::new();
+        // Build the work items: (case, model, run_index) triples.
+        let mut work: Vec<(&Case, String, u32)> = Vec::new();
         for case in cases {
             match resolve_models(case, &self.runner_cfg) {
                 Ok(models) => {
                     for m in models {
-                        for _ in 0..self.suite_cfg.runs {
-                            work.push((case, m.clone()));
+                        for i in 0..self.suite_cfg.runs {
+                            work.push((case, m.clone(), i));
                         }
                     }
                 }
@@ -113,14 +113,13 @@ impl<'a> SuiteRunner<'a> {
 
         if self.suite_cfg.parallel <= 1 {
             // Serial path: simpler, preserves ordering, supports circuit breaker inline.
-            for (case, model) in work {
+            for (case, model, run_index) in work {
                 if aborted.load(Ordering::Relaxed) {
-                    eprintln!(
-                        "[astra-test] circuit breaker tripped — aborting remaining cases"
-                    );
+                    eprintln!("[astra-test] circuit breaker tripped — aborting remaining cases");
                     break;
                 }
-                let report = self.run_one(case, &model).await;
+                let mut report = self.run_one(case, &model).await;
+                report.run_index = run_index;
                 self.update_circuit_breaker(&report, &consecutive_infra, &aborted);
                 suite.runs.push(report);
             }
@@ -130,7 +129,7 @@ impl<'a> SuiteRunner<'a> {
 
             let futures: FuturesUnordered<_> = work
                 .into_iter()
-                .map(|(case, model)| {
+                .map(|(case, model, run_index)| {
                     let sem = semaphore.clone();
                     let aborted = aborted.clone();
                     let consecutive_infra = consecutive_infra.clone();
@@ -142,7 +141,8 @@ impl<'a> SuiteRunner<'a> {
                         if aborted.load(Ordering::Relaxed) {
                             return None;
                         }
-                        let report = self.run_one(case, &model).await;
+                        let mut report = self.run_one(case, &model).await;
+                        report.run_index = run_index;
                         self.update_circuit_breaker(&report, &consecutive_infra, &aborted);
                         Some(report)
                     }
@@ -153,6 +153,11 @@ impl<'a> SuiteRunner<'a> {
             for r in results.into_iter().flatten() {
                 suite.runs.push(r);
             }
+            // Stabilize ordering: sort by (case_name, model, run_index)
+            // so parallel execution doesn't produce non-deterministic diffs.
+            suite.runs.sort_by(|a, b| {
+                (&a.case_name, &a.model, a.run_index).cmp(&(&b.case_name, &b.model, b.run_index))
+            });
         }
 
         suite
@@ -218,7 +223,11 @@ impl<'a> SuiteRunner<'a> {
         // Auto-attach a default judger criterion when the case has none
         // and judger is enabled. This ensures every case gets a quality check.
         let mut criteria = case.criteria.clone();
-        if !self.no_judger && !criteria.iter().any(|c| matches!(c, Criterion::Judger { .. })) {
+        if !self.no_judger
+            && !criteria
+                .iter()
+                .any(|c| matches!(c, Criterion::Judger { .. }))
+        {
             criteria.push(Criterion::Judger {
                 question: format!(
                     "Given the task: \"{}\"\nDid the agent complete it correctly and efficiently? \
@@ -230,8 +239,7 @@ impl<'a> SuiteRunner<'a> {
             });
         }
 
-        let mut det =
-            evaluate_deterministic_with_session(&criteria, &outcome, session.as_ref());
+        let mut det = evaluate_deterministic_with_session(&criteria, &outcome, session.as_ref());
 
         if !self.no_judger && non_judger_all_pass(&criteria, &det) {
             for (i, c) in criteria.iter().enumerate() {
@@ -281,6 +289,7 @@ impl<'a> SuiteRunner<'a> {
             case_name: case.name.clone(),
             model: model.to_string(),
             passed,
+            run_index: 0, // overwritten by caller
             outcome,
             criteria: det,
             session,
@@ -304,13 +313,13 @@ fn is_rate_limited(outcome: &crate::runner::RunOutcome) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use crate::criteria::Criterion;
     use crate::exec::test_support::FakeExecutor;
     use crate::judger::JudgerScore;
     use crate::runner::RunOutcome;
     use crate::session_capture::SessionCapture;
     use async_trait::async_trait;
+    use std::path::PathBuf;
 
     fn case_with(name: &str, criteria: Vec<Criterion>) -> Case {
         Case {
@@ -345,18 +354,32 @@ mod tests {
         }
     }
 
-    struct FixedJudger { score: f64 }
+    struct FixedJudger {
+        score: f64,
+    }
 
     #[async_trait]
     impl Judger for FixedJudger {
-        async fn score(&self, _q: &str, _m: Option<&str>, _o: &RunOutcome) -> Result<JudgerScore, String> {
-            Ok(JudgerScore { score: self.score, rationale: "fixed".into(), full_rationale: "fixed".into(), votes: Vec::new() })
+        async fn score(
+            &self,
+            _q: &str,
+            _m: Option<&str>,
+            _o: &RunOutcome,
+        ) -> Result<JudgerScore, String> {
+            Ok(JudgerScore {
+                score: self.score,
+                rationale: "fixed".into(),
+                full_rationale: "fixed".into(),
+                votes: Vec::new(),
+            })
         }
     }
 
     struct NoopSessionLoader;
     impl SessionLoader for NoopSessionLoader {
-        fn load(&self, _id: &str) -> Option<SessionCapture> { None }
+        fn load(&self, _id: &str) -> Option<SessionCapture> {
+            None
+        }
     }
 
     #[tokio::test]
@@ -370,8 +393,12 @@ mod tests {
         let cfg = RunnerConfig::new(PathBuf::from("astra"))
             .with_fallback_models(vec!["a".into(), "b".into()]);
         let runner = SuiteRunner {
-            executor: &exec, judger: &judger, session_loader: &loader,
-            digest_collector: None, runner_cfg: cfg, no_judger: true,
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
         };
@@ -392,15 +419,25 @@ mod tests {
 
         let judger = FixedJudger { score: 1.0 };
         let loader = NoopSessionLoader;
-        let cfg = RunnerConfig::new(PathBuf::from("astra"))
-            .with_fallback_models(vec!["m".into()]);
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
         let runner = SuiteRunner {
-            executor: &exec, judger: &judger, session_loader: &loader,
-            digest_collector: None, runner_cfg: cfg, no_judger: true,
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
             session_mode: SessionCaptureMode::Never,
-            suite_cfg: SuiteConfig { parallel: 1, circuit_breaker_threshold: 3, retry_on_429: false, runs: 1 },
+            suite_cfg: SuiteConfig {
+                parallel: 1,
+                circuit_breaker_threshold: 3,
+                retry_on_429: false,
+                runs: 1,
+            },
         };
-        let cases: Vec<Case> = (0..5).map(|i| case_with(&format!("c{i}"), vec![Criterion::ExitCode { code: 0 }])).collect();
+        let cases: Vec<Case> = (0..5)
+            .map(|i| case_with(&format!("c{i}"), vec![Criterion::ExitCode { code: 0 }]))
+            .collect();
         let report = runner.run_all(&cases).await;
         // Circuit breaker should trip after 3, so we get 3 runs not 5.
         assert_eq!(report.total(), 3);
@@ -414,17 +451,23 @@ mod tests {
 
         let judger = FixedJudger { score: 1.0 };
         let loader = NoopSessionLoader;
-        let cfg = RunnerConfig::new(PathBuf::from("astra"))
-            .with_fallback_models(vec!["m".into()]);
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
         let runner = SuiteRunner {
-            executor: &exec, judger: &judger, session_loader: &loader,
-            digest_collector: None, runner_cfg: cfg, no_judger: true,
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
         };
         let cases = vec![case_with("c1", vec![Criterion::ExitCode { code: 0 }])];
         let report = runner.run_all(&cases).await;
-        assert_eq!(report.runs[0].failure_class, Some(FailureClass::InfraTimeout));
+        assert_eq!(
+            report.runs[0].failure_class,
+            Some(FailureClass::InfraTimeout)
+        );
     }
 
     #[tokio::test]
@@ -433,25 +476,49 @@ mod tests {
         exec.seed("c1", "m", outcome_ok("m", "hello", &["Read"]));
         exec.seed("c2", "m", outcome_ok("m", "hello", &[]));
 
-        struct TrackingJudger { hits: std::sync::Mutex<u32> }
+        struct TrackingJudger {
+            hits: std::sync::Mutex<u32>,
+        }
         #[async_trait]
         impl Judger for TrackingJudger {
-            async fn score(&self, _q: &str, _m: Option<&str>, _o: &RunOutcome) -> Result<JudgerScore, String> {
+            async fn score(
+                &self,
+                _q: &str,
+                _m: Option<&str>,
+                _o: &RunOutcome,
+            ) -> Result<JudgerScore, String> {
                 *self.hits.lock().unwrap() += 1;
-                Ok(JudgerScore { score: 1.0, rationale: "".into(), full_rationale: "".into(), votes: Vec::new() })
+                Ok(JudgerScore {
+                    score: 1.0,
+                    rationale: "".into(),
+                    full_rationale: "".into(),
+                    votes: Vec::new(),
+                })
             }
         }
-        let judger = TrackingJudger { hits: std::sync::Mutex::new(0) };
+        let judger = TrackingJudger {
+            hits: std::sync::Mutex::new(0),
+        };
         let loader = NoopSessionLoader;
         let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
         let runner = SuiteRunner {
-            executor: &exec, judger: &judger, session_loader: &loader,
-            digest_collector: None, runner_cfg: cfg, no_judger: false,
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: false,
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
         };
-        let j = Criterion::Judger { question: "q?".into(), threshold: 0.7, model: None };
-        let read_req = Criterion::ToolCalled { name: "Read".into() };
+        let j = Criterion::Judger {
+            question: "q?".into(),
+            threshold: 0.7,
+            model: None,
+        };
+        let read_req = Criterion::ToolCalled {
+            name: "Read".into(),
+        };
         let cases = vec![
             case_with("c1", vec![read_req.clone(), j.clone()]),
             case_with("c2", vec![read_req, j]),
@@ -470,12 +537,23 @@ mod tests {
         let loader = NoopSessionLoader;
         let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
         let runner = SuiteRunner {
-            executor: &exec, judger: &judger, session_loader: &loader,
-            digest_collector: None, runner_cfg: cfg, no_judger: true,
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
         };
-        let case = case_with("c1", vec![Criterion::Judger { question: "q?".into(), threshold: 0.7, model: None }]);
+        let case = case_with(
+            "c1",
+            vec![Criterion::Judger {
+                question: "q?".into(),
+                threshold: 0.7,
+                model: None,
+            }],
+        );
         let report = runner.run_all(&[case]).await;
         assert_eq!(report.passed(), 1);
         assert!(report.runs[0].criteria[0].detail.contains("skipped"));
@@ -488,8 +566,12 @@ mod tests {
         let loader = NoopSessionLoader;
         let cfg = RunnerConfig::new(PathBuf::from("astra"));
         let runner = SuiteRunner {
-            executor: &exec, judger: &judger, session_loader: &loader,
-            digest_collector: None, runner_cfg: cfg, no_judger: true,
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
         };
@@ -512,12 +594,18 @@ mod tests {
 
         let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
         let runner = SuiteRunner {
-            executor: &exec, judger: &judger, session_loader: &loader,
-            digest_collector: Some(&digest), runner_cfg: cfg, no_judger: true,
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: Some(&digest),
+            runner_cfg: cfg,
+            no_judger: true,
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
         };
-        let read_req = Criterion::ToolCalled { name: "Read".into() };
+        let read_req = Criterion::ToolCalled {
+            name: "Read".into(),
+        };
         let cases = vec![
             case_with("c_fail", vec![read_req.clone()]),
             case_with("c_pass", vec![read_req]),
@@ -550,8 +638,12 @@ mod tests {
         let loader = FixedLoader;
         let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
         let runner = SuiteRunner {
-            executor: &exec, judger: &judger, session_loader: &loader,
-            digest_collector: None, runner_cfg: cfg, no_judger: true,
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
             session_mode: SessionCaptureMode::OnDebugLog,
             suite_cfg: SuiteConfig::default(),
         };

@@ -72,12 +72,12 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
     }
 
     // Criterion-based classification.
-    let tools_count_failed = criteria_results.iter().any(|r| {
-        !r.passed && matches!(r.criterion, Criterion::ToolsCountBetween { .. })
-    });
-    let text_contains_passed = criteria_results.iter().any(|r| {
-        r.passed && matches!(r.criterion, Criterion::TextContains { .. })
-    });
+    let tools_count_failed = criteria_results
+        .iter()
+        .any(|r| !r.passed && matches!(r.criterion, Criterion::ToolsCountBetween { .. }));
+    let text_contains_passed = criteria_results
+        .iter()
+        .any(|r| r.passed && matches!(r.criterion, Criterion::TextContains { .. }));
 
     if tools_count_failed {
         // Check if tool_calls_count exceeds the max bound.
@@ -148,7 +148,16 @@ fn extract_provider(model: &str, stderr: &str) -> String {
     }
     // Heuristic: look for known provider names in stderr or model name.
     let haystack = format!("{} {}", model.to_lowercase(), stderr.to_lowercase());
-    for name in ["anthropic", "openai", "bedrock", "google", "azure", "minimax", "moonshot", "dashscope"] {
+    for name in [
+        "anthropic",
+        "openai",
+        "bedrock",
+        "google",
+        "azure",
+        "minimax",
+        "moonshot",
+        "dashscope",
+    ] {
         if haystack.contains(name) {
             return name.to_string();
         }
@@ -206,8 +215,8 @@ mod tests {
 
     #[test]
     fn provider_error_extracts_provider() {
-        let outcome = RunOutcome::new("anthropic/claude-3")
-            .with_stderr("HTTP 500 internal server error");
+        let outcome =
+            RunOutcome::new("anthropic/claude-3").with_stderr("HTTP 500 internal server error");
         let class = classify(&outcome, &[]);
         assert_eq!(
             class,
@@ -219,8 +228,8 @@ mod tests {
 
     #[test]
     fn provider_error_extracts_from_dot_separated_model() {
-        let outcome = RunOutcome::new("us.anthropic.claude-sonnet-4-6")
-            .with_stderr("HTTP 400 bad request");
+        let outcome =
+            RunOutcome::new("us.anthropic.claude-sonnet-4-6").with_stderr("HTTP 400 bad request");
         let class = classify(&outcome, &[]);
         assert_eq!(
             class,
@@ -239,10 +248,7 @@ mod tests {
     #[test]
     fn instruction_following_when_tools_exceed_max() {
         let outcome = make_outcome().with_tools_used(vec!["a".into(), "b".into(), "c".into()]);
-        let results = vec![cr(
-            Criterion::ToolsCountBetween { min: 1, max: 2 },
-            false,
-        )];
+        let results = vec![cr(Criterion::ToolsCountBetween { min: 1, max: 2 }, false)];
         assert_eq!(
             classify(&outcome, &results),
             FailureClass::ModelInstructionFollowing
@@ -253,19 +259,19 @@ mod tests {
     fn model_capability_when_all_deterministic_fail() {
         let results = vec![
             cr(Criterion::ToolCalled { name: "x".into() }, false),
-            cr(
-                Criterion::TextContains {
-                    needle: "y".into(),
-                },
-                false,
-            ),
+            cr(Criterion::TextContains { needle: "y".into() }, false),
         ];
-        assert_eq!(classify(&make_outcome(), &results), FailureClass::ModelCapability);
+        assert_eq!(
+            classify(&make_outcome(), &results),
+            FailureClass::ModelCapability
+        );
     }
 
     #[test]
     fn unknown_fallback() {
-        let outcome = make_outcome().with_exit_code(1).with_stderr("something weird");
+        let outcome = make_outcome()
+            .with_exit_code(1)
+            .with_stderr("something weird");
         assert_eq!(classify(&outcome, &[]), FailureClass::Unknown);
     }
 

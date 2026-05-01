@@ -64,7 +64,11 @@ async fn check_server(astra_bin: &Path) -> Result<(), PreflightError> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(PreflightError::ServerUnreachable {
-            detail: format!("exit {}: {}", output.status.code().unwrap_or(-1), stderr.trim()),
+            detail: format!(
+                "exit {}: {}",
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            ),
         });
     }
 
@@ -121,7 +125,9 @@ async fn check_model(astra_bin: &Path, model: &str) -> Result<(), PreflightError
             .await;
             match retry {
                 Ok(Ok(o)) if o.status.success() => {
-                    eprintln!("[astra-test] preflight: auto-register succeeded, model `{model}` OK");
+                    eprintln!(
+                        "[astra-test] preflight: auto-register succeeded, model `{model}` OK"
+                    );
                     return Ok(());
                 }
                 _ => {}
@@ -143,9 +149,7 @@ async fn check_model(astra_bin: &Path, model: &str) -> Result<(), PreflightError
         });
     }
 
-    eprintln!(
-        "[astra-test] preflight: model `{model}` responded OK"
-    );
+    eprintln!("[astra-test] preflight: model `{model}` responded OK");
     Ok(())
 }
 
@@ -160,7 +164,13 @@ async fn try_auto_register(astra_bin: &Path) -> bool {
 
     // Register (may fail if user already exists — that's fine).
     let _ = Command::new(&admin_bin)
-        .args(["register", "--username", "harness-auto", "--password", "harness-auto-pw"])
+        .args([
+            "register",
+            "--username",
+            "harness-auto",
+            "--password",
+            "harness-auto-pw",
+        ])
         .env("NO_PROXY", "localhost,127.0.0.1")
         .env("no_proxy", "localhost,127.0.0.1")
         .output()
@@ -168,7 +178,13 @@ async fn try_auto_register(astra_bin: &Path) -> bool {
 
     // Login to get fresh tokens.
     let login_out = Command::new(&admin_bin)
-        .args(["login", "--username", "harness-auto", "--password", "harness-auto-pw"])
+        .args([
+            "login",
+            "--username",
+            "harness-auto",
+            "--password",
+            "harness-auto-pw",
+        ])
         .env("NO_PROXY", "localhost,127.0.0.1")
         .env("no_proxy", "localhost,127.0.0.1")
         .output()
@@ -237,7 +253,11 @@ fn write_credentials(access_token: &str, refresh_token: &str) -> bool {
         creds["current_profile"] = serde_json::json!("default");
     }
 
-    std::fs::write(&creds_path, serde_json::to_string_pretty(&creds).unwrap_or_default()).is_ok()
+    std::fs::write(
+        &creds_path,
+        serde_json::to_string_pretty(&creds).unwrap_or_default(),
+    )
+    .is_ok()
 }
 
 #[cfg(test)]
@@ -253,13 +273,19 @@ mod tests {
     #[tokio::test]
     async fn server_unreachable_on_bad_binary() {
         let result = check_server(Path::new("/nonexistent/astra")).await;
-        assert!(matches!(result, Err(PreflightError::ServerUnreachable { .. })));
+        assert!(matches!(
+            result,
+            Err(PreflightError::ServerUnreachable { .. })
+        ));
     }
 
     #[tokio::test]
     async fn model_check_spawn_failure() {
         let result = check_model(Path::new("/nonexistent/astra"), "gpt-4").await;
-        assert!(matches!(result, Err(PreflightError::ModelUnavailable { .. })));
+        assert!(matches!(
+            result,
+            Err(PreflightError::ModelUnavailable { .. })
+        ));
     }
 
     #[cfg(unix)]

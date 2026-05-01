@@ -15,7 +15,7 @@ use astra_test_harness::judger::{
 use astra_test_harness::preflight::run_preflight;
 use astra_test_harness::report::{Format, render};
 use astra_test_harness::runner::{RunnerConfig, resolve_models};
-use astra_test_harness::suite::{DiskSessionLoader, SessionCaptureMode, SuiteRunner, SuiteConfig};
+use astra_test_harness::suite::{DiskSessionLoader, SessionCaptureMode, SuiteConfig, SuiteRunner};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -127,7 +127,10 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(p) = explicit {
         if !p.is_file() {
-            anyhow::bail!("--astra-bin {:?} does not exist or is not a file", p.display());
+            anyhow::bail!(
+                "--astra-bin {:?} does not exist or is not a file",
+                p.display()
+            );
         }
         return Ok(p);
     }
@@ -136,19 +139,28 @@ fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
     {
         let p = PathBuf::from(env_path);
         if p.is_file() {
-            eprintln!("[astra-test] using astra bin from ASTRA_BIN: {}", p.display());
+            eprintln!(
+                "[astra-test] using astra bin from ASTRA_BIN: {}",
+                p.display()
+            );
             return Ok(p);
         }
     }
     if let Some(found) = find_on_path("astra") {
-        eprintln!("[astra-test] using astra bin from PATH: {}", found.display());
+        eprintln!(
+            "[astra-test] using astra bin from PATH: {}",
+            found.display()
+        );
         return Ok(found);
     }
     let cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("cwd: {e}"))?;
     for ancestor in cwd.ancestors() {
         let candidate = ancestor.join("rust/target/release/astra");
         if candidate.is_file() {
-            eprintln!("[astra-test] using astra bin from workspace: {}", candidate.display());
+            eprintln!(
+                "[astra-test] using astra bin from workspace: {}",
+                candidate.display()
+            );
             return Ok(candidate);
         }
     }
@@ -164,7 +176,9 @@ fn matches_filter(name: &str, pattern: &str) -> bool {
     // Simple glob: * matches any sequence, ? matches one char.
     let regex_str = format!(
         "^{}$",
-        regex::escape(pattern).replace(r"\*", ".*").replace(r"\?", ".")
+        regex::escape(pattern)
+            .replace(r"\*", ".*")
+            .replace(r"\?", ".")
     );
     regex::Regex::new(&regex_str)
         .map(|re| re.is_match(name))
@@ -213,7 +227,8 @@ async fn main() -> Result<()> {
             vec![fallback_models[0].clone()]
         } else {
             // Try first case's model list
-            cases.first()
+            cases
+                .first()
                 .and_then(|c| c.models.as_ref())
                 .and_then(|m| m.first().cloned())
                 .into_iter()
@@ -227,7 +242,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    let mut runner_cfg = RunnerConfig::new(astra_bin.clone()).with_fallback_models(fallback_models.clone());
+    let mut runner_cfg =
+        RunnerConfig::new(astra_bin.clone()).with_fallback_models(fallback_models.clone());
     runner_cfg.working_dir = args.working_dir.clone();
 
     let judger_cfg = JudgerConfig {
@@ -238,7 +254,10 @@ async fn main() -> Result<()> {
 
     let executor = AstraCliExecutor::new(runner_cfg.clone());
     let cli_judger = AstraCliJudger::new(judger_cfg);
-    let quorum_agg: QuorumAgg = args.judger_agg.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+    let quorum_agg: QuorumAgg = args
+        .judger_agg
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
     let judger: Box<dyn Judger> = if args.judger_n > 1 {
         Box::new(QuorumJudger::new(cli_judger, args.judger_n, quorum_agg))
     } else {
@@ -266,7 +285,11 @@ async fn main() -> Result<()> {
 
     let digest = AstraCliDigestCollector::new(astra_bin.clone()).with_timeout(args.digest_timeout);
     let digest_collector: Option<&dyn astra_test_harness::digest::DigestCollector> =
-        if args.no_digest_on_fail { None } else { Some(&digest) };
+        if args.no_digest_on_fail {
+            None
+        } else {
+            Some(&digest)
+        };
 
     let suite_cfg = SuiteConfig {
         parallel: args.parallel.max(1),
@@ -288,7 +311,10 @@ async fn main() -> Result<()> {
 
     let suite = runner.run_all(&cases).await;
 
-    let fmt: Format = args.format.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+    let fmt: Format = args
+        .format
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
     println!("{}", render(&suite, fmt, args.verbose));
 
     if suite.failed() > 0 {

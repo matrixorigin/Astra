@@ -2,17 +2,17 @@
 
 Declarative end-to-end test framework for the astra CLI. Runs YAML
 cases against one or more models, captures session state (journal +
-stderr), evaluates success criteria (deterministic matchers +
-optional LLM judger), and emits a scored report.
+step_events + stderr), evaluates success criteria (deterministic
+matchers + optional LLM judger), and emits a scored report.
 
 ## Why a dedicated harness
 
 Unit and integration tests prove code correctness; this harness
 proves *end-to-end behavior* — that a model, wired through the astra
 CLI against a running server, produces the expected tool-call
-sequence and session state. The existing runtime tests exercise
-components in isolation; the harness exercises the whole binary
-against real provider keys.
+sequence, session state, and performance characteristics. The
+existing runtime tests exercise components in isolation; the harness
+exercises the whole binary against real provider keys.
 
 ## Installation
 
@@ -32,11 +32,11 @@ make test-harness MODELS=qwen-flash
 ## Quick start
 
 ```sh
-# Local smoke: one case, no judger, no session capture
+# Local smoke: one case, no judger, parallel 4
 ./rust/target/release/astra-test \
     --suite rust/crates/astra-test-harness/cases \
-    --models qwen-flash \
-    --no-judger
+    --force-model qwen-flash \
+    --no-judger --parallel 4
 
 # Cross-family judger (recommended: different family than tested models)
 ./rust/target/release/astra-test \
@@ -44,6 +44,13 @@ make test-harness MODELS=qwen-flash
     --models MiniMax-M2.7 \
     --judger-model us.anthropic.claude-sonnet-4-6 \
     --judger-n 3 --judger-agg median
+
+# Filter to specific cases, repeat 3 times for flakiness detection
+./rust/target/release/astra-test \
+    --suite rust/crates/astra-test-harness/cases \
+    --filter fork_prefix \
+    --force-model us.anthropic.claude-sonnet-4-6 \
+    --runs 3 --parallel 2
 ```
 
 ### `--astra-bin` resolution
@@ -77,6 +84,17 @@ criteria:
     code: 0
   - type: tool_called
     name: spawn_agent
+  - type: tool_sequence
+    tools: [spawn_agent]
+  - type: tokens_between
+    min: 0
+    max: 5000
+  - type: turn_rounds_between
+    min: 1
+    max: 5
+  - type: duration_between
+    min_ms: 0
+    max_ms: 120000
   - type: stderr_matches
     pattern: '\[fork-cache\]'
   - type: fork_cache_outcome
@@ -88,17 +106,34 @@ criteria:
 
 ### Criteria types
 
-| Type | What passes |
-|------|-------------|
-| `exit_code { code }` | subprocess exit equals `code` |
-| `tool_called { name }` | `tools_used` envelope contains `name` |
-| `tools_count_between { min, max }` | `tool_calls_count` inclusive |
-| `stderr_matches { pattern }` | multi-line regex on stderr |
-| `text_contains { needle }` | substring in final text |
-| `fork_cache_outcome { expect }` | `[fork-cache]` event `outcome` ∈ `expect` (one of `hit`, `partial_drift`, `miss`, `exceeded_expected`) |
-| `session_event_count { event_type, min, optional }` | journal has ≥ `min` events of that type |
-| `journal_tool_called { name, optional }` | tool name appears in journal `tool_calls` |
-| `judger { question, threshold, model }` | LLM scores ≥ threshold |
+| Type | What passes | Data source |
+|------|-------------|-------------|
+| `exit_code { code }` | subprocess exit equals `code` | envelope |
+| `tool_called { name }` | `tools_used` envelope contains `name` | envelope |
+| `tools_count_between { min, max }` | `tool_calls_count` inclusive | envelope |
+| `tool_sequence { tools }` | `tools_used` contains tools as ordered subsequence | envelope |
+| `tokens_between { min, max }` | total tokens (prompt + completion) in range | envelope |
+| `duration_between { min_ms, max_ms }` | wall-clock duration in range | envelope |
+| `turn_rounds_between { min, max }` | LLM round-trips (StepStarted events) in range | step_events |
+| `cache_rate_above { threshold }` | tool cache hit rate ≥ threshold (0.0–1.0) | step_events |
+| `stderr_matches { pattern }` | multi-line regex on stderr | stderr |
+| `text_contains { needle }` | substring in final text | envelope |
+| `fork_cache_outcome { expect }` | `[fork-cache]` event `outcome` ∈ `expect` | stderr |
+| `session_event_count { event_type, min, optional }` | journal has ≥ `min` events of that type | journal |
+| `journal_tool_called { name, optional }` | tool name appears in journal `tool_calls` | journal |
+| `judger { question, threshold, model }` | LLM scores ≥ threshold | LLM |
+
+### Auto-judger
+
+When `--no-judger` is NOT set and a case has no explicit `judger`
+criterion, the harness auto-attaches a default quality-check judger:
+
+> "Given the task: {prompt}\nDid the agent complete it correctly and
+> efficiently? Score 0.0 for wrong/incomplete, 0.5 for partially
+> correct, 1.0 for fully correct."
+
+This ensures every case gets a quality assessment without requiring
+manual judger config in each YAML. Disable with `--no-judger`.
 
 ### Session-based criteria semantics
 
@@ -161,6 +196,7 @@ On FAIL, each case report includes:
   `--no-digest-on-fail`.
 - `judger full_detail`: the untruncated rationale for every judge
   vote when quorum is on.
+- `failure_class`: automated classification (infra, model, flaky, etc.)
 
 ## CLI reference
 
@@ -168,19 +204,25 @@ On FAIL, each case report includes:
 astra-test [OPTIONS] --suite <DIR>
 
 Main options:
-  --suite <DIR>                case YAML directory (recursive? NO, flat)
+  --suite <DIR>                case YAML directory (flat)
   --models <CSV>               fallback model list (case `models:` wins)
+  --force-model <MODEL>        override all cases to use this model
+  --filter <PATTERN>           run only cases whose name contains pattern
+  --parallel <N>               concurrent case execution (default 1)
+  --runs <N>                   repeat each (case, model) pair N times
   --astra-bin <PATH>           astra CLI to spawn (auto-detected otherwise)
   --working-dir <DIR>          cd subprocess here
   --format text|json           output format
   --verbose                    always dump text+stderr + load session journal
+  --skip-preflight             skip login/model availability checks
+  --retry-on-429              retry rate-limited cases (default: classify as infra fail)
 
 Judger:
   --judger-model <MODEL>       scoring model (default claude-sonnet-4-6)
   --judger-timeout <SEC>       hard timeout per judger call
   --judger-n <N>               run N times and aggregate (default 1)
   --judger-agg median|mean|min|max   aggregation for --judger-n
-  --no-judger                  skip judger criteria entirely
+  --no-judger                  skip judger criteria entirely (also disables auto-judger)
 
 Session capture:
   --capture-session            load journals for every case (not just
@@ -192,24 +234,45 @@ Digest:
                                to 30-60 on cold CI)
 ```
 
-## Execution model: serial
+## Execution model: parallel with circuit breaker
 
-The harness runs cases × models strictly serially. A 16-case × 3-model
-matrix with ~60–120s per run serializes to 45–100 minutes. This is
-intentional for the current phase:
+The harness runs cases × models with configurable concurrency
+(`--parallel N`). Default is serial (`--parallel 1`).
 
-- Each subprocess hits a single running astra-server; true
-  concurrency is capped by server capacity anyway.
-- Session-capture races (two cases writing to overlapping paths) are
-  avoided by construction.
-- Quorum judger calls within a single case already serialize — the
-  dominant cost is there, not in the case loop.
+- **Parallel mode** (`--parallel 4`): uses a semaphore-gated
+  `FuturesUnordered` pool. Results are sorted by
+  `(case_name, model, run_index)` for stable diffs regardless of
+  completion order.
+- **Circuit breaker**: 3 consecutive infrastructure failures
+  (timeout, spawn error, rate limit) abort the remaining queue.
+  Prevents burning provider credits on a broken server.
+- **Run index**: when `--runs N > 1`, each report carries a
+  `run_index` (0-based) for disambiguation.
 
-If you need a concurrency knob (independent model rows in parallel,
-or distinct suites), open an issue. The library-side primitive
-(`SuiteRunner`) is ready to accept a semaphore-gated `FuturesUnordered`
-pass — the decision to hold off is about surface-area commitments,
-not implementation difficulty.
+## Preflight checks
+
+Before running cases, the harness validates:
+
+1. **Login**: verifies credentials are valid (auto-registers a
+   `harness-test` user if needed, preserving existing credentials).
+2. **Model availability**: sends a minimal probe to each model in
+   the matrix to catch misconfigured keys early.
+3. **Binary resolution**: confirms the astra binary exists and is
+   executable.
+
+Skip with `--skip-preflight` for faster iteration when you know the
+environment is healthy.
+
+## Failure classification
+
+Every FAIL is auto-classified into one of:
+
+| Class | Meaning | Suggested action |
+|-------|---------|-----------------|
+| `Infra` | timeout, spawn error, rate limit | retry / check server |
+| `Model` | wrong answer, bad tool choice | adjust prompt or model |
+| `Platform` | exit ≠ 0 with tool errors | investigate astra bug |
+| `Flaky` | passes on retry | add to flaky watchlist |
 
 ## Design principles
 

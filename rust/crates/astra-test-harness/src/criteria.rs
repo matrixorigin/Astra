@@ -449,7 +449,10 @@ fn evaluate_one(
                 } else {
                     format!(
                         "tool sequence {:?} NOT found (matched {}/{}, actual: {:?})",
-                        tools, matched, tools.len(), outcome.tools_used
+                        tools,
+                        matched,
+                        tools.len(),
+                        outcome.tools_used
                     )
                 },
                 full_detail: None,
@@ -470,11 +473,26 @@ fn evaluate_one(
         }
 
         Criterion::CacheRateAbove { threshold } => {
-            if outcome.total_tool_calls == 0 {
+            if outcome.total_tool_calls == 0 && outcome.tool_calls_count == 0 {
+                // Genuinely no tool calls — cache rate is N/A.
                 CriterionResult {
                     criterion: c.clone(),
                     passed: true,
                     detail: "no tool calls — cache rate N/A (skip-pass)".into(),
+                    full_detail: None,
+                    score: None,
+                }
+            } else if outcome.total_tool_calls == 0 {
+                // tool_calls_count > 0 but step_events weren't parsed.
+                // This means step_events.jsonl was missing or unreadable.
+                CriterionResult {
+                    criterion: c.clone(),
+                    passed: false,
+                    detail: format!(
+                        "step_events missing: tool_calls_count={} but total_tool_calls=0 \
+                         (cannot compute cache rate)",
+                        outcome.tool_calls_count
+                    ),
                     full_detail: None,
                     score: None,
                 }
@@ -486,7 +504,10 @@ fn evaluate_one(
                     passed,
                     detail: format!(
                         "cache_rate={:.1}% ({}/{}), threshold={:.0}%",
-                        rate * 100.0, outcome.cache_hits, outcome.total_tool_calls, threshold * 100.0
+                        rate * 100.0,
+                        outcome.cache_hits,
+                        outcome.total_tool_calls,
+                        threshold * 100.0
                     ),
                     full_detail: None,
                     score: None,
@@ -605,7 +626,9 @@ pub fn validate_criterion(c: &Criterion) -> Result<(), String> {
         }
         Criterion::DurationBetween { min_ms, max_ms } => {
             if min_ms > max_ms {
-                return Err(format!("DurationBetween: min_ms ({min_ms}) > max_ms ({max_ms})"));
+                return Err(format!(
+                    "DurationBetween: min_ms ({min_ms}) > max_ms ({max_ms})"
+                ));
             }
             Ok(())
         }
@@ -623,7 +646,9 @@ pub fn validate_criterion(c: &Criterion) -> Result<(), String> {
         }
         Criterion::CacheRateAbove { threshold } => {
             if !threshold.is_finite() || *threshold < 0.0 || *threshold > 1.0 {
-                return Err(format!("CacheRateAbove.threshold must be in [0.0, 1.0]; got {threshold}"));
+                return Err(format!(
+                    "CacheRateAbove.threshold must be in [0.0, 1.0]; got {threshold}"
+                ));
             }
             Ok(())
         }
@@ -676,10 +701,10 @@ mod tests {
             completion_tokens: 0,
             prompt_tokens: 0,
             duration_ms: 0,
-        turn_rounds: 0,
-        cache_hits: 0,
-        total_tool_calls: 0,
-        ttft_ms: 0,
+            turn_rounds: 0,
+            cache_hits: 0,
+            total_tool_calls: 0,
+            ttft_ms: 0,
         }
     }
 
@@ -1160,10 +1185,7 @@ mod tests {
         let mut out = RunOutcome::new("m");
         out.prompt_tokens = 100;
         out.completion_tokens = 200;
-        let r = evaluate_deterministic(
-            &[Criterion::TokensBetween { min: 200, max: 400 }],
-            &out,
-        );
+        let r = evaluate_deterministic(&[Criterion::TokensBetween { min: 200, max: 400 }], &out);
         assert!(r[0].passed, "{}", r[0].detail);
     }
 
@@ -1172,10 +1194,7 @@ mod tests {
         let mut out = RunOutcome::new("m");
         out.prompt_tokens = 5000;
         out.completion_tokens = 5000;
-        let r = evaluate_deterministic(
-            &[Criterion::TokensBetween { min: 0, max: 1000 }],
-            &out,
-        );
+        let r = evaluate_deterministic(&[Criterion::TokensBetween { min: 0, max: 1000 }], &out);
         assert!(!r[0].passed);
         assert!(r[0].detail.contains("10000"));
     }
@@ -1185,7 +1204,10 @@ mod tests {
         let mut out = RunOutcome::new("m");
         out.duration_ms = 5000;
         let r = evaluate_deterministic(
-            &[Criterion::DurationBetween { min_ms: 1000, max_ms: 10000 }],
+            &[Criterion::DurationBetween {
+                min_ms: 1000,
+                max_ms: 10000,
+            }],
             &out,
         );
         assert!(r[0].passed);
@@ -1196,7 +1218,10 @@ mod tests {
         let mut out = RunOutcome::new("m");
         out.duration_ms = 60000;
         let r = evaluate_deterministic(
-            &[Criterion::DurationBetween { min_ms: 0, max_ms: 30000 }],
+            &[Criterion::DurationBetween {
+                min_ms: 0,
+                max_ms: 30000,
+            }],
             &out,
         );
         assert!(!r[0].passed);
@@ -1205,10 +1230,16 @@ mod tests {
 
     #[test]
     fn tool_sequence_passes_subsequence() {
-        let out = RunOutcome::new("m")
-            .with_tools_used(vec!["bash".into(), "read_file".into(), "bash".into(), "str_replace".into()]);
+        let out = RunOutcome::new("m").with_tools_used(vec![
+            "bash".into(),
+            "read_file".into(),
+            "bash".into(),
+            "str_replace".into(),
+        ]);
         let r = evaluate_deterministic(
-            &[Criterion::ToolSequence { tools: vec!["read_file".into(), "str_replace".into()] }],
+            &[Criterion::ToolSequence {
+                tools: vec!["read_file".into(), "str_replace".into()],
+            }],
             &out,
         );
         assert!(r[0].passed, "{}", r[0].detail);
@@ -1216,10 +1247,12 @@ mod tests {
 
     #[test]
     fn tool_sequence_fails_wrong_order() {
-        let out = RunOutcome::new("m")
-            .with_tools_used(vec!["str_replace".into(), "read_file".into()]);
+        let out =
+            RunOutcome::new("m").with_tools_used(vec!["str_replace".into(), "read_file".into()]);
         let r = evaluate_deterministic(
-            &[Criterion::ToolSequence { tools: vec!["read_file".into(), "str_replace".into()] }],
+            &[Criterion::ToolSequence {
+                tools: vec!["read_file".into(), "str_replace".into()],
+            }],
             &out,
         );
         assert!(!r[0].passed);
@@ -1227,10 +1260,11 @@ mod tests {
 
     #[test]
     fn tool_sequence_fails_missing_tool() {
-        let out = RunOutcome::new("m")
-            .with_tools_used(vec!["bash".into()]);
+        let out = RunOutcome::new("m").with_tools_used(vec!["bash".into()]);
         let r = evaluate_deterministic(
-            &[Criterion::ToolSequence { tools: vec!["read_file".into(), "str_replace".into()] }],
+            &[Criterion::ToolSequence {
+                tools: vec!["read_file".into(), "str_replace".into()],
+            }],
             &out,
         );
         assert!(!r[0].passed);
@@ -1238,60 +1272,55 @@ mod tests {
     }
 }
 
-    #[test]
-    fn turn_rounds_between_passes() {
-        let mut out = RunOutcome::new("m");
-        out.turn_rounds = 2;
-        let r = evaluate_deterministic(
-            &[Criterion::TurnRoundsBetween { min: 1, max: 3 }],
-            &out,
-        );
-        assert!(r[0].passed, "{}", r[0].detail);
-    }
+#[test]
+fn turn_rounds_between_passes() {
+    let mut out = RunOutcome::new("m");
+    out.turn_rounds = 2;
+    let r = evaluate_deterministic(&[Criterion::TurnRoundsBetween { min: 1, max: 3 }], &out);
+    assert!(r[0].passed, "{}", r[0].detail);
+}
 
-    #[test]
-    fn turn_rounds_between_fails_too_many() {
-        let mut out = RunOutcome::new("m");
-        out.turn_rounds = 10;
-        let r = evaluate_deterministic(
-            &[Criterion::TurnRoundsBetween { min: 1, max: 3 }],
-            &out,
-        );
-        assert!(!r[0].passed);
-        assert!(r[0].detail.contains("10"));
-    }
+#[test]
+fn turn_rounds_between_fails_too_many() {
+    let mut out = RunOutcome::new("m");
+    out.turn_rounds = 10;
+    let r = evaluate_deterministic(&[Criterion::TurnRoundsBetween { min: 1, max: 3 }], &out);
+    assert!(!r[0].passed);
+    assert!(r[0].detail.contains("10"));
+}
 
-    #[test]
-    fn cache_rate_above_passes() {
-        let mut out = RunOutcome::new("m");
-        out.total_tool_calls = 10;
-        out.cache_hits = 8;
-        let r = evaluate_deterministic(
-            &[Criterion::CacheRateAbove { threshold: 0.5 }],
-            &out,
-        );
-        assert!(r[0].passed, "{}", r[0].detail);
-    }
+#[test]
+fn cache_rate_above_passes() {
+    let mut out = RunOutcome::new("m");
+    out.total_tool_calls = 10;
+    out.cache_hits = 8;
+    let r = evaluate_deterministic(&[Criterion::CacheRateAbove { threshold: 0.5 }], &out);
+    assert!(r[0].passed, "{}", r[0].detail);
+}
 
-    #[test]
-    fn cache_rate_above_fails() {
-        let mut out = RunOutcome::new("m");
-        out.total_tool_calls = 10;
-        out.cache_hits = 1;
-        let r = evaluate_deterministic(
-            &[Criterion::CacheRateAbove { threshold: 0.5 }],
-            &out,
-        );
-        assert!(!r[0].passed);
-        assert!(r[0].detail.contains("10.0%"));
-    }
+#[test]
+fn cache_rate_above_fails() {
+    let mut out = RunOutcome::new("m");
+    out.total_tool_calls = 10;
+    out.cache_hits = 1;
+    let r = evaluate_deterministic(&[Criterion::CacheRateAbove { threshold: 0.5 }], &out);
+    assert!(!r[0].passed);
+    assert!(r[0].detail.contains("10.0%"));
+}
 
-    #[test]
-    fn cache_rate_above_skip_passes_no_tools() {
-        let out = RunOutcome::new("m");
-        let r = evaluate_deterministic(
-            &[Criterion::CacheRateAbove { threshold: 0.9 }],
-            &out,
-        );
-        assert!(r[0].passed); // skip-pass when no tool calls
-    }
+#[test]
+fn cache_rate_above_skip_passes_no_tools() {
+    let out = RunOutcome::new("m");
+    let r = evaluate_deterministic(&[Criterion::CacheRateAbove { threshold: 0.9 }], &out);
+    assert!(r[0].passed); // skip-pass when no tool calls
+}
+
+#[test]
+fn cache_rate_above_fails_when_step_events_missing() {
+    let mut out = RunOutcome::new("m");
+    out.tool_calls_count = 3; // envelope says tools were called
+    out.total_tool_calls = 0; // but step_events weren't parsed
+    let r = evaluate_deterministic(&[Criterion::CacheRateAbove { threshold: 0.5 }], &out);
+    assert!(!r[0].passed);
+    assert!(r[0].detail.contains("step_events missing"));
+}
