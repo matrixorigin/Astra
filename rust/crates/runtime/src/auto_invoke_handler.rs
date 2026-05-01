@@ -97,6 +97,55 @@ impl AutoInvokeHandler {
     }
 }
 
+/// Build [`SessionSignals`] from the live observability view the runtime
+/// already maintains. Designed as a single reconciliation point for the
+/// turn loop:
+///
+/// ```text
+/// let signals = compute_session_signals(&obs);
+/// let diagnoses = handler.maybe_fire(&signals, Instant::now()).await;
+/// ```
+///
+/// Mapping:
+/// - `consecutive_stalls` → `obs.stall_event_count`. This is cumulative,
+///   not literally "consecutive" — but the per-cause cooldown in
+///   `AutoInvokeGate` ensures the stall skill fires at most once per
+///   60-second window regardless, so treating the cumulative count as
+///   an "any stall in this session" gate is sound.
+/// - `budget_pressure` → the most recent `context_traces` pressure
+///   value, else 0.0 when no traces have been recorded yet.
+/// - `recent_corrections` → `obs.user_corrections.len()`. These are
+///   already session-scoped, so the list's length doubles as a count.
+/// - `corrections_window` → fixed 10 turns (the gate doesn't re-window;
+///   this field is surfaced only for logging).
+///
+/// Returns a zero-valued `SessionSignals` when `obs` is `None`, so the
+/// caller can use this unconditionally and let the gate's thresholds
+/// decide whether to fire.
+#[must_use]
+pub fn compute_session_signals(
+    obs: Option<&crate::observability_integration::ObservabilitySession>,
+) -> SessionSignals {
+    let Some(session) = obs else {
+        return SessionSignals::default();
+    };
+
+    let budget_pressure = session
+        .context_traces
+        .last()
+        .map(|trace| trace.token_budget.budget_pressure)
+        .unwrap_or(0.0);
+
+    let recent_corrections = u32::try_from(session.user_corrections.len()).unwrap_or(u32::MAX);
+
+    SessionSignals {
+        consecutive_stalls: session.stall_event_count,
+        budget_pressure,
+        recent_corrections,
+        corrections_window: 10,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +376,89 @@ mod tests {
         let out = h.maybe_fire(&signals(3, 0.95, 0), Instant::now()).await;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].skill, "optimize_prompt");
+    }
+
+    // ── compute_session_signals ────────────────────────────────────────────
+
+    #[test]
+    fn compute_signals_none_observability_yields_zero() {
+        let s = compute_session_signals(None);
+        assert_eq!(s, SessionSignals::default());
+    }
+
+    #[test]
+    fn compute_signals_reads_cumulative_stall_count() {
+        use crate::observability_integration::ObservabilitySession;
+        let mut obs = ObservabilitySession::new_simple("s-p7b");
+        obs.record_stall_event();
+        obs.record_stall_event();
+        obs.record_stall_event();
+
+        let s = compute_session_signals(Some(&obs));
+        assert_eq!(s.consecutive_stalls, 3);
+    }
+
+    #[test]
+    fn compute_signals_reads_user_corrections_length() {
+        use crate::observability_integration::ObservabilitySession;
+        let mut obs = ObservabilitySession::new_simple("s-p7b");
+        obs.user_corrections = vec![1, 2, 5, 7];
+
+        let s = compute_session_signals(Some(&obs));
+        assert_eq!(s.recent_corrections, 4);
+        assert_eq!(s.corrections_window, 10);
+    }
+
+    #[test]
+    fn compute_signals_budget_pressure_defaults_to_zero_without_traces() {
+        use crate::observability_integration::ObservabilitySession;
+        let obs = ObservabilitySession::new_simple("s-p7b");
+        let s = compute_session_signals(Some(&obs));
+        assert_eq!(s.budget_pressure, 0.0);
+    }
+
+    #[tokio::test]
+    async fn compute_signals_end_to_end_with_handler_fires_stall_and_corrections() {
+        // Observability populated with stall + corrections must drive the
+        // handler to fire analyze_session + evaluate_session (budget
+        // pressure requires a ContextAssemblyTrace, which is verified in
+        // its own unit test above).
+        use crate::observability_integration::ObservabilitySession;
+        let mut obs = ObservabilitySession::new_simple("s-p7b-e2e");
+        obs.record_stall_event();
+        obs.record_stall_event();
+        obs.record_stall_event();
+        obs.user_corrections = vec![1, 2, 3];
+
+        let signals = compute_session_signals(Some(&obs));
+        assert!(signals.consecutive_stalls >= 3);
+        assert!(signals.recent_corrections >= 3);
+
+        let exec = Arc::new(
+            StubExecutor::new()
+                .with(
+                    "analyze_session",
+                    Some(well_formed_reply(
+                        "analyze_session",
+                        "consecutive_stalls",
+                        "stalls",
+                    )),
+                )
+                .with(
+                    "evaluate_session",
+                    Some(well_formed_reply(
+                        "evaluate_session",
+                        "repeated_corrections",
+                        "corrections",
+                    )),
+                ),
+        );
+        let mut h = AutoInvokeHandler::new(exec);
+
+        let out = h.maybe_fire(&signals, Instant::now()).await;
+        let skills: std::collections::HashSet<&str> =
+            out.iter().map(|d| d.skill.as_str()).collect();
+        assert!(skills.contains("analyze_session"));
+        assert!(skills.contains("evaluate_session"));
     }
 }
