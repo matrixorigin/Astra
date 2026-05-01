@@ -347,6 +347,9 @@ pub struct ToolExecutor {
     build_test_tracker: std::sync::Mutex<build_test::BuildTestTracker>,
     /// Circuit breaker: skip Memoria calls after consecutive failures.
     memoria_fail_count: std::sync::atomic::AtomicU32,
+    /// Whether the user has been notified about Memoria being down.
+    /// Prevents spamming the same warning every turn.
+    memoria_notified_down: std::sync::atomic::AtomicBool,
     /// File state tracker: records mtime after each read/write/edit.
     /// Used for staleness detection (prevent overwriting user edits)
     /// and dedup (skip re-reading unchanged files).
@@ -468,6 +471,7 @@ impl ToolExecutor {
             budget_pressure: std::sync::Mutex::new(0.0),
             build_test_tracker: std::sync::Mutex::new(build_test::BuildTestTracker::new()),
             memoria_fail_count: std::sync::atomic::AtomicU32::new(0),
+            memoria_notified_down: std::sync::atomic::AtomicBool::new(false),
             file_state: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             aggregate_output_bytes: std::sync::atomic::AtomicUsize::new(0),
             url_cache: std::sync::Mutex::new(HashMap::new()),

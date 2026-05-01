@@ -30,6 +30,16 @@ impl ToolExecutor {
             .load(std::sync::atomic::Ordering::Relaxed)
             >= MAX_FAILS
         {
+            if !self
+                .memoria_notified_down
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                eprintln!(
+                    "  {} Memoria memory service is unreachable — memory features \
+                     disabled for this session. Check MEMORIA_BASE_URL or /info.",
+                    crossterm::style::Stylize::yellow("⚠"),
+                );
+            }
             return json!({"error": "Memory service unavailable (circuit open)"}).to_string();
         }
 
@@ -77,6 +87,15 @@ impl ToolExecutor {
                     Ok(text) => {
                         self.memoria_fail_count
                             .store(0, std::sync::atomic::Ordering::Relaxed);
+                        if self
+                            .memoria_notified_down
+                            .swap(false, std::sync::atomic::Ordering::Relaxed)
+                        {
+                            eprintln!(
+                                "  {} Memoria memory service reconnected.",
+                                crossterm::style::Stylize::green("✓"),
+                            );
+                        }
                         text
                     }
                     Err(e) => {
@@ -86,8 +105,20 @@ impl ToolExecutor {
                     }
                 },
                 Err(e) => {
-                    self.memoria_fail_count
+                    let prev = self
+                        .memoria_fail_count
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if prev + 1 >= MAX_FAILS
+                        && !self
+                            .memoria_notified_down
+                            .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        eprintln!(
+                            "  {} Memoria memory service is unreachable — memory features \
+                             disabled for this session. Check MEMORIA_BASE_URL or /info.",
+                            crossterm::style::Stylize::yellow("⚠"),
+                        );
+                    }
                     json!({"error": format!("memoria request failed: {e}")}).to_string()
                 }
             },
