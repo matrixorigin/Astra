@@ -190,10 +190,12 @@ pub fn load_session(session_id: &str) -> Option<SessionCapture> {
 /// `load_session_from_path_with_caps` when a suite needs bigger.
 pub const DEFAULT_MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Maximum events the loader will retain. Beyond this we truncate
-/// from the tail (most recent) so observability events the criteria
-/// care about — `[fork-cache]` lines, `ToolCallCompleted` at the end
-/// of the run — are kept even for very long sessions.
+/// Maximum events the loader will retain. Beyond this we evict
+/// from the head (oldest events) on each insert, so the newest
+/// events — where observability criteria (`[fork-cache]` lines,
+/// `ToolCallCompleted` near the end of the run) usually live —
+/// survive in the returned `SessionCapture` even for very long
+/// sessions.
 pub const DEFAULT_MAX_EVENTS: usize = 100_000;
 
 /// Load a session journal from an explicit path — test seam. Detects
@@ -243,7 +245,7 @@ pub fn load_session_from_path_with_caps(
     let body = std::fs::read_to_string(path).ok()?;
     let mut events: Vec<JournalEvent> = Vec::with_capacity(128);
     let mut skipped: u32 = 0;
-    let mut truncated_from_tail: u32 = 0;
+    let mut dropped_from_head: u32 = 0;
     for line in body.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -258,12 +260,11 @@ pub fn load_session_from_path_with_caps(
                     .unwrap_or("")
                     .to_string();
                 if events.len() >= max_events {
-                    // Ring-buffer-ish: drop oldest to make room for
-                    // newest. Observability criteria (`[fork-cache]`,
-                    // ToolCallCompleted near the end) care about the
-                    // tail more than the head.
+                    // Ring-buffer: drop the head (oldest event) so
+                    // the tail (newest events — where `[fork-cache]`
+                    // and closing `ToolCallCompleted` live) survives.
                     events.remove(0);
-                    truncated_from_tail = truncated_from_tail.saturating_add(1);
+                    dropped_from_head = dropped_from_head.saturating_add(1);
                 }
                 events.push(JournalEvent {
                     event_type,
@@ -273,10 +274,10 @@ pub fn load_session_from_path_with_caps(
             Err(_) => skipped = skipped.saturating_add(1),
         }
     }
-    if truncated_from_tail > 0 {
+    if dropped_from_head > 0 {
         eprintln!(
             "[astra-test] WARNING: session {session_id} journal truncated to most-recent \
-             {max_events} events ({truncated_from_tail} older events dropped). \
+             {max_events} events ({dropped_from_head} older events dropped from the head). \
              Criteria that look for early events may need the uncapped loader."
         );
     }
@@ -462,10 +463,11 @@ mod tests {
     }
 
     #[test]
-    fn load_session_truncates_tail_when_event_cap_exceeded() {
+    fn load_session_drops_from_head_when_event_cap_exceeded() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("many.jsonl");
-        // 500 events; cap at 10. Most recent 10 should be kept.
+        // 500 events; cap at 10. Oldest 490 should be dropped from
+        // the head of the buffer; the newest 10 (seq 490..=499) kept.
         let lines: Vec<String> = (0..500)
             .map(|i| format!(r#"{{"type":"evt","seq":{i}}}"#))
             .collect();
@@ -474,13 +476,14 @@ mod tests {
         let cap =
             load_session_from_path_with_caps("many", &path, u64::MAX, 10).expect("load");
         assert_eq!(cap.events.len(), 10);
-        // First retained event should be the 491st (0-indexed 490)
-        // since the ring-buffer drops oldest. Check by seq field.
+        // Ring-buffer drops from head (oldest) so the buffer retains
+        // the tail of the jsonl (newest events). Check by seq field.
         let first_seq = cap.events[0].raw.get("seq").and_then(|v| v.as_u64());
         assert_eq!(
             first_seq,
             Some(490),
-            "tail-window must keep newest events; got first={first_seq:?}"
+            "retained buffer must start at seq=490 (oldest of the kept window); \
+             got first={first_seq:?}"
         );
         let last_seq = cap.events[9].raw.get("seq").and_then(|v| v.as_u64());
         assert_eq!(last_seq, Some(499));

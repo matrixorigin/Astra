@@ -92,7 +92,18 @@ impl std::str::FromStr for Format {
 /// so tests can assert on the output without touching stdout.
 pub fn render(report: &SuiteReport, fmt: Format, verbose: bool) -> String {
     match fmt {
-        Format::Json => serde_json::to_string_pretty(report).unwrap_or_default(),
+        // Serialize-failure is unreachable today — every field in
+        // `SuiteReport` / its transitive types is serde-safe — but a
+        // future field addition could break that invariant silently.
+        // Emit a structured error blob instead of an empty string so
+        // CI consumers parsing the output see a clear failure rather
+        // than a mystery zero-byte file.
+        Format::Json => serde_json::to_string_pretty(report).unwrap_or_else(|e| {
+            format!(
+                "{{\n  \"error\": \"SuiteReport JSON render failed: {}\"\n}}",
+                e.to_string().replace('"', "\\\"")
+            )
+        }),
         Format::Text => render_text(report, verbose),
     }
 }

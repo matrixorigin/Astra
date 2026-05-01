@@ -81,17 +81,30 @@ mod harness_stderr_prefix_pin {
                 continue;
             }
             let src = std::fs::read_to_string(&path).expect("read src");
-            // Skip test modules — only production eprintlns matter for
-            // the invariant. #[cfg(test)] blocks may print whatever.
-            // We scan line-by-line and track a depth counter for
-            // #[cfg(test)] mod { ... } — coarse but adequate.
+            // Skip test modules — only production eprintlns matter
+            // for the invariant. #[cfg(test)] blocks may print
+            // whatever. We scan line-by-line and track a depth
+            // counter for #[cfg(test)] mod { ... }.
+            //
+            // Detection is deliberately strict:
+            // - `#[cfg(test)]` must be alone on its line (after
+            //   trimming). Guards against someone pasting the token
+            //   into a docstring example.
+            // - `mod tests` / this module's own name must appear AS
+            //   a `mod` declaration (not e.g. `let tests = …`).
+            //
+            // We also fold into test-mode on `#[test]` / `#[tokio::test]`
+            // function attrs so top-level `fn`-scoped test code
+            // (outside a `mod tests`) is also skipped.
             let mut depth: i32 = 0;
             let mut in_test_mod = false;
             for (lineno, line) in src.lines().enumerate() {
-                if line.contains("#[cfg(test)]")
-                    || line.contains("mod tests")
-                    || line.contains("mod harness_stderr_prefix_pin")
-                {
+                let trimmed = line.trim();
+                let is_cfg_test_line = trimmed == "#[cfg(test)]";
+                let declares_test_mod = trimmed.starts_with("mod tests")
+                    || trimmed.starts_with("pub(crate) mod tests")
+                    || trimmed.starts_with("mod harness_stderr_prefix_pin");
+                if is_cfg_test_line || declares_test_mod {
                     in_test_mod = true;
                 }
                 // Track brace depth so we can exit the test mod.
@@ -101,9 +114,7 @@ mod harness_stderr_prefix_pin {
                     in_test_mod = false;
                     depth = 0;
                 }
-                if !in_test_mod
-                    && line.contains("eprintln!")
-                {
+                if !in_test_mod && line.contains("eprintln!") {
                     // Grab the literal that follows `eprintln!(`.
                     // Tolerate multi-line strings: the next non-
                     // comment token should be a `"` opening quote;
