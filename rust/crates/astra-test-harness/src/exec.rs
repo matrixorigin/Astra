@@ -91,7 +91,11 @@ fn shell_escape(s: String) -> String {
     // and it should actually work.
     let empty = s.is_empty();
     let escaped = s.replace('\'', "'\\''");
-    if empty { "''".to_string() } else { format!("'{escaped}'") }
+    if empty {
+        "''".to_string()
+    } else {
+        format!("'{escaped}'")
+    }
 }
 
 async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> RunOutcome {
@@ -307,7 +311,10 @@ mod tests {
         assert!(got.starts_with('\''), "must start with single quote: {got}");
         assert!(got.ends_with('\''), "must end with single quote: {got}");
         // The two inner apostrophes are each turned into `'\''`.
-        assert!(got.contains(r"'\''"), "inner quotes must be POSIX-escaped: {got}");
+        assert!(
+            got.contains(r"'\''"),
+            "inner quotes must be POSIX-escaped: {got}"
+        );
         // `$` and backticks must be present LITERALLY (no expansion)
         // because single-quoted strings don't expand.
         assert!(got.contains("$(echo c)"));

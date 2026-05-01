@@ -175,8 +175,7 @@ pub fn load_session(session_id: &str) -> Option<SessionCapture> {
             // Legacy's path wins as the primary identifier (the jq
             // hint points there); events are the union.
             legacy_c.events.extend(step_c.events);
-            legacy_c.skipped_lines =
-                legacy_c.skipped_lines.saturating_add(step_c.skipped_lines);
+            legacy_c.skipped_lines = legacy_c.skipped_lines.saturating_add(step_c.skipped_lines);
             Some(legacy_c)
         }
     }
@@ -266,10 +265,7 @@ pub fn load_session_from_path_with_caps(
                     events.remove(0);
                     dropped_from_head = dropped_from_head.saturating_add(1);
                 }
-                events.push(JournalEvent {
-                    event_type,
-                    raw: v,
-                });
+                events.push(JournalEvent { event_type, raw: v });
             }
             Err(_) => skipped = skipped.saturating_add(1),
         }
@@ -473,8 +469,7 @@ mod tests {
             .collect();
         std::fs::write(&path, lines.join("\n")).unwrap();
 
-        let cap =
-            load_session_from_path_with_caps("many", &path, u64::MAX, 10).expect("load");
+        let cap = load_session_from_path_with_caps("many", &path, u64::MAX, 10).expect("load");
         assert_eq!(cap.events.len(), 10);
         // Ring-buffer drops from head (oldest) so the buffer retains
         // the tail of the jsonl (newest events). Check by seq field.
@@ -493,11 +488,7 @@ mod tests {
     fn load_session_under_caps_behaves_as_before() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("small.jsonl");
-        let body = [
-            r#"{"type":"a"}"#,
-            r#"{"type":"b"}"#,
-        ]
-        .join("\n");
+        let body = [r#"{"type":"a"}"#, r#"{"type":"b"}"#].join("\n");
         std::fs::write(&path, body).unwrap();
         let cap = load_session_from_path_with_caps("small", &path, 1024, 100).unwrap();
         assert_eq!(cap.events.len(), 2);

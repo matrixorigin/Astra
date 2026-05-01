@@ -12,10 +12,10 @@ use astra_test_harness::case::Case;
 use astra_test_harness::digest::AstraCliDigestCollector;
 use astra_test_harness::exec::AstraCliExecutor;
 use astra_test_harness::judger::{
-    warn_if_same_family, AstraCliJudger, Judger, JudgerConfig, QuorumAgg, QuorumJudger,
+    AstraCliJudger, Judger, JudgerConfig, QuorumAgg, QuorumJudger, warn_if_same_family,
 };
-use astra_test_harness::report::{render, Format};
-use astra_test_harness::runner::{resolve_models, RunnerConfig};
+use astra_test_harness::report::{Format, render};
+use astra_test_harness::runner::{RunnerConfig, resolve_models};
 use astra_test_harness::suite::{DiskSessionLoader, SessionCaptureMode, SuiteRunner};
 
 #[derive(Debug, Parser)]
@@ -148,12 +148,18 @@ fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
     {
         let p = PathBuf::from(env_path);
         if p.is_file() {
-            eprintln!("[astra-test] using astra bin from ASTRA_BIN: {}", p.display());
+            eprintln!(
+                "[astra-test] using astra bin from ASTRA_BIN: {}",
+                p.display()
+            );
             return Ok(p);
         }
     }
     if let Some(found) = find_on_path("astra") {
-        eprintln!("[astra-test] using astra bin from PATH: {}", found.display());
+        eprintln!(
+            "[astra-test] using astra bin from PATH: {}",
+            found.display()
+        );
         return Ok(found);
     }
     // Last resort: walk up from CWD looking for a Cargo workspace root
@@ -197,8 +203,7 @@ async fn main() -> Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    let mut runner_cfg =
-        RunnerConfig::new(astra_bin.clone()).with_fallback_models(fallback_models);
+    let mut runner_cfg = RunnerConfig::new(astra_bin.clone()).with_fallback_models(fallback_models);
     runner_cfg.working_dir = args.working_dir.clone();
 
     let judger_cfg = JudgerConfig {
@@ -248,10 +253,13 @@ async fn main() -> Result<()> {
     // Digest collector: always construct, conditionally wire. Keeping
     // the value out of scope when disabled lets the SuiteRunner see
     // `None` and skip the subprocess per-FAIL.
-    let digest =
-        AstraCliDigestCollector::new(astra_bin.clone()).with_timeout(args.digest_timeout);
+    let digest = AstraCliDigestCollector::new(astra_bin.clone()).with_timeout(args.digest_timeout);
     let digest_collector: Option<&dyn astra_test_harness::digest::DigestCollector> =
-        if args.no_digest_on_fail { None } else { Some(&digest) };
+        if args.no_digest_on_fail {
+            None
+        } else {
+            Some(&digest)
+        };
 
     let runner = SuiteRunner {
         executor: &executor,

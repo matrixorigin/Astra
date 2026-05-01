@@ -234,11 +234,7 @@ mod tests {
     fn loads_minimal_case() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("c.yaml");
-        std::fs::write(
-            &path,
-            "name: hello\nprompt: just say ok\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "name: hello\nprompt: just say ok\n").unwrap();
         let c = Case::from_path(&path).unwrap();
         assert_eq!(c.name, "hello");
         assert_eq!(c.prompt, "just say ok");
@@ -308,9 +304,8 @@ mod tests {
         ] {
             let dir = tempdir().unwrap();
             let path = dir.path().join("bad.yaml");
-            let yaml = format!(
-                "name: c\nprompt: p\nextra_cli_args: [{reserved:?}, \"something\"]\n"
-            );
+            let yaml =
+                format!("name: c\nprompt: p\nextra_cli_args: [{reserved:?}, \"something\"]\n");
             std::fs::write(&path, yaml).unwrap();
             let err = Case::from_path(&path)
                 .err()
@@ -375,11 +370,7 @@ mod tests {
     fn timeout_seconds_zero_rejected() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("bad.yaml");
-        std::fs::write(
-            &path,
-            "name: c\nprompt: p\ntimeout_seconds: 0\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "name: c\nprompt: p\ntimeout_seconds: 0\n").unwrap();
         let err = Case::from_path(&path).expect_err("timeout_seconds=0 must fail");
         assert!(err.to_string().contains("timeout_seconds must be >= 1"));
     }

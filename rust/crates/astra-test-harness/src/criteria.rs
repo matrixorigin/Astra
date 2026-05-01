@@ -246,7 +246,7 @@ fn evaluate_one(
                             )
                         },
                         full_detail: None,
-                score: None,
+                        score: None,
                     }
                 }
                 Err(e) => CriterionResult {
@@ -254,7 +254,7 @@ fn evaluate_one(
                     passed: false,
                     detail: format!("invalid regex /{pattern}/: {e}"),
                     full_detail: None,
-                score: None,
+                    score: None,
                 },
             }
         }
@@ -311,9 +311,7 @@ fn evaluate_one(
             CriterionResult {
                 criterion: c.clone(),
                 passed: pass,
-                detail: format!(
-                    "session events type={event_type} count={n} (expected >= {min})"
-                ),
+                detail: format!("session events type={event_type} count={n} (expected >= {min})"),
                 full_detail: None,
                 score: None,
             }
@@ -322,9 +320,7 @@ fn evaluate_one(
             let Some(sess) = session else {
                 let passed = *optional;
                 let detail = if *optional {
-                    format!(
-                        "journal_tool_called {name} skipped (optional + no session capture)"
-                    )
+                    format!("journal_tool_called {name} skipped (optional + no session capture)")
                 } else {
                     format!(
                         "journal_tool_called {name} FAILED: no session loaded \
@@ -348,9 +344,7 @@ fn evaluate_one(
                 detail: if hit {
                     format!("journal tool {name} was invoked")
                 } else {
-                    format!(
-                        "journal tool {name} NOT invoked (journal tools: {tools:?})"
-                    )
+                    format!("journal tool {name} NOT invoked (journal tools: {tools:?})")
                 },
                 full_detail: None,
                 score: None,
@@ -369,9 +363,7 @@ fn evaluate_one(
                 } else if hits.is_empty() {
                     "no [fork-cache] events observed in stderr".to_string()
                 } else {
-                    format!(
-                        "no [fork-cache] event matched {expect:?}; seen outcomes: {hits:?}"
-                    )
+                    format!("no [fork-cache] event matched {expect:?}; seen outcomes: {hits:?}")
                 },
                 full_detail: None,
                 score: None,
@@ -448,7 +440,9 @@ pub fn validate_criterion(c: &Criterion) -> Result<(), String> {
             }
             Ok(())
         }
-        Criterion::SessionEventCount { min, event_type, .. } => {
+        Criterion::SessionEventCount {
+            min, event_type, ..
+        } => {
             if *min == 0 {
                 return Err(format!(
                     "SessionEventCount.min must be >= 1 (min=0 is trivially-true for \
@@ -586,15 +580,11 @@ mod tests {
     #[test]
     fn tools_count_range_inclusive() {
         let out = outcome_with_tools(&["a", "b", "c"]);
-        let inside = evaluate_deterministic(
-            &[Criterion::ToolsCountBetween { min: 1, max: 3 }],
-            &out,
-        );
+        let inside =
+            evaluate_deterministic(&[Criterion::ToolsCountBetween { min: 1, max: 3 }], &out);
         assert!(inside[0].passed);
-        let outside = evaluate_deterministic(
-            &[Criterion::ToolsCountBetween { min: 5, max: 10 }],
-            &out,
-        );
+        let outside =
+            evaluate_deterministic(&[Criterion::ToolsCountBetween { min: 5, max: 10 }], &out);
         assert!(!outside[0].passed);
     }
 
@@ -864,19 +854,23 @@ mod tests {
 
     #[test]
     fn validate_stderr_matches_rejects_bad_regex() {
-        let err = validate_criterion(&Criterion::StderrMatches { pattern: "(".into() })
-            .expect_err("bad regex should fail at load");
+        let err = validate_criterion(&Criterion::StderrMatches {
+            pattern: "(".into(),
+        })
+        .expect_err("bad regex should fail at load");
         assert!(err.contains("invalid regex"));
     }
 
     #[test]
     fn validate_rejects_empty_tool_name_and_empty_needle() {
         assert!(validate_criterion(&Criterion::ToolCalled { name: "   ".into() }).is_err());
-        assert!(validate_criterion(&Criterion::JournalToolCalled {
-            name: "".into(),
-            optional: false
-        })
-        .is_err());
+        assert!(
+            validate_criterion(&Criterion::JournalToolCalled {
+                name: "".into(),
+                optional: false
+            })
+            .is_err()
+        );
         assert!(validate_criterion(&Criterion::TextContains { needle: "".into() }).is_err());
     }
 
@@ -992,7 +986,10 @@ mod tests {
             }],
             &out,
         );
-        assert!(r[0].passed, "one malformed event must not mask a later valid hit");
+        assert!(
+            r[0].passed,
+            "one malformed event must not mask a later valid hit"
+        );
     }
 
     #[test]

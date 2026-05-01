@@ -169,10 +169,7 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         }
         if verbose || !run.passed {
             if !run.outcome.text.is_empty() {
-                s.push_str(&format!(
-                    "    text: {}\n",
-                    truncate(&run.outcome.text, 500)
-                ));
+                s.push_str(&format!("    text: {}\n", truncate(&run.outcome.text, 500)));
             }
             if !run.outcome.stderr.is_empty() {
                 s.push_str(&format!(
@@ -199,9 +196,7 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                 // with shell metachars could make the copy-paste hint
                 // a remote-execution vector for an unwary developer.
                 if is_safe_session_id(id) {
-                    s.push_str(&format!(
-                        "    journal: ~/.astra/sessions/{id}.jsonl\n"
-                    ));
+                    s.push_str(&format!("    journal: ~/.astra/sessions/{id}.jsonl\n"));
                     // Filter to llm_round events first, then project
                     // out the nested tool_calls[].name. Without the
                     // `select(.type==\"llm_round\")` the hint would
@@ -282,9 +277,7 @@ fn render_digest_summary(json: &serde_json::Value, out: &mut String) {
     if let Some(id) = json.get("session_id").and_then(|v| v.as_str())
         && is_safe_session_id(id)
     {
-        out.push_str(&format!(
-            "      full:  astra journal digest {id}\n"
-        ));
+        out.push_str(&format!("      full:  astra journal digest {id}\n"));
     }
 }
 
@@ -398,8 +391,7 @@ mod tests {
     fn text_report_emits_diag_hints_on_fail() {
         let mut r = mk_report_passed();
         r.runs[0].passed = false;
-        r.runs[0].reproducer =
-            Some("/path/to/astra chat -m 'say ok' --model m --json -y".into());
+        r.runs[0].reproducer = Some("/path/to/astra chat -m 'say ok' --model m --json -y".into());
         let out = render(&r, Format::Text, false);
         assert!(out.contains("journal: ~/.astra/sessions/sess.jsonl"));
         assert!(out.contains("jq "));
@@ -429,7 +421,9 @@ mod tests {
             r.runs[0].outcome.session_id = Some(injection.to_string());
             let out = render(&r, Format::Text, false);
             assert!(
-                !out.contains(&format!("jq -r '.tool_calls[]?.name' ~/.astra/sessions/{injection}")),
+                !out.contains(&format!(
+                    "jq -r '.tool_calls[]?.name' ~/.astra/sessions/{injection}"
+                )),
                 "jq hint must NOT splice the suspicious id: {out}"
             );
             assert!(
@@ -451,9 +445,18 @@ mod tests {
     fn is_safe_session_id_rejects_shell_metachars_and_oversize() {
         // Shell metachar rejects.
         for bad in [
-            "", "sess;rm", "sess|evil", "sess\"quote", "sess'quote",
-            "sess`cmd`", "sess$(cmd)", "sess>file", "sess<file",
-            "sess\nline", "sess\\/", "sess space",
+            "",
+            "sess;rm",
+            "sess|evil",
+            "sess\"quote",
+            "sess'quote",
+            "sess`cmd`",
+            "sess$(cmd)",
+            "sess>file",
+            "sess<file",
+            "sess\nline",
+            "sess\\/",
+            "sess space",
         ] {
             assert!(!is_safe_session_id(bad), "should reject {bad:?}");
         }
@@ -594,6 +597,12 @@ mod tests {
         let r = SuiteReport::default();
         let out = render(&r, Format::Json, false);
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
-        assert_eq!(parsed.get("runs").and_then(|v| v.as_array()).map(|a| a.len()), Some(0));
+        assert_eq!(
+            parsed
+                .get("runs")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(0)
+        );
     }
 }

@@ -114,7 +114,9 @@ fn shipped_cases_reference_only_known_criterion_variants() {
         let body = std::fs::read_to_string(&path).expect("read");
         for (lineno, line) in body.lines().enumerate() {
             // Match `- type: <name>` or `type: <name>` inside a list item.
-            let trimmed = line.trim_start_matches(|c: char| c.is_whitespace() || c == '-').trim();
+            let trimmed = line
+                .trim_start_matches(|c: char| c.is_whitespace() || c == '-')
+                .trim();
             let Some(rest) = trimmed.strip_prefix("type:") else {
                 continue;
             };

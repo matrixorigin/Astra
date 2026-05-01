@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 
 use astra_test_harness::criteria::{
-    evaluate_deterministic_with_session, Criterion, CriterionResult,
+    Criterion, CriterionResult, evaluate_deterministic_with_session,
 };
 use astra_test_harness::runner::RunOutcome;
 use astra_test_harness::session_capture::load_session_from_path;
@@ -57,8 +57,11 @@ fn outcome_placeholder() -> RunOutcome {
 
 #[test]
 fn legacy_fixture_loads_correct_event_count() {
-    let cap = load_session_from_path("fixture-sess-legacy", &fixture_path("fixture_realistic_legacy.jsonl"))
-        .expect("fixture should load");
+    let cap = load_session_from_path(
+        "fixture-sess-legacy",
+        &fixture_path("fixture_realistic_legacy.jsonl"),
+    )
+    .expect("fixture should load");
     assert_eq!(
         cap.events.len(),
         11,
@@ -69,8 +72,11 @@ fn legacy_fixture_loads_correct_event_count() {
 
 #[test]
 fn legacy_fixture_counts_llm_round_correctly() {
-    let cap = load_session_from_path("fixture-sess-legacy", &fixture_path("fixture_realistic_legacy.jsonl"))
-        .expect("fixture should load");
+    let cap = load_session_from_path(
+        "fixture-sess-legacy",
+        &fixture_path("fixture_realistic_legacy.jsonl"),
+    )
+    .expect("fixture should load");
     assert_eq!(
         cap.count_events("llm_round"),
         4,
@@ -92,8 +98,11 @@ fn legacy_fixture_tools_invoked_walks_nested_tool_calls() {
     // non-existent top-level `tool_invocation` events. Ground truth
     // from the fixture: git_diff appears twice in sequential rounds,
     // then git_log once. De-duped first-seen order: [git_diff, git_log].
-    let cap = load_session_from_path("fixture-sess-legacy", &fixture_path("fixture_realistic_legacy.jsonl"))
-        .expect("fixture should load");
+    let cap = load_session_from_path(
+        "fixture-sess-legacy",
+        &fixture_path("fixture_realistic_legacy.jsonl"),
+    )
+    .expect("fixture should load");
     let tools = cap.tools_invoked();
     assert_eq!(
         tools,
@@ -108,8 +117,11 @@ fn legacy_fixture_journal_tool_called_criterion_matches() {
     // must PASS against a real-shape fixture. Before the R4 fix this
     // criterion returned the `no-session` FAIL path on EVERY real
     // session because tools_invoked() never saw the nested shape.
-    let cap = load_session_from_path("fixture-sess-legacy", &fixture_path("fixture_realistic_legacy.jsonl"))
-        .expect("fixture should load");
+    let cap = load_session_from_path(
+        "fixture-sess-legacy",
+        &fixture_path("fixture_realistic_legacy.jsonl"),
+    )
+    .expect("fixture should load");
     let outcome = outcome_placeholder();
 
     for name in ["git_diff", "git_log"] {
@@ -148,8 +160,11 @@ fn legacy_fixture_session_event_count_llm_round_matches() {
     // `session_event_count { event_type: llm_round, min: 1 }` should
     // PASS with ground truth 4 ≥ 1. Also tests the strict-fail path by
     // asserting `min: 5` (above ground truth) fails.
-    let cap = load_session_from_path("fixture-sess-legacy", &fixture_path("fixture_realistic_legacy.jsonl"))
-        .expect("fixture should load");
+    let cap = load_session_from_path(
+        "fixture-sess-legacy",
+        &fixture_path("fixture_realistic_legacy.jsonl"),
+    )
+    .expect("fixture should load");
     let outcome = outcome_placeholder();
 
     let pass = evaluate_deterministic_with_session(
@@ -161,7 +176,11 @@ fn legacy_fixture_session_event_count_llm_round_matches() {
         &outcome,
         Some(&cap),
     );
-    assert!(pass[0].passed, "4 llm_rounds >= 1 must PASS: {}", pass[0].detail);
+    assert!(
+        pass[0].passed,
+        "4 llm_rounds >= 1 must PASS: {}",
+        pass[0].detail
+    );
 
     let fail = evaluate_deterministic_with_session(
         &[Criterion::SessionEventCount {
@@ -172,7 +191,11 @@ fn legacy_fixture_session_event_count_llm_round_matches() {
         &outcome,
         Some(&cap),
     );
-    assert!(!fail[0].passed, "4 llm_rounds >= 5 must FAIL: {}", fail[0].detail);
+    assert!(
+        !fail[0].passed,
+        "4 llm_rounds >= 5 must FAIL: {}",
+        fail[0].detail
+    );
 }
 
 // ── Step-events fixture: <id>/step_events.jsonl ──

@@ -212,10 +212,7 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
             .get("completion_tokens")
             .and_then(|x| x.as_u64())
             .unwrap_or(0),
-        prompt_tokens: v
-            .get("prompt_tokens")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0),
+        prompt_tokens: v.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
         duration_ms: 0,
     }
 }

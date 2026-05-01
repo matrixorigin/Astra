@@ -15,13 +15,13 @@
 //! against fakes in integration tests.
 
 use crate::case::Case;
-use crate::criteria::{evaluate_deterministic_with_session, non_judger_all_pass, Criterion};
+use crate::criteria::{Criterion, evaluate_deterministic_with_session, non_judger_all_pass};
 use crate::digest::DigestCollector;
 use crate::exec::CaseExecutor;
-use crate::judger::{evaluate_judger, Judger};
+use crate::judger::{Judger, evaluate_judger};
 use crate::report::{CaseRunReport, SuiteReport};
-use crate::runner::{resolve_models, RunnerConfig};
-use crate::session_capture::{load_session, SessionCapture};
+use crate::runner::{RunnerConfig, resolve_models};
+use crate::session_capture::{SessionCapture, load_session};
 
 /// What to do with session journals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,8 +304,7 @@ mod tests {
         };
         let loader = NoopSessionLoader;
 
-        let cfg = RunnerConfig::new(PathBuf::from("astra"))
-            .with_fallback_models(vec!["m".into()]);
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
         let runner = SuiteRunner {
             executor: &exec,
             judger: &judger,
@@ -342,8 +341,7 @@ mod tests {
         let judger = FixedJudger { score: 0.0 };
         let loader = NoopSessionLoader;
 
-        let cfg = RunnerConfig::new(PathBuf::from("astra"))
-            .with_fallback_models(vec!["m".into()]);
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
         let runner = SuiteRunner {
             executor: &exec,
             judger: &judger,
@@ -391,11 +389,7 @@ mod tests {
     #[tokio::test]
     async fn session_capture_on_debug_log_uses_loader() {
         let exec = FakeExecutor::new();
-        exec.seed(
-            "dbg",
-            "m",
-            outcome_ok("m", "text", &[]),
-        );
+        exec.seed("dbg", "m", outcome_ok("m", "text", &[]));
         let judger = FixedJudger { score: 1.0 };
 
         struct FixedLoader;
@@ -411,8 +405,7 @@ mod tests {
         }
         let loader = FixedLoader;
 
-        let cfg = RunnerConfig::new(PathBuf::from("astra"))
-            .with_fallback_models(vec!["m".into()]);
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
         let runner = SuiteRunner {
             executor: &exec,
             judger: &judger,
@@ -435,8 +428,7 @@ mod tests {
         exec.seed("c1", "m", outcome_ok("m", "hi", &[]));
         let judger = FixedJudger { score: 1.0 };
         let loader = NoopSessionLoader;
-        let cfg = RunnerConfig::new(PathBuf::from("astra"))
-            .with_fallback_models(vec!["m".into()]);
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
         let runner = SuiteRunner {
             executor: &exec,
             judger: &judger,
@@ -468,13 +460,9 @@ mod tests {
         let loader = NoopSessionLoader;
 
         let digest = FakeDigestCollector::new();
-        digest.seed_ok(
-            "sess-m",
-            serde_json::json!({"aggregates": {"turns": 2}}),
-        );
+        digest.seed_ok("sess-m", serde_json::json!({"aggregates": {"turns": 2}}));
 
-        let cfg = RunnerConfig::new(PathBuf::from("astra"))
-            .with_fallback_models(vec!["m".into()]);
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
         let runner = SuiteRunner {
             executor: &exec,
             judger: &judger,
@@ -521,8 +509,7 @@ mod tests {
         let digest = FakeDigestCollector::new();
         digest.seed_err("sess-m", "session file missing");
 
-        let cfg = RunnerConfig::new(PathBuf::from("astra"))
-            .with_fallback_models(vec!["m".into()]);
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
         let runner = SuiteRunner {
             executor: &exec,
             judger: &judger,
@@ -553,8 +540,7 @@ mod tests {
         let judger = FixedJudger { score: 1.0 };
         let loader = NoopSessionLoader;
 
-        let cfg = RunnerConfig::new(PathBuf::from("astra"))
-            .with_fallback_models(vec!["m".into()]);
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
         let runner = SuiteRunner {
             executor: &exec,
             judger: &judger,

@@ -125,8 +125,7 @@ pub async fn evaluate_judger(
             let votes_tag = if score.votes.is_empty() {
                 String::new()
             } else {
-                let rendered: Vec<String> =
-                    score.votes.iter().map(|v| format!("{v:.2}")).collect();
+                let rendered: Vec<String> = score.votes.iter().map(|v| format!("{v:.2}")).collect();
                 format!(" votes=[{}]", rendered.join(", "))
             };
             Some(CriterionResult {
@@ -262,10 +261,7 @@ fn truncate_for_judger(s: &str, max: usize) -> String {
     let half = max / 2;
     let head: String = s.chars().take(half).collect();
     let tail: String = s.chars().skip(len - half).collect();
-    format!(
-        "{head}\n… [{} chars elided] …\n{tail}",
-        len - max
-    )
+    format!("{head}\n… [{} chars elided] …\n{tail}", len - max)
 }
 
 /// Actually invoke the judger model via the astra CLI and parse
@@ -318,9 +314,7 @@ async fn run_judger_call(
         if stderr_preview.is_empty() {
             format!("{parse_err} (exit_code={exit_code:?}, stderr empty)")
         } else {
-            format!(
-                "{parse_err} (exit_code={exit_code:?}; subprocess stderr:\n{stderr_preview})"
-            )
+            format!("{parse_err} (exit_code={exit_code:?}; subprocess stderr:\n{stderr_preview})")
         }
     })
 }
@@ -396,7 +390,9 @@ impl std::str::FromStr for QuorumAgg {
             "mean" | "avg" | "average" => Ok(QuorumAgg::Mean),
             "min" => Ok(QuorumAgg::Min),
             "max" => Ok(QuorumAgg::Max),
-            other => Err(format!("unknown quorum agg {other:?} (median|mean|min|max)")),
+            other => Err(format!(
+                "unknown quorum agg {other:?} (median|mean|min|max)"
+            )),
         }
     }
 }
@@ -916,7 +912,10 @@ mod tests {
         // parsing `full_rationale`.
         assert_eq!(s.votes.len(), 3);
         assert_eq!(
-            s.votes.iter().map(|v| format!("{v:.2}")).collect::<Vec<_>>(),
+            s.votes
+                .iter()
+                .map(|v| format!("{v:.2}"))
+                .collect::<Vec<_>>(),
             vec!["0.90", "0.10", "0.85"]
         );
     }
@@ -999,10 +998,7 @@ mod tests {
 
     #[tokio::test]
     async fn quorum_fails_when_all_runs_fail() {
-        let inner = ScriptedJudger::new(vec![
-            Err("timeout".into()),
-            Err("rate limit".into()),
-        ]);
+        let inner = ScriptedJudger::new(vec![Err("timeout".into()), Err("rate limit".into())]);
         let q = QuorumJudger::new(inner, 2, QuorumAgg::Median);
         let res = q.score("q", None, &dummy_outcome()).await;
         let err = res.unwrap_err();
@@ -1016,7 +1012,10 @@ mod tests {
     #[test]
     fn model_family_recognizes_common_providers() {
         assert_eq!(model_family("claude-sonnet-4-6"), Some("anthropic"));
-        assert_eq!(model_family("us.anthropic.claude-opus-4-7"), Some("anthropic"));
+        assert_eq!(
+            model_family("us.anthropic.claude-opus-4-7"),
+            Some("anthropic")
+        );
         assert_eq!(model_family("gpt-4o"), Some("openai"));
         assert_eq!(model_family("qwen-flash"), Some("alibaba"));
         assert_eq!(model_family("MiniMax-M2.7"), Some("minimax"));

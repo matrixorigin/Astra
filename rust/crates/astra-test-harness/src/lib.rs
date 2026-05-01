@@ -129,11 +129,8 @@ mod harness_stderr_prefix_pin {
                     // the first 80 chars of the call. Generous enough
                     // for formatting variations; tight enough to
                     // catch drift.
-                    let window: String = snippet
-                        .chars()
-                        .skip_while(|&c| c != '"')
-                        .take(80)
-                        .collect();
+                    let window: String =
+                        snippet.chars().skip_while(|&c| c != '"').take(80).collect();
                     if !window.contains(HARNESS_STDERR_PREFIX) {
                         violators.push(format!(
                             "{}:{}: eprintln without {HARNESS_STDERR_PREFIX}: {}",
