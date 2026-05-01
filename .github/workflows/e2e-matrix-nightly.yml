@@ -46,7 +46,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          shared-key: ci-online
+          shared-key: ci-test
           save-if: false
       - name: Wait for dependencies
         run: make dev-deps-wait

@@ -405,7 +405,6 @@ build: build-release
 build-release: sweep
 	@echo "Building Rust workspace (release)..."
 	@$(CARGO) build $(CARGO_MANIFEST_FLAG) --release
-	@touch $(RUST_TARGET_DIR)/.sweep-stamp
 	@echo "✅ Release artifacts: $(RUST_RELEASE_BIN_DIR)/"
 
 .PHONY: build-cli
@@ -449,28 +448,23 @@ clean-incremental:
 	@rm -rf $(RUST_TARGET_DIR)/debug/incremental
 	@echo "✅ Incremental cache removed"
 
-SWEEP_STAMP := $(RUST_TARGET_DIR)/.sweep-stamp
+# Maximum age (in hours) for build artifacts before sweep removes them.
+# Override: make sweep SWEEP_MAX_AGE_H=2
+SWEEP_MAX_AGE_H ?= 4
 
-.PHONY: sweep-stamp
-sweep-stamp:
-	@touch $(SWEEP_STAMP)
-
+# Time-based sweep: removes debug and release artifacts older than SWEEP_MAX_AGE_H.
+# Runs automatically before build-release and test-offline to keep disk usage bounded.
 .PHONY: sweep
 sweep:
-	@if [ -f $(SWEEP_STAMP) ]; then \
-		echo "Sweeping artifacts inactive since $$(stat -c '%y' $(SWEEP_STAMP) | cut -d. -f1)..."; \
-		find $(RUST_TARGET_DIR)/debug/incremental -maxdepth 1 -type d ! -newer $(SWEEP_STAMP) -exec rm -rf {} + 2>/dev/null || true; \
-		find $(RUST_TARGET_DIR)/debug/deps -type f ! -newer $(SWEEP_STAMP) -delete 2>/dev/null || true; \
-		find $(RUST_TARGET_DIR)/debug/.fingerprint -maxdepth 1 -type d ! -newer $(SWEEP_STAMP) -exec rm -rf {} + 2>/dev/null || true; \
-		find $(RUST_TARGET_DIR)/release/incremental -maxdepth 1 -type d ! -newer $(SWEEP_STAMP) -exec rm -rf {} + 2>/dev/null || true; \
-	else \
-		echo "No stamp found, sweeping artifacts older than 5 days..."; \
-		find $(RUST_TARGET_DIR)/debug/incremental -maxdepth 1 -type d -mtime +5 -exec rm -rf {} + 2>/dev/null || true; \
-		find $(RUST_TARGET_DIR)/debug/deps -type f -atime +5 -delete 2>/dev/null || true; \
-		find $(RUST_TARGET_DIR)/debug/.fingerprint -maxdepth 1 -type d -mtime +5 -exec rm -rf {} + 2>/dev/null || true; \
-		find $(RUST_TARGET_DIR)/release/incremental -maxdepth 1 -type d -mtime +5 -exec rm -rf {} + 2>/dev/null || true; \
-	fi
-	@echo "✅ Inactive artifacts removed"
+	@AGE_MIN=$$(( $(SWEEP_MAX_AGE_H) * 60 )); \
+	echo "Sweeping artifacts older than $(SWEEP_MAX_AGE_H)h..."; \
+	find $(RUST_TARGET_DIR)/debug/incremental -mindepth 1 -maxdepth 1 -type d -mmin +$$AGE_MIN -exec rm -rf {} + 2>/dev/null || true; \
+	find $(RUST_TARGET_DIR)/debug/deps -type f -mmin +$$AGE_MIN -delete 2>/dev/null || true; \
+	find $(RUST_TARGET_DIR)/debug/.fingerprint -mindepth 1 -maxdepth 1 -type d -mmin +$$AGE_MIN -exec rm -rf {} + 2>/dev/null || true; \
+	find $(RUST_TARGET_DIR)/release/incremental -mindepth 1 -maxdepth 1 -type d -mmin +$$AGE_MIN -exec rm -rf {} + 2>/dev/null || true; \
+	find $(RUST_TARGET_DIR)/release/deps -type f -mmin +$$AGE_MIN -delete 2>/dev/null || true; \
+	find $(RUST_TARGET_DIR)/release/.fingerprint -mindepth 1 -maxdepth 1 -type d -mmin +$$AGE_MIN -exec rm -rf {} + 2>/dev/null || true
+	@echo "✅ Stale artifacts removed"
 	@du -sh $(RUST_TARGET_DIR) 2>/dev/null || true
 
 # ============================================================================
@@ -481,14 +475,14 @@ sweep:
 test: test-offline test-online
 
 .PHONY: test-offline
-test-offline: test-workspace test-runtime-bridge-hooks test-sdk-offline
+test-offline: sweep test-workspace test-runtime-bridge-hooks test-sdk-offline
 
 .PHONY: test-workspace
 test-workspace:
 	@echo "Running Rust workspace tests (nextest profile=$(NEXTEST_OFFLINE_PROFILE))..."
-	@cargo nextest run $(CARGO_MANIFEST_FLAG) --workspace $(NEXTEST_OFFLINE_FLAGS)
+	@CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) --workspace $(NEXTEST_OFFLINE_FLAGS)
 	@echo "Running workspace doctests (cargo test --doc; not covered by nextest)..."
-	@$(CARGO) test $(CARGO_MANIFEST_FLAG) --workspace --doc
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) --workspace --doc
 
 # Guard: server allowlist names ⊆ all_tool_schemas(), memory_* allowlist coverage,
 # DEFAULT_EXECUTOR_TOOL_NAMES ⊆ SERVER_EXECUTOR_TOOL_NAMES (manifest-path rust/Cargo.toml).
@@ -502,7 +496,7 @@ check-server-tool-schemas:
 .PHONY: test-runtime-bridge-hooks
 test-runtime-bridge-hooks:
 	@echo "Running astra-runtime tests with feature bridge-e2e-hooks (nextest profile=$(NEXTEST_OFFLINE_PROFILE))..."
-	@cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
+	@CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
 		--features bridge-e2e-hooks $(NEXTEST_OFFLINE_FLAGS)
 
 # Ignored tests: opt-in via env vars (see `make test-online`). Enable with:
@@ -528,7 +522,7 @@ test-ignored-integration:
 		else \
 			echo "Running online integration tests (ignored; live MatrixOne; bridge-e2e-hooks enabled for system_matrix_http_e2e)..."; \
 		fi; \
-		cargo nextest run $(CARGO_MANIFEST_FLAG) \
+		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
 			-p astra-runtime -p astra-services -p astra-plan \
 			--features astra-runtime/bridge-e2e-hooks \
 			--tests --run-ignored only \
@@ -557,7 +551,7 @@ test-online:
 	echo "Running astra-runtime ignored unit tests (live DB; nextest profile=$(NEXTEST_ONLINE_PROFILE); live-LLM suite gated by ASTRA_LIVE_LLM)..."; \
 	FAILED=""; \
 	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
-		cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
+		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
 			--run-ignored only $(NEXTEST_ONLINE_FLAGS) \
 			|| FAILED="$$FAILED astra-runtime-ignored"; \
 	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
@@ -651,7 +645,7 @@ ci: check test
 .PHONY: lint
 lint:
 	@echo "Running clippy..."
-	@$(CARGO) clippy $(CARGO_MANIFEST_FLAG) --release --all-targets -- -D warnings
+	@$(CARGO) clippy $(CARGO_MANIFEST_FLAG) --all-targets -- -D warnings
 
 .PHONY: lint-fix
 lint-fix:
@@ -675,7 +669,7 @@ audit:
 .PHONY: type-check
 type-check:
 	@echo "Running compile checks..."
-	@$(CARGO) check $(CARGO_MANIFEST_FLAG) --release --all-targets
+	@$(CARGO) check $(CARGO_MANIFEST_FLAG) --all-targets
 
 # ============================================================================
 # Memoria (Memory Service)

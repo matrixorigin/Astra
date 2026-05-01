@@ -12,6 +12,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   check:
@@ -22,7 +23,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          shared-key: ci-static
+          shared-key: ci-test
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run clippy
         run: make lint
