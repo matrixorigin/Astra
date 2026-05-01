@@ -206,6 +206,121 @@ fn build_resolved_active_llm_from_row(
     })
 }
 
+/// Resolve a short / partial model name against the full list of
+/// active model names.
+///
+/// The LLM, when prompted to call `spawn_agent`, frequently produces
+/// the short family name (`claude-sonnet`, `qwen-flash`) rather than
+/// the fully-qualified registered name (`us.anthropic.claude-sonnet-4-6`).
+/// Rejecting those calls outright forces the case author to retrain
+/// the prompt. Instead, we do a **deterministic, unambiguous** alias
+/// lookup:
+///
+/// 1. **Exact match** — name equal (case-sensitive) → that name.
+/// 2. **Case-insensitive exact match** — unique match → that name.
+/// 3. **Substring match** — unique active row whose name contains the
+///    requested string (case-insensitive) → that name.
+/// 4. Otherwise → `Err` with the candidate list so the caller can
+///    surface a useful error. Ambiguity (2+ candidates) is also
+///    `Err` — picking arbitrarily would be worse than failing.
+///
+/// Pure function; the DB query path uses it by passing the names
+/// from `SELECT model_name FROM infra_llm_models WHERE is_active = 1`.
+/// Keeping it pure means the behavior is fully unit-testable without
+/// spinning up a pool.
+pub fn resolve_model_alias<'a>(
+    requested: &str,
+    active_names: &'a [String],
+) -> Result<&'a str, ModelAliasResolutionError> {
+    let trimmed = requested.trim();
+    if trimmed.is_empty() {
+        return Err(ModelAliasResolutionError::Empty);
+    }
+    // Level 1: exact match wins.
+    if let Some(hit) = active_names.iter().find(|n| n.as_str() == trimmed) {
+        return Ok(hit.as_str());
+    }
+    // Level 2: case-insensitive exact. Narrower than substring — a
+    // user typing "CLAUDE-HAIKU-4-5-20251001" should still resolve
+    // without needing to match case.
+    let requested_lower = trimmed.to_ascii_lowercase();
+    let ci_hits: Vec<&String> = active_names
+        .iter()
+        .filter(|n| n.to_ascii_lowercase() == requested_lower)
+        .collect();
+    match ci_hits.len() {
+        0 => {}
+        1 => return Ok(ci_hits[0].as_str()),
+        _ => {
+            return Err(ModelAliasResolutionError::Ambiguous {
+                requested: trimmed.into(),
+                candidates: ci_hits.iter().map(|s| s.to_string()).collect(),
+            });
+        }
+    }
+    // Level 3: substring (case-insensitive). Unique match only.
+    let sub_hits: Vec<&String> = active_names
+        .iter()
+        .filter(|n| n.to_ascii_lowercase().contains(&requested_lower))
+        .collect();
+    match sub_hits.len() {
+        0 => Err(ModelAliasResolutionError::NotFound {
+            requested: trimmed.into(),
+            candidates: active_names.iter().map(|s| s.to_string()).collect(),
+        }),
+        1 => Ok(sub_hits[0].as_str()),
+        _ => Err(ModelAliasResolutionError::Ambiguous {
+            requested: trimmed.into(),
+            candidates: sub_hits.iter().map(|s| s.to_string()).collect(),
+        }),
+    }
+}
+
+/// Error surface for [`resolve_model_alias`]. Preserved so the
+/// DB-layer caller can distinguish "no such model" from "ambiguous"
+/// and render a helpful message to the LLM / user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelAliasResolutionError {
+    Empty,
+    NotFound {
+        requested: String,
+        candidates: Vec<String>,
+    },
+    Ambiguous {
+        requested: String,
+        candidates: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for ModelAliasResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "empty model name"),
+            Self::NotFound {
+                requested,
+                candidates,
+            } => write!(
+                f,
+                "Model '{requested}' is not configured on this server \
+                 (no exact or substring match in infra_llm_models). \
+                 Registered active models: {candidates:?}. Omit the \
+                 model override or choose one of the registered names."
+            ),
+            Self::Ambiguous {
+                requested,
+                candidates,
+            } => write!(
+                f,
+                "Model '{requested}' is ambiguous — matches multiple \
+                 registered models: {candidates:?}. Use a more specific \
+                 name."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ModelAliasResolutionError {}
+
 /// Resolve the active LLM model from the database for in-process / server-side callers.
 ///
 /// When `preferred` is `Some(name)`, the row **must** exist and be active — otherwise this
@@ -241,6 +356,8 @@ pub async fn resolve_active_llm_model(
     let pref = preferred.map(str::trim).filter(|s| !s.is_empty());
 
     if let Some(name) = pref {
+        // Try exact match first — the fast path. If the LLM supplied
+        // the fully-qualified name it resolves in one query.
         let row = sqlx::query(
             "SELECT model_name, api_key_encrypted, base_url, provider, \
                     IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json, is_active \
@@ -251,12 +368,42 @@ pub async fn resolve_active_llm_model(
         .await
         .map_err(|e| format!("DB query: {e}"))?;
 
-        let row = row.ok_or_else(|| {
-            format!(
-                "Model '{name}' is not configured on this server (no infra_llm_models row). \
-                 Omit the model override or choose a configured active model."
-            )
-        })?;
+        // Class C fix: fall through to the alias resolver when exact
+        // match fails. The LLM often produces short names like
+        // `claude-sonnet` for `spawn_agent`'s `model_override`; doing
+        // a deterministic substring / case-insensitive match against
+        // active rows lets those calls succeed without forcing every
+        // case author to retrain the prompt. Ambiguity still errors.
+        let row = match row {
+            Some(r) => r,
+            None => {
+                let active_names: Vec<String> = sqlx::query_scalar::<_, String>(
+                    "SELECT model_name FROM infra_llm_models WHERE is_active = 1",
+                )
+                .fetch_all(pool)
+                .await
+                .map_err(|e| format!("DB query: {e}"))?;
+
+                match resolve_model_alias(name, &active_names) {
+                    Ok(canonical) => sqlx::query(
+                        "SELECT model_name, api_key_encrypted, base_url, provider, \
+                                IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json, is_active \
+                         FROM infra_llm_models WHERE model_name = ? LIMIT 1",
+                    )
+                    .bind(canonical)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|e| format!("DB query: {e}"))?
+                    .ok_or_else(|| {
+                        format!(
+                            "alias resolver returned '{canonical}' but no row exists \
+                             — concurrent delete?"
+                        )
+                    })?,
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+        };
 
         let is_active_int: i16 = row.try_get("is_active").unwrap_or(0);
         if is_active_int == 0 {
@@ -1259,6 +1406,141 @@ impl From<ModelListItem> for ModelListItemResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── resolve_model_alias ──
+    //
+    // Class C regression: LLMs frequently produce short family names
+    // like `claude-sonnet` when calling `spawn_agent`, but the DB
+    // registers fully-qualified names like
+    // `us.anthropic.claude-sonnet-4-6`. Pre-alias behavior rejected
+    // these outright, breaking the three shipped fork-prefix /
+    // spawn-agent cases. The alias resolver deterministically maps
+    // short names to their unique registered form.
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn alias_exact_match_wins() {
+        let active = names(&[
+            "us.anthropic.claude-sonnet-4-6",
+            "us.anthropic.claude-haiku-4-5-20251001",
+        ]);
+        let hit = resolve_model_alias("us.anthropic.claude-sonnet-4-6", &active).unwrap();
+        assert_eq!(hit, "us.anthropic.claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn alias_short_name_resolves_to_unique_substring_match() {
+        // The primary motivating case: model emits `claude-sonnet`,
+        // registered name is `us.anthropic.claude-sonnet-4-6`. No
+        // other active model contains that substring.
+        let active = names(&[
+            "us.anthropic.claude-sonnet-4-6",
+            "us.anthropic.claude-haiku-4-5-20251001",
+            "MiniMax-M2.7",
+            "qwen3.6-plus",
+        ]);
+        let hit = resolve_model_alias("claude-sonnet", &active).unwrap();
+        assert_eq!(hit, "us.anthropic.claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn alias_short_name_qwen_flash_resolves() {
+        let active = names(&[
+            "qwen-flash",
+            "qwen3.6-plus",
+            "us.anthropic.claude-sonnet-4-6",
+        ]);
+        // Level 1 exact match.
+        let hit = resolve_model_alias("qwen-flash", &active).unwrap();
+        assert_eq!(hit, "qwen-flash");
+    }
+
+    #[test]
+    fn alias_case_insensitive_exact_match() {
+        let active = names(&["MiniMax-M2.7", "qwen-flash"]);
+        // `minimax-m2.7` (lowercased) should resolve to the
+        // mixed-case registered form.
+        let hit = resolve_model_alias("minimax-m2.7", &active).unwrap();
+        assert_eq!(hit, "MiniMax-M2.7");
+    }
+
+    #[test]
+    fn alias_unknown_name_reports_not_found_with_candidates() {
+        let active = names(&["qwen-flash", "MiniMax-M2.7"]);
+        let err = resolve_model_alias("gpt-5", &active).unwrap_err();
+        match err {
+            ModelAliasResolutionError::NotFound {
+                requested,
+                candidates,
+            } => {
+                assert_eq!(requested, "gpt-5");
+                assert!(candidates.contains(&"qwen-flash".into()));
+                assert!(candidates.contains(&"MiniMax-M2.7".into()));
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alias_ambiguous_substring_fails_loudly_not_silently() {
+        // Both `claude-haiku-4-5` and `claude-haiku-4-5-20251001` are
+        // registered. A bare `claude-haiku` matches both — picking
+        // one arbitrarily would be worse than failing, because the
+        // caller's intent is unclear.
+        let active = names(&[
+            "us.anthropic.claude-haiku-4-5",
+            "us.anthropic.claude-haiku-4-5-20251001",
+            "MiniMax-M2.7",
+        ]);
+        let err = resolve_model_alias("claude-haiku", &active).unwrap_err();
+        match err {
+            ModelAliasResolutionError::Ambiguous {
+                requested,
+                candidates,
+            } => {
+                assert_eq!(requested, "claude-haiku");
+                assert_eq!(
+                    candidates.len(),
+                    2,
+                    "expected exactly two ambiguous candidates"
+                );
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alias_empty_string_is_error_not_first_model() {
+        // Guard: an empty preferred-name coming from a caller should
+        // NOT fall through to first-match. The upstream DB query
+        // handles `preferred = None` separately; an explicit empty
+        // string is a bug the caller should see.
+        let active = names(&["qwen-flash", "MiniMax-M2.7"]);
+        assert!(matches!(
+            resolve_model_alias("", &active),
+            Err(ModelAliasResolutionError::Empty)
+        ));
+        assert!(matches!(
+            resolve_model_alias("   ", &active),
+            Err(ModelAliasResolutionError::Empty)
+        ));
+    }
+
+    #[test]
+    fn alias_exact_wins_even_when_substring_would_match_something_else() {
+        // Scenario: registered names `qwen-flash` and `qwen-flash-preview`.
+        // Requested = `qwen-flash`. Must pick exact match, not fail
+        // on substring ambiguity.
+        let active = names(&["qwen-flash", "qwen-flash-preview"]);
+        let hit = resolve_model_alias("qwen-flash", &active).unwrap();
+        assert_eq!(
+            hit, "qwen-flash",
+            "exact match must win over substring ambiguity"
+        );
+    }
 
     // -- rank_cheapest_index --
 
