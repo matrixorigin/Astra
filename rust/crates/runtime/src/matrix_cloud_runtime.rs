@@ -15,7 +15,7 @@ use astra_services::{
     CloudTransport, SyncOrchestrator, SyncPolicy, TaskLeaseHoldCache, TaskRecord,
     event_ingestion::{self, IngestionConfig, IngestionEvent},
     session_journal::JournalEvent,
-    state_sync::{MatrixOneSyncService, PlanTemplateSyncRow},
+    state_sync::{MatrixOneSyncService, PlanTemplateSyncRow, StateSyncService},
 };
 
 use crate::sync_adapters::{
@@ -86,7 +86,7 @@ pub struct MatrixCloudRuntime {
     /// Phase 3: dirty task IDs pending sync, shared with [`TaskAdapter`].
     pub task_dirty: Arc<Mutex<HashSet<String>>>,
     edge_agent_id: Arc<str>,
-    audit_writer: astra_services::state_sync::SyncAuditWriter,
+    sync_service: Arc<MatrixOneSyncService>,
     audit_flusher_shutdown: tokio_util::sync::CancellationToken,
     audit_flusher_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -120,7 +120,7 @@ impl MatrixCloudRuntime {
             audit_flusher.writer.clone(),
         ));
         let transport: Arc<dyn CloudTransport> = Arc::new(MatrixOneTransport::new(
-            sync_svc,
+            sync_svc.clone() as Arc<dyn StateSyncService>,
             profile.to_string(),
             edge_agent_id.as_ref(),
         ));
@@ -172,7 +172,7 @@ impl MatrixCloudRuntime {
             task_mirror,
             task_dirty,
             edge_agent_id,
-            audit_writer: audit_flusher.writer,
+            sync_service: sync_svc,
             audit_flusher_shutdown: audit_flusher.shutdown,
             audit_flusher_handle: Mutex::new(Some(audit_flusher.join_handle)),
         }
@@ -193,8 +193,14 @@ impl MatrixCloudRuntime {
         &self.shared_pool
     }
 
-    pub fn audit_writer(&self) -> &astra_services::state_sync::SyncAuditWriter {
-        &self.audit_writer
+    /// Shared sync service for push operations (checkpoints, session state, context traces).
+    ///
+    /// Callers that spawn background tasks holding an `Arc` clone **must** use
+    /// [`spawn_session_sync_task`] so the runtime can drain them before shutting
+    /// down the audit flusher. Tasks spawned outside that mechanism may lose
+    /// audit entries on shutdown.
+    pub fn sync_service(&self) -> &Arc<MatrixOneSyncService> {
+        &self.sync_service
     }
 
     /// Snapshot of ingestion stats (events received/flushed/errors + overflow).

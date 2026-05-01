@@ -163,12 +163,17 @@ impl SyncAuditWriter {
         match self.tx.try_send(entry) {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(dropped)) => {
-                tracing::warn!(
-                    target: "astra_services::audit",
-                    session_id = %dropped.session_id,
-                    sync_type = %dropped.sync_type,
-                    "sync audit channel full, entry dropped"
-                );
+                static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n.is_power_of_two() || n == 1 {
+                    tracing::warn!(
+                        target: "astra_services::audit",
+                        session_id = %dropped.session_id,
+                        sync_type = %dropped.sync_type,
+                        total_dropped = n,
+                        "sync audit channel full, entry dropped"
+                    );
+                }
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(dropped)) => {
                 tracing::error!(
@@ -783,8 +788,8 @@ impl StateSyncService for LocalOnlySyncService {
 /// - `user_preferences` — user settings
 /// - `session_sync_log` — audit trail (written via async `SyncAuditWriter`)
 pub struct MatrixOneSyncService {
-    pool: sqlx::Pool<sqlx::MySql>,
-    audit: SyncAuditWriter,
+    pub(crate) pool: sqlx::Pool<sqlx::MySql>,
+    pub(crate) audit: SyncAuditWriter,
 }
 
 impl MatrixOneSyncService {
@@ -794,7 +799,7 @@ impl MatrixOneSyncService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn log_sync(
+    pub(crate) fn log_sync(
         &self,
         user_id: &str,
         session_id: &str,

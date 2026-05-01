@@ -24,8 +24,6 @@ use astra_services::session_audit::{
 use astra_services::session_restore::{
     COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND, HybridRestoreService, SessionRestoreService,
     persist_remote_composite_snapshot_index, pull_step_checkpoint_from_cloud,
-    push_checkpoint_to_cloud, push_context_trace_signal_to_cloud, push_session_state_to_cloud,
-    push_step_checkpoint_to_cloud,
 };
 use astra_services::session_workspace::{
     ContextTraceSignal, ContextTraceToolSelection, WorkspaceMetadata, persist_remote_workspace,
@@ -1488,6 +1486,7 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
     let pool = shared.get().clone();
     let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
     let audit = flusher.writer.clone();
+    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
 
     let user_id = Uuid::new_v4().to_string();
     let session_a = Uuid::new_v4().to_string();
@@ -1530,8 +1529,7 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
     .await
     .expect("insert existing session A");
 
-    push_session_state_to_cloud(
-        &pool,
+    svc.push_session_state(
         &session_a,
         &user_id,
         Some(&plan_a_json),
@@ -1540,12 +1538,10 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
         3,
         Some("feature/cloud-sync"),
         Some("gpt-5.4"),
-        &audit,
     )
     .await
     .expect("push session state A");
-    push_session_state_to_cloud(
-        &pool,
+    svc.push_session_state(
         &session_b,
         &user_id,
         Some(&plan_b_json),
@@ -1554,12 +1550,10 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
         2,
         Some("legacy-fallback"),
         None,
-        &audit,
     )
     .await
     .expect("push session state B");
-    push_session_state_to_cloud(
-        &pool,
+    svc.push_session_state(
         &session_a,
         &user_id,
         None,
@@ -1568,7 +1562,6 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
         0,
         Some("feature/cloud-sync"),
         Some("gpt-5.4"),
-        &audit,
     )
     .await
     .expect("clear session state A plan fields");
@@ -1729,10 +1722,10 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
         explanations: vec!["trace-b".into()],
     };
 
-    push_context_trace_signal_to_cloud(&pool, &session_a, &user_id, &trace_a, &audit)
+    svc.push_context_trace_signal(&session_a, &user_id, &trace_a)
         .await
         .expect("push trace A");
-    push_context_trace_signal_to_cloud(&pool, &session_b, &user_id, &trace_b, &audit)
+    svc.push_context_trace_signal(&session_b, &user_id, &trace_b)
         .await
         .expect("push trace B");
 
@@ -1898,14 +1891,14 @@ async fn session_sync_log_async_audit_flusher_writes_per_type_on_live_matrixone(
     let pool = shared.get().clone();
     let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
     let audit = flusher.writer.clone();
+    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
 
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
 
     cleanup_restore_fixture(&pool, &user_id, std::slice::from_ref(&session_id)).await;
 
-    push_session_state_to_cloud(
-        &pool,
+    svc.push_session_state(
         &session_id,
         &user_id,
         None,
@@ -1914,12 +1907,10 @@ async fn session_sync_log_async_audit_flusher_writes_per_type_on_live_matrixone(
         0,
         Some("feature/prune"),
         Some("gpt-5.4"),
-        &audit,
     )
     .await
     .expect("push session state");
-    push_checkpoint_to_cloud(
-        &pool,
+    svc.push_checkpoint(
         &session_id,
         &user_id,
         &astra_services::session_checkpoint::Checkpoint {
@@ -1933,13 +1924,12 @@ async fn session_sync_log_async_audit_flusher_writes_per_type_on_live_matrixone(
             error_count: 0,
             contract_state_json: None,
         },
-        &audit,
     )
     .await
     .expect("push checkpoint");
 
     // Bulk-seed 199 rows directly into `session_sync_log` (matching the
-    // schema that `push_context_trace_signal_to_cloud` would write).
+    // schema that `push_context_trace_signal` would write).
     // The final 6 pushes go through the production API so the async audit
     // flusher batches and writes audit entries alongside the seeded rows.
     let seed_count = 199_i64;
@@ -1984,7 +1974,7 @@ async fn session_sync_log_async_audit_flusher_writes_per_type_on_live_matrixone(
             timing: None,
             explanations: vec![format!("trace-{idx}")],
         };
-        push_context_trace_signal_to_cloud(&pool, &session_id, &user_id, &trace, &audit)
+        svc.push_context_trace_signal(&session_id, &user_id, &trace)
             .await
             .expect("push context trace");
     }
@@ -2037,7 +2027,7 @@ async fn session_sync_log_async_audit_flusher_writes_per_type_on_live_matrixone(
 
     assert_eq!(session_state_count, 1, "1 push_session_state = 1 audit row");
     assert_eq!(checkpoint_count, 1, "1 push_checkpoint = 1 audit row");
-    // 199 bulk-seeded + 6 from push_context_trace_signal_to_cloud
+    // 199 bulk-seeded + 6 from push_context_trace_signal
     assert_eq!(
         context_trace_count, 205,
         "199 seeded + 6 pushed = 205 context_trace audit rows"
@@ -2148,7 +2138,7 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
     let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
-    let audit = flusher.writer.clone();
+    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
 
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
@@ -2163,8 +2153,7 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
         "fixture should prove remote composite snapshot restore without local composite_snapshots.json"
     );
 
-    push_session_state_to_cloud(
-        &pool,
+    svc.push_session_state(
         &session_id,
         &user_id,
         None,
@@ -2173,12 +2162,10 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
         0,
         Some("feature/remote-composite"),
         Some("gpt-5.4"),
-        &audit,
     )
     .await
     .expect("push session state");
-    push_checkpoint_to_cloud(
-        &pool,
+    svc.push_checkpoint(
         &session_id,
         &user_id,
         &astra_services::session_checkpoint::Checkpoint {
@@ -2192,7 +2179,6 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
             error_count: 0,
             contract_state_json: Some(r#"{"mode":"remote-composite"}"#.into()),
         },
-        &audit,
     )
     .await
     .expect("push checkpoint");
@@ -2302,15 +2288,14 @@ async fn restore_recent_tools_falls_back_to_legacy_turn_complete_metadata_on_liv
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
     let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
-    let audit = flusher.writer.clone();
+    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
 
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
 
     cleanup_restore_fixture(&pool, &user_id, std::slice::from_ref(&session_id)).await;
 
-    push_session_state_to_cloud(
-        &pool,
+    svc.push_session_state(
         &session_id,
         &user_id,
         None,
@@ -2319,7 +2304,6 @@ async fn restore_recent_tools_falls_back_to_legacy_turn_complete_metadata_on_liv
         0,
         Some("feature/legacy-tools"),
         Some("gpt-5.4"),
-        &audit,
     )
     .await
     .expect("push session state");
@@ -2391,6 +2375,7 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
     let pool = shared.get().clone();
     let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
     let audit = flusher.writer.clone();
+    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
 
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
@@ -2416,7 +2401,7 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
         explanations: vec!["missing row".into()],
     };
 
-    push_context_trace_signal_to_cloud(&pool, &session_id, &user_id, &trace, &audit)
+    svc.push_context_trace_signal(&session_id, &user_id, &trace)
         .await
         .expect("push context trace");
 
@@ -2488,6 +2473,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
     let pool = shared.get().clone();
     let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
     let audit = flusher.writer.clone();
+    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
 
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
@@ -2611,8 +2597,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
     .await
     .expect("insert legacy-heavy user_query");
 
-    push_checkpoint_to_cloud(
-        &pool,
+    svc.push_checkpoint(
         &session_id,
         &user_id,
         &astra_services::session_checkpoint::Checkpoint {
@@ -2626,13 +2611,11 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             error_count: 0,
             contract_state_json: None,
         },
-        &audit,
     )
     .await
     .expect("push ordinary checkpoint");
 
-    push_step_checkpoint_to_cloud(
-        &pool,
+    svc.push_step_checkpoint(
         &session_id,
         &user_id,
         1,
@@ -2648,7 +2631,6 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             serde_json::json!({"kind":"rate_limited","resumable":true}),
             serde_json::json!({"attempt_count":1,"cumulative_tokens_freed":50,"last_was_insufficient":false}),
         ),
-        &audit,
     )
     .await
     .expect("push first step checkpoint");
@@ -2660,8 +2642,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             "side_effect": "execute"
         }, true]]
     });
-    push_step_checkpoint_to_cloud(
-        &pool,
+    svc.push_step_checkpoint(
         &session_id,
         &user_id,
         1,
@@ -2682,12 +2663,10 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             serde_json::json!({"kind":"rate_limited","resumable":true}),
             serde_json::json!({"attempt_count":2,"cumulative_tokens_freed":120,"last_was_insufficient":false}),
         ),
-        &audit,
     )
     .await
     .expect("update step checkpoint");
-    push_step_checkpoint_to_cloud(
-        &pool,
+    svc.push_step_checkpoint(
         &heavy_only_session,
         &user_id,
         1,
@@ -2706,7 +2685,6 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             serde_json::json!({"kind":"context_window","resumable":true}),
             serde_json::json!({"attempt_count":1,"cumulative_tokens_freed":80,"last_was_insufficient":true}),
         ),
-        &audit,
     )
     .await
     .expect("push heavy-only step checkpoint");
@@ -2722,8 +2700,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             true
         ]]
     });
-    push_step_checkpoint_to_cloud(
-        &pool,
+    svc.push_step_checkpoint(
         &legacy_heavy_session,
         &user_id,
         1,
@@ -2742,7 +2719,6 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             serde_json::json!({"kind":"legacy_resume","resumable":true}),
             serde_json::json!({"attempt_count":3,"cumulative_tokens_freed":64,"last_was_insufficient":false}),
         ),
-        &audit,
     )
     .await
     .expect("push legacy heavy step checkpoint");

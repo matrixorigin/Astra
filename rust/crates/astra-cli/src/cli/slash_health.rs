@@ -151,11 +151,9 @@ pub(super) async fn handle_health_command(arg: &str, state: &ReplState) {
             eprintln!("  {}", "Set MATRIXONE_HOST to enable cloud sync.".dim());
         }
         Some(mc) => {
-            let svc = astra_services::state_sync::MatrixOneSyncService::new(
-                mc.shared_pool().get().clone(),
-                mc.audit_writer().clone(),
-            );
-            let sync_status = astra_services::state_sync::StateSyncService::status(&svc).await;
+            let sync_status =
+                astra_services::state_sync::StateSyncService::status(mc.sync_service().as_ref())
+                    .await;
             display_sync_status(&sync_status);
         }
     }

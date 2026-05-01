@@ -1117,19 +1117,16 @@ fn commit_turn_journal_workspace_and_sidecars(
                 // Push checkpoint to MatrixOne for cross-device availability
                 if let Some(ref mc) = state.matrix_runtime {
                     let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
-                    let pool = mc.shared_pool().get().clone();
-                    let audit = mc.audit_writer().clone();
+                    let svc = std::sync::Arc::clone(mc.sync_service());
                     let sid_owned = sid.to_string();
                     let user_id_owned = user_id.to_string();
                     let cp_clone = cp.clone();
                     let cp_number = cp.number;
                     mc.spawn_session_sync_task(async move {
-                        if let Err(e) = astra_services::session_restore::push_checkpoint_to_cloud(
-                            &pool,
+                        if let Err(e) = svc.push_checkpoint(
                             &sid_owned,
                             &user_id_owned,
                             &cp_clone,
-                            &audit,
                         )
                         .await
                         {
@@ -1157,8 +1154,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                 && let Ok(state_json) = serde_json::to_string(step_cp)
             {
                 let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
-                let pool = mc.shared_pool().get().clone();
-                let audit = mc.audit_writer().clone();
+                let svc = std::sync::Arc::clone(mc.sync_service());
                 let sid_owned = sid.to_string();
                 let user_id_owned = user_id.to_string();
                 let cp_number = result
@@ -1185,8 +1181,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                     }
                 };
                 mc.spawn_session_sync_task(async move {
-                    if let Err(e) = astra_services::session_restore::push_step_checkpoint_to_cloud(
-                        &pool,
+                    if let Err(e) = svc.push_step_checkpoint(
                         &sid_owned,
                         &user_id_owned,
                         cp_number,
@@ -1195,7 +1190,6 @@ fn commit_turn_journal_workspace_and_sidecars(
                         &title,
                         &tools_json,
                         &state_json,
-                        &audit,
                     )
                     .await
                     {
@@ -1211,21 +1205,17 @@ fn commit_turn_journal_workspace_and_sidecars(
                 && let Some(ref trace_signal) = ws.last_context_trace
             {
                 let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
-                let pool = mc.shared_pool().get().clone();
-                let audit = mc.audit_writer().clone();
+                let svc = std::sync::Arc::clone(mc.sync_service());
                 let sid_owned = sid.to_string();
                 let user_id_owned = user_id.to_string();
                 let trace_signal = trace_signal.clone();
                 mc.spawn_session_sync_task(async move {
-                    if let Err(e) =
-                        astra_services::session_restore::push_context_trace_signal_to_cloud(
-                            &pool,
-                            &sid_owned,
-                            &user_id_owned,
-                            &trace_signal,
-                            &audit,
-                        )
-                        .await
+                    if let Err(e) = svc.push_context_trace_signal(
+                        &sid_owned,
+                        &user_id_owned,
+                        &trace_signal,
+                    )
+                    .await
                     {
                         astra_core::agent_warn!(
                             "context_trace_sync",
@@ -1242,8 +1232,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                     astra_services::session_checkpoint::CHECKPOINT_INTERVAL,
                 )
             {
-                let pool = mc.shared_pool().get().clone();
-                let audit = mc.audit_writer().clone();
+                let svc = std::sync::Arc::clone(mc.sync_service());
                 let sid_owned = sid.to_string();
                 let user_id = state
                     .ingestion_user_id
@@ -1261,19 +1250,18 @@ fn commit_turn_journal_workspace_and_sidecars(
                     Some(ws.model.clone())
                 };
                 mc.spawn_session_sync_task(async move {
-                    if let Err(e) = astra_services::session_restore::push_session_state_to_cloud(
-                        &pool,
-                        &sid_owned,
-                        &user_id,
-                        plan_json.as_deref(),
-                        goal.as_deref(),
-                        config.as_deref(),
-                        rounds,
-                        git_branch.as_deref(),
-                        model.as_deref(),
-                        &audit,
-                    )
-                    .await
+                    if let Err(e) = svc
+                        .push_session_state(
+                            &sid_owned,
+                            &user_id,
+                            plan_json.as_deref(),
+                            goal.as_deref(),
+                            config.as_deref(),
+                            rounds,
+                            git_branch.as_deref(),
+                            model.as_deref(),
+                        )
+                        .await
                     {
                         astra_core::agent_warn!(
                             "session_state_sync",
@@ -2864,41 +2852,34 @@ fn spawn_manual_checkpoint_cloud_uploads(
         .unwrap_or("anonymous")
         .to_string();
     let user_id_step = user_id.clone();
-    let pool = mc.shared_pool().get().clone();
-    let audit = mc.audit_writer().clone();
-    let audit2 = audit.clone();
+    let svc = std::sync::Arc::clone(mc.sync_service());
+    let svc2 = std::sync::Arc::clone(&svc);
     let sid_owned = sid.to_string();
     let cp_clone = session_cp.clone();
     mc.spawn_session_sync_task(async move {
-        if let Err(e) = astra_services::session_restore::push_checkpoint_to_cloud(
-            &pool, &sid_owned, &user_id, &cp_clone, &audit,
-        )
-        .await
-        {
+        if let Err(e) = svc.push_checkpoint(&sid_owned, &user_id, &cp_clone).await {
             astra_core::agent_warn!("checkpoint", "cloud push session checkpoint: {e}");
         }
     });
 
-    let pool2 = mc.shared_pool().get().clone();
     let sid_step = sid.to_string();
     let title_owned = title.to_string();
     let state_json = serde_json::to_string(step_cp).unwrap_or_default();
     let tools_json =
         serde_json::to_string(&state.recent_tools).unwrap_or_else(|_| "[]".to_string());
     mc.spawn_session_sync_task(async move {
-        if let Err(e) = astra_services::session_restore::push_step_checkpoint_to_cloud(
-            &pool2,
-            &sid_step,
-            &user_id_step,
-            next_step,
-            turn,
-            "heavy",
-            &title_owned,
-            &tools_json,
-            &state_json,
-            &audit2,
-        )
-        .await
+        if let Err(e) = svc2
+            .push_step_checkpoint(
+                &sid_step,
+                &user_id_step,
+                next_step,
+                turn,
+                "heavy",
+                &title_owned,
+                &tools_json,
+                &state_json,
+            )
+            .await
         {
             astra_core::agent_warn!("checkpoint", "cloud push step checkpoint: {e}");
         }
