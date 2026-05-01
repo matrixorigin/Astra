@@ -682,6 +682,28 @@ mod tests {
     }
 
     #[test]
+    fn all_variants_is_exhaustive() {
+        // `as_str` has an exhaustive `match` that won't compile if a variant
+        // is missing, but `ALL_VARIANTS` is a hand-maintained array. This
+        // test detects drift: every serde round-trip tag must map back to
+        // a variant that's in the array.
+        let tags: std::collections::HashSet<&str> =
+            ALL_VARIANTS.iter().map(|k| k.as_str()).collect();
+        // If ALL_VARIANTS misses a variant, as_str() has more arms than
+        // the set has entries → this assert fires.
+        assert_eq!(
+            tags.len(),
+            ALL_VARIANTS.len(),
+            "ALL_VARIANTS has duplicates or drift"
+        );
+        // Reverse: every tag must parse back to a variant in the array.
+        for &kind in ALL_VARIANTS {
+            let rt = ErrorKind::parse_tag(kind.as_str());
+            assert_eq!(rt, Some(kind), "parse_tag roundtrip failed for {kind:?}");
+        }
+    }
+
+    #[test]
     fn guidance_non_empty() {
         for &kind in ALL_VARIANTS {
             assert!(!kind.guidance().is_empty(), "empty guidance for {kind:?}");

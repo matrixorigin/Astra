@@ -147,6 +147,9 @@ pub const DEFAULT_LESSON_CONFIDENCE: f64 = 0.6;
 pub const MAX_TRIGGER_SIGNAL_LEN: usize = 255;
 /// Max `action` length.
 pub const MAX_ACTION_LEN: usize = 1024;
+/// Maximum active lessons kept per user after prune. Prevents unbounded
+/// growth from `trigger_signal` text variation ("3 failures" vs "5 failures").
+pub const MAX_LESSONS_PER_USER: u32 = 100;
 
 impl NewLesson {
     /// Reject payloads that would violate the schema or carry nonsensical
@@ -400,7 +403,27 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         .bind(i64::from(max_age_days))
         .execute(&pool)
         .await?;
-        Ok(retired.rows_affected() + stale.rows_affected())
+
+        // Row ceiling: keep at most MAX_LESSONS_PER_USER active rows per
+        // user to prevent unbounded growth from trigger_signal text
+        // variation. Deletes the oldest active rows first.
+        let overflow = query(
+            "DELETE FROM agent_lessons \
+             WHERE user_id = ? AND status = 'active' AND id NOT IN ( \
+               SELECT id FROM ( \
+                 SELECT id FROM agent_lessons \
+                 WHERE user_id = ? AND status = 'active' \
+                 ORDER BY updated_at DESC LIMIT ? \
+               ) AS keep \
+             )",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(i64::from(MAX_LESSONS_PER_USER))
+        .execute(&pool)
+        .await?;
+
+        Ok(retired.rows_affected() + stale.rows_affected() + overflow.rows_affected())
     }
 
     async fn record_exposure(&self, exposure: LessonExposure) -> Result<(), sqlx::Error> {
@@ -597,7 +620,7 @@ pub const AGENT_LESSONS_DDL: &str = "CREATE TABLE IF NOT EXISTS agent_lessons (
     workload_key VARCHAR(64) NOT NULL DEFAULT '',
     kind VARCHAR(32) NOT NULL,
     trigger_signal VARCHAR(255) NOT NULL,
-    action TEXT NOT NULL,
+    action VARCHAR(1024) NOT NULL,
     confidence DOUBLE NOT NULL DEFAULT 0.6,
     hit_count BIGINT NOT NULL DEFAULT 0,
     status VARCHAR(16) NOT NULL DEFAULT 'active',
@@ -728,7 +751,7 @@ mod tests {
             "workload_tag VARCHAR(64) NULL",
             "kind VARCHAR(32) NOT NULL",
             "trigger_signal VARCHAR(255) NOT NULL",
-            "action TEXT NOT NULL",
+            "action VARCHAR(1024) NOT NULL",
             "confidence DOUBLE",
             "hit_count BIGINT",
             "status VARCHAR(16)",

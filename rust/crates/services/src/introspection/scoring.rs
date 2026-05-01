@@ -701,14 +701,40 @@ pub fn compute_drift(
     (drift, level, signals)
 }
 
-/// Lowercase + alphanumeric token segmentation. Deliberately simple; enough
-/// for Jaccard on short prompt previews without pulling in a stemmer.
+/// Tokenise a short text for Jaccard comparison. Two strategies:
+///
+/// 1. **Latin / space-separated**: split on non-alphanumeric, keep tokens
+///    with ≥2 chars. Standard word tokenisation.
+/// 2. **CJK**: characters in the CJK Unified Ideographs range
+///    (U+4E00..=U+9FFF) are additionally segmented into character bigrams
+///    so "列出所有文件" → {"列出", "出所", "所有", "有文", "文件"}.
+///    Without this, a spaceless Chinese sentence is a single token and any
+///    partial overlap collapses to 0% or 100%.
+///
+/// Both strategies run simultaneously; results merge into one set.
 fn tokenise(s: &str) -> std::collections::HashSet<String> {
-    s.to_lowercase()
+    let lower = s.to_lowercase();
+    let mut tokens: std::collections::HashSet<String> = lower
         .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.len() >= 2)
+        .filter(|t| t.chars().count() >= 2)
         .map(str::to_string)
-        .collect()
+        .collect();
+
+    // CJK bigrams: slide a 2-character window over CJK runs.
+    let chars: Vec<char> = lower.chars().collect();
+    for window in chars.windows(2) {
+        if is_cjk(window[0]) && is_cjk(window[1]) {
+            tokens.insert(format!("{}{}", window[0], window[1]));
+        }
+    }
+
+    tokens
+}
+
+fn is_cjk(c: char) -> bool {
+    ('\u{4E00}'..='\u{9FFF}').contains(&c)
+        || ('\u{3400}'..='\u{4DBF}').contains(&c) // Extension A
+        || ('\u{F900}'..='\u{FAFF}').contains(&c) // Compatibility
 }
 
 #[cfg(test)]
@@ -988,6 +1014,52 @@ mod tests {
         let (score, level, _) = compute_drift("alpha beta gamma", "alpha delta epsilon");
         assert!(score >= 0.8);
         assert_eq!(level, "high");
+    }
+
+    #[test]
+    fn compute_drift_chinese_partial_overlap() {
+        // CJK text has no spaces — the tokeniser must produce meaningful
+        // sub-tokens so two partially-overlapping Chinese sentences don't
+        // collapse to 0.0 or 1.0 drift.
+        let (score, level, _) = compute_drift("列出所有 Rust 文件", "列出所有 Python 文件");
+        assert!(
+            (0.01..0.99).contains(&score),
+            "Chinese partial overlap must produce intermediate drift, got {score}"
+        );
+        assert_ne!(level, "aligned");
+        assert_ne!(level, "high");
+    }
+
+    #[test]
+    fn compute_drift_chinese_identical() {
+        let (score, level, _) = compute_drift("分析这个项目的结构", "分析这个项目的结构");
+        assert!(
+            score < 0.01,
+            "identical Chinese must be aligned, got {score}"
+        );
+        assert_eq!(level, "aligned");
+    }
+
+    #[test]
+    fn compute_drift_chinese_unrelated() {
+        let (score, _, _) = compute_drift("列出所有文件", "部署到生产环境");
+        assert!(
+            score > 0.5,
+            "unrelated Chinese must have high drift, got {score}"
+        );
+    }
+
+    #[test]
+    fn compute_drift_pure_cjk_partial_overlap() {
+        // Pure CJK without spaces — the tokeniser must still produce
+        // meaningful sub-tokens. "列出所有文件" and "列出测试文件" share
+        // "列出" and "文件" but differ in "所有" vs "测试".
+        let (score, level, _) = compute_drift("列出所有文件", "列出测试文件");
+        assert!(
+            (0.01..0.99).contains(&score),
+            "pure CJK partial overlap must have intermediate drift, got {score}"
+        );
+        assert_ne!(level, "aligned");
     }
 
     #[test]
