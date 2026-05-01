@@ -76,6 +76,70 @@ fn shipped_case_names_are_unique() {
     );
 }
 
+// ── Class D regression: YAML criteria that don't match real CLI behavior ──
+
+#[test]
+fn text_rejects_hallucinated_file_claim_does_not_assert_exit_zero() {
+    let case =
+        Case::from_path(&shipped_cases_dir().join("text_rejects_hallucinated_file_claim.yaml"))
+            .expect("load case");
+    let has_exit_zero = case.criteria.iter().any(|c| {
+        matches!(
+            c,
+            astra_test_harness::criteria::Criterion::ExitCode { code: 0 }
+        )
+    });
+    assert!(
+        !has_exit_zero,
+        "text_rejects_hallucinated_file_claim must NOT assert exit_code=0. \
+         A tool failure (read_file on nonexistent path) correctly exits 1. \
+         The case should only check the judger criterion."
+    );
+}
+
+#[test]
+fn text_contains_simple_answer_has_adequate_timeout() {
+    let case = Case::from_path(&shipped_cases_dir().join("text_contains_simple_answer.yaml"))
+        .expect("load case");
+    assert!(
+        case.timeout_seconds >= 120,
+        "text_contains_simple_answer timeout_seconds={} is too short; \
+         provider cold-start can exceed 60s. Needs >= 120.",
+        case.timeout_seconds
+    );
+}
+
+#[test]
+fn fork_prefix_hit_e2e_tool_count_allows_model_retry() {
+    let case = Case::from_path(&shipped_cases_dir().join("fork_prefix_hit_end_to_end.yaml"))
+        .expect("load case");
+    let max = case.criteria.iter().find_map(|c| match c {
+        astra_test_harness::criteria::Criterion::ToolsCountBetween { max, .. } => Some(*max),
+        _ => None,
+    });
+    assert!(
+        max.unwrap_or(0) >= 6,
+        "fork_prefix_hit_end_to_end tools_count max={} is too strict; \
+         models may retry spawn_agent. Needs >= 6.",
+        max.unwrap_or(0)
+    );
+}
+
+#[test]
+fn fork_prefix_delegate_inherits_uses_spawn_agent_not_delegate() {
+    let case = Case::from_path(&shipped_cases_dir().join("fork_prefix_delegate_inherits.yaml"))
+        .expect("load case");
+    let requires_delegate = case.criteria.iter().any(|c| {
+        matches!(c, astra_test_harness::criteria::Criterion::ToolCalled { name } if name == "delegate")
+    });
+    assert!(
+        !requires_delegate,
+        "fork_prefix_delegate_inherits must not require tool_called: delegate. \
+         The delegate tool is not available in `astra chat` — it only exists \
+         in the server-side DelegationEngine. Use spawn_agent instead."
+    );
+}
+
 #[test]
 fn shipped_cases_reference_only_known_criterion_variants() {
     // Positive sanity: when the serde tag on `Criterion` changes

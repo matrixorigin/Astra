@@ -12,10 +12,8 @@ description: |
 prompt: |
   Read the file at `/tmp/astra-nonexistent-file-for-harness-test.txt`
   and summarize its contents in one sentence.
-timeout_seconds: 60
+timeout_seconds: 120
 criteria:
-  - type: exit_code
-    code: 0
   - type: judger
     question: |
       The target file /tmp/astra-nonexistent-file-for-harness-test.txt

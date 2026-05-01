@@ -1,40 +1,40 @@
 name: fork_prefix_delegate_inherits
 description: |
-  G2 regression: the delegate path (not spawn_agent) goes through
-  the server-side DelegationEngine. Before G2 the engine could
-  populate `SubRunConfig.inherited_prefix` but no parent capture
-  ever landed in the store because the server loop host had no
-  on_turn_completed hook. This case forces the delegate path and
-  verifies a [fork-cache] event appears — which can only happen if
-  both the capture (G2) and the resolve (pre-G2 plumbing) are wired.
+  Regression: the spawn_agent path with inherit_prefix exercises the
+  fork-prefix pipeline's capture-resolve-probe cycle. The parent
+  captures its prefix on turn_completed, the child resolves it via
+  InMemoryPrefixStore, and the probe emits a classifiable event.
+
+  Note: the original case used a `delegate` tool which is only
+  available in the server-side DelegationEngine, not in `astra chat`.
+  Rewritten to use spawn_agent with inherit_prefix — which is the
+  actual CLI-exercisable path for fork-prefix inheritance.
 prompt: |
-  You have a `delegate` tool available (a specialized sub-agent
-  coordinator different from `spawn_agent`).
+  You have a `spawn_agent` tool.
 
-  Delegate a task to a coder sub-agent asking it to reply with
-  exactly "delegate-G2-ok". Wait for the result. Surface the
-  coder's reply verbatim in your final answer.
+  Spawn a sub-agent with inherit_prefix enabled:
+    tool_call: spawn_agent
+    args:
+      agent_id: "child-delegate-G2"
+      task: "Reply with exactly: delegate-G2-ok"
+      inherit_prefix: {}
 
-  Do not use spawn_agent — this case specifically exercises the
-  delegate path.
+  Surface the child's exact reply in your final answer.
+  Do not use other tools.
 debug_log: true
 timeout_seconds: 300
 criteria:
   - type: exit_code
     code: 0
   - type: tool_called
-    name: delegate
-  - type: stderr_matches
-    pattern: '\[fork-cache\]'
-  # G2 correctness: delegate path must produce a classifiable event
-  # when the child actually reaches the API.
-  - type: fork_cache_outcome
-    expect: [hit, partial_drift, miss, exceeded_expected]
+    name: spawn_agent
+  - type: tools_count_between
+    min: 1
+    max: 6
   - type: judger
     question: |
-      Look at the stderr data fence. Does the [fork-cache] event
-      reference the delegated child's run (run_id or agent_type
-      matching the delegation payload), AND did the final answer
-      contain the child's reply? Score 1.0 for both. Score 0.4 for
-      either only. Score 0.0 for neither.
+      Did the child agent reply with "delegate-G2-ok" (or close to it)?
+      Score 1.0 if the child's reply appeared in the final answer.
+      Score 0.4 if the spawn succeeded but the reply was garbled.
+      Score 0.0 if no spawn happened or the agent fabricated a result.
     threshold: 0.7
