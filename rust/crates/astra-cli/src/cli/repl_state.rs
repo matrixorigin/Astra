@@ -280,6 +280,9 @@ pub(crate) struct ReplState {
     /// Passed through to every turn's ToolExecutor so the LLM sees prior
     /// session's advice on every SelfModel snapshot.
     pub session_lessons: Vec<astra_runtime::self_model::LessonHint>,
+    /// Set after the first bootstrap attempt regardless of result count.
+    /// Prevents per-turn DB calls for new users with zero lessons.
+    pub session_lessons_loaded: bool,
 
     /// P8: persistent auto-invoke handler. Owns the per-cause cooldowns
     /// across turns of this session. Created lazily on first turn so
@@ -465,6 +468,7 @@ impl Default for ReplState {
             drift_user_corrections: Vec::new(),
             drift_original_query: None,
             session_lessons: Vec::new(),
+            session_lessons_loaded: false,
             auto_invoke_handler: None,
             latest_skill_diagnosis: None,
             diagnosis_outcome_tracker:

@@ -41,11 +41,16 @@ pub trait SkillExecutor: Send + Sync {
     async fn run(&self, req: &AutoInvokeRequest) -> Option<String>;
 }
 
+/// Maximum diagnostic skill invocations per session. Prevents runaway
+/// auto-invoke in multi-hour sessions with persistent stalls.
+pub const MAX_FIRES_PER_SESSION: u32 = 10;
+
 /// Glue layer around [`AutoInvokeGate`]. Owns the gate's mutable
 /// cooldown state; callers keep one handler per session.
 pub struct AutoInvokeHandler {
     gate: AutoInvokeGate,
     executor: Arc<dyn SkillExecutor>,
+    fires_this_session: u32,
 }
 
 impl AutoInvokeHandler {
@@ -54,6 +59,7 @@ impl AutoInvokeHandler {
         Self {
             gate: AutoInvokeGate::new(),
             executor,
+            fires_this_session: 0,
         }
     }
 
@@ -68,6 +74,9 @@ impl AutoInvokeHandler {
         signals: &SessionSignals,
         now: Instant,
     ) -> Vec<SkillDiagnosis> {
+        if self.fires_this_session >= MAX_FIRES_PER_SESSION {
+            return Vec::new();
+        }
         let requests = self.gate.evaluate(signals, now);
         if requests.is_empty() {
             return Vec::new();
@@ -75,6 +84,9 @@ impl AutoInvokeHandler {
 
         let mut out = Vec::with_capacity(requests.len());
         for req in &requests {
+            if self.fires_this_session >= MAX_FIRES_PER_SESSION {
+                break;
+            }
             let Some(reply) = self.executor.run(req).await else {
                 tracing::debug!(
                     target: "auto_invoke_handler",
@@ -84,7 +96,10 @@ impl AutoInvokeHandler {
                 continue;
             };
             match SkillDiagnosis::parse_from_skill_output(&reply) {
-                Some(diag) => out.push(diag),
+                Some(diag) => {
+                    self.fires_this_session += 1;
+                    out.push(diag);
+                }
                 None => {
                     tracing::warn!(
                         target: "auto_invoke_handler",

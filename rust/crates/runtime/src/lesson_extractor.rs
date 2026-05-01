@@ -511,8 +511,8 @@ mod tests {
         let out = extract_lessons(&s, "u", "p", None);
         assert_eq!(out.len(), 1);
         assert!(
-            out[0].trigger_signal.chars().count() <= 255,
-            "trigger_signal must stay within DAO's MAX_TRIGGER_SIGNAL_LEN"
+            out[0].trigger_signal.len() <= 255,
+            "trigger_signal byte length must stay within DAO's MAX_TRIGGER_SIGNAL_LEN"
         );
     }
 

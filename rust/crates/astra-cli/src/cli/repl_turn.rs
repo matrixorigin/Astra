@@ -539,7 +539,7 @@ fn contains_any_token(haystack: &str, tokens: &[&str]) -> bool {
 /// the cache is empty AND the session has a populated lesson source. Kept
 /// pure so a unit test can pin the trigger condition.
 fn should_bootstrap_lessons(state: &ReplState) -> bool {
-    state.session_lessons.is_empty()
+    !state.session_lessons_loaded
         && state.matrix_runtime.is_some()
         && state.ingestion_user_id.is_some()
 }
@@ -851,17 +851,20 @@ async fn run_chat_turn(
         && let Some(ref mc) = state.matrix_runtime
         && let Some(ref user_id) = state.ingestion_user_id
     {
+        state.session_lessons_loaded = true;
         let svc = mc.agent_lessons_service();
-        match svc
-            .load_recent(
+        let load_result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            svc.load_recent(
                 user_id,
                 "generic",
                 None,
                 astra_runtime::lesson_bootstrap::DEFAULT_SESSION_BOOTSTRAP_LIMIT,
-            )
-            .await
-        {
-            Ok(rows) => {
+            ),
+        )
+        .await;
+        match load_result {
+            Ok(Ok(rows)) => {
                 if let Some(session_id) = state.session_id.as_deref() {
                     for lesson in &rows {
                         if let Err(e) = svc
@@ -890,10 +893,14 @@ async fn run_chat_turn(
                     .map(astra_runtime::self_model::LessonHint::from_lesson)
                     .collect();
             }
-            Err(e) => tracing::warn!(
+            Ok(Err(e)) => tracing::warn!(
                 target: "repl_turn",
                 error = %e,
                 "agent_lessons::load_recent failed; starting without carried-over lessons",
+            ),
+            Err(_elapsed) => tracing::warn!(
+                target: "repl_turn",
+                "agent_lessons::load_recent timed out after 3s; starting without lessons",
             ),
         }
     }
@@ -1067,16 +1074,23 @@ async fn maybe_run_auto_invoke(state: &mut ReplState) {
         .maybe_fire(&signals, std::time::Instant::now())
         .await;
 
-    // Use the first diagnosis. Activate it in the tracker so its
-    // success_criteria are evaluated on subsequent turns.
-    if let Some(diag) = diagnoses.into_iter().next() {
+    // Activate ALL returned diagnoses in the tracker so their
+    // success_criteria are evaluated on subsequent turns, even if we
+    // only render the first in the prompt.
+    for diag in &diagnoses {
         state
             .diagnosis_outcome_tracker
             .activate(diag.clone(), signals, state.turn);
-        state.latest_skill_diagnosis = Some(diag);
-    } else {
-        state.latest_skill_diagnosis = None;
     }
+    // Render the first diagnosis in the prompt. If the handler returned
+    // nothing (cooldown), keep the previous diagnosis visible so the LLM
+    // sees what it's being measured against while the tracker evaluates.
+    if let Some(diag) = diagnoses.into_iter().next() {
+        state.latest_skill_diagnosis = Some(diag);
+    }
+    // Don't clear latest_skill_diagnosis on cooldown — the tracker is
+    // still evaluating. It gets cleared in the zero-signals fast path
+    // above, or when a new diagnosis replaces it.
 }
 
 /// Build a compact tool-call summary for cross-turn context continuity.
@@ -6158,22 +6172,15 @@ mod tests {
     }
 
     #[test]
-    fn should_bootstrap_lessons_skips_when_already_cached() {
-        // Simulate a successful prior bootstrap by populating the cache.
-        // We don't actually need a live matrix_runtime for this assertion —
-        // the gate checks session_lessons first.
+    fn should_bootstrap_lessons_skips_when_already_loaded() {
+        // Once the flag is set (after first attempt), bootstrap must not
+        // re-fire even if the lesson cache is empty (new user, zero rows).
         let mut state = ReplState::default();
-        state.session_lessons = vec![astra_runtime::self_model::LessonHint {
-            kind: "tool_deprioritize".into(),
-            trigger_signal: "t".into(),
-            action: "a".into(),
-            workload_tag: None,
-        }];
+        state.session_lessons_loaded = true;
         state.ingestion_user_id = Some("u1".into());
-        // matrix_runtime still None, but cache non-empty should be enough.
         assert!(
             !should_bootstrap_lessons(&state),
-            "non-empty cache must skip re-bootstrap"
+            "loaded flag must prevent re-bootstrap regardless of cache contents"
         );
     }
 
@@ -6278,13 +6285,12 @@ mod tests {
         assert!(first_diag.is_some(), "first turn must fire");
 
         // Second call: signals unchanged, but cooldown should block.
-        // (maybe_run_auto_invoke overwrites latest_skill_diagnosis with
-        // diagnoses.into_iter().next() — None if the handler returned
-        // nothing. So we expect it to become None.)
+        // The diagnosis stays visible in the prompt so the LLM knows
+        // what it's being measured against while the tracker evaluates.
         maybe_run_auto_invoke(&mut state).await;
         assert!(
-            state.latest_skill_diagnosis.is_none(),
-            "second turn inside cooldown must clear the diagnosis slot"
+            state.latest_skill_diagnosis.is_some(),
+            "cooldown must NOT clear the diagnosis — tracker still evaluating"
         );
     }
 
