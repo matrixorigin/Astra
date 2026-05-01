@@ -660,4 +660,54 @@ mod tests {
             Some(0)
         );
     }
+
+    #[test]
+    fn render_text_shows_token_summary() {
+        let r = SuiteReport {
+            runs: vec![
+                CaseRunReport {
+                    case_name: "a".into(),
+                    model: "m".into(),
+                    passed: true,
+                    outcome: {
+                        let mut o = RunOutcome::new("m");
+                        o.duration_ms = 5000;
+                        o
+                    },
+                    criteria: vec![],
+                    failure_class: None,
+                    session: None,
+                    reproducer: None,
+                    digest: None,
+                    digest_error: None,
+                },
+            ],
+        };
+        let out = render_text(&r, false);
+        assert!(out.contains("tokens: 0in/0out"), "missing token summary: {out}");
+        assert!(out.contains("wall: 0m5s"), "missing wall time: {out}");
+    }
+
+    #[test]
+    fn render_text_shows_pass_rate_when_repeated() {
+        let make_run = |passed: bool| CaseRunReport {
+            case_name: "flaky".into(),
+            model: "m".into(),
+            passed,
+            outcome: RunOutcome::new("m"),
+            criteria: vec![],
+            failure_class: None,
+            session: None,
+            reproducer: None,
+            digest: None,
+            digest_error: None,
+        };
+        let r = SuiteReport {
+            runs: vec![make_run(true), make_run(true), make_run(false)],
+        };
+        let out = render_text(&r, false);
+        assert!(out.contains("pass rate"), "missing pass rate section: {out}");
+        assert!(out.contains("2/3"), "missing 2/3 count: {out}");
+        assert!(out.contains("67%"), "missing percentage: {out}");
+    }
 }
