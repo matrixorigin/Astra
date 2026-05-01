@@ -156,15 +156,38 @@ pub fn sanitize_for_prompt(s: &str) -> String {
             if c.is_control() && *c != '\n' {
                 return false;
             }
-            !matches!(
-                *c,
-                '\u{200B}'..='\u{200F}'
-                    | '\u{2028}'..='\u{202F}'
-                    | '\u{2060}'..='\u{2064}'
-                    | '\u{FEFF}'
-            )
+            !is_invisible_unicode(*c)
         })
         .collect()
+}
+
+/// Comprehensive invisible/deceptive Unicode character filter.
+fn is_invisible_unicode(c: char) -> bool {
+    matches!(
+        c,
+        // Zero-width spaces and joiners
+        '\u{200B}'..='\u{200F}'
+        // Line/paragraph separators + bidi overrides/isolates
+        | '\u{2028}'..='\u{202F}'
+        // Word joiners and invisible operators
+        | '\u{2060}'..='\u{2064}'
+        // BOM
+        | '\u{FEFF}'
+        // Soft hyphen (renders as nothing unless line break)
+        | '\u{00AD}'
+        // Combining grapheme joiner
+        | '\u{034F}'
+        // Arabic letter mark
+        | '\u{061C}'
+        // Hangul fillers
+        | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}'
+        // Khmer vowel inherent
+        | '\u{17B4}' | '\u{17B5}'
+        // Mongolian vowel separator
+        | '\u{180E}'
+        // Tag characters (U+E0001–U+E007F)
+        | '\u{E0001}'..='\u{E007F}'
+    )
 }
 
 /// Payload for `record`. Id / timestamps are assigned by the DAO.
@@ -599,7 +622,7 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         // rows — the second transaction blocks until the first commits,
         // then sees outcome_recorded_at IS NOT NULL and skips them.
         let locked_rows = query(
-            "SELECT lesson_id FROM agent_lesson_exposures \
+            "SELECT lesson_id, adopted FROM agent_lesson_exposures \
              WHERE session_id = ? AND user_id = ? AND outcome_recorded_at IS NULL \
              FOR UPDATE",
         )
@@ -608,58 +631,75 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         .fetch_all(&mut *tx)
         .await?;
 
-        let lesson_ids: Vec<String> = locked_rows
-            .iter()
-            .filter_map(|r| r.try_get::<String, _>("lesson_id").ok())
-            .collect();
-
-        if lesson_ids.is_empty() {
+        if locked_rows.is_empty() {
             tx.commit().await?;
             return Ok(0);
         }
 
-        // Build a placeholder list for the IN clause: (?, ?, ...)
-        let placeholders = lesson_ids
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        // Bulk confidence + counter update.
-        let update_sql = format!(
-            "UPDATE agent_lessons \
-             SET positive_outcome_count = positive_outcome_count + ?, \
-                 negative_outcome_count = negative_outcome_count + ?, \
-                 confidence = CASE \
-                     WHEN confidence + ? > 0.95 THEN 0.95 \
-                     WHEN confidence + ? < 0.1 THEN 0.1 \
-                     ELSE confidence + ? END, \
-                 updated_at = CURRENT_TIMESTAMP(6) \
-             WHERE id IN ({placeholders})"
-        );
-        let mut q = query(&update_sql)
-            .bind(pos_inc)
-            .bind(neg_inc)
-            .bind(confidence_delta)
-            .bind(confidence_delta)
-            .bind(confidence_delta);
-        for id in &lesson_ids {
-            q = q.bind(id);
+        // Split by adoption status: adopted lessons get full confidence
+        // delta, non-adopted get half — they were exposed but the agent
+        // didn't act on them, so the outcome signal is weaker.
+        let mut adopted_ids = Vec::new();
+        let mut passive_ids = Vec::new();
+        for row in &locked_rows {
+            let id: String = row.try_get("lesson_id")?;
+            let adopted: bool = row.try_get("adopted").unwrap_or(false);
+            if adopted {
+                adopted_ids.push(id);
+            } else {
+                passive_ids.push(id);
+            }
         }
-        let updated = q.execute(&mut *tx).await?;
 
-        // Retirement pass: separate statement reads the already-updated
-        // counters (visible within the same transaction).
+        let mut total_updated = 0u64;
+        for (ids, delta_scale) in [(&adopted_ids, 1.0), (&passive_ids, 0.5)] {
+            if ids.is_empty() {
+                continue;
+            }
+            let scaled_delta = confidence_delta * delta_scale;
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+
+            let update_sql = format!(
+                "UPDATE agent_lessons \
+                 SET positive_outcome_count = positive_outcome_count + ?, \
+                     negative_outcome_count = negative_outcome_count + ?, \
+                     confidence = CASE \
+                         WHEN confidence + ? > 0.95 THEN 0.95 \
+                         WHEN confidence + ? < 0.1 THEN 0.1 \
+                         ELSE confidence + ? END, \
+                     updated_at = CURRENT_TIMESTAMP(6) \
+                 WHERE id IN ({placeholders})"
+            );
+            let mut q = query(&update_sql)
+                .bind(pos_inc)
+                .bind(neg_inc)
+                .bind(scaled_delta)
+                .bind(scaled_delta)
+                .bind(scaled_delta);
+            for id in ids {
+                q = q.bind(id);
+            }
+            total_updated += q.execute(&mut *tx).await?.rows_affected();
+        }
+
+        // Retirement pass: reads the already-updated counters (visible
+        // within the same transaction).
+        let all_ids: Vec<&str> = adopted_ids
+            .iter()
+            .chain(passive_ids.iter())
+            .map(String::as_str)
+            .collect();
+        let all_placeholders = all_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let retire_sql = format!(
             "UPDATE agent_lessons \
              SET status = 'retired', updated_at = CURRENT_TIMESTAMP(6) \
              WHERE status = 'active' \
                AND negative_outcome_count >= 5 \
                AND negative_outcome_count > positive_outcome_count \
-               AND id IN ({placeholders})"
+               AND id IN ({all_placeholders})"
         );
         let mut q = query(&retire_sql);
-        for id in &lesson_ids {
+        for id in &all_ids {
             q = q.bind(id);
         }
         q.execute(&mut *tx).await?;
@@ -685,7 +725,7 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         .await?;
 
         tx.commit().await?;
-        Ok(updated.rows_affected())
+        Ok(total_updated)
     }
 }
 
@@ -1200,6 +1240,21 @@ mod tests {
         let bom_and_joiners = "\u{FEFF}start\u{2060}mid\u{2064}end";
         let clean = sanitize_for_prompt(bom_and_joiners);
         assert_eq!(clean, "startmidend");
+    }
+
+    #[test]
+    fn sanitize_strips_exotic_invisible_unicode() {
+        let exotic = "a\u{00AD}b\u{034F}c\u{061C}d\u{115F}e\u{180E}f\u{E0001}g\u{E0020}h";
+        let clean = sanitize_for_prompt(exotic);
+        assert_eq!(clean, "abcdefgh", "all exotic invisible chars stripped");
+    }
+
+    #[test]
+    fn sanitize_strips_tag_characters_range() {
+        let tags: String = (0xE0001..=0xE007Fu32).filter_map(char::from_u32).collect();
+        let input = format!("before{tags}after");
+        let clean = sanitize_for_prompt(&input);
+        assert_eq!(clean, "beforeafter");
     }
 
     #[test]

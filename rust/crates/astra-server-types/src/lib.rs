@@ -280,6 +280,10 @@ pub struct LearningHealthResponse {
     pub service: String,
     pub version: String,
     pub timestamp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lesson_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_count: Option<u64>,
 }
 
 #[derive(Serialize, PartialEq, Eq)]
