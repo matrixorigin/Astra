@@ -486,7 +486,8 @@ test-offline: test-workspace test-runtime-bridge-hooks test-sdk-offline
 .PHONY: test-workspace
 test-workspace:
 	@echo "Running Rust workspace tests (nextest profile=$(NEXTEST_OFFLINE_PROFILE))..."
-	@cargo nextest run $(CARGO_MANIFEST_FLAG) --workspace $(NEXTEST_OFFLINE_FLAGS)
+	@scripts/ci/run-tests-timeout-as-warn.sh \
+		cargo nextest run $(CARGO_MANIFEST_FLAG) --workspace $(NEXTEST_OFFLINE_FLAGS)
 	@echo "Running workspace doctests (cargo test --doc; not covered by nextest)..."
 	@$(CARGO) test $(CARGO_MANIFEST_FLAG) --workspace --doc
 
@@ -502,7 +503,8 @@ check-server-tool-schemas:
 .PHONY: test-runtime-bridge-hooks
 test-runtime-bridge-hooks:
 	@echo "Running astra-runtime tests with feature bridge-e2e-hooks (nextest profile=$(NEXTEST_OFFLINE_PROFILE))..."
-	@cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
+	@scripts/ci/run-tests-timeout-as-warn.sh \
+		cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
 		--features bridge-e2e-hooks $(NEXTEST_OFFLINE_FLAGS)
 
 # Ignored tests: opt-in via env vars (see `make test-online`). Enable with:
