@@ -21,7 +21,7 @@
 //! ## Lifecycle
 //!
 //! - **Record**: upsert-by-content. If a lesson with the same
-//!   `(user_id, persona, workload_tag, kind, trigger_signal, action)` already
+//!   `(user_id, persona, workload_tag, kind, trigger_signal)` already
 //!   exists, its `hit_count` is incremented and `updated_at` refreshed —
 //!   never a new row. This keeps the table from ballooning under repeated
 //!   signals.
@@ -217,7 +217,7 @@ impl NewLesson {
 #[async_trait]
 pub trait AgentLessonsService: Send + Sync {
     /// Record (or upsert-by-content) a lesson. If an existing row matches on
-    /// `(user_id, persona, workload_tag, kind, trigger_signal, action)`,
+    /// `(user_id, persona, workload_tag, kind, trigger_signal)`,
     /// increment its `hit_count` and refresh `updated_at`; otherwise insert.
     /// Returns the persisted row.
     async fn record(&self, new: NewLesson) -> Result<Lesson, sqlx::Error>;
@@ -460,12 +460,11 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         .execute(&mut *tx)
         .await?;
 
-        // Exposure retention: delete exposure rows older than max_age_days
-        // or orphaned (lesson_id no longer exists). Without this, the
-        // exposure table grows unboundedly — ~5K rows/day under heavy use.
+        // Exposure retention: delete exposure rows older than max_age_days.
+        // Without this, the exposure table grows unboundedly.
         let _exposure_stale = query(
             "DELETE FROM agent_lesson_exposures \
-             WHERE user_id = ? AND created_at < DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? DAY)",
+             WHERE user_id = ? AND exposed_at < DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? DAY)",
         )
         .bind(user_id)
         .bind(i64::from(max_age_days))
@@ -749,8 +748,8 @@ pub fn compute_confidence_delta(outcome: &LessonOutcome) -> f64 {
         + outcome.tool_failures
         + outcome.unmet_postconditions) as f64;
 
-    let total_weight = DIAGNOSIS_WEIGHT + NOISE_WEIGHT;
-    let raw = (diagnosis_score - noise_negative * NOISE_WEIGHT) / total_weight.max(1.0);
+    let total_weight = DIAGNOSIS_WEIGHT + NOISE_WEIGHT; // 4.0
+    let raw = (diagnosis_score - noise_negative * NOISE_WEIGHT) / total_weight;
 
     // Bounded learning rate: scale raw score to a small step, clamped.
     (raw * 0.05).clamp(-MAX_CONFIDENCE_STEP, MAX_CONFIDENCE_STEP)
