@@ -203,7 +203,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "文件结构",
             "目录结构",
         ],
-        pinned: false,
+        pinned: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         schema_tokens: 25,
