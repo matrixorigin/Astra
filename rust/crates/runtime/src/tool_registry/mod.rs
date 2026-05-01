@@ -518,17 +518,17 @@ mod tests {
 
     #[test]
     fn word_boundary_match_basic() {
-        assert!(word_boundary_match("show me the pr", &[], "pr"));
-        assert!(word_boundary_match("pr list", &[], "pr"));
-        assert!(!word_boundary_match("spray", &[], "pr"));
-        assert!(!word_boundary_match("express", &[], "pr"));
+        assert!(word_boundary_match("show me the pr", "pr"));
+        assert!(word_boundary_match("pr list", "pr"));
+        assert!(!word_boundary_match("spray", "pr"));
+        assert!(!word_boundary_match("express", "pr"));
     }
 
     #[test]
     fn word_boundary_match_cjk_adjacent() {
         // CJK chars are not ASCII word chars, so they act as boundaries
-        assert!(word_boundary_match("最新的pr", &[], "pr"));
-        assert!(word_boundary_match("看pr详情", &[], "pr"));
+        assert!(word_boundary_match("最新的pr", "pr"));
+        assert!(word_boundary_match("看pr详情", "pr"));
     }
 
     // ── select_with_budget ──

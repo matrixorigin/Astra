@@ -105,10 +105,9 @@ pub fn tfidf_score(query_terms: &[String], tool_idx: usize) -> f64 {
 /// Returns a score in [0.0, 1.0] based on match quality.
 /// This is COMPLEMENTARY to TF-IDF — triggers capture multilingual synonyms
 /// and phrase patterns that TF-IDF might miss (e.g., "关注" → github tools).
-pub fn trigger_match_score(tool: &ToolMeta, query_lower: &str, query_chars: &[char]) -> f64 {
+pub fn trigger_match_score(tool: &ToolMeta, query_lower: &str) -> f64 {
     use astra_turn_core::tool_registry_state::{split_haystack_words, word_boundary_match_prepared};
 
-    let _ = query_chars; // legacy arg, retained for ABI stability with callers
     let mut best_score = 0.0;
     // Split the haystack once and reuse across all triggers. The haystack
     // split is O(haystack_len), which dominates for long user messages (see
@@ -223,7 +222,7 @@ fn file_context_tool_boost(tool_name: &str, file_context: &[String]) -> f64 {
     if boost { 0.05 } else { 0.0 }
 }
 
-fn explicit_lsp_signal(query_lower: &str, query_chars: &[char]) -> bool {
+fn explicit_lsp_signal(query_lower: &str) -> bool {
     use astra_turn_core::tool_registry_state::word_boundary_match;
 
     const LSP_SIGNALS: &[&str] = &[
@@ -298,7 +297,7 @@ fn explicit_lsp_signal(query_lower: &str, query_chars: &[char]) -> bool {
 
     LSP_SIGNALS
         .iter()
-        .any(|signal| word_boundary_match(query_lower, query_chars, signal))
+        .any(|signal| word_boundary_match(query_lower, signal))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -308,7 +307,6 @@ fn tool_relevance_score(
     state: &ConversationState,
     query_terms: &[String],
     query_lower: &str,
-    query_chars: &[char],
     memory_domain_hints: &[crate::pipeline::routing::DomainHint],
     co_occurrence: &HashMap<String, f64>,
     file_context: &[String],
@@ -322,7 +320,7 @@ fn tool_relevance_score(
     let text_score = tfidf_score(query_terms, tool_idx);
     score += text_score * 0.40;
 
-    let trigger_score = trigger_match_score(tool, query_lower, query_chars);
+    let trigger_score = trigger_match_score(tool, query_lower);
     score += trigger_score * 0.25;
 
     // Content relevance = weighted sum of objective textual signals.
@@ -389,7 +387,7 @@ fn tool_relevance_score(
     // ── Phase 3b: Explicit code-intel boost ──
     // Queries that explicitly ask for LSP-style editor intelligence should
     // prefer the unified lsp tool over generic file/text tools.
-    if tool.name == "lsp" && explicit_lsp_signal(query_lower, query_chars) {
+    if tool.name == "lsp" && explicit_lsp_signal(query_lower) {
         score += 0.30;
     }
 
@@ -767,7 +765,6 @@ fn pre_filter_dynamic_core(
     // would burn seconds of CPU on every turn.
     let query: &str = truncate_at_char_boundary(query, SCORING_QUERY_BYTE_CAP);
     let query_lower = query.to_lowercase();
-    let query_chars: Vec<char> = query.chars().collect();
     let query_terms = tokenize(query);
     let mut scored: Vec<(usize, f64)> = TOOL_CATALOG
         .iter()
@@ -780,7 +777,6 @@ fn pre_filter_dynamic_core(
                 state,
                 &query_terms,
                 &query_lower,
-                &query_chars,
                 memory_domain_hints,
                 co_occurrence,
                 file_context,
@@ -1120,9 +1116,8 @@ mod tests {
             "这里能自动导入吗",
         ] {
             let lower = query.to_lowercase();
-            let chars: Vec<char> = query.chars().collect();
             assert!(
-                explicit_lsp_signal(&lower, &chars),
+                explicit_lsp_signal(&lower),
                 "expected explicit LSP signal for query: {query}"
             );
         }

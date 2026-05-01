@@ -582,7 +582,7 @@ mod tests {
     async fn dispatch_bash_timeout_keeps_partial_output() {
         let (_tmp, exec) = test_executor();
         // Regression guard: pipe-leak via orphaned `sleep` would stall this
-        // test for the full 5s. `kill_process_group` (in shell_ops) kills
+        // test for the full 5s. `sigkill_process_group` (in shell_ops) kills
         // the whole group on timeout.
         let result = exec
             .execute(

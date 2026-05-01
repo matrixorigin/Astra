@@ -8960,9 +8960,7 @@ mod trigger_match_regressions {
     #[test]
     fn review_local_changes_matches_review_changes_trigger() {
         let tool = find_tool("git_diff");
-        let query = "review local changes";
-        let chars: Vec<char> = query.chars().collect();
-        let score = trigger_match_score(tool, query, &chars);
+        let score = trigger_match_score(tool, "review local changes");
         assert!(
             score > 0.4,
             "trigger 'review changes' must match 'review local changes' with score > 0.4, got {score}"
@@ -8972,14 +8970,8 @@ mod trigger_match_regressions {
     #[test]
     fn exact_trigger_scores_higher_than_bag_of_words() {
         let tool = find_tool("git_diff");
-        let exact_query = "review changes";
-        let exact_chars: Vec<char> = exact_query.chars().collect();
-        let exact_score = trigger_match_score(tool, exact_query, &exact_chars);
-
-        let bow_query = "review local changes";
-        let bow_chars: Vec<char> = bow_query.chars().collect();
-        let bow_score = trigger_match_score(tool, bow_query, &bow_chars);
-
+        let exact_score = trigger_match_score(tool, "review changes");
+        let bow_score = trigger_match_score(tool, "review local changes");
         assert!(
             exact_score > bow_score,
             "exact match ({exact_score}) must score higher than bag-of-words ({bow_score})"
@@ -8989,9 +8981,7 @@ mod trigger_match_regressions {
     #[test]
     fn single_word_trigger_still_works() {
         let tool = find_tool("git_diff");
-        let query = "diff";
-        let chars: Vec<char> = query.chars().collect();
-        let score = trigger_match_score(tool, query, &chars);
+        let score = trigger_match_score(tool, "diff");
         assert!(
             score > 0.4,
             "single-word trigger 'diff' must match, got {score}"
@@ -9001,18 +8991,14 @@ mod trigger_match_regressions {
     #[test]
     fn no_match_returns_zero() {
         let tool = find_tool("git_diff");
-        let query = "send email to team";
-        let chars: Vec<char> = query.chars().collect();
-        let score = trigger_match_score(tool, query, &chars);
+        let score = trigger_match_score(tool, "send email to team");
         assert!(score < 0.01, "unrelated query must score ~0, got {score}");
     }
 
     #[test]
     fn chinese_trigger_matches() {
         let tool = find_tool("git_diff");
-        let query = "看改动";
-        let chars: Vec<char> = query.chars().collect();
-        let score = trigger_match_score(tool, query, &chars);
+        let score = trigger_match_score(tool, "看改动");
         assert!(
             score > 0.3,
             "Chinese trigger '看改动' must match, got {score}"

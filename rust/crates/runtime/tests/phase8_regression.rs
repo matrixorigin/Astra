@@ -29,9 +29,7 @@ mod universal_stemming {
     use super::*;
 
     fn wbm(haystack: &str, needle: &str) -> bool {
-        let lower = haystack.to_lowercase();
-        let chars: Vec<char> = lower.chars().collect();
-        word_boundary_match(&lower, &chars, needle)
+        word_boundary_match(&haystack.to_lowercase(), needle)
     }
 
     #[test]

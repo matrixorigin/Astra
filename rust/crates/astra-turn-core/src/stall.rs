@@ -1169,45 +1169,41 @@ mod tests {
     #[test]
     fn stemming_plurals_match() {
         let lower = "list all pull requests and issues";
-        let chars: Vec<char> = lower.chars().collect();
-        assert!(word_boundary_match(lower, &chars, "pull request"));
-        assert!(word_boundary_match(lower, &chars, "issue"));
+        assert!(word_boundary_match(lower, "pull request"));
+        assert!(word_boundary_match(lower, "issue"));
     }
 
     #[test]
     fn stemming_gerund_match() {
-        let lower = "committing changes to the branch";
-        let chars: Vec<char> = lower.chars().collect();
-        assert!(word_boundary_match(lower, &chars, "commit"));
+        assert!(word_boundary_match(
+            "committing changes to the branch",
+            "commit",
+        ));
     }
 
     #[test]
     fn stemming_past_tense_match() {
-        let lower = "committed the fix yesterday";
-        let chars: Vec<char> = lower.chars().collect();
-        assert!(word_boundary_match(lower, &chars, "commit"));
+        assert!(word_boundary_match(
+            "committed the fix yesterday",
+            "commit",
+        ));
     }
 
     #[test]
     fn stemming_no_false_positive() {
-        let lower = "the community is growing";
-        let chars: Vec<char> = lower.chars().collect();
-        assert!(!word_boundary_match(lower, &chars, "commit"));
+        assert!(!word_boundary_match("the community is growing", "commit"));
     }
 
     #[test]
     fn stemming_exact_still_works() {
         let lower = "git diff";
-        let chars: Vec<char> = lower.chars().collect();
-        assert!(word_boundary_match(lower, &chars, "git"));
-        assert!(word_boundary_match(lower, &chars, "diff"));
+        assert!(word_boundary_match(lower, "git"));
+        assert!(word_boundary_match(lower, "diff"));
     }
 
     #[test]
     fn stemming_prs_matches_pr() {
-        let lower = "show me the prs";
-        let chars: Vec<char> = lower.chars().collect();
-        assert!(word_boundary_match(lower, &chars, "pr"));
+        assert!(word_boundary_match("show me the prs", "pr"));
     }
 
     // ── Structured reflection ──

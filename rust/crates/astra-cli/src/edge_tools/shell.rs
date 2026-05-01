@@ -2588,12 +2588,17 @@ const BASH_PIPE_READ_TIMEOUT: Duration = Duration::from_millis(500);
 fn sigkill_process_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
-        let pid = child.id();
-        // Safety: `child.id()` returns the OS PID of a not-yet-reaped child;
+        // `child.id()` returns the OS PID of a not-yet-reaped child;
         // `process_group(0)` at spawn guarantees pgid == pid. `killpg` is
         // signal-safe and ignores ESRCH if the group has already exited.
-        let pgid = nix::unistd::Pid::from_raw(pid as i32);
-        let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+        // Skip the `killpg` call if the PID exceeds `i32::MAX` (would wrap
+        // to a negative value and target the wrong group); on real Linux
+        // `pid_max` is far below that ceiling so this is a theoretical
+        // guard, not a hot path.
+        if let Ok(raw) = i32::try_from(child.id()) {
+            let pgid = nix::unistd::Pid::from_raw(raw);
+            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+        }
     }
     let _ = child.kill();
 }

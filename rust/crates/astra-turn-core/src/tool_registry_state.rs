@@ -91,12 +91,14 @@ impl ConversationState {
         };
 
         let msg_lower = effective_msg.to_lowercase();
+        // `chars` is used by signal classifiers that need a Unicode char
+        // count (not byte count) — see `is_conversational_msg`,
+        // `is_followup_msg`. Built once and reused.
         let chars: Vec<char> = msg_lower.chars().collect();
 
         let mut state = Self {
             references_history: contains_any(
                 &msg_lower,
-                &chars,
                 &[
                     "前一个",
                     "上一轮",
@@ -117,7 +119,6 @@ impl ConversationState {
             ),
             is_analytical: contains_any(
                 &msg_lower,
-                &chars,
                 &[
                     "分析",
                     "评估",
@@ -142,7 +143,6 @@ impl ConversationState {
             ),
             is_fetch: contains_any(
                 &msg_lower,
-                &chars,
                 &[
                     "查看",
                     "列出",
@@ -172,7 +172,6 @@ impl ConversationState {
             ),
             is_mutate: contains_any(
                 &msg_lower,
-                &chars,
                 &[
                     "创建",
                     "修改",
@@ -202,7 +201,6 @@ impl ConversationState {
             is_conversational: is_conversational_msg(&msg_lower, &chars),
             is_git: contains_any(
                 &msg_lower,
-                &chars,
                 &[
                     "git", "diff", "commit", "branch", "merge", "rebase", "stash", "提交", "分支",
                     "合并",
@@ -210,7 +208,6 @@ impl ConversationState {
             ),
             is_github: contains_any(
                 &msg_lower,
-                &chars,
                 &[
                     "github",
                     "pr",
@@ -228,7 +225,6 @@ impl ConversationState {
             is_followup: is_followup_msg(&msg_lower, &chars, turn_count),
             is_memory: contains_any(
                 &msg_lower,
-                &chars,
                 &[
                     "记忆",
                     "memory",
@@ -329,14 +325,14 @@ fn is_followup_msg(lower: &str, chars: &[char], turn_count: u32) -> bool {
     false
 }
 
-fn contains_any(lower: &str, chars: &[char], patterns: &[&str]) -> bool {
+fn contains_any(lower: &str, patterns: &[&str]) -> bool {
     patterns.iter().any(|p| {
         if p.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
             // CJK: direct substring match
             lower.contains(p)
         } else {
             // ASCII: word-boundary-aware
-            word_boundary_match(lower, chars, p)
+            word_boundary_match(lower, p)
         }
     })
 }
@@ -345,8 +341,20 @@ fn contains_any(lower: &str, chars: &[char], patterns: &[&str]) -> bool {
 /// Uses lightweight stemming: strips common English suffixes (-s, -es, -ing, -ed, -tion)
 /// so keywords like "commit" match "commits", "committing", "committed".
 /// This is a UNIVERSAL rule — no per-keyword plural/tense additions needed.
-pub fn word_boundary_match(haystack: &str, _chars: &[char], needle: &str) -> bool {
+///
+/// Hot-path callers that evaluate many needles against the same haystack
+/// should use [`split_haystack_words`] + [`word_boundary_match_prepared`]
+/// instead; this convenience form pays an extra split per call.
+pub fn word_boundary_match(haystack: &str, needle: &str) -> bool {
+    // Fast path: CJK/non-ASCII needles match by substring, no tokenization.
+    let needle_lower = needle.to_lowercase();
+    if !needle_lower.is_ascii() {
+        return haystack.contains(&needle_lower);
+    }
     let words = split_haystack_words(haystack);
+    // Reuse `needle` (not `needle_lower`) so the prepared helper owns the
+    // lowercase conversion — cheap duplicate work, and keeping a single
+    // source of truth for the ASCII path avoids subtle drift.
     word_boundary_match_prepared(haystack, &words, needle)
 }
 
@@ -526,7 +534,7 @@ fn is_conversational_msg(lower: &str, chars: &[char]) -> bool {
     // (e.g., "this" matching "hi", "tokenbudget" matching "ok")
     conversational_en
         .iter()
-        .any(|p| word_boundary_match(lower, chars, p))
+        .any(|p| word_boundary_match(lower, p))
 }
 
 #[cfg(test)]
@@ -539,59 +547,43 @@ mod tests {
 
     #[test]
     fn word_boundary_exact_match() {
-        let h = "check the git log";
-        let chars: Vec<char> = h.chars().collect();
-        assert!(word_boundary_match(h, &chars, "git"));
+        assert!(word_boundary_match("check the git log", "git"));
     }
 
     #[test]
     fn word_boundary_no_false_positive_substring() {
         // "digit" contains "git" but shouldn't match at word boundary
-        let h = "digit recognition";
-        let chars: Vec<char> = h.chars().collect();
-        assert!(!word_boundary_match(h, &chars, "git"));
+        assert!(!word_boundary_match("digit recognition", "git"));
     }
 
     #[test]
     fn word_boundary_stem_plural() {
-        let h = "list all commits";
-        let chars: Vec<char> = h.chars().collect();
-        assert!(word_boundary_match(h, &chars, "commit"));
+        assert!(word_boundary_match("list all commits", "commit"));
     }
 
     #[test]
     fn word_boundary_stem_past_tense() {
-        let h = "i already fixed it";
-        let chars: Vec<char> = h.chars().collect();
-        assert!(word_boundary_match(h, &chars, "fix"));
+        assert!(word_boundary_match("i already fixed it", "fix"));
     }
 
     #[test]
     fn word_boundary_stem_gerund() {
-        let h = "currently debugging the issue";
-        let chars: Vec<char> = h.chars().collect();
-        assert!(word_boundary_match(h, &chars, "debug"));
+        assert!(word_boundary_match("currently debugging the issue", "debug"));
     }
 
     #[test]
     fn word_boundary_cjk_substring() {
-        let h = "我需要分析这个";
-        let chars: Vec<char> = h.chars().collect();
-        assert!(word_boundary_match(h, &chars, "分析"));
+        assert!(word_boundary_match("我需要分析这个", "分析"));
     }
 
     #[test]
     fn word_boundary_multi_word_needle() {
-        let h = "open a pull request for this";
-        let chars: Vec<char> = h.chars().collect();
-        assert!(word_boundary_match(h, &chars, "pull request"));
+        assert!(word_boundary_match("open a pull request for this", "pull request"));
     }
 
     #[test]
     fn word_boundary_no_match() {
-        let h = "hello world";
-        let chars: Vec<char> = h.chars().collect();
-        assert!(!word_boundary_match(h, &chars, "git"));
+        assert!(!word_boundary_match("hello world", "git"));
     }
 
     // ──────────────────────────────────────────────────────────

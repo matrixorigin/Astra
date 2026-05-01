@@ -2053,15 +2053,19 @@ fn append_context_flags(cmd: &mut Command, before: Option<usize>, after: Option<
 /// Uses a direct syscall (best-effort; failures are ignored because the
 /// child may already have exited and been reaped, in which case the pgid
 /// is gone). Falls back to `child.kill()` on non-unix platforms.
-async fn kill_process_group(child: &mut tokio::process::Child) {
+async fn sigkill_process_group(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
-        if let Some(pid) = child.id() {
-            // Safety: `pid` came from `Child::id()` and the child is still
-            // owned by us (not reaped yet). The pgid equals the PID because
-            // we called `process_group(0)` before spawn. `killpg` is
-            // signal-safe.
-            let pgid = nix::unistd::Pid::from_raw(pid as i32);
+        if let Some(pid) = child.id()
+            && let Ok(raw) = i32::try_from(pid)
+        {
+            // `pid` came from `Child::id()` on a not-yet-reaped child; the
+            // pgid equals the PID because we called `process_group(0)`
+            // before spawn. `killpg` is signal-safe and ignores ESRCH if
+            // the group has already exited. We skip the call entirely if
+            // the PID ever exceeds `i32::MAX` (would silently wrap to a
+            // negative value and target the wrong group).
+            let pgid = nix::unistd::Pid::from_raw(raw);
             let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
         }
     }
@@ -2130,14 +2134,14 @@ async fn run_readonly_command_with_partial(
             Ok(None) => {
                 if tokio::time::Instant::now() >= deadline {
                     timed_out = true;
-                    kill_process_group(&mut child).await;
+                    sigkill_process_group(&mut child).await;
                     break;
                 }
                 if let Some(token) = cancel_token {
                     tokio::select! {
                         _ = token.cancelled() => {
                             cancelled = true;
-                            kill_process_group(&mut child).await;
+                            sigkill_process_group(&mut child).await;
                             break;
                         }
                         _ = tokio::time::sleep(Duration::from_millis(25)) => {}
@@ -3408,7 +3412,7 @@ printf 'probe.txt:1:needle\n'
         let ctx = crate::ToolContext::test(dir.path());
 
         // Regression guard against the pipe-leak bug fixed by
-        // `kill_process_group`: if bash's `sleep` child were left as an
+        // `sigkill_process_group`: if bash's `sleep` child were left as an
         // orphan holding the stdio pipe, this test would block for the full
         // 5s sleep even though timeout=0.2s. Killing the process group
         // reaps the sleep too.
