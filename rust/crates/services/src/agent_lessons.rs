@@ -432,6 +432,19 @@ impl AgentLessonsService for DatabaseAgentLessonsService {
         .execute(&mut *tx)
         .await?;
 
+        // Tool-specific lessons (ToolDeprioritize/ToolBoost) get a shorter
+        // TTL (7 days) because tool issues are often transient and a stale
+        // "avoid grep" from a week-old resource-limit event can cripple the
+        // agent. General lessons use the caller's max_age_days (typically 30).
+        let _tool_stale = query(
+            "DELETE FROM agent_lessons \
+             WHERE user_id = ? AND kind IN ('tool_deprioritize', 'tool_boost') \
+               AND updated_at < DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 7 DAY)",
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+
         let stale = query(
             "DELETE FROM agent_lessons \
              WHERE user_id = ? AND updated_at < DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? DAY)",

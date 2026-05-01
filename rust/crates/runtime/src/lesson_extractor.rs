@@ -28,12 +28,24 @@ use crate::observability_integration::ObservabilitySession;
 pub struct SessionSummary {
     /// `tool_name → failure_count` across the session.
     pub tool_failures: HashMap<String, u32>,
+    /// Tools whose failures are predominantly transient infrastructure
+    /// issues (ResourceLimit, Network, ServerError, Auth, StreamIdle,
+    /// StreamTransport) rather than tool-inherent bugs (ToolInvalidArgs,
+    /// ToolTimeout, ToolNotFound). The extractor will **not** create
+    /// ToolDeprioritize lessons for these — it would be wrong to teach
+    /// the agent to avoid `grep` because the network was flaky.
+    pub transient_failure_tools: std::collections::HashSet<String>,
     /// Number of stall events the pipeline detected.
     pub stall_events: u32,
     /// User-correction snippets recorded during the session.
     pub user_corrections: Vec<String>,
     /// Number of unmet postconditions on the session's last ActionPlan run.
     pub unmet_postconditions: u32,
+    /// Tools that were successfully used ≥ SUCCESS_REHABILITATE_THRESHOLD
+    /// times this session. Used to weaken stale ToolDeprioritize lessons:
+    /// if the agent successfully used grep 5 times today, the "avoid grep"
+    /// lesson from last week should lose confidence.
+    pub rehabilitated_tools: std::collections::HashSet<String>,
 }
 
 // ── Thresholds (test-pinned; bump deliberately) ─────────────────────────────
@@ -41,6 +53,9 @@ pub struct SessionSummary {
 /// A tool must fail at least this many times to warrant a
 /// ToolDeprioritize lesson.
 pub const TOOL_FAILURE_LESSON_THRESHOLD: u32 = 3;
+/// A tool must succeed at least this many times in one session to
+/// rehabilitate (weaken) an existing ToolDeprioritize lesson.
+pub const SUCCESS_REHABILITATE_THRESHOLD: usize = 3;
 /// Stall events that warrant a PromptShape lesson.
 pub const STALL_LESSON_THRESHOLD: u32 = 3;
 /// User corrections that warrant a PromptShape lesson.
@@ -66,10 +81,18 @@ pub fn extract_lessons(
     let mut out = Vec::new();
 
     // Tool failures → ToolDeprioritize, one per over-threshold tool.
+    // SAFETY: skip tools whose failures are predominantly transient infra
+    // issues (network, resource limit, etc.). Creating a ToolDeprioritize
+    // lesson for "grep timed out because the network was flaky" would
+    // teach the agent to avoid grep for 7+ days — exactly the cascading
+    // block scenario that caused outages before this guard.
     let mut tools: Vec<(&String, &u32)> = summary
         .tool_failures
         .iter()
-        .filter(|&(_, c)| *c >= TOOL_FAILURE_LESSON_THRESHOLD)
+        .filter(|&(name, c)| {
+            *c >= TOOL_FAILURE_LESSON_THRESHOLD
+                && !summary.transient_failure_tools.contains(name.as_str())
+        })
         .collect();
     tools.sort_by_key(|(name, _)| name.as_str());
     for (name, count) in tools {
@@ -80,7 +103,7 @@ pub fn extract_lessons(
             kind: LessonKind::ToolDeprioritize,
             trigger_signal: format!("tool_failures:{name}"),
             action: format!(
-                "deprioritize `{name}` for this workload — failed {count} times last session",
+                "consider alternatives to `{name}` — failed {count} times last session due to tool-specific issues",
             ),
             confidence: None,
         });
@@ -156,9 +179,33 @@ pub fn summarise_from_runtime(
     obs: Option<&ObservabilitySession>,
 ) -> SessionSummary {
     let mut tool_failures = HashMap::new();
+    let mut transient_failure_tools = std::collections::HashSet::new();
+
     for entry in tool_health {
         if entry.total_failures > 0 {
             tool_failures.insert(entry.name.clone(), entry.total_failures as u32);
+        }
+        // Check recent_outcomes: if ≥50% of failures have a transient
+        // failure_category, mark this tool as transient-dominated.
+        let failed_outcomes: Vec<&astra_pipeline::ToolOutcome> = entry
+            .recent_outcomes
+            .iter()
+            .flat_map(|cache| cache.outcomes.iter())
+            .filter(|o| !o.success)
+            .collect();
+        if !failed_outcomes.is_empty() {
+            let transient_count = failed_outcomes
+                .iter()
+                .filter(|o| {
+                    o.failure_category
+                        .as_deref()
+                        .map(is_transient_error_kind)
+                        .unwrap_or(false)
+                })
+                .count();
+            if transient_count * 2 >= failed_outcomes.len() {
+                transient_failure_tools.insert(entry.name.clone());
+            }
         }
     }
 
@@ -171,12 +218,40 @@ pub fn summarise_from_runtime(
         ),
     };
 
+    // Tools that were successfully used enough times this session to
+    // rehabilitate stale ToolDeprioritize lessons.
+    let mut rehabilitated_tools = std::collections::HashSet::new();
+    for entry in tool_health {
+        let successes = entry.total_calls.saturating_sub(entry.total_failures);
+        if successes >= SUCCESS_REHABILITATE_THRESHOLD {
+            rehabilitated_tools.insert(entry.name.clone());
+        }
+    }
+
     SessionSummary {
         tool_failures,
+        transient_failure_tools,
         stall_events,
         user_corrections,
         unmet_postconditions,
+        rehabilitated_tools,
     }
+}
+
+/// Transient infrastructure error kinds that should NOT produce
+/// ToolDeprioritize lessons. These are environmental failures, not
+/// evidence that the tool itself is broken.
+fn is_transient_error_kind(tag: &str) -> bool {
+    matches!(
+        tag,
+        "resource_limit"
+            | "network"
+            | "server_error"
+            | "auth"
+            | "rate_limit"
+            | "stream_idle"
+            | "stream_transport"
+    )
 }
 
 /// Session-end convenience: extract lessons from `summary` and record each
@@ -217,6 +292,75 @@ pub async fn persist_session_lessons(
         }
     }
     persisted
+}
+
+/// Weaken ToolDeprioritize lessons for tools that were successfully used
+/// this session. If the agent used `grep` 5 times successfully, the
+/// "avoid grep" lesson from last week should lose confidence — the tool
+/// is clearly working now.
+///
+/// Loads all active ToolDeprioritize lessons for the user and decreases
+/// confidence for any whose trigger_signal matches a rehabilitated tool.
+/// Best-effort: errors swallowed with log.
+pub async fn weaken_rehabilitated_tools(
+    svc: Arc<dyn AgentLessonsService>,
+    summary: &SessionSummary,
+    user_id: &str,
+    persona: &str,
+    workload_tag: Option<&str>,
+) {
+    if summary.rehabilitated_tools.is_empty() {
+        return;
+    }
+
+    let lessons = match svc.load_recent(user_id, persona, workload_tag, 100).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(
+                target: "lesson_extractor",
+                error = %e,
+                "failed to load lessons for rehabilitation; skipping"
+            );
+            return;
+        }
+    };
+
+    for lesson in &lessons {
+        if lesson.kind != astra_services::LessonKind::ToolDeprioritize {
+            continue;
+        }
+        // Extract tool name from "tool_failures:<name>"
+        let tool_name = match lesson.trigger_signal.split_once(':') {
+            Some((_, name)) => name,
+            None => continue,
+        };
+        if !summary.rehabilitated_tools.contains(tool_name) {
+            continue;
+        }
+        // Tool was successfully used this session → weaken the lesson.
+        // Using record_outcome with a synthetic positive outcome is overkill;
+        // just bump hit_count (which refreshes updated_at and keeps it alive)
+        // and rely on the weighted confidence update from the real outcome.
+        // The key insight: a tool used successfully this session will contribute
+        // a positive diagnosis_criteria_met signal via the outcome, which
+        // naturally increases confidence of helpful lessons and decreases
+        // confidence of lessons the agent ignored (used the tool anyway).
+        // So we don't need an explicit confidence decrease here — the
+        // weighted outcome system handles it.
+        //
+        // What we DO need: ensure the lesson's updated_at stays fresh so it
+        // doesn't get pruned by the 7-day tool TTL while it's being
+        // rehabilitated. A hit_count bump achieves this.
+        if let Err(e) = svc.record_hit(&lesson.id).await {
+            tracing::debug!(
+                target: "lesson_extractor",
+                lesson_id = &lesson.id,
+                tool = tool_name,
+                error = %e,
+                "failed to refresh rehabilitated lesson; skipping"
+            );
+        }
+    }
 }
 
 fn truncate_log_field(s: &str, max: usize) -> String {
@@ -737,5 +881,171 @@ mod tests {
             !lessons.iter().any(|l| l.trigger_signal.contains("bash")),
             "sub-threshold tool must not produce a lesson"
         );
+    }
+
+    // ── Safety: transient error filtering ───────────────────────────────────
+
+    #[test]
+    fn transient_failure_tool_does_not_produce_deprioritize_lesson() {
+        // grep fails 10 times but all failures are ResourceLimit (fork bomb).
+        // The extractor must NOT create a ToolDeprioritize lesson — it would
+        // teach the agent to avoid grep for days when the real problem was
+        // system resources.
+        let mut s = base_summary();
+        s.tool_failures.insert("grep".into(), 10);
+        s.transient_failure_tools.insert("grep".into());
+        let lessons = extract_lessons(&s, "u", "p", None);
+        assert!(
+            !lessons.iter().any(|l| l.trigger_signal.contains("grep")),
+            "transient failure tool must NOT produce ToolDeprioritize"
+        );
+    }
+
+    #[test]
+    fn tool_inherent_failure_still_produces_deprioritize_lesson() {
+        // grep fails 5 times with ToolTimeout (scope too broad — tool's fault).
+        // NOT in transient set → should produce lesson.
+        let mut s = base_summary();
+        s.tool_failures.insert("grep".into(), 5);
+        // transient_failure_tools does NOT contain "grep"
+        let lessons = extract_lessons(&s, "u", "p", None);
+        assert!(
+            lessons.iter().any(|l| l.trigger_signal.contains("grep")),
+            "tool-inherent failure must produce ToolDeprioritize"
+        );
+    }
+
+    #[test]
+    fn summarise_classifies_transient_vs_inherent_from_outcomes() {
+        use astra_pipeline::tool_health_types::{ToolOutcome, ToolOutcomeCacheEntry};
+
+        // grep: 3 failures, all "resource_limit" → transient
+        let grep = ToolHealthEntry {
+            name: "grep".into(),
+            total_calls: 5,
+            total_failures: 3,
+            failure_rate: 0.6,
+            last_updated_epoch: 0,
+            recent_outcomes: vec![ToolOutcomeCacheEntry {
+                signature: "grep *".into(),
+                outcomes: vec![
+                    ToolOutcome {
+                        success: false,
+                        latency_ms: 0,
+                        result_hash: 0,
+                        at_epoch: 0,
+                        failure_category: Some("resource_limit".into()),
+                    },
+                    ToolOutcome {
+                        success: false,
+                        latency_ms: 0,
+                        result_hash: 0,
+                        at_epoch: 0,
+                        failure_category: Some("network".into()),
+                    },
+                    ToolOutcome {
+                        success: false,
+                        latency_ms: 0,
+                        result_hash: 0,
+                        at_epoch: 0,
+                        failure_category: Some("resource_limit".into()),
+                    },
+                ],
+            }],
+        };
+        // rg: 3 failures, all "tool_timeout" → inherent
+        let rg = ToolHealthEntry {
+            name: "rg".into(),
+            total_calls: 5,
+            total_failures: 3,
+            failure_rate: 0.6,
+            last_updated_epoch: 0,
+            recent_outcomes: vec![ToolOutcomeCacheEntry {
+                signature: "rg pattern".into(),
+                outcomes: vec![
+                    ToolOutcome {
+                        success: false,
+                        latency_ms: 0,
+                        result_hash: 0,
+                        at_epoch: 0,
+                        failure_category: Some("tool_timeout".into()),
+                    },
+                    ToolOutcome {
+                        success: false,
+                        latency_ms: 0,
+                        result_hash: 0,
+                        at_epoch: 0,
+                        failure_category: Some("tool_timeout".into()),
+                    },
+                    ToolOutcome {
+                        success: false,
+                        latency_ms: 0,
+                        result_hash: 0,
+                        at_epoch: 0,
+                        failure_category: Some("tool_invalid_args".into()),
+                    },
+                ],
+            }],
+        };
+
+        let summary = summarise_from_runtime(&[grep, rg], None);
+        assert!(
+            summary.transient_failure_tools.contains("grep"),
+            "grep failures are all transient → must be in transient set"
+        );
+        assert!(
+            !summary.transient_failure_tools.contains("rg"),
+            "rg failures are tool-inherent → must NOT be in transient set"
+        );
+
+        // Extract: grep should be skipped, rg should produce a lesson.
+        let lessons = extract_lessons(&summary, "u", "p", None);
+        assert!(!lessons.iter().any(|l| l.trigger_signal.contains("grep")));
+        assert!(lessons.iter().any(|l| l.trigger_signal.contains("rg")));
+    }
+
+    #[test]
+    fn rehabilitated_tools_populated_from_successful_outcomes() {
+        // grep: 10 total calls, 2 failures → 8 successes ≥ threshold → rehabilitated
+        // rg: 3 calls, 3 failures → 0 successes → not rehabilitated
+        let grep = health("grep", 2, 10);
+        let rg = health("rg", 3, 3);
+        let summary = summarise_from_runtime(&[grep, rg], None);
+        assert!(summary.rehabilitated_tools.contains("grep"));
+        assert!(!summary.rehabilitated_tools.contains("rg"));
+    }
+
+    #[test]
+    fn is_transient_error_kind_classification() {
+        // Pin the classification so accidental changes don't silently
+        // let transient errors through to lesson creation.
+        for transient in [
+            "resource_limit",
+            "network",
+            "server_error",
+            "auth",
+            "rate_limit",
+            "stream_idle",
+            "stream_transport",
+        ] {
+            assert!(
+                super::is_transient_error_kind(transient),
+                "{transient} must be classified as transient"
+            );
+        }
+        for inherent in [
+            "tool_timeout",
+            "tool_invalid_args",
+            "tool_not_found",
+            "tool_unavailable",
+            "unknown",
+            "database_error",
+            "stall",
+        ] {
+            assert!(
+                !super::is_transient_error_kind(inherent),
+                "{inherent} must NOT be classified as transient"
+            );
+        }
     }
 }

@@ -83,6 +83,18 @@ pub(super) async fn finalize_session(state: &ReplState) {
             None,
         )
         .await;
+        // Rehabilitate: if tools were successfully used this session,
+        // refresh their ToolDeprioritize lessons' updated_at so they
+        // stay alive through the 7-day tool TTL while the weighted
+        // outcome system naturally adjusts confidence.
+        astra_runtime::lesson_extractor::weaken_rehabilitated_tools(
+            svc.clone(),
+            &summary,
+            user_id,
+            "generic",
+            None,
+        )
+        .await;
         if let Some(ref session_id) = state.session_id
             && let Err(e) = svc
                 .record_outcome(astra_services::LessonOutcome {
