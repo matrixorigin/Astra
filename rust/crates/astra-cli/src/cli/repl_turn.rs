@@ -570,16 +570,20 @@ fn maybe_checkpoint_lessons(state: &mut ReplState) {
     }
 
     // Write to Memoria as `working` memory (session-scoped, T4).
-    // Mid-session observations are provisional — they get promoted to
-    // `semantic` T3 at session end if the L1b narrative confirms them.
+    // Quality gate filters generic template content before storage.
+    // Promoted to semantic T3 at session end via final checkpoint flush.
     let memoria_lessons: Vec<astra_runtime::lesson_synthesizer::ExtractedLesson> = delta
         .into_iter()
+        .filter(|l| astra_runtime::lesson_synthesizer::is_synthesized_lesson_acceptable(&l.action))
         .map(|l| astra_runtime::lesson_synthesizer::ExtractedLesson {
             memory_type: "working",
             content: format!("💡 LESSON: {}", l.action),
             trust_tier: "T4",
         })
         .collect();
+    if memoria_lessons.is_empty() {
+        return;
+    }
     let sid = state.session_id.clone();
     tokio::spawn(
         super::edge_tools::memoria::memoria_store_lessons_fire_and_forget(memoria_lessons, sid),

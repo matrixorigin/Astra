@@ -45,12 +45,13 @@ pub(super) async fn finalize_session(state: &ReplState) {
     // 3b. Trigger Memoria governance + consolidation (best-effort with timeout)
     let gov_handle = tokio::spawn(edge_tools::memoria::memoria_governance_fire_and_forget());
     let con_handle = tokio::spawn(edge_tools::memoria::memoria_consolidate_fire_and_forget());
-    // 3c. L3 knowledge backflow: extract learnings from L1b narrative
-    //     and store in Memoria as durable semantic/episodic memory
-    //     (Session Memory Protocol §6.2). Fire-and-forget.
+    // 3c. L3 knowledge backflow (Session Memory Protocol §6.2).
+    //     Three sources merged into one batch Memoria write:
+    //     (a) L1b narrative Learnings + User Corrections → semantic T2/T3
+    //     (b) Checkpointer final flush (tool failures, stalls) → semantic T3
+    //     (c) Episodic session summary → episodic T3
     if state.turn > 0 {
         let narrative = state.session_id.as_deref().and_then(|sid| {
-            // Try astra's own artifact path first, then Claude Code compat path.
             let raw = astra_services::local_session_artifact_store()
                 .session_path(sid, "session-memory.md")
                 .ok()
@@ -66,9 +67,44 @@ pub(super) async fn finalize_session(state: &ReplState) {
             astra_runtime::turn::cloud::session_memory_protocol::SessionMemory::parse(&raw)
         });
 
+        // (a) L1b narrative extraction
         let mut all_lessons =
             astra_runtime::lesson_synthesizer::extract_learnings_for_backflow(narrative.as_ref());
 
+        // (b) Final tool/stall lessons — extract directly from signals and
+        //     promote to semantic T3 (mid-session copies were working T4).
+        //     Quality gate applied to filter out generic template content.
+        let summary = match state
+            .observability_session
+            .as_ref()
+            .and_then(|arc| arc.read().ok())
+        {
+            Some(guard) => astra_runtime::lesson_extractor::summarise_from_runtime(
+                &state.tool_health_entries,
+                Some(&*guard),
+            ),
+            None => astra_runtime::lesson_extractor::summarise_from_runtime(
+                &state.tool_health_entries,
+                None,
+            ),
+        };
+        let signal_lessons = astra_runtime::lesson_extractor::extract_lessons(
+            &summary,
+            state.ingestion_user_id.as_deref().unwrap_or("unknown"),
+            "generic",
+            None,
+        );
+        for cl in signal_lessons {
+            if astra_runtime::lesson_synthesizer::is_synthesized_lesson_acceptable(&cl.action) {
+                all_lessons.push(astra_runtime::lesson_synthesizer::ExtractedLesson {
+                    memory_type: "semantic",
+                    content: format!("💡 LESSON: {}", cl.action),
+                    trust_tier: "T3",
+                });
+            }
+        }
+
+        // (c) Episodic summary
         if let Some(episodic) = astra_runtime::lesson_synthesizer::build_episodic_summary(
             state.session_id.as_deref().unwrap_or("unknown"),
             state.turn,
