@@ -6,15 +6,30 @@ fail-fast = false
 slow-timeout = { period = "4s", terminate-after = 1 }
 failure-output = "immediate"
 
-# Per-case hard budget for `make test-offline` / `make test-online`. A case that
-# runs longer than `period` is terminated after `terminate-after` slow-periods
-# and counted as a FAIL. Defaults come from the Makefile; override the period
-# per-invocation with `make test-offline TEST_OFFLINE_TIMEOUT=2s`, etc.
-# (The Makefile feeds the value in via `--config profile.strict.slow-timeout…`.)
+# Per-case hard budget profiles. The `slow-timeout.period` is baked into each
+# profile — nextest has no CLI override for it, and `--config` is Cargo-only
+# (not nextest). To pick a budget, select the matching profile:
+#   offline local:  `--profile strict`          (1s)
+#   offline CI:     `--profile ci`              (4s)
+#   online local:   `--profile strict-online`   (2s)
+#   online CI:      `--profile strict-online-ci` (8s)
+#
+# Extending: define a new `[profile.X]` block with the desired slow-timeout,
+# then wire it into the Makefile target.
 [profile.strict]
 fail-fast = false
 failure-output = "immediate"
 slow-timeout = { period = "1s", terminate-after = 1 }
+
+[profile.strict-online]
+fail-fast = false
+failure-output = "immediate"
+slow-timeout = { period = "2s", terminate-after = 1 }
+
+[profile.strict-online-ci]
+fail-fast = false
+failure-output = "immediate"
+slow-timeout = { period = "8s", terminate-after = 1 }
 
 # ── Parallelism management + budget headroom for E2E integration tests ────
 # End-to-end tests that drive real handlers (Axum router + agentic loop +

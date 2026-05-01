@@ -28,8 +28,8 @@ help:
 	@echo ""
 	@echo "Testing:"
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
-	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (fails any case > TEST_OFFLINE_TIMEOUT, default 1s; override: make test-offline TEST_OFFLINE_TIMEOUT=2s)"
-	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (fails any case > TEST_ONLINE_TIMEOUT, default 2s; override: make test-online TEST_ONLINE_TIMEOUT=4s; set ASTRA_SDK_ONLINE_E2E=1 + API for make test-sdk-online)"
+	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (1s per case via profile=strict; override: NEXTEST_OFFLINE_PROFILE=<profile>)"
+	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (2s per case via profile=strict-online; CI uses strict-online-ci=8s; set ASTRA_SDK_ONLINE_E2E=1 + API for make test-sdk-online)"
 	@echo "  make test-live-llm      - Live LLM suite (real provider APIs from .models.yaml; one model per provider)"
 	@echo "  make test-contract      - Run contract tests (http/admin/config)"
 	@echo "  (also: test-sdk-offline, test-sdk-online — @astra/sdk; offline in test-offline; remote E2E opt-in on test-online)"
@@ -79,21 +79,20 @@ RUST_RELEASE_BIN_DIR := $(RUST_TARGET_DIR)/release
 API_SERVER_BIN := astra-server
 CLI_BINS := astra astra-admin
 
-# Per-test-case hard budget. Any case running longer than the budget is killed
-# and counted as FAIL (nextest profile `strict`, terminate-after=1). Override
-# as a make variable — no env vars:
-#   make test-offline TEST_OFFLINE_TIMEOUT=2s
-#   make test-online  TEST_ONLINE_TIMEOUT=4s
-TEST_OFFLINE_TIMEOUT ?= 1s
-TEST_ONLINE_TIMEOUT  ?= 2s
+# Per-test-case hard budget. Any case running longer than the budget is
+# killed and counted as FAIL. Nextest has no CLI override for slow-timeout
+# (`--config` is Cargo-only, not nextest), so budgets live as named profiles
+# in `rust/.config/nextest.toml`:
+#   offline:      profile `strict`            → 1s
+#   online:       profile `strict-online`     → 2s
+#   online (CI):  profile `strict-online-ci`  → 8s
+# To switch budgets, override the profile name:
+#   make test-online NEXTEST_ONLINE_PROFILE=strict-online-ci
+NEXTEST_OFFLINE_PROFILE ?= strict
+NEXTEST_ONLINE_PROFILE  ?= strict-online
 
-# Wire the chosen budget into nextest's `strict` profile via --config overrides.
-NEXTEST_OFFLINE_FLAGS := --profile strict \
-	--config 'profile.strict.slow-timeout.period="$(TEST_OFFLINE_TIMEOUT)"' \
-	--config 'profile.strict.slow-timeout.terminate-after=1'
-NEXTEST_ONLINE_FLAGS := --profile strict \
-	--config 'profile.strict.slow-timeout.period="$(TEST_ONLINE_TIMEOUT)"' \
-	--config 'profile.strict.slow-timeout.terminate-after=1'
+NEXTEST_OFFLINE_FLAGS := --profile $(NEXTEST_OFFLINE_PROFILE)
+NEXTEST_ONLINE_FLAGS  := --profile $(NEXTEST_ONLINE_PROFILE)
 
 # ============================================================================
 # Environment Setup
@@ -486,7 +485,7 @@ test-offline: test-workspace test-runtime-bridge-hooks test-sdk-offline
 
 .PHONY: test-workspace
 test-workspace:
-	@echo "Running Rust workspace tests (nextest; per-case budget $(TEST_OFFLINE_TIMEOUT))..."
+	@echo "Running Rust workspace tests (nextest profile=$(NEXTEST_OFFLINE_PROFILE))..."
 	@cargo nextest run $(CARGO_MANIFEST_FLAG) --workspace $(NEXTEST_OFFLINE_FLAGS)
 	@echo "Running workspace doctests (cargo test --doc; not covered by nextest)..."
 	@$(CARGO) test $(CARGO_MANIFEST_FLAG) --workspace --doc
@@ -502,7 +501,7 @@ check-server-tool-schemas:
 # `required-features = ["bridge-e2e-hooks"]` (e.g. chat_turn_bridge_ledger_inject_e2e).
 .PHONY: test-runtime-bridge-hooks
 test-runtime-bridge-hooks:
-	@echo "Running astra-runtime tests with feature bridge-e2e-hooks (nextest; per-case budget $(TEST_OFFLINE_TIMEOUT))..."
+	@echo "Running astra-runtime tests with feature bridge-e2e-hooks (nextest profile=$(NEXTEST_OFFLINE_PROFILE))..."
 	@cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
 		--features bridge-e2e-hooks $(NEXTEST_OFFLINE_FLAGS)
 
@@ -580,7 +579,7 @@ test-online:
 		-e "DROP DATABASE IF EXISTS $$TEST_DB; CREATE DATABASE $$TEST_DB;" 2>/dev/null || \
 	mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS --skip-ssl \
 		-e "DROP DATABASE IF EXISTS $$TEST_DB; CREATE DATABASE $$TEST_DB;" 2>/dev/null || true; \
-	echo "Running astra-runtime ignored unit tests (live DB; nextest per-case budget $(TEST_ONLINE_TIMEOUT); live-LLM suite gated by ASTRA_LIVE_LLM)..."; \
+	echo "Running astra-runtime ignored unit tests (live DB; nextest profile=$(NEXTEST_ONLINE_PROFILE); live-LLM suite gated by ASTRA_LIVE_LLM)..."; \
 	FAILED=""; \
 	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 		cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
@@ -595,7 +594,7 @@ test-online:
 		echo "❌ test-online: failed suites:$$FAILED"; \
 		exit 1; \
 	else \
-		echo "✅ test-online: all online suites passed (online per-case budget $(TEST_ONLINE_TIMEOUT))"; \
+		echo "✅ test-online: all online suites passed (nextest profile=$(NEXTEST_ONLINE_PROFILE))"; \
 	fi
 	@if [ "$${ASTRA_SDK_ONLINE_E2E:-}" = "1" ]; then \
 		$(MAKE) test-sdk-online; \
