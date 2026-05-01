@@ -29,7 +29,7 @@ help:
 	@echo "Testing:"
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
 	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (fails any case > TEST_OFFLINE_TIMEOUT, default 1s; override: make test-offline TEST_OFFLINE_TIMEOUT=2s)"
-	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (per-binary budgets in rust/.config/nextest.toml; set ASTRA_SDK_ONLINE_E2E=1 + API for make test-sdk-online)"
+	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (fails any case > TEST_ONLINE_TIMEOUT, default 2s; override: make test-online TEST_ONLINE_TIMEOUT=4s; set ASTRA_SDK_ONLINE_E2E=1 + API for make test-sdk-online)"
 	@echo "  make test-live-llm      - Live LLM suite (real provider APIs from .models.yaml; one model per provider)"
 	@echo "  make test-contract      - Run contract tests (http/admin/config)"
 	@echo "  (also: test-sdk-offline, test-sdk-online — @astra/sdk; offline in test-offline; remote E2E opt-in on test-online)"
@@ -79,21 +79,21 @@ RUST_RELEASE_BIN_DIR := $(RUST_TARGET_DIR)/release
 API_SERVER_BIN := astra-server
 CLI_BINS := astra astra-admin
 
-# Per-test-case hard budget for offline tests. Any case running longer than
-# the budget is killed and counted as FAIL (nextest profile `strict`,
-# terminate-after=1). Override as a make variable:
+# Per-test-case hard budget. Any case running longer than the budget is killed
+# and counted as FAIL (nextest profile `strict`, terminate-after=1). Override
+# as a make variable — no env vars:
 #   make test-offline TEST_OFFLINE_TIMEOUT=2s
-#
-# Online tests (`make test-online`) take the budget from nextest's
-# per-binary overrides in `rust/.config/nextest.toml` — DB-backed
-# `*_db_it` binaries get their own ceilings there, so there's no
-# meaningful single "online default" to set here.
+#   make test-online  TEST_ONLINE_TIMEOUT=4s
 TEST_OFFLINE_TIMEOUT ?= 1s
+TEST_ONLINE_TIMEOUT  ?= 2s
 
+# Wire the chosen budget into nextest's `strict` profile via --config overrides.
 NEXTEST_OFFLINE_FLAGS := --profile strict \
 	--config 'profile.strict.slow-timeout.period="$(TEST_OFFLINE_TIMEOUT)"' \
 	--config 'profile.strict.slow-timeout.terminate-after=1'
-NEXTEST_ONLINE_FLAGS := --profile strict
+NEXTEST_ONLINE_FLAGS := --profile strict \
+	--config 'profile.strict.slow-timeout.period="$(TEST_ONLINE_TIMEOUT)"' \
+	--config 'profile.strict.slow-timeout.terminate-after=1'
 
 # ============================================================================
 # Environment Setup

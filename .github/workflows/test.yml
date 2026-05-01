@@ -222,7 +222,7 @@ jobs:
         env:
           ASTRA_TEST_DB_IT: "1"
           ASTRA_TEST_DB_IT_TEST_THREADS: "1"
-        run: make test-online
+        run: make test-online TEST_ONLINE_TIMEOUT=8s
       - name: Dump dependency logs
         if: failure()
         run: make dev-deps-logs-once
