@@ -79,7 +79,6 @@ jobs:
         env:
           NEXTEST_FILTER: ${{ matrix.filter }}
         run: >-
-          scripts/ci/run-tests-timeout-as-warn.sh
           timeout ${{ matrix.command_timeout }} cargo nextest run
           --manifest-path rust/Cargo.toml -p astra-cli
           --profile ci --bins -E "$NEXTEST_FILTER"
@@ -103,18 +102,14 @@ jobs:
           save-if: false
       - name: Test astra-runtime
         run: >-
-          scripts/ci/run-tests-timeout-as-warn.sh
           cargo nextest run --manifest-path rust/Cargo.toml -p astra-runtime
           --profile ci
       - name: Test contract (http + admin + settings)
         run: |
-          scripts/ci/run-tests-timeout-as-warn.sh \
-            cargo nextest run --manifest-path rust/Cargo.toml -p astra-runtime --profile ci --test http_contract --test admin_contract
-          scripts/ci/run-tests-timeout-as-warn.sh \
-            cargo nextest run --manifest-path rust/Cargo.toml -p astra-core --profile ci --lib -E 'test(/settings_contract/)'
+          cargo nextest run --manifest-path rust/Cargo.toml -p astra-runtime --profile ci --test http_contract --test admin_contract
+          cargo nextest run --manifest-path rust/Cargo.toml -p astra-core --profile ci --lib -E 'test(/settings_contract/)'
       - name: Test trusted_moi auth integration
         run: >-
-          scripts/ci/run-tests-timeout-as-warn.sh
           cargo nextest run --manifest-path rust/Cargo.toml -p astra-runtime
           --profile ci --test trusted_moi_auth_integration
       - name: Comment contract failure on PR
@@ -145,7 +140,6 @@ jobs:
           save-if: false
       - name: Test astra-turn-core + astra-services
         run: >-
-          scripts/ci/run-tests-timeout-as-warn.sh
           cargo nextest run --manifest-path rust/Cargo.toml
           -p astra-turn-core -p astra-services
           --profile ci
@@ -166,7 +160,6 @@ jobs:
           save-if: false
       - name: Test core crates
         run: >-
-          scripts/ci/run-tests-timeout-as-warn.sh
           cargo nextest run --manifest-path rust/Cargo.toml
           -p astra-core -p astra-thin-client -p astra-admin-cli
           -p astra-tools -p astra-pipeline -p astra-turn-types
@@ -177,7 +170,6 @@ jobs:
           --profile ci
       - name: Test bridge-e2e-hooks
         run: >-
-          scripts/ci/run-tests-timeout-as-warn.sh
           cargo nextest run --manifest-path rust/Cargo.toml -p astra-runtime
           --features bridge-e2e-hooks --profile ci
 

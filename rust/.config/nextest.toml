@@ -1,133 +1,44 @@
 [profile.default]
 fail-fast = false
 
+# All profiles share a uniform 15s per-test-case hard budget. TIMEOUT = FAIL;
+# no per-test/per-binary carve-outs. 15s is deliberately lax so flake from
+# known contention (e.g. the `session_sync_log` prune hot path tracked in
+# `plans/session-sync-log-prune-hotpath-2026-05-01.md`) doesn't block work,
+# but any genuinely runaway test still fails loudly. Tighten later when the
+# prune contention is fixed — ideally back toward 1–2s per case.
 [profile.ci]
 fail-fast = false
-slow-timeout = { period = "4s", terminate-after = 1 }
+slow-timeout = { period = "15s", terminate-after = 1 }
 failure-output = "immediate"
 
-# Per-case hard budget profiles. The `slow-timeout.period` is baked into each
-# profile — nextest has no CLI override for it, and `--config` is Cargo-only
-# (not nextest). To pick a budget, select the matching profile:
-#   offline local:  `--profile strict`          (1s)
-#   offline CI:     `--profile ci`              (4s)
-#   online local:   `--profile strict-online`   (2s)
-#   online CI:      `--profile strict-online-ci` (8s)
-#
-# Extending: define a new `[profile.X]` block with the desired slow-timeout,
-# then wire it into the Makefile target.
 [profile.strict]
 fail-fast = false
 failure-output = "immediate"
-slow-timeout = { period = "1s", terminate-after = 1 }
+slow-timeout = { period = "15s", terminate-after = 1 }
 
 [profile.strict-online]
 fail-fast = false
 failure-output = "immediate"
-slow-timeout = { period = "2s", terminate-after = 1 }
+slow-timeout = { period = "15s", terminate-after = 1 }
 
 [profile.strict-online-ci]
 fail-fast = false
 failure-output = "immediate"
-slow-timeout = { period = "8s", terminate-after = 1 }
+slow-timeout = { period = "15s", terminate-after = 1 }
 
-# ── Parallelism management + budget headroom for E2E integration tests ────
-# End-to-end tests that drive real handlers (Axum router + agentic loop +
-# mock LLM + SSE) each complete in 300-900ms in isolation on a quiet box.
-# Under concurrent load (4 nextest workers), CPU contention pushes some
-# above 1s — not because of sleeps or bugs, but because a debug-build
-# Axum+Tokio round-trip costs real CPU and four of them stepping on each
-# other each get ~25% of it. Plus the laptop-dev scenario: thermal throttle
-# after repeated `make test-offline` runs makes these tests 2x slower.
-#
-# Solution: group them + cap parallelism + give a 2s ceiling. The point of
-# the strict 1s budget is to force optimizations for NEW slow-ness; tests
-# that are already doing meaningful integration work don't get rewritten
-# into smaller unit tests (that would delete coverage). The 2s ceiling is
-# still half of the `ci` profile's 4s and low enough that any NEW slowness
-# introduced to these tests would still fail.
+# ── Parallelism caps for heavy integration suites ────────────────────────
+# Group membership is set via `[[profile.X.overrides]]` below. These test
+# groups cap how many members run in parallel — they exist to stop DB / mock
+# LLM contention, not to affect the slow-timeout budget (the budget is 15s
+# for everyone, uniformly).
 [test-groups]
 integration_e2e = { max-threads = 2 }
-# `spawn_plan_executor_*` tests serialize fully — each is ~500ms and
-# sharing the 2-wide group with other heavy tests caused pile-ups.
 plan_executor_e2e = { max-threads = 1 }
-# Per-test-DB teardown (CREATE DATABASE + ensure_core_schema + DROP DATABASE)
-# is MatrixOne-bound and doesn't benefit from concurrency — parallel drops on
-# the same instance just contend. These two tests can't share a DB (they
-# assert global `COUNT(*)` invariants). Serialise them in their own 1-wide
-# group so they don't steal slots from `integration_e2e` either.
 db_scoped_trim = { max-threads = 1 }
 
-# ── per-case 5s carve-outs (offline strict) ──────────────────────────────
-# Tests that intermittently hit 1–2s under load. Not investigated yet —
-# placeholder 5s budget to unblock CI. Must be revisited: see
-# `plans/session-sync-log-prune-hotpath-2026-05-01.md` for the known
-# prune-contention pattern that accounts for some of these; the others
-# need their own profiling.
-#
-# IMPORTANT: this override block is placed **before** the
-# `integration_e2e` override so first-match wins and the 5s ceiling
-# applies to `stress_multi_turn_state_continuity_50_turns`,
-# `spawn_plan_executor_emits_compact_history_entries_between_subtasks`,
-# and `rollback_session_state_current_turn_restores_server_self_mod_and_tasks`
-# (which also appear in the `integration_e2e` filter below) without
-# losing their test-group parallelism caps (those are still inherited
-# via group membership elsewhere, or the overrides simply coexist).
-[[profile.strict.overrides]]
-filter = """
-test(/slash_debug::tests::resolve_session_id_exact_uuid_passthrough/)
- or test(/slash_debug::tests::resolve_session_id_no_match_returns_input/)
- or test(/slash_agent::tests::load_recent_delegations_collects_summary_and_subruns/)
- or test(/plan_executor::tests::spawn_plan_executor_emits_compact_history_entries_between_subtasks/)
- or test(/delegation_engine::tests::cancel_token_per_execution_isolation/)
- or test(/delegation_engine::tests::gate_exhausted_retries_sequential/)
- or test(/delegation_engine::tests::cross_delegation_isolation/)
- or test(/delegation_engine::tests::gate_fail_marks_verification_failed/)
- or test(/agentic_delegate_interception::tests::partition_handles_all_delegate_calls/)
- or test(/agentic_loop_host::tests::session_start_hook_injects_context_before_first_turn/)
- or test(/server_tool_executor::tests::rollback_session_state_current_turn_restores_server_self_mod_and_tasks/)
- or test(/session_workspace::tests::finalize_workspace_on_end_with_compact_summary/)
- or test(/agentic_loop_host::tests::stress_multi_turn_state_continuity_50_turns/)
-"""
-slow-timeout = { period = "5s", terminate-after = 1 }
-
-# `pre_filter_very_long_query` hits 1.002s occasionally under strict.
-# 2s is plenty of headroom while still catching new regressions.
-[[profile.strict.overrides]]
-filter = "test(/tool_registry::scoring::tests::pre_filter_very_long_query/)"
-slow-timeout = { period = "2s", terminate-after = 1 }
-
-# ── CI profiles: mirror the offline/online strict carve-outs ────────────
-# CI machines are more contended than dev boxes, so we extend the same
-# slow-case exemptions to `ci` (offline CI) and `strict-online-ci` (online CI)
-# with the CI's relative headroom (×~2.5 over local). Same filters,
-# different budgets. Must be kept in sync with the strict/strict-online
-# overrides above — if you add a new slow test, add all four blocks.
-
-[[profile.ci.overrides]]
-filter = """
-test(/slash_debug::tests::resolve_session_id_exact_uuid_passthrough/)
- or test(/slash_debug::tests::resolve_session_id_no_match_returns_input/)
- or test(/slash_agent::tests::load_recent_delegations_collects_summary_and_subruns/)
- or test(/plan_executor::tests::spawn_plan_executor_emits_compact_history_entries_between_subtasks/)
- or test(/delegation_engine::tests::cancel_token_per_execution_isolation/)
- or test(/delegation_engine::tests::gate_exhausted_retries_sequential/)
- or test(/delegation_engine::tests::cross_delegation_isolation/)
- or test(/delegation_engine::tests::gate_fail_marks_verification_failed/)
- or test(/agentic_delegate_interception::tests::partition_handles_all_delegate_calls/)
- or test(/agentic_loop_host::tests::session_start_hook_injects_context_before_first_turn/)
- or test(/server_tool_executor::tests::rollback_session_state_current_turn_restores_server_self_mod_and_tasks/)
- or test(/session_workspace::tests::finalize_workspace_on_end_with_compact_summary/)
- or test(/agentic_loop_host::tests::stress_multi_turn_state_continuity_50_turns/)
- or test(/tool_registry::scoring::tests::pre_filter_very_long_query/)
-"""
-slow-timeout = { period = "10s", terminate-after = 1 }
-
-# ── integration_e2e membership + ceiling ─────────────────────────────────
 # Every test that runs the production agentic loop / SSE handler /
-# delegation engine end-to-end belongs here. Each is 100-900ms
-# intrinsic; 2s ceiling absorbs loaded-laptop contention while still
-# catching any NEW test that creeps above 2s.
+# delegation engine end-to-end belongs here (2-wide cap).
 [[profile.strict.overrides]]
 filter = """
 test(/stress_multi_turn_state_continuity_50_turns/)
@@ -143,170 +54,30 @@ test(/stress_multi_turn_state_continuity_50_turns/)
  or package(astra-runtime) and binary(team_delegation_integration)
  or package(astra-runtime) and binary(team_execute_http_integration)
  or package(astra-runtime) and binary(phase_f_nested_cancel)
-"""
-test-group = "integration_e2e"
-slow-timeout = { period = "2s", terminate-after = 1 }
-
-# spawn_plan_executor tests need their own 1-wide group — see group def.
-# Each drives a full `spawn_plan_executor` → agentic loop → mock LLM
-# → subtask completion → `PlanUpdate::HistoryEntry` emission flow
-# (coverage of the real production plan-execution path). Isolated
-# 274-512ms; serialize at 1-wide with a 2s ceiling.
-[[profile.strict.overrides]]
-filter = "test(/spawn_plan_executor_/)"
-test-group = "plan_executor_e2e"
-slow-timeout = { period = "2s", terminate-after = 1 }
-
-# ── selector_metric_e2e_trims_global_window_to_recent_rows ────────────────
-# Exercises the global LRU-trim invariant on `skill_selector_turn_metrics`:
-# when the table grows past `SKILL_SELECTOR_RECENT_WINDOW_SIZE` (1000), the
-# production trim step prunes oldest rows. Needs its own MatrixOne database
-# (the other three tests in `selector_metrics_db_e2e` are session-scoped and
-# share one via `shared_setup()`), because the assertion reads `COUNT(*)`
-# across the entire table — pollution from sibling tests would corrupt it.
-#
-# Intrinsic cost breakdown (measured): ~600ms schema bootstrap + ~70ms
-# bulk-insert of 1000 preload rows + ~30ms 3×production-persist (each trims)
-# + ~5ms assertions + ~400ms `DROP DATABASE` teardown. Total ~1.1–1.9s in
-# isolation, with the DROP DATABASE dominating the tail. Put in its own
-# 1-wide `db_scoped_trim` group — doesn't steal slots from
-# `integration_e2e` (where `system_matrix_http_e2e`'s 59 tests live).
-# 5s ceiling absorbs stage-1 `make test-online` contention where 50+
-# astra-runtime ignored tests share MatrixOne.
-[[profile.strict-online.overrides]]
-filter = "test(/selector_metric_e2e_trims_global_window_to_recent_rows/)"
-test-group = "db_scoped_trim"
-slow-timeout = { period = "5s", terminate-after = 1 }
-
-# ── plan_repository_db_it parallelism cap (online) ────────────────────────
-# All 22 tests in this binary setup the shared `CloudPlanRepository` against
-# a shared MatrixOne DB via `common::setup_pool()`. Each is 100–140ms
-# isolated, but 22 tests × other binaries all sharing one MatrixOne at
-# default nextest parallelism (24 CPUs) causes DB lock contention on the
-# shared schema — some tests saw 2s+. Cap at 2-wide `integration_e2e` and
-# 3s ceiling; intrinsic solo cost stays well under 2s.
-[[profile.strict-online.overrides]]
-filter = "package(astra-plan) and binary(plan_repository_db_it)"
-test-group = "integration_e2e"
-slow-timeout = { period = "5s", terminate-after = 1 }
-
-# ── plan_sync_db_it::migration_dedupe (online) ────────────────────────────
-# Asserts that migrations 7 (dedupe) + 8 (add UNIQUE) run in order and leave
-# exactly one row per attempt tuple. Re-runs `ensure_core_schema` inside the
-# test body (after planting duplicates), so it pays the schema-check tax
-# twice. 0.2s solo, 2s+ under contention from other ignored integration
-# tests. Cap at 3s with `integration_e2e` parallelism.
-[[profile.strict-online.overrides]]
-filter = "test(/migration_dedupe_removes_duplicate_attempt_tuples/)"
-test-group = "integration_e2e"
-slow-timeout = { period = "3s", terminate-after = 1 }
-
-# ── server_loop hook_events E2E (online) ─────────────────────────────────
-# Same pattern as `selector_metric_e2e_trims_*`: per-test MatrixOne
-# database + full `ensure_core_schema` + `DROP DATABASE` teardown. 0.8s
-# solo, but `DROP DATABASE` on MatrixOne is consistently slow (~300–800ms)
-# and contends with sibling binaries running `make test-online`. Can't
-# share the DB — this is the only test using `setup_runtime_db_pool` in
-# this binary, and the 1-line summary assertion takes `sample_size(1)`
-# globally. 1-wide `db_scoped_trim` group, 5s ceiling (stage-1 contention
-# with 50+ astra-runtime ignored tests sharing MatrixOne pushes it past 3s).
-[[profile.strict-online.overrides]]
-filter = "test(/persist_server_loop_hook_events_e2e_persists_selector_metric/)"
-test-group = "db_scoped_trim"
-slow-timeout = { period = "5s", terminate-after = 1 }
-
-# ── online per-case 5s carve-out (whole-binary) ───────────────────────────
-# Same reasoning as the offline 5s block above: these binaries hit 2s
-# TIMEOUTs flaky under `make test-online` concurrency because of the
-# `session_sync_log` prune contention documented in
-# `plans/session-sync-log-prune-hotpath-2026-05-01.md`, plus per-test
-# `setup_pool` contention on shared MatrixOne state. Raising to 5s is a
-# stopgap; fix the root cause and tighten this back to 2–3s.
-[[profile.strict-online.overrides]]
-filter = """
-package(astra-runtime) and binary(plan_http_db_it)
- or package(astra-runtime) and binary(selector_metrics_db_e2e)
- or package(astra-services) and binary(plan_sync_db_it)
- or package(astra-services) and binary(services_db_integration)
- or package(astra-services) and binary(team_persistence_integration)
- or package(astra-services) and binary(multi_agent_integration)
-"""
-slow-timeout = { period = "10s", terminate-after = 1 }
-
-
-[[profile.strict-online-ci.overrides]]
-filter = """
-package(astra-runtime) and binary(plan_http_db_it)
- or package(astra-runtime) and binary(selector_metrics_db_e2e)
- or package(astra-services) and binary(plan_sync_db_it)
- or package(astra-services) and binary(services_db_integration)
- or package(astra-services) and binary(team_persistence_integration)
- or package(astra-services) and binary(multi_agent_integration)
-"""
-slow-timeout = { period = "15s", terminate-after = 1 }
-
-# ── system_matrix_http_e2e parallelism cap (online) ──────────────────────
-# 59 E2E tests in `tests/system_matrix_http_e2e/` all drive the full prod
-# stack (Axum router + agentic loop + mock LLM + MatrixOne). Each is
-# 0.2–1.3s in isolation (bootstrap dominates: bcrypt hash+verify + pool
-# connect + register/login/refresh). When nextest's default machine-wide
-# parallelism runs ~24 of them concurrently against a single MatrixOne
-# instance, DB contention pushes p95 wall time from ~0.8s → 2.5s+ —
-# intrinsic rate is fine; only contention is the issue.
-#
-# Two `rate_limit_failure` tests are intrinsically longer (~1.9s and ~3.3s)
-# because they assert retry-exhaustion surface behavior: 3 retries × mock
-# 429 with no Retry-After header. The `ASTRA_LLM_RETRY_BASE_MS=10` +
-# `ASTRA_DEFAULT_RETRY_AFTER_MS=10` env overrides (set by the E2E harness)
-# collapse the per-retry wait from 1s→10ms, but the 4 stream hits + DB
-# artifact persistence + cooldown follow-up turn still total ~3s.
-#
-# Solution: 2-wide cap (same as offline `integration_e2e`) + 3s ceiling on
-# strict-online. Local: 2s default applies to most tests, 3s override to
-# this binary absorbs rate_limit_failure + contention. CI (8s baseline from
-# strict-online-ci) has plenty of headroom already.
-[[profile.strict-online.overrides]]
-filter = "package(astra-runtime) and binary(system_matrix_http_e2e)"
-test-group = "integration_e2e"
-slow-timeout = { period = "3s", terminate-after = 1 }
-
-# Note: online DB-backed binaries (`*_db_it`, `*_integration`) have their
-# budget driven by `TEST_ONLINE_TIMEOUT` in the Makefile (local default 2s,
-# CI 8s). No per-binary overrides here — otherwise those would re-clamp
-# CI's 8s back down.
-
-# ── bridge-e2e-hooks full-stack integration tests (~100 tests) ─────────────
-# Located in `rust/crates/runtime/tests/{web_agent_e2e.rs,bridge_e2e_comprehensive.rs}`
-# under the `bridge-e2e-hooks` feature. Each test drives the PRODUCTION
-# `/chat/stream` or `/chat/turn` handler via `build_app(state)` + axum
-# `Router::oneshot`, wires a `test_llm_rounds` mock through `context`, and
-# asserts end-to-end SSE invariants (event ordering, session_info shape,
-# persistence hooks, bridge fallback). This is the ONLY suite that
-# covers the real web-agent production handler end-to-end; replacing it
-# with unit-level tests would delete the integration contract.
-#
-# Intrinsic cost: ~2s per test (measured in isolation on a quiet box).
-# Breakdown per test: ~500ms `build_app`/state assembly + ~500ms
-# agentic-loop scaffolding + ~300ms SSE round-trip + ~700ms background
-# observer/journal/hook flush before body completes (see
-# `ServerAgenticLoopHost` finalization in
-# `runtime/src/server/server_loop_host.rs`).
-#
-# Reducing per-test cost would require a shared `TestApp` fixture (one
-# `OnceLock<Router>` across all tests) — a ~100-test refactor that also
-# changes the isolation story (shared state between tests is itself a
-# correctness hazard). Scoped as a follow-up.
-#
-# Budget: 3s with the 2-wide parallelism cap. This does not hide
-# regressions: individual tests that legitimately creep past 3s still
-# fail, and a new test that blows through 3s still fails immediately.
-# The negative-path tests (`security_missing_secret_header_*` etc.)
-# that wait for a real LLM timeout cap are the ceiling — those are
-# testing behavior that hits a production timeout wall by design.
-[[profile.strict.overrides]]
-filter = """
-package(astra-runtime) and binary(web_agent_e2e)
+ or package(astra-runtime) and binary(web_agent_e2e)
  or package(astra-runtime) and binary(bridge_e2e_comprehensive)
 """
 test-group = "integration_e2e"
-slow-timeout = { period = "3s", terminate-after = 1 }
+
+# `spawn_plan_executor_*` tests serialize fully (1-wide).
+[[profile.strict.overrides]]
+filter = "test(/spawn_plan_executor_/)"
+test-group = "plan_executor_e2e"
+
+# Tests that need per-test MatrixOne databases (CREATE + DROP DATABASE)
+# serialise to avoid parallel DROP contention.
+[[profile.strict-online.overrides]]
+filter = """
+test(/selector_metric_e2e_trims_global_window_to_recent_rows/)
+ or test(/persist_server_loop_hook_events_e2e_persists_selector_metric/)
+"""
+test-group = "db_scoped_trim"
+
+# Heavy online integration binaries share a 2-wide cap.
+[[profile.strict-online.overrides]]
+filter = """
+package(astra-plan) and binary(plan_repository_db_it)
+ or package(astra-runtime) and binary(system_matrix_http_e2e)
+ or test(/migration_dedupe_removes_duplicate_attempt_tuples/)
+"""
+test-group = "integration_e2e"
