@@ -25,8 +25,9 @@ use astra_test_harness::suite::{DiskSessionLoader, SessionCaptureMode, SuiteConf
 )]
 struct Args {
     /// Directory containing case YAML files.
+    /// Optional when --live-dashboard is used (auto-detected).
     #[arg(long, value_name = "DIR")]
-    suite: PathBuf,
+    suite: Option<PathBuf>,
 
     /// Comma-separated fallback model list.
     #[arg(long, value_name = "CSV", default_value = "")]
@@ -157,6 +158,31 @@ struct Args {
     live_dashboard: Option<u16>,
 }
 
+fn resolve_suite_dir(explicit: &std::path::Path, astra_bin: &std::path::Path) -> PathBuf {
+    if !explicit.as_os_str().is_empty() && explicit.is_dir() {
+        return explicit.to_path_buf();
+    }
+    // Auto-detect: look for the cases/ directory relative to the astra binary
+    // or the current working directory.
+    for base in [
+        astra_bin
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf()),
+        std::env::current_dir().ok(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let candidate = base.join("rust/crates/astra-test-harness/cases");
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+    PathBuf::from("rust/crates/astra-test-harness/cases")
+}
+
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
@@ -237,10 +263,42 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let astra_bin = resolve_astra_bin(args.astra_bin.clone())?;
 
-    let mut cases = Case::load_dir(&args.suite)
-        .with_context(|| format!("load cases from {}", args.suite.display()))?;
+    // ── Dashboard-only mode ─────────────────────────────────────────
+    // When --live-dashboard is passed without a full CLI run config,
+    // start the dashboard server and let the user configure everything
+    // from the web UI.
+    if let Some(port) = args.live_dashboard {
+        let suite_dir = resolve_suite_dir(args.suite.as_deref().unwrap_or("".as_ref()), &astra_bin);
+        let fallback_models: Vec<String> = args
+            .models
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let dashboard_config = astra_test_harness::dashboard::DashboardConfig {
+            suite_dir,
+            astra_bin,
+            available_models: fallback_models,
+            judger_model: args.judger_model.clone(),
+        };
+        let server = astra_test_harness::dashboard::DashboardServer::new(dashboard_config);
+        eprintln!("[astra-test] starting dashboard at http://localhost:{port}");
+        eprintln!("[astra-test] open in your browser — configure and run from there.");
+        eprintln!("[astra-test] press Ctrl-C to stop.");
+        server.start(port).await?;
+        return Ok(());
+    }
+
+    // ── Normal CLI mode ─────────────────────────────────────────────
+    let suite_path = args.suite.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "--suite is required in CLI mode. Use --live-dashboard for the web console."
+        )
+    })?;
+    let mut cases = Case::load_dir(suite_path)
+        .with_context(|| format!("load cases from {}", suite_path.display()))?;
     if cases.is_empty() {
-        anyhow::bail!("no cases found in {}", args.suite.display());
+        anyhow::bail!("no cases found in {}", suite_path.display());
     }
 
     // Apply --filter
@@ -359,26 +417,6 @@ async fn main() -> Result<()> {
         runs: args.runs.max(1),
     };
 
-    let dashboard_tx = if let Some(port) = args.live_dashboard {
-        let dashboard_config = astra_test_harness::dashboard::DashboardConfig {
-            suite_dir: args.suite.clone(),
-            astra_bin: astra_bin.clone(),
-            available_models: fallback_models.clone(),
-            judger_model: args.judger_model.clone(),
-        };
-        let server = astra_test_harness::dashboard::DashboardServer::new(dashboard_config);
-        let tx = server.sender();
-        tokio::spawn(async move {
-            if let Err(e) = server.start(port).await {
-                eprintln!("[astra-test] dashboard error: {e}");
-            }
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        Some(tx)
-    } else {
-        None
-    };
-
     let runner = SuiteRunner {
         executor: executor.as_ref(),
         judger: judger.as_ref(),
@@ -388,7 +426,7 @@ async fn main() -> Result<()> {
         no_judger: args.no_judger,
         session_mode,
         suite_cfg,
-        dashboard_tx,
+        dashboard_tx: None,
     };
 
     let suite = runner.run_all(&cases).await;
@@ -455,12 +493,6 @@ async fn main() -> Result<()> {
                 eprintln!("[astra-test] WARNING: summarizer failed: {e}");
             }
         }
-    }
-
-    if args.live_dashboard.is_some() {
-        eprintln!("[astra-test] dashboard still running — press Ctrl-C to exit.");
-        tokio::signal::ctrl_c().await.ok();
-        return Ok(());
     }
 
     if suite.failed() > 0 {
