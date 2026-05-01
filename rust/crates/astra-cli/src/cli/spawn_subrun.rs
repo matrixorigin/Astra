@@ -22,7 +22,7 @@ use astra_runtime::{
     turn::tool_schema_prune::openai_tool_names_from_schemas,
     turn::turn_guard::TurnGuard,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::edge_tools;
 use super::permission_manager::PermissionMode;
@@ -48,6 +48,38 @@ pub struct CliSpawnAgentExecutor {
     /// prepend the parent prefix — but no ForkCacheEvent is emitted.
     /// Zero-cost when unset.
     fork_cache_sink: Option<Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink>>,
+}
+
+/// Build the child agent's message array from system prompt, optional
+/// inherited prefix, and the child task. Ensures role alternation is
+/// valid for providers that require strict user/assistant alternation
+/// (e.g. Bedrock Converse).
+pub(crate) fn build_child_messages(
+    system_prompt: &str,
+    prefix_messages: Option<&[Value]>,
+    child_task: &str,
+) -> Vec<Value> {
+    let prefix_len = prefix_messages.map_or(0, |p| p.len());
+    let mut messages = Vec::with_capacity(3 + prefix_len);
+    messages.push(json!({ "role": "system", "content": system_prompt }));
+    if let Some(prefix) = prefix_messages {
+        messages.extend(prefix.iter().cloned());
+        // Bedrock Converse requires strict role alternation. If the
+        // prefix ends with user or tool role, inserting the child task
+        // (also user) would create consecutive user messages → HTTP 400.
+        // Insert a synthetic assistant bridge to maintain alternation.
+        let last_role = messages.iter().rev()
+            .find_map(|m| m.get("role").and_then(|r| r.as_str()))
+            .filter(|r| *r != "system");
+        if matches!(last_role, Some("user") | Some("tool")) {
+            messages.push(json!({
+                "role": "assistant",
+                "content": "I'll now work on the delegated task."
+            }));
+        }
+    }
+    messages.push(json!({ "role": "user", "content": child_task }));
+    messages
 }
 
 impl CliSpawnAgentExecutor {
@@ -182,17 +214,11 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         // the provider can hit in its prompt cache. The child task
         // at the tail is always fresh (cacheable only for future
         // child turns, not for this first call).
-        let mut messages = Vec::with_capacity(
-            2 + config
-                .inherited_prefix
-                .as_ref()
-                .map_or(0, |ip| ip.prefix_messages.len()),
+        let messages = build_child_messages(
+            &system_prompt,
+            config.inherited_prefix.as_ref().map(|ip| ip.prefix_messages.as_slice()),
+            &config.task,
         );
-        messages.push(json!({ "role": "system", "content": system_prompt }));
-        if let Some(ref ip) = config.inherited_prefix {
-            messages.extend(ip.prefix_messages.iter().cloned());
-        }
-        messages.push(json!({ "role": "user", "content": config.task }));
 
         // Build restricted tools based on agent type's allowed_tools
         let restricted_tools: HashSet<String> = if config.allowed_tools.iter().any(|t| t == "*") {
@@ -524,6 +550,88 @@ mod tests {
             None,
         );
         assert!(executor.skill_resolver.is_none());
+    }
+
+    /// Bug1 regression: when inherited prefix ends with a user or tool
+    /// message, the child task (also user role) creates consecutive
+    /// user messages. Bedrock Converse rejects this with HTTP 400:
+    /// "The provided request is not valid".
+    ///
+    /// The fix must insert a synthetic assistant message between the
+    /// prefix and the child task when the last prefix message has
+    /// role "user" or "tool".
+    #[test]
+    fn prefix_ending_with_user_or_tool_must_insert_assistant_bridge() {
+        // Simulate the message construction logic from execute()
+        let prefix_messages = vec![
+            json!({"role": "user", "content": "original prompt"}),
+        ];
+        let system_prompt = "You are a child agent.";
+        let child_task = "Reply: inherited-ok";
+
+        let messages = build_child_messages(system_prompt, Some(&prefix_messages), child_task);
+
+        // After system, the messages should NOT have two consecutive user roles.
+        let non_system: Vec<&str> = messages
+            .iter()
+            .filter_map(|m| m.get("role").and_then(|r| r.as_str()))
+            .filter(|r| *r != "system")
+            .collect();
+
+        for window in non_system.windows(2) {
+            let both_user = (window[0] == "user" || window[0] == "tool")
+                && (window[1] == "user" || window[1] == "tool");
+            assert!(
+                !both_user,
+                "consecutive user/tool messages detected: [{}, {}] — \
+                 Bedrock will reject with HTTP 400",
+                window[0], window[1]
+            );
+        }
+    }
+
+    /// Same as above but for prefix ending with tool role.
+    #[test]
+    fn prefix_ending_with_tool_must_insert_assistant_bridge() {
+        let prefix_messages = vec![
+            json!({"role": "user", "content": "do something"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [{"id": "1", "function": {"name": "bash", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "1", "content": "done"}),
+        ];
+        let messages = build_child_messages("system", Some(&prefix_messages), "child task");
+
+        let non_system: Vec<&str> = messages
+            .iter()
+            .filter_map(|m| m.get("role").and_then(|r| r.as_str()))
+            .filter(|r| *r != "system")
+            .collect();
+
+        for window in non_system.windows(2) {
+            let both_user = (window[0] == "user" || window[0] == "tool")
+                && (window[1] == "user" || window[1] == "tool");
+            assert!(
+                !both_user,
+                "consecutive user/tool messages detected: [{}, {}]",
+                window[0], window[1]
+            );
+        }
+    }
+
+    /// When prefix ends with assistant, no bridge is needed.
+    #[test]
+    fn prefix_ending_with_assistant_needs_no_bridge() {
+        let prefix_messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+        ];
+        let messages = build_child_messages("system", Some(&prefix_messages), "child task");
+
+        // Should be: system, user, assistant, user(child task) — no extra assistant
+        let roles: Vec<&str> = messages
+            .iter()
+            .filter_map(|m| m.get("role").and_then(|r| r.as_str()))
+            .collect();
+        assert_eq!(roles, vec!["system", "user", "assistant", "user"]);
     }
 
     /// Regression guard for "Session not found" during real-world

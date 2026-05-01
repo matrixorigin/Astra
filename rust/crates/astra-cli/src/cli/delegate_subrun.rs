@@ -26,7 +26,6 @@ use astra_runtime::{
     turn::turn_guard::TurnGuard,
 };
 use astra_services::coordination::AgentResult;
-use serde_json::json;
 
 use super::edge_tools;
 use super::permission_manager::PermissionMode;
@@ -329,17 +328,11 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         // sits behind it as cacheable context, and the child's
         // task message is the fresh suffix. When no prefix was
         // resolved, this degenerates to the pre-fix 2-message layout.
-        let mut messages = Vec::with_capacity(
-            2 + config
-                .inherited_prefix
-                .as_ref()
-                .map_or(0, |ip| ip.prefix_messages.len()),
+        let messages = crate::spawn_subrun::build_child_messages(
+            &system_prompt,
+            config.inherited_prefix.as_ref().map(|ip| ip.prefix_messages.as_slice()),
+            &user_message,
         );
-        messages.push(json!({ "role": "system", "content": system_prompt }));
-        if let Some(ref ip) = config.inherited_prefix {
-            messages.extend(ip.prefix_messages.iter().cloned());
-        }
-        messages.push(json!({ "role": "user", "content": user_message }));
 
         let restricted_tools = build_restricted_tools(&profile.skill_filter, &valid_tool_names);
 

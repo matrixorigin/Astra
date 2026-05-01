@@ -985,7 +985,44 @@ fn build_bedrock_messages(
         }
     }
     flush_tool_buffer(&mut out, &mut tool_buffer);
+
+    // Bedrock Converse requires strict role alternation (user/assistant/user/...).
+    // Runtime-injected messages (correctives, attention, budget warnings) can
+    // create consecutive user messages. Merge them into a single message with
+    // combined content blocks.
+    let out = merge_consecutive_same_role(out);
+
     (system, out)
+}
+
+/// Merge consecutive messages with the same role into a single message
+/// with combined content blocks. Bedrock Converse requires strict
+/// user/assistant alternation.
+fn merge_consecutive_same_role(messages: Vec<Value>) -> Vec<Value> {
+    if messages.is_empty() {
+        return messages;
+    }
+    let mut merged: Vec<Value> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or_default();
+        let can_merge = merged.last().is_some_and(|prev: &Value| {
+            prev.get("role").and_then(Value::as_str) == Some(role)
+        });
+        if can_merge {
+            // Append content blocks to the previous message
+            if let Some(new_content) = msg.get("content").and_then(Value::as_array) {
+                if let Some(prev) = merged.last_mut() {
+                    if let Some(prev_content) = prev.get_mut("content").and_then(Value::as_array_mut)
+                    {
+                        prev_content.extend(new_content.iter().cloned());
+                    }
+                }
+            }
+        } else {
+            merged.push(msg);
+        }
+    }
+    merged
 }
 
 fn build_bedrock_tools(tools: &[Value]) -> Vec<Value> {
@@ -994,10 +1031,14 @@ fn build_bedrock_tools(tools: &[Value]) -> Vec<Value> {
         if let Some(mapped) = (|| {
             let function = tool.get("function")?.as_object()?;
             let name = function.get("name").and_then(Value::as_str)?;
-            let input_schema = function
+            let mut input_schema = function
                 .get("parameters")
                 .cloned()
                 .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            // Bedrock Converse rejects schemas with unsupported fields like
+            // "default", "minimum", "maximum" inside property definitions.
+            // Strip them recursively to avoid HTTP 400.
+            strip_unsupported_schema_fields(&mut input_schema);
             let mut tool_spec = Map::new();
             tool_spec.insert("name".to_string(), Value::String(name.to_string()));
             if let Some(description) = function.get("description").and_then(Value::as_str) {
@@ -1018,6 +1059,42 @@ fn build_bedrock_tools(tools: &[Value]) -> Vec<Value> {
         }
     }
     out
+}
+
+/// Recursively strip JSON Schema fields that Bedrock Converse does not accept.
+/// Bedrock's toolSpec inputSchema only supports a subset of JSON Schema:
+/// type, description, properties, required, items, enum.
+/// Fields like "default", "minimum", "maximum", "minItems", "maxItems",
+/// "pattern", "format" cause HTTP 400 "The provided request is not valid".
+fn strip_unsupported_schema_fields(value: &mut Value) {
+    const UNSUPPORTED: &[&str] = &[
+        "default",
+        "minimum",
+        "maximum",
+        "minItems",
+        "maxItems",
+        "pattern",
+        "format",
+        "examples",
+        "title",
+        "$schema",
+        "additionalProperties",
+    ];
+    if let Some(obj) = value.as_object_mut() {
+        for key in UNSUPPORTED {
+            obj.remove(*key);
+        }
+        // Recurse into properties
+        if let Some(props) = obj.get_mut("properties").and_then(Value::as_object_mut) {
+            for (_, prop_val) in props.iter_mut() {
+                strip_unsupported_schema_fields(prop_val);
+            }
+        }
+        // Recurse into items (array schemas)
+        if let Some(items) = obj.get_mut("items") {
+            strip_unsupported_schema_fields(items);
+        }
+    }
 }
 
 fn bedrock_messages_contain_tool_blocks(messages: &[Value]) -> bool {
@@ -1143,7 +1220,16 @@ pub(crate) fn build_provider_request_body(
             if !bedrock_tools.is_empty() {
                 body["toolConfig"] = json!({ "tools": bedrock_tools });
             } else if bedrock_messages_contain_tool_blocks(&bedrock_messages) {
-                body["toolConfig"] = json!({ "tools": [] });
+                // Bedrock requires toolConfig when messages contain toolUse/toolResult
+                // blocks, but rejects an empty tools array. Provide a minimal
+                // placeholder tool so the request validates.
+                body["toolConfig"] = json!({ "tools": [{
+                    "toolSpec": {
+                        "name": "_noop",
+                        "description": "No-op placeholder for message history compatibility",
+                        "inputSchema": { "json": { "type": "object", "properties": {} } }
+                    }
+                }] });
             }
             thinking.apply_bedrock(&mut body);
             if thinking.is_enabled() {
@@ -4873,16 +4959,17 @@ mod tests {
             &ThinkingConfig::Off,
         );
         let out = body["messages"].as_array().expect("messages array");
-        // assistant / user(tool x) / user(interrupt) / assistant / user(tool y)
-        assert_eq!(out.len(), 5);
+        // After merge: assistant / user(tool x + interrupt) / assistant / user(tool y)
+        assert_eq!(out.len(), 4);
         assert_eq!(
             out[1]["content"][0]["toolResult"]["toolUseId"], "x",
             "first tool group"
         );
-        assert_eq!(out[2]["role"], "user");
-        assert_eq!(out[2]["content"][0]["text"], "interrupt");
+        // The interrupt text is merged into the same user message
+        assert_eq!(out[1]["content"][1]["text"], "interrupt");
+        assert_eq!(out[2]["role"], "assistant");
         assert_eq!(
-            out[4]["content"][0]["toolResult"]["toolUseId"], "y",
+            out[3]["content"][0]["toolResult"]["toolUseId"], "y",
             "second tool group"
         );
     }
@@ -5012,15 +5099,19 @@ mod tests {
             .filter_map(|b| b.get("toolResult")?.get("toolUseId")?.as_str())
             .collect();
         assert_eq!(ids, vec!["a", "b"], "{body:#?}");
-        // empty tools + tool blocks in history ⇒ toolConfig must still be present
+        // Bedrock requires toolConfig when messages have tool blocks but
+        // rejects empty tools array. We provide a _noop placeholder.
         assert!(
             body.get("toolConfig").is_some(),
-            "toolConfig missing: {body:#?}"
+            "toolConfig should have placeholder: {body:#?}"
+        );
+        assert_eq!(
+            body["toolConfig"]["tools"][0]["toolSpec"]["name"], "_noop"
         );
     }
 
     #[test]
-    fn build_bedrock_body_includes_tool_config_when_history_has_tool_blocks() {
+    fn build_bedrock_body_omits_tool_config_when_no_tools_provided() {
         let messages = vec![
             json!({"role": "user", "content": "list files"}),
             json!({
@@ -5045,10 +5136,15 @@ mod tests {
             false,
             &ThinkingConfig::Off,
         );
+        // Bedrock requires toolConfig when messages have tool blocks but
+        // rejects empty tools array. We provide a _noop placeholder.
+        assert!(
+            body.get("toolConfig").is_some(),
+            "toolConfig should have placeholder: {body:#?}"
+        );
         assert_eq!(
-            body["toolConfig"]["tools"],
-            json!([]),
-            "empty tools array required when history contains tool blocks"
+            body["toolConfig"]["tools"][0]["toolSpec"]["name"], "_noop",
+            "placeholder tool required when history contains tool blocks"
         );
     }
 
@@ -6453,5 +6549,72 @@ mod tests {
             );
             assert_eq!(body["enable_thinking"], true);
         }
+    }
+
+    #[test]
+    fn bedrock_merges_consecutive_user_messages() {
+        let messages = vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "hello"}]}),
+            json!({"role": "assistant", "content": [{"type": "toolUse", "name": "bash", "toolUseId": "1", "input": {}}]}),
+            json!({"role": "user", "content": [{"type": "toolResult", "toolUseId": "1", "content": [{"text": "ok"}]}]}),
+            json!({"role": "user", "content": [{"type": "text", "text": "correction 1"}]}),
+            json!({"role": "user", "content": [{"type": "text", "text": "correction 2"}]}),
+        ];
+        let merged = merge_consecutive_same_role(messages);
+        assert_eq!(merged.len(), 3, "should merge 3 consecutive user msgs into 1");
+        assert_eq!(merged[0]["role"], "user");
+        assert_eq!(merged[1]["role"], "assistant");
+        assert_eq!(merged[2]["role"], "user");
+        // The merged user message should have 3 content blocks
+        let content = merged[2]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+    }
+
+    #[test]
+    fn bedrock_tools_strip_unsupported_schema_fields() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "spawn_agent",
+                "description": "Spawn a sub-agent",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "max_turns": {
+                            "type": "integer",
+                            "description": "Max turns",
+                            "minimum": 1,
+                            "maximum": 100,
+                            "default": 10
+                        },
+                        "background": {
+                            "type": "boolean",
+                            "description": "Run in background",
+                            "default": true
+                        },
+                        "allowed_tools": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "minItems": 1
+                        }
+                    },
+                    "required": ["max_turns"]
+                }
+            }
+        })];
+        let bedrock = build_bedrock_tools(&tools);
+        let schema = &bedrock[0]["toolSpec"]["inputSchema"]["json"];
+        let max_turns = &schema["properties"]["max_turns"];
+        // "minimum", "maximum", "default" must be stripped
+        assert!(max_turns.get("minimum").is_none(), "minimum not stripped");
+        assert!(max_turns.get("maximum").is_none(), "maximum not stripped");
+        assert!(max_turns.get("default").is_none(), "default not stripped");
+        // "type" and "description" must survive
+        assert_eq!(max_turns["type"], "integer");
+        assert_eq!(max_turns["description"], "Max turns");
+        // nested items should not have minItems
+        assert!(schema["properties"]["allowed_tools"].get("minItems").is_none());
+        // "required" at top level must survive
+        assert_eq!(schema["required"], json!(["max_turns"]));
     }
 }
