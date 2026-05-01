@@ -226,6 +226,7 @@ mod tests {
                 score: self.score,
                 rationale: "fixed".into(),
                 full_rationale: "fixed".into(),
+                votes: Vec::new(),
             })
         }
     }
@@ -290,6 +291,7 @@ mod tests {
                     score: 1.0,
                     rationale: "".into(),
                     full_rationale: "".into(),
+                    votes: Vec::new(),
                 })
             }
         }

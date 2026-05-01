@@ -182,6 +182,25 @@ Digest:
   --no-digest-on-fail          disable on-FAIL digest auto-capture
 ```
 
+## Execution model: serial
+
+The harness runs cases × models strictly serially. A 16-case × 3-model
+matrix with ~60–120s per run serializes to 45–100 minutes. This is
+intentional for the current phase:
+
+- Each subprocess hits a single running astra-server; true
+  concurrency is capped by server capacity anyway.
+- Session-capture races (two cases writing to overlapping paths) are
+  avoided by construction.
+- Quorum judger calls within a single case already serialize — the
+  dominant cost is there, not in the case loop.
+
+If you need a concurrency knob (independent model rows in parallel,
+or distinct suites), open an issue. The library-side primitive
+(`SuiteRunner`) is ready to accept a semaphore-gated `FuturesUnordered`
+pass — the decision to hold off is about surface-area commitments,
+not implementation difficulty.
+
 ## Design principles
 
 1. **Cases are data**, not code. YAML only.

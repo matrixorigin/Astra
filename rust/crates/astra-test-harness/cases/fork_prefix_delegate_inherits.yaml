@@ -27,9 +27,9 @@ criteria:
   - type: stderr_matches
     pattern: '\[fork-cache\]'
   # G2 correctness: delegate path must produce a classifiable event
-  # — hit when inheritance works, or a soft-fallback class if not.
-  - type: fork_cache_class
-    expect: [hit, partial_drift, validation_failed, fallback]
+  # when the child actually reaches the API.
+  - type: fork_cache_outcome
+    expect: [hit, partial_drift, miss, exceeded_expected]
   - type: judger
     question: |
       Look at the stderr data fence. Does the [fork-cache] event

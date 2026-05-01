@@ -281,45 +281,67 @@ mod tests {
         assert!(repro.contains("\"say 'hello'\""));
     }
 
-    // Regression: case timeout MUST kill the child process, not leak
-    // it. We invoke /bin/sleep directly so the stable `astra chat`
-    // arg vector doesn't interfere — this pins the kill-on-drop +
-    // timeout semantics independent of the astra bin's arg shape.
-    // Skipped on platforms without /bin/sleep (Windows CI).
+    // Regression: case timeout MUST kill the child process AND
+    // surface the synthetic exit=124 / "timeout" outcome through
+    // `AstraCliExecutor::execute`. The timeout branch has its own
+    // synthetic-outcome construction that was previously untested;
+    // this test routes a shim `/bin/sh -c "sleep 10"` script through
+    // the real executor path.
     #[tokio::test]
     async fn timeout_kills_subprocess_and_returns_posix_124() {
-        if !std::path::Path::new("/bin/sleep").exists() {
+        if !std::path::Path::new("/bin/sh").exists() {
             return;
         }
-        // Custom command, bypassing `AstraCliExecutor` so the sh/sleep
-        // binary isn't forced through `astra chat` args.
-        use std::process::Stdio;
-        use std::time::Duration;
-        use tokio::process::Command;
+        // Write a shim binary that ignores the `astra chat` arg
+        // vector and just sleeps. This lets `AstraCliExecutor`
+        // spawn it via its real `chat -m ... --model ... --json -y`
+        // arg assembly without the child exiting early.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shim = tmp.path().join("fake-astra");
+        std::fs::write(&shim, "#!/bin/sh\nsleep 10\n").expect("write shim");
+        let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&shim, perms).unwrap();
 
-        let mut cmd = Command::new("/bin/sleep");
-        cmd.arg("10")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let child = cmd.spawn().expect("spawn /bin/sleep");
+        let cfg = RunnerConfig::new(shim.clone());
+        let exec = AstraCliExecutor::new(cfg);
+        let case = Case {
+            name: "timeout_probe".into(),
+            description: None,
+            prompt: "ignored by the shim — just needs to be non-empty".into(),
+            models: Some(vec!["ignored".into()]),
+            criteria: vec![],
+            debug_log: false,
+            extra_cli_args: vec![],
+            timeout_seconds: 1,
+        };
         let start = std::time::Instant::now();
-        let timeout_secs = 1u64;
-        let result =
-            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
-                .await;
+        let outcome = exec.execute(&case, "ignored").await;
         let elapsed = start.elapsed();
-        assert!(
-            result.is_err(),
-            "wait_with_output should time out while sleep is still running"
-        );
-        // 3s slack so CI slowness doesn't flake; the whole point is
-        // that the child is killed on drop, not that timing is exact.
+
+        // `kill_on_drop` + explicit timeout capped the elapsed wall
+        // time near the 1s budget. 3s slack for CI noise.
         assert!(
             elapsed.as_secs() <= 3,
-            "kill_on_drop didn't cap elapsed — ran {}s",
+            "timeout didn't kill subprocess — elapsed {}s",
             elapsed.as_secs()
+        );
+        // Synthetic outcome: POSIX 124 + explanatory text. This is
+        // the contract downstream report rendering + reproducer
+        // hinting rely on.
+        assert_eq!(
+            outcome.exit_code, 124,
+            "timeout branch must surface POSIX 124 exit"
+        );
+        assert!(
+            outcome.text.contains("timeout"),
+            "timeout text must surface for the report: {}",
+            outcome.text
+        );
+        assert!(
+            outcome.duration_ms > 0,
+            "duration_ms should be populated on the synthetic outcome"
         );
     }
 

@@ -30,17 +30,33 @@ criteria:
     code: 0
   - type: tool_called
     name: spawn_agent
-  - type: stderr_matches
-    pattern: '\[fork-cache\]'
-  # Either a clean hit (clamp didn't matter) or a classified
-  # validation_failed / fallback satisfies the contract.
-  - type: fork_cache_class
-    expect: [hit, validation_failed, fallback]
+  # Note: ThinkingBudgetConflict short-circuits the resolver via
+  # `PrefixResolveOutcome::Failed` rather than emitting a
+  # `[fork-cache]` event. So if the clamp triggers, no fork-cache
+  # line appears at all; if the clamp did NOT matter (provider
+  # happened to round the same way) we get a `hit`. Both are fine.
+  # Deterministic check: if a fork-cache event DID appear, outcome
+  # must be `hit` (a `miss` / `partial_drift` with a clamp-triggered
+  # divergence would mean the resolver missed the validation). This
+  # is "optional" semantics because we don't know a priori which
+  # branch the runtime will take.
+  - type: fork_cache_outcome
+    # If any event appears at all it must be a hit. If none appears
+    # (resolver rejected), the fork_cache_outcome check FAILs and we
+    # fall back to the judger below for evidence of soft-fallback.
+    expect: [hit]
+    # The criterion doesn't have an `optional` field yet; a future
+    # case-level `allow_fail` gate could cover this. For now rely on
+    # the judger when the resolver rejects.
   - type: judger
     question: |
-      Deterministic class check already covered the classification.
-      Score only whether the child completed cleanly — no crash, no
-      silent corrupt prefix. Look for either the child's reply in
-      the final text OR an explicit acknowledgment that a fallback
-      occurred.
+      Either (a) the fork_cache_outcome criterion above already
+      passed with a hit (clamp didn't matter), OR (b) no [fork-cache]
+      event appeared because the resolver caught the
+      ThinkingBudgetConflict and the child ran without inheritance.
+      For case (b), evidence of correct behavior is a spawn_agent
+      tool error surfaced in the agent's transcript and a final text
+      that either reports the child's reply (spawn retried without
+      inheritance) OR transparently acknowledges the fallback. Do
+      NOT reward a silent success claim.
     threshold: 0.7

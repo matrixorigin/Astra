@@ -33,19 +33,27 @@ criteria:
     code: 0
   - type: tool_called
     name: spawn_agent
-  - type: stderr_matches
-    # Fallback MUST emit a fork-cache event — the mismatch is a
-    # classifiable outcome, not a silent skip.
-    pattern: '\[fork-cache\]'
-  # Provider mismatch → validation_failed or fallback; both are
-  # acceptable soft-fallback classifications.
-  - type: fork_cache_class
-    expect: [validation_failed, fallback]
+  # Note on observability: the current runtime signals validation
+  # failures via `PrefixResolveOutcome::Failed` (spawner returns a
+  # SpawnError), NOT via a `[fork-cache]` stderr event. So this case
+  # does NOT assert a fork-cache line — instead we verify:
+  #   (a) the agent still invoked spawn_agent (fork_cache didn't
+  #       silently short-circuit the call),
+  #   (b) the whole run still terminated cleanly (exit_code 0 — the
+  #       parent caught the tool error and surfaced it in text).
+  # A future `[fork-resolve]` stderr sink would let us pin this
+  # deterministically; see docs/scope-cut in PR #288.
   - type: judger
     question: |
-      The deterministic fork_cache_class criterion already pinned
-      that a soft-fallback event appeared. Score whether the child
-      still completed cleanly: did the final text either surface the
-      child's reply OR transparently acknowledge the fallback? A
-      correct run doesn't crash and doesn't silently claim success.
+      The child model 'qwen-flash' is on a different provider than
+      the parent's anthropic model, so the fork-prefix resolver MUST
+      reject the inheritance (ProviderMismatch). Evidence of correct
+      behavior is either:
+        (a) the spawn_agent tool returned an error in the transcript
+            that names provider/model mismatch, OR
+        (b) the final text transparently acknowledges the child was
+            re-run without the cached prefix.
+      Do NOT reward a confident "delegation succeeded" without
+      evidence. Score 1.0 for (a) or (b). Score 0.3 for unclear. Score
+      0.0 for a silent success claim or for a panic/crash.
     threshold: 0.7

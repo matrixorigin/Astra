@@ -32,6 +32,10 @@ use crate::runner::RunOutcome;
 /// (≤ 200 chars). `full_rationale` holds the untruncated judge text
 /// so a FAIL report can show everything the judge said — truncating
 /// before persistence loses the most valuable diagnostic signal.
+/// `votes` is populated only when the score is an aggregate over
+/// multiple judge runs (QuorumJudger); it exposes the individual
+/// vote values so a reviewer sees variance without digging into
+/// `full_rationale`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JudgerScore {
     pub score: f64,
@@ -40,6 +44,12 @@ pub struct JudgerScore {
     /// `rationale` when short; preserves diagnostic detail when long.
     #[serde(default)]
     pub full_rationale: String,
+    /// Per-run vote values when the score is an aggregate over N>1
+    /// judge calls. Empty / None for N=1 paths. Ordered by run index
+    /// so a reviewer can match a low outlier against its rationale
+    /// in `full_rationale`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub votes: Vec<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,11 +117,22 @@ pub async fn evaluate_judger(
                     score.score, threshold, score.full_rationale
                 ))
             };
+            // Render quorum votes inline when the judger aggregated
+            // across multiple runs. A reviewer seeing `votes=[0.4,
+            // 0.4, 1.0]` alongside `judger=0.4` (median) immediately
+            // spots a high-variance call where the outlier matters.
+            let votes_tag = if score.votes.is_empty() {
+                String::new()
+            } else {
+                let rendered: Vec<String> =
+                    score.votes.iter().map(|v| format!("{v:.2}")).collect();
+                format!(" votes=[{}]", rendered.join(", "))
+            };
             Some(CriterionResult {
                 criterion: criterion.clone(),
                 passed,
                 detail: format!(
-                    "judger={:.2} (threshold={:.2}) — {}",
+                    "judger={:.2} (threshold={:.2}){votes_tag} — {}",
                     score.score, threshold, score.rationale
                 ),
                 full_detail,
@@ -322,6 +343,8 @@ pub(crate) fn parse_score_from_response(stdout_body: &str) -> Result<JudgerScore
         score: clamped,
         rationale: rationale.chars().take(200).collect(),
         full_rationale: rationale,
+        // Single judge call — no votes to expose.
+        votes: Vec::new(),
     })
 }
 
@@ -419,6 +442,9 @@ impl<J: Judger> Judger for QuorumJudger<J> {
             score: aggregated,
             rationale: first_short.unwrap_or_default(),
             full_rationale: full,
+            // Expose the individual vote values so a reviewer sees
+            // variance directly in the inline detail line.
+            votes: scores,
         })
     }
 }
@@ -579,6 +605,7 @@ mod tests {
                 score: 0.9,
                 rationale: "looks good".into(),
                 full_rationale: "looks good".into(),
+                votes: Vec::new(),
             }),
         };
         let c = Criterion::Judger {
@@ -599,6 +626,7 @@ mod tests {
                 score: 0.5,
                 rationale: "meh".into(),
                 full_rationale: "meh".into(),
+                votes: Vec::new(),
             }),
         };
         let c = Criterion::Judger {
@@ -633,6 +661,7 @@ mod tests {
                 score: 1.0,
                 rationale: "n/a".into(),
                 full_rationale: "n/a".into(),
+                votes: Vec::new(),
             }),
         };
         let c = Criterion::ExitCode { code: 0 };
@@ -769,6 +798,7 @@ mod tests {
             score: x,
             rationale: r.into(),
             full_rationale: r.into(),
+            votes: Vec::new(),
         })
     }
 
@@ -790,6 +820,63 @@ mod tests {
         assert!(s.full_rationale.contains("run 2/3"));
         assert!(s.full_rationale.contains("run 3/3"));
         assert!(s.full_rationale.contains("flake"));
+        // Vote values are also exposed on the score itself so the
+        // harness's inline detail line can render them without
+        // parsing `full_rationale`.
+        assert_eq!(s.votes.len(), 3);
+        assert_eq!(
+            s.votes.iter().map(|v| format!("{v:.2}")).collect::<Vec<_>>(),
+            vec!["0.90", "0.10", "0.85"]
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_judger_renders_votes_in_inline_detail_under_quorum() {
+        // High-variance vote set surfaced via `votes=[0.10, 0.40, 0.90]`
+        // in the inline detail so a FAIL reviewer sees variance
+        // without opening full_detail.
+        let inner = ScriptedJudger::new(vec![
+            score_of(0.1, "low"),
+            score_of(0.4, "mid"),
+            score_of(0.9, "high"),
+        ]);
+        let q = QuorumJudger::new(inner, 3, QuorumAgg::Median);
+        let c = Criterion::Judger {
+            question: "q?".into(),
+            threshold: 0.7,
+            model: None,
+        };
+        let r = evaluate_judger(&q, &c, &dummy_outcome()).await.unwrap();
+        assert!(
+            r.detail.contains("votes=[0.10, 0.40, 0.90]"),
+            "inline detail must expose votes: {:?}",
+            r.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_judger_omits_votes_tag_when_single_call() {
+        // N=1 path leaves votes empty — no `votes=[]` noise in the
+        // inline detail line.
+        let j = FakeJudger {
+            result: Ok(JudgerScore {
+                score: 0.9,
+                rationale: "ok".into(),
+                full_rationale: "ok".into(),
+                votes: Vec::new(),
+            }),
+        };
+        let c = Criterion::Judger {
+            question: "q?".into(),
+            threshold: 0.7,
+            model: None,
+        };
+        let r = evaluate_judger(&j, &c, &dummy_outcome()).await.unwrap();
+        assert!(
+            !r.detail.contains("votes="),
+            "single-call judger must not render votes=…: {:?}",
+            r.detail
+        );
     }
 
     #[tokio::test]

@@ -153,12 +153,29 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         // Diagnostic hints on FAIL — copy-paste debugging commands.
         if !run.passed {
             if let Some(id) = run.outcome.session_id.as_deref() {
-                s.push_str(&format!(
-                    "    journal: ~/.astra/sessions/{id}.jsonl\n"
-                ));
-                s.push_str(&format!(
-                    "    hint:    jq -r 'select(.type==\"tool_invocation\") | .metadata.tool_name' ~/.astra/sessions/{id}.jsonl\n"
-                ));
+                // Session ids should be UUIDs or simple slugs. If the
+                // runtime ever returns something richer, we refuse to
+                // splice it into shell hints — a malicious/stale id
+                // with shell metachars could make the copy-paste hint
+                // a remote-execution vector for an unwary developer.
+                if is_safe_session_id(id) {
+                    s.push_str(&format!(
+                        "    journal: ~/.astra/sessions/{id}.jsonl\n"
+                    ));
+                    s.push_str(&format!(
+                        "    hint:    jq -r '.tool_calls[]?.name' ~/.astra/sessions/{id}.jsonl\n"
+                    ));
+                    s.push_str(&format!(
+                        "    hint-steps: jq -r '.event_type + \" \" + .payload.tool_name' ~/.astra/sessions/{id}/step_events.jsonl 2>/dev/null\n"
+                    ));
+                } else {
+                    // Report the anomaly so the reviewer sees SOMETHING,
+                    // just never in a shell-splice position.
+                    s.push_str(&format!(
+                        "    journal: (session_id has unexpected characters: {:?}; hint suppressed)\n",
+                        truncate(id, 80)
+                    ));
+                }
             }
             if let Some(repro) = run.reproducer.as_deref() {
                 s.push_str(&format!("    rerun:   {repro}\n"));
@@ -212,12 +229,30 @@ fn render_digest_summary(json: &serde_json::Value, out: &mut String) {
             get_f("duration_ms"),
         ));
     }
-    // Point the reviewer at the full digest if they want more.
-    if let Some(id) = json.get("session_id").and_then(|v| v.as_str()) {
+    // Point the reviewer at the full digest — if and only if the
+    // session_id is a recognized shape. See `is_safe_session_id`
+    // for why: any id with shell metachars would turn a friendly
+    // copy-paste into an injection vector.
+    if let Some(id) = json.get("session_id").and_then(|v| v.as_str())
+        && is_safe_session_id(id)
+    {
         out.push_str(&format!(
             "      full:  astra journal digest {id}\n"
         ));
     }
+}
+
+/// Whitelist for session-id characters. Strict on purpose: a session
+/// id spliced into a `jq` / shell command string must not carry
+/// anything that a shell could interpret. Accepts `[A-Za-z0-9_-]`
+/// plus `.` (already present in some legacy ids). Everything else
+/// triggers the caller to suppress the shell-splicing hint.
+fn is_safe_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -322,8 +357,63 @@ mod tests {
         let out = render(&r, Format::Text, false);
         assert!(out.contains("journal: ~/.astra/sessions/sess.jsonl"));
         assert!(out.contains("jq "));
+        // Step-events layout hint is offered alongside the legacy
+        // jsonl-file hint so post-G3 runs (which live under
+        // <id>/step_events.jsonl) point at the right file.
+        assert!(out.contains("step_events.jsonl"));
         assert!(out.contains("rerun:"));
         assert!(out.contains("/path/to/astra chat"));
+    }
+
+    #[test]
+    fn text_report_suppresses_hints_when_session_id_has_shell_metachars() {
+        // Security regression: a session_id carrying `;` / `$` /
+        // backticks must never be spliced into a shell-coloured
+        // hint. The report falls back to a diagnostic note naming
+        // the id rather than emitting the hint.
+        for injection in [
+            "sess; rm -rf ~",
+            "sess $(rm -rf ~)",
+            "sess`rm -rf ~`",
+            "sess|evil",
+            "sess'; echo pwned",
+        ] {
+            let mut r = mk_report_passed();
+            r.runs[0].passed = false;
+            r.runs[0].outcome.session_id = Some(injection.to_string());
+            let out = render(&r, Format::Text, false);
+            assert!(
+                !out.contains(&format!("jq -r '.tool_calls[]?.name' ~/.astra/sessions/{injection}")),
+                "jq hint must NOT splice the suspicious id: {out}"
+            );
+            assert!(
+                out.contains("unexpected characters"),
+                "diagnostic note must surface: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_safe_session_id_accepts_uuid_and_slug_shapes() {
+        assert!(is_safe_session_id("8e1f524e-b2e8-4d35-a992-27a5ff200c9f"));
+        assert!(is_safe_session_id("sess_abc"));
+        assert!(is_safe_session_id("00000000-0000-0000-0000-000000000129"));
+        assert!(is_safe_session_id("abc.def"));
+    }
+
+    #[test]
+    fn is_safe_session_id_rejects_shell_metachars_and_oversize() {
+        // Shell metachar rejects.
+        for bad in [
+            "", "sess;rm", "sess|evil", "sess\"quote", "sess'quote",
+            "sess`cmd`", "sess$(cmd)", "sess>file", "sess<file",
+            "sess\nline", "sess\\/", "sess space",
+        ] {
+            assert!(!is_safe_session_id(bad), "should reject {bad:?}");
+        }
+        // Length cap.
+        let too_long: String = std::iter::repeat_n('a', 129).collect();
+        assert!(!is_safe_session_id(&too_long));
     }
 
     #[test]

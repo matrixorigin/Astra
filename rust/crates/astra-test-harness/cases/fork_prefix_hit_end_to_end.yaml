@@ -37,12 +37,12 @@ criteria:
     # Anchors the line to the fork-cache prefix.
     pattern: '\[fork-cache\]'
   # Deterministic classification — no judger drift on the happy path.
-  - type: fork_cache_class
+  - type: fork_cache_outcome
     expect: [hit]
   - type: judger
     question: |
       Did the child agent's reply appear verbatim in the final answer
-      (prefixed with "CHILD:")? The fork_cache_class criterion above
+      (prefixed with "CHILD:")? The fork_cache_outcome criterion above
       already pins the cache classification; the judger only scores
       whether the delegation's observable outcome surfaced in the
       final text.

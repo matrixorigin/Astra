@@ -68,16 +68,35 @@ fn default_timeout_seconds() -> u64 {
 /// Flags the harness owns and must not be overridden by a case.
 /// The CLI parser chosen by `astra chat` lets later args win for most
 /// of these, so a case that included them could silently clobber the
-/// harness's prompt or output format — making the whole run
-/// meaningless. Fail fast at case load instead.
+/// harness's prompt, output format, or safety boundaries — making the
+/// whole run meaningless (or worse, unsafe). Fail fast at case load.
+///
+/// Entries cover both the real `astra chat` subcommand flag names and
+/// top-level astra aliases (`-y`/`--yes` top-level, `--auto-approve`
+/// on `chat`). `--approve-all` from the original denylist was
+/// removed — that flag does not exist in the CLI surface.
 pub(crate) const RESERVED_CLI_ARGS: &[&str] = &[
+    // Prompt / message input — the harness owns the prompt.
     "-m",
     "--message",
+    "--stdin",
+    // Model selection — harness controls via --models / case.models.
     "--model",
+    // Output format — harness parses --json.
     "--json",
-    "-y",
-    "--approve-all",
     "--quiet",
+    // Tool approval — the harness auto-approves (`-y`).
+    "-y",
+    "--yes",
+    "--auto-approve",
+    // Permission mode — harness runs non-interactive; overriding
+    // could silently expand auth (`auto` gives write access without
+    // prompts).
+    "--permission-mode",
+    // System prompt — the harness lets cases set prompt content via
+    // `prompt:`; allowing --system-prompt would bypass the judger's
+    // anti-gaming preamble assumptions.
+    "--system-prompt",
 ];
 
 /// Validate that `args` does not contain any reserved flag. Returns
@@ -180,7 +199,25 @@ mod tests {
 
     #[test]
     fn parse_rejects_reserved_flags_in_extra_cli_args() {
-        for reserved in ["-m", "--message", "--model", "--json", "-y", "--quiet"] {
+        // Covers the full denylist including flags surfaced by R2 #4:
+        //  - top-level `--yes` (astra --yes)
+        //  - chat `--auto-approve` (new canonical name for -y on chat)
+        //  - `--permission-mode` (silently expands tool auth)
+        //  - `--stdin` (would redirect prompt input to stdin)
+        //  - `--system-prompt` (bypasses judger's anti-gaming preamble)
+        for reserved in [
+            "-m",
+            "--message",
+            "--stdin",
+            "--model",
+            "--json",
+            "--quiet",
+            "-y",
+            "--yes",
+            "--auto-approve",
+            "--permission-mode",
+            "--system-prompt",
+        ] {
             let dir = tempdir().unwrap();
             let path = dir.path().join("bad.yaml");
             let yaml = format!(
@@ -196,6 +233,14 @@ mod tests {
                 "error should name the reserved flag {reserved}: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn reserved_list_does_not_include_nonexistent_flags() {
+        // Regression guard: `--approve-all` was in the original
+        // denylist but is not a real flag. Removing dead entries
+        // keeps the error message actionable for cases that hit it.
+        assert!(!RESERVED_CLI_ARGS.contains(&"--approve-all"));
     }
 
     #[test]
