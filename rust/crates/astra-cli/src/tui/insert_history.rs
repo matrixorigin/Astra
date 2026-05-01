@@ -73,6 +73,13 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
         // Step 1: If viewport is near bottom, push it down by scrolling region above it
         if wrapped_rows > 0 && area.top() > 0 {
             let scroll_amount = wrapped_rows;
+
+            // Clear viewport content BEFORE scroll, so stale composer/footer
+            // text doesn't leak into scrollback when RI pushes it down
+            for row in area.top()..area.bottom() {
+                queue!(writer, cursor::MoveTo(0, row), Print("\x1b[2K"))?;
+            }
+
             // Set scroll region to cover viewport top to screen bottom
             let top_1based = area.top() + 1;
             queue!(writer, Print(format!("\x1b[{};{}r", top_1based, screen_size.height)))?;

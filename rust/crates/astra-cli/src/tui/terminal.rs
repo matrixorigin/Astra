@@ -77,10 +77,11 @@ impl TerminalGuard {
             let terminal = &mut self.terminal;
 
             // 1. Update viewport position
-            Self::update_inline_viewport(terminal, height, self.is_zellij)?;
+            let mut needs_repaint =
+                Self::update_inline_viewport(terminal, height, self.is_zellij)?;
 
             // 2. Flush history
-            let needs_repaint = Self::flush_pending_history(
+            needs_repaint |= Self::flush_pending_history(
                 terminal,
                 &mut self.pending_history,
                 self.is_zellij,
@@ -88,6 +89,14 @@ impl TerminalGuard {
 
             if needs_repaint {
                 terminal.invalidate_viewport();
+                // Also clear any stale content below viewport on physical terminal
+                let vp = terminal.viewport_area;
+                queue!(
+                    terminal.backend_mut(),
+                    cursor::MoveTo(0, vp.bottom()),
+                    Print("\x1b[J"), // ED: clear from cursor to end of screen
+                )?;
+                std::io::Write::flush(terminal.backend_mut())?;
             }
 
             // 3. Render
@@ -99,11 +108,12 @@ impl TerminalGuard {
         terminal: &mut CustomTerminal,
         height: u16,
         is_zellij: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         let size = terminal.size()?;
         let mut area = terminal.viewport_area;
         area.height = height.min(size.height);
         area.width = size.width;
+        let mut needs_full_repaint = false;
 
 
         // If viewport would extend past bottom, scroll content above it up
@@ -136,25 +146,23 @@ impl TerminalGuard {
         }
 
         if area != terminal.viewport_area {
-            // If viewport shrank, clear the gap between old and new viewport tops
-            // to remove stale rendered content
-            let old_top = terminal.viewport_area.top();
-            let new_top = area.top();
-            if new_top > old_top {
-                // Viewport moved down (shrank) — clear rows old_top..new_top
-                for row in old_top..new_top {
-                    queue!(
-                        terminal.backend_mut(),
-                        cursor::MoveTo(0, row),
-                        Print("\x1b[2K"), // Clear entire line
-                    )?;
-                }
-            }
-            terminal.clear()?;
+            // Clear from min(old_top, new_top) to screen bottom BEFORE moving viewport
+            // This prevents stale viewport content from leaking into scrollback
+            let previous_area = terminal.viewport_area;
+            let clear_y = previous_area.y.min(area.y);
+            queue!(
+                terminal.backend_mut(),
+                cursor::MoveTo(0, clear_y),
+                Print("\x1b[J"), // ED: clear to end of screen
+            )?;
+            std::io::Write::flush(terminal.backend_mut())?;
+
             terminal.set_viewport_area(area);
+            terminal.invalidate_viewport();
+            needs_full_repaint = true;
         }
 
-        Ok(())
+        Ok(needs_full_repaint)
     }
 
     fn flush_pending_history(

@@ -10,15 +10,26 @@ pub(crate) struct Footer {
     pub model: Option<String>,
     pub session_id: Option<String>,
     pub token_usage: Option<String>,
+    pub cwd: Option<String>,
     pub is_turn_active: bool,
 }
 
 impl Footer {
     pub fn new() -> Self {
+        let cwd = std::env::current_dir().ok().map(|p| {
+            let home = dirs::home_dir();
+            match home {
+                Some(h) if p.starts_with(&h) => {
+                    format!("~/{}", p.strip_prefix(&h).unwrap_or(&p).display())
+                }
+                _ => p.display().to_string(),
+            }
+        });
         Self {
             model: None,
             session_id: None,
             token_usage: None,
+            cwd,
             is_turn_active: false,
         }
     }
@@ -29,36 +40,51 @@ impl Footer {
         }
 
         let dim = Style::default().fg(Color::DarkGray);
+        let sep = Span::styled(" · ", dim);
 
-        let mut left_items: Vec<Span> = Vec::new();
-        left_items.push(Span::raw("  ")); // 2-space indent like Codex FOOTER_INDENT_COLS
-        if self.is_turn_active {
-            left_items.push(Span::styled("⏹ interrupt", dim));
-        } else {
-            left_items.push(Span::styled("? for shortcuts", dim));
-        }
+        // Build right side: model · dir · tokens
+        let mut right_parts: Vec<Span> = Vec::new();
 
-        let mut right_items: Vec<Span> = Vec::new();
-        if let Some(ref usage) = self.token_usage {
-            right_items.push(Span::styled(usage.clone(), dim));
-            right_items.push(Span::styled(" · ", dim));
-        }
         if let Some(ref model) = self.model {
-            right_items.push(Span::styled(model.clone(), dim));
+            right_parts.push(Span::styled(model.clone(), dim));
         }
-        right_items.push(Span::raw("  ")); // trailing indent
 
-        // Compose: left items ... padding ... right items
-        let left = Line::from(left_items);
-        let right = Line::from(right_items);
+        if let Some(ref cwd) = self.cwd {
+            if !right_parts.is_empty() {
+                right_parts.push(sep.clone());
+            }
+            let display = if cwd.len() > 25 {
+                format!("…{}", &cwd[cwd.len() - 24..])
+            } else {
+                cwd.clone()
+            };
+            right_parts.push(Span::styled(display, dim));
+        }
 
-        let left_w: usize = left.spans.iter().map(|s| s.content.len()).sum();
-        let right_w: usize = right.spans.iter().map(|s| s.content.len()).sum();
-        let padding = (area.width as usize).saturating_sub(left_w + right_w);
+        if let Some(ref usage) = self.token_usage {
+            if !right_parts.is_empty() {
+                right_parts.push(sep.clone());
+            }
+            right_parts.push(Span::styled(usage.clone(), dim));
+        }
 
-        let mut all_spans = left.spans;
+        // Build left side
+        let mut left_parts: Vec<Span> = Vec::new();
+        left_parts.push(Span::raw("  ")); // 2-space indent
+        if self.is_turn_active {
+            left_parts.push(Span::styled("⏹ interrupt", dim));
+        } else {
+            left_parts.push(Span::styled("? for shortcuts", dim));
+        }
+
+        // Compose: left ... padding ... right
+        let left_w: usize = left_parts.iter().map(|s| s.content.len()).sum();
+        let right_w: usize = right_parts.iter().map(|s| s.content.len()).sum();
+        let padding = (area.width as usize).saturating_sub(left_w + right_w + 2); // +2 for trailing margin
+
+        let mut all_spans = left_parts;
         all_spans.push(Span::raw(" ".repeat(padding)));
-        all_spans.extend(right.spans);
+        all_spans.extend(right_parts);
 
         Widget::render(Line::from(all_spans), area, buf);
     }
