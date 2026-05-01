@@ -433,7 +433,9 @@ pub fn classify_tool_output(error_str: &str) -> ErrorKind {
         || lower.contains("ebusy")
         || lower.contains("emfile")
         || lower.contains("device or resource busy")
-        || lower.contains("oom")
+        || contains_word(&lower, "oom")
+        || lower.contains("oom-killer")
+        || lower.contains("oom killer")
         || lower.contains("资源暂时不足")
         || lower.contains("系统资源")
         || lower.contains("内存不足")
@@ -468,15 +470,21 @@ pub fn classify_tool_output(error_str: &str) -> ErrorKind {
         return ErrorKind::ToolTimeout;
     }
 
-    // Transient: network, timeout, rate limit, server errors
+    // Transient: network, timeout, rate limit, server errors.
+    // HTTP status codes require "http" context or textual description to
+    // avoid false positives on line numbers / filenames containing "500".
     if lower.contains("timeout")
         || lower.contains("timed out")
         || lower.contains("rate limit")
-        || lower.contains("429")
-        || lower.contains("500")
-        || lower.contains("502")
-        || lower.contains("503")
-        || lower.contains("504")
+        || (lower.contains("429") && lower.contains("rate"))
+        || lower.contains("http 500")
+        || lower.contains("http 502")
+        || lower.contains("http 503")
+        || lower.contains("http 504")
+        || lower.contains("status 500")
+        || lower.contains("status 502")
+        || lower.contains("status 503")
+        || lower.contains("status 504")
         || lower.contains("internal server error")
         || lower.contains("service unavailable")
         || lower.contains("bad gateway")
@@ -496,9 +504,11 @@ pub fn classify_tool_output(error_str: &str) -> ErrorKind {
         return ErrorKind::Network;
     }
 
-    // Auth
-    if lower.contains("401")
-        || lower.contains("403")
+    // Auth — numeric codes require "http" context to avoid false positives.
+    if lower.contains("http 401")
+        || lower.contains("status 401")
+        || lower.contains("http 403")
+        || lower.contains("status 403")
         || lower.contains("unauthorized")
         || lower.contains("forbidden")
         || lower.contains("permission denied")
@@ -565,6 +575,30 @@ pub fn classify_tool_output(error_str: &str) -> ErrorKind {
     }
 
     ErrorKind::Unknown
+}
+
+/// True when `word` appears as a standalone word in `haystack` (already
+/// lowercased). A "word boundary" is start/end of string or any non-alphanumeric
+/// character. This prevents "oom" from matching inside "room" or "zoom".
+fn contains_word(haystack: &str, word: &str) -> bool {
+    let haystack_bytes = haystack.as_bytes();
+    let word_bytes = word.as_bytes();
+    let wlen = word_bytes.len();
+    if wlen == 0 || haystack_bytes.len() < wlen {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(word) {
+        let abs = start + pos;
+        let before_ok = abs == 0 || !haystack_bytes[abs - 1].is_ascii_alphanumeric();
+        let after_ok = abs + wlen >= haystack_bytes.len()
+            || !haystack_bytes[abs + wlen].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
 }
 
 /// True when the error comes from the Edge workspace guard: existing paths must
@@ -831,6 +865,49 @@ mod tests {
         assert_eq!(
             classify_tool_output("connection timed out after 30s"),
             ErrorKind::Network
+        );
+    }
+
+    #[test]
+    fn classify_oom_word_boundary() {
+        // "oom" must match the OOM-killer pattern, NOT substrings inside
+        // normal words like "room", "zoom", "bloom", "chatroom".
+        assert_eq!(
+            classify_tool_output("OOM killer invoked"),
+            ErrorKind::ResourceLimit,
+        );
+        assert_eq!(
+            classify_tool_output("oom: process killed"),
+            ErrorKind::ResourceLimit,
+        );
+        // False positives that must NOT match ResourceLimit:
+        for innocent in [
+            "entering the chatroom now",
+            "zoom meeting failed",
+            "blooming flowers render",
+            "room not found",
+            "vroom vroom",
+        ] {
+            assert_ne!(
+                classify_tool_output(innocent),
+                ErrorKind::ResourceLimit,
+                "{innocent:?} must not be ResourceLimit"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_http_status_codes_require_context() {
+        // Bare "500" inside a line number or filename must not trigger Network.
+        assert_eq!(
+            classify_tool_output("Error at line 500 of parser.rs"),
+            ErrorKind::Unknown,
+            "line numbers must not match HTTP status codes"
+        );
+        // But actual HTTP errors should still match:
+        assert_eq!(
+            classify_tool_output("HTTP 500 Internal Server Error"),
+            ErrorKind::Network,
         );
     }
 
