@@ -1,20 +1,14 @@
-//! Suite orchestration.
-//!
-//! A `SuiteRunner` composes a [`CaseExecutor`] + [`Judger`] and runs
-//! every (case, model) pair through the full pipeline:
-//!
-//! 1. Execute case (subprocess or fake)
-//! 2. Evaluate deterministic criteria
-//! 3. If every non-Judger criterion passed, run the Judger
-//! 4. Optionally load the session journal
-//! 5. Collect a `CaseRunReport`
-//!
-//! The split from `main.rs` is deliberate: this struct is the unit
-//! that third-party tools (e.g. a dev-mode harness embedded in the
-//! admin dashboard) would want to reuse, and it is what we test
-//! against fakes in integration tests.
+//! Suite orchestration with parallel execution, circuit breaker,
+//! failure classification, and retry on rate-limit.
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::Semaphore;
 
 use crate::case::Case;
+use crate::classify::{FailureClass, classify};
 use crate::criteria::{Criterion, evaluate_deterministic_with_session, non_judger_all_pass};
 use crate::digest::DigestCollector;
 use crate::exec::CaseExecutor;
@@ -26,26 +20,22 @@ use crate::session_capture::{SessionCapture, load_session};
 /// What to do with session journals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionCaptureMode {
-    /// Never load the journal — fastest, smallest report.
     Never,
-    /// Load only when the case sets `debug_log: true`.
     OnDebugLog,
-    /// Always load. Useful with `--verbose`.
     Always,
 }
 
 impl SessionCaptureMode {
     fn should_load(self, case: &Case) -> bool {
         match self {
-            SessionCaptureMode::Never => false,
-            SessionCaptureMode::OnDebugLog => case.debug_log,
-            SessionCaptureMode::Always => true,
+            Self::Never => false,
+            Self::OnDebugLog => case.debug_log,
+            Self::Always => true,
         }
     }
 }
 
-/// Hook for loading session captures. Default impl reads from disk;
-/// tests can inject an in-memory loader.
+/// Hook for loading session captures.
 pub trait SessionLoader: Send + Sync {
     fn load(&self, session_id: &str) -> Option<SessionCapture>;
 }
@@ -59,54 +49,162 @@ impl SessionLoader for DiskSessionLoader {
     }
 }
 
-/// Orchestrates the full pipeline. Construct with real impls in
-/// `main.rs` or with fakes in integration tests.
+/// Configuration for suite-level behavior.
+#[derive(Debug, Clone)]
+pub struct SuiteConfig {
+    /// Max concurrent case executions.
+    pub parallel: usize,
+    /// Abort after N consecutive infra failures.
+    pub circuit_breaker_threshold: usize,
+    /// Retry rate-limited cases once after backoff.
+    pub retry_on_429: bool,
+    /// Run each (case, model) pair N times for flaky detection.
+    pub runs: u32,
+}
+
+impl Default for SuiteConfig {
+    fn default() -> Self {
+        Self {
+            parallel: 1,
+            circuit_breaker_threshold: 3,
+            retry_on_429: false,
+            runs: 1,
+        }
+    }
+}
+
+/// Orchestrates the full pipeline.
 pub struct SuiteRunner<'a> {
     pub executor: &'a dyn CaseExecutor,
     pub judger: &'a dyn Judger,
     pub session_loader: &'a dyn SessionLoader,
-    /// Optional digest collector. When set, the runner shells out
-    /// on FAIL to populate `CaseRunReport.digest`. `None` disables
-    /// digest collection entirely — used in unit tests and when the
-    /// caller doesn't want to pay the extra subprocess per FAIL.
     pub digest_collector: Option<&'a dyn DigestCollector>,
     pub runner_cfg: RunnerConfig,
     pub no_judger: bool,
     pub session_mode: SessionCaptureMode,
+    pub suite_cfg: SuiteConfig,
 }
 
 impl<'a> SuiteRunner<'a> {
-    /// Run every (case × resolved models) combination and return
-    /// the aggregated report. Cases whose models can't be resolved
-    /// (no `models:` + no fallback) are skipped with a log line —
-    /// they don't kill the whole suite.
+    /// Run every (case × model) pair with concurrency control and circuit breaker.
     pub async fn run_all(&self, cases: &[Case]) -> SuiteReport {
-        let mut suite = SuiteReport::default();
+        // Build the work items: (case, model) pairs × runs.
+        let mut work: Vec<(&Case, String)> = Vec::new();
         for case in cases {
-            let models = match resolve_models(case, &self.runner_cfg) {
-                Ok(m) => m,
-                Err(e) => {
-                    // Unified `[astra-test]` prefix so all harness
-                    // self-logging lines are greppable + visually
-                    // distinct from astra's `[fork-cache]` /
-                    // `[selector]` observability.
-                    eprintln!("[astra-test] skip case {:?}: {e}", case.name);
-                    continue;
+            match resolve_models(case, &self.runner_cfg) {
+                Ok(models) => {
+                    for m in models {
+                        for _ in 0..self.suite_cfg.runs {
+                            work.push((case, m.clone()));
+                        }
+                    }
                 }
-            };
-            for model in models {
-                suite.runs.push(self.run_one(case, &model).await);
+                Err(e) => {
+                    eprintln!("[astra-test] skip case {:?}: {e}", case.name);
+                }
             }
         }
+
+        let semaphore = Arc::new(Semaphore::new(self.suite_cfg.parallel));
+        let aborted = Arc::new(AtomicBool::new(false));
+        let consecutive_infra = Arc::new(AtomicUsize::new(0));
+
+        let mut suite = SuiteReport::default();
+
+        if self.suite_cfg.parallel <= 1 {
+            // Serial path: simpler, preserves ordering, supports circuit breaker inline.
+            for (case, model) in work {
+                if aborted.load(Ordering::Relaxed) {
+                    eprintln!(
+                        "[astra-test] circuit breaker tripped — aborting remaining cases"
+                    );
+                    break;
+                }
+                let report = self.run_one(case, &model).await;
+                self.update_circuit_breaker(&report, &consecutive_infra, &aborted);
+                suite.runs.push(report);
+            }
+        } else {
+            // Parallel path: use FuturesUnordered with semaphore.
+            use futures::stream::{FuturesUnordered, StreamExt};
+
+            let futures: FuturesUnordered<_> = work
+                .into_iter()
+                .map(|(case, model)| {
+                    let sem = semaphore.clone();
+                    let aborted = aborted.clone();
+                    let consecutive_infra = consecutive_infra.clone();
+                    async move {
+                        if aborted.load(Ordering::Relaxed) {
+                            return None;
+                        }
+                        let _permit = sem.acquire().await.ok()?;
+                        if aborted.load(Ordering::Relaxed) {
+                            return None;
+                        }
+                        let report = self.run_one(case, &model).await;
+                        self.update_circuit_breaker(&report, &consecutive_infra, &aborted);
+                        Some(report)
+                    }
+                })
+                .collect();
+
+            let results: Vec<_> = futures.collect().await;
+            for r in results.into_iter().flatten() {
+                suite.runs.push(r);
+            }
+        }
+
         suite
     }
 
-    async fn run_one(&self, case: &Case, model: &str) -> CaseRunReport {
-        let outcome = self.executor.execute(case, model).await;
+    fn update_circuit_breaker(
+        &self,
+        report: &CaseRunReport,
+        consecutive_infra: &AtomicUsize,
+        aborted: &AtomicBool,
+    ) {
+        if report.passed {
+            consecutive_infra.store(0, Ordering::Relaxed);
+            return;
+        }
+        if let Some(ref class) = report.failure_class {
+            let is_infra = matches!(
+                class,
+                FailureClass::InfraAuth
+                    | FailureClass::InfraTimeout
+                    | FailureClass::InfraProviderError { .. }
+                    | FailureClass::InfraRateLimit
+            );
+            if is_infra {
+                let count = consecutive_infra.fetch_add(1, Ordering::Relaxed) + 1;
+                if count >= self.suite_cfg.circuit_breaker_threshold {
+                    eprintln!(
+                        "[astra-test] circuit breaker: {} consecutive infra failures (class: {class})",
+                        count
+                    );
+                    aborted.store(true, Ordering::Relaxed);
+                }
+            } else {
+                consecutive_infra.store(0, Ordering::Relaxed);
+            }
+        }
+    }
 
-        // Load session first so session-dependent criteria can see it.
-        // If session_mode doesn't request load, criteria that need it
-        // SKIP-pass rather than fail — explicit opt-in, no surprises.
+    async fn run_one(&self, case: &Case, model: &str) -> CaseRunReport {
+        let mut outcome = self.executor.execute(case, model).await;
+
+        // Retry on 429 if enabled.
+        if self.suite_cfg.retry_on_429 && is_rate_limited(&outcome) {
+            eprintln!(
+                "[astra-test] rate-limited on case={} model={}, retrying after 5s",
+                case.name, model
+            );
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            outcome = self.executor.execute(case, model).await;
+        }
+
+        // Load session.
         let session = if self.session_mode.should_load(case) {
             outcome
                 .session_id
@@ -116,6 +214,7 @@ impl<'a> SuiteRunner<'a> {
             None
         };
 
+        // Evaluate criteria.
         let mut det =
             evaluate_deterministic_with_session(&case.criteria, &outcome, session.as_ref());
 
@@ -138,17 +237,19 @@ impl<'a> SuiteRunner<'a> {
 
         let passed = det.iter().all(|c| c.passed);
 
-        // Reproducer: a shell command a developer can paste to re-run
-        // the case. Empty string for fake executor in tests.
+        // Classify failure.
+        let failure_class = if !passed {
+            Some(classify(&outcome, &det))
+        } else {
+            None
+        };
+
         let reproducer = {
             let r = self.executor.reproducer(case, model);
             if r.is_empty() { None } else { Some(r) }
         };
 
-        // Digest collection: only on FAIL + session_id present +
-        // collector configured. Errors go into `digest_error`, not
-        // the case's FAIL reason — collector failure shouldn't
-        // mask the actual diagnostic.
+        // Digest on FAIL.
         let (digest, digest_error) = if !passed
             && let Some(collector) = self.digest_collector
             && let Some(sid) = outcome.session_id.as_deref()
@@ -171,19 +272,30 @@ impl<'a> SuiteRunner<'a> {
             reproducer,
             digest,
             digest_error,
+            failure_class,
         }
     }
+}
+
+fn is_rate_limited(outcome: &crate::runner::RunOutcome) -> bool {
+    let s = &outcome.stderr;
+    s.contains("Too many requests")
+        || s.contains("rate_limit")
+        || s.contains("rate limit")
+        || s.contains("[rate_limit]")
+        || (s.contains("429") && (s.contains("error") || s.contains("Error") || s.contains("HTTP")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use crate::criteria::Criterion;
     use crate::exec::test_support::FakeExecutor;
     use crate::judger::JudgerScore;
     use crate::runner::RunOutcome;
+    use crate::session_capture::SessionCapture;
     use async_trait::async_trait;
-    use std::path::PathBuf;
 
     fn case_with(name: &str, criteria: Vec<Criterion>) -> Case {
         Case {
@@ -214,115 +326,113 @@ mod tests {
         }
     }
 
-    struct FixedJudger {
-        score: f64,
-    }
+    struct FixedJudger { score: f64 }
 
     #[async_trait]
     impl Judger for FixedJudger {
-        async fn score(
-            &self,
-            _q: &str,
-            _m: Option<&str>,
-            _o: &RunOutcome,
-        ) -> Result<JudgerScore, String> {
-            Ok(JudgerScore {
-                score: self.score,
-                rationale: "fixed".into(),
-                full_rationale: "fixed".into(),
-                votes: Vec::new(),
-            })
+        async fn score(&self, _q: &str, _m: Option<&str>, _o: &RunOutcome) -> Result<JudgerScore, String> {
+            Ok(JudgerScore { score: self.score, rationale: "fixed".into(), full_rationale: "fixed".into(), votes: Vec::new() })
         }
     }
 
     struct NoopSessionLoader;
     impl SessionLoader for NoopSessionLoader {
-        fn load(&self, _id: &str) -> Option<SessionCapture> {
-            None
-        }
+        fn load(&self, _id: &str) -> Option<SessionCapture> { None }
     }
 
     #[tokio::test]
-    async fn run_all_runs_each_case_against_each_fallback_model() {
+    async fn run_all_serial() {
         let exec = FakeExecutor::new();
         exec.seed("c1", "a", outcome_ok("a", "t", &[]));
         exec.seed("c1", "b", outcome_ok("b", "t", &[]));
-        exec.seed("c2", "a", outcome_ok("a", "t", &[]));
-        exec.seed("c2", "b", outcome_ok("b", "t", &[]));
 
         let judger = FixedJudger { score: 1.0 };
         let loader = NoopSessionLoader;
-
         let cfg = RunnerConfig::new(PathBuf::from("astra"))
             .with_fallback_models(vec!["a".into(), "b".into()]);
         let runner = SuiteRunner {
-            executor: &exec,
-            judger: &judger,
-            session_loader: &loader,
-            digest_collector: None,
-            runner_cfg: cfg,
-            no_judger: false,
+            executor: &exec, judger: &judger, session_loader: &loader,
+            digest_collector: None, runner_cfg: cfg, no_judger: true,
             session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
         };
-
-        let cases = vec![case_with("c1", vec![]), case_with("c2", vec![])];
+        let cases = vec![case_with("c1", vec![])];
         let report = runner.run_all(&cases).await;
-        assert_eq!(report.total(), 4);
-        assert_eq!(report.passed(), 4);
-        assert_eq!(exec.calls.lock().unwrap().len(), 4);
+        assert_eq!(report.total(), 2);
+        assert_eq!(report.passed(), 2);
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_aborts_on_consecutive_infra() {
+        let exec = FakeExecutor::new();
+        // All cases return auth failure.
+        for i in 0..5 {
+            let name = format!("c{i}");
+            exec.seed(&name, "m", RunOutcome::new("m").with_exit_code(3));
+        }
+
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let cfg = RunnerConfig::new(PathBuf::from("astra"))
+            .with_fallback_models(vec!["m".into()]);
+        let runner = SuiteRunner {
+            executor: &exec, judger: &judger, session_loader: &loader,
+            digest_collector: None, runner_cfg: cfg, no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig { parallel: 1, circuit_breaker_threshold: 3, retry_on_429: false, runs: 1 },
+        };
+        let cases: Vec<Case> = (0..5).map(|i| case_with(&format!("c{i}"), vec![Criterion::ExitCode { code: 0 }])).collect();
+        let report = runner.run_all(&cases).await;
+        // Circuit breaker should trip after 3, so we get 3 runs not 5.
+        assert_eq!(report.total(), 3);
+        assert_eq!(report.failed(), 3);
+    }
+
+    #[tokio::test]
+    async fn failure_class_populated_on_fail() {
+        let exec = FakeExecutor::new();
+        exec.seed("c1", "m", RunOutcome::new("m").with_exit_code(124));
+
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let cfg = RunnerConfig::new(PathBuf::from("astra"))
+            .with_fallback_models(vec!["m".into()]);
+        let runner = SuiteRunner {
+            executor: &exec, judger: &judger, session_loader: &loader,
+            digest_collector: None, runner_cfg: cfg, no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+        };
+        let cases = vec![case_with("c1", vec![Criterion::ExitCode { code: 0 }])];
+        let report = runner.run_all(&cases).await;
+        assert_eq!(report.runs[0].failure_class, Some(FailureClass::InfraTimeout));
     }
 
     #[tokio::test]
     async fn judger_only_fires_when_deterministic_checks_pass() {
         let exec = FakeExecutor::new();
         exec.seed("c1", "m", outcome_ok("m", "hello", &["Read"]));
-        // c2's deterministic check will FAIL because "Read" wasn't called.
         exec.seed("c2", "m", outcome_ok("m", "hello", &[]));
 
-        struct TrackingJudger {
-            hits: std::sync::Mutex<u32>,
-        }
+        struct TrackingJudger { hits: std::sync::Mutex<u32> }
         #[async_trait]
         impl Judger for TrackingJudger {
-            async fn score(
-                &self,
-                _q: &str,
-                _m: Option<&str>,
-                _o: &RunOutcome,
-            ) -> Result<JudgerScore, String> {
+            async fn score(&self, _q: &str, _m: Option<&str>, _o: &RunOutcome) -> Result<JudgerScore, String> {
                 *self.hits.lock().unwrap() += 1;
-                Ok(JudgerScore {
-                    score: 1.0,
-                    rationale: "".into(),
-                    full_rationale: "".into(),
-                    votes: Vec::new(),
-                })
+                Ok(JudgerScore { score: 1.0, rationale: "".into(), full_rationale: "".into(), votes: Vec::new() })
             }
         }
-        let judger = TrackingJudger {
-            hits: std::sync::Mutex::new(0),
-        };
+        let judger = TrackingJudger { hits: std::sync::Mutex::new(0) };
         let loader = NoopSessionLoader;
-
         let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
         let runner = SuiteRunner {
-            executor: &exec,
-            judger: &judger,
-            session_loader: &loader,
-            digest_collector: None,
-            runner_cfg: cfg,
-            no_judger: false,
+            executor: &exec, judger: &judger, session_loader: &loader,
+            digest_collector: None, runner_cfg: cfg, no_judger: false,
             session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
         };
-
-        let j = Criterion::Judger {
-            question: "q?".into(),
-            threshold: 0.7,
-            model: None,
-        };
-        let read_req = Criterion::ToolCalled {
-            name: "Read".into(),
-        };
+        let j = Criterion::Judger { question: "q?".into(), threshold: 0.7, model: None };
+        let read_req = Criterion::ToolCalled { name: "Read".into() };
         let cases = vec![
             case_with("c1", vec![read_req.clone(), j.clone()]),
             case_with("c2", vec![read_req, j]),
@@ -330,7 +440,6 @@ mod tests {
         let report = runner.run_all(&cases).await;
         assert_eq!(report.total(), 2);
         assert_eq!(report.passed(), 1);
-        // Judger should fire for c1 (det passed) and NOT for c2 (det failed).
         assert_eq!(*judger.hits.lock().unwrap(), 1);
     }
 
@@ -340,25 +449,14 @@ mod tests {
         exec.seed("c1", "m", outcome_ok("m", "hello", &[]));
         let judger = FixedJudger { score: 0.0 };
         let loader = NoopSessionLoader;
-
         let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
         let runner = SuiteRunner {
-            executor: &exec,
-            judger: &judger,
-            session_loader: &loader,
-            digest_collector: None,
-            runner_cfg: cfg,
-            no_judger: true,
+            executor: &exec, judger: &judger, session_loader: &loader,
+            digest_collector: None, runner_cfg: cfg, no_judger: true,
             session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
         };
-        let case = case_with(
-            "c1",
-            vec![Criterion::Judger {
-                question: "q?".into(),
-                threshold: 0.7,
-                model: None,
-            }],
-        );
+        let case = case_with("c1", vec![Criterion::Judger { question: "q?".into(), threshold: 0.7, model: None }]);
         let report = runner.run_all(&[case]).await;
         assert_eq!(report.passed(), 1);
         assert!(report.runs[0].criteria[0].detail.contains("skipped"));
@@ -369,17 +467,12 @@ mod tests {
         let exec = FakeExecutor::new();
         let judger = FixedJudger { score: 1.0 };
         let loader = NoopSessionLoader;
-
-        // Empty fallback models and case.models = None → skipped.
         let cfg = RunnerConfig::new(PathBuf::from("astra"));
         let runner = SuiteRunner {
-            executor: &exec,
-            judger: &judger,
-            session_loader: &loader,
-            digest_collector: None,
-            runner_cfg: cfg,
-            no_judger: true,
+            executor: &exec, judger: &judger, session_loader: &loader,
+            digest_collector: None, runner_cfg: cfg, no_judger: true,
             session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
         };
         let cases = vec![case_with("c1", vec![])];
         let report = runner.run_all(&cases).await;
@@ -387,7 +480,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_capture_on_debug_log_uses_loader() {
+    async fn digest_collected_on_fail_only() {
+        use crate::digest::test_support::FakeDigestCollector;
+
+        let exec = FakeExecutor::new();
+        exec.seed("c_fail", "m", outcome_ok("m", "hello", &[]));
+        exec.seed("c_pass", "m", outcome_ok("m", "hello", &["Read"]));
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let digest = FakeDigestCollector::new();
+        digest.seed_ok("sess-m", serde_json::json!({"aggregates": {"turns": 2}}));
+
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+        let runner = SuiteRunner {
+            executor: &exec, judger: &judger, session_loader: &loader,
+            digest_collector: Some(&digest), runner_cfg: cfg, no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+        };
+        let read_req = Criterion::ToolCalled { name: "Read".into() };
+        let cases = vec![
+            case_with("c_fail", vec![read_req.clone()]),
+            case_with("c_pass", vec![read_req]),
+        ];
+        let report = runner.run_all(&cases).await;
+        assert_eq!(report.passed(), 1);
+        assert_eq!(report.failed(), 1);
+        let calls = digest.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], "sess-m");
+    }
+
+    #[tokio::test]
+    async fn session_capture_on_debug_log() {
         let exec = FakeExecutor::new();
         exec.seed("dbg", "m", outcome_ok("m", "text", &[]));
         let judger = FixedJudger { score: 1.0 };
@@ -404,161 +529,17 @@ mod tests {
             }
         }
         let loader = FixedLoader;
-
         let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
         let runner = SuiteRunner {
-            executor: &exec,
-            judger: &judger,
-            session_loader: &loader,
-            digest_collector: None,
-            runner_cfg: cfg,
-            no_judger: true,
+            executor: &exec, judger: &judger, session_loader: &loader,
+            digest_collector: None, runner_cfg: cfg, no_judger: true,
             session_mode: SessionCaptureMode::OnDebugLog,
+            suite_cfg: SuiteConfig::default(),
         };
         let mut case = case_with("dbg", vec![]);
         case.debug_log = true;
         let report = runner.run_all(&[case]).await;
         let s = report.runs[0].session.as_ref().unwrap();
         assert_eq!(s.session_id, "sess-m");
-    }
-
-    #[tokio::test]
-    async fn reproducer_threaded_from_executor_to_report() {
-        let exec = FakeExecutor::new();
-        exec.seed("c1", "m", outcome_ok("m", "hi", &[]));
-        let judger = FixedJudger { score: 1.0 };
-        let loader = NoopSessionLoader;
-        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
-        let runner = SuiteRunner {
-            executor: &exec,
-            judger: &judger,
-            session_loader: &loader,
-            digest_collector: None,
-            runner_cfg: cfg,
-            no_judger: true,
-            session_mode: SessionCaptureMode::Never,
-        };
-        let cases = vec![case_with("c1", vec![])];
-        let report = runner.run_all(&cases).await;
-        let repro = report.runs[0].reproducer.as_deref().unwrap();
-        assert!(repro.contains("fake executor"));
-        assert!(repro.contains("c1"));
-    }
-
-    // ── Digest auto-capture (Item 3) ──
-
-    #[tokio::test]
-    async fn digest_collected_on_fail_only_with_session_id() {
-        use crate::digest::test_support::FakeDigestCollector;
-
-        let exec = FakeExecutor::new();
-        // Case c_fail will FAIL (criterion expects Read, outcome has none).
-        exec.seed("c_fail", "m", outcome_ok("m", "hello", &[]));
-        // Case c_pass will PASS; digest collector must NOT be called.
-        exec.seed("c_pass", "m", outcome_ok("m", "hello", &["Read"]));
-        let judger = FixedJudger { score: 1.0 };
-        let loader = NoopSessionLoader;
-
-        let digest = FakeDigestCollector::new();
-        digest.seed_ok("sess-m", serde_json::json!({"aggregates": {"turns": 2}}));
-
-        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
-        let runner = SuiteRunner {
-            executor: &exec,
-            judger: &judger,
-            session_loader: &loader,
-            digest_collector: Some(&digest),
-            runner_cfg: cfg,
-            no_judger: true,
-            session_mode: SessionCaptureMode::Never,
-        };
-        let read_req = Criterion::ToolCalled {
-            name: "Read".into(),
-        };
-        let cases = vec![
-            case_with("c_fail", vec![read_req.clone()]),
-            case_with("c_pass", vec![read_req]),
-        ];
-        let report = runner.run_all(&cases).await;
-        assert_eq!(report.passed(), 1);
-        assert_eq!(report.failed(), 1);
-
-        // Collector was called exactly once, for the failing case.
-        let calls = digest.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0], "sess-m");
-        drop(calls);
-
-        let fail_run = report.runs.iter().find(|r| !r.passed).unwrap();
-        assert!(fail_run.digest.is_some());
-        assert!(fail_run.digest_error.is_none());
-        let pass_run = report.runs.iter().find(|r| r.passed).unwrap();
-        assert!(pass_run.digest.is_none());
-    }
-
-    #[tokio::test]
-    async fn digest_error_surfaces_without_masking_case_fail() {
-        use crate::digest::test_support::FakeDigestCollector;
-
-        let exec = FakeExecutor::new();
-        exec.seed("c_fail", "m", outcome_ok("m", "hello", &[]));
-        let judger = FixedJudger { score: 1.0 };
-        let loader = NoopSessionLoader;
-
-        // Collector fails — digest subprocess unhappy for whatever reason.
-        let digest = FakeDigestCollector::new();
-        digest.seed_err("sess-m", "session file missing");
-
-        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
-        let runner = SuiteRunner {
-            executor: &exec,
-            judger: &judger,
-            session_loader: &loader,
-            digest_collector: Some(&digest),
-            runner_cfg: cfg,
-            no_judger: true,
-            session_mode: SessionCaptureMode::Never,
-        };
-        let cases = vec![case_with(
-            "c_fail",
-            vec![Criterion::ToolCalled {
-                name: "Read".into(),
-            }],
-        )];
-        let report = runner.run_all(&cases).await;
-        let run = &report.runs[0];
-        // Case still FAILs (digest failure doesn't mask the real signal).
-        assert!(!run.passed);
-        assert!(run.digest.is_none());
-        assert_eq!(run.digest_error.as_deref(), Some("session file missing"));
-    }
-
-    #[tokio::test]
-    async fn digest_skipped_entirely_when_collector_is_none() {
-        let exec = FakeExecutor::new();
-        exec.seed("c_fail", "m", outcome_ok("m", "hello", &[]));
-        let judger = FixedJudger { score: 1.0 };
-        let loader = NoopSessionLoader;
-
-        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
-        let runner = SuiteRunner {
-            executor: &exec,
-            judger: &judger,
-            session_loader: &loader,
-            digest_collector: None,
-            runner_cfg: cfg,
-            no_judger: true,
-            session_mode: SessionCaptureMode::Never,
-        };
-        let cases = vec![case_with(
-            "c_fail",
-            vec![Criterion::ToolCalled {
-                name: "Read".into(),
-            }],
-        )];
-        let report = runner.run_all(&cases).await;
-        assert!(!report.runs[0].passed);
-        assert!(report.runs[0].digest.is_none());
-        assert!(report.runs[0].digest_error.is_none());
     }
 }

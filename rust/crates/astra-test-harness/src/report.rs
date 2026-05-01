@@ -52,6 +52,9 @@ pub struct CaseRunReport {
     /// without hiding it inside the case FAIL.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub digest_error: Option<String>,
+    /// Failure classification — populated only when `passed == false`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub failure_class: Option<crate::classify::FailureClass>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -134,11 +137,21 @@ pub(crate) fn format_render_error(reason: &str) -> String {
 fn render_text(report: &SuiteReport, verbose: bool) -> String {
     let mut s = String::new();
     s.push_str("=== astra-test suite report ===\n");
+
+    let total_prompt: u64 = report.runs.iter().map(|r| r.outcome.prompt_tokens).sum();
+    let total_completion: u64 = report.runs.iter().map(|r| r.outcome.completion_tokens).sum();
+    let total_dur: u64 = report.runs.iter().map(|r| r.outcome.duration_ms).sum();
+    let wall_secs = total_dur / 1000;
+
     s.push_str(&format!(
-        "total={} passed={} failed={}\n\n",
+        "total={} passed={} failed={} | tokens: {}in/{}out | wall: {}m{}s\n\n",
         report.total(),
         report.passed(),
-        report.failed()
+        report.failed(),
+        total_prompt,
+        total_completion,
+        wall_secs / 60,
+        wall_secs % 60,
     ));
     for run in &report.runs {
         let marker = if run.passed { "PASS" } else { "FAIL" };
@@ -150,6 +163,13 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
             run.outcome.tool_calls_count,
             run.outcome.duration_ms
         ));
+        if let Some(ref class) = run.failure_class {
+            s.push_str(&format!(
+                "    class: {} → {}\n",
+                class,
+                crate::classify::suggested_action(class)
+            ));
+        }
         for c in &run.criteria {
             let m = if c.passed { " ok " } else { "FAIL" };
             s.push_str(&format!("    [{m}] {}\n", c.detail));
@@ -235,6 +255,39 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         }
         s.push('\n');
     }
+
+    // Pass rate summary when --runs > 1 (multiple runs per case×model).
+    let has_repeats = {
+        let mut seen = std::collections::HashSet::new();
+        report.runs.iter().any(|r| !seen.insert((&r.case_name, &r.model)))
+    };
+    if has_repeats {
+        s.push_str("=== pass rate (flaky detection) ===\n");
+        let mut groups: std::collections::BTreeMap<(&str, &str), (u32, u32)> =
+            std::collections::BTreeMap::new();
+        for r in &report.runs {
+            let entry = groups.entry((&r.case_name, &r.model)).or_default();
+            entry.1 += 1;
+            if r.passed {
+                entry.0 += 1;
+            }
+        }
+        for ((case, model), (passed, total)) in &groups {
+            let pct = (*passed as f64 / *total as f64) * 100.0;
+            let marker = if *passed == *total {
+                "✓"
+            } else if *passed == 0 {
+                "✗"
+            } else {
+                "~"
+            };
+            s.push_str(&format!(
+                "  [{marker}] {case} × {model}: {passed}/{total} ({pct:.0}%)\n"
+            ));
+        }
+        s.push('\n');
+    }
+
     s
 }
 
@@ -344,6 +397,7 @@ mod tests {
                 reproducer: None,
                 digest: None,
                 digest_error: None,
+                failure_class: None,
             }],
         }
     }
@@ -532,6 +586,7 @@ mod tests {
             reproducer: None,
             digest: None,
             digest_error: None,
+                failure_class: None,
         });
         assert_eq!(r.total(), 2);
         assert_eq!(r.passed(), 1);

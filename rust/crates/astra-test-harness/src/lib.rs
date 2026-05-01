@@ -39,10 +39,12 @@
 //! without building from the `astra-test` binary.
 
 pub mod case;
+pub mod classify;
 pub mod criteria;
 pub mod digest;
 pub mod exec;
 pub mod judger;
+pub mod preflight;
 pub mod report;
 pub mod runner;
 pub mod session_capture;

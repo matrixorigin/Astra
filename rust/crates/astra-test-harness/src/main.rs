@@ -1,7 +1,5 @@
-//! `astra-test` — CLI entrypoint. Parse args, build deps, hand off
-//! to [`astra_test_harness::suite::SuiteRunner`]. Keep this file
-//! small — all orchestration logic lives in the library so it can
-//! be unit-tested with fakes.
+//! `astra-test` — CLI entrypoint. Parse args, run preflight, hand off
+//! to [`astra_test_harness::suite::SuiteRunner`].
 
 use std::path::PathBuf;
 
@@ -14,9 +12,10 @@ use astra_test_harness::exec::AstraCliExecutor;
 use astra_test_harness::judger::{
     AstraCliJudger, Judger, JudgerConfig, QuorumAgg, QuorumJudger, warn_if_same_family,
 };
+use astra_test_harness::preflight::run_preflight;
 use astra_test_harness::report::{Format, render};
 use astra_test_harness::runner::{RunnerConfig, resolve_models};
-use astra_test_harness::suite::{DiskSessionLoader, SessionCaptureMode, SuiteRunner};
+use astra_test_harness::suite::{DiskSessionLoader, SessionCaptureMode, SuiteRunner, SuiteConfig};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -24,96 +23,94 @@ use astra_test_harness::suite::{DiskSessionLoader, SessionCaptureMode, SuiteRunn
     about = "Declarative CLI test harness for astra: cases × models × agent judger."
 )]
 struct Args {
-    /// Directory containing case YAML files. Non-YAML files are skipped.
+    /// Directory containing case YAML files.
     #[arg(long, value_name = "DIR")]
     suite: PathBuf,
 
-    /// Comma-separated fallback model list. Used when a case has no
-    /// `models:` field. If both are missing the case is skipped.
+    /// Comma-separated fallback model list.
     #[arg(long, value_name = "CSV", default_value = "")]
     models: String,
 
-    /// Path to the astra binary. Subprocess invocation target. When
-    /// unset, the harness searches (in order):
-    /// 1. `ASTRA_BIN` env var
-    /// 2. `astra` on `$PATH`
-    /// 3. `rust/target/release/astra` relative to the nearest
-    ///    workspace root above CWD.
-    ///
-    /// Resolution is performed only once at startup; the chosen path
-    /// is logged to stderr for transparency.
+    /// Path to the astra binary.
     #[arg(long, value_name = "PATH")]
     astra_bin: Option<PathBuf>,
 
-    /// Working directory for each subprocess. Defaults to CWD.
+    /// Working directory for each subprocess.
     #[arg(long, value_name = "DIR")]
     working_dir: Option<PathBuf>,
 
-    /// Model to use when running a judger criterion. Per-case
-    /// override still wins.
+    /// Filter cases by name (glob pattern, e.g. "fork_*" or "hello*").
+    #[arg(long, value_name = "PATTERN")]
+    filter: Option<String>,
+
+    /// Override all case-level `models:` fields with this model.
+    /// Forces every case to run against exactly this one model.
+    #[arg(long, value_name = "MODEL")]
+    force_model: Option<String>,
+
+    /// Parallel execution concurrency. Default 1 (serial).
+    #[arg(long, default_value_t = 1)]
+    parallel: usize,
+
+    /// Run each (case, model) pair N times to detect flaky behavior.
+    /// Report shows pass rate per case.
+    #[arg(long, default_value_t = 1)]
+    runs: u32,
+
+    /// Circuit breaker: abort after N consecutive infra failures.
+    #[arg(long, default_value_t = 3)]
+    circuit_breaker: usize,
+
+    /// Model for judger scoring.
     #[arg(long, value_name = "MODEL", default_value = "claude-sonnet-4-6")]
     judger_model: String,
 
-    /// Judger timeout in seconds. Keeps the suite from hanging on a
-    /// pathological judger call.
+    /// Judger timeout in seconds.
     #[arg(long, default_value_t = 60)]
     judger_timeout: u64,
 
-    /// Run the judger N times per criterion and aggregate the scores.
-    /// N=1 (default) matches pre-quorum behavior. N>=3 is recommended
-    /// when you've observed flaky pass/fail from a single call.
+    /// Run the judger N times and aggregate.
     #[arg(long, value_name = "N", default_value_t = 1)]
     judger_n: u32,
 
-    /// Aggregation for `--judger-n`: `median` (default, robust to one
-    /// outlier), `mean`, `min` (paranoid — one LOW vote kills), `max`.
+    /// Aggregation for --judger-n.
     #[arg(long, value_name = "AGG", default_value = "median")]
     judger_agg: String,
 
-    /// Output format: `text` (default, human) or `json` (CI).
+    /// Output format: text or json.
     #[arg(long, default_value = "text")]
     format: String,
 
-    /// Print full stderr/text on every case and always load session
-    /// journals.
+    /// Print full stderr/text on every case.
     #[arg(long)]
     verbose: bool,
 
-    /// Skip the LLM judger step entirely. Useful for offline CI —
-    /// deterministic checks still run.
+    /// Skip the LLM judger step entirely.
     #[arg(long)]
     no_judger: bool,
 
-    /// Force-load session journals for every case (normally only
-    /// loaded when `debug_log: true`). Enables session-dependent
-    /// criteria across the whole suite.
+    /// Force-load session journals for every case.
     #[arg(long)]
     capture_session: bool,
 
-    /// Disable the on-FAIL journal digest auto-capture. By default the
-    /// harness shells out to `astra journal digest` for each failed
-    /// case and embeds the aggregate JSON in the report. Useful when
-    /// the digest subprocess is slow or the digest binary is missing.
+    /// Disable on-FAIL journal digest.
     #[arg(long)]
     no_digest_on_fail: bool,
 
-    /// Timeout (seconds) for the `astra journal digest` subprocess
-    /// the harness spawns on FAIL. Default 15s is fine on warmed-up
-    /// dev machines; cold CI containers running debug builds may
-    /// need 30-60.
+    /// Timeout for digest subprocess.
     #[arg(long, default_value_t = 15)]
     digest_timeout: u64,
+
+    /// Skip pre-flight checks.
+    #[arg(long)]
+    skip_preflight: bool,
+
+    /// Retry rate-limited (429) cases once after backoff.
+    #[arg(long)]
+    retry_on_429: bool,
 }
 
-/// Unix: scan `$PATH` for an executable file with the given name.
-/// Windows callers would need to also try common extensions (`.exe`,
-/// `.bat`) — astra is Unix-only today so we don't.
-///
-/// Inlined to avoid pulling the `which` crate in for one callsite;
-/// this is the entirety of what we'd use there.
 fn find_on_path(name: &str) -> Option<PathBuf> {
-    // `OS_PATH_SEPARATOR` would be `;` on Windows — mirror that if
-    // anyone ports the harness; on Unix it's `:`.
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         if dir.as_os_str().is_empty() {
@@ -127,19 +124,10 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Resolve the astra binary path. See the `--astra-bin` doc comment
-/// for the resolution order. Returns an error only when no candidate
-/// is usable, with a message that explains what was tried.
 fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(p) = explicit {
-        // Explicit flag wins — but still verify it's an executable
-        // file so the first subprocess spawn isn't the one to surface
-        // the typo.
         if !p.is_file() {
-            anyhow::bail!(
-                "--astra-bin {:?} does not exist or is not a file",
-                p.display()
-            );
+            anyhow::bail!("--astra-bin {:?} does not exist or is not a file", p.display());
         }
         return Ok(p);
     }
@@ -148,31 +136,19 @@ fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
     {
         let p = PathBuf::from(env_path);
         if p.is_file() {
-            eprintln!(
-                "[astra-test] using astra bin from ASTRA_BIN: {}",
-                p.display()
-            );
+            eprintln!("[astra-test] using astra bin from ASTRA_BIN: {}", p.display());
             return Ok(p);
         }
     }
     if let Some(found) = find_on_path("astra") {
-        eprintln!(
-            "[astra-test] using astra bin from PATH: {}",
-            found.display()
-        );
+        eprintln!("[astra-test] using astra bin from PATH: {}", found.display());
         return Ok(found);
     }
-    // Last resort: walk up from CWD looking for a Cargo workspace root
-    // with `rust/target/release/astra`. Covers the common dev case of
-    // running the harness from any subdirectory inside the repo.
     let cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("cwd: {e}"))?;
     for ancestor in cwd.ancestors() {
         let candidate = ancestor.join("rust/target/release/astra");
         if candidate.is_file() {
-            eprintln!(
-                "[astra-test] using astra bin from workspace: {}",
-                candidate.display()
-            );
+            eprintln!("[astra-test] using astra bin from workspace: {}", candidate.display());
             return Ok(candidate);
         }
     }
@@ -184,16 +160,42 @@ fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
     )
 }
 
+fn matches_filter(name: &str, pattern: &str) -> bool {
+    // Simple glob: * matches any sequence, ? matches one char.
+    let regex_str = format!(
+        "^{}$",
+        regex::escape(pattern).replace(r"\*", ".*").replace(r"\?", ".")
+    );
+    regex::Regex::new(&regex_str)
+        .map(|re| re.is_match(name))
+        .unwrap_or(false)
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let args = Args::parse();
-
     let astra_bin = resolve_astra_bin(args.astra_bin.clone())?;
 
-    let cases = Case::load_dir(&args.suite)
+    let mut cases = Case::load_dir(&args.suite)
         .with_context(|| format!("load cases from {}", args.suite.display()))?;
     if cases.is_empty() {
         anyhow::bail!("no cases found in {}", args.suite.display());
+    }
+
+    // Apply --filter
+    if let Some(ref pattern) = args.filter {
+        cases.retain(|c| matches_filter(&c.name, pattern));
+        if cases.is_empty() {
+            anyhow::bail!("no cases match filter {:?}", pattern);
+        }
+        eprintln!("[astra-test] filter matched {} case(s)", cases.len());
+    }
+
+    // Apply --force-model: override case-level models
+    if let Some(ref forced) = args.force_model {
+        for case in &mut cases {
+            case.models = Some(vec![forced.clone()]);
+        }
     }
 
     let fallback_models: Vec<String> = args
@@ -203,7 +205,26 @@ async fn main() -> Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    let mut runner_cfg = RunnerConfig::new(astra_bin.clone()).with_fallback_models(fallback_models);
+    // Pre-flight checks
+    if !args.skip_preflight {
+        let preflight_models = if let Some(ref forced) = args.force_model {
+            vec![forced.clone()]
+        } else if !fallback_models.is_empty() {
+            vec![fallback_models[0].clone()]
+        } else {
+            // Try first case's model list
+            cases.first()
+                .and_then(|c| c.models.as_ref())
+                .and_then(|m| m.first().cloned())
+                .into_iter()
+                .collect()
+        };
+        if let Err(e) = run_preflight(&astra_bin, &preflight_models).await {
+            anyhow::bail!("pre-flight check failed: {e}\n  (use --skip-preflight to bypass)");
+        }
+    }
+
+    let mut runner_cfg = RunnerConfig::new(astra_bin.clone()).with_fallback_models(fallback_models.clone());
     runner_cfg.working_dir = args.working_dir.clone();
 
     let judger_cfg = JudgerConfig {
@@ -214,22 +235,13 @@ async fn main() -> Result<()> {
 
     let executor = AstraCliExecutor::new(runner_cfg.clone());
     let cli_judger = AstraCliJudger::new(judger_cfg);
-    let quorum_agg: QuorumAgg = args
-        .judger_agg
-        .parse()
-        .map_err(|e: String| anyhow::anyhow!(e))?;
-    // Build the active judger — either the raw CLI judger (N=1) or a
-    // quorum decorator. Doing this with a boxed trait object keeps the
-    // SuiteRunner signature unchanged.
+    let quorum_agg: QuorumAgg = args.judger_agg.parse().map_err(|e: String| anyhow::anyhow!(e))?;
     let judger: Box<dyn Judger> = if args.judger_n > 1 {
         Box::new(QuorumJudger::new(cli_judger, args.judger_n, quorum_agg))
     } else {
         Box::new(cli_judger)
     };
 
-    // Same-family warning: judger scoring its own family is a known
-    // source of inflated scores. Resolve the full set of tested models
-    // from the cases + fallback so the advisor sees every collision.
     if !args.no_judger {
         let mut tested: Vec<String> = Vec::new();
         for c in &cases {
@@ -243,23 +255,22 @@ async fn main() -> Result<()> {
     }
 
     let session_loader = DiskSessionLoader;
-
     let session_mode = if args.capture_session || args.verbose {
         SessionCaptureMode::Always
     } else {
         SessionCaptureMode::OnDebugLog
     };
 
-    // Digest collector: always construct, conditionally wire. Keeping
-    // the value out of scope when disabled lets the SuiteRunner see
-    // `None` and skip the subprocess per-FAIL.
     let digest = AstraCliDigestCollector::new(astra_bin.clone()).with_timeout(args.digest_timeout);
     let digest_collector: Option<&dyn astra_test_harness::digest::DigestCollector> =
-        if args.no_digest_on_fail {
-            None
-        } else {
-            Some(&digest)
-        };
+        if args.no_digest_on_fail { None } else { Some(&digest) };
+
+    let suite_cfg = SuiteConfig {
+        parallel: args.parallel.max(1),
+        circuit_breaker_threshold: args.circuit_breaker,
+        retry_on_429: args.retry_on_429,
+        runs: args.runs.max(1),
+    };
 
     let runner = SuiteRunner {
         executor: &executor,
@@ -269,17 +280,14 @@ async fn main() -> Result<()> {
         runner_cfg,
         no_judger: args.no_judger,
         session_mode,
+        suite_cfg,
     };
 
     let suite = runner.run_all(&cases).await;
 
-    let fmt: Format = args
-        .format
-        .parse()
-        .map_err(|e: String| anyhow::anyhow!(e))?;
+    let fmt: Format = args.format.parse().map_err(|e: String| anyhow::anyhow!(e))?;
     println!("{}", render(&suite, fmt, args.verbose));
 
-    // Non-zero exit when any case failed — so CI can gate on this.
     if suite.failed() > 0 {
         std::process::exit(1);
     }
