@@ -419,3 +419,35 @@ Peak tokens_in: {peak} tokens ({peak/effective * 100}% utilization)
 | Tool selector | `rust/crates/runtime/src/tool_selector.rs` |
 | Compaction | `rust/crates/runtime/src/turn/cloud/compaction.rs` |
 | History management | `rust/crates/runtime/src/turn/history.rs` |
+
+---
+
+## Machine-Readable Output (auto-invoke)
+
+When auto-invoked by [`AutoInvokeGate`](../../rust/crates/astra-skills/src/auto_invoke.rs), append a fenced JSON block at the end of your response matching the `SkillDiagnosis` schema:
+
+````markdown
+```skill-diagnosis
+{
+  "schema_version": 1,
+  "skill": "optimize_prompt",
+  "cause": "budget_pressure",
+  "headline": "system prompt at 87% pressure — tool schemas dominate",
+  "findings": [
+    "12K tokens of tool schemas, ~30% are never called in this scenario",
+    "reasoning_content persists across 5 turns without pruning"
+  ],
+  "recommended_action": "trim tool list to top-8 by recent use; drop stale reasoning_content"
+}
+```
+````
+
+**Contract (enforced by `SkillDiagnosis::parse_from_skill_output`):**
+
+- `schema_version` must be `1`.
+- `cause` must be one of `consecutive_stalls` | `budget_pressure` | `repeated_corrections`.
+- `skill` should match `optimize_prompt`.
+- `headline` ≤160 chars; `findings` ≤5 × ≤160 chars; `recommended_action` optional ≤160 chars.
+- Last block wins if multiple are present.
+
+Keep the human-readable optimization report above the block for the interactive user.

@@ -359,3 +359,38 @@ Keep the report compact and grounded in digest JSON.
 | REPL turn handler | `rust/crates/astra-cli/src/cli/repl_turn.rs` |
 | Debug command | `rust/crates/astra-cli/src/cli/slash_debug.rs` |
 | Chat stream | `rust/crates/astra-cli/src/cli/chat_stream/` |
+
+---
+
+## Machine-Readable Output (auto-invoke)
+
+When the skill is **auto-invoked** by the runtime's [`AutoInvokeGate`](../../rust/crates/astra-skills/src/auto_invoke.rs) (caller passes `--auto-invoke` or the runtime is wiring your output back into the next turn's SelfModel), append a fenced JSON block at the end of your response matching the `SkillDiagnosis` schema:
+
+````markdown
+```skill-diagnosis
+{
+  "schema_version": 1,
+  "skill": "analyze_session",
+  "cause": "consecutive_stalls",
+  "headline": "agent looping on grep in src/",
+  "findings": [
+    "grep invoked 4× with identical args (turns 5-8)",
+    "no new matches since turn 3"
+  ],
+  "recommended_action": "switch to rg or narrow scope to src/"
+}
+```
+````
+
+**Contract (enforced by `SkillDiagnosis::parse_from_skill_output`):**
+
+- `schema_version` must be `1`. Unknown versions are dropped.
+- `cause` must be one of `consecutive_stalls` | `budget_pressure` | `repeated_corrections`.
+- `skill` should match `analyze_session` (the invoking skill's name).
+- `headline` is one sentence, ≤160 chars.
+- `findings` is a list of ≤5 short bullets, each ≤160 chars.
+- `recommended_action` is optional; ≤160 chars.
+- Overflow is truncated silently by the parser — prefer concise output.
+- If multiple blocks appear, **the last one wins**.
+
+Keep the human-readable analysis above the block for the interactive user; the block is strictly for the runtime self-model.

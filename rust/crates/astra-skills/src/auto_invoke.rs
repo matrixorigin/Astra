@@ -261,6 +261,102 @@ impl SkillDiagnosis {
         }
         s
     }
+
+    /// Extract a diagnosis from the free-form markdown output of an
+    /// auto-invoked skill. Returns `None` if no valid fenced
+    /// ` ```skill-diagnosis ``` ` block is present.
+    ///
+    /// If multiple blocks appear, the **last** one wins — mirroring "the
+    /// agent's last word is the commit" that shows up elsewhere in the
+    /// runtime (e.g. final reflection overrides earlier ones).
+    ///
+    /// Rejects silently (returns `None`) on:
+    ///   * missing block
+    ///   * malformed JSON
+    ///   * `schema_version` other than [`SKILL_DIAGNOSIS_SCHEMA_VERSION`]
+    ///   * missing required fields (`skill`, `cause`, `headline`)
+    ///   * unknown `cause` tag (must match `AutoInvokeCause::as_str`)
+    ///
+    /// Oversized fields are truncated by running the parsed payload
+    /// through [`SkillDiagnosis::new`], not rejected.
+    #[must_use]
+    pub fn parse_from_skill_output(text: &str) -> Option<Self> {
+        let raw = extract_last_fenced_block(text, "skill-diagnosis")?;
+        let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+
+        let schema = value.get("schema_version").and_then(|v| v.as_u64())?;
+        if schema != u64::from(SKILL_DIAGNOSIS_SCHEMA_VERSION) {
+            return None;
+        }
+        let skill = value.get("skill").and_then(|v| v.as_str())?.to_string();
+        let cause_str = value.get("cause").and_then(|v| v.as_str())?;
+        let cause = parse_cause_tag(cause_str)?;
+        let headline = value.get("headline").and_then(|v| v.as_str())?.to_string();
+        let findings: Vec<String> = value
+            .get("findings")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let recommended_action = value
+            .get("recommended_action")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        // Run through `new` so caps are enforced even when the skill emits
+        // oversized payloads.
+        Some(Self::new(
+            skill,
+            &cause,
+            headline,
+            findings,
+            recommended_action,
+        ))
+    }
+}
+
+/// Map a stable tag string back to an `AutoInvokeCause` carrying a placeholder
+/// magnitude. We don't need the original numeric value for parsing — the
+/// cause discriminator is what downstream consumers care about — so we
+/// rebuild with zero/0.0 and accept any three known tags.
+fn parse_cause_tag(tag: &str) -> Option<AutoInvokeCause> {
+    match tag {
+        "consecutive_stalls" => Some(AutoInvokeCause::ConsecutiveStalls { count: 0 }),
+        "budget_pressure" => Some(AutoInvokeCause::BudgetPressure { level: 0.0 }),
+        "repeated_corrections" => Some(AutoInvokeCause::RepeatedCorrections { count: 0 }),
+        _ => None,
+    }
+}
+
+/// Locate the **last** fenced code block whose info-string equals `tag` and
+/// return its inner contents. Lightweight parser — we don't run the full
+/// CommonMark engine because the skill-output grammar is constrained.
+fn extract_last_fenced_block<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let open_marker = format!("```{tag}");
+    let mut last_block: Option<&str> = None;
+
+    let mut cursor = text;
+    while let Some(open_offset) = cursor.find(&open_marker) {
+        let after_open = &cursor[open_offset + open_marker.len()..];
+        // Consume the trailing newline after the opening fence.
+        let body_start = after_open
+            .find('\n')
+            .map(|i| i + 1)
+            .unwrap_or(after_open.len());
+        let body_and_rest = &after_open[body_start..];
+        if let Some(close_offset) = body_and_rest.find("```") {
+            let body = &body_and_rest[..close_offset];
+            last_block = Some(body);
+            cursor = &body_and_rest[close_offset + 3..];
+        } else {
+            break;
+        }
+    }
+
+    last_block
 }
 
 /// Truncate `s` to at most `max` characters (not bytes), adding an ellipsis

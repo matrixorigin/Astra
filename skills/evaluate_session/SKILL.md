@@ -156,3 +156,35 @@ Show before/after comparison with explicit trade-off impact.
 | Journal digest CLI | `rust/crates/astra-cli/src/cli/journal_digest.rs` |
 | Session journal | `rust/crates/services/src/session_journal.rs` |
 | Event ingestion | `rust/crates/services/src/event_ingestion.rs` |
+
+---
+
+## Machine-Readable Output (auto-invoke)
+
+When auto-invoked by [`AutoInvokeGate`](../../rust/crates/astra-skills/src/auto_invoke.rs), append a fenced JSON block at the end of your response matching the `SkillDiagnosis` schema:
+
+````markdown
+```skill-diagnosis
+{
+  "schema_version": 1,
+  "skill": "evaluate_session",
+  "cause": "repeated_corrections",
+  "headline": "user re-scoped 5× in 8 turns — systematic scope drift",
+  "findings": [
+    "corrections cluster on file-scope selection",
+    "agent defaults to whole-repo greps"
+  ],
+  "recommended_action": "prompt agent to restate user's scope before tool calls"
+}
+```
+````
+
+**Contract (enforced by `SkillDiagnosis::parse_from_skill_output`):**
+
+- `schema_version` must be `1`.
+- `cause` must be one of `consecutive_stalls` | `budget_pressure` | `repeated_corrections`.
+- `skill` should match `evaluate_session`.
+- `headline` ≤160 chars; `findings` ≤5 × ≤160 chars; `recommended_action` optional ≤160 chars.
+- Last block wins if multiple are present.
+
+Keep the human-readable evaluation above the block for the interactive user.
