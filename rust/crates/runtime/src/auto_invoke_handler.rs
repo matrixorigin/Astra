@@ -988,3 +988,123 @@ mod tests {
         );
     }
 }
+
+// ── Unhappy-path coverage audit ─────────────────────────────────────
+
+#[test]
+fn evaluate_criterion_negative_delta_from_counter_reset() {
+    // If a new session starts and baseline has higher stalls than
+    // current (impossible in normal flow but defensive), saturating_sub
+    // must produce 0, not underflow.
+    use astra_skills::auto_invoke::{DiagnosisCriterion, DiagnosisMetric, DiagnosisOperator};
+    let baseline = SessionSignals {
+        session_stalls: 10,
+        budget_pressure: 0.9,
+        recent_corrections: 5,
+        corrections_window: 10,
+    };
+    let current = SessionSignals {
+        session_stalls: 3, // less than baseline (hypothetical reset)
+        budget_pressure: 0.2,
+        recent_corrections: 1,
+        corrections_window: 10,
+    };
+    let criterion = DiagnosisCriterion {
+        metric: DiagnosisMetric::SessionStallsDelta,
+        operator: DiagnosisOperator::Lte,
+        threshold: 0.0,
+        window_turns: 5,
+        description: "stalls stop".into(),
+    };
+    // saturating_sub(3, 10) = 0 → delta 0 ≤ 0 → Satisfied.
+    let status = evaluate_criterion(&criterion, &baseline, &current, 1);
+    assert_eq!(status, DiagnosisCriterionStatus::Satisfied);
+}
+
+#[test]
+fn tracker_evaluate_on_empty_produces_no_outcomes() {
+    let mut tracker = DiagnosisOutcomeTracker::new();
+    let signals = SessionSignals::default();
+    let outcomes = tracker.evaluate_turn(&signals, 5);
+    assert!(outcomes.is_empty());
+}
+
+#[test]
+fn tracker_handles_diagnosis_with_empty_success_criteria() {
+    // A diagnosis with zero criteria should complete immediately
+    // (all-non-Pending is vacuously true for an empty set).
+    let mut tracker = DiagnosisOutcomeTracker::new();
+    let baseline = SessionSignals::default();
+    let mut diag = SkillDiagnosis::new(
+        "test",
+        &astra_skills::auto_invoke::AutoInvokeCause::SessionStalls { count: 1 },
+        "h",
+        Vec::<String>::new(),
+        None,
+    );
+    diag.success_criteria = vec![]; // explicitly empty
+    tracker.activate(diag, baseline, 0);
+
+    let outcomes = tracker.evaluate_turn(&baseline, 1);
+    assert_eq!(outcomes.len(), 1, "empty criteria → immediate completion");
+    assert!(outcomes[0].complete);
+    assert!(outcomes[0].statuses.is_empty());
+}
+
+#[test]
+fn tracker_mixed_satisfied_and_failed_criteria() {
+    use astra_skills::auto_invoke::{DiagnosisCriterion, DiagnosisMetric, DiagnosisOperator};
+    let mut tracker = DiagnosisOutcomeTracker::new();
+    let baseline = SessionSignals {
+        session_stalls: 3,
+        budget_pressure: 0.9,
+        recent_corrections: 0,
+        corrections_window: 10,
+    };
+    let mut diag = SkillDiagnosis::new(
+        "test",
+        &astra_skills::auto_invoke::AutoInvokeCause::SessionStalls { count: 3 },
+        "h",
+        Vec::<String>::new(),
+        None,
+    );
+    diag.success_criteria = vec![
+        DiagnosisCriterion {
+            metric: DiagnosisMetric::SessionStallsDelta,
+            operator: DiagnosisOperator::Lte,
+            threshold: 0.0,
+            window_turns: 2,
+            description: "stalls stop".into(),
+        },
+        DiagnosisCriterion {
+            metric: DiagnosisMetric::BudgetPressure,
+            operator: DiagnosisOperator::Lte,
+            threshold: 0.5,
+            window_turns: 2,
+            description: "pressure drops".into(),
+        },
+    ];
+    tracker.activate(diag, baseline, 0);
+
+    // Turn 3: stalls didn't increase (delta 0 ≤ 0 → Satisfied),
+    // but pressure is still 0.85 (> 0.5 threshold, window=2, elapsed=3 ≥ 2 → Failed).
+    let current = SessionSignals {
+        session_stalls: 3, // no new
+        budget_pressure: 0.85,
+        recent_corrections: 0,
+        corrections_window: 10,
+    };
+    let outcomes = tracker.evaluate_turn(&current, 3);
+    assert_eq!(outcomes.len(), 1);
+    assert!(outcomes[0].complete);
+    assert!(
+        outcomes[0]
+            .statuses
+            .contains(&DiagnosisCriterionStatus::Satisfied)
+    );
+    assert!(
+        outcomes[0]
+            .statuses
+            .contains(&DiagnosisCriterionStatus::Failed)
+    );
+}

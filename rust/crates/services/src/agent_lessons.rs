@@ -743,10 +743,11 @@ pub fn compute_confidence_delta(outcome: &LessonOutcome) -> f64 {
     let diagnosis_score = outcome.diagnosis_criteria_met as f64 * DIAGNOSIS_WEIGHT
         - outcome.diagnosis_criteria_failed as f64 * DIAGNOSIS_WEIGHT;
 
-    let noise_negative = (outcome.stall_events
-        + outcome.user_corrections
-        + outcome.tool_failures
-        + outcome.unmet_postconditions) as f64;
+    // Cast each field to f64 individually to avoid u32 addition overflow.
+    let noise_negative = outcome.stall_events as f64
+        + outcome.user_corrections as f64
+        + outcome.tool_failures as f64
+        + outcome.unmet_postconditions as f64;
 
     let total_weight = DIAGNOSIS_WEIGHT + NOISE_WEIGHT; // 4.0
     let raw = (diagnosis_score - noise_negative * NOISE_WEIGHT) / total_weight;
@@ -1022,5 +1023,38 @@ mod tests {
             d.abs() < 0.01,
             "balanced signals should be near zero, got {d}"
         );
+    }
+
+    // ── Unhappy-path coverage audit ─────────────────────────────────────────
+
+    #[test]
+    fn validate_accepts_boundary_confidence_values() {
+        let mut n = valid_new();
+        n.confidence = Some(0.0);
+        assert!(n.validate().is_ok(), "confidence 0.0 must be accepted");
+        n.confidence = Some(1.0);
+        assert!(n.validate().is_ok(), "confidence 1.0 must be accepted");
+    }
+
+    #[test]
+    fn parse_tag_rejects_empty_and_wrong_case() {
+        assert!(LessonKind::parse_tag("").is_none());
+        assert!(LessonKind::parse_tag("ToolDeprioritize").is_none());
+        assert!(LessonKind::parse_tag("TOOL_DEPRIORITIZE").is_none());
+    }
+
+    #[test]
+    fn parse_mysql_datetime_rejects_empty_and_whitespace() {
+        assert!(parse_mysql_datetime("").is_err());
+        assert!(parse_mysql_datetime("   ").is_err());
+        assert!(parse_mysql_datetime("  2026-05-01 12:00:00  ").is_ok());
+    }
+
+    #[test]
+    fn compute_confidence_delta_extreme_u32_values() {
+        let extreme = outcome(u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX);
+        let d = compute_confidence_delta(&extreme);
+        assert!(d.is_finite(), "must not be NaN/inf with u32::MAX inputs");
+        assert!(d.abs() <= MAX_CONFIDENCE_STEP + f64::EPSILON);
     }
 }
