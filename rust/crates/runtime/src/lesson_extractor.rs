@@ -818,7 +818,7 @@ mod tests {
             let mut guard = self.lessons.lock().unwrap();
             if let Some(l) = guard.iter_mut().find(|l| l.id == lesson_id) {
                 l.hit_count += 1;
-                Ok(l.hit_count as i64)
+                Ok(l.hit_count)
             } else {
                 Err(sqlx::Error::RowNotFound)
             }
