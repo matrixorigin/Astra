@@ -1635,24 +1635,31 @@ fn apply_turn_success_sync(
 
     // ── Post-turn status line ────────────────────────────────────────────
     print_turn_status_line(state, &result, turn_start);
-    if let Some(suggestion) = state.pending_followup_suggestion.as_ref() {
-        eprintln!(
-            "{}",
-            format!("  💡 Next prompt: {}  (Tab to accept)", suggestion.text).dim()
-        );
-    }
+    if state.tui_render_policy.is_none() {
+        if let Some(suggestion) = state.pending_followup_suggestion.as_ref() {
+            eprintln!(
+                "{}",
+                format!("  💡 Next prompt: {}  (Tab to accept)", suggestion.text).dim()
+            );
+        }
 
-    if result.tool_calls_count == 0 && looks_like_live_query_with_context(line, &state.recent_tools)
-    {
-        eprintln!(
-            "{}",
-            "  ⚠ Warning: This answer was generated without tool calls. Data may be hallucinated."
-                .yellow()
-        );
+        if result.tool_calls_count == 0
+            && looks_like_live_query_with_context(line, &state.recent_tools)
+        {
+            eprintln!(
+                "{}",
+                "  ⚠ Warning: This answer was generated without tool calls. Data may be hallucinated."
+                    .yellow()
+            );
+        }
     }
 }
 
 fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: Instant) {
+    // In TUI mode, suppress line-mode status output — TUI has its own footer
+    if state.tui_render_policy.is_some() {
+        return;
+    }
     let elapsed = turn_start.elapsed();
     let elapsed_str = if elapsed.as_secs() >= 60 {
         format!("{}m{:.0}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)

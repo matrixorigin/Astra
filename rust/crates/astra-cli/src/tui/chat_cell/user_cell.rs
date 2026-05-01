@@ -1,4 +1,4 @@
-use ratatui::style::{Style, Stylize};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::ChatCell;
@@ -16,23 +16,38 @@ impl UserChatCell {
 }
 
 impl ChatCell for UserChatCell {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let bg = user_message_style();
+
         let mut lines = Vec::new();
+        lines.push(Line::styled("", bg)); // blank line above
+
         for (i, text_line) in self.message.lines().enumerate() {
             let prefix = if i == 0 {
-                Span::styled("› ", Style::default().cyan())
+                Span::styled(
+                    "› ",
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
+                )
             } else {
                 Span::raw("  ")
             };
-            lines.push(Line::from(vec![
-                prefix,
-                Span::styled(text_line.to_string(), bg),
-            ]));
+            lines.push(Line::from(vec![prefix, Span::raw(text_line.to_string())]).style(bg));
         }
-        if lines.is_empty() {
-            lines.push(Line::from(Span::styled("› ", Style::default().cyan())));
+        if self.message.is_empty() {
+            lines.push(
+                Line::from(Span::styled(
+                    "› ",
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
+                ))
+                .style(bg),
+            );
         }
+
+        lines.push(Line::styled("", bg)); // blank line below
         lines
     }
 }

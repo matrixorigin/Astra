@@ -1,5 +1,7 @@
 pub(crate) mod assistant_cell;
 pub(crate) mod system_cell;
+pub(crate) mod thinking_cell;
+pub(crate) mod tool_cell;
 pub(crate) mod user_cell;
 
 use std::any::Any;
@@ -9,6 +11,8 @@ use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
 
 pub(crate) trait ChatCell: Debug + Send + Sync + Any {
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+
     fn display_lines(&self, width: u16) -> Vec<Line<'static>>;
 
     fn desired_height(&self, width: u16) -> u16 {

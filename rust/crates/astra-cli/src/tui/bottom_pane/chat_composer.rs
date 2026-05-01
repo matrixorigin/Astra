@@ -2,9 +2,9 @@ use crossterm::event::KeyEvent;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Style, Stylize},
+    style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Widget},
+    widgets::Widget,
 };
 
 use super::textarea::{TextArea, TextAreaAction};
@@ -55,10 +55,9 @@ impl ChatComposer {
     }
 
     pub fn desired_height(&self, width: u16) -> u16 {
-        let border_overhead = 2; // top + bottom border
         let prefix_w = self.prompt_prefix.len() as u16;
-        let inner_w = width.saturating_sub(border_overhead + prefix_w);
-        self.textarea.desired_height(inner_w) + border_overhead
+        let inner_w = width.saturating_sub(prefix_w);
+        self.textarea.desired_height(inner_w)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ComposerAction {
@@ -130,33 +129,31 @@ impl ChatComposer {
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Input ")
-            .border_style(Style::default().fg(Color::DarkGray));
-        let inner = block.inner(area);
-        block.render(area, buf);
-
-        if inner.height == 0 || inner.width == 0 {
+        if area.height == 0 || area.width == 0 {
             return;
         }
 
-        // Render prompt prefix on first line
-        let prefix = Span::styled(&self.prompt_prefix, Style::default().cyan());
+        // Codex: › bold when active
+        let prefix = Span::styled(
+            &self.prompt_prefix,
+            Style::default().add_modifier(ratatui::style::Modifier::BOLD),
+        );
         let prefix_width = self.prompt_prefix.len() as u16;
-        let prefix_area = Rect::new(inner.x, inner.y, prefix_width.min(inner.width), 1);
+        let prefix_area = Rect::new(area.x, area.y, prefix_width.min(area.width), 1);
         Widget::render(Line::from(prefix), prefix_area, buf);
 
-        // Textarea gets the remaining width
         let text_area = Rect::new(
-            inner.x + prefix_width.min(inner.width),
-            inner.y,
-            inner.width.saturating_sub(prefix_width),
-            inner.height,
+            area.x + prefix_width.min(area.width),
+            area.y,
+            area.width.saturating_sub(prefix_width),
+            area.height,
         );
 
         if self.textarea.is_empty() {
-            let placeholder = Span::styled("Type a message...", Style::default().dark_gray());
+            let placeholder = Span::styled(
+                "Ask astra to do anything",
+                Style::default().fg(Color::DarkGray),
+            );
             Widget::render(Line::from(placeholder), text_area, buf);
         } else {
             self.textarea.render(text_area, buf);
@@ -164,14 +161,12 @@ impl ChatComposer {
     }
 
     pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
-        let block = Block::default().borders(Borders::ALL);
-        let inner = block.inner(area);
         let prefix_width = self.prompt_prefix.len() as u16;
         let text_area = Rect::new(
-            inner.x + prefix_width.min(inner.width),
-            inner.y,
-            inner.width.saturating_sub(prefix_width),
-            inner.height,
+            area.x + prefix_width.min(area.width),
+            area.y,
+            area.width.saturating_sub(prefix_width),
+            area.height,
         );
         self.textarea.cursor_position(text_area)
     }

@@ -32,6 +32,7 @@ impl BottomPane {
     }
 
     pub fn set_task_status(&mut self, status: TaskStatus) {
+        self.footer.is_turn_active = status.is_active();
         self.task_status = status;
     }
 

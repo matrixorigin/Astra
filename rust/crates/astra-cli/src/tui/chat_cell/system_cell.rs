@@ -44,6 +44,7 @@ impl SystemChatCell {
 }
 
 impl ChatCell for SystemChatCell {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let style = match self.level {
             SystemLevel::Info => Style::default().dim(),

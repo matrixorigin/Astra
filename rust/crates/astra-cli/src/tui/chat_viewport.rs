@@ -1,8 +1,8 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    text::Text,
-    widgets::{Paragraph, Widget, Wrap},
+    text::{Line, Text},
+    widgets::{Clear, Paragraph, Widget},
 };
 
 use super::chat_cell::ChatCell;
@@ -49,6 +49,18 @@ impl ChatViewport {
         }
     }
 
+    pub fn mutate_cell<F>(&mut self, idx: usize, f: F)
+    where
+        F: FnOnce(&mut dyn std::any::Any),
+    {
+        if idx < self.cells.len() {
+            let any = self.cells[idx].as_any_mut();
+            f(any);
+            // Don't auto-scroll on mutation — only push_cell triggers scroll-to-bottom.
+            // In-place updates (thinking chunks, tool status) shouldn't jump the viewport.
+        }
+    }
+
     pub fn scroll_up(&mut self, amount: u16) {
         self.auto_follow = false;
         self.scroll_offset = self.scroll_offset.saturating_sub(amount);
@@ -90,11 +102,21 @@ impl ChatViewport {
     }
 
     fn total_content_height(&self, width: u16) -> u16 {
-        self.cells.iter().map(|c| c.desired_height(width)).sum()
+        let mut h: u16 = 0;
+        for (i, cell) in self.cells.iter().enumerate() {
+            if i > 0 {
+                h = h.saturating_add(1); // 1-line spacing between cells
+            }
+            h = h.saturating_add(cell.desired_height(width));
+        }
+        h
     }
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
         self.last_width = area.width;
+
+        // Clear the entire area first — prevents stale glyphs from previous frames
+        Clear.render(area, buf);
 
         if self.needs_scroll_to_bottom {
             let total = self.total_content_height(area.width);
@@ -103,8 +125,11 @@ impl ChatViewport {
         }
 
         let width = area.width;
-        let mut all_lines = Vec::new();
-        for cell in &self.cells {
+        let mut all_lines: Vec<Line<'static>> = Vec::new();
+        for (i, cell) in self.cells.iter().enumerate() {
+            if i > 0 {
+                all_lines.push(Line::default()); // 1-line spacing between cells
+            }
             let lines = cell.display_lines(width);
             all_lines.extend(lines);
         }
@@ -115,9 +140,7 @@ impl ChatViewport {
             .min(total_lines.saturating_sub(area.height));
 
         let text = Text::from(all_lines);
-        let paragraph = Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0));
+        let paragraph = Paragraph::new(text).scroll((scroll, 0));
         Widget::render(paragraph, area, buf);
     }
 }

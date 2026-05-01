@@ -306,10 +306,10 @@ pub(super) async fn try_silent_auth(api: &astra_thin_client::ThinClient, profile
             .await
         {
             Ok(resp) if resp.status().is_success() => return,
-            Ok(resp) if resp.status().is_client_error() => {
-                // 4xx (401 expired, 404 user gone, etc.) — token is invalid
+            Ok(resp) if resp.status().as_u16() == 401 => {
+                // 401 Unauthorized — token is definitely invalid, try refresh
             }
-            _ => return, // Network error or 5xx: proceed with cached creds
+            _ => return, // Network error, proxy error, 5xx, other 4xx: keep cached creds
         }
     } else {
         return;
@@ -338,22 +338,10 @@ pub(super) async fn try_silent_auth(api: &astra_thin_client::ThinClient, profile
         }
     }
 
-    let mut creds = load_credentials();
-    let name = profile_name(profile, &creds);
-    if let Some(p) = creds.profiles.get_mut(&name) {
-        p.access_token = None;
-        // Keep refresh_token for next login attempt - it may still be valid
-        // even if this refresh attempt failed (e.g., due to temporary network issues).
-        // If refresh_token is truly expired, the next refresh will also fail and
-        // user will be prompted to re-login then.
-    }
-    if let Err(e) = save_credentials(&creds) {
-        tracing::warn!(
-            target: "astra_cli::repl_runtime",
-            error = %e,
-            "failed to save credentials after token refresh"
-        );
-    }
+    // Never wipe credentials in try_silent_auth — it's a best-effort check.
+    // If both access_token validation and refresh fail, the user still has
+    // their saved credentials for the next explicit login or refresh attempt.
+    // Wiping here causes repeated "not logged in" after proxy/network issues.
 }
 
 fn should_keep_credentials_on_refresh_error(err: &astra_thin_client::ThinClientError) -> bool {

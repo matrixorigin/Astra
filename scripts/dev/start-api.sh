@@ -105,23 +105,25 @@ start_detached env \
     HTTP_PROXY="${HTTP_PROXY:-${http_proxy:-}}" \
     ALL_PROXY="${ALL_PROXY:-${all_proxy:-}}" \
     NO_PROXY="${NO_PROXY:-${no_proxy:-}}" \
-    ASTRA_API_HOST=0.0.0.0 \
-    ASTRA_API_PORT=8000 \
+    ASTRA_API_HOST="${ASTRA_API_HOST:-0.0.0.0}" \
+    ASTRA_API_PORT="${ASTRA_API_PORT:-8000}" \
     "$BIN_PATH"
 SETSID_PID=$DETACHED_PID
 sleep 1
 PID=$SETSID_PID
 echo $PID > "$PID_FILE"
 
+API_PORT="${ASTRA_API_PORT:-8000}"
+
 # Wait until the process is alive and the health endpoint reports a connected DB.
 for i in {1..30}; do
     if ! kill -0 "$PID" 2>/dev/null; then
         break
     fi
-    HEALTH=$(NO_PROXY=localhost,127.0.0.1 curl -s --connect-timeout 1 --max-time 2 http://127.0.0.1:8000/health 2>/dev/null || true)
+    HEALTH=$(NO_PROXY=localhost,127.0.0.1 curl -s --connect-timeout 1 --max-time 2 "http://127.0.0.1:${API_PORT}/health" 2>/dev/null || true)
     if echo "$HEALTH" | grep -q '"status":"healthy"' && \
        echo "$HEALTH" | grep -q '"database":"connected"'; then
-        echo "✅ API server started (PID: $PID)"
+        echo "✅ API server started (PID: $PID, port: $API_PORT)"
         exit 0
     fi
     sleep 2
@@ -134,7 +136,7 @@ else
 fi
 echo ""
 echo "Troubleshooting:"
-echo "  1. Check if port 8000 is in use: lsof -i :8000"
+echo "  1. Check if port $API_PORT is in use: lsof -i :$API_PORT"
 echo "  2. View error log: tail -50 $LOG_FILE"
 echo "  3. Stop via script: make dev-api-stop"
 echo "  4. Check database: make dev-status"

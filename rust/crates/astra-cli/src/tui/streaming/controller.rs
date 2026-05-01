@@ -73,7 +73,7 @@ impl StreamController {
         (Some(Box::new(cell)), Some(source))
     }
 
-    /// Drain one line from the queue, returning a transient cell if available.
+    /// Drain queued lines, returning them if available.
     pub fn tick(&mut self) -> Option<Vec<Line<'static>>> {
         let batch = self.state.drain_n(5);
         if batch.is_empty() {
@@ -82,6 +82,19 @@ impl StreamController {
             self.emitted_len += batch.len();
             Some(batch)
         }
+    }
+
+    /// Flush any pending (uncommitted) text for immediate display.
+    /// Called periodically so short responses without newlines still render.
+    pub fn flush_pending(&mut self) {
+        if let Some(remaining) = self.state.collector.finalize_and_drain_source() {
+            if !remaining.is_empty() {
+                self.raw_source.push_str(&remaining);
+                self.recompute_and_sync();
+            }
+        }
+        // Re-create the collector so future deltas continue to buffer
+        self.state.collector = crate::tui::markdown_stream::MarkdownStreamCollector::new(self.width);
     }
 
     /// Returns all lines emitted so far (for building a transient cell).

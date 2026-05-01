@@ -1,7 +1,7 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Style, Stylize},
+    style::{Color, Style},
     text::{Line, Span},
     widgets::Widget,
 };
@@ -10,7 +10,7 @@ pub(crate) struct Footer {
     pub model: Option<String>,
     pub session_id: Option<String>,
     pub token_usage: Option<String>,
-    pub cwd: Option<String>,
+    pub is_turn_active: bool,
 }
 
 impl Footer {
@@ -19,51 +19,47 @@ impl Footer {
             model: None,
             session_id: None,
             token_usage: None,
-            cwd: std::env::current_dir()
-                .ok()
-                .map(|p| {
-                    let home = dirs::home_dir();
-                    match home {
-                        Some(h) if p.starts_with(&h) => {
-                            format!("~/{}", p.strip_prefix(&h).unwrap_or(&p).display())
-                        }
-                        _ => p.display().to_string(),
-                    }
-                }),
+            is_turn_active: false,
         }
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
-        let mut items: Vec<Span> = Vec::new();
-
-        if let Some(ref model) = self.model {
-            items.push(Span::styled(model.clone(), Style::default().cyan()));
+        if area.width == 0 || area.height == 0 {
+            return;
         }
 
+        let dim = Style::default().fg(Color::DarkGray);
+
+        let mut left_items: Vec<Span> = Vec::new();
+        left_items.push(Span::raw("  ")); // 2-space indent like Codex FOOTER_INDENT_COLS
+        if self.is_turn_active {
+            left_items.push(Span::styled("⏹ interrupt", dim));
+        } else {
+            left_items.push(Span::styled("? for shortcuts", dim));
+        }
+
+        let mut right_items: Vec<Span> = Vec::new();
         if let Some(ref usage) = self.token_usage {
-            if !items.is_empty() {
-                items.push(Span::raw(" │ "));
-            }
-            items.push(Span::raw(usage.clone()));
+            right_items.push(Span::styled(usage.clone(), dim));
+            right_items.push(Span::styled(" · ", dim));
         }
-
-        if let Some(ref cwd) = self.cwd {
-            if !items.is_empty() {
-                items.push(Span::raw(" │ "));
-            }
-            let display = if cwd.len() > 30 {
-                format!("…{}", &cwd[cwd.len() - 29..])
-            } else {
-                cwd.clone()
-            };
-            items.push(Span::styled(display, Style::default().dim()));
+        if let Some(ref model) = self.model {
+            right_items.push(Span::styled(model.clone(), dim));
         }
+        right_items.push(Span::raw("  ")); // trailing indent
 
-        items.push(Span::raw(" │ "));
-        items.push(Span::styled("Ctrl+C", Style::default().yellow()));
-        items.push(Span::raw(" quit"));
+        // Compose: left items ... padding ... right items
+        let left = Line::from(left_items);
+        let right = Line::from(right_items);
 
-        let line = Line::from(items);
-        Widget::render(line, area, buf);
+        let left_w: usize = left.spans.iter().map(|s| s.content.len()).sum();
+        let right_w: usize = right.spans.iter().map(|s| s.content.len()).sum();
+        let padding = (area.width as usize).saturating_sub(left_w + right_w);
+
+        let mut all_spans = left.spans;
+        all_spans.push(Span::raw(" ".repeat(padding)));
+        all_spans.extend(right.spans);
+
+        Widget::render(Line::from(all_spans), area, buf);
     }
 }
