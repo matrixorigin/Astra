@@ -20,6 +20,7 @@ mod markdown_render;
 mod markdown_stream;
 mod render;
 mod shimmer;
+mod slash_dispatch;
 mod stream_bridge;
 mod streaming;
 mod style;
@@ -171,14 +172,15 @@ pub(crate) async fn run_tui_repl(
                                 do_draw(&mut guard, &active_cell, &mut bottom_pane)?;
 
                                 if text.starts_with('/') {
-                                    let slash_action = dispatch_slash_inline(
-                                        &text, api, profile, &mut state, &startup, &mut guard, &mut bottom_pane, w,
-                                    ).await;
-                                    match slash_action {
-                                        SlashAction::Handled => {}
-                                        SlashAction::Exit => { break 'main Ok(()); }
-                                        SlashAction::Fallback => {
-                                            // Complex commands: temporarily leave TUI
+                                    let mut dctx = slash_dispatch::DispatchContext {
+                                        api, profile, state: &mut state,
+                                        guard: &mut guard, bottom_pane: &mut bottom_pane, width: w,
+                                    };
+                                    let result = slash_dispatch::dispatch(&text, &mut dctx).await;
+                                    match result {
+                                        slash_dispatch::SlashResult::Handled => {}
+                                        slash_dispatch::SlashResult::Exit => { break 'main Ok(()); }
+                                        slash_dispatch::SlashResult::Fallback => {
                                             let slash_text = text.clone();
                                             let slash_result = guard.with_restored(|| async {
                                                 let token = crate::repl_runtime::current_access_token(profile);
@@ -312,7 +314,7 @@ pub(crate) async fn run_tui_repl(
                             BottomPaneAction::SubmitInput(_) => {}
                             BottomPaneAction::ViewCompleted(result) => {
                                 if let Some(name) = result {
-                                    handle_view_result(
+                                    slash_dispatch::handle_view_result(
                                         &name, &mut state, &mut guard, &mut bottom_pane,
                                     );
                                     bottom_pane.sync_popups();
@@ -549,140 +551,4 @@ impl<'a> render::renderable::Renderable for BottomPaneRenderable<'a> {
     }
 }
 
-// ── View result handling ───────────────────────────────────────────────────
-
-fn handle_view_result(
-    name: &str,
-    state: &mut crate::repl_state::ReplState,
-    guard: &mut TerminalGuard,
-    bottom_pane: &mut BottomPane,
-) {
-    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-
-    // Skill menu actions
-    if name == "List skills" {
-        // Insert $ into composer to trigger skill mention popup
-        bottom_pane.composer.set_text("$");
-        return;
-    }
-    if name == "Skill info" {
-        let msg = SystemChatCell::info("Use /skill info <name> for skill details".into());
-        guard.queue_history_lines(msg.display_lines(w));
-        return;
-    }
-
-    // Check if it's a skill name → insert $name into composer
-    if state.unified_skill_registry.get_manifest(name).is_some() {
-        bottom_pane.composer.set_text(&format!("${name} "));
-        return;
-    }
-
-    // Otherwise treat as model selection
-    state.model = Some(name.to_string());
-    bottom_pane.footer.model = Some(name.to_string());
-    let msg = SystemChatCell::info(format!("Model set to: {name}"));
-    guard.queue_history_lines(msg.display_lines(w));
-}
-
-// ── Inline slash dispatch ──────────────────────────────────────────────────
-
-enum SlashAction {
-    Handled,
-    Exit,
-    Fallback,
-}
-
-async fn dispatch_slash_inline(
-    text: &str,
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    state: &mut crate::repl_state::ReplState,
-    _startup: &crate::repl_startup::ReplStartupArtifacts,
-    guard: &mut TerminalGuard,
-    bottom_pane: &mut BottomPane,
-    w: u16,
-) -> SlashAction {
-    let cmd = text.split_whitespace().next().unwrap_or(text);
-    let _args = text[cmd.len()..].trim();
-
-    match cmd {
-        "/exit" | "/quit" => SlashAction::Exit,
-
-        "/help" | "/commands" => {
-            let lines = crate::repl_ui::format_help_lines();
-            guard.queue_history_lines(
-                lines.into_iter().map(|s| {
-                    ratatui::text::Line::from(ratatui::text::Span::styled(
-                        s, ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
-                    ))
-                }).collect(),
-            );
-            SlashAction::Handled
-        }
-
-        "/model" => {
-            let token = crate::repl_runtime::current_access_token(profile);
-            match crate::slash_router::fetch_model_list(api, token.as_deref()).await {
-                Ok(models) => {
-                    use bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
-                    let current = state.model.clone().unwrap_or_default();
-                    let items: Vec<SelectionItem> = models.into_iter().map(|m| {
-                        let is_current = m == current;
-                        SelectionItem { name: m, description: None, is_current }
-                    }).collect();
-                    if items.is_empty() {
-                        let err = SystemChatCell::info("No models available".into());
-                        guard.queue_history_lines(err.display_lines(w));
-                    } else {
-                        let view = ListSelectionView::new(items, Some("Select model:".into()));
-                        bottom_pane.push_view(Box::new(view));
-                    }
-                    SlashAction::Handled
-                }
-                Err(e) => {
-                    let err = SystemChatCell::error(format!("Failed to fetch models: {e}"));
-                    guard.queue_history_lines(err.display_lines(w));
-                    SlashAction::Handled
-                }
-            }
-        }
-
-        "/skill" | "/skills" => {
-            use bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
-            let skill_count = state.unified_skill_registry.all_manifests()
-                .iter().filter(|m| m.user_invocable).count();
-            let items = vec![
-                SelectionItem {
-                    name: "List skills".into(),
-                    description: Some(format!("Tip: press $ to open this list directly. ({skill_count} skills)")),
-                    is_current: false,
-                },
-                SelectionItem {
-                    name: "Skill info".into(),
-                    description: Some("Show details of a specific skill".into()),
-                    is_current: false,
-                },
-            ];
-            let view = ListSelectionView::new(items, Some("Skills — choose an action:".into()));
-            bottom_pane.push_view(Box::new(view));
-            SlashAction::Handled
-        }
-
-        "/stats" | "/info" => {
-            let info = format!(
-                "Session: {} | Model: {} | Tokens: {}↑ {}↓ | Cost: ${:.4}",
-                state.session_id.as_deref().unwrap_or("<none>"),
-                state.model.as_deref().unwrap_or("<unset>"),
-                state.total_prompt_tokens,
-                state.total_completion_tokens,
-                state.total_session_cost,
-            );
-            let cell = SystemChatCell::info(info);
-            guard.queue_history_lines(cell.display_lines(w));
-            SlashAction::Handled
-        }
-
-        _ => SlashAction::Fallback,
-    }
-}
 
