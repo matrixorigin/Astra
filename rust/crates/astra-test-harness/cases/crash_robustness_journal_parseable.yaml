@@ -21,10 +21,15 @@ criteria:
   # The harness's SessionCapture exposes `skipped_lines` in its
   # debug string but not as a direct criterion. We proxy by asking
   # for a strictly positive event count — if the journal were
-  # unparseable we'd see 0 events. `llm_round` is universal in
-  # `~/.astra/sessions/<id>.jsonl` (every turn records one);
-  # `ToolCallCompleted` only fires in the step-events layout and is
-  # absent on many run types.
+  # unparseable we'd see 0 events.
+  #
+  # Layout note: real `astra chat --json` runs on this deployment
+  # write ONLY the step-events layout (`<id>/step_events.jsonl`).
+  # The legacy layout (`<id>.jsonl` with `llm_round`) is gated
+  # behind `full_llm_capture` / `astra session trace on` and is
+  # NOT produced by a plain chat invocation. Count `StepCompleted`
+  # — the step-events analogue of `llm_round` that fires exactly
+  # once per completed turn.
   - type: session_event_count
-    event_type: llm_round
+    event_type: StepCompleted
     min: 1

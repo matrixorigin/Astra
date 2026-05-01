@@ -12,8 +12,12 @@ description: |
   `llm_round.tool_calls[]` as well as step-events
   `ToolCallCompleted`). Both must agree on the same tool name.
 prompt: |
-  Use the list_dir tool to list the current directory. Then briefly
+  Use ONLY the `list_dir` tool (not `bash`, not any other tool) to
+  list the current directory. After you see the output, briefly
   describe what you saw in one sentence.
+
+  Constraint: you must call `list_dir` exactly once. Do not use bash,
+  read_file, grep, or any other tool for this task.
 debug_log: true
 timeout_seconds: 120
 criteria:
@@ -23,10 +27,12 @@ criteria:
     name: list_dir
   - type: journal_tool_called
     name: list_dir
-  # `llm_round` is universal in the legacy jsonl; `ToolCallCompleted`
-  # only appears when the step-events layout is enabled. Assert on
-  # the universal event type so this case runs cleanly against any
-  # session.
+  # Layout note: real `astra chat --json` runs on this deployment
+  # write ONLY the step-events layout (`<id>/step_events.jsonl`).
+  # The legacy layout (`<id>.jsonl` with `llm_round`) is gated
+  # behind `full_llm_capture` / `astra session trace on` and is
+  # NOT produced by a plain chat invocation. `StepCompleted` is
+  # the step-events analogue: exactly one per completed turn.
   - type: session_event_count
-    event_type: llm_round
+    event_type: StepCompleted
     min: 1
