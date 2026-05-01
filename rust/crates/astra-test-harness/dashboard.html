@@ -3,307 +3,1876 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>astra-test dashboard</title>
+<title>astra-test</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#0a0e1a;--card:#131a2e;--border:#1e293b;--accent:#3b82f6;--green:#22c55e;--red:#ef4444;--yellow:#eab308;--text:#e2e8f0;--muted:#64748b;--font:system-ui,-apple-system,'Segoe UI',sans-serif;--mono:'SF Mono',Menlo,Consolas,monospace}
-body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;overflow-x:hidden}
-.container{max-width:1400px;margin:0 auto;padding:24px}
+/* ================================================================
+   CSS Reset & Custom Properties
+   ================================================================ */
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
-/* Connection banner */
-.conn{position:fixed;top:0;left:0;right:0;padding:8px 16px;text-align:center;font-size:13px;z-index:100;transition:all .3s}
-.conn.connecting{background:#1e293b;color:var(--yellow)}
-.conn.connected{background:var(--green);color:#000;transform:translateY(-100%);opacity:0}
-.conn.error{background:var(--red);color:#fff}
+:root {
+  --bg: #06080f;
+  --bg-subtle: #0a0e1a;
+  --card: rgba(15, 23, 42, 0.8);
+  --card-hover: rgba(15, 23, 42, 0.95);
+  --border: rgba(59, 130, 246, 0.15);
+  --border-strong: rgba(59, 130, 246, 0.3);
+  --accent: #3b82f6;
+  --accent2: #8b5cf6;
+  --green: #22c55e;
+  --green-dim: rgba(34, 197, 94, 0.15);
+  --red: #ef4444;
+  --red-dim: rgba(239, 68, 68, 0.15);
+  --yellow: #eab308;
+  --yellow-dim: rgba(234, 179, 8, 0.15);
+  --blue-dim: rgba(59, 130, 246, 0.15);
+  --text: #e2e8f0;
+  --text-secondary: #94a3b8;
+  --muted: #64748b;
+  --font: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', Menlo, Consolas, monospace;
+  --radius: 12px;
+  --radius-sm: 8px;
+  --radius-xs: 6px;
+  --shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 8px 40px rgba(0, 0, 0, 0.4);
+  --transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  --spring: 0.35s cubic-bezier(.34, 1.56, .64, 1);
+  --gradient: linear-gradient(135deg, var(--accent), var(--accent2));
+}
 
-/* Header */
-header{text-align:center;padding:48px 0 32px}
-header h1{font-size:28px;font-weight:700;letter-spacing:-0.5px;background:linear-gradient(135deg,var(--accent),#a855f7);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-header .subtitle{color:var(--muted);font-size:14px;margin-top:4px}
+html { font-variant-numeric: tabular-nums; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  min-height: 100vh;
+  overflow-x: hidden;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
 
-/* Stats grid */
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px;margin:24px 0}
-.stat{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;text-align:center;transition:transform .3s,box-shadow .3s}
-.stat:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,.3)}
-.stat .value{font-size:36px;font-weight:800;font-variant-numeric:tabular-nums}
-.stat .label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-top:4px}
-.stat.pass .value{color:var(--green)}
-.stat.fail .value{color:var(--red)}
-.stat.rate .value{color:var(--accent)}
+/* ================================================================
+   Animated Background Mesh
+   ================================================================ */
+.bg-mesh {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.bg-mesh::before, .bg-mesh::after {
+  content: '';
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(120px);
+  opacity: 0.07;
+  animation: meshFloat 20s ease-in-out infinite alternate;
+}
+.bg-mesh::before {
+  width: 600px; height: 600px;
+  background: var(--accent);
+  top: -200px; left: -100px;
+}
+.bg-mesh::after {
+  width: 500px; height: 500px;
+  background: var(--accent2);
+  bottom: -200px; right: -100px;
+  animation-delay: -10s;
+  animation-direction: alternate-reverse;
+}
+@keyframes meshFloat {
+  0%   { transform: translate(0, 0) scale(1); }
+  33%  { transform: translate(80px, 40px) scale(1.1); }
+  66%  { transform: translate(-40px, 80px) scale(0.95); }
+  100% { transform: translate(40px, -40px) scale(1.05); }
+}
 
-/* Progress bar */
-.progress-wrap{background:var(--card);border-radius:12px;padding:16px 20px;margin:16px 0;border:1px solid var(--border)}
-.progress-bar{height:8px;background:var(--border);border-radius:4px;overflow:hidden;margin-top:8px}
-.progress-fill{height:100%;background:linear-gradient(90deg,var(--accent),#a855f7);border-radius:4px;transition:width .5s cubic-bezier(.4,0,.2,1);width:0}
-.progress-label{display:flex;justify-content:space-between;font-size:13px;color:var(--muted)}
+/* ================================================================
+   Layout
+   ================================================================ */
+.app { position: relative; z-index: 1; }
+.container { max-width: 1440px; margin: 0 auto; padding: 24px 32px; }
+@media (max-width: 900px) { .container { padding: 16px; } }
 
-/* Model comparison */
-.section{margin:32px 0}
-.section h2{font-size:18px;font-weight:600;margin-bottom:16px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;font-size:12px}
-.model-table{width:100%;border-collapse:separate;border-spacing:0;background:var(--card);border-radius:12px;overflow:hidden;border:1px solid var(--border)}
-.model-table th{padding:12px 16px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);background:rgba(0,0,0,.2)}
-.model-table td{padding:12px 16px;border-top:1px solid var(--border);font-variant-numeric:tabular-nums;font-size:14px}
-.model-table tr:hover td{background:rgba(59,130,246,.05)}
+/* ================================================================
+   Toast Notifications
+   ================================================================ */
+.toast-container {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.toast {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 16px;
+  font-size: 13px;
+  color: var(--text);
+  backdrop-filter: blur(16px);
+  box-shadow: var(--shadow);
+  max-width: 380px;
+  animation: toastIn 0.3s var(--spring) both;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.toast.error { border-color: rgba(239, 68, 68, 0.4); }
+.toast.error::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--red); flex-shrink: 0; }
+.toast.info::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
+.toast.removing { animation: toastOut 0.2s ease-in both; }
+@keyframes toastIn { from { opacity: 0; transform: translateX(100px); } to { opacity: 1; transform: translateX(0); } }
+@keyframes toastOut { from { opacity: 1; transform: translateX(0); } to { opacity: 0; transform: translateX(100px); } }
 
-/* Case cards */
-.cases{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px;margin-top:16px}
-.case-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;cursor:pointer;transition:all .3s;animation:slideUp .4s cubic-bezier(.4,0,.2,1) both}
-.case-card:hover{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),0 4px 16px rgba(59,130,246,.1)}
-.case-card.pass{border-left:3px solid var(--green)}
-.case-card.fail{border-left:3px solid var(--red)}
-.case-card .case-header{display:flex;justify-content:space-between;align-items:center}
-.case-card .case-name{font-weight:600;font-size:14px}
-.case-card .badge{padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:.5px}
-.case-card .badge.pass{background:rgba(34,197,94,.15);color:var(--green)}
-.case-card .badge.fail{background:rgba(239,68,68,.15);color:var(--red)}
-.case-card .case-model{font-size:12px;color:var(--muted);margin-top:4px;font-family:var(--mono)}
-.case-card .case-metrics{display:flex;gap:12px;margin-top:8px;font-size:12px;color:var(--muted)}
-.case-card .case-metrics span{display:flex;align-items:center;gap:4px}
-.case-card .detail{display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);font-size:13px}
-.case-card.expanded .detail{display:block}
-.case-card .detail pre{background:rgba(0,0,0,.3);padding:8px 12px;border-radius:6px;overflow-x:auto;font-family:var(--mono);font-size:12px;margin:6px 0;white-space:pre-wrap;word-break:break-all}
-.case-card .criterion{padding:4px 0;display:flex;align-items:center;gap:6px}
-.case-card .criterion .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
-.case-card .criterion .dot.ok{background:var(--green)}
-.case-card .criterion .dot.fail{background:var(--red)}
+/* ================================================================
+   Connection Status
+   ================================================================ */
+.conn-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  display: inline-block;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+.conn-dot.connected { background: var(--green); box-shadow: 0 0 8px var(--green); }
+.conn-dot.connecting { background: var(--yellow); animation: pulse 1.5s infinite; }
+.conn-dot.error { background: var(--red); }
 
-/* Spinner for running cases */
-.spinner{display:inline-block;width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+/* ================================================================
+   Header
+   ================================================================ */
+header {
+  padding: 48px 0 16px;
+  text-align: center;
+}
+.logo {
+  font-size: 32px;
+  font-weight: 900;
+  letter-spacing: -1px;
+  background: var(--gradient);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.logo span {
+  font-weight: 500;
+  opacity: 0.7;
+}
+.subtitle {
+  color: var(--muted);
+  font-size: 14px;
+  margin-top: 4px;
+}
+
+/* ================================================================
+   Phase 1: Configuration Panel
+   ================================================================ */
+.config-panel {
+  max-width: 720px;
+  margin: 32px auto;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+.config-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+  backdrop-filter: blur(16px);
+}
+.config-card h3 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+.config-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  font-family: var(--mono);
+  padding: 8px 12px;
+  background: rgba(0,0,0,0.3);
+  border-radius: var(--radius-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Model chips */
+.chip-container {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--transition);
+  border: 1px solid var(--border);
+  background: rgba(0,0,0,0.2);
+  color: var(--text-secondary);
+  user-select: none;
+}
+.chip:hover { border-color: var(--border-strong); }
+.chip.active {
+  background: var(--blue-dim);
+  border-color: var(--accent);
+  color: var(--text);
+}
+.chip .chip-x {
+  width: 14px; height: 14px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  font-size: 11px;
+  opacity: 0.5;
+  transition: opacity var(--transition);
+}
+.chip:hover .chip-x { opacity: 1; }
+
+/* Custom model input */
+.model-input-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.model-input-row input {
+  flex: 1;
+  padding: 8px 12px;
+  background: rgba(0,0,0,0.3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  color: var(--text);
+  font-size: 13px;
+  font-family: var(--font);
+  outline: none;
+  transition: border-color var(--transition);
+}
+.model-input-row input:focus { border-color: var(--accent); }
+.model-input-row input::placeholder { color: var(--muted); }
+.model-input-row button {
+  padding: 8px 16px;
+  background: rgba(59,130,246,0.1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+.model-input-row button:hover { background: rgba(59,130,246,0.2); border-color: var(--accent); }
+
+/* Filter input */
+.filter-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.filter-row input {
+  flex: 1;
+  padding: 10px 14px;
+  background: rgba(0,0,0,0.3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 14px;
+  font-family: var(--mono);
+  outline: none;
+  transition: border-color var(--transition);
+}
+.filter-row input:focus { border-color: var(--accent); }
+.filter-row input::placeholder { color: var(--muted); }
+.filter-count {
+  font-size: 13px;
+  color: var(--muted);
+  white-space: nowrap;
+  min-width: 80px;
+  text-align: right;
+}
+
+/* Advanced settings */
+.advanced-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+  border: none;
+  background: none;
+  padding: 0;
+  font-family: var(--font);
+}
+.advanced-toggle:hover { color: var(--text-secondary); }
+.advanced-toggle .arrow {
+  transition: transform var(--transition);
+  font-size: 10px;
+}
+.advanced-toggle .arrow.open { transform: rotate(90deg); }
+.advanced-body {
+  display: none;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.advanced-body.open { display: block; }
+
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 0;
+}
+.setting-row label {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.setting-row .setting-value {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Slider */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 140px;
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  outline: none;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px; height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  transition: transform var(--spring);
+}
+input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.2); }
+
+/* Toggle switch */
+.toggle {
+  width: 40px; height: 22px;
+  background: rgba(0,0,0,0.4);
+  border-radius: 11px;
+  position: relative;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  transition: all var(--transition);
+}
+.toggle.active { background: rgba(59,130,246,0.3); border-color: var(--accent); }
+.toggle::after {
+  content: '';
+  position: absolute;
+  top: 2px; left: 2px;
+  width: 16px; height: 16px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: all var(--spring);
+}
+.toggle.active::after { left: 20px; background: var(--accent); }
+
+.judger-model-select {
+  padding: 6px 10px;
+  background: rgba(0,0,0,0.3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  color: var(--text);
+  font-size: 13px;
+  font-family: var(--mono);
+  outline: none;
+}
+.judger-model-select:focus { border-color: var(--accent); }
+
+/* Run button */
+.run-btn {
+  width: 100%;
+  padding: 16px;
+  border: none;
+  border-radius: var(--radius);
+  background: var(--gradient);
+  color: #fff;
+  font-size: 16px;
+  font-weight: 700;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: all var(--spring);
+  position: relative;
+  overflow: hidden;
+  letter-spacing: 0.5px;
+}
+.run-btn:hover:not(:disabled) { transform: scale(1.02); box-shadow: 0 0 30px rgba(59,130,246,0.3); }
+.run-btn:active:not(:disabled) { transform: scale(0.98); }
+.run-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+.run-btn.ready {
+  animation: btnGlow 2s ease-in-out infinite;
+}
+@keyframes btnGlow {
+  0%, 100% { box-shadow: 0 0 20px rgba(59, 130, 246, 0.2); }
+  50% { box-shadow: 0 0 40px rgba(59, 130, 246, 0.4), 0 0 60px rgba(139, 92, 246, 0.2); }
+}
+
+/* ================================================================
+   Phase 2: Running View
+   ================================================================ */
+.running-view { display: none; }
+
+/* Progress ring */
+.progress-ring-container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 32px 0;
+  position: relative;
+}
+.progress-ring-wrap {
+  position: relative;
+  width: 180px;
+  height: 180px;
+}
+.progress-ring-wrap svg {
+  transform: rotate(-90deg);
+  width: 180px;
+  height: 180px;
+}
+.progress-ring-bg {
+  fill: none;
+  stroke: rgba(59, 130, 246, 0.1);
+  stroke-width: 8;
+}
+.progress-ring-fg {
+  fill: none;
+  stroke: url(#progressGradient);
+  stroke-width: 8;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.progress-ring-center {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+.progress-ring-pct {
+  font-size: 42px;
+  font-weight: 900;
+  background: var(--gradient);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.progress-ring-label {
+  font-size: 12px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+/* Live counters */
+.live-counters {
+  display: flex;
+  justify-content: center;
+  gap: 32px;
+  margin: 16px 0 32px;
+  flex-wrap: wrap;
+}
+.live-counter {
+  text-align: center;
+  min-width: 80px;
+}
+.live-counter .lc-value {
+  font-size: 28px;
+  font-weight: 800;
+}
+.live-counter .lc-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+.live-counter.pass .lc-value { color: var(--green); }
+.live-counter.fail .lc-value { color: var(--red); }
+.live-counter.running .lc-value { color: var(--accent); }
+.live-counter.remaining .lc-value { color: var(--muted); }
+
+.running-spinner {
+  display: inline-block;
+  width: 14px; height: 14px;
+  border: 2px solid transparent;
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  vertical-align: middle;
+  margin-left: 4px;
+}
+
+/* ================================================================
+   Case Cards Grid (shared between Phase 2 & 3)
+   ================================================================ */
+.case-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 12px;
+}
+@media (max-width: 800px) { .case-grid { grid-template-columns: 1fr; } }
+
+.case-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 16px 16px 20px;
+  cursor: pointer;
+  transition: all var(--transition);
+  backdrop-filter: blur(8px);
+  animation: cardSlideIn 0.4s cubic-bezier(.34, 1.56, .64, 1) both;
+  position: relative;
+}
+.case-card::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 12px; bottom: 12px;
+  width: 3px;
+  border-radius: 2px;
+  transition: background var(--transition);
+}
+.case-card.pass::before { background: var(--green); }
+.case-card.fail::before { background: var(--red); }
+.case-card.running::before { background: var(--accent); animation: pulse 1.5s infinite; }
+.case-card:hover {
+  border-color: var(--border-strong);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow);
+}
+.case-card .cc-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+}
+.case-card .cc-name {
+  font-weight: 600;
+  font-size: 14px;
+  word-break: break-word;
+}
+.case-card .cc-model {
+  font-size: 12px;
+  color: var(--muted);
+  font-family: var(--mono);
+  margin-top: 2px;
+}
+.badge {
+  padding: 3px 10px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+.badge.pass { background: var(--green-dim); color: var(--green); }
+.badge.fail { background: var(--red-dim); color: var(--red); }
+.badge.running { background: var(--blue-dim); color: var(--accent); }
+
+.cc-metrics {
+  display: flex;
+  gap: 14px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.cc-metrics .metric {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.cc-metrics .metric-icon { opacity: 0.6; font-size: 11px; }
+
+/* Expandable detail */
+.cc-detail {
+  display: none;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+}
+.case-card.expanded .cc-detail { display: block; animation: fadeIn 0.2s ease; }
+
+.cc-detail .criteria-list { display: flex; flex-direction: column; gap: 4px; }
+.criterion-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 0;
+}
+.criterion-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  margin-top: 5px;
+}
+.criterion-dot.ok { background: var(--green); }
+.criterion-dot.fail { background: var(--red); }
+.criterion-text { color: var(--text-secondary); line-height: 1.4; }
+
+/* Score bar */
+.score-bar-container {
+  margin-top: 8px;
+}
+.score-bar-label {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.score-bar {
+  height: 6px;
+  background: rgba(0,0,0,0.3);
+  border-radius: 3px;
+  overflow: hidden;
+  position: relative;
+}
+.score-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.5s ease;
+}
+
+/* Copyable fields */
+.copyable {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  background: rgba(59, 130, 246, 0.08);
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: all;
+  transition: background var(--transition);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.copyable:hover { background: rgba(59, 130, 246, 0.15); }
+.copyable::after {
+  content: 'copy';
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--accent);
+  opacity: 0;
+  transition: opacity var(--transition);
+  font-family: var(--font);
+  flex-shrink: 0;
+}
+.copyable:hover::after { opacity: 1; }
+
+.cc-detail pre {
+  background: rgba(0,0,0,0.3);
+  padding: 10px 14px;
+  border-radius: var(--radius-xs);
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  margin: 8px 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text-secondary);
+  max-height: 300px;
+  overflow-y: auto;
+}
+.cc-detail .detail-label {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-top: 10px;
+  margin-bottom: 4px;
+}
+.cc-detail .detail-section {
+  margin-top: 10px;
+}
+
+/* Step results */
+.step-card {
+  background: rgba(0,0,0,0.2);
+  border-radius: var(--radius-xs);
+  padding: 8px 12px;
+  margin: 4px 0;
+  font-size: 12px;
+}
+.step-card .step-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--text-secondary);
+}
+.step-card .step-prompt {
+  margin-top: 4px;
+  color: var(--muted);
+  font-style: italic;
+}
+.step-criteria { margin-top: 6px; }
+
+/* Collapsible output */
+.collapsible-trigger {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+  border: none;
+  background: none;
+  padding: 2px 0;
+  font-family: var(--font);
+}
+.collapsible-trigger:hover { color: var(--text-secondary); }
+.collapsible-trigger .caret {
+  font-size: 8px;
+  transition: transform var(--transition);
+}
+.collapsible-trigger .caret.open { transform: rotate(90deg); }
+.collapsible-content { display: none; }
+.collapsible-content.open { display: block; }
+
+/* ================================================================
+   Phase 3: Results Summary
+   ================================================================ */
+.results-view { display: none; }
+
+.summary-header {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 48px;
+  padding: 40px 0;
+  flex-wrap: wrap;
+}
+.summary-big-rate {
+  text-align: center;
+}
+.summary-big-rate .big-pct {
+  font-size: 72px;
+  font-weight: 900;
+  line-height: 1;
+}
+.summary-big-rate .big-label {
+  font-size: 13px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-top: 4px;
+}
+.summary-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.summary-stat {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.summary-stat .ss-dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+}
+.summary-stat .ss-dot.green { background: var(--green); }
+.summary-stat .ss-dot.red { background: var(--red); }
+.summary-stat .ss-dot.blue { background: var(--accent); }
+.summary-stat .ss-value {
+  font-size: 18px;
+  font-weight: 700;
+}
+.summary-stat .ss-label {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+/* Sortable table */
+.section { margin: 32px 0; }
+.section-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  color: var(--muted);
+  margin-bottom: 16px;
+  font-weight: 600;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  background: var(--card);
+  border-radius: var(--radius);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  backdrop-filter: blur(8px);
+}
+.data-table th {
+  padding: 12px 16px;
+  text-align: left;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--muted);
+  background: rgba(0,0,0,0.2);
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+  transition: color var(--transition);
+  white-space: nowrap;
+}
+.data-table th:hover { color: var(--text-secondary); }
+.data-table th.sorted { color: var(--accent); }
+.data-table th .sort-arrow {
+  display: inline-block;
+  margin-left: 4px;
+  font-size: 9px;
+  opacity: 0;
+  transition: opacity var(--transition);
+}
+.data-table th.sorted .sort-arrow { opacity: 1; }
+.data-table td {
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+  font-size: 14px;
+}
+.data-table tr:hover td { background: rgba(59, 130, 246, 0.03); }
+.rate-pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-weight: 700;
+  font-size: 13px;
+}
+
+/* Filters for case list */
+.filter-bar {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.filter-bar select, .filter-bar input {
+  padding: 8px 12px;
+  background: rgba(0,0,0,0.3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  color: var(--text);
+  font-size: 13px;
+  font-family: var(--font);
+  outline: none;
+  transition: border-color var(--transition);
+}
+.filter-bar select:focus, .filter-bar input:focus { border-color: var(--accent); }
+.filter-bar select option { background: var(--bg-subtle); }
+
+/* ================================================================
+   Utility & Animations
+   ================================================================ */
+@keyframes cardSlideIn {
+  from { opacity: 0; transform: translateY(16px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+@keyframes countUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+.hidden { display: none !important; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
 
 /* Empty state */
-.empty{text-align:center;padding:80px 20px;color:var(--muted)}
-.empty .icon{font-size:48px;margin-bottom:16px;opacity:.3}
-.empty p{font-size:14px}
-
-/* Animations */
-@keyframes slideUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
-@keyframes spin{to{transform:rotate(360deg)}}
-@keyframes countUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+.empty-state {
+  text-align: center;
+  padding: 60px 20px;
+  color: var(--muted);
+}
+.empty-state .es-icon {
+  font-size: 40px;
+  opacity: 0.2;
+  margin-bottom: 12px;
+}
+.empty-state p { font-size: 14px; }
 </style>
 </head>
 <body>
-<div class="conn connecting" id="conn">Connecting to test runner...</div>
+<div class="bg-mesh"></div>
+<div class="toast-container" id="toastContainer"></div>
+
+<div class="app">
 <div class="container">
+
+  <!-- ============================================================
+       Header
+       ============================================================ -->
   <header>
-    <h1>astra-test</h1>
-    <div class="subtitle" id="subtitle">waiting for suite to start...</div>
+    <div class="logo">astra-test</div>
+    <div class="subtitle" id="subtitle">
+      <span class="conn-dot connecting" id="connDot"></span>
+      <span id="subtitleText">connecting...</span>
+    </div>
   </header>
 
-  <div class="progress-wrap" id="progressWrap" style="display:none">
-    <div class="progress-label">
-      <span id="progressText">0 / 0</span>
-      <span id="progressPct">0%</span>
+  <!-- ============================================================
+       Phase 1: Configuration
+       ============================================================ -->
+  <div id="configPhase" class="config-panel">
+    <!-- Suite info card -->
+    <div class="config-card">
+      <h3>Suite Directory</h3>
+      <div class="config-info" id="suiteDir">loading...</div>
     </div>
-    <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+
+    <!-- Model selector -->
+    <div class="config-card">
+      <h3>Models</h3>
+      <div class="chip-container" id="modelChips"></div>
+      <div class="model-input-row">
+        <input type="text" id="customModelInput" placeholder="Add custom model name..." />
+        <button id="addModelBtn" type="button">Add</button>
+      </div>
+    </div>
+
+    <!-- Case filter -->
+    <div class="config-card">
+      <h3>Case Filter</h3>
+      <div class="filter-row">
+        <input type="text" id="caseFilterInput" placeholder="* (glob pattern, e.g. spawn_*)" />
+        <div class="filter-count" id="filterCount">-- cases</div>
+      </div>
+    </div>
+
+    <!-- Advanced settings -->
+    <div class="config-card">
+      <button class="advanced-toggle" id="advancedToggle" type="button">
+        <span class="arrow" id="advancedArrow">&#9654;</span>
+        Advanced Settings
+      </button>
+      <div class="advanced-body" id="advancedBody">
+        <div class="setting-row">
+          <label>Parallel Workers</label>
+          <div class="setting-value">
+            <input type="range" id="parallelSlider" min="1" max="8" value="2" />
+            <span id="parallelValue" style="font-size:14px;font-weight:700;min-width:20px;text-align:center">2</span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <label>Enable Judger</label>
+          <div class="setting-value">
+            <div class="toggle active" id="judgerToggle"></div>
+          </div>
+        </div>
+        <div class="setting-row" id="judgerModelRow">
+          <label>Judger Model</label>
+          <div class="setting-value">
+            <input type="text" class="judger-model-select" id="judgerModelInput" />
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Run button -->
+    <button class="run-btn ready" id="runBtn" type="button">
+      Run Suite
+    </button>
   </div>
 
-  <div class="stats" id="stats" style="display:none">
-    <div class="stat pass"><div class="value" id="passCount">0</div><div class="label">passed</div></div>
-    <div class="stat fail"><div class="value" id="failCount">0</div><div class="label">failed</div></div>
-    <div class="stat rate"><div class="value" id="passRate">—</div><div class="label">pass rate</div></div>
-    <div class="stat"><div class="value" id="wallTime">—</div><div class="label">wall time</div></div>
-    <div class="stat"><div class="value" id="tokTotal">—</div><div class="label">tokens</div></div>
-  </div>
+  <!-- ============================================================
+       Phase 2: Running
+       ============================================================ -->
+  <div id="runningPhase" class="running-view">
+    <!-- SVG progress ring -->
+    <div class="progress-ring-container">
+      <div class="progress-ring-wrap">
+        <svg viewBox="0 0 180 180">
+          <defs>
+            <linearGradient id="progressGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" stop-color="var(--accent)" />
+              <stop offset="100%" stop-color="var(--accent2)" />
+            </linearGradient>
+          </defs>
+          <circle class="progress-ring-bg" cx="90" cy="90" r="82" />
+          <circle class="progress-ring-fg" id="progressRing" cx="90" cy="90" r="82"
+                  stroke-dasharray="515.22" stroke-dashoffset="515.22" />
+        </svg>
+        <div class="progress-ring-center">
+          <div class="progress-ring-pct" id="ringPct">0%</div>
+          <div class="progress-ring-label">complete</div>
+        </div>
+      </div>
+    </div>
 
-  <div class="section" id="modelSection" style="display:none">
-    <h2>Model Comparison</h2>
-    <table class="model-table" id="modelTable">
-      <thead><tr>
-        <th>Model</th><th>Pass</th><th>Rate</th>
-        <th>Tok/Pass</th><th>Dur/Pass</th><th>Turns/Pass</th>
-      </tr></thead>
-      <tbody id="modelBody"></tbody>
-    </table>
-  </div>
+    <!-- Live counters -->
+    <div class="live-counters">
+      <div class="live-counter pass">
+        <div class="lc-value" id="lcPassed">0</div>
+        <div class="lc-label">Passed</div>
+      </div>
+      <div class="live-counter fail">
+        <div class="lc-value" id="lcFailed">0</div>
+        <div class="lc-label">Failed</div>
+      </div>
+      <div class="live-counter running">
+        <div class="lc-value" id="lcRunning">0<span class="running-spinner"></span></div>
+        <div class="lc-label">Running</div>
+      </div>
+      <div class="live-counter remaining">
+        <div class="lc-value" id="lcRemaining">0</div>
+        <div class="lc-label">Remaining</div>
+      </div>
+    </div>
 
-  <div class="section">
-    <h2>Cases</h2>
-    <div class="cases" id="caseGrid"></div>
-    <div class="empty" id="emptyState">
-      <div class="icon">🧪</div>
-      <p>Cases will appear here as they complete</p>
+    <!-- Live model comparison (top) -->
+    <div class="section" id="liveModelSection" style="display:none">
+      <div class="section-title">Model Comparison (Live)</div>
+      <table class="data-table" id="liveModelTable">
+        <thead><tr>
+          <th>Model</th><th>Pass</th><th>Rate</th>
+          <th>Tok/Pass</th><th>Dur/Pass</th><th>Turns/Pass</th>
+        </tr></thead>
+        <tbody id="liveModelBody"></tbody>
+      </table>
+    </div>
+
+    <!-- Live case cards -->
+    <div class="section">
+      <div class="section-title">Cases</div>
+      <div class="case-grid" id="liveCaseGrid"></div>
+      <div class="empty-state" id="liveEmptyState">
+        <div class="es-icon">&#9881;</div>
+        <p>Cases will appear here as they complete</p>
+      </div>
     </div>
   </div>
+
+  <!-- ============================================================
+       Phase 3: Results
+       ============================================================ -->
+  <div id="resultsPhase" class="results-view">
+    <!-- Summary header -->
+    <div class="summary-header" id="summaryHeader"></div>
+
+    <!-- Model comparison table (sortable) -->
+    <div class="section" id="resultModelSection" style="display:none">
+      <div class="section-title">Model Comparison</div>
+      <table class="data-table" id="resultModelTable">
+        <thead><tr>
+          <th data-col="model">Model <span class="sort-arrow"></span></th>
+          <th data-col="rate">Pass Rate <span class="sort-arrow"></span></th>
+          <th data-col="tokPass">Tok/Pass <span class="sort-arrow"></span></th>
+          <th data-col="durPass">Dur/Pass <span class="sort-arrow"></span></th>
+          <th data-col="turnsPass">Turns/Pass <span class="sort-arrow"></span></th>
+        </tr></thead>
+        <tbody id="resultModelBody"></tbody>
+      </table>
+    </div>
+
+    <!-- Filtered case list -->
+    <div class="section">
+      <div class="section-title">Case Results</div>
+      <div class="filter-bar" id="resultFilterBar">
+        <select id="resultModelFilter"><option value="">All Models</option></select>
+        <select id="resultStatusFilter">
+          <option value="">All Statuses</option>
+          <option value="pass">Passed</option>
+          <option value="fail">Failed</option>
+        </select>
+        <select id="resultCapabilityFilter"><option value="">All Capabilities</option></select>
+        <input type="text" id="resultSearchInput" placeholder="Search cases..." style="flex:1;min-width:160px" />
+      </div>
+      <div class="case-grid" id="resultCaseGrid"></div>
+    </div>
+  </div>
+
+</div>
 </div>
 
+<!-- ================================================================
+     JavaScript
+     ================================================================ -->
 <script>
-const state = {
-  total: 0, completed: 0, passed: 0, failed: 0,
-  models: [], runs: [], running: new Map(),
-  startTime: null, suiteComplete: false
+/* ================================================================
+   State
+   ================================================================ */
+const S = {
+  phase: 'config',     // 'config' | 'running' | 'results'
+  ws: null,
+  connected: false,
+
+  // Config data from server
+  config: { suite_dir: '', available_models: [], judger_model: '' },
+  cases: [],
+
+  // User selections
+  selectedModels: [],
+  filter: '',
+  parallel: 2,
+  noJudger: false,
+  judgerModel: '',
+
+  // Run state
+  total: 0,
+  completed: 0,
+  passed: 0,
+  failed: 0,
+  runningSet: new Map(),  // key -> { case_name, model }
+  runs: [],               // CaseRunReport[]
+  startTime: null,
+  wallTimer: null,
+  suiteReport: null,
+
+  // Results sort
+  modelSortCol: 'rate',
+  modelSortAsc: false,
 };
 
-function $(id) { return document.getElementById(id); }
+/* ================================================================
+   DOM Helpers
+   ================================================================ */
+const $ = (id) => document.getElementById(id);
+const esc = (s) => { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; };
+const trunc = (s, n) => s && s.length > n ? s.slice(0, n) + '...' : (s || '');
 
 function formatDur(ms) {
+  if (ms == null) return '--';
   if (ms < 1000) return ms + 'ms';
-  if (ms < 60000) return (ms/1000).toFixed(1) + 's';
-  return Math.floor(ms/60000) + 'm' + Math.floor((ms%60000)/1000) + 's';
+  if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
+  const m = Math.floor(ms / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  return m + 'm' + s + 's';
 }
+
 function formatTok(n) {
+  if (n == null) return '--';
   if (n < 1000) return String(n);
-  if (n < 1e6) return (n/1000).toFixed(1) + 'k';
-  return (n/1e6).toFixed(1) + 'M';
+  if (n < 1e6) return (n / 1000).toFixed(1) + 'k';
+  return (n / 1e6).toFixed(1) + 'M';
 }
+
 function normModel(m) {
-  for (const p of ['us.anthropic.','eu.anthropic.','ap.anthropic.']) {
+  for (const p of ['us.anthropic.', 'eu.anthropic.', 'ap.anthropic.', 'us.amazon.', 'eu.amazon.']) {
     if (m.startsWith(p)) return m.slice(p.length);
   }
   return m;
 }
 
-function updateStats() {
-  $('passCount').textContent = state.passed;
-  $('failCount').textContent = state.failed;
-  const rate = state.completed > 0 ? Math.round(state.passed / state.completed * 100) : 0;
-  $('passRate').textContent = rate + '%';
-
-  const elapsed = state.startTime ? Date.now() - state.startTime : 0;
-  $('wallTime').textContent = formatDur(elapsed);
-
-  const totalTok = state.runs.reduce((s, r) => s + (r.outcome.prompt_tokens||0) + (r.outcome.completion_tokens||0), 0);
-  $('tokTotal').textContent = formatTok(totalTok);
-
-  $('progressText').textContent = state.completed + ' / ' + state.total;
-  const pct = state.total > 0 ? Math.round(state.completed / state.total * 100) : 0;
-  $('progressPct').textContent = pct + '%';
-  $('progressFill').style.width = pct + '%';
-
-  updateModelTable();
+/* ================================================================
+   Toast Notifications
+   ================================================================ */
+function toast(msg, type) {
+  type = type || 'error';
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.textContent = msg;
+  $('toastContainer').appendChild(el);
+  setTimeout(() => {
+    el.classList.add('removing');
+    setTimeout(() => el.remove(), 300);
+  }, 5000);
 }
 
-function updateModelTable() {
-  const models = {};
-  for (const r of state.runs) {
-    const m = normModel(r.model);
-    if (!models[m]) models[m] = { pass:0, total:0, passTok:0, passDur:0, passTurns:0 };
-    const s = models[m];
-    s.total++;
-    if (r.passed) {
-      s.pass++;
-      s.passTok += (r.outcome.prompt_tokens||0) + (r.outcome.completion_tokens||0);
-      s.passDur += r.outcome.duration_ms||0;
-      s.passTurns += r.outcome.turn_rounds||0;
-    }
+/* ================================================================
+   Glob Matching (for live filter count)
+   ================================================================ */
+function globToRegex(pattern) {
+  if (!pattern || pattern === '*') return null;
+  const re = pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*/g, '.*')
+    .replace(/\?/g, '.');
+  try { return new RegExp('^' + re + '$'); } catch { return null; }
+}
+
+function matchingCaseCount() {
+  const re = globToRegex($('caseFilterInput').value.trim());
+  if (!re) return S.cases.length;
+  return S.cases.filter(c => re.test(c.name)).length;
+}
+
+/* ================================================================
+   Phase Management
+   ================================================================ */
+function setPhase(phase) {
+  S.phase = phase;
+  $('configPhase').style.display = phase === 'config' ? '' : 'none';
+  $('runningPhase').style.display = phase === 'running' ? '' : 'none';
+  $('resultsPhase').style.display = phase === 'results' ? '' : 'none';
+}
+
+/* ================================================================
+   Phase 1: Configuration
+   ================================================================ */
+function initConfig() {
+  // Fetch config
+  fetch('/api/config')
+    .then(r => r.json())
+    .then(data => {
+      S.config = data;
+      $('suiteDir').textContent = data.suite_dir || '(unknown)';
+      S.selectedModels = [...(data.available_models || [])];
+      S.judgerModel = data.judger_model || '';
+      $('judgerModelInput').value = S.judgerModel;
+      renderModelChips();
+    })
+    .catch(e => toast('Failed to load config: ' + e.message));
+
+  // Fetch cases
+  fetch('/api/cases')
+    .then(r => r.json())
+    .then(data => {
+      S.cases = data.cases || [];
+      updateFilterCount();
+    })
+    .catch(e => toast('Failed to load cases: ' + e.message));
+}
+
+function renderModelChips() {
+  const container = $('modelChips');
+  container.innerHTML = '';
+  const allModels = new Set([...S.config.available_models, ...S.selectedModels]);
+  for (const m of allModels) {
+    const chip = document.createElement('div');
+    chip.className = 'chip' + (S.selectedModels.includes(m) ? ' active' : '');
+    chip.innerHTML = esc(m) + '<span class="chip-x">&times;</span>';
+    chip.addEventListener('click', () => {
+      const idx = S.selectedModels.indexOf(m);
+      if (idx >= 0) S.selectedModels.splice(idx, 1);
+      else S.selectedModels.push(m);
+      renderModelChips();
+    });
+    container.appendChild(chip);
   }
-  const sorted = Object.entries(models).sort((a,b) => (b[1].pass/b[1].total) - (a[1].pass/a[1].total));
-  if (sorted.length < 2) { $('modelSection').style.display = 'none'; return; }
-  $('modelSection').style.display = '';
-  $('modelBody').innerHTML = sorted.map(([name, s]) => {
-    const rate = Math.round(s.pass / s.total * 100);
+}
+
+function updateFilterCount() {
+  const count = matchingCaseCount();
+  $('filterCount').textContent = count + ' case' + (count !== 1 ? 's' : '');
+}
+
+// Event listeners for config phase
+$('caseFilterInput').addEventListener('input', updateFilterCount);
+$('parallelSlider').addEventListener('input', () => {
+  S.parallel = +$('parallelSlider').value;
+  $('parallelValue').textContent = S.parallel;
+});
+$('judgerToggle').addEventListener('click', () => {
+  S.noJudger = !S.noJudger;
+  $('judgerToggle').classList.toggle('active', !S.noJudger);
+  $('judgerModelRow').style.opacity = S.noJudger ? '0.4' : '1';
+});
+$('advancedToggle').addEventListener('click', () => {
+  const open = $('advancedBody').classList.toggle('open');
+  $('advancedArrow').classList.toggle('open', open);
+});
+$('addModelBtn').addEventListener('click', addCustomModel);
+$('customModelInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') addCustomModel();
+});
+
+function addCustomModel() {
+  const val = $('customModelInput').value.trim();
+  if (!val) return;
+  if (!S.selectedModels.includes(val)) {
+    S.selectedModels.push(val);
+    renderModelChips();
+  }
+  $('customModelInput').value = '';
+}
+
+/* ================================================================
+   Run Button
+   ================================================================ */
+$('runBtn').addEventListener('click', startRun);
+
+function startRun() {
+  if (S.selectedModels.length === 0) {
+    toast('Select at least one model', 'error');
+    return;
+  }
+
+  $('runBtn').disabled = true;
+  $('runBtn').classList.remove('ready');
+  $('runBtn').textContent = 'Starting...';
+
+  const body = {
+    models: S.selectedModels,
+    parallel: S.parallel,
+    no_judger: S.noJudger,
+  };
+  const filterVal = $('caseFilterInput').value.trim();
+  if (filterVal && filterVal !== '*') body.filter = filterVal;
+  const jm = $('judgerModelInput').value.trim();
+  if (jm && jm !== S.config.judger_model) body.judger_model = jm;
+
+  fetch('/api/run', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) {
+        toast(data.error, 'error');
+        $('runBtn').disabled = false;
+        $('runBtn').classList.add('ready');
+        $('runBtn').textContent = 'Run Suite';
+      }
+      // suite_started event via WS will trigger phase switch
+    })
+    .catch(e => {
+      toast('Run request failed: ' + e.message, 'error');
+      $('runBtn').disabled = false;
+      $('runBtn').classList.add('ready');
+      $('runBtn').textContent = 'Run Suite';
+    });
+}
+
+/* ================================================================
+   Phase 2: Running — Updates
+   ================================================================ */
+const CIRCUMFERENCE = 2 * Math.PI * 82; // ~515.22
+
+function updateRunningView() {
+  const pct = S.total > 0 ? Math.round((S.completed / S.total) * 100) : 0;
+  $('ringPct').textContent = pct + '%';
+  const offset = CIRCUMFERENCE - (CIRCUMFERENCE * pct / 100);
+  $('progressRing').setAttribute('stroke-dashoffset', offset);
+
+  $('lcPassed').textContent = S.passed;
+  $('lcFailed').textContent = S.failed;
+  const runningCount = S.runningSet.size;
+  $('lcRunning').innerHTML = runningCount + '<span class="running-spinner"></span>';
+  $('lcRemaining').textContent = Math.max(0, S.total - S.completed - runningCount);
+
+  updateLiveModelTable();
+}
+
+function updateLiveModelTable() {
+  const models = computeModelStats();
+  const sorted = Object.entries(models).sort((a, b) =>
+    (b[1].pass / Math.max(b[1].total, 1)) - (a[1].pass / Math.max(a[1].total, 1))
+  );
+  if (sorted.length < 2) {
+    $('liveModelSection').style.display = 'none';
+    return;
+  }
+  $('liveModelSection').style.display = '';
+  $('liveModelBody').innerHTML = sorted.map(([name, s]) => {
+    const rate = Math.round(s.pass / Math.max(s.total, 1) * 100);
     const p = Math.max(s.pass, 1);
-    const rateColor = rate >= 80 ? 'var(--green)' : rate >= 50 ? 'var(--yellow)' : 'var(--red)';
     return `<tr>
-      <td style="font-weight:600">${name}</td>
+      <td style="font-weight:600">${esc(name)}</td>
       <td>${s.pass}/${s.total}</td>
-      <td style="color:${rateColor};font-weight:700">${rate}%</td>
-      <td>${formatTok(Math.round(s.passTok/p))}</td>
-      <td>${formatDur(Math.round(s.passDur/p))}</td>
-      <td>${(s.passTurns/p).toFixed(1)}</td>
+      <td><span class="rate-pill" style="background:${rateColor(rate)};color:#fff">${rate}%</span></td>
+      <td>${formatTok(Math.round(s.passTok / p))}</td>
+      <td>${formatDur(Math.round(s.passDur / p))}</td>
+      <td>${(s.passTurns / p).toFixed(1)}</td>
     </tr>`;
   }).join('');
 }
 
-function addCaseCard(report) {
-  $('emptyState').style.display = 'none';
-  const card = document.createElement('div');
-  card.className = 'case-card ' + (report.passed ? 'pass' : 'fail');
-  card.style.animationDelay = (state.completed * 30) + 'ms';
-  const tok = (report.outcome.prompt_tokens||0) + (report.outcome.completion_tokens||0);
-  const criteria = (report.criteria||[]).map(c =>
-    `<div class="criterion"><div class="dot ${c.passed?'ok':'fail'}"></div>${escHtml(c.detail)}</div>`
-  ).join('');
-  const sid = report.outcome.session_id;
-  const sessionHtml = sid ? `<div style="margin-top:8px"><span style="font-family:var(--mono);font-size:11px;background:rgba(59,130,246,.1);padding:2px 6px;border-radius:3px;user-select:all">${sid}</span></div>` : '';
-  const reproducerHtml = report.reproducer ? `<div style="margin-top:6px;font-size:11px;color:var(--muted)">rerun:</div><pre>${escHtml(report.reproducer)}</pre>` : '';
-  const stepsHtml = (report.steps||[]).map(s =>
-    `<div style="margin:4px 0;padding:4px 8px;background:rgba(0,0,0,.2);border-radius:4px;font-size:12px">
-      step[${s.step_index}] ${formatDur(s.duration_ms)} — ${escHtml(truncate(s.outcome?.text||'',120))}
-    </div>`
-  ).join('');
-  card.innerHTML = `
-    <div class="case-header">
-      <div>
-        <div class="case-name">${escHtml(report.case_name)}</div>
-        <div class="case-model">${escHtml(report.model)}</div>
-      </div>
-      <span class="badge ${report.passed?'pass':'fail'}">${report.passed?'PASS':'FAIL'}</span>
-    </div>
-    <div class="case-metrics">
-      <span>⏱ ${formatDur(report.outcome.duration_ms||0)}</span>
-      <span>📊 ${formatTok(tok)}</span>
-      <span>🔄 ${report.outcome.turn_rounds||0} turns</span>
-      <span>🔧 ${report.outcome.tool_calls_count||0} tools</span>
-    </div>
-    <div class="detail">
-      ${criteria}
-      ${stepsHtml}
-      ${sessionHtml}
-      ${reproducerHtml}
-      ${report.failure_class ? `<div style="margin-top:6px;color:var(--red);font-size:12px">class: ${escHtml(report.failure_class)}</div>` : ''}
-      ${report.outcome.text ? `<div style="margin-top:6px;font-size:11px;color:var(--muted)">output:</div><pre>${escHtml(truncate(report.outcome.text, 500))}</pre>` : ''}
-    </div>`;
-  card.onclick = () => card.classList.toggle('expanded');
-  $('caseGrid').appendChild(card);
+function computeModelStats() {
+  const models = {};
+  for (const r of S.runs) {
+    const m = normModel(r.model);
+    if (!models[m]) models[m] = { pass: 0, total: 0, passTok: 0, passDur: 0, passTurns: 0, passTools: 0, allTok: 0, allDur: 0 };
+    const s = models[m];
+    s.total++;
+    const tok = (r.outcome.prompt_tokens || 0) + (r.outcome.completion_tokens || 0);
+    s.allTok += tok;
+    s.allDur += r.outcome.duration_ms || 0;
+    if (r.passed) {
+      s.pass++;
+      s.passTok += tok;
+      s.passDur += r.outcome.duration_ms || 0;
+      s.passTurns += r.outcome.turn_rounds || 0;
+      s.passTools += r.outcome.tool_calls_count || 0;
+    }
+  }
+  return models;
 }
 
-function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-function truncate(s, n) { return s.length > n ? s.slice(0, n) + '...' : s; }
+function rateColor(rate) {
+  if (rate >= 80) return 'rgba(34, 197, 94, 0.8)';
+  if (rate >= 50) return 'rgba(234, 179, 8, 0.8)';
+  return 'rgba(239, 68, 68, 0.8)';
+}
 
-// WebSocket
+function rateFg(rate) {
+  if (rate >= 80) return 'var(--green)';
+  if (rate >= 50) return 'var(--yellow)';
+  return 'var(--red)';
+}
+
+/* ================================================================
+   Case Card Builder (shared)
+   ================================================================ */
+function buildCaseCard(report, index) {
+  const card = document.createElement('div');
+  const status = report.passed ? 'pass' : 'fail';
+  card.className = 'case-card ' + status;
+  card.style.animationDelay = (index * 50) + 'ms';
+
+  const tok = (report.outcome.prompt_tokens || 0) + (report.outcome.completion_tokens || 0);
+
+  // Criteria HTML
+  const criteriaHtml = (report.criteria || []).map(c => {
+    let extra = '';
+    if (c.score != null) {
+      const pct = Math.round(c.score * 100);
+      const color = c.score >= 0.7 ? 'var(--green)' : c.score >= 0.4 ? 'var(--yellow)' : 'var(--red)';
+      extra = `<div class="score-bar-container">
+        <div class="score-bar-label">Score: ${c.score.toFixed(2)}</div>
+        <div class="score-bar"><div class="score-bar-fill" style="width:${pct}%;background:${color}"></div></div>
+      </div>`;
+    }
+    return `<div class="criterion-row">
+      <div class="criterion-dot ${c.passed ? 'ok' : 'fail'}"></div>
+      <div class="criterion-text">${esc(c.detail)}${extra}</div>
+    </div>`;
+  }).join('');
+
+  // Steps HTML
+  const stepsHtml = (report.steps || []).map(step => {
+    const stepCriteria = (step.criteria || []).map(c =>
+      `<div class="criterion-row" style="margin-left:8px">
+        <div class="criterion-dot ${c.passed ? 'ok' : 'fail'}"></div>
+        <div class="criterion-text" style="font-size:12px">${esc(c.detail)}</div>
+      </div>`
+    ).join('');
+    return `<div class="step-card">
+      <div class="step-header">
+        <span>Step ${step.step_index}</span>
+        <span>${formatDur(step.duration_ms)}</span>
+      </div>
+      <div class="step-prompt">${esc(trunc(step.prompt, 120))}</div>
+      ${step.outcome && step.outcome.text ? `<div style="margin-top:4px;font-size:11px;color:var(--muted)">${esc(trunc(step.outcome.text, 200))}</div>` : ''}
+      ${stepCriteria ? `<div class="step-criteria">${stepCriteria}</div>` : ''}
+    </div>`;
+  }).join('');
+
+  // Session ID
+  const sid = report.outcome.session_id;
+  const sessionHtml = sid
+    ? `<div class="detail-section"><div class="detail-label">Session ID</div><div class="copyable" data-copy="${esc(sid)}">${esc(sid)}</div></div>`
+    : '';
+
+  // Reproducer
+  const reproHtml = report.reproducer
+    ? `<div class="detail-section"><div class="detail-label">Reproducer</div><pre class="copyable" data-copy="${esc(report.reproducer)}" style="display:block;cursor:pointer;max-width:100%">${esc(report.reproducer)}</pre></div>`
+    : '';
+
+  // Failure class
+  const failClassHtml = report.failure_class
+    ? `<div class="detail-section" style="color:var(--red)"><div class="detail-label">Failure Class</div>${esc(typeof report.failure_class === 'string' ? report.failure_class : JSON.stringify(report.failure_class))}</div>`
+    : '';
+
+  // Output text (collapsible)
+  const outputText = report.outcome.text;
+  const outputHtml = outputText
+    ? `<div class="detail-section">
+        <button class="collapsible-trigger" data-target="output-${index}">
+          <span class="caret">&#9654;</span> Output (${outputText.length} chars)
+        </button>
+        <div class="collapsible-content" id="output-${index}">
+          <pre>${esc(trunc(outputText, 2000))}</pre>
+        </div>
+      </div>`
+    : '';
+
+  // Capability / difficulty badges
+  let metaBadges = '';
+  if (report.capability) metaBadges += `<span class="metric"><span class="metric-icon">&#9670;</span>${esc(typeof report.capability === 'string' ? report.capability : '')}</span>`;
+  if (report.difficulty) metaBadges += `<span class="metric"><span class="metric-icon">d</span>${report.difficulty}</span>`;
+
+  card.innerHTML = `
+    <div class="cc-header">
+      <div>
+        <div class="cc-name">${esc(report.case_name)}</div>
+        <div class="cc-model">${esc(normModel(report.model))}</div>
+      </div>
+      <span class="badge ${status}">${report.passed ? 'PASS' : 'FAIL'}</span>
+    </div>
+    <div class="cc-metrics">
+      <span class="metric"><span class="metric-icon">&#9201;</span>${formatDur(report.outcome.duration_ms || 0)}</span>
+      <span class="metric"><span class="metric-icon">&#9671;</span>${formatTok(tok)} tok</span>
+      <span class="metric"><span class="metric-icon">&#8634;</span>${report.outcome.turn_rounds || 0} turns</span>
+      <span class="metric"><span class="metric-icon">&#9881;</span>${report.outcome.tool_calls_count || 0} tools</span>
+      ${metaBadges}
+    </div>
+    <div class="cc-detail">
+      ${criteriaHtml ? `<div class="criteria-list">${criteriaHtml}</div>` : ''}
+      ${stepsHtml ? `<div class="detail-section"><div class="detail-label">Steps</div>${stepsHtml}</div>` : ''}
+      ${sessionHtml}
+      ${reproHtml}
+      ${failClassHtml}
+      ${outputHtml}
+    </div>`;
+
+  card.addEventListener('click', (e) => {
+    // Don't toggle if clicking on copyable elements or collapsible triggers
+    if (e.target.closest('.copyable') || e.target.closest('.collapsible-trigger')) return;
+    card.classList.toggle('expanded');
+  });
+
+  // Copyable handler
+  card.querySelectorAll('.copyable').forEach(el => {
+    el.addEventListener('click', () => {
+      const text = el.dataset.copy || el.textContent;
+      navigator.clipboard.writeText(text).then(
+        () => toast('Copied to clipboard', 'info'),
+        () => {}
+      );
+    });
+  });
+
+  // Collapsible handler
+  card.querySelectorAll('.collapsible-trigger').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const targetId = btn.dataset.target;
+      const content = card.querySelector('#' + targetId);
+      if (!content) return;
+      const isOpen = content.classList.toggle('open');
+      btn.querySelector('.caret').classList.toggle('open', isOpen);
+    });
+  });
+
+  return card;
+}
+
+function addRunningCard(report) {
+  $('liveEmptyState').style.display = 'none';
+  const card = buildCaseCard(report, S.completed);
+  $('liveCaseGrid').appendChild(card);
+}
+
+/* ================================================================
+   Phase 3: Results Rendering
+   ================================================================ */
+function renderResults() {
+  setPhase('results');
+
+  // Animated pass rate
+  const rate = S.completed > 0 ? S.passed / S.completed * 100 : 0;
+  const wallMs = S.suiteReport ? S.suiteReport.wall_time_ms : (S.startTime ? Date.now() - S.startTime : 0);
+
+  $('summaryHeader').innerHTML = `
+    <div class="summary-big-rate">
+      <div class="big-pct" id="animatedRate" style="color:${rateFg(rate)}">0%</div>
+      <div class="big-label">Pass Rate</div>
+    </div>
+    <div class="summary-stats">
+      <div class="summary-stat">
+        <div class="ss-dot green"></div>
+        <div class="ss-value">${S.passed}</div>
+        <div class="ss-label">passed</div>
+      </div>
+      <div class="summary-stat">
+        <div class="ss-dot red"></div>
+        <div class="ss-value">${S.failed}</div>
+        <div class="ss-label">failed</div>
+      </div>
+      <div class="summary-stat">
+        <div class="ss-dot blue"></div>
+        <div class="ss-value">${S.completed}</div>
+        <div class="ss-label">total</div>
+      </div>
+      <div class="summary-stat">
+        <div class="ss-dot blue" style="opacity:0.4"></div>
+        <div class="ss-value">${formatDur(wallMs)}</div>
+        <div class="ss-label">wall time</div>
+      </div>
+    </div>`;
+
+  // Animate the pass rate count
+  animateCount($('animatedRate'), 0, Math.round(rate), 800, '%');
+
+  // Model comparison table
+  renderResultModelTable();
+
+  // Populate filter dropdowns
+  populateResultFilters();
+
+  // Render all case cards
+  renderResultCases();
+}
+
+function animateCount(el, from, to, duration, suffix) {
+  const start = performance.now();
+  function step(now) {
+    const progress = Math.min((now - start) / duration, 1);
+    const eased = 1 - Math.pow(1 - progress, 3); // ease-out cubic
+    const current = Math.round(from + (to - from) * eased);
+    el.textContent = current + (suffix || '');
+    if (progress < 1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+function renderResultModelTable() {
+  const models = computeModelStats();
+  const entries = Object.entries(models);
+  if (entries.length < 2) {
+    $('resultModelSection').style.display = 'none';
+    return;
+  }
+  $('resultModelSection').style.display = '';
+
+  // Sort
+  const col = S.modelSortCol;
+  const asc = S.modelSortAsc;
+  entries.sort((a, b) => {
+    let va, vb;
+    const sa = a[1], sb = b[1];
+    const pa = Math.max(sa.pass, 1), pb = Math.max(sb.pass, 1);
+    switch (col) {
+      case 'model': va = a[0]; vb = b[0]; return asc ? va.localeCompare(vb) : vb.localeCompare(va);
+      case 'rate': va = sa.pass / Math.max(sa.total, 1); vb = sb.pass / Math.max(sb.total, 1); break;
+      case 'tokPass': va = sa.passTok / pa; vb = sb.passTok / pb; break;
+      case 'durPass': va = sa.passDur / pa; vb = sb.passDur / pb; break;
+      case 'turnsPass': va = sa.passTurns / pa; vb = sb.passTurns / pb; break;
+      default: va = 0; vb = 0;
+    }
+    return asc ? va - vb : vb - va;
+  });
+
+  // Highlight sorted column
+  $('resultModelTable').querySelectorAll('th').forEach(th => {
+    const isThis = th.dataset.col === col;
+    th.classList.toggle('sorted', isThis);
+    const arrow = th.querySelector('.sort-arrow');
+    if (arrow) arrow.textContent = isThis ? (asc ? '▲' : '▼') : '';
+  });
+
+  $('resultModelBody').innerHTML = entries.map(([name, s]) => {
+    const rate = Math.round(s.pass / Math.max(s.total, 1) * 100);
+    const p = Math.max(s.pass, 1);
+    return `<tr>
+      <td style="font-weight:600">${esc(name)}</td>
+      <td><span class="rate-pill" style="background:${rateColor(rate)};color:#fff">${rate}%</span> <span style="color:var(--muted);font-size:12px">${s.pass}/${s.total}</span></td>
+      <td>${formatTok(Math.round(s.passTok / p))}</td>
+      <td>${formatDur(Math.round(s.passDur / p))}</td>
+      <td>${(s.passTurns / p).toFixed(1)}</td>
+    </tr>`;
+  }).join('');
+}
+
+// Sortable headers
+$('resultModelTable').addEventListener('click', (e) => {
+  const th = e.target.closest('th[data-col]');
+  if (!th) return;
+  const col = th.dataset.col;
+  if (S.modelSortCol === col) S.modelSortAsc = !S.modelSortAsc;
+  else { S.modelSortCol = col; S.modelSortAsc = col === 'model'; }
+  renderResultModelTable();
+});
+
+function populateResultFilters() {
+  const modelSet = new Set(S.runs.map(r => normModel(r.model)));
+  const capSet = new Set(S.runs.filter(r => r.capability).map(r => typeof r.capability === 'string' ? r.capability : ''));
+
+  const mf = $('resultModelFilter');
+  mf.innerHTML = '<option value="">All Models</option>';
+  for (const m of [...modelSet].sort()) {
+    mf.innerHTML += `<option value="${esc(m)}">${esc(m)}</option>`;
+  }
+
+  const cf = $('resultCapabilityFilter');
+  cf.innerHTML = '<option value="">All Capabilities</option>';
+  for (const c of [...capSet].sort()) {
+    if (c) cf.innerHTML += `<option value="${esc(c)}">${esc(c)}</option>`;
+  }
+}
+
+function renderResultCases() {
+  const modelFilter = $('resultModelFilter').value;
+  const statusFilter = $('resultStatusFilter').value;
+  const capFilter = $('resultCapabilityFilter').value;
+  const search = $('resultSearchInput').value.toLowerCase().trim();
+
+  const grid = $('resultCaseGrid');
+  grid.innerHTML = '';
+
+  let idx = 0;
+  // Sort: failures first, then by case name
+  const sorted = [...S.runs].sort((a, b) => {
+    if (a.passed !== b.passed) return a.passed ? 1 : -1;
+    return a.case_name.localeCompare(b.case_name);
+  });
+
+  for (const r of sorted) {
+    const m = normModel(r.model);
+    if (modelFilter && m !== modelFilter) continue;
+    if (statusFilter === 'pass' && !r.passed) continue;
+    if (statusFilter === 'fail' && r.passed) continue;
+    const rCap = typeof r.capability === 'string' ? r.capability : '';
+    if (capFilter && rCap !== capFilter) continue;
+    if (search && !r.case_name.toLowerCase().includes(search) && !m.toLowerCase().includes(search)) continue;
+
+    grid.appendChild(buildCaseCard(r, idx++));
+  }
+
+  if (idx === 0) {
+    grid.innerHTML = '<div class="empty-state"><div class="es-icon">&#128269;</div><p>No cases match the current filters</p></div>';
+  }
+}
+
+// Filter event listeners
+$('resultModelFilter').addEventListener('change', renderResultCases);
+$('resultStatusFilter').addEventListener('change', renderResultCases);
+$('resultCapabilityFilter').addEventListener('change', renderResultCases);
+$('resultSearchInput').addEventListener('input', renderResultCases);
+
+/* ================================================================
+   WebSocket
+   ================================================================ */
 function connect() {
-  const ws = new WebSocket(`ws://${location.host}/ws`);
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${protocol}//${location.host}/ws`);
+  S.ws = ws;
+
   ws.onopen = () => {
-    $('conn').className = 'conn connected';
-    setTimeout(() => $('conn').style.display = 'none', 1000);
+    S.connected = true;
+    $('connDot').className = 'conn-dot connected';
+    $('subtitleText').textContent = 'connected';
+    // Load config after connection
+    initConfig();
   };
+
   ws.onclose = () => {
-    if (!state.suiteComplete) {
-      $('conn').className = 'conn error';
-      $('conn').textContent = 'Disconnected — reconnecting...';
-      $('conn').style.display = '';
+    S.connected = false;
+    if (S.phase !== 'results') {
+      $('connDot').className = 'conn-dot error';
+      $('subtitleText').textContent = 'disconnected - reconnecting...';
       setTimeout(connect, 2000);
     }
   };
+
+  ws.onerror = () => {
+    S.connected = false;
+    $('connDot').className = 'conn-dot error';
+    $('subtitleText').textContent = 'connection error';
+  };
+
   ws.onmessage = (e) => {
-    const ev = JSON.parse(e.data);
-    switch (ev.type) {
-      case 'suite_started':
-        state.total = ev.total_cases;
-        state.models = ev.models;
-        state.startTime = Date.now();
-        $('subtitle').textContent = ev.models.join(' vs ') + ' — ' + ev.total_cases + ' cases';
-        $('stats').style.display = '';
-        $('progressWrap').style.display = '';
-        updateStats();
-        // Keep wall time ticking
-        setInterval(() => {
-          if (!state.suiteComplete) {
-            const elapsed = Date.now() - state.startTime;
-            $('wallTime').textContent = formatDur(elapsed);
-          }
-        }, 500);
-        break;
-      case 'case_started':
-        state.running.set(ev.case_name + '/' + ev.model, true);
-        break;
-      case 'case_completed':
-        state.completed++;
-        state.runs.push(ev.report);
-        if (ev.report.passed) state.passed++; else state.failed++;
-        state.running.delete(ev.report.case_name + '/' + ev.report.model);
-        addCaseCard(ev.report);
-        updateStats();
-        break;
-      case 'suite_completed':
-        state.suiteComplete = true;
-        $('subtitle').textContent = 'Suite complete — ' + state.passed + '/' + state.completed + ' passed';
-        if (ev.report.wall_time_ms) $('wallTime').textContent = formatDur(ev.report.wall_time_ms);
-        break;
-    }
+    let ev;
+    try { ev = JSON.parse(e.data); } catch { return; }
+    handleEvent(ev);
   };
 }
+
+function handleEvent(ev) {
+  switch (ev.type) {
+
+    case 'suite_started': {
+      S.total = ev.total_cases || 0;
+      S.completed = 0;
+      S.passed = 0;
+      S.failed = 0;
+      S.runs = [];
+      S.runningSet.clear();
+      S.startTime = Date.now();
+      S.suiteReport = null;
+
+      setPhase('running');
+      $('subtitleText').textContent = (ev.models || []).join(' vs ') + ' — ' + ev.total_cases + ' cases';
+      $('liveCaseGrid').innerHTML = '';
+      $('liveEmptyState').style.display = '';
+
+      updateRunningView();
+
+      // Start wall clock timer
+      if (S.wallTimer) clearInterval(S.wallTimer);
+      S.wallTimer = setInterval(() => {
+        if (S.phase === 'running' && S.startTime) {
+          // Timer is just for display — actual wall time comes from suite_completed
+        }
+      }, 500);
+      break;
+    }
+
+    case 'case_started': {
+      const key = ev.case_name + '/' + ev.model + '/' + (ev.run_index || 0);
+      S.runningSet.set(key, { case_name: ev.case_name, model: ev.model });
+      updateRunningView();
+      break;
+    }
+
+    case 'case_completed': {
+      const r = ev.report;
+      S.completed++;
+      S.runs.push(r);
+      if (r.passed) S.passed++; else S.failed++;
+      const key = r.case_name + '/' + r.model + '/' + (r.run_index || 0);
+      S.runningSet.delete(key);
+      addRunningCard(r);
+      updateRunningView();
+      break;
+    }
+
+    case 'suite_completed': {
+      S.suiteReport = ev.report || {};
+      if (S.wallTimer) { clearInterval(S.wallTimer); S.wallTimer = null; }
+      // Small delay for visual effect before showing results
+      setTimeout(renderResults, 400);
+      break;
+    }
+
+    case 'lagged': {
+      toast('Missed ' + (ev.missed || '?') + ' events (stream lag)', 'error');
+      break;
+    }
+  }
+}
+
+/* ================================================================
+   Boot
+   ================================================================ */
+setPhase('config');
 connect();
 </script>
 </body>

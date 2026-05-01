@@ -360,7 +360,13 @@ async fn main() -> Result<()> {
     };
 
     let dashboard_tx = if let Some(port) = args.live_dashboard {
-        let server = astra_test_harness::dashboard::DashboardServer::new();
+        let dashboard_config = astra_test_harness::dashboard::DashboardConfig {
+            suite_dir: args.suite.clone(),
+            astra_bin: astra_bin.clone(),
+            available_models: fallback_models.clone(),
+            judger_model: args.judger_model.clone(),
+        };
+        let server = astra_test_harness::dashboard::DashboardServer::new(dashboard_config);
         let tx = server.sender();
         tokio::spawn(async move {
             if let Err(e) = server.start(port).await {
