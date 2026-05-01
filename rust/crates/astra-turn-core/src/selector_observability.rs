@@ -52,7 +52,12 @@ pub fn is_selector_observability_enabled() -> bool {
     match OBS_FLAG.load(Ordering::Relaxed) {
         0 => {
             let enabled = std::env::var(SELECTOR_OBS_ENV)
-                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+                .map(|v| {
+                    matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "on" | "yes"
+                    )
+                })
                 .unwrap_or(false);
             OBS_FLAG.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
             enabled
@@ -81,6 +86,32 @@ pub fn restore_selector_observability_for_tests(raw: u8) {
 /// `fork_capture::FORK_FLAG_TEST_MUTEX`.
 #[doc(hidden)]
 pub static SELECTOR_OBS_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test-only in-process capture of the last serialized `[selector]`
+/// trace. Lets tests assert *what* was emitted — not just that the
+/// hot path didn't panic. Production code never reads this; it's
+/// only populated when `CAPTURE_TO_BUFFER` is enabled via the
+/// test-only setter below.
+#[doc(hidden)]
+static CAPTURE_TO_BUFFER: AtomicU8 = AtomicU8::new(0);
+
+#[doc(hidden)]
+static CAPTURED_TRACES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Enable in-process capture of emitted trace JSON. Returns previous
+/// state. Tests MUST hold `SELECTOR_OBS_TEST_MUTEX` for the whole
+/// window they read the buffer to avoid interleaved writes.
+#[doc(hidden)]
+pub fn set_capture_to_buffer_for_tests(enabled: bool) -> bool {
+    CAPTURE_TO_BUFFER.swap(u8::from(enabled), Ordering::Relaxed) != 0
+}
+
+/// Drain the captured-trace buffer and return the vector.
+#[doc(hidden)]
+pub fn drain_captured_traces_for_tests() -> Vec<String> {
+    let mut g = CAPTURED_TRACES.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut *g)
+}
 
 /// Selection-decision trace. One per selector invocation. Designed to
 /// answer "why did the selector pick these tools and not others" —
@@ -146,7 +177,14 @@ pub fn emit_selector_trace(trace: &SelectionTrace<'_>) {
         reason: trace.reason,
     };
     match serde_json::to_string(&for_emit) {
-        Ok(json) => eprintln!("[selector] {json}"),
+        Ok(json) => {
+            if CAPTURE_TO_BUFFER.load(Ordering::Relaxed) != 0 {
+                if let Ok(mut g) = CAPTURED_TRACES.lock() {
+                    g.push(json.clone());
+                }
+            }
+            eprintln!("[selector] {json}");
+        }
         Err(e) => eprintln!("[selector] serde_err: {e}"),
     }
 }

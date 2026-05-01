@@ -261,6 +261,8 @@ impl ToolRegistry {
         recent_tools: &[String],
         quality_tracker: Option<&ToolQualityTracker>,
     ) -> (Vec<Value>, SelectionReport) {
+        use astra_turn_core::selector_observability as obs;
+
         let state = ConversationState::from_message_with_context(query, turn_count, recent_tools);
 
         if state.is_conversational
@@ -271,6 +273,14 @@ impl ToolRegistry {
         {
             let schemas = self.pinned_only();
             let names = Self::selected_names(&schemas);
+            obs::emit_selector_trace(&obs::SelectionTrace {
+                query,
+                mode: "quality_conversational",
+                top: None,
+                r#final: &names,
+                budget: None,
+                reason: Some("quality path — conversational, pinned-only"),
+            });
             let report = SelectionReport {
                 tools_selected: names,
                 selected_count: schemas.len() as u32,
@@ -293,6 +303,25 @@ impl ToolRegistry {
             })
             .map(|n| self.token_cost(n))
             .sum();
+
+        if obs::is_selector_observability_enabled() {
+            let top: Vec<(&str, f64)> = ranked
+                .iter()
+                .take(10)
+                .map(|(idx, score)| (TOOL_CATALOG[*idx].name, *score))
+                .collect();
+            obs::emit_selector_trace(&obs::SelectionTrace {
+                query,
+                mode: "quality",
+                top: Some(top),
+                r#final: &names,
+                budget: Some(obs::SelectionBudget {
+                    used: budget_used,
+                    total: budget,
+                }),
+                reason: None,
+            });
+        }
 
         let report = SelectionReport {
             selected_count: schemas.len() as u32,
@@ -379,10 +408,24 @@ impl ToolRegistry {
         file_context: &[String],
         outcome_bias: &std::collections::HashMap<String, f64>,
     ) -> (Vec<Value>, SelectionReport) {
+        use astra_turn_core::selector_observability as obs;
+
         // Use tool_filter for early conversational detection
         if routing.tool_filter == ToolFilter::Minimal {
             let schemas = self.pinned_only();
             let names = Self::selected_names(&schemas);
+            // Observability: minimal-filter early return. A G3-class
+            // bug where a tool is missing from the routed-minimal
+            // path shows up as `final` not containing the expected
+            // tool — visible without reading the routing engine.
+            obs::emit_selector_trace(&obs::SelectionTrace {
+                query,
+                mode: "routed_minimal",
+                top: None,
+                r#final: &names,
+                budget: None,
+                reason: Some("routing.tool_filter == Minimal — pinned-only"),
+            });
             return (
                 schemas,
                 SelectionReport {
@@ -449,6 +492,42 @@ impl ToolRegistry {
             })
             .map(|n| self.token_cost(n))
             .sum();
+
+        // Observability: routed + pressure dynamic path — this is
+        // the production selector entry point (tool_selector.rs).
+        // G3 would show up here as a final list missing the tool
+        // the caller expected, paired with a top list that shows
+        // either (a) the tool absent entirely, or (b) a low score.
+        if obs::is_selector_observability_enabled() {
+            let top: Vec<(&str, f64)> = ranked
+                .iter()
+                .take(10)
+                .map(|(idx, score)| (TOOL_CATALOG[*idx].name, *score))
+                .collect();
+            // Mode distinguishes pressure path from plain routed so
+            // a reviewer can tell which pipeline ran. Label stays
+            // short — grep-friendly.
+            let mode = if budget_pressure > 0.01
+                || has_co_occurrence
+                || has_file_context
+                || has_outcome_bias
+            {
+                "routed_pressure"
+            } else {
+                "routed"
+            };
+            obs::emit_selector_trace(&obs::SelectionTrace {
+                query,
+                mode,
+                top: Some(top),
+                r#final: &names,
+                budget: Some(obs::SelectionBudget {
+                    used: budget_used,
+                    total: budget,
+                }),
+                reason: None,
+            });
+        }
 
         (
             schemas,
@@ -766,8 +845,8 @@ mod tests {
     #[test]
     fn select_with_report_ctx_conversational_path_does_not_panic_with_obs_on() {
         use astra_turn_core::selector_observability::{
-            restore_selector_observability_for_tests, set_selector_observability_for_tests,
-            SELECTOR_OBS_TEST_MUTEX,
+            SELECTOR_OBS_TEST_MUTEX, restore_selector_observability_for_tests,
+            set_selector_observability_for_tests,
         };
         let _lock = SELECTOR_OBS_TEST_MUTEX
             .lock()
@@ -780,8 +859,7 @@ mod tests {
         schemas.push(sample_schema("github_list_prs"));
         let registry = ToolRegistry::new(schemas);
         // "hello" is the conversational short-circuit case.
-        let (out_schemas, report) =
-            registry.select_with_report_ctx("hello", 0, 800, &[]);
+        let (out_schemas, report) = registry.select_with_report_ctx("hello", 0, 800, &[]);
         assert!(!out_schemas.is_empty());
         assert_eq!(report.selected_count as usize, out_schemas.len());
 
@@ -791,8 +869,8 @@ mod tests {
     #[test]
     fn select_with_report_ctx_dynamic_path_does_not_panic_with_obs_on() {
         use astra_turn_core::selector_observability::{
-            restore_selector_observability_for_tests, set_selector_observability_for_tests,
-            SELECTOR_OBS_TEST_MUTEX,
+            SELECTOR_OBS_TEST_MUTEX, restore_selector_observability_for_tests,
+            set_selector_observability_for_tests,
         };
         let _lock = SELECTOR_OBS_TEST_MUTEX
             .lock()
@@ -821,8 +899,8 @@ mod tests {
         // the selection result must be identical to the pre-obs
         // behavior (byte-for-byte on tools_selected).
         use astra_turn_core::selector_observability::{
-            restore_selector_observability_for_tests, set_selector_observability_for_tests,
-            SELECTOR_OBS_TEST_MUTEX,
+            SELECTOR_OBS_TEST_MUTEX, restore_selector_observability_for_tests,
+            set_selector_observability_for_tests,
         };
         let _lock = SELECTOR_OBS_TEST_MUTEX
             .lock()
@@ -831,11 +909,208 @@ mod tests {
 
         let schemas = vec![sample_schema("bash"), sample_schema("read_file")];
         let registry = ToolRegistry::new(schemas);
-        let (_out, report) =
-            registry.select_with_report_ctx("search for needles", 0, 800, &[]);
+        let (_out, report) = registry.select_with_report_ctx("search for needles", 0, 800, &[]);
         assert!(report.selected_count >= 1);
 
         restore_selector_observability_for_tests(prev);
+    }
+
+    // ── Production-path coverage (G3 repro surface) ──
+    //
+    // `select_routed_with_pressure` is the ONLY registry selection
+    // entry point called from production code (tool_selector.rs:700).
+    // If observability only fires on `select_with_report_ctx` then
+    // turning the flag on yields zero lines in production and the
+    // G3-class bug it was built to catch goes undetected.
+    //
+    // These tests capture emitted trace JSON in-process so we can
+    // assert each production path emits exactly one `[selector]`
+    // record with the right shape. They would FAIL on the original
+    // PR (no emit on routed / quality paths) — that's the TDD red
+    // before the emit-site additions below.
+
+    fn with_obs_capture<F, R>(f: F) -> (R, Vec<String>)
+    where
+        F: FnOnce() -> R,
+    {
+        use astra_turn_core::selector_observability::{
+            SELECTOR_OBS_TEST_MUTEX, drain_captured_traces_for_tests,
+            restore_selector_observability_for_tests, set_capture_to_buffer_for_tests,
+            set_selector_observability_for_tests,
+        };
+        let _lock = SELECTOR_OBS_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_flag = set_selector_observability_for_tests(true);
+        let prev_capture = set_capture_to_buffer_for_tests(true);
+        // Drain anything a prior test left behind so we only see this
+        // test's writes.
+        let _ = drain_captured_traces_for_tests();
+
+        let out = f();
+        let captured = drain_captured_traces_for_tests();
+
+        set_capture_to_buffer_for_tests(prev_capture);
+        restore_selector_observability_for_tests(prev_flag);
+        (out, captured)
+    }
+
+    #[test]
+    fn routed_pressure_dynamic_path_emits_selector_trace() {
+        use crate::pipeline::routing::RoutingEngine;
+        let schemas = vec![
+            sample_schema("bash"),
+            sample_schema("read_file"),
+            sample_schema("grep"),
+            sample_schema("list_dir"),
+        ];
+        let registry = ToolRegistry::new(schemas);
+        let query = "search for TODO in source files";
+        let ((_out, report), captured) = with_obs_capture(|| {
+            let routing = RoutingEngine::analyze(query, 0, &[], &[], vec![]);
+            registry.select_routed_with_pressure(
+                query,
+                &routing,
+                800,
+                &[],
+                None,
+                None,
+                &[],
+                0.0,
+                &std::collections::HashMap::new(),
+                &[],
+                &std::collections::HashMap::new(),
+            )
+        });
+        assert!(report.selected_count > 0);
+        assert_eq!(
+            captured.len(),
+            1,
+            "routed_with_pressure must emit exactly one selector trace; got {captured:?}"
+        );
+        let json = &captured[0];
+        assert!(
+            json.contains("\"mode\":\"routed\"") || json.contains("\"mode\":\"routed_pressure\""),
+            "expected routed mode label in trace; got {json}"
+        );
+        assert!(
+            json.contains("\"query\":"),
+            "trace must include query; got {json}"
+        );
+        assert!(
+            json.contains("\"final\":"),
+            "trace must include final list; got {json}"
+        );
+    }
+
+    #[test]
+    fn routed_pressure_minimal_filter_emits_selector_trace() {
+        use crate::pipeline::routing::{RoutingEngine, ToolFilter};
+        let schemas = vec![sample_schema("bash"), sample_schema("read_file")];
+        let registry = ToolRegistry::new(schemas);
+        // A short greeting triggers the Minimal ToolFilter branch.
+        // Verify the early-return path ALSO emits — otherwise the
+        // "tool missing from conversational path" case stays silent.
+        let query = "hello";
+        let ((_out, _report), captured) = with_obs_capture(|| {
+            let mut routing = RoutingEngine::analyze(query, 0, &[], &[], vec![]);
+            // Force Minimal so the test doesn't depend on the routing
+            // engine's classification heuristics.
+            routing.tool_filter = ToolFilter::Minimal;
+            registry.select_routed_with_pressure(
+                query,
+                &routing,
+                800,
+                &[],
+                None,
+                None,
+                &[],
+                0.0,
+                &std::collections::HashMap::new(),
+                &[],
+                &std::collections::HashMap::new(),
+            )
+        });
+        assert_eq!(
+            captured.len(),
+            1,
+            "minimal-filter early return must also emit a trace; got {captured:?}"
+        );
+        assert!(
+            captured[0].contains("\"mode\":\"routed_minimal\"")
+                || captured[0].contains("\"mode\":\"routed\""),
+            "expected minimal-filter mode label; got {}",
+            captured[0]
+        );
+    }
+
+    #[test]
+    fn quality_path_emits_selector_trace_on_dynamic_branch() {
+        let schemas = vec![
+            sample_schema("bash"),
+            sample_schema("read_file"),
+            sample_schema("grep"),
+        ];
+        let registry = ToolRegistry::new(schemas);
+        let query = "search for TODO comments";
+        let ((_out, report), captured) =
+            with_obs_capture(|| registry.select_with_quality(query, 0, 800, &[], None));
+        assert!(report.selected_count > 0);
+        assert_eq!(
+            captured.len(),
+            1,
+            "select_with_quality dynamic branch must emit exactly one trace; got {captured:?}"
+        );
+        assert!(
+            captured[0].contains("\"mode\":\"quality\""),
+            "expected quality mode label; got {}",
+            captured[0]
+        );
+    }
+
+    #[test]
+    fn routed_pressure_off_flag_emits_nothing() {
+        // Sanity guard: we must not emit when the flag is off, even
+        // on production paths. Would catch a regression where the
+        // flag check gets skipped inside the new emit sites.
+        use astra_turn_core::selector_observability::{
+            SELECTOR_OBS_TEST_MUTEX, drain_captured_traces_for_tests,
+            restore_selector_observability_for_tests, set_capture_to_buffer_for_tests,
+            set_selector_observability_for_tests,
+        };
+        let _lock = SELECTOR_OBS_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_flag = set_selector_observability_for_tests(false);
+        let prev_capture = set_capture_to_buffer_for_tests(true);
+        let _ = drain_captured_traces_for_tests();
+
+        use crate::pipeline::routing::RoutingEngine;
+        let schemas = vec![sample_schema("bash"), sample_schema("read_file")];
+        let registry = ToolRegistry::new(schemas);
+        let query = "anything";
+        let routing = RoutingEngine::analyze(query, 0, &[], &[], vec![]);
+        let _ = registry.select_routed_with_pressure(
+            query,
+            &routing,
+            800,
+            &[],
+            None,
+            None,
+            &[],
+            0.0,
+            &std::collections::HashMap::new(),
+            &[],
+            &std::collections::HashMap::new(),
+        );
+
+        let captured = drain_captured_traces_for_tests();
+        set_capture_to_buffer_for_tests(prev_capture);
+        restore_selector_observability_for_tests(prev_flag);
+        assert!(
+            captured.is_empty(),
+            "flag off must produce zero traces; got {captured:?}"
+        );
     }
 }
 
