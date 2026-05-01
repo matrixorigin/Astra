@@ -78,7 +78,7 @@ pub fn extract_lessons(
             persona: persona.to_string(),
             workload_tag: workload_tag.map(str::to_string),
             kind: LessonKind::ToolDeprioritize,
-            trigger_signal: format!("{count} failures on {name}"),
+            trigger_signal: format!("tool_failures:{name}"),
             action: format!(
                 "deprioritize `{name}` for this workload — failed {count} times last session",
             ),
@@ -93,7 +93,7 @@ pub fn extract_lessons(
             persona: persona.to_string(),
             workload_tag: workload_tag.map(str::to_string),
             kind: LessonKind::PromptShape,
-            trigger_signal: format!("{} stall events in one session", summary.stall_events),
+            trigger_signal: "stall_events".to_string(),
             action: "tighten the plan: restate scope before each tool call and break tasks into \
                  explicit steps"
                 .into(),
@@ -110,28 +110,12 @@ pub fn extract_lessons(
         .filter(|s| !s.trim().is_empty() && seen.insert(s.trim().to_lowercase()))
         .collect();
     if distinct_corrections.len() >= CORRECTION_LESSON_THRESHOLD {
-        // Summarise by length-bounded join so the lesson row stays within
-        // `MAX_TRIGGER_SIGNAL_LEN`. The extractor does not know that cap
-        // but truncates defensively anyway.
-        let mut joined = distinct_corrections
-            .iter()
-            .take(3)
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join(" | ");
-        if joined.chars().count() > 200 {
-            joined = joined.chars().take(199).collect::<String>() + "…";
-        }
         out.push(NewLesson {
             user_id: user_id.to_string(),
             persona: persona.to_string(),
             workload_tag: workload_tag.map(str::to_string),
             kind: LessonKind::PromptShape,
-            trigger_signal: format!(
-                "{} distinct user corrections: {}",
-                distinct_corrections.len(),
-                joined,
-            ),
+            trigger_signal: "user_corrections".to_string(),
             action:
                 "restate the user's scope/intent before planning; confirm contested choices early"
                     .into(),
@@ -146,10 +130,7 @@ pub fn extract_lessons(
             persona: persona.to_string(),
             workload_tag: workload_tag.map(str::to_string),
             kind: LessonKind::PostconditionPattern,
-            trigger_signal: format!(
-                "{} unmet postconditions on final ActionPlan",
-                summary.unmet_postconditions
-            ),
+            trigger_signal: "unmet_postconditions".to_string(),
             action: "split the plan into smaller actions with narrower postconditions; \
                      verify each action's outcome before the next one"
                 .into(),
@@ -281,7 +262,7 @@ mod tests {
         let out = extract_lessons(&s, "u1", "generic", None);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].kind, LessonKind::ToolDeprioritize);
-        assert!(out[0].trigger_signal.contains("grep"));
+        assert_eq!(out[0].trigger_signal, "tool_failures:grep");
         assert!(out[0].action.contains("`grep`"));
         assert_eq!(out[0].user_id, "u1");
         assert_eq!(out[0].persona, "generic");
@@ -307,9 +288,9 @@ mod tests {
             })
             .collect();
         // Sorted alphabetically → bash, grep, rg.
-        assert!(names[0].contains("bash"));
-        assert!(names[1].contains("grep"));
-        assert!(names[2].contains("rg"));
+        assert_eq!(names[0], "tool_failures:bash");
+        assert_eq!(names[1], "tool_failures:grep");
+        assert_eq!(names[2], "tool_failures:rg");
     }
 
     #[test]
@@ -319,7 +300,7 @@ mod tests {
         let out = extract_lessons(&s, "u", "p", None);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].kind, LessonKind::PromptShape);
-        assert!(out[0].trigger_signal.contains("3 stall"));
+        assert_eq!(out[0].trigger_signal, "stall_events");
     }
 
     #[test]
@@ -329,8 +310,7 @@ mod tests {
         let out = extract_lessons(&s, "u", "p", None);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].kind, LessonKind::PromptShape);
-        assert!(out[0].trigger_signal.contains("use rg not grep"));
-        assert!(out[0].trigger_signal.contains("limit to src"));
+        assert_eq!(out[0].trigger_signal, "user_corrections");
     }
 
     #[test]
@@ -417,6 +397,50 @@ mod tests {
                 panic!("extracted lesson failed DAO validation: {e}; lesson = {l:?}")
             });
         }
+    }
+
+    #[test]
+    fn trigger_signals_are_stable_bucket_keys() {
+        // R3 contract: trigger_signal must NOT contain volatile counts or
+        // correction snippets. It must be a stable key so the DAO's upsert-
+        // by-content dedup works across sessions with different counts.
+        let mut s = base_summary();
+        s.tool_failures.insert("grep".into(), 3);
+        s.stall_events = 5;
+        s.user_corrections = vec!["a".into(), "b".into()];
+        s.unmet_postconditions = 4;
+        let lessons = extract_lessons(&s, "u", "p", None);
+
+        for l in &lessons {
+            // No digits in trigger_signal — counts go in action only.
+            assert!(
+                !l.trigger_signal.chars().any(|c| c.is_ascii_digit()),
+                "trigger_signal {:?} contains a digit — volatile count leaked into key",
+                l.trigger_signal
+            );
+        }
+
+        // Changing the counts must produce the SAME trigger_signals
+        // (different action text is fine — action is not part of the key).
+        let mut s2 = base_summary();
+        s2.tool_failures.insert("grep".into(), 10); // different count
+        s2.stall_events = 20;
+        s2.user_corrections = vec!["x".into(), "y".into()]; // different snippets
+        s2.unmet_postconditions = 99;
+        let lessons2 = extract_lessons(&s2, "u", "p", None);
+
+        let keys1: Vec<(&str, &str)> = lessons
+            .iter()
+            .map(|l| (l.kind.as_str(), l.trigger_signal.as_str()))
+            .collect();
+        let keys2: Vec<(&str, &str)> = lessons2
+            .iter()
+            .map(|l| (l.kind.as_str(), l.trigger_signal.as_str()))
+            .collect();
+        assert_eq!(
+            keys1, keys2,
+            "trigger_signals must be identical across sessions with different counts"
+        );
     }
 
     // ── P5: summarise_from_runtime ──────────────────────────────────────────
