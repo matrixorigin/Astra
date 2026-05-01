@@ -59,6 +59,7 @@ fn lesson(kind: &str, trigger: &str, action: &str, tag: Option<&str>) -> LessonH
         trigger_signal: trigger.to_string(),
         action: action.to_string(),
         workload_tag: tag.map(str::to_string),
+        compact: None,
     }
 }
 

@@ -128,7 +128,13 @@ pub struct Lesson {
 pub struct LessonHint {
     pub kind: LessonKind,
     pub trigger_signal: String,
+    /// Full action text — used when prompt space permits.
     pub action: String,
+    /// Short summary (~15 tokens) for compact rendering under prompt
+    /// pressure. Inspired by Memoria V2's abstract/overview/detail model.
+    /// When `None`, the renderer falls back to `action`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_tag: Option<String>,
 }
@@ -136,13 +142,32 @@ pub struct LessonHint {
 impl LessonHint {
     #[must_use]
     pub fn from_lesson(l: &Lesson) -> Self {
+        let action = sanitize_for_prompt(&l.action);
+        let compact = make_compact(&action);
         Self {
             kind: l.kind,
             trigger_signal: sanitize_for_prompt(&l.trigger_signal),
-            action: sanitize_for_prompt(&l.action),
+            action,
+            compact,
             workload_tag: l.workload_tag.clone(),
         }
     }
+}
+
+/// Generate a compact summary (~60 chars) from a full action string.
+/// Returns `None` if the action is already short enough.
+fn make_compact(action: &str) -> Option<String> {
+    if action.len() <= 80 {
+        return None;
+    }
+    let first_sentence = action
+        .split_once(['.', '—', ';', '\n'])
+        .map(|(s, _)| s.trim())
+        .unwrap_or(action);
+    if first_sentence.len() >= action.len() - 5 {
+        return None;
+    }
+    Some(first_sentence.to_string())
 }
 
 /// Strip control characters, zero-width Unicode, and bidirectional

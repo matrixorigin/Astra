@@ -328,6 +328,7 @@ mod tests {
             trigger_signal: "test".into(),
             action: action.into(),
             workload_tag: None,
+            compact: None,
         }
     }
 

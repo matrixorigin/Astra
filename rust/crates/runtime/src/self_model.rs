@@ -1124,10 +1124,11 @@ impl SelfModel {
                         .as_deref()
                         .map(|t| format!(" @{t}"))
                         .unwrap_or_default();
+                    let display_text = l.compact.as_deref().unwrap_or(&l.action);
                     let _ = writeln!(
                         s,
                         "  - [{}{}] {} — {}",
-                        l.kind, scope, l.trigger_signal, l.action
+                        l.kind, scope, l.trigger_signal, display_text
                     );
                 }
                 if total > MAX_SHOWN {

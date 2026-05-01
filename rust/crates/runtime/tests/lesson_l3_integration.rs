@@ -79,12 +79,14 @@ fn bootstrap_merge_deduplicates_and_preserves_unique() {
             trigger_signal: "tool_failures:grep".into(),
             action: "consider alternatives to grep".into(),
             workload_tag: None,
+            compact: None,
         },
         LessonHint {
             kind: LessonKind::PromptShape,
             trigger_signal: "stall_events".into(),
             action: "restate scope before tool calls".into(),
             workload_tag: None,
+            compact: None,
         },
     ];
     let memoria = vec![
@@ -94,6 +96,7 @@ fn bootstrap_merge_deduplicates_and_preserves_unique() {
             trigger_signal: "memoria".into(),
             action: "💡 LESSON: consider alternatives to grep in large repos".into(),
             workload_tag: None,
+            compact: None,
         },
         // Unique — from Memoria reflection
         LessonHint {
@@ -101,6 +104,7 @@ fn bootstrap_merge_deduplicates_and_preserves_unique() {
             trigger_signal: "memoria".into(),
             action: "💡 LESSON: This repo uses pnpm workspaces; npm install breaks".into(),
             workload_tag: None,
+            compact: None,
         },
     ];
 
@@ -206,6 +210,7 @@ fn full_loop_lessons_are_prompt_ready() {
             trigger_signal: l.trigger_signal.clone(),
             action: astra_services::sanitize_for_prompt(&l.action),
             workload_tag: None,
+            compact: None,
         })
         .collect();
 

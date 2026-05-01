@@ -511,12 +511,14 @@ async fn set_session_lessons_feeds_build_self_model_snapshot() {
             trigger_signal: "3 stalls on grep".into(),
             action: "switch to rg".into(),
             workload_tag: None,
+            compact: None,
         },
         astra_runtime::self_model::LessonHint {
             kind: astra_services::LessonKind::PromptShape,
             trigger_signal: "repeated scope drift".into(),
             action: "restate scope before tool call".into(),
             workload_tag: Some("code-review".into()),
+            compact: None,
         },
     ];
     exe.set_session_lessons(lessons.clone());
