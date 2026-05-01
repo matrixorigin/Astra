@@ -71,6 +71,38 @@ filter = "test(/spawn_plan_executor_/)"
 test-group = "plan_executor_e2e"
 slow-timeout = { period = "2s", terminate-after = 1 }
 
+# ── DB-backed HTTP integration tests (online; MatrixOne required) ─────────
+# `plan_http_db_it` drives the plan HTTP handlers against a live
+# MatrixOne instance — every test pays for:
+# - TCP round-trip to MatrixOne (~1-2ms × N SQL statements per test)
+# - `CREATE DATABASE` / schema migration via `ASTRA_AUTO_CREATE_DATABASE=1`
+#   + row insert/update round-trips (plan + subtask + step_run rows)
+# - axum `Router::oneshot` per test
+# - the handler itself: serde + validation + SQL round-trip
+#
+# Intrinsic cost is ~1s per test; it's DB I/O bound. 2s ceiling gives
+# headroom for a busy DB without hiding regressions. This is
+# strictly `make test-online` surface — offline profiles never hit it
+# because the whole binary is `#[ignore]` gated.
+[[profile.strict.overrides]]
+filter = "package(astra-runtime) and binary(plan_http_db_it)"
+slow-timeout = { period = "2s", terminate-after = 1 }
+
+# Same pattern for the rest of the `*_db_it` online binaries — any
+# test that's DB-backed gets the same 2s ceiling. The isolation story
+# stays intact because each test still creates + tears down its own
+# row IDs; this is purely a timeout policy.
+[[profile.strict.overrides]]
+filter = """
+package(astra-runtime) and binary(plan_http_db_it)
+ or package(astra-services) and binary(plan_sync_db_it)
+ or package(astra-services) and binary(services_db_integration)
+ or package(astra-services) and binary(team_persistence_integration)
+ or package(astra-services) and binary(multi_agent_integration)
+ or package(astra-plan) and binary(plan_repository_db_it)
+"""
+slow-timeout = { period = "2s", terminate-after = 1 }
+
 # ── bridge-e2e-hooks full-stack integration tests (~100 tests) ─────────────
 # Located in `rust/crates/runtime/tests/{web_agent_e2e.rs,bridge_e2e_comprehensive.rs}`
 # under the `bridge-e2e-hooks` feature. Each test drives the PRODUCTION
