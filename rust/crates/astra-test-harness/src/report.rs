@@ -338,9 +338,11 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         s.push('\n');
     }
 
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
+
     // Pass rate summary when --runs > 1 (multiple runs per case×model).
     let has_repeats = {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         report
             .runs
             .iter()
@@ -348,8 +350,7 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
     };
     if has_repeats {
         s.push_str("=== pass rate (flaky detection) ===\n");
-        let mut groups: std::collections::BTreeMap<(&str, &str), (u32, u32)> =
-            std::collections::BTreeMap::new();
+        let mut groups: BTreeMap<(&str, &str), (u32, u32)> = BTreeMap::new();
         for r in &report.runs {
             let entry = groups.entry((&r.case_name, &r.model)).or_default();
             entry.1 += 1;
@@ -373,12 +374,80 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         s.push('\n');
     }
 
-    // Capability × model aggregation
+    // Collect distinct models.
+    let models: BTreeSet<&str> = report.runs.iter().map(|r| r.model.as_str()).collect();
+    let multi_model = models.len() > 1;
+
+    // ── Model scoreboard (always shown when > 1 model) ──
+    if multi_model {
+        // model → (raw_pass, raw_total, weighted_pass, weighted_total, total_tokens, total_dur_ms)
+        #[derive(Default)]
+        struct ModelStats {
+            pass: u32,
+            total: u32,
+            w_pass: f64,
+            w_total: f64,
+            tokens: u64,
+            dur_ms: u64,
+        }
+        let mut stats: BTreeMap<&str, ModelStats> = BTreeMap::new();
+        for r in &report.runs {
+            let e = stats.entry(&r.model).or_default();
+            e.total += 1;
+            e.w_total += r.weight;
+            e.tokens += r.outcome.prompt_tokens + r.outcome.completion_tokens;
+            e.dur_ms += r.outcome.duration_ms;
+            if r.passed {
+                e.pass += 1;
+                e.w_pass += r.weight;
+            }
+        }
+        s.push_str("=== model scoreboard ===\n");
+        // Sort by weighted score descending for ranking.
+        let mut ranked: Vec<_> = stats.iter().collect();
+        ranked.sort_by(|a, b| {
+            let sa = if a.1.w_total > 0.0 {
+                a.1.w_pass / a.1.w_total
+            } else {
+                0.0
+            };
+            let sb = if b.1.w_total > 0.0 {
+                b.1.w_pass / b.1.w_total
+            } else {
+                0.0
+            };
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (i, (model, st)) in ranked.iter().enumerate() {
+            let raw_pct = if st.total > 0 {
+                st.pass as f64 / st.total as f64 * 100.0
+            } else {
+                0.0
+            };
+            let w_pct = if st.w_total > 0.0 {
+                st.w_pass / st.w_total * 100.0
+            } else {
+                0.0
+            };
+            s.push_str(&format!(
+                "  #{rank} {model}: {pass}/{total} ({raw:.0}%) weighted={w:.0}% \
+                 tokens={tok} dur={dur}ms\n",
+                rank = i + 1,
+                pass = st.pass,
+                total = st.total,
+                raw = raw_pct,
+                w = w_pct,
+                tok = st.tokens,
+                dur = st.dur_ms,
+            ));
+        }
+        s.push('\n');
+    }
+
+    // ── Capability × model ──
     let has_capabilities = report.runs.iter().any(|r| r.capability.is_some());
     if has_capabilities {
-        use std::collections::BTreeMap;
         s.push_str("=== capability × model ===\n");
-        // (capability_str, model) → (weighted_pass, total_weight)
         let mut cap_groups: BTreeMap<(String, &str), (f64, f64)> = BTreeMap::new();
         for r in &report.runs {
             if let Some(ref cap) = r.capability {
@@ -396,24 +465,56 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         s.push('\n');
     }
 
-    // Capability × difficulty × model aggregation
+    // ── Difficulty curve (per-difficulty pass rate across models) ──
     let has_difficulty = report.runs.iter().any(|r| r.difficulty.is_some());
-    if has_capabilities && has_difficulty {
-        use std::collections::BTreeMap;
+    if has_difficulty {
+        s.push_str("=== difficulty curve ===\n");
+        // (difficulty, model) → (weighted_pass, weighted_total)
+        let mut diff_groups: BTreeMap<(u8, &str), (f64, f64)> = BTreeMap::new();
+        // Also aggregate across all models for single-model view.
+        let mut diff_all: BTreeMap<u8, (f64, f64)> = BTreeMap::new();
+        for r in &report.runs {
+            if let Some(d) = r.difficulty {
+                let entry = diff_groups.entry((d, &r.model)).or_default();
+                entry.1 += r.weight;
+                if r.passed {
+                    entry.0 += r.weight;
+                }
+                let all = diff_all.entry(d).or_default();
+                all.1 += r.weight;
+                if r.passed {
+                    all.0 += r.weight;
+                }
+            }
+        }
+        if multi_model {
+            for ((diff, model), (wp, tw)) in &diff_groups {
+                let pct = if *tw > 0.0 { wp / tw * 100.0 } else { 0.0 };
+                s.push_str(&format!("  d{diff} × {model}: {pct:.0}%\n"));
+            }
+        } else {
+            for (diff, (wp, tw)) in &diff_all {
+                let pct = if *tw > 0.0 { wp / tw * 100.0 } else { 0.0 };
+                s.push_str(&format!("  d{diff}: {pct:.0}%\n"));
+            }
+        }
+        s.push('\n');
+    }
+
+    // ── Capability × difficulty × model (detailed, only when both axes exist) ──
+    if has_capabilities && has_difficulty && multi_model {
         s.push_str("=== capability × difficulty × model ===\n");
-        let mut cap_diff_groups: BTreeMap<(String, u8, &str), (f64, f64)> = BTreeMap::new();
+        let mut cdm: BTreeMap<(String, u8, &str), (f64, f64)> = BTreeMap::new();
         for r in &report.runs {
             if let (Some(cap), Some(diff)) = (&r.capability, r.difficulty) {
-                let entry = cap_diff_groups
-                    .entry((cap.to_string(), diff, &r.model))
-                    .or_default();
+                let entry = cdm.entry((cap.to_string(), diff, &r.model)).or_default();
                 entry.1 += r.weight;
                 if r.passed {
                     entry.0 += r.weight;
                 }
             }
         }
-        for ((cap, diff, model), (wp, tw)) in &cap_diff_groups {
+        for ((cap, diff, model), (wp, tw)) in &cdm {
             let pct = if *tw > 0.0 { wp / tw * 100.0 } else { 0.0 };
             s.push_str(&format!("  {cap} × d{diff} × {model}: {pct:.0}%\n"));
         }
@@ -874,17 +975,32 @@ mod tests {
         assert!(out.contains("67%"), "missing percentage: {out}");
     }
 
-    #[test]
-    fn render_text_shows_capability_aggregation() {
-        let make = |cap, passed| CaseRunReport {
-            case_name: "c".into(),
-            model: "m".into(),
+    fn mk_run(
+        case: &str,
+        model: &str,
+        passed: bool,
+        cap: Option<crate::case::Capability>,
+        diff: Option<u8>,
+        weight: f64,
+        dur_ms: u64,
+        tokens_in: u64,
+        tokens_out: u64,
+    ) -> CaseRunReport {
+        CaseRunReport {
+            case_name: case.into(),
+            model: model.into(),
             passed,
             run_index: 0,
-            capability: Some(cap),
-            weight: 1.0,
-            difficulty: None,
-            outcome: RunOutcome::new("m"),
+            capability: cap,
+            weight,
+            difficulty: diff,
+            outcome: {
+                let mut o = RunOutcome::new(model);
+                o.duration_ms = dur_ms;
+                o.prompt_tokens = tokens_in;
+                o.completion_tokens = tokens_out;
+                o
+            },
             criteria: vec![],
             steps: vec![],
             failure_class: None,
@@ -892,57 +1008,132 @@ mod tests {
             reproducer: None,
             digest: None,
             digest_error: None,
-        };
+        }
+    }
+
+    #[test]
+    fn model_scoreboard_always_shown_for_multi_model() {
+        use crate::case::Capability::*;
         let r = SuiteReport {
             runs: vec![
-                make(crate::case::Capability::ToolUse, true),
-                make(crate::case::Capability::ToolUse, false),
+                mk_run(
+                    "easy",
+                    "gpt-4",
+                    true,
+                    Some(ToolUse),
+                    Some(1),
+                    1.0,
+                    500,
+                    100,
+                    50,
+                ),
+                mk_run(
+                    "easy",
+                    "qwen",
+                    true,
+                    Some(ToolUse),
+                    Some(1),
+                    1.0,
+                    300,
+                    80,
+                    40,
+                ),
+                mk_run(
+                    "hard",
+                    "gpt-4",
+                    false,
+                    Some(ToolUse),
+                    Some(4),
+                    2.0,
+                    3000,
+                    2000,
+                    500,
+                ),
+                mk_run(
+                    "hard",
+                    "qwen",
+                    true,
+                    Some(ToolUse),
+                    Some(4),
+                    2.0,
+                    2000,
+                    1500,
+                    400,
+                ),
+            ],
+            ..Default::default()
+        };
+        let out = render_text(&r, false);
+        // Must have a per-model scoreboard
+        assert!(
+            out.contains("model scoreboard"),
+            "multi-model runs must show model scoreboard:\n{out}"
+        );
+        // qwen: 2/2 passed (weight 1+2=3, weighted 3/3=100%)
+        // gpt-4: 1/2 passed (weight 1+2=3, weighted 1/3=33%)
+        assert!(
+            out.contains("qwen") && out.contains("gpt-4"),
+            "both models must appear:\n{out}"
+        );
+    }
+
+    #[test]
+    fn model_scoreboard_shows_weighted_score() {
+        use crate::case::Capability::*;
+        let r = SuiteReport {
+            runs: vec![
+                mk_run("easy", "A", true, Some(ToolUse), Some(1), 1.0, 100, 10, 5),
+                mk_run("hard", "A", false, Some(ToolUse), Some(5), 3.0, 100, 10, 5),
+                mk_run("easy", "B", true, Some(ToolUse), Some(1), 1.0, 100, 10, 5),
+                mk_run("hard", "B", true, Some(ToolUse), Some(5), 3.0, 100, 10, 5),
+            ],
+            ..Default::default()
+        };
+        let out = render_text(&r, false);
+        // A: unweighted 1/2=50%, weighted 1.0/(1.0+3.0)=25%
+        // B: unweighted 2/2=100%, weighted 4.0/4.0=100%
+        assert!(
+            out.contains("B") && out.contains("100%"),
+            "B should show 100%:\n{out}"
+        );
+        assert!(
+            out.contains("A") && out.contains("25%"),
+            "A should show weighted 25%:\n{out}"
+        );
+    }
+
+    #[test]
+    fn difficulty_curve_shown_when_difficulty_present() {
+        use crate::case::Capability::*;
+        let r = SuiteReport {
+            runs: vec![
+                mk_run("e1", "m", true, Some(Reasoning), Some(1), 1.0, 100, 10, 5),
+                mk_run("e2", "m", true, Some(Reasoning), Some(2), 1.0, 100, 10, 5),
+                mk_run("h1", "m", false, Some(Reasoning), Some(4), 1.0, 100, 10, 5),
+                mk_run("h2", "m", false, Some(Reasoning), Some(5), 1.0, 100, 10, 5),
             ],
             ..Default::default()
         };
         let out = render_text(&r, false);
         assert!(
-            out.contains("capability × model"),
-            "missing cap section: {out}"
+            out.contains("difficulty curve"),
+            "should show difficulty curve section:\n{out}"
         );
-        assert!(out.contains("tool_use × m: 50%"), "wrong pct: {out}");
     }
 
     #[test]
-    fn render_text_shows_difficulty_aggregation() {
-        let make = |diff, passed| CaseRunReport {
-            case_name: "c".into(),
-            model: "m".into(),
-            passed,
-            run_index: 0,
-            capability: Some(crate::case::Capability::Reasoning),
-            weight: 1.0,
-            difficulty: Some(diff),
-            outcome: RunOutcome::new("m"),
-            criteria: vec![],
-            steps: vec![],
-            failure_class: None,
-            session: None,
-            reproducer: None,
-            digest: None,
-            digest_error: None,
-        };
+    fn single_model_no_scoreboard() {
         let r = SuiteReport {
-            runs: vec![make(1, true), make(3, false)],
+            runs: vec![
+                mk_run("c1", "m", true, None, None, 1.0, 100, 10, 5),
+                mk_run("c2", "m", false, None, None, 1.0, 100, 10, 5),
+            ],
             ..Default::default()
         };
         let out = render_text(&r, false);
         assert!(
-            out.contains("capability × difficulty × model"),
-            "missing cap×diff section: {out}"
-        );
-        assert!(
-            out.contains("reasoning × d1 × m: 100%"),
-            "d1 should be 100%: {out}"
-        );
-        assert!(
-            out.contains("reasoning × d3 × m: 0%"),
-            "d3 should be 0%: {out}"
+            !out.contains("model scoreboard"),
+            "single-model run should not show scoreboard:\n{out}"
         );
     }
 }
