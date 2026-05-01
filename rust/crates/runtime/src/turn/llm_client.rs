@@ -59,10 +59,13 @@ pub(crate) const LLM_MAX_RETRIES: u32 = 3;
 pub(crate) const LLM_RETRY_BASE_MS: u64 = 1000;
 
 fn llm_retry_base_ms() -> u64 {
-    std::env::var("ASTRA_LLM_RETRY_BASE_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(LLM_RETRY_BASE_MS)
+    static VAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("ASTRA_LLM_RETRY_BASE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(LLM_RETRY_BASE_MS)
+    })
 }
 /// Extended delay for TPM (tokens per minute) exhaustion (60 seconds).
 /// TPM limits typically reset after 60 seconds, so we wait longer.
