@@ -309,6 +309,15 @@ pub(crate) struct ReplState {
     /// Unified CSL manager for persisting/restoring conversation state.
     /// Created lazily when session_id is first known.
     pub csl_manager: Option<CslManager>,
+
+    // ── TUI mode overrides ──
+    /// When set, `run_chat_turn` uses this render policy instead of `Stream`.
+    pub tui_render_policy: Option<crate::stream_render::RenderPolicy>,
+    /// When set, `run_chat_turn` injects this channel into ChatTurnParams.
+    pub tui_stream_event_tx: Option<crate::chat_stream::StreamEventTx>,
+    /// External cancellation token for TUI Ctrl+C interrupt.
+    /// When set, `run_chat_turn` monitors this alongside its own ctrl_c handler.
+    pub tui_cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
 }
 
 impl Default for ReplState {
@@ -453,6 +462,9 @@ impl Default for ReplState {
             },
             evolution_service: None,
             csl_manager: None,
+            tui_render_policy: None,
+            tui_stream_event_tx: None,
+            tui_cancel_token: None,
         }
     }
 }

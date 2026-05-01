@@ -86,6 +86,9 @@ pub(crate) struct Cli {
     /// Only explicitly provided context (--system-prompt, --add-dir, --mcp-config) is used.
     #[arg(long = "bare")]
     pub bare: bool,
+    /// Enable experimental full-screen TUI (default: classic line-mode REPL)
+    #[arg(long = "tui")]
+    pub tui: bool,
     /// Disable auto-loading of .astra/instructions.md project instructions
     #[arg(long = "no-instructions")]
     pub no_instructions: bool,

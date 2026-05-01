@@ -211,13 +211,27 @@ pub(super) async fn handle_chat_input(
     state: &mut ReplState,
     ctx: ReplTurnContext<'_>,
 ) -> Result<(), String> {
+    handle_chat_input_with_ui(
+        line,
+        current_token,
+        state,
+        ctx,
+        &mut crate::ui_adapter::LineUiAdapter,
+    )
+    .await
+}
+
+pub(super) async fn handle_chat_input_with_ui(
+    line: String,
+    current_token: Option<&str>,
+    state: &mut ReplState,
+    ctx: ReplTurnContext<'_>,
+    ui: &mut dyn crate::ui_adapter::ReplUiAdapter,
+) -> Result<(), String> {
     let token = match current_token {
         Some(token) => token,
         None => {
-            eprintln!(
-                "{}",
-                "  Not logged in. Use /login to authenticate.".yellow()
-            );
+            ui.show_warning("  Not logged in. Use /login to authenticate.");
             return Ok(());
         }
     };
@@ -230,7 +244,7 @@ pub(super) async fn handle_chat_input(
                 slash_session::restore_session_into_state(&session_id, ctx.profile, ctx.api, state)
                     .await
             {
-                eprintln!("  {} {}", theme::icon_err(), e.red());
+                ui.show_error(&format!("  {} {e}", theme::icon_err()));
                 return Ok(());
             }
         } else {
@@ -238,14 +252,14 @@ pub(super) async fn handle_chat_input(
         }
     }
 
-    eprintln!();
+    ui.blank_line();
 
     // Consume one-shot resume guidance before building the effective line.
     let resume_guidance = state.resume_guidance.take();
     // P3.3 — pending plan-resume digest. Kept until the user sends an
     // explicit resume-like line, then consumed once.
     let plan_resume_digest = consume_plan_resume_if_matches(state, &line);
-    let mut effective_line = build_effective_line(&line, state);
+    let mut effective_line = build_effective_line(&line, state, ui);
     effective_line = apply_resume_context(effective_line, resume_guidance, plan_resume_digest);
     let turn_start = Instant::now();
 
@@ -294,10 +308,7 @@ pub(super) async fn handle_chat_input(
                     // Unregister stale mailbox to avoid agent_id collision on re-registration
                     state.unregister_root_mailbox().await;
                     state.observability_session = None;
-                    eprintln!(
-                        "{}",
-                        "  Session not found. Creating a new session…".yellow()
-                    );
+                    ui.show_warning("  Session not found. Creating a new session…");
 
                     match run_chat_turn(state, &ctx, token, &effective_line, None).await {
                         TurnAttempt::Interrupted => {
@@ -336,6 +347,7 @@ pub(super) async fn handle_chat_input(
                                     &line,
                                     &retry_failure,
                                     turn_start,
+                                    ui,
                                 );
                                 return Ok(());
                             }
@@ -345,11 +357,10 @@ pub(super) async fn handle_chat_input(
 
                 // ── 401 auth error: attempt silent token refresh + retry ──
                 if is_auth_error(&failure.error) {
-                    use crossterm::style::Stylize;
-                    eprintln!("{}", "  Token expired, attempting refresh…".yellow());
+                    ui.show_warning("  Token expired, attempting refresh…");
                     if repl_runtime::attempt_token_refresh(ctx.api, ctx.profile).await {
                         if let Some(new_token) = repl_runtime::current_access_token(ctx.profile) {
-                            eprintln!("  {} Token refreshed, retrying…", crate::theme::icon_ok());
+                            ui.show_info(&format!("  {} Token refreshed, retrying…", crate::theme::icon_ok()));
                             match run_chat_turn(
                                 state,
                                 &ctx,
@@ -383,6 +394,7 @@ pub(super) async fn handle_chat_input(
                                             &line,
                                             &retry_failure,
                                             turn_start,
+                                            ui,
                                         );
                                         return Ok(());
                                     }
@@ -393,7 +405,7 @@ pub(super) async fn handle_chat_input(
                     // Refresh failed — fall through to report original failure.
                 }
 
-                report_turn_failure(state, ctx.profile, &line, &failure, turn_start);
+                report_turn_failure(state, ctx.profile, &line, &failure, turn_start, ui);
             }
         },
     }
@@ -421,7 +433,7 @@ fn apply_resume_context(
     effective_line
 }
 
-pub(super) fn build_effective_line(line: &str, state: &ReplState) -> String {
+pub(super) fn build_effective_line(line: &str, state: &ReplState, ui: &mut dyn crate::ui_adapter::ReplUiAdapter) -> String {
     let mut effective_line = if let Some(ref dev) = state.skill_dev {
         let skill_md = dev.dir.join("SKILL.md");
         // Re-read SKILL.md from disk every turn so external edits are picked up.
@@ -435,17 +447,17 @@ pub(super) fn build_effective_line(line: &str, state: &ReplState) -> String {
                 )
             ),
             Ok(_) => {
-                eprintln!(
+                ui.show_warning(&format!(
                     "  ⚠ SKILL.md is empty at {}, dev context skipped",
                     skill_md.display()
-                );
+                ));
                 line.to_string()
             }
             Err(_) => {
-                eprintln!(
+                ui.show_warning(&format!(
                     "  ⚠ SKILL.md not found at {}, dev context skipped",
                     skill_md.display()
-                );
+                ));
                 line.to_string()
             }
         }
@@ -869,7 +881,7 @@ async fn run_chat_turn(
             history: &state.history,
             perm_manager: &mut state.perm_manager,
             verbose_mode: state.verbose_mode,
-            render_policy: crate::stream_render::RenderPolicy::Stream,
+            render_policy: state.tui_render_policy.unwrap_or(crate::stream_render::RenderPolicy::Stream),
             selector: ctx.selector,
             recent_tools: &state.recent_tools,
             tool_health_entries: &state.tool_health_entries,
@@ -880,7 +892,7 @@ async fn run_chat_turn(
             delegation_engine: state.delegation_engine.clone(),
             cancel_token: Some(cancel_token),
             plan_assemble_line_release: None,
-            stream_event_tx: None,
+            stream_event_tx: state.tui_stream_event_tx.clone(),
             approval_request_tx: None,
             mcp_manager: Some(state.mcp_manager.clone()),
             skill_search: &state.skill_search,
@@ -906,9 +918,19 @@ async fn run_chat_turn(
             pre_loaded_messages: None,
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
-            // Trigger cancellation to interrupt any in-flight SSE streaming.
             cancel_token_for_signal.cancel();
-            eprintln!("\n{}", "  Interrupted.".dim());
+            if state.tui_cancel_token.is_none() {
+                eprintln!("\n{}", "  Interrupted.".dim());
+            }
+            TurnAttempt::Interrupted
+        }
+        _ = async {
+            match &state.tui_cancel_token {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending().await,
+            }
+        } => {
+            cancel_token_for_signal.cancel();
             TurnAttempt::Interrupted
         }
     }
@@ -2419,15 +2441,12 @@ fn report_turn_failure(
     line: &str,
     failure: &crate::TurnFailure,
     turn_start: Instant,
+    ui: &mut dyn crate::ui_adapter::ReplUiAdapter,
 ) {
     if is_auth_error(&failure.error) {
-        eprintln!("{}", "  Session expired. Run /login to refresh.".yellow());
+        ui.show_error("  Session expired. Run /login to refresh.");
     } else {
-        eprintln!(
-            "  {} {}",
-            crate::theme::icon_err(),
-            failure.error.as_str().red()
-        );
+        ui.show_error(&format!("  {} {}", crate::theme::icon_err(), &failure.error));
     }
 
     // If the turn carried a session_id but the journal was never initialised
@@ -3628,7 +3647,7 @@ mod tests {
             ..ReplState::default()
         };
 
-        let effective = build_effective_line("继续", &state);
+        let effective = build_effective_line("继续", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(effective.contains("[Active task attachment]"));
         assert!(effective.contains("debug Chinese input drops"));
         assert!(effective.contains("[User follow-up]\n继续"));
@@ -3655,7 +3674,7 @@ mod tests {
             ..ReplState::default()
         };
 
-        let effective = build_effective_line("修复?", &state);
+        let effective = build_effective_line("修复?", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(effective.contains("[Active task attachment]"));
         assert!(effective.contains("review commit aa1f419b"));
         assert!(effective.contains("fix / patch / test / continue"));
@@ -3669,7 +3688,7 @@ mod tests {
             ..ReplState::default()
         };
 
-        let effective = build_effective_line("修一下输入法问题", &state);
+        let effective = build_effective_line("修一下输入法问题", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(!effective.contains("[Active task attachment]"));
         assert_eq!(effective, "修一下输入法问题");
     }
@@ -3685,7 +3704,7 @@ mod tests {
             ..ReplState::default()
         };
 
-        let effective = build_effective_line("ok", &state);
+        let effective = build_effective_line("ok", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(
             effective.contains("[Active task attachment]"),
             "anchor injected"
@@ -3705,7 +3724,7 @@ mod tests {
             session_goal: None,
             ..ReplState::default()
         };
-        let effective_no_goal = build_effective_line("sure", &state_no_goal);
+        let effective_no_goal = build_effective_line("sure", &state_no_goal, &mut crate::ui_adapter::LineUiAdapter);
         assert!(effective_no_goal.contains("[Active task attachment]"));
         assert!(!effective_no_goal.contains("Session goal:"));
     }
@@ -3791,7 +3810,7 @@ mod tests {
             ..ReplState::default()
         };
 
-        let effective = build_effective_line("improve this skill", &state);
+        let effective = build_effective_line("improve this skill", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(effective.contains("[SKILL DEV: test-skill]"));
         assert!(effective.contains("Do stuff."));
         assert!(effective.contains("improve this skill"));
@@ -3812,7 +3831,7 @@ mod tests {
             ..ReplState::default()
         };
 
-        let turn1 = build_effective_line("check", &state);
+        let turn1 = build_effective_line("check", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(turn1.contains("V1"));
 
         // Simulate external edit between turns
@@ -3822,7 +3841,7 @@ mod tests {
         )
         .unwrap();
 
-        let turn2 = build_effective_line("check again", &state);
+        let turn2 = build_effective_line("check again", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(!turn2.contains("V1"), "should not contain old content");
         assert!(turn2.contains("V2 rewritten"), "should contain new content");
     }
@@ -3837,7 +3856,7 @@ mod tests {
             ..ReplState::default()
         };
 
-        let effective = build_effective_line("hello", &state);
+        let effective = build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert_eq!(effective, "hello");
     }
 
@@ -3856,7 +3875,7 @@ mod tests {
             ..ReplState::default()
         };
 
-        let effective = build_effective_line("hello", &state);
+        let effective = build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
         // Empty SKILL.md should not inject a useless prefix
         assert_eq!(effective, "hello");
     }
@@ -3880,7 +3899,7 @@ mod tests {
             ..ReplState::default()
         };
 
-        let effective = build_effective_line("x", &state);
+        let effective = build_effective_line("x", &state, &mut crate::ui_adapter::LineUiAdapter);
         // Must contain the actual path, not a hardcoded .astra/skills/ path
         let expected_path = skill_dir.join("SKILL.md").display().to_string();
         assert!(
@@ -3911,7 +3930,7 @@ mod tests {
         };
 
         // Short continuation prompt triggers all three layers
-        let effective = build_effective_line("continue", &state);
+        let effective = build_effective_line("continue", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(effective.contains("[SKILL DEV: combo]"), "skill dev prefix");
         assert!(effective.contains("Concise"), "system skill");
         assert!(effective.contains("[Active task attachment]"), "anchor");
@@ -4078,7 +4097,7 @@ mod tests {
             ..ReplState::default()
         };
 
-        let effective = build_effective_line("继续", &state);
+        let effective = build_effective_line("继续", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(
             effective.contains("[Active task attachment]"),
             "anchor injection must work after compaction"
@@ -4093,7 +4112,7 @@ mod tests {
         );
 
         // Phase 5: Normal prompt should NOT inject anchor
-        let normal = build_effective_line("explain Pin in detail", &state);
+        let normal = build_effective_line("explain Pin in detail", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(
             !normal.contains("[Active task attachment]"),
             "normal prompt must not inject anchor"
@@ -4353,6 +4372,7 @@ mod tests {
             "show session metrics",
             &failure,
             Instant::now(),
+            &mut crate::ui_adapter::LineUiAdapter,
         );
 
         let event = state.last_turn_event.as_ref().expect("turn_error event");
@@ -4736,7 +4756,7 @@ mod tests {
             "Latest user task: now explain borrowing\nLatest assistant summary:\nBorrowing lets you reference data"
                 .to_string(),
         );
-        let effective = build_effective_line("continue", &state);
+        let effective = build_effective_line("continue", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(effective.contains("[Active task attachment]"));
         assert!(effective.contains("explain borrowing"));
 
