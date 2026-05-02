@@ -9,6 +9,7 @@ mod chat_cell;
 mod chat_viewport;
 mod color;
 mod custom_terminal;
+mod diff_render;
 mod event;
 mod frame_rate_limiter;
 mod frame_requester;

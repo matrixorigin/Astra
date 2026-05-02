@@ -111,33 +111,38 @@ impl ChatCell for ToolChatCell {
             }
         }
 
-        // Output with └ prefix (first line) then 4-space indent
-        // Diff lines (+/-) get green/red coloring
+        // Output summary with └ prefix, using diff renderer for +/- lines
         if let Some(ref summary) = self.output_summary {
-            let max_w = w.saturating_sub(8);
-            let out_lines: Vec<&str> = summary.lines().take(8).collect();
-            for (i, ol) in out_lines.iter().enumerate() {
-                let prefix = if i == 0 {
-                    Span::styled("  └ ", dim)
-                } else {
-                    Span::raw("    ")
-                };
-                let content = truncate_by_width(ol, max_w);
-                let style = if ol.starts_with('+') {
-                    Style::default().fg(Color::Green)
-                } else if ol.starts_with('-') {
-                    Style::default().fg(Color::Red)
-                } else {
-                    Style::default()
-                };
-                lines.push(Line::from(vec![prefix, Span::styled(content, style)]));
-            }
-            if summary.lines().count() > 8 {
-                let remaining = summary.lines().count() - 8;
-                lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(format!("… +{remaining} lines"), dim),
-                ]));
+            let has_diff = summary.lines().any(|l| l.starts_with('+') || l.starts_with('-'));
+            if has_diff {
+                let diff_lines = crate::tui::diff_render::render_diff_lines(summary, 8);
+                for (i, dl) in diff_lines.into_iter().enumerate() {
+                    if i == 0 {
+                        let mut spans = vec![Span::styled("  └ ", dim)];
+                        spans.extend(dl.spans);
+                        lines.push(Line::from(spans));
+                    } else {
+                        lines.push(dl);
+                    }
+                }
+            } else {
+                let max_w = w.saturating_sub(4);
+                let out_lines: Vec<&str> = summary.lines().take(5).collect();
+                for (i, ol) in out_lines.iter().enumerate() {
+                    let prefix = if i == 0 {
+                        Span::styled("  └ ", dim)
+                    } else {
+                        Span::raw("    ")
+                    };
+                    lines.push(Line::from(vec![prefix, Span::raw(truncate_by_width(ol, max_w))]));
+                }
+                if summary.lines().count() > 5 {
+                    let remaining = summary.lines().count() - 5;
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(format!("… +{remaining} lines"), dim),
+                    ]));
+                }
             }
         }
 
@@ -146,26 +151,12 @@ impl ChatCell for ToolChatCell {
 
     fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = self.display_lines(width);
-        // Include full output in transcript (truncated in display)
+        // Full output in transcript using diff renderer
         if let Some(ref output) = self.output {
             if !output.trim().is_empty() {
-                let dim = Style::default().dim();
                 lines.push(Line::default());
-                for ol in output.lines().take(50) {
-                    let style = if ol.starts_with('+') {
-                        Style::default().fg(Color::Green)
-                    } else if ol.starts_with('-') {
-                        Style::default().fg(Color::Red)
-                    } else {
-                        dim
-                    };
-                    lines.push(Line::from(Span::styled(format!("    {ol}"), style)));
-                }
-                if output.lines().count() > 50 {
-                    lines.push(Line::from(Span::styled(
-                        format!("    … +{} more lines", output.lines().count() - 50), dim,
-                    )));
-                }
+                let diff_lines = crate::tui::diff_render::render_diff_lines(output, 100);
+                lines.extend(diff_lines);
             }
         }
         lines
