@@ -802,9 +802,11 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         scope: Scope::CrossSession,
         schema_tokens: 35,
     },
-    // memory_retrieve is pinned — intrinsic memory capability. The model
-    // must always be able to recall memories. Without this, "我有哪些记忆?"
-    // falls back to codebase exploration (session 2adc611f regression).
+    // memory_retrieve is dynamic but richly triggered. Per-turn
+    // memory_boost_search already provides automatic recall (capability
+    // layer). This tool is only needed when the user explicitly asks
+    // to browse or inspect memories. Rich triggers ensure selector
+    // scores it high for "我有哪些记忆?" etc.
     ToolMeta {
         name: "memory_retrieve",
         description: "Retrieve persistent memories via semantic search",
@@ -833,8 +835,15 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "搜一下记忆",
             "我的偏好",
             "我记住了",
+            "有什么记忆",
+            "看看记忆",
+            "查记忆",
+            "what do you remember",
+            "what memories",
+            "show memories",
+            "list memories",
         ],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::Memory],
         scope: Scope::CrossSession,
         schema_tokens: 30,
@@ -1431,11 +1440,21 @@ mod tests {
     }
 
     #[test]
-    fn catalog_memory_tools_are_pinned() {
-        for name in &["memory_store", "memory_retrieve"] {
-            let tool = TOOL_CATALOG.iter().find(|t| t.name == *name).unwrap();
-            assert!(tool.pinned, "{name} must be pinned — intrinsic memory capability");
-        }
+    fn catalog_memory_store_is_pinned() {
+        let tool = TOOL_CATALOG
+            .iter()
+            .find(|t| t.name == "memory_store")
+            .unwrap();
+        assert!(tool.pinned, "memory_store must be pinned — intrinsic store capability");
+    }
+
+    #[test]
+    fn catalog_memory_retrieve_is_dynamic() {
+        let tool = TOOL_CATALOG
+            .iter()
+            .find(|t| t.name == "memory_retrieve")
+            .unwrap();
+        assert!(!tool.pinned, "memory_retrieve should be dynamic — per-turn boost_search is the capability layer");
     }
 
     #[test]
@@ -1444,7 +1463,7 @@ mod tests {
         assert!(is_pinned_tool("read_file"));
         assert!(is_pinned_tool("str_replace"));
         assert!(is_pinned_tool("memory_store"));
-        assert!(is_pinned_tool("memory_retrieve"));
+        assert!(!is_pinned_tool("memory_retrieve"));
         assert!(!is_pinned_tool("nonexistent_tool"));
     }
 }

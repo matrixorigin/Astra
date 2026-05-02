@@ -73,13 +73,13 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_6_pinned() {
-        assert_eq!(ToolRegistry::pinned_count(), 6);
+    fn catalog_has_5_pinned() {
+        assert_eq!(ToolRegistry::pinned_count(), 5);
     }
 
     #[test]
-    fn catalog_has_37_dynamic() {
-        assert_eq!(ToolRegistry::dynamic_count(), 37);
+    fn catalog_has_38_dynamic() {
+        assert_eq!(ToolRegistry::dynamic_count(), 38);
     }
 
     #[test]
@@ -93,8 +93,8 @@ mod tests {
         assert!(pinned.contains(&"read_file"));
         assert!(pinned.contains(&"str_replace"));
         assert!(pinned.contains(&"list_dir"));
-        assert!(pinned.contains(&"memory_store"), "memory_store must be pinned — intrinsic memory capability");
-        assert!(pinned.contains(&"memory_retrieve"), "memory_retrieve must be pinned — intrinsic memory capability");
+        assert!(pinned.contains(&"memory_store"), "memory_store must be pinned — intrinsic store capability");
+        assert!(!pinned.contains(&"memory_retrieve"), "memory_retrieve is dynamic — boost_search is the capability layer");
         assert!(!pinned.contains(&"write_file"));
         assert!(!pinned.contains(&"grep"));
         assert!(!pinned.contains(&"glob"));
@@ -184,22 +184,20 @@ mod tests {
     }
 
     #[test]
-    fn memory_tools_are_pinned_not_dynamic() {
-        // memory_store and memory_retrieve are pinned — they should NOT
-        // appear in the dynamic pre-filter results (they're always included).
-        let state = ConversationState::from_message("之前我记住了什么偏好?", 1);
-        let ranked = pre_filter_dynamic(&state, "之前我记住了什么偏好?");
-        let dynamic_names: Vec<&str> = ranked
+    fn prefilter_ranks_memory_retrieve_for_recall() {
+        // memory_retrieve is dynamic with rich triggers. It must score
+        // high enough to be selected for explicit memory queries.
+        let state = ConversationState::from_message("我有哪些记忆?", 1);
+        let ranked = pre_filter_dynamic(&state, "我有哪些记忆?");
+        let top_names: Vec<&str> = ranked
             .iter()
+            .take(8)
             .map(|&(idx, _)| TOOL_CATALOG[idx].name)
             .collect();
         assert!(
-            !dynamic_names.contains(&"memory_store"),
-            "pinned memory_store should not appear in dynamic results"
-        );
-        assert!(
-            !dynamic_names.contains(&"memory_retrieve"),
-            "pinned memory_retrieve should not appear in dynamic results"
+            top_names.contains(&"memory_retrieve"),
+            "memory_retrieve must rank in top-8 for '我有哪些记忆?', got: {:?}",
+            top_names
         );
     }
 
