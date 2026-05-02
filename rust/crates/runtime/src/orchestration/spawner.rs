@@ -274,6 +274,8 @@ pub struct DynamicAgentSpawner {
     background_tasks: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
     /// Agent IDs spawned in background mode, for result collection after drain.
     background_agent_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Completion notifiers: get_agent_result awaits these instead of polling.
+    completion_notifiers: Arc<RwLock<HashMap<String, Arc<tokio::sync::Notify>>>>,
     /// Optional fork-prefix store for cache inheritance across
     /// parent/child spawns. When `None` (default), spawn behavior is
     /// identical to pre-fork-prefix builds — existing callers are
@@ -304,6 +306,7 @@ impl DynamicAgentSpawner {
             completed_agents: Arc::new(RwLock::new(Vec::new())),
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             background_agent_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            completion_notifiers: Arc::new(RwLock::new(HashMap::new())),
             prefix_store: None,
             prefix_resolve_outcomes: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -328,6 +331,7 @@ impl DynamicAgentSpawner {
             completed_agents: Arc::new(RwLock::new(Vec::new())),
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             background_agent_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            completion_notifiers: Arc::new(RwLock::new(HashMap::new())),
             prefix_store: None,
             prefix_resolve_outcomes: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -350,6 +354,7 @@ impl DynamicAgentSpawner {
             completed_agents: Arc::new(RwLock::new(Vec::new())),
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             background_agent_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            completion_notifiers: Arc::new(RwLock::new(HashMap::new())),
             prefix_store: None,
             prefix_resolve_outcomes: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -674,6 +679,11 @@ impl DynamicAgentSpawner {
             if let Ok(mut ids) = self.background_agent_ids.lock() {
                 ids.push(agent_id.clone());
             }
+            // Register completion notifier for get_agent_result.
+            self.completion_notifiers
+                .write()
+                .await
+                .insert(agent_id.clone(), Arc::new(tokio::sync::Notify::new()));
 
             Ok(SpawnAgentOutput::Launched {
                 agent_id,
@@ -820,6 +830,7 @@ impl DynamicAgentSpawner {
                 self.update_status(agent_id, status).await;
                 self.archive_agent(agent_id).await;
                 self.unregister_mailbox(agent_id).await;
+                self.notify_completion(agent_id).await;
             }
             Err(e) => {
                 self.persist_agent_terminated(agent_id, "failed").await;
@@ -827,6 +838,7 @@ impl DynamicAgentSpawner {
                     .await;
                 self.archive_agent(agent_id).await;
                 self.unregister_mailbox(agent_id).await;
+                self.notify_completion(agent_id).await;
             }
         }
     }
@@ -896,6 +908,48 @@ impl DynamicAgentSpawner {
         }
     }
 
+    async fn notify_completion(&self, agent_id: &str) {
+        if let Some(notifier) = self.completion_notifiers.read().await.get(agent_id) {
+            notifier.notify_waiters();
+        }
+    }
+
+    /// Wait for a background agent to complete. Returns immediately if
+    /// already completed. Uses `tokio::sync::Notify` — zero polling.
+    pub async fn wait_for_agent(
+        &self,
+        agent_id: &str,
+        timeout: std::time::Duration,
+    ) -> Option<AgentStatus> {
+        // Already completed?
+        for s in self.completed_agents.read().await.iter() {
+            if s.agent_id == agent_id {
+                return Some(s.status.clone());
+            }
+        }
+
+        // Get or create notifier.
+        let notifier = {
+            let map = self.completion_notifiers.read().await;
+            map.get(agent_id).cloned()
+        };
+        let notifier = notifier?;
+
+        // Wait for notification with timeout.
+        match tokio::time::timeout(timeout, notifier.notified()).await {
+            Ok(()) => {
+                // Check completed_agents now.
+                for s in self.completed_agents.read().await.iter() {
+                    if s.agent_id == agent_id {
+                        return Some(s.status.clone());
+                    }
+                }
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
     /// Clone the spawner for use in spawned tasks.
     fn clone_for_task(&self) -> Self {
         Self {
@@ -910,6 +964,7 @@ impl DynamicAgentSpawner {
             // Share the same JoinSet so shutdown can drain tasks spawned by clones.
             background_tasks: Arc::clone(&self.background_tasks),
             background_agent_ids: Arc::clone(&self.background_agent_ids),
+            completion_notifiers: Arc::clone(&self.completion_notifiers),
             // Share prefix-store + resolve-outcomes map so clones
             // see/write the same view. The store is an Arc<dyn ...>
             // itself already, so cloning the Option just bumps refcount.
@@ -1886,6 +1941,41 @@ mod tests {
             !bg_results.is_empty(),
             "shutdown_and_wait must return completed background agent results"
         );
+    }
+
+    /// wait_for_agent returns immediately when child is already completed.
+    #[tokio::test]
+    async fn wait_for_agent_returns_immediately_when_completed() {
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
+
+        let result = spawner
+            .spawn(make_bg_input(), &make_bg_context())
+            .await
+            .unwrap();
+        let agent_id = match result {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected Launched, got {other:?}"),
+        };
+
+        // Wait for background task to complete via the notifier.
+        let status = spawner
+            .wait_for_agent(&agent_id, std::time::Duration::from_secs(5))
+            .await;
+        assert!(
+            matches!(status, Some(AgentStatus::Completed { .. })),
+            "wait_for_agent must return Completed, got {status:?}"
+        );
+    }
+
+    /// wait_for_agent times out when agent doesn't exist.
+    #[tokio::test]
+    async fn wait_for_agent_times_out_for_unknown_agent() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let status = spawner
+            .wait_for_agent("nonexistent", std::time::Duration::from_millis(100))
+            .await;
+        assert!(status.is_none(), "unknown agent should return None");
     }
 
     /// Regression: background task completes BEFORE shutdown_and_wait is called.
