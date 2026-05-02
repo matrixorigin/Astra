@@ -6,18 +6,15 @@ description: |
   **Pass means**: The child resolved the parent's prefix, produced the expected reply, and the parent surfaced it in the final answer.
   **Fail means**: Prefix capture missed turn_completed, InMemoryPrefixStore lookup failed, or spawn_agent tool dispatch is broken.
 prompt: |
-  You have `spawn_agent` and `get_agent_result` tools.
-
-  Step 1: Call spawn_agent with:
+  You have a `spawn_agent` tool. Call it with:
     agent_id: "child-delegate-G2"
     task: "Reply with exactly: delegate-G2-ok"
     inherit_prefix: {}
-    background: true
 
-  Step 2: Call get_agent_result with the agent_id to get the reply.
+  The child runs synchronously — its reply will be in the tool result.
 
   Surface the child's exact reply in your final answer.
-  Do not use any other tools besides spawn_agent and get_agent_result.
+  Do not use any other tools.
 debug_log: true
 timeout_seconds: 300
 criteria:
@@ -32,9 +29,7 @@ criteria:
     question: |
       Did the parent invoke spawn_agent and did the child reply with
       "delegate-G2-ok" (or close)? The final answer should surface
-      the child's reply. A [fork-cache] stderr event may or may not
-      appear depending on whether the prefix store had a captured
-      prefix; its absence does not indicate failure.
+      the child's reply.
       Score 1.0 if the child replied and the text surfaces it.
       Score 0.5 if spawn succeeded but the reply is garbled or
       the child's output is only partially surfaced.

@@ -6,21 +6,15 @@ description: |
   **Pass means**: The child agent successfully inherited the parent's prefix, produced a reply, and the parent surfaced it.
   **Fail means**: Prefix capture failed (parent side), prefix resolution failed (child side), or spawn_agent tool dispatch is broken.
 prompt: |
-  You have a `spawn_agent` tool.
-
-  You also have a `get_agent_result` tool.
-
-  Step 1 — call spawn_agent ONCE with:
+  You have a `spawn_agent` tool. Call it ONCE with:
     agent_id: "child-G1"
     task: "Reply with exactly: inherited-ok"
     inherit_prefix: {}
-    background: true
 
-  Step 2 — call get_agent_result with the agent_id from step 1
-  to retrieve the child's reply.
+  The child runs synchronously — its reply will be in the tool result.
 
-  Step 3 — include the child's exact reply in your final answer,
-  prefixed with `CHILD:`.
+  Include the child's exact reply in your final answer, prefixed
+  with `CHILD:`.
 
   Do not re-spawn. Do not use other tools.
 debug_log: true
@@ -35,11 +29,6 @@ criteria:
     max: 6
   - type: text_contains
     needle: "CHILD:"
-  # TODO: restore when SSE loop wires StderrForkCacheSink:
-  #  - type: stderr_matches
-  #    pattern: '\[fork-cache\]'
-  #  - type: fork_cache_outcome
-  #    expect: [hit]
   - type: judger
     question: |
       Did the child agent's reply appear verbatim in the final answer

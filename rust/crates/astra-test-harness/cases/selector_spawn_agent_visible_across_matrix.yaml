@@ -6,14 +6,11 @@ description: |
   **Pass means**: All three model families discovered spawn_agent and used it, proving the selector fix is universal.
   **Fail means**: Tool selector regression — spawn_agent is hidden from one or more model families (TOOL_CATALOG or selector bug).
 prompt: |
-  You have `spawn_agent` and `get_agent_result` tools.
-
-  Step 1: Call spawn_agent with:
+  You have a `spawn_agent` tool. Call it with:
     agent_id: "child-G3"
     task: "Reply with exactly: G3-matrix-ok"
-    background: true
 
-  Step 2: Call get_agent_result with the agent_id to get the reply.
+  The child runs synchronously — its reply will be in the tool result.
 
   Surface the child's exact reply in your final answer.
 models:
