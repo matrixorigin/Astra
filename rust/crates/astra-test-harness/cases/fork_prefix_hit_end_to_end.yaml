@@ -10,7 +10,6 @@ prompt: |
     agent_id: "child-G1"
     task: "Say the exact text: inherited-ok. Do not use any tools, just reply with that text."
     inherit_prefix: {}
-    background: true
 
   Include the child's exact reply in your final answer, prefixed
   with `CHILD:`.

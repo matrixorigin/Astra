@@ -9,7 +9,6 @@ prompt: |
   You have a `spawn_agent` tool. Call it with:
     agent_id: "child-hello"
     task: "Say the exact text: hello from child. Do not use any tools, just reply with that text."
-    background: true
 
   Report "CHILD:" followed by the child's reply in your final answer.
 timeout_seconds: 180

@@ -10,7 +10,6 @@ prompt: |
     agent_id: "child-delegate-G2"
     task: "Say the exact text: delegate-G2-ok. Do not use any tools, just reply with that text."
     inherit_prefix: {}
-    background: true
 
   Surface the child's exact reply in your final answer.
   Do not use any other tools.

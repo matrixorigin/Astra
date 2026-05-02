@@ -9,7 +9,6 @@ prompt: |
   You have a `spawn_agent` tool. Call it with:
     agent_id: "child-G3"
     task: "Say the exact text: G3-matrix-ok. Do not use any tools, just reply with that text."
-    background: true
 
   Surface the child's exact reply in your final answer.
 models:
