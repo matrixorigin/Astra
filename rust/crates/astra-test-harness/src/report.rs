@@ -589,7 +589,7 @@ fn is_safe_session_id(id: &str) -> bool {
 
 /// Strip provider-route prefixes for display grouping.
 /// `us.anthropic.claude-sonnet-4-6` → `claude-sonnet-4-6`
-fn normalize_model_display(model: &str) -> &str {
+pub fn normalize_model_display(model: &str) -> &str {
     for prefix in [
         "us.anthropic.",
         "eu.anthropic.",

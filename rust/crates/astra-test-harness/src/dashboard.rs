@@ -103,6 +103,7 @@ struct AppState {
     config: Arc<DashboardConfig>,
     running: Arc<Mutex<bool>>,
     cancel_token: Arc<Mutex<Option<CancellationToken>>>,
+    last_report: Arc<Mutex<Option<SuiteReport>>>,
 }
 
 pub struct DashboardServer {
@@ -129,6 +130,7 @@ impl DashboardServer {
             config: self.config,
             running: Arc::new(Mutex::new(false)),
             cancel_token: Arc::new(Mutex::new(None)),
+            last_report: Arc::new(Mutex::new(None)),
         };
         let app = Router::new()
             .route("/", get(index_handler))
@@ -141,6 +143,7 @@ impl DashboardServer {
             .route("/api/login", post(login_handler))
             .route("/api/chat", post(chat_handler))
             .route("/api/orchestrate", post(orchestrate_handler))
+            .route("/api/report", get(report_handler))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
@@ -291,14 +294,20 @@ async fn run_handler(
     let tx = state.tx.clone();
     let running_flag = state.running.clone();
     let cancel_token_slot = state.cancel_token.clone();
+    let last_report = state.last_report.clone();
 
     tokio::spawn(async move {
         let result = execute_run(config, tx.clone(), req, token).await;
-        if let Err(e) = result {
-            eprintln!("[astra-test] dashboard run error: {e}");
-            let _ = tx.send(DashboardEvent::SuiteCompleted {
-                report: Arc::new(SuiteReport::default()),
-            });
+        match result {
+            Ok(report) => {
+                *last_report.lock().await = Some(report);
+            }
+            Err(e) => {
+                eprintln!("[astra-test] dashboard run error: {e}");
+                let _ = tx.send(DashboardEvent::SuiteCompleted {
+                    report: Arc::new(SuiteReport::default()),
+                });
+            }
         }
         *running_flag.lock().await = false;
         *cancel_token_slot.lock().await = None;
@@ -314,6 +323,15 @@ async fn cancel_handler(State(state): State<AppState>) -> Json<serde_json::Value
         Json(serde_json::json!({"status": "cancelled"}))
     } else {
         Json(serde_json::json!({"error": "No run in progress"}))
+    }
+}
+
+/// Return the latest run report as JSON for the frontend.
+async fn report_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let report = state.last_report.lock().await;
+    match &*report {
+        Some(r) => Json(serde_json::json!({"report": r})),
+        None => Json(serde_json::json!({"report": null})),
     }
 }
 
@@ -402,12 +420,51 @@ async fn chat_handler(
         })
         .unwrap_or_default();
 
+    // Include the latest run results so astra can answer questions about them.
+    let report_ctx = {
+        let report = state.last_report.lock().await;
+        if let Some(ref r) = *report {
+            let runs: Vec<String> = r
+                .runs
+                .iter()
+                .map(|run| {
+                    format!(
+                        "  {} × {}: {} | exit={} tok={} dur={}ms turns={} tools={:?}{}",
+                        run.case_name,
+                        crate::report::normalize_model_display(&run.model),
+                        if run.passed { "PASS" } else { "FAIL" },
+                        run.outcome.exit_code,
+                        run.outcome.prompt_tokens + run.outcome.completion_tokens,
+                        run.outcome.duration_ms,
+                        run.outcome.turn_rounds,
+                        run.outcome.tools_used,
+                        run.failure_class
+                            .as_ref()
+                            .map(|c| format!(" class={c}"))
+                            .unwrap_or_default()
+                    )
+                })
+                .collect();
+            format!(
+                "\n\nLatest run results ({} total, {} passed, {} failed, wall={}ms):\n{}",
+                r.total(),
+                r.passed(),
+                r.failed(),
+                r.wall_time_ms,
+                runs.join("\n")
+            )
+        } else {
+            String::new()
+        }
+    };
+
     let system_ctx = format!(
         "You are an expert test engineer analyzing astra-test-harness results.\n\
          Available test cases:\n{cases_summary}\n\n\
-         Suite directory: {}\n\
+         Suite directory: {}{report_ctx}\n\n\
          When the user asks about test results, failures, or comparisons, \
-         give specific, actionable analysis citing case names and metrics.",
+         give specific, actionable analysis citing case names and metrics. \
+         Use markdown formatting for readability.",
         state.config.suite_dir.display()
     );
 
@@ -568,7 +625,7 @@ async fn execute_run(
     tx: broadcast::Sender<DashboardEvent>,
     req: RunRequest,
     _cancel: CancellationToken,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<SuiteReport> {
     use crate::case::Case;
     use crate::digest::AstraCliDigestCollector;
     use crate::exec::AstraCliExecutor;
@@ -638,6 +695,6 @@ async fn execute_run(
         dashboard_tx: Some(tx),
     };
 
-    runner.run_all(&cases).await;
-    Ok(())
+    let report = runner.run_all(&cases).await;
+    Ok(report)
 }
