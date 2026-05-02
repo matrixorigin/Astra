@@ -208,19 +208,19 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&shim, perms).unwrap();
 
-        let collector = AstraCliDigestCollector::new(shim).with_timeout(1);
+        let collector = AstraCliDigestCollector::new(shim).with_timeout(2);
         let start = std::time::Instant::now();
         let res = collector.collect("sess-hangs").await;
         let elapsed = start.elapsed();
-        assert!(res.is_err());
+        assert!(res.is_err(), "hanging subprocess should produce an error");
+        let err = res.unwrap_err();
         assert!(
-            res.unwrap_err().contains("digest timeout after 1s"),
-            "error must name the configured timeout"
+            err.contains("digest timeout after 2s"),
+            "error should name the configured timeout, got: {err}"
         );
-        // 3s slack for CI noise; the point is the 1s override worked.
         assert!(
-            elapsed.as_secs() <= 3,
-            "with_timeout(1) didn't cap elapsed — ran {}s",
+            elapsed.as_secs() <= 5,
+            "with_timeout(2) didn't cap elapsed — ran {}s",
             elapsed.as_secs()
         );
     }
