@@ -25,3 +25,5 @@ criteria:
     code: 0
   - type: tool_called
     name: read_file
+  - type: text_contains
+    needle: "hello world 42"

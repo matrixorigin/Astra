@@ -394,7 +394,7 @@ fn evaluate_one(
                     passed,
                     detail,
                     full_detail: None,
-                    score: None,
+                    score: if passed { Some(1.0) } else { Some(0.0) },
                 };
             };
             let n = sess.count_events(event_type);
@@ -405,7 +405,7 @@ fn evaluate_one(
                 passed: pass,
                 detail: format!("session events type={event_type} count={n} (expected >= {min})"),
                 full_detail: None,
-                score: None,
+                score: if pass { Some(1.0) } else { Some(0.0) },
             }
         }
         Criterion::JournalToolCalled { name, optional } => {
@@ -426,7 +426,7 @@ fn evaluate_one(
                     passed,
                     detail,
                     full_detail: None,
-                    score: None,
+                    score: if passed { Some(1.0) } else { Some(0.0) },
                 };
             };
             let tools = sess.tools_invoked();

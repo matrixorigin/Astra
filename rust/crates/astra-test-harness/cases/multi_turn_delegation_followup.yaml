@@ -25,3 +25,9 @@ criteria:
   - type: turn_rounds_between
     min: 1
     max: 8
+  - type: judger
+    question: |
+      Did the agent correctly delegate 17*23 to a sub-agent and report
+      back the result 391? The agent must have used spawn_agent (not
+      calculated directly) and the final answer must be 391.
+    threshold: 0.7

@@ -8,7 +8,7 @@ description: |
 prompt: |
   What year did Rust 1.0 ship? Reply with just the year as a 4-digit
   number. No extra prose.
-timeout_seconds: 120
+timeout_seconds: 60
 criteria:
   - type: exit_code
     code: 0

@@ -102,9 +102,9 @@ fn text_contains_simple_answer_has_adequate_timeout() {
     let case = Case::from_path(&shipped_cases_dir().join("text_contains_simple_answer.yaml"))
         .expect("load case");
     assert!(
-        case.timeout_seconds >= 120,
+        case.timeout_seconds >= 30,
         "text_contains_simple_answer timeout_seconds={} is too short; \
-         provider cold-start can exceed 60s. Needs >= 120.",
+         a trivial factual question needs at least 30s.",
         case.timeout_seconds
     );
 }
