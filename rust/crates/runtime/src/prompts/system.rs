@@ -247,7 +247,11 @@ fn memory_prompt_mode(tool_names: &[&str], profile_desc: &str) -> MemoryPromptMo
     let has_memory_ops = tool_names.iter().any(|name| {
         matches!(
             *name,
-            "memory_retrieve" | "memory_correct" | "memory_purge" | "memory_profile"
+            "memory_retrieve"
+                | "memory_search"
+                | "memory_correct"
+                | "memory_purge"
+                | "memory_profile"
         )
     });
     let has_user_memories = profile_desc.contains("## User Memories");
@@ -1603,6 +1607,15 @@ mod tests {
         assert!(p.contains("Memory Rules"));
         assert!(p.contains("<types>"));
         assert!(p.contains("<name>user</name>"));
+    }
+
+    #[test]
+    fn prompt_memory_search_alias_triggers_full_mode() {
+        let p = build_main_system_prompt(&["memory_store", "memory_search"], "", 0.5, None);
+        assert!(
+            p.contains("<types>"),
+            "memory_search (server-side alias) must trigger Full mode with type taxonomy"
+        );
     }
 
     #[test]
