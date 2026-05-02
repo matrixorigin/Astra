@@ -104,6 +104,8 @@ mod journal_digest;
 mod journal_tree;
 #[path = "cli/mock_llm.rs"]
 mod mock_llm;
+#[path = "cli/memory_extraction.rs"]
+mod memory_extraction;
 #[path = "cli/permission_manager.rs"]
 mod permission_manager;
 #[path = "cli/picker_echo.rs"]
@@ -857,7 +859,7 @@ async fn run_chat_repl(
         }
     };
 
-    finalize_repl_exit(&state, profile, repl_exit).await;
+    finalize_repl_exit(&mut state, profile, repl_exit).await;
 
     // Save cross-session learning state (including tool health)
     {
@@ -1512,7 +1514,7 @@ mod tests {
             .await
             .unwrap();
         assert!(exit);
-        finalize_repl_exit(&state, None, ReplExit::Command).await;
+        finalize_repl_exit(&mut state, None, ReplExit::Command).await;
 
         // Verify session_end was written to journal
         let events = session_journal::read_journal(&sid).unwrap();
@@ -1552,7 +1554,7 @@ mod tests {
             .await
             .unwrap();
         assert!(exit);
-        finalize_repl_exit(&state, None, ReplExit::Command).await;
+        finalize_repl_exit(&mut state, None, ReplExit::Command).await;
 
         let events = session_journal::read_journal(&sid).unwrap();
         let has_session_end = events

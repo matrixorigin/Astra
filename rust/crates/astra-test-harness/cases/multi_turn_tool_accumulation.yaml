@@ -1,11 +1,14 @@
 name: multi_turn_tool_accumulation
 description: |
-  **What**: Read a file in turn 1, then append to it in turn 2, verifying tool results carry forward across turns.
-  **Tests**: Multi-turn tool accumulation — tool outputs from earlier turns must inform decisions and actions in later turns.
-  **Why**: Real agent workflows chain tool calls across turns (read then modify); if tool results are lost, the agent operates blind in subsequent turns.
-  **Pass means**: The agent uses knowledge from the turn 1 read_file to correctly target the file for modification in turn 2.
-  **Fail means**: Tool results dropped between turns (session state bug), or the agent failed to connect the read output with the write target.
-  **Note**: setup_cmd force-creates the file fresh before each run to prevent cross-contamination in parallel mode.
+  **What**: Read a file in turn 1, append to it in turn 2, then store a project fact about the
+  file in memory in turn 3.
+  **Tests**: Multi-turn tool accumulation + memory persistence — tool outputs from earlier turns
+  inform later actions, and discovered facts can be persisted for future sessions.
+  **Why**: Real agent workflows chain tool calls across turns; if tool results are lost, the agent
+  operates blind. Additionally, facts discovered during exploration should be persistable.
+  **Pass means**: Turn 1 reads successfully, turn 2 appends, turn 3 stores the fact.
+  **Fail means**: Tool results dropped, append failed, or memory_store not called.
+  **Note**: setup_cmd force-creates the file fresh before each run.
 prompt: |
   Read the file /tmp/astra_harness_mt_test.txt and tell me what's in it.
   Include the file contents in your answer.
@@ -21,6 +24,10 @@ steps:
       - type: tools_count_between
         min: 1
         max: 8
+  - prompt: "Please remember that /tmp/astra_harness_mt_test.txt is our scratch file for integration testing. Store this in your memory."
+    criteria:
+      - type: tool_called
+        name: memory_store
 criteria:
   - type: exit_code
     code: 0
@@ -34,5 +41,6 @@ criteria:
       Do NOT try to read files yourself.
       Turn 1: did the agent read the file and show "hello world 42"?
       Turn 2: did the agent append "second line" using any tool?
-      Score 1.0 if both turns worked, 0.5 if partial, 0.0 if fabricated.
-    threshold: 0.7
+      Turn 3: did the agent store a fact about the file using memory_store?
+      Score 1.0 if all three turns worked, 0.5 if partial, 0.0 if fabricated.
+    threshold: 0.6

@@ -1633,6 +1633,7 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::LlmRound => "llm_round",
         JournalEventType::LlmRequestFull => "llm_request_full",
         JournalEventType::LlmResponseFull => "llm_response_full",
+        JournalEventType::MemoryExtraction => "memory_extraction",
     }
     .to_string()
 }

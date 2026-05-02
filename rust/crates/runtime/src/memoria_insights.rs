@@ -33,7 +33,16 @@ pub fn render_digest(contents: &[String]) -> Option<String> {
         if !seen.insert(key) {
             continue;
         }
-        bullets.push(truncate_with_ellipsis(&cleaned, MAX_CHARS_PER_BULLET));
+        // Decode business type prefix for categorized display.
+        let (cat, body) = astra_prompts::memory_types::decode(&cleaned);
+        let label = match cat {
+            Some(c) => format!("[{}] ", c.content_prefix().trim_matches(|ch| ch == '[' || ch == ']')),
+            None => String::new(),
+        };
+        bullets.push(format!(
+            "{label}{}",
+            truncate_with_ellipsis(body, MAX_CHARS_PER_BULLET)
+        ));
     }
     if bullets.is_empty() {
         return None;
@@ -141,5 +150,38 @@ mod tests {
         let hits = vec!["multi\n  line\n\t\tcontent with gaps".to_string()];
         let out = render_digest(&hits).expect("digest");
         assert!(out.contains("- multi line content with gaps"));
+    }
+
+    #[test]
+    fn categorized_rendering_with_business_prefix() {
+        let hits = vec![
+            "[feedback] always use RS256 for JWT signing".to_string(),
+            "[user] senior Rust engineer, prefers CLI tools".to_string(),
+            "plain legacy memory without prefix".to_string(),
+        ];
+        let out = render_digest(&hits).expect("digest");
+        assert!(
+            out.contains("[feedback] always use RS256"),
+            "should show category label for typed memories"
+        );
+        assert!(
+            out.contains("[user] senior Rust"),
+            "should show category label for user memories"
+        );
+        assert!(
+            out.contains("- plain legacy memory"),
+            "legacy memories should render without label"
+        );
+    }
+
+    #[test]
+    fn categorized_rendering_strips_prefix_from_body() {
+        let hits = vec!["[project] merge freeze starts May 8th for mobile release".to_string()];
+        let out = render_digest(&hits).expect("digest");
+        assert!(
+            !out.contains("[project] [project]"),
+            "should not double the prefix"
+        );
+        assert!(out.contains("[project] merge freeze"));
     }
 }

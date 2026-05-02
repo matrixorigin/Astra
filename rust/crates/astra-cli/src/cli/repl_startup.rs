@@ -238,19 +238,21 @@ pub(crate) async fn complete_repl_startup(
                 let th =
                     std::sync::Arc::new(std::sync::Mutex::new(state.tool_health_entries.clone()));
                 let lease = std::sync::Arc::new(astra_services::TaskLeaseHoldCache::default());
-                Some(std::sync::Arc::new(
-                    astra_runtime::MatrixCloudRuntime::attach(
-                        pool,
-                        profile.unwrap_or("default"),
-                        &user_id,
-                        pipeline_modules.entity_graph.clone(),
-                        pipeline_modules.pattern_library.clone(),
-                        pipeline_modules.calibrator.clone(),
-                        th,
-                        state.cloud_learning_version,
-                        lease,
-                    ),
-                ))
+                let mut runtime = astra_runtime::MatrixCloudRuntime::attach(
+                    pool,
+                    profile.unwrap_or("default"),
+                    &user_id,
+                    pipeline_modules.entity_graph.clone(),
+                    pipeline_modules.pattern_library.clone(),
+                    pipeline_modules.calibrator.clone(),
+                    th,
+                    state.cloud_learning_version,
+                    lease,
+                );
+                if let Ok(enc) = astra_services::FernetTokenEncryptor::from_env() {
+                    runtime = runtime.with_encryptor(std::sync::Arc::new(enc));
+                }
+                Some(std::sync::Arc::new(runtime))
             }
             Err(e) => {
                 // Log the error so users know cloud sync won't work for this session.

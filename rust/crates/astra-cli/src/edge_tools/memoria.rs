@@ -456,6 +456,51 @@ mod build_direct_request_tests {
         assert_eq!(pl["session_id"], "sess-42");
         assert_eq!(pl["trust_tier"], "T1");
     }
+
+    // ── Cloud helper endpoint contracts ──
+
+    #[test]
+    fn cloud_helpers_use_correct_endpoints() {
+        let src = include_str!("memoria.rs");
+        assert!(src.contains("\"/v1/snapshots\""), "snapshot_create endpoint");
+        assert!(src.contains("/v1/snapshots/{name}/rollback"), "rollback endpoint");
+        assert!(src.contains("/v1/snapshots/{name}/diff"), "snapshot diff endpoint");
+        assert!(src.contains("\"/v1/branches\""), "branch_create endpoint");
+        assert!(src.contains("/v1/branches/{name}/checkout"), "checkout endpoint");
+        assert!(src.contains("/v1/branches/{name}/merge"), "merge endpoint");
+        assert!(src.contains("/v1/branches/{name}/diff"), "branch diff endpoint");
+        assert!(src.contains("\"/v1/reflect\""), "reflect endpoint");
+        assert!(src.contains("\"/v1/health/analyze\""), "health endpoint");
+    }
+
+    #[test]
+    fn cloud_helpers_all_public() {
+        let src = include_str!("memoria.rs");
+        assert!(src.contains("pub async fn memoria_snapshot_create"));
+        assert!(src.contains("pub async fn memoria_snapshot_rollback"));
+        assert!(src.contains("pub async fn memoria_snapshot_diff"));
+        assert!(src.contains("pub async fn memoria_snapshots_list"));
+        assert!(src.contains("pub async fn memoria_branch_create"));
+        assert!(src.contains("pub async fn memoria_branch_checkout"));
+        assert!(src.contains("pub async fn memoria_branch_merge"));
+        assert!(src.contains("pub async fn memoria_branch_diff"));
+        assert!(src.contains("pub async fn memoria_branches_list"));
+        assert!(src.contains("pub async fn memoria_reflect"));
+        assert!(src.contains("pub async fn memoria_health"));
+    }
+
+    #[test]
+    fn cloud_helpers_use_generic_request() {
+        let src = include_str!("memoria.rs");
+        assert!(
+            src.contains("async fn memoria_cloud_request("),
+            "should have a shared memoria_cloud_request helper"
+        );
+        assert!(
+            src.contains("memoria_cloud_request(HttpMethod::"),
+            "cloud helpers should delegate to memoria_cloud_request"
+        );
+    }
 }
 
 /// Public accessor for session_cleanup's working-memory purge.
@@ -605,6 +650,7 @@ pub async fn memoria_store_lessons_fire_and_forget(
                 "content": l.content,
                 "memory_type": l.memory_type,
                 "trust_tier": l.trust_tier,
+                "source": {"agent": "session_end"},
             });
             if let Some(ref sid) = session_id {
                 m["session_id"] = json!(sid);
@@ -627,4 +673,79 @@ pub async fn memoria_store_lessons_fire_and_forget(
             "batch lesson store failed",
         );
     }
+}
+
+// ── Cloud memory helpers (snapshots, branches, reflect, health) ──────────
+
+async fn memoria_cloud_request(
+    method: HttpMethod,
+    path: &str,
+    timeout_secs: u64,
+    body: Option<serde_json::Value>,
+) -> Result<String, String> {
+    let (client, base, key) = memoria_oneshot_client(timeout_secs).ok_or("Memoria not configured")?;
+    let url = format!("{base}{path}");
+    let req = match method {
+        HttpMethod::Get => client.get(&url),
+        HttpMethod::Post => client.post(&url),
+        HttpMethod::Put => client.put(&url),
+    };
+    let req = req.header("Authorization", format!("Bearer {key}"));
+    let req = if let Some(b) = body {
+        req.json(&b)
+    } else {
+        req
+    };
+    let resp = req.send().await.map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    let resp_body = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        Ok(resp_body)
+    } else {
+        Err(format!("({status}) {resp_body}"))
+    }
+}
+
+pub async fn memoria_snapshot_create(name: &str) -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Post, "/v1/snapshots", 5, Some(json!({"name": name}))).await
+}
+
+pub async fn memoria_snapshot_rollback(name: &str) -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Post, &format!("/v1/snapshots/{name}/rollback"), 10, None).await
+}
+
+pub async fn memoria_snapshot_diff(name: &str) -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Get, &format!("/v1/snapshots/{name}/diff"), 5, None).await
+}
+
+pub async fn memoria_snapshots_list() -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Get, "/v1/snapshots", 5, None).await
+}
+
+pub async fn memoria_branch_create(name: &str) -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Post, "/v1/branches", 5, Some(json!({"name": name}))).await
+}
+
+pub async fn memoria_branch_checkout(name: &str) -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Post, &format!("/v1/branches/{name}/checkout"), 5, None).await
+}
+
+pub async fn memoria_branch_merge(name: &str) -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Post, &format!("/v1/branches/{name}/merge"), 5, None).await
+}
+
+pub async fn memoria_branch_diff(name: &str) -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Get, &format!("/v1/branches/{name}/diff"), 5, None).await
+}
+
+pub async fn memoria_branches_list() -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Get, "/v1/branches", 5, None).await
+}
+
+pub async fn memoria_reflect() -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Post, "/v1/reflect", 15, Some(json!({"mode": "auto"}))).await
+}
+
+pub async fn memoria_health() -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Get, "/v1/health/analyze", 5, None).await
 }

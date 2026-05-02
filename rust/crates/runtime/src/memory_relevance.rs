@@ -2,7 +2,8 @@
 //!
 //! Filters retrieved memories/lessons to only those clearly relevant
 //! to the current task, reducing prompt noise and token waste.
-//! Uses the cheapest `selector`-tagged model from the registry.
+//! Uses the cheapest `selector`-tagged model from the registry
+//! (resolved via `resolve_memory_model` from the model DB).
 
 /// Prompt for the selector model to judge memory relevance.
 pub const RELEVANCE_FILTER_PROMPT: &str = "\
@@ -57,6 +58,83 @@ pub fn filter_by_indices<T: Clone>(items: &[T], indices: &[usize]) -> Vec<T> {
         .iter()
         .filter_map(|&i| items.get(i).cloned())
         .collect()
+}
+
+/// Connection parameters for an OpenAI-compatible LLM endpoint.
+/// Resolved from the model registry via `resolve_memory_model`.
+#[derive(Debug, Clone)]
+pub struct LlmConnParams {
+    pub base_url: String,
+    pub api_key: String,
+    pub model_name: String,
+}
+
+/// Filter a list of text items through the selector model.
+/// Returns only items deemed relevant to `user_message`.
+///
+/// On any error (network, timeout, parse failure) returns the original
+/// list unchanged — graceful degradation over silent filtering.
+pub async fn filter_memories(
+    params: &LlmConnParams,
+    user_message: &str,
+    items: &[String],
+) -> Vec<String> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let query = build_relevance_query(user_message, items);
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .no_proxy()
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return items.to_vec(),
+    };
+
+    let resp = match client
+        .post(format!("{}/chat/completions", params.base_url))
+        .header("Authorization", format!("Bearer {}", params.api_key))
+        .json(&serde_json::json!({
+            "model": params.model_name,
+            "messages": [
+                {"role": "system", "content": RELEVANCE_FILTER_PROMPT},
+                {"role": "user", "content": query},
+            ],
+            "max_tokens": 50,
+            "temperature": 0.0,
+        }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return items.to_vec(),
+    };
+
+    let body = resp.text().await.unwrap_or_default();
+    let text = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.get("choices")?
+                .get(0)?
+                .get("message")?
+                .get("content")?
+                .as_str()
+                .map(String::from)
+        })
+        .unwrap_or_default();
+
+    if text.is_empty() {
+        return items.to_vec();
+    }
+
+    let indices = parse_relevance_response(&text, items.len());
+    if indices.is_empty() {
+        return items.to_vec();
+    }
+
+    filter_by_indices(items, &indices)
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -136,5 +214,76 @@ mod tests {
         let long_msg = "x".repeat(500);
         let query = build_relevance_query(&long_msg, &["short".into()]);
         assert!(query.len() < 500 + 200); // truncated message + memory
+    }
+
+    // ── parse_relevance_response edge cases ──
+
+    #[test]
+    fn parse_all_out_of_bounds_returns_empty() {
+        assert!(parse_relevance_response("[10, 20, 30]", 5).is_empty());
+    }
+
+    #[test]
+    fn parse_mixed_valid_invalid_indices() {
+        assert_eq!(parse_relevance_response("[0, 99, 2, 150]", 5), vec![0, 2]);
+    }
+
+    #[test]
+    fn parse_negative_in_json_falls_back_to_digit_extraction() {
+        // JSON parse fails (usize can't be negative), fallback extracts digits:
+        // "-1" splits on '-' → "1", so [1, 0, 2] are the extracted indices.
+        assert_eq!(parse_relevance_response("[-1, 0, 2]", 5), vec![1, 0, 2]);
+    }
+
+    // ── LlmConnParams tests ──
+
+    #[test]
+    fn llm_conn_params_clone() {
+        let params = LlmConnParams {
+            base_url: "https://api.example.com/v1".into(),
+            api_key: "sk-test".into(),
+            model_name: "qwen-flash".into(),
+        };
+        let cloned = params.clone();
+        assert_eq!(cloned.base_url, "https://api.example.com/v1");
+        assert_eq!(cloned.api_key, "sk-test");
+        assert_eq!(cloned.model_name, "qwen-flash");
+    }
+
+    #[test]
+    fn llm_conn_params_debug_format() {
+        let params = LlmConnParams {
+            base_url: "http://localhost:8080".into(),
+            api_key: "key".into(),
+            model_name: "model".into(),
+        };
+        let debug = format!("{params:?}");
+        assert!(debug.contains("LlmConnParams"));
+        assert!(debug.contains("localhost"));
+    }
+
+    // ── filter_memories tests ──
+
+    #[tokio::test]
+    async fn filter_memories_empty_input_returns_empty() {
+        let params = LlmConnParams {
+            base_url: "http://nonexistent:9999".into(),
+            api_key: "key".into(),
+            model_name: "model".into(),
+        };
+        let result = filter_memories(&params, "query", &[]).await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn filter_memories_unreachable_server_returns_all() {
+        let params = LlmConnParams {
+            base_url: "http://127.0.0.1:1".into(),
+            api_key: "key".into(),
+            model_name: "model".into(),
+        };
+        let items = vec!["a".into(), "b".into(), "c".into()];
+        let result = filter_memories(&params, "query", &items).await;
+        assert_eq!(result, items, "unreachable server should return all items");
     }
 }

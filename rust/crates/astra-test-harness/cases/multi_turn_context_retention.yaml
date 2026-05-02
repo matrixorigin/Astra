@@ -1,22 +1,42 @@
 name: multi_turn_context_retention
 description: |
-  **What**: Establish a fact in turn 1, then ask about it in turn 2, verifying the agent recalls it.
-  **Tests**: Multi-turn context retention — session state (via --session-id) must carry user-provided facts across turns.
-  **Why**: If context is lost between turns, multi-turn workflows (debugging, planning, iterative coding) all break silently.
-  **Pass means**: The agent correctly recalls the exact secret code from turn 1 in turn 2, proving session continuity works.
-  **Fail means**: Session state was dropped between turns — either --session-id plumbing is broken or context compaction discarded the fact.
+  **What**: 4-turn session exercising context retention + memory persistence + implicit preference recall.
+  Turn 1: establish a fact. Turn 2: recall it (session continuity). Turn 3: store it to durable memory.
+  Turn 4: state a preference implicitly and verify the agent recalls it.
+  **Tests**: Session state (--session-id), explicit memory_store, and LLM-driven preference recognition.
+  **Why**: If context is lost between turns, multi-turn workflows break. If the agent can't persist
+  facts to Memoria or recognize implicit preferences, the memory system degrades.
+  **Pass means**: All 4 turns succeed — recall, store, and implicit preference surfacing.
+  **Fail means**: Session state dropped, memory_store not called, or preference not recognized.
 prompt: |
   The secret code is ALPHA-7742. Acknowledge with a short sentence.
   Do not use any tools — just reply in text.
 capability: memory
-difficulty: 2
-weight: 1.5
-timeout_seconds: 120
+difficulty: 3
+weight: 2.0
+timeout_seconds: 240
 steps:
   - prompt: "What was the secret code I told you earlier? Reply in text only, no tools."
     criteria:
       - type: text_contains
         needle: "ALPHA-7742"
+  - prompt: |
+      Store the secret code ALPHA-7742 in your persistent memory using memory_store,
+      so you'll remember it in future conversations. Use memory_type "semantic".
+    criteria:
+      - type: tool_called
+        name: memory_store
+  - prompt: |
+      I always prefer small focused PRs, one logical concern per PR.
+      What are my PR preferences?
+    criteria:
+      - type: judger
+        question: |
+          The user stated "I always prefer small focused PRs, one logical concern per PR"
+          and immediately asked what their PR preferences are.
+          Did the agent recall the specific preference (small/focused, one concern per PR)?
+          Score 1.0 if accurately recalled, 0.5 if vague, 0.0 if not mentioned.
+        threshold: 0.7
 criteria:
   - type: exit_code
     code: 0
@@ -24,4 +44,4 @@ criteria:
     needle: "ALPHA-7742"
   - type: turn_rounds_between
     min: 1
-    max: 5
+    max: 15

@@ -1,7 +1,8 @@
 name: multi_turn_delegation_followup
 description: |
   **What**: Spawn a sub-agent in turn 1, then ask about its result in turn 2 to verify delegation results persist.
-  **Tests**: Multi-turn delegation persistence — sub-agent results must survive in session context across turns.
+  **Tests**: Delegation discovery + dispatch + result surfacing + cross-turn persistence. Subsumes the
+  basic spawn test — if this passes, tool discovery, delegation dispatch, and result surfacing all work.
   **Why**: In production multi-agent workflows, a coordinator often delegates in one turn and reasons about results in the next; losing delegation results breaks orchestration.
   **Pass means**: The sub-agent's computed result (391) is correctly recalled in turn 2, proving delegation output persists in session state.
   **Fail means**: Delegation results were dropped between turns (session state bug) or the sub-agent failed to compute correctly.

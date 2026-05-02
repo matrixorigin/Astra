@@ -20,7 +20,7 @@ use super::repl_turn::enqueue_ingestion_pub;
 use super::session_guard::clear_panic_guard;
 
 /// Finalize a REPL session: journal end event, persist state, extract learnings.
-pub(super) async fn finalize_session(state: &ReplState) {
+pub(super) async fn finalize_session(state: &mut ReplState) {
     // 1. Journal: session end event (idempotent — panic hook may have already written it)
     if let Some(ref j) = state.journal {
         let wrote =
@@ -138,6 +138,33 @@ pub(super) async fn finalize_session(state: &ReplState) {
                         .await;
                 }
             });
+        }
+    }
+    // 3f. Drain any in-flight memory extraction (bounded 5s).
+    if let Some(outcome) = state
+        .memory_extractor
+        .drain(Duration::from_secs(5))
+        .await
+    {
+        if let Some(ref j) = state.journal {
+            let (saved, cats, dur) = match &outcome {
+                super::memory_extraction::ExtractionOutcome::Extracted {
+                    count,
+                    categories,
+                    duration_ms,
+                } => (*count, categories.clone(), *duration_ms),
+                _ => (0, vec![], 0),
+            };
+            let evt = session_journal::JournalEvent::memory_extraction(
+                state.session_id.as_deref(),
+                state.turn,
+                outcome.tag(),
+                saved,
+                &cats,
+                dur,
+            );
+            let _ = j.append(&evt);
+            enqueue_ingestion_pub(state, &evt);
         }
     }
     // 3e. End observability only after session-derived lessons/outcomes have

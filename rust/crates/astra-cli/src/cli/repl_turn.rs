@@ -592,74 +592,35 @@ fn maybe_checkpoint_lessons(state: &mut ReplState) {
 }
 
 /// Filter lessons through a cheap selector model for relevance.
-/// Requires ASTRA_SELECTOR_MODEL_URL + ASTRA_SELECTOR_MODEL_KEY + ASTRA_SELECTOR_MODEL env vars.
-/// Falls back to returning all lessons on any error, timeout, or missing config.
+/// Resolves the selector model from the DB model registry via `MatrixCloudRuntime`.
+/// Falls back to returning all lessons if no selector model is configured or on error.
 async fn filter_lessons_by_relevance(
     user_message: &str,
     lessons: Vec<astra_runtime::self_model::LessonHint>,
-    _matrix_runtime: Option<&std::sync::Arc<astra_runtime::MatrixCloudRuntime>>,
+    matrix_runtime: Option<&std::sync::Arc<astra_runtime::MatrixCloudRuntime>>,
 ) -> Vec<astra_runtime::self_model::LessonHint> {
-    let base_url = match std::env::var("ASTRA_SELECTOR_MODEL_URL").ok() {
-        Some(u) if !u.is_empty() => u,
-        _ => return lessons,
+    let params = match matrix_runtime {
+        Some(rt) => rt.resolve_selector_model().await,
+        None => None,
     };
-    let api_key = std::env::var("ASTRA_SELECTOR_MODEL_KEY").unwrap_or_default();
-    let model_name = std::env::var("ASTRA_SELECTOR_MODEL").unwrap_or_else(|_| "qwen-flash".into());
-
-    let memory_texts: Vec<String> = lessons.iter().map(|l| l.action.clone()).collect();
-    let query = astra_runtime::memory_relevance::build_relevance_query(user_message, &memory_texts);
-
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .no_proxy()
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return lessons,
+    let Some(params) = params else {
+        return lessons;
     };
 
-    let resp = match client
-        .post(format!("{base_url}/chat/completions"))
-        .header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "model": model_name,
-            "messages": [
-                {"role": "system", "content": astra_runtime::memory_relevance::RELEVANCE_FILTER_PROMPT},
-                {"role": "user", "content": query},
-            ],
-            "max_tokens": 50,
-            "temperature": 0.0,
-        }))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(_) => return lessons,
-    };
+    let texts: Vec<String> = lessons.iter().map(|l| l.action.clone()).collect();
+    let filtered = astra_runtime::memory_relevance::filter_memories(&params, user_message, &texts).await;
 
-    let body = resp.text().await.unwrap_or_default();
-    let text = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| {
-            v.get("choices")?
-                .get(0)?
-                .get("message")?
-                .get("content")?
-                .as_str()
-                .map(String::from)
-        })
-        .unwrap_or_default();
-
-    if text.is_empty() {
+    if filtered.len() == texts.len() {
         return lessons;
     }
 
-    let indices = astra_runtime::memory_relevance::parse_relevance_response(&text, lessons.len());
-    if indices.is_empty() {
-        return lessons;
-    }
-
-    astra_runtime::memory_relevance::filter_by_indices(&lessons, &indices)
+    // Map filtered texts back to LessonHint structs
+    let filtered_set: std::collections::HashSet<&str> =
+        filtered.iter().map(|s| s.as_str()).collect();
+    lessons
+        .into_iter()
+        .filter(|l| filtered_set.contains(l.action.as_str()))
+        .collect()
 }
 
 fn should_bootstrap_lessons(state: &ReplState) -> bool {
@@ -969,6 +930,13 @@ async fn run_chat_turn(
     // Memoria is the single source of truth for lessons (Session Memory
     // Protocol L3). agent_lessons table is no longer used for bootstrap.
     if should_bootstrap_lessons(state) {
+        // Resolve selector model on first bootstrap (cached for future turns).
+        if state.selector_model_params.is_none() {
+            if let Some(ref rt) = state.matrix_runtime {
+                state.selector_model_params = rt.resolve_selector_model().await;
+            }
+        }
+
         let lessons = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             super::edge_tools::memoria::memoria_retrieve_lessons(6, Some(message)),
@@ -1773,6 +1741,42 @@ async fn apply_turn_success_async(
         }
     }
     check_skill_improvement_async(state).await;
+
+    // Background memory extraction: analyze this turn for durable memories.
+    let tools_used: Vec<String> = state.recent_tools.to_vec();
+    let extraction_turn = state.turn;
+    let outcome = state.memory_extractor.maybe_extract(
+        super::memory_extraction::ExtractionContext {
+            turn: extraction_turn,
+            selector_params: state.selector_model_params.as_ref(),
+            user_message: line,
+            assistant_response: state.last_response.as_deref().unwrap_or(""),
+            tools_used: &tools_used,
+            session_id: state.session_id.as_deref(),
+            existing_manifest: "",
+        },
+    );
+    // Journal: record extraction skip reasons for audit trail.
+    // Started outcomes are journaled when drain() completes (session end).
+    match &outcome {
+        super::memory_extraction::ExtractionOutcome::SkippedMainWrote
+        | super::memory_extraction::ExtractionOutcome::SkippedNoSelector
+        | super::memory_extraction::ExtractionOutcome::Error(_) => {
+            let evt = astra_services::session_journal::JournalEvent::memory_extraction(
+                state.session_id.as_deref(),
+                extraction_turn,
+                outcome.tag(),
+                0,
+                &[],
+                0,
+            );
+            enqueue_ingestion(state, &evt);
+            if let Some(ref j) = state.journal {
+                let _ = j.append(&evt);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn apply_turn_success_sync(
@@ -6272,6 +6276,42 @@ mod tests {
         assert!(
             !should_bootstrap_lessons(&state),
             "loaded flag must prevent re-bootstrap"
+        );
+    }
+
+    // ─── filter_lessons_by_relevance: no env vars ─────────────────────────
+
+    #[test]
+    fn filter_lessons_uses_matrix_runtime_not_env_vars() {
+        let source = include_str!("repl_turn.rs");
+        // Exclude the test module itself (everything after #[cfg(test)])
+        let prod_code = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
+        let selector_prefix = "ASTRA_SELECTOR";
+        assert!(
+            !prod_code.contains(selector_prefix),
+            "production code must not reference ASTRA_SELECTOR env vars"
+        );
+    }
+
+    #[test]
+    fn filter_lessons_resolves_via_matrix_runtime() {
+        let source = include_str!("repl_turn.rs");
+        assert!(
+            source.contains("resolve_selector_model"),
+            "filter_lessons_by_relevance should resolve model from matrix_runtime"
+        );
+        assert!(
+            source.contains("filter_memories"),
+            "filter_lessons_by_relevance should delegate to memory_relevance::filter_memories"
+        );
+    }
+
+    #[test]
+    fn selector_model_params_cached_in_repl_state() {
+        let state = ReplState::default();
+        assert!(
+            state.selector_model_params.is_none(),
+            "selector_model_params should start as None"
         );
     }
 

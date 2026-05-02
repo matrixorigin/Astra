@@ -141,8 +141,8 @@ mod tests {
     fn memory_rules_include_negative_examples() {
         let p = build_main_system_prompt(&["memory_store", "memory_search"], "", 1.0, None);
         assert!(
-            p.contains("SKIP:"),
-            "should have negative guidance (SKIP list)"
+            p.contains("What NOT to save"),
+            "should have negative guidance (What NOT to save)"
         );
     }
 
@@ -953,8 +953,8 @@ mod tests {
         // Batching read-only tool calls, and Turn Discipline (announce/summary/no-narration)).
         // Headroom: ~200 chars above measured size. Bump when adding new rules.
         assert!(
-            p.len() < 19800,
-            "full toolset prompt should be under 19800 chars, got {}",
+            p.len() < 24000,
+            "full toolset prompt should be under 24000 chars, got {}",
             p.len()
         );
     }

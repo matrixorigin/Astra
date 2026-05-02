@@ -288,6 +288,12 @@ pub(crate) struct ReplState {
     /// recorded this session to prevent double-recording.
     pub lesson_checkpointer: astra_runtime::lesson_checkpoint::LessonCheckpointer,
 
+    /// Resolved selector model connection parameters (cached at first use).
+    /// Used for memory relevance filtering with the cheapest model from the registry.
+    pub selector_model_params: Option<astra_runtime::memory_relevance::LlmConnParams>,
+    /// Background memory extraction agent.
+    pub memory_extractor: super::memory_extraction::MemoryExtractor,
+
     /// P8: persistent auto-invoke handler. Owns the per-cause cooldowns
     /// across turns of this session. Created lazily on first turn so
     /// sessions that never trigger anything pay no cost. The REPL is
@@ -474,6 +480,8 @@ impl Default for ReplState {
             session_lessons: Vec::new(),
             session_lessons_loaded: false,
             lesson_checkpointer: astra_runtime::lesson_checkpoint::LessonCheckpointer::new(),
+            selector_model_params: None,
+            memory_extractor: super::memory_extraction::MemoryExtractor::new(),
             auto_invoke_handler: None,
             latest_skill_diagnosis: None,
             diagnosis_outcome_tracker:

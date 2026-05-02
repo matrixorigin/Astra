@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 astra-core.workspace = true
 astra-logging.workspace = true
+astra-prompts.workspace = true
 astra-services.workspace = true
 astra-runtime.workspace = true
 astra-pipeline.workspace = true

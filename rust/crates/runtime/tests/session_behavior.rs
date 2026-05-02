@@ -243,12 +243,20 @@ mod system_prompt_memory_rules {
     }
 
     #[test]
-    fn prompt_contains_guanzhu_example() {
+    fn prompt_contains_type_taxonomy() {
         let tools = &["bash", "memory_store", "memory_search"];
         let prompt = build_main_system_prompt(tools, "", 1.0, None);
         assert!(
-            prompt.contains("关注"),
-            "Prompt should include 关注 as a trigger example"
+            prompt.contains("<types>"),
+            "Prompt should include structured type taxonomy"
+        );
+        assert!(
+            prompt.contains("<name>user</name>"),
+            "Prompt should include user type"
+        );
+        assert!(
+            prompt.contains("<name>feedback</name>"),
+            "Prompt should include feedback type"
         );
     }
 
@@ -283,12 +291,30 @@ mod system_prompt_memory_rules {
     }
 
     #[test]
-    fn immediate_store_examples_present() {
+    fn prompt_contains_what_not_to_save() {
         let tools = &["bash", "memory_store", "memory_search"];
         let prompt = build_main_system_prompt(tools, "", 1.0, None);
         assert!(
-            prompt.contains("IMMEDIATELY"),
-            "Prompt should say store IMMEDIATELY"
+            prompt.contains("What NOT to save"),
+            "Prompt should include What NOT to save section"
+        );
+        assert!(
+            prompt.contains("derivable from the codebase"),
+            "What NOT to save should exclude derivable content"
+        );
+    }
+
+    #[test]
+    fn prompt_contains_examples_with_real_scenarios() {
+        let tools = &["bash", "memory_store", "memory_search"];
+        let prompt = build_main_system_prompt(tools, "", 1.0, None);
+        assert!(
+            prompt.contains("data scientist"),
+            "Prompt should include concrete user type example"
+        );
+        assert!(
+            prompt.contains("merge freeze"),
+            "Prompt should include concrete project type example"
         );
     }
 }

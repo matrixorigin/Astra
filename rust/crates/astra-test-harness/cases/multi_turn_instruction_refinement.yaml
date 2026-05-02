@@ -1,10 +1,13 @@
 name: multi_turn_instruction_refinement
 description: |
-  **What**: Ask for a Rust function signature in turn 1, then refine it (return type + doc comment) in turn 2.
-  **Tests**: Multi-turn instruction refinement — the agent must build on its previous output when given incremental changes.
-  **Why**: Iterative code refinement is a core agent workflow; if the agent starts from scratch each turn instead of building on prior output, productivity drops sharply.
-  **Pass means**: Turn 2 output contains both the doc comment and the updated return type, proving the agent refined rather than regenerated.
-  **Fail means**: Agent lost turn 1 context (session bug), ignored the refinement (instruction following issue), or produced unrelated output.
+  **What**: Ask for a Rust function signature in turn 1, refine it in turn 2, then store the
+  coding convention as a persistent memory in turn 3.
+  **Tests**: Multi-turn instruction refinement + memory persistence — the agent builds on prior
+  output AND can persist learned conventions to durable memory when instructed.
+  **Why**: Iterative code refinement is a core agent workflow. Additionally, conventions that emerge
+  during refinement (e.g., "always add doc comments") should be persistable for future sessions.
+  **Pass means**: Turn 2 refines correctly, turn 3 calls memory_store to persist the convention.
+  **Fail means**: Context lost (turn 1→2), refinement ignored, or memory_store not called (turn 3).
 prompt: |
   Write me a short Rust function signature (just the signature, no body)
   called 'greet' that takes a &str parameter called 'name' and prints
@@ -12,7 +15,7 @@ prompt: |
 capability: instruction_following
 difficulty: 3
 weight: 2.0
-timeout_seconds: 120
+timeout_seconds: 180
 steps:
   - prompt: "Now change it to return a String instead of printing, and add a /// doc comment above it. Show the updated version in a code block. Don't create any files."
     criteria:
@@ -20,6 +23,10 @@ steps:
         needle: "///"
       - type: text_contains
         needle: "String"
+  - prompt: "I always want /// doc comments on every public function in this project. Please remember this convention for our future conversations using memory_store."
+    criteria:
+      - type: tool_called
+        name: memory_store
 criteria:
   - type: exit_code
     code: 0
@@ -30,4 +37,4 @@ criteria:
     max: 80000
   - type: turn_rounds_between
     min: 1
-    max: 10
+    max: 15
