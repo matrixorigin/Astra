@@ -345,6 +345,14 @@ impl<'a> SuiteRunner<'a> {
         let mut step_results: Vec<StepResult> = Vec::new();
 
         // Multi-turn: execute follow-up steps using the same session.
+        if !case.steps.is_empty() && outcome.session_id.is_none() {
+            eprintln!(
+                "[astra-test] WARNING: case {} has {} steps but turn 1 returned no session_id — \
+                 steps will be skipped. This usually means the first turn failed.",
+                case.name,
+                case.steps.len()
+            );
+        }
         if !case.steps.is_empty()
             && let Some(ref session_id) = outcome.session_id
         {
