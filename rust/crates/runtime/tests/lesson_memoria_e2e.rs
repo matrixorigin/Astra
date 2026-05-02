@@ -370,3 +370,91 @@ async fn cross_session_lesson_appears_in_self_model_prompt() {
             .await;
     }
 }
+
+#[tokio::test]
+#[ignore]
+async fn memory_correct_by_query_works() {
+    let (base, key) = require_memoria_env();
+    let user_id = unique_user_id();
+    let client = client();
+
+    // Store a memory
+    let resp = client
+        .post(format!("{base}/v1/memories"))
+        .header("Authorization", format!("Bearer {key}"))
+        .header("X-User-Id", &user_id)
+        .json(&serde_json::json!({
+            "content": "User prefers HS256 for JWT",
+            "memory_type": "semantic",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    // Correct by query
+    let resp = client
+        .post(format!("{base}/v1/memories/correct"))
+        .header("Authorization", format!("Bearer {key}"))
+        .header("X-User-Id", &user_id)
+        .json(&serde_json::json!({
+            "query": "JWT signing algorithm preference",
+            "new_content": "User prefers RS256 for JWT (corrected from HS256)",
+            "reason": "security upgrade",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "correct by query must succeed: {}",
+        resp.status()
+    );
+
+    // Verify correction applied
+    let resp = client
+        .post(format!("{base}/v1/memories/retrieve"))
+        .header("Authorization", format!("Bearer {key}"))
+        .header("X-User-Id", &user_id)
+        .json(&serde_json::json!({"query": "JWT", "top_k": 1}))
+        .send()
+        .await
+        .unwrap();
+    let results: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert!(!results.is_empty());
+    let content = results[0]["content"].as_str().unwrap();
+    assert!(
+        content.contains("RS256"),
+        "corrected content must contain RS256: {content}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn memory_profile_endpoint_reachable() {
+    let (base, key) = require_memoria_env();
+    let user_id = unique_user_id();
+    let client = client();
+
+    // Store a profile memory first
+    let _ = client
+        .post(format!("{base}/v1/memories"))
+        .header("Authorization", format!("Bearer {key}"))
+        .header("X-User-Id", &user_id)
+        .json(&serde_json::json!({
+            "content": "Senior Rust engineer",
+            "memory_type": "profile",
+        }))
+        .send()
+        .await;
+
+    // GET /v1/profiles/{user_id}
+    let resp = client
+        .get(format!("{base}/v1/profiles/{user_id}"))
+        .header("Authorization", format!("Bearer {key}"))
+        .header("X-User-Id", &user_id)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(resp.status(), 404, "profile endpoint must not 404");
+}
