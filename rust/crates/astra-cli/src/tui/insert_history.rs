@@ -192,9 +192,9 @@ fn write_history_line(writer: &mut impl Write, line: &Line<'_>) -> io::Result<()
         ))
     )?;
 
-    // Write spans with style
+    // Write spans with style (span overrides line-level style)
     for span in &line.spans {
-        let merged = span.style.patch(line.style);
+        let merged = line.style.patch(span.style);
         write_styled_span(writer, &span.content, &merged)?;
     }
 
@@ -214,6 +214,9 @@ fn write_styled_span(
     content: &str,
     style: &ratatui::style::Style,
 ) -> io::Result<()> {
+    // Reset all attributes before each span to prevent color leaking
+    queue!(writer, SetAttribute(Attribute::Reset))?;
+
     // Apply modifiers
     if style.add_modifier.contains(Modifier::BOLD) {
         queue!(writer, SetAttribute(Attribute::Bold))?;
@@ -237,11 +240,6 @@ fn write_styled_span(
     }
 
     queue!(writer, Print(content))?;
-
-    // Reset modifiers (but keep line-level colors)
-    if !style.add_modifier.is_empty() {
-        queue!(writer, SetAttribute(Attribute::Reset))?;
-    }
 
     Ok(())
 }
