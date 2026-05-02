@@ -192,7 +192,7 @@ pub(crate) async fn run_tui_repl(
     let mut active_cell: Option<Box<dyn ChatCell>> = None;
     let mut stream_controller: Option<StreamController> = None;
     let mut transcript: Vec<ratatui::text::Line<'static>> = Vec::new();
-    let mut auto_send_queued: Option<String> = None;
+    let mut inject_submit: Option<String> = None;
 
     frame_requester.schedule_frame();
 
@@ -202,7 +202,7 @@ pub(crate) async fn run_tui_repl(
 
         // After turn ends, load first queued message into composer for review/send
         if active_cell.is_none() && stream_controller.is_none() {
-            if let Some(text) = auto_send_queued.take() {
+            if let Some(text) = inject_submit.take() {
                 bottom_pane.composer.set_text(&text);
                 frame_requester.schedule_frame();
             }
@@ -453,7 +453,7 @@ pub(crate) async fn run_tui_repl(
                                     state.tui_cancel_token = Some(new_tok);
 
                                     // Auto-send first queued message (will be picked up next iteration)
-                                    auto_send_queued = bottom_pane.take_next_queued();
+                                    inject_submit = bottom_pane.take_next_queued();
                                 }
                             }
                             BottomPaneAction::SubmitInput(_) => {}
