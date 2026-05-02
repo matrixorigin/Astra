@@ -5,17 +5,26 @@
 
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use super::ToolExecutor;
 
 pub use astra_tools::memoria::{
-    BoostSearchHit, parse_memory_search_hits,
+    memoria_branch_checkout,
+    memoria_branch_create,
+    memoria_branch_diff,
+    memoria_branch_merge,
+    memoria_branches_list,
+    memoria_health,
+    memoria_oneshot_client,
+    memoria_reflect,
     // Cloud helpers — single source of truth in astra-tools
-    memoria_snapshot_create, memoria_snapshot_rollback, memoria_snapshot_diff,
-    memoria_snapshots_list, memoria_branch_create, memoria_branch_checkout,
-    memoria_branch_merge, memoria_branch_diff, memoria_branches_list,
-    memoria_reflect, memoria_health, memoria_oneshot_client,
+    memoria_snapshot_create,
+    memoria_snapshot_diff,
+    memoria_snapshot_rollback,
+    memoria_snapshots_list,
+    parse_memory_search_hits,
+    BoostSearchHit,
 };
 
 impl ToolExecutor {
@@ -53,10 +62,7 @@ impl ToolExecutor {
         // Delegate to the shared MemoriaClient (single source of truth for
         // build_direct_request, type normalization, and HTTP method routing).
         let cloud_token = self.cloud_token();
-        let client = astra_tools::memoria::MemoriaClient::new(
-            self.cloud_base.clone(),
-            cloud_token,
-        );
+        let client = astra_tools::memoria::MemoriaClient::new(self.cloud_base.clone(), cloud_token);
         let result = client.call_with_timeout(op, args, timeout).await;
 
         // CLI-specific: update circuit breaker + user notification
@@ -310,10 +316,10 @@ mod build_direct_request_tests {
     fn cloud_helpers_are_re_exported_from_shared() {
         // These re-exports prove the shared module exposes all cloud helpers.
         // If any is removed from astra-tools, this file won't compile.
-        let _ = memoria_snapshot_create as fn(&str) -> _;
-        let _ = memoria_branch_create as fn(&str) -> _;
-        let _ = memoria_reflect as fn() -> _;
-        let _ = memoria_health as fn() -> _;
+        let _ = memoria_snapshot_create;
+        let _ = memoria_branch_create;
+        let _ = memoria_reflect;
+        let _ = memoria_health;
     }
 }
 
@@ -398,8 +404,7 @@ pub async fn memoria_retrieve_lessons(
 }
 
 pub use astra_tools::memoria::{
-    memoria_governance_fire_and_forget,
-    memoria_consolidate_fire_and_forget,
+    memoria_consolidate_fire_and_forget, memoria_governance_fire_and_forget,
 };
 
 /// Store extracted lessons in Memoria as L3 durable memory using the

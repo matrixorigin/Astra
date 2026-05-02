@@ -165,6 +165,9 @@ impl MemoriaClient {
                 }
             };
             let (ep, pl, m) = Self::build_direct_request(&base, op, args);
+            if ep.is_empty() {
+                return pl.to_string();
+            }
             (ep, pl, format!("Bearer {key}"), m)
         };
 
@@ -321,15 +324,19 @@ impl MemoriaClient {
                 let new_content = args.get("new_content").and_then(Value::as_str).unwrap_or("");
                 let reason = args.get("reason").and_then(Value::as_str).unwrap_or("correction");
                 if let Some(mid) = args.get("memory_id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    let mut pl = json!({"new_content": new_content, "reason": reason});
+                    inject_identity(&mut pl);
                     (
                         format!("{base}/v1/memories/{mid}/correct"),
-                        json!({"new_content": new_content, "reason": reason}),
+                        pl,
                         HttpMethod::Put,
                     )
                 } else if let Some(query) = args.get("query").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    let mut pl = json!({"query": query, "new_content": new_content, "reason": reason});
+                    inject_identity(&mut pl);
                     (
                         format!("{base}/v1/memories/correct"),
-                        json!({"query": query, "new_content": new_content, "reason": reason}),
+                        pl,
                         HttpMethod::Post,
                     )
                 } else {
@@ -340,7 +347,11 @@ impl MemoriaClient {
                     )
                 }
             }
-            "profile" => (format!("{base}/v1/profiles/me"), json!({}), HttpMethod::Get),
+            "profile" => {
+                let mut pl = json!({});
+                inject_identity(&mut pl);
+                (format!("{base}/v1/profiles/me"), pl, HttpMethod::Get)
+            }
             _ => (
                 String::new(),
                 json!({"error": format!("Unknown memoria op: {op}")}),
@@ -459,23 +470,24 @@ mod tests {
 
     #[test]
     fn map_business_types_to_memoria_primitives() {
-        assert_eq!(map_business_type_to_memoria("user"), "profile");
-        assert_eq!(map_business_type_to_memoria("feedback"), "semantic");
-        assert_eq!(map_business_type_to_memoria("project"), "semantic");
-        assert_eq!(map_business_type_to_memoria("lesson"), "semantic");
-        assert_eq!(map_business_type_to_memoria("ref"), "procedural");
-        assert_eq!(map_business_type_to_memoria("reference"), "procedural");
-        assert_eq!(map_business_type_to_memoria("episode"), "episodic");
+        use astra_prompts::memory_types::normalize_memoria_type;
+        assert_eq!(normalize_memoria_type("user"), "profile");
+        assert_eq!(normalize_memoria_type("feedback"), "semantic");
+        assert_eq!(normalize_memoria_type("project"), "semantic");
+        assert_eq!(normalize_memoria_type("lesson"), "semantic");
+        assert_eq!(normalize_memoria_type("ref"), "procedural");
+        assert_eq!(normalize_memoria_type("reference"), "procedural");
+        assert_eq!(normalize_memoria_type("episode"), "episodic");
         // V1 primitives pass through unchanged
-        assert_eq!(map_business_type_to_memoria("semantic"), "semantic");
-        assert_eq!(map_business_type_to_memoria("profile"), "profile");
-        assert_eq!(map_business_type_to_memoria("working"), "working");
+        assert_eq!(normalize_memoria_type("semantic"), "semantic");
+        assert_eq!(normalize_memoria_type("profile"), "profile");
+        assert_eq!(normalize_memoria_type("working"), "working");
     }
 
     #[test]
     fn store_maps_business_type_before_sending() {
         let args = json!({"content": "test", "memory_type": "feedback"});
-        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "store", &args);
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "store", &args);
         assert_eq!(
             pl["memory_type"], "semantic",
             "business type 'feedback' must be mapped to 'semantic' for Memoria V1"
@@ -492,7 +504,7 @@ mod tests {
         });
 
         // retrieve
-        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "retrieve", &args);
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "retrieve", &args);
         assert_eq!(pl["session_id"], "user-42");
         assert_eq!(pl["user_id"], "user-42");
         assert_eq!(pl["query"], "rust patterns");
@@ -502,7 +514,7 @@ mod tests {
         );
 
         // search
-        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "search", &args);
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "search", &args);
         assert_eq!(pl["session_id"], "user-42");
         assert_eq!(pl["user_id"], "user-42");
 
@@ -512,7 +524,7 @@ mod tests {
             "session_id": "user-42",
             "user_id": "user-42"
         });
-        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "store", &store_args);
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "store", &store_args);
         assert_eq!(pl["session_id"], "user-42");
         assert_eq!(pl["user_id"], "user-42");
 
@@ -522,7 +534,7 @@ mod tests {
             "session_id": "user-42",
             "user_id": "user-42"
         });
-        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "purge", &purge_args);
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "purge", &purge_args);
         assert_eq!(pl["session_id"], "user-42");
         assert_eq!(pl["user_id"], "user-42");
 
@@ -533,13 +545,13 @@ mod tests {
             "session_id": "user-42",
             "user_id": "user-42"
         });
-        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "correct", &correct_args);
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "correct", &correct_args);
         assert_eq!(pl["session_id"], "user-42");
         assert_eq!(pl["user_id"], "user-42");
 
         // profile
         let profile_args = json!({"session_id": "user-42", "user_id": "user-42"});
-        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "profile", &profile_args);
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "profile", &profile_args);
         assert_eq!(pl["session_id"], "user-42");
         assert_eq!(pl["user_id"], "user-42");
     }
@@ -547,7 +559,7 @@ mod tests {
     #[test]
     fn build_direct_request_omits_identity_when_absent() {
         let args = json!({"query": "test"});
-        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "retrieve", &args);
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "retrieve", &args);
         assert!(pl.get("session_id").is_none());
         assert!(pl.get("user_id").is_none());
         assert!(
@@ -559,7 +571,7 @@ mod tests {
     #[test]
     fn build_direct_request_retrieve_respects_explicit_min_confidence() {
         let args = json!({"query": "q", "min_confidence": 0.7});
-        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "retrieve", &args);
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "retrieve", &args);
         assert_eq!(pl["min_confidence"], json!(0.7));
     }
 
@@ -573,7 +585,7 @@ mod tests {
             "filter_session": true,
             "include_cross_session": false,
         });
-        let (endpoint, pl) = MemoriaClient::build_direct_request("http://mem", "retrieve", &args);
+        let (endpoint, pl, _) = MemoriaClient::build_direct_request("http://mem", "retrieve", &args);
         assert_eq!(endpoint, "http://mem/v1/memories/retrieve");
         assert_eq!(pl["filter_session"], true);
         assert_eq!(pl["include_cross_session"], false);
@@ -582,7 +594,7 @@ mod tests {
     #[test]
     fn retrieve_omits_filter_and_include_when_absent() {
         let args = json!({"query": "test", "top_k": 5});
-        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "retrieve", &args);
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "retrieve", &args);
         assert!(pl.get("filter_session").is_none());
         assert!(pl.get("include_cross_session").is_none());
     }
@@ -592,7 +604,7 @@ mod tests {
     #[test]
     fn search_routes_to_retrieve_endpoint() {
         let args = json!({"query": "test", "top_k": 10});
-        let (endpoint, _) = MemoriaClient::build_direct_request("http://mem", "search", &args);
+        let (endpoint, _, _) = MemoriaClient::build_direct_request("http://mem", "search", &args);
         assert_eq!(
             endpoint, "http://mem/v1/memories/retrieve",
             "search must route to /retrieve (not /search) for session_id support"
@@ -607,7 +619,7 @@ mod tests {
             "session_id": "sess-abc",
             "filter_session": true,
         });
-        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "search", &args);
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "search", &args);
         assert_eq!(pl["session_id"], "sess-abc");
         assert_eq!(pl["filter_session"], true);
     }
@@ -619,14 +631,14 @@ mod tests {
             "top_k": 10,
             "include_cross_session": false,
         });
-        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "search", &args);
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "search", &args);
         assert_eq!(pl["include_cross_session"], false);
     }
 
     #[test]
     fn search_omits_session_fields_when_absent() {
         let args = json!({"query": "test", "top_k": 10});
-        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "search", &args);
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "search", &args);
         assert!(pl.get("session_id").is_none());
         assert!(pl.get("filter_session").is_none());
         assert!(pl.get("include_cross_session").is_none());
