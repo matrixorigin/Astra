@@ -43,19 +43,14 @@ impl ToolExecutor {
             return json!({"error": "Memory service unavailable (circuit open)"}).to_string();
         }
 
-        // Map business category types before ANY dispatch path (cloud or direct).
+        // Normalize business category types before ANY dispatch path (cloud or direct).
+        // Single source of truth: astra_prompts::memory_types::normalize_memoria_type.
         let args = &{
             let mut a = args.clone();
             if op == "store" {
                 if let Some(obj) = a.as_object_mut() {
                     if let Some(raw) = obj.get("memory_type").and_then(Value::as_str).map(String::from) {
-                        let mapped = match raw.as_str() {
-                            "user" => "profile",
-                            "feedback" | "project" | "lesson" => "semantic",
-                            "ref" | "reference" => "procedural",
-                            "episode" => "episodic",
-                            other => other,
-                        };
+                        let mapped = astra_prompts::memory_types::normalize_memoria_type(&raw);
                         obj.insert("memory_type".to_string(), Value::String(mapped.to_string()));
                     }
                 }
@@ -294,16 +289,7 @@ fn build_direct_request(base: &str, op: &str, args: &Value) -> (String, Value, H
                 .get("memory_type")
                 .and_then(Value::as_str)
                 .unwrap_or("semantic");
-            // Map business category names to Memoria V1 primitives.
-            // The system prompt teaches types like "user", "feedback", "project", "ref"
-            // but Memoria only accepts: semantic, profile, procedural, working, episodic, tool_result.
-            let memory_type = match raw_type {
-                "user" => "profile",
-                "feedback" | "project" | "lesson" => "semantic",
-                "ref" | "reference" => "procedural",
-                "episode" => "episodic",
-                other => other,
-            };
+            let memory_type = astra_prompts::memory_types::normalize_memoria_type(raw_type);
             let mut payload = json!({"content": content, "memory_type": memory_type});
             // Forward trust_tier and session_id when provided by the LLM
             if let Some(tier) = args.get("trust_tier").and_then(Value::as_str) {

@@ -86,6 +86,21 @@ impl MemoryCategory {
     }
 }
 
+/// Map a raw memory_type string (business category OR Memoria primitive)
+/// to a valid Memoria V1 primitive. Business names from the system prompt
+/// taxonomy are mapped; V1 primitives pass through unchanged.
+///
+/// Single source of truth — called by both CLI and server dispatch.
+pub fn normalize_memoria_type(raw: &str) -> &str {
+    match raw {
+        "user" => "profile",
+        "feedback" | "project" | "lesson" => "semantic",
+        "ref" | "reference" => "procedural",
+        "episode" => "episodic",
+        other => other,
+    }
+}
+
 /// Encode content with category prefix.
 pub fn encode(category: MemoryCategory, text: &str) -> String {
     format!("{} {}", category.content_prefix(), text)
@@ -308,6 +323,29 @@ mod tests {
         let (cat, text) = decode("[ user] text");
         assert_eq!(cat, None);
         assert_eq!(text, "[ user] text");
+    }
+
+    // ── normalize_memoria_type (single source of truth) ──
+
+    #[test]
+    fn normalize_maps_all_business_types() {
+        assert_eq!(normalize_memoria_type("user"), "profile");
+        assert_eq!(normalize_memoria_type("feedback"), "semantic");
+        assert_eq!(normalize_memoria_type("project"), "semantic");
+        assert_eq!(normalize_memoria_type("lesson"), "semantic");
+        assert_eq!(normalize_memoria_type("ref"), "procedural");
+        assert_eq!(normalize_memoria_type("reference"), "procedural");
+        assert_eq!(normalize_memoria_type("episode"), "episodic");
+    }
+
+    #[test]
+    fn normalize_passes_through_v1_primitives() {
+        assert_eq!(normalize_memoria_type("semantic"), "semantic");
+        assert_eq!(normalize_memoria_type("profile"), "profile");
+        assert_eq!(normalize_memoria_type("procedural"), "procedural");
+        assert_eq!(normalize_memoria_type("working"), "working");
+        assert_eq!(normalize_memoria_type("episodic"), "episodic");
+        assert_eq!(normalize_memoria_type("tool_result"), "tool_result");
     }
 
     // ── Memoria mapping ──

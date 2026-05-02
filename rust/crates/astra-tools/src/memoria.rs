@@ -324,17 +324,10 @@ impl MemoriaClient {
     }
 }
 
-/// Map business category names (from system prompt taxonomy) to Memoria V1 primitives.
-/// The system prompt teaches "user", "feedback", "project", "ref" but Memoria V1
-/// only accepts: semantic, profile, procedural, working, episodic, tool_result.
+/// Map business category types to Memoria V1 primitives.
+/// Delegates to the single source of truth in astra-prompts.
 fn map_business_type_to_memoria(raw: &str) -> &str {
-    match raw {
-        "user" => "profile",
-        "feedback" | "project" | "lesson" => "semantic",
-        "ref" | "reference" => "procedural",
-        "episode" => "episodic",
-        other => other,
-    }
+    astra_prompts::memory_types::normalize_memoria_type(raw)
 }
 
 /// Build a one-shot Memoria HTTP client + auth header.
