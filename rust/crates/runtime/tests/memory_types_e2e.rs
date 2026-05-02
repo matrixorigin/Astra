@@ -278,7 +278,72 @@ fn v2_tag_names_are_unique() {
     assert_eq!(tags.len(), unique.len(), "V2 tags must be unique");
 }
 
-// ── 8. Journal event structure ──────────────────────────────────────────
+// ── 8. Boundary conditions ──────────────────────────────────────────────
+
+#[test]
+fn system_prompt_without_lessons_has_no_lessons_header() {
+    let prompt = astra_runtime::prompts::build_main_system_prompt(
+        &["bash", "memory_store"],
+        "",
+        1.0,
+        None,
+    );
+    assert!(
+        !prompt.contains("📚 Lessons"),
+        "prompt without lesson injection should not render Lessons header"
+    );
+}
+
+#[test]
+fn system_prompt_with_mixed_tools_includes_memory() {
+    let prompt = astra_runtime::prompts::build_main_system_prompt(
+        &["bash", "read_file", "memory_store", "memory_search"],
+        "",
+        1.0,
+        None,
+    );
+    assert!(prompt.contains("Memory Rules"));
+    assert!(prompt.contains("<types>"));
+}
+
+#[test]
+fn system_prompt_with_no_tools_still_valid() {
+    let prompt = astra_runtime::prompts::build_main_system_prompt(&[], "", 1.0, None);
+    assert!(!prompt.is_empty());
+    assert!(!prompt.contains("Memory Rules"));
+}
+
+// ── 9. Session cleanup sequencing contract ──────────────────────────────
+
+#[test]
+fn session_cleanup_sequences_store_before_purge() {
+    let src = include_str!("../../astra-cli/src/cli/session_cleanup.rs");
+    let store_pos = src.find("memoria_store_lessons_fire_and_forget");
+    let purge_pos = src.find("/v1/memories/purge");
+    assert!(
+        store_pos.is_some() && purge_pos.is_some(),
+        "session_cleanup must have both store and purge"
+    );
+    let store_pos = store_pos.unwrap();
+    let purge_pos = purge_pos.unwrap();
+
+    let between = &src[store_pos..purge_pos];
+    assert!(
+        between.contains(".await"),
+        "store must be awaited BEFORE purge to prevent race (found: store at {store_pos}, purge at {purge_pos})"
+    );
+}
+
+#[test]
+fn signal_lessons_use_strict_quality_gate() {
+    let src = include_str!("../../astra-cli/src/cli/session_cleanup.rs");
+    assert!(
+        src.contains("is_synthesized_lesson_acceptable"),
+        "signal lessons must use is_synthesized_lesson_acceptable (strict gate with blocklist), not is_high_quality_lesson"
+    );
+}
+
+// ── 10. Journal event structure ─────────────────────────────────────────
 
 #[test]
 fn memory_extraction_journal_event_structure() {

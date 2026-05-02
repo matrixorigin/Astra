@@ -214,12 +214,17 @@ impl MemoryExtractor {
     }
 
     /// Wait for in-flight extraction to complete (bounded timeout).
+    /// On timeout, aborts the background task to prevent orphaned work.
     pub async fn drain(&mut self, timeout: std::time::Duration) -> Option<ExtractionOutcome> {
         let handle = self.in_flight.take()?;
+        let abort_handle = handle.abort_handle();
         match tokio::time::timeout(timeout, handle).await {
             Ok(Ok(outcome)) => Some(outcome),
             Ok(Err(_)) => Some(ExtractionOutcome::Error("task panicked".into())),
-            Err(_) => Some(ExtractionOutcome::Error("drain timeout".into())),
+            Err(_) => {
+                abort_handle.abort();
+                Some(ExtractionOutcome::Error("drain timeout".into()))
+            }
         }
     }
 }

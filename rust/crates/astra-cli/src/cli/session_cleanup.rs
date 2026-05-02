@@ -92,7 +92,7 @@ pub(super) async fn finalize_session(state: &mut ReplState) {
         for cl in signal_lessons {
             // Template-generated lessons use the basic gate (hedging + length).
             // The template blocklist is only for LLM-synthesized content.
-            if astra_runtime::lesson_synthesizer::is_high_quality_lesson(&cl.action) {
+            if astra_runtime::lesson_synthesizer::is_synthesized_lesson_acceptable(&cl.action) {
                 all_lessons.push(astra_runtime::lesson_synthesizer::ExtractedLesson {
                     memory_type: "semantic",
                     content: format!("💡 LESSON: {}", cl.action),
@@ -111,17 +111,35 @@ pub(super) async fn finalize_session(state: &mut ReplState) {
         }
 
         if !all_lessons.is_empty() {
-            tokio::spawn(edge_tools::memoria::memoria_store_lessons_fire_and_forget(
-                all_lessons,
-                state.session_id.clone(),
-            ));
-        }
-
-        // Purge mid-session working T4 lesson ghosts. The semantic T3 copies
-        // written above are the canonical versions; the working copies from
-        // maybe_checkpoint_lessons would otherwise linger and pollute
-        // boost_search (which doesn't filter by memory_type).
-        if let Some(ref sid) = state.session_id {
+            // Store T3 semantic lessons FIRST, then purge T4 working copies.
+            // Sequenced to prevent the purge from racing ahead and deleting
+            // in-flight T3 writes that share the same topic prefix.
+            let sid_for_purge = state.session_id.clone();
+            tokio::spawn(async move {
+                edge_tools::memoria::memoria_store_lessons_fire_and_forget(
+                    all_lessons,
+                    sid_for_purge.clone(),
+                )
+                .await;
+                // Only purge AFTER store completes.
+                if let Some(sid) = sid_for_purge {
+                    if let Some((client, base, key)) =
+                        edge_tools::memoria::memoria_oneshot_client_pub(5)
+                    {
+                        let _ = client
+                            .post(format!("{base}/v1/memories/purge"))
+                            .header("Authorization", format!("Bearer {key}"))
+                            .json(&serde_json::json!({
+                                "topic": format!("LESSON session:{sid}"),
+                                "reason": "session-end promotion to semantic T3",
+                            }))
+                            .send()
+                            .await;
+                    }
+                }
+            });
+        } else if let Some(ref sid) = state.session_id {
+            // No new lessons but still purge stale T4 working copies.
             let sid = sid.clone();
             tokio::spawn(async move {
                 if let Some((client, base, key)) =
@@ -132,7 +150,7 @@ pub(super) async fn finalize_session(state: &mut ReplState) {
                         .header("Authorization", format!("Bearer {key}"))
                         .json(&serde_json::json!({
                             "topic": format!("LESSON session:{sid}"),
-                            "reason": "session-end promotion to semantic T3",
+                            "reason": "session-end cleanup (no new lessons)",
                         }))
                         .send()
                         .await;

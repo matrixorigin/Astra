@@ -15,15 +15,14 @@
 //!   3. Retrieve returns direct array with correct fields
 //!   4. Trust tier mapping (T2/T3) produces correct confidence
 
-fn require_memoria_env() -> (String, String) {
+fn require_memoria_env() -> Option<(String, String)> {
     if std::env::var("ASTRA_TEST_MEMORIA_E2E").as_deref() != Ok("1") {
-        eprintln!("ASTRA_TEST_MEMORIA_E2E not set — skipping");
-        std::process::exit(0);
+        return None;
     }
     dotenvy::dotenv().ok();
     let base = std::env::var("MEMORIA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8100".into());
     let key = std::env::var("MEMORIA_MASTER_KEY").expect("MEMORIA_MASTER_KEY must be set");
-    (base, key)
+    Some((base, key))
 }
 
 fn unique_user_id() -> String {
@@ -41,7 +40,7 @@ fn client() -> reqwest::Client {
 #[tokio::test]
 #[ignore]
 async fn store_and_retrieve_semantic_lesson() {
-    let (base, key) = require_memoria_env();
+    let Some((base, key)) = require_memoria_env() else { return; };
     let user_id = unique_user_id();
     let client = client();
 
@@ -107,7 +106,7 @@ async fn store_and_retrieve_semantic_lesson() {
 #[tokio::test]
 #[ignore]
 async fn batch_store_session_end_pattern() {
-    let (base, key) = require_memoria_env();
+    let Some((base, key)) = require_memoria_env() else { return; };
     let user_id = unique_user_id();
     let client = client();
 
@@ -192,7 +191,7 @@ async fn batch_store_session_end_pattern() {
 #[tokio::test]
 #[ignore]
 async fn governance_and_consolidate_paths_reachable() {
-    let (base, key) = require_memoria_env();
+    let Some((base, key)) = require_memoria_env() else { return; };
     let user_id = unique_user_id();
     let client = client();
 
@@ -235,7 +234,7 @@ async fn governance_and_consolidate_paths_reachable() {
 #[tokio::test]
 #[ignore]
 async fn cross_session_lesson_appears_in_self_model_prompt() {
-    let (base, key) = require_memoria_env();
+    let Some((base, key)) = require_memoria_env() else { return; };
     let user_id = unique_user_id();
     let client = client();
 
@@ -373,7 +372,7 @@ async fn cross_session_lesson_appears_in_self_model_prompt() {
 #[tokio::test]
 #[ignore]
 async fn memory_correct_by_query_works() {
-    let (base, key) = require_memoria_env();
+    let Some((base, key)) = require_memoria_env() else { return; };
     let user_id = unique_user_id();
     let client = client();
 
@@ -431,7 +430,7 @@ async fn memory_correct_by_query_works() {
 #[tokio::test]
 #[ignore]
 async fn memory_profile_endpoint_reachable() {
-    let (base, key) = require_memoria_env();
+    let Some((base, key)) = require_memoria_env() else { return; };
     let user_id = unique_user_id();
     let client = client();
 

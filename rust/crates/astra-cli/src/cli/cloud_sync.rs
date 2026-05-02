@@ -155,7 +155,11 @@ async fn drain_ephemeral_audit(
     drop(svc);
     drop(flusher.writer);
     flusher.shutdown.cancel();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), flusher.join_handle).await;
+    match tokio::time::timeout(std::time::Duration::from_secs(5), flusher.join_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!(target: "cloud_sync", "audit flusher panicked: {e}"),
+        Err(_) => tracing::warn!(target: "cloud_sync", "audit flusher drain timed out (5s), some entries may be lost"),
+    }
 }
 
 /// Push learning state to cloud with optimistic locking.
