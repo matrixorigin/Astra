@@ -9,13 +9,10 @@ prompt: |
   You have a `spawn_agent` tool available. Call it with:
     agent_id: "child-hello"
     task: "Reply with exactly: hello from child"
-    background: true
 
-  The child runs asynchronously. Its result will be appended to
-  your output once it completes.
-
-  After spawning, report "CHILD:" followed by whatever reply the
-  child produces in your final answer.
+  The child runs synchronously — you will receive its reply directly
+  in the tool result. Report "CHILD:" followed by the child's reply
+  in your final answer.
 timeout_seconds: 180
 criteria:
   - type: exit_code

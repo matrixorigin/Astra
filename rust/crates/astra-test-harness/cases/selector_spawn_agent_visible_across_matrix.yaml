@@ -9,12 +9,11 @@ prompt: |
   You have a `spawn_agent` tool. Call it with:
     agent_id: "child-G3"
     task: "Reply with exactly: G3-matrix-ok"
-    background: true
 
-  The child runs asynchronously. Its result will be appended to
-  your output once it completes.
+  The child runs synchronously — you will receive its reply directly
+  in the tool result.
 
-  Surface the child's reply in your final answer.
+  Surface the child's exact reply in your final answer.
 models:
   - qwen-flash
   - us.anthropic.claude-sonnet-4-6

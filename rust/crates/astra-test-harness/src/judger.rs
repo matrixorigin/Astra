@@ -336,11 +336,36 @@ pub(crate) fn parse_score_from_response(stdout_body: &str) -> Result<JudgerScore
     // in case the model repeats itself.
     let re = regex::Regex::new(r"(?i)SCORE:\s*([0-9]+(?:\.[0-9]+)?)")
         .map_err(|e| format!("regex compile: {e}"))?;
-    let captured = re
-        .captures_iter(&text)
-        .last()
-        .and_then(|c| c.get(1))
-        .ok_or_else(|| format!("no SCORE: line in judger response; text={text:?}"))?;
+    let captured = match re.captures_iter(&text).last().and_then(|c| c.get(1)) {
+        Some(m) => m,
+        None => {
+            // Fallback: some models output a bare float on the last
+            // line (e.g. "0.85") without the SCORE: prefix. Try to
+            // parse the last non-empty line as a float in [0,1].
+            let fallback = text
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .and_then(|l| l.trim().parse::<f64>().ok())
+                .filter(|&v| (0.0..=1.0).contains(&v));
+            if let Some(score) = fallback {
+                eprintln!(
+                    "[astra-test] WARNING: judger omitted SCORE: prefix; \
+                     inferred {score} from last line"
+                );
+                let rationale = text.trim().to_string();
+                return Ok(JudgerScore {
+                    score,
+                    rationale: rationale.chars().take(200).collect(),
+                    full_rationale: rationale,
+                    votes: Vec::new(),
+                });
+            }
+            return Err(format!(
+                "no SCORE: line in judger response; text={text:?}"
+            ));
+        }
+    };
     let score: f64 = captured
         .as_str()
         .parse()
@@ -718,6 +743,19 @@ mod tests {
     #[test]
     fn parse_score_missing_line_fails() {
         let body = r#"{"text":"I have no opinion"}"#;
+        assert!(parse_score_from_response(body).is_err());
+    }
+
+    #[test]
+    fn parse_score_bare_float_fallback() {
+        let body = r#"{"text":"The agent did well.\n0.85"}"#;
+        let s = parse_score_from_response(body).unwrap();
+        assert!((s.score - 0.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_score_bare_float_out_of_range_still_fails() {
+        let body = r#"{"text":"Some text\n5.0"}"#;
         assert!(parse_score_from_response(body).is_err());
     }
 

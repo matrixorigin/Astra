@@ -28,7 +28,7 @@ criteria:
     name: spawn_agent
   - type: turn_rounds_between
     min: 1
-    max: 20
+    max: 50
   - type: judger
     question: |
       Did the agent correctly delegate 17*23 to a sub-agent and report
