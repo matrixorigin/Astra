@@ -16,11 +16,10 @@
 //!   4. Trust tier mapping (T2/T3) produces correct confidence
 
 fn require_memoria_env() -> (String, String) {
-    assert_eq!(
-        std::env::var("ASTRA_TEST_MEMORIA_E2E").as_deref(),
-        Ok("1"),
-        "set ASTRA_TEST_MEMORIA_E2E=1 to run Memoria E2E tests"
-    );
+    if std::env::var("ASTRA_TEST_MEMORIA_E2E").as_deref() != Ok("1") {
+        eprintln!("ASTRA_TEST_MEMORIA_E2E not set — skipping");
+        std::process::exit(0);
+    }
     dotenvy::dotenv().ok();
     let base = std::env::var("MEMORIA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8100".into());
     let key = std::env::var("MEMORIA_MASTER_KEY").expect("MEMORIA_MASTER_KEY must be set");
