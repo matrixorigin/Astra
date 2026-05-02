@@ -1000,8 +1000,19 @@ input[type="range"]::-moz-range-thumb {
   transition: height 0.3s var(--ease);
   display: flex; flex-direction: column;
   overflow: hidden;
+  min-height: 40px;
+  position: relative;
 }
 .chat-panel.collapsed { height: 40px !important; }
+.chat-panel.dragging { transition: none; }
+.chat-resize-handle {
+  position: absolute; top: -3px; left: 0; right: 0; height: 6px;
+  cursor: ns-resize; z-index: 10;
+}
+.chat-resize-handle:hover, .chat-resize-handle:active {
+  background: linear-gradient(to bottom, var(--accent), transparent);
+  opacity: 0.4;
+}
 .chat-header {
   display: flex; align-items: center; justify-content: space-between;
   padding: 8px 16px;
@@ -1698,6 +1709,7 @@ body.sidebar-collapsed .main-scroll { padding-left: 32px; }
 
     <!-- Ask Astra chat panel (bottom) -->
     <div class="chat-panel collapsed" id="chatPanel">
+      <div class="chat-resize-handle" id="chatResizeHandle"></div>
       <div class="chat-header" id="chatHeader">
         <div class="chat-header-left">
           <span class="chat-icon">&#128172;</span>
@@ -2617,11 +2629,30 @@ chatHeader.addEventListener('click', () => {
   chatPanel.classList.toggle('collapsed');
   if (!chatPanel.classList.contains('collapsed')) {
     // Expand to a reasonable height
-    chatPanel.style.height = '280px';
+    chatPanel.style.height = '50vh';
     chatInput.focus();
   } else {
     chatPanel.style.height = '';
   }
+});
+
+// Resize handle drag
+const chatResizeHandle = $('chatResizeHandle');
+let resizing = false;
+chatResizeHandle.addEventListener('mousedown', (e) => {
+  if (chatPanel.classList.contains('collapsed')) return;
+  resizing = true;
+  chatPanel.classList.add('dragging');
+  e.preventDefault();
+});
+document.addEventListener('mousemove', (e) => {
+  if (!resizing) return;
+  const windowH = window.innerHeight;
+  const newH = Math.max(150, Math.min(windowH - 100, windowH - e.clientY));
+  chatPanel.style.height = newH + 'px';
+});
+document.addEventListener('mouseup', () => {
+  if (resizing) { resizing = false; chatPanel.classList.remove('dragging'); }
 });
 
 chatSend.addEventListener('click', sendChat);

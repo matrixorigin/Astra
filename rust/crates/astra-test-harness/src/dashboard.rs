@@ -428,11 +428,15 @@ async fn chat_handler(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let output = match tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output()).await
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(300), cmd.output()).await
     {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => return Json(serde_json::json!({"error": format!("spawn: {e}")})),
-        Err(_) => return Json(serde_json::json!({"error": "chat timed out after 120s"})),
+        Err(_) => {
+            return Json(serde_json::json!({
+                "error": "Chat timed out after 5 minutes. Try a shorter question or a faster model."
+            }));
+        }
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
