@@ -577,6 +577,99 @@ pub async fn resolve_reasoning_model(
     build_resolved_active_llm_from_row(&rows[best_idx], encryptor)
 }
 
+/// Resolve the cheapest model tagged `"selector"` for memory-related
+/// decisions (relevance filtering, lesson synthesis, L1b extraction).
+///
+/// Resolution order:
+/// 1. Cheapest active model whose `tags` JSON array contains `"selector"`.
+/// 2. Fallback: cheapest active model overall (same as `resolve_reasoning_model`
+///    without the admin override).
+///
+/// This is cheaper than the main conversation model and dedicated to
+/// low-stakes judgment calls where latency is acceptable (2–3s).
+pub async fn resolve_memory_model(
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    pool: Option<&sqlx::Pool<sqlx::MySql>>,
+) -> Result<ResolvedActiveLlmModel, String> {
+    let ephemeral;
+    let pool: &sqlx::Pool<sqlx::MySql> = match pool {
+        Some(p) => p,
+        None => {
+            let url = format!(
+                "{}?connect_timeout=2",
+                matrixone.database_url_with_password()
+            );
+            ephemeral = sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(std::time::Duration::from_secs(3))
+                .connect(&url)
+                .await
+                .map_err(|e| format!("DB connect: {e}"))?;
+            &ephemeral
+        }
+    };
+
+    let rows = sqlx::query(
+        "SELECT model_name, api_key_encrypted, base_url, provider, \
+                IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json, \
+                IFNULL(CAST(pricing AS CHAR), '{}') AS pricing_json, \
+                IFNULL(CAST(tags AS CHAR), '[]') AS tags_json \
+         FROM infra_llm_models WHERE is_active = 1",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("DB query memory model: {e}"))?;
+
+    if rows.is_empty() {
+        return Err("No active LLM model configured.".to_string());
+    }
+
+    // Prefer models tagged "selector" (ultra-cheap intent/judgment models).
+    let selector_rows: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            let tags_json: String = row
+                .try_get("tags_json")
+                .unwrap_or_else(|_| "[]".to_string());
+            tags_json.contains("\"selector\"")
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    let best_idx = if !selector_rows.is_empty() {
+        // Pick cheapest among selector-tagged models.
+        let selector_entries: Vec<(String, String)> = selector_rows
+            .iter()
+            .map(|&i| {
+                let name: String = rows[i].try_get("model_name").unwrap_or_default();
+                let pricing: String = rows[i]
+                    .try_get("pricing_json")
+                    .unwrap_or_else(|_| "{}".to_string());
+                (name, pricing)
+            })
+            .collect();
+        let local_best = rank_cheapest_index(&selector_entries);
+        selector_rows[local_best]
+    } else {
+        // No selector models — fall back to cheapest overall.
+        let entries: Vec<(String, String)> = rows
+            .iter()
+            .map(|row| {
+                let name: String = row.try_get("model_name").unwrap_or_default();
+                let pricing: String = row
+                    .try_get("pricing_json")
+                    .unwrap_or_else(|_| "{}".to_string());
+                (name, pricing)
+            })
+            .collect();
+        rank_cheapest_index(&entries)
+    };
+
+    build_resolved_active_llm_from_row(&rows[best_idx], encryptor)
+}
+
 /// Return the index of the cheapest entry by `pricing.completion`.
 ///
 /// * Missing / unparseable pricing and `completion <= 0` are treated as `+infinity`,
@@ -2082,5 +2175,46 @@ mod tests {
         .await;
         let msg = result.expect("should return an error");
         assert!(msg.contains("Invalid base_url"), "got: {msg}");
+    }
+
+    // ── resolve_memory_model: selector tag preference ──────────────────
+
+    #[test]
+    fn selector_tag_detected_in_tags_json() {
+        // Simulates the tag matching logic from resolve_memory_model.
+        let with_selector = r#"["chat", "selector"]"#;
+        let without_selector = r#"["chat", "reasoning"]"#;
+        let empty = "[]";
+
+        assert!(with_selector.contains("\"selector\""));
+        assert!(!without_selector.contains("\"selector\""));
+        assert!(!empty.contains("\"selector\""));
+    }
+
+    #[test]
+    fn rank_cheapest_among_selector_subset() {
+        // Given 3 models where 2 have selector tag, picks cheapest selector.
+        let all_entries = vec![
+            (
+                "expensive-main".to_string(),
+                r#"{"prompt":0.003,"completion":0.015}"#.to_string(),
+            ),
+            (
+                "qwen-flash".to_string(),
+                r#"{"prompt":0.00000015,"completion":0.0000015}"#.to_string(),
+            ),
+            (
+                "qwen3-flash".to_string(),
+                r#"{"prompt":0.0000002,"completion":0.000002}"#.to_string(),
+            ),
+        ];
+        // selector_rows indices: [1, 2]
+        let selector_entries: Vec<(String, String)> =
+            vec![all_entries[1].clone(), all_entries[2].clone()];
+        let best = rank_cheapest_index(&selector_entries);
+        assert_eq!(
+            selector_entries[best].0, "qwen-flash",
+            "cheapest selector should be qwen-flash"
+        );
     }
 }
