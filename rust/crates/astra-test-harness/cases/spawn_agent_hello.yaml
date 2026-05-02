@@ -9,8 +9,7 @@ prompt: |
   You have a `spawn_agent` tool. Call it with:
     agent_id: "child-hello"
     task: "Reply with exactly: hello from child"
-
-  The child runs synchronously — its reply will be in the tool result.
+    background: true
 
   Report "CHILD:" followed by the child's reply in your final answer.
 timeout_seconds: 180

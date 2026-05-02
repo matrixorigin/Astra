@@ -10,8 +10,7 @@ prompt: |
     agent_id: "child-delegate-G2"
     task: "Reply with exactly: delegate-G2-ok"
     inherit_prefix: {}
-
-  The child runs synchronously — its reply will be in the tool result.
+    background: true
 
   Surface the child's exact reply in your final answer.
   Do not use any other tools.
@@ -31,7 +30,6 @@ criteria:
       "delegate-G2-ok" (or close)? The final answer should surface
       the child's reply.
       Score 1.0 if the child replied and the text surfaces it.
-      Score 0.5 if spawn succeeded but the reply is garbled or
-      the child's output is only partially surfaced.
+      Score 0.5 if spawn succeeded but the reply is garbled.
       Score 0.0 if no spawn happened or the agent fabricated a result.
     threshold: 0.5

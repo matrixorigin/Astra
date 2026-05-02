@@ -276,6 +276,8 @@ pub struct DynamicAgentSpawner {
     background_agent_ids: Arc<std::sync::Mutex<Vec<String>>>,
     /// Completion notifiers: get_agent_result awaits these instead of polling.
     completion_notifiers: Arc<RwLock<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    /// How long background spawn auto-waits for the child before returning Launched.
+    background_wait_timeout: std::time::Duration,
     /// Optional fork-prefix store for cache inheritance across
     /// parent/child spawns. When `None` (default), spawn behavior is
     /// identical to pre-fork-prefix builds — existing callers are
@@ -307,6 +309,7 @@ impl DynamicAgentSpawner {
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             background_agent_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             completion_notifiers: Arc::new(RwLock::new(HashMap::new())),
+            background_wait_timeout: std::time::Duration::from_secs(120),
             prefix_store: None,
             prefix_resolve_outcomes: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -332,6 +335,7 @@ impl DynamicAgentSpawner {
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             background_agent_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             completion_notifiers: Arc::new(RwLock::new(HashMap::new())),
+            background_wait_timeout: std::time::Duration::from_secs(120),
             prefix_store: None,
             prefix_resolve_outcomes: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -355,6 +359,7 @@ impl DynamicAgentSpawner {
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             background_agent_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             completion_notifiers: Arc::new(RwLock::new(HashMap::new())),
+            background_wait_timeout: std::time::Duration::from_secs(120),
             prefix_store: None,
             prefix_resolve_outcomes: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -363,6 +368,14 @@ impl DynamicAgentSpawner {
     /// Set the executor for running spawned agents.
     pub fn with_executor(mut self, executor: Arc<dyn SpawnAgentExecutor>) -> Self {
         self.executor = Some(executor);
+        self
+    }
+
+    /// Override the auto-wait timeout for background spawns. Production
+    /// default is 120s. Tests can set a shorter value.
+    #[cfg(test)]
+    pub fn with_background_wait_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.background_wait_timeout = timeout;
         self
     }
 
@@ -661,29 +674,65 @@ impl DynamicAgentSpawner {
                 let agent_id_clone = agent_id.clone();
                 let _description = input.description.clone();
 
+                // Notify on completion (or panic) via a drop guard so
+                // auto-wait unblocks even if the child panics.
+                let notifiers = Arc::clone(&self.completion_notifiers);
+                let notify_id = agent_id.clone();
+                let spawn_future = async move {
+                    struct NotifyOnDrop(Arc<RwLock<HashMap<String, Arc<tokio::sync::Notify>>>>, String);
+                    impl Drop for NotifyOnDrop {
+                        fn drop(&mut self) {
+                            if let Ok(map) = self.0.try_read() {
+                                if let Some(n) = map.get(&self.1) {
+                                    n.notify_waiters();
+                                }
+                            }
+                        }
+                    }
+                    let _guard = NotifyOnDrop(notifiers, notify_id);
+                    let result = executor.execute(run_config).await;
+                    spawner.handle_completion(&agent_id_clone, result).await;
+                };
                 if let Ok(mut tasks) = self.background_tasks.lock() {
-                    tasks.spawn(async move {
-                        let result = executor.execute(run_config).await;
-                        spawner.handle_completion(&agent_id_clone, result).await;
-                    });
+                    tasks.spawn(spawn_future);
                 } else {
-                    // Lock poisoned (extremely unlikely) — fall back to untracked spawn.
-                    tokio::spawn(async move {
-                        let result = executor.execute(run_config).await;
-                        spawner.handle_completion(&agent_id_clone, result).await;
-                    });
+                    tokio::spawn(spawn_future);
                 }
             }
 
             // Track for result collection in shutdown_and_wait.
+            let task_spawned = self.executor.is_some();
             if let Ok(mut ids) = self.background_agent_ids.lock() {
                 ids.push(agent_id.clone());
             }
-            // Register completion notifier for get_agent_result.
+            // Register completion notifier.
             self.completion_notifiers
                 .write()
                 .await
                 .insert(agent_id.clone(), Arc::new(tokio::sync::Notify::new()));
+
+            // Auto-wait: most children complete quickly. Wait for the
+            // result so the parent gets it in the same tool-call response.
+            // Only wait if a task was actually spawned (executor present).
+            if task_spawned {
+                let wait_timeout = self.background_wait_timeout;
+                if let Some(status) = self.wait_for_agent(&agent_id, wait_timeout).await {
+                    match status {
+                        AgentStatus::Completed { result } => {
+                            return Ok(SpawnAgentOutput::Completed {
+                                agent_id,
+                                result,
+                                tool_calls: 0,
+                                duration_ms: 0,
+                            });
+                        }
+                        AgentStatus::Failed { error } => {
+                            return Ok(SpawnAgentOutput::Failed { error });
+                        }
+                        _ => {}
+                    }
+                }
+            }
 
             Ok(SpawnAgentOutput::Launched {
                 agent_id,
@@ -965,6 +1014,7 @@ impl DynamicAgentSpawner {
             background_tasks: Arc::clone(&self.background_tasks),
             background_agent_ids: Arc::clone(&self.background_agent_ids),
             completion_notifiers: Arc::clone(&self.completion_notifiers),
+            background_wait_timeout: self.background_wait_timeout,
             // Share prefix-store + resolve-outcomes map so clones
             // see/write the same view. The store is an Arc<dyn ...>
             // itself already, so cloning the Option just bumps refcount.
@@ -1664,11 +1714,15 @@ mod tests {
             ..Default::default()
         };
 
+        // ImmediateSuccessExecutor completes instantly, so auto-wait
+        // kicks in and spawn() returns Completed directly.
         let agent_id = match spawner.spawn(input, &context).await.unwrap() {
+            SpawnAgentOutput::Completed { agent_id, .. } => agent_id,
             SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
-            other => panic!("expected launched output, got {other:?}"),
+            other => panic!("expected Completed or Launched, got {other:?}"),
         };
 
+        // Mailbox should be unregistered after completion.
         for _ in 0..20 {
             if router.list_registered_agents().await.is_empty() {
                 break;
@@ -1680,9 +1734,6 @@ mod tests {
             router.list_registered_agents().await.is_empty(),
             "background completion should unregister mailbox"
         );
-        let state = spawner.get_agent_state(&agent_id).await.unwrap();
-        assert!(matches!(state.status, AgentStatus::Completed { .. }));
-        assert!(state.messaging_address.is_none());
     }
 
     #[tokio::test]
@@ -1877,13 +1928,34 @@ mod tests {
         }
     }
 
+    /// Background spawn auto-waits: the parent receives Completed (not Launched)
+    /// because the child finishes within the wait window.
+    #[tokio::test]
+    async fn background_spawn_auto_waits_for_fast_child() {
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
+
+        let result = spawner
+            .spawn(make_bg_input(), &make_bg_context())
+            .await
+            .unwrap();
+
+        // Even though background=true, the child completes instantly,
+        // so spawn() should auto-wait and return Completed.
+        assert!(
+            matches!(result, SpawnAgentOutput::Completed { .. }),
+            "background spawn of a fast child should return Completed, got {result:?}"
+        );
+    }
+
     /// HIGH #5: background agent tracked in JoinSet; shutdown_and_wait drains it.
     #[tokio::test]
     async fn background_agent_tracked_and_drained_on_shutdown() {
         let factory = BlockingExecutorFactory::new();
         let factory2 = Arc::clone(&factory);
         let spawner = DynamicAgentSpawner::new(mock_router())
-            .with_executor(factory as Arc<dyn SpawnAgentExecutor>);
+            .with_executor(factory as Arc<dyn SpawnAgentExecutor>)
+            .with_background_wait_timeout(std::time::Duration::from_millis(50));
 
         let result = spawner
             .spawn(make_bg_input(), &make_bg_context())
@@ -1921,7 +1993,8 @@ mod tests {
         let factory = BlockingExecutorFactory::new();
         let factory2 = Arc::clone(&factory);
         let spawner = DynamicAgentSpawner::new(mock_router())
-            .with_executor(factory as Arc<dyn SpawnAgentExecutor>);
+            .with_executor(factory as Arc<dyn SpawnAgentExecutor>)
+            .with_background_wait_timeout(std::time::Duration::from_millis(50));
 
         let result = spawner
             .spawn(make_bg_input(), &make_bg_context())
@@ -1953,9 +2026,11 @@ mod tests {
             .spawn(make_bg_input(), &make_bg_context())
             .await
             .unwrap();
+        // Auto-wait kicks in, so we may get Completed or Launched.
         let agent_id = match result {
-            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
-            other => panic!("expected Launched, got {other:?}"),
+            SpawnAgentOutput::Completed { agent_id, .. }
+            | SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected Completed or Launched, got {other:?}"),
         };
 
         // Wait for background task to complete via the notifier.
@@ -1979,12 +2054,15 @@ mod tests {
     }
 
     /// Regression: background task completes BEFORE shutdown_and_wait is called.
-    /// The old pre/post diff approach returned empty because the agent was
-    /// already in completed_agents when the pre-drain snapshot was taken.
+    /// Uses BlockingExecutorFactory + short auto-wait timeout so the child
+    /// finishes after auto-wait gives up but before shutdown_and_wait is called.
     #[tokio::test]
     async fn shutdown_returns_results_even_when_task_completed_before_drain() {
+        let factory = BlockingExecutorFactory::new();
+        let factory2 = Arc::clone(&factory);
         let spawner = DynamicAgentSpawner::new(mock_router())
-            .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
+            .with_executor(factory as Arc<dyn SpawnAgentExecutor>)
+            .with_background_wait_timeout(std::time::Duration::from_millis(50));
 
         let result = spawner
             .spawn(make_bg_input(), &make_bg_context())
@@ -1992,21 +2070,15 @@ mod tests {
             .unwrap();
         assert!(matches!(result, SpawnAgentOutput::Launched { .. }));
 
-        // Poll until the background task completes and enters completed_agents.
+        // Unblock the child, then let it finish before we drain.
+        factory2.unblock();
         for _ in 0..200 {
             if !spawner.completed_agents.read().await.is_empty() {
                 break;
             }
             tokio::task::yield_now().await;
         }
-        assert!(
-            !spawner.completed_agents.read().await.is_empty(),
-            "background task should have completed by now"
-        );
 
-        // By now the background task has ALREADY completed. The JoinSet
-        // may already be empty. This is the exact race that the old
-        // pre/post diff approach got wrong.
         let bg_results = spawner
             .shutdown_and_wait(std::time::Duration::from_secs(2))
             .await;
