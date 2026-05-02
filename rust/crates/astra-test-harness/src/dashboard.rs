@@ -454,6 +454,8 @@ struct ChatRequest {
     model: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
 }
 
 async fn chat_handler(
@@ -464,8 +466,9 @@ async fn chat_handler(
 
     let model = req.model.as_deref().unwrap_or("claude-sonnet-4-6");
     eprintln!(
-        "[astra-test] chat: model={model} session_id={:?} msg_len={}",
+        "[astra-test] chat: model={model} session_id={:?} run_id={:?} msg_len={}",
         req.session_id.as_deref().unwrap_or("(new)"),
+        req.run_id.as_deref().unwrap_or("-"),
         req.message.len()
     );
 

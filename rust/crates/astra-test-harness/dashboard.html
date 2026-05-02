@@ -1576,6 +1576,8 @@ const S = {
   modelRegistry: [],
 
   // Run state
+  runId: null,
+  runHistory: [], // [{runId, startTime, models, total, passed, failed}]
   running: false,
   total: 0,
   completed: 0,
@@ -1941,12 +1943,14 @@ function addRailDot(type, label, targetEl) {
 }
 
 function createTimelineCard() {
+  const runLabel = S.runId || 'run';
   const html = `<div class="timeline-card" id="activeTimeline">
     <div class="tl-header">
       <div class="tl-header-left">
         <span class="tl-status-icon">&#128260;</span>
         <span class="tl-title">Running</span>
         <span class="tl-counter" id="tlCounter">(0/${S.total})</span>
+        <span style="font-size:11px;color:var(--dim);font-family:var(--mono);margin-left:8px">${esc(runLabel)}</span>
       </div>
     </div>
     <div class="tl-progress-bar"><div class="tl-progress-fill" id="tlProgressFill" style="width:0%"></div></div>
@@ -2187,6 +2191,9 @@ function addReportCard() {
   html += '<div class="report-header-left"><span style="font-size:18px">&#128202;</span>';
   html += '<span class="report-title">Results: ' + S.passed + '/' + S.completed + ' passed (' + rate + '%)</span></div>';
   html += '<span class="report-rate" style="color:' + rateFg(rate) + '">' + rate + '%</span>';
+  if (S.runId) {
+    html += '<span style="font-size:11px;color:var(--dim);font-family:var(--mono);margin-left:8px">' + esc(S.runId) + '</span>';
+  }
   html += '</div>';
 
   // Summary stats
@@ -2688,9 +2695,11 @@ function sendInput() {
 }
 
 function sendChat(msg, model) {
+  // Include run_id so the backend can trace chat questions to specific runs
   const body = { message: msg };
   if (model) body.model = model;
   if (S.chatSessionId) body.session_id = S.chatSessionId;
+  if (S.runId) body.run_id = S.runId;
 
   fetch('/api/chat', {
     method: 'POST',
@@ -2861,6 +2870,7 @@ function handleEvent(ev) {
     }
 
     case 'suite_started': {
+      S.runId = ev.run_id || ('run-' + Date.now());
       S.total = ev.total_cases || 0;
       S.completed = 0;
       S.passed = 0;
@@ -2878,7 +2888,7 @@ function handleEvent(ev) {
 
       // Create timeline card in conversation and show rail
       showTimelineRail();
-      addRailDot('plan', 'Run started', null);
+      addRailDot('plan', S.runId + ' started', null);
       createTimelineCard();
       break;
     }
@@ -2913,11 +2923,22 @@ function handleEvent(ev) {
       S.runningSet.clear();
       S.running = false;
 
+      // Record run in history for tracing
+      S.runHistory.push({
+        runId: S.runId,
+        startTime: S.startTime,
+        endTime: Date.now(),
+        total: S.total,
+        passed: S.passed,
+        failed: S.failed,
+        models: [...new Set(S.runs.map(r => normModel(r.model)))],
+      });
+
       setTimeout(() => {
         finalizeTimeline();
         addReportCard();
         resetRunBtn();
-        addRailDot('report', 'Report — ' + S.passed + '/' + S.completed + ' passed', null);
+        addRailDot('report', S.runId + ' — ' + S.passed + '/' + S.completed + ' passed', null);
       }, 300);
       break;
     }
