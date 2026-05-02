@@ -73,13 +73,13 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_8_pinned() {
-        assert_eq!(ToolRegistry::pinned_count(), 4);
+    fn catalog_has_6_pinned() {
+        assert_eq!(ToolRegistry::pinned_count(), 6);
     }
 
     #[test]
-    fn catalog_has_35_dynamic() {
-        assert_eq!(ToolRegistry::dynamic_count(), 39);
+    fn catalog_has_37_dynamic() {
+        assert_eq!(ToolRegistry::dynamic_count(), 37);
     }
 
     #[test]
@@ -93,12 +93,11 @@ mod tests {
         assert!(pinned.contains(&"read_file"));
         assert!(pinned.contains(&"str_replace"));
         assert!(pinned.contains(&"list_dir"));
-        assert!(!pinned.contains(&"memory_store"));
+        assert!(pinned.contains(&"memory_store"), "memory_store must be pinned — intrinsic memory capability");
+        assert!(pinned.contains(&"memory_retrieve"), "memory_retrieve must be pinned — intrinsic memory capability");
         assert!(!pinned.contains(&"write_file"));
         assert!(!pinned.contains(&"grep"));
         assert!(!pinned.contains(&"glob"));
-        // memory_retrieve is dynamic — selected only when query involves recall
-        assert!(!pinned.contains(&"memory_retrieve"));
     }
 
     #[test]
@@ -185,21 +184,22 @@ mod tests {
     }
 
     #[test]
-    fn prefilter_ranks_memory_tools_for_recall() {
-        // memory_store, memory_retrieve, and memory_purge are dynamic.
-        // For memory recall queries, memory_retrieve should appear.
+    fn memory_tools_are_pinned_not_dynamic() {
+        // memory_store and memory_retrieve are pinned — they should NOT
+        // appear in the dynamic pre-filter results (they're always included).
         let state = ConversationState::from_message("之前我记住了什么偏好?", 1);
         let ranked = pre_filter_dynamic(&state, "之前我记住了什么偏好?");
-
-        let top_names: Vec<&str> = ranked
+        let dynamic_names: Vec<&str> = ranked
             .iter()
-            .take(6)
             .map(|&(idx, _)| TOOL_CATALOG[idx].name)
             .collect();
         assert!(
-            top_names.contains(&"memory_retrieve"),
-            "memory_retrieve should appear for recall query, got: {:?}",
-            top_names
+            !dynamic_names.contains(&"memory_store"),
+            "pinned memory_store should not appear in dynamic results"
+        );
+        assert!(
+            !dynamic_names.contains(&"memory_retrieve"),
+            "pinned memory_retrieve should not appear in dynamic results"
         );
     }
 

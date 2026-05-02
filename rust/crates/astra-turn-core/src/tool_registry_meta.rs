@@ -758,10 +758,10 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         scope: Scope::External,
         schema_tokens: 25,
     },
-    // memory_store is now selective, not baseline-pinned. We surface it for
-    // explicit remember/track language plus common preference phrasing, so
-    // implicit user preferences can still route without paying the schema tax
-    // on unrelated turns.
+    // memory_store is pinned — intrinsic memory capability. The model must
+    // always be able to store memories regardless of query content. Without
+    // this, implicit preferences and background extraction have no way to
+    // persist information.
     ToolMeta {
         name: "memory_store",
         description: "Store information to persistent memory",
@@ -792,19 +792,19 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "倾向",
             "好吃",
             "比较好",
-            // Disambiguate from write_file "保存"
             "保存到记忆",
             "存储到记忆",
             "存一下",
             "帮我记住",
         ],
-        pinned: false,
+        pinned: true,
         intents: &[IntentType::Memory],
         scope: Scope::CrossSession,
         schema_tokens: 35,
     },
-    // memory_retrieve is dynamic: only needed when user explicitly asks about
-    // stored memories. Rich triggers ensure tfidf selects it reliably.
+    // memory_retrieve is pinned — intrinsic memory capability. The model
+    // must always be able to recall memories. Without this, "我有哪些记忆?"
+    // falls back to codebase exploration (session 2adc611f regression).
     ToolMeta {
         name: "memory_retrieve",
         description: "Retrieve persistent memories via semantic search",
@@ -834,7 +834,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "我的偏好",
             "我记住了",
         ],
-        pinned: false,
+        pinned: true,
         intents: &[IntentType::Memory],
         scope: Scope::CrossSession,
         schema_tokens: 30,
@@ -1431,12 +1431,11 @@ mod tests {
     }
 
     #[test]
-    fn catalog_memory_store_is_not_pinned() {
-        let ms = TOOL_CATALOG
-            .iter()
-            .find(|t| t.name == "memory_store")
-            .unwrap();
-        assert!(!ms.pinned, "memory_store should be selected dynamically");
+    fn catalog_memory_tools_are_pinned() {
+        for name in &["memory_store", "memory_retrieve"] {
+            let tool = TOOL_CATALOG.iter().find(|t| t.name == *name).unwrap();
+            assert!(tool.pinned, "{name} must be pinned — intrinsic memory capability");
+        }
     }
 
     #[test]
@@ -1444,7 +1443,8 @@ mod tests {
         assert!(is_pinned_tool("bash"));
         assert!(is_pinned_tool("read_file"));
         assert!(is_pinned_tool("str_replace"));
-        assert!(!is_pinned_tool("memory_store"));
+        assert!(is_pinned_tool("memory_store"));
+        assert!(is_pinned_tool("memory_retrieve"));
         assert!(!is_pinned_tool("nonexistent_tool"));
     }
 }
