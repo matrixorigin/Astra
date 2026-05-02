@@ -1878,6 +1878,38 @@ mod tests {
         );
     }
 
+    /// Regression: background task completes BEFORE shutdown_and_wait is called.
+    /// The old pre/post diff approach returned empty because the agent was
+    /// already in completed_agents when the pre-drain snapshot was taken.
+    #[tokio::test]
+    async fn shutdown_returns_results_even_when_task_completed_before_drain() {
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
+
+        let result = spawner
+            .spawn(make_bg_input(), &make_bg_context())
+            .await
+            .unwrap();
+        assert!(matches!(result, SpawnAgentOutput::Launched { .. }));
+
+        // Give the immediate executor time to complete and call
+        // handle_completion → archive_agent → completed_agents.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // By now the background task has ALREADY completed. The JoinSet
+        // may already be empty. This is the exact race that the old
+        // pre/post diff approach got wrong.
+        let bg_results = spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(2))
+            .await;
+
+        assert!(
+            !bg_results.is_empty(),
+            "shutdown_and_wait must return results even when background \
+             task completed before drain was called"
+        );
+    }
+
     /// HIGH #5: background agent that panics does not leave a zombie in the JoinSet.
     #[tokio::test]
     async fn background_agent_panic_does_not_leave_zombie() {
