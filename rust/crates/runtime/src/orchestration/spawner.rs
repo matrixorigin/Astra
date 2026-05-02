@@ -907,12 +907,16 @@ impl DynamicAgentSpawner {
         }
     }
 
-    /// Signal all background agents to finish and wait for them to drain.
+    /// Drain all background agents, wait up to `deadline`, and return
+    /// completed results so the caller can surface them.
     ///
-    /// This aborts tasks that exceed `deadline` rather than leaving them as zombies.
-    /// Panics inside a background task are caught via [`tokio::task::JoinError`] and
-    /// logged; they do not propagate to the caller.
-    pub async fn shutdown_and_wait(&self, deadline: std::time::Duration) {
+    /// Returns `(agent_id, result_text)` for every background child that
+    /// finished with `AgentStatus::Completed`. Aborts tasks that exceed
+    /// `deadline`; panics inside a background task are caught and logged.
+    pub async fn shutdown_and_wait(
+        &self,
+        deadline: std::time::Duration,
+    ) -> Vec<(String, String)> {
         let mut set = self
             .background_tasks
             .lock()
@@ -920,8 +924,17 @@ impl DynamicAgentSpawner {
             .unwrap_or_default();
 
         if set.is_empty() {
-            return;
+            return Vec::new();
         }
+
+        // Snapshot completed-agent IDs before drain to detect new completions.
+        let pre_drain: std::collections::HashSet<String> = self
+            .completed_agents
+            .read()
+            .await
+            .iter()
+            .map(|s| s.agent_id.clone())
+            .collect();
 
         match tokio::time::timeout(deadline, async {
             while let Some(result) = set.join_next().await {
@@ -946,6 +959,21 @@ impl DynamicAgentSpawner {
                 set.abort_all();
             }
         }
+
+        // Collect results from agents that completed during the drain.
+        self.completed_agents
+            .read()
+            .await
+            .iter()
+            .filter(|s| !pre_drain.contains(&s.agent_id))
+            .filter_map(|s| {
+                if let AgentStatus::Completed { ref result } = s.status {
+                    Some((s.agent_id.clone(), result.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Number of in-flight background tasks currently tracked.
@@ -1244,6 +1272,7 @@ mod tests {
             description: "Test agent".to_string(),
             prompt: "Do a test".to_string(),
             agent_type: "explore".to_string(),
+            background: true,
             ..Default::default()
         };
         let context = SpawnContext {
@@ -1337,11 +1366,12 @@ mod tests {
             inherited_skills: vec![],
         };
 
-        // Spawn an agent
+        // Spawn an agent in background mode
         let input = SpawnAgentInput {
             description: "Explore codebase".to_string(),
             prompt: "Explore".to_string(),
             agent_type: "explore".to_string(),
+            background: true,
             ..Default::default()
         };
         let result = spawner.spawn(input, &context).await.unwrap();
@@ -1384,6 +1414,7 @@ mod tests {
             prompt: "Send a message".to_string(),
             agent_type: "explore".to_string(),
             name: Some("named".to_string()),
+            background: true,
             ..Default::default()
         };
 
@@ -1555,6 +1586,7 @@ mod tests {
             prompt: "Finish immediately".to_string(),
             agent_type: "explore".to_string(),
             name: Some("bg".to_string()),
+            background: true,
             ..Default::default()
         };
 
@@ -1673,6 +1705,7 @@ mod tests {
             description: "Test with skills".to_string(),
             prompt: "Test".to_string(),
             agent_type: "explore".to_string(),
+            background: true,
             ..Default::default()
         };
         // Skills are stored in context and passed through — spawner launches successfully
@@ -1765,6 +1798,7 @@ mod tests {
             description: "bg test".to_string(),
             prompt: "do it".to_string(),
             agent_type: "explore".to_string(),
+            background: true,
             ..Default::default()
         }
     }
@@ -1804,6 +1838,34 @@ mod tests {
             spawner.background_task_count(),
             0,
             "all background tasks must be drained after shutdown"
+        );
+    }
+
+    /// Background agent results are returned by shutdown_and_wait.
+    #[tokio::test]
+    async fn shutdown_returns_completed_background_results() {
+        let factory = BlockingExecutorFactory::new();
+        let factory2 = Arc::clone(&factory);
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(factory as Arc<dyn SpawnAgentExecutor>);
+
+        let result = spawner
+            .spawn(make_bg_input(), &make_bg_context())
+            .await
+            .unwrap();
+        assert!(matches!(result, SpawnAgentOutput::Launched { .. }));
+
+        factory2.unblock();
+
+        let bg_results = spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(2))
+            .await;
+
+        // The mock executor returns a completed result, so we should
+        // see it in the drain output.
+        assert!(
+            !bg_results.is_empty(),
+            "shutdown_and_wait must return completed background agent results"
         );
     }
 
@@ -2054,6 +2116,7 @@ mod tests {
             description: "child".into(),
             prompt: "work".into(),
             agent_type: "explore".into(),
+            background: true,
             ..Default::default()
         };
         let ctx = parent_context("run-parent");
