@@ -21,6 +21,8 @@ pub enum FailureClass {
     PlatformSetupFailed,
     ModelInstructionFollowing,
     ModelCapability,
+    ModelQualityLow,
+    EfficiencyBoundsExceeded,
     Unknown,
 }
 
@@ -34,6 +36,8 @@ impl fmt::Display for FailureClass {
             Self::PlatformSetupFailed => write!(f, "PlatformSetupFailed"),
             Self::ModelInstructionFollowing => write!(f, "ModelInstructionFollowing"),
             Self::ModelCapability => write!(f, "ModelCapability"),
+            Self::ModelQualityLow => write!(f, "ModelQualityLow"),
+            Self::EfficiencyBoundsExceeded => write!(f, "EfficiencyBoundsExceeded"),
             Self::Unknown => write!(f, "Unknown"),
         }
     }
@@ -107,6 +111,26 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
         return FailureClass::ModelCapability;
     }
 
+    // Judger-only failure: deterministic checks passed but judger scored low.
+    let judger_failed = criteria_results
+        .iter()
+        .any(|r| !r.passed && matches!(r.criterion, crate::criteria::Criterion::Judger { .. }));
+    let hard_all_pass = criteria_results
+        .iter()
+        .filter(|r| r.severity == crate::criteria::CriterionSeverity::Hard)
+        .all(|r| r.passed);
+    if judger_failed && hard_all_pass {
+        return FailureClass::ModelQualityLow;
+    }
+
+    // Soft criteria failure only (efficiency bounds exceeded).
+    let soft_failed = criteria_results
+        .iter()
+        .any(|r| !r.passed && r.severity == crate::criteria::CriterionSeverity::Soft);
+    if soft_failed && hard_all_pass {
+        return FailureClass::EfficiencyBoundsExceeded;
+    }
+
     FailureClass::Unknown
 }
 
@@ -127,6 +151,12 @@ pub fn suggested_action(class: &FailureClass) -> &'static str {
         }
         FailureClass::ModelCapability => {
             "Model lacks capability for this task; try a more capable model"
+        }
+        FailureClass::ModelQualityLow => {
+            "Model completed the task but judger scored quality below threshold"
+        }
+        FailureClass::EfficiencyBoundsExceeded => {
+            "Task completed correctly but exceeded efficiency bounds (tokens/duration/turns)"
         }
         FailureClass::Unknown => "Inspect stderr and session journal for clues",
     }

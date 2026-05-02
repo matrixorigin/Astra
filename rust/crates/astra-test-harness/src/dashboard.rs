@@ -162,6 +162,7 @@ impl DashboardServer {
             .route("/api/chat", post(chat_handler))
             .route("/api/orchestrate", post(orchestrate_handler))
             .route("/api/report", get(report_handler))
+            .route("/api/analyze", post(analyze_handler))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
@@ -354,6 +355,29 @@ async fn cancel_handler(State(state): State<AppState>) -> Json<serde_json::Value
         Json(serde_json::json!({"status": "cancelling"}))
     } else {
         Json(serde_json::json!({"error": "No run in progress"}))
+    }
+}
+
+/// Run the 5-dimension LLM analysis on the latest report.
+#[derive(Debug, Deserialize)]
+struct AnalyzeRequest {
+    #[serde(default)]
+    model: Option<String>,
+}
+
+async fn analyze_handler(
+    State(state): State<AppState>,
+    Json(req): Json<AnalyzeRequest>,
+) -> Json<serde_json::Value> {
+    let report = state.last_report.lock().await;
+    let Some(ref r) = *report else {
+        return Json(serde_json::json!({"error": "No run results to analyze"}));
+    };
+
+    let model = req.model.as_deref().unwrap_or("claude-sonnet-4-6");
+    match crate::summarizer::summarize(&state.config.astra_bin, model, r, 300).await {
+        Ok(text) => Json(serde_json::json!({"analysis": text})),
+        Err(e) => Json(serde_json::json!({"error": e})),
     }
 }
 
