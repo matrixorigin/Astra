@@ -1422,21 +1422,24 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
 
     // Check for unrecovered tool failures. Agents self-correct by
     // retrying with the same or different tools (write_file fails →
-    // bash echo succeeds). Only fail if the LAST tool call failed —
-    // any successful tool call after a failure means the agent recovered.
+    // bash echo succeeds). Only fail if the LAST tool call failed AND
+    // the agent didn't produce a final answer. A trailing failed
+    // verification tool (bash, git_status) after a completed task
+    // is not a real failure — the agent did its job.
     let has_any_failure = sr.tool_call_records.iter().any(|r| !r.ok);
     if has_any_failure {
-        let last_ok = sr
-            .tool_call_records
-            .iter()
-            .rev()
-            .find(|r| r.ok)
-            .map(|_| true)
-            .unwrap_or(false);
+        let any_succeeded = sr.tool_call_records.iter().any(|r| r.ok);
         let last_record_ok = sr.tool_call_records.last().map(|r| r.ok).unwrap_or(true);
-        // Fail only if no tool call succeeded after the failures,
-        // OR the very last call itself failed.
-        if !last_ok || !last_record_ok {
+        let has_final_answer = !sr.full_text.trim().is_empty();
+
+        // If no tool ever succeeded, it's a clear failure.
+        if !any_succeeded {
+            return ExitCode::ToolFailure;
+        }
+        // If the last tool failed but the agent produced a final answer
+        // and at least one tool succeeded, the trailing failure is
+        // cleanup/verification — not a task failure.
+        if !last_record_ok && !has_final_answer {
             return ExitCode::ToolFailure;
         }
     }
@@ -3023,6 +3026,32 @@ mod exit_code_tests {
                 ..Default::default()
             });
         assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
+    }
+
+    #[test]
+    fn exit_code_success_trailing_failure_with_final_answer() {
+        let mut sr = empty_stream_result();
+        sr.full_text = "CHILD: G3-matrix-ok".to_string();
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "spawn_agent".to_string(),
+                ok: true,
+                ms: 5000,
+                ..Default::default()
+            });
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "Bash".to_string(),
+                ok: false,
+                ms: 100,
+                error: Some("exit 1".to_string()),
+                ..Default::default()
+            });
+        assert_eq!(
+            compute_exit_code(&sr),
+            ExitCode::Success,
+            "trailing failed verification tool should not cause exit=1 when agent produced a final answer"
+        );
     }
 
     #[test]
