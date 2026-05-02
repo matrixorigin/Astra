@@ -304,12 +304,12 @@ pub(crate) struct ReplState {
     /// diagnosis fires, its success_criteria are registered here. On each
     /// subsequent turn, evaluate_turn checks whether the criteria are met.
     /// Session cleanup reads the accumulated met/failed counts for the
-    /// LessonOutcome record.
+    /// DiagnosisOutcomeTracker.
     pub diagnosis_outcome_tracker: astra_runtime::auto_invoke_handler::DiagnosisOutcomeTracker,
 
     /// R1: cumulative met/failed diagnosis criteria for the session.
     /// Incremented by `maybe_run_auto_invoke` when tracker completes a
-    /// diagnosis evaluation. Written to `LessonOutcome` at session end.
+    /// diagnosis evaluation. Written to DiagnosisOutcomeTracker for observability.
     pub diagnosis_criteria_met: u32,
     pub diagnosis_criteria_failed: u32,
 
