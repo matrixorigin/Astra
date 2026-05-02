@@ -383,9 +383,11 @@ async fn login_handler(
         .output()
         .await;
     match output {
-        Ok(o) if o.status.success() => {
-            Json(serde_json::json!({"status": "ok", "message": "Logged in successfully"}))
-        }
+        Ok(o) if o.status.success() => Json(serde_json::json!({
+            "status": "ok",
+            "username": req.username,
+            "message": "Logged in successfully"
+        })),
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
             let detail = if stderr.contains("Invalid") {
@@ -684,7 +686,7 @@ async fn execute_run(
     req: RunRequest,
     cancel_flag: Arc<AtomicBool>,
     run_id: &str,
-    source: &str,
+    _source: &str,
 ) -> anyhow::Result<SuiteReport> {
     use crate::case::Case;
     use crate::digest::AstraCliDigestCollector;
@@ -740,15 +742,7 @@ async fn execute_run(
         runs: 1,
     };
 
-    // Emit suite_started with run_id and source
-    let _ = tx.send(DashboardEvent::SuiteStarted {
-        run_id: run_id.to_string(),
-        total_cases: cases.len() * runner_cfg.fallback_models.len().max(1),
-        models: runner_cfg.fallback_models.clone(),
-        started_at: chrono::Utc::now().to_rfc3339(),
-        source: source.to_string(),
-    });
-
+    // SuiteStarted is emitted by runner.run_all() — don't duplicate here.
     let runner = SuiteRunner {
         executor: &executor,
         judger: &judger,

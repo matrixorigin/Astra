@@ -1699,7 +1699,11 @@ function doLogin() {
         $('loginModal').classList.remove('open');
         $('loginUsername').value = '';
         $('loginPassword').value = '';
-        toast('Logged in', 'success');
+        const uname = data.username || 'user';
+        toast('Logged in as ' + uname, 'success');
+        $('loginBtn').textContent = uname;
+        // Refresh models list (auth was expired before)
+        loadModels();
       }
     })
     .catch(e => {
@@ -2658,6 +2662,19 @@ function updateInputModelSelector() {
 /* ================================================================
    Init: Load Config + Cases
    ================================================================ */
+function loadModels() {
+  fetch('/api/models')
+    .then(r => r.json())
+    .then(data => {
+      S.modelRegistry = data.models || [];
+      buildModelList();
+      renderModelList();
+      renderModelTags();
+      updateInputModelSelector();
+    })
+    .catch(() => {});
+}
+
 function loadConfig() {
   const modelsPromise = fetch('/api/models')
     .then(r => r.json())
