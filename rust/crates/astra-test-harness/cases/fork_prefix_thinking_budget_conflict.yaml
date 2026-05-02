@@ -13,10 +13,9 @@ prompt: |
     task: "Reply: thinking-clamp-ok"
     max_output_tokens: 256
     inherit_prefix: {}
-    background: false
 
-  IMPORTANT: You MUST set background: false so you receive the child's
-  reply synchronously in the tool result.
+  The child runs synchronously — you will receive its reply directly
+  in the tool result.
 
   Surface the child's reply in the final answer. If the spawn
   soft-falls back without the prefix, acknowledge that in the text.

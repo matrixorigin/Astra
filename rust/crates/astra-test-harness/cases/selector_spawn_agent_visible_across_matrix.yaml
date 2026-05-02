@@ -9,10 +9,10 @@ prompt: |
   You have a `spawn_agent` tool. Call it with:
     agent_id: "child-G3"
     task: "Reply with exactly: G3-matrix-ok"
-    background: false
+    background: true
 
-  IMPORTANT: You MUST set background: false so you receive the child's
-  reply synchronously in the tool result.
+  The child runs asynchronously. Its result will be appended to
+  your output once it completes.
 
   Surface the child's reply in your final answer.
 models:

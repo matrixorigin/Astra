@@ -9,13 +9,13 @@ prompt: |
   You have a `spawn_agent` tool available. Call it with:
     agent_id: "child-hello"
     task: "Reply with exactly: hello from child"
-    background: false
+    background: true
 
-  IMPORTANT: You MUST set background: false so you receive the child's
-  reply synchronously in the tool result.
+  The child runs asynchronously. Its result will be appended to
+  your output once it completes.
 
-  Then report the sub-agent's exact reply verbatim in your final answer,
-  prefixed with "CHILD:".
+  After spawning, report "CHILD:" followed by whatever reply the
+  child produces in your final answer.
 timeout_seconds: 180
 criteria:
   - type: exit_code

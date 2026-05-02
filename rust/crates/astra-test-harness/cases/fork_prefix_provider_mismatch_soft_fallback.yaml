@@ -13,10 +13,9 @@ prompt: |
     task: "Reply: cross-provider-fallback-ok"
     model: "qwen-flash"
     inherit_prefix: {}
-    background: false
 
-  IMPORTANT: You MUST set background: false so you receive the child's
-  reply synchronously in the tool result.
+  The child runs synchronously — you will receive its reply directly
+  in the tool result.
 
   Step 2 — surface the child's reply in your final answer. If the
   spawn fails, still report what you saw.

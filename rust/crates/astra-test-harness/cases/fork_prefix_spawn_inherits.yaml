@@ -10,12 +10,12 @@ prompt: |
     agent_id: "child-delegate-G2"
     task: "Reply with exactly: delegate-G2-ok"
     inherit_prefix: {}
-    background: false
+    background: true
 
-  IMPORTANT: You MUST set background: false so you receive the child's
-  reply synchronously in the tool result.
+  The child runs asynchronously. Its result will be appended to
+  your output once it completes.
 
-  Once the child replies, surface its exact reply in your final answer.
+  Surface the child's reply in your final answer.
   Do not use any other tools.
 debug_log: true
 timeout_seconds: 300

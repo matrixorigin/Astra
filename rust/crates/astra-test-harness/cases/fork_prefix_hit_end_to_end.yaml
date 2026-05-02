@@ -14,12 +14,12 @@ prompt: |
       agent_id: "child-G1"
       task: "Reply with exactly: inherited-ok"
       inherit_prefix: {}
-      background: false
+      background: true
 
-  IMPORTANT: You MUST set background: false so you receive the child's
-  reply synchronously in the tool result.
+  The child runs asynchronously. Its result will be appended to
+  your output once it completes.
 
-  Step 2 — include the child's exact reply in your final answer,
+  Step 2 — include the child's reply in your final answer,
   prefixed with `CHILD:`.
 
   Do not re-spawn. Do not use other tools.
