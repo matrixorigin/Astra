@@ -832,7 +832,12 @@ async fn execute_run(
 
     if !req.models.is_empty() {
         for case in &mut cases {
-            case.models = Some(req.models.clone());
+            // Only override models for cases that don't specify their own.
+            // Cases with explicit models: [...] are model-specific tests
+            // (e.g. fork_prefix_provider_mismatch requires Anthropic parent).
+            if case.models.is_none() {
+                case.models = Some(req.models.clone());
+            }
         }
     }
 

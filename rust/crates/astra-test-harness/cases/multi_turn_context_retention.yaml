@@ -20,6 +20,8 @@ steps:
 criteria:
   - type: exit_code
     code: 0
+  - type: text_contains
+    needle: "ALPHA-7742"
   - type: turn_rounds_between
     min: 1
     max: 5
