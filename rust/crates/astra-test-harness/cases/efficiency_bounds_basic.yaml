@@ -15,7 +15,7 @@ criteria:
     code: 0
   - type: tokens_between
     min: 1
-    max: 8000
+    max: 12000
   - type: duration_between
     min_ms: 0
     max_ms: 30000
