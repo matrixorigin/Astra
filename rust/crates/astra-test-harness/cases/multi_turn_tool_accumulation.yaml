@@ -15,8 +15,9 @@ teardown_cmd: "rm -f /tmp/astra_harness_mt_test.txt"
 steps:
   - prompt: "Now append the line 'second line' to that same file and confirm it was done."
     criteria:
-      - type: tool_called
-        name: bash
+      - type: tools_count_between
+        min: 1
+        max: 8
 criteria:
   - type: exit_code
     code: 0

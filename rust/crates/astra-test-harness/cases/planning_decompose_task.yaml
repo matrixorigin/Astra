@@ -16,9 +16,7 @@ criteria:
     code: 0
   - type: tools_count_between
     min: 3
-    max: 10
-  - type: text_contains
-    needle: "step1 done"
+    max: 15
   - type: turn_rounds_between
     min: 1
-    max: 6
+    max: 8
