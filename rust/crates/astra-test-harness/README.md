@@ -123,6 +123,20 @@ criteria:
 | `journal_tool_called { name, optional }` | tool name appears in journal `tool_calls` | journal |
 | `judger { question, threshold, model }` | LLM scores ≥ threshold | LLM |
 
+### Criterion severity levels
+
+Each criterion has a severity that controls how failures are treated:
+
+| Severity | Meaning | Criteria types |
+|----------|---------|----------------|
+| **Hard** | Fundamental correctness — failure means the case did not work. Blocks the LLM judger from running (no point scoring a broken run). | `exit_code`, `tool_called`, `text_contains`, `tool_sequence`, `fork_cache_outcome` |
+| **Soft** | Efficiency / performance bounds — failure means the case worked but outside acceptable limits. Does NOT block the judger. | `tools_count_between`, `tokens_between`, `duration_between`, `turn_rounds_between`, `cache_rate_above`, `stderr_matches` |
+| **Quality** | Continuous quality score (0.0-1.0) rather than binary pass/fail. | `judger`, `session_event_count`, `journal_tool_called` |
+
+Severity is assigned automatically based on criterion type (see
+`criterion_severity()` in `src/criteria.rs`). Case authors do not set
+severity manually.
+
 ### Auto-judger
 
 When `--no-judger` is NOT set and a case has no explicit `judger`

@@ -39,9 +39,9 @@ pub fn classify_tool_idempotency(tool_name: &str) -> ToolIdempotency {
         | "github_get_pr" | "github_ci_status" | "github_list_issues" | "github_get_issue"
         | "github_repo_stats" | "web_fetch" | "WebFetchTool" | "web_search" | "WebSearchTool"
         | "memory_search" | "memory_retrieve" | "memory_profile" | "mo_query"
-        | "get_agent_info" | "get_agent_result" | "reflect" | "context_analysis" | "diagnose" | "search" | "find"
-        | "tool_search" | "lsp" | "task_list" | "task_get" | "skill" | "discover_skills"
-        | "brief" | "query_context" => ToolIdempotency::PureRead,
+        | "get_agent_info" | "get_agent_result" | "reflect" | "context_analysis" | "diagnose"
+        | "search" | "find" | "tool_search" | "lsp" | "task_list" | "task_get" | "skill"
+        | "discover_skills" | "brief" | "query_context" => ToolIdempotency::PureRead,
 
         // ask_user blocks until user responds — retrying it would double-prompt.
         // sleep has wall-clock side effects — not safe to retry transparently.

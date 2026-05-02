@@ -322,23 +322,9 @@ impl DynamicAgentSpawner {
         mailbox_router: Arc<AgentMailboxRouter>,
         progress_broadcaster: Arc<ProgressBroadcaster>,
     ) -> Self {
-        Self {
-            mailbox_router,
-            active_agents: Arc::new(RwLock::new(HashMap::new())),
-            progress_broadcaster,
-            context_cache: Arc::new(SharedContextCache::default()),
-            executor: None,
-            session_id: None,
-            agent_registry:
-                astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
-            completed_agents: Arc::new(RwLock::new(Vec::new())),
-            background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
-            background_agent_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
-            completion_notifiers: Arc::new(RwLock::new(HashMap::new())),
-            background_wait_timeout: std::time::Duration::from_secs(120),
-            prefix_store: None,
-            prefix_resolve_outcomes: Arc::new(RwLock::new(HashMap::new())),
-        }
+        let mut s = Self::new(mailbox_router);
+        s.progress_broadcaster = progress_broadcaster;
+        s
     }
 
     /// Create a new spawner with a custom context cache.
@@ -346,23 +332,9 @@ impl DynamicAgentSpawner {
         mailbox_router: Arc<AgentMailboxRouter>,
         context_cache: Arc<SharedContextCache>,
     ) -> Self {
-        Self {
-            mailbox_router,
-            active_agents: Arc::new(RwLock::new(HashMap::new())),
-            progress_broadcaster: Arc::new(ProgressBroadcaster::default()),
-            context_cache,
-            executor: None,
-            session_id: None,
-            agent_registry:
-                astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
-            completed_agents: Arc::new(RwLock::new(Vec::new())),
-            background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
-            background_agent_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
-            completion_notifiers: Arc::new(RwLock::new(HashMap::new())),
-            background_wait_timeout: std::time::Duration::from_secs(120),
-            prefix_store: None,
-            prefix_resolve_outcomes: Arc::new(RwLock::new(HashMap::new())),
-        }
+        let mut s = Self::new(mailbox_router);
+        s.context_cache = context_cache;
+        s
     }
 
     /// Set the executor for running spawned agents.
@@ -668,31 +640,39 @@ impl DynamicAgentSpawner {
             // Background mode: launch async and return immediately.
             // The JoinHandle is tracked in `background_tasks` so `shutdown_and_wait`
             // can drain it and panics are surfaced instead of silently lost.
+
+            // Track for result collection in shutdown_and_wait.
+            let task_spawned = self.executor.is_some();
+            if let Ok(mut ids) = self.background_agent_ids.lock() {
+                ids.push(agent_id.clone());
+            }
+            // Register completion notifier BEFORE spawning the task so
+            // the Notify is visible to NotifyOnDrop even if the child
+            // completes (or panics) immediately.
+            let notify = Arc::new(tokio::sync::Notify::new());
+            self.completion_notifiers
+                .write()
+                .await
+                .insert(agent_id.clone(), Arc::clone(&notify));
+
             if let Some(ref executor) = self.executor {
                 let executor = Arc::clone(executor);
                 let spawner = self.clone_for_task();
                 let agent_id_clone = agent_id.clone();
-                let _description = input.description.clone();
 
                 // Notify on completion (or panic) via a drop guard so
                 // auto-wait unblocks even if the child panics.
-                let notifiers = Arc::clone(&self.completion_notifiers);
-                let notify_id = agent_id.clone();
+                // The Notify Arc is captured directly — no map lookup
+                // needed in Drop (which runs in sync context).
+                let notify_guard = Arc::clone(&notify);
                 let spawn_future = async move {
-                    struct NotifyOnDrop(
-                        Arc<RwLock<HashMap<String, Arc<tokio::sync::Notify>>>>,
-                        String,
-                    );
+                    struct NotifyOnDrop(Arc<tokio::sync::Notify>);
                     impl Drop for NotifyOnDrop {
                         fn drop(&mut self) {
-                            if let Ok(map) = self.0.try_read() {
-                                if let Some(n) = map.get(&self.1) {
-                                    n.notify_waiters();
-                                }
-                            }
+                            self.0.notify_waiters();
                         }
                     }
-                    let _guard = NotifyOnDrop(notifiers, notify_id);
+                    let _guard = NotifyOnDrop(notify_guard);
                     let result = executor.execute(run_config).await;
                     spawner.handle_completion(&agent_id_clone, result).await;
                 };
@@ -702,17 +682,6 @@ impl DynamicAgentSpawner {
                     tokio::spawn(spawn_future);
                 }
             }
-
-            // Track for result collection in shutdown_and_wait.
-            let task_spawned = self.executor.is_some();
-            if let Ok(mut ids) = self.background_agent_ids.lock() {
-                ids.push(agent_id.clone());
-            }
-            // Register completion notifier.
-            self.completion_notifiers
-                .write()
-                .await
-                .insert(agent_id.clone(), Arc::new(tokio::sync::Notify::new()));
 
             // Auto-wait: most children complete quickly. Wait for the
             // result so the parent gets it in the same tool-call response.
@@ -880,16 +849,18 @@ impl DynamicAgentSpawner {
                 self.persist_agent_terminated(agent_id, &run_result.status)
                     .await;
                 self.update_status(agent_id, status).await;
-                self.archive_agent(agent_id).await;
+                // Unregister mailbox before archive removes the agent from active_agents.
                 self.unregister_mailbox(agent_id).await;
+                self.archive_agent(agent_id).await;
                 self.notify_completion(agent_id).await;
             }
             Err(e) => {
                 self.persist_agent_terminated(agent_id, "failed").await;
                 self.update_status(agent_id, AgentStatus::Failed { error: e })
                     .await;
-                self.archive_agent(agent_id).await;
+                // Unregister mailbox before archive removes the agent from active_agents.
                 self.unregister_mailbox(agent_id).await;
+                self.archive_agent(agent_id).await;
                 self.notify_completion(agent_id).await;
             }
         }
@@ -926,19 +897,21 @@ impl DynamicAgentSpawner {
             state.metrics.completion_tokens,
             duration_ms,
         );
-        let _ = writer.append(&event);
+        if let Err(e) = writer.append(&event) {
+            astra_core::agent_warn!("spawner", "journal append failed for {agent_id}: {e}");
+        }
     }
 
     /// Archive a completed agent state for history queries.
     async fn archive_agent(&self, agent_id: &str) {
-        if let Some(state) = self.active_agents.read().await.get(agent_id) {
+        if let Some(state) = self.active_agents.write().await.remove(agent_id) {
             let mut completed = self.completed_agents.write().await;
             // Cap history to prevent unbounded memory growth.
             const MAX_COMPLETED_AGENTS: usize = 256;
             if completed.len() >= MAX_COMPLETED_AGENTS {
                 completed.remove(0);
             }
-            completed.push(state.clone());
+            completed.push(state);
         }
     }
 
@@ -961,7 +934,7 @@ impl DynamicAgentSpawner {
     }
 
     async fn notify_completion(&self, agent_id: &str) {
-        if let Some(notifier) = self.completion_notifiers.read().await.get(agent_id) {
+        if let Some(notifier) = self.completion_notifiers.write().await.remove(agent_id) {
             notifier.notify_waiters();
         }
     }
@@ -1064,6 +1037,9 @@ impl DynamicAgentSpawner {
             }
         }
 
+        // Clean up any leftover completion notifiers (e.g. from timed-out tasks).
+        self.completion_notifiers.write().await.clear();
+
         // Collect results for all background-spawned agents.
         let bg_ids: std::collections::HashSet<String> = self
             .background_agent_ids
@@ -1094,16 +1070,6 @@ impl DynamicAgentSpawner {
     /// Primarily useful for tests and observability.
     pub fn background_task_count(&self) -> usize {
         self.background_tasks.lock().map(|g| g.len()).unwrap_or(0)
-    }
-
-    /// Snapshot of all completed agents for result retrieval.
-    pub async fn completed_agents_snapshot(&self) -> Vec<SpawnedAgentInfo> {
-        self.completed_agents
-            .read()
-            .await
-            .iter()
-            .map(SpawnedAgentInfo::from)
-            .collect()
     }
 
     /// List all active agents spawned by a parent.
@@ -2110,6 +2076,110 @@ mod tests {
             spawner.background_task_count(),
             0,
             "panicked background task must not leave zombie in JoinSet"
+        );
+    }
+
+    // ─── HIGH #1: completion_notifiers cleaned up after notify ────────────
+
+    /// After a background agent completes and wait_for_agent returns,
+    /// the completion_notifiers map must be empty (entry removed).
+    #[tokio::test]
+    async fn completion_notifiers_cleaned_after_wait() {
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
+
+        let result = spawner
+            .spawn(make_bg_input(), &make_bg_context())
+            .await
+            .unwrap();
+        let agent_id = match result {
+            SpawnAgentOutput::Completed { agent_id, .. }
+            | SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected Completed or Launched, got {other:?}"),
+        };
+
+        // Wait for agent to ensure it has fully completed.
+        let _ = spawner
+            .wait_for_agent(&agent_id, std::time::Duration::from_secs(5))
+            .await;
+
+        // Give handle_completion a moment to finish (it runs in the
+        // background task which may still be executing notify_completion).
+        for _ in 0..100 {
+            if spawner.completion_notifiers.read().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            spawner.completion_notifiers.read().await.is_empty(),
+            "completion_notifiers must be empty after agent completes"
+        );
+    }
+
+    /// shutdown_and_wait also cleans up any leftover completion notifiers.
+    #[tokio::test]
+    async fn shutdown_cleans_completion_notifiers() {
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
+
+        let _ = spawner
+            .spawn(make_bg_input(), &make_bg_context())
+            .await
+            .unwrap();
+
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(2))
+            .await;
+
+        assert!(
+            spawner.completion_notifiers.read().await.is_empty(),
+            "shutdown_and_wait must clear completion_notifiers"
+        );
+    }
+
+    // ─── HIGH #2: active_agents cleaned after archive ──────────────────
+
+    /// After a background agent completes and is archived,
+    /// active_agents must not contain the agent any more.
+    #[tokio::test]
+    async fn active_agents_empty_after_background_completion() {
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(ImmediateSuccessExecutor) as Arc<dyn SpawnAgentExecutor>);
+
+        let result = spawner
+            .spawn(make_bg_input(), &make_bg_context())
+            .await
+            .unwrap();
+        let agent_id = match result {
+            SpawnAgentOutput::Completed { agent_id, .. }
+            | SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected Completed or Launched, got {other:?}"),
+        };
+
+        // Wait for agent to fully complete and archive.
+        let _ = spawner
+            .wait_for_agent(&agent_id, std::time::Duration::from_secs(5))
+            .await;
+
+        // Give handle_completion/archive_agent time to finish.
+        for _ in 0..100 {
+            if spawner.active_agents.read().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            spawner.active_agents.read().await.is_empty(),
+            "active_agents must be empty after agent completes and is archived"
+        );
+
+        // Agent should be in completed_agents instead.
+        assert!(
+            !spawner.completed_agents.read().await.is_empty(),
+            "completed_agents must contain the archived agent"
         );
     }
 

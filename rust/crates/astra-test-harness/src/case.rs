@@ -263,6 +263,20 @@ pub(crate) fn validate_extra_cli_args(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Simple glob filter: `*` matches any sequence, `?` matches one char.
+/// Used by both the CLI `--filter` and the dashboard filter.
+pub fn matches_filter(name: &str, pattern: &str) -> bool {
+    let regex_str = format!(
+        "^{}$",
+        regex::escape(pattern)
+            .replace(r"\*", ".*")
+            .replace(r"\?", ".")
+    );
+    regex::Regex::new(&regex_str)
+        .map(|re| re.is_match(name))
+        .unwrap_or(false)
+}
+
 impl Case {
     /// Load a case from a YAML file on disk.
     pub fn from_path(path: &Path) -> Result<Self, anyhow::Error> {
@@ -683,5 +697,25 @@ mod tests {
         let c = Case::from_path(&path).expect("valid weight+difficulty");
         assert!((c.weight - 2.5).abs() < f64::EPSILON);
         assert_eq!(c.difficulty, Some(3));
+    }
+
+    // ── matches_filter (glob) ──
+
+    #[test]
+    fn matches_filter_star_glob() {
+        assert!(matches_filter("fork_prefix_hit", "fork_*"));
+        assert!(!matches_filter("hello_world", "fork_*"));
+    }
+
+    #[test]
+    fn matches_filter_question_mark_glob() {
+        assert!(matches_filter("abc", "a?c"));
+        assert!(!matches_filter("abbc", "a?c"));
+    }
+
+    #[test]
+    fn matches_filter_exact_match() {
+        assert!(matches_filter("hello", "hello"));
+        assert!(!matches_filter("hello_world", "hello"));
     }
 }

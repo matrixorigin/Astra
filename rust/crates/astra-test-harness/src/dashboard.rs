@@ -117,7 +117,7 @@ pub struct DashboardConfig {
 struct AppState {
     tx: broadcast::Sender<DashboardEvent>,
     config: Arc<DashboardConfig>,
-    running: Arc<Mutex<bool>>,
+    running: Arc<AtomicBool>,
     cancel_flag: Arc<AtomicBool>,
     last_report: Arc<Mutex<Option<SuiteReport>>>,
     run_counter: Arc<std::sync::atomic::AtomicU32>,
@@ -149,7 +149,7 @@ impl DashboardServer {
         let state = AppState {
             tx: self.tx,
             config: self.config,
-            running: Arc::new(Mutex::new(false)),
+            running: Arc::new(AtomicBool::new(false)),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             last_report: Arc::new(Mutex::new(None)),
             run_counter: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -205,7 +205,7 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
     let _ws_guard = WsGuard(state.ws_connections.clone());
 
     // Send full state snapshot so page refresh recovers.
-    let running = *state.running.lock().await;
+    let running = state.running.load(Ordering::Acquire);
     let report = state.last_report.lock().await.clone();
     let init = serde_json::json!({
         "type": "init",
@@ -330,7 +330,10 @@ struct RunRequest {
     no_judger: bool,
     #[serde(default)]
     judger_model: Option<String>,
+    /// Request origin tag ("manual" / "orchestrate"). Deserialized
+    /// for API completeness but not consumed by `execute_run`.
     #[serde(default)]
+    #[allow(dead_code)]
     source: Option<String>,
 }
 
@@ -355,19 +358,19 @@ async fn run_handler(
     // M7: clamp parallel to a sane range.
     req.parallel = req.parallel.clamp(1, 32);
 
+    // Atomically swap false→true. If it was already true, a run is in progress.
+    if state
+        .running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
     {
-        let mut running = state.running.lock().await;
-        if *running {
-            return Json(serde_json::json!({"error": "A run is already in progress"}));
-        }
-        *running = true;
+        return Json(serde_json::json!({"error": "A run is already in progress"}));
     }
 
     state.cancel_flag.store(false, Ordering::SeqCst);
 
     let run_num = state.run_counter.fetch_add(1, Ordering::SeqCst);
     let run_id = format!("run-{run_num}");
-    let source = req.source.clone().unwrap_or_else(|| "manual".into());
 
     let _ = state.tx.send(DashboardEvent::RunReset {
         run_id: run_id.clone(),
@@ -382,19 +385,15 @@ async fn run_handler(
 
     tokio::spawn(async move {
         // M3: ensure running_flag is always reset, even if the body panics.
-        struct RunGuard(Arc<Mutex<bool>>);
+        struct RunGuard(Arc<AtomicBool>);
         impl Drop for RunGuard {
             fn drop(&mut self) {
-                // Cannot do async in Drop, but try_lock suffices here because
-                // nothing else contends on the mutex while the run task owns it.
-                if let Ok(mut g) = self.0.try_lock() {
-                    *g = false;
-                }
+                self.0.store(false, Ordering::Release);
             }
         }
         let _guard = RunGuard(running_flag);
 
-        let result = execute_run(config, tx.clone(), req, cancel_flag, &rid, &source).await;
+        let result = execute_run(config, tx.clone(), req, cancel_flag, &rid).await;
         match result {
             Ok(report) => {
                 *last_report.lock().await = Some(report);
@@ -414,7 +413,7 @@ async fn run_handler(
 }
 
 async fn cancel_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
-    if *state.running.lock().await {
+    if state.running.load(Ordering::Acquire) {
         state.cancel_flag.store(true, Ordering::SeqCst);
         Json(serde_json::json!({"status": "cancelling"}))
     } else {
@@ -801,7 +800,6 @@ async fn execute_run(
     req: RunRequest,
     cancel_flag: Arc<AtomicBool>,
     run_id: &str,
-    _source: &str,
 ) -> anyhow::Result<SuiteReport> {
     use crate::case::Case;
     use crate::digest::AstraCliDigestCollector;
@@ -817,15 +815,7 @@ async fn execute_run(
             req.cases.iter().map(|s| s.as_str()).collect();
         cases.retain(|c| selected.contains(c.name.as_str()));
     } else if let Some(ref pattern) = req.filter {
-        let re_str = format!(
-            "^{}$",
-            regex::escape(pattern)
-                .replace(r"\*", ".*")
-                .replace(r"\?", ".")
-        );
-        if let Ok(re) = regex::Regex::new(&re_str) {
-            cases.retain(|c| re.is_match(&c.name));
-        }
+        cases.retain(|c| crate::case::matches_filter(&c.name, pattern));
     }
 
     if cases.is_empty() {

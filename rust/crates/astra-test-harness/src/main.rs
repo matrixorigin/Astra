@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use astra_test_harness::case::Case;
+use astra_test_harness::case::{Case, matches_filter};
 use astra_test_harness::digest::AstraCliDigestCollector;
 use astra_test_harness::exec::AstraCliExecutor;
 use astra_test_harness::judger::{
@@ -260,18 +260,6 @@ fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
     )
 }
 
-fn matches_filter(name: &str, pattern: &str) -> bool {
-    // Simple glob: * matches any sequence, ? matches one char.
-    let regex_str = format!(
-        "^{}$",
-        regex::escape(pattern)
-            .replace(r"\*", ".*")
-            .replace(r"\?", ".")
-    );
-    regex::Regex::new(&regex_str)
-        .map(|re| re.is_match(name))
-        .unwrap_or(false)
-}
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {

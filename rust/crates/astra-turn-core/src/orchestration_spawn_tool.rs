@@ -256,7 +256,7 @@ pub fn spawn_agent_schema() -> serde_json::Value {
                     "background": {
                         "type": "boolean",
                         "description": "Run in background (async). If true, returns immediately with agent_id; use send_message to get results later. Default: false (synchronous — waits for child to complete and returns result directly).",
-                        "default": true
+                        "default": false
                     },
                     "name": {
                         "type": "string",

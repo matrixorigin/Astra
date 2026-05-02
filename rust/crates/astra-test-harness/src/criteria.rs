@@ -764,29 +764,6 @@ pub fn validate_criteria(criteria: &[Criterion]) -> Result<(), String> {
     Ok(())
 }
 
-/// True when every non-Judger criterion passed. Used by the runner
-/// to decide whether to even bother invoking the LLM judger — if a
-/// deterministic check already failed, the case is known-FAIL and
-/// the judger call would waste a provider round-trip.
-///
-/// The slice length of `results` must equal `criteria.len()` (they
-/// come out of `evaluate_deterministic`). Mismatched lengths return
-/// `false` conservatively.
-/// Returns true when all Hard criteria passed, meaning the judger should
-/// run. Soft failures (tokens/duration exceeding bounds) should NOT skip
-/// the judger — we still want a quality score even for inefficient runs.
-pub fn non_judger_all_pass(criteria: &[Criterion], results: &[CriterionResult]) -> bool {
-    if results.len() != criteria.len() {
-        return false;
-    }
-    criteria
-        .iter()
-        .zip(results.iter())
-        .filter(|(c, _)| !matches!(c, Criterion::Judger { .. }))
-        .filter(|(_, r)| r.severity == CriterionSeverity::Hard)
-        .all(|(_, r)| r.passed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -882,46 +859,6 @@ mod tests {
         // Placeholder-failed; caller runs the async judger separately.
         assert!(!r[0].passed);
         assert!(r[0].detail.contains("judger"));
-    }
-
-    // Regression: the judger placeholder `passed=false` must NOT
-    // gate the judger from running. `non_judger_all_pass` only
-    // considers the deterministic checks. Before this fix,
-    // every Judger-bearing case short-circuited to FAIL and the
-    // judger never ran.
-    #[test]
-    fn non_judger_all_pass_ignores_judger_placeholder() {
-        let out = outcome_with_tools(&["Read"]);
-        let criteria = vec![
-            Criterion::ExitCode { code: 0 },
-            Criterion::ToolCalled {
-                name: "Read".into(),
-            },
-            Criterion::Judger {
-                question: "ok?".into(),
-                threshold: 0.7,
-                model: None,
-            },
-        ];
-        let results = evaluate_deterministic(&criteria, &out);
-        assert!(non_judger_all_pass(&criteria, &results));
-    }
-
-    #[test]
-    fn non_judger_all_pass_fails_when_deterministic_fails() {
-        let out = outcome_with_tools(&[]);
-        let criteria = vec![
-            Criterion::ToolCalled {
-                name: "nonexistent".into(),
-            },
-            Criterion::Judger {
-                question: "ok?".into(),
-                threshold: 0.7,
-                model: None,
-            },
-        ];
-        let results = evaluate_deterministic(&criteria, &out);
-        assert!(!non_judger_all_pass(&criteria, &results));
     }
 
     fn mk_session(events: &[(&str, serde_json::Value)]) -> SessionCapture {
@@ -1060,16 +997,6 @@ mod tests {
         );
         assert!(r[0].passed);
         assert!(r[0].detail.contains("skipped"));
-    }
-
-    #[test]
-    fn non_judger_all_pass_false_on_length_mismatch() {
-        // Defensive guard — callers should never pass mismatched
-        // slices, but if they do we must NOT proceed to run a judger
-        // against a case whose results we can't align.
-        let criteria = vec![Criterion::ExitCode { code: 0 }];
-        let results: Vec<CriterionResult> = vec![];
-        assert!(!non_judger_all_pass(&criteria, &results));
     }
 
     // ── validate_criterion / validate_criteria (R3 #2) ──

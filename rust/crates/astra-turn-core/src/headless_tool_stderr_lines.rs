@@ -39,6 +39,7 @@ fn friendly_tool_name(tool_name: &str) -> &str {
         "sleep" => "Sleeping",
         "send_message" => "Sending message",
         "spawn_agent" => "Spawning agent",
+        "get_agent_result" => "Getting agent result",
         "diagnose" => "Diagnosing",
         "env" => "Environment",
         "notebook_edit" => "Editing notebook",
@@ -329,6 +330,10 @@ mod tests {
         assert_eq!(friendly_tool_name("sleep"), "Sleeping");
         assert_eq!(friendly_tool_name("send_message"), "Sending message");
         assert_eq!(friendly_tool_name("spawn_agent"), "Spawning agent");
+        assert_eq!(
+            friendly_tool_name("get_agent_result"),
+            "Getting agent result"
+        );
         assert_eq!(friendly_tool_name("diagnose"), "Diagnosing");
         assert_eq!(friendly_tool_name("env"), "Environment");
         assert_eq!(friendly_tool_name("notebook_edit"), "Editing notebook");

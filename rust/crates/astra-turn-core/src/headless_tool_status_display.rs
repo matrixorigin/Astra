@@ -529,6 +529,10 @@ fn fmt_utility_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
                 _ => None,
             }
         }
+        "get_agent_result" => obj
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(|id| truncate_str(id, 50)),
         "diagnose" => {
             let category = obj.get("category").and_then(|v| v.as_str());
             let verbose = obj.get("verbose").and_then(|v| v.as_bool());
@@ -1032,6 +1036,15 @@ mod tests {
             &json!({"description": "review auth", "agent_type": "code-review"}),
         );
         assert_eq!(detail.as_deref(), Some("review auth (code-review)"));
+    }
+
+    #[test]
+    fn tool_call_detail_get_agent_result_shows_agent_id() {
+        let detail = tool_call_detail(
+            "get_agent_result",
+            &json!({"agent_id": "agent-abc-123"}),
+        );
+        assert_eq!(detail.as_deref(), Some("agent-abc-123"));
     }
 
     #[test]
