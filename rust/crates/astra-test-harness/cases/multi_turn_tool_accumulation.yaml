@@ -17,7 +17,12 @@ difficulty: 2
 weight: 2.0
 timeout_seconds: 180
 setup_cmd: "printf 'hello world 42\\n' > /tmp/astra_harness_mt_test.txt"
-teardown_cmd: "rm -f /tmp/astra_harness_mt_test.txt"
+teardown_cmd: |
+  rm -f /tmp/astra_harness_mt_test.txt
+  curl -sf -X POST "${MEMORIA_BASE_URL:-http://127.0.0.1:8100}/v1/memories/purge" \
+    -H "Authorization: Bearer ${MEMORIA_MASTER_KEY}" \
+    -H "Content-Type: application/json" \
+    -d '{"topic":"astra_harness_mt_test","reason":"harness teardown"}' 2>/dev/null || true
 steps:
   - prompt: "Now append the line 'second line' to that same file and confirm it was done."
     criteria:

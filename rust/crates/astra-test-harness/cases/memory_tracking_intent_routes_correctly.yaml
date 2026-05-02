@@ -42,3 +42,8 @@ criteria:
       Score 1.0 if stored without exploration, 0.5 if stored but also explored,
       0.0 if only explored without storing.
     threshold: 0.6
+teardown_cmd: |
+  curl -sf -X POST "${MEMORIA_BASE_URL:-http://127.0.0.1:8100}/v1/memories/purge" \
+    -H "Authorization: Bearer ${MEMORIA_MASTER_KEY}" \
+    -H "Content-Type: application/json" \
+    -d '{"topic":"oceanbase","reason":"harness teardown"}' 2>/dev/null || true

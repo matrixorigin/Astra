@@ -35,6 +35,11 @@ steps:
     criteria:
       - type: tool_called
         name: memory_purge
+teardown_cmd: |
+  curl -sf -X POST "${MEMORIA_BASE_URL:-http://127.0.0.1:8100}/v1/memories/purge" \
+    -H "Authorization: Bearer ${MEMORIA_MASTER_KEY}" \
+    -H "Content-Type: application/json" \
+    -d '{"topic":"NEPTUNE","reason":"harness teardown"}' 2>/dev/null || true
 criteria:
   - type: exit_code
     code: 0
