@@ -3076,7 +3076,12 @@ function loadModels() {
 function loadConfig() {
   const modelsPromise = fetch('/api/models')
     .then(r => r.json())
-    .then(data => { S.modelRegistry = data.models || []; })
+    .then(data => {
+      S.modelRegistry = data.models || [];
+      if (data.error) {
+        toast('Models: ' + data.error + ' — please login first', 'error');
+      }
+    })
     .catch(() => { S.modelRegistry = []; });
 
   const configPromise = fetch('/api/config')

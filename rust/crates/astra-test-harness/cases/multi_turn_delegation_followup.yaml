@@ -6,7 +6,14 @@ description: |
   **Pass means**: The sub-agent's computed result (391) is correctly recalled in turn 2, proving delegation output persists in session state.
   **Fail means**: Delegation results were dropped between turns (session state bug) or the sub-agent failed to compute correctly.
 prompt: |
-  Spawn a sub-agent with task "Calculate 17*23 and report the answer".
+  Use the spawn_agent tool with:
+    agent_id: "calc-agent"
+    task: "Calculate 17*23 and report the answer"
+    background: false
+
+  IMPORTANT: You MUST set background: false so you receive the child's
+  reply synchronously in the tool result.
+
   Tell me what it says.
 capability: delegation
 difficulty: 3

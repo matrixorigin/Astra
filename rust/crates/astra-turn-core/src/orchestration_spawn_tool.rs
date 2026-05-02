@@ -51,8 +51,10 @@ pub struct SpawnAgentInput {
     /// Optional model override.
     pub model: Option<String>,
 
-    /// Run in background (async) - default true.
-    #[serde(default = "default_true")]
+    /// Run in background (async). Default false — synchronous mode
+    /// ensures the parent receives the child's result in the tool-call
+    /// response before its turn budget is consumed.
+    #[serde(default)]
     pub background: bool,
 
     /// Name for agent-to-agent messaging.
@@ -162,7 +164,7 @@ impl Default for SpawnAgentInput {
             prompt: String::new(),
             agent_type: default_agent_type(),
             model: None,
-            background: default_true(),
+            background: false,
             name: None,
             max_turns: None,
             max_output_tokens: None,
@@ -175,10 +177,6 @@ impl Default for SpawnAgentInput {
 
 fn default_agent_type() -> String {
     "general-purpose".to_string()
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// Output from spawn_agent tool.
@@ -257,7 +255,7 @@ pub fn spawn_agent_schema() -> serde_json::Value {
                     },
                     "background": {
                         "type": "boolean",
-                        "description": "Run in background (async). If true, returns immediately with agent_id. Default: true.",
+                        "description": "Run in background (async). If true, returns immediately with agent_id; use send_message to get results later. Default: false (synchronous — waits for child to complete and returns result directly).",
                         "default": true
                     },
                     "name": {
@@ -325,11 +323,31 @@ mod tests {
         let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
         assert_eq!(input.description, "Test");
         assert_eq!(input.agent_type, "general-purpose");
-        assert!(input.background);
+        // Default is synchronous (background=false) so the parent
+        // receives the child's result in the tool-call response.
+        assert!(!input.background);
         // Inheritance defaults to None — existing clients get no
         // behavior change when they don't set inherit_prefix.
         assert!(input.inherit_prefix.is_none());
         assert!(input.max_output_tokens.is_none());
+    }
+
+    #[test]
+    fn background_default_is_false() {
+        let input = SpawnAgentInput::default();
+        assert!(
+            !input.background,
+            "background must default to false — synchronous spawn \
+             ensures the parent receives the child's result before \
+             its turn budget is consumed"
+        );
+    }
+
+    #[test]
+    fn background_true_requires_explicit_opt_in() {
+        let json = r#"{"description": "D", "prompt": "P", "background": true}"#;
+        let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
+        assert!(input.background, "explicit background: true must be honored");
     }
 
     #[test]

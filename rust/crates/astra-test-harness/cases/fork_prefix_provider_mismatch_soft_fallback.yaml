@@ -11,8 +11,12 @@ prompt: |
   Step 1 — call spawn_agent with:
     agent_id: "child-cross-provider"
     task: "Reply: cross-provider-fallback-ok"
-    model: "qwen-flash"   # different provider family than the parent
+    model: "qwen-flash"
     inherit_prefix: {}
+    background: false
+
+  IMPORTANT: You MUST set background: false so you receive the child's
+  reply synchronously in the tool result.
 
   Step 2 — surface the child's reply in your final answer. If the
   spawn fails, still report what you saw.
@@ -55,4 +59,4 @@ criteria:
       or an error/fallback message appears in the text.
       Score 0.5 if spawn_agent was called but outcome is unclear.
       Score 0.0 if no spawn or the agent fabricated results.
-    threshold: 0.5
+    threshold: 0.7

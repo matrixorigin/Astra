@@ -18,10 +18,18 @@ criteria:
   - type: exit_code
     code: 0
   - type: text_contains
-    needle: "7 crossings"
+    needle: "7"
   - type: tokens_between
     min: 1
     max: 25000
   - type: turn_rounds_between
     min: 1
     max: 5
+  - type: judger
+    question: |
+      The correct answer to the fox-chicken-grain river crossing puzzle
+      is 7 crossings. Did the agent output exactly 7 (not 17, 27, 70,
+      or any other number containing 7)?
+      Score 1.0 if the answer is clearly 7.
+      Score 0.0 if the answer is wrong or ambiguous.
+    threshold: 0.7
