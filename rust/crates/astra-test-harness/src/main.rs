@@ -152,6 +152,11 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     report_file: Option<PathBuf>,
 
+    /// Save the structured evaluation report (capability scores, runtime
+    /// health, efficiency metrics) to a JSON file.
+    #[arg(long, value_name = "PATH")]
+    eval_file: Option<PathBuf>,
+
     /// Start a live dashboard server for real-time test visualization.
     /// Opens http://localhost:PORT (default 9100) in your browser.
     #[arg(long, value_name = "PORT", default_missing_value = "9100", num_args = 0..=1)]
@@ -478,6 +483,24 @@ async fn main() -> Result<()> {
                 "[astra-test] report saved to {} ({} bytes)",
                 path.display(),
                 json.len()
+            );
+        }
+    }
+
+    // Save structured evaluation report.
+    if let Some(ref path) = args.eval_file {
+        let eval = astra_test_harness::eval::evaluate(&suite);
+        let json = serde_json::to_string_pretty(&eval).unwrap_or_default();
+        if let Err(e) = std::fs::write(path, &json) {
+            eprintln!(
+                "[astra-test] WARNING: failed to write eval to {}: {e}",
+                path.display()
+            );
+        } else {
+            eprintln!(
+                "[astra-test] eval saved to {} (overall={:.0})",
+                path.display(),
+                eval.overall_score
             );
         }
     }

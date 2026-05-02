@@ -163,6 +163,7 @@ impl DashboardServer {
             .route("/api/orchestrate", post(orchestrate_handler))
             .route("/api/report", get(report_handler))
             .route("/api/analyze", post(analyze_handler))
+            .route("/api/eval", get(eval_handler))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
@@ -364,6 +365,18 @@ async fn cancel_handler(State(state): State<AppState>) -> Json<serde_json::Value
         Json(serde_json::json!({"status": "cancelling"}))
     } else {
         Json(serde_json::json!({"error": "No run in progress"}))
+    }
+}
+
+/// Structured capability evaluation with numeric scores.
+async fn eval_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let report = state.last_report.lock().await;
+    match &*report {
+        Some(r) => {
+            let eval = crate::eval::evaluate(r);
+            Json(serde_json::json!({"eval": eval}))
+        }
+        None => Json(serde_json::json!({"error": "No run results to evaluate"})),
     }
 }
 

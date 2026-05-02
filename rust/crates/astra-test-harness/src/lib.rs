@@ -44,6 +44,7 @@ pub mod classify;
 pub mod criteria;
 pub mod dashboard;
 pub mod digest;
+pub mod eval;
 pub mod exec;
 pub mod judger;
 pub mod preflight;
