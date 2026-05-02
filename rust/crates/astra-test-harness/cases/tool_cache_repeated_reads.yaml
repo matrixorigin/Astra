@@ -1,0 +1,25 @@
+name: tool_cache_repeated_reads
+description: |
+  Exercises the tool call idempotency cache by asking the agent to
+  read the same file twice. The second read_file call should hit
+  the cache (if the runtime supports it). Tests that repeated
+  identical tool calls are efficiently served.
+prompt: |
+  Read the file Makefile using read_file. Then read the exact same
+  file again (Makefile, same path). Tell me how many lines it has.
+  You MUST call read_file twice — once to read it, once to verify.
+capability: efficiency
+difficulty: 2
+weight: 1.5
+timeout_seconds: 120
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: read_file
+  - type: tools_count_between
+    min: 2
+    max: 6
+  - type: cache_rate_above
+    threshold: 0.3
+    min_calls: 2
