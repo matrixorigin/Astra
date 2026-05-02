@@ -153,6 +153,7 @@ mod tests {
                 digest: None,
                 digest_error: None,
                 failure_class: None,
+                has_warnings: false,
             }],
             ..Default::default()
         };

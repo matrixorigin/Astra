@@ -129,6 +129,7 @@ pub async fn evaluate_judger(
                 format!(" votes=[{}]", rendered.join(", "))
             };
             Some(CriterionResult {
+                severity: crate::criteria::CriterionSeverity::Quality,
                 criterion: criterion.clone(),
                 passed,
                 detail: format!(
@@ -141,6 +142,7 @@ pub async fn evaluate_judger(
         }
         Err(e) => Some(CriterionResult {
             criterion: criterion.clone(),
+            severity: crate::criteria::CriterionSeverity::Quality,
             passed: false,
             detail: format!("judger call failed: {e}"),
             full_detail: None,

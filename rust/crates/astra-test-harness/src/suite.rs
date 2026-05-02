@@ -320,6 +320,7 @@ impl<'a> SuiteRunner<'a> {
                     digest: None,
                     digest_error: None,
                     failure_class: Some(crate::classify::FailureClass::PlatformSetupFailed),
+                    has_warnings: false,
                 };
             }
         }
@@ -466,7 +467,15 @@ impl<'a> SuiteRunner<'a> {
         }
 
         let steps_passed = step_results.iter().all(|s| s.passed);
-        let passed = det.iter().all(|c| c.passed) && steps_passed;
+        // A case passes if all Hard criteria pass. Soft and Quality
+        // failures are warnings, not hard fails — they still contribute
+        // to the overall quality score but don't mark the case as FAIL.
+        let hard_passed = det
+            .iter()
+            .filter(|c| c.severity == crate::criteria::CriterionSeverity::Hard)
+            .all(|c| c.passed);
+        let all_passed = det.iter().all(|c| c.passed) && steps_passed;
+        let passed = hard_passed && steps_passed;
 
         // Classify failure.
         let failure_class = if !passed {
@@ -532,6 +541,7 @@ impl<'a> SuiteRunner<'a> {
             digest,
             digest_error,
             failure_class,
+            has_warnings: passed && !all_passed,
         }
     }
 }

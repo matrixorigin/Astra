@@ -172,11 +172,29 @@ fn default_event_min() -> u32 {
     1
 }
 
+/// How severe a criterion failure is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CriterionSeverity {
+    /// Hard requirement: exit_code, tool_called, text_contains.
+    /// Failure means the case fundamentally didn't work.
+    Hard,
+    /// Soft bound: tokens_between, duration_between, turn_rounds, cache_rate.
+    /// Failure means the case worked but outside acceptable efficiency bounds.
+    Soft,
+    /// Quality score: judger, session checks.
+    /// Uses a 0-1 continuous score rather than binary pass/fail.
+    Quality,
+}
+
 /// Result of evaluating a single criterion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CriterionResult {
     pub criterion: Criterion,
     pub passed: bool,
+    /// Severity level — tells the frontend how to treat this result.
+    #[serde(default = "default_severity")]
+    pub severity: CriterionSeverity,
     /// Short human explanation (≤ 200 chars). Surfaces in report
     /// on FAIL; suppressed on PASS unless `--verbose`.
     pub detail: String,
@@ -189,6 +207,32 @@ pub struct CriterionResult {
     /// For Judger only: the score the judger returned.
     #[serde(default)]
     pub score: Option<f64>,
+}
+
+fn default_severity() -> CriterionSeverity {
+    CriterionSeverity::Hard
+}
+
+/// Classify the severity of a criterion type.
+pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
+    match c {
+        Criterion::ExitCode { .. }
+        | Criterion::ToolCalled { .. }
+        | Criterion::TextContains { .. }
+        | Criterion::ToolSequence { .. }
+        | Criterion::ForkCacheOutcome { .. } => CriterionSeverity::Hard,
+
+        Criterion::ToolsCountBetween { .. }
+        | Criterion::TokensBetween { .. }
+        | Criterion::DurationBetween { .. }
+        | Criterion::TurnRoundsBetween { .. }
+        | Criterion::CacheRateAbove { .. }
+        | Criterion::StderrMatches { .. } => CriterionSeverity::Soft,
+
+        Criterion::Judger { .. }
+        | Criterion::SessionEventCount { .. }
+        | Criterion::JournalToolCalled { .. } => CriterionSeverity::Quality,
+    }
 }
 
 /// Evaluate every criterion against the outcome in list order.
@@ -233,6 +277,7 @@ fn evaluate_one(
             let hit = outcome.tools_used.iter().any(|t| t == name);
             CriterionResult {
                 criterion: c.clone(),
+                severity: criterion_severity(c),
                 passed: hit,
                 detail: if hit {
                     format!("tool {name} was called")
@@ -250,6 +295,7 @@ fn evaluate_one(
             let pass = outcome.exit_code == *code;
             CriterionResult {
                 criterion: c.clone(),
+                severity: criterion_severity(c),
                 passed: pass,
                 detail: format!("exit_code {} (expected {})", outcome.exit_code, code),
                 full_detail: None,
@@ -261,6 +307,7 @@ fn evaluate_one(
             let pass = n >= *min && n <= *max;
             CriterionResult {
                 criterion: c.clone(),
+                severity: criterion_severity(c),
                 passed: pass,
                 detail: format!("tool_calls_count={n}, expected {min}..={max}"),
                 full_detail: None,
@@ -276,6 +323,7 @@ fn evaluate_one(
                     let hit = re.is_match(&outcome.stderr);
                     CriterionResult {
                         criterion: c.clone(),
+                        severity: criterion_severity(c),
                         passed: hit,
                         detail: if hit {
                             format!("stderr matches /{pattern}/")
@@ -291,6 +339,7 @@ fn evaluate_one(
                 }
                 Err(e) => CriterionResult {
                     criterion: c.clone(),
+                    severity: criterion_severity(c),
                     passed: false,
                     detail: format!("invalid regex /{pattern}/: {e}"),
                     full_detail: None,
@@ -302,6 +351,7 @@ fn evaluate_one(
             let hit = outcome.text.contains(needle);
             CriterionResult {
                 criterion: c.clone(),
+                severity: criterion_severity(c),
                 passed: hit,
                 detail: if hit {
                     format!("text contains {needle:?}")
@@ -340,6 +390,7 @@ fn evaluate_one(
                 };
                 return CriterionResult {
                     criterion: c.clone(),
+                    severity: criterion_severity(c),
                     passed,
                     detail,
                     full_detail: None,
@@ -350,6 +401,7 @@ fn evaluate_one(
             let pass = n as u32 >= *min;
             CriterionResult {
                 criterion: c.clone(),
+                severity: criterion_severity(c),
                 passed: pass,
                 detail: format!("session events type={event_type} count={n} (expected >= {min})"),
                 full_detail: None,
@@ -370,6 +422,7 @@ fn evaluate_one(
                 };
                 return CriterionResult {
                     criterion: c.clone(),
+                    severity: criterion_severity(c),
                     passed,
                     detail,
                     full_detail: None,
@@ -380,6 +433,7 @@ fn evaluate_one(
             let hit = tools.iter().any(|t| t == name);
             CriterionResult {
                 criterion: c.clone(),
+                severity: criterion_severity(c),
                 passed: hit,
                 detail: if hit {
                     format!("journal tool {name} was invoked")
@@ -395,6 +449,7 @@ fn evaluate_one(
             let pass = hits.iter().any(|c| expect.iter().any(|e| e == c));
             CriterionResult {
                 criterion: c.clone(),
+                severity: criterion_severity(c),
                 passed: pass,
                 detail: if pass {
                     format!(
@@ -411,6 +466,7 @@ fn evaluate_one(
         }
         Criterion::Judger { .. } => CriterionResult {
             criterion: c.clone(),
+            severity: criterion_severity(c),
             passed: false,
             detail: "judger not yet evaluated (handled by runner)".into(),
             full_detail: None,
@@ -424,6 +480,7 @@ fn evaluate_one(
             let passed = total >= *min && total <= *max;
             CriterionResult {
                 criterion: c.clone(),
+                severity: criterion_severity(c),
                 passed,
                 detail: format!("tokens_total={total}, expected {min}..={max}"),
                 full_detail: None,
@@ -436,6 +493,7 @@ fn evaluate_one(
             let passed = dur >= *min_ms && dur <= *max_ms;
             CriterionResult {
                 criterion: c.clone(),
+                severity: criterion_severity(c),
                 passed,
                 detail: format!("duration={dur}ms, expected {min_ms}..={max_ms}ms"),
                 full_detail: None,
@@ -455,6 +513,7 @@ fn evaluate_one(
             let passed = matched == tools.len();
             CriterionResult {
                 criterion: c.clone(),
+                severity: criterion_severity(c),
                 passed,
                 detail: if passed {
                     format!("tool sequence {:?} found", tools)
@@ -477,6 +536,7 @@ fn evaluate_one(
             let passed = rounds >= *min && rounds <= *max;
             CriterionResult {
                 criterion: c.clone(),
+                severity: criterion_severity(c),
                 passed,
                 detail: format!("turn_rounds={rounds}, expected {min}..={max}"),
                 full_detail: None,
@@ -496,6 +556,7 @@ fn evaluate_one(
             if effective_calls < *min_calls {
                 return CriterionResult {
                     criterion: c.clone(),
+                    severity: criterion_severity(c),
                     passed: false,
                     detail: format!(
                         "too few tool calls: {effective_calls} < min_calls={min_calls} \
@@ -508,6 +569,7 @@ fn evaluate_one(
             if outcome.total_tool_calls == 0 && outcome.tool_calls_count == 0 {
                 CriterionResult {
                     criterion: c.clone(),
+                    severity: criterion_severity(c),
                     passed: true,
                     detail: "no tool calls — cache rate N/A (skip-pass)".into(),
                     full_detail: None,
@@ -518,6 +580,7 @@ fn evaluate_one(
                 // This means step_events.jsonl was missing or unreadable.
                 CriterionResult {
                     criterion: c.clone(),
+                    severity: criterion_severity(c),
                     passed: false,
                     detail: format!(
                         "step_events missing: tool_calls_count={} but total_tool_calls=0 \
@@ -532,6 +595,7 @@ fn evaluate_one(
                 let passed = rate >= *threshold;
                 CriterionResult {
                     criterion: c.clone(),
+                    severity: criterion_severity(c),
                     passed,
                     detail: format!(
                         "cache_rate={:.1}% ({}/{}), threshold={:.0}%",

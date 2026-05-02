@@ -75,6 +75,10 @@ pub struct CaseRunReport {
     /// Failure classification — populated only when `passed == false`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub failure_class: Option<crate::classify::FailureClass>,
+    /// True when passed==true but some Soft/Quality criteria failed.
+    /// Frontend shows these as yellow warnings, not green passes.
+    #[serde(default)]
+    pub has_warnings: bool,
 }
 
 /// Result of a single step in a multi-turn case.
@@ -653,6 +657,7 @@ mod tests {
                     criterion: Criterion::ToolCalled {
                         name: "Read".into(),
                     },
+                    severity: crate::criteria::CriterionSeverity::Hard,
                     passed: true,
                     detail: "tool Read was called".into(),
                     full_detail: None,
@@ -664,6 +669,7 @@ mod tests {
                 digest: None,
                 digest_error: None,
                 failure_class: None,
+                has_warnings: false,
             }],
             ..Default::default()
         }
@@ -859,6 +865,7 @@ mod tests {
             digest: None,
             digest_error: None,
             failure_class: None,
+            has_warnings: false,
         });
         assert_eq!(r.total(), 2);
         assert_eq!(r.passed(), 1);
@@ -952,6 +959,7 @@ mod tests {
                 criteria: vec![],
                 steps: vec![],
                 failure_class: None,
+                has_warnings: false,
                 session: None,
                 reproducer: None,
                 digest: None,
@@ -981,6 +989,7 @@ mod tests {
             criteria: vec![],
             steps: vec![],
             failure_class: None,
+            has_warnings: false,
             session: None,
             reproducer: None,
             digest: None,
@@ -1048,6 +1057,7 @@ mod tests {
             criteria: vec![],
             steps: vec![],
             failure_class: None,
+            has_warnings: false,
             session: None,
             reproducer: None,
             digest: None,

@@ -193,6 +193,7 @@ mod tests {
     fn cr(criterion: Criterion, passed: bool) -> CriterionResult {
         CriterionResult {
             criterion,
+            severity: crate::criteria::CriterionSeverity::Hard,
             passed,
             detail: String::new(),
             full_detail: None,
