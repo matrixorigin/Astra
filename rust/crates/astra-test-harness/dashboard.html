@@ -237,6 +237,44 @@ body {
   opacity: 0; transition: opacity 0.15s;
 }
 .tl-dot:hover .tl-dot-tooltip { opacity: 1; }
+
+/* Mini preview card on hover */
+.tl-dot .tl-dot-preview {
+  position: absolute; left: 24px; top: 50%; transform: translateY(-50%);
+  background: var(--bg-raised);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--border-focus);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  min-width: 240px; max-width: 300px;
+  pointer-events: none;
+  opacity: 0; transition: all 0.2s var(--ease);
+  z-index: 20;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+}
+.tl-dot:hover .tl-dot-preview { opacity: 1; pointer-events: auto; }
+.tl-dot-preview .dp-header {
+  display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
+}
+.tl-dot-preview .dp-badge {
+  font-size: 10px; font-weight: 700; padding: 2px 6px;
+  border-radius: 3px; letter-spacing: 0.5px;
+}
+.tl-dot-preview .dp-badge.pass { background: var(--green-dim); color: var(--green); }
+.tl-dot-preview .dp-badge.fail { background: var(--red-dim); color: var(--red); }
+.tl-dot-preview .dp-name {
+  font-size: 12px; font-weight: 600; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tl-dot-preview .dp-model {
+  font-size: 11px; color: var(--dim); font-family: var(--mono);
+}
+.tl-dot-preview .dp-metrics {
+  display: flex; gap: 12px; font-size: 11px; color: var(--muted); margin-top: 4px;
+}
+.tl-dot-preview .dp-hint {
+  font-size: 10px; color: var(--dim); margin-top: 6px; font-style: italic;
+}
 @keyframes dotAppear {
   from { transform: scale(0); opacity: 0; }
   to { transform: scale(1); opacity: 1; }
@@ -1927,15 +1965,41 @@ function clearTimelineRail() {
   railDotY = 20;
 }
 
-function addRailDot(type, label, targetEl) {
+function addRailDot(type, label, targetEl, report) {
   const rail = $('timelineRail');
   if (!rail) return;
   const dot = document.createElement('div');
   dot.className = 'tl-dot ' + type;
   dot.style.top = railDotY + 'px';
-  dot.innerHTML = `<span class="tl-dot-tooltip">${esc(label)}</span>`;
+
+  if (report && report.case_name) {
+    const status = report.passed ? 'pass' : 'fail';
+    const tok = (report.outcome.prompt_tokens || 0) + (report.outcome.completion_tokens || 0);
+    dot.innerHTML = `<div class="tl-dot-preview">
+      <div class="dp-header">
+        <span class="dp-badge ${status}">${report.passed ? 'PASS' : 'FAIL'}</span>
+        <span class="dp-name">${esc(report.case_name.replace(/_/g, ' '))}</span>
+      </div>
+      <div class="dp-model">${esc(normModel(report.model))}</div>
+      <div class="dp-metrics">
+        <span>${formatDur(report.outcome.duration_ms || 0)}</span>
+        <span>${formatTok(tok)} tok</span>
+        <span>${report.outcome.turn_rounds || 0} turns</span>
+      </div>
+      <div class="dp-hint">Click to see details</div>
+    </div>`;
+  } else {
+    dot.innerHTML = `<span class="tl-dot-tooltip">${esc(label)}</span>`;
+  }
+
   dot.addEventListener('click', () => {
-    if (targetEl) targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if (targetEl) {
+      targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      // If it's a case row, trigger the detail expand
+      if (report && targetEl.classList.contains('tl-row')) {
+        toggleCaseDetail(targetEl, report);
+      }
+    }
   });
   rail.appendChild(dot);
   railDotY += 28;
@@ -2914,7 +2978,7 @@ function handleEvent(ev) {
       // Add dot to the rail
       const rowEl = document.getElementById('tlr_' + r.case_name + '_' + r.model + '_' + (r.run_index || 0));
       const shortName = r.case_name.replace(/_/g, ' ');
-      addRailDot(r.passed ? 'pass' : 'fail', shortName + ' × ' + normModel(r.model), rowEl);
+      addRailDot(r.passed ? 'pass' : 'fail', shortName + ' × ' + normModel(r.model), rowEl, r);
       break;
     }
 
