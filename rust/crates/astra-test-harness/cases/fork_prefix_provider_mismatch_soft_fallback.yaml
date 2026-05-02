@@ -10,7 +10,7 @@ prompt: |
 
   Step 1 — call spawn_agent with:
     agent_id: "child-cross-provider"
-    task: "Reply: cross-provider-fallback-ok"
+    task: "Say the exact text: cross-provider-fallback-ok. Do not use any tools, just reply with that text."
     model: "qwen-flash"
     inherit_prefix: {}
 

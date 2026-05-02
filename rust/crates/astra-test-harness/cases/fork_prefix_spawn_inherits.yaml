@@ -8,7 +8,7 @@ description: |
 prompt: |
   You have a `spawn_agent` tool. Call it with:
     agent_id: "child-delegate-G2"
-    task: "Reply with exactly: delegate-G2-ok"
+    task: "Say the exact text: delegate-G2-ok. Do not use any tools, just reply with that text."
     inherit_prefix: {}
     background: true
 

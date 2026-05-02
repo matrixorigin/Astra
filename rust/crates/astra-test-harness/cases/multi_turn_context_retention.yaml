@@ -5,13 +5,15 @@ description: |
   **Why**: If context is lost between turns, multi-turn workflows (debugging, planning, iterative coding) all break silently.
   **Pass means**: The agent correctly recalls the exact secret code from turn 1 in turn 2, proving session continuity works.
   **Fail means**: Session state was dropped between turns — either --session-id plumbing is broken or context compaction discarded the fact.
-prompt: "Remember this: the secret code is ALPHA-7742. Just acknowledge."
+prompt: |
+  The secret code is ALPHA-7742. Acknowledge with a short sentence.
+  Do not use any tools — just reply in text.
 capability: memory
 difficulty: 2
 weight: 1.5
 timeout_seconds: 120
 steps:
-  - prompt: "What was the secret code I told you earlier?"
+  - prompt: "What was the secret code I told you earlier? Reply in text only, no tools."
     criteria:
       - type: text_contains
         needle: "ALPHA-7742"
@@ -20,4 +22,4 @@ criteria:
     code: 0
   - type: turn_rounds_between
     min: 1
-    max: 10
+    max: 5

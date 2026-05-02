@@ -10,7 +10,7 @@ prompt: |
 
   Call it with:
     agent_id: "child-thinking-clamp"
-    task: "Reply: thinking-clamp-ok"
+    task: "Say the exact text: thinking-clamp-ok. Do not use any tools, just reply with that text."
     max_output_tokens: 256
     inherit_prefix: {}
 
