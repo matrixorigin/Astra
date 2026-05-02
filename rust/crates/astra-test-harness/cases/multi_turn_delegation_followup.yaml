@@ -12,6 +12,8 @@ prompt: |
 
   The child runs synchronously — you will receive its reply directly
   in the tool result. Tell me what it says.
+
+  Do not use any other tools after receiving the child reply.
 capability: delegation
 difficulty: 3
 weight: 2.0
