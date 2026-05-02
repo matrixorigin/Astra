@@ -226,3 +226,147 @@ async fn governance_and_consolidate_paths_reachable() {
         "consolidate must not 404 (was /v1/memories/consolidate before fix)"
     );
 }
+
+// ── Cross-session lesson flow: store → retrieve → SelfModel prompt ──────
+
+/// The money test: proves that a lesson stored in Session A appears in
+/// Session B's SelfModel prompt section. This is the complete data path
+/// from Memoria storage through retrieval, LessonHint construction,
+/// SelfModel.with_lessons(), and to_system_prompt_section().
+#[tokio::test]
+#[ignore]
+async fn cross_session_lesson_appears_in_self_model_prompt() {
+    let (base, key) = require_memoria_env();
+    let user_id = unique_user_id();
+    let client = client();
+
+    // ─── Session A: store a specific lesson ─────────────────────────
+    let resp = client
+        .post(format!("{base}/v1/memories/batch"))
+        .header("Authorization", format!("Bearer {key}"))
+        .header("X-User-Id", &user_id)
+        .json(&serde_json::json!({
+            "memories": [
+                {
+                    "content": "🔧 CORRECTION: In this monorepo, always use `rg --glob '!node_modules'` instead of `grep -r`",
+                    "memory_type": "semantic",
+                    "trust_tier": "T2",
+                },
+                {
+                    "content": "💡 LESSON: pnpm workspaces require --filter flag for cross-package commands",
+                    "memory_type": "semantic",
+                    "trust_tier": "T3",
+                },
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let stored: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert_eq!(stored.len(), 2);
+
+    // ─── Session B: retrieve lessons (simulating bootstrap) ─────────
+    let resp = client
+        .post(format!("{base}/v1/memories/retrieve"))
+        .header("Authorization", format!("Bearer {key}"))
+        .header("X-User-Id", &user_id)
+        .json(&serde_json::json!({
+            "query": "grep rg pnpm monorepo tools",
+            "top_k": 5,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let results: serde_json::Value = resp.json().await.unwrap();
+    let memories = results.as_array().expect("direct array");
+    assert!(
+        memories.len() >= 2,
+        "both lessons must be retrievable, got {}",
+        memories.len()
+    );
+
+    // ─── Convert to LessonHints (same logic as memoria_retrieve_lessons) ──
+    let hints: Vec<astra_services::LessonHint> = memories
+        .iter()
+        .filter_map(|m| {
+            let content = m.get("content")?.as_str()?;
+            let memory_type = m.get("memory_type")?.as_str()?;
+            if !matches!(memory_type, "semantic" | "procedural") {
+                return None;
+            }
+            let action = astra_services::sanitize_for_prompt(content);
+            let compact = if action.len() > 80 {
+                action
+                    .split_once(['.', '—', ';'])
+                    .map(|(s, _)| s.trim().to_string())
+            } else {
+                None
+            };
+            Some(astra_services::LessonHint {
+                kind: astra_services::LessonKind::PromptShape,
+                trigger_signal: "memoria".into(),
+                action,
+                compact,
+                workload_tag: None,
+            })
+        })
+        .collect();
+    assert!(hints.len() >= 2, "both lessons parsed to hints");
+
+    // ─── Attach to SelfModel and render prompt ──────────────────────
+    let model_json = serde_json::json!({
+        "capabilities": {
+            "total_tools": 0, "tool_names": [], "tool_health": [],
+            "deprioritized_tools": [], "pinned_tools": [], "skills": [],
+            "boosted_tools": [], "widen_selection_pending": false,
+            "outcome_memory": [],
+        },
+        "state": {
+            "turn_number": 1, "token_budget": null, "scenario": null,
+            "active_experiment": null, "session_elapsed_secs": 0,
+            "correction_count": 0, "compression_count": 0,
+        },
+        "goals": {
+            "goal": null, "session_goal": null, "plan_goal": null,
+            "tracked_goal": null, "goal_source": "none",
+            "tracking_status": "idle", "progress": null,
+            "recent_milestones": [], "milestone_count": 0,
+        },
+        "recent_signals": [],
+        "constraints": {
+            "max_mutations_per_turn": 2, "config_drift_ceiling": 0.3,
+            "min_tool_pool_size": 5, "token_reserve_fraction": 0.2,
+        }
+    });
+    let self_model: astra_runtime::self_model::SelfModel =
+        serde_json::from_value(model_json).unwrap();
+    let self_model = self_model.with_lessons(hints);
+    let prompt = self_model.to_system_prompt_section();
+
+    // ─── The actual assertion: lessons visible in the prompt ─────────
+    assert!(
+        prompt.contains("📚 Lessons from prior sessions"),
+        "prompt must have lessons header:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("rg") && prompt.contains("grep"),
+        "rg/grep lesson must be visible in prompt:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("pnpm"),
+        "pnpm lesson must be visible in prompt:\n{prompt}"
+    );
+
+    // ─── Cleanup ────────────────────────────────────────────────────
+    for m in &stored {
+        let mid = m["memory_id"].as_str().unwrap();
+        let _ = client
+            .delete(format!("{base}/v1/memories/{mid}"))
+            .header("Authorization", format!("Bearer {key}"))
+            .header("X-User-Id", &user_id)
+            .send()
+            .await;
+    }
+}
