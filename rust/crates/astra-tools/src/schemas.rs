@@ -75,7 +75,8 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "ask_user",
     "memory_retrieve",
     "memory_store",
-    "memory_search",
+    // memory_search removed — duplicate of memory_retrieve (same endpoint).
+    // Dispatch still handles it for backwards compat.
     "memory_purge",
     "memory_correct",
     "memory_profile",
@@ -1005,25 +1006,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "memory_search",
-                "description": "Search memories by keyword or topic. Use when user asks 'what do you know about X'. Supports session-scoped filtering via session_id and filter_session.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search query"},
-                        "top_k": {"type": "integer", "description": "Max results (default 10)"},
-                        "min_confidence": {"type": "number", "description": "Minimum confidence threshold 0.0-1.0 (default 0.3). Filters low-quality results."},
-                        "session_id": {"type": "string", "description": "Session ID for scoped search. When provided with filter_session=true, restricts results to this session."},
-                        "filter_session": {"type": "boolean", "description": "When true, restrict search to the given session_id. Requires session_id."},
-                        "include_cross_session": {"type": "boolean", "description": "Legacy flag. false is equivalent to filter_session=true when session_id is set. Default true."}
-                    },
-                    "required": ["query"]
-                }
-            }
-        }),
+        // memory_search schema removed — duplicate of memory_retrieve (same Memoria endpoint).
+        // Dispatch layer still handles memory_search calls for backwards compatibility.
         json!({
             "type": "function",
             "function": {
