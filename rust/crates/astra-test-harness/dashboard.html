@@ -2192,7 +2192,7 @@ function addReportCard() {
 
   html += '</div>';
 
-  const row = addRichCard(html);
+  const row = addRichCard(html, { id: 'reportRow' });
 
   // Bind failed case clicks
   row.querySelectorAll('.report-fail-row').forEach(el => {
@@ -2720,6 +2720,7 @@ function connect() {
   ws.onmessage = e => {
     let ev;
     try { ev = JSON.parse(e.data); } catch { return; }
+    console.log('[ws]', ev.type, ev.type === 'case_completed' ? ev.report?.case_name : '');
     handleEvent(ev);
   };
 }
@@ -2729,6 +2730,11 @@ function handleEvent(ev) {
 
     case 'run_reset': {
       clearTimelineRail();
+      // Remove old timeline card and report card from DOM
+      const oldTimeline = document.getElementById('timelineRow');
+      if (oldTimeline) oldTimeline.remove();
+      const oldReport = document.getElementById('reportRow');
+      if (oldReport) oldReport.remove();
       S.runs = [];
       S.completed = 0;
       S.passed = 0;
