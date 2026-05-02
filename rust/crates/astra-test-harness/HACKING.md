@@ -126,3 +126,23 @@ cargo test -p astra-test-harness
 # With the Makefile shortcut
 make test-harness MODELS=qwen-flash
 ```
+
+## Known Design Issue: File Tool Sandbox vs Bash
+
+The runtime sandboxes `read_file`, `write_file`, `str_replace` to the
+workspace root (`is_within_workspace_root` in `astra-tools/src/fs_ops.rs`).
+But `bash` executes as a real subprocess with full filesystem access.
+
+**Impact on harness**: Test cases that write to `/tmp` only work when the
+model uses `bash`, not `str_replace`/`write_file`. This creates an unfair
+bias toward models that prefer bash over structured file tools.
+
+**Current workaround**: All harness cases use workspace-relative paths
+(`.harness_xxx.txt`) instead of `/tmp`.
+
+**Proper fix (TODO)**: Either:
+1. Add an `allowed_paths: ["/tmp"]` config to the sandbox, OR
+2. Make `resolve_path` accept an explicit allow-list alongside workspace_root, OR
+3. Align bash and file tools to use the same sandbox boundary
+
+Tracked as a runtime design issue, not a harness bug.
