@@ -397,6 +397,11 @@ async fn chat_handler(
     use tokio::process::Command;
 
     let model = req.model.as_deref().unwrap_or("claude-sonnet-4-6");
+    eprintln!(
+        "[astra-test] chat: model={model} session_id={:?} msg_len={}",
+        req.session_id.as_deref().unwrap_or("(new)"),
+        req.message.len()
+    );
 
     // Build context about available cases + models so astra can reason
     // about the harness and give actionable advice.
