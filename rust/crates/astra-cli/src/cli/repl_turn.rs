@@ -591,6 +591,77 @@ fn maybe_checkpoint_lessons(state: &mut ReplState) {
     );
 }
 
+/// Filter lessons through a cheap selector model for relevance.
+/// Requires ASTRA_SELECTOR_MODEL_URL + ASTRA_SELECTOR_MODEL_KEY + ASTRA_SELECTOR_MODEL env vars.
+/// Falls back to returning all lessons on any error, timeout, or missing config.
+async fn filter_lessons_by_relevance(
+    user_message: &str,
+    lessons: Vec<astra_runtime::self_model::LessonHint>,
+    _matrix_runtime: Option<&std::sync::Arc<astra_runtime::MatrixCloudRuntime>>,
+) -> Vec<astra_runtime::self_model::LessonHint> {
+    let base_url = match std::env::var("ASTRA_SELECTOR_MODEL_URL").ok() {
+        Some(u) if !u.is_empty() => u,
+        _ => return lessons,
+    };
+    let api_key = std::env::var("ASTRA_SELECTOR_MODEL_KEY").unwrap_or_default();
+    let model_name = std::env::var("ASTRA_SELECTOR_MODEL").unwrap_or_else(|_| "qwen-flash".into());
+
+    let memory_texts: Vec<String> = lessons.iter().map(|l| l.action.clone()).collect();
+    let query = astra_runtime::memory_relevance::build_relevance_query(user_message, &memory_texts);
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .no_proxy()
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return lessons,
+    };
+
+    let resp = match client
+        .post(format!("{base_url}/chat/completions"))
+        .header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": astra_runtime::memory_relevance::RELEVANCE_FILTER_PROMPT},
+                {"role": "user", "content": query},
+            ],
+            "max_tokens": 50,
+            "temperature": 0.0,
+        }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return lessons,
+    };
+
+    let body = resp.text().await.unwrap_or_default();
+    let text = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.get("choices")?
+                .get(0)?
+                .get("message")?
+                .get("content")?
+                .as_str()
+                .map(String::from)
+        })
+        .unwrap_or_default();
+
+    if text.is_empty() {
+        return lessons;
+    }
+
+    let indices = astra_runtime::memory_relevance::parse_relevance_response(&text, lessons.len());
+    if indices.is_empty() {
+        return lessons;
+    }
+
+    astra_runtime::memory_relevance::filter_by_indices(&lessons, &indices)
+}
+
 fn should_bootstrap_lessons(state: &ReplState) -> bool {
     !state.session_lessons_loaded
 }
@@ -904,7 +975,13 @@ async fn run_chat_turn(
         )
         .await
         .unwrap_or_default();
-        state.session_lessons = lessons;
+        // Relevance filter: if we have lessons AND a selector model, filter noise.
+        // Best-effort: timeout or model unavailable → keep all lessons.
+        state.session_lessons = if lessons.len() > 1 {
+            filter_lessons_by_relevance(message, lessons, state.matrix_runtime.as_ref()).await
+        } else {
+            lessons
+        };
         state.session_lessons_loaded = true;
     }
 
