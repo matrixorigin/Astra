@@ -1,11 +1,10 @@
 name: skill_discovery_uses_skill_tool
 description: |
-  The skill/discover_skills tools are injected dynamically by the
-  runtime's lifecycle preamble when a resolver is present. A
-  regression in that injection path (or in the selector surfacing
-  those names) would make skills silently uncallable. This case
-  asks for a skill-relevant task and verifies the model reached for
-  the `skill` or `discover_skills` tool rather than improvising.
+  **What**: Ask for a skill-relevant task and verify the agent uses the skill/discover_skills tool rather than improvising.
+  **Tests**: Dynamic skill tool injection — the runtime's lifecycle preamble must inject skill tools when a resolver is present.
+  **Why**: A regression in the injection path or selector surfacing would make skills silently uncallable, degrading the agent to brute-force approaches.
+  **Pass means**: The agent invoked skill or discover_skills and named a specific relevant skill, proving the injection and selector paths work.
+  **Fail means**: Skill tools were not injected (lifecycle preamble bug), not surfaced by the selector, or the agent guessed a skill name without using the discovery tool.
 prompt: |
   I want to analyze a past astra session to find token waste. There's
   likely a skill for this. Use whichever tool discovers available

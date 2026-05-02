@@ -1,9 +1,10 @@
 name: efficiency_bounds_basic
-description: >
-  Smoke case exercising the newer criteria types:
-  tokens_between, duration_between, tool_sequence, turn_rounds_between,
-  and cache_rate_above. Prompt is trivial so any model can pass; the
-  bounds are intentionally wide to avoid flakiness.
+description: |
+  **What**: Send a trivial prompt and validate that efficiency criteria (tokens, duration, turn rounds) evaluate without errors.
+  **Tests**: Harness criteria plumbing — tokens_between, duration_between, and turn_rounds_between all fire correctly on a minimal case.
+  **Why**: Ensures new criteria types work end-to-end; if the harness can't evaluate these on a trivial prompt, all efficiency-gated cases are broken.
+  **Pass means**: The harness criteria engine correctly extracts and evaluates token counts, wall-clock duration, and turn rounds.
+  **Fail means**: Criteria extraction bug in the harness itself (not a model issue) — e.g., missing fields in the JSON envelope.
 prompt: "Say exactly: ok"
 timeout_seconds: 60
 capability: efficiency

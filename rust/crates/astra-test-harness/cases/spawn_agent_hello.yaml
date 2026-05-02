@@ -1,9 +1,10 @@
 name: spawn_agent_hello
 description: |
-  Verify the model picks up the `spawn_agent` tool for a task that
-  clearly benefits from delegation, and that it surfaces the
-  sub-agent result in its final answer. This is the canonical
-  orchestration smoke test.
+  **What**: Spawn a sub-agent, have it reply with a known phrase, and verify the parent surfaces the reply verbatim.
+  **Tests**: Basic orchestration via spawn_agent — tool discovery, delegation dispatch, and result surfacing.
+  **Why**: Canonical orchestration smoke test; if this fails, all multi-agent workflows (delegation, fork-prefix, matrix runs) are broken.
+  **Pass means**: The model discovered spawn_agent, delegated successfully, and surfaced the child's reply prefixed with "CHILD:".
+  **Fail means**: spawn_agent tool not discovered (selector issue), delegation dispatch failed (runtime bug), or result not surfaced (model instruction-following issue).
 prompt: |
   You have a `spawn_agent` tool available. Spawn a sub-agent and
   ask it to reply with exactly "hello from child". Then report

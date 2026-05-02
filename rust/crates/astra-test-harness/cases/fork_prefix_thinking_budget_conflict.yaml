@@ -1,15 +1,10 @@
 name: fork_prefix_thinking_budget_conflict
 description: |
-  Regression for `ForkValidationError::ThinkingBudgetConflict`.
-  Anthropic's KV cache key includes `thinking.budget_tokens`. If the
-  child's `max_output_tokens` clamps the effective budget to a
-  different value than the parent used, the cache key diverges and
-  reuse is meaningless. The resolver must catch this and soft-fall
-  back rather than send a corrupt prefix.
-
-  The child is explicitly constrained with a tiny max_output_tokens
-  that forces the thinking budget to be clamped, so validation
-  fires.
+  **What**: Spawn a child with a tiny max_output_tokens to force a thinking budget clamp, verifying the resolver handles the cache key divergence.
+  **Tests**: ForkValidationError::ThinkingBudgetConflict — when the child's clamped budget diverges from the parent's, the resolver must soft-fall back.
+  **Why**: Anthropic's KV cache key includes thinking.budget_tokens; a mismatch means prefix reuse is meaningless and would waste tokens or produce errors.
+  **Pass means**: The resolver detected the budget conflict and either soft-fell back (no prefix) or the clamp happened not to diverge (legitimate hit).
+  **Fail means**: Corrupt prefix sent despite budget mismatch (silent cache key collision), or the resolver crashed instead of falling back gracefully.
 prompt: |
   You have a `spawn_agent` tool.
 

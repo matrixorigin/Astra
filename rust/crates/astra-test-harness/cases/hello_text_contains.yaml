@@ -1,8 +1,10 @@
 name: hello_text_contains
 description: |
-  Smoke case — send the model a trivial prompt and assert that the
-  reply mentions the magic phrase. No tool calls expected. Used to
-  verify the harness end-to-end before richer cases.
+  **What**: Send a trivial prompt and verify the response contains a specific word.
+  **Tests**: Basic model responsiveness and instruction following.
+  **Why**: Smoke test — if this fails, nothing else will work (auth, routing, model access).
+  **Pass means**: The model is reachable and can follow simple instructions.
+  **Fail means**: Infrastructure issue (auth expired, model unavailable) — not a model capability problem.
 prompt: |
   Please reply with a single short sentence that contains the word
   "astra-harness-ok" verbatim. Do not use any tools.

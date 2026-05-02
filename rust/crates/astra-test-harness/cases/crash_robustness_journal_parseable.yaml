@@ -1,11 +1,10 @@
 name: crash_robustness_journal_parseable
 description: |
-  Journal lines that fail to parse must be counted, not silently
-  dropped or crashing the analyzer. We run a normal case with
-  debug_log enabled and require that `skipped_lines == 0` — the
-  loader's defensive counter should stay at zero on a clean run.
-  If future code writes malformed lines this case FAILs with a
-  visible count.
+  **What**: Run a clean session with debug_log and verify all journal lines parse without skips or crashes.
+  **Tests**: Journal robustness — the session loader must handle every line it wrote, with zero silent drops.
+  **Why**: Guards against malformed journal lines that silently corrupt session replay or crash the analyzer, which would break post-hoc debugging.
+  **Pass means**: Every journal line round-trips cleanly through the parser and at least one StepCompleted event is emitted.
+  **Fail means**: Runtime wrote unparseable journal lines (serialization regression) or the loader silently dropped events.
 prompt: |
   List the files in the current directory with list_dir. Reply with
   "scan-complete" in your final answer.

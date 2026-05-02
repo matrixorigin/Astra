@@ -1,7 +1,10 @@
 name: multi_turn_instruction_refinement
 description: |
-  Agent receives a task, then a refinement. Tests that the agent
-  incorporates follow-up instructions in the same session.
+  **What**: Ask for a Rust function signature in turn 1, then refine it (return type + doc comment) in turn 2.
+  **Tests**: Multi-turn instruction refinement — the agent must build on its previous output when given incremental changes.
+  **Why**: Iterative code refinement is a core agent workflow; if the agent starts from scratch each turn instead of building on prior output, productivity drops sharply.
+  **Pass means**: Turn 2 output contains both the doc comment and the updated return type, proving the agent refined rather than regenerated.
+  **Fail means**: Agent lost turn 1 context (session bug), ignored the refinement (instruction following issue), or produced unrelated output.
 prompt: |
   Write me a short Rust function signature (just the signature, no body)
   called 'greet' that takes a &str parameter called 'name' and prints

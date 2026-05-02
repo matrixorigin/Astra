@@ -234,7 +234,7 @@ impl JwtSettings {
             access_token_expire_minutes: parse_or_default(
                 lookup,
                 "ASTRA_JWT_ACCESS_TTL_MINUTES",
-                60_u32,
+                10080_u32, // 1 week (was 60 min — too short for dev/harness use)
             )?,
             refresh_token_expire_days: parse_or_default(
                 lookup,
@@ -548,7 +548,7 @@ mod tests {
         let settings = AppSettings::from_map(&m).expect("defaults should parse");
 
         assert_eq!(settings.jwt.algorithm, "HS256");
-        assert_eq!(settings.jwt.access_token_expire_minutes, 60);
+        assert_eq!(settings.jwt.access_token_expire_minutes, 10080);
         assert_eq!(settings.jwt.refresh_token_expire_days, 7);
         assert_eq!(settings.jwt.secret_key.len(), 32);
         assert!(

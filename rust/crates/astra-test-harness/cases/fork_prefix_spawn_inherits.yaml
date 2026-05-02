@@ -1,11 +1,10 @@
 name: fork_prefix_spawn_inherits
 description: |
-  Regression: spawn_agent with inherit_prefix exercises the fork-prefix
-  pipeline's capture-resolve-probe cycle. The parent captures its prefix
-  on turn_completed, the child resolves it via InMemoryPrefixStore.
-
-  This verifies the CLI-exercisable path for fork-prefix inheritance
-  (spawn_agent), not the server-side DelegationEngine (delegate tool).
+  **What**: Spawn a child agent with inherit_prefix and verify the full capture-resolve-probe cycle via the CLI path.
+  **Tests**: Fork-prefix pipeline for spawn_agent — parent captures prefix on turn_completed, child resolves via InMemoryPrefixStore.
+  **Why**: Regression for the CLI-exercisable fork-prefix path (distinct from server-side DelegationEngine), ensuring prefix inheritance works end-to-end.
+  **Pass means**: The child resolved the parent's prefix, produced the expected reply, and the parent surfaced it in the final answer.
+  **Fail means**: Prefix capture missed turn_completed, InMemoryPrefixStore lookup failed, or spawn_agent tool dispatch is broken.
 prompt: |
   Use the spawn_agent tool to create a child agent. Enable prefix
   inheritance by passing inherit_prefix. Give the child agent the ID

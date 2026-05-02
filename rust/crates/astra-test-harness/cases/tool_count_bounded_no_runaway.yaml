@@ -1,10 +1,10 @@
 name: tool_count_bounded_no_runaway
 description: |
-  Catches runaway tool-loop regressions. A well-behaved agent given
-  a trivial task should make ≤ 4 tool calls. If a compaction bug or
-  circuit-breaker regression makes the agent loop, this case FAILs
-  loudly with `tool_calls_count` out of range — much faster than
-  noticing via production session metrics.
+  **What**: Give a trivial directory-listing task and verify the agent completes it in 4 or fewer tool calls.
+  **Tests**: Runaway tool-loop detection — the agent must not enter infinite tool-call loops on simple tasks.
+  **Why**: Guards against compaction bugs or circuit-breaker regressions that cause the agent to loop indefinitely, which is cheaper to catch here than in production metrics.
+  **Pass means**: The agent completed the task within the tool-call bound, proving the loop circuit-breaker and compaction are healthy.
+  **Fail means**: Runaway tool loop (compaction bug causing repeated actions, or circuit-breaker regression failing to terminate the loop).
 prompt: |
   List the current directory using one tool call. Your final answer
   should be a one-sentence summary of what you found.

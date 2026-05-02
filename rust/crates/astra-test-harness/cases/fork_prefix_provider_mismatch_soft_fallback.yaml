@@ -1,15 +1,10 @@
 name: fork_prefix_provider_mismatch_soft_fallback
 description: |
-  Regression for `ForkValidationError::ProviderMismatch`: when a
-  child's model is on a different provider than the captured parent
-  prefix, the resolver must soft-fallback (run without the prefix)
-  and emit a classifiable telemetry event. Crashing or silently
-  succeeding with a corrupt prefix is a P0 bug — this case guards
-  against both.
-
-  The child is explicitly asked to use a model from a different
-  family than the parent, so `ProviderKind` hashes diverge and
-  validation fires.
+  **What**: Spawn a child on a different provider than the parent and verify the fork-prefix resolver soft-falls back gracefully.
+  **Tests**: ForkValidationError::ProviderMismatch — cross-provider prefix inheritance must fail safely, not crash or corrupt.
+  **Why**: Guards against a P0 bug where a mismatched provider prefix is sent to the wrong backend, causing silent corruption or a panic.
+  **Pass means**: The resolver detected the provider mismatch, rejected the prefix, and the child ran without inheritance (or the error was reported transparently).
+  **Fail means**: Runtime crash (panic on mismatch), silent corruption (wrong prefix sent to wrong provider), or the resolver failed to detect the mismatch.
 prompt: |
   You have a `spawn_agent` tool.
 

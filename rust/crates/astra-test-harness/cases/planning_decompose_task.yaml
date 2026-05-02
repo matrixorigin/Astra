@@ -1,7 +1,10 @@
 name: planning_decompose_task
 description: |
-  Give the agent a complex task and verify it decomposes into steps
-  rather than attempting everything in one shot.
+  **What**: Give a multi-step file task (check, create, read, delete) and verify the agent decomposes it into sequential tool calls.
+  **Tests**: Task decomposition and planning — the agent must break a compound task into ordered steps rather than attempting one monolithic action.
+  **Why**: Complex real-world tasks require step-by-step execution; an agent that tries to do everything in one shot will fail on interdependent steps.
+  **Pass means**: The agent used 3+ tool calls in a logical sequence, proving it decomposed the task and executed steps in order.
+  **Fail means**: Agent attempted a single-shot execution (no decomposition), or steps were misordered causing downstream failures.
 prompt: |
   I need you to: 1) check if /tmp exists, 2) create a file
   /tmp/astra_plan_test.txt with content "step1 done", 3) read it back

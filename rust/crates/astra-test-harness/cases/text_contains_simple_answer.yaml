@@ -1,9 +1,10 @@
 name: text_contains_simple_answer
 description: |
-  Factual-answer smoke test. Verifies the model can answer a simple
-  knowledge question and produce the correct text output. The answer
-  must appear in the final text regardless of whether the model chose
-  to verify via tools.
+  **What**: Ask a simple factual question (Rust 1.0 release year) and verify the answer appears in the output.
+  **Tests**: Basic factual recall and text output — the model must produce a correct, specific answer without hallucinating.
+  **Why**: Smoke test for knowledge retrieval; if the model cannot answer a well-known fact, it signals a model loading or configuration issue.
+  **Pass means**: The model correctly answered "2015", proving basic knowledge retrieval and text output work.
+  **Fail means**: Model returned wrong answer (hallucination or knowledge gap) or output was empty/garbled (infrastructure issue).
 prompt: |
   What year did Rust 1.0 ship? Reply with just the year as a 4-digit
   number. No extra prose.

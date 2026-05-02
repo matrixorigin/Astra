@@ -1,7 +1,10 @@
 name: multi_turn_error_correction
 description: |
-  Agent makes a tool call in turn 1, user points out an issue in turn 2.
-  Tests that the agent can correct itself using session context.
+  **What**: Give a simple question in turn 1, then correct/refine it in turn 2, verifying the agent adapts.
+  **Tests**: Multi-turn error correction — the agent must incorporate user corrections from subsequent turns using session context.
+  **Why**: Real users frequently refine or correct their requests; if the agent ignores follow-up corrections, iterative workflows fail.
+  **Pass means**: The agent correctly answers the refined question (2+2+2=6) in turn 2, proving it reads and applies user corrections.
+  **Fail means**: Session context lost (agent cannot see turn 1), or the agent ignores the correction and repeats the old answer.
 prompt: "What is 2+2? Answer with just the number."
 capability: instruction_following
 difficulty: 1

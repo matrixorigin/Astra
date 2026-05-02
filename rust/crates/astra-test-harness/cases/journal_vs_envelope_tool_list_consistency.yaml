@@ -1,16 +1,10 @@
 name: journal_vs_envelope_tool_list_consistency
 description: |
-  Cross-validation: the CLI JSON envelope's `tools_used` should match
-  the tool names nested in the journal's `llm_round.tool_calls`
-  array. A disagreement means the envelope is missing tools emitted
-  inside sub-agent runs — a known class of bug that the harness now
-  catches automatically since it loads both data sources.
-
-  We exercise a prompt that triggers at least one tool call. The
-  `tool_called` criterion reads from the envelope;
-  `journal_tool_called` walks the journal (which supports legacy
-  `llm_round.tool_calls[]` as well as step-events
-  `ToolCallCompleted`). Both must agree on the same tool name.
+  **What**: Trigger a tool call and verify the CLI JSON envelope's tools_used matches the journal's tool_calls records.
+  **Tests**: Cross-source consistency — envelope and journal must agree on which tools were called, including sub-agent runs.
+  **Why**: Guards against a known bug class where the envelope omits tools emitted inside sub-agent runs, breaking post-hoc analysis and billing.
+  **Pass means**: Both the envelope (tool_called) and journal (journal_tool_called / StepCompleted) report the same tool, proving data-source parity.
+  **Fail means**: Envelope-journal desync — the envelope is missing tool calls (likely sub-agent emission bug) or the journal loader dropped events.
 prompt: |
   Use ONLY the `list_dir` tool (not `bash`, not any other tool) to
   list the current directory. After you see the output, briefly

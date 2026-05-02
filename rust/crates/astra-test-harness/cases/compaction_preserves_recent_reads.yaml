@@ -1,17 +1,10 @@
 name: compaction_preserves_recent_reads
 description: |
-  Regression for the "recent file reads survive compaction" invariant.
-  `recent_file_reads` on AgenticLoopState is supposed to be re-injected
-  after a compaction so the LLM retains awareness of files it already
-  looked at. If compaction drops that state, a long session where a
-  file was read early would later "forget" it — manifesting as the
-  agent asking to re-read the file, or confusing the user with stale
-  claims.
-
-  We deliberately steer the agent to: (1) read a file, (2) produce
-  enough follow-up text to trigger compaction pressure, (3) refer
-  back to the early read. Judger decides whether the agent retained
-  the context.
+  **What**: Read a file, then reference its contents later without re-reading, verifying context survives compaction.
+  **Tests**: Compaction resilience — recent_file_reads state must be re-injected after context compaction.
+  **Why**: Regression guard for a known bug class where compaction drops file-read state, causing the agent to "forget" files it already read in long sessions.
+  **Pass means**: The agent retains specific file content (target names, variables) after compaction pressure, proving state re-injection works.
+  **Fail means**: Compaction dropped recent_file_reads — the agent either re-read the file (wasted a tool call) or fabricated generic content.
 prompt: |
   First, use read_file to look at ./Makefile (top 30 lines is fine).
   Then in your final answer, do two things:

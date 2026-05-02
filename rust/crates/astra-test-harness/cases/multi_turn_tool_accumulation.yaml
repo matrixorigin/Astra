@@ -1,8 +1,10 @@
 name: multi_turn_tool_accumulation
 description: |
-  First turn asks agent to read a file, second turn asks to modify it.
-  Tests that tool results from turn 1 inform turn 2 decisions.
-  Uses setup_cmd to create a temp file.
+  **What**: Read a file in turn 1, then append to it in turn 2, verifying tool results carry forward across turns.
+  **Tests**: Multi-turn tool accumulation — tool outputs from earlier turns must inform decisions and actions in later turns.
+  **Why**: Real agent workflows chain tool calls across turns (read then modify); if tool results are lost, the agent operates blind in subsequent turns.
+  **Pass means**: The agent uses knowledge from the turn 1 read_file to correctly target the file for modification in turn 2.
+  **Fail means**: Tool results dropped between turns (session state bug), or the agent failed to connect the read output with the write target.
 prompt: |
   Read the file /tmp/astra_harness_mt_test.txt and tell me what's in it.
   Include the file contents in your answer.

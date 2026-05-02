@@ -1,14 +1,10 @@
 name: fork_prefix_hit_end_to_end
 description: |
-  End-to-end regression for the fork-prefix cache inheritance pipeline.
-  When the parent spawns a child with `inherit_prefix: {}`, the child
-  should inherit the parent's cached prefix and produce a reply.
-
-  NOTE: stderr-based fork-cache event assertions (stderr_matches,
-  fork_cache_outcome) are currently disabled because the SSE loop
-  (`astra chat`) does not yet wire StderrForkCacheSink into the
-  spawn/delegate executor. Those criteria will be restored once the
-  sink plumbing lands. See agent_runtime.rs for the wired path.
+  **What**: Spawn a child agent with inherit_prefix and verify it inherits the parent's cached prefix and replies.
+  **Tests**: Fork-prefix cache inheritance — the capture-resolve-probe pipeline for parent-to-child prefix reuse.
+  **Why**: End-to-end regression for the cache inheritance pipeline; a break here means child agents pay full cold-start cost on every spawn.
+  **Pass means**: The child agent successfully inherited the parent's prefix, produced a reply, and the parent surfaced it.
+  **Fail means**: Prefix capture failed (parent side), prefix resolution failed (child side), or spawn_agent tool dispatch is broken.
 prompt: |
   You have a `spawn_agent` tool.
 

@@ -1,7 +1,10 @@
 name: code_gen_write_and_verify
 description: |
-  Ask the agent to write code to a file and then verify it compiles.
-  Tests the full code generation workflow with tool use.
+  **What**: Ask the agent to write a Python fibonacci function to a file, then run and verify correctness.
+  **Tests**: End-to-end code generation — file writing, code correctness, and self-verification via tool use.
+  **Why**: Validates the full dev-loop workflow (write, execute, confirm) that production agents rely on daily.
+  **Pass means**: The agent can generate correct code, persist it to disk, and verify it by execution.
+  **Fail means**: Code generation bug (wrong logic), file-write tool failure, or inability to chain write-then-execute steps.
 prompt: |
   Write a Python script at /tmp/astra_harness_fib.py that defines a
   function fibonacci(n) returning the nth Fibonacci number (0-indexed,

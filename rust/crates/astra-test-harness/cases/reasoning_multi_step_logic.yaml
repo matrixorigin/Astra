@@ -1,7 +1,10 @@
 name: reasoning_multi_step_logic
 description: |
-  A logic puzzle requiring multi-step reasoning without tools.
-  Tests pure reasoning capability.
+  **What**: Pose the classic river-crossing puzzle and verify the agent computes the correct minimum number of crossings (7).
+  **Tests**: Pure multi-step logical reasoning without tool assistance — the model must reason through constraints and state transitions.
+  **Why**: Validates that the model can handle constraint-satisfaction problems, which underpin planning and debugging tasks in production.
+  **Pass means**: The model correctly reasoned through the fox-chicken-grain constraints and arrived at the answer (7 crossings).
+  **Fail means**: Model reasoning failure (wrong answer) — not an infrastructure issue; indicates the model struggles with multi-step logic at this difficulty level.
 prompt: |
   A farmer has a fox, a chicken, and a bag of grain. He needs to cross
   a river in a boat that can only carry him and one item. If left alone,

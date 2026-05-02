@@ -1,15 +1,10 @@
 name: judger_quorum_catches_flaky_scores
 description: |
-  Meta-regression for Item 4's QuorumJudger. A borderline case that
-  a single judger call might score inconsistently. We ask for a
-  response that would score high-variance (subjective quality
-  judgment) and pin the threshold at the borderline. When this case
-  is run with --judger-n 3, outlier-driven flakes are smoothed out;
-  without quorum, it may pass/fail stochastically between runs.
-
-  Not a green-path regression — this case is a deliberate probe to
-  be run with explicit quorum settings. Included so we can re-run
-  periodically and confirm variance stays bounded.
+  **What**: Ask a borderline subjective question and verify the quorum judger smooths out scoring variance across multiple evaluations.
+  **Tests**: QuorumJudger reliability — a single judger call may score inconsistently; quorum (--judger-n 3) should stabilize the result.
+  **Why**: Meta-regression for the judger infrastructure itself; if quorum fails to dampen variance, all judger-gated cases become flaky.
+  **Pass means**: The quorum-averaged score is stable across runs, proving the multi-call judger correctly smooths outliers.
+  **Fail means**: Judger quorum logic is broken (scores not averaged), or the borderline threshold needs recalibration.
 prompt: |
   Explain TCP in exactly one short sentence that mentions at least
   three concepts: "reliability", "ordering", and "connection". Do

@@ -1,10 +1,10 @@
 name: selector_spawn_agent_visible_across_matrix
 description: |
-  G3 regression. Pre-G3, the tfidf tool selector hid `spawn_agent`
-  from models because the tool has no entry in TOOL_CATALOG. This
-  case pins three different model families (alibaba, anthropic,
-  minimax) and asserts all three pick the tool up — the fix should
-  work across families, not just the one used during development.
+  **What**: Run spawn_agent across three different model families (Alibaba, Anthropic, MiniMax) and verify all can discover and use it.
+  **Tests**: Cross-model tool selector visibility — spawn_agent must be surfaced by the tfidf selector regardless of model family.
+  **Why**: G3 regression for a bug where spawn_agent had no TOOL_CATALOG entry, making it invisible to some models; the fix must work across all families.
+  **Pass means**: All three model families discovered spawn_agent and used it, proving the selector fix is universal.
+  **Fail means**: Tool selector regression — spawn_agent is hidden from one or more model families (TOOL_CATALOG or selector bug).
 prompt: |
   You have a `spawn_agent` tool. Spawn a child and ask it to reply
   with exactly "G3-matrix-ok". Surface the child's reply in your
