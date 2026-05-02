@@ -473,6 +473,11 @@ sweep:
 .PHONY: test test-offline test-online test-sdk-offline test-sdk-online
 test: test-offline test-online
 
+.PHONY: test-dashboard
+test-dashboard: ## Build astra-test and launch live dashboard
+	@cd rust && cargo build --release -p astra-test-harness
+	./rust/target/release/astra-test --live-dashboard
+
 .PHONY: test-offline
 test-offline: sweep test-workspace test-runtime-bridge-hooks test-sdk-offline
 
