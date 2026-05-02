@@ -1,36 +1,16 @@
 use super::*;
 
-pub(super) async fn learning_health_handler(
-    State(state): State<AppState>,
-) -> Json<LearningHealthResponse> {
-    let (lesson_count, retired_count) = match &state.shared_pool {
-        Some(pool) => {
-            let active: Option<u64> =
-                sqlx::query_scalar("SELECT COUNT(*) FROM agent_lessons WHERE status = 'active'")
-                    .fetch_optional(pool.get())
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|v: i64| u64::try_from(v).ok());
-            let retired: Option<u64> =
-                sqlx::query_scalar("SELECT COUNT(*) FROM agent_lessons WHERE status = 'retired'")
-                    .fetch_optional(pool.get())
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|v: i64| u64::try_from(v).ok());
-            (active, retired)
-        }
-        None => (None, None),
-    };
-
+pub(super) async fn learning_health_handler() -> Json<LearningHealthResponse> {
+    // Lessons are now stored in Memoria (Session Memory Protocol L3),
+    // not in the agent_lessons DB table. Health is reported by Memoria's
+    // own /health endpoint. This handler returns a static healthy status.
     Json(LearningHealthResponse {
         status: "healthy".to_string(),
         service: "learning".to_string(),
         version: "1.0.0".to_string(),
         timestamp: Utc::now().to_rfc3339(),
-        lesson_count,
-        retired_count,
+        lesson_count: None,
+        retired_count: None,
     })
 }
 

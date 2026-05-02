@@ -1,10 +1,9 @@
 //! Regression tests for session behavior issues found in session 292f7100.
 //!
-//! Four issues fixed:
+//! Issues addressed:
 //! 1. "我关注X" → LLM explored codebase instead of calling memory_store
-//!    Fix: system prompt now has HIGHEST PRIORITY memory section with explicit examples
-//! 2. Tracking intents not detected by detect_store_signal
-//!    Fix: "tracking" category added; 关注/follow/watch patterns fire BEFORE preference check
+//!    Fix: system prompt memory rules + LLM-driven store decisions
+//! 2. Tracking intent detection (detect_tracking_intent)
 //! 3. GitHub tools bleeding into memory-only queries via recency boost
 //!    Fix: GENERAL content-gated recency — recency amplifies textual relevance, never creates it.
 //!    Zero per-intent special cases. Gate = content_relevance / RECENCY_CONTENT_GATE.

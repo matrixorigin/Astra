@@ -1204,10 +1204,7 @@ impl InProcessChatTurnBridge {
                 .unwrap_or_default();
 
             // Memory storage decisions are now fully LLM-driven via system
-            // prompt rules. The Rust-side detect_store_signal keyword matching
-            // was removed — it was redundant with the prompt rules and could
-            // not handle semantic signals like "这很重要以后要用".
-            let memory_signal_hint = String::new();
+            // prompt rules. detect_store_signal keyword matching was removed.
 
             // ── Implicit feedback detection: inject correction/frustration context ──
             // When user expresses dissatisfaction (correction, frustration, rephrasing),
@@ -1348,21 +1345,6 @@ impl InProcessChatTurnBridge {
                     .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
                         context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                             learned_runtime_context: true,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
-                );
-            }
-            if !memory_signal_hint.is_empty() {
-                dynamic_sections.push(
-                    prompts::PromptSection::dynamic(
-                        memory_signal_hint.clone(),
-                        prompts::PromptTokenBucket::Environment,
-                    )
-                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            memory_signal_detected: true,
                             ..Default::default()
                         },
                         ..Default::default()
@@ -4084,7 +4066,7 @@ mod tests {
     fn build_system_message_records_bridge_context_signals() {
         let active_skill_names = vec!["concise"];
         let learned_context_text = "matrixorigin => github";
-        let memory_signal_hint = ""; // Removed: LLM-driven via system prompt rules
+        // memory_signal_hint removed — LLM-driven via system prompt rules
         let implicit_feedback_hint =
             "\n\n## Implicit Feedback\nThe user is correcting the previous attempt.";
         let feedback_rules_hint = "\n\n[Learned Feedback Rules]\n- Rule: do not use mocks";
@@ -4132,7 +4114,7 @@ mod tests {
                 astra_turn_core::context_assembly_trace::PromptTraceSignals {
                     context_signals:
                         astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            memory_signal_detected: !memory_signal_hint.is_empty(),
+                            memory_signal_detected: false,
                             ..Default::default()
                         },
                     ..Default::default()
