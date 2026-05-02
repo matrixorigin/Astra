@@ -1699,9 +1699,8 @@ impl AgenticRunLifecycleService {
         mut events: Vec<Value>,
         loop_state: &AgenticLoopState,
     ) -> (Vec<Value>, RunStatus, Option<String>) {
-        let total_input = loop_state.total_prompt
-            + loop_state.total_cache_read
-            + loop_state.total_cache_creation;
+        let total_input =
+            loop_state.total_prompt + loop_state.total_cache_read + loop_state.total_cache_creation;
         let usage = json!({
             "prompt_tokens": total_input,
             "completion_tokens": loop_state.total_completion,

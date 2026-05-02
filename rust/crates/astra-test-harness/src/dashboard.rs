@@ -278,7 +278,9 @@ async fn models_handler(State(state): State<AppState>) -> Json<serde_json::Value
             Json(serde_json::json!({"models": [], "error": stderr.trim()}))
         }
         Ok(Err(e)) => Json(serde_json::json!({"models": [], "error": e.to_string()})),
-        Err(_) => Json(serde_json::json!({"models": [], "error": "model list timed out after 30s"})),
+        Err(_) => {
+            Json(serde_json::json!({"models": [], "error": "model list timed out after 30s"}))
+        }
     }
 }
 

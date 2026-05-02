@@ -855,9 +855,7 @@ fn maybe_pin_spawn_agent_schema(registry: &mut ToolRegistry, spawner_wired: bool
         return;
     }
     registry.upsert_schema(astra_runtime::orchestration::spawn_agent_schema());
-    registry.upsert_schema(
-        crate::edge_tools::agent_spawning::get_agent_result_schema(),
-    );
+    registry.upsert_schema(crate::edge_tools::agent_spawning::get_agent_result_schema());
 }
 
 #[cfg(test)]

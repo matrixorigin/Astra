@@ -73,6 +73,7 @@ mod tests {
             llm_rounds: None,
             interruption: None,
             final_messages: Vec::new(),
+            background_agent_results: Vec::new(),
         }
     }
 

@@ -2331,10 +2331,7 @@ mod tests {
     fn resolve_path_sandboxed_denies_tmp_with_empty_allowed() {
         let workspace = tempfile::tempdir().unwrap();
         let result = resolve_path_sandboxed(workspace.path(), "/tmp/test_file.txt", &[]);
-        assert!(
-            result.is_err(),
-            "empty allowed_paths must deny /tmp"
-        );
+        assert!(result.is_err(), "empty allowed_paths must deny /tmp");
         assert!(result.unwrap_err().contains("SANDBOX_DENIED"));
     }
 

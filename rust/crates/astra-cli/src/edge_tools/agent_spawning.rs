@@ -114,10 +114,7 @@ pub async fn handle_spawn_agent_tool(args: &Value, ctx: Option<&SpawnAgentContex
 /// When a parent spawns a child with `background: true`, the child runs
 /// asynchronously and the parent receives only a "launched" status. This
 /// tool lets the parent poll for the child's result once it completes.
-pub async fn handle_get_agent_result_tool(
-    args: &Value,
-    ctx: Option<&SpawnAgentContext>,
-) -> String {
+pub async fn handle_get_agent_result_tool(args: &Value, ctx: Option<&SpawnAgentContext>) -> String {
     let agent_id = match args.get("agent_id").and_then(|v| v.as_str()) {
         Some(id) => id,
         None => {
@@ -147,38 +144,30 @@ pub async fn handle_get_agent_result_tool(
     // returns as soon as the child finishes (or times out).
     let timeout = std::time::Duration::from_secs(120);
     match ctx.spawner.wait_for_agent(agent_id, timeout).await {
-        Some(AgentStatus::Completed { result }) => {
-            json!({
-                "status": "completed",
-                "agent_id": agent_id,
-                "result": result,
-            })
-            .to_string()
-        }
-        Some(AgentStatus::Failed { error }) => {
-            json!({
-                "status": "failed",
-                "agent_id": agent_id,
-                "error": error,
-            })
-            .to_string()
-        }
-        Some(status) => {
-            json!({
-                "status": "unknown",
-                "agent_id": agent_id,
-                "detail": format!("{status:?}"),
-            })
-            .to_string()
-        }
-        None => {
-            json!({
-                "status": "timeout",
-                "agent_id": agent_id,
-                "error": format!("Agent '{agent_id}' did not complete within {}s", timeout.as_secs()),
-            })
-            .to_string()
-        }
+        Some(AgentStatus::Completed { result }) => json!({
+            "status": "completed",
+            "agent_id": agent_id,
+            "result": result,
+        })
+        .to_string(),
+        Some(AgentStatus::Failed { error }) => json!({
+            "status": "failed",
+            "agent_id": agent_id,
+            "error": error,
+        })
+        .to_string(),
+        Some(status) => json!({
+            "status": "unknown",
+            "agent_id": agent_id,
+            "detail": format!("{status:?}"),
+        })
+        .to_string(),
+        None => json!({
+            "status": "timeout",
+            "agent_id": agent_id,
+            "error": format!("Agent '{agent_id}' did not complete within {}s", timeout.as_secs()),
+        })
+        .to_string(),
     }
 }
 

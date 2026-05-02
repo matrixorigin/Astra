@@ -189,7 +189,10 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
         .to_string();
     if let Some(bg) = v.get("background_agent_results").and_then(|x| x.as_array()) {
         for entry in bg {
-            let agent_id = entry.get("agent_id").and_then(|x| x.as_str()).unwrap_or("?");
+            let agent_id = entry
+                .get("agent_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("?");
             let result = entry.get("result").and_then(|x| x.as_str()).unwrap_or("");
             text.push_str(&format!("\n[background:{agent_id}]: {result}"));
         }

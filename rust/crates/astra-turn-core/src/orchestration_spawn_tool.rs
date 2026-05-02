@@ -347,7 +347,10 @@ mod tests {
     fn background_true_requires_explicit_opt_in() {
         let json = r#"{"description": "D", "prompt": "P", "background": true}"#;
         let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
-        assert!(input.background, "explicit background: true must be honored");
+        assert!(
+            input.background,
+            "explicit background: true must be honored"
+        );
     }
 
     #[test]

@@ -361,9 +361,7 @@ pub(crate) fn parse_score_from_response(stdout_body: &str) -> Result<JudgerScore
                     votes: Vec::new(),
                 });
             }
-            return Err(format!(
-                "no SCORE: line in judger response; text={text:?}"
-            ));
+            return Err(format!("no SCORE: line in judger response; text={text:?}"));
         }
     };
     let score: f64 = captured

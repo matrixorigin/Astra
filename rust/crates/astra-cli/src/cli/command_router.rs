@@ -460,9 +460,7 @@ pub(super) async fn execute_cli_command(
                 &mut skill_qt,
             );
             params.pre_loaded_messages = continuation_messages.take();
-            let sr = match stream_chat_sse(params)
-            .await
-            {
+            let sr = match stream_chat_sse(params).await {
                 Ok(sr) => sr,
                 Err(e) if is_session_not_found_error(&e.error) && session_id.is_some() => {
                     let _ = clear_profile_last_session(profile.as_deref());
@@ -915,9 +913,7 @@ pub(super) async fn execute_cli_command(
                 &mut skill_qt,
             );
             params.pre_loaded_messages = continuation_messages.take();
-            let mut sr = match stream_chat_sse(params)
-            .await
-            {
+            let mut sr = match stream_chat_sse(params).await {
                 Ok(sr) => sr,
                 Err(e) if is_session_not_found_error(&e.error) && session_id.is_some() => {
                     let _ = clear_profile_last_session(profile.as_deref());
@@ -1437,11 +1433,7 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
             .find(|r| r.ok)
             .map(|_| true)
             .unwrap_or(false);
-        let last_record_ok = sr
-            .tool_call_records
-            .last()
-            .map(|r| r.ok)
-            .unwrap_or(true);
+        let last_record_ok = sr.tool_call_records.last().map(|r| r.ok).unwrap_or(true);
         // Fail only if no tool call succeeded after the failures,
         // OR the very last call itself failed.
         if !last_ok || !last_record_ok {
@@ -1522,9 +1514,7 @@ pub(super) async fn run_print_mode(
         &mut skill_qt,
     );
     params.pre_loaded_messages = continuation_messages.take();
-    let sr = match stream_chat_sse(params)
-    .await
-    {
+    let sr = match stream_chat_sse(params).await {
         Ok(sr) => sr,
         Err(e) if is_session_not_found_error(&e.error) && session_id.is_some() => {
             let _ = clear_profile_last_session(profile);
@@ -2865,6 +2855,7 @@ mod exit_code_tests {
             llm_rounds: None,
             interruption: None,
             final_messages: Vec::new(),
+            background_agent_results: Vec::new(),
         }
     }
 
@@ -3433,6 +3424,7 @@ mod api_url_config_tests {
 
 #[cfg(test)]
 mod session_continuation_tests {
+    #[allow(unused_imports)]
     use serde_json::json;
 
     /// Regression test: `--session-id` in one-shot mode must load previous
@@ -3495,8 +3487,7 @@ mod session_continuation_tests {
 
     #[test]
     fn load_session_messages_returns_none_for_missing_session() {
-        let messages =
-            super::load_session_messages_for_continuation("nonexistent-session-xyz-42");
+        let messages = super::load_session_messages_for_continuation("nonexistent-session-xyz-42");
         assert!(messages.is_none());
     }
 }

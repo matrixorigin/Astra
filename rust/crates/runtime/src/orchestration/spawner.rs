@@ -679,7 +679,10 @@ impl DynamicAgentSpawner {
                 let notifiers = Arc::clone(&self.completion_notifiers);
                 let notify_id = agent_id.clone();
                 let spawn_future = async move {
-                    struct NotifyOnDrop(Arc<RwLock<HashMap<String, Arc<tokio::sync::Notify>>>>, String);
+                    struct NotifyOnDrop(
+                        Arc<RwLock<HashMap<String, Arc<tokio::sync::Notify>>>>,
+                        String,
+                    );
                     impl Drop for NotifyOnDrop {
                         fn drop(&mut self) {
                             if let Ok(map) = self.0.try_read() {
@@ -1029,10 +1032,7 @@ impl DynamicAgentSpawner {
     /// Returns `(agent_id, result_text)` for every background child that
     /// finished with `AgentStatus::Completed`. Aborts tasks that exceed
     /// `deadline`; panics inside a background task are caught and logged.
-    pub async fn shutdown_and_wait(
-        &self,
-        deadline: std::time::Duration,
-    ) -> Vec<(String, String)> {
+    pub async fn shutdown_and_wait(&self, deadline: std::time::Duration) -> Vec<(String, String)> {
         let mut set = self
             .background_tasks
             .lock()
@@ -1716,7 +1716,7 @@ mod tests {
 
         // ImmediateSuccessExecutor completes instantly, so auto-wait
         // kicks in and spawn() returns Completed directly.
-        let agent_id = match spawner.spawn(input, &context).await.unwrap() {
+        let _agent_id = match spawner.spawn(input, &context).await.unwrap() {
             SpawnAgentOutput::Completed { agent_id, .. } => agent_id,
             SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
             other => panic!("expected Completed or Launched, got {other:?}"),

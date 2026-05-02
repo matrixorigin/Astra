@@ -1367,7 +1367,9 @@ mod tests {
             run_id: String::new(),
             cancel_flag: Some(cancel),
         };
-        let cases: Vec<Case> = (0..5).map(|i| case_with(&format!("c{i}"), vec![])).collect();
+        let cases: Vec<Case> = (0..5)
+            .map(|i| case_with(&format!("c{i}"), vec![]))
+            .collect();
         let report = runner.run_all(&cases).await;
         // Cancel fires after 1st case; the 2nd case still executes
         // (cancel is checked BEFORE each case, not during), then the

@@ -1008,6 +1008,7 @@ mod tests {
         assert!(out.contains("67%"), "missing percentage: {out}");
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn mk_run(
         case: &str,
         model: &str,
@@ -1024,6 +1025,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn mk_run_full(
         case: &str,
         model: &str,
