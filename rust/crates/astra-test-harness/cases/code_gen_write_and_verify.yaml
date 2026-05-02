@@ -5,18 +5,17 @@ description: |
   **Why**: Validates the full dev-loop workflow (write, execute, confirm) that production agents rely on daily.
   **Pass means**: The agent can generate correct code, persist it to disk, and verify it by execution.
   **Fail means**: Code generation bug (wrong logic), file-write tool failure, or inability to chain write-then-execute steps.
-  **Note**: Uses workspace-relative path so write_file/str_replace work within sandbox.
 prompt: |
-  Write a Python script at .harness_fib.py that defines a function
-  fibonacci(n) returning the nth Fibonacci number (0-indexed, so
-  fibonacci(0)=0, fibonacci(1)=1, fibonacci(10)=55). Then run it with
-  python3 -c "import sys; sys.path.insert(0,'.'); from harness_fib import fibonacci; print(fibonacci(10))"
+  Write a Python script at /tmp/astra_harness_fib.py that defines a
+  function fibonacci(n) returning the nth Fibonacci number (0-indexed,
+  so fibonacci(0)=0, fibonacci(1)=1, fibonacci(10)=55). Then run it
+  with python3 -c "from astra_harness_fib import fibonacci; print(fibonacci(10))"
   and confirm the output is 55.
 capability: code_generation
 difficulty: 3
 weight: 2.0
 timeout_seconds: 180
-teardown_cmd: "rm -f .harness_fib.py"
+teardown_cmd: "rm -f /tmp/astra_harness_fib.py"
 criteria:
   - type: exit_code
     code: 0

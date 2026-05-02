@@ -75,10 +75,30 @@ pub(crate) fn relative_to_workspace_root(workspace_root: &Path, path: &Path) -> 
     })
 }
 
+/// Default allowed paths that ALL sandbox modes include.
+/// Both `SandboxConfig::standard` and `SandboxConfig::strict` allow `/tmp`.
+static DEFAULT_ALLOWED: &[&str] = &["/tmp"];
+
 /// Resolve a relative path against workspace_root with normalization.
 ///
-/// Returns an error if the resolved path escapes the workspace boundary.
+/// Allows workspace root AND default allowed paths (`/tmp`).
+/// For custom allowed paths, use [`resolve_path_sandboxed`].
 pub fn resolve_path(workspace_root: &Path, relative: &str) -> Result<PathBuf, String> {
+    let allowed: Vec<PathBuf> = DEFAULT_ALLOWED.iter().map(PathBuf::from).collect();
+    resolve_path_sandboxed(workspace_root, relative, &allowed)
+}
+
+/// Resolve a path with full sandbox awareness: allows workspace root
+/// AND any path under `allowed_paths` (e.g., `/tmp`).
+///
+/// This closes the inconsistency where `bash("cat /tmp/x")` works but
+/// `read_file("/tmp/x")` gets SANDBOX_DENIED. The `allowed_paths` list
+/// comes from [`SandboxConfig`] and typically includes `/tmp`.
+pub fn resolve_path_sandboxed(
+    workspace_root: &Path,
+    relative: &str,
+    allowed_paths: &[PathBuf],
+) -> Result<PathBuf, String> {
     let path = if Path::new(relative).is_absolute() {
         PathBuf::from(relative)
     } else {
@@ -95,14 +115,23 @@ pub fn resolve_path(workspace_root: &Path, relative: &str) -> Result<PathBuf, St
         normalized
     };
 
-    if !is_within_workspace_root(&final_path, workspace_root) {
-        return Err(format!(
-            "SANDBOX_DENIED: Path '{}' is outside workspace root '{}'",
-            relative,
-            workspace_root.display()
-        ));
+    // Check workspace root first.
+    if is_within_workspace_root(&final_path, workspace_root) {
+        return Ok(final_path);
     }
-    Ok(final_path)
+
+    // Check allowed_paths (e.g., /tmp).
+    for allowed in allowed_paths {
+        if is_within_workspace_root(&final_path, allowed) {
+            return Ok(final_path);
+        }
+    }
+
+    Err(format!(
+        "SANDBOX_DENIED: Path '{}' is outside workspace root '{}'",
+        relative,
+        workspace_root.display()
+    ))
 }
 
 pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
@@ -2283,5 +2312,62 @@ mod tests {
         let result = multi_edit(tmp.path(), &args);
         assert!(result.is_error);
         assert!(result.output.contains("2 times"));
+    }
+
+    // ── Sandbox allowed_paths tests ──
+
+    #[test]
+    fn resolve_path_allows_tmp_by_default() {
+        let workspace = tempfile::tempdir().unwrap();
+        let result = resolve_path(workspace.path(), "/tmp/test_file.txt");
+        assert!(
+            result.is_ok(),
+            "resolve_path must allow /tmp (default allowed path): {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn resolve_path_sandboxed_denies_tmp_with_empty_allowed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let result = resolve_path_sandboxed(workspace.path(), "/tmp/test_file.txt", &[]);
+        assert!(
+            result.is_err(),
+            "empty allowed_paths must deny /tmp"
+        );
+        assert!(result.unwrap_err().contains("SANDBOX_DENIED"));
+    }
+
+    #[test]
+    fn resolve_path_sandboxed_allows_tmp_when_configured() {
+        let workspace = tempfile::tempdir().unwrap();
+        let allowed = vec![PathBuf::from("/tmp")];
+        let result = resolve_path_sandboxed(workspace.path(), "/tmp/test_file.txt", &allowed);
+        assert!(
+            result.is_ok(),
+            "resolve_path_sandboxed must allow /tmp when in allowed_paths: {:?}",
+            result
+        );
+        assert!(result.unwrap().starts_with("/tmp"));
+    }
+
+    #[test]
+    fn resolve_path_sandboxed_still_denies_etc() {
+        let workspace = tempfile::tempdir().unwrap();
+        let allowed = vec![PathBuf::from("/tmp")];
+        let result = resolve_path_sandboxed(workspace.path(), "/etc/passwd", &allowed);
+        assert!(
+            result.is_err(),
+            "/etc must still be denied even with /tmp allowed"
+        );
+    }
+
+    #[test]
+    fn resolve_path_sandboxed_allows_workspace_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("hello.txt"), "hi").unwrap();
+        let allowed = vec![PathBuf::from("/tmp")];
+        let result = resolve_path_sandboxed(workspace.path(), "hello.txt", &allowed);
+        assert!(result.is_ok(), "workspace-relative paths must still work");
     }
 }
