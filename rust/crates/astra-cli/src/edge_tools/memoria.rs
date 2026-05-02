@@ -270,10 +270,20 @@ fn build_direct_request(base: &str, op: &str, args: &Value) -> (String, Value, H
         }
         "store" => {
             let content = args.get("content").and_then(Value::as_str).unwrap_or("");
-            let memory_type = args
+            let raw_type = args
                 .get("memory_type")
                 .and_then(Value::as_str)
                 .unwrap_or("semantic");
+            // Map business category names to Memoria V1 primitives.
+            // The system prompt teaches types like "user", "feedback", "project", "ref"
+            // but Memoria only accepts: semantic, profile, procedural, working, episodic, tool_result.
+            let memory_type = match raw_type {
+                "user" => "profile",
+                "feedback" | "project" | "lesson" => "semantic",
+                "ref" | "reference" => "procedural",
+                "episode" => "episodic",
+                other => other,
+            };
             let mut payload = json!({"content": content, "memory_type": memory_type});
             // Forward trust_tier and session_id when provided by the LLM
             if let Some(tier) = args.get("trust_tier").and_then(Value::as_str) {
@@ -455,6 +465,23 @@ mod build_direct_request_tests {
         assert_eq!(endpoint, "http://mem/v1/memories");
         assert_eq!(pl["session_id"], "sess-42");
         assert_eq!(pl["trust_tier"], "T1");
+    }
+
+    #[test]
+    fn store_maps_business_type_to_memoria_primitive() {
+        let args = json!({"content": "preference", "memory_type": "feedback"});
+        let (_, pl, _) = build_direct_request("http://mem", "store", &args);
+        assert_eq!(
+            pl["memory_type"], "semantic",
+            "business type 'feedback' must map to 'semantic'"
+        );
+    }
+
+    #[test]
+    fn store_passes_through_valid_memoria_types() {
+        let args = json!({"content": "test", "memory_type": "profile"});
+        let (_, pl, _) = build_direct_request("http://mem", "store", &args);
+        assert_eq!(pl["memory_type"], "profile");
     }
 
     // ── Cloud helper endpoint contracts ──

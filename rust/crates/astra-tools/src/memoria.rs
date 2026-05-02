@@ -253,10 +253,11 @@ impl MemoriaClient {
             }
             "store" => {
                 let content = args.get("content").and_then(Value::as_str).unwrap_or("");
-                let memory_type = args
+                let raw_type = args
                     .get("memory_type")
                     .and_then(Value::as_str)
                     .unwrap_or("semantic");
+                let memory_type = map_business_type_to_memoria(raw_type);
                 let mut payload = json!({"content": content, "memory_type": memory_type});
                 if let Some(tier) = args.get("trust_tier").and_then(Value::as_str) {
                     payload["trust_tier"] = json!(tier);
@@ -323,6 +324,19 @@ impl MemoriaClient {
     }
 }
 
+/// Map business category names (from system prompt taxonomy) to Memoria V1 primitives.
+/// The system prompt teaches "user", "feedback", "project", "ref" but Memoria V1
+/// only accepts: semantic, profile, procedural, working, episodic, tool_result.
+fn map_business_type_to_memoria(raw: &str) -> &str {
+    match raw {
+        "user" => "profile",
+        "feedback" | "project" | "lesson" => "semantic",
+        "ref" | "reference" => "procedural",
+        "episode" => "episodic",
+        other => other,
+    }
+}
+
 /// Build a one-shot Memoria HTTP client + auth header.
 fn memoria_oneshot_client(timeout_secs: u64) -> Option<(reqwest::Client, String, String)> {
     let base = std::env::var("MEMORIA_BASE_URL")
@@ -366,6 +380,31 @@ pub async fn memoria_consolidate_fire_and_forget() {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn map_business_types_to_memoria_primitives() {
+        assert_eq!(map_business_type_to_memoria("user"), "profile");
+        assert_eq!(map_business_type_to_memoria("feedback"), "semantic");
+        assert_eq!(map_business_type_to_memoria("project"), "semantic");
+        assert_eq!(map_business_type_to_memoria("lesson"), "semantic");
+        assert_eq!(map_business_type_to_memoria("ref"), "procedural");
+        assert_eq!(map_business_type_to_memoria("reference"), "procedural");
+        assert_eq!(map_business_type_to_memoria("episode"), "episodic");
+        // V1 primitives pass through unchanged
+        assert_eq!(map_business_type_to_memoria("semantic"), "semantic");
+        assert_eq!(map_business_type_to_memoria("profile"), "profile");
+        assert_eq!(map_business_type_to_memoria("working"), "working");
+    }
+
+    #[test]
+    fn store_maps_business_type_before_sending() {
+        let args = json!({"content": "test", "memory_type": "feedback"});
+        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "store", &args);
+        assert_eq!(
+            pl["memory_type"], "semantic",
+            "business type 'feedback' must be mapped to 'semantic' for Memoria V1"
+        );
+    }
 
     #[test]
     fn build_direct_request_propagates_session_and_user_id() {
