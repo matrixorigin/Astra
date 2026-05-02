@@ -184,12 +184,13 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 }
 
 async fn handle_ws(mut socket: WebSocket, state: AppState) {
-    // Send current state to late-joining clients.
+    // Send full state snapshot so page refresh recovers.
     let running = *state.running.lock().await;
+    let report = state.last_report.lock().await.clone();
     let init = serde_json::json!({
         "type": "init",
         "running": running,
-        "has_report": state.last_report.lock().await.is_some(),
+        "report": report,
     });
     let _ = socket.send(Message::Text(init.to_string().into())).await;
 

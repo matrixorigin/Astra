@@ -253,11 +253,11 @@ body {
 }
 .tl-dot:hover .tl-dot-tooltip { opacity: 1; }
 
-/* Mini preview card — pinned in left rail, click to toggle */
+/* Mini preview card — click to toggle, positioned next to dot */
 .tl-dot .tl-dot-preview {
-  position: fixed;
-  left: 56px; /* right of the rail */
-  top: auto;
+  position: absolute;
+  left: 24px;
+  top: -20px;
   background: var(--bg-raised);
   backdrop-filter: blur(20px);
   border: 1px solid var(--border-focus);
@@ -2067,12 +2067,7 @@ function addRailDot(type, label, targetEl, report) {
     });
     // Toggle this preview
     dot.classList.toggle('preview-open');
-    // Position the preview card next to the dot
-    const preview = dot.querySelector('.tl-dot-preview');
-    if (preview && dot.classList.contains('preview-open')) {
-      const rect = dot.getBoundingClientRect();
-      preview.style.top = Math.max(60, rect.top - 20) + 'px';
-    }
+    // No JS positioning needed — CSS absolute handles it
   });
 
   // "View details" link inside preview → scroll to timeline row
@@ -2997,6 +2992,39 @@ function connect() {
 
 function handleEvent(ev) {
   switch (ev.type) {
+
+    case 'init': {
+      // Restore state after page refresh.
+      if (ev.report && ev.report.runs && ev.report.runs.length > 0) {
+        const r = ev.report;
+        S.runs = r.runs;
+        S.total = r.runs.length;
+        S.passed = r.runs.filter(x => x.passed).length;
+        S.failed = S.total - S.passed;
+        S.completed = S.total;
+        S.suiteReport = r;
+        S.running = false;
+
+        // Rebuild timeline + report in conversation
+        hideWelcome();
+        showTimelineRail();
+        addRailDot('plan', 'Restored run', null);
+        createTimelineCard();
+        for (const run of r.runs) {
+          addTimelineRow(run);
+          const rowEl = document.getElementById(
+            'tlr_' + run.case_name + '_' + run.model + '_' + (run.run_index || 0)
+          );
+          addRailDot(run.passed ? 'pass' : 'fail',
+            run.case_name.replace(/_/g,' ') + ' × ' + normModel(run.model), rowEl, run);
+        }
+        updateTimelineCard();
+        finalizeTimeline();
+        addReportCard();
+        addRailDot('report', S.passed + '/' + S.completed + ' passed', null);
+      }
+      break;
+    }
 
     case 'run_reset': {
       clearTimelineRail();
