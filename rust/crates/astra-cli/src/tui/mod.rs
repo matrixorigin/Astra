@@ -565,6 +565,7 @@ fn do_draw(
 
 /// Handle a TUI app event. When a cell transition occurs (tool→assistant or
 /// assistant→tool), the previous cell is flushed to scrollback automatically.
+#[allow(clippy::too_many_arguments)]
 fn handle_app_event(
     ev: TuiAppEvent,
     guard: &mut TerminalGuard,
@@ -729,6 +730,7 @@ fn drain_tick(
 
 use ratatui::widgets::Widget;
 
+#[allow(clippy::too_many_arguments)]
 fn format_turn_summary(
     state: &crate::repl_state::ReplState,
     prompt_tokens: u64,

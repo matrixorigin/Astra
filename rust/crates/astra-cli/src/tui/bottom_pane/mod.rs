@@ -90,6 +90,7 @@ impl BottomPane {
         !self.view_stack.is_empty()
     }
 
+    #[allow(clippy::borrowed_box)]
     fn active_view(&self) -> Option<&Box<dyn BottomPaneView>> {
         self.view_stack.last()
     }

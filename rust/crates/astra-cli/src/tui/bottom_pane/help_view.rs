@@ -93,9 +93,8 @@ impl BottomPaneView for HelpView {
         };
         let visible_end = (visible_start + MAX_CMD_ROWS).min(cmds.len());
 
-        for i in visible_start..visible_end  {
+        for (i, &meta) in cmds.iter().enumerate().skip(visible_start).take(visible_end - visible_start) {
             if y >= area.bottom() { return; }
-            let meta = cmds[i];
             let is_sel = i == self.selected_cmd;
 
             let cmd_display = if let Some(hint) = meta.arg_hint {

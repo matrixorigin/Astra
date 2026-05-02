@@ -69,7 +69,7 @@ impl TextArea {
             return 1;
         }
         let lines = self.wrapped_lines(width);
-        (lines.len() as u16).max(1).min(6)
+        (lines.len() as u16).clamp(1, 6)
     }
 
     // ─── Input handling ─────────────────────────────────────────────────
@@ -482,6 +482,7 @@ impl TextArea {
 
 // ─── Wrap computation ───────────────────────────────────────────────────────
 
+#[allow(clippy::single_range_in_vec_init)]
 fn compute_wrap_ranges(text: &str, width: u16) -> Vec<Range<usize>> {
     if text.is_empty() {
         return vec![0..0];
