@@ -1892,9 +1892,17 @@ mod tests {
             .unwrap();
         assert!(matches!(result, SpawnAgentOutput::Launched { .. }));
 
-        // Give the immediate executor time to complete and call
-        // handle_completion → archive_agent → completed_agents.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Poll until the background task completes and enters completed_agents.
+        for _ in 0..200 {
+            if !spawner.completed_agents.read().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !spawner.completed_agents.read().await.is_empty(),
+            "background task should have completed by now"
+        );
 
         // By now the background task has ALREADY completed. The JoinSet
         // may already be empty. This is the exact race that the old

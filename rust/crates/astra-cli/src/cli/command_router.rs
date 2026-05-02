@@ -953,20 +953,9 @@ pub(super) async fn execute_cli_command(
             // [fork-cache] stderr lines (if any) appear before the
             // JSON/text result — operators grepping stderr don't
             // see the order swap.
-            let bg_results = spawner_handle_for_drain
+            sr.background_agent_results = spawner_handle_for_drain
                 .shutdown_and_wait(std::time::Duration::from_secs(30))
                 .await;
-
-            // Append background agent results to the parent's output
-            // so downstream consumers (harness, users) see child outputs
-            // even when spawn_agent was called with background: true.
-            if !bg_results.is_empty() {
-                sr.full_text.push_str("\n\n--- Background Agent Results ---\n");
-                for (agent_id, result) in &bg_results {
-                    sr.full_text
-                        .push_str(&format!("[{agent_id}]: {result}\n"));
-                }
-            }
 
             // Output result
             if args.json {
@@ -986,6 +975,9 @@ pub(super) async fn execute_cli_command(
                     "selector_strategy": sr.selector_strategy,
                     "exit_code": i32::from(exit_code),
                     "success": exit_code == ExitCode::Success,
+                    "background_agent_results": sr.background_agent_results.iter()
+                        .map(|(id, text)| serde_json::json!({"agent_id": id, "result": text}))
+                        .collect::<Vec<_>>(),
                 });
                 println!(
                     "{}",

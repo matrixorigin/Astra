@@ -180,14 +180,24 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
             };
         }
     };
+    // Merge background agent results into the visible text so
+    // criteria (text_contains, judger) can see child output.
+    let mut text = v
+        .get("text")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    if let Some(bg) = v.get("background_agent_results").and_then(|x| x.as_array()) {
+        for entry in bg {
+            let agent_id = entry.get("agent_id").and_then(|x| x.as_str()).unwrap_or("?");
+            let result = entry.get("result").and_then(|x| x.as_str()).unwrap_or("");
+            text.push_str(&format!("\n[background:{agent_id}]: {result}"));
+        }
+    }
     RunOutcome {
         model: model.into(),
         exit_code: v.get("exit_code").and_then(|x| x.as_i64()).unwrap_or(0) as i32,
-        text: v
-            .get("text")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string(),
+        text,
         stderr: String::new(),
         session_id: v
             .get("session_id")
@@ -287,6 +297,35 @@ mod tests {
         assert_eq!(
             out.exit_code, -1,
             "fallback must signal anomaly via exit_code=-1"
+        );
+    }
+
+    #[test]
+    fn parse_json_outcome_merges_background_agent_results() {
+        let stdout = r#"{
+            "text": "parent output",
+            "exit_code": 0,
+            "tool_calls_count": 1,
+            "tools_used": ["spawn_agent"],
+            "background_agent_results": [
+                {"agent_id": "child-G1", "result": "inherited-ok"},
+                {"agent_id": "child-G2", "result": "delegate-G2-ok"}
+            ]
+        }"#;
+        let out = parse_json_outcome(stdout, "m");
+        assert!(
+            out.text.contains("inherited-ok"),
+            "background result must appear in text: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("delegate-G2-ok"),
+            "second background result must appear in text: {}",
+            out.text
+        );
+        assert!(
+            out.text.starts_with("parent output"),
+            "parent text must come first"
         );
     }
 

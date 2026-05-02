@@ -127,6 +127,9 @@ pub(crate) struct StreamResult {
     pub(crate) interruption: Option<serde_json::Value>,
     /// Full messages array after this turn — used by CslManager for persistence.
     pub(crate) final_messages: Vec<serde_json::Value>,
+    /// Results from background-spawned agents collected after the agentic
+    /// loop ended. Each entry is (agent_id, result_text).
+    pub(crate) background_agent_results: Vec<(String, String)>,
 }
 
 impl StreamResult {

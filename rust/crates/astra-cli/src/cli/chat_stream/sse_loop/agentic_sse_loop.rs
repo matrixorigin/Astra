@@ -265,6 +265,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         llm_rounds,
         interruption,
         final_messages,
+        background_agent_results: Vec::new(),
     }
 }
 #[cfg(test)]
