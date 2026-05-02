@@ -13,6 +13,7 @@ pub(crate) struct Footer {
     pub token_usage: Option<String>,
     pub cwd: Option<String>,
     pub is_turn_active: bool,
+    pub permission_mode: Option<String>,
 }
 
 impl Footer {
@@ -32,6 +33,7 @@ impl Footer {
             token_usage: None,
             cwd,
             is_turn_active: false,
+            permission_mode: None,
         }
     }
 
@@ -76,6 +78,19 @@ impl Footer {
             left_parts.push(Span::styled("Ctrl+C interrupt", dim));
         } else {
             left_parts.push(Span::styled("/ commands · $ skills · Ctrl+O transcript", dim));
+        }
+
+        // Show non-default permission mode as a warning indicator
+        if let Some(ref mode) = self.permission_mode {
+            if mode != "prompt" {
+                let mode_style = if mode == "auto" {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::Red)
+                };
+                left_parts.push(Span::styled(" · ", dim));
+                left_parts.push(Span::styled(format!("⚡{mode}"), mode_style));
+            }
         }
 
         // Compose: left ... padding ... right

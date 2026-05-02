@@ -172,6 +172,7 @@ pub(crate) async fn run_tui_repl(
     if let Some(ref sid) = state.session_id {
         bottom_pane.footer.session_id = Some(sid[..8.min(sid.len())].to_string());
     }
+    bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
 
     // Load skill items for $ mention popup
     {
@@ -270,6 +271,7 @@ pub(crate) async fn run_tui_repl(
                                     }
                                     if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.clone()); }
                                     if let Some(ref s) = state.session_id { bottom_pane.footer.session_id = Some(s[..8.min(s.len())].to_string()); }
+                                    bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
                                 } else {
                                     let mut ac = AssistantChatCell::from_rendered(vec![]);
                                     ac.start_thinking();
@@ -401,6 +403,7 @@ pub(crate) async fn run_tui_repl(
                                     if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.clone()); }
                                     if let Some(ref s) = state.session_id { bottom_pane.footer.session_id = Some(s[..8.min(s.len())].to_string()); }
                                     bottom_pane.footer.token_usage = Some(format!("{}↑ {}↓", state.total_prompt_tokens, state.total_completion_tokens));
+                                    bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
 
                                     // Turn summary separator
                                     {
@@ -437,6 +440,9 @@ pub(crate) async fn run_tui_repl(
                                         &name, &mut state, &mut guard, &mut bottom_pane,
                                     );
                                     bottom_pane.sync_popups();
+                                    // Update footer after view actions (model/permission may change)
+                                    if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.clone()); }
+                                    bottom_pane.footer.permission_mode = Some(format!("{}", state.perm_manager.mode()));
                                 } else if let Some(cmd) = reopen {
                                     // Reopen parent menu (e.g., Esc from stats detail → back to /stats menu)
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);

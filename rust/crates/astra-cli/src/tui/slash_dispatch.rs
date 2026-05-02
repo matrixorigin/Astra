@@ -176,14 +176,33 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
             match args {
                 "" => {
-                    // Cycle: prompt → auto → deny → prompt
-                    let next = match ctx.state.perm_manager.mode() {
-                        PermissionMode::Prompt => PermissionMode::Auto,
-                        PermissionMode::Auto => PermissionMode::Deny,
-                        PermissionMode::Deny => PermissionMode::Prompt,
-                    };
-                    ctx.state.perm_manager.set_mode(next);
-                    ctx.show_info(format!("Permission mode → {next}"));
+                    let current = ctx.state.perm_manager.mode();
+                    let rules_count = ctx.state.perm_manager.rules_summary().lines().count();
+                    let items = vec![
+                        SelectionItem {
+                            name: "Auto".into(),
+                            description: Some("All tools auto-approved".into()),
+                            is_current: current == PermissionMode::Auto,
+                        },
+                        SelectionItem {
+                            name: "Prompt".into(),
+                            description: Some("Ask before write/execute tools".into()),
+                            is_current: current == PermissionMode::Prompt,
+                        },
+                        SelectionItem {
+                            name: "Deny".into(),
+                            description: Some("Deny all tool calls".into()),
+                            is_current: current == PermissionMode::Deny,
+                        },
+                        SelectionItem {
+                            name: "Rules".into(),
+                            description: Some(format!("View permission rules ({rules_count} lines)")),
+                            is_current: false,
+                        },
+                    ];
+                    ctx.bottom_pane.push_view(Box::new(
+                        ListSelectionView::new(items, Some(format!("Permission mode: {current}")))
+                    ));
                     SlashResult::Handled
                 }
                 "all" | "auto" => {
@@ -460,6 +479,41 @@ pub(crate) fn handle_view_result(
             state.project_instructions = None;
             let msg = SystemChatCell::info("Project instructions disabled".into());
             guard.queue_history_lines(msg.display_lines(w));
+            return;
+        }
+        _ => {}
+    }
+
+    // Permission menu
+    match name {
+        "Auto" => {
+            use crate::permission_manager::PermissionMode;
+            state.perm_manager.set_mode(PermissionMode::Auto);
+            let msg = SystemChatCell::info("Permission mode → auto".into());
+            guard.queue_history_lines(msg.display_lines(w));
+            return;
+        }
+        "Prompt" => {
+            use crate::permission_manager::PermissionMode;
+            state.perm_manager.set_mode(PermissionMode::Prompt);
+            let msg = SystemChatCell::info("Permission mode → prompt".into());
+            guard.queue_history_lines(msg.display_lines(w));
+            return;
+        }
+        "Deny" => {
+            use crate::permission_manager::PermissionMode;
+            state.perm_manager.set_mode(PermissionMode::Deny);
+            let msg = SystemChatCell::info("Permission mode → deny".into());
+            guard.queue_history_lines(msg.display_lines(w));
+            return;
+        }
+        "Rules" => {
+            use crate::tui::bottom_pane::info_view::InfoView;
+            let summary = state.perm_manager.rules_summary();
+            bottom_pane.push_view(Box::new(
+                InfoView::from_plain("Permission Rules", summary.lines().map(|l| l.to_string()).collect())
+                    .with_reopen("/allow")
+            ));
             return;
         }
         _ => {}
