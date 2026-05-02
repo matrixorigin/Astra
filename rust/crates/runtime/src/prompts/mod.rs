@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn memory_rules_include_negative_examples() {
-        let p = build_main_system_prompt(&["memory_store", "memory_search"], "", 1.0, None);
+        let p = build_main_system_prompt(&["memory_store", "memory_retrieve"], "", 1.0, None);
         assert!(
             p.contains("What NOT to save"),
             "should have negative guidance (What NOT to save)"
@@ -189,7 +189,7 @@ mod tests {
     /// Implicit preference instruction is present when memory tools available.
     #[test]
     fn memory_rules_include_store_guidance() {
-        let p = build_main_system_prompt(&["memory_store", "memory_search"], "", 1.0, None);
+        let p = build_main_system_prompt(&["memory_store", "memory_retrieve"], "", 1.0, None);
         assert!(
             p.contains("memory_store"),
             "should mention memory_store when memory tools available"
@@ -936,7 +936,7 @@ mod tests {
                 "github_list_prs",
                 "github_repo_stats",
                 "memory_store",
-                "memory_search",
+                "memory_retrieve",
             ],
             "",
             1.0,

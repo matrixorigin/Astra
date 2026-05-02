@@ -230,7 +230,7 @@ mod system_prompt_memory_rules {
 
     #[test]
     fn memory_section_present_when_memory_tools_selected() {
-        let tools = &["bash", "memory_store", "memory_search"];
+        let tools = &["bash", "memory_store", "memory_retrieve"];
         let prompt = build_main_system_prompt(tools, "", 1.0, None);
         assert!(
             prompt.contains("Memory Rules"),
@@ -244,7 +244,7 @@ mod system_prompt_memory_rules {
 
     #[test]
     fn prompt_contains_type_taxonomy() {
-        let tools = &["bash", "memory_store", "memory_search"];
+        let tools = &["bash", "memory_store", "memory_retrieve"];
         let prompt = build_main_system_prompt(tools, "", 1.0, None);
         assert!(
             prompt.contains("<types>"),
@@ -262,7 +262,7 @@ mod system_prompt_memory_rules {
 
     #[test]
     fn prompt_contains_do_not_ask_instruction() {
-        let tools = &["bash", "memory_store", "memory_search"];
+        let tools = &["bash", "memory_store", "memory_retrieve"];
         let prompt = build_main_system_prompt(tools, "", 1.0, None);
         assert!(
             prompt.contains("Do NOT ask"),
@@ -272,7 +272,7 @@ mod system_prompt_memory_rules {
 
     #[test]
     fn prompt_contains_no_exploration_instruction() {
-        let tools = &["bash", "memory_store", "memory_search"];
+        let tools = &["bash", "memory_store", "memory_retrieve"];
         let prompt = build_main_system_prompt(tools, "", 1.0, None);
         assert!(
             prompt.contains("Do NOT explore"),
@@ -292,7 +292,7 @@ mod system_prompt_memory_rules {
 
     #[test]
     fn prompt_contains_what_not_to_save() {
-        let tools = &["bash", "memory_store", "memory_search"];
+        let tools = &["bash", "memory_store", "memory_retrieve"];
         let prompt = build_main_system_prompt(tools, "", 1.0, None);
         assert!(
             prompt.contains("What NOT to save"),
@@ -306,7 +306,7 @@ mod system_prompt_memory_rules {
 
     #[test]
     fn prompt_contains_examples_with_real_scenarios() {
-        let tools = &["bash", "memory_store", "memory_search"];
+        let tools = &["bash", "memory_store", "memory_retrieve"];
         let prompt = build_main_system_prompt(tools, "", 1.0, None);
         assert!(
             prompt.contains("data scientist"),

@@ -879,7 +879,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory_retrieve",
-                "description": "Retrieve the most relevant memories for a semantic query (hybrid / graph-backed when configured). Use at conversation start or when you need grounded context from Memoria before answering. Prefer memory_search when the user asks for keyword/topic browse; use memory_retrieve for focused semantic recall.",
+                "description": "Retrieve the most relevant memories for a semantic query (hybrid vector + fulltext + graph). Use at conversation start or when you need context from prior sessions. Supports both focused semantic recall and broad keyword/topic browsing.",
                 "parameters": {
                     "type": "object",
                     "properties": {

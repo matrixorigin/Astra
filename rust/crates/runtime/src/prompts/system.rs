@@ -231,7 +231,7 @@ fn tool_error_recovery_section() -> &'static str {
      - **Network failure**: check connectivity if multiple tools fail. Report to user.\n\
      - **Auth/credential error**: do NOT retry with same creds. Ask user to re-authenticate.\n\
      - **DB connection error**: verify MATRIXONE_HOST/PORT config. Use `mo_query` with simple SELECT 1 to test.\n\
-     - **Empty results** (memory_search returns nothing): normal for new users — don't treat as error.\n\
+     - **Empty results** (memory_retrieve returns nothing): normal for new users — don't treat as error.\n\
      - **Unknown tool**: check get_agent_info for available tools. Do NOT invent tool names.\n"
 }
 
@@ -247,7 +247,7 @@ fn memory_prompt_mode(tool_names: &[&str], profile_desc: &str) -> MemoryPromptMo
     let has_memory_ops = tool_names.iter().any(|name| {
         matches!(
             *name,
-            "memory_search" | "memory_correct" | "memory_purge" | "memory_profile"
+            "memory_retrieve" | "memory_correct" | "memory_purge" | "memory_profile"
         )
     });
     let has_user_memories = profile_desc.contains("## User Memories");
@@ -1599,7 +1599,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_memory_rules_when_memory_tools_present() {
-        let p = build_main_system_prompt(&["memory_store", "memory_search"], "", 0.5, None);
+        let p = build_main_system_prompt(&["memory_store", "memory_retrieve"], "", 0.5, None);
         assert!(p.contains("Memory Rules"));
         assert!(p.contains("<types>"));
         assert!(p.contains("<name>user</name>"));
@@ -1933,7 +1933,7 @@ mod tests {
 
     #[test]
     fn prompt_memory_rules_include_dedup_and_negative() {
-        let p = build_main_system_prompt(&["memory_store", "memory_search"], "", 0.5, None);
+        let p = build_main_system_prompt(&["memory_store", "memory_retrieve"], "", 0.5, None);
         assert!(p.contains("memory_correct"));
         assert!(p.contains("don't want"));
         assert!(p.contains("What NOT to save"));

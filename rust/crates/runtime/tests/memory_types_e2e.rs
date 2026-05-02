@@ -168,7 +168,7 @@ fn extraction_to_batch_payload_full_pipeline() {
 #[test]
 fn system_prompt_full_mode_exercises_all_business_types() {
     let prompt = astra_runtime::prompts::build_main_system_prompt(
-        &["memory_store", "memory_search", "memory_correct"],
+        &["memory_store", "memory_retrieve", "memory_correct"],
         "",
         1.0,
         None,
@@ -297,7 +297,7 @@ fn system_prompt_without_lessons_has_no_lessons_header() {
 #[test]
 fn system_prompt_with_mixed_tools_includes_memory() {
     let prompt = astra_runtime::prompts::build_main_system_prompt(
-        &["bash", "read_file", "memory_store", "memory_search"],
+        &["bash", "read_file", "memory_store", "memory_retrieve"],
         "",
         1.0,
         None,
