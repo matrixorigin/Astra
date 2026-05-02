@@ -1040,10 +1040,7 @@ mod tests {
 
     #[test]
     fn tool_call_detail_get_agent_result_shows_agent_id() {
-        let detail = tool_call_detail(
-            "get_agent_result",
-            &json!({"agent_id": "agent-abc-123"}),
-        );
+        let detail = tool_call_detail("get_agent_result", &json!({"agent_id": "agent-abc-123"}));
         assert_eq!(detail.as_deref(), Some("agent-abc-123"));
     }
 

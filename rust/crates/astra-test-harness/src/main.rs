@@ -260,7 +260,6 @@ fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
     )
 }
 
-
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let args = Args::parse();
