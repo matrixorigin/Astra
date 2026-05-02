@@ -319,7 +319,9 @@ async fn run_interactive_chat(
             eprintln!("TUI mode requires an interactive terminal. Falling back to line mode.");
             return run_chat_repl(api, profile, initial_model, resume_session_id, no_instructions, max_budget).await;
         }
-        tui::run_tui_repl(api, profile, initial_model, resume_session_id, no_instructions, max_budget).await
+        // Box::pin to reduce the parent future's stack frame size (avoids stack
+        // overflow in debug-mode tests that instantiate execute_cli_command).
+        Box::pin(tui::run_tui_repl(api, profile, initial_model, resume_session_id, no_instructions, max_budget)).await
     } else {
         run_chat_repl(api, profile, initial_model, resume_session_id, no_instructions, max_budget).await
     }
