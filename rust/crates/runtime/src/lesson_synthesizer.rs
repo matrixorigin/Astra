@@ -183,9 +183,10 @@ pub fn is_synthesized_lesson_acceptable(text: &str) -> bool {
         .any(|phrase| lower.contains(phrase))
 }
 
-/// Quality gate: reject lessons that are too short, too long, or contain
-/// hedging language that indicates low confidence.
-fn is_high_quality_lesson(text: &str) -> bool {
+/// Basic quality gate for template-generated lessons: reject too short,
+/// too long, or hedging content. Does NOT check the template blocklist
+/// (that's only for LLM-synthesized content in `is_synthesized_lesson_acceptable`).
+pub fn is_high_quality_lesson(text: &str) -> bool {
     if !(10..=500).contains(&text.len()) {
         return false;
     }

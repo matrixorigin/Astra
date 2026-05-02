@@ -1052,6 +1052,7 @@ mod tests {
             LessonKind::PromptShape,
             LessonKind::PostconditionPattern,
             LessonKind::ErrorRecovery,
+            LessonKind::SkillAcquired,
         ] {
             assert_eq!(LessonKind::parse_tag(k.as_str()), Some(k));
         }
@@ -1405,6 +1406,7 @@ mod tests {
             LessonKind::PromptShape,
             LessonKind::PostconditionPattern,
             LessonKind::ErrorRecovery,
+            LessonKind::SkillAcquired,
         ] {
             assert_eq!(format!("{kind}"), kind.as_str());
         }

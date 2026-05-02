@@ -570,11 +570,12 @@ fn maybe_checkpoint_lessons(state: &mut ReplState) {
     }
 
     // Write to Memoria as `working` memory (session-scoped, T4).
-    // Quality gate filters generic template content before storage.
+    // Basic quality gate (hedging + length). Template blocklist NOT applied
+    // here — these are deterministic template lessons, not LLM output.
     // Promoted to semantic T3 at session end via final checkpoint flush.
     let memoria_lessons: Vec<astra_runtime::lesson_synthesizer::ExtractedLesson> = delta
         .into_iter()
-        .filter(|l| astra_runtime::lesson_synthesizer::is_synthesized_lesson_acceptable(&l.action))
+        .filter(|l| astra_runtime::lesson_synthesizer::is_high_quality_lesson(&l.action))
         .map(|l| astra_runtime::lesson_synthesizer::ExtractedLesson {
             memory_type: "working",
             content: format!("💡 LESSON: {}", l.action),

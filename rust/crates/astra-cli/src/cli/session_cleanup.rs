@@ -95,7 +95,9 @@ pub(super) async fn finalize_session(state: &ReplState) {
             None,
         );
         for cl in signal_lessons {
-            if astra_runtime::lesson_synthesizer::is_synthesized_lesson_acceptable(&cl.action) {
+            // Template-generated lessons use the basic gate (hedging + length).
+            // The template blocklist is only for LLM-synthesized content.
+            if astra_runtime::lesson_synthesizer::is_high_quality_lesson(&cl.action) {
                 all_lessons.push(astra_runtime::lesson_synthesizer::ExtractedLesson {
                     memory_type: "semantic",
                     content: format!("💡 LESSON: {}", cl.action),

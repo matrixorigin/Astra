@@ -154,6 +154,13 @@ fn full_loop_lessons_are_prompt_ready() {
     for l in &lessons {
         let sanitized = astra_services::sanitize_for_prompt(&l.action);
         assert_eq!(l.action, sanitized, "action must be sanitization-safe");
+        // Template lessons must PASS the basic quality gate (hedging + length)
+        // but NOT be blocked by the template blocklist (that's for LLM output).
+        assert!(
+            lesson_synthesizer::is_high_quality_lesson(&l.action),
+            "template lesson must pass basic quality gate: {}",
+            l.action
+        );
         if l.kind == LessonKind::ToolDeprioritize {
             assert!(
                 l.trigger_signal.starts_with("tool_failures:"),
