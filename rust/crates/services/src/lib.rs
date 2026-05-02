@@ -63,11 +63,7 @@ pub use admin_config::{
     ADMIN_CONFIG_ALLOWED_KEYS, ADMIN_CONFIG_KEY_REASONING_MODEL, AdminConfigService,
     DatabaseAdminConfigService, UnconfiguredAdminConfigService,
 };
-pub use agent_lessons::{
-    AGENT_LESSON_EXPOSURES_DDL, AGENT_LESSONS_DDL, AgentLessonsService, DEFAULT_LESSON_CONFIDENCE,
-    DatabaseAgentLessonsService, Lesson, LessonExposure, LessonHint, LessonKind, LessonOutcome,
-    NewLesson, UnconfiguredAgentLessonsService, sanitize_for_prompt,
-};
+pub use agent_lessons::{Lesson, LessonHint, LessonKind, NewLesson, sanitize_for_prompt};
 pub use agents::{
     AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,
     AgentUpdateRequestData, DatabaseAgentService, InMemoryAgentService, UnconfiguredAgentService,
