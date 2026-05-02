@@ -1241,6 +1241,32 @@ impl InProcessChatTurnBridge {
                         &signal.signal_type,
                         signal.confidence,
                     ) {
+                        // Persist feedback rule to Memoria L3 (fire-and-forget).
+                        // Closes the reflect→memory loop: correction detected in
+                        // this turn → stored durably → recalled in future sessions.
+                        if let Some(ref mc) = memoria_client_owned {
+                            use crate::turn::cloud::memoria_compact::MemoriaClient;
+                            if let Some(lesson) =
+                                crate::lesson_synthesizer::feedback_rule_to_lesson(&fb)
+                            {
+                                let c = mc.clone();
+                                let sid = session_id.clone();
+                                tokio::spawn(async move {
+                                    match c
+                                        .store(
+                                            &lesson.content,
+                                            lesson.memory_type,
+                                            Some(&sid),
+                                            Some(lesson.trust_tier),
+                                        )
+                                        .await
+                                    {
+                                        Ok(_) => tracing::debug!("Persisted feedback rule to Memoria"),
+                                        Err(e) => tracing::debug!("Failed to persist feedback rule: {e}"),
+                                    }
+                                });
+                            }
+                        }
                         feedback_store.add(&session_id, fb);
                     }
                 }

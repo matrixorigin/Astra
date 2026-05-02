@@ -14,10 +14,10 @@ use astra_services::session_artifact_store::SessionArtifactStore;
 use astra_services::session_journal;
 use std::time::Duration;
 
-use super::ReplState;
 use super::edge_tools;
 use super::repl_turn::enqueue_ingestion_pub;
 use super::session_guard::clear_panic_guard;
+use super::ReplState;
 
 /// Finalize a REPL session: journal end event, persist state, extract learnings.
 pub(super) async fn finalize_session(state: &mut ReplState) {
@@ -159,11 +159,7 @@ pub(super) async fn finalize_session(state: &mut ReplState) {
         }
     }
     // 3f. Drain any in-flight memory extraction (bounded 5s).
-    if let Some(outcome) = state
-        .memory_extractor
-        .drain(Duration::from_secs(5))
-        .await
-    {
+    if let Some(outcome) = state.memory_extractor.drain(Duration::from_secs(5)).await {
         if let Some(ref j) = state.journal {
             let (saved, cats, dur) = match &outcome {
                 super::memory_extraction::ExtractionOutcome::Extracted {

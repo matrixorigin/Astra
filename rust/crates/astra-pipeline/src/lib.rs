@@ -16,6 +16,7 @@ pub mod event;
 pub mod feedback_extraction;
 pub mod feedback_store;
 pub mod pattern;
+pub mod reflection_feedback;
 pub mod routing;
 pub mod scheduling;
 pub mod stages;
