@@ -222,10 +222,25 @@ body {
   transition: all 0.3s var(--spring);
   animation: dotAppear 0.4s var(--spring) both;
 }
-.tl-dot:hover { transform: scale(1.4); }
-.tl-dot.pass { background: var(--green); box-shadow: 0 0 8px rgba(34,197,94,0.4); }
-.tl-dot.fail { background: var(--red); box-shadow: 0 0 8px rgba(239,68,68,0.4); }
-.tl-dot.running { background: var(--accent); box-shadow: 0 0 8px rgba(59,130,246,0.4); animation: dotAppear 0.4s var(--spring) both, pulse 1.5s infinite; }
+.tl-dot:hover { transform: scale(1.5); filter: brightness(1.3); }
+.tl-dot.preview-open { transform: scale(1.6); filter: brightness(1.4); }
+.tl-dot.pass {
+  background: var(--green);
+  box-shadow: 0 0 8px rgba(34,197,94,0.4), 0 0 20px rgba(34,197,94,0.1);
+}
+.tl-dot.fail {
+  background: var(--red);
+  box-shadow: 0 0 8px rgba(239,68,68,0.4), 0 0 20px rgba(239,68,68,0.1);
+}
+.tl-dot.running {
+  background: var(--accent);
+  box-shadow: 0 0 8px rgba(59,130,246,0.4);
+  animation: dotAppear 0.4s var(--spring) both, dotPulse 2s ease-in-out infinite;
+}
+@keyframes dotPulse {
+  0%, 100% { box-shadow: 0 0 8px rgba(59,130,246,0.4); }
+  50% { box-shadow: 0 0 16px rgba(59,130,246,0.7), 0 0 30px rgba(59,130,246,0.2); }
+}
 .tl-dot.plan { background: var(--accent2); box-shadow: 0 0 8px rgba(139,92,246,0.4); }
 .tl-dot.report { background: linear-gradient(135deg, var(--accent), var(--accent2)); box-shadow: 0 0 10px rgba(59,130,246,0.4); width: 18px; height: 18px; left: 10px; }
 .tl-dot .tl-dot-tooltip {
@@ -238,21 +253,27 @@ body {
 }
 .tl-dot:hover .tl-dot-tooltip { opacity: 1; }
 
-/* Mini preview card on hover */
+/* Mini preview card — pinned in left rail, click to toggle */
 .tl-dot .tl-dot-preview {
-  position: absolute; left: 24px; top: 50%; transform: translateY(-50%);
+  position: fixed;
+  left: 56px; /* right of the rail */
+  top: auto;
   background: var(--bg-raised);
-  backdrop-filter: blur(16px);
+  backdrop-filter: blur(20px);
   border: 1px solid var(--border-focus);
-  border-radius: var(--radius-sm);
-  padding: 10px 14px;
-  min-width: 240px; max-width: 300px;
-  pointer-events: none;
-  opacity: 0; transition: all 0.2s var(--ease);
-  z-index: 20;
-  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  min-width: 260px; max-width: 320px;
+  pointer-events: auto;
+  opacity: 0; transform: translateX(-8px) scale(0.96);
+  transition: all 0.25s var(--spring);
+  z-index: 50;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.5), 0 0 0 1px rgba(100,150,255,0.1);
+  display: none;
 }
-.tl-dot:hover .tl-dot-preview { opacity: 1; pointer-events: auto; }
+.tl-dot.preview-open .tl-dot-preview {
+  display: block; opacity: 1; transform: translateX(0) scale(1);
+}
 .tl-dot-preview .dp-header {
   display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
 }
@@ -749,6 +770,38 @@ body {
   margin: 8px 0;
 }
 .analysis-content strong { color: var(--text); }
+
+/* Markdown tables */
+.md-table, .analysis-content table, .msg-content table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  margin: 10px 0;
+  font-size: 12px;
+  border-radius: var(--radius-xs);
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+.md-table th, .analysis-content th, .msg-content th {
+  padding: 8px 12px;
+  text-align: left;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--muted);
+  background: rgba(0,0,0,0.25);
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+}
+.md-table td, .analysis-content td, .msg-content td {
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+}
+.md-table tr:last-child td, .analysis-content tr:last-child td { border-bottom: none; }
+.md-table tr:hover td, .analysis-content tr:hover td {
+  background: rgba(59,130,246,0.04);
+}
 .report-header {
   display: flex; align-items: center; justify-content: space-between;
   margin-bottom: 18px;
@@ -1703,18 +1756,32 @@ function toast(msg, type) {
    ================================================================ */
 function renderMarkdown(text) {
   let html = esc(text);
+  // Code blocks
   html = html.replace(/```([^`]*?)```/gs, (_, code) => '<pre><code>' + code.trim() + '</code></pre>');
   html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // Bold
   html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  // Headers
   html = html.replace(/^#### (.+)$/gm, '<h4>$1</h4>');
   html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
   html = html.replace(/^## (.+)$/gm, '<h3>$1</h3>');
   html = html.replace(/^# (.+)$/gm, '<h3>$1</h3>');
+  // Tables (| col | col | format)
+  html = html.replace(/^(\|.+\|)\n(\|[-| :]+\|)\n((?:\|.+\|\n?)+)/gm, (_, header, sep, body) => {
+    const ths = header.split('|').filter(c => c.trim()).map(c => '<th>' + c.trim() + '</th>').join('');
+    const rows = body.trim().split('\n').map(row => {
+      const tds = row.split('|').filter(c => c.trim()).map(c => '<td>' + c.trim() + '</td>').join('');
+      return '<tr>' + tds + '</tr>';
+    }).join('');
+    return '<table class="md-table"><thead><tr>' + ths + '</tr></thead><tbody>' + rows + '</tbody></table>';
+  });
+  // Lists
   html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
   html = html.replace(/((?:<li>.*?<\/li>\n?)+)/g, '<ul>$1</ul>');
+  // Line breaks
   html = html.replace(/\n/g, '<br>');
-  html = html.replace(/<\/(pre|h3|h4|ul|li)><br>/g, '</$1>');
-  html = html.replace(/<br><(pre|h3|h4|ul)/g, '<$1');
+  html = html.replace(/<\/(pre|h3|h4|ul|li|table)><br>/g, '</$1>');
+  html = html.replace(/<br><(pre|h3|h4|ul|table)/g, '<$1');
   return html;
 }
 
@@ -1986,21 +2053,40 @@ function addRailDot(type, label, targetEl, report) {
         <span>${formatTok(tok)} tok</span>
         <span>${report.outcome.turn_rounds || 0} turns</span>
       </div>
-      <div class="dp-hint">Click to see details</div>
+      <div class="dp-detail-link" style="margin-top:8px;font-size:11px;color:var(--accent);cursor:pointer;font-weight:600">View details →</div>
     </div>`;
   } else {
     dot.innerHTML = `<span class="tl-dot-tooltip">${esc(label)}</span>`;
   }
 
-  dot.addEventListener('click', () => {
-    if (targetEl) {
+  dot.addEventListener('click', (e) => {
+    e.stopPropagation();
+    // Close any other open preview
+    document.querySelectorAll('.tl-dot.preview-open').forEach(d => {
+      if (d !== dot) d.classList.remove('preview-open');
+    });
+    // Toggle this preview
+    dot.classList.toggle('preview-open');
+    // Position the preview card next to the dot
+    const preview = dot.querySelector('.tl-dot-preview');
+    if (preview && dot.classList.contains('preview-open')) {
+      const rect = dot.getBoundingClientRect();
+      preview.style.top = Math.max(60, rect.top - 20) + 'px';
+    }
+  });
+
+  // "View details" link inside preview → scroll to timeline row
+  const detailLink = dot.querySelector('.dp-detail-link');
+  if (detailLink && targetEl) {
+    detailLink.addEventListener('click', (e) => {
+      e.stopPropagation();
+      dot.classList.remove('preview-open');
       targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      // If it's a case row, trigger the detail expand
       if (report && targetEl.classList.contains('tl-row')) {
         toggleCaseDetail(targetEl, report);
       }
-    }
-  });
+    });
+  }
   rail.appendChild(dot);
   railDotY += 28;
   return dot;
@@ -3018,6 +3104,11 @@ function handleEvent(ev) {
    Boot
    ================================================================ */
 connect();
+
+// Close preview cards when clicking outside
+document.addEventListener('click', () => {
+  document.querySelectorAll('.tl-dot.preview-open').forEach(d => d.classList.remove('preview-open'));
+});
 </script>
 </body>
 </html>
