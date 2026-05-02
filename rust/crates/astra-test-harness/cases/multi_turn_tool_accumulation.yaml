@@ -5,15 +5,16 @@ description: |
   **Why**: Real agent workflows chain tool calls across turns (read then modify); if tool results are lost, the agent operates blind in subsequent turns.
   **Pass means**: The agent uses knowledge from the turn 1 read_file to correctly target the file for modification in turn 2.
   **Fail means**: Tool results dropped between turns (session state bug), or the agent failed to connect the read output with the write target.
+  **Note**: Uses workspace-relative path (not /tmp) so str_replace/write_file work within sandbox.
 prompt: |
-  Read the file /tmp/astra_harness_mt_test.txt and tell me what's in it.
+  Read the file .harness_mt_test.txt and tell me what's in it.
   Include the file contents in your answer.
 capability: tool_use
 difficulty: 2
 weight: 2.0
 timeout_seconds: 180
-setup_cmd: "rm -f /tmp/astra_harness_mt_test.txt && echo 'hello world 42' > /tmp/astra_harness_mt_test.txt"
-teardown_cmd: "rm -f /tmp/astra_harness_mt_test.txt"
+setup_cmd: "rm -f .harness_mt_test.txt && echo 'hello world 42' > .harness_mt_test.txt"
+teardown_cmd: "rm -f .harness_mt_test.txt"
 steps:
   - prompt: "Now append the line 'second line' to that same file and confirm it was done."
     criteria:
