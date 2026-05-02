@@ -14,7 +14,7 @@ fn is_tui_native(name: &str) -> bool {
     matches!(name,
         "/help" | "/commands" | "/model" | "/stats" | "/skill" | "/skills"
         | "/copy" | "/version" | "/whoami" | "/history"
-        | "/instructions" | "/exit" | "/quit"
+        | "/instructions" | "/allow" | "/yolo" | "/exit" | "/quit"
     )
 }
 

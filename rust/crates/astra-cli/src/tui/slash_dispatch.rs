@@ -166,8 +166,59 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
+        // ── Allow / permission mode ─────────────────────────────────
+        "/allow" | "/yolo" => {
+            use crate::permission_manager::PermissionMode;
+            if resolved == "/yolo" {
+                ctx.state.perm_manager.set_mode(PermissionMode::Auto);
+                ctx.show_info("⚡ YOLO mode! All tools auto-approved. Use /allow prompt to restore.".into());
+                return SlashResult::Handled;
+            }
+            match args {
+                "" => {
+                    // Cycle: prompt → auto → deny → prompt
+                    let next = match ctx.state.perm_manager.mode() {
+                        PermissionMode::Prompt => PermissionMode::Auto,
+                        PermissionMode::Auto => PermissionMode::Deny,
+                        PermissionMode::Deny => PermissionMode::Prompt,
+                    };
+                    ctx.state.perm_manager.set_mode(next);
+                    ctx.show_info(format!("Permission mode → {next}"));
+                    SlashResult::Handled
+                }
+                "all" | "auto" => {
+                    ctx.state.perm_manager.set_mode(PermissionMode::Auto);
+                    ctx.show_info("Permission mode → auto (all tools auto-approved)".into());
+                    SlashResult::Handled
+                }
+                "prompt" => {
+                    ctx.state.perm_manager.set_mode(PermissionMode::Prompt);
+                    ctx.show_info("Permission mode → prompt".into());
+                    SlashResult::Handled
+                }
+                "deny" => {
+                    ctx.state.perm_manager.set_mode(PermissionMode::Deny);
+                    ctx.show_info("Permission mode → deny".into());
+                    SlashResult::Handled
+                }
+                "rules" | "status" => {
+                    use crate::tui::bottom_pane::info_view::InfoView;
+                    let summary = ctx.state.perm_manager.rules_summary();
+                    ctx.bottom_pane.push_view(Box::new(InfoView::from_plain(
+                        "Permission Rules",
+                        summary.lines().map(|l| l.to_string()).collect(),
+                    )));
+                    SlashResult::Handled
+                }
+                _ => {
+                    ctx.show_error(format!("Unknown mode '{args}'. Use: auto, prompt, deny, all, rules"));
+                    SlashResult::Handled
+                }
+            }
+        }
+
         // ── State commands → with_restored (share full logic with non-TUI) ──
-        "/allow" | "/yolo" | "/clear" | "/undo" | "/redo"
+        "/clear" | "/undo" | "/redo"
         | "/compact" | "/explain" | "/verbose" | "/reflect" => SlashResult::Fallback,
 
         // ── Copy last response ──────────────────────────────────────
