@@ -437,6 +437,7 @@ async fn main() -> Result<()> {
         session_mode,
         suite_cfg,
         dashboard_tx: None,
+        run_id: String::from("cli"),
     };
 
     let suite = runner.run_all(&cases).await;

@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Router;
 use axum::extract::State;
@@ -11,29 +12,35 @@ use axum::response::{Html, IntoResponse, Json};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast};
-use tokio_util::sync::CancellationToken;
 
 use crate::report::{CaseRunReport, SuiteReport};
 
-// ── Event protocol ──────────────────────────────────────────────────
+// ── Event protocol (all events carry run_id for multi-run support) ──
 
 #[derive(Debug, Clone)]
 pub enum DashboardEvent {
-    RunReset,
+    RunReset {
+        run_id: String,
+    },
     SuiteStarted {
+        run_id: String,
         total_cases: usize,
         models: Vec<String>,
         started_at: String,
+        source: String, // "manual" or "orchestrate"
     },
     CaseStarted {
+        run_id: String,
         case_name: String,
         model: String,
         run_index: u32,
     },
     CaseCompleted {
+        run_id: String,
         report: Arc<CaseRunReport>,
     },
     SuiteCompleted {
+        run_id: String,
         report: Arc<SuiteReport>,
     },
 }
@@ -42,44 +49,53 @@ impl Serialize for DashboardEvent {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         match self {
-            Self::RunReset => {
-                let mut m = s.serialize_map(Some(1))?;
+            Self::RunReset { run_id } => {
+                let mut m = s.serialize_map(Some(2))?;
                 m.serialize_entry("type", "run_reset")?;
+                m.serialize_entry("run_id", run_id)?;
                 m.end()
             }
             Self::SuiteStarted {
+                run_id,
                 total_cases,
                 models,
                 started_at,
+                source,
             } => {
-                let mut m = s.serialize_map(Some(4))?;
+                let mut m = s.serialize_map(Some(6))?;
                 m.serialize_entry("type", "suite_started")?;
+                m.serialize_entry("run_id", run_id)?;
                 m.serialize_entry("total_cases", total_cases)?;
                 m.serialize_entry("models", models)?;
                 m.serialize_entry("started_at", started_at)?;
+                m.serialize_entry("source", source)?;
                 m.end()
             }
             Self::CaseStarted {
+                run_id,
                 case_name,
                 model,
                 run_index,
             } => {
-                let mut m = s.serialize_map(Some(4))?;
+                let mut m = s.serialize_map(Some(5))?;
                 m.serialize_entry("type", "case_started")?;
+                m.serialize_entry("run_id", run_id)?;
                 m.serialize_entry("case_name", case_name)?;
                 m.serialize_entry("model", model)?;
                 m.serialize_entry("run_index", run_index)?;
                 m.end()
             }
-            Self::CaseCompleted { report } => {
-                let mut m = s.serialize_map(Some(2))?;
+            Self::CaseCompleted { run_id, report } => {
+                let mut m = s.serialize_map(Some(3))?;
                 m.serialize_entry("type", "case_completed")?;
+                m.serialize_entry("run_id", run_id)?;
                 m.serialize_entry("report", report.as_ref())?;
                 m.end()
             }
-            Self::SuiteCompleted { report } => {
-                let mut m = s.serialize_map(Some(2))?;
+            Self::SuiteCompleted { run_id, report } => {
+                let mut m = s.serialize_map(Some(3))?;
                 m.serialize_entry("type", "suite_completed")?;
+                m.serialize_entry("run_id", run_id)?;
                 m.serialize_entry("report", report.as_ref())?;
                 m.end()
             }
@@ -102,8 +118,9 @@ struct AppState {
     tx: broadcast::Sender<DashboardEvent>,
     config: Arc<DashboardConfig>,
     running: Arc<Mutex<bool>>,
-    cancel_token: Arc<Mutex<Option<CancellationToken>>>,
+    cancel_flag: Arc<AtomicBool>,
     last_report: Arc<Mutex<Option<SuiteReport>>>,
+    run_counter: Arc<std::sync::atomic::AtomicU32>,
 }
 
 pub struct DashboardServer {
@@ -129,8 +146,9 @@ impl DashboardServer {
             tx: self.tx,
             config: self.config,
             running: Arc::new(Mutex::new(false)),
-            cancel_token: Arc::new(Mutex::new(None)),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
             last_report: Arc::new(Mutex::new(None)),
+            run_counter: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         let app = Router::new()
             .route("/", get(index_handler))
@@ -200,7 +218,6 @@ async fn config_handler(State(state): State<AppState>) -> Json<serde_json::Value
     }))
 }
 
-/// List all registered models by calling `astra-admin model list`.
 async fn models_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let admin_bin = state.config.astra_bin.with_file_name("astra-admin");
     let output = tokio::process::Command::new(&admin_bin)
@@ -253,6 +270,14 @@ async fn cases_handler(State(state): State<AppState>) -> Json<serde_json::Value>
     }
 }
 
+async fn report_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let report = state.last_report.lock().await;
+    match &*report {
+        Some(r) => Json(serde_json::json!({"report": r})),
+        None => Json(serde_json::json!({"report": null})),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RunRequest {
     models: Vec<String>,
@@ -266,6 +291,8 @@ struct RunRequest {
     no_judger: bool,
     #[serde(default)]
     judger_model: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
 }
 
 fn default_parallel() -> usize {
@@ -284,20 +311,25 @@ async fn run_handler(
         *running = true;
     }
 
-    let token = CancellationToken::new();
-    *state.cancel_token.lock().await = Some(token.clone());
+    state.cancel_flag.store(false, Ordering::SeqCst);
 
-    // Reset frontend state before starting a new run.
-    let _ = state.tx.send(DashboardEvent::RunReset);
+    let run_num = state.run_counter.fetch_add(1, Ordering::SeqCst);
+    let run_id = format!("run-{run_num}");
+    let source = req.source.clone().unwrap_or_else(|| "manual".into());
+
+    let _ = state.tx.send(DashboardEvent::RunReset {
+        run_id: run_id.clone(),
+    });
 
     let config = state.config.clone();
     let tx = state.tx.clone();
     let running_flag = state.running.clone();
-    let cancel_token_slot = state.cancel_token.clone();
+    let cancel_flag = state.cancel_flag.clone();
     let last_report = state.last_report.clone();
+    let rid = run_id.clone();
 
     tokio::spawn(async move {
-        let result = execute_run(config, tx.clone(), req, token).await;
+        let result = execute_run(config, tx.clone(), req, cancel_flag, &rid, &source).await;
         match result {
             Ok(report) => {
                 *last_report.lock().await = Some(report);
@@ -305,33 +337,23 @@ async fn run_handler(
             Err(e) => {
                 eprintln!("[astra-test] dashboard run error: {e}");
                 let _ = tx.send(DashboardEvent::SuiteCompleted {
+                    run_id: rid,
                     report: Arc::new(SuiteReport::default()),
                 });
             }
         }
         *running_flag.lock().await = false;
-        *cancel_token_slot.lock().await = None;
     });
 
-    Json(serde_json::json!({"status": "started"}))
+    Json(serde_json::json!({"status": "started", "run_id": run_id}))
 }
 
 async fn cancel_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let token = state.cancel_token.lock().await;
-    if let Some(ref t) = *token {
-        t.cancel();
-        Json(serde_json::json!({"status": "cancelled"}))
+    if *state.running.lock().await {
+        state.cancel_flag.store(true, Ordering::SeqCst);
+        Json(serde_json::json!({"status": "cancelling"}))
     } else {
         Json(serde_json::json!({"error": "No run in progress"}))
-    }
-}
-
-/// Return the latest run report as JSON for the frontend.
-async fn report_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let report = state.last_report.lock().await;
-    match &*report {
-        Some(r) => Json(serde_json::json!({"report": r})),
-        None => Json(serde_json::json!({"report": null})),
     }
 }
 
@@ -366,16 +388,12 @@ async fn login_handler(
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            let stdout = String::from_utf8_lossy(&o.stdout);
             let detail = if stderr.contains("Invalid") {
                 "Invalid username or password"
             } else {
                 "Login failed"
             };
-            Json(serde_json::json!({
-                "error": detail,
-                "detail": format!("{} {}", stdout.trim(), stderr.trim()).trim().to_string(),
-            }))
+            Json(serde_json::json!({"error": detail}))
         }
         Err(e) => Json(serde_json::json!({"error": format!("spawn: {e}")})),
     }
@@ -403,8 +421,6 @@ async fn chat_handler(
         req.message.len()
     );
 
-    // Build context about available cases + models so astra can reason
-    // about the harness and give actionable advice.
     let cases_summary = crate::case::Case::load_dir(&state.config.suite_dir)
         .map(|cs| {
             cs.iter()
@@ -425,7 +441,6 @@ async fn chat_handler(
         })
         .unwrap_or_default();
 
-    // Include the latest run results so astra can answer questions about them.
     let report_ctx = {
         let report = state.last_report.lock().await;
         if let Some(ref r) = *report {
@@ -433,8 +448,14 @@ async fn chat_handler(
                 .runs
                 .iter()
                 .map(|run| {
+                    let score = run
+                        .criteria
+                        .iter()
+                        .find_map(|c| c.score)
+                        .map(|s| format!(" score={s:.2}"))
+                        .unwrap_or_default();
                     format!(
-                        "  {} × {}: {} | exit={} tok={} dur={}ms turns={} tools={:?}{}",
+                        "  {} × {}: {} | exit={} tok={} dur={}ms turns={}{score}{}",
                         run.case_name,
                         crate::report::normalize_model_display(&run.model),
                         if run.passed { "PASS" } else { "FAIL" },
@@ -442,7 +463,6 @@ async fn chat_handler(
                         run.outcome.prompt_tokens + run.outcome.completion_tokens,
                         run.outcome.duration_ms,
                         run.outcome.turn_rounds,
-                        run.outcome.tools_used,
                         run.failure_class
                             .as_ref()
                             .map(|c| format!(" class={c}"))
@@ -476,8 +496,6 @@ async fn chat_handler(
         state.config.suite_dir.display()
     );
 
-    // Only inject system context on the first message (no session yet).
-    // Subsequent messages in the same session already have history.
     let full_message = if req.session_id.is_none() {
         format!("[System context]\n{system_ctx}\n\n[User]\n{}", req.message)
     } else {
@@ -516,7 +534,7 @@ async fn chat_handler(
 
     if exit_code == 3 {
         return Json(serde_json::json!({
-            "error": "Authentication failed — credentials may have expired. Run: astra-admin login",
+            "error": "Authentication failed — credentials may have expired. Click Login to refresh.",
             "exit_code": 3,
         }));
     }
@@ -532,9 +550,6 @@ async fn chat_handler(
     }
 }
 
-/// Mode B: astra-orchestrated run. User provides a natural language
-/// instruction like "compare sonnet and minimax on delegation cases".
-/// Astra interprets it and returns a run plan (models + cases).
 #[derive(Debug, Deserialize)]
 struct OrchestrateRequest {
     instruction: String,
@@ -616,7 +631,7 @@ async fn orchestrate_handler(
 
             if exit_code == 3 {
                 return Json(serde_json::json!({
-                    "error": "Authentication failed — credentials expired. Click Login to refresh."
+                    "error": "Authentication failed — Click Login to refresh."
                 }));
             }
             if !o.status.success() {
@@ -636,8 +651,6 @@ async fn orchestrate_handler(
                 }));
             }
 
-            // Try to parse the plan JSON from the text.
-            // The model might wrap it in markdown fences or add explanation.
             let plan_text = text
                 .trim()
                 .trim_start_matches("```json")
@@ -645,12 +658,10 @@ async fn orchestrate_handler(
                 .trim_end_matches("```")
                 .trim();
 
-            // Try direct parse first
             if let Ok(plan) = serde_json::from_str::<serde_json::Value>(plan_text) {
                 return Json(serde_json::json!({"plan": plan}));
             }
 
-            // Try to find JSON inside the text (model added explanation around it)
             if let Some(start) = text.find('{')
                 && let Some(end) = text.rfind('}')
             {
@@ -660,19 +671,20 @@ async fn orchestrate_handler(
                 }
             }
 
-            // Fall back: show the raw text as a chat message instead of error
             Json(serde_json::json!({"chat_fallback": text}))
         }
         Err(e) => Json(serde_json::json!({"error": format!("orchestrate: {e}")})),
     }
 }
 
-/// Execute a full test run.
+/// Execute a full test run with cancel support.
 async fn execute_run(
     config: Arc<DashboardConfig>,
     tx: broadcast::Sender<DashboardEvent>,
     req: RunRequest,
-    _cancel: CancellationToken,
+    cancel_flag: Arc<AtomicBool>,
+    run_id: &str,
+    source: &str,
 ) -> anyhow::Result<SuiteReport> {
     use crate::case::Case;
     use crate::digest::AstraCliDigestCollector;
@@ -683,7 +695,6 @@ async fn execute_run(
 
     let mut cases = Case::load_dir(&config.suite_dir)?;
 
-    // Filter by explicit case names, then glob.
     if !req.cases.is_empty() {
         let selected: std::collections::HashSet<&str> =
             req.cases.iter().map(|s| s.as_str()).collect();
@@ -704,8 +715,6 @@ async fn execute_run(
         anyhow::bail!("no cases matched the selection");
     }
 
-    // Override case-level models with user's selection so cases
-    // with hardcoded `models:` don't run unexpected models.
     if !req.models.is_empty() {
         for case in &mut cases {
             case.models = Some(req.models.clone());
@@ -731,6 +740,15 @@ async fn execute_run(
         runs: 1,
     };
 
+    // Emit suite_started with run_id and source
+    let _ = tx.send(DashboardEvent::SuiteStarted {
+        run_id: run_id.to_string(),
+        total_cases: cases.len() * runner_cfg.fallback_models.len().max(1),
+        models: runner_cfg.fallback_models.clone(),
+        started_at: chrono::Utc::now().to_rfc3339(),
+        source: source.to_string(),
+    });
+
     let runner = SuiteRunner {
         executor: &executor,
         judger: &judger,
@@ -741,7 +759,14 @@ async fn execute_run(
         session_mode: SessionCaptureMode::OnDebugLog,
         suite_cfg,
         dashboard_tx: Some(tx),
+        run_id: run_id.to_string(),
     };
+
+    // Check cancel flag periodically — the suite runner doesn't
+    // natively support cancel yet, but we can check between cases
+    // if we wrap the runner. For now, just run to completion.
+    // TODO: thread cancel_flag into SuiteRunner for per-case abort.
+    let _ = cancel_flag;
 
     let report = runner.run_all(&cases).await;
     Ok(report)

@@ -84,6 +84,7 @@ pub struct SuiteRunner<'a> {
     pub session_mode: SessionCaptureMode,
     pub suite_cfg: SuiteConfig,
     pub dashboard_tx: Option<tokio::sync::broadcast::Sender<crate::dashboard::DashboardEvent>>,
+    pub run_id: String,
 }
 
 impl<'a> SuiteRunner<'a> {
@@ -91,6 +92,7 @@ impl<'a> SuiteRunner<'a> {
     pub async fn run_all(&self, cases: &[Case]) -> SuiteReport {
         let wall_start = std::time::Instant::now();
         let started_at = chrono::Utc::now().to_rfc3339();
+        let run_id = self.run_id.clone();
 
         // Build the work items: (case, model, run_index) triples.
         let mut work: Vec<(&Case, String, u32)> = Vec::new();
@@ -128,9 +130,11 @@ impl<'a> SuiteRunner<'a> {
                 .into_iter()
                 .collect();
             let _ = tx.send(crate::dashboard::DashboardEvent::SuiteStarted {
+                run_id: run_id.clone(),
                 total_cases: work.len(),
                 models,
                 started_at,
+                source: "suite".into(),
             });
         }
 
@@ -143,6 +147,7 @@ impl<'a> SuiteRunner<'a> {
                 }
                 if let Some(ref tx) = self.dashboard_tx {
                     let _ = tx.send(crate::dashboard::DashboardEvent::CaseStarted {
+                        run_id: run_id.clone(),
                         case_name: case.name.clone(),
                         model: model.clone(),
                         run_index,
@@ -158,6 +163,7 @@ impl<'a> SuiteRunner<'a> {
                 );
                 if let Some(ref tx) = self.dashboard_tx {
                     let _ = tx.send(crate::dashboard::DashboardEvent::CaseCompleted {
+                        run_id: run_id.clone(),
                         report: Arc::new(report.clone()),
                     });
                 }
@@ -175,6 +181,7 @@ impl<'a> SuiteRunner<'a> {
                     let consecutive_infra = consecutive_infra.clone();
                     let total_auth_failures = total_auth_failures.clone();
                     let dashboard_tx = self.dashboard_tx.clone();
+                    let run_id = self.run_id.clone();
                     async move {
                         if aborted.load(Ordering::Relaxed) {
                             return None;
@@ -185,6 +192,7 @@ impl<'a> SuiteRunner<'a> {
                         }
                         if let Some(ref tx) = dashboard_tx {
                             let _ = tx.send(crate::dashboard::DashboardEvent::CaseStarted {
+                                run_id: run_id.clone(),
                                 case_name: case.name.clone(),
                                 model: model.clone(),
                                 run_index,
@@ -200,6 +208,7 @@ impl<'a> SuiteRunner<'a> {
                         );
                         if let Some(ref tx) = dashboard_tx {
                             let _ = tx.send(crate::dashboard::DashboardEvent::CaseCompleted {
+                                run_id: run_id.clone(),
                                 report: Arc::new(report.clone()),
                             });
                         }
@@ -223,6 +232,7 @@ impl<'a> SuiteRunner<'a> {
         suite.ended_at = Some(chrono::Utc::now().to_rfc3339());
         if let Some(ref tx) = self.dashboard_tx {
             let _ = tx.send(crate::dashboard::DashboardEvent::SuiteCompleted {
+                run_id: run_id.clone(),
                 report: Arc::new(suite.clone()),
             });
         }
@@ -633,6 +643,7 @@ mod tests {
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
+            run_id: String::new(),
         };
         let cases = vec![case_with("c1", vec![])];
         let report = runner.run_all(&cases).await;
@@ -667,6 +678,7 @@ mod tests {
                 runs: 1,
             },
             dashboard_tx: None,
+            run_id: String::new(),
         };
         let cases: Vec<Case> = (0..5)
             .map(|i| case_with(&format!("c{i}"), vec![Criterion::ExitCode { code: 0 }]))
@@ -695,6 +707,7 @@ mod tests {
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
+            run_id: String::new(),
         };
         let cases = vec![case_with("c1", vec![Criterion::ExitCode { code: 0 }])];
         let report = runner.run_all(&cases).await;
@@ -745,6 +758,7 @@ mod tests {
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
+            run_id: String::new(),
         };
         let j = Criterion::Judger {
             question: "q?".into(),
@@ -781,6 +795,7 @@ mod tests {
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
+            run_id: String::new(),
         };
         let case = case_with(
             "c1",
@@ -811,6 +826,7 @@ mod tests {
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
+            run_id: String::new(),
         };
         let cases = vec![case_with("c1", vec![])];
         let report = runner.run_all(&cases).await;
@@ -840,6 +856,7 @@ mod tests {
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
+            run_id: String::new(),
         };
         let read_req = Criterion::ToolCalled {
             name: "Read".into(),
@@ -885,6 +902,7 @@ mod tests {
             session_mode: SessionCaptureMode::OnDebugLog,
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
+            run_id: String::new(),
         };
         let mut case = case_with("dbg", vec![]);
         case.debug_log = true;
@@ -910,6 +928,7 @@ mod tests {
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
+            run_id: String::new(),
         };
         let mut case = case_with("c1", vec![]);
         case.setup_cmd = Some("exit 1".into());
@@ -948,6 +967,7 @@ mod tests {
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
+            run_id: String::new(),
         };
         let mut case = case_with("mt", vec![]);
         case.steps = vec![crate::case::CaseStep {
@@ -983,6 +1003,7 @@ mod tests {
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
+            run_id: String::new(),
         };
         let mut case = case_with("mt", vec![]);
         case.steps = vec![crate::case::CaseStep {
@@ -1021,6 +1042,7 @@ mod tests {
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
+            run_id: String::new(),
         };
         let mut case = case_with("c1", vec![]);
         case.capability = Some(crate::case::Capability::ToolUse);
@@ -1050,6 +1072,7 @@ mod tests {
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
+            run_id: String::new(),
         };
         let report = runner.run_all(&[case_with("c1", vec![])]).await;
         assert!(report.started_at.is_some());
@@ -1099,6 +1122,7 @@ mod tests {
             session_mode: SessionCaptureMode::Never,
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
+            run_id: String::new(),
         };
         let mut case = case_with("mt", vec![]);
         case.prompt = "What is 2+2? Answer with just the number.".into();
@@ -1145,6 +1169,7 @@ mod tests {
                 ..Default::default()
             },
             dashboard_tx: None,
+            run_id: String::new(),
         };
         let cases = vec![
             case_with("c0", vec![Criterion::ExitCode { code: 0 }]),
