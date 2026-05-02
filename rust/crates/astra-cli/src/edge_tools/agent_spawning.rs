@@ -142,47 +142,75 @@ pub async fn handle_get_agent_result_tool(
 
     use astra_turn_core::orchestration_types::AgentStatus;
 
-    // Check completed agents first.
-    let completed = ctx.spawner.completed_agents_snapshot().await;
-    if let Some(info) = completed.iter().find(|s| s.agent_id == agent_id) {
-        match &info.status {
-            AgentStatus::Completed { result } => {
+    // Poll for the agent's result with a timeout. Background children
+    // may still be running when this is called, so we poll rather than
+    // returning not_found immediately.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+
+    loop {
+        // Check completed agents.
+        let completed = ctx.spawner.completed_agents_snapshot().await;
+        if let Some(info) = completed.iter().find(|s| s.agent_id == agent_id) {
+            match &info.status {
+                AgentStatus::Completed { result } => {
+                    return json!({
+                        "status": "completed",
+                        "agent_id": agent_id,
+                        "result": result,
+                    })
+                    .to_string();
+                }
+                AgentStatus::Failed { error } => {
+                    return json!({
+                        "status": "failed",
+                        "agent_id": agent_id,
+                        "error": error,
+                    })
+                    .to_string();
+                }
+                _ => {}
+            }
+        }
+
+        // Check if still running.
+        let active = ctx.spawner.list_agents(&ctx.run_id).await;
+        let still_active = active.iter().any(|a| a.agent_id == agent_id);
+
+        if !still_active && std::time::Instant::now() >= deadline {
+            return json!({
+                "status": "not_found",
+                "agent_id": agent_id,
+                "error": format!("Agent '{agent_id}' not found after 60s timeout")
+            })
+            .to_string();
+        }
+
+        if !still_active {
+            // Agent is neither active nor completed — might be in
+            // transit between spawned and registered. Brief wait.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if std::time::Instant::now() >= deadline {
                 return json!({
-                    "status": "completed",
+                    "status": "timeout",
                     "agent_id": agent_id,
-                    "result": result,
+                    "error": "Agent did not complete within 60s"
                 })
                 .to_string();
             }
-            AgentStatus::Failed { error } => {
-                return json!({
-                    "status": "failed",
-                    "agent_id": agent_id,
-                    "error": error,
-                })
-                .to_string();
-            }
-            _ => {}
+            continue;
+        }
+
+        // Agent is still running — wait and retry.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if std::time::Instant::now() >= deadline {
+            return json!({
+                "status": "timeout",
+                "agent_id": agent_id,
+                "error": "Agent did not complete within 60s"
+            })
+            .to_string();
         }
     }
-
-    // Check active agents.
-    let active = ctx.spawner.list_agents(&ctx.run_id).await;
-    if let Some(info) = active.iter().find(|a| a.agent_id == agent_id) {
-        return json!({
-            "status": "running",
-            "agent_id": agent_id,
-            "description": info.description,
-        })
-        .to_string();
-    }
-
-    json!({
-        "status": "not_found",
-        "agent_id": agent_id,
-        "error": format!("No agent with id '{agent_id}' found")
-    })
-    .to_string()
 }
 
 /// JSON schema for get_agent_result tool.
