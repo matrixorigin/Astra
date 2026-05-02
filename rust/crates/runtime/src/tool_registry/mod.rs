@@ -97,8 +97,8 @@ mod tests {
         assert!(!pinned.contains(&"write_file"));
         assert!(!pinned.contains(&"grep"));
         assert!(!pinned.contains(&"glob"));
-        // memory_search is dynamic — selected only when query involves recall
-        assert!(!pinned.contains(&"memory_search"));
+        // memory_retrieve is dynamic — selected only when query involves recall
+        assert!(!pinned.contains(&"memory_retrieve"));
     }
 
     #[test]
@@ -186,8 +186,8 @@ mod tests {
 
     #[test]
     fn prefilter_ranks_memory_tools_for_recall() {
-        // memory_store, memory_search, and memory_purge are dynamic.
-        // For memory recall queries, memory_search should appear.
+        // memory_store, memory_retrieve, and memory_purge are dynamic.
+        // For memory recall queries, memory_retrieve should appear.
         let state = ConversationState::from_message("之前我记住了什么偏好?", 1);
         let ranked = pre_filter_dynamic(&state, "之前我记住了什么偏好?");
 
@@ -197,8 +197,8 @@ mod tests {
             .map(|&(idx, _)| TOOL_CATALOG[idx].name)
             .collect();
         assert!(
-            top_names.contains(&"memory_search"),
-            "memory_search should appear for recall query, got: {:?}",
+            top_names.contains(&"memory_retrieve"),
+            "memory_retrieve should appear for recall query, got: {:?}",
             top_names
         );
     }
@@ -253,13 +253,15 @@ mod tests {
 
     /// Regression: recall queries should surface recall-oriented memory tools.
     #[test]
-    fn select_memory_query_prefers_memory_search() {
+    fn select_memory_query_has_memory_retrieve() {
         let registry = ToolRegistry::new(mock_schemas());
         let selected = registry.select("我有哪些记忆？", 1);
         let names = ToolRegistry::selected_names(&selected);
+        let has_memory = names.contains(&"memory_retrieve".to_string())
+            || names.contains(&"memory_retrieve".to_string());
         assert!(
-            names.contains(&"memory_search".to_string()),
-            "memory_search must be in selection for '我有哪些记忆？', got: {:?}",
+            has_memory,
+            "memory query must select memory_retrieve (or legacy memory_retrieve), got: {:?}",
             names
         );
     }
@@ -472,8 +474,8 @@ mod tests {
         let selected = registry.select("我之前记住的偏好是什么?", 1);
         let names = ToolRegistry::selected_names(&selected);
         assert!(
-            names.contains(&"memory_search".to_string()),
-            "memory query should include memory_search, got: {:?}",
+            names.contains(&"memory_retrieve".to_string()),
+            "memory query should include memory_retrieve, got: {:?}",
             names
         );
     }
@@ -589,7 +591,7 @@ mod tests {
         let terms = tokenize("search memory recall preferences");
         let mem_idx = TOOL_CATALOG
             .iter()
-            .position(|t| t.name == "memory_search")
+            .position(|t| t.name == "memory_retrieve")
             .unwrap();
         let git_idx = TOOL_CATALOG
             .iter()
@@ -597,7 +599,7 @@ mod tests {
             .unwrap();
         assert!(
             tfidf_score(&terms, mem_idx) > tfidf_score(&terms, git_idx),
-            "memory_search should score higher than git_diff for memory query"
+            "memory_retrieve should score higher than git_diff for memory query"
         );
     }
 

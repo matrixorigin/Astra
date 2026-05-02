@@ -803,11 +803,11 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         scope: Scope::CrossSession,
         schema_tokens: 35,
     },
-    // memory_search is dynamic: only needed when user explicitly asks about
+    // memory_retrieve is dynamic: only needed when user explicitly asks about
     // stored memories. Rich triggers ensure tfidf selects it reliably.
     ToolMeta {
-        name: "memory_search",
-        description: "Search persistent memories for relevant information",
+        name: "memory_retrieve",
+        description: "Retrieve persistent memories via semantic search",
         triggers: &[
             "recall",
             "search memory",
