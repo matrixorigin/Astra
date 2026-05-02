@@ -1799,7 +1799,7 @@ const S = {
   detailOpen: false,
 };
 
-const PRESETS = ['claude-sonnet-4-6', 'MiniMax-M2.7', 'qwen-flash', 'deepseek-chat', 'gpt-4o'];
+const PRESETS = []; // All models come from /api/models (DB registered)
 
 /* ================================================================
    DOM Helpers
@@ -2883,13 +2883,9 @@ function loadConfig() {
   // Wait for both, then build the model list
   Promise.all([modelsPromise, configPromise]).then(() => {
     buildModelList();
-    // Auto-select active models from registry, or fall back to config.available_models
-    const activeFromRegistry = S.modelRegistry.filter(m => m.is_active).map(m => m.name);
-    if (activeFromRegistry.length > 0) {
-      activeFromRegistry.forEach(m => S.selectedModels.add(m));
-    } else {
-      (S.config.available_models || []).forEach(m => S.selectedModels.add(m));
-    }
+    // Don't auto-select all — user picks what they want.
+    // If config has a specific model list (from --models CLI), pre-select those.
+    (S.config.available_models || []).forEach(m => S.selectedModels.add(m));
     renderModelList();
     renderModelTags();
     updateModelOverrideNote();
