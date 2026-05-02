@@ -48,7 +48,6 @@ use event::{TuiEvent, TuiEventStream};
 use frame_requester::FrameRequester;
 
 /// Flush a completed cell to terminal scrollback with trailing blank lines.
-/// Also appends transcript_lines to the transcript log.
 fn flush_cell_to_scrollback(
     guard: &mut TerminalGuard,
     cell: Box<dyn ChatCell>,
@@ -72,20 +71,40 @@ fn flush_cell_to_scrollback(
     }
 }
 
-/// Finalize the stream controller: flush pending text, drain all ticks,
-/// and update the active AssistantChatCell with final lines.
-fn finalize_stream_controller(
+/// Flush a streaming mini-cell to scrollback (no trailing blanks — continuation).
+fn flush_mini_cell(
+    guard: &mut TerminalGuard,
+    cell: Box<dyn ChatCell>,
+    width: u16,
+    transcript: &mut Vec<ratatui::text::Line<'static>>,
+) {
+    let display = cell.display_lines(width);
+    let trans = cell.transcript_lines(width);
+    if !display.is_empty() {
+        guard.queue_history_lines(display);
+    }
+    if !trans.is_empty() {
+        transcript.extend(trans);
+    }
+}
+
+/// Finalize stream controller: emit final mini-cell + trailing blanks.
+fn finalize_stream(
     sc: &mut Option<StreamController>,
-    active_cell: &mut Option<Box<dyn ChatCell>>,
+    guard: &mut TerminalGuard,
+    width: u16,
+    transcript: &mut Vec<ratatui::text::Line<'static>>,
 ) {
     if let Some(mut controller) = sc.take() {
-        controller.flush_pending();
-        while controller.tick().is_some() {}
-        if let Some(cell) = active_cell {
-            if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() {
-                ac.update_rendered_lines(controller.emitted_lines().to_vec());
-            }
+        let (final_cell, _source) = controller.finalize();
+        if let Some(cell) = final_cell {
+            flush_mini_cell(guard, cell, width, transcript);
         }
+        guard.queue_history_lines(vec![
+            ratatui::text::Line::default(),
+            ratatui::text::Line::default(),
+        ]);
+        transcript.push(ratatui::text::Line::default());
     }
 }
 
@@ -331,7 +350,7 @@ pub(crate) async fn run_tui_repl(
                                                     let _ = do_draw(&mut guard, &active_cell, &mut bottom_pane);
                                                 }
                                                 _ = &mut itick => {
-                                                    drain_tick(&mut stream_controller, &mut active_cell, &frame_requester);
+                                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80); drain_tick(&mut stream_controller, &mut guard, w, &mut transcript, &frame_requester);
                                                     let _ = do_draw(&mut guard, &active_cell, &mut bottom_pane);
                                                 }
                                             }
@@ -350,11 +369,11 @@ pub(crate) async fn run_tui_repl(
                                         }
                                     }
 
-                                    // Finalize stream controller
-                                    finalize_stream_controller(&mut stream_controller, &mut active_cell);
-
-                                    // Flush final active cell → scrollback
+                                    // Finalize stream — emit remaining mini-cell + trailing blanks
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                    finalize_stream(&mut stream_controller, &mut guard, w, &mut transcript);
+
+                                    // Flush any remaining active cell (thinking indicator, tool cell)
                                     if let Some(cell) = active_cell.take() {
                                         flush_cell_to_scrollback(&mut guard, cell, w, &mut transcript);
                                     }
@@ -442,7 +461,7 @@ pub(crate) async fn run_tui_repl(
                 handle_app_event(ae, &mut guard, w, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester, &mut transcript);
             }
             _ = &mut tick => {
-                drain_tick(&mut stream_controller, &mut active_cell, &frame_requester);
+                let w = guard.terminal.size().map(|s| s.width).unwrap_or(80); drain_tick(&mut stream_controller, &mut guard, w, &mut transcript, &frame_requester);
             }
         }
     };
@@ -516,33 +535,37 @@ fn handle_app_event(
 ) {
     match ev {
         TuiAppEvent::Token(text) => {
-            // If active cell is a ToolChatCell, flush it to scrollback and
-            // start a new AssistantChatCell for the text that follows.
-            let need_new_assistant = active_cell
+            // If active cell is a ToolChatCell, flush it before streaming text
+            let need_new_stream = active_cell
                 .as_ref()
                 .map(|c| c.as_any_ref().is::<ToolChatCell>())
                 .unwrap_or(false);
-            if need_new_assistant {
+            if need_new_stream {
                 if let Some(cell) = active_cell.take() {
                     flush_cell_to_scrollback(guard, cell, width, transcript);
                 }
-                let ac = AssistantChatCell::from_rendered(vec![]);
-                *active_cell = Some(Box::new(ac));
                 *sc = Some(StreamController::new(Some(width as usize)));
             }
 
-            if let Some(cell) = active_cell {
-                if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() {
-                    if ac.is_thinking() { ac.finish_thinking(); }
+            // Clear thinking state — tokens are flowing
+            if let Some(cell) = active_cell.as_ref() {
+                if cell.as_any_ref().is::<AssistantChatCell>() {
+                    active_cell.take(); // Remove thinking cell from viewport
                 }
             }
+
+            // Ensure stream controller exists
+            if sc.is_none() {
+                *sc = Some(StreamController::new(Some(width as usize)));
+            }
+
+            // Push delta and drain any ready lines as mini-cells to scrollback
             if let Some(s) = sc {
-                s.push_delta(&text);
-                if s.tick().is_some() {
-                    if let Some(cell) = active_cell {
-                        if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() {
-                            ac.update_rendered_lines(s.emitted_lines().to_vec());
-                        }
+                if s.push_delta(&text) {
+                    // Newline crossed — drain catch-up batch
+                    let (cell, _idle) = s.on_commit_tick_batch(5);
+                    if let Some(cell) = cell {
+                        flush_mini_cell(guard, cell, width, transcript);
                     }
                 }
             }
@@ -599,8 +622,9 @@ fn handle_app_event(
             fr.schedule_frame();
         }
         TuiAppEvent::ToolStarted { name, description } => {
-            // Flush current cell (assistant text before tool) to scrollback
-            finalize_stream_controller(sc, active_cell);
+            // Finalize any active stream — flush remaining mini-cell
+            finalize_stream(sc, guard, width, transcript);
+            // Flush any non-streaming active cell (thinking indicator, etc.)
             if let Some(cell) = active_cell.take() {
                 flush_cell_to_scrollback(guard, cell, width, transcript);
             }
@@ -625,18 +649,19 @@ fn handle_app_event(
     }
 }
 
+/// Codex pattern: each tick drains queued lines into a mini-cell,
+/// immediately flushed to scrollback. No bulk flush at turn end.
 fn drain_tick(
     sc: &mut Option<StreamController>,
-    active_cell: &mut Option<Box<dyn ChatCell>>,
+    guard: &mut TerminalGuard,
+    width: u16,
+    transcript: &mut Vec<ratatui::text::Line<'static>>,
     fr: &FrameRequester,
 ) {
     if let Some(s) = sc {
-        if s.tick().is_some() {
-            if let Some(cell) = active_cell {
-                if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() {
-                    ac.update_rendered_lines(s.emitted_lines().to_vec());
-                }
-            }
+        let (cell, _idle) = s.on_commit_tick();
+        if let Some(cell) = cell {
+            flush_mini_cell(guard, cell, width, transcript);
             fr.schedule_frame();
         }
     }

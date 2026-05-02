@@ -3,15 +3,16 @@ use std::path::PathBuf;
 use ratatui::text::Line;
 
 use super::StreamState;
-use crate::tui::chat_cell::assistant_cell::AssistantChatCell;
+use crate::tui::chat_cell::agent_message_cell::AgentMessageCell;
 use crate::tui::chat_cell::ChatCell;
 use crate::tui::markdown::append_markdown;
-use crate::tui::render::line_utils::line_to_static;
 
 /// Streams markdown deltas while retaining source for resize reflow.
 ///
-/// Follows Codex's newline-gated pattern: deltas are buffered until a newline
-/// is seen, then the completed source is rendered and queued for display.
+/// Follows Codex's pattern: deltas are buffered until a newline,
+/// then rendered lines are queued. Each commit tick drains queued lines
+/// into a mini-cell (AgentMessageCell) that gets immediately flushed
+/// to terminal scrollback.
 pub(crate) struct StreamController {
     state: StreamState,
     raw_source: String,
@@ -55,78 +56,67 @@ impl StreamController {
         false
     }
 
-    /// Finalize the stream, returning a ChatCell with all content + the raw source.
-    pub fn finalize(mut self) -> (Option<Box<dyn ChatCell>>, Option<String>) {
+    /// Drain one batch of queued lines, wrap in a mini-cell.
+    /// Returns (cell, is_idle).
+    pub fn on_commit_tick(&mut self) -> (Option<Box<dyn ChatCell>>, bool) {
+        let batch = self.state.drain_n(1);
+        self.emitted_len += batch.len();
+        (self.emit(batch), self.state.is_idle())
+    }
+
+    /// Drain up to max_lines, wrap in a mini-cell. For catch-up.
+    pub fn on_commit_tick_batch(&mut self, max_lines: usize) -> (Option<Box<dyn ChatCell>>, bool) {
+        let batch = self.state.drain_n(max_lines);
+        self.emitted_len += batch.len();
+        (self.emit(batch), self.state.is_idle())
+    }
+
+    /// Finalize: commit remaining buffered text, return final mini-cell + raw source.
+    pub fn finalize(&mut self) -> (Option<Box<dyn ChatCell>>, Option<String>) {
+        // Commit any remaining buffered text
         if let Some(remaining) = self.state.collector.finalize_and_drain_source() {
-            self.raw_source.push_str(&remaining);
+            if !remaining.is_empty() {
+                self.raw_source.push_str(&remaining);
+            }
         }
 
         if self.raw_source.is_empty() {
             return (None, None);
         }
 
-        let source = self.raw_source.clone();
-        let cell = AssistantChatCell::from_source(
-            source.clone(),
-            self.width.unwrap_or(80) as u16,
+        // Re-render full source to get final lines
+        let mut full_rendered = Vec::new();
+        append_markdown(
+            &self.raw_source,
+            self.width,
+            Some(self.cwd.as_path()),
+            &mut full_rendered,
         );
-        (Some(Box::new(cell)), Some(source))
-    }
 
-    /// Drain queued lines, returning them if available.
-    pub fn tick(&mut self) -> Option<Vec<Line<'static>>> {
-        let batch = self.state.drain_n(5);
-        if batch.is_empty() {
-            None
+        // Only emit lines not yet emitted
+        let remaining_lines = if self.emitted_len < full_rendered.len() {
+            full_rendered[self.emitted_len..].to_vec()
         } else {
-            self.emitted_len += batch.len();
-            Some(batch)
+            Vec::new()
+        };
+
+        let source = std::mem::take(&mut self.raw_source);
+        let cell = self.emit(remaining_lines);
+        (cell, Some(source))
+    }
+
+    /// Wrap lines in a mini AgentMessageCell.
+    fn emit(&mut self, lines: Vec<Line<'static>>) -> Option<Box<dyn ChatCell>> {
+        if lines.is_empty() {
+            return None;
         }
+        let is_first = !self.header_emitted;
+        self.header_emitted = true;
+        Some(Box::new(AgentMessageCell::new(lines, is_first)))
     }
 
-    /// Flush any pending (uncommitted) text for immediate display.
-    /// Called periodically so short responses without newlines still render.
-    pub fn flush_pending(&mut self) {
-        if let Some(remaining) = self.state.collector.finalize_and_drain_source() {
-            if !remaining.is_empty() {
-                self.raw_source.push_str(&remaining);
-                self.recompute_and_sync();
-            }
-        }
-        // Re-create the collector so future deltas continue to buffer
-        self.state.collector = crate::tui::markdown_stream::MarkdownStreamCollector::new(self.width);
-    }
-
-    /// Returns all lines emitted so far (for building a transient cell).
-    pub fn emitted_lines(&self) -> &[Line<'static>] {
-        &self.rendered_lines[..self.emitted_len.min(self.rendered_lines.len())]
-    }
-
-    /// Take lines that have been emitted but not yet flushed to scrollback.
-    /// After calling, those lines are marked as flushed and won't be returned again.
-    pub fn take_flushed_lines(&mut self) -> Vec<Line<'static>> {
-        let flushed_end = self.emitted_len.min(self.rendered_lines.len());
-        let start = self.state.scrollback_flushed;
-        if start >= flushed_end {
-            return Vec::new();
-        }
-        let lines = self.rendered_lines[start..flushed_end].to_vec();
-        self.state.scrollback_flushed = flushed_end;
-        lines
-    }
-
-    /// How many emitted lines have NOT yet been flushed to scrollback.
-    pub fn unflushed_count(&self) -> usize {
-        let flushed_end = self.emitted_len.min(self.rendered_lines.len());
-        flushed_end.saturating_sub(self.state.scrollback_flushed)
-    }
-
-    pub fn queued_len(&self) -> usize {
-        self.state.queued_len()
-    }
-
-    pub fn is_idle(&self) -> bool {
-        self.state.is_idle()
+    pub fn has_queued(&self) -> bool {
+        self.state.queued_len() > 0
     }
 
     pub fn set_width(&mut self, new_width: usize) {
@@ -137,7 +127,6 @@ impl StreamController {
             return;
         }
 
-        // Recompute rendered lines from source at new width
         self.rendered_lines.clear();
         append_markdown(
             &self.raw_source,
@@ -146,7 +135,6 @@ impl StreamController {
             &mut self.rendered_lines,
         );
 
-        // Re-sync queue: only queue lines beyond what was already emitted
         let already_emitted = self.emitted_len.min(self.rendered_lines.len());
         self.enqueued_len = already_emitted;
         self.sync_queue();
@@ -164,13 +152,11 @@ impl StreamController {
     }
 
     fn sync_queue(&mut self) {
-        if self.enqueued_len < self.rendered_lines.len() {
-            let new_lines: Vec<Line<'static>> = self.rendered_lines[self.enqueued_len..]
-                .iter()
-                .map(|l| line_to_static(l))
-                .collect();
+        let target_len = self.rendered_lines.len();
+        if self.enqueued_len < target_len {
+            let new_lines = self.rendered_lines[self.enqueued_len..target_len].to_vec();
             self.state.enqueue(new_lines);
-            self.enqueued_len = self.rendered_lines.len();
+            self.enqueued_len = target_len;
         }
     }
 }
