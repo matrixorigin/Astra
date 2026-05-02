@@ -192,13 +192,21 @@ pub(crate) async fn run_tui_repl(
     let mut active_cell: Option<Box<dyn ChatCell>> = None;
     let mut stream_controller: Option<StreamController> = None;
     let mut transcript: Vec<ratatui::text::Line<'static>> = Vec::new();
-    let mut pending_messages: Vec<String> = Vec::new();
+    let mut auto_send_queued: Option<String> = None;
 
     frame_requester.schedule_frame();
 
     let result: Result<(), String> = 'main: loop {
         let tick = tokio::time::sleep(Duration::from_millis(50));
         tokio::pin!(tick);
+
+        // After turn ends, load first queued message into composer for review/send
+        if active_cell.is_none() && stream_controller.is_none() {
+            if let Some(text) = auto_send_queued.take() {
+                bottom_pane.composer.set_text(&text);
+                frame_requester.schedule_frame();
+            }
+        }
 
         tokio::select! {
             Some(ev) = event_stream.next() => {
@@ -307,20 +315,24 @@ pub(crate) async fn run_tui_repl(
                                                     match tev {
                                                         TuiEvent::Key(k) => {
                                                             // During turn: composer stays usable.
-                                                            // Enter queues message, Ctrl+C interrupts.
-                                                            match bottom_pane.handle_key(k) {
-                                                                BottomPaneAction::SubmitInput(queued_text) => {
-                                                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                                                    let note = SystemChatCell::info(
-                                                                        format!("⏳ Queued: {queued_text}")
-                                                                    );
-                                                                    guard.queue_history_lines(note.display_lines(w));
-                                                                    pending_messages.push(queued_text);
+                                                            // Enter queues message (shown as preview, not in scrollback).
+                                                            // Up edits last queued. Ctrl+C interrupts.
+                                                            // Up arrow with queued messages → edit last
+                                                            if k.code == crossterm::event::KeyCode::Up
+                                                                && !bottom_pane.queued_messages.is_empty()
+                                                                && bottom_pane.composer.is_empty()
+                                                            {
+                                                                bottom_pane.edit_last_queued();
+                                                            } else {
+                                                                match bottom_pane.handle_key(k) {
+                                                                    BottomPaneAction::SubmitInput(queued_text) => {
+                                                                        bottom_pane.queued_messages.push(queued_text);
+                                                                    }
+                                                                    BottomPaneAction::Interrupt | BottomPaneAction::Quit => {
+                                                                        tui_cancel_token.cancel();
+                                                                    }
+                                                                    _ => {}
                                                                 }
-                                                                BottomPaneAction::Interrupt | BottomPaneAction::Quit => {
-                                                                    tui_cancel_token.cancel();
-                                                                }
-                                                                _ => {}
                                                             }
                                                             frame_requester.schedule_frame();
                                                             let _ = do_draw(&mut guard, &active_cell, &mut bottom_pane);
@@ -440,19 +452,8 @@ pub(crate) async fn run_tui_repl(
                                     tui_cancel_token = new_tok.clone();
                                     state.tui_cancel_token = Some(new_tok);
 
-                                    // Auto-dispatch queued messages
-                                    if let Some(next_msg) = pending_messages.first().cloned() {
-                                        pending_messages.remove(0);
-                                        let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                        let note = SystemChatCell::info(format!("▶ Sending queued: {next_msg}"));
-                                        guard.queue_history_lines(note.display_lines(w));
-                                        // Re-inject as SubmitInput by setting composer and triggering
-                                        bottom_pane.composer.set_text(&next_msg);
-                                        // Will be picked up on next loop iteration as SubmitInput
-                                        // Actually — we need to submit it directly. Use a flag.
-                                        // For now, just set it in composer. User sees it and presses Enter.
-                                        // TODO: auto-submit queued messages
-                                    }
+                                    // Auto-send first queued message (will be picked up next iteration)
+                                    auto_send_queued = bottom_pane.take_next_queued();
                                 }
                             }
                             BottomPaneAction::SubmitInput(_) => {}
