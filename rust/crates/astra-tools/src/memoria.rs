@@ -11,6 +11,14 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+/// HTTP method for Memoria API calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpMethod {
+    Get,
+    Put,
+    Post,
+}
+
 /// A single memory hit from search, carrying both ID and content.
 #[derive(Debug, Clone)]
 pub struct BoostSearchHit {
@@ -123,13 +131,25 @@ impl MemoriaClient {
             return json!({"error": "Memory service unavailable (circuit open)"}).to_string();
         }
 
-        let (endpoint, payload, auth_header) = if let (Some(cloud_base), Some(token)) =
+        // Normalize business types before any dispatch path.
+        let args = &{
+            let mut a = args.clone();
+            if op == "store" && let Some(obj) = a.as_object_mut() && let Some(raw) = obj.get("memory_type").and_then(Value::as_str).map(String::from) {
+                let mapped = astra_prompts::memory_types::normalize_memoria_type(&raw);
+                obj.insert("memory_type".to_string(), Value::String(mapped.to_string()));
+            }
+            a
+        };
+
+        let (endpoint, payload, auth_header, method) = if let (Some(cloud_base), Some(token)) =
             (&self.cloud_base, &self.cloud_token)
         {
+            // Cloud proxy handles method routing server-side; always POST.
             (
                 format!("{cloud_base}/memory/{op}"),
                 args.clone(),
                 format!("Bearer {token}"),
+                HttpMethod::Post,
             )
         } else {
             let base = std::env::var("MEMORIA_BASE_URL")
@@ -144,8 +164,8 @@ impl MemoriaClient {
                         .to_string();
                 }
             };
-            let (ep, pl) = Self::build_direct_request(&base, op, args);
-            (ep, pl, format!("Bearer {key}"))
+            let (ep, pl, m) = Self::build_direct_request(&base, op, args);
+            (ep, pl, format!("Bearer {key}"), m)
         };
 
         match reqwest::Client::builder()
@@ -153,28 +173,34 @@ impl MemoriaClient {
             .no_proxy()
             .build()
         {
-            Ok(client) => match client
-                .post(&endpoint)
-                .header("Authorization", &auth_header)
-                .json(&payload)
-                .send()
-                .await
-            {
-                Ok(resp) => match resp.text().await {
-                    Ok(text) => {
-                        self.fail_count.store(0, Ordering::Relaxed);
-                        text
-                    }
+            Ok(client) => {
+                let req = match method {
+                    HttpMethod::Get => client.get(&endpoint),
+                    HttpMethod::Put => client.put(&endpoint),
+                    HttpMethod::Post => client.post(&endpoint),
+                };
+                match req
+                    .header("Authorization", &auth_header)
+                    .json(&payload)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => match resp.text().await {
+                        Ok(text) => {
+                            self.fail_count.store(0, Ordering::Relaxed);
+                            text
+                        }
+                        Err(e) => {
+                            self.fail_count.fetch_add(1, Ordering::Relaxed);
+                            json!({"error": format!("read response: {e}")}).to_string()
+                        }
+                    },
                     Err(e) => {
                         self.fail_count.fetch_add(1, Ordering::Relaxed);
-                        json!({"error": format!("read response: {e}")}).to_string()
+                        json!({"error": format!("memoria request failed: {e}")}).to_string()
                     }
-                },
-                Err(e) => {
-                    self.fail_count.fetch_add(1, Ordering::Relaxed);
-                    json!({"error": format!("memoria request failed: {e}")}).to_string()
                 }
-            },
+            }
             Err(e) => json!({"error": format!("build client: {e}")}).to_string(),
         }
     }
@@ -220,9 +246,7 @@ impl MemoriaClient {
             }
         }
     }
-    fn build_direct_request(base: &str, op: &str, args: &Value) -> (String, Value) {
-        // Helper: propagate session_id and user_id when present in args
-        // so Memoria can scope operations to the correct user.
+    pub fn build_direct_request(base: &str, op: &str, args: &Value) -> (String, Value, HttpMethod) {
         let inject_identity = |pl: &mut Value| {
             if let Some(obj) = pl.as_object_mut() {
                 if let Some(sid) = args.get("session_id").and_then(Value::as_str) {
@@ -242,14 +266,13 @@ impl MemoriaClient {
                     pl["min_confidence"] = json!(mc);
                 }
                 inject_identity(&mut pl);
-                // Forward filter_session and include_cross_session for session-scoped retrieval
                 if let Some(fs) = args.get("filter_session").and_then(Value::as_bool) {
                     pl["filter_session"] = json!(fs);
                 }
                 if let Some(ics) = args.get("include_cross_session").and_then(Value::as_bool) {
                     pl["include_cross_session"] = json!(ics);
                 }
-                (format!("{base}/v1/memories/retrieve"), pl)
+                (format!("{base}/v1/memories/retrieve"), pl, HttpMethod::Post)
             }
             "store" => {
                 let content = args.get("content").and_then(Value::as_str).unwrap_or("");
@@ -257,17 +280,15 @@ impl MemoriaClient {
                     .get("memory_type")
                     .and_then(Value::as_str)
                     .unwrap_or("semantic");
-                let memory_type = map_business_type_to_memoria(raw_type);
+                let memory_type = astra_prompts::memory_types::normalize_memoria_type(raw_type);
                 let mut payload = json!({"content": content, "memory_type": memory_type});
                 if let Some(tier) = args.get("trust_tier").and_then(Value::as_str) {
                     payload["trust_tier"] = json!(tier);
                 }
                 inject_identity(&mut payload);
-                (format!("{base}/v1/memories"), payload)
+                (format!("{base}/v1/memories"), payload, HttpMethod::Post)
             }
             "search" => {
-                // Route to /v1/memories/retrieve (not /search) so session_id and
-                // filter_session are honoured by the Memoria API.
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("");
                 let top_k = args.get("top_k").and_then(Value::as_u64).unwrap_or(10);
                 let mut pl = json!({"query": query, "top_k": top_k});
@@ -284,7 +305,7 @@ impl MemoriaClient {
                 if let Some(ics) = args.get("include_cross_session").and_then(Value::as_bool) {
                     pl["include_cross_session"] = json!(ics);
                 }
-                (format!("{base}/v1/memories/retrieve"), pl)
+                (format!("{base}/v1/memories/retrieve"), pl, HttpMethod::Post)
             }
             "purge" => {
                 let topic = args.get("topic").and_then(Value::as_str).unwrap_or("");
@@ -294,44 +315,44 @@ impl MemoriaClient {
                     .unwrap_or("user request");
                 let mut pl = json!({"topic": topic, "reason": reason});
                 inject_identity(&mut pl);
-                (format!("{base}/v1/memories/purge"), pl)
+                (format!("{base}/v1/memories/purge"), pl, HttpMethod::Post)
             }
             "correct" => {
-                let memory_id = args.get("memory_id").and_then(Value::as_str).unwrap_or("");
-                let new_content = args
-                    .get("new_content")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let reason = args
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("correction");
-                let mut pl =
-                    json!({"memory_id": memory_id, "new_content": new_content, "reason": reason});
-                inject_identity(&mut pl);
-                (format!("{base}/v1/memories/correct"), pl)
+                let new_content = args.get("new_content").and_then(Value::as_str).unwrap_or("");
+                let reason = args.get("reason").and_then(Value::as_str).unwrap_or("correction");
+                if let Some(mid) = args.get("memory_id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    (
+                        format!("{base}/v1/memories/{mid}/correct"),
+                        json!({"new_content": new_content, "reason": reason}),
+                        HttpMethod::Put,
+                    )
+                } else if let Some(query) = args.get("query").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    (
+                        format!("{base}/v1/memories/correct"),
+                        json!({"query": query, "new_content": new_content, "reason": reason}),
+                        HttpMethod::Post,
+                    )
+                } else {
+                    (
+                        String::new(),
+                        json!({"error": "memory_correct requires either memory_id or query"}),
+                        HttpMethod::Post,
+                    )
+                }
             }
-            "profile" => {
-                let mut pl = json!({});
-                inject_identity(&mut pl);
-                (format!("{base}/v1/memories/profile"), pl)
-            }
+            "profile" => (format!("{base}/v1/profiles/me"), json!({}), HttpMethod::Get),
             _ => (
                 String::new(),
                 json!({"error": format!("Unknown memoria op: {op}")}),
+                HttpMethod::Post,
             ),
         }
     }
 }
 
-/// Map business category types to Memoria V1 primitives.
-/// Delegates to the single source of truth in astra-prompts.
-fn map_business_type_to_memoria(raw: &str) -> &str {
-    astra_prompts::memory_types::normalize_memoria_type(raw)
-}
 
 /// Build a one-shot Memoria HTTP client + auth header.
-fn memoria_oneshot_client(timeout_secs: u64) -> Option<(reqwest::Client, String, String)> {
+pub fn memoria_oneshot_client(timeout_secs: u64) -> Option<(reqwest::Client, String, String)> {
     let base = std::env::var("MEMORIA_BASE_URL")
         .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
     let key = std::env::var("MEMORIA_MASTER_KEY").ok()?;
@@ -349,7 +370,7 @@ pub async fn memoria_governance_fire_and_forget() {
         return;
     };
     let _ = client
-        .post(format!("{base}/v1/memories/governance"))
+        .post(format!("{base}/v1/governance"))
         .header("Authorization", format!("Bearer {key}"))
         .json(&json!({"force": false}))
         .send()
@@ -362,11 +383,73 @@ pub async fn memoria_consolidate_fire_and_forget() {
         return;
     };
     let _ = client
-        .post(format!("{base}/v1/memories/consolidate"))
+        .post(format!("{base}/v1/consolidate"))
         .header("Authorization", format!("Bearer {key}"))
         .json(&json!({"force": false}))
         .send()
         .await;
+}
+
+// ── Cloud memory helpers (shared between CLI and server) ────────────────
+
+/// Generic Memoria API request for cloud management operations.
+pub async fn memoria_cloud_request(
+    method: HttpMethod,
+    path: &str,
+    timeout_secs: u64,
+    body: Option<serde_json::Value>,
+) -> Result<String, String> {
+    let (client, base, key) = memoria_oneshot_client(timeout_secs).ok_or("Memoria not configured")?;
+    let url = format!("{base}{path}");
+    let req = match method {
+        HttpMethod::Get => client.get(&url),
+        HttpMethod::Put => client.put(&url),
+        HttpMethod::Post => client.post(&url),
+    };
+    let req = req.header("Authorization", format!("Bearer {key}"));
+    let req = if let Some(b) = body { req.json(&b) } else { req };
+    let resp = req.send().await.map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    let resp_body = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        Ok(resp_body)
+    } else {
+        Err(format!("({status}) {resp_body}"))
+    }
+}
+
+pub async fn memoria_snapshot_create(name: &str) -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Post, "/v1/snapshots", 5, Some(json!({"name": name}))).await
+}
+pub async fn memoria_snapshot_rollback(name: &str) -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Post, &format!("/v1/snapshots/{name}/rollback"), 10, None).await
+}
+pub async fn memoria_snapshot_diff(name: &str) -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Get, &format!("/v1/snapshots/{name}/diff"), 5, None).await
+}
+pub async fn memoria_snapshots_list() -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Get, "/v1/snapshots", 5, None).await
+}
+pub async fn memoria_branch_create(name: &str) -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Post, "/v1/branches", 5, Some(json!({"name": name}))).await
+}
+pub async fn memoria_branch_checkout(name: &str) -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Post, &format!("/v1/branches/{name}/checkout"), 5, None).await
+}
+pub async fn memoria_branch_merge(name: &str) -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Post, &format!("/v1/branches/{name}/merge"), 5, None).await
+}
+pub async fn memoria_branch_diff(name: &str) -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Get, &format!("/v1/branches/{name}/diff"), 5, None).await
+}
+pub async fn memoria_branches_list() -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Get, "/v1/branches", 5, None).await
+}
+pub async fn memoria_reflect() -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Post, "/v1/reflect", 15, Some(json!({"mode": "auto"}))).await
+}
+pub async fn memoria_health() -> Result<String, String> {
+    memoria_cloud_request(HttpMethod::Get, "/v1/health/analyze", 5, None).await
 }
 
 #[cfg(test)]

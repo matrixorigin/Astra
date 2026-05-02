@@ -9,7 +9,14 @@ use serde_json::{Value, json};
 
 use super::ToolExecutor;
 
-pub use astra_tools::memoria::{BoostSearchHit, parse_memory_search_hits};
+pub use astra_tools::memoria::{
+    BoostSearchHit, parse_memory_search_hits,
+    // Cloud helpers — single source of truth in astra-tools
+    memoria_snapshot_create, memoria_snapshot_rollback, memoria_snapshot_diff,
+    memoria_snapshots_list, memoria_branch_create, memoria_branch_checkout,
+    memoria_branch_merge, memoria_branch_diff, memoria_branches_list,
+    memoria_reflect, memoria_health, memoria_oneshot_client,
+};
 
 impl ToolExecutor {
     pub(super) async fn memoria_call(&self, op: &str, args: &Value) -> String {
@@ -23,7 +30,7 @@ impl ToolExecutor {
         args: &Value,
         timeout: Duration,
     ) -> String {
-        // Circuit breaker: skip after 2 consecutive failures (reset on success)
+        // CLI-specific circuit breaker with user notification.
         const MAX_FAILS: u32 = 2;
         if self
             .memoria_fail_count
@@ -43,111 +50,33 @@ impl ToolExecutor {
             return json!({"error": "Memory service unavailable (circuit open)"}).to_string();
         }
 
-        // Normalize business category types before ANY dispatch path (cloud or direct).
-        // Single source of truth: astra_prompts::memory_types::normalize_memoria_type.
-        let args = &{
-            let mut a = args.clone();
-            if op == "store" {
-                if let Some(obj) = a.as_object_mut() {
-                    if let Some(raw) = obj.get("memory_type").and_then(Value::as_str).map(String::from) {
-                        let mapped = astra_prompts::memory_types::normalize_memoria_type(&raw);
-                        obj.insert("memory_type".to_string(), Value::String(mapped.to_string()));
-                    }
-                }
-            }
-            a
-        };
-
-        // Build endpoint and payload
+        // Delegate to the shared MemoriaClient (single source of truth for
+        // build_direct_request, type normalization, and HTTP method routing).
         let cloud_token = self.cloud_token();
-        let (endpoint, payload, auth_header, _method) = if let (Some(cloud_base), Some(token)) =
-            (&self.cloud_base, cloud_token.as_deref())
-        {
-            // Cloud proxy handles method routing server-side; always POST.
-            (
-                format!("{cloud_base}/memory/{op}"),
-                args.clone(),
-                format!("Bearer {token}"),
-                HttpMethod::Post,
-            )
+        let client = astra_tools::memoria::MemoriaClient::new(
+            self.cloud_base.clone(),
+            cloud_token,
+        );
+        let result = client.call_with_timeout(op, args, timeout).await;
+
+        // CLI-specific: update circuit breaker + user notification
+        if result.contains("\"error\"") {
+            self.memoria_fail_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         } else {
-            let base = std::env::var("MEMORIA_BASE_URL")
-                .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
-            let key = match std::env::var("MEMORIA_MASTER_KEY").ok() {
-                Some(k) => k,
-                None => {
-                    return json!({
-                            "error": "Memory unavailable: not connected to cloud and MEMORIA_MASTER_KEY not set",
-                            "hint": "Login with /login to enable cloud-backed memory with user isolation"
-                        })
-                        .to_string();
-                }
-            };
-
-            let (ep, pl, _method) = build_direct_request(&base, op, args);
-            (ep, pl, format!("Bearer {key}"), _method)
-        };
-
-        match reqwest::Client::builder()
-            .timeout(timeout)
-            .no_proxy()
-            .build()
-        {
-            Ok(client) => {
-                let req = match _method {
-                    HttpMethod::Get => client.get(&endpoint).header("Authorization", &auth_header),
-                    HttpMethod::Put => client
-                        .put(&endpoint)
-                        .header("Authorization", &auth_header)
-                        .json(&payload),
-                    HttpMethod::Post => client
-                        .post(&endpoint)
-                        .header("Authorization", &auth_header)
-                        .json(&payload),
-                };
-                match req.send().await {
-                    Ok(resp) => match resp.text().await {
-                        Ok(text) => {
-                            self.memoria_fail_count
-                                .store(0, std::sync::atomic::Ordering::Relaxed);
-                            if self
-                                .memoria_notified_down
-                                .swap(false, std::sync::atomic::Ordering::Relaxed)
-                            {
-                                eprintln!(
-                                    "  {} Memoria memory service reconnected.",
-                                    crossterm::style::Stylize::green("✓"),
-                                );
-                            }
-                            text
-                        }
-                        Err(e) => {
-                            self.memoria_fail_count
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            json!({"error": format!("read response: {e}")}).to_string()
-                        }
-                    },
-                    Err(e) => {
-                        let prev = self
-                            .memoria_fail_count
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if prev + 1 >= MAX_FAILS
-                            && !self
-                                .memoria_notified_down
-                                .swap(true, std::sync::atomic::Ordering::Relaxed)
-                        {
-                            eprintln!(
-                                "  {} Memoria memory service is unreachable — memory features \
-                             disabled for this session. Check MEMORIA_BASE_URL or /info.",
-                                crossterm::style::Stylize::yellow("⚠"),
-                            );
-                        }
-                        json!({"error": format!("memoria request failed: {e}")}).to_string()
-                    }
-                }
+            self.memoria_fail_count
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            if self
+                .memoria_notified_down
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                eprintln!(
+                    "  {} Memoria memory service reconnected.",
+                    crossterm::style::Stylize::green("✓"),
+                );
             }
-            Err(e) => json!({"error": format!("build client: {e}")}).to_string(),
         }
+        result
     }
 
     pub async fn memory_boost_search(&self, query: &str, top_k: u64) -> Vec<BoostSearchHit> {
@@ -253,130 +182,15 @@ impl ToolExecutor {
     }
 }
 
-/// HTTP method for Memoria API calls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HttpMethod {
-    Post,
-    Put,
-    Get,
+// HttpMethod + build_direct_request moved to astra_tools::memoria::MemoriaClient
+// (single source of truth for CLI and server).
+use astra_tools::memoria::HttpMethod;
+
+fn build_direct_request(base: &str, op: &str, args: &Value) -> (String, Value, HttpMethod) {
+    astra_tools::memoria::MemoriaClient::build_direct_request(base, op, args)
 }
 
-/// Build endpoint URL, JSON payload, and HTTP method for a direct Memoria API call.
-fn build_direct_request(base: &str, op: &str, args: &Value) -> (String, Value, HttpMethod) {
-    match op {
-        "retrieve" => {
-            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-            let top_k = args.get("top_k").and_then(Value::as_u64).unwrap_or(5);
-            let mut pl = json!({"query": query, "top_k": top_k});
-            if let Some(mc) = args.get("min_confidence").and_then(Value::as_f64) {
-                pl["min_confidence"] = json!(mc);
-            }
-            if let Some(sid) = args.get("session_id").and_then(Value::as_str) {
-                pl["session_id"] = json!(sid);
-            }
-            // Forward filter_session and include_cross_session for session-scoped retrieval
-            if let Some(fs) = args.get("filter_session").and_then(Value::as_bool) {
-                pl["filter_session"] = json!(fs);
-            }
-            if let Some(ics) = args.get("include_cross_session").and_then(Value::as_bool) {
-                pl["include_cross_session"] = json!(ics);
-            }
-            (format!("{base}/v1/memories/retrieve"), pl, HttpMethod::Post)
-        }
-        "store" => {
-            let content = args.get("content").and_then(Value::as_str).unwrap_or("");
-            let raw_type = args
-                .get("memory_type")
-                .and_then(Value::as_str)
-                .unwrap_or("semantic");
-            let memory_type = astra_prompts::memory_types::normalize_memoria_type(raw_type);
-            let mut payload = json!({"content": content, "memory_type": memory_type});
-            // Forward trust_tier and session_id when provided by the LLM
-            if let Some(tier) = args.get("trust_tier").and_then(Value::as_str) {
-                payload["trust_tier"] = json!(tier);
-            }
-            if let Some(sid) = args.get("session_id").and_then(Value::as_str) {
-                payload["session_id"] = json!(sid);
-            }
-            (format!("{base}/v1/memories"), payload, HttpMethod::Post)
-        }
-        "search" => {
-            // Route to /v1/memories/retrieve (not /search) so session_id and
-            // filter_session are honoured by the Memoria API.
-            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-            let top_k = args.get("top_k").and_then(Value::as_u64).unwrap_or(10);
-            let mut pl = json!({"query": query, "top_k": top_k});
-            if let Some(mc) = args.get("min_confidence").and_then(Value::as_f64) {
-                pl["min_confidence"] = json!(mc);
-            }
-            if let Some(sid) = args.get("session_id").and_then(Value::as_str) {
-                pl["session_id"] = json!(sid);
-            }
-            if let Some(fs) = args.get("filter_session").and_then(Value::as_bool) {
-                pl["filter_session"] = json!(fs);
-            }
-            if let Some(ics) = args.get("include_cross_session").and_then(Value::as_bool) {
-                pl["include_cross_session"] = json!(ics);
-            }
-            (format!("{base}/v1/memories/retrieve"), pl, HttpMethod::Post)
-        }
-        "purge" => {
-            let topic = args.get("topic").and_then(Value::as_str).unwrap_or("");
-            let reason = args
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("user request");
-            (
-                format!("{base}/v1/memories/purge"),
-                json!({"topic": topic, "reason": reason}),
-                HttpMethod::Post,
-            )
-        }
-        "correct" => {
-            let new_content = args
-                .get("new_content")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let reason = args
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("correction");
-            if let Some(memory_id) = args
-                .get("memory_id")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
-                (
-                    format!("{base}/v1/memories/{memory_id}/correct"),
-                    json!({"new_content": new_content, "reason": reason}),
-                    HttpMethod::Put,
-                )
-            } else if let Some(query) = args
-                .get("query")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
-                (
-                    format!("{base}/v1/memories/correct"),
-                    json!({"query": query, "new_content": new_content, "reason": reason}),
-                    HttpMethod::Post,
-                )
-            } else {
-                (
-                    String::new(),
-                    json!({"error": "memory_correct requires either memory_id or query"}),
-                    HttpMethod::Post,
-                )
-            }
-        }
-        "profile" => (format!("{base}/v1/profiles/me"), json!({}), HttpMethod::Get),
-        _ => (
-            String::new(),
-            json!({"error": format!("Unknown memoria op: {op}")}),
-            HttpMethod::Post,
-        ),
-    }
-}
+// Old build_direct_request body (120 lines) removed.
 
 #[cfg(test)]
 mod build_direct_request_tests {
@@ -490,67 +304,22 @@ mod build_direct_request_tests {
         assert_eq!(pl["memory_type"], "profile");
     }
 
-    // ── Cloud helper endpoint contracts ──
+    // ── Cloud helpers now in astra-tools (single source of truth) ──
 
     #[test]
-    fn cloud_helpers_use_correct_endpoints() {
-        let src = include_str!("memoria.rs");
-        assert!(src.contains("\"/v1/snapshots\""), "snapshot_create endpoint");
-        assert!(src.contains("/v1/snapshots/{name}/rollback"), "rollback endpoint");
-        assert!(src.contains("/v1/snapshots/{name}/diff"), "snapshot diff endpoint");
-        assert!(src.contains("\"/v1/branches\""), "branch_create endpoint");
-        assert!(src.contains("/v1/branches/{name}/checkout"), "checkout endpoint");
-        assert!(src.contains("/v1/branches/{name}/merge"), "merge endpoint");
-        assert!(src.contains("/v1/branches/{name}/diff"), "branch diff endpoint");
-        assert!(src.contains("\"/v1/reflect\""), "reflect endpoint");
-        assert!(src.contains("\"/v1/health/analyze\""), "health endpoint");
-    }
-
-    #[test]
-    fn cloud_helpers_all_public() {
-        let src = include_str!("memoria.rs");
-        assert!(src.contains("pub async fn memoria_snapshot_create"));
-        assert!(src.contains("pub async fn memoria_snapshot_rollback"));
-        assert!(src.contains("pub async fn memoria_snapshot_diff"));
-        assert!(src.contains("pub async fn memoria_snapshots_list"));
-        assert!(src.contains("pub async fn memoria_branch_create"));
-        assert!(src.contains("pub async fn memoria_branch_checkout"));
-        assert!(src.contains("pub async fn memoria_branch_merge"));
-        assert!(src.contains("pub async fn memoria_branch_diff"));
-        assert!(src.contains("pub async fn memoria_branches_list"));
-        assert!(src.contains("pub async fn memoria_reflect"));
-        assert!(src.contains("pub async fn memoria_health"));
-    }
-
-    #[test]
-    fn cloud_helpers_use_generic_request() {
-        let src = include_str!("memoria.rs");
-        assert!(
-            src.contains("async fn memoria_cloud_request("),
-            "should have a shared memoria_cloud_request helper"
-        );
-        assert!(
-            src.contains("memoria_cloud_request(HttpMethod::"),
-            "cloud helpers should delegate to memoria_cloud_request"
-        );
+    fn cloud_helpers_are_re_exported_from_shared() {
+        // These re-exports prove the shared module exposes all cloud helpers.
+        // If any is removed from astra-tools, this file won't compile.
+        let _ = memoria_snapshot_create as fn(&str) -> _;
+        let _ = memoria_branch_create as fn(&str) -> _;
+        let _ = memoria_reflect as fn() -> _;
+        let _ = memoria_health as fn() -> _;
     }
 }
 
 /// Public accessor for session_cleanup's working-memory purge.
 pub fn memoria_oneshot_client_pub(timeout_secs: u64) -> Option<(reqwest::Client, String, String)> {
-    memoria_oneshot_client(timeout_secs)
-}
-
-fn memoria_oneshot_client(timeout_secs: u64) -> Option<(reqwest::Client, String, String)> {
-    let base = std::env::var("MEMORIA_BASE_URL")
-        .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
-    let key = std::env::var("MEMORIA_MASTER_KEY").ok()?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(timeout_secs))
-        .no_proxy()
-        .build()
-        .ok()?;
-    Some((client, base, key))
+    astra_tools::memoria::memoria_oneshot_client(timeout_secs)
 }
 
 /// Retrieve procedural/semantic lessons from Memoria for session bootstrap.
@@ -628,40 +397,10 @@ pub async fn memoria_retrieve_lessons(
         .collect()
 }
 
-/// Fire-and-forget: trigger Memoria governance (quarantine low-confidence,
-/// clean stale data). Called at session end. Server has 1-hour cooldown.
-pub async fn memoria_governance_fire_and_forget() {
-    let Some((client, base, key)) = memoria_oneshot_client(10) else {
-        return;
-    };
-    if let Err(e) = client
-        .post(format!("{base}/v1/governance"))
-        .header("Authorization", format!("Bearer {key}"))
-        .json(&json!({"force": false}))
-        .send()
-        .await
-    {
-        eprintln!("[memoria] governance trigger failed: {e}");
-    }
-}
-
-/// Fire-and-forget: trigger Memoria graph consolidation (merge duplicates,
-/// detect contradictions, fix orphaned nodes, promote trust tiers).
-/// Called at session end. Server has 30-minute cooldown.
-pub async fn memoria_consolidate_fire_and_forget() {
-    let Some((client, base, key)) = memoria_oneshot_client(15) else {
-        return;
-    };
-    if let Err(e) = client
-        .post(format!("{base}/v1/consolidate"))
-        .header("Authorization", format!("Bearer {key}"))
-        .json(&json!({"force": false}))
-        .send()
-        .await
-    {
-        eprintln!("[memoria] consolidation trigger failed: {e}");
-    }
-}
+pub use astra_tools::memoria::{
+    memoria_governance_fire_and_forget,
+    memoria_consolidate_fire_and_forget,
+};
 
 /// Store extracted lessons in Memoria as L3 durable memory using the
 /// batch endpoint (Session Memory Protocol §6.2). Single HTTP call for
@@ -708,77 +447,5 @@ pub async fn memoria_store_lessons_fire_and_forget(
     }
 }
 
-// ── Cloud memory helpers (snapshots, branches, reflect, health) ──────────
-
-async fn memoria_cloud_request(
-    method: HttpMethod,
-    path: &str,
-    timeout_secs: u64,
-    body: Option<serde_json::Value>,
-) -> Result<String, String> {
-    let (client, base, key) = memoria_oneshot_client(timeout_secs).ok_or("Memoria not configured")?;
-    let url = format!("{base}{path}");
-    let req = match method {
-        HttpMethod::Get => client.get(&url),
-        HttpMethod::Post => client.post(&url),
-        HttpMethod::Put => client.put(&url),
-    };
-    let req = req.header("Authorization", format!("Bearer {key}"));
-    let req = if let Some(b) = body {
-        req.json(&b)
-    } else {
-        req
-    };
-    let resp = req.send().await.map_err(|e| format!("request failed: {e}"))?;
-    let status = resp.status();
-    let resp_body = resp.text().await.unwrap_or_default();
-    if status.is_success() {
-        Ok(resp_body)
-    } else {
-        Err(format!("({status}) {resp_body}"))
-    }
-}
-
-pub async fn memoria_snapshot_create(name: &str) -> Result<String, String> {
-    memoria_cloud_request(HttpMethod::Post, "/v1/snapshots", 5, Some(json!({"name": name}))).await
-}
-
-pub async fn memoria_snapshot_rollback(name: &str) -> Result<String, String> {
-    memoria_cloud_request(HttpMethod::Post, &format!("/v1/snapshots/{name}/rollback"), 10, None).await
-}
-
-pub async fn memoria_snapshot_diff(name: &str) -> Result<String, String> {
-    memoria_cloud_request(HttpMethod::Get, &format!("/v1/snapshots/{name}/diff"), 5, None).await
-}
-
-pub async fn memoria_snapshots_list() -> Result<String, String> {
-    memoria_cloud_request(HttpMethod::Get, "/v1/snapshots", 5, None).await
-}
-
-pub async fn memoria_branch_create(name: &str) -> Result<String, String> {
-    memoria_cloud_request(HttpMethod::Post, "/v1/branches", 5, Some(json!({"name": name}))).await
-}
-
-pub async fn memoria_branch_checkout(name: &str) -> Result<String, String> {
-    memoria_cloud_request(HttpMethod::Post, &format!("/v1/branches/{name}/checkout"), 5, None).await
-}
-
-pub async fn memoria_branch_merge(name: &str) -> Result<String, String> {
-    memoria_cloud_request(HttpMethod::Post, &format!("/v1/branches/{name}/merge"), 5, None).await
-}
-
-pub async fn memoria_branch_diff(name: &str) -> Result<String, String> {
-    memoria_cloud_request(HttpMethod::Get, &format!("/v1/branches/{name}/diff"), 5, None).await
-}
-
-pub async fn memoria_branches_list() -> Result<String, String> {
-    memoria_cloud_request(HttpMethod::Get, "/v1/branches", 5, None).await
-}
-
-pub async fn memoria_reflect() -> Result<String, String> {
-    memoria_cloud_request(HttpMethod::Post, "/v1/reflect", 15, Some(json!({"mode": "auto"}))).await
-}
-
-pub async fn memoria_health() -> Result<String, String> {
-    memoria_cloud_request(HttpMethod::Get, "/v1/health/analyze", 5, None).await
-}
+// Cloud memory helpers (snapshot, branch, reflect, health) now live in
+// astra_tools::memoria — re-exported at the top of this file.
