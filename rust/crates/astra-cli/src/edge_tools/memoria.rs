@@ -43,6 +43,26 @@ impl ToolExecutor {
             return json!({"error": "Memory service unavailable (circuit open)"}).to_string();
         }
 
+        // Map business category types before ANY dispatch path (cloud or direct).
+        let args = &{
+            let mut a = args.clone();
+            if op == "store" {
+                if let Some(obj) = a.as_object_mut() {
+                    if let Some(raw) = obj.get("memory_type").and_then(Value::as_str).map(String::from) {
+                        let mapped = match raw.as_str() {
+                            "user" => "profile",
+                            "feedback" | "project" | "lesson" => "semantic",
+                            "ref" | "reference" => "procedural",
+                            "episode" => "episodic",
+                            other => other,
+                        };
+                        obj.insert("memory_type".to_string(), Value::String(mapped.to_string()));
+                    }
+                }
+            }
+            a
+        };
+
         // Build endpoint and payload
         let cloud_token = self.cloud_token();
         let (endpoint, payload, auth_header, _method) = if let (Some(cloud_base), Some(token)) =
