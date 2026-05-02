@@ -2603,9 +2603,44 @@ document.querySelectorAll('.input-mode-btn').forEach(btn => {
 });
 
 inputSend.addEventListener('click', sendInput);
+
+// Command history (↑/↓ arrows)
+const cmdHistory = [];
+let cmdHistoryIdx = -1;
+let cmdDraft = '';
+
 inputText.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendInput(); }
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    const msg = inputText.value.trim();
+    if (msg) {
+      cmdHistory.push(msg);
+      cmdHistoryIdx = cmdHistory.length;
+      // Persist to sessionStorage
+      try { sessionStorage.setItem('astra_cmd_history', JSON.stringify(cmdHistory)); } catch {}
+    }
+    sendInput();
+  } else if (e.key === 'ArrowUp') {
+    if (cmdHistoryIdx > 0) {
+      if (cmdHistoryIdx === cmdHistory.length) cmdDraft = inputText.value;
+      cmdHistoryIdx--;
+      inputText.value = cmdHistory[cmdHistoryIdx];
+      e.preventDefault();
+    }
+  } else if (e.key === 'ArrowDown') {
+    if (cmdHistoryIdx < cmdHistory.length) {
+      cmdHistoryIdx++;
+      inputText.value = cmdHistoryIdx === cmdHistory.length ? cmdDraft : cmdHistory[cmdHistoryIdx];
+      e.preventDefault();
+    }
+  }
 });
+
+// Restore history from sessionStorage
+try {
+  const saved = JSON.parse(sessionStorage.getItem('astra_cmd_history') || '[]');
+  if (Array.isArray(saved)) { cmdHistory.push(...saved); cmdHistoryIdx = cmdHistory.length; }
+} catch {}
 
 // Welcome suggestion buttons
 document.querySelectorAll('.suggestion-btn').forEach(btn => {
