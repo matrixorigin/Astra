@@ -127,4 +127,34 @@ impl ChatCell for AssistantChatCell {
 
         lines
     }
+
+    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+
+        // Include thinking content (hidden in display_lines)
+        if !self.thinking_chunks.is_empty() {
+            let dim_italic = Style::default().dim().add_modifier(ratatui::style::Modifier::ITALIC);
+            let elapsed = self.thinking_elapsed_str();
+            lines.push(Line::from(Span::styled(
+                format!("  │ Thinking ({elapsed})"), dim_italic,
+            )));
+            let full = self.thinking_chunks.join("");
+            for text_line in full.lines().take(20) {
+                let preview: String = text_line.chars().take(width as usize - 6).collect();
+                lines.push(Line::from(Span::styled(
+                    format!("  │ {preview}"), dim_italic,
+                )));
+            }
+            if full.lines().count() > 20 {
+                lines.push(Line::from(Span::styled(
+                    format!("  │ … +{} more lines", full.lines().count() - 20), dim_italic,
+                )));
+            }
+            lines.push(Line::default());
+        }
+
+        // Then the normal display content
+        lines.extend(self.display_lines(width));
+        lines
+    }
 }

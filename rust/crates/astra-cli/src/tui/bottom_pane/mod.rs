@@ -8,6 +8,7 @@ pub(crate) mod list_selection_view;
 pub(crate) mod skill_popup;
 pub(crate) mod slash_popup;
 pub(crate) mod textarea;
+pub(crate) mod transcript_view;
 pub(crate) mod view;
 
 use chat_composer::{ChatComposer, ComposerAction};

@@ -48,18 +48,27 @@ use event::{TuiEvent, TuiEventStream};
 use frame_requester::FrameRequester;
 
 /// Flush a completed cell to terminal scrollback with trailing blank lines.
+/// Also appends transcript_lines to the transcript log.
 fn flush_cell_to_scrollback(
     guard: &mut TerminalGuard,
     cell: Box<dyn ChatCell>,
     width: u16,
+    transcript: &mut Vec<ratatui::text::Line<'static>>,
 ) {
-    let lines = cell.display_lines(width);
-    if !lines.is_empty() {
+    let display = cell.display_lines(width);
+    let trans = cell.transcript_lines(width);
+
+    if !display.is_empty() {
         let mut hist = Vec::new();
-        hist.extend(lines);
+        hist.extend(display);
         hist.push(ratatui::text::Line::default());
         hist.push(ratatui::text::Line::default());
         guard.queue_history_lines(hist);
+    }
+
+    if !trans.is_empty() {
+        transcript.extend(trans);
+        transcript.push(ratatui::text::Line::default());
     }
 }
 
@@ -152,6 +161,7 @@ pub(crate) async fn run_tui_repl(
 
     let mut active_cell: Option<Box<dyn ChatCell>> = None;
     let mut stream_controller: Option<StreamController> = None;
+    let mut transcript: Vec<ratatui::text::Line<'static>> = Vec::new();
 
     frame_requester.schedule_frame();
 
@@ -163,10 +173,27 @@ pub(crate) async fn run_tui_repl(
             Some(ev) = event_stream.next() => {
                 match ev {
                     TuiEvent::Key(key) => {
+                        // Ctrl+O: open transcript view
+                        if key.code == crossterm::event::KeyCode::Char('o')
+                            && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                            && !bottom_pane.has_active_view()
+                        {
+                            use bottom_pane::transcript_view::TranscriptView;
+                            if transcript.is_empty() {
+                                // nothing to show
+                            } else {
+                                bottom_pane.push_view(Box::new(TranscriptView::new(transcript.clone())));
+                            }
+                            frame_requester.schedule_frame();
+                            continue;
+                        }
                         match bottom_pane.handle_key(key) {
                             BottomPaneAction::SubmitInput(text) if active_cell.is_none() => {
                                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                let user_lines = UserChatCell::new(text.clone()).display_lines(w);
+                                let user_cell = UserChatCell::new(text.clone());
+                                let user_lines = user_cell.display_lines(w);
+                                transcript.extend(user_cell.transcript_lines(w));
+                                transcript.push(ratatui::text::Line::default());
                                 guard.queue_history_lines(user_lines);
 
                                 do_draw(&mut guard, &active_cell, &mut bottom_pane)?;
@@ -211,6 +238,14 @@ pub(crate) async fn run_tui_repl(
                                     active_cell = Some(Box::new(ac));
                                     stream_controller = Some(StreamController::new(Some(w as usize)));
                                     bottom_pane.set_task_status(TaskStatus::WaitingModel);
+                                    let turn_start = std::time::Instant::now();
+                                    let pre_prompt_tokens = state.total_prompt_tokens;
+                                    let pre_completion_tokens = state.total_completion_tokens;
+                                    let pre_cost = state.total_session_cost;
+                                    let pre_cache_read = state.total_cache_read_tokens;
+                                    let pre_cache_creation = state.total_cache_creation_tokens;
+                                    let mut turn_tool_count: u32 = 0;
+                                    let mut turn_ttft: Option<std::time::Instant> = None;
 
                                     let turn_tx = stream_bridge::create_per_turn_bridge(tui_tx.clone());
                                     state.tui_stream_event_tx = Some(turn_tx);
@@ -249,8 +284,20 @@ pub(crate) async fn run_tui_repl(
                                                     }
                                                 }
                                                 Some(ae) = tui_rx.recv() => {
+                                                    // Track per-turn metrics
+                                                    match &ae {
+                                                        TuiAppEvent::Token(_) => {
+                                                            if turn_ttft.is_none() {
+                                                                turn_ttft = Some(std::time::Instant::now());
+                                                            }
+                                                        }
+                                                        TuiAppEvent::ToolStarted { .. } => {
+                                                            turn_tool_count += 1;
+                                                        }
+                                                        _ => {}
+                                                    }
                                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                                    handle_app_event(ae, &mut guard, w, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester);
+                                                    handle_app_event(ae, &mut guard, w, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester, &mut transcript);
                                                     let _ = do_draw(&mut guard, &active_cell, &mut bottom_pane);
                                                 }
                                                 Some(req) = approval_rx.recv() => {
@@ -282,7 +329,7 @@ pub(crate) async fn run_tui_repl(
                                     loop {
                                         match tui_rx.recv().await {
                                             Some(TuiAppEvent::TurnComplete) | None => break,
-                                            Some(ae) => handle_app_event(ae, &mut guard, w, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester),
+                                            Some(ae) => handle_app_event(ae, &mut guard, w, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester, &mut transcript),
                                         }
                                     }
 
@@ -292,7 +339,7 @@ pub(crate) async fn run_tui_repl(
                                     // Flush final active cell → scrollback
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                     if let Some(cell) = active_cell.take() {
-                                        flush_cell_to_scrollback(&mut guard, cell, w);
+                                        flush_cell_to_scrollback(&mut guard, cell, w, &mut transcript);
                                     }
 
                                     bottom_pane.set_task_status(TaskStatus::Idle);
@@ -305,6 +352,29 @@ pub(crate) async fn run_tui_repl(
                                     if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.clone()); }
                                     if let Some(ref s) = state.session_id { bottom_pane.footer.session_id = Some(s[..8.min(s.len())].to_string()); }
                                     bottom_pane.footer.token_usage = Some(format!("{}↑ {}↓", state.total_prompt_tokens, state.total_completion_tokens));
+
+                                    // Turn summary separator
+                                    {
+                                        let turn_prompt = state.total_prompt_tokens - pre_prompt_tokens;
+                                        let turn_completion = state.total_completion_tokens - pre_completion_tokens;
+                                        let turn_cost = state.total_session_cost - pre_cost;
+                                        let turn_cache_read = state.total_cache_read_tokens - pre_cache_read;
+                                        let turn_cache_creation = state.total_cache_creation_tokens - pre_cache_creation;
+                                        let elapsed = turn_start.elapsed();
+                                        let ttft_ms = turn_ttft.map(|t| {
+                                            t.duration_since(turn_start).as_millis() as u64
+                                        });
+                                        let summary = format_turn_summary(
+                                            &state, turn_prompt, turn_completion,
+                                            turn_cache_read, turn_cache_creation,
+                                            turn_cost, elapsed, ttft_ms, turn_tool_count,
+                                        );
+                                        let dim = ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray);
+                                        let line = ratatui::text::Line::from(
+                                            ratatui::text::Span::styled(summary, dim),
+                                        );
+                                        guard.queue_history_lines(vec![line, ratatui::text::Line::default()]);
+                                    }
 
                                     let new_tok = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
                                     tui_cancel_token = new_tok.clone();
@@ -348,7 +418,7 @@ pub(crate) async fn run_tui_repl(
             }
             Some(ae) = tui_rx.recv() => {
                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                handle_app_event(ae, &mut guard, w, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester);
+                handle_app_event(ae, &mut guard, w, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester, &mut transcript);
             }
             _ = &mut tick => {
                 drain_tick(&mut stream_controller, &mut active_cell, &frame_requester);
@@ -382,12 +452,19 @@ fn do_draw(
         None => RenderableItem::Owned(Box::new(())),
     };
 
+    // Thin dim separator between scrollback area and composer
+    let sep_line = ratatui::text::Line::from(ratatui::text::Span::styled(
+        "─".repeat(width as usize),
+        ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
+    ));
+    let sep_renderable = RenderableItem::Owned(Box::new(sep_line));
+
     let bp_renderable = BottomPaneRenderable(bottom_pane);
-    let bp_item = RenderableItem::Owned(Box::new(bp_renderable) as Box<dyn Renderable>)
-        .inset(Insets::tlbr(1, 0, 0, 0));
+    let bp_item = RenderableItem::Owned(Box::new(bp_renderable) as Box<dyn Renderable>);
 
     let mut flex = FlexRenderable::new();
     flex.push(1, ac_renderable);
+    flex.push(0, sep_renderable);
     flex.push(0, bp_item);
 
     let total_h = flex.desired_height(width);
@@ -414,6 +491,7 @@ fn handle_app_event(
     active_cell: &mut Option<Box<dyn ChatCell>>,
     bottom_pane: &mut BottomPane,
     fr: &FrameRequester,
+    transcript: &mut Vec<ratatui::text::Line<'static>>,
 ) {
     match ev {
         TuiAppEvent::Token(text) => {
@@ -425,7 +503,7 @@ fn handle_app_event(
                 .unwrap_or(false);
             if need_new_assistant {
                 if let Some(cell) = active_cell.take() {
-                    flush_cell_to_scrollback(guard, cell, width);
+                    flush_cell_to_scrollback(guard, cell, width, transcript);
                 }
                 let ac = AssistantChatCell::from_rendered(vec![]);
                 *active_cell = Some(Box::new(ac));
@@ -458,7 +536,7 @@ fn handle_app_event(
                 .unwrap_or(false);
             if is_tool {
                 if let Some(cell) = active_cell.take() {
-                    flush_cell_to_scrollback(guard, cell, width);
+                    flush_cell_to_scrollback(guard, cell, width, transcript);
                 }
             }
 
@@ -503,7 +581,7 @@ fn handle_app_event(
             // Flush current cell (assistant text before tool) to scrollback
             finalize_stream_controller(sc, active_cell);
             if let Some(cell) = active_cell.take() {
-                flush_cell_to_scrollback(guard, cell, width);
+                flush_cell_to_scrollback(guard, cell, width, transcript);
             }
 
             *active_cell = Some(Box::new(ToolChatCell::new_running(name.clone(), description)));
@@ -544,6 +622,82 @@ fn drain_tick(
 }
 
 use ratatui::widgets::Widget;
+
+fn format_turn_summary(
+    state: &crate::repl_state::ReplState,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+    turn_cost: f64,
+    elapsed: std::time::Duration,
+    ttft_ms: Option<u64>,
+    tool_count: u32,
+) -> String {
+    let elapsed_str = if elapsed.as_secs() >= 60 {
+        format!("{}m{:.0}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    };
+
+    let total_input = prompt_tokens + cache_read_tokens + cache_creation_tokens;
+    let total_tokens = total_input + completion_tokens;
+    let tokens_str = if total_tokens > 1000 {
+        format!("{:.1}k", total_tokens as f64 / 1000.0)
+    } else {
+        format!("{total_tokens}")
+    };
+    let prompt_short = if total_input > 1000 {
+        format!("{:.1}k", total_input as f64 / 1000.0)
+    } else {
+        format!("{total_input}")
+    };
+    let completion_short = if completion_tokens > 1000 {
+        format!("{:.1}k", completion_tokens as f64 / 1000.0)
+    } else {
+        format!("{completion_tokens}")
+    };
+
+    let mut parts = Vec::new();
+
+    if let Some(ref model) = state.model {
+        parts.push(format!("model:{model}"));
+    }
+
+    parts.push(format!("tokens:{tokens_str} (↑{prompt_short} ↓{completion_short})"));
+
+    if turn_cost > 0.0 {
+        parts.push(crate::slash_stats::format_cost(turn_cost));
+    }
+
+    parts.push(elapsed_str);
+
+    if let Some(ttft) = ttft_ms {
+        if ttft > 0 {
+            parts.push(format!("ttft:{ttft}ms"));
+        }
+    }
+
+    if tool_count > 0 {
+        parts.push(format!(
+            "{} tool{}",
+            tool_count,
+            if tool_count == 1 { "" } else { "s" }
+        ));
+    }
+
+    if cache_read_tokens > 0 {
+        let cache_pct = cache_read_tokens as f64 / total_input.max(1) as f64 * 100.0;
+        parts.push(format!("cache:{cache_pct:.0}%"));
+    }
+
+    let session_cost = state.total_session_cost;
+    let mut line = format!("  ─ {} ─", parts.join(" │ "));
+    if session_cost > 0.0 && state.turn > 0 {
+        line.push_str(&format!("  session: {}", crate::slash_stats::format_cost(session_cost)));
+    }
+    line
+}
 
 struct BottomPaneRenderable<'a>(&'a mut BottomPane);
 

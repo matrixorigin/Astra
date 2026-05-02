@@ -73,9 +73,9 @@ impl Footer {
         let mut left_parts: Vec<Span> = Vec::new();
         left_parts.push(Span::raw("  ")); // 2-space indent
         if self.is_turn_active {
-            left_parts.push(Span::styled("⏹ interrupt", dim));
+            left_parts.push(Span::styled("Ctrl+C interrupt", dim));
         } else {
-            left_parts.push(Span::styled("? for shortcuts", dim));
+            left_parts.push(Span::styled("/ commands · $ skills · Ctrl+O transcript", dim));
         }
 
         // Compose: left ... padding ... right
