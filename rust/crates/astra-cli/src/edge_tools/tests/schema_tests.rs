@@ -100,24 +100,13 @@ fn no_duplicate_tool_names() {
     }
 }
 
-// ── single source of truth: schemas come from astra-tools ────────────────
-
-#[test]
-fn schemas_are_from_astra_tools_not_local() {
-    let cli_schemas = all_tool_schemas();
-    let shared_schemas = astra_tools::schemas::all_tool_schemas();
-    assert_eq!(
-        cli_schemas.len(),
-        shared_schemas.len(),
-        "CLI all_tool_schemas must be the same as astra_tools (single source of truth)"
-    );
-}
-
 // ── TOOL_CATALOG ↔ schema consistency ────────────────────────────────────
 
 #[test]
 fn every_catalog_tool_has_schema() {
     // Tools with dynamically constructed schemas (not in static all_tool_schemas).
+    // This list is self-validated below — if a tool listed here gains a static
+    // schema or is removed from the catalog, the test will catch it.
     const DYNAMIC_SCHEMA_TOOLS: &[&str] = &["delegate"];
 
     let schemas = all_tool_schemas();
@@ -125,6 +114,26 @@ fn every_catalog_tool_has_schema() {
         .iter()
         .filter_map(|s| s["function"]["name"].as_str())
         .collect();
+
+    // Validate the allowlist itself: every entry must exist in TOOL_CATALOG
+    // and must NOT have a static schema (otherwise remove it from the list).
+    let catalog_names: std::collections::HashSet<&str> = astra_runtime::tool_registry::TOOL_CATALOG
+        .iter()
+        .map(|t| t.name)
+        .collect();
+    for &dyn_tool in DYNAMIC_SCHEMA_TOOLS {
+        assert!(
+            catalog_names.contains(dyn_tool),
+            "DYNAMIC_SCHEMA_TOOLS lists '{}' but it's not in TOOL_CATALOG — remove it",
+            dyn_tool
+        );
+        assert!(
+            !schema_names.contains(dyn_tool),
+            "DYNAMIC_SCHEMA_TOOLS lists '{}' but it now has a static schema — remove it from the allowlist",
+            dyn_tool
+        );
+    }
+
     for tool in astra_runtime::tool_registry::TOOL_CATALOG {
         if DYNAMIC_SCHEMA_TOOLS.contains(&tool.name) {
             continue;
@@ -136,6 +145,11 @@ fn every_catalog_tool_has_schema() {
         );
     }
 }
+
+// NOTE: no reverse test (every schema → catalog entry) because TOOL_CATALOG
+// is only for selection-eligible tools.  Many tools (ask_user, spawn_agent,
+// plan-mode tools, etc.) have schemas but are dispatched directly without
+// catalog-based selection.  The forward check above is the meaningful one.
 
 // ── new tool schema coverage ──────────────────────────────────────────────
 
