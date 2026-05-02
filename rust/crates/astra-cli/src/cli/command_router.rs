@@ -1421,12 +1421,17 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
         }
     }
 
-    // Check for tool failures — only if the LAST tool call failed.
-    // Intermediate failures followed by successful retries are normal
-    // agent self-correction behavior and should not mark the run as failed.
-    if let Some(last) = sr.tool_call_records.last() {
-        if !last.ok {
-            return ExitCode::ToolFailure;
+    // Check for unrecovered tool failures. A failed tool call that was
+    // later retried successfully (same tool name) is normal agent
+    // self-correction and should not mark the run as failed.
+    for (i, record) in sr.tool_call_records.iter().enumerate() {
+        if !record.ok {
+            let later_success = sr.tool_call_records[i + 1..]
+                .iter()
+                .any(|r| r.ok && r.name == record.name);
+            if !later_success {
+                return ExitCode::ToolFailure;
+            }
         }
     }
 

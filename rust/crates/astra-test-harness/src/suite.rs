@@ -85,6 +85,7 @@ pub struct SuiteRunner<'a> {
     pub suite_cfg: SuiteConfig,
     pub dashboard_tx: Option<tokio::sync::broadcast::Sender<crate::dashboard::DashboardEvent>>,
     pub run_id: String,
+    pub cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl<'a> SuiteRunner<'a> {
@@ -141,6 +142,14 @@ impl<'a> SuiteRunner<'a> {
         if self.suite_cfg.parallel <= 1 {
             // Serial path: simpler, preserves ordering, supports circuit breaker inline.
             for (case, model, run_index) in work {
+                if self
+                    .cancel_flag
+                    .as_ref()
+                    .is_some_and(|f| f.load(Ordering::Relaxed))
+                {
+                    eprintln!("[astra-test] run cancelled by user");
+                    break;
+                }
                 if aborted.load(Ordering::Relaxed) {
                     eprintln!("[astra-test] circuit breaker tripped — aborting remaining cases");
                     break;
@@ -182,7 +191,14 @@ impl<'a> SuiteRunner<'a> {
                     let total_auth_failures = total_auth_failures.clone();
                     let dashboard_tx = self.dashboard_tx.clone();
                     let run_id = self.run_id.clone();
+                    let cancel_flag = self.cancel_flag.clone();
                     async move {
+                        if cancel_flag
+                            .as_ref()
+                            .is_some_and(|f| f.load(Ordering::Relaxed))
+                        {
+                            return None;
+                        }
                         if aborted.load(Ordering::Relaxed) {
                             return None;
                         }
@@ -655,6 +671,7 @@ mod tests {
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
             run_id: String::new(),
+            cancel_flag: None,
         };
         let cases = vec![case_with("c1", vec![])];
         let report = runner.run_all(&cases).await;
@@ -690,6 +707,7 @@ mod tests {
             },
             dashboard_tx: None,
             run_id: String::new(),
+            cancel_flag: None,
         };
         let cases: Vec<Case> = (0..5)
             .map(|i| case_with(&format!("c{i}"), vec![Criterion::ExitCode { code: 0 }]))
@@ -719,6 +737,7 @@ mod tests {
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
             run_id: String::new(),
+            cancel_flag: None,
         };
         let cases = vec![case_with("c1", vec![Criterion::ExitCode { code: 0 }])];
         let report = runner.run_all(&cases).await;
@@ -770,6 +789,7 @@ mod tests {
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
             run_id: String::new(),
+            cancel_flag: None,
         };
         let j = Criterion::Judger {
             question: "q?".into(),
@@ -807,6 +827,7 @@ mod tests {
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
             run_id: String::new(),
+            cancel_flag: None,
         };
         let case = case_with(
             "c1",
@@ -838,6 +859,7 @@ mod tests {
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
             run_id: String::new(),
+            cancel_flag: None,
         };
         let cases = vec![case_with("c1", vec![])];
         let report = runner.run_all(&cases).await;
@@ -868,6 +890,7 @@ mod tests {
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
             run_id: String::new(),
+            cancel_flag: None,
         };
         let read_req = Criterion::ToolCalled {
             name: "Read".into(),
@@ -914,6 +937,7 @@ mod tests {
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
             run_id: String::new(),
+            cancel_flag: None,
         };
         let mut case = case_with("dbg", vec![]);
         case.debug_log = true;
@@ -940,6 +964,7 @@ mod tests {
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
             run_id: String::new(),
+            cancel_flag: None,
         };
         let mut case = case_with("c1", vec![]);
         case.setup_cmd = Some("exit 1".into());
@@ -979,6 +1004,7 @@ mod tests {
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
             run_id: String::new(),
+            cancel_flag: None,
         };
         let mut case = case_with("mt", vec![]);
         case.steps = vec![crate::case::CaseStep {
@@ -1015,6 +1041,7 @@ mod tests {
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
             run_id: String::new(),
+            cancel_flag: None,
         };
         let mut case = case_with("mt", vec![]);
         case.steps = vec![crate::case::CaseStep {
@@ -1054,6 +1081,7 @@ mod tests {
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
             run_id: String::new(),
+            cancel_flag: None,
         };
         let mut case = case_with("c1", vec![]);
         case.capability = Some(crate::case::Capability::ToolUse);
@@ -1084,6 +1112,7 @@ mod tests {
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
             run_id: String::new(),
+            cancel_flag: None,
         };
         let report = runner.run_all(&[case_with("c1", vec![])]).await;
         assert!(report.started_at.is_some());
@@ -1134,6 +1163,7 @@ mod tests {
             suite_cfg: SuiteConfig::default(),
             dashboard_tx: None,
             run_id: String::new(),
+            cancel_flag: None,
         };
         let mut case = case_with("mt", vec![]);
         case.prompt = "What is 2+2? Answer with just the number.".into();
@@ -1181,6 +1211,7 @@ mod tests {
             },
             dashboard_tx: None,
             run_id: String::new(),
+            cancel_flag: None,
         };
         let cases = vec![
             case_with("c0", vec![Criterion::ExitCode { code: 0 }]),
@@ -1193,5 +1224,44 @@ mod tests {
         assert_eq!(report.passed(), 1);
         // The warning was printed to stderr (we can't capture eprintln
         // easily, but the auth counter logic is exercised).
+    }
+
+    #[tokio::test]
+    async fn parallel_execution_produces_sorted_results() {
+        let exec = FakeExecutor::new();
+        exec.seed("b", "m", outcome_ok("m", "b-text", &[]));
+        exec.seed("a", "m", outcome_ok("m", "a-text", &[]));
+        exec.seed("c", "m", outcome_ok("m", "c-text", &[]));
+
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig {
+                parallel: 3,
+                ..Default::default()
+            },
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let cases = vec![
+            case_with("b", vec![]),
+            case_with("a", vec![]),
+            case_with("c", vec![]),
+        ];
+        let report = runner.run_all(&cases).await;
+        assert_eq!(report.total(), 3);
+        assert_eq!(report.passed(), 3);
+        // Parallel path sorts by (case_name, model, run_index).
+        let names: Vec<&str> = report.runs.iter().map(|r| r.case_name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
     }
 }

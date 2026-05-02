@@ -183,6 +183,15 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 }
 
 async fn handle_ws(mut socket: WebSocket, state: AppState) {
+    // Send current state to late-joining clients.
+    let running = *state.running.lock().await;
+    let init = serde_json::json!({
+        "type": "init",
+        "running": running,
+        "has_report": state.last_report.lock().await.is_some(),
+    });
+    let _ = socket.send(Message::Text(init.to_string().into())).await;
+
     let mut rx = state.tx.subscribe();
     loop {
         tokio::select! {
@@ -778,13 +787,8 @@ async fn execute_run(
         suite_cfg,
         dashboard_tx: Some(tx),
         run_id: run_id.to_string(),
+        cancel_flag: Some(cancel_flag),
     };
-
-    // Check cancel flag periodically — the suite runner doesn't
-    // natively support cancel yet, but we can check between cases
-    // if we wrap the runner. For now, just run to completion.
-    // TODO: thread cancel_flag into SuiteRunner for per-case abort.
-    let _ = cancel_flag;
 
     let report = runner.run_all(&cases).await;
     Ok(report)
