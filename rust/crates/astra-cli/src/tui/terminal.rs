@@ -161,21 +161,9 @@ impl TerminalGuard {
         }
 
         let lines = std::mem::take(pending);
-
-        // Batch insert to avoid overflowing the scroll region.
-        // Each batch fits within the space above the viewport.
-        let max_batch = (terminal.viewport_area.top() as usize).max(4).saturating_sub(2);
-        if lines.len() <= max_batch || max_batch == 0 {
-            super::insert_history::insert_history_lines_with_terminal(
-                terminal, &lines, is_zellij,
-            )?;
-        } else {
-            for chunk in lines.chunks(max_batch) {
-                super::insert_history::insert_history_lines_with_terminal(
-                    terminal, chunk, is_zellij,
-                )?;
-            }
-        }
+        super::insert_history::insert_history_lines_with_terminal(
+            terminal, &lines, is_zellij,
+        )?;
 
         Ok(is_zellij)
     }

@@ -360,12 +360,23 @@ pub(crate) async fn run_tui_repl(
 
                                     state.tui_stream_event_tx = None;
 
-                                    // Drain remaining events
+                                    // Drain remaining events (also track ttft/tools)
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                     loop {
                                         match tui_rx.recv().await {
                                             Some(TuiAppEvent::TurnComplete) | None => break,
-                                            Some(ae) => handle_app_event(ae, &mut guard, w, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester, &mut transcript),
+                                            Some(ae) => {
+                                                match &ae {
+                                                    TuiAppEvent::Token(_) if turn_ttft.is_none() => {
+                                                        turn_ttft = Some(std::time::Instant::now());
+                                                    }
+                                                    TuiAppEvent::ToolStarted { .. } => {
+                                                        turn_tool_count += 1;
+                                                    }
+                                                    _ => {}
+                                                }
+                                                handle_app_event(ae, &mut guard, w, &mut stream_controller, &mut active_cell, &mut bottom_pane, &frame_requester, &mut transcript);
+                                            }
                                         }
                                     }
 
@@ -547,10 +558,16 @@ fn handle_app_event(
                 *sc = Some(StreamController::new(Some(width as usize)));
             }
 
-            // Clear thinking state — tokens are flowing
+            // Clear thinking state — tokens are flowing.
+            // Save thinking content to transcript before discarding.
             if let Some(cell) = active_cell.as_ref() {
                 if cell.as_any_ref().is::<AssistantChatCell>() {
-                    active_cell.take(); // Remove thinking cell from viewport
+                    let trans = cell.transcript_lines(width);
+                    if !trans.is_empty() {
+                        transcript.extend(trans);
+                        transcript.push(ratatui::text::Line::default());
+                    }
+                    active_cell.take();
                 }
             }
 
@@ -602,6 +619,17 @@ fn handle_app_event(
                 if let Some(ac) = cell.as_any_mut().downcast_mut::<AssistantChatCell>() {
                     ac.push_thinking_chunk(&text);
                 }
+            } else {
+                // Active cell already taken (tokens flowing) — append to transcript
+                let dim_italic = ratatui::style::Style::default()
+                    .fg(ratatui::style::Color::DarkGray)
+                    .add_modifier(ratatui::style::Modifier::ITALIC);
+                for line in text.lines() {
+                    let preview: String = line.chars().take(width as usize - 6).collect();
+                    transcript.push(ratatui::text::Line::from(
+                        ratatui::text::Span::styled(format!("  │ {preview}"), dim_italic),
+                    ));
+                }
             }
             fr.schedule_frame();
         }
@@ -611,6 +639,7 @@ fn handle_app_event(
                     ac.finish_thinking();
                 }
             }
+            // No action needed if active_cell is None — thinking already saved to transcript
             fr.schedule_frame();
         }
         TuiAppEvent::WaitingForModel => {
