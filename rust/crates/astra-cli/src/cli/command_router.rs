@@ -1421,17 +1421,28 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
         }
     }
 
-    // Check for unrecovered tool failures. A failed tool call that was
-    // later retried successfully (same tool name) is normal agent
-    // self-correction and should not mark the run as failed.
-    for (i, record) in sr.tool_call_records.iter().enumerate() {
-        if !record.ok {
-            let later_success = sr.tool_call_records[i + 1..]
-                .iter()
-                .any(|r| r.ok && r.name == record.name);
-            if !later_success {
-                return ExitCode::ToolFailure;
-            }
+    // Check for unrecovered tool failures. Agents self-correct by
+    // retrying with the same or different tools (write_file fails →
+    // bash echo succeeds). Only fail if the LAST tool call failed —
+    // any successful tool call after a failure means the agent recovered.
+    let has_any_failure = sr.tool_call_records.iter().any(|r| !r.ok);
+    if has_any_failure {
+        let last_ok = sr
+            .tool_call_records
+            .iter()
+            .rev()
+            .find(|r| r.ok)
+            .map(|_| true)
+            .unwrap_or(false);
+        let last_record_ok = sr
+            .tool_call_records
+            .last()
+            .map(|r| r.ok)
+            .unwrap_or(true);
+        // Fail only if no tool call succeeded after the failures,
+        // OR the very last call itself failed.
+        if !last_ok || !last_record_ok {
+            return ExitCode::ToolFailure;
         }
     }
 
@@ -2951,6 +2962,73 @@ mod exit_code_tests {
                 ..Default::default()
             });
         assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+    }
+
+    #[test]
+    fn exit_code_success_same_tool_retry() {
+        let mut sr = empty_stream_result();
+        // bash fails first
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "Bash".to_string(),
+                ok: false,
+                ms: 50,
+                error: Some("exit 1".to_string()),
+                ..Default::default()
+            });
+        // agent retries bash successfully
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "Bash".to_string(),
+                ok: true,
+                ms: 80,
+                ..Default::default()
+            });
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+    }
+
+    #[test]
+    fn exit_code_success_cross_tool_recovery() {
+        let mut sr = empty_stream_result();
+        // write_file fails (sandbox denied)
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "write_file".to_string(),
+                ok: false,
+                ms: 30,
+                error: Some("SANDBOX_DENIED".to_string()),
+                ..Default::default()
+            });
+        // agent self-corrects by using bash instead
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "Bash".to_string(),
+                ok: true,
+                ms: 100,
+                ..Default::default()
+            });
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+    }
+
+    #[test]
+    fn exit_code_failure_when_last_call_fails() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "Bash".to_string(),
+                ok: true,
+                ms: 50,
+                ..Default::default()
+            });
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "Bash".to_string(),
+                ok: false,
+                ms: 100,
+                error: Some("exit 1".to_string()),
+                ..Default::default()
+            });
+        assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
     }
 
     #[test]

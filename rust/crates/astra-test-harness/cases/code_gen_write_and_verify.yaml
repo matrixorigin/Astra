@@ -15,6 +15,7 @@ capability: code_generation
 difficulty: 3
 weight: 2.0
 timeout_seconds: 180
+setup_cmd: "rm -f /tmp/astra_harness_fib.py"
 teardown_cmd: "rm -f /tmp/astra_harness_fib.py"
 criteria:
   - type: exit_code

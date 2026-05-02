@@ -9,7 +9,7 @@ use tokio::sync::Semaphore;
 
 use crate::case::Case;
 use crate::classify::{FailureClass, classify};
-use crate::criteria::{Criterion, evaluate_deterministic_with_session, non_judger_all_pass};
+use crate::criteria::{Criterion, evaluate_deterministic_with_session};
 use crate::digest::DigestCollector;
 use crate::exec::CaseExecutor;
 use crate::judger::{Judger, evaluate_judger};
@@ -474,7 +474,9 @@ impl<'a> SuiteRunner<'a> {
 
         let mut det = evaluate_deterministic_with_session(&criteria, &outcome, session.as_ref());
 
-        if !self.no_judger && non_judger_all_pass(&criteria, &det) {
+        // Always run the judger (unless --no-judger) — the quality
+        // score is useful for diagnostics even when Hard criteria fail.
+        if !self.no_judger {
             for (i, c) in criteria.iter().enumerate() {
                 if let Criterion::Judger { .. } = c
                     && let Some(res) = evaluate_judger(self.judger, c, &outcome).await
@@ -482,7 +484,7 @@ impl<'a> SuiteRunner<'a> {
                     det[i] = res;
                 }
             }
-        } else if self.no_judger {
+        } else {
             for (i, c) in criteria.iter().enumerate() {
                 if let Criterion::Judger { .. } = c {
                     det[i].passed = true;
@@ -756,7 +758,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn judger_only_fires_when_deterministic_checks_pass() {
+    async fn judger_always_fires_even_when_hard_criteria_fail() {
         let exec = FakeExecutor::new();
         exec.seed("c1", "m", outcome_ok("m", "hello", &["Read"]));
         exec.seed("c2", "m", outcome_ok("m", "hello", &[]));
@@ -813,8 +815,12 @@ mod tests {
         ];
         let report = runner.run_all(&cases).await;
         assert_eq!(report.total(), 2);
+        // c2 still fails (Hard criterion ToolCalled fails) even though
+        // the judger ran and scored 1.0.
         assert_eq!(report.passed(), 1);
-        assert_eq!(*judger.hits.lock().unwrap(), 1);
+        // Judger fires for BOTH cases — quality score is diagnostic
+        // even when Hard criteria fail.
+        assert_eq!(*judger.hits.lock().unwrap(), 2);
     }
 
     #[tokio::test]

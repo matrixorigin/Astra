@@ -35,4 +35,4 @@ criteria:
       Turn 1: did the agent read the file and show "hello world 42"?
       Turn 2: did the agent append "second line" using any tool?
       Score 1.0 if both turns worked, 0.5 if partial, 0.0 if fabricated.
-    threshold: 0.6
+    threshold: 0.7

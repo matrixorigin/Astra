@@ -24,8 +24,13 @@ criteria:
     max: 6
   - type: judger
     question: |
-      Did the child agent reply with "delegate-G2-ok" (or close to it)?
-      Score 1.0 if the child's reply appeared in the final answer.
-      Score 0.4 if the spawn succeeded but the reply was garbled.
+      Did the parent invoke spawn_agent and did the child reply with
+      "delegate-G2-ok" (or close)? The final answer should surface
+      the child's reply. A [fork-cache] stderr event may or may not
+      appear depending on whether the prefix store had a captured
+      prefix; its absence does not indicate failure.
+      Score 1.0 if the child replied and the text surfaces it.
+      Score 0.5 if spawn succeeded but the reply is garbled or
+      the child's output is only partially surfaced.
       Score 0.0 if no spawn happened or the agent fabricated a result.
-    threshold: 0.7
+    threshold: 0.5

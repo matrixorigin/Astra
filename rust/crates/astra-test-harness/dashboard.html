@@ -1588,8 +1588,8 @@ input[type="range"]::-moz-range-thumb {
           <select class="input-model-select" id="inputModel">
             <option value="">auto</option>
           </select>
-          <input type="text" class="input-text" id="inputText"
-                 placeholder="Ask anything or describe a test to run... (auto-detects intent)" />
+          <textarea class="input-text" id="inputText" rows="1"
+                    placeholder="Ask anything or describe a test to run... (auto-detects intent)"></textarea>
           <div class="input-mode-toggle" id="inputModeToggle" title="Auto-detects intent. Force 'Run' to always orchestrate.">
             <button class="input-mode-btn active" data-mode="chat" type="button">Auto</button>
             <button class="input-mode-btn" data-mode="run" type="button">Run</button>
@@ -1888,9 +1888,9 @@ function doLogin() {
         const uname = data.username || 'user';
         toast('Logged in as ' + uname, 'success');
         $('loginBtn').textContent = uname;
-        try { sessionStorage.setItem('astra_login_user', uname); } catch {}
-        // Refresh models list (auth was expired before)
-        loadModels();
+        try { localStorage.setItem('astra_login_user', uname); } catch {}
+        // Refresh models + cases (auth was expired before login)
+        loadConfig();
       }
     })
     .catch(e => {
@@ -2250,12 +2250,18 @@ function openDetailModal(report) {
   bindCollapseToggles(content);
 }
 
-$('detailModalOverlay').addEventListener('click', (e) => {
-  if (e.target === $('detailModalOverlay')) $('detailModalOverlay').classList.remove('open');
-});
-$('detailModalClose').addEventListener('click', () => {
-  $('detailModalOverlay').classList.remove('open');
-});
+// Bound after DOM is fully parsed (element lives after the script block)
+function _bindDetailModal() {
+  const ov = $('detailModalOverlay');
+  const cl = $('detailModalClose');
+  if (ov) ov.addEventListener('click', (e) => { if (e.target === ov) ov.classList.remove('open'); });
+  if (cl) cl.addEventListener('click', () => { if (ov) ov.classList.remove('open'); });
+}
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', _bindDetailModal);
+} else {
+  requestAnimationFrame(_bindDetailModal);
+}
 
 function buildCaseDetailHTML(report) {
   const status = report.passed ? 'pass' : 'fail';
@@ -2823,6 +2829,13 @@ const cmdHistory = [];
 let cmdHistoryIdx = -1;
 let cmdDraft = '';
 
+// Auto-resize textarea
+function autoResize() {
+  inputText.style.height = 'auto';
+  inputText.style.height = Math.min(inputText.scrollHeight, 120) + 'px';
+}
+inputText.addEventListener('input', autoResize);
+
 inputText.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
@@ -2830,10 +2843,10 @@ inputText.addEventListener('keydown', e => {
     if (msg) {
       cmdHistory.push(msg);
       cmdHistoryIdx = cmdHistory.length;
-      // Persist to sessionStorage
-      try { sessionStorage.setItem('astra_cmd_history', JSON.stringify(cmdHistory)); } catch {}
+      try { localStorage.setItem('astra_cmd_history', JSON.stringify(cmdHistory)); } catch {}
     }
     sendInput();
+    requestAnimationFrame(autoResize);
   } else if (e.key === 'ArrowUp') {
     if (cmdHistoryIdx > 0) {
       if (cmdHistoryIdx === cmdHistory.length) cmdDraft = inputText.value;
@@ -2850,9 +2863,9 @@ inputText.addEventListener('keydown', e => {
   }
 });
 
-// Restore history from sessionStorage
+// Restore history from localStorage
 try {
-  const saved = JSON.parse(sessionStorage.getItem('astra_cmd_history') || '[]');
+  const saved = JSON.parse(localStorage.getItem('astra_cmd_history') || '[]');
   if (Array.isArray(saved)) { cmdHistory.push(...saved); cmdHistoryIdx = cmdHistory.length; }
 } catch {}
 
@@ -3197,7 +3210,7 @@ connect();
 
 // Restore login state
 try {
-  const savedUser = sessionStorage.getItem('astra_login_user');
+  const savedUser = localStorage.getItem('astra_login_user');
   if (savedUser) $('loginBtn').textContent = savedUser;
 } catch {}
 
