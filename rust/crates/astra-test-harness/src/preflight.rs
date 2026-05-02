@@ -238,11 +238,17 @@ fn write_credentials(access_token: &str, refresh_token: &str) -> bool {
         creds["current_profile"] = serde_json::json!("harness-auto");
     }
 
-    std::fs::write(
+    let ok = std::fs::write(
         &creds_path,
         serde_json::to_string_pretty(&creds).unwrap_or_default(),
     )
-    .is_ok()
+    .is_ok();
+    #[cfg(unix)]
+    if ok {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&creds_path, std::fs::Permissions::from_mode(0o600));
+    }
+    ok
 }
 
 #[cfg(test)]

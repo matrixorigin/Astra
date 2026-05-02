@@ -291,6 +291,7 @@ impl CaseExecutor for ExternalCmdExecutor {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn();
 
         let mut child = match child {

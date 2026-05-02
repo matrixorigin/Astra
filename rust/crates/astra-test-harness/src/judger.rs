@@ -628,6 +628,7 @@ impl Judger for ExternalCmdJudger {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("spawn judger-cmd {}: {e}", self.cmd))?;
 

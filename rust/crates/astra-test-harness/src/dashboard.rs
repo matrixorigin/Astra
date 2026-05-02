@@ -165,7 +165,7 @@ impl DashboardServer {
             .route("/api/analyze", post(analyze_handler))
             .with_state(state);
 
-        let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
+        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
         eprintln!("[astra-test] dashboard: http://localhost:{port}");
         axum::serve(listener, app).await?;
         Ok(())

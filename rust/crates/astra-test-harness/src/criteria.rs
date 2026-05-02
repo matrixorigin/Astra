@@ -1370,95 +1370,95 @@ mod tests {
         assert!(!r[0].passed);
         assert!(r[0].detail.contains("matched 0/2"));
     }
-}
 
-#[test]
-fn turn_rounds_between_passes() {
-    let mut out = RunOutcome::new("m");
-    out.turn_rounds = 2;
-    let r = evaluate_deterministic(&[Criterion::TurnRoundsBetween { min: 1, max: 3 }], &out);
-    assert!(r[0].passed, "{}", r[0].detail);
-}
+    #[test]
+    fn turn_rounds_between_passes() {
+        let mut out = RunOutcome::new("m");
+        out.turn_rounds = 2;
+        let r = evaluate_deterministic(&[Criterion::TurnRoundsBetween { min: 1, max: 3 }], &out);
+        assert!(r[0].passed, "{}", r[0].detail);
+    }
 
-#[test]
-fn turn_rounds_between_fails_too_many() {
-    let mut out = RunOutcome::new("m");
-    out.turn_rounds = 10;
-    let r = evaluate_deterministic(&[Criterion::TurnRoundsBetween { min: 1, max: 3 }], &out);
-    assert!(!r[0].passed);
-    assert!(r[0].detail.contains("10"));
-}
+    #[test]
+    fn turn_rounds_between_fails_too_many() {
+        let mut out = RunOutcome::new("m");
+        out.turn_rounds = 10;
+        let r = evaluate_deterministic(&[Criterion::TurnRoundsBetween { min: 1, max: 3 }], &out);
+        assert!(!r[0].passed);
+        assert!(r[0].detail.contains("10"));
+    }
 
-#[test]
-fn cache_rate_above_passes() {
-    let mut out = RunOutcome::new("m");
-    out.total_tool_calls = 10;
-    out.cache_hits = 8;
-    let r = evaluate_deterministic(
-        &[Criterion::CacheRateAbove {
-            threshold: 0.5,
-            min_calls: 1,
-        }],
-        &out,
-    );
-    assert!(r[0].passed, "{}", r[0].detail);
-}
+    #[test]
+    fn cache_rate_above_passes() {
+        let mut out = RunOutcome::new("m");
+        out.total_tool_calls = 10;
+        out.cache_hits = 8;
+        let r = evaluate_deterministic(
+            &[Criterion::CacheRateAbove {
+                threshold: 0.5,
+                min_calls: 1,
+            }],
+            &out,
+        );
+        assert!(r[0].passed, "{}", r[0].detail);
+    }
 
-#[test]
-fn cache_rate_above_fails() {
-    let mut out = RunOutcome::new("m");
-    out.total_tool_calls = 10;
-    out.cache_hits = 1;
-    let r = evaluate_deterministic(
-        &[Criterion::CacheRateAbove {
-            threshold: 0.5,
-            min_calls: 1,
-        }],
-        &out,
-    );
-    assert!(!r[0].passed);
-    assert!(r[0].detail.contains("10.0%"));
-}
+    #[test]
+    fn cache_rate_above_fails() {
+        let mut out = RunOutcome::new("m");
+        out.total_tool_calls = 10;
+        out.cache_hits = 1;
+        let r = evaluate_deterministic(
+            &[Criterion::CacheRateAbove {
+                threshold: 0.5,
+                min_calls: 1,
+            }],
+            &out,
+        );
+        assert!(!r[0].passed);
+        assert!(r[0].detail.contains("10.0%"));
+    }
 
-#[test]
-fn cache_rate_above_fails_when_no_tools_and_min_calls_set() {
-    let out = RunOutcome::new("m");
-    let r = evaluate_deterministic(
-        &[Criterion::CacheRateAbove {
-            threshold: 0.9,
-            min_calls: 1,
-        }],
-        &out,
-    );
-    assert!(!r[0].passed, "min_calls=1 with 0 tool calls must FAIL");
-    assert!(r[0].detail.contains("too few tool calls"));
-}
+    #[test]
+    fn cache_rate_above_fails_when_no_tools_and_min_calls_set() {
+        let out = RunOutcome::new("m");
+        let r = evaluate_deterministic(
+            &[Criterion::CacheRateAbove {
+                threshold: 0.9,
+                min_calls: 1,
+            }],
+            &out,
+        );
+        assert!(!r[0].passed, "min_calls=1 with 0 tool calls must FAIL");
+        assert!(r[0].detail.contains("too few tool calls"));
+    }
 
-#[test]
-fn cache_rate_above_skip_passes_no_tools_when_min_calls_zero() {
-    let out = RunOutcome::new("m");
-    let r = evaluate_deterministic(
-        &[Criterion::CacheRateAbove {
-            threshold: 0.9,
-            min_calls: 0,
-        }],
-        &out,
-    );
-    assert!(r[0].passed, "min_calls=0 with no tools should skip-pass");
-}
+    #[test]
+    fn cache_rate_above_skip_passes_no_tools_when_min_calls_zero() {
+        let out = RunOutcome::new("m");
+        let r = evaluate_deterministic(
+            &[Criterion::CacheRateAbove {
+                threshold: 0.9,
+                min_calls: 0,
+            }],
+            &out,
+        );
+        assert!(r[0].passed, "min_calls=0 with no tools should skip-pass");
+    }
 
-#[test]
-fn cache_rate_above_fails_when_step_events_missing() {
-    let mut out = RunOutcome::new("m");
-    out.tool_calls_count = 3; // envelope says tools were called
-    out.total_tool_calls = 0; // but step_events weren't parsed
-    let r = evaluate_deterministic(
-        &[Criterion::CacheRateAbove {
-            threshold: 0.5,
-            min_calls: 1,
-        }],
-        &out,
-    );
-    assert!(!r[0].passed);
-    assert!(r[0].detail.contains("step_events missing"));
+    #[test]
+    fn cache_rate_above_fails_when_step_events_missing() {
+        let mut out = RunOutcome::new("m");
+        out.tool_calls_count = 3; // envelope says tools were called
+        out.total_tool_calls = 0; // but step_events weren't parsed
+        let r = evaluate_deterministic(
+            &[Criterion::CacheRateAbove {
+                threshold: 0.5,
+                min_calls: 1,
+            }],
+            &out,
+        );
+        assert!(!r[0].passed);
+        assert!(r[0].detail.contains("step_events missing"));
+    }
 }

@@ -392,8 +392,9 @@ impl<'a> SuiteRunner<'a> {
             }
         }
 
-        // Retry on 429 if enabled.
-        if self.suite_cfg.retry_on_429 && is_rate_limited(&outcome) {
+        // Retry on 429 if enabled. Skip for multi-turn cases because
+        // retrying only re-executes the first turn, not the full step sequence.
+        if self.suite_cfg.retry_on_429 && case.steps.is_empty() && is_rate_limited(&outcome) {
             eprintln!(
                 "[astra-test] rate-limited on case={} model={}, retrying after 5s",
                 case.name, model
