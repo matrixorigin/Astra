@@ -10,6 +10,14 @@ use crate::command_registry::{self, CommandMeta};
 
 const MAX_VISIBLE: usize = 10;
 
+fn is_tui_native(name: &str) -> bool {
+    matches!(name,
+        "/help" | "/commands" | "/model" | "/stats" | "/skill" | "/skills"
+        | "/copy" | "/version" | "/whoami" | "/history"
+        | "/instructions" | "/exit" | "/quit"
+    )
+}
+
 pub(crate) struct SlashPopup {
     filter: String,
     matches: Vec<&'static CommandMeta>,
@@ -105,22 +113,29 @@ impl SlashPopup {
 
             let meta = self.matches[i];
             let is_sel = i == self.selected;
+            let native = is_tui_native(meta.name);
 
+            let marker = if native { "● " } else { "  " };
             let name_w = 16;
             let padded_name = format!("{:<width$}", meta.name, width = name_w);
-            let desc_budget = (area.width as usize).saturating_sub(2 + name_w);
+            let desc_budget = (area.width as usize).saturating_sub(4 + name_w);
             let desc: String = meta.description.chars().take(desc_budget).collect();
 
             let line = if is_sel {
                 let sel = Style::default().fg(Color::Cyan).add_modifier(ratatui::style::Modifier::BOLD);
                 Line::from(vec![
-                    Span::styled("  ", sel),
+                    Span::styled(marker, sel),
                     Span::styled(padded_name, sel),
                     Span::styled(desc, sel),
                 ])
             } else {
+                let marker_style = if native {
+                    Style::default().fg(Color::Green)
+                } else {
+                    dim
+                };
                 Line::from(vec![
-                    Span::raw("  "),
+                    Span::styled(marker, marker_style),
                     Span::raw(padded_name),
                     Span::styled(desc, dim),
                 ])

@@ -166,14 +166,141 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
-        // ── Allow/Deny (permission mode) ────────────────────────────
-        "/allow" => {
-            if !args.is_empty() {
-                return SlashResult::Fallback; // /allow auto|prompt|deny needs slash_router
+        // ── State commands → with_restored (share full logic with non-TUI) ──
+        "/allow" | "/yolo" | "/clear" | "/undo" | "/redo"
+        | "/compact" | "/explain" | "/verbose" | "/reflect" => SlashResult::Fallback,
+
+        // ── Copy last response ──────────────────────────────────────
+        "/copy" => {
+            match &ctx.state.last_response {
+                Some(resp) if !resp.is_empty() => {
+                    let n = resp.chars().count();
+                    if crate::slash_info::copy_to_clipboard(resp) {
+                        let preview: String = resp.chars().take(60).collect();
+                        let suffix = if n > 60 { "…" } else { "" };
+                        ctx.show_info(format!("Copied {n} chars: {preview}{suffix}"));
+                    } else {
+                        ctx.show_error("No clipboard tool found (install xclip or xsel)".into());
+                    }
+                }
+                _ => ctx.show_info("No response to copy".into()),
             }
-            let mode = ctx.state.perm_manager.mode();
-            ctx.show_info(format!("Permission mode: {mode}"));
             SlashResult::Handled
+        }
+
+        // ── Version ─────────────────────────────────────────────────
+        "/version" => {
+            ctx.show_info(format!("astra v{}", env!("CARGO_PKG_VERSION")));
+            SlashResult::Handled
+        }
+
+        // ── Whoami — matches render_whoami() from slash_info.rs ─────
+        "/whoami" => {
+            use crate::tui::bottom_pane::info_view::InfoView;
+            let recent_tools = if ctx.state.recent_tools.is_empty() {
+                "<none>".to_string()
+            } else {
+                ctx.state.recent_tools.iter().take(8).cloned().collect::<Vec<_>>().join(", ")
+            };
+            let pending = ctx.state.skill_improvement_tracker.pending_proposal
+                .as_ref().map(|p| p.skill_name.clone())
+                .unwrap_or_else(|| "<none>".into());
+            let pairs: Vec<(&str, String)> = vec![
+                ("version", format!("astra v{}", env!("CARGO_PKG_VERSION"))),
+                ("model", ctx.state.model.clone().unwrap_or_else(|| "<unset>".into())),
+                ("session", ctx.state.session_id.clone().unwrap_or_else(|| "<none>".into())),
+                ("turn", ctx.state.turn.to_string()),
+                ("exchanges", ctx.state.history.len().to_string()),
+                ("skills", ctx.state.unified_skill_registry.len().to_string()),
+                ("pending improve", pending),
+                ("recent tools", recent_tools),
+                ("permission", format!("{}", ctx.state.perm_manager.mode())),
+                ("explain", format!("{}", ctx.state.explain)),
+                ("verbose", if ctx.state.verbose_mode { "on" } else { "off" }.into()),
+            ];
+            ctx.bottom_pane.push_view(Box::new(InfoView::from_key_value("whoami", pairs)));
+            SlashResult::Handled
+        }
+
+        // ── History — full grep support inline ──────────────────────
+        "/history" => {
+            use crate::tui::bottom_pane::info_view::InfoView;
+            if ctx.state.history.is_empty() {
+                ctx.show_info("No history yet".into());
+                return SlashResult::Handled;
+            }
+
+            let filter = if args.starts_with("grep ") {
+                Some(args.strip_prefix("grep ").unwrap_or("").to_lowercase())
+            } else {
+                None
+            };
+
+            let mut lines = Vec::new();
+            let mut match_count = 0;
+            for (i, (user, asst)) in ctx.state.history.iter().enumerate() {
+                let turn = i + 1;
+                if let Some(ref q) = filter {
+                    let u_match = user.to_lowercase().contains(q);
+                    let a_match = asst.to_lowercase().contains(q);
+                    if !u_match && !a_match { continue; }
+                    match_count += 1;
+                }
+                let u_preview: String = user.chars().take(100).collect();
+                let a_preview: String = asst.chars().take(100).collect();
+                let u_suffix = if user.chars().count() > 100 { "…" } else { "" };
+                let a_suffix = if asst.chars().count() > 100 { "…" } else { "" };
+                lines.push(format!("  Turn {turn}"));
+                lines.push(format!("    › {u_preview}{u_suffix}"));
+                lines.push(format!("    {a_preview}{a_suffix}"));
+                lines.push(String::new());
+            }
+
+            let title = if let Some(ref q) = filter {
+                if lines.is_empty() {
+                    ctx.show_info(format!("No matches for '{q}'"));
+                    return SlashResult::Handled;
+                }
+                format!("History — {match_count} match(es) for '{q}'")
+            } else {
+                format!("Conversation History ({} turns)", ctx.state.history.len())
+            };
+
+            ctx.bottom_pane.push_view(Box::new(InfoView::from_plain(&title, lines)));
+            SlashResult::Handled
+        }
+
+        // ── Style ───────────────────────────────────────────────────
+        "/style" => SlashResult::Fallback,
+
+        // ── Instructions — full subcommand support ──────────────────
+        "/instructions" => {
+            use crate::tui::bottom_pane::info_view::InfoView;
+            match args {
+                "" | "show" => {
+                    if let Some(ref pi) = ctx.state.project_instructions {
+                        let line_count = pi.lines().count();
+                        let title = format!("Project Instructions ({line_count} lines)");
+                        ctx.bottom_pane.push_view(Box::new(InfoView::from_plain(
+                            &title,
+                            pi.lines().map(|l| format!("  {l}")).collect(),
+                        )));
+                    } else {
+                        ctx.show_info("No project instructions loaded. Create .astra/instructions.md in your project root.".into());
+                    }
+                    SlashResult::Handled
+                }
+                "reload" => SlashResult::Fallback,
+                "off" => {
+                    ctx.state.project_instructions = None;
+                    ctx.show_info("Project instructions disabled for this session".into());
+                    SlashResult::Handled
+                }
+                _ => {
+                    ctx.show_error("Usage: /instructions [show|reload|off]".into());
+                    SlashResult::Handled
+                }
+            }
         }
 
         // ── Everything else → with_restored fallback ────────────────

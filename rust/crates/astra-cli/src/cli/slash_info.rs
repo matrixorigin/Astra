@@ -21,7 +21,7 @@ fn format_bytes(bytes: u32) -> String {
     }
 }
 
-fn copy_to_clipboard(text: &str) -> bool {
+pub(crate) fn copy_to_clipboard(text: &str) -> bool {
     // Try Wayland first (if WAYLAND_DISPLAY is set), then X11 tools, then macOS.
     let wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
     let mut candidates: Vec<(&str, &[&str])> = Vec::new();
