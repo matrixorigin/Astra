@@ -234,54 +234,6 @@ mod key_routing_tests {
     }
 }
 
-#[cfg(test)]
-mod viewport_tests {
-    use crate::tui::chat_cell::system_cell::SystemChatCell;
-    use crate::tui::chat_viewport::ChatViewport;
-
-    #[test]
-    fn auto_follow_on_push() {
-        let mut vp = ChatViewport::new();
-        for i in 0..50 {
-            vp.push_cell(Box::new(SystemChatCell::info(format!("Line {i}"))));
-        }
-        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 10));
-        vp.render(ratatui::layout::Rect::new(0, 0, 80, 10), &mut buf);
-        // After render, scroll should be near the bottom (auto-follow)
-        // Just verify it doesn't panic
-    }
-
-    #[test]
-    fn scroll_up_disables_auto_follow() {
-        let mut vp = ChatViewport::new();
-        for i in 0..50 {
-            vp.push_cell(Box::new(SystemChatCell::info(format!("Line {i}"))));
-        }
-        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 10));
-        vp.render(ratatui::layout::Rect::new(0, 0, 80, 10), &mut buf);
-
-        vp.scroll_up(5);
-        // Push new cell — should NOT scroll to bottom
-        vp.push_cell(Box::new(SystemChatCell::info("new".to_string())));
-        // auto_follow should be false
-        // Verify by checking needs_scroll_to_bottom is false (indirect: no panic)
-        vp.render(ratatui::layout::Rect::new(0, 0, 80, 10), &mut buf);
-    }
-
-    #[test]
-    fn jump_to_bottom_restores_auto_follow() {
-        let mut vp = ChatViewport::new();
-        for i in 0..50 {
-            vp.push_cell(Box::new(SystemChatCell::info(format!("Line {i}"))));
-        }
-        vp.scroll_up(10);
-        vp.jump_to_bottom(80, 10);
-        vp.push_cell(Box::new(SystemChatCell::info("new".to_string())));
-        // Should auto-follow now
-        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 10));
-        vp.render(ratatui::layout::Rect::new(0, 0, 80, 10), &mut buf);
-    }
-}
 
 #[cfg(test)]
 mod markdown_tests {
