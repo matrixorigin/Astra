@@ -45,13 +45,15 @@ impl ToolExecutor {
 
         // Build endpoint and payload
         let cloud_token = self.cloud_token();
-        let (endpoint, payload, auth_header) = if let (Some(cloud_base), Some(token)) =
+        let (endpoint, payload, auth_header, _method) = if let (Some(cloud_base), Some(token)) =
             (&self.cloud_base, cloud_token.as_deref())
         {
+            // Cloud proxy handles method routing server-side; always POST.
             (
                 format!("{cloud_base}/memory/{op}"),
                 args.clone(),
                 format!("Bearer {token}"),
+                HttpMethod::Post,
             )
         } else {
             let base = std::env::var("MEMORIA_BASE_URL")
@@ -67,8 +69,8 @@ impl ToolExecutor {
                 }
             };
 
-            let (ep, pl) = build_direct_request(&base, op, args);
-            (ep, pl, format!("Bearer {key}"))
+            let (ep, pl, _method) = build_direct_request(&base, op, args);
+            (ep, pl, format!("Bearer {key}"), _method)
         };
 
         match reqwest::Client::builder()
@@ -76,52 +78,59 @@ impl ToolExecutor {
             .no_proxy()
             .build()
         {
-            Ok(client) => match client
-                .post(&endpoint)
-                .header("Authorization", &auth_header)
-                .json(&payload)
-                .send()
-                .await
-            {
-                Ok(resp) => match resp.text().await {
-                    Ok(text) => {
-                        self.memoria_fail_count
-                            .store(0, std::sync::atomic::Ordering::Relaxed);
-                        if self
-                            .memoria_notified_down
-                            .swap(false, std::sync::atomic::Ordering::Relaxed)
+            Ok(client) => {
+                let req = match _method {
+                    HttpMethod::Get => client.get(&endpoint).header("Authorization", &auth_header),
+                    HttpMethod::Put => client
+                        .put(&endpoint)
+                        .header("Authorization", &auth_header)
+                        .json(&payload),
+                    HttpMethod::Post => client
+                        .post(&endpoint)
+                        .header("Authorization", &auth_header)
+                        .json(&payload),
+                };
+                match req.send().await {
+                    Ok(resp) => match resp.text().await {
+                        Ok(text) => {
+                            self.memoria_fail_count
+                                .store(0, std::sync::atomic::Ordering::Relaxed);
+                            if self
+                                .memoria_notified_down
+                                .swap(false, std::sync::atomic::Ordering::Relaxed)
+                            {
+                                eprintln!(
+                                    "  {} Memoria memory service reconnected.",
+                                    crossterm::style::Stylize::green("✓"),
+                                );
+                            }
+                            text
+                        }
+                        Err(e) => {
+                            self.memoria_fail_count
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            json!({"error": format!("read response: {e}")}).to_string()
+                        }
+                    },
+                    Err(e) => {
+                        let prev = self
+                            .memoria_fail_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if prev + 1 >= MAX_FAILS
+                            && !self
+                                .memoria_notified_down
+                                .swap(true, std::sync::atomic::Ordering::Relaxed)
                         {
                             eprintln!(
-                                "  {} Memoria memory service reconnected.",
-                                crossterm::style::Stylize::green("✓"),
+                                "  {} Memoria memory service is unreachable — memory features \
+                             disabled for this session. Check MEMORIA_BASE_URL or /info.",
+                                crossterm::style::Stylize::yellow("⚠"),
                             );
                         }
-                        text
+                        json!({"error": format!("memoria request failed: {e}")}).to_string()
                     }
-                    Err(e) => {
-                        self.memoria_fail_count
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        json!({"error": format!("read response: {e}")}).to_string()
-                    }
-                },
-                Err(e) => {
-                    let prev = self
-                        .memoria_fail_count
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if prev + 1 >= MAX_FAILS
-                        && !self
-                            .memoria_notified_down
-                            .swap(true, std::sync::atomic::Ordering::Relaxed)
-                    {
-                        eprintln!(
-                            "  {} Memoria memory service is unreachable — memory features \
-                             disabled for this session. Check MEMORIA_BASE_URL or /info.",
-                            crossterm::style::Stylize::yellow("⚠"),
-                        );
-                    }
-                    json!({"error": format!("memoria request failed: {e}")}).to_string()
                 }
-            },
+            }
             Err(e) => json!({"error": format!("build client: {e}")}).to_string(),
         }
     }
@@ -229,11 +238,16 @@ impl ToolExecutor {
     }
 }
 
-/// Build endpoint URL and JSON payload for a direct Memoria API call.
-///
-/// Extracted from `memoria_call_with_timeout` so it can be unit-tested
-/// without requiring a live Memoria server.
-fn build_direct_request(base: &str, op: &str, args: &Value) -> (String, Value) {
+/// HTTP method for Memoria API calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpMethod {
+    Post,
+    Put,
+    Get,
+}
+
+/// Build endpoint URL, JSON payload, and HTTP method for a direct Memoria API call.
+fn build_direct_request(base: &str, op: &str, args: &Value) -> (String, Value, HttpMethod) {
     match op {
         "retrieve" => {
             let query = args.get("query").and_then(Value::as_str).unwrap_or("");
@@ -252,7 +266,7 @@ fn build_direct_request(base: &str, op: &str, args: &Value) -> (String, Value) {
             if let Some(ics) = args.get("include_cross_session").and_then(Value::as_bool) {
                 pl["include_cross_session"] = json!(ics);
             }
-            (format!("{base}/v1/memories/retrieve"), pl)
+            (format!("{base}/v1/memories/retrieve"), pl, HttpMethod::Post)
         }
         "store" => {
             let content = args.get("content").and_then(Value::as_str).unwrap_or("");
@@ -268,7 +282,7 @@ fn build_direct_request(base: &str, op: &str, args: &Value) -> (String, Value) {
             if let Some(sid) = args.get("session_id").and_then(Value::as_str) {
                 payload["session_id"] = json!(sid);
             }
-            (format!("{base}/v1/memories"), payload)
+            (format!("{base}/v1/memories"), payload, HttpMethod::Post)
         }
         "search" => {
             // Route to /v1/memories/retrieve (not /search) so session_id and
@@ -288,7 +302,7 @@ fn build_direct_request(base: &str, op: &str, args: &Value) -> (String, Value) {
             if let Some(ics) = args.get("include_cross_session").and_then(Value::as_bool) {
                 pl["include_cross_session"] = json!(ics);
             }
-            (format!("{base}/v1/memories/retrieve"), pl)
+            (format!("{base}/v1/memories/retrieve"), pl, HttpMethod::Post)
         }
         "purge" => {
             let topic = args.get("topic").and_then(Value::as_str).unwrap_or("");
@@ -299,10 +313,10 @@ fn build_direct_request(base: &str, op: &str, args: &Value) -> (String, Value) {
             (
                 format!("{base}/v1/memories/purge"),
                 json!({"topic": topic, "reason": reason}),
+                HttpMethod::Post,
             )
         }
         "correct" => {
-            let memory_id = args.get("memory_id").and_then(Value::as_str).unwrap_or("");
             let new_content = args
                 .get("new_content")
                 .and_then(Value::as_str)
@@ -311,15 +325,39 @@ fn build_direct_request(base: &str, op: &str, args: &Value) -> (String, Value) {
                 .get("reason")
                 .and_then(Value::as_str)
                 .unwrap_or("correction");
-            (
-                format!("{base}/v1/memories/correct"),
-                json!({"memory_id": memory_id, "new_content": new_content, "reason": reason}),
-            )
+            if let Some(memory_id) = args
+                .get("memory_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                (
+                    format!("{base}/v1/memories/{memory_id}/correct"),
+                    json!({"new_content": new_content, "reason": reason}),
+                    HttpMethod::Put,
+                )
+            } else if let Some(query) = args
+                .get("query")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                (
+                    format!("{base}/v1/memories/correct"),
+                    json!({"query": query, "new_content": new_content, "reason": reason}),
+                    HttpMethod::Post,
+                )
+            } else {
+                (
+                    String::new(),
+                    json!({"error": "memory_correct requires either memory_id or query"}),
+                    HttpMethod::Post,
+                )
+            }
         }
-        "profile" => (format!("{base}/v1/memories/profile"), json!({})),
+        "profile" => (format!("{base}/v1/profiles/me"), json!({}), HttpMethod::Get),
         _ => (
             String::new(),
             json!({"error": format!("Unknown memoria op: {op}")}),
+            HttpMethod::Post,
         ),
     }
 }
@@ -335,7 +373,7 @@ mod build_direct_request_tests {
             "top_k": 5,
             "session_id": "sess-123",
         });
-        let (endpoint, pl) = build_direct_request("http://mem", "retrieve", &args);
+        let (endpoint, pl, _) = build_direct_request("http://mem", "retrieve", &args);
         assert_eq!(endpoint, "http://mem/v1/memories/retrieve");
         assert_eq!(pl["session_id"], "sess-123");
         assert_eq!(pl["query"], "test query");
@@ -349,7 +387,7 @@ mod build_direct_request_tests {
             "filter_session": true,
             "include_cross_session": false,
         });
-        let (endpoint, pl) = build_direct_request("http://mem", "retrieve", &args);
+        let (endpoint, pl, _) = build_direct_request("http://mem", "retrieve", &args);
         assert_eq!(endpoint, "http://mem/v1/memories/retrieve");
         assert_eq!(pl["filter_session"], true);
         assert_eq!(pl["include_cross_session"], false);
@@ -358,7 +396,7 @@ mod build_direct_request_tests {
     #[test]
     fn retrieve_omits_filter_and_include_when_absent() {
         let args = json!({"query": "test", "top_k": 5});
-        let (_, pl) = build_direct_request("http://mem", "retrieve", &args);
+        let (_, pl, _) = build_direct_request("http://mem", "retrieve", &args);
         assert!(pl.get("filter_session").is_none());
         assert!(pl.get("include_cross_session").is_none());
     }
@@ -366,7 +404,7 @@ mod build_direct_request_tests {
     #[test]
     fn search_routes_to_retrieve_endpoint() {
         let args = json!({"query": "test", "top_k": 10});
-        let (endpoint, _) = build_direct_request("http://mem", "search", &args);
+        let (endpoint, _, _) = build_direct_request("http://mem", "search", &args);
         assert_eq!(
             endpoint, "http://mem/v1/memories/retrieve",
             "search must route to /retrieve (not /search) for session_id support"
@@ -381,7 +419,7 @@ mod build_direct_request_tests {
             "session_id": "sess-abc",
             "filter_session": true,
         });
-        let (_, pl) = build_direct_request("http://mem", "search", &args);
+        let (_, pl, _) = build_direct_request("http://mem", "search", &args);
         assert_eq!(pl["session_id"], "sess-abc");
         assert_eq!(pl["filter_session"], true);
     }
@@ -393,14 +431,14 @@ mod build_direct_request_tests {
             "top_k": 10,
             "include_cross_session": false,
         });
-        let (_, pl) = build_direct_request("http://mem", "search", &args);
+        let (_, pl, _) = build_direct_request("http://mem", "search", &args);
         assert_eq!(pl["include_cross_session"], false);
     }
 
     #[test]
     fn search_omits_session_fields_when_absent() {
         let args = json!({"query": "test", "top_k": 10});
-        let (_, pl) = build_direct_request("http://mem", "search", &args);
+        let (_, pl, _) = build_direct_request("http://mem", "search", &args);
         assert!(pl.get("session_id").is_none());
         assert!(pl.get("filter_session").is_none());
         assert!(pl.get("include_cross_session").is_none());
@@ -413,7 +451,7 @@ mod build_direct_request_tests {
             "session_id": "sess-42",
             "trust_tier": "T1",
         });
-        let (endpoint, pl) = build_direct_request("http://mem", "store", &args);
+        let (endpoint, pl, _) = build_direct_request("http://mem", "store", &args);
         assert_eq!(endpoint, "http://mem/v1/memories");
         assert_eq!(pl["session_id"], "sess-42");
         assert_eq!(pl["trust_tier"], "T1");

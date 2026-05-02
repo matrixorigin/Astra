@@ -68,7 +68,6 @@ fn tool_schemas_include_core_tools() {
         "github_ci_status",
         "github_repo_stats",
         "memory_store",
-        "memory_search",
         "adjust_config",
         "prioritize_tool",
         "deprioritize_tool",

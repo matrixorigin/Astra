@@ -894,25 +894,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "memory_search",
-                "description": "Search memories by keyword or topic. Use when user asks 'what do you know about X'. Supports session-scoped filtering via session_id and filter_session.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search query"},
-                        "top_k": {"type": "integer", "description": "Max results (default 10)"},
-                        "min_confidence": {"type": "number", "description": "Minimum confidence threshold 0.0-1.0 (default 0.3). Filters low-quality results."},
-                        "session_id": {"type": "string", "description": "Session ID for scoped search. When provided with filter_session=true, restricts results to this session."},
-                        "filter_session": {"type": "boolean", "description": "When true, restrict search to the given session_id. Requires session_id."},
-                        "include_cross_session": {"type": "boolean", "description": "Legacy flag. false is equivalent to filter_session=true when session_id is set. Default true."}
-                    },
-                    "required": ["query"]
-                }
-            }
-        }),
+        // memory_search removed — duplicate of memory_retrieve (both route to /v1/memories/retrieve).
+        // LLM should use memory_retrieve for all recall needs.
         json!({
             "type": "function",
             "function": {
@@ -932,15 +915,16 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory_correct",
-                "description": "Correct or update an existing memory. Use when user says a stored memory is wrong or needs updating.",
+                "description": "Correct or update an existing memory. Provide either memory_id (from a previous search) or query (to find and correct by content match).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "memory_id": {"type": "string", "description": "ID of the memory to correct"},
+                        "memory_id": {"type": "string", "description": "ID of the memory to correct (from a previous search result). Use this when you have the ID."},
+                        "query": {"type": "string", "description": "Search query to find the memory to correct. Use this when you don't have the ID."},
                         "new_content": {"type": "string", "description": "Updated content for the memory"},
                         "reason": {"type": "string", "description": "Reason for the correction"}
                     },
-                    "required": ["memory_id", "new_content"]
+                    "required": ["new_content"]
                 }
             }
         }),
