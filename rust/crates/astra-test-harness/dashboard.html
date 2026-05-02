@@ -222,11 +222,23 @@ body {
   transition: all 0.3s var(--spring);
   animation: dotAppear 0.4s var(--spring) both;
 }
+/* Invisible hover bridge so the mouse can reach the preview card */
+.tl-dot::before {
+  content: '';
+  position: absolute;
+  top: -10px; bottom: -10px;
+  right: -4px; left: -40px;
+  z-index: -1;
+}
 .tl-dot:hover { transform: scale(1.5); filter: brightness(1.3); }
 .tl-dot.preview-open { transform: scale(1.6); filter: brightness(1.4); }
 .tl-dot.pass {
   background: var(--green);
   box-shadow: 0 0 8px rgba(34,197,94,0.4), 0 0 20px rgba(34,197,94,0.1);
+}
+.tl-dot.warn {
+  background: var(--yellow);
+  box-shadow: 0 0 8px rgba(234,179,8,0.4), 0 0 20px rgba(234,179,8,0.1);
 }
 .tl-dot.fail {
   background: var(--red);
@@ -244,7 +256,7 @@ body {
 .tl-dot.plan { background: var(--accent2); box-shadow: 0 0 8px rgba(139,92,246,0.4); }
 .tl-dot.report { background: linear-gradient(135deg, var(--accent), var(--accent2)); box-shadow: 0 0 10px rgba(59,130,246,0.4); width: 18px; height: 18px; left: 10px; }
 .tl-dot .tl-dot-tooltip {
-  position: absolute; left: 22px; top: 50%; transform: translateY(-50%);
+  position: absolute; right: 22px; top: 50%; transform: translateY(-50%);
   background: var(--bg-raised); border: 1px solid var(--border-focus);
   padding: 4px 8px; border-radius: 4px;
   font-size: 11px; color: var(--text-secondary);
@@ -253,10 +265,10 @@ body {
 }
 .tl-dot:hover .tl-dot-tooltip { opacity: 1; }
 
-/* Mini preview card — shows on hover, positioned next to dot */
+/* Mini preview card — shows on hover, positioned to the LEFT of the dot */
 .tl-dot .tl-dot-preview {
   position: absolute;
-  left: 24px;
+  right: 22px;
   top: -20px;
   background: var(--bg-raised);
   backdrop-filter: blur(20px);
@@ -264,15 +276,14 @@ body {
   border-radius: var(--radius);
   padding: 12px 16px;
   min-width: 260px; max-width: 320px;
-  pointer-events: none;
-  opacity: 0; transform: translateX(-8px) scale(0.96);
+  pointer-events: auto;
+  opacity: 0; transform: translateX(8px) scale(0.96);
   transition: all 0.25s var(--spring);
   z-index: 50;
   box-shadow: 0 12px 40px rgba(0,0,0,0.5), 0 0 0 1px rgba(100,150,255,0.1);
 }
 .tl-dot:hover .tl-dot-preview {
   opacity: 1; transform: translateX(0) scale(1);
-  pointer-events: auto;
 }
 .tl-dot-preview .dp-header {
   display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
@@ -282,6 +293,7 @@ body {
   border-radius: 3px; letter-spacing: 0.5px;
 }
 .tl-dot-preview .dp-badge.pass { background: var(--green-dim); color: var(--green); }
+.tl-dot-preview .dp-badge.warn { background: var(--yellow-dim); color: var(--yellow); }
 .tl-dot-preview .dp-badge.fail { background: var(--red-dim); color: var(--red); }
 .tl-dot-preview .dp-name {
   font-size: 12px; font-weight: 600; color: var(--text);
@@ -336,6 +348,7 @@ body {
   border-radius: 4px; letter-spacing: 0.5px;
 }
 .detail-modal .dm-badge.pass { background: var(--green-dim); color: var(--green); }
+.detail-modal .dm-badge.warn { background: var(--yellow-dim); color: var(--yellow); }
 .detail-modal .dm-badge.fail { background: var(--red-dim); color: var(--red); }
 .detail-modal .dm-title { font-size: 16px; font-weight: 700; }
 .detail-modal .dm-model { font-size: 13px; color: var(--dim); font-family: var(--mono); }
@@ -626,6 +639,7 @@ body {
   font-size: 11px; color: var(--muted);
 }
 .tl-row.pass .tl-row-icon { color: var(--green); }
+.tl-row.warn .tl-row-icon { color: var(--yellow); }
 .tl-row.fail .tl-row-icon { color: var(--red); }
 .tl-row.running .tl-row-icon { color: var(--accent); }
 .tl-row.queued .tl-row-icon { color: var(--dim); }
@@ -1526,6 +1540,9 @@ input[type="range"]::-moz-range-thumb {
     </div>
     <div class="topbar-right">
       <span class="conn-dot connecting" id="connDot" title="WebSocket status"></span>
+      <button class="topbar-btn" id="clearChatBtn" type="button" title="Clear conversation">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+      </button>
       <button class="topbar-btn" id="loginBtn" type="button">Login</button>
       <button class="topbar-btn" id="sidebarToggleBtn" type="button" title="Manual configuration">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -1738,7 +1755,7 @@ const S = {
    DOM Helpers
    ================================================================ */
 const $ = id => document.getElementById(id);
-const esc = s => { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; };
+const esc = s => { const d = document.createElement('div'); d.textContent = s; return d.innerHTML.replace(/"/g, '&quot;'); };
 const trunc = (s, n) => s && s.length > n ? s.slice(0, n) + '...' : (s || '');
 
 function formatDur(ms) {
@@ -1845,6 +1862,18 @@ $('sidebarOverlay').addEventListener('click', () => {
 });
 
 /* ================================================================
+   Clear Chat
+   ================================================================ */
+$('clearChatBtn').addEventListener('click', () => {
+  clearChatHistory();
+  // Remove all msg-row elements except the typing indicator
+  Array.from(messagesInner.querySelectorAll('.msg-row:not(:last-child)')).forEach(el => el.remove());
+  if (welcomeView) welcomeView.style.display = '';
+  S.chatSessionId = null;
+  toast('Conversation cleared', 'success');
+});
+
+/* ================================================================
    Login
    ================================================================ */
 $('loginBtn').addEventListener('click', () => {
@@ -1929,6 +1958,36 @@ function hideTyping() {
   typingIndicator.classList.remove('visible');
 }
 
+// Chat history persistence
+const CHAT_HISTORY_KEY = 'astra_chat_history';
+const CHAT_HISTORY_MAX = 100;
+
+function saveChatHistory(role, content) {
+  if (role === 'system') return;
+  try {
+    const history = JSON.parse(localStorage.getItem(CHAT_HISTORY_KEY) || '[]');
+    history.push({ role, content, ts: Date.now() });
+    if (history.length > CHAT_HISTORY_MAX) history.splice(0, history.length - CHAT_HISTORY_MAX);
+    localStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(history));
+  } catch {}
+}
+
+function restoreChatHistory() {
+  try {
+    const history = JSON.parse(localStorage.getItem(CHAT_HISTORY_KEY) || '[]');
+    if (history.length === 0) return;
+    hideWelcome();
+    for (const msg of history) {
+      addMessage(msg.role, msg.content, { skipSave: true });
+    }
+  } catch {}
+}
+
+function clearChatHistory() {
+  try { localStorage.removeItem(CHAT_HISTORY_KEY); } catch {}
+  try { localStorage.removeItem('astra_chat_session_id'); } catch {}
+}
+
 function addMessage(role, content, opts) {
   hideWelcome();
   opts = opts || {};
@@ -1952,6 +2011,8 @@ function addMessage(role, content, opts) {
   const typingRow = typingIndicator.closest('.msg-row');
   messagesInner.insertBefore(row, typingRow);
   scrollToBottom();
+
+  if (!opts.skipSave) saveChatHistory(role, content);
 
   return row;
 }
@@ -2084,11 +2145,12 @@ function addRailDot(type, label, targetEl, report) {
   dot.style.top = railDotY + 'px';
 
   if (report && report.case_name) {
-    const status = report.passed ? 'pass' : 'fail';
+    const status = report.passed ? (report.has_warnings ? 'warn' : 'pass') : 'fail';
+    const badgeLabel = report.passed ? (report.has_warnings ? 'WARN' : 'PASS') : 'FAIL';
     const tok = (report.outcome.prompt_tokens || 0) + (report.outcome.completion_tokens || 0);
     dot.innerHTML = `<div class="tl-dot-preview">
       <div class="dp-header">
-        <span class="dp-badge ${status}">${report.passed ? 'PASS' : 'FAIL'}</span>
+        <span class="dp-badge ${status}">${badgeLabel}</span>
         <span class="dp-name">${esc(report.case_name.replace(/_/g, ' '))}</span>
       </div>
       <div class="dp-model">${esc(normModel(report.model))}</div>
@@ -2165,7 +2227,7 @@ function addTimelineRow(report) {
   const rows = $('tlRows');
   if (!rows) return;
 
-  const status = report.passed ? 'pass' : 'fail';
+  const status = report.passed ? (report.has_warnings ? 'warn' : 'pass') : 'fail';
   const tok = (report.outcome.prompt_tokens || 0) + (report.outcome.completion_tokens || 0);
   const key = 'tlr_' + report.case_name + '_' + report.model + '_' + (report.run_index || 0);
 
@@ -2177,7 +2239,7 @@ function addTimelineRow(report) {
   el.className = 'tl-row ' + status;
   el.id = key;
   el.innerHTML = `
-    <span class="tl-row-icon">${report.passed ? '&#10004;' : '&#10008;'}</span>
+    <span class="tl-row-icon">${report.passed ? (report.has_warnings ? '&#9888;' : '&#10004;') : '&#10008;'}</span>
     <span class="tl-row-name">${esc(report.case_name.replace(/_/g, ' '))}</span>
     <span class="tl-row-model">${esc(normModel(report.model))}</span>
     <span class="tl-row-metrics">
@@ -2237,10 +2299,11 @@ function toggleCaseDetail(rowEl, report) {
 function openDetailModal(report) {
   const overlay = $('detailModalOverlay');
   const content = $('detailModalContent');
-  const status = report.passed ? 'pass' : 'fail';
+  const status = report.passed ? (report.has_warnings ? 'warn' : 'pass') : 'fail';
+  const badgeLabel = report.passed ? (report.has_warnings ? 'WARN' : 'PASS') : 'FAIL';
   content.innerHTML = `
     <div class="dm-header">
-      <span class="dm-badge ${status}">${report.passed ? 'PASS' : 'FAIL'}</span>
+      <span class="dm-badge ${status}">${badgeLabel}</span>
       <span class="dm-title">${esc(report.case_name.replace(/_/g, ' '))}</span>
     </div>
     <div class="dm-model">${esc(normModel(report.model))}</div>
@@ -2292,6 +2355,11 @@ function buildCaseDetailHTML(report) {
         const pct = Math.round(c.score * 100);
         const col = c.score >= 0.7 ? 'var(--green)' : c.score >= 0.4 ? 'var(--yellow)' : 'var(--red)';
         html += `<div class="score-bar-wrap"><div class="score-bar-lbl">Score: ${c.score.toFixed(2)}</div><div class="score-bar-outer"><div class="score-bar-fill" style="width:${pct}%;background:${col}"></div></div></div>`;
+      }
+      if (c.full_detail && c.full_detail !== c.detail) {
+        const fdUid = 'fd_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+        html += `<button class="collapse-toggle" type="button" data-tgt="${fdUid}"><span class="caret">&#9654;</span> Full judger reasoning</button>`;
+        html += `<div class="collapse-body" id="${fdUid}"><div class="cd-code-block" style="white-space:pre-wrap;word-break:break-word">${esc(c.full_detail)}</div></div>`;
       }
       html += '</div></div>';
     }
@@ -2410,8 +2478,12 @@ function addReportCard() {
   html += '</div>';
 
   // Summary stats
+  const warnCount = S.runs.filter(r => r.passed && r.has_warnings).length;
   html += '<div class="report-summary-row">';
   html += '<div class="report-stat"><div class="rs-val" style="color:var(--green)">' + S.passed + '</div><div class="rs-lbl">Passed</div></div>';
+  if (warnCount > 0) {
+    html += '<div class="report-stat"><div class="rs-val" style="color:var(--yellow)">' + warnCount + '</div><div class="rs-lbl">Warnings</div></div>';
+  }
   html += '<div class="report-stat"><div class="rs-val" style="color:var(--red)">' + S.failed + '</div><div class="rs-lbl">Failed</div></div>';
   html += '<div class="report-stat"><div class="rs-val">' + formatDur(wallMs) + '</div><div class="rs-lbl">Wall Time</div></div>';
   html += '</div>';
@@ -2793,8 +2865,8 @@ function cancelRun() {
   fetch('/api/cancel', { method: 'POST' })
     .then(r => r.json())
     .then(data => {
-      if (data.status === 'cancelled') toast('Run cancelled', 'info');
-      else if (data.error) toast(data.error, 'error');
+      if (data.error) toast(data.error, 'error');
+      else toast('Run cancelling', 'info');
     })
     .catch(e => toast('Cancel failed: ' + e.message, 'error'));
 }
@@ -2934,7 +3006,10 @@ function sendChat(msg, model) {
       } else {
         const text = data.text || JSON.stringify(data);
         addMessage('assistant', text);
-        if (data.session_id) S.chatSessionId = data.session_id;
+        if (data.session_id) {
+          S.chatSessionId = data.session_id;
+          try { localStorage.setItem('astra_chat_session_id', data.session_id); } catch {}
+        }
       }
     })
     .catch(e => { hideTyping(); addMessage('system', 'Request failed: ' + e.message); })
@@ -2942,7 +3017,7 @@ function sendChat(msg, model) {
 }
 
 function sendOrchestrate(instruction, model) {
-  addMessage('assistant', 'Planning your test run...');
+  addMessage('assistant', 'Planning your test run...', { skipSave: true });
 
   const body = { instruction };
   if (model) body.model = model;
@@ -3167,7 +3242,8 @@ function handleEvent(ev) {
       // Add dot to the rail
       const rowEl = document.getElementById('tlr_' + r.case_name + '_' + r.model + '_' + (r.run_index || 0));
       const shortName = r.case_name.replace(/_/g, ' ');
-      addRailDot(r.passed ? 'pass' : 'fail', shortName + ' × ' + normModel(r.model), rowEl, r);
+      const dotType = r.passed ? (r.has_warnings ? 'warn' : 'pass') : 'fail';
+      addRailDot(dotType, shortName + ' × ' + normModel(r.model), rowEl, r);
       break;
     }
 
@@ -3214,7 +3290,14 @@ try {
   if (savedUser) $('loginBtn').textContent = savedUser;
 } catch {}
 
-// (Preview cards now show on hover, no click-outside needed)
+// Restore chat session ID
+try {
+  const savedSessionId = localStorage.getItem('astra_chat_session_id');
+  if (savedSessionId) S.chatSessionId = savedSessionId;
+} catch {}
+
+// Restore chat conversation history
+restoreChatHistory();
 </script>
 <!-- Detail Modal -->
 <div class="detail-modal-overlay" id="detailModalOverlay">

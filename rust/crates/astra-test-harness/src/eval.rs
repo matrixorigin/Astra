@@ -254,7 +254,18 @@ fn score_model(report: &SuiteReport, model: &str) -> ModelScore {
 
 fn compute_efficiency(runs: &[&crate::report::CaseRunReport]) -> EfficiencyScore {
     let passed: Vec<_> = runs.iter().filter(|r| r.passed).collect();
-    let n = passed.len().max(1) as f64;
+
+    // No passes → zero efficiency; there is nothing to measure.
+    if passed.is_empty() {
+        return EfficiencyScore {
+            avg_tokens_per_pass: 0.0,
+            avg_duration_per_pass: 0.0,
+            avg_turns_per_pass: 0.0,
+            score: 0.0,
+        };
+    }
+
+    let n = passed.len() as f64;
 
     let avg_tok: f64 = passed
         .iter()
@@ -429,6 +440,26 @@ mod tests {
             "broken should be a universal failure"
         );
         assert!(eval.runtime_health.score < 100.0);
+    }
+
+    #[test]
+    fn zero_passes_gives_zero_efficiency() {
+        let report = SuiteReport {
+            runs: vec![
+                mk("fail1", "A", false, Some("tool_use"), 1),
+                mk("fail2", "A", false, Some("tool_use"), 2),
+            ],
+            ..Default::default()
+        };
+        let eval = evaluate(&report);
+        let a = eval.model_scores.iter().find(|m| m.model == "A").unwrap();
+        assert_eq!(
+            a.efficiency.score, 0.0,
+            "efficiency score must be 0 when no cases pass"
+        );
+        assert_eq!(a.efficiency.avg_tokens_per_pass, 0.0);
+        assert_eq!(a.efficiency.avg_duration_per_pass, 0.0);
+        assert_eq!(a.efficiency.avg_turns_per_pass, 0.0);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use axum::Router;
 use axum::extract::State;
@@ -121,7 +121,11 @@ struct AppState {
     cancel_flag: Arc<AtomicBool>,
     last_report: Arc<Mutex<Option<SuiteReport>>>,
     run_counter: Arc<std::sync::atomic::AtomicU32>,
+    ws_connections: Arc<AtomicUsize>,
 }
+
+/// Maximum number of concurrent WebSocket connections.
+const MAX_WS_CONNECTIONS: usize = 100;
 
 pub struct DashboardServer {
     tx: broadcast::Sender<DashboardEvent>,
@@ -149,6 +153,7 @@ impl DashboardServer {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             last_report: Arc::new(Mutex::new(None)),
             run_counter: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            ws_connections: Arc::new(AtomicUsize::new(0)),
         };
         let app = Router::new()
             .route("/", get(index_handler))
@@ -180,10 +185,25 @@ async fn index_handler() -> Html<&'static str> {
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    let current = state.ws_connections.load(Ordering::Relaxed);
+    if current >= MAX_WS_CONNECTIONS {
+        return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     ws.on_upgrade(move |socket| handle_ws(socket, state))
+        .into_response()
 }
 
 async fn handle_ws(mut socket: WebSocket, state: AppState) {
+    state.ws_connections.fetch_add(1, Ordering::Relaxed);
+    // Ensure the counter is decremented when this function exits for any reason.
+    struct WsGuard(Arc<AtomicUsize>);
+    impl Drop for WsGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    let _ws_guard = WsGuard(state.ws_connections.clone());
+
     // Send full state snapshot so page refresh recovers.
     let running = *state.running.lock().await;
     let report = state.last_report.lock().await.clone();
@@ -232,16 +252,20 @@ async fn config_handler(State(state): State<AppState>) -> Json<serde_json::Value
 
 async fn models_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let admin_bin = state.config.astra_bin.with_file_name("astra-admin");
-    let output = tokio::process::Command::new(&admin_bin)
-        .args(["model", "list"])
-        .env("NO_PROXY", "localhost,127.0.0.1")
-        .env("no_proxy", "localhost,127.0.0.1")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::process::Command::new(&admin_bin)
+            .args(["model", "list"])
+            .env("NO_PROXY", "localhost,127.0.0.1")
+            .env("no_proxy", "localhost,127.0.0.1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
     match output {
-        Ok(o) if o.status.success() => {
+        Ok(Ok(o)) if o.status.success() => {
             let stdout = String::from_utf8_lossy(&o.stdout);
             if let Ok(models) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
                 Json(serde_json::json!({"models": models}))
@@ -249,11 +273,12 @@ async fn models_handler(State(state): State<AppState>) -> Json<serde_json::Value
                 Json(serde_json::json!({"models": [], "error": "parse failed"}))
             }
         }
-        Ok(o) => {
+        Ok(Ok(o)) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
             Json(serde_json::json!({"models": [], "error": stderr.trim()}))
         }
-        Err(e) => Json(serde_json::json!({"models": [], "error": e.to_string()})),
+        Ok(Err(e)) => Json(serde_json::json!({"models": [], "error": e.to_string()})),
+        Err(_) => Json(serde_json::json!({"models": [], "error": "model list timed out after 30s"})),
     }
 }
 
@@ -313,8 +338,21 @@ fn default_parallel() -> usize {
 
 async fn run_handler(
     State(state): State<AppState>,
-    Json(req): Json<RunRequest>,
+    Json(mut req): Json<RunRequest>,
 ) -> Json<serde_json::Value> {
+    // H3: reject early when no models are specified and no cases have their own models.
+    if req.models.is_empty() {
+        let cases_have_models = crate::case::Case::load_dir(&state.config.suite_dir)
+            .map(|cs| cs.iter().any(|c| c.models.is_some()))
+            .unwrap_or(false);
+        if !cases_have_models {
+            return Json(serde_json::json!({"error": "No models specified"}));
+        }
+    }
+
+    // M7: clamp parallel to a sane range.
+    req.parallel = req.parallel.clamp(1, 32);
+
     {
         let mut running = state.running.lock().await;
         if *running {
@@ -341,6 +379,19 @@ async fn run_handler(
     let rid = run_id.clone();
 
     tokio::spawn(async move {
+        // M3: ensure running_flag is always reset, even if the body panics.
+        struct RunGuard(Arc<Mutex<bool>>);
+        impl Drop for RunGuard {
+            fn drop(&mut self) {
+                // Cannot do async in Drop, but try_lock suffices here because
+                // nothing else contends on the mutex while the run task owns it.
+                if let Ok(mut g) = self.0.try_lock() {
+                    *g = false;
+                }
+            }
+        }
+        let _guard = RunGuard(running_flag);
+
         let result = execute_run(config, tx.clone(), req, cancel_flag, &rid, &source).await;
         match result {
             Ok(report) => {
@@ -354,7 +405,7 @@ async fn run_handler(
                 });
             }
         }
-        *running_flag.lock().await = false;
+        // The RunGuard drop will reset the flag.
     });
 
     Json(serde_json::json!({"status": "started", "run_id": run_id}))
@@ -633,25 +684,30 @@ async fn orchestrate_handler(
         .unwrap_or_default();
 
     let admin_bin = state.config.astra_bin.with_file_name("astra-admin");
-    let models_list = tokio::process::Command::new(&admin_bin)
-        .args(["model", "list"])
-        .env("NO_PROXY", "localhost,127.0.0.1")
-        .env("no_proxy", "localhost,127.0.0.1")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-        .ok()
-        .and_then(|o| {
-            serde_json::from_str::<Vec<serde_json::Value>>(&String::from_utf8_lossy(&o.stdout)).ok()
-        })
-        .map(|ms| {
-            ms.iter()
-                .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
+    let models_list = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::process::Command::new(&admin_bin)
+            .args(["model", "list"])
+            .env("NO_PROXY", "localhost,127.0.0.1")
+            .env("no_proxy", "localhost,127.0.0.1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .and_then(|o| {
+        serde_json::from_str::<Vec<serde_json::Value>>(&String::from_utf8_lossy(&o.stdout)).ok()
+    })
+    .map(|ms| {
+        ms.iter()
+            .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
+    .unwrap_or_default();
 
     let prompt = format!(
         "You are a test harness planner. Given an instruction, output ONLY a JSON object with:\n\
@@ -667,16 +723,20 @@ async fn orchestrate_handler(
     );
 
     let model = req.model.as_deref().unwrap_or("claude-sonnet-4-6");
-    let output = tokio::process::Command::new(&state.config.astra_bin)
-        .args(["chat", "-m", &prompt, "--model", model, "--json", "-y"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        tokio::process::Command::new(&state.config.astra_bin)
+            .args(["chat", "-m", &prompt, "--model", model, "--json", "-y"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
 
     match output {
-        Ok(o) => {
+        Ok(Ok(o)) => {
             let exit_code = o.status.code().unwrap_or(-1);
             let stdout = String::from_utf8_lossy(&o.stdout);
             let stderr = String::from_utf8_lossy(&o.stderr);
@@ -725,7 +785,10 @@ async fn orchestrate_handler(
 
             Json(serde_json::json!({"chat_fallback": text}))
         }
-        Err(e) => Json(serde_json::json!({"error": format!("orchestrate: {e}")})),
+        Ok(Err(e)) => Json(serde_json::json!({"error": format!("orchestrate: {e}")})),
+        Err(_) => Json(serde_json::json!({
+            "error": "Orchestrate timed out after 5 minutes. Try a simpler instruction or a faster model."
+        })),
     }
 }
 

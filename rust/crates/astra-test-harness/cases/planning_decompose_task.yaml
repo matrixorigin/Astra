@@ -13,6 +13,7 @@ capability: planning
 difficulty: 2
 weight: 1.5
 timeout_seconds: 180
+setup_cmd: "rm -f /tmp/astra_plan_test.txt"
 teardown_cmd: "rm -f /tmp/astra_plan_test.txt"
 criteria:
   - type: exit_code

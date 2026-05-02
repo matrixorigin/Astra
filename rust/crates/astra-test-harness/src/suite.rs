@@ -9,7 +9,7 @@ use tokio::sync::Semaphore;
 
 use crate::case::Case;
 use crate::classify::{FailureClass, classify};
-use crate::criteria::{Criterion, evaluate_deterministic_with_session};
+use crate::criteria::{Criterion, CriterionSeverity, evaluate_deterministic_with_session};
 use crate::digest::DigestCollector;
 use crate::exec::CaseExecutor;
 use crate::judger::{Judger, evaluate_judger};
@@ -307,14 +307,25 @@ impl<'a> SuiteRunner<'a> {
             if let Some(ref wd) = self.runner_cfg.working_dir {
                 setup_cmd.current_dir(wd);
             }
-            setup_cmd.arg("-c").arg(cmd);
-            let status = setup_cmd.status().await;
-            let failed = match &status {
-                Ok(s) => !s.success(),
-                Err(_) => true,
+            setup_cmd.arg("-c").arg(cmd).kill_on_drop(true);
+            let status = tokio::time::timeout(Duration::from_secs(30), setup_cmd.status()).await;
+            let failed = match status {
+                Ok(Ok(s)) => !s.success(),
+                Ok(Err(_)) => true,
+                Err(_) => {
+                    eprintln!(
+                        "[astra-test] setup_cmd timed out (30s) for case={}",
+                        case.name
+                    );
+                    true
+                }
             };
             if failed {
-                let exit = status.as_ref().ok().and_then(|s| s.code()).unwrap_or(-1);
+                let exit = status
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .and_then(|s| s.code())
+                    .unwrap_or(-1);
                 eprintln!(
                     "[astra-test] setup_cmd failed for case={}; aborting (exit {})",
                     case.name, exit
@@ -386,7 +397,10 @@ impl<'a> SuiteRunner<'a> {
                 } else {
                     vec![]
                 };
-                let step_passed = step_criteria_results.iter().all(|r| r.passed);
+                let step_passed = step_criteria_results
+                    .iter()
+                    .filter(|r| r.severity == CriterionSeverity::Hard)
+                    .all(|r| r.passed);
 
                 step_results.push(StepResult {
                     step_index: idx as u32,
@@ -538,8 +552,22 @@ impl<'a> SuiteRunner<'a> {
             if let Some(ref wd) = self.runner_cfg.working_dir {
                 teardown_cmd.current_dir(wd);
             }
-            teardown_cmd.arg("-c").arg(cmd);
-            let _ = teardown_cmd.status().await;
+            teardown_cmd.arg("-c").arg(cmd).kill_on_drop(true);
+            match tokio::time::timeout(Duration::from_secs(30), teardown_cmd.status()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    eprintln!(
+                        "[astra-test] teardown_cmd error for case={}: {e}",
+                        case.name
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[astra-test] teardown_cmd timed out (30s) for case={}, continuing",
+                        case.name
+                    );
+                }
+            }
         }
 
         // Progress: emit per-case result to stderr so long runs show
@@ -1277,5 +1305,171 @@ mod tests {
         // Parallel path sorts by (case_name, model, run_index).
         let names: Vec<&str> = report.runs.iter().map(|r| r.case_name.as_str()).collect();
         assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn cancel_flag_stops_run_early() {
+        let exec = FakeExecutor::new();
+        for i in 0..5 {
+            let name = format!("c{i}");
+            exec.seed(&name, "m", outcome_ok("m", "text", &[]));
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+
+        // Use a custom executor that sets the cancel flag after the first case.
+        struct CancelAfterFirst {
+            inner: FakeExecutor,
+            flag: Arc<AtomicBool>,
+            call_count: AtomicUsize,
+        }
+        #[async_trait]
+        impl CaseExecutor for CancelAfterFirst {
+            async fn execute(&self, case: &Case, model: &str) -> RunOutcome {
+                let n = self.call_count.fetch_add(1, Ordering::Relaxed);
+                if n >= 1 {
+                    // After the first case completes, set cancel flag.
+                    self.flag.store(true, Ordering::Relaxed);
+                }
+                self.inner.execute(case, model).await
+            }
+            fn reproducer(&self, _case: &Case, _model: &str) -> String {
+                String::new()
+            }
+        }
+
+        let cancel_exec = CancelAfterFirst {
+            inner: {
+                let e = FakeExecutor::new();
+                for i in 0..5 {
+                    let name = format!("c{i}");
+                    e.seed(&name, "m", outcome_ok("m", "text", &[]));
+                }
+                e
+            },
+            flag: cancel.clone(),
+            call_count: AtomicUsize::new(0),
+        };
+
+        let runner = SuiteRunner {
+            executor: &cancel_exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: Some(cancel),
+        };
+        let cases: Vec<Case> = (0..5).map(|i| case_with(&format!("c{i}"), vec![])).collect();
+        let report = runner.run_all(&cases).await;
+        // Cancel fires after 1st case; the 2nd case still executes
+        // (cancel is checked BEFORE each case, not during), then the
+        // loop sees the flag and stops. So we expect fewer than 5.
+        assert!(
+            report.total() < 5,
+            "cancel_flag should stop the run early, got {} results",
+            report.total()
+        );
+    }
+
+    #[tokio::test]
+    async fn has_warnings_when_soft_criterion_fails() {
+        let exec = FakeExecutor::new();
+        // Outcome with 0 tokens — the TokensBetween criterion will fail.
+        exec.seed("c1", "m", outcome_ok("m", "hello", &["Read"]));
+
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        // Hard criterion passes (ToolCalled "Read"), Soft criterion fails
+        // (TokensBetween 100..500, but outcome has 0 tokens).
+        let case = case_with(
+            "c1",
+            vec![
+                Criterion::ToolCalled {
+                    name: "Read".into(),
+                },
+                Criterion::TokensBetween { min: 100, max: 500 },
+            ],
+        );
+        let report = runner.run_all(&[case]).await;
+        assert!(
+            report.runs[0].passed,
+            "case should PASS because Hard criterion passed"
+        );
+        assert!(
+            report.runs[0].has_warnings,
+            "case should have warnings because Soft criterion failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_soft_criterion_failure_does_not_fail_case() {
+        let exec = FakeExecutor::new();
+        exec.seed("mt", "m", outcome_ok("m", "turn0", &["Read"]));
+        // Step outcome: 0 tokens, so TokensBetween will fail.
+        exec.seed("mt__step0", "m", outcome_ok("m", "turn1", &["Write"]));
+
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let mut case = case_with("mt", vec![]);
+        case.steps = vec![crate::case::CaseStep {
+            prompt: "follow up".into(),
+            // Soft criterion that will fail (0 tokens not in 100..500).
+            criteria: vec![Criterion::TokensBetween { min: 100, max: 500 }],
+            timeout_seconds: None,
+        }];
+        let report = runner.run_all(&[case]).await;
+        assert_eq!(report.total(), 1);
+        // Step's Soft criterion fails, but the case should still PASS
+        // because only Hard step criteria cause case failure.
+        assert!(
+            report.runs[0].passed,
+            "step soft criterion failure must NOT fail the case"
+        );
+        // The step itself should be marked as passed (only Hard matters).
+        assert!(
+            report.runs[0].steps[0].passed,
+            "step should be passed since only Soft criterion failed"
+        );
+        // Verify the soft criterion actually failed.
+        assert!(
+            !report.runs[0].steps[0].criteria[0].passed,
+            "soft criterion should report as failed"
+        );
     }
 }

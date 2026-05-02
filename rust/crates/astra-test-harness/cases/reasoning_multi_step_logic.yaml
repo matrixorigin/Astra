@@ -18,7 +18,7 @@ criteria:
   - type: exit_code
     code: 0
   - type: text_contains
-    needle: "7"
+    needle: "7 crossings"
   - type: tokens_between
     min: 1
     max: 25000
