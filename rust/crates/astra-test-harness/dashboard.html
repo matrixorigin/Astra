@@ -2629,9 +2629,12 @@ function sendOrchestrate(instruction, model) {
     .then(data => {
       hideTyping();
       if (data.error) {
-        addMessage('system', 'Error: ' + data.error + (data.raw ? '\n\nRaw: ' + data.raw : ''));
+        addMessage('system', data.error);
       } else if (data.plan) {
         renderPlanCard(data.plan);
+      } else if (data.chat_fallback) {
+        // Model gave a text answer instead of a plan — show it as chat
+        addMessage('assistant', data.chat_fallback);
       }
     })
     .catch(e => { hideTyping(); addMessage('system', 'Orchestrate failed: ' + e.message); })

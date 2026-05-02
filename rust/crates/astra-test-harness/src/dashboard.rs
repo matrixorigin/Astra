@@ -610,24 +610,58 @@ async fn orchestrate_handler(
 
     match output {
         Ok(o) => {
+            let exit_code = o.status.code().unwrap_or(-1);
             let stdout = String::from_utf8_lossy(&o.stdout);
+            let stderr = String::from_utf8_lossy(&o.stderr);
+
+            if exit_code == 3 {
+                return Json(serde_json::json!({
+                    "error": "Authentication failed — credentials expired. Click Login to refresh."
+                }));
+            }
+            if !o.status.success() {
+                return Json(serde_json::json!({
+                    "error": format!("astra exited {} — {}", exit_code, stderr.chars().take(200).collect::<String>())
+                }));
+            }
+
             let text = serde_json::from_str::<serde_json::Value>(stdout.trim())
                 .ok()
                 .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
                 .unwrap_or_else(|| stdout.trim().to_string());
 
+            if text.is_empty() {
+                return Json(serde_json::json!({
+                    "error": format!("astra returned empty response (exit={})", exit_code)
+                }));
+            }
+
             // Try to parse the plan JSON from the text.
+            // The model might wrap it in markdown fences or add explanation.
             let plan_text = text
                 .trim()
                 .trim_start_matches("```json")
                 .trim_start_matches("```")
                 .trim_end_matches("```")
                 .trim();
+
+            // Try direct parse first
             if let Ok(plan) = serde_json::from_str::<serde_json::Value>(plan_text) {
-                Json(serde_json::json!({"plan": plan}))
-            } else {
-                Json(serde_json::json!({"error": "Could not parse plan", "raw": text}))
+                return Json(serde_json::json!({"plan": plan}));
             }
+
+            // Try to find JSON inside the text (model added explanation around it)
+            if let Some(start) = text.find('{')
+                && let Some(end) = text.rfind('}')
+            {
+                let json_slice = &text[start..=end];
+                if let Ok(plan) = serde_json::from_str::<serde_json::Value>(json_slice) {
+                    return Json(serde_json::json!({"plan": plan}));
+                }
+            }
+
+            // Fall back: show the raw text as a chat message instead of error
+            Json(serde_json::json!({"chat_fallback": text}))
         }
         Err(e) => Json(serde_json::json!({"error": format!("orchestrate: {e}")})),
     }
