@@ -2,6 +2,7 @@ pub(crate) mod approval_overlay;
 pub(crate) mod chat_composer;
 pub(crate) mod footer;
 pub(crate) mod help_view;
+pub(crate) mod history_view;
 pub(crate) mod info_view;
 pub(crate) mod list_selection_view;
 pub(crate) mod skill_popup;

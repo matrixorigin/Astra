@@ -222,75 +222,100 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
-        // ── History — full grep support inline ──────────────────────
+        // ── History — interactive search view ────────────────────────
         "/history" => {
-            use crate::tui::bottom_pane::info_view::InfoView;
+            use crate::tui::bottom_pane::history_view::HistoryView;
             if ctx.state.history.is_empty() {
                 ctx.show_info("No history yet".into());
                 return SlashResult::Handled;
             }
-
-            let filter = if args.starts_with("grep ") {
-                Some(args.strip_prefix("grep ").unwrap_or("").to_lowercase())
+            let initial_query = if args.starts_with("grep ") {
+                args.strip_prefix("grep ").unwrap_or("").trim()
             } else {
-                None
+                ""
             };
-
-            let mut lines = Vec::new();
-            let mut match_count = 0;
-            for (i, (user, asst)) in ctx.state.history.iter().enumerate() {
-                let turn = i + 1;
-                if let Some(ref q) = filter {
-                    let u_match = user.to_lowercase().contains(q);
-                    let a_match = asst.to_lowercase().contains(q);
-                    if !u_match && !a_match { continue; }
-                    match_count += 1;
-                }
-                let u_preview: String = user.chars().take(100).collect();
-                let a_preview: String = asst.chars().take(100).collect();
-                let u_suffix = if user.chars().count() > 100 { "…" } else { "" };
-                let a_suffix = if asst.chars().count() > 100 { "…" } else { "" };
-                lines.push(format!("  Turn {turn}"));
-                lines.push(format!("    › {u_preview}{u_suffix}"));
-                lines.push(format!("    {a_preview}{a_suffix}"));
-                lines.push(String::new());
-            }
-
-            let title = if let Some(ref q) = filter {
-                if lines.is_empty() {
-                    ctx.show_info(format!("No matches for '{q}'"));
-                    return SlashResult::Handled;
-                }
-                format!("History — {match_count} match(es) for '{q}'")
-            } else {
-                format!("Conversation History ({} turns)", ctx.state.history.len())
-            };
-
-            ctx.bottom_pane.push_view(Box::new(InfoView::from_plain(&title, lines)));
+            ctx.bottom_pane.push_view(Box::new(HistoryView::new(&ctx.state.history, initial_query)));
             SlashResult::Handled
         }
 
         // ── Style ───────────────────────────────────────────────────
         "/style" => SlashResult::Fallback,
 
-        // ── Instructions — full subcommand support ──────────────────
+        // ── Instructions — subcommand menu or direct action ─────────
         "/instructions" => {
             use crate::tui::bottom_pane::info_view::InfoView;
             match args {
-                "" | "show" => {
+                "" => {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    let inst_path = cwd.join(".astra").join("instructions.md");
+
+                    let file_info = if let Ok(meta) = std::fs::metadata(&inst_path) {
+                        let size = meta.len();
+                        let age = meta.modified().ok().and_then(|t| {
+                            let s = t.elapsed().ok()?.as_secs();
+                            Some(if s < 60 { format!("{s}s ago") }
+                                 else if s < 3600 { format!("{}m ago", s / 60) }
+                                 else if s < 86400 { format!("{}h ago", s / 3600) }
+                                 else { format!("{}d ago", s / 86400) })
+                        }).unwrap_or_else(|| "?".into());
+                        format!("{size}B, {age}")
+                    } else {
+                        "file not found".into()
+                    };
+
+                    let status = if let Some(ref pi) = ctx.state.project_instructions {
+                        let lc = pi.lines().count();
+                        format!("✓ loaded ({lc} lines) · {file_info}")
+                    } else {
+                        format!("✗ not loaded · {file_info}")
+                    };
+
+                    let items = vec![
+                        SelectionItem {
+                            name: "Show".into(),
+                            description: Some(status),
+                            is_current: false,
+                        },
+                        SelectionItem {
+                            name: "Reload".into(),
+                            description: Some(format!("Reload from {}", inst_path.display())),
+                            is_current: false,
+                        },
+                        SelectionItem {
+                            name: "Off".into(),
+                            description: Some("Disable instructions for this session".into()),
+                            is_current: false,
+                        },
+                    ];
+                    ctx.bottom_pane.push_view(Box::new(
+                        ListSelectionView::new(items, Some("Project Instructions:".into()))
+                    ));
+                    SlashResult::Handled
+                }
+                "show" => {
                     if let Some(ref pi) = ctx.state.project_instructions {
                         let line_count = pi.lines().count();
                         let title = format!("Project Instructions ({line_count} lines)");
-                        ctx.bottom_pane.push_view(Box::new(InfoView::from_plain(
-                            &title,
-                            pi.lines().map(|l| format!("  {l}")).collect(),
-                        )));
+                        ctx.bottom_pane.push_view(Box::new(
+                            InfoView::from_plain(&title, pi.lines().map(|l| format!("  {l}")).collect())
+                                .with_reopen("/instructions")
+                        ));
                     } else {
                         ctx.show_info("No project instructions loaded. Create .astra/instructions.md in your project root.".into());
                     }
                     SlashResult::Handled
                 }
-                "reload" => SlashResult::Fallback,
+                "reload" => {
+                    if let Some(instructions) = crate::project_instructions::discover_project_instructions() {
+                        let lines = instructions.lines().count();
+                        ctx.state.project_instructions = Some(instructions);
+                        ctx.show_info(format!("Reloaded project instructions ({lines} lines)"));
+                    } else {
+                        ctx.state.project_instructions = None;
+                        ctx.show_info("No .astra/instructions.md found".into());
+                    }
+                    SlashResult::Handled
+                }
                 "off" => {
                     ctx.state.project_instructions = None;
                     ctx.show_info("Project instructions disabled for this session".into());
@@ -347,6 +372,46 @@ pub(crate) fn handle_view_result(
     if let Some(sub) = stats_sub {
         show_stats_view(sub, state, guard, bottom_pane);
         return;
+    }
+
+    // Instructions menu → dispatch subcommands
+    match name {
+        "Show" => {
+            use crate::tui::bottom_pane::info_view::InfoView;
+            if let Some(ref pi) = state.project_instructions {
+                let lc = pi.lines().count();
+                bottom_pane.push_view(Box::new(
+                    InfoView::from_plain(
+                        &format!("Project Instructions ({lc} lines)"),
+                        pi.lines().map(|l| format!("  {l}")).collect(),
+                    ).with_reopen("/instructions")
+                ));
+            } else {
+                let msg = SystemChatCell::info("No project instructions loaded. Create .astra/instructions.md".into());
+                guard.queue_history_lines(msg.display_lines(w));
+            }
+            return;
+        }
+        "Reload" => {
+            if let Some(instructions) = crate::project_instructions::discover_project_instructions() {
+                let lc = instructions.lines().count();
+                state.project_instructions = Some(instructions);
+                let msg = SystemChatCell::info(format!("Reloaded project instructions ({lc} lines)"));
+                guard.queue_history_lines(msg.display_lines(w));
+            } else {
+                state.project_instructions = None;
+                let msg = SystemChatCell::info("No .astra/instructions.md found".into());
+                guard.queue_history_lines(msg.display_lines(w));
+            }
+            return;
+        }
+        "Off" => {
+            state.project_instructions = None;
+            let msg = SystemChatCell::info("Project instructions disabled".into());
+            guard.queue_history_lines(msg.display_lines(w));
+            return;
+        }
+        _ => {}
     }
 
     // Slash command selected from help → insert into composer
