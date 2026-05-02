@@ -100,6 +100,43 @@ fn no_duplicate_tool_names() {
     }
 }
 
+// ── single source of truth: schemas come from astra-tools ────────────────
+
+#[test]
+fn schemas_are_from_astra_tools_not_local() {
+    let cli_schemas = all_tool_schemas();
+    let shared_schemas = astra_tools::schemas::all_tool_schemas();
+    assert_eq!(
+        cli_schemas.len(),
+        shared_schemas.len(),
+        "CLI all_tool_schemas must be the same as astra_tools (single source of truth)"
+    );
+}
+
+// ── TOOL_CATALOG ↔ schema consistency ────────────────────────────────────
+
+#[test]
+fn every_catalog_tool_has_schema() {
+    // Tools with dynamically constructed schemas (not in static all_tool_schemas).
+    const DYNAMIC_SCHEMA_TOOLS: &[&str] = &["delegate"];
+
+    let schemas = all_tool_schemas();
+    let schema_names: std::collections::HashSet<&str> = schemas
+        .iter()
+        .filter_map(|s| s["function"]["name"].as_str())
+        .collect();
+    for tool in astra_runtime::tool_registry::TOOL_CATALOG {
+        if DYNAMIC_SCHEMA_TOOLS.contains(&tool.name) {
+            continue;
+        }
+        assert!(
+            schema_names.contains(tool.name),
+            "TOOL_CATALOG has '{}' but no schema defined — add it to astra-tools/schemas.rs",
+            tool.name
+        );
+    }
+}
+
 // ── new tool schema coverage ──────────────────────────────────────────────
 
 #[test]

@@ -58,14 +58,12 @@ pub(crate) use session_state::SessionStateRollbackJournal;
 #[path = "edge_tools/passive_lsp.rs"]
 mod passive_lsp;
 use astra_tools::passive_tsc_check;
-#[path = "edge_tools/schemas.rs"]
-mod schemas;
 #[path = "edge_tools/shell.rs"]
 #[allow(clippy::needless_range_loop)]
 mod shell;
 use astra_tools::env_tools;
 pub use env_tools::apply_overlay as apply_env_overlay;
-pub use schemas::all_tool_schemas;
+pub use astra_tools::schemas::all_tool_schemas;
 #[path = "edge_tools/code_analysis.rs"]
 mod code_analysis;
 #[path = "edge_tools/config_tool.rs"]
