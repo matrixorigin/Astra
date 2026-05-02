@@ -29,3 +29,13 @@ criteria:
   - type: tokens_between
     min: 1
     max: 150000
+  - type: judger
+    question: |
+      Evaluate ONLY based on the tool calls and final text provided.
+      Do NOT attempt to read or execute files yourself.
+      The agent was asked to write a fibonacci function and verify
+      fibonacci(10)=55. Check: (1) did the tool calls include writing
+      a file and running bash? (2) does the final text confirm the
+      output was 55? Score 1.0 if both are true, 0.5 if partially,
+      0.0 if the agent claimed success without evidence.
+    threshold: 0.7

@@ -12,7 +12,7 @@ capability: tool_use
 difficulty: 2
 weight: 2.0
 timeout_seconds: 180
-setup_cmd: "echo 'hello world 42' > /tmp/astra_harness_mt_test.txt"
+setup_cmd: "rm -f /tmp/astra_harness_mt_test.txt && echo 'hello world 42' > /tmp/astra_harness_mt_test.txt"
 teardown_cmd: "rm -f /tmp/astra_harness_mt_test.txt"
 steps:
   - prompt: "Now append the line 'second line' to that same file and confirm it was done."
