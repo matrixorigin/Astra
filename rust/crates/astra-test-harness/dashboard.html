@@ -253,7 +253,7 @@ body {
 }
 .tl-dot:hover .tl-dot-tooltip { opacity: 1; }
 
-/* Mini preview card — click to toggle, positioned next to dot */
+/* Mini preview card — shows on hover, positioned next to dot */
 .tl-dot .tl-dot-preview {
   position: absolute;
   left: 24px;
@@ -264,15 +264,15 @@ body {
   border-radius: var(--radius);
   padding: 12px 16px;
   min-width: 260px; max-width: 320px;
-  pointer-events: auto;
+  pointer-events: none;
   opacity: 0; transform: translateX(-8px) scale(0.96);
   transition: all 0.25s var(--spring);
   z-index: 50;
   box-shadow: 0 12px 40px rgba(0,0,0,0.5), 0 0 0 1px rgba(100,150,255,0.1);
-  display: none;
 }
-.tl-dot.preview-open .tl-dot-preview {
-  display: block; opacity: 1; transform: translateX(0) scale(1);
+.tl-dot:hover .tl-dot-preview {
+  opacity: 1; transform: translateX(0) scale(1);
+  pointer-events: auto;
 }
 .tl-dot-preview .dp-header {
   display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
@@ -296,6 +296,49 @@ body {
 .tl-dot-preview .dp-hint {
   font-size: 10px; color: var(--dim); margin-top: 6px; font-style: italic;
 }
+
+/* ── Detail Modal (floating card) ── */
+.detail-modal-overlay {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(0,0,0,0.5);
+  backdrop-filter: blur(4px);
+  opacity: 0; transition: opacity 0.2s;
+  pointer-events: none;
+  display: flex; align-items: center; justify-content: center;
+}
+.detail-modal-overlay.open { opacity: 1; pointer-events: auto; }
+.detail-modal {
+  background: var(--bg-raised);
+  border: 1px solid var(--border-focus);
+  border-radius: var(--radius);
+  width: 90%; max-width: 640px; max-height: 80vh;
+  overflow-y: auto;
+  padding: 24px 28px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+  transform: scale(0.95) translateY(10px);
+  transition: transform 0.3s var(--spring);
+}
+.detail-modal-overlay.open .detail-modal {
+  transform: scale(1) translateY(0);
+}
+.detail-modal .dm-close {
+  position: absolute; top: 16px; right: 16px;
+  background: none; border: none; color: var(--muted);
+  font-size: 20px; cursor: pointer; padding: 4px 8px;
+  border-radius: 4px; transition: all 0.15s;
+}
+.detail-modal .dm-close:hover { background: var(--bg-surface); color: var(--text); }
+.detail-modal .dm-header {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 16px;
+}
+.detail-modal .dm-badge {
+  font-size: 12px; font-weight: 700; padding: 4px 10px;
+  border-radius: 4px; letter-spacing: 0.5px;
+}
+.detail-modal .dm-badge.pass { background: var(--green-dim); color: var(--green); }
+.detail-modal .dm-badge.fail { background: var(--red-dim); color: var(--red); }
+.detail-modal .dm-title { font-size: 16px; font-weight: 700; }
+.detail-modal .dm-model { font-size: 13px; color: var(--dim); font-family: var(--mono); }
 @keyframes dotAppear {
   from { transform: scale(0); opacity: 0; }
   to { transform: scale(1); opacity: 1; }
@@ -2060,27 +2103,22 @@ function addRailDot(type, label, targetEl, report) {
     dot.innerHTML = `<span class="tl-dot-tooltip">${esc(label)}</span>`;
   }
 
+  // Click dot → open detail modal
   dot.addEventListener('click', (e) => {
     e.stopPropagation();
-    // Close any other open preview
-    document.querySelectorAll('.tl-dot.preview-open').forEach(d => {
-      if (d !== dot) d.classList.remove('preview-open');
-    });
-    // Toggle this preview
-    dot.classList.toggle('preview-open');
-    // No JS positioning needed — CSS absolute handles it
+    if (report && report.case_name) {
+      openDetailModal(report);
+    } else if (targetEl) {
+      targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
   });
 
-  // "View details" link inside preview → scroll to timeline row
+  // "View details →" link in preview also opens modal
   const detailLink = dot.querySelector('.dp-detail-link');
-  if (detailLink && targetEl) {
+  if (detailLink) {
     detailLink.addEventListener('click', (e) => {
       e.stopPropagation();
-      dot.classList.remove('preview-open');
-      targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      if (report && targetEl.classList.contains('tl-row')) {
-        toggleCaseDetail(targetEl, report);
-      }
+      if (report) openDetailModal(report);
     });
   }
   rail.appendChild(dot);
@@ -2148,7 +2186,7 @@ function addTimelineRow(report) {
     </span>`;
 
   // Make clickable to expand detail
-  el.addEventListener('click', () => toggleCaseDetail(el, report));
+  el.addEventListener('click', () => openDetailModal(report));
   rows.appendChild(el);
   rows.scrollTop = rows.scrollHeight;
 }
@@ -2195,6 +2233,29 @@ function toggleCaseDetail(rowEl, report) {
   bindCopyButtons(detail);
   bindCollapseToggles(detail);
 }
+
+function openDetailModal(report) {
+  const overlay = $('detailModalOverlay');
+  const content = $('detailModalContent');
+  const status = report.passed ? 'pass' : 'fail';
+  content.innerHTML = `
+    <div class="dm-header">
+      <span class="dm-badge ${status}">${report.passed ? 'PASS' : 'FAIL'}</span>
+      <span class="dm-title">${esc(report.case_name.replace(/_/g, ' '))}</span>
+    </div>
+    <div class="dm-model">${esc(normModel(report.model))}</div>
+    <div style="margin-top:12px">${buildCaseDetailHTML(report)}</div>`;
+  overlay.classList.add('open');
+  bindCopyButtons(content);
+  bindCollapseToggles(content);
+}
+
+$('detailModalOverlay').addEventListener('click', (e) => {
+  if (e.target === $('detailModalOverlay')) $('detailModalOverlay').classList.remove('open');
+});
+$('detailModalClose').addEventListener('click', () => {
+  $('detailModalOverlay').classList.remove('open');
+});
 
 function buildCaseDetailHTML(report) {
   const status = report.passed ? 'pass' : 'fail';
@@ -3140,10 +3201,14 @@ try {
   if (savedUser) $('loginBtn').textContent = savedUser;
 } catch {}
 
-// Close preview cards when clicking outside
-document.addEventListener('click', () => {
-  document.querySelectorAll('.tl-dot.preview-open').forEach(d => d.classList.remove('preview-open'));
-});
+// (Preview cards now show on hover, no click-outside needed)
 </script>
+<!-- Detail Modal -->
+<div class="detail-modal-overlay" id="detailModalOverlay">
+  <div class="detail-modal" style="position:relative">
+    <button class="dm-close" id="detailModalClose" type="button">&times;</button>
+    <div id="detailModalContent"></div>
+  </div>
+</div>
 </body>
 </html>
