@@ -308,3 +308,81 @@ fn mixed_lessons_filter_correctly() {
     assert!(rendered.contains("tool_failures:rg"));
     assert!(rendered.contains("stall_events"));
 }
+
+// ─── Invariant 10: pressure-adaptive rendering ──────────────────────────────
+
+fn model_with_pressure(pressure: f64) -> SelfModel {
+    let json = serde_json::json!({
+        "capabilities": {
+            "total_tools": 0, "tool_names": [], "tool_health": [],
+            "deprioritized_tools": [], "pinned_tools": [], "skills": [],
+            "boosted_tools": [], "widen_selection_pending": false,
+            "outcome_memory": [],
+        },
+        "state": {
+            "turn_number": 10, "scenario": null,
+            "active_experiment": null, "session_elapsed_secs": 0,
+            "correction_count": 0, "compression_count": 0,
+            "token_budget": {
+                "max_tokens": 100000,
+                "total_used": (100000.0 * pressure) as u64,
+                "remaining": (100000.0 * (1.0 - pressure)) as u64,
+                "pressure": pressure,
+                "compression_triggered": false,
+            },
+        },
+        "goals": {
+            "goal": null, "session_goal": null, "plan_goal": null,
+            "tracked_goal": null, "goal_source": "none",
+            "tracking_status": "idle", "progress": null,
+            "recent_milestones": [], "milestone_count": 0,
+        },
+        "recent_signals": [],
+        "constraints": {
+            "max_mutations_per_turn": 2, "config_drift_ceiling": 0.3,
+            "min_tool_pool_size": 5, "token_reserve_fraction": 0.2,
+        }
+    });
+    serde_json::from_value(json).expect("model with pressure")
+}
+
+#[test]
+fn high_pressure_shows_fewer_compact_lessons() {
+    let lessons: Vec<LessonHint> = (0..6)
+        .map(|i| LessonHint {
+            kind: astra_services::LessonKind::PromptShape,
+            trigger_signal: format!("sig_{i}"),
+            action: format!("This is a detailed action for lesson {i}. It contains enough text to have a compact version generated automatically by the make_compact function."),
+            compact: Some(format!("compact {i}")),
+            workload_tag: None,
+        })
+        .collect();
+
+    // Low pressure: 5 lessons, full text
+    let low = model_with_pressure(0.3).with_lessons(lessons.clone());
+    let rendered_low = low.to_system_prompt_section();
+    assert!(rendered_low.contains("sig_4"), "low pressure shows 5");
+    assert!(!rendered_low.contains("sig_5"), "6th hidden");
+    assert!(
+        rendered_low.contains("detailed action"),
+        "low pressure uses full text"
+    );
+
+    // High pressure: 2 lessons, compact text
+    let high = model_with_pressure(0.8).with_lessons(lessons);
+    let rendered_high = high.to_system_prompt_section();
+    assert!(rendered_high.contains("sig_0"), "high shows first");
+    assert!(rendered_high.contains("sig_1"), "high shows second");
+    assert!(
+        !rendered_high.contains("sig_2"),
+        "3rd hidden at high pressure"
+    );
+    assert!(
+        rendered_high.contains("compact 0"),
+        "high pressure uses compact"
+    );
+    assert!(
+        !rendered_high.contains("detailed action"),
+        "high pressure hides full text"
+    );
+}

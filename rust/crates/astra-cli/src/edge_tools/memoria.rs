@@ -470,9 +470,16 @@ pub async fn memoria_retrieve_lessons(
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    let memories = match value.get("memories").and_then(|v| v.as_array()) {
-        Some(arr) => arr,
-        None => return Vec::new(),
+    // Memoria /v1/memories/retrieve returns a direct array when explain
+    // is off, or {"results": [...]} when explain is on. Handle both.
+    let memories = if let Some(arr) = value.as_array() {
+        arr
+    } else if let Some(arr) = value.get("memories").and_then(|v| v.as_array()) {
+        arr
+    } else if let Some(arr) = value.get("results").and_then(|v| v.as_array()) {
+        arr
+    } else {
+        return Vec::new();
     };
     memories
         .iter()

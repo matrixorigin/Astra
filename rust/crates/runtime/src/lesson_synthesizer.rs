@@ -35,7 +35,7 @@ pub fn extract_learnings_for_backflow(narrative: Option<&SessionMemory>) -> Vec<
     // Store as T2 (curated, 180-day half-life) because human-verified.
     if let Some(corrections) = narrative.section("User Corrections") {
         for line in extract_bullet_points(corrections) {
-            if is_high_quality_lesson(line) {
+            if is_synthesized_lesson_acceptable(line) {
                 lessons.push(ExtractedLesson {
                     memory_type: "semantic",
                     content: format!("🔧 CORRECTION: {line}"),
@@ -49,7 +49,7 @@ pub fn extract_learnings_for_backflow(narrative: Option<&SessionMemory>) -> Vec<
     // Store as T3 (inferred, 60-day half-life) — less certain than corrections.
     if let Some(learnings) = narrative.section("Learnings") {
         for line in extract_bullet_points(learnings) {
-            if is_high_quality_lesson(line) {
+            if is_synthesized_lesson_acceptable(line) {
                 lessons.push(ExtractedLesson {
                     memory_type: "semantic",
                     content: format!("💡 LESSON: {line}"),

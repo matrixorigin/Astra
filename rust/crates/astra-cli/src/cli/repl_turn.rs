@@ -897,13 +897,14 @@ async fn run_chat_turn(
     // Memoria is the single source of truth for lessons (Session Memory
     // Protocol L3). agent_lessons table is no longer used for bootstrap.
     if should_bootstrap_lessons(state) {
-        state.session_lessons_loaded = true;
-        state.session_lessons = tokio::time::timeout(
+        let lessons = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             super::edge_tools::memoria::memoria_retrieve_lessons(6, Some(message)),
         )
         .await
         .unwrap_or_default();
+        state.session_lessons = lessons;
+        state.session_lessons_loaded = true;
     }
 
     // ─── Drift Tracking: Detect user corrections ────────────────────────────
