@@ -469,7 +469,10 @@ async fn chat_handler(
          Suite directory: {}{report_ctx}\n\n\
          When the user asks about test results, failures, or comparisons, \
          give specific, actionable analysis citing case names and metrics. \
-         Use markdown formatting for readability.",
+         Use markdown formatting for readability.\n\n\
+         If the user asks to run tests, compare models, or create a test workflow, \
+         respond with a concrete plan and tell them you can execute it. \
+         Include the exact models and case names in your suggestion.",
         state.config.suite_dir.display()
     );
 

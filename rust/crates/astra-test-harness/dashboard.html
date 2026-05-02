@@ -1419,9 +1419,9 @@ input[type="range"]::-moz-range-thumb {
             <option value="">auto</option>
           </select>
           <input type="text" class="input-text" id="inputText"
-                 placeholder="Tell me what you want to test..." />
-          <div class="input-mode-toggle" id="inputModeToggle">
-            <button class="input-mode-btn active" data-mode="chat" type="button">Chat</button>
+                 placeholder="Ask anything or describe a test to run... (auto-detects intent)" />
+          <div class="input-mode-toggle" id="inputModeToggle" title="Auto-detects intent. Force 'Run' to always orchestrate.">
+            <button class="input-mode-btn active" data-mode="chat" type="button">Auto</button>
             <button class="input-mode-btn" data-mode="run" type="button">Run</button>
           </div>
           <button class="input-send-btn" id="inputSend" type="button">
@@ -2534,8 +2534,8 @@ document.querySelectorAll('.input-mode-btn').forEach(btn => {
     S.chatMode = btn.dataset.mode;
     document.querySelectorAll('.input-mode-btn').forEach(b => b.classList.toggle('active', b === btn));
     inputText.placeholder = S.chatMode === 'run'
-      ? 'Compare sonnet and minimax on delegation cases...'
-      : 'Tell me what you want to test...';
+      ? 'Describe the test workflow to execute...'
+      : 'Ask anything or describe a test to run... (auto-detects intent)';
   });
 });
 
@@ -2557,6 +2557,18 @@ document.querySelectorAll('.suggestion-btn').forEach(btn => {
   });
 });
 
+function looksLikeRunIntent(msg) {
+  const lower = msg.toLowerCase();
+  const runPatterns = [
+    /\b(run|execute|test|比较|对比|跑|测试|验证|benchmark)\b/,
+    /\b(compare|compare.*model|vs|versus)\b/,
+    /\b(all cases|selected cases|delegation cases|tool.use cases)\b/,
+    /\b(sonnet.*minimax|minimax.*sonnet|qwen.*claude)\b/,
+    /\b(跑一下|跑.*case|测一下|试一下|生成.*工作流|编排)\b/,
+  ];
+  return runPatterns.some(re => re.test(lower));
+}
+
 function sendInput() {
   const msg = inputText.value.trim();
   if (!msg) return;
@@ -2565,14 +2577,14 @@ function sendInput() {
   inputSend.disabled = true;
 
   const model = $('inputModel').value || undefined;
+  addMessage('user', msg);
+  showTyping();
 
-  if (S.chatMode === 'run') {
-    addMessage('user', msg);
-    showTyping();
+  // Smart routing: auto-detect intent.
+  // 'run' mode: always orchestrate. 'chat' (auto): detect from message.
+  if (S.chatMode === 'run' || (S.chatMode === 'chat' && looksLikeRunIntent(msg))) {
     sendOrchestrate(msg, model);
   } else {
-    addMessage('user', msg);
-    showTyping();
     sendChat(msg, model);
   }
 }
