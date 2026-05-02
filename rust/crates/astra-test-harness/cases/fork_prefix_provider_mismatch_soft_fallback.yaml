@@ -59,3 +59,9 @@ criteria:
       Score 0.5 if spawn_agent was called but outcome is unclear.
       Score 0.0 if no spawn or the agent fabricated results.
     threshold: 0.7
+  - type: tokens_between
+    min: 1
+    max: 80000
+  - type: turn_rounds_between
+    min: 1
+    max: 10

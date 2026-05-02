@@ -7,10 +7,16 @@ description: |
   **Fail means**: Model returned wrong answer (hallucination or knowledge gap) or output was empty/garbled (infrastructure issue).
 prompt: |
   What year did Rust 1.0 ship? Reply with just the year as a 4-digit
-  number. No extra prose.
+  number. No extra prose. Do not use any tools.
 timeout_seconds: 60
 criteria:
   - type: exit_code
     code: 0
   - type: text_contains
     needle: "2015"
+  - type: tokens_between
+    min: 1
+    max: 15000
+  - type: turn_rounds_between
+    min: 1
+    max: 3
