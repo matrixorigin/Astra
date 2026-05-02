@@ -468,7 +468,13 @@ async fn chat_handler(
         state.config.suite_dir.display()
     );
 
-    let full_message = format!("[System context]\n{system_ctx}\n\n[User]\n{}", req.message);
+    // Only inject system context on the first message (no session yet).
+    // Subsequent messages in the same session already have history.
+    let full_message = if req.session_id.is_none() {
+        format!("[System context]\n{system_ctx}\n\n[User]\n{}", req.message)
+    } else {
+        req.message.clone()
+    };
 
     let mut cmd = Command::new(&state.config.astra_bin);
     cmd.arg("chat")
