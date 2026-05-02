@@ -5803,6 +5803,7 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "rollback_turn_actions" => format!("Rollback turn actions: {preview}"),
         "send_message" => format!("Send message: {preview}"),
         "spawn_agent" => format!("Spawn agent: {preview}"),
+        "get_agent_result" => format!("Get agent result: {preview}"),
         "diagnose" => format!("Diagnose: {preview}"),
         "env" => format!("Env: {preview}"),
         "notebook_edit" => format!("Notebook edit: {preview}"),

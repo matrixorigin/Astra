@@ -8,17 +8,18 @@ description: |
 prompt: |
   You have a `spawn_agent` tool.
 
-  Step 1 — call it ONCE with this structure:
-    tool_call: spawn_agent
-    args:
-      agent_id: "child-G1"
-      task: "Reply with exactly: inherited-ok"
-      inherit_prefix: {}
+  You also have a `get_agent_result` tool.
 
-  The child runs synchronously — you will receive its reply directly
-  in the tool result.
+  Step 1 — call spawn_agent ONCE with:
+    agent_id: "child-G1"
+    task: "Reply with exactly: inherited-ok"
+    inherit_prefix: {}
+    background: true
 
-  Step 2 — include the child's exact reply in your final answer,
+  Step 2 — call get_agent_result with the agent_id from step 1
+  to retrieve the child's reply.
+
+  Step 3 — include the child's exact reply in your final answer,
   prefixed with `CHILD:`.
 
   Do not re-spawn. Do not use other tools.

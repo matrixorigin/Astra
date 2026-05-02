@@ -991,6 +991,16 @@ impl DynamicAgentSpawner {
         self.background_tasks.lock().map(|g| g.len()).unwrap_or(0)
     }
 
+    /// Snapshot of all completed agents for result retrieval.
+    pub async fn completed_agents_snapshot(&self) -> Vec<SpawnedAgentInfo> {
+        self.completed_agents
+            .read()
+            .await
+            .iter()
+            .map(SpawnedAgentInfo::from)
+            .collect()
+    }
+
     /// List all active agents spawned by a parent.
     pub async fn list_agents(&self, parent_run_id: &str) -> Vec<SpawnedAgentInfo> {
         self.active_agents

@@ -1112,6 +1112,10 @@ impl ToolExecutor {
                 "spawn_agent" => {
                     agent_spawning::handle_spawn_agent_tool(args, self.spawn_context.as_ref()).await
                 }
+                "get_agent_result" => {
+                    agent_spawning::handle_get_agent_result_tool(args, self.spawn_context.as_ref())
+                        .await
+                }
                 "share_context" => self.share_context(args),
                 "query_context" => self.query_context(args),
                 astra_runtime::turn::agentic_loop_host::DELEGATE_TOOL_NAME => {

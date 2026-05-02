@@ -6,16 +6,18 @@ description: |
   **Pass means**: The child resolved the parent's prefix, produced the expected reply, and the parent surfaced it in the final answer.
   **Fail means**: Prefix capture missed turn_completed, InMemoryPrefixStore lookup failed, or spawn_agent tool dispatch is broken.
 prompt: |
-  Use the spawn_agent tool to create a child agent. Call it with:
+  You have `spawn_agent` and `get_agent_result` tools.
+
+  Step 1: Call spawn_agent with:
     agent_id: "child-delegate-G2"
     task: "Reply with exactly: delegate-G2-ok"
     inherit_prefix: {}
+    background: true
 
-  The child runs synchronously — you will receive its reply directly
-  in the tool result.
+  Step 2: Call get_agent_result with the agent_id to get the reply.
 
   Surface the child's exact reply in your final answer.
-  Do not use any other tools.
+  Do not use any other tools besides spawn_agent and get_agent_result.
 debug_log: true
 timeout_seconds: 300
 criteria:

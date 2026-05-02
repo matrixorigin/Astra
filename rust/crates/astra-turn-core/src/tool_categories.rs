@@ -272,6 +272,7 @@ static TOOL_TABLE: &[ToolMeta] = &[
     // ── Mutating — orchestration ─────────────────────────────────────
     tool("send_message", MU, OR),
     tool("spawn_agent", MU, OR),
+    tool("get_agent_result", RO, OR),
     tool("share_context", MU, OR),
     tool("run_chain", MU, OR),
     tool("run_build_test", MU, OR),

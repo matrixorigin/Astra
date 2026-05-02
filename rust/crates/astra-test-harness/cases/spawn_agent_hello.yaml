@@ -6,13 +6,17 @@ description: |
   **Pass means**: The model discovered spawn_agent, delegated successfully, and surfaced the child's reply prefixed with "CHILD:".
   **Fail means**: spawn_agent tool not discovered (selector issue), delegation dispatch failed (runtime bug), or result not surfaced (model instruction-following issue).
 prompt: |
-  You have a `spawn_agent` tool available. Call it with:
+  You have a `spawn_agent` tool and a `get_agent_result` tool.
+
+  Step 1: Call spawn_agent with:
     agent_id: "child-hello"
     task: "Reply with exactly: hello from child"
+    background: true
 
-  The child runs synchronously — you will receive its reply directly
-  in the tool result. Report "CHILD:" followed by the child's reply
-  in your final answer.
+  Step 2: Call get_agent_result with agent_id from step 1 to retrieve
+  the child's reply once it completes.
+
+  Report "CHILD:" followed by the child's reply in your final answer.
 timeout_seconds: 180
 criteria:
   - type: exit_code

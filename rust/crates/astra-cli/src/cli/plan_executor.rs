@@ -2760,6 +2760,7 @@ mod tests {
             llm_rounds: None,
             interruption: None,
             final_messages: Vec::new(),
+            background_agent_results: Vec::new(),
         }
     }
 
@@ -3797,6 +3798,7 @@ All acceptance checks pass:
             llm_rounds: Some(3),
             interruption: None,
             final_messages: Vec::new(),
+            background_agent_results: Vec::new(),
         };
 
         let mut turn_evt = session_journal::JournalEvent::turn(
