@@ -311,13 +311,26 @@ impl MemoriaClient {
                 (format!("{base}/v1/memories/retrieve"), pl, HttpMethod::Post)
             }
             "purge" => {
-                let topic = args.get("topic").and_then(Value::as_str).unwrap_or("");
-                let reason = args
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("user request");
-                let mut pl = json!({"topic": topic, "reason": reason});
-                inject_identity(&mut pl);
+                // Memoria purge accepts ONLY ONE of: memory_ids, topic, session_id.
+                // Do NOT inject_identity here — it would add session_id alongside
+                // topic, causing 422 "provide only one of memory_ids, topic, or session_id".
+                let mut pl = json!({});
+                if let Some(ids) = args.get("memory_ids").or_else(|| args.get("memory_id")) {
+                    pl["memory_ids"] = if ids.is_array() {
+                        ids.clone()
+                    } else if let Some(s) = ids.as_str() {
+                        json!(s.split(',').map(str::trim).collect::<Vec<_>>())
+                    } else {
+                        ids.clone()
+                    };
+                } else if let Some(topic) = args.get("topic").and_then(Value::as_str) {
+                    pl["topic"] = json!(topic);
+                } else if let Some(sid) = args.get("session_id").and_then(Value::as_str) {
+                    pl["session_id"] = json!(sid);
+                }
+                if let Some(reason) = args.get("reason").and_then(Value::as_str) {
+                    pl["reason"] = json!(reason);
+                }
                 (format!("{base}/v1/memories/purge"), pl, HttpMethod::Post)
             }
             "correct" => {
@@ -528,15 +541,19 @@ mod tests {
         assert_eq!(pl["session_id"], "user-42");
         assert_eq!(pl["user_id"], "user-42");
 
-        // purge
+        // purge — Memoria requires ONLY ONE of memory_ids, topic, session_id.
+        // inject_identity is NOT called (would add session_id alongside topic → 422).
         let purge_args = json!({
             "topic": "old",
             "session_id": "user-42",
             "user_id": "user-42"
         });
         let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "purge", &purge_args);
-        assert_eq!(pl["session_id"], "user-42");
-        assert_eq!(pl["user_id"], "user-42");
+        assert_eq!(pl["topic"], "old", "purge should use topic as the filter");
+        assert!(
+            pl.get("session_id").is_none() || pl.get("topic").is_some(),
+            "purge must not send both topic AND session_id"
+        );
 
         // correct
         let correct_args = json!({
@@ -642,5 +659,43 @@ mod tests {
         assert!(pl.get("session_id").is_none());
         assert!(pl.get("filter_session").is_none());
         assert!(pl.get("include_cross_session").is_none());
+    }
+
+    // ── purge exclusivity (Memoria requires ONE of memory_ids/topic/session_id) ──
+
+    #[test]
+    fn purge_with_topic_does_not_include_session_id() {
+        let args = json!({"topic": "NEPTUNE", "session_id": "sess-42"});
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "purge", &args);
+        assert_eq!(pl["topic"], "NEPTUNE");
+        assert!(
+            pl.get("session_id").is_none(),
+            "purge by topic must not include session_id"
+        );
+    }
+
+    #[test]
+    fn purge_with_memory_ids() {
+        let args = json!({"memory_ids": ["id1", "id2"]});
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "purge", &args);
+        assert!(pl["memory_ids"].is_array());
+        assert!(pl.get("topic").is_none());
+    }
+
+    #[test]
+    fn purge_with_memory_id_string_becomes_array() {
+        let args = json!({"memory_id": "id1,id2"});
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "purge", &args);
+        let ids = pl["memory_ids"].as_array().expect("should be array");
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn purge_by_session_id_only() {
+        let args = json!({"session_id": "sess-42"});
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "purge", &args);
+        assert_eq!(pl["session_id"], "sess-42");
+        assert!(pl.get("topic").is_none());
+        assert!(pl.get("memory_ids").is_none());
     }
 }
