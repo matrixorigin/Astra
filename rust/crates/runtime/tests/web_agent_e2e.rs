@@ -4821,18 +4821,21 @@ async fn context_meta_exposes_memory_signal_context_flag() {
     )
     .await;
 
+    // Memory signal detection removed — LLM decides via system prompt rules.
+    // Verify the flag is now always false.
     let context_meta = find_events(&events, "context_meta")
         .into_iter()
         .find(|event| {
             event["system_prompt_breakdown"]["context_signals"]["memory_signal_detected"].as_bool()
-                == Some(true)
+                == Some(false)
         })
-        .expect("memory-signal context_meta event");
+        .expect("context_meta event with memory_signal_detected=false");
 
     assert_eq!(
         context_meta["system_prompt_breakdown"]["context_signals"]["memory_signal_detected"]
             .as_bool(),
-        Some(true)
+        Some(false),
+        "memory_signal_detected must be false — keyword detection removed"
     );
     assert!(
         context_meta["system_prompt_breakdown"]["context_signals"]["active_output_skills"]
@@ -4880,7 +4883,8 @@ async fn context_meta_exposes_builder_supplied_context_signals() {
     );
     assert_eq!(
         context_signals["memory_signal_detected"].as_bool(),
-        Some(true)
+        Some(false),
+        "memory_signal_detected removed — LLM-driven"
     );
     assert_eq!(
         context_signals["system_prompt_override"].as_bool(),

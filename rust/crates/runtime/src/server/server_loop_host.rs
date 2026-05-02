@@ -1661,18 +1661,8 @@ impl ServerAgenticLoopHost {
             ));
         }
 
-        // Memory signal detection
-        let memory_signal_hint = if let Some(category) =
-            astra_prompts::memory_lifecycle::detect_store_signal(user_content)
-        {
-            let ns = astra_prompts::memory_lifecycle::suggest_namespace(category);
-            format!(
-                "\n\n⚡ MEMORY SIGNAL DETECTED: category=\"{category}\", namespace=\"{ns}\". \
-                 Store the user's intent with memory_store BEFORE doing anything else."
-            )
-        } else {
-            String::new()
-        };
+        // Memory storage decisions are now LLM-driven via system prompt rules.
+        let memory_signal_hint = String::new();
 
         // System prompt override from delegation coordination context
         let system_override = self
@@ -2013,17 +2003,7 @@ impl ServerAgenticLoopHost {
         } else {
             format!("\n\n# Project Profile\n{}", profile_parts.join("\n"))
         };
-        let memory_signal_hint = if let Some(category) =
-            astra_prompts::memory_lifecycle::detect_store_signal(user_content)
-        {
-            let ns = astra_prompts::memory_lifecycle::suggest_namespace(category);
-            format!(
-                "\n\n⚡ MEMORY SIGNAL DETECTED: category=\"{category}\", namespace=\"{ns}\". \
-                 Store the user's intent with memory_store BEFORE doing anything else."
-            )
-        } else {
-            String::new()
-        };
+        let memory_signal_hint = String::new();
         let round_budget_hint = String::new(); // deprecated: circuit breaker replaces countdown budget
         let plan_resume = self
             .plan_resume_hint
@@ -3652,9 +3632,11 @@ mod tests {
         .build();
 
         let prompt = host.build_system_prompt("remember that I prefer dark mode", &host.edge_tools);
+        // Memory signal detection removed — LLM decides via system prompt rules.
+        // The prompt should NOT contain the old keyword-triggered injection.
         assert!(
-            prompt.contains("MEMORY SIGNAL DETECTED"),
-            "should detect memory store signal"
+            !prompt.contains("MEMORY SIGNAL DETECTED"),
+            "keyword-based memory signal injection must be removed"
         );
     }
 
@@ -3754,7 +3736,10 @@ mod tests {
 
         assert!(breakdown.context_signals.active_output_skills);
         assert!(breakdown.context_signals.learned_runtime_context);
-        assert!(breakdown.context_signals.memory_signal_detected);
+        assert!(
+            !breakdown.context_signals.memory_signal_detected,
+            "memory signal detection removed — LLM-driven"
+        );
         assert!(breakdown.context_signals.system_prompt_override);
         assert!(breakdown.context_signals.effort_hint);
         assert!(breakdown.context_signals.agent_type_hint);

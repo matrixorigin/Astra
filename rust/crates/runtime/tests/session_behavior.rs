@@ -12,7 +12,7 @@
 //!    Fix: system prompt now instructs proactive store + "DO NOT ask, just store"
 
 use astra_runtime::{
-    prompts::memory_lifecycle::{detect_store_signal, detect_tracking_intent, suggest_namespace},
+    prompts::memory_lifecycle::{detect_tracking_intent, suggest_namespace},
     tool_registry::{
         IntentType, TOOL_CATALOG, scoring::pre_filter_dynamic, state::ConversationState,
     },
@@ -51,53 +51,14 @@ fn tool_names(results: &[(usize, f64)]) -> Vec<&'static str> {
 mod tracking_intent_detection {
     use super::*;
 
-    /// The original session failure: "我关注matrixorigin" must be detected as tracking.
-    #[test]
-    fn guanzhu_is_tracking() {
-        assert_eq!(detect_store_signal("我关注matrixorigin"), Some("tracking"));
-    }
-
-    #[test]
-    fn follow_is_tracking() {
-        assert_eq!(
-            detect_store_signal("I follow this project"),
-            Some("tracking")
-        );
-    }
-
-    #[test]
-    fn watch_is_tracking() {
-        assert_eq!(detect_store_signal("I watch this repo"), Some("tracking"));
-    }
-
-    #[test]
-    fn interested_in_is_tracking() {
-        assert_eq!(
-            detect_store_signal("interested in matrixone"),
-            Some("tracking")
-        );
-    }
-
-    #[test]
-    fn genzong_is_tracking() {
-        assert_eq!(detect_store_signal("我跟踪这个项目"), Some("tracking"));
-    }
-
-    #[test]
-    fn tracking_beats_preference() {
-        // If message has both tracking AND preference signal, tracking wins
-        assert_eq!(
-            detect_store_signal("我关注matrixorigin，我喜欢这个项目"),
-            Some("tracking")
-        );
-    }
+    // detect_store_signal tests removed — keyword matching replaced by
+    // LLM-driven memory decisions via system prompt rules.
 
     #[test]
     fn tracking_namespace_is_interest_active() {
         assert_eq!(suggest_namespace("tracking"), "@interest/active");
     }
 
-    /// detect_tracking_intent works on raw user messages too
     #[test]
     fn detect_tracking_intent_raw_messages() {
         assert!(detect_tracking_intent("我关注matrixorigin"));
@@ -105,14 +66,6 @@ mod tracking_intent_detection {
         assert!(detect_tracking_intent("keep an eye on memoria"));
         assert!(!detect_tracking_intent("show me the diff"));
         assert!(!detect_tracking_intent("帮我修复这个bug"));
-    }
-
-    /// Normal queries are NOT tracking intents
-    #[test]
-    fn code_queries_not_tracking() {
-        assert_eq!(detect_store_signal("帮我修复这个bug"), None);
-        assert_eq!(detect_store_signal("show me the git diff"), None);
-        assert_eq!(detect_store_signal("what's the CI status"), None);
     }
 }
 

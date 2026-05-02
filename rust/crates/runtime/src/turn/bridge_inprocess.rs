@@ -1203,21 +1203,11 @@ impl InProcessChatTurnBridge {
                 .map(|text| format!("\n\n{text}"))
                 .unwrap_or_default();
 
-            // ── Memory lifecycle: detect tracking/store signals in user input ──
-            // Injects a priority hint into the system prompt so the LLM stores
-            // the user's interest immediately rather than exploring the codebase.
-            // This wires the Rust-side detect_store_signal into the live pipeline.
-            let memory_signal_hint = if let Some(category) =
-                astra_prompts::memory_lifecycle::detect_store_signal(user_content_for_signal)
-            {
-                let ns = astra_prompts::memory_lifecycle::suggest_namespace(category);
-                format!(
-                    "\n\n⚡ MEMORY SIGNAL DETECTED: category=\"{category}\", namespace=\"{ns}\". \
-                     Store the user's intent with memory_store BEFORE doing anything else."
-                )
-            } else {
-                String::new()
-            };
+            // Memory storage decisions are now fully LLM-driven via system
+            // prompt rules. The Rust-side detect_store_signal keyword matching
+            // was removed — it was redundant with the prompt rules and could
+            // not handle semantic signals like "这很重要以后要用".
+            let memory_signal_hint = String::new();
 
             // ── Implicit feedback detection: inject correction/frustration context ──
             // When user expresses dissatisfaction (correction, frustration, rephrasing),
@@ -4094,8 +4084,7 @@ mod tests {
     fn build_system_message_records_bridge_context_signals() {
         let active_skill_names = vec!["concise"];
         let learned_context_text = "matrixorigin => github";
-        let memory_signal_hint =
-            "\n\n⚡ MEMORY SIGNAL DETECTED: category=\"preference\", namespace=\"prefs\".";
+        let memory_signal_hint = ""; // Removed: LLM-driven via system prompt rules
         let implicit_feedback_hint =
             "\n\n## Implicit Feedback\nThe user is correcting the previous attempt.";
         let feedback_rules_hint = "\n\n[Learned Feedback Rules]\n- Rule: do not use mocks";
@@ -4231,7 +4220,10 @@ mod tests {
 
         assert!(breakdown.context_signals.active_output_skills);
         assert!(breakdown.context_signals.learned_runtime_context);
-        assert!(breakdown.context_signals.memory_signal_detected);
+        assert!(
+            !breakdown.context_signals.memory_signal_detected,
+            "memory signal detection removed — LLM-driven"
+        );
         assert!(breakdown.context_signals.self_awareness);
         assert!(breakdown.context_signals.implicit_feedback);
         assert!(breakdown.context_signals.learned_feedback_rules);
