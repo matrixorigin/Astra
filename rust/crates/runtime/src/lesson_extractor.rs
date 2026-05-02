@@ -2,7 +2,7 @@
 //!
 //! When a session ends, the signals we already track — repeated tool
 //! failures, stall events, user corrections, unmet postconditions — need
-//! to be distilled into durable `NewLesson` rows for `agent_lessons`.
+//! to be distilled into lessons for Memoria L3 storage.
 //!
 //! This module is the pure mapping step: `SessionSummary` → `Vec<NewLesson>`.
 //! No DB, no clocks, no config. The main loop (or the session-end hook) is
@@ -393,7 +393,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(
             out[0].trigger_signal.len() <= 255,
-            "trigger_signal byte length must stay within DAO's MAX_TRIGGER_SIGNAL_LEN"
+            "trigger_signal byte length must stay within MAX_TRIGGER_SIGNAL_LEN"
         );
     }
 

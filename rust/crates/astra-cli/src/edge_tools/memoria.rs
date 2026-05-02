@@ -458,7 +458,11 @@ mod build_direct_request_tests {
     }
 }
 
-/// Build a one-shot Memoria HTTP client + auth header. Returns None if no API key.
+/// Public accessor for session_cleanup's working-memory purge.
+pub fn memoria_oneshot_client_pub(timeout_secs: u64) -> Option<(reqwest::Client, String, String)> {
+    memoria_oneshot_client(timeout_secs)
+}
+
 fn memoria_oneshot_client(timeout_secs: u64) -> Option<(reqwest::Client, String, String)> {
     let base = std::env::var("MEMORIA_BASE_URL")
         .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());

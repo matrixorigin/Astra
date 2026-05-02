@@ -196,44 +196,11 @@ pub struct NewLesson {
     pub kind: LessonKind,
     pub trigger_signal: String,
     pub action: String,
-    /// Defaults to `DEFAULT_LESSON_CONFIDENCE` when unset.
     pub confidence: Option<f64>,
 }
 
-/// A lesson was shown to a session. Exposure is separate from usefulness:
-/// loading a lesson is not counted as success until an outcome is recorded.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LessonExposure {
-    pub lesson_id: String,
-    pub session_id: String,
-    pub user_id: String,
-    pub persona: String,
-    pub workload_tag: Option<String>,
-    pub adopted: bool,
-}
-
-/// Session-end outcome attached to all unresolved exposures in a session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LessonOutcome {
-    pub session_id: String,
-    pub user_id: String,
-    pub stall_events: u32,
-    pub user_corrections: u32,
-    pub tool_failures: u32,
-    pub unmet_postconditions: u32,
-    pub diagnosis_criteria_met: u32,
-    pub diagnosis_criteria_failed: u32,
-}
-
-/// Default confidence score for a freshly-recorded lesson.
-pub const DEFAULT_LESSON_CONFIDENCE: f64 = 0.6;
-/// Max `trigger_signal` length, enforced by `NewLesson::validate`.
 pub const MAX_TRIGGER_SIGNAL_LEN: usize = 255;
-/// Max `action` length.
 pub const MAX_ACTION_LEN: usize = 1024;
-/// Maximum active lessons kept per user after prune. Prevents unbounded
-/// growth from `trigger_signal` text variation ("3 failures" vs "5 failures").
-pub const MAX_LESSONS_PER_USER: u32 = 100;
 
 impl NewLesson {
     /// Reject payloads that would violate the schema or carry nonsensical
