@@ -31,6 +31,7 @@ pub enum StreamEvent {
         status: String,
         duration_ms: u64,
         output_summary: Option<String>,
+        output: Option<String>,
     },
     /// Waiting for first SSE frame (TTFT gap).
     WaitingForModel,

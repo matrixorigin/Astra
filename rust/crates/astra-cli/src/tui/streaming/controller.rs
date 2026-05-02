@@ -102,6 +102,25 @@ impl StreamController {
         &self.rendered_lines[..self.emitted_len.min(self.rendered_lines.len())]
     }
 
+    /// Take lines that have been emitted but not yet flushed to scrollback.
+    /// After calling, those lines are marked as flushed and won't be returned again.
+    pub fn take_flushed_lines(&mut self) -> Vec<Line<'static>> {
+        let flushed_end = self.emitted_len.min(self.rendered_lines.len());
+        let start = self.state.scrollback_flushed;
+        if start >= flushed_end {
+            return Vec::new();
+        }
+        let lines = self.rendered_lines[start..flushed_end].to_vec();
+        self.state.scrollback_flushed = flushed_end;
+        lines
+    }
+
+    /// How many emitted lines have NOT yet been flushed to scrollback.
+    pub fn unflushed_count(&self) -> usize {
+        let flushed_end = self.emitted_len.min(self.rendered_lines.len());
+        flushed_end.saturating_sub(self.state.scrollback_flushed)
+    }
+
     pub fn queued_len(&self) -> usize {
         self.state.queued_len()
     }

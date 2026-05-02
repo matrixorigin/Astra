@@ -609,10 +609,10 @@ fn handle_app_event(
             bottom_pane.set_task_status(TaskStatus::ToolExecuting { name, started_at: std::time::Instant::now() });
             fr.schedule_frame();
         }
-        TuiAppEvent::ToolCompleted { name: _, description, status, duration_ms, output_summary } => {
+        TuiAppEvent::ToolCompleted { name: _, description, status, duration_ms, output_summary, output } => {
             if let Some(cell) = active_cell {
                 if let Some(tc) = cell.as_any_mut().downcast_mut::<ToolChatCell>() {
-                    tc.complete(&status, duration_ms, description, output_summary);
+                    tc.complete(&status, duration_ms, description, output_summary, output);
                 }
             }
             fr.schedule_frame();

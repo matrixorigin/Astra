@@ -17,6 +17,7 @@ pub(crate) enum TuiAppEvent {
         status: String,
         duration_ms: u64,
         output_summary: Option<String>,
+        output: Option<String>,
     },
     WaitingForModel,
     ModelResponding,

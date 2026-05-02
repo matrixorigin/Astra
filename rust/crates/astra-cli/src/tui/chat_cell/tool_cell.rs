@@ -20,6 +20,7 @@ pub(crate) struct ToolChatCell {
     pub started_at: Instant,
     pub duration_ms: Option<u64>,
     pub output_summary: Option<String>,
+    pub output: Option<String>,
 }
 
 impl ToolChatCell {
@@ -31,10 +32,11 @@ impl ToolChatCell {
             started_at: Instant::now(),
             duration_ms: None,
             output_summary: None,
+            output: None,
         }
     }
 
-    pub fn complete(&mut self, status_str: &str, duration_ms: u64, description: String, output_summary: Option<String>) {
+    pub fn complete(&mut self, status_str: &str, duration_ms: u64, description: String, output_summary: Option<String>, output: Option<String>) {
         self.status = if status_str == "success" {
             ToolStatus::Success
         } else {
@@ -45,6 +47,7 @@ impl ToolChatCell {
             self.description = description;
         }
         self.output_summary = output_summary;
+        self.output = output;
     }
 
     fn bullet(&self) -> Span<'static> {
@@ -138,6 +141,33 @@ impl ChatCell for ToolChatCell {
             }
         }
 
+        lines
+    }
+
+    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = self.display_lines(width);
+        // Include full output in transcript (truncated in display)
+        if let Some(ref output) = self.output {
+            if !output.trim().is_empty() {
+                let dim = Style::default().dim();
+                lines.push(Line::default());
+                for ol in output.lines().take(50) {
+                    let style = if ol.starts_with('+') {
+                        Style::default().fg(Color::Green)
+                    } else if ol.starts_with('-') {
+                        Style::default().fg(Color::Red)
+                    } else {
+                        dim
+                    };
+                    lines.push(Line::from(Span::styled(format!("    {ol}"), style)));
+                }
+                if output.lines().count() > 50 {
+                    lines.push(Line::from(Span::styled(
+                        format!("    … +{} more lines", output.lines().count() - 50), dim,
+                    )));
+                }
+            }
+        }
         lines
     }
 }

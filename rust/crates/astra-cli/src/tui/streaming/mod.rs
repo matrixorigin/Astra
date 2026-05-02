@@ -11,6 +11,8 @@ pub(crate) struct StreamState {
     pub collector: MarkdownStreamCollector,
     queued_lines: VecDeque<QueuedLine>,
     pub has_seen_delta: bool,
+    /// How many emitted lines have been flushed to scrollback already.
+    pub scrollback_flushed: usize,
 }
 
 struct QueuedLine {
@@ -25,6 +27,7 @@ impl StreamState {
             collector: MarkdownStreamCollector::new(width),
             queued_lines: VecDeque::new(),
             has_seen_delta: false,
+            scrollback_flushed: 0,
         }
     }
 

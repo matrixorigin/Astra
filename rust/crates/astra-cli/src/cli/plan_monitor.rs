@@ -556,6 +556,7 @@ fn display_plan_updates_live(
                         status,
                         duration_ms,
                         output_summary,
+                        ..
                     } => {
                         let dur = cli_formatting::format_duration_suffix(duration_ms);
                         let icon = if status == "error" {

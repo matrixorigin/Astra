@@ -112,16 +112,15 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
             let scroll_amount = wrapped_rows.min(screen_size.height - area.bottom());
 
             let top_1based = area.top() + 1;
-            // Scroll region: viewport_top to screen_bottom. RI pushes content down.
             queue!(
                 writer,
                 Print(format!("\x1b[{};{}r", top_1based, screen_size.height))
             )?;
             queue!(writer, MoveTo(0, area.top()))?;
             for _ in 0..scroll_amount {
-                queue!(writer, Print("\x1bM"))?; // Reverse Index
+                queue!(writer, Print("\x1bM"))?;
             }
-            queue!(writer, Print("\x1b[r"))?; // Reset scroll region
+            queue!(writer, Print("\x1b[r"))?;
 
             let ct = area.top().saturating_sub(1);
             new_area.y += scroll_amount;
@@ -131,8 +130,6 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
             area.top().saturating_sub(1)
         };
 
-        // Set scroll region to rows ABOVE the viewport only.
-        // This protects viewport content from being affected by our writes.
         if new_area.top() > 0 {
             queue!(
                 writer,
@@ -147,7 +144,7 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
                 write_history_line(writer, line)?;
             }
 
-            queue!(writer, Print("\x1b[r"))?; // Reset scroll region
+            queue!(writer, Print("\x1b[r"))?;
         }
 
         // Restore cursor position

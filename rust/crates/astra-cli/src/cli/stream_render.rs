@@ -1155,6 +1155,7 @@ impl<'a> CliSseStreamHost<'a> {
                 } else {
                     Some(output_summary)
                 },
+                output: Some(output.chars().take(5000).collect()),
             });
         }
 
@@ -2229,6 +2230,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 } else {
                     Some(output_summary)
                 },
+                output: Some(output.chars().take(5000).collect()),
             });
         }
 
@@ -2735,6 +2737,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     } else {
                         Some(output_summary)
                     },
+                    output: Some(output.chars().take(5000).collect()),
                 });
             }
 
