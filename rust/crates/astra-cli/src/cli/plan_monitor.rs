@@ -358,7 +358,7 @@ fn display_plan_updates_live(
                 state.executing_plan = None;
                 state.current_plan_subtask_id = None;
                 if let Some(tx) = state.pending_approval.take() {
-                    let _ = tx.send(false);
+                    let _ = tx.send(crate::chat_stream::ApprovalResponse::Deny);
                 }
                 print_plan_monitor_line(
                     plan_spinner,
@@ -406,7 +406,7 @@ fn display_plan_updates_live(
                 state.executing_plan = None;
                 state.current_plan_subtask_id = None;
                 if let Some(tx) = state.pending_approval.take() {
-                    let _ = tx.send(false);
+                    let _ = tx.send(crate::chat_stream::ApprovalResponse::Deny);
                 }
                 print_plan_monitor_line(
                     plan_spinner,
@@ -858,7 +858,7 @@ fn cleanup_orphan_plan_executor(state: &mut ReplState, plan_spinner: &mut Option
     state.executing_plan = None;
     state.current_plan_subtask_id = None;
     if let Some(tx) = state.pending_approval.take() {
-        let _ = tx.send(false);
+        let _ = tx.send(crate::chat_stream::ApprovalResponse::Deny);
     }
     eprintln!(
         "\n{}  Plan executor stopped without a final status (channel closed). State cleared.",
@@ -930,7 +930,7 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut ReplState) {
             .await
             .unwrap_or(false);
             if let Some(tx) = state.pending_approval.take() {
-                let _ = tx.send(approved);
+                let _ = tx.send(if approved { crate::chat_stream::ApprovalResponse::AllowOnce } else { crate::chat_stream::ApprovalResponse::Deny });
             }
             continue;
         }

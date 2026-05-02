@@ -462,7 +462,7 @@ async fn run_chat_repl(
                         let autorun = trimmed == "!" || trimmed == "all" || trimmed == "yolo";
                         let denied = trimmed == "n" || trimmed == "no";
                         if approved || autorun || denied {
-                            let _ = tx.send(approved || autorun);
+                            let response = if autorun { chat_stream::ApprovalResponse::AutoRunSession } else { chat_stream::ApprovalResponse::AllowOnce }; let _ = tx.send(response);
                             if autorun {
                                 state
                                     .perm_manager
@@ -484,7 +484,7 @@ async fn run_chat_repl(
                             continue;
                         } else {
                             // Unrecognized — treat as deny and fall through
-                            let _ = tx.send(false);
+                            let _ = tx.send(chat_stream::ApprovalResponse::Deny);
                             eprintln!(
                                 "  {} Unrecognized response, treating as denied",
                                 theme::icon_err()

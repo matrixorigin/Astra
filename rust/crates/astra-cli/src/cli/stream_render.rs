@@ -1851,6 +1851,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 reason,
             } => {
                 if let Some(tx) = &self.approval_request_tx {
+                    use super::chat_stream::ApprovalResponse;
                     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                     let _ = tx.send(super::chat_stream::ApprovalRequest {
                         tool: t.clone(),
@@ -1859,21 +1860,33 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         reason,
                         response_tx: resp_tx,
                     });
-                    let result = if let Some(token) = self.cancel_token {
+                    let response = if let Some(token) = self.cancel_token {
                         tokio::select! {
                             biased;
-                            _ = token.cancelled() => false,
-                            r = resp_rx => r.unwrap_or(false),
+                            _ = token.cancelled() => ApprovalResponse::Deny,
+                            r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
                         }
                     } else {
-                        resp_rx.await.unwrap_or(false)
+                        resp_rx.await.unwrap_or(ApprovalResponse::Deny)
                     };
-                    if let Some(pm) = self.perm_manager.as_mut()
-                        && result
-                    {
-                        pm.record_approval(&t, Some(args), true);
+                    if let Some(pm) = self.perm_manager.as_mut() {
+                        match response {
+                            ApprovalResponse::AllowOnce => {
+                                pm.record_approval(&t, Some(args), true);
+                            }
+                            ApprovalResponse::AlwaysAllow => {
+                                pm.record_approval(&t, Some(args), true);
+                                let rule = crate::permission_manager::PermissionManager::make_allow_rule(&t, args);
+                                pm.add_allow_rule(&rule);
+                            }
+                            ApprovalResponse::AutoRunSession => {
+                                pm.record_approval(&t, Some(args), true);
+                                pm.set_mode(crate::permission_manager::PermissionMode::Auto);
+                            }
+                            ApprovalResponse::Skip | ApprovalResponse::Deny => {}
+                        }
                     }
-                    result
+                    response.is_approved()
                 } else if self.render_policy.is_silent() {
                     astra_core::agent_warn!(
                         "permission",
@@ -2033,7 +2046,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 ..
                             } => {
                                 if let Some(tx) = &self.approval_request_tx {
-                                    // Plan execution mode: route through channel
+                                    use super::chat_stream::ApprovalResponse;
                                     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                                     let _ = tx.send(super::chat_stream::ApprovalRequest {
                                         tool: sandbox_tool_key.clone(),
@@ -2042,19 +2055,26 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         reason,
                                         response_tx: resp_tx,
                                     });
-                                    let grant = if let Some(token) = self.cancel_token {
+                                    let response = if let Some(token) = self.cancel_token {
                                         tokio::select! {
                                             biased;
-                                            _ = token.cancelled() => false,
-                                            r = resp_rx => r.unwrap_or(false),
+                                            _ = token.cancelled() => ApprovalResponse::Deny,
+                                            r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
                                         }
                                     } else {
-                                        resp_rx.await.unwrap_or(false)
+                                        resp_rx.await.unwrap_or(ApprovalResponse::Deny)
                                     };
-                                    if grant {
+                                    if let ApprovalResponse::AlwaysAllow = response {
+                                        let rule = crate::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, args);
+                                        pm.add_allow_rule(&rule);
+                                    }
+                                    if response == ApprovalResponse::AutoRunSession {
+                                        pm.set_mode(crate::permission_manager::PermissionMode::Auto);
+                                    }
+                                    if response.is_approved() {
                                         pm.record_approval(&sandbox_tool_key, Some(args), true);
                                     }
-                                    grant
+                                    response.is_approved()
                                 } else if self.render_policy.is_silent() {
                                     // Sub-run mode: auto-deny sandbox expansion
                                     astra_core::agent_warn!(

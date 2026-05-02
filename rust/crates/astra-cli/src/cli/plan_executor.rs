@@ -113,7 +113,7 @@ pub enum PlanUpdate {
         header: String,
         detail: Option<String>,
         reason: String,
-        response_tx: tokio::sync::oneshot::Sender<bool>,
+        response_tx: tokio::sync::oneshot::Sender<super::chat_stream::ApprovalResponse>,
     },
     /// Sync subtask status back to the REPL so plan_mode stays up-to-date
     /// across re-runs. Sent after each subtask completes or fails.
