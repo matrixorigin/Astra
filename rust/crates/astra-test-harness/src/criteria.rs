@@ -772,6 +772,9 @@ pub fn validate_criteria(criteria: &[Criterion]) -> Result<(), String> {
 /// The slice length of `results` must equal `criteria.len()` (they
 /// come out of `evaluate_deterministic`). Mismatched lengths return
 /// `false` conservatively.
+/// Returns true when all Hard criteria passed, meaning the judger should
+/// run. Soft failures (tokens/duration exceeding bounds) should NOT skip
+/// the judger — we still want a quality score even for inefficient runs.
 pub fn non_judger_all_pass(criteria: &[Criterion], results: &[CriterionResult]) -> bool {
     if results.len() != criteria.len() {
         return false;
@@ -780,6 +783,7 @@ pub fn non_judger_all_pass(criteria: &[Criterion], results: &[CriterionResult]) 
         .iter()
         .zip(results.iter())
         .filter(|(c, _)| !matches!(c, Criterion::Judger { .. }))
+        .filter(|(_, r)| r.severity == CriterionSeverity::Hard)
         .all(|(_, r)| r.passed)
 }
 

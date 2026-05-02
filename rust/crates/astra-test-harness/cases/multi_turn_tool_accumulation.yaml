@@ -27,3 +27,13 @@ criteria:
     name: read_file
   - type: text_contains
     needle: "hello world 42"
+  - type: judger
+    question: |
+      Evaluate based on the tool calls and text output only.
+      Do NOT try to read files yourself.
+      Turn 1: did the agent read the file and show its content?
+      Turn 2: did the agent append "second line" using any tool
+      (bash, str_replace, or write_file are all valid methods)?
+      Score 1.0 if both turns completed correctly, 0.5 if turn 1
+      worked but turn 2 is unclear, 0.0 if the agent fabricated output.
+    threshold: 0.6

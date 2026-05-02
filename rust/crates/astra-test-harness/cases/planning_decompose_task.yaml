@@ -23,3 +23,14 @@ criteria:
   - type: turn_rounds_between
     min: 1
     max: 8
+  - type: judger
+    question: |
+      Evaluate based on the tool calls and text output only.
+      Do NOT try to read or verify files yourself.
+      The agent was asked to: check /tmp exists, create a file,
+      read it back, then delete it. Score based on OUTCOMES reported
+      in the text, not on how many individual tool calls were used.
+      Bundling steps into a single bash call is valid if all 4 steps
+      completed. Score 1.0 if all 4 steps reported as done, 0.5 if
+      partially, 0.0 if fabricated.
+    threshold: 0.6
