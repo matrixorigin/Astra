@@ -34,18 +34,31 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
     let wrap_width = area.width.max(1) as usize;
     let mut should_update_area = false;
 
-    // Pre-wrap lines (simple width-based wrapping)
-    let mut wrapped: Vec<&Line<'_>> = Vec::new();
+    // Pre-wrap lines using adaptive wrapping (URL-aware, span-preserving)
+    let mut wrapped: Vec<Line<'static>> = Vec::new();
     let mut wrapped_rows: u16 = 0;
     for line in lines {
-        let w: usize = line.spans.iter().map(|s| s.content.width()).sum();
-        let rows = if w == 0 {
-            1
+        let line_w: usize = line.spans.iter().map(|s| s.content.width()).sum();
+        if line_w == 0 {
+            wrapped.push(super::render::line_utils::line_to_static(line));
+            wrapped_rows += 1;
+        } else if super::wrapping::line_contains_url_like(line)
+            && !super::wrapping::line_has_mixed_url_and_non_url_tokens(line)
+        {
+            // Pure URL line — don't wrap, let terminal handle it (keeps URL clickable)
+            let physical = line_w.max(1).div_ceil(wrap_width) as u16;
+            wrapped_rows += physical;
+            wrapped.push(super::render::line_utils::line_to_static(line));
         } else {
-            ((w + wrap_width - 1) / wrap_width) as u16
-        };
-        wrapped_rows += rows;
-        wrapped.push(line);
+            let line_wrapped = super::wrapping::adaptive_wrap_line(
+                line,
+                super::wrapping::RtOptions::new(wrap_width),
+            );
+            for wl in &line_wrapped {
+                wrapped_rows += wl.width().max(1).div_ceil(wrap_width) as u16;
+            }
+            wrapped.extend(line_wrapped.into_iter().map(|l| crate::tui::render::line_utils::line_to_static(&l)));
+        }
     }
 
     if wrapped_rows == 0 {

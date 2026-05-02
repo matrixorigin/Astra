@@ -28,6 +28,7 @@ mod task_status;
 mod terminal;
 mod terminal_palette;
 pub(crate) mod ui_adapter;
+mod wrapping;
 
 use app_event::TuiAppEvent;
 use bottom_pane::{BottomPane, BottomPaneAction};
