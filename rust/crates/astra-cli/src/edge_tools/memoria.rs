@@ -209,13 +209,12 @@ impl ToolExecutor {
                 Ok(c) => c,
                 Err(_) => return,
             };
-            let url = format!("{base}/v1/memories/feedback");
             for mid in memory_ids {
+                let url = format!("{base}/v1/memories/{mid}/feedback");
                 if let Err(e) = client
                     .post(&url)
                     .header("Authorization", format!("Bearer {key}"))
                     .json(&json!({
-                        "memory_id": mid,
                         "signal": "useful",
                         "context": "boost_search retrieval"
                     }))
@@ -516,7 +515,7 @@ pub async fn memoria_governance_fire_and_forget() {
         return;
     };
     if let Err(e) = client
-        .post(format!("{base}/v1/memories/governance"))
+        .post(format!("{base}/v1/governance"))
         .header("Authorization", format!("Bearer {key}"))
         .json(&json!({"force": false}))
         .send()
@@ -534,7 +533,7 @@ pub async fn memoria_consolidate_fire_and_forget() {
         return;
     };
     if let Err(e) = client
-        .post(format!("{base}/v1/memories/consolidate"))
+        .post(format!("{base}/v1/consolidate"))
         .header("Authorization", format!("Bearer {key}"))
         .json(&json!({"force": false}))
         .send()
