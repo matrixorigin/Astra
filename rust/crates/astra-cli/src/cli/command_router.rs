@@ -1421,9 +1421,11 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
         }
     }
 
-    // Check for tool failures
-    for record in &sr.tool_call_records {
-        if !record.ok {
+    // Check for tool failures — only if the LAST tool call failed.
+    // Intermediate failures followed by successful retries are normal
+    // agent self-correction behavior and should not mark the run as failed.
+    if let Some(last) = sr.tool_call_records.last() {
+        if !last.ok {
             return ExitCode::ToolFailure;
         }
     }
