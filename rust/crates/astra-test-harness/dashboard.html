@@ -1845,6 +1845,7 @@ function doLogin() {
         const uname = data.username || 'user';
         toast('Logged in as ' + uname, 'success');
         $('loginBtn').textContent = uname;
+        try { sessionStorage.setItem('astra_login_user', uname); } catch {}
         // Refresh models list (auth was expired before)
         loadModels();
       }
@@ -3132,6 +3133,12 @@ function handleEvent(ev) {
    Boot
    ================================================================ */
 connect();
+
+// Restore login state
+try {
+  const savedUser = sessionStorage.getItem('astra_login_user');
+  if (savedUser) $('loginBtn').textContent = savedUser;
+} catch {}
 
 // Close preview cards when clicking outside
 document.addEventListener('click', () => {
