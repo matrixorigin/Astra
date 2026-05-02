@@ -101,30 +101,36 @@ impl BottomPaneView for ListSelectionView {
 
             let marker = if is_sel { "› " } else { "  " };
             let num = format!("{}. ", idx + 1);
-
-            let name_style = if is_sel {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-            } else if item.is_current {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default()
-            };
-
             let current_tag = if item.is_current { " (current)" } else { "" };
 
-            let mut spans = vec![
-                Span::raw("  "),
-                Span::styled(marker, name_style),
-                Span::styled(num, dim),
-                Span::styled(format!("{}{}", &item.name, current_tag), name_style),
-            ];
+            let sel_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+
+            let mut spans = if is_sel {
+                vec![
+                    Span::styled("  ", sel_style),
+                    Span::styled(marker, sel_style),
+                    Span::styled(num, sel_style),
+                    Span::styled(format!("{}{}", &item.name, current_tag), sel_style),
+                ]
+            } else {
+                vec![
+                    Span::raw("  "),
+                    Span::raw(marker),
+                    Span::raw(num),
+                    Span::raw(format!("{}{}", &item.name, current_tag)),
+                ]
+            };
 
             if let Some(ref desc) = item.description {
                 let budget = (area.width as usize).saturating_sub(8 + item.name.len() + current_tag.len());
                 if budget > 5 {
                     let d: String = desc.chars().take(budget).collect();
                     spans.push(Span::raw("  "));
-                    spans.push(Span::styled(d, dim));
+                    if is_sel {
+                        spans.push(Span::styled(d, sel_style));
+                    } else {
+                        spans.push(Span::styled(d, dim));
+                    }
                 }
             }
 
@@ -206,6 +212,7 @@ impl BottomPaneView for ListSelectionView {
         if self.completed {
             Some(ViewCompletion {
                 result: self.accepted_name.clone(),
+                reopen: None,
             })
         } else {
             None

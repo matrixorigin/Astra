@@ -191,7 +191,7 @@ impl BottomPaneView for ApprovalOverlay {
 
     fn completion(&self) -> Option<ViewCompletion> {
         if self.completed {
-            Some(ViewCompletion { result: None })
+            Some(ViewCompletion { result: None, reopen: None })
         } else {
             None
         }

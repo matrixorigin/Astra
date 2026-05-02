@@ -312,12 +312,20 @@ pub(crate) async fn run_tui_repl(
                                 }
                             }
                             BottomPaneAction::SubmitInput(_) => {}
-                            BottomPaneAction::ViewCompleted(result) => {
+                            BottomPaneAction::ViewCompleted { result, reopen } => {
                                 if let Some(name) = result {
                                     slash_dispatch::handle_view_result(
                                         &name, &mut state, &mut guard, &mut bottom_pane,
                                     );
                                     bottom_pane.sync_popups();
+                                } else if let Some(cmd) = reopen {
+                                    // Reopen parent menu (e.g., Esc from stats detail → back to /stats menu)
+                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                    let mut dctx = slash_dispatch::DispatchContext {
+                                        api, profile, state: &mut state,
+                                        guard: &mut guard, bottom_pane: &mut bottom_pane, width: w,
+                                    };
+                                    let _ = slash_dispatch::dispatch(&cmd, &mut dctx).await;
                                 }
                             }
                             BottomPaneAction::Interrupt | BottomPaneAction::Quit => { break 'main Ok(()); }

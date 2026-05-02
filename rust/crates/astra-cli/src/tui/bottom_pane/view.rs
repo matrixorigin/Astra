@@ -9,6 +9,7 @@ pub(crate) enum CancellationEvent {
 
 pub(crate) struct ViewCompletion {
     pub result: Option<String>,
+    pub reopen: Option<String>,
 }
 
 pub(crate) trait BottomPaneView: Send {

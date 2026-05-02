@@ -1,6 +1,8 @@
 pub(crate) mod approval_overlay;
 pub(crate) mod chat_composer;
 pub(crate) mod footer;
+pub(crate) mod help_view;
+pub(crate) mod info_view;
 pub(crate) mod list_selection_view;
 pub(crate) mod skill_popup;
 pub(crate) mod slash_popup;
@@ -148,12 +150,22 @@ impl BottomPane {
             return BottomPaneAction::Consumed;
         }
 
-        // Esc: dismiss active view or popup
-        if key.code == KeyCode::Esc {
-            if !self.view_stack.is_empty() {
+        // Route to active view first (view handles its own Esc)
+        if let Some(view) = self.active_view_mut() {
+            view.handle_key(key);
+            if view.is_complete() {
+                let completion = view.completion();
                 self.view_stack.pop();
-                return BottomPaneAction::ViewCompleted(None);
+                if let Some(vc) = completion {
+                    return BottomPaneAction::ViewCompleted { result: vc.result, reopen: vc.reopen };
+                }
+                return BottomPaneAction::ViewCompleted { result: None, reopen: None };
             }
+            return BottomPaneAction::Consumed;
+        }
+
+        // Esc: dismiss popup
+        if key.code == KeyCode::Esc {
             if self.slash_popup.is_some() {
                 self.slash_popup = None;
                 return BottomPaneAction::Consumed;
@@ -162,20 +174,6 @@ impl BottomPane {
                 self.skill_popup = None;
                 return BottomPaneAction::Consumed;
             }
-        }
-
-        // Route to active view first
-        if let Some(view) = self.active_view_mut() {
-            view.handle_key(key);
-            if view.is_complete() {
-                let completion = view.completion();
-                self.view_stack.pop();
-                if let Some(vc) = completion {
-                    return BottomPaneAction::ViewCompleted(vc.result);
-                }
-                return BottomPaneAction::ViewCompleted(None);
-            }
-            return BottomPaneAction::Consumed;
         }
 
         // Popup key handling: Up/Down/Tab/Enter when popup is visible
@@ -296,7 +294,7 @@ impl BottomPane {
 #[derive(Debug)]
 pub(crate) enum BottomPaneAction {
     SubmitInput(String),
-    ViewCompleted(Option<String>),
+    ViewCompleted { result: Option<String>, reopen: Option<String> },
     Interrupt,
     Quit,
     Consumed,

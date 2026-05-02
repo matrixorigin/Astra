@@ -104,17 +104,27 @@ impl SlashPopup {
             if row >= area.bottom() { break; }
 
             let meta = self.matches[i];
+            let is_sel = i == self.selected;
 
             let name_w = 16;
             let padded_name = format!("{:<width$}", meta.name, width = name_w);
-            let desc_budget = (area.width as usize).saturating_sub(4 + name_w);
+            let desc_budget = (area.width as usize).saturating_sub(2 + name_w);
             let desc: String = meta.description.chars().take(desc_budget).collect();
 
-            let line = Line::from(vec![
-                Span::raw("  "),
-                Span::styled(padded_name, dim),
-                Span::styled(desc, dim),
-            ]);
+            let line = if is_sel {
+                let sel = Style::default().fg(Color::Cyan).add_modifier(ratatui::style::Modifier::BOLD);
+                Line::from(vec![
+                    Span::styled("  ", sel),
+                    Span::styled(padded_name, sel),
+                    Span::styled(desc, sel),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::raw(padded_name),
+                    Span::styled(desc, dim),
+                ])
+            };
             Widget::render(line, Rect::new(area.x, row, area.width, 1), buf);
         }
     }

@@ -107,20 +107,31 @@ impl SkillPopup {
         for (_vi, i) in (visible_start..visible_end).enumerate() {
             if y >= area.bottom() { break; }
             let item = filtered[i];
+            let is_sel = i == self.selected;
 
             let tag = format!("[{}]", item.source);
             let name_w = 18;
             let tag_w = tag.len() + 1;
             let padded_name = format!("{:<width$}", item.name, width = name_w);
-            let desc_budget = (area.width as usize).saturating_sub(4 + name_w + tag_w + 1);
+            let desc_budget = (area.width as usize).saturating_sub(2 + name_w + tag_w + 1);
             let desc: String = item.description.chars().take(desc_budget).collect();
 
-            let line = Line::from(vec![
-                Span::raw("  "),
-                Span::styled(padded_name, dim),
-                Span::styled(format!("{tag} "), Style::default().fg(Color::Cyan)),
-                Span::styled(desc, dim),
-            ]);
+            let line = if is_sel {
+                let sel = Style::default().fg(Color::Cyan).add_modifier(ratatui::style::Modifier::BOLD);
+                Line::from(vec![
+                    Span::styled("  ", sel),
+                    Span::styled(padded_name, sel),
+                    Span::styled(format!("{tag} "), sel),
+                    Span::styled(desc, sel),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::raw(padded_name),
+                    Span::styled(format!("{tag} "), Style::default().fg(Color::Cyan)),
+                    Span::styled(desc, dim),
+                ])
+            };
             Widget::render(line, Rect::new(area.x, y, area.width, 1), buf);
             y += 1;
         }
