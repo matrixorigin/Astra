@@ -272,6 +272,8 @@ pub struct DynamicAgentSpawner {
     /// JoinSet tracking all in-flight background agent tasks for graceful shutdown drain.
     /// Shared across `clone_for_task` clones so every background handle lands here.
     background_tasks: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
+    /// Agent IDs spawned in background mode, for result collection after drain.
+    background_agent_ids: Arc<std::sync::Mutex<Vec<String>>>,
     /// Optional fork-prefix store for cache inheritance across
     /// parent/child spawns. When `None` (default), spawn behavior is
     /// identical to pre-fork-prefix builds — existing callers are
@@ -301,6 +303,7 @@ impl DynamicAgentSpawner {
                 astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            background_agent_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             prefix_store: None,
             prefix_resolve_outcomes: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -324,6 +327,7 @@ impl DynamicAgentSpawner {
                 astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            background_agent_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             prefix_store: None,
             prefix_resolve_outcomes: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -345,6 +349,7 @@ impl DynamicAgentSpawner {
                 astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
             background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            background_agent_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             prefix_store: None,
             prefix_resolve_outcomes: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -665,6 +670,11 @@ impl DynamicAgentSpawner {
                 }
             }
 
+            // Track for result collection in shutdown_and_wait.
+            if let Ok(mut ids) = self.background_agent_ids.lock() {
+                ids.push(agent_id.clone());
+            }
+
             Ok(SpawnAgentOutput::Launched {
                 agent_id,
                 description: input.description,
@@ -899,6 +909,7 @@ impl DynamicAgentSpawner {
             completed_agents: Arc::clone(&self.completed_agents),
             // Share the same JoinSet so shutdown can drain tasks spawned by clones.
             background_tasks: Arc::clone(&self.background_tasks),
+            background_agent_ids: Arc::clone(&self.background_agent_ids),
             // Share prefix-store + resolve-outcomes map so clones
             // see/write the same view. The store is an Arc<dyn ...>
             // itself already, so cloning the Option just bumps refcount.
@@ -923,19 +934,7 @@ impl DynamicAgentSpawner {
             .map(|mut g| std::mem::take(&mut *g))
             .unwrap_or_default();
 
-        if set.is_empty() {
-            return Vec::new();
-        }
-
-        // Snapshot completed-agent IDs before drain to detect new completions.
-        let pre_drain: std::collections::HashSet<String> = self
-            .completed_agents
-            .read()
-            .await
-            .iter()
-            .map(|s| s.agent_id.clone())
-            .collect();
-
+        // Drain JoinSet — even if empty (tasks may have already completed).
         match tokio::time::timeout(deadline, async {
             while let Some(result) = set.join_next().await {
                 if let Err(e) = result {
@@ -960,12 +959,22 @@ impl DynamicAgentSpawner {
             }
         }
 
-        // Collect results from agents that completed during the drain.
+        // Collect results for all background-spawned agents.
+        let bg_ids: std::collections::HashSet<String> = self
+            .background_agent_ids
+            .lock()
+            .map(|ids| ids.iter().cloned().collect())
+            .unwrap_or_default();
+
+        if bg_ids.is_empty() {
+            return Vec::new();
+        }
+
         self.completed_agents
             .read()
             .await
             .iter()
-            .filter(|s| !pre_drain.contains(&s.agent_id))
+            .filter(|s| bg_ids.contains(&s.agent_id))
             .filter_map(|s| {
                 if let AgentStatus::Completed { ref result } = s.status {
                     Some((s.agent_id.clone(), result.clone()))
