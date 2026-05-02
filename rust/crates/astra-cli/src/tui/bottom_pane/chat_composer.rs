@@ -120,7 +120,7 @@ impl ChatComposer {
 
     fn navigate_history_next(&mut self) {
         match self.history_index {
-            None => return,
+            None => (),
             Some(i) if i + 1 >= self.history.len() => {
                 self.history_index = None;
                 if let Some(ref draft) = self.draft.take() {

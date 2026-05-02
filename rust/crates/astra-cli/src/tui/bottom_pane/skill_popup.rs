@@ -104,7 +104,7 @@ impl SkillPopup {
         let visible_end = (visible_start + MAX_VISIBLE).min(filtered.len());
 
         let mut y = area.y;
-        for (_vi, i) in (visible_start..visible_end).enumerate() {
+        for i in visible_start..visible_end  {
             if y >= area.bottom() { break; }
             let item = filtered[i];
             let is_sel = i == self.selected;

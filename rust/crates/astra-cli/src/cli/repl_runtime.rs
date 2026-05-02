@@ -323,7 +323,6 @@ pub(super) async fn try_silent_auth(api: &astra_thin_client::ThinClient, profile
     match try_refresh_token(api, profile, refresh_str).await {
         Ok(()) => {
             eprintln!("  {} Token refreshed", theme::icon_ok());
-            return;
         }
         Err(err) => {
             // Do not wipe local creds on transport failures, 5xx, or malformed JSON —
@@ -333,7 +332,6 @@ pub(super) async fn try_silent_auth(api: &astra_thin_client::ThinClient, profile
             }
             // Another CLI may have won refresh first (server revokes old refresh on success).
             if recover_credentials_after_refresh_race(api, profile, refresh_str).await {
-                return;
             }
         }
     }

@@ -23,7 +23,7 @@ const LIGHT_ADD_BG: Color = Color::Rgb(218, 251, 225);
 const LIGHT_DEL_BG: Color = Color::Rgb(255, 235, 233);
 
 fn is_light_bg() -> bool {
-    default_bg().map_or(false, is_light)
+    default_bg().is_some_and(is_light)
 }
 
 /// Style for an added line.

@@ -29,7 +29,7 @@ pub(crate) fn prefix_lines<'a>(
             subsequent.clone()
         };
         let mut spans = prefix.spans;
-        spans.extend(line.spans.drain(..));
+        spans.append(&mut line.spans);
         result.push(Line::from(spans));
     }
     result

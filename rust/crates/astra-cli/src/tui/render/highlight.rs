@@ -30,7 +30,7 @@ fn syntax_set() -> &'static SyntaxSet {
 }
 
 fn default_theme() -> Theme {
-    let is_light_bg = default_bg().map_or(false, is_light);
+    let is_light_bg = default_bg().is_some_and(is_light);
     let themes = extra_themes();
     let name = if is_light_bg {
         EmbeddedThemeName::CatppuccinLatte

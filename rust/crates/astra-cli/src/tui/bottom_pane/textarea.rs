@@ -368,7 +368,7 @@ impl TextArea {
         let before = &self.text[..pos];
         before
             .grapheme_indices(true)
-            .last()
+            .next_back()
             .map(|(i, _)| i)
             .unwrap_or(0)
     }
