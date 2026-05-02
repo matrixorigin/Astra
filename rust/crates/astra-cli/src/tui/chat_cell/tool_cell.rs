@@ -109,22 +109,28 @@ impl ChatCell for ToolChatCell {
         }
 
         // Output with └ prefix (first line) then 4-space indent
+        // Diff lines (+/-) get green/red coloring
         if let Some(ref summary) = self.output_summary {
-            let max_w = w.saturating_sub(4);
-            let out_lines: Vec<&str> = summary.lines().take(5).collect();
+            let max_w = w.saturating_sub(8);
+            let out_lines: Vec<&str> = summary.lines().take(8).collect();
             for (i, ol) in out_lines.iter().enumerate() {
                 let prefix = if i == 0 {
                     Span::styled("  └ ", dim)
                 } else {
                     Span::raw("    ")
                 };
-                lines.push(Line::from(vec![
-                    prefix,
-                    Span::raw(truncate_by_width(ol, max_w)),
-                ]));
+                let content = truncate_by_width(ol, max_w);
+                let style = if ol.starts_with('+') {
+                    Style::default().fg(Color::Green)
+                } else if ol.starts_with('-') {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(vec![prefix, Span::styled(content, style)]));
             }
-            if summary.lines().count() > 5 {
-                let remaining = summary.lines().count() - 5;
+            if summary.lines().count() > 8 {
+                let remaining = summary.lines().count() - 8;
                 lines.push(Line::from(vec![
                     Span::raw("    "),
                     Span::styled(format!("… +{remaining} lines"), dim),

@@ -89,6 +89,14 @@ fn finalize_stream_controller(
     }
 }
 
+/// Check if the terminal supports TUI mode.
+pub(crate) fn can_run_tui() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && std::env::var("TERM").map_or(true, |t| t != "dumb")
+}
+
 pub(crate) async fn run_tui_repl(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
@@ -173,6 +181,15 @@ pub(crate) async fn run_tui_repl(
             Some(ev) = event_stream.next() => {
                 match ev {
                     TuiEvent::Key(key) => {
+                        // Ctrl+L: force full redraw
+                        if key.code == crossterm::event::KeyCode::Char('l')
+                            && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                        {
+                            let _ = guard.terminal.clear();
+                            guard.terminal.invalidate_viewport();
+                            frame_requester.schedule_frame();
+                            continue;
+                        }
                         // Ctrl+O: open transcript view
                         if key.code == crossterm::event::KeyCode::Char('o')
                             && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
@@ -404,7 +421,11 @@ pub(crate) async fn run_tui_repl(
                         }
                         frame_requester.schedule_frame();
                     }
-                    TuiEvent::Resize | TuiEvent::Draw => {
+                    TuiEvent::Resize => {
+                        guard.terminal.invalidate_viewport();
+                        do_draw(&mut guard, &active_cell, &mut bottom_pane)?;
+                    }
+                    TuiEvent::Draw => {
                         do_draw(&mut guard, &active_cell, &mut bottom_pane)?;
                     }
                     TuiEvent::Paste(text) => {

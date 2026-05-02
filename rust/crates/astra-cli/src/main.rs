@@ -315,6 +315,10 @@ async fn run_interactive_chat(
     use_tui: bool,
 ) -> Result<(), String> {
     if use_tui {
+        if !tui::can_run_tui() {
+            eprintln!("TUI mode requires an interactive terminal. Falling back to line mode.");
+            return run_chat_repl(api, profile, initial_model, resume_session_id, no_instructions, max_budget).await;
+        }
         tui::run_tui_repl(api, profile, initial_model, resume_session_id, no_instructions, max_budget).await
     } else {
         run_chat_repl(api, profile, initial_model, resume_session_id, no_instructions, max_budget).await
