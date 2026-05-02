@@ -77,6 +77,7 @@ pub mod lesson_extractor;
 pub mod lesson_synthesizer;
 pub mod matrix_cloud_runtime;
 pub mod memoria_insights;
+pub mod memory_relevance;
 pub mod observability_integration;
 pub mod pipeline;
 pub use astra_plan as plan;

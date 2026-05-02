@@ -2194,7 +2194,7 @@ mod tests {
     #[test]
     fn rank_cheapest_among_selector_subset() {
         // Given 3 models where 2 have selector tag, picks cheapest selector.
-        let all_entries = vec![
+        let all_entries = [
             (
                 "expensive-main".to_string(),
                 r#"{"prompt":0.003,"completion":0.015}"#.to_string(),
@@ -2209,8 +2209,7 @@ mod tests {
             ),
         ];
         // selector_rows indices: [1, 2]
-        let selector_entries: Vec<(String, String)> =
-            vec![all_entries[1].clone(), all_entries[2].clone()];
+        let selector_entries = [all_entries[1].clone(), all_entries[2].clone()];
         let best = rank_cheapest_index(&selector_entries);
         assert_eq!(
             selector_entries[best].0, "qwen-flash",

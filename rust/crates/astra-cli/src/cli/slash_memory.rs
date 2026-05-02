@@ -254,8 +254,73 @@ pub(super) async fn handle_memory_domain_command(
                         Err(e) => eprintln!("{}", format!("  ✗ Unreachable: {e}").red()),
                     }
                 }
+                "dismiss" if !sub_arg.is_empty() => {
+                    // Search for matching memories, then send "irrelevant" feedback.
+                    let payload = serde_json::json!({
+                        "query": sub_arg,
+                        "top_k": 3,
+                    });
+                    match api.post_memory_search_json(tok, &payload).await {
+                        Ok(r) if r.status().is_success() => {
+                            let body = r.text().await.unwrap_or_default();
+                            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&body) {
+                                if arr.is_empty() {
+                                    eprintln!("  {}", "No matching memories to dismiss.".dim());
+                                } else {
+                                    let mut dismissed = 0u32;
+                                    for m in &arr {
+                                        let Some(mid) = m.get("memory_id").and_then(|v| v.as_str())
+                                        else {
+                                            continue;
+                                        };
+                                        let content = m
+                                            .get("content")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("?");
+                                        let preview: String = content.chars().take(60).collect();
+                                        // Send "irrelevant" feedback to lower retrieval score
+                                        let fb_url = format!(
+                                            "{}/v1/memories/{mid}/feedback",
+                                            std::env::var("MEMORIA_BASE_URL").unwrap_or_else(
+                                                |_| astra_core::config::DEFAULT_MEMORIA_URL
+                                                    .to_string()
+                                            )
+                                        );
+                                        let key =
+                                            std::env::var("MEMORIA_MASTER_KEY").unwrap_or_default();
+                                        if let Ok(client) = reqwest::Client::builder()
+                                            .timeout(std::time::Duration::from_secs(3))
+                                            .no_proxy()
+                                            .build()
+                                        {
+                                            let _ = client
+                                                .post(&fb_url)
+                                                .header("Authorization", format!("Bearer {key}"))
+                                                .json(&serde_json::json!({"signal": "irrelevant", "context": "user /memory dismiss"}))
+                                                .send()
+                                                .await;
+                                        }
+                                        eprintln!("  {} dismissed: {preview}", "✗".red());
+                                        dismissed += 1;
+                                    }
+                                    eprintln!(
+                                        "  {} memories dismissed (retrieval score lowered)",
+                                        dismissed.to_string().cyan()
+                                    );
+                                }
+                            }
+                        }
+                        Ok(r) => {
+                            eprintln!("{}", format!("  ✗ Search failed ({})", r.status()).red())
+                        }
+                        Err(e) => eprintln!("{}", format!("  ✗ Unreachable: {e}").red()),
+                    }
+                }
                 _ => {
-                    eprintln!("  {} /memory [list | search <query>]", "Usage:".dim());
+                    eprintln!(
+                        "  {} /memory [list | search <query> | dismiss <query>]",
+                        "Usage:".dim()
+                    );
                 }
             }
         }
