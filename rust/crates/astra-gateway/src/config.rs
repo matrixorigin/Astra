@@ -22,6 +22,12 @@ pub struct GatewayConfig {
     /// Access control policy (who can send messages).
     #[serde(default)]
     pub access: crate::access_control::AccessPolicy,
+    /// Group chat: isolate sessions per user (true) or share per group (false).
+    #[serde(default = "default_true")]
+    pub group_sessions_per_user: bool,
+    /// Group chat: require @mention to activate (reduces noise).
+    #[serde(default)]
+    pub group_require_mention: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -37,6 +43,8 @@ impl Default for DatabaseConfig {
         }
     }
 }
+
+fn default_true() -> bool { true }
 
 fn default_db_url() -> String {
     std::env::var("GATEWAY_DATABASE_URL")

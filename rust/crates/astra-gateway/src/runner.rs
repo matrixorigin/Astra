@@ -137,9 +137,26 @@ impl GatewayRunner {
     ) -> Option<String> {
         // Access control check
         if !self.config.access.is_allowed(&msg.user_id) {
-            tracing::debug!(user = %msg.user_id, "message rejected by access policy");
+            tracing::debug!(user = %safe_id(&msg.user_id), "message rejected by access policy");
             return Some(self.config.access.rejection_message().to_string());
         }
+
+        // Group chat: require @mention if configured
+        if msg.chat_type == crate::platforms::ChatType::Group
+            && self.config.group_require_mention
+            && !msg.text.contains("@bot") && !msg.text.contains("@Bot")
+        {
+            return None; // silently ignore non-mentioned group messages
+        }
+
+        // Group chat: per-user session isolation
+        let effective_chat_id = if msg.chat_type == crate::platforms::ChatType::Group
+            && self.config.group_sessions_per_user
+        {
+            format!("{}:{}", msg.chat_id, msg.user_id)
+        } else {
+            msg.chat_id.clone()
+        };
 
         // Resolve active CLI profile (user may have switched via /cli)
         let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
@@ -150,7 +167,7 @@ impl GatewayRunner {
             config: &self.config,
             pool: self.pool.as_ref(),
             platform: msg.platform,
-            chat_id: &msg.chat_id,
+            chat_id: &effective_chat_id,
             user_id: &msg.user_id,
             resolved_cli: &cli_profile,
             durable_store: self.durable_store.as_ref().map(|s| s.as_ref() as &dyn astra_core::durable_task_store::DurableTaskStore),
@@ -168,19 +185,19 @@ impl GatewayRunner {
 
         // Auto-reset session if policy triggers
         if let Some(ref pool) = self.pool
-            && let Ok(Some(last_active_str)) = storage::get_session_last_active(pool, msg.platform, &msg.chat_id, &cli_name).await
+            && let Ok(Some(last_active_str)) = storage::get_session_last_active(pool, msg.platform, &effective_chat_id, &cli_name).await
             && let Ok(last_active) = chrono::NaiveDateTime::parse_from_str(&last_active_str, "%Y-%m-%d %H:%M:%S%.f")
         {
             let last_utc = last_active.and_utc();
             let now = chrono::Utc::now();
             if self.config.session_reset.should_reset(last_utc, now) {
-                let _ = storage::reset_session_for_cli(pool, msg.platform, &msg.chat_id, &cli_name).await;
+                let _ = storage::reset_session_for_cli(pool, msg.platform, &effective_chat_id, &cli_name).await;
                 tracing::info!(cli = cli_name, "session auto-reset by policy");
             }
         }
 
         let session_id = if let Some(ref pool) = self.pool {
-            storage::get_current_session_for_cli(pool, msg.platform, &msg.chat_id, &cli_name)
+            storage::get_current_session_for_cli(pool, msg.platform, &effective_chat_id, &cli_name)
                 .await
                 .ok()
                 .flatten()
@@ -190,8 +207,8 @@ impl GatewayRunner {
 
         tracing::info!(
             platform = msg.platform,
-            chat_id = %msg.chat_id,
-            user = %msg.user_id,
+            chat_id = %safe_id(&msg.chat_id),
+            user = %safe_id(&msg.user_id),
             "→ {}",
             truncate(&msg.text, 80),
         );
@@ -215,7 +232,7 @@ impl GatewayRunner {
                 self.pool.is_some(),
             );
             if let Some(ref pool) = self.pool
-                && let Ok(jobs) = storage::list_cron_jobs(pool, msg.platform, &msg.chat_id).await
+                && let Ok(jobs) = storage::list_cron_jobs(pool, msg.platform, &effective_chat_id).await
             {
                 let cron_list: Vec<_> = jobs.iter().map(|(id, expr, desc, _)| {
                     (id[..8.min(id.len())].to_string(), expr.clone(), desc.clone())
@@ -223,7 +240,7 @@ impl GatewayRunner {
                 ctx = ctx.with_cron_jobs(cron_list);
             }
             if let Some(ref store) = self.durable_store {
-                let owner = format!("{}:{}", msg.platform, msg.chat_id);
+                let owner = format!("{}:{}", msg.platform, effective_chat_id);
                 let filter = astra_core::durable_task_store::TaskFilter {
                     owner_id: Some(owner),
                     ..Default::default()
@@ -251,7 +268,7 @@ impl GatewayRunner {
         // Run CLI with rich progress heartbeats (no hard timeout — only stall detection).
         let message_text = msg.text.clone();
         let sid = session_id.clone();
-        let chat_id = msg.chat_id.clone();
+        let chat_id = effective_chat_id.clone();
         let cli_name = cli_profile.name().to_string();
 
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<CliProgress>(64);
@@ -334,7 +351,7 @@ impl GatewayRunner {
         // Helper: suspend running durable tasks for this chat on failure
         let suspend_tasks = |store: &Option<std::sync::Arc<crate::durable_task_store::MysqlDurableTaskStore>>, reason: String| {
             let store = store.clone();
-            let owner = format!("{platform}:{chat_id}", platform = msg.platform, chat_id = msg.chat_id);
+            let owner = format!("{platform}:{chat_id}", platform = msg.platform, chat_id = effective_chat_id);
             async move {
                 if let Some(ref s) = store {
                     let n = s.suspend_running_tasks_for_owner(&owner, &reason).await.unwrap_or(0);
@@ -383,10 +400,10 @@ impl GatewayRunner {
         if let Some(ref pool) = self.pool {
             if let Some(ref sid) = result.session_id {
                 let _ = storage::set_current_session_for_cli(
-                    pool, msg.platform, &msg.chat_id, &msg.user_id, sid, &cli_name,
+                    pool, msg.platform, &effective_chat_id, &msg.user_id, sid, &cli_name,
                 ).await;
             } else {
-                let _ = storage::touch_session_for_cli(pool, msg.platform, &msg.chat_id, &cli_name).await;
+                let _ = storage::touch_session_for_cli(pool, msg.platform, &effective_chat_id, &cli_name).await;
             }
         }
 
@@ -413,12 +430,29 @@ impl GatewayRunner {
 
         tracing::info!(
             platform = msg.platform,
-            chat_id = %msg.chat_id,
+            chat_id = %safe_id(&msg.chat_id),
             text_len = text.len(),
             tools = result.tool_calls_count.unwrap_or(0),
             exit = result.exit_code,
             "← done"
         );
+
+        // Append token usage stats
+        let elapsed = start.elapsed();
+        let mut stats_parts = Vec::new();
+        if let Some(p) = result.tokens_prompt {
+            stats_parts.push(format!("↓{}", format_tokens(p)));
+        }
+        if let Some(c) = result.tokens_completion {
+            stats_parts.push(format!("↑{}", format_tokens(c)));
+        }
+        if result.tool_calls_count.unwrap_or(0) > 0 {
+            stats_parts.push(format!("🔧{}", result.tool_calls_count.unwrap()));
+        }
+        stats_parts.push(format_elapsed(elapsed));
+        if !text.is_empty() && !stats_parts.is_empty() {
+            text.push_str(&format!("\n\n`{}`", stats_parts.join(" | ")));
+        }
 
         if text.is_empty() {
             Some("(无回复)".into())
@@ -1288,3 +1322,17 @@ mod tests {
         execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("数据库"), "{}", r[0]);
     }
+
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1e6) }
+    else if n >= 1_000 { format!("{:.1}k", n as f64 / 1e3) }
+    else { format!("{n}") }
+}
+
+fn safe_id(id: &str) -> String {
+    if id.len() <= 8 {
+        id.to_string()
+    } else {
+        format!("{}…", &id[..8])
+    }
+}

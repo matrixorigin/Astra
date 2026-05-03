@@ -197,7 +197,16 @@ impl PlatformAdapter for WeixinAdapter {
                 .unwrap();
             let mut dedup = MessageDeduplicator::new();
             let mut shutdown_rx = shutdown_tx.subscribe();
-            let mut sync_buf = String::new();
+            // Restore sync cursor from DB
+            let mut sync_buf = if let Some(ref pool) = pool
+                && let Ok(Some(cred)) = crate::storage::get_credential(pool, "weixin", "default", "sync_buf").await
+                && let Some(s) = cred.credentials.as_str()
+            {
+                tracing::info!("restored sync cursor from DB");
+                s.to_string()
+            } else {
+                String::new()
+            };
             let mut consecutive_errors = 0u32;
 
             loop {
@@ -363,9 +372,15 @@ async fn poll_updates(
         return Err(format!("getupdates error {errcode}: {errmsg}").into());
     }
 
-    // Update sync cursor
+    // Update sync cursor and persist to DB
     if let Some(buf) = data["get_updates_buf"].as_str() {
         *sync_buf = buf.to_string();
+        if let Some(pool) = pool {
+            let _ = crate::storage::save_credential(
+                pool, "weixin", "default", "sync_buf",
+                &serde_json::Value::String(buf.to_string()), None,
+            ).await;
+        }
     }
 
     // Parse messages
