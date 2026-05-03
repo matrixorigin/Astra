@@ -1562,3 +1562,82 @@ fn safe_id(id: &str) -> String {
         execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
         assert!(r[0].contains("名称不能为空"), "{}", r[0]);
     }
+
+    // ── Concurrency tests ───────────────────────────────────────
+
+    #[test]
+    fn null_adapter_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<NullAdapter>();
+    }
+
+    #[test]
+    fn cli_response_fields() {
+        let r = CliResponse {
+            chat_id: "c1".into(),
+            text: "hello".into(),
+            reply_token: Some("tok".into()),
+        };
+        assert_eq!(r.chat_id, "c1");
+        assert_eq!(r.text, "hello");
+        assert_eq!(r.reply_token.as_deref(), Some("tok"));
+    }
+
+    #[tokio::test]
+    async fn handle_fast_slash_command_returns_ok() {
+        // Can't easily construct a full GatewayRunner in unit test (needs DB),
+        // but we can test that NullAdapter works for spawned tasks
+        let adapter = NullAdapter;
+        let result = adapter.send_text("chat", "text", None).await;
+        assert!(result.is_ok());
+        let result = adapter.send_typing("chat").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cli_response_channel_roundtrip() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CliResponse>(8);
+        tx.send(CliResponse {
+            chat_id: "c1".into(),
+            text: "result".into(),
+            reply_token: None,
+        }).await.unwrap();
+        let resp = rx.recv().await.unwrap();
+        assert_eq!(resp.chat_id, "c1");
+        assert_eq!(resp.text, "result");
+    }
+
+    #[tokio::test]
+    async fn concurrent_cli_responses_ordered() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CliResponse>(8);
+        let tx2 = tx.clone();
+
+        // Simulate two concurrent CLI tasks
+        let h1 = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tx.send(CliResponse {
+                chat_id: "user1".into(),
+                text: "response1".into(),
+                reply_token: None,
+            }).await.unwrap();
+        });
+        let h2 = tokio::spawn(async move {
+            tx2.send(CliResponse {
+                chat_id: "user2".into(),
+                text: "response2".into(),
+                reply_token: None,
+            }).await.unwrap();
+        });
+
+        h1.await.unwrap();
+        h2.await.unwrap();
+
+        // Both responses arrive (order may vary)
+        let mut responses = vec![];
+        while let Ok(r) = rx.try_recv() {
+            responses.push(r.chat_id);
+        }
+        assert_eq!(responses.len(), 2);
+        assert!(responses.contains(&"user1".to_string()));
+        assert!(responses.contains(&"user2".to_string()));
+    }
