@@ -199,14 +199,8 @@ impl TurnToolEventWriter for CapturingTurnToolWriter {
 }
 
 fn matrixone_dummy() -> MatrixOneSettings {
-    MatrixOneSettings {
-        host: "127.0.0.1".into(),
-        port: 1,
-        user: "x".into(),
-        password: "x".into(),
-        database: "x".into(),
+        MatrixOneSettings::mock()
     }
-}
 
 fn ledger_inject_app(capture: ToolPersistCapture) -> Router {
     let encryptor =

@@ -204,6 +204,18 @@ impl MatrixOneSettings {
         s
     }
 
+    /// Fake settings for unit tests that never open a real DB connection.
+    #[cfg(any(test, feature = "dev-defaults"))]
+    pub fn mock() -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            port: 6001,
+            user: "test".into(),
+            password: "test".into(),
+            database: "test".into(),
+        }
+    }
+
     /// Returns the database URL with password REDACTED — safe for logging.
     ///
     /// Use [`MatrixOneSettings::database_url_with_password`] when an actual

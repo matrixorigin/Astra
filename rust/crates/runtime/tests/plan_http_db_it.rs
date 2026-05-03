@@ -52,18 +52,7 @@ fn require_db_it_env() -> Option<MatrixOneSettings> {
     if std::env::var("ASTRA_TEST_DB_IT").as_deref() != Ok("1") {
         return None;
     }
-    dotenvy::dotenv().ok();
-    Some(MatrixOneSettings {
-        host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-        port: std::env::var("MATRIXONE_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6001),
-        user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
-        password: std::env::var("MATRIXONE_PASSWORD")
-            .unwrap_or_else(|_| DEV_MATRIXONE_PASSWORD.to_string()),
-        database: resolve_database_name(&|k| std::env::var(k).ok()),
-    })
+    Some(MatrixOneSettings::from_env())
 }
 
 /// Per-binary cached schema-bootstrap + pool. `ensure_core_schema` is

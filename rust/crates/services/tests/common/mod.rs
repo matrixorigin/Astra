@@ -31,18 +31,8 @@ pub fn require_db_it_env() -> MatrixOneSettings {
         Ok("1"),
         "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
     );
-    dotenvy::dotenv().ok();
-    MatrixOneSettings {
-        host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-        port: std::env::var("MATRIXONE_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6001),
-        user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
-        password: std::env::var("MATRIXONE_PASSWORD")
-            .unwrap_or_else(|_| DEV_MATRIXONE_PASSWORD.to_string()),
-        database: resolve_database_name(&|k| std::env::var(k).ok()),
-    }
+    MatrixOneSettings::from_env()
+}
 }
 
 /// Shared per-binary bootstrap. Runs `ensure_core_schema` + `SharedPool::new`

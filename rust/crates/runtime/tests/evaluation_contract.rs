@@ -80,16 +80,8 @@ fn build_unconfigured_app() -> axum::Router {
 }
 
 fn dummy_matrixone() -> MatrixOneSettings {
-    // Placeholder settings — the memory-health/memory-metrics routes only call
-    // Memoria over HTTP and never open a DB connection, so this is never dialed.
-    MatrixOneSettings {
-        host: "invalid.test".to_string(),
-        port: 1,
-        user: "x".to_string(),
-        password: "x".to_string(),
-        database: "x".to_string(),
+        MatrixOneSettings::mock()
     }
-}
 
 async fn start_mock_memoria_health() -> String {
     let app = Router::new()

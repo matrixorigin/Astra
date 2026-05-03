@@ -473,13 +473,7 @@ mod tests {
     use super::*;
 
     fn mock_matrixone() -> MatrixOneSettings {
-        MatrixOneSettings {
-            host: "127.0.0.1".to_string(),
-            port: 6001,
-            user: "test".to_string(),
-            password: "test".to_string(),
-            database: "test".to_string(),
-        }
+        MatrixOneSettings::mock()
     }
 
     fn mock_encryptor() -> Arc<FernetTokenEncryptor> {

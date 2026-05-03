@@ -296,13 +296,7 @@ mod tests {
     }
 
     fn test_matrixone() -> astra_core::MatrixOneSettings {
-        astra_core::MatrixOneSettings {
-            host: "127.0.0.1".into(),
-            port: 6001,
-            user: "root".into(),
-            password: "root".into(),
-            database: "astra_test".into(),
-        }
+        astra_core::MatrixOneSettings::mock()
     }
 
     #[test]

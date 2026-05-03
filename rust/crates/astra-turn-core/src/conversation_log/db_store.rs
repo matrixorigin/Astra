@@ -326,16 +326,7 @@ mod tests {
     // The DB must have the `conversation_log` table created (via ensure_core_schema).
 
     async fn test_store() -> DbCslStore {
-        let settings = MatrixOneSettings {
-            host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-            port: std::env::var("MATRIXONE_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(6001),
-            user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
-            password: std::env::var("MATRIXONE_PASSWORD").unwrap_or_else(|_| "111".into()),
-            database: std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "astra_test".into()),
-        };
+        let settings = MatrixOneSettings::from_env_with_database("astra_test");
         let store = DbCslStore::new(settings);
 
         // Ensure table exists for tests.
