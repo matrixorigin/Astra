@@ -73,13 +73,13 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_5_pinned() {
-        assert_eq!(ToolRegistry::pinned_count(), 5);
+    fn catalog_has_6_pinned() {
+        assert_eq!(ToolRegistry::pinned_count(), 6);
     }
 
     #[test]
-    fn catalog_has_38_dynamic() {
-        assert_eq!(ToolRegistry::dynamic_count(), 38);
+    fn catalog_has_37_dynamic() {
+        assert_eq!(ToolRegistry::dynamic_count(), 37);
     }
 
     #[test]
@@ -98,8 +98,8 @@ mod tests {
             "memory_store must be pinned — intrinsic store capability"
         );
         assert!(
-            !pinned.contains(&"memory_retrieve"),
-            "memory_retrieve is dynamic — boost_search is the capability layer"
+            pinned.contains(&"memory_retrieve"),
+            "memory_retrieve must be pinned — intrinsic recall capability"
         );
         assert!(!pinned.contains(&"write_file"));
         assert!(!pinned.contains(&"grep"));
@@ -190,20 +190,17 @@ mod tests {
     }
 
     #[test]
-    fn prefilter_ranks_memory_retrieve_for_recall() {
-        // memory_retrieve is dynamic with rich triggers. It must score
-        // high enough to be selected for explicit memory queries.
-        let state = ConversationState::from_message("我有哪些记忆?", 1);
-        let ranked = pre_filter_dynamic(&state, "我有哪些记忆?");
-        let top_names: Vec<&str> = ranked
+    fn pinned_memory_retrieve_always_available_for_recall() {
+        // memory_retrieve is now pinned — it no longer needs to rank in
+        // pre_filter_dynamic. Verify it IS pinned so memory lifecycle
+        // cases always have it available.
+        let tool = TOOL_CATALOG
             .iter()
-            .take(8)
-            .map(|&(idx, _)| TOOL_CATALOG[idx].name)
-            .collect();
+            .find(|t| t.name == "memory_retrieve")
+            .unwrap();
         assert!(
-            top_names.contains(&"memory_retrieve"),
-            "memory_retrieve must rank in top-8 for '我有哪些记忆?', got: {:?}",
-            top_names
+            tool.pinned,
+            "memory_retrieve must be pinned for reliable memory lifecycle"
         );
     }
 

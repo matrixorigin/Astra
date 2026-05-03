@@ -983,12 +983,16 @@ mod tests {
             )
         });
         assert!(report.selected_count > 0);
+        let matching: Vec<_> = captured
+            .iter()
+            .filter(|t| t.contains("\"query\":\"search for TODO in source files\""))
+            .collect();
         assert_eq!(
-            captured.len(),
+            matching.len(),
             1,
-            "routed_with_pressure must emit exactly one selector trace; got {captured:?}"
+            "routed_with_pressure must emit exactly one selector trace for its query; got {captured:?}"
         );
-        let json = &captured[0];
+        let json = matching[0];
         assert!(
             json.contains("\"mode\":\"routed\"") || json.contains("\"mode\":\"routed_pressure\""),
             "expected routed mode label in trace; got {json}"
@@ -1056,15 +1060,19 @@ mod tests {
         let ((_out, report), captured) =
             with_obs_capture(|| registry.select_with_quality(query, 0, 800, &[], None));
         assert!(report.selected_count > 0);
+        let matching: Vec<_> = captured
+            .iter()
+            .filter(|t| t.contains("\"query\":\"search for TODO comments\""))
+            .collect();
         assert_eq!(
-            captured.len(),
+            matching.len(),
             1,
-            "select_with_quality dynamic branch must emit exactly one trace; got {captured:?}"
+            "select_with_quality dynamic branch must emit exactly one trace for its query; got {captured:?}"
         );
         assert!(
-            captured[0].contains("\"mode\":\"quality\""),
+            matching[0].contains("\"mode\":\"quality\""),
             "expected quality mode label; got {}",
-            captured[0]
+            matching[0]
         );
     }
 

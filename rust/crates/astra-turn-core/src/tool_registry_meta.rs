@@ -843,7 +843,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "show memories",
             "list memories",
         ],
-        pinned: false,
+        pinned: true,
         intents: &[IntentType::Memory],
         scope: Scope::CrossSession,
         schema_tokens: 30,
@@ -1452,14 +1452,14 @@ mod tests {
     }
 
     #[test]
-    fn catalog_memory_retrieve_is_dynamic() {
+    fn catalog_memory_retrieve_is_pinned() {
         let tool = TOOL_CATALOG
             .iter()
             .find(|t| t.name == "memory_retrieve")
             .unwrap();
         assert!(
-            !tool.pinned,
-            "memory_retrieve should be dynamic — per-turn boost_search is the capability layer"
+            tool.pinned,
+            "memory_retrieve must be pinned — intrinsic recall capability"
         );
     }
 
@@ -1469,7 +1469,7 @@ mod tests {
         assert!(is_pinned_tool("read_file"));
         assert!(is_pinned_tool("str_replace"));
         assert!(is_pinned_tool("memory_store"));
-        assert!(!is_pinned_tool("memory_retrieve"));
+        assert!(is_pinned_tool("memory_retrieve"));
         assert!(!is_pinned_tool("nonexistent_tool"));
     }
 }

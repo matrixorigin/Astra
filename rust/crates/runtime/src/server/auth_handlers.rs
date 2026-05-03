@@ -133,6 +133,15 @@ async fn memory_proxy_call(
         );
     }
 
+    // Memoria PurgeRequest only accepts: memory_ids, topic, reason.
+    // Strip injected fields that would cause a 422 Unprocessable Entity.
+    if endpoint.ends_with("/purge") {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("session_id");
+            obj.remove("user_id");
+        }
+    }
+
     state
         .memoria_forwarder
         .forward(endpoint, body)

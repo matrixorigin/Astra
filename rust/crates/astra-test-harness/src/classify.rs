@@ -23,6 +23,7 @@ pub enum FailureClass {
     ModelCapability,
     ModelQualityLow,
     EfficiencyBoundsExceeded,
+    ToolUnavailable,
     Unknown,
 }
 
@@ -38,6 +39,7 @@ impl fmt::Display for FailureClass {
             Self::ModelCapability => write!(f, "ModelCapability"),
             Self::ModelQualityLow => write!(f, "ModelQualityLow"),
             Self::EfficiencyBoundsExceeded => write!(f, "EfficiencyBoundsExceeded"),
+            Self::ToolUnavailable => write!(f, "ToolUnavailable"),
             Self::Unknown => write!(f, "Unknown"),
         }
     }
@@ -102,6 +104,19 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
         }
     }
 
+    // Tool unavailable: the agent reported a required tool is missing.
+    let tool_missing_signals = [
+        "don't have a memory_retrieve tool",
+        "tool available in my current toolset",
+        "not available in my current tool",
+        "tool is not available",
+        "no such tool",
+    ];
+    let text_lower = outcome.text.to_lowercase();
+    if tool_missing_signals.iter().any(|s| text_lower.contains(s)) {
+        return FailureClass::ToolUnavailable;
+    }
+
     // All deterministic criteria failed → model can't do the task.
     let deterministic_results: Vec<_> = criteria_results
         .iter()
@@ -157,6 +172,9 @@ pub fn suggested_action(class: &FailureClass) -> &'static str {
         }
         FailureClass::EfficiencyBoundsExceeded => {
             "Task completed correctly but exceeded efficiency bounds (tokens/duration/turns)"
+        }
+        FailureClass::ToolUnavailable => {
+            "A required tool was not exposed at runtime; check tool registry and selector config"
         }
         FailureClass::Unknown => "Inspect stderr and session journal for clues",
     }
@@ -317,6 +335,7 @@ mod tests {
             FailureClass::InfraAuth,
             FailureClass::InfraTimeout,
             FailureClass::InfraRateLimit,
+            FailureClass::ToolUnavailable,
             FailureClass::Unknown,
         ];
         for class in &classes {

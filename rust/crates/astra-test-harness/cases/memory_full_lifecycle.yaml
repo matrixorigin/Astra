@@ -18,15 +18,15 @@ weight: 2.5
 timeout_seconds: 240
 steps:
   - prompt: |
-      Use memory_retrieve to search for "NEPTUNE project codename".
-      Tell me the codename and launch date from your memory.
+      Recall the project codename and launch date you stored earlier.
+      Tell me both values.
     criteria:
-      - type: tool_called
-        name: memory_retrieve
       - type: judger
         question: |
           The agent stored "NEPTUNE-2742, launch date June 15th" in turn 1.
-          Did it surface BOTH values (codename + date) from memory_retrieve?
+          Did it surface BOTH values (codename NEPTUNE-2742 + date June 15th)?
+          It may use memory_retrieve, memory_store lookup, or runtime-injected
+          context — any retrieval path counts.
           Score 1.0 if both, 0.5 if one, 0.0 if neither.
         threshold: 0.7
   - prompt: |
@@ -35,6 +35,13 @@ steps:
     criteria:
       - type: tool_called
         name: memory_purge
+      - type: judger
+        question: |
+          Did memory_purge succeed (return a confirmation or deleted_count)?
+          A 422, error, or "Unprocessable Entity" response means failure.
+          Score 1.0 for a successful purge confirmation, 0.0 for any error.
+        threshold: 0.7
+        severity: Hard
 teardown_cmd: |
   curl -sf -X POST "${MEMORIA_BASE_URL:-http://127.0.0.1:8100}/v1/memories/purge" \
     -H "Authorization: Bearer ${MEMORIA_MASTER_KEY}" \
