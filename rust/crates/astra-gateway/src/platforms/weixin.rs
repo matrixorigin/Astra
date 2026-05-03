@@ -55,6 +55,9 @@ impl WeixinConfig {
 
 /// Per-user context token cache (required for sending replies).
 type ContextTokens = Arc<Mutex<HashMap<String, String>>>;
+type TypingTickets = Arc<Mutex<HashMap<String, (String, std::time::Instant)>>>;
+
+const TYPING_TICKET_TTL_SECS: u64 = 600; // 10 minutes
 
 pub struct WeixinAdapter {
     config: WeixinConfig,
@@ -62,6 +65,7 @@ pub struct WeixinAdapter {
     msg_tx: mpsc::Sender<InboundMessage>,
     msg_rx: Option<mpsc::Receiver<InboundMessage>>,
     context_tokens: ContextTokens,
+    typing_tickets: TypingTickets,
     shutdown: Option<tokio::sync::broadcast::Sender<()>>,
 }
 
@@ -74,6 +78,7 @@ impl WeixinAdapter {
             msg_tx: tx,
             msg_rx: Some(rx),
             context_tokens: Arc::new(Mutex::new(HashMap::new())),
+            typing_tickets: Arc::new(Mutex::new(HashMap::new())),
             shutdown: None,
         }
     }
@@ -169,6 +174,21 @@ impl PlatformAdapter for WeixinAdapter {
         let config = self.config.clone();
         let msg_tx = self.msg_tx.clone();
         let tokens = self.context_tokens.clone();
+        let pool = self.pool.clone();
+
+        // Restore persisted context_tokens from DB
+        if let Some(ref pool) = pool
+            && let Ok(Some(cred)) = crate::storage::get_credential(pool, "weixin", "default", "context_tokens").await
+            && let Some(map) = cred.credentials.as_object()
+        {
+            let mut t = tokens.lock().await;
+            for (k, v) in map {
+                if let Some(s) = v.as_str() {
+                    t.insert(k.clone(), s.to_string());
+                }
+            }
+            tracing::info!(count = t.len(), "restored context_tokens from DB");
+        }
 
         tokio::spawn(async move {
             let client = reqwest::Client::builder()
@@ -182,7 +202,7 @@ impl PlatformAdapter for WeixinAdapter {
 
             loop {
                 tokio::select! {
-                    result = poll_updates(&client, &config, &mut sync_buf, &msg_tx, &mut dedup, &tokens) => {
+                    result = poll_updates(&client, &config, &mut sync_buf, &msg_tx, &mut dedup, &tokens, &pool) => {
                         match result {
                             Ok(()) => { consecutive_errors = 0; }
                             Err(e) => {
@@ -282,6 +302,51 @@ impl PlatformAdapter for WeixinAdapter {
         Ok(())
     }
 
+    async fn send_typing(&self, chat_id: &str) -> Result<(), String> {
+        // Get or fetch typing ticket
+        let ticket = {
+            let cache = self.typing_tickets.lock().await;
+            cache.get(chat_id)
+                .filter(|(_, ts)| ts.elapsed().as_secs() < TYPING_TICKET_TTL_SECS)
+                .map(|(t, _)| t.clone())
+        };
+        let ticket = match ticket {
+            Some(t) => t,
+            None => {
+                // Fetch from getconfig
+                let context_token = {
+                    let tokens = self.context_tokens.lock().await;
+                    tokens.get(chat_id).cloned()
+                };
+                match fetch_typing_ticket(&self.config.token, chat_id, context_token.as_deref()).await {
+                    Ok(t) => {
+                        let mut cache = self.typing_tickets.lock().await;
+                        cache.insert(chat_id.to_string(), (t.clone(), std::time::Instant::now()));
+                        t
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "typing ticket fetch failed");
+                        return Ok(()); // non-fatal
+                    }
+                }
+            }
+        };
+
+        let client = reqwest::Client::new();
+        let body = json!({
+            "ilink_user_id": chat_id,
+            "typing_ticket": ticket,
+            "status": 1,
+        });
+        let _ = client
+            .post(format!("{ILINK_BASE_URL}/ilink/bot/sendtyping"))
+            .headers(build_headers(&self.config.token))
+            .json(&body)
+            .send()
+            .await;
+        Ok(())
+    }
+
     async fn recv(&mut self) -> Option<InboundMessage> {
         self.msg_rx.as_mut()?.recv().await
     }
@@ -294,6 +359,7 @@ async fn poll_updates(
     msg_tx: &mpsc::Sender<InboundMessage>,
     dedup: &mut MessageDeduplicator,
     context_tokens: &ContextTokens,
+    pool: &Option<sqlx::MySqlPool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{ILINK_BASE_URL}/ilink/bot/getupdates");
 
@@ -378,6 +444,15 @@ async fn poll_updates(
             {
                 let mut tokens = context_tokens.lock().await;
                 tokens.insert(from_id.clone(), ct.to_string());
+                // Persist to DB for crash recovery
+                if let Some(pool) = pool {
+                    let map: serde_json::Value = tokens.iter()
+                        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                        .collect();
+                    let _ = crate::storage::save_credential(
+                        pool, "weixin", "default", "context_tokens", &map, None,
+                    ).await;
+                }
             }
 
             let room_id = msg["room_id"].as_str().unwrap_or("");
@@ -433,6 +508,28 @@ fn extract_text(msg: &Value) -> String {
 }
 
 // ─── QR Login ──────────────────────────────────────────────────────────────
+
+async fn fetch_typing_ticket(token: &str, user_id: &str, context_token: Option<&str>) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let mut body = json!({ "ilink_user_id": user_id });
+    if let Some(ct) = context_token {
+        body["context_token"] = json!(ct);
+    }
+    let resp = client
+        .post(format!("{ILINK_BASE_URL}/ilink/bot/getconfig"))
+        .headers(build_headers(token))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("getconfig: {e}"))?;
+    let data: Value = resp.json().await.map_err(|e| format!("getconfig parse: {e}"))?;
+    data["typing_ticket"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "no typing_ticket in response".into())
+}
 
 const ILINK_BOT_TYPE: &str = "3";
 

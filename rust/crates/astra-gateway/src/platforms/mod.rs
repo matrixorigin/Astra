@@ -35,6 +35,8 @@ pub trait PlatformAdapter: Send + Sync + 'static {
     async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn stop(&mut self);
     async fn send_text(&self, chat_id: &str, text: &str, reply_token: Option<&str>) -> Result<(), String>;
+    /// Send typing indicator (start). No-op for platforms that don't support it.
+    async fn send_typing(&self, _chat_id: &str) -> Result<(), String> { Ok(()) }
     /// Receive the next inbound message (blocking).
     async fn recv(&mut self) -> Option<InboundMessage>;
 }

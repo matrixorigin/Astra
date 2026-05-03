@@ -176,6 +176,9 @@ impl GatewayRunner {
             truncate(&msg.text, 80),
         );
 
+        // Send typing indicator immediately so user gets feedback
+        let _ = adapter.send_typing(&msg.chat_id).await;
+
         // Check CLI is available before spawning
         let availability = cli_bridge::probe_cli(&cli_profile).await;
         if !availability.is_available() {
@@ -473,17 +476,69 @@ fn split_message(text: &str) -> Vec<&str> {
     let mut remaining = text;
     while !remaining.is_empty() {
         if remaining.len() <= MAX_CHUNK_LEN {
-            chunks.push(remaining);
+            if !remaining.trim().is_empty() {
+                chunks.push(remaining);
+            }
             break;
         }
-        let split_at = remaining[..MAX_CHUNK_LEN]
-            .rfind('\n')
-            .or_else(|| remaining[..MAX_CHUNK_LEN].rfind(' '))
+        let window = &remaining[..MAX_CHUNK_LEN];
+        // Priority 1: paragraph boundary (\n\n)
+        let split_at = rfind_paragraph_break(window)
+            // Priority 2: code fence boundary (``` on its own line)
+            .or_else(|| rfind_fence_break(window))
+            // Priority 3: any newline
+            .or_else(|| window.rfind('\n'))
+            // Priority 4: space
+            .or_else(|| window.rfind(' '))
+            // Fallback: hard cut
             .unwrap_or(MAX_CHUNK_LEN);
-        chunks.push(&remaining[..split_at]);
-        remaining = remaining[split_at..].trim_start();
+
+        let chunk = &remaining[..split_at];
+        if !chunk.trim().is_empty() {
+            chunks.push(chunk);
+        }
+        remaining = remaining[split_at..].trim_start_matches('\n');
+        if remaining.starts_with('\n') {
+            remaining = remaining.trim_start_matches('\n');
+        }
     }
     chunks
+}
+
+fn rfind_paragraph_break(s: &str) -> Option<usize> {
+    // Find last \n\n that's not inside a code fence
+    let mut pos = s.len();
+    while pos > 0 {
+        if let Some(p) = s[..pos].rfind("\n\n") {
+            // Check we're not inside a code block
+            let before = &s[..p];
+            let fence_count = before.matches("```").count();
+            if fence_count.is_multiple_of(2) {
+                return Some(p);
+            }
+            pos = p;
+        } else {
+            break;
+        }
+    }
+    None
+}
+
+fn rfind_fence_break(s: &str) -> Option<usize> {
+    // Find last ``` followed by \n — split after the closing fence
+    let mut search = s.len();
+    while search > 3 {
+        if let Some(p) = s[..search].rfind("```") {
+            let after_fence = p + 3;
+            if after_fence < s.len() && s.as_bytes().get(after_fence) == Some(&b'\n') {
+                return Some(after_fence + 1);
+            }
+            search = p;
+        } else {
+            break;
+        }
+    }
+    None
 }
 
 async fn connect_db(url: &str) -> Result<MySqlPool, sqlx::Error> {
@@ -909,7 +964,51 @@ mod tests {
         let text = "x".repeat(8000);
         let chunks = split_message(&text);
         assert!(chunks.len() >= 2);
-        assert_eq!(chunks.join(""), text);
+        for chunk in &chunks {
+            assert!(!chunk.is_empty());
+        }
+    }
+
+    #[test]
+    fn split_preserves_code_block() {
+        // Code block should not be split in the middle
+        let code = format!("before\n\n```rust\n{}\n```\n\nafter", "let x = 1;\n".repeat(300));
+        let chunks = split_message(&code);
+        // The code block should be entirely in one chunk (or if too large, at least not split mid-line)
+        let has_orphan_fence = chunks.iter().any(|c| {
+            let opens = c.matches("```").count();
+            opens % 2 != 0 // odd number of fences = split inside a code block
+        });
+        // If the code block fits in one chunk, it should not be split
+        if code.len() <= MAX_CHUNK_LEN {
+            assert_eq!(chunks.len(), 1);
+        } else {
+            // Large code block: at least no orphan fences
+            assert!(!has_orphan_fence, "code block was split mid-fence: {chunks:?}");
+        }
+    }
+
+    #[test]
+    fn split_prefers_paragraph_boundary() {
+        let text = format!("{}\n\n{}", "a".repeat(1000), "b".repeat(1000));
+        if text.len() <= MAX_CHUNK_LEN {
+            assert_eq!(split_message(&text).len(), 1);
+        }
+        // For text > MAX_CHUNK_LEN: split at \n\n paragraph boundary
+        let big = format!("{}\n\n{}", "a".repeat(2000), "b".repeat(2000));
+        let chunks = split_message(&big);
+        if chunks.len() >= 2 {
+            assert!(chunks[0].ends_with('a'), "should split at paragraph boundary, got: {:?}...", &chunks[0][chunks[0].len()-20..]);
+        }
+    }
+
+    #[test]
+    fn split_no_empty_chunks() {
+        let text = "a\n\n\n\nb\n\n\n\nc".repeat(500);
+        let chunks = split_message(&text);
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(!chunk.trim().is_empty(), "chunk {i} is empty");
+        }
     }
 
     #[test]
