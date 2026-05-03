@@ -217,6 +217,25 @@ pub async fn get_current_session_for_cli(
     Ok(row.map(|r| r.0))
 }
 
+pub async fn get_session_last_active(
+    pool: &MySqlPool,
+    platform: &str,
+    chat_id: &str,
+    cli_profile: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT CAST(last_active AS CHAR) FROM gw_sessions
+         WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND is_current = TRUE
+         ORDER BY last_active DESC LIMIT 1",
+    )
+    .bind(platform)
+    .bind(chat_id)
+    .bind(cli_profile)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.0))
+}
+
 pub async fn set_current_session(
     pool: &MySqlPool,
     platform: &str,

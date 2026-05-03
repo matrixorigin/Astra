@@ -16,6 +16,12 @@ pub struct GatewayConfig {
     /// Directory containing user-defined skill markdown files.
     #[serde(default)]
     pub skills_dir: Option<String>,
+    /// Session auto-reset policy.
+    #[serde(default)]
+    pub session_reset: crate::session_policy::ResetPolicy,
+    /// Access control policy (who can send messages).
+    #[serde(default)]
+    pub access: crate::access_control::AccessPolicy,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

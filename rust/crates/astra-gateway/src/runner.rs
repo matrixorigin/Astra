@@ -135,6 +135,12 @@ impl GatewayRunner {
         msg: &InboundMessage,
         adapter: &dyn PlatformAdapter,
     ) -> Option<String> {
+        // Access control check
+        if !self.config.access.is_allowed(&msg.user_id) {
+            tracing::debug!(user = %msg.user_id, "message rejected by access policy");
+            return Some(self.config.access.rejection_message().to_string());
+        }
+
         // Resolve active CLI profile (user may have switched via /cli)
         let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
 
@@ -159,6 +165,20 @@ impl GatewayRunner {
         }
 
         let cli_name = cli_profile.name().to_string();
+
+        // Auto-reset session if policy triggers
+        if let Some(ref pool) = self.pool
+            && let Ok(Some(last_active_str)) = storage::get_session_last_active(pool, msg.platform, &msg.chat_id, &cli_name).await
+            && let Ok(last_active) = chrono::NaiveDateTime::parse_from_str(&last_active_str, "%Y-%m-%d %H:%M:%S%.f")
+        {
+            let last_utc = last_active.and_utc();
+            let now = chrono::Utc::now();
+            if self.config.session_reset.should_reset(last_utc, now) {
+                let _ = storage::reset_session_for_cli(pool, msg.platform, &msg.chat_id, &cli_name).await;
+                tracing::info!(cli = cli_name, "session auto-reset by policy");
+            }
+        }
+
         let session_id = if let Some(ref pool) = self.pool {
             storage::get_current_session_for_cli(pool, msg.platform, &msg.chat_id, &cli_name)
                 .await

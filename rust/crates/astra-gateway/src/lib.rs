@@ -1,10 +1,13 @@
+pub mod access_control;
 pub mod cli_bridge;
 pub mod commands;
 pub mod config;
 pub mod dedup;
 pub mod durable_task_store;
 pub mod markdown;
+pub mod session_policy;
 pub mod gateway_context;
+pub mod health;
 pub mod platforms;
 pub mod runner;
 pub mod scheduler;
