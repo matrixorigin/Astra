@@ -178,7 +178,7 @@ mod tests {
     }
 
     fn sample_trace() -> SessionTrace {
-        let mut trace = SessionTrace::new("scenario-test".into());
+        let mut trace = SessionTrace::new(Some("scenario-test".into()));
         trace.started_at_unix_millis = 1_000_000;
         trace.ended_at_unix_millis = Some(1_005_000);
         trace.total_turns = 3;

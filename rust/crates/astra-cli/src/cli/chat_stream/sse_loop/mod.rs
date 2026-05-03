@@ -746,11 +746,11 @@ pub(crate) async fn stream_chat_sse(
                                 sink.clone() as std::sync::Arc<dyn astra_harness::SnapshotSink>
                             ),
                         );
-                        let session_id = p.session_id.unwrap_or("unknown").to_string();
+                        let session_id = p.session_id.map(|s| s.to_string());
                         let recording = if let Some(ref trace_arc) = p.harness_trace {
                             // Share ReplState's trace Arc so /inspect reads live data
                             if let Ok(mut t) = trace_arc.write() {
-                                t.session_id = session_id;
+                                t.session_id = session_id.clone();
                             }
                             std::sync::Arc::new(astra_harness::RecordingKernel::with_trace(
                                 base_kernel,

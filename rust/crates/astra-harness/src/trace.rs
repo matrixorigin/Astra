@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 /// Complete trace of a session's harness lifecycle.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionTrace {
-    pub session_id: String,
+    pub session_id: Option<String>,
     pub model: Option<String>,
     pub started_at_unix_millis: u64,
     pub ended_at_unix_millis: Option<u64>,
@@ -25,7 +25,7 @@ pub enum TraceOutcome {
 }
 
 impl SessionTrace {
-    pub fn new(session_id: String) -> Self {
+    pub fn new(session_id: Option<String>) -> Self {
         Self {
             session_id,
             model: None,
@@ -169,7 +169,7 @@ impl SessionTrace {
             PrivacyPolicy::MetadataOnly => {
                 let mut trace = self.clone();
                 trace.model = None;
-                trace.session_id = truncate_id(&trace.session_id);
+                trace.session_id = trace.session_id.as_ref().map(|s| truncate_id(s));
                 for r in &mut trace.records {
                     r.session_id = truncate_id(&r.session_id);
                     r.snapshot.session_id = truncate_id(&r.snapshot.session_id);
@@ -181,7 +181,7 @@ impl SessionTrace {
             }
             PrivacyPolicy::Redacted => {
                 let mut trace = self.clone();
-                trace.session_id = truncate_id(&trace.session_id);
+                trace.session_id = trace.session_id.as_ref().map(|s| truncate_id(s));
                 trace.model = trace.model.as_deref().map(|m| hash_name(m, "model"));
                 for r in &mut trace.records {
                     r.session_id = truncate_id(&r.session_id);
@@ -240,7 +240,7 @@ pub struct RecordingKernel {
 }
 
 impl RecordingKernel {
-    pub fn new(inner: Arc<dyn HarnessKernel>, session_id: String) -> Self {
+    pub fn new(inner: Arc<dyn HarnessKernel>, session_id: Option<String>) -> Self {
         Self {
             inner,
             trace: Arc::new(RwLock::new(SessionTrace::new(session_id))),
@@ -287,11 +287,15 @@ impl HarnessKernel for RecordingKernel {
     fn on_record(&self, record: &DecisionRecord) -> HookVerdict {
         match self.trace.write() {
             Ok(mut trace) => {
+                // Adopt session_id from first record (late-binding for resume/new-session flows)
+                if trace.session_id.is_none() && !record.session_id.is_empty() {
+                    trace.session_id = Some(record.session_id.clone());
+                }
                 debug_assert!(
-                    trace.session_id.is_empty()
+                    trace.session_id.is_none()
                         || record.session_id.is_empty()
-                        || trace.session_id == record.session_id,
-                    "RecordingKernel session mismatch: trace={}, record={}",
+                        || trace.session_id.as_deref() == Some(&record.session_id),
+                    "RecordingKernel session mismatch: trace={:?}, record={}",
                     trace.session_id,
                     record.session_id,
                 );
@@ -358,7 +362,7 @@ mod tests {
             sink.clone() as Arc<dyn SnapshotSink>,
             vec![],
         ));
-        let kernel = RecordingKernel::new(inner, "test-session".into());
+        let kernel = RecordingKernel::new(inner, Some("test-session".into()));
         (kernel, sink)
     }
 
@@ -366,8 +370,8 @@ mod tests {
 
     #[test]
     fn trace_new_is_empty() {
-        let trace = SessionTrace::new("s1".into());
-        assert_eq!(trace.session_id, "s1");
+        let trace = SessionTrace::new(Some("s1".into()));
+        assert_eq!(trace.session_id, Some("s1".into()));
         assert_eq!(trace.outcome, TraceOutcome::InProgress);
         assert!(trace.records.is_empty());
         assert_eq!(trace.total_turns, 0);
@@ -375,7 +379,7 @@ mod tests {
 
     #[test]
     fn trace_serde_roundtrip() {
-        let mut trace = SessionTrace::new("s1".into());
+        let mut trace = SessionTrace::new(Some("s1".into()));
         trace
             .records
             .push_back(make_record("s1", 0, HookPoint::SessionStart));
@@ -386,14 +390,14 @@ mod tests {
         let json = serde_json::to_string(&trace).unwrap();
         let deserialized: SessionTrace = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.records.len(), 2);
-        assert_eq!(deserialized.session_id, "s1");
+        assert_eq!(deserialized.session_id, Some("s1".into()));
     }
 
     // ── Trace reader (query) tests ──────────────────────────────────────
 
     #[test]
     fn records_for_turn_filters_correctly() {
-        let mut trace = SessionTrace::new("s1".into());
+        let mut trace = SessionTrace::new(Some("s1".into()));
         trace
             .records
             .push_back(make_record("s1", 0, HookPoint::SessionStart));
@@ -418,7 +422,7 @@ mod tests {
 
     #[test]
     fn records_at_point_filters_correctly() {
-        let mut trace = SessionTrace::new("s1".into());
+        let mut trace = SessionTrace::new(Some("s1".into()));
         trace
             .records
             .push_back(make_record("s1", 0, HookPoint::SessionStart));
@@ -436,7 +440,7 @@ mod tests {
 
     #[test]
     fn turns_summary_aggregates() {
-        let mut trace = SessionTrace::new("s1".into());
+        let mut trace = SessionTrace::new(Some("s1".into()));
         trace
             .records
             .push_back(make_record("s1", 1, HookPoint::PreLlmRequest));
@@ -464,7 +468,7 @@ mod tests {
 
     #[test]
     fn tool_calls_timeline() {
-        let mut trace = SessionTrace::new("s1".into());
+        let mut trace = SessionTrace::new(Some("s1".into()));
         trace
             .records
             .push_back(make_record("s1", 1, HookPoint::PostToolBatch));
@@ -483,7 +487,7 @@ mod tests {
 
     #[test]
     fn duration_millis() {
-        let mut trace = SessionTrace::new("s1".into());
+        let mut trace = SessionTrace::new(Some("s1".into()));
         trace.started_at_unix_millis = 1000;
         trace.ended_at_unix_millis = Some(5000);
         assert_eq!(trace.duration_millis(), Some(4000));
@@ -496,26 +500,26 @@ mod tests {
 
     #[test]
     fn privacy_full_is_identity() {
-        let mut trace = SessionTrace::new("session-abc-123".into());
+        let mut trace = SessionTrace::new(Some("session-abc-123".into()));
         trace
             .records
             .push_back(make_record("session-abc-123", 1, HookPoint::PostTurn));
 
         let sanitized = trace.with_privacy(PrivacyPolicy::Full);
-        assert_eq!(sanitized.session_id, "session-abc-123");
+        assert_eq!(sanitized.session_id, Some("session-abc-123".into()));
         assert_eq!(sanitized.records[0].snapshot.unique_tools_used.len(), 2);
     }
 
     #[test]
     fn privacy_metadata_only_strips_tools_and_model() {
-        let mut trace = SessionTrace::new("session-abc-123".into());
+        let mut trace = SessionTrace::new(Some("session-abc-123".into()));
         trace.model = Some("claude-sonnet-4-6".into());
         trace
             .records
             .push_back(make_record("session-abc-123", 1, HookPoint::PostTurn));
 
         let sanitized = trace.with_privacy(PrivacyPolicy::MetadataOnly);
-        assert_eq!(sanitized.session_id, "session-…");
+        assert_eq!(sanitized.session_id, Some("session-…".into()));
         assert!(sanitized.model.is_none());
         assert!(sanitized.records[0].snapshot.unique_tools_used.is_empty());
         assert!(sanitized.records[0].snapshot.last_tool_called.is_none());
@@ -524,13 +528,13 @@ mod tests {
 
     #[test]
     fn privacy_redacted_hashes_tool_names() {
-        let mut trace = SessionTrace::new("session-abc-123".into());
+        let mut trace = SessionTrace::new(Some("session-abc-123".into()));
         trace
             .records
             .push_back(make_record("session-abc-123", 1, HookPoint::PostTurn));
 
         let sanitized = trace.with_privacy(PrivacyPolicy::Redacted);
-        assert_eq!(sanitized.session_id, "session-…");
+        assert_eq!(sanitized.session_id, Some("session-…".into()));
         // Tools should be hashed, not original
         for t in &sanitized.records[0].snapshot.unique_tools_used {
             assert!(t.starts_with("tool_"));
@@ -603,7 +607,7 @@ mod tests {
                 max_duration_millis: None,
             })],
         ));
-        let kernel = RecordingKernel::new(inner, "blocked-test".into());
+        let kernel = RecordingKernel::new(inner, Some("blocked-test".into()));
 
         let mut record = make_record("blocked-test", 2, HookPoint::PostTurn);
         record.snapshot.turns_used = 2;
@@ -621,14 +625,14 @@ mod tests {
 
         let trace = kernel.into_trace();
         assert_eq!(trace.record_count(), 1);
-        assert_eq!(trace.session_id, "test-session");
+        assert_eq!(trace.session_id, Some("test-session".into()));
     }
 
     // ── Persistence tests ───────────────────────────────────────────────
 
     #[test]
     fn save_and_load_json() {
-        let mut trace = SessionTrace::new("persist-test".into());
+        let mut trace = SessionTrace::new(Some("persist-test".into()));
         trace
             .records
             .push_back(make_record("persist-test", 0, HookPoint::SessionStart));
@@ -645,7 +649,7 @@ mod tests {
         trace.save_to_file(&path).unwrap();
         let loaded = SessionTrace::load_from_file(&path).unwrap();
 
-        assert_eq!(loaded.session_id, "persist-test");
+        assert_eq!(loaded.session_id, Some("persist-test".into()));
         assert_eq!(loaded.record_count(), 2);
         assert_eq!(loaded.outcome, TraceOutcome::Completed);
         assert_eq!(loaded.total_turns, 2);
@@ -655,7 +659,7 @@ mod tests {
 
     #[test]
     fn save_jsonl_writes_one_record_per_line() {
-        let mut trace = SessionTrace::new("jsonl-test".into());
+        let mut trace = SessionTrace::new(Some("jsonl-test".into()));
         trace
             .records
             .push_back(make_record("jsonl-test", 0, HookPoint::SessionStart));
@@ -718,7 +722,7 @@ mod tests {
 
     #[test]
     fn privacy_redacted_also_redacts_model() {
-        let mut trace = SessionTrace::new("session-abc-123".into());
+        let mut trace = SessionTrace::new(Some("session-abc-123".into()));
         trace.model = Some("claude-sonnet-4-6".into());
         trace
             .records
@@ -742,7 +746,7 @@ mod tests {
     fn recording_kernel_caps_trace_size() {
         let (_, sink) = make_recording_kernel();
         let inner = Arc::new(StandardKernel::new(sink as Arc<dyn SnapshotSink>, vec![]));
-        let kernel = RecordingKernel::new(inner, "cap-test".into()).with_max_records(3);
+        let kernel = RecordingKernel::new(inner, Some("cap-test".into())).with_max_records(3);
 
         for i in 0..10 {
             kernel.on_record(&make_record("cap-test", i, HookPoint::PostTurn));
@@ -759,7 +763,7 @@ mod tests {
     fn into_trace_recovers_from_poison() {
         let sink = InMemorySnapshotSink::arc();
         let inner = Arc::new(StandardKernel::new(sink as Arc<dyn SnapshotSink>, vec![]));
-        let kernel = RecordingKernel::new(inner, "poison-test".into());
+        let kernel = RecordingKernel::new(inner, Some("poison-test".into()));
         kernel.on_record(&make_record("poison-test", 0, HookPoint::SessionStart));
 
         // Poison the lock
@@ -776,7 +780,7 @@ mod tests {
 
         // into_trace should recover, not panic
         let trace = kernel.into_trace();
-        assert_eq!(trace.session_id, "poison-test");
+        assert_eq!(trace.session_id, Some("poison-test".into()));
         assert_eq!(trace.record_count(), 1);
     }
 
@@ -784,7 +788,7 @@ mod tests {
 
     #[test]
     fn privacy_redacted_full_chain_multi_turn() {
-        let mut trace = SessionTrace::new("session-xyz-long-id".into());
+        let mut trace = SessionTrace::new(Some("session-xyz-long-id".into()));
         trace.model = Some("claude-opus-4-6".into());
         for i in 0..5 {
             let mut r = make_record("session-xyz-long-id", i, HookPoint::PostTurn);
@@ -796,8 +800,8 @@ mod tests {
         let sanitized = trace.with_privacy(super::PrivacyPolicy::Redacted);
 
         // Session ID truncated
-        assert!(sanitized.session_id.ends_with('…'));
-        assert!(sanitized.session_id.len() < "session-xyz-long-id".len());
+        assert!(sanitized.session_id.as_deref().unwrap().ends_with('…'));
+        assert!(sanitized.session_id.as_deref().unwrap().len() < "session-xyz-long-id".len());
 
         // Model hashed
         assert!(sanitized.model.as_ref().unwrap().starts_with("model_"));
@@ -820,7 +824,7 @@ mod tests {
 
     #[test]
     fn privacy_metadata_only_strips_everything_sensitive() {
-        let mut trace = SessionTrace::new("session-xyz-long-id".into());
+        let mut trace = SessionTrace::new(Some("session-xyz-long-id".into()));
         trace.model = Some("claude-opus-4-6".into());
         let mut r = make_record("session-xyz-long-id", 1, HookPoint::PostTurn);
         r.snapshot.last_tool_called = Some("bash".into());
@@ -836,7 +840,7 @@ mod tests {
 
     #[test]
     fn privacy_redacted_handles_none_fields() {
-        let mut trace = SessionTrace::new("short".into());
+        let mut trace = SessionTrace::new(Some("short".into()));
         let mut r = make_record("short", 1, HookPoint::PostTurn);
         r.snapshot.last_tool_called = None;
         r.snapshot.unique_tools_used = vec![];

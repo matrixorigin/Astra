@@ -134,7 +134,7 @@ mod tests {
     }
 
     fn sample_trace() -> SessionTrace {
-        let mut trace = SessionTrace::new("rollback-test".into());
+        let mut trace = SessionTrace::new(Some("rollback-test".into()));
         trace
             .records
             .push_back(make_record(0, HookPoint::SessionStart, 0, 0, &[]));
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn rollback_safe_when_only_reads() {
-        let mut trace = SessionTrace::new("safe".into());
+        let mut trace = SessionTrace::new(Some("safe".into()));
         trace.records.push_back(make_record(
             1,
             HookPoint::PostTurn,

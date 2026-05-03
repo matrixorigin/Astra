@@ -17,7 +17,7 @@ pub struct TurnContext {
 /// Session-wide forensics summary.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ForensicsSummary {
-    pub session_id: String,
+    pub session_id: Option<String>,
     pub total_turns: u32,
     pub total_records: usize,
     pub peak_context_utilization: Option<f32>,
@@ -160,7 +160,7 @@ mod tests {
     }
 
     fn sample_trace() -> SessionTrace {
-        let mut trace = SessionTrace::new("forensics-test".into());
+        let mut trace = SessionTrace::new(Some("forensics-test".into()));
         trace
             .records
             .push_back(make_record(0, HookPoint::SessionStart, 0, 0));
@@ -206,7 +206,7 @@ mod tests {
     fn forensics_summary_basic() {
         let trace = sample_trace();
         let summary = trace.forensics_summary();
-        assert_eq!(summary.session_id, "forensics-test");
+        assert_eq!(summary.session_id, Some("forensics-test".into()));
         assert_eq!(summary.total_turns, 3);
         assert_eq!(summary.total_records, 7);
         assert_eq!(summary.total_tokens, 12_000);
@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn forensics_warns_on_high_utilization() {
-        let mut trace = SessionTrace::new("s1".into());
+        let mut trace = SessionTrace::new(Some("s1".into()));
         let mut r = make_record(1, HookPoint::PostTurn, 100_000, 5);
         r.snapshot.context_utilization = Some(0.95);
         trace.records.push_back(r);
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn forensics_warns_on_tool_stall() {
-        let mut trace = SessionTrace::new("s1".into());
+        let mut trace = SessionTrace::new(Some("s1".into()));
         let mut r = make_record(3, HookPoint::PostTurn, 50_000, 10);
         r.snapshot.consecutive_same_tool = 4;
         trace.records.push_back(r);
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn forensics_warns_on_rapid_token_growth() {
-        let mut trace = SessionTrace::new("s1".into());
+        let mut trace = SessionTrace::new(Some("s1".into()));
         trace
             .records
             .push_back(make_record(1, HookPoint::PostTurn, 1_000, 1));

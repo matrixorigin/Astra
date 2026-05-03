@@ -518,7 +518,7 @@ impl Default for ReplState {
             harness_sink: astra_harness::InMemorySnapshotSink::arc(),
             #[cfg(feature = "harness")]
             harness_trace: std::sync::Arc::new(std::sync::RwLock::new(
-                astra_harness::SessionTrace::new(String::new()),
+                astra_harness::SessionTrace::new(None),
             )),
         }
     }
