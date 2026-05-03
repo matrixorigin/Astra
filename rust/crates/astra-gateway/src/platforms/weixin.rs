@@ -446,7 +446,7 @@ async fn poll_updates(
                 from = %from_id,
                 text_len = text.len(),
                 "weixin ← {}",
-                &text[..text.len().min(60)]
+                safe_truncate(&text, 60)
             );
 
             let inbound = InboundMessage {
@@ -466,6 +466,17 @@ async fn poll_updates(
     }
 
     Ok(())
+}
+
+fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 fn extract_text(msg: &Value) -> String {
@@ -796,7 +807,6 @@ mod tests {
         };
         assert!(truncated.len() < 3000);
     }
-}
 
     #[tokio::test]
     async fn typing_ticket_cache_hit() {
@@ -866,3 +876,49 @@ mod tests {
         assert!(TYPING_TICKET_TTL_SECS >= 300, "TTL should be >= 5min");
         assert!(TYPING_TICKET_TTL_SECS <= 1800, "TTL should be <= 30min");
     }
+
+    #[test]
+    fn truncate_exact_crash_repro() {
+        // This is the exact string that caused the panic:
+        // byte 60 falls inside '量' (bytes 58..61)
+        let text = "多角度review当前分支的修改 ，设计，工程质量，测试强度，产品行为等";
+        // Must NOT panic
+        let safe = safe_truncate(text, 60);
+        assert!(safe.len() <= 60);
+        assert!(text.is_char_boundary(safe.len()), "must end on char boundary");
+    }
+
+    #[test]
+    fn truncate_chinese_various_boundaries() {
+        let text = "你好世界测试中文截断";  // 10 chars × 3 bytes = 30 bytes
+        for max in 0..35 {
+            let safe = safe_truncate(text, max);
+            assert!(safe.len() <= max, "max={max}, got len={}", safe.len());
+            assert!(text.is_char_boundary(safe.len()), "max={max}: not a char boundary");
+        }
+    }
+
+    #[test]
+    fn truncate_ascii_exact() {
+        let text = "hello world this is a test";
+        let safe = safe_truncate(text, 10);
+        assert_eq!(safe, "hello worl");
+    }
+
+    #[test]
+    fn truncate_short_passthrough() {
+        let text = "短";
+        let safe = safe_truncate(text, 60);
+        assert_eq!(safe, "短");
+    }
+
+    #[test]
+    fn truncate_empty() {
+        assert_eq!(safe_truncate("", 10), "");
+    }
+
+    #[test]
+    fn truncate_zero_max() {
+        assert_eq!(safe_truncate("hello", 0), "");
+    }
+}
