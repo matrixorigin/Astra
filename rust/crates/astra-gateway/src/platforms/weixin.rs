@@ -254,53 +254,12 @@ impl PlatformAdapter for WeixinAdapter {
             tokens.get(chat_id).cloned().unwrap_or_default()
         };
 
-        let client = reqwest::Client::new();
-        let url = format!("{ILINK_BASE_URL}/ilink/bot/sendmessage");
-        let client_id = format!("astra-gw-{}", uuid::Uuid::new_v4());
-
-        let body = json!({
-            "msg": {
-                "from_user_id": "",
-                "to_user_id": chat_id,
-                "client_id": client_id,
-                "message_type": 2,
-                "message_state": 2,
-                "context_token": context_token,
-                "item_list": [
-                    {
-                        "type": 1,
-                        "text_item": {
-                            "text": text
-                        }
-                    }
-                ]
-            },
-            "base_info": {
-                "channel_version": CHANNEL_VERSION
-            }
-        });
-
-        let resp = client
-            .post(&url)
-            .headers(build_headers(&self.config.token))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("weixin send failed: {e}"))?;
-
-        let data: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("weixin send parse error: {e}"))?;
-
-        let ret = data["ret"].as_i64().unwrap_or(-1);
-        if ret != 0 {
-            let errcode = data["errcode"].as_i64().unwrap_or(ret);
-            let errmsg = data["errmsg"].as_str().unwrap_or("unknown");
-            return Err(format!("weixin send error {errcode}: {errmsg}"));
-        }
-
-        Ok(())
+        send_text_with_retry(
+            &self.config.token,
+            chat_id,
+            &text,
+            &context_token,
+        ).await
     }
 
     async fn send_typing(&self, chat_id: &str) -> Result<(), String> {
@@ -510,6 +469,93 @@ fn extract_text(msg: &Value) -> String {
 
 // ─── QR Login ──────────────────────────────────────────────────────────────
 
+const SEND_MAX_RETRIES: usize = 3;
+const SEND_RETRY_DELAY_MS: u64 = 1500;
+
+async fn send_text_with_retry(
+    token: &str,
+    chat_id: &str,
+    text: &str,
+    context_token: &str,
+) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let url = format!("{ILINK_BASE_URL}/ilink/bot/sendmessage");
+    let mut last_error = String::new();
+    let mut tried_tokenless = false;
+
+    for attempt in 0..=SEND_MAX_RETRIES {
+        let ct = if tried_tokenless { "" } else { context_token };
+        let client_id = format!("astra-gw-{}", uuid::Uuid::new_v4());
+
+        let body = json!({
+            "msg": {
+                "from_user_id": "",
+                "to_user_id": chat_id,
+                "client_id": client_id,
+                "message_type": 2,
+                "message_state": 2,
+                "context_token": ct,
+                "item_list": [{"type": 1, "text_item": {"text": text}}]
+            },
+            "base_info": {"channel_version": CHANNEL_VERSION}
+        });
+
+        let resp = match client
+            .post(&url)
+            .headers(build_headers(token))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_error = format!("HTTP error: {e}");
+                if attempt < SEND_MAX_RETRIES {
+                    tokio::time::sleep(std::time::Duration::from_millis(SEND_RETRY_DELAY_MS * (attempt as u64 + 1))).await;
+                }
+                continue;
+            }
+        };
+
+        let data: Value = match resp.json().await {
+            Ok(d) => d,
+            Err(e) => {
+                last_error = format!("parse error: {e}");
+                continue;
+            }
+        };
+
+        let errcode = data["errcode"].as_i64().or_else(|| data["ret"].as_i64()).unwrap_or(0);
+        if errcode == 0 {
+            return Ok(());
+        }
+
+        let errmsg = data["errmsg"].as_str().unwrap_or("unknown");
+        last_error = format!("{errcode}: {errmsg}");
+
+        // Session expired — retry without context_token
+        if errcode == -14 && !tried_tokenless {
+            tracing::debug!("send got -14, retrying without context_token");
+            tried_tokenless = true;
+            continue;
+        }
+
+        // Rate limit — backoff
+        if errcode == -2 && errmsg.contains("freq") {
+            tracing::warn!("send rate limited, backing off");
+            tokio::time::sleep(std::time::Duration::from_millis(SEND_RETRY_DELAY_MS * 3)).await;
+            continue;
+        }
+
+        // Other error — retry with delay
+        if attempt < SEND_MAX_RETRIES {
+            tokio::time::sleep(std::time::Duration::from_millis(SEND_RETRY_DELAY_MS)).await;
+        }
+    }
+
+    Err(format!("weixin send failed after retries: {last_error}"))
+}
+
 async fn fetch_typing_ticket(token: &str, user_id: &str, context_token: Option<&str>) -> Result<String, String> {
     let client = reqwest::Client::new();
     let mut body = json!({ "ilink_user_id": user_id });
@@ -714,4 +760,16 @@ mod tests {
         assert_eq!(h.get("iLink-App-ClientVersion").unwrap(), "131072");
         assert!(h.get("authorizationtype").is_some());
         assert!(h.get("x-wechat-uin").is_some());
+    }
+
+    #[test]
+    fn send_retry_constants() {
+        assert!(SEND_MAX_RETRIES >= 2, "should retry at least twice");
+        assert!(SEND_RETRY_DELAY_MS >= 1000, "delay should be >= 1s");
+    }
+
+    #[test]
+    fn typing_ticket_ttl_reasonable() {
+        assert!(TYPING_TICKET_TTL_SECS >= 300, "TTL should be >= 5min");
+        assert!(TYPING_TICKET_TTL_SECS <= 1800, "TTL should be <= 30min");
     }
