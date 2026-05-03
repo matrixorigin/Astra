@@ -6,7 +6,7 @@
 //! This module is shared between CLI and server — both use HTTP proxy
 //! calls to the Memoria service.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -111,6 +111,29 @@ impl MemoriaClient {
             cloud_base,
             cloud_token,
             fail_count: AtomicU32::new(0),
+        }
+    }
+
+    /// Builds a tool result that confirms purge success to the agent.
+    /// Use this instead of returning the raw Memoria `{}` response.
+    pub fn purge_result_to_agent_response(raw: &Value, filter: &str) -> Value {
+        let deleted = raw
+            .get("deleted_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        json!({
+            "status": "ok",
+            "deleted_count": deleted,
+            "message": Self::purge_success_message(deleted, filter),
+        })
+    }
+
+    /// Returns a human-readable success message for a purge response.
+    pub fn purge_success_message(deleted_count: u64, filter: &str) -> String {
+        if deleted_count == 0 {
+            format!("memory_purge: no entries matched filter [{filter}] (0 deleted)")
+        } else {
+            format!("memory_purge: deleted {deleted_count} entries matching [{filter}]")
         }
     }
 
@@ -386,7 +409,6 @@ impl MemoriaClient {
         }
     }
 }
-
 
 /// Build a one-shot Memoria HTTP client + auth header.
 pub fn memoria_oneshot_client(timeout_secs: u64) -> Option<(reqwest::Client, String, String)> {
@@ -702,6 +724,11 @@ mod tests {
         let ids = pl["memory_ids"].as_array().expect("should be array");
         assert_eq!(ids.len(), 2);
     }
+}
+
+#[cfg(test)]
+mod memoria_http_client_tests {
+    use super::*;
 
     #[test]
     fn purge_by_session_id_only() {
@@ -710,5 +737,52 @@ mod tests {
         assert_eq!(pl["session_id"], "sess-42");
         assert!(pl.get("topic").is_none());
         assert!(pl.get("memory_ids").is_none());
+    }
+
+    #[test]
+    fn purge_empty_filter_returns_error() {
+        let args = json!({});
+        let (name, pl, _) = MemoriaClient::build_direct_request("http://mem", "purge", &args);
+        assert_eq!(name, "");
+        assert!(pl.get("error").is_some());
+        assert!(pl["error"].as_str().unwrap().contains("memory_purge requires"));
+    }
+
+    #[test]
+    fn purge_topic_returns_topic_filter() {
+        let args = json!({"topic": "NEPTUNE"});
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "purge", &args);
+        assert_eq!(pl["topic"], "NEPTUNE");
+        assert!(pl.get("session_id").is_none());
+        assert!(pl.get("memory_ids").is_none());
+    }
+
+    #[test]
+    fn purge_responses_are_not_empty() {
+        let args = json!({"topic": "NEPTUNE"});
+        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "purge", &args);
+        assert!(
+            pl.is_object() && !pl.as_object().unwrap().contains_key("error"),
+            "purge with valid filter must produce non-error payload, got: {pl}"
+        );
+    }
+
+    #[test]
+    fn purge_result_to_agent_response_delivers_message() {
+        use super::*;
+        let raw = json!({"deleted_count": 3});
+        let enriched = MemoriaClient::purge_result_to_agent_response(&raw, "topic:NEPTUNE");
+        assert_eq!(enriched["status"], "ok");
+        assert_eq!(enriched["deleted_count"], 3);
+        assert!(enriched["message"].as_str().unwrap().contains("3"));
+    }
+
+    #[test]
+    fn purge_result_to_agent_response_zero_deleted() {
+        use super::*;
+        let raw = json!({"deleted_count": 0});
+        let enriched = MemoriaClient::purge_result_to_agent_response(&raw, "session:abc");
+        assert_eq!(enriched["deleted_count"], 0);
+        assert!(enriched["message"].as_str().unwrap().contains("0 deleted"));
     }
 }

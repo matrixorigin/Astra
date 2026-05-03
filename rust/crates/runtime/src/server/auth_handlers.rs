@@ -182,5 +182,31 @@ pub(super) async fn memory_proxy_purge_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    memory_proxy_call(&state, &headers, "/v1/memories/purge", body).await
+    let filter = body
+        .as_object()
+        .and_then(|o| {
+            o.get("topic")
+                .or(o.get("session_id"))
+                .or(o.get("memory_ids"))
+        })
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let result = memory_proxy_call(&state, &headers, "/v1/memories/purge", body).await?;
+    let deleted = result
+        .get("deleted_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let message = if deleted == 0 {
+        format!("memory_purge: no entries matched filter [{filter}] (0 deleted)")
+    } else {
+        format!("memory_purge: deleted {deleted} entries matching [{filter}]")
+    };
+    let enriched = serde_json::json!({
+        "status": "ok",
+        "deleted_count": deleted,
+        "message": message,
+    });
+    Ok(Json(enriched))
 }
