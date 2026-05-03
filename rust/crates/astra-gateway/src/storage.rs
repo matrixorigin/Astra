@@ -94,6 +94,26 @@ pub async fn ensure_schema(pool: &MySqlPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS gw_durable_tasks (
+            task_id VARCHAR(64) PRIMARY KEY,
+            name VARCHAR(512) NOT NULL,
+            description TEXT,
+            owner_id VARCHAR(128) NOT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'created',
+            progress_pct TINYINT UNSIGNED NOT NULL DEFAULT 0,
+            step_description VARCHAR(512),
+            checkpoint_json LONGTEXT,
+            error_message TEXT,
+            created_at DATETIME(6) DEFAULT NOW(6),
+            updated_at DATETIME(6) DEFAULT NOW(6),
+            INDEX idx_owner_status (owner_id, status),
+            INDEX idx_owner_updated (owner_id, updated_at)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     tracing::info!("gateway schema ensured");
     Ok(())
 }
