@@ -519,6 +519,7 @@ pub struct ServerAgenticLoopHost {
     shared_pool: Option<SharedPool>,
     model_override: Option<String>,
     llm_token_service: Option<LlmTokenServiceConfig>,
+    resolved_model_name: Option<String>,
 
     // ── Context ──
     edge_tools: Vec<Value>,
@@ -832,6 +833,7 @@ impl ServerAgenticLoopHostBuilder {
             shared_pool: self.shared_pool,
             model_override: self.model_override,
             llm_token_service: self.llm_token_service,
+            resolved_model_name: None,
             edge_tools,
             edge_profile: self.edge_profile,
             valid_tools,
@@ -1058,7 +1060,10 @@ impl ServerAgenticLoopHost {
         // loop host level — including Anthropic cache_control blocks and the
         // OpenAI stable-prefix / dynamic split.
         let cache_cfg = match &self.mock_provider {
-            Some((provider, model)) => PromptCacheConfig::latch(provider, model),
+            Some((provider, model)) => {
+                self.resolved_model_name = Some(model.clone());
+                PromptCacheConfig::latch(provider, model)
+            }
             None => PromptCacheConfig::default(),
         };
 
@@ -1809,6 +1814,24 @@ impl ServerAgenticLoopHost {
                 ),
             );
         }
+        // Runtime identity: model, workspace, session, user, date.
+        let runtime_ctx = crate::prompts::AgentRuntimeContext {
+            model_name: self.resolved_model_name.clone(),
+            workspace_cwd: self.edge_profile.get("cwd").and_then(Value::as_str).map(String::from),
+            git_branch: self
+                .edge_profile
+                .get("git_branch")
+                .and_then(Value::as_str)
+                .map(String::from),
+            session_id: Some(self.session_id.clone()),
+            user_id: Some(self.user_id.clone()),
+            current_date: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+        };
+        dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+            runtime_ctx.to_prompt_section(),
+            crate::prompts::PromptTokenBucket::Environment,
+        ));
+
         let full_dynamic = crate::prompts::sections_to_string(&dynamic_sections);
 
         // Build structured system messages with Anthropic cache annotations.
@@ -2011,8 +2034,21 @@ impl ServerAgenticLoopHost {
             .ok()
             .and_then(|g| g.clone())
             .unwrap_or_default();
+        let runtime_ctx = crate::prompts::AgentRuntimeContext {
+            model_name: self.resolved_model_name.clone(),
+            workspace_cwd: self.edge_profile.get("cwd").and_then(Value::as_str).map(String::from),
+            git_branch: self
+                .edge_profile
+                .get("git_branch")
+                .and_then(Value::as_str)
+                .map(String::from),
+            session_id: Some(self.session_id.clone()),
+            user_id: Some(self.user_id.clone()),
+            current_date: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+        };
+        let runtime_identity = runtime_ctx.to_prompt_section();
         let full_dynamic = format!(
-            "{profile_desc}{skill_hint}{learned_context_hint}{memory_signal_hint}{round_budget_hint}{plan_resume}"
+            "{profile_desc}{skill_hint}{learned_context_hint}{memory_signal_hint}{round_budget_hint}{plan_resume}{runtime_identity}"
         );
 
         cached_system_prompt(
@@ -2370,6 +2406,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // Latch prompt cache config from provider info (once per turn is fine;
         // provider doesn't change within a turn).
         let cache_cfg = PromptCacheConfig::latch(&llm_cfg.provider, &llm_cfg.model_name);
+        self.resolved_model_name = Some(llm_cfg.model_name.clone());
 
         let (system_messages, system_prompt_plain, system_prompt_breakdown) =
             self.build_system_messages_cached(&user_content, &visible_tools, state, &cache_cfg);

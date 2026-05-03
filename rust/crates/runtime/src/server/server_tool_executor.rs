@@ -1411,6 +1411,8 @@ impl ServerToolExecutor {
                     .execute("github_create_issue", args)
                     .await
             }
+            // ── Agent introspection ────────────────────────────────────
+            "get_agent_info" => tool_result_from_output(self.server_get_agent_info(args)),
             // ── Delegation placeholder ─────────────────────────────────
             "delegate" => astra_tools::ToolResult::text(
                 "Delegation request acknowledged. The delegation engine will execute \
@@ -1426,7 +1428,7 @@ impl ServerToolExecutor {
                      grep, glob, git_status, git_diff, git_log, git_file_history, git_contributors, git_log_search, \
                      git_show, git_blame, symbols, git_commit, git_stash, git_revert_commit, github_list_prs, github_get_pr, \
                      github_ci_status, github_list_issues, github_get_issue, github_repo_stats, github_create_issue, memory_*, web_fetch, \
-                     web_search, ask_user"
+                     web_search, ask_user, get_agent_info"
             )),
         };
 
@@ -2178,6 +2180,52 @@ impl ServerToolExecutor {
             );
         }
         output
+    }
+
+    fn server_get_agent_info(&self, args: &Value) -> String {
+        let dimension = args
+            .get("dimension")
+            .and_then(Value::as_str)
+            .unwrap_or("all");
+        let identity = || {
+            serde_json::json!({
+                "name": "astra",
+                "version": env!("CARGO_PKG_VERSION"),
+                "runtime": "cloud-server",
+                "user_id": self.user_id,
+                "session_id": self.session_id,
+                "workspace": self.workspace_root.display().to_string(),
+            })
+        };
+        let capability = || {
+            let schemas = astra_tools::schemas::server_executor_tool_schemas();
+            let tool_names: Vec<&str> = schemas
+                .iter()
+                .filter_map(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                })
+                .collect();
+            serde_json::json!({
+                "tool_count": tool_names.len(),
+                "tools": tool_names,
+            })
+        };
+        match dimension {
+            "identity" => identity().to_string(),
+            "capability" => capability().to_string(),
+            _ => {
+                let mut info = identity();
+                if let Value::Object(ref mut m) = info {
+                    let cap = capability();
+                    if let Value::Object(cap_m) = cap {
+                        m.extend(cap_m);
+                    }
+                }
+                info.to_string()
+            }
+        }
     }
 
     fn adjust_config(&self, args: &Value) -> String {
