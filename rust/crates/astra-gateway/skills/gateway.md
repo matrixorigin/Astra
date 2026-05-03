@@ -71,7 +71,11 @@ IMPORTANT:
 - For "取消所有任务", list first then delete each one.
 {{#if cron_jobs_count}}
 
-Currently {{cron_jobs_count}} scheduled task(s) active.
+**Current scheduled tasks ({{cron_jobs_count}}):**
+{{#each cron_jobs}}
+- `{{this}}` 
+{{/each}}
+The user can refer to these by name or description. Use the short ID to delete.
 {{/if}}
 {{/if}}
 
@@ -108,6 +112,17 @@ Returns the last saved JSON state so you can continue.
 
 Use durable tasks for: weekly reports, multi-repo analysis, batch data collection.
 Always checkpoint after each major step so work is not lost on interruption.
+{{/if}}
+
+{{#if active_tasks}}
+
+**Current durable tasks:**
+{{#each active_tasks}}
+- {{this}}
+{{/each}}
+The user can refer to tasks by name. Use the short ID for dtask_cancel/dtask_resume/dtask_status.
+When the user says "取消/删除/停止" a task, match by name and use dtask_cancel with the ID.
+When the user asks about progress, use dtask_status with the ID.
 {{/if}}
 
 {{#if has_harness}}

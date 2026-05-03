@@ -3,6 +3,7 @@
 //! Each inbound message spawns `astra chat -m "..." --session-id X`
 //! and streams CLI progress to the chat platform while waiting for output.
 
+use astra_core::durable_task_store::DurableTaskStore as _;
 use crate::cli_bridge::{self, CliProfile, CliProgress};
 use crate::commands::{self, CommandContext};
 use crate::config::GatewayConfig;
@@ -193,7 +194,29 @@ impl GatewayRunner {
             if let Some(ref pool) = self.pool
                 && let Ok(jobs) = storage::list_cron_jobs(pool, msg.platform, &msg.chat_id).await
             {
-                ctx = ctx.with_cron_count(jobs.len());
+                let cron_list: Vec<_> = jobs.iter().map(|(id, expr, desc, _)| {
+                    (id[..8.min(id.len())].to_string(), expr.clone(), desc.clone())
+                }).collect();
+                ctx = ctx.with_cron_jobs(cron_list);
+            }
+            if let Some(ref store) = self.durable_store {
+                let owner = format!("{}:{}", msg.platform, msg.chat_id);
+                let filter = astra_core::durable_task_store::TaskFilter {
+                    owner_id: Some(owner),
+                    ..Default::default()
+                };
+                if let Ok(tasks) = store.list(filter).await {
+                    let task_list: Vec<_> = tasks.iter()
+                        .filter(|t| t.status.is_active())
+                        .map(|t| (
+                            t.id.0[..8.min(t.id.0.len())].to_string(),
+                            t.name.clone(),
+                            t.status.as_str().to_string(),
+                            t.progress_pct,
+                        ))
+                        .collect();
+                    ctx = ctx.with_active_tasks(task_list);
+                }
             }
             if !self.user_skills.is_empty() {
                 ctx = ctx.with_extra_skills(self.user_skills.clone());

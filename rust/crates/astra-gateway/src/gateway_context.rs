@@ -19,6 +19,8 @@ pub struct GatewayContext {
     pub has_harness: bool,
     pub has_durable_tasks: bool,
     pub cron_jobs_count: usize,
+    pub cron_jobs: Vec<(String, String, String)>,  // (short_id, expr, description)
+    pub active_tasks: Vec<(String, String, String, u8)>,  // (short_id, name, status, progress)
     pub db_tables: Vec<String>,
     pub extra_skills: Vec<(String, String)>,
 }
@@ -48,6 +50,8 @@ impl GatewayContext {
             has_harness: caps.supports_harness,
             has_durable_tasks: has_db,
             cron_jobs_count: 0,
+            cron_jobs: Vec::new(),
+            active_tasks: Vec::new(),
             db_tables: Vec::new(),
             extra_skills: Vec::new(),
         }
@@ -55,6 +59,17 @@ impl GatewayContext {
 
     pub fn with_cron_count(mut self, count: usize) -> Self {
         self.cron_jobs_count = count;
+        self
+    }
+
+    pub fn with_cron_jobs(mut self, jobs: Vec<(String, String, String)>) -> Self {
+        self.cron_jobs_count = jobs.len();
+        self.cron_jobs = jobs;
+        self
+    }
+
+    pub fn with_active_tasks(mut self, tasks: Vec<(String, String, String, u8)>) -> Self {
+        self.active_tasks = tasks;
         self
     }
 
@@ -143,12 +158,16 @@ fn render_template(template: &str, ctx: &GatewayContext) -> String {
                 i += 1;
             }
             // Render for each item
-            if var == "db_tables" {
-                for table in &ctx.db_tables {
-                    for bl in &body_lines {
-                        out.push_str(&bl.replace("{{this}}", table));
-                        out.push('\n');
-                    }
+            let items: Vec<String> = match var {
+                "db_tables" => ctx.db_tables.clone(),
+                "cron_jobs" => ctx.cron_jobs.iter().map(|(id, expr, desc)| format!("`{id}` | `{expr}` | {desc}")).collect(),
+                "active_tasks" => ctx.active_tasks.iter().map(|(id, name, status, pct)| format!("`{id}` | {name} | {status} | {pct}%")).collect(),
+                _ => Vec::new(),
+            };
+            for item in &items {
+                for bl in &body_lines {
+                    out.push_str(&bl.replace("{{this}}", item));
+                    out.push('\n');
                 }
             }
             i += 1; // skip {{/each}}
@@ -191,6 +210,7 @@ fn check_condition(var: &str, ctx: &GatewayContext) -> bool {
         "has_cron" => ctx.has_cron,
         "has_harness" => ctx.has_harness,
         "has_durable_tasks" => ctx.has_durable_tasks,
+        "active_tasks" => !ctx.active_tasks.is_empty(),
         "db_tables" => !ctx.db_tables.is_empty(),
         "cron_jobs_count" => ctx.cron_jobs_count > 0,
         "model" => ctx.model.is_some(),
@@ -243,11 +263,15 @@ mod tests {
     }
 
     #[test]
-    fn template_with_cron_count() {
+    fn template_with_cron_jobs() {
         let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true)
-            .with_cron_count(3);
+            .with_cron_jobs(vec![
+                ("abc123".into(), "0 9 * * *".into(), "早报".into()),
+            ]);
         let prompt = ctx.to_system_prompt();
-        assert!(prompt.contains("3 scheduled task(s) active"));
+        assert!(prompt.contains("abc123"), "should show job ID");
+        assert!(prompt.contains("早报"), "should show description");
+        assert!(prompt.contains("1)"), "should show count");
     }
 
     #[test]
@@ -362,4 +386,23 @@ mod tests {
         let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), false);
         let prompt = ctx.to_system_prompt();
         assert!(!prompt.contains("Durable Tasks"));
+    }
+
+    #[test]
+    fn active_tasks_in_prompt() {
+        let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true)
+            .with_active_tasks(vec![
+                ("abc12345".into(), "weekly report".into(), "running".into(), 50),
+            ]);
+        let prompt = ctx.to_system_prompt();
+        assert!(prompt.contains("abc12345"), "should show task ID");
+        assert!(prompt.contains("weekly report"), "should show task name");
+        assert!(prompt.contains("50%"), "should show progress");
+    }
+
+    #[test]
+    fn no_active_tasks_no_section() {
+        let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true);
+        let prompt = ctx.to_system_prompt();
+        assert!(!prompt.contains("Current durable tasks"));
     }
