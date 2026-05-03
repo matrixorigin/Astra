@@ -560,8 +560,62 @@ impl GatewayRunner {
             }
         };
 
+        // Stale session recovery: if CLI says "No conversation found", clear and retry
+        if result.exit_code != 0
+            && (result.stderr.contains("No conversation found")
+                || result.stderr.contains("session not found"))
+            && session_id.is_some()
+        {
+            tracing::info!(cli = cli_name, "stale session detected — clearing and retrying");
+            if let Some(ref pool) = self.pool {
+                let _ = storage::reset_session_for_cli(pool, msg.platform, &effective_chat_id, &cli_name).await;
+            }
+            // Retry without session-id
+            let retry_handle = tokio::spawn({
+                let profile = cli_profile.clone();
+                let message_text = msg.text.clone();
+                let system_prompt = system_prompt.clone();
+                let ws = workspace.clone();
+                async move {
+                    cli_bridge::run_cli_with_context(
+                        &profile,
+                        &message_text,
+                        None, // no session-id
+                        ws.as_deref(),
+                        None,
+                        Some(&system_prompt),
+                    ).await
+                }
+            });
+            match retry_handle.await {
+                Ok(Ok(retry_result)) if retry_result.exit_code == 0 => {
+                    // Save new session
+                    if let Some(ref pool) = self.pool {
+                        if let Some(ref sid) = retry_result.session_id {
+                            let _ = storage::set_current_session_for_cli(
+                                pool, msg.platform, &effective_chat_id, &msg.user_id, sid, &cli_name,
+                            ).await;
+                        }
+                    }
+                    let text = retry_result.text.as_deref().unwrap_or(retry_result.stdout.trim());
+                    self.clear_pending_message(pending_id).await;
+                    if text.is_empty() {
+                        return Some("(无回复)".into());
+                    }
+                    return Some(text.to_string());
+                }
+                _ => {} // fall through to normal error handling
+            }
+        }
+
         if result.exit_code != 0 {
-            tracing::warn!(exit_code = result.exit_code, "CLI non-zero exit");
+            tracing::warn!(
+                exit_code = result.exit_code,
+                stderr = %result.stderr.chars().take(200).collect::<String>(),
+                stdout_len = result.stdout.len(),
+                text = ?result.text.as_deref().map(|t| &t[..t.len().min(100)]),
+                "CLI non-zero exit"
+            );
             suspend_tasks(
                 &self.durable_store,
                 format!("CLI exit code {}", result.exit_code),
