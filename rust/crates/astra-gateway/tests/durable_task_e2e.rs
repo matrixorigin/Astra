@@ -262,3 +262,51 @@ async fn suspend_running_tasks_for_owner() {
     store.delete(&id_a).await.unwrap();
     store.delete(&id_b).await.unwrap();
 }
+
+// ─── Context token persistence tests ──────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn context_token_persist_and_restore() {
+    let url = "mysql://root:111@127.0.0.1:6001/astra_gateway";
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(url)
+        .await
+        .unwrap();
+    astra_gateway::storage::ensure_schema(&pool).await.unwrap();
+
+    // Save context tokens
+    let tokens = serde_json::json!({
+        "user_a": "token_aaa",
+        "user_b": "token_bbb",
+    });
+    astra_gateway::storage::save_credential(
+        &pool, "weixin", "default", "context_tokens", &tokens, None,
+    ).await.unwrap();
+
+    // Restore
+    let cred = astra_gateway::storage::get_credential(
+        &pool, "weixin", "default", "context_tokens",
+    ).await.unwrap().unwrap();
+
+    assert_eq!(cred.credentials["user_a"], "token_aaa");
+    assert_eq!(cred.credentials["user_b"], "token_bbb");
+
+    // Update (overwrite)
+    let tokens2 = serde_json::json!({
+        "user_a": "token_aaa_updated",
+        "user_c": "token_ccc",
+    });
+    astra_gateway::storage::save_credential(
+        &pool, "weixin", "default", "context_tokens", &tokens2, None,
+    ).await.unwrap();
+
+    let cred2 = astra_gateway::storage::get_credential(
+        &pool, "weixin", "default", "context_tokens",
+    ).await.unwrap().unwrap();
+    assert_eq!(cred2.credentials["user_a"], "token_aaa_updated");
+    assert_eq!(cred2.credentials["user_c"], "token_ccc");
+    // user_b gone (full replacement)
+    assert!(cred2.credentials.get("user_b").is_none());
+}

@@ -657,3 +657,60 @@ mod tests {
         assert!(truncated.len() < 3000);
     }
 }
+
+    #[tokio::test]
+    async fn typing_ticket_cache_hit() {
+        let cache: TypingTickets = Arc::new(Mutex::new(HashMap::new()));
+        let user = "user1";
+        // Insert a fresh ticket
+        {
+            let mut c = cache.lock().await;
+            c.insert(user.to_string(), ("ticket_abc".into(), std::time::Instant::now()));
+        }
+        // Should hit cache
+        let c = cache.lock().await;
+        let entry = c.get(user)
+            .filter(|(_, ts)| ts.elapsed().as_secs() < TYPING_TICKET_TTL_SECS);
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().0, "ticket_abc");
+    }
+
+    #[tokio::test]
+    async fn typing_ticket_cache_expired() {
+        let cache: TypingTickets = Arc::new(Mutex::new(HashMap::new()));
+        let user = "user1";
+        // Insert an expired ticket (fake old timestamp)
+        {
+            let mut c = cache.lock().await;
+            let old = std::time::Instant::now() - std::time::Duration::from_secs(TYPING_TICKET_TTL_SECS + 10);
+            c.insert(user.to_string(), ("old_ticket".into(), old));
+        }
+        let c = cache.lock().await;
+        let entry = c.get(user)
+            .filter(|(_, ts)| ts.elapsed().as_secs() < TYPING_TICKET_TTL_SECS);
+        assert!(entry.is_none(), "expired ticket should not hit cache");
+    }
+
+    #[tokio::test]
+    async fn context_tokens_cache_roundtrip() {
+        let tokens: ContextTokens = Arc::new(Mutex::new(HashMap::new()));
+        // Simulate receiving a message with context_token
+        {
+            let mut t = tokens.lock().await;
+            t.insert("user_abc".into(), "ctx_token_123".into());
+        }
+        // Read back
+        let t = tokens.lock().await;
+        assert_eq!(t.get("user_abc").unwrap(), "ctx_token_123");
+    }
+
+    #[test]
+    fn build_headers_contains_auth() {
+        let h = build_headers("test-token");
+        assert!(h.get("authorization").is_some());
+        assert_eq!(h.get("authorization").unwrap(), "Bearer test-token");
+        assert_eq!(h.get("iLink-App-Id").unwrap(), "bot");
+        assert_eq!(h.get("iLink-App-ClientVersion").unwrap(), "131072");
+        assert!(h.get("authorizationtype").is_some());
+        assert!(h.get("x-wechat-uin").is_some());
+    }
