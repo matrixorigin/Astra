@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{Value, json};
 
 use astra_tools::executor::DefaultToolExecutor;
-use astra_tools::{AskUserDecision, AskUserGate, ToolContext, ToolExecutor};
+use astra_tools::{AskUserDecision, AskUserGate, ToolExecutor};
 use async_trait::async_trait;
 
 use crate::tool_sandbox::{
@@ -1090,35 +1090,13 @@ impl ServerToolExecutor {
                 .map(|workspace| (workspace.pinned_tools, workspace.deprioritized_tools))
                 .unwrap_or_else(|_| (Vec::new(), Vec::new()));
 
-        let http_client = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(15))
-            .user_agent("astra-server/0.1.0")
-            .build()
-            .expect("Failed to build HTTP client");
-
-        let default_executor = DefaultToolExecutor::new(ToolContext {
-            project_root: workspace_root.clone(),
-            workspace_root: workspace_root.clone(),
-            user_id: user_id.clone(),
-            session_id: session_id.clone(),
-            sandbox: astra_tools::SandboxConfig::standard(workspace_root.clone()),
-            http_client: Some(http_client.clone()),
-            logger: std::sync::Arc::new(astra_tools::TracingLogger),
-            cancel_token: None,
-        });
-        // Wire GitHubClient into DefaultToolExecutor if any token is available
-        let github_tokens = astra_tools::github::resolve_github_tokens();
-        let default_executor = if !github_tokens.is_empty() {
-            let github = astra_tools::github::GitHubClient::from_tokens(
-                http_client.clone(),
-                github_tokens,
-                Vec::new(),
-            );
-            default_executor.with_github_client(github)
-        } else {
-            default_executor
-        };
+        let default_executor = DefaultToolExecutor::for_workspace(
+            &workspace_root,
+            user_id.clone(),
+            session_id.clone(),
+            "astra-server/0.1.0",
+            Duration::from_secs(15),
+        );
 
         Self {
             workspace_root,

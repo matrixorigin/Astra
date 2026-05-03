@@ -139,32 +139,14 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
         .canonicalize()
         .unwrap_or_else(|_| args.workspace_dir.clone());
 
-    // Build a production ToolContext (not test) with HTTP client for web_fetch/GitHub
-    let http_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .user_agent("astra-edge/0.1")
-        .no_proxy()
-        .build()
-        .expect("Failed to create HTTP client");
-    let ctx = astra_tools::ToolContext {
-        project_root: workspace.clone(),
-        workspace_root: workspace.clone(),
-        user_id: args.edge_id.clone(),
-        session_id: format!("edge-{}", &uuid::Uuid::new_v4().to_string()[..8]),
-        sandbox: astra_tools::SandboxConfig::standard(&workspace),
-        http_client: Some(http_client.clone()),
-        logger: std::sync::Arc::new(astra_tools::TracingLogger),
-        cancel_token: None,
-    };
-
-    // Build executor with optional GitHub client (from GITHUB_TOKEN + gh auth token)
-    let mut executor = astra_tools::executor::DefaultToolExecutor::new(ctx);
-    let tokens = astra_tools::github::resolve_github_tokens();
-    if !tokens.is_empty() {
-        let github =
-            astra_tools::github::GitHubClient::from_tokens(http_client, tokens, Vec::new());
-        executor = executor.with_github_client(github);
-    }
+    let session_id = format!("edge-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let executor = astra_tools::executor::DefaultToolExecutor::for_workspace(
+        &workspace,
+        args.edge_id.clone(),
+        session_id,
+        "astra-edge/0.1",
+        Duration::from_secs(30),
+    );
 
     // Heartbeat ticker
     let mut heartbeat = tokio::time::interval(Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS));
