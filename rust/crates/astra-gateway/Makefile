@@ -49,9 +49,8 @@ run: build _ensure_config
 
 start: build _ensure_config
 	@if [ -f $(PID_FILE) ] && kill -0 $$(cat $(PID_FILE)) 2>/dev/null; then \
-		echo "Gateway already running (PID $$(cat $(PID_FILE)))"; \
-		echo "Use 'make restart' to restart, or 'make stop' first."; \
-		exit 1; \
+		echo "✅ Gateway already running (PID $$(cat $(PID_FILE)))"; \
+		exit 0; \
 	fi
 	@echo "Starting gateway in background..."
 	@nohup $(RELEASE_BIN) --config $(CONFIG) > $(LOG_FILE) 2>&1 &
