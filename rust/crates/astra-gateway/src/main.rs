@@ -179,5 +179,6 @@ async fn main() {
         let _ = shutdown_tx_clone.send(());
     });
 
+    let runner = std::sync::Arc::new(runner);
     runner.run(adapters, cron_rx, shutdown_rx).await;
 }

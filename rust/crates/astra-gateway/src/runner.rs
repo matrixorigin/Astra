@@ -30,6 +30,25 @@ pub struct GatewayRunner {
     projects: Vec<String>,
 }
 
+/// No-op adapter used in spawned CLI tasks (typing/heartbeats not available in background).
+struct NullAdapter;
+
+#[async_trait::async_trait]
+impl PlatformAdapter for NullAdapter {
+    fn name(&self) -> &'static str { "null" }
+    async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    async fn stop(&mut self) {}
+    async fn send_text(&self, _: &str, _: &str, _: Option<&str>) -> Result<(), String> { Ok(()) }
+    async fn recv(&mut self) -> Option<InboundMessage> { None }
+}
+
+/// Response from a background CLI task, routed back to the adapter.
+struct CliResponse {
+    chat_id: String,
+    text: String,
+    reply_token: Option<String>,
+}
+
 impl GatewayRunner {
     pub async fn new(config: GatewayConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let thin = astra_thin_client::ThinClient::new(
@@ -172,16 +191,15 @@ impl GatewayRunner {
     }
 
 
-    /// Handle a single inbound message.
-    pub async fn handle_message(
+    /// Fast path: access control + slash commands. Returns Some if handled (no CLI needed).
+    pub async fn handle_fast(
         &self,
         msg: &InboundMessage,
-        adapter: &dyn PlatformAdapter,
-    ) -> Option<String> {
+    ) -> Result<Option<String>, InboundMessage> {
         // Access control check
         if !self.config.access.is_allowed(&msg.user_id) {
             tracing::debug!(user = %safe_id(&msg.user_id), "message rejected by access policy");
-            return Some(self.config.access.rejection_message().to_string());
+            return Ok(Some(self.config.access.rejection_message().to_string()));
         }
 
         // Group chat: require @mention if configured
@@ -189,7 +207,7 @@ impl GatewayRunner {
             && self.config.group_require_mention
             && !msg.text.contains("@bot") && !msg.text.contains("@Bot")
         {
-            return None; // silently ignore non-mentioned group messages
+            return Ok(None);
         }
 
         // Group chat: per-user session isolation
@@ -201,10 +219,10 @@ impl GatewayRunner {
             msg.chat_id.clone()
         };
 
-        // Resolve active CLI profile (user may have switched via /cli)
+        // Resolve active CLI profile
         let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
 
-        // Slash commands
+        // Slash commands — instant response, no CLI
         let cmd_ctx = CommandContext {
             astra: &self.thin,
             config: &self.config,
@@ -216,8 +234,29 @@ impl GatewayRunner {
             durable_store: self.durable_store.as_ref().map(|s| s.as_ref() as &dyn astra_core::durable_task_store::DurableTaskStore),
         };
         if let Some(response) = commands::handle_command(&cmd_ctx, &msg.text).await {
-            return Some(response);
+            return Ok(Some(response));
         }
+
+        // Not a slash command — needs CLI (slow path)
+        Err(msg.clone())
+    }
+
+    /// Handle a single inbound message (full path including CLI).
+    pub async fn handle_message(
+        &self,
+        msg: &InboundMessage,
+        adapter: &dyn PlatformAdapter,
+    ) -> Option<String> {
+        // Group chat: per-user session isolation
+        let effective_chat_id = if msg.chat_type == crate::platforms::ChatType::Group
+            && self.config.group_sessions_per_user
+        {
+            format!("{}:{}", msg.chat_id, msg.user_id)
+        } else {
+            msg.chat_id.clone()
+        };
+
+        let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
 
         // Ensure user exists (if DB available)
         if let Some(ref pool) = self.pool {
@@ -537,7 +576,7 @@ impl GatewayRunner {
     }
 
     pub async fn run(
-        &self,
+        self: std::sync::Arc<Self>,
         adapters: Vec<Box<dyn PlatformAdapter>>,
         mut cron_rx: tokio::sync::mpsc::Receiver<OutboundMessage>,
         mut shutdown: tokio::sync::broadcast::Receiver<()>,
@@ -559,6 +598,9 @@ impl GatewayRunner {
         }
         tracing::info!(count = adapters.len(), "gateway running");
 
+        // Channel for CLI task responses back to the main loop
+        let (cli_resp_tx, mut cli_resp_rx) = tokio::sync::mpsc::channel::<CliResponse>(64);
+
         if let Some(adapter) = adapters.first_mut() {
             // Replay any pending messages from a previous crash
             self.replay_pending_messages(adapter.as_ref()).await;
@@ -567,18 +609,51 @@ impl GatewayRunner {
                 tokio::select! {
                     msg = adapter.recv() => {
                         if let Some(msg) = msg {
-                            let response = self.handle_message(&msg, adapter.as_ref()).await;
-                            if let Some(text) = response {
-                                for chunk in split_message(&text) {
-                                    let _ = adapter.send_text(
-                                        &msg.chat_id,
-                                        chunk,
-                                        msg.reply_token.as_deref(),
-                                    ).await;
+                            // Fast path: slash commands — instant, no CLI
+                            match self.handle_fast(&msg).await {
+                                Ok(Some(text)) => {
+                                    for chunk in split_message(&text) {
+                                        let _ = adapter.send_text(
+                                            &msg.chat_id,
+                                            chunk,
+                                            msg.reply_token.as_deref(),
+                                        ).await;
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(msg) => {
+                                    // Slow path: spawn CLI task in background
+                                    let runner = self.clone();
+                                    let tx = cli_resp_tx.clone();
+                                    let chat_id = msg.chat_id.clone();
+                                    let reply_token = msg.reply_token.clone();
+                                    // Send typing immediately before spawning
+                                    let _ = adapter.send_typing(&msg.chat_id).await;
+                                    tokio::spawn(async move {
+                                        if let Some(text) = runner.handle_message(&msg, &NullAdapter).await {
+                                            let _ = tx.send(CliResponse {
+                                                chat_id,
+                                                text,
+                                                reply_token,
+                                            }).await;
+                                        }
+                                    });
                                 }
                             }
                         } else {
                             break;
+                        }
+                    }
+                    // CLI task completed — send response to user
+                    resp = cli_resp_rx.recv() => {
+                        if let Some(resp) = resp {
+                            for chunk in split_message(&resp.text) {
+                                let _ = adapter.send_text(
+                                    &resp.chat_id,
+                                    chunk,
+                                    resp.reply_token.as_deref(),
+                                ).await;
+                            }
                         }
                     }
                     outbound = cron_rx.recv() => {
