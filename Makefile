@@ -35,10 +35,12 @@ help:
 	@echo "  (also: test-sdk-offline, test-sdk-online — @astra/sdk; offline in test-offline; remote E2E opt-in on test-online)"
 	@echo ""
 	@echo "Gateway (Chat Platform Bridge):"
-	@echo "  make gateway-setup      - Interactive setup wizard (config + build)"
-	@echo "  make gateway            - Start the gateway (uses gateway.yaml)"
+	@echo "  make gateway            - Build + run gateway"
 	@echo "  make gateway-build      - Build gateway binary (release)"
-	@echo "  make test-gateway-live  - Live e2e tests (astra + claude, requires LLM)"
+	@echo "  make gateway-login      - WeChat QR login"
+	@echo "  make gateway-setup      - Interactive setup wizard"
+	@echo "  make gateway-test       - Gateway unit tests"
+	@echo "  make gateway-lint       - Gateway clippy + fmt"
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  make check              - Run all static checks (lint + format + type)"
@@ -437,21 +439,30 @@ build-server-release: sweep
 
 # Gateway targets delegate to the gateway crate's own Makefile.
 # For full gateway dev workflow: cd rust/crates/astra-gateway && make help
-.PHONY: gateway-setup gateway gateway-build gateway-login-weixin
+.PHONY: gateway gateway-build gateway-login gateway-setup gateway-test gateway-lint gateway-docker
 
 GATEWAY_DIR = rust/crates/astra-gateway
 
-gateway-setup:
-	@cd $(GATEWAY_DIR) && make setup
+gateway:
+	@cd $(GATEWAY_DIR) && make run
 
 gateway-build:
 	@cd $(GATEWAY_DIR) && make build
 
-gateway-login-weixin:
+gateway-login:
 	@cd $(GATEWAY_DIR) && make login-weixin
 
-gateway:
-	@cd $(GATEWAY_DIR) && make run
+gateway-setup:
+	@cd $(GATEWAY_DIR) && make setup
+
+gateway-test:
+	@cd $(GATEWAY_DIR) && make test
+
+gateway-lint:
+	@cd $(GATEWAY_DIR) && make lint
+
+gateway-docker:
+	@cd $(GATEWAY_DIR) && make docker
 
 # ============================================================================
 # Cleanup
@@ -507,7 +518,14 @@ test-dashboard: ## Build astra-test and launch live dashboard
 	./rust/target/release/astra-test --live-dashboard
 
 .PHONY: test-offline
-test-offline: sweep test-workspace test-runtime-bridge-hooks test-sdk-offline
+test-offline: sweep test-workspace test-runtime-bridge-hooks test-sdk-offline test-gateway
+
+.PHONY: test-gateway
+test-gateway:
+	@echo "Running gateway unit tests..."
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-gateway --lib
+	@echo "Running gateway offline fixture tests..."
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-gateway --test offline_cli_bridge
 
 .PHONY: test-workspace
 test-workspace: sweep
