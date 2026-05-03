@@ -643,19 +643,25 @@ impl GatewayRunner {
             "← done"
         );
 
-        // Append token usage stats
+        // Append token usage stats + cost estimate
         let elapsed = start.elapsed();
+        let prompt_tok = result.tokens_prompt.unwrap_or(0);
+        let completion_tok = result.tokens_completion.unwrap_or(0);
+        let cost = (prompt_tok as f64 * 3.0 + completion_tok as f64 * 15.0) / 1_000_000.0;
         let mut stats_parts = Vec::new();
-        if let Some(p) = result.tokens_prompt {
-            stats_parts.push(format!("↓{}", format_tokens(p)));
+        if prompt_tok > 0 {
+            stats_parts.push(format!("↓{}", format_tokens(prompt_tok)));
         }
-        if let Some(c) = result.tokens_completion {
-            stats_parts.push(format!("↑{}", format_tokens(c)));
+        if completion_tok > 0 {
+            stats_parts.push(format!("↑{}", format_tokens(completion_tok)));
         }
         if result.tool_calls_count.unwrap_or(0) > 0 {
             stats_parts.push(format!("🔧{}", result.tool_calls_count.unwrap()));
         }
         stats_parts.push(format_elapsed(elapsed));
+        if cost > 0.001 {
+            stats_parts.push(format!("${cost:.3}"));
+        }
         if !text.is_empty() && !stats_parts.is_empty() {
             text.push_str(&format!("\n\n`{}`", stats_parts.join(" | ")));
         }

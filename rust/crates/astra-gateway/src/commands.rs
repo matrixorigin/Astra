@@ -82,10 +82,11 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     snap.turns_used,
                     snap.turns_limit_str()
                 ));
-                lines.push(format!("- Token: {}", format_tokens(snap.tokens)));
-                lines.push(format!("- 工具: {}", snap.tool_calls));
-                if snap.consecutive_same_tool > 1 {
-                    lines.push(format!("- ⚠️ 重复工具: {}次", snap.consecutive_same_tool));
+                lines.push(format!("- Token: ↓{} ↑{}", format_tokens(snap.tokens_prompt), format_tokens(snap.tokens_completion)));
+                lines.push(format!("- 工具: {} ({})", snap.tool_calls, snap.tool_summary()));
+                lines.push(format!("- 成本: ~${:.4}", snap.cost_estimate_usd()));
+                for w in snap.warnings() {
+                    lines.push(format!("- {w}"));
                 }
             }
             Some(lines.join("\n"))
@@ -105,22 +106,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 _ => return Some("❌ 当前无活跃会话。".into()),
             };
             match fetch_harness_snapshot(ctx.astra, &sid, &ctx.config.astra.api_key).await {
-                Some(snap) => Some(format!(
-                    "🔭 **Harness 快照**\n\
-                     - 轮次: {}/{}\n\
-                     - Token: {}\n\
-                     - 工具: {}\n\
-                     - 利用率: {}\n\
-                     - 消息: {}\n\
-                     - 耗时: {}",
-                    snap.turns_used,
-                    snap.turns_limit_str(),
-                    format_tokens(snap.tokens),
-                    snap.tool_calls,
-                    snap.utilization_str(),
-                    snap.message_count,
-                    format_duration(snap.elapsed_ms),
-                )),
+                Some(snap) => Some(snap.format_full()),
                 None => Some("⚠️ 暂无 harness 数据。".into()),
             }
         }
@@ -395,7 +381,8 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              `/usage` — 用量统计\n\n\
              **监控**\n\
              `/status` — 状态 + harness\n\
-             `/inspect` — harness 详情\n\n\
+             `/inspect` — harness 详情 (token/cost/tools/warnings)\n\
+             `/audit` — 审计记录 (最近 N 轮决策链)\n\n\
              **定时任务**\n\
              `/cron list` — 查看任务\n\
              `/cron add <expr> <msg>` — 创建\n\
@@ -502,6 +489,42 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             } else {
                 Some("用法: `/task [list|cancel <id>|resume <id>|status <id>]`".into())
             }
+        }
+
+        "/audit" => {
+            let cli_name = ctx.resolved_cli.name();
+            let sid = match storage::get_current_session_for_cli(
+                require_db!(ctx), ctx.platform, ctx.chat_id, cli_name,
+            ).await {
+                Ok(Some(s)) => s,
+                _ => return Some("❌ 当前无活跃会话。".into()),
+            };
+            let history = fetch_harness_history(ctx.astra, &sid, &ctx.config.astra.api_key, 10).await;
+            if history.is_empty() {
+                return Some("📋 暂无审计记录。".into());
+            }
+            let mut lines = vec![format!("📋 **审计记录** (最近 {} 轮)", history.len())];
+            for snap in &history {
+                let tools = if snap.unique_tools.is_empty() {
+                    "—".into()
+                } else {
+                    snap.unique_tools.join(", ")
+                };
+                lines.push(format!(
+                    "**Turn {}** ↓{} ↑{} | 🔧 {} ({}) | ctx:{} | ${:.4}",
+                    snap.turn_number,
+                    format_tokens(snap.tokens_prompt),
+                    format_tokens(snap.tokens_completion),
+                    snap.tool_calls, tools,
+                    snap.utilization_pct(),
+                    snap.cost_estimate_usd(),
+                ));
+                let warnings = snap.warnings();
+                for w in &warnings {
+                    lines.push(format!("  {w}"));
+                }
+            }
+            Some(lines.join("\n"))
         }
 
         "/running" => {
@@ -636,27 +659,111 @@ fn parse_cron_add(input: &str) -> Option<(String, String)> {
 
 // ─── Harness snapshot ───────────────────────────────────────────────────────
 
-struct SnapshotSummary {
+struct HarnessSnapshot {
+    // Identity
+    session_id: String,
+    turn_number: u32,
+    model: Option<String>,
+    // Context
+    context_utilization: Option<f32>,
+    context_message_count: u32,
+    context_total_tokens: Option<u32>,
+    // Budget
     turns_used: u32,
     turns_limit: Option<u32>,
-    tokens: u64,
-    tool_calls: u32,
-    consecutive_same_tool: u32,
-    utilization: Option<f32>,
-    message_count: u32,
+    tokens_used: u64,
+    tokens_prompt: u64,
+    tokens_completion: u64,
+    tokens_cache_read: u64,
     elapsed_ms: u64,
+    // Tools
+    tool_calls: u32,
+    unique_tools: Vec<String>,
+    last_tool: Option<String>,
+    consecutive_same_tool: u32,
+    // Delegation
+    #[allow(dead_code)]
+    delegations: u32,
+    // Errors
+    consecutive_errors: u32,
 }
 
-impl SnapshotSummary {
+impl HarnessSnapshot {
     fn turns_limit_str(&self) -> String {
-        self.turns_limit
-            .map(|l| l.to_string())
-            .unwrap_or_else(|| "∞".into())
+        self.turns_limit.map(|l| l.to_string()).unwrap_or_else(|| "∞".into())
     }
-    fn utilization_str(&self) -> String {
-        self.utilization
-            .map(|u| format!("{:.0}%", u * 100.0))
-            .unwrap_or_else(|| "—".into())
+    fn utilization_pct(&self) -> String {
+        self.context_utilization.map(|u| format!("{:.0}%", u * 100.0)).unwrap_or_else(|| "—".into())
+    }
+    fn cost_estimate_usd(&self) -> f64 {
+        // Rough estimate: $3/M input, $15/M output (Sonnet-class pricing)
+        (self.tokens_prompt as f64 * 3.0 + self.tokens_completion as f64 * 15.0) / 1_000_000.0
+    }
+    fn tool_summary(&self) -> String {
+        if self.unique_tools.is_empty() { return "—".into(); }
+        self.unique_tools.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+    }
+    fn warnings(&self) -> Vec<String> {
+        let mut w = Vec::new();
+        if self.consecutive_same_tool > 2 {
+            w.push(format!("⚠️ 重复工具 {}次: {}", self.consecutive_same_tool, self.last_tool.as_deref().unwrap_or("?")));
+        }
+        if let Some(u) = self.context_utilization
+            && u > 0.85
+        {
+            w.push(format!("⚠️ Context 使用率 {:.0}%，接近上限", u * 100.0));
+        }
+        if self.consecutive_errors > 1 {
+            w.push(format!("⚠️ 连续 {} 次错误", self.consecutive_errors));
+        }
+        w
+    }
+
+    fn format_full(&self) -> String {
+        let mut lines = vec![
+            format!("🔭 **Harness — Session `{}`**", &self.session_id[..8.min(self.session_id.len())]),
+            String::new(),
+            format!("**状态** Turn {}/{} | {} | 🔧 {}",
+                self.turns_used, self.turns_limit_str(),
+                format_duration(self.elapsed_ms), self.tool_calls),
+            String::new(),
+            format!("**Token** ↓{} ↑{} 缓存↩{} | 总{}",
+                format_tokens(self.tokens_prompt), format_tokens(self.tokens_completion),
+                format_tokens(self.tokens_cache_read), format_tokens(self.tokens_used)),
+            format!("**Context** {} msgs | {} | {}",
+                self.context_message_count, self.utilization_pct(),
+                self.context_total_tokens.map(|t| format_tokens(t as u64)).unwrap_or_else(|| "—".into())),
+            format!("**成本** ~${:.4}", self.cost_estimate_usd()),
+        ];
+        if let Some(ref model) = self.model {
+            lines.push(format!("**模型** `{model}`"));
+        }
+        if !self.unique_tools.is_empty() {
+            lines.push(format!("**工具** {}", self.tool_summary()));
+        }
+        let warnings = self.warnings();
+        if !warnings.is_empty() {
+            lines.push(String::new());
+            for w in &warnings {
+                lines.push(w.clone());
+            }
+        }
+        lines.join("\n")
+    }
+
+    #[allow(dead_code)]
+    fn format_compact(&self) -> String {
+        let mut parts = vec![
+            format!("↓{} ↑{}", format_tokens(self.tokens_prompt), format_tokens(self.tokens_completion)),
+            format!("🔧{}", self.tool_calls),
+            format!("ctx:{}", self.utilization_pct()),
+            format!("${:.3}", self.cost_estimate_usd()),
+        ];
+        let warnings = self.warnings();
+        if !warnings.is_empty() {
+            parts.push(warnings[0].clone());
+        }
+        format!("`{}`", parts.join(" | "))
     }
 }
 
@@ -664,23 +771,57 @@ async fn fetch_harness_snapshot(
     astra: &astra_thin_client::ThinClient,
     session_id: &str,
     api_key: &str,
-) -> Option<SnapshotSummary> {
+) -> Option<HarnessSnapshot> {
     let path = format!("/sessions/{session_id}/harness/snapshot");
-    let text = astra
-        .get_bearer_path_query_text(api_key, &path, &[])
-        .await
-        .ok()?;
+    let text = astra.get_bearer_path_query_text(api_key, &path, &[]).await.ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    Some(SnapshotSummary {
+    Some(parse_harness_snapshot(&v, session_id))
+}
+
+async fn fetch_harness_history(
+    astra: &astra_thin_client::ThinClient,
+    session_id: &str,
+    api_key: &str,
+    n: usize,
+) -> Vec<HarnessSnapshot> {
+    let path = format!("/sessions/{session_id}/harness/history?n={n}");
+    let text = match astra.get_bearer_path_query_text(api_key, &path, &[]).await {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let v: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    v.as_array()
+        .map(|arr| arr.iter().map(|s| parse_harness_snapshot(s, session_id)).collect())
+        .unwrap_or_default()
+}
+
+fn parse_harness_snapshot(v: &serde_json::Value, session_id: &str) -> HarnessSnapshot {
+    HarnessSnapshot {
+        session_id: v["session_id"].as_str().unwrap_or(session_id).to_string(),
+        turn_number: v["turn_number"].as_u64().unwrap_or(0) as u32,
+        model: v["model"].as_str().map(String::from),
+        context_utilization: v["context_utilization"].as_f64().map(|u| u as f32),
+        context_message_count: v["context_message_count"].as_u64().unwrap_or(0) as u32,
+        context_total_tokens: v["context_total_tokens"].as_u64().map(|t| t as u32),
         turns_used: v["turns_used"].as_u64().unwrap_or(0) as u32,
         turns_limit: v["turns_limit"].as_u64().map(|l| l as u32),
-        tokens: v["tokens_used_session"].as_u64().unwrap_or(0),
-        tool_calls: v["tool_calls_this_session"].as_u64().unwrap_or(0) as u32,
-        consecutive_same_tool: v["consecutive_same_tool"].as_u64().unwrap_or(0) as u32,
-        utilization: v["context_utilization"].as_f64().map(|u| u as f32),
-        message_count: v["context_message_count"].as_u64().unwrap_or(0) as u32,
+        tokens_used: v["tokens_used_session"].as_u64().unwrap_or(0),
+        tokens_prompt: v["tokens_prompt"].as_u64().unwrap_or(0),
+        tokens_completion: v["tokens_completion"].as_u64().unwrap_or(0),
+        tokens_cache_read: v["tokens_cache_read"].as_u64().unwrap_or(0),
         elapsed_ms: v["elapsed_millis"].as_u64().unwrap_or(0),
-    })
+        tool_calls: v["tool_calls_this_session"].as_u64().unwrap_or(0) as u32,
+        unique_tools: v["unique_tools_used"].as_array()
+            .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+            .unwrap_or_default(),
+        last_tool: v["last_tool_called"].as_str().map(String::from),
+        consecutive_same_tool: v["consecutive_same_tool"].as_u64().unwrap_or(0) as u32,
+        delegations: v["delegations_this_turn"].as_u64().unwrap_or(0) as u32,
+        consecutive_errors: v["consecutive_errors"].as_u64().unwrap_or(0) as u32,
+    }
 }
 
 fn format_tokens(n: u64) -> String {
@@ -803,5 +944,125 @@ mod tests {
             resolve_model_shortcut("OPUS"),
             "us.anthropic.claude-opus-4-6-v1"
         );
+    }
+
+    // ── Harness snapshot tests ──────────────────────────────────
+
+    fn test_snapshot() -> HarnessSnapshot {
+        HarnessSnapshot {
+            session_id: "abc12345-def6-7890".into(),
+            turn_number: 5,
+            model: Some("claude-opus-4-6".into()),
+            context_utilization: Some(0.42),
+            context_message_count: 12,
+            context_total_tokens: Some(50000),
+            turns_used: 5,
+            turns_limit: Some(20),
+            tokens_used: 25000,
+            tokens_prompt: 20000,
+            tokens_completion: 5000,
+            tokens_cache_read: 10000,
+            elapsed_ms: 35000,
+            tool_calls: 8,
+            unique_tools: vec!["bash".into(), "read_file".into(), "edit_file".into()],
+            last_tool: Some("edit_file".into()),
+            consecutive_same_tool: 1,
+            delegations: 0,
+            consecutive_errors: 0,
+        }
+    }
+
+    #[test]
+    fn snapshot_format_full_contains_key_fields() {
+        let s = test_snapshot();
+        let full = s.format_full();
+        assert!(full.contains("abc12345"), "session id");
+        assert!(full.contains("5/20"), "turns");
+        assert!(full.contains("🔧 8"), "tool calls");
+        assert!(full.contains("42%"), "utilization");
+        assert!(full.contains("claude-opus-4-6"), "model");
+        assert!(full.contains("bash"), "tool name");
+        assert!(full.contains("$"), "cost");
+    }
+
+    #[test]
+    fn snapshot_format_compact() {
+        let s = test_snapshot();
+        let compact = s.format_compact();
+        assert!(compact.contains("↓"), "prompt tokens");
+        assert!(compact.contains("↑"), "completion tokens");
+        assert!(compact.contains("🔧"), "tools");
+        assert!(compact.contains("ctx:"), "context");
+        assert!(compact.contains("$"), "cost");
+    }
+
+    #[test]
+    fn snapshot_warnings_consecutive_tool() {
+        let mut s = test_snapshot();
+        s.consecutive_same_tool = 5;
+        s.last_tool = Some("bash".into());
+        let w = s.warnings();
+        assert!(!w.is_empty());
+        assert!(w[0].contains("重复工具"));
+        assert!(w[0].contains("bash"));
+    }
+
+    #[test]
+    fn snapshot_warnings_high_utilization() {
+        let mut s = test_snapshot();
+        s.context_utilization = Some(0.92);
+        let w = s.warnings();
+        assert!(!w.is_empty());
+        assert!(w[0].contains("接近上限"));
+    }
+
+    #[test]
+    fn snapshot_warnings_consecutive_errors() {
+        let mut s = test_snapshot();
+        s.consecutive_errors = 3;
+        let w = s.warnings();
+        assert!(!w.is_empty());
+        assert!(w[0].contains("连续"));
+    }
+
+    #[test]
+    fn snapshot_no_warnings_when_healthy() {
+        let s = test_snapshot();
+        assert!(s.warnings().is_empty());
+    }
+
+    #[test]
+    fn snapshot_cost_estimate() {
+        let s = test_snapshot();
+        let cost = s.cost_estimate_usd();
+        // 20k * $3/M + 5k * $15/M = $0.06 + $0.075 = $0.135
+        assert!(cost > 0.1 && cost < 0.2, "cost={cost}");
+    }
+
+    #[test]
+    fn parse_snapshot_from_json() {
+        let v = serde_json::json!({
+            "session_id": "test-123",
+            "turn_number": 3,
+            "model": "opus",
+            "turns_used": 3,
+            "turns_limit": 10,
+            "tokens_used_session": 15000,
+            "tokens_prompt": 12000,
+            "tokens_completion": 3000,
+            "tokens_cache_read": 5000,
+            "elapsed_millis": 8000,
+            "tool_calls_this_session": 4,
+            "unique_tools_used": ["bash", "read_file"],
+            "last_tool_called": "read_file",
+            "consecutive_same_tool": 0,
+            "context_utilization": 0.35,
+            "context_message_count": 8,
+        });
+        let snap = parse_harness_snapshot(&v, "fallback");
+        assert_eq!(snap.session_id, "test-123");
+        assert_eq!(snap.turn_number, 3);
+        assert_eq!(snap.tokens_prompt, 12000);
+        assert_eq!(snap.unique_tools.len(), 2);
     }
 }
