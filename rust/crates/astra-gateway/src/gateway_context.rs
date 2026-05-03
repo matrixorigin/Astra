@@ -20,6 +20,7 @@ pub struct GatewayContext {
     pub has_durable_tasks: bool,
     pub cron_jobs_count: usize,
     pub db_tables: Vec<String>,
+    pub extra_skills: Vec<(String, String)>,
 }
 
 impl GatewayContext {
@@ -48,6 +49,7 @@ impl GatewayContext {
             has_durable_tasks: has_db,
             cron_jobs_count: 0,
             db_tables: Vec::new(),
+            extra_skills: Vec::new(),
         }
     }
 
@@ -61,9 +63,49 @@ impl GatewayContext {
         self
     }
 
-    pub fn to_system_prompt(&self) -> String {
-        render_template(SKILL_TEMPLATE, self)
+    pub fn with_extra_skills(mut self, skills: Vec<(String, String)>) -> Self {
+        self.extra_skills = skills;
+        self
     }
+
+    pub fn to_system_prompt(&self) -> String {
+        let mut prompt = render_template(SKILL_TEMPLATE, self);
+        for (name, content) in &self.extra_skills {
+            prompt.push_str(&format!("\n\n### Skill: {name}\n\n{content}"));
+        }
+        prompt
+    }
+}
+
+/// Load skill markdown files from a directory. Returns (name, content) pairs sorted by name.
+pub fn load_skills_from_dir(dir: &str) -> Vec<(String, String)> {
+    let expanded = if dir.starts_with('~') {
+        let home = std::env::var("HOME").unwrap_or_default();
+        dir.replacen('~', &home, 1)
+    } else {
+        dir.to_string()
+    };
+    let path = std::path::Path::new(&expanded);
+    if !path.is_dir() {
+        return Vec::new();
+    }
+    let mut skills = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("md")
+                && let Ok(content) = std::fs::read_to_string(&p)
+            {
+                let name = p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                skills.push((name, content));
+            }
+        }
+    }
+    skills.sort_by(|a, b| a.0.cmp(&b.0));
+    skills
 }
 
 fn render_template(template: &str, ctx: &GatewayContext) -> String {
@@ -270,3 +312,54 @@ mod tests {
         assert!(!out.contains("hidden"));
     }
 }
+
+    #[test]
+    fn load_skills_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills = load_skills_from_dir(dir.path().to_str().unwrap());
+        assert!(skills.is_empty());
+    }
+
+    #[test]
+    fn load_skills_nonexistent_dir() {
+        let skills = load_skills_from_dir("/nonexistent/path/12345");
+        assert!(skills.is_empty());
+    }
+
+    #[test]
+    fn load_skills_from_dir_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("report.md"), "# Weekly Report\nCollect stats.").unwrap();
+        std::fs::write(dir.path().join("alert.md"), "# Alert Rules").unwrap();
+        std::fs::write(dir.path().join("ignore.txt"), "not a skill").unwrap();
+
+        let skills = load_skills_from_dir(dir.path().to_str().unwrap());
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0].0, "alert"); // sorted
+        assert_eq!(skills[1].0, "report");
+        assert!(skills[1].1.contains("Weekly Report"));
+    }
+
+    #[test]
+    fn extra_skills_appended_to_prompt() {
+        let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), false)
+            .with_extra_skills(vec![("myskill".into(), "Do X then Y.".into())]);
+        let prompt = ctx.to_system_prompt();
+        assert!(prompt.contains("### Skill: myskill"));
+        assert!(prompt.contains("Do X then Y."));
+    }
+
+    #[test]
+    fn template_includes_durable_tasks_when_db() {
+        let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true);
+        let prompt = ctx.to_system_prompt();
+        assert!(prompt.contains("Durable Tasks"));
+        assert!(prompt.contains("dtask_create"));
+    }
+
+    #[test]
+    fn template_excludes_durable_tasks_without_db() {
+        let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), false);
+        let prompt = ctx.to_system_prompt();
+        assert!(!prompt.contains("Durable Tasks"));
+    }

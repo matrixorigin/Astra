@@ -13,6 +13,9 @@ pub struct GatewayConfig {
     pub cli_profiles: std::collections::HashMap<String, crate::cli_bridge::CliProfile>,
     #[serde(default)]
     pub platforms: PlatformConfigs,
+    /// Directory containing user-defined skill markdown files.
+    #[serde(default)]
+    pub skills_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

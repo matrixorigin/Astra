@@ -182,6 +182,39 @@ impl DurableTaskStore for MysqlDurableTaskStore {
     }
 }
 
+// ─── Gateway-specific (not on trait) ───────────────────────────────────────
+
+impl MysqlDurableTaskStore {
+    pub async fn suspend_stale_running_tasks(&self, reason: &str) -> Result<u64, String> {
+        let result = sqlx::query(
+            "UPDATE gw_durable_tasks SET status = 'suspended', error_message = ?, updated_at = NOW(6)
+             WHERE status = 'running'",
+        )
+        .bind(reason)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("sweep stale tasks failed: {e}"))?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn suspend_running_tasks_for_owner(
+        &self,
+        owner_id: &str,
+        reason: &str,
+    ) -> Result<u64, String> {
+        let result = sqlx::query(
+            "UPDATE gw_durable_tasks SET status = 'suspended', error_message = ?, updated_at = NOW(6)
+             WHERE owner_id = ? AND status = 'running'",
+        )
+        .bind(reason)
+        .bind(owner_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("suspend tasks for owner failed: {e}"))?;
+        Ok(result.rows_affected())
+    }
+}
+
 fn row_to_task(r: TaskRow) -> DurableTask {
     DurableTask {
         id: TaskId(r.0),

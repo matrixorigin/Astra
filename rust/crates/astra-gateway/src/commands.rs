@@ -12,6 +12,7 @@ pub struct CommandContext<'a> {
     pub chat_id: &'a str,
     pub user_id: &'a str,
     pub resolved_cli: &'a crate::cli_bridge::CliProfile,
+    pub durable_store: Option<&'a dyn astra_core::durable_task_store::DurableTaskStore>,
 }
 
 /// Helper: get pool or return error message for DB-dependent commands.
@@ -316,6 +317,79 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              **安全**\n\
              `/approve` — 权限说明".into(),
         ),
+
+        "/task" => {
+            let store = match ctx.durable_store {
+                Some(s) => s,
+                None => return Some("⚠️ 持久任务需要数据库支持".into()),
+            };
+            let owner_id = format!("{}:{}", ctx.platform, ctx.chat_id);
+
+            if arg.is_empty() || arg == "list" {
+                let filter = astra_core::durable_task_store::TaskFilter {
+                    owner_id: Some(owner_id),
+                    ..Default::default()
+                };
+                match store.list(filter).await {
+                    Ok(tasks) if tasks.is_empty() => Some("📋 没有持久任务。".into()),
+                    Ok(tasks) => {
+                        let mut lines = vec![format!("📋 **持久任务** ({} 个)", tasks.len())];
+                        for t in &tasks {
+                            let short_id = &t.id.0[..8.min(t.id.0.len())];
+                            let icon = match t.status {
+                                astra_core::durable_task_store::DurableTaskStatus::Running => "🔄",
+                                astra_core::durable_task_store::DurableTaskStatus::Suspended => "⏸",
+                                astra_core::durable_task_store::DurableTaskStatus::Completed => "✅",
+                                astra_core::durable_task_store::DurableTaskStatus::Failed => "❌",
+                                astra_core::durable_task_store::DurableTaskStatus::Cancelled => "🚫",
+                                _ => "📋",
+                            };
+                            lines.push(format!("{icon} `{short_id}` | {} | {}%", t.name, t.progress_pct));
+                        }
+                        Some(lines.join("\n"))
+                    }
+                    Err(e) => Some(format!("⚠️ 查询失败: {e}")),
+                }
+            } else if let Some(id) = arg.strip_prefix("cancel ").or_else(|| arg.strip_prefix("rm ")) {
+                let tid = astra_core::durable_task_store::TaskId(id.trim().to_string());
+                match store.update_status(&tid, astra_core::durable_task_store::DurableTaskStatus::Cancelled, None).await {
+                    Ok(()) => Some("🚫 任务已取消".into()),
+                    Err(e) => Some(format!("⚠️ {e}")),
+                }
+            } else if let Some(id) = arg.strip_prefix("resume ") {
+                let tid = astra_core::durable_task_store::TaskId(id.trim().to_string());
+                match store.resume(&tid).await {
+                    Ok(Some(cp)) => {
+                        let _ = store.update_status(&tid, astra_core::durable_task_store::DurableTaskStatus::Running, None).await;
+                        Some(format!("▶️ 任务已恢复\n检查点:\n```\n{}\n```", serde_json::to_string_pretty(&cp).unwrap_or_default()))
+                    }
+                    Ok(None) => Some("▶️ 任务无检查点，将从头开始".into()),
+                    Err(e) => Some(format!("⚠️ {e}")),
+                }
+            } else if let Some(id) = arg.strip_prefix("status ") {
+                let tid = astra_core::durable_task_store::TaskId(id.trim().to_string());
+                match store.get(&tid).await {
+                    Ok(Some(t)) => {
+                        let mut lines = vec![
+                            format!("📋 **{}**", t.name),
+                            format!("- 状态: {}", t.status.as_str()),
+                            format!("- 进度: {}%", t.progress_pct),
+                        ];
+                        if let Some(ref step) = t.step_description {
+                            lines.push(format!("- 当前: {step}"));
+                        }
+                        if let Some(ref err) = t.error_message {
+                            lines.push(format!("- 信息: {err}"));
+                        }
+                        Some(lines.join("\n"))
+                    }
+                    Ok(None) => Some(format!("❌ 任务 `{}` 不存在", id.trim())),
+                    Err(e) => Some(format!("⚠️ {e}")),
+                }
+            } else {
+                Some("用法: `/task [list|cancel <id>|resume <id>|status <id>]`".into())
+            }
+        }
 
         _ => None,
     }

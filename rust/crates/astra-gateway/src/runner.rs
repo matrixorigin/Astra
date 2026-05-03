@@ -27,6 +27,7 @@ pub struct GatewayRunner {
     thin: astra_thin_client::ThinClient,
     outbound_tx: Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
     durable_store: Option<std::sync::Arc<crate::durable_task_store::MysqlDurableTaskStore>>,
+    user_skills: Vec<(String, String)>,
 }
 
 impl GatewayRunner {
@@ -57,6 +58,13 @@ impl GatewayRunner {
             std::sync::Arc::new(crate::durable_task_store::MysqlDurableTaskStore::new(p.clone()))
         });
 
+        let user_skills = config.skills_dir.as_deref()
+            .map(crate::gateway_context::load_skills_from_dir)
+            .unwrap_or_default();
+        if !user_skills.is_empty() {
+            tracing::info!(count = user_skills.len(), "loaded user skills from directory");
+        }
+
         Ok(Self {
             config,
             pool,
@@ -64,6 +72,7 @@ impl GatewayRunner {
             thin,
             outbound_tx: None,
             durable_store,
+            user_skills,
         })
     }
 
@@ -73,6 +82,16 @@ impl GatewayRunner {
 
     pub fn cli_profile(&self) -> &CliProfile {
         &self.cli_profile
+    }
+
+    pub async fn sweep_stale_tasks(&self) {
+        if let Some(ref store) = self.durable_store {
+            match store.suspend_stale_running_tasks("gateway restarted").await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(count = n, "swept stale running tasks → suspended"),
+                Err(e) => tracing::warn!(error = %e, "failed to sweep stale tasks"),
+            }
+        }
     }
 
     pub fn set_outbound_tx(&mut self, tx: tokio::sync::mpsc::Sender<OutboundMessage>) {
@@ -127,6 +146,7 @@ impl GatewayRunner {
             chat_id: &msg.chat_id,
             user_id: &msg.user_id,
             resolved_cli: &cli_profile,
+            durable_store: self.durable_store.as_ref().map(|s| s.as_ref() as &dyn astra_core::durable_task_store::DurableTaskStore),
         };
         if let Some(response) = commands::handle_command(&cmd_ctx, &msg.text).await {
             return Some(response);
@@ -174,6 +194,9 @@ impl GatewayRunner {
                 && let Ok(jobs) = storage::list_cron_jobs(pool, msg.platform, &msg.chat_id).await
             {
                 ctx = ctx.with_cron_count(jobs.len());
+            }
+            if !self.user_skills.is_empty() {
+                ctx = ctx.with_extra_skills(self.user_skills.clone());
             }
             ctx
         };
@@ -262,20 +285,40 @@ impl GatewayRunner {
             }
         }
 
+        // Helper: suspend running durable tasks for this chat on failure
+        let suspend_tasks = |store: &Option<std::sync::Arc<crate::durable_task_store::MysqlDurableTaskStore>>, reason: String| {
+            let store = store.clone();
+            let owner = format!("{platform}:{chat_id}", platform = msg.platform, chat_id = msg.chat_id);
+            async move {
+                if let Some(ref s) = store {
+                    let n = s.suspend_running_tasks_for_owner(&owner, &reason).await.unwrap_or(0);
+                    if n > 0 {
+                        tracing::info!(count = n, %reason, "auto-suspended durable tasks on CLI failure");
+                    }
+                }
+            }
+        };
+
         if stalled {
+            suspend_tasks(&self.durable_store, "CLI stalled — no activity".into()).await;
             return Some(format!("⚠️ `{cli_name}` 执行超时，请重试或 `/new` 新建会话"));
         }
 
         let result = match cli_handle.await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
+                suspend_tasks(&self.durable_store, format!("CLI error: {e}")).await;
                 return Some(cli_bridge::translate_cli_error(&cli_profile, -1, &e));
             }
-            Err(e) => return Some(format!("⚠️ 任务中断: {e}")),
+            Err(e) => {
+                suspend_tasks(&self.durable_store, format!("CLI interrupted: {e}")).await;
+                return Some(format!("⚠️ 任务中断: {e}"));
+            }
         };
 
         if result.exit_code != 0 {
             tracing::warn!(exit_code = result.exit_code, "CLI non-zero exit");
+            suspend_tasks(&self.durable_store, format!("CLI exit code {}", result.exit_code)).await;
             if result.text.is_none() || result.text.as_deref() == Some("") {
                 let error_text = if result.stderr.is_empty() {
                     &result.stdout

@@ -200,3 +200,65 @@ async fn create_with_initial_state() {
     assert_eq!(cp["repos"][0], "a");
     store.delete(&id).await.unwrap();
 }
+
+#[tokio::test]
+#[ignore]
+async fn sweep_stale_running_tasks() {
+    let store = setup().await;
+    let owner = format!("test:{}", uuid::Uuid::new_v4());
+
+    // Create two tasks and checkpoint them to running
+    let s = |n: &str| TaskSpec { name: n.into(), description: None, owner_id: owner.clone(), initial_state: None };
+    let id1 = store.create(&s("stale-1")).await.unwrap();
+    let id2 = store.create(&s("stale-2")).await.unwrap();
+    store.checkpoint(&id1, &serde_json::json!({"step":1}), Some(10), None).await.unwrap();
+    store.checkpoint(&id2, &serde_json::json!({"step":2}), Some(50), None).await.unwrap();
+
+    // Both should be running
+    assert_eq!(store.get(&id1).await.unwrap().unwrap().status, DurableTaskStatus::Running);
+    assert_eq!(store.get(&id2).await.unwrap().unwrap().status, DurableTaskStatus::Running);
+
+    // Sweep
+    let count = store.suspend_stale_running_tasks("gateway restarted").await.unwrap();
+    assert!(count >= 2, "should suspend at least 2 tasks, got {count}");
+
+    // Both should be suspended with reason
+    let t1 = store.get(&id1).await.unwrap().unwrap();
+    assert_eq!(t1.status, DurableTaskStatus::Suspended);
+    assert_eq!(t1.error_message.as_deref(), Some("gateway restarted"));
+    let t2 = store.get(&id2).await.unwrap().unwrap();
+    assert_eq!(t2.status, DurableTaskStatus::Suspended);
+
+    // Checkpoint should be preserved
+    assert!(t1.checkpoint.is_some());
+    assert!(t2.checkpoint.is_some());
+
+    store.delete(&id1).await.unwrap();
+    store.delete(&id2).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn suspend_running_tasks_for_owner() {
+    let store = setup().await;
+    let owner_a = format!("test:{}", uuid::Uuid::new_v4());
+    let owner_b = format!("test:{}", uuid::Uuid::new_v4());
+
+    let spec_a = TaskSpec { name: "a-task".into(), description: None, owner_id: owner_a.clone(), initial_state: None };
+    let spec_b = TaskSpec { name: "b-task".into(), description: None, owner_id: owner_b.clone(), initial_state: None };
+    let id_a = store.create(&spec_a).await.unwrap();
+    let id_b = store.create(&spec_b).await.unwrap();
+    store.checkpoint(&id_a, &serde_json::json!({}), None, None).await.unwrap();
+    store.checkpoint(&id_b, &serde_json::json!({}), None, None).await.unwrap();
+
+    // Suspend only owner_a's tasks
+    let count = store.suspend_running_tasks_for_owner(&owner_a, "CLI crashed").await.unwrap();
+    assert_eq!(count, 1);
+
+    // owner_a suspended, owner_b still running
+    assert_eq!(store.get(&id_a).await.unwrap().unwrap().status, DurableTaskStatus::Suspended);
+    assert_eq!(store.get(&id_b).await.unwrap().unwrap().status, DurableTaskStatus::Running);
+
+    store.delete(&id_a).await.unwrap();
+    store.delete(&id_b).await.unwrap();
+}
