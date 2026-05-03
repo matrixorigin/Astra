@@ -1929,23 +1929,6 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "get_agent_info",
-                "description": "Retrieve the agent's runtime identity and capabilities. Returns structured JSON with name, version, runtime mode, user/session IDs, workspace path, and available tools. Use this when you need to reflect on your own identity, verify your configuration, or report your runtime context to the user.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "dimension": {
-                            "type": "string",
-                            "enum": ["identity", "capability", "all"],
-                            "description": "What to return: 'identity' (name, version, user, session, workspace), 'capability' (tools), or 'all' (both). Default: all."
-                        }
-                    }
-                }
-            }
-        }),
     ]
 }
 
