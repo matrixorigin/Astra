@@ -13,10 +13,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # Cap parallel codegen/link jobs. This branch adds 7 new integration test
-  # files in astra-runtime, each producing a separate ~200MB binary. Linking
-  # all concurrently exceeds the 7GB RAM on ubuntu-latest runners.
-  CARGO_BUILD_JOBS: "3"
 
 jobs:
   # ── Stage 1: compile once, cache for all downstream jobs ───────────
