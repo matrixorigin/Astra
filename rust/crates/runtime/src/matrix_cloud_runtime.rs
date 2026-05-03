@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinSet;
 
-use astra_core::{MatrixOneSettings, SharedPool, resolve_database_name};
+use astra_core::{MatrixOneSettings, SharedPool};
 use astra_services::{
     CloudTransport, SyncOrchestrator, SyncPolicy, TaskLeaseHoldCache, TaskRecord,
     event_ingestion::{self, IngestionConfig, IngestionEvent},
@@ -46,17 +46,7 @@ pub trait BridgePersistTracker: Send + Sync {
 /// Requires `MATRIXONE_PASSWORD` to be set — fails closed rather than
 /// substituting a hardcoded development password.
 pub fn matrix_settings_from_env() -> Result<MatrixOneSettings, String> {
-    Ok(MatrixOneSettings {
-        host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".into()),
-        port: std::env::var("MATRIXONE_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6001),
-        user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
-        password: std::env::var("MATRIXONE_PASSWORD")
-            .map_err(|_| "MATRIXONE_PASSWORD environment variable is required".to_string())?,
-        database: resolve_database_name(&|k| std::env::var(k).ok()),
-    })
+    MatrixOneSettings::from_env_strict()
 }
 
 /// Pool + ingestion + unified sync orchestrator. Safe to share behind `Arc`.

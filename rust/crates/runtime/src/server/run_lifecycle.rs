@@ -4186,18 +4186,7 @@ mod tests {
     }
 
     fn test_settings() -> MatrixOneSettings {
-        dotenvy::dotenv().ok();
-        let lookup = |k: &str| std::env::var(k).ok();
-        MatrixOneSettings {
-            host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".into()),
-            port: std::env::var("MATRIXONE_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(6001),
-            user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
-            password: std::env::var("MATRIXONE_PASSWORD").unwrap_or_else(|_| "111".into()),
-            database: astra_core::resolve_database_name_or(&lookup, "test_astra_runtime"),
-        }
+        MatrixOneSettings::from_env_with_database("test_astra_runtime")
     }
 
     fn test_encryptor() -> Arc<FernetTokenEncryptor> {
@@ -4213,18 +4202,7 @@ mod tests {
     }
 
     fn runtime_db_it_settings(database: &str) -> MatrixOneSettings {
-        dotenvy::dotenv().ok();
-        MatrixOneSettings {
-            host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".into()),
-            port: std::env::var("MATRIXONE_PORT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(6001),
-            user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
-            password: std::env::var("MATRIXONE_PASSWORD")
-                .unwrap_or_else(|_| astra_core::DEV_MATRIXONE_PASSWORD.to_string()),
-            database: database.to_string(),
-        }
+        MatrixOneSettings::from_env_with_database(database)
     }
 
     async fn setup_runtime_db_pool(database: &str) -> (MatrixOneSettings, SharedPool) {

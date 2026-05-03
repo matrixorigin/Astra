@@ -138,7 +138,72 @@ impl fmt::Debug for MatrixOneSettings {
     }
 }
 
+/// MySQL CLI connect timeout (seconds) — shared between server and edge tool execution.
+pub const MO_CLI_CONNECT_TIMEOUT_SECS: u32 = 5;
+
 impl MatrixOneSettings {
+    /// Build a `mysql` CLI [`Command`](std::process::Command) pre-configured
+    /// with this settings' host/port/user/password.
+    ///
+    /// Password is passed via `MYSQL_PWD` env var (hidden from `ps`).
+    pub fn mysql_cmd(&self, database: Option<&str>) -> std::process::Command {
+        let db = database.unwrap_or(&self.database);
+        let mut cmd = std::process::Command::new("mysql");
+        cmd.arg(format!("-h{}", self.host))
+            .arg(format!("-P{}", self.port))
+            .arg(format!("-u{}", self.user))
+            .env("MYSQL_PWD", &self.password)
+            .arg(db)
+            .arg(format!("--connect-timeout={MO_CLI_CONNECT_TIMEOUT_SECS}"))
+            .arg("--table");
+        cmd
+    }
+
+    /// Build settings from environment with dev-safe defaults.
+    ///
+    /// Falls back to `localhost:6001`, `root`, and the bundled dev password.
+    /// Suitable for local dev and tests. Call `dotenvy::dotenv().ok()` first
+    /// if you need `.env` file loading (the server entry point already does this).
+    pub fn from_env() -> Self {
+        let lookup = |k: &str| env::var(k).ok();
+        Self {
+            host: env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".into()),
+            port: env::var("MATRIXONE_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(6001),
+            user: env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
+            password: env::var("MATRIXONE_PASSWORD").unwrap_or_else(|_| "111".into()),
+            database: resolve_database_name(&lookup),
+        }
+    }
+
+    /// Build settings from environment, **requiring** `MATRIXONE_PASSWORD`.
+    ///
+    /// Returns `Err` when the password is unset — suitable for production and
+    /// any code path that must not silently fall back to a dev password.
+    pub fn from_env_strict() -> Result<Self, String> {
+        let lookup = |k: &str| env::var(k).ok();
+        Ok(Self {
+            host: env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".into()),
+            port: env::var("MATRIXONE_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(6001),
+            user: env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
+            password: env::var("MATRIXONE_PASSWORD")
+                .map_err(|_| "MATRIXONE_PASSWORD environment variable is required".to_string())?,
+            database: resolve_database_name(&lookup),
+        })
+    }
+
+    /// Build settings with a specific database name (other values from env).
+    pub fn from_env_with_database(database: impl Into<String>) -> Self {
+        let mut s = Self::from_env();
+        s.database = database.into();
+        s
+    }
+
     /// Returns the database URL with password REDACTED — safe for logging.
     ///
     /// Use [`MatrixOneSettings::database_url_with_password`] when an actual
@@ -226,6 +291,17 @@ impl fmt::Debug for ApiSettings {
 pub struct MemoriaSettings {
     pub base_url: String,
     pub master_key: Option<String>,
+}
+
+impl MemoriaSettings {
+    /// Read Memoria connection config from environment.
+    pub fn from_env() -> Self {
+        Self {
+            base_url: env::var("MEMORIA_BASE_URL")
+                .unwrap_or_else(|_| DEFAULT_MEMORIA_URL.to_string()),
+            master_key: env::var("MEMORIA_MASTER_KEY").ok(),
+        }
+    }
 }
 
 impl fmt::Debug for MemoriaSettings {
@@ -352,6 +428,11 @@ where
             .map_err(|_| ConfigError::InvalidInteger { key, value }),
         None => Ok(default),
     }
+}
+
+/// Read `ASTRA_CLI_USER_ID` from environment, defaulting to `"local"`.
+pub fn cli_user_id() -> String {
+    env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string())
 }
 
 fn normalize_jwt_secret(secret: &str) -> String {

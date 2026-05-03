@@ -31,8 +31,6 @@ use crate::tool_sandbox::{
 };
 use astra_turn_core::file_edit_journal::{EditType, FileEditJournal};
 
-const ASTRA_CONNECT_TIMEOUT_SECS: u32 = 5;
-
 fn normalize_path(path: &Path) -> PathBuf {
     path.components()
         .fold(PathBuf::new(), |mut acc, component| {
@@ -938,23 +936,8 @@ fn is_mo_error(output: &str) -> bool {
 }
 
 fn mo_mysql_cmd(database: Option<&str>) -> Result<Command, String> {
-    let host = std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".to_string());
-    let port = std::env::var("MATRIXONE_PORT").unwrap_or_else(|_| "6001".to_string());
-    let user = std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".to_string());
-    let password = std::env::var("MATRIXONE_PASSWORD").unwrap_or_else(|_| "111".to_string());
-    let db = database
-        .map(ToString::to_string)
-        .unwrap_or_else(|| astra_core::resolve_database_name(&|k| std::env::var(k).ok()));
-
-    let mut cmd = Command::new("mysql");
-    cmd.arg(format!("-h{host}"))
-        .arg(format!("-P{port}"))
-        .arg(format!("-u{user}"))
-        .env("MYSQL_PWD", &password)
-        .arg(db)
-        .arg(format!("--connect-timeout={ASTRA_CONNECT_TIMEOUT_SECS}"))
-        .arg("--table");
-    Ok(cmd)
+    let settings = astra_core::MatrixOneSettings::from_env();
+    Ok(settings.mysql_cmd(database))
 }
 
 fn mo_execute_sql(sql: &str, database: Option<&str>) -> String {

@@ -307,7 +307,7 @@ pub async fn build_server_state(
     // Wire team persistence store backed by MatrixOne.
     let team_store =
         astra_services::team_persistence::MatrixOneTeamStore::new(shared_pool.get().clone());
-    let user_id = std::env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string());
+    let user_id = astra_core::cli_user_id();
     if let Err(e) = team_store.ensure_builtins(&user_id).await {
         tracing::warn!(
             target: "astra_runtime::state_builder",
