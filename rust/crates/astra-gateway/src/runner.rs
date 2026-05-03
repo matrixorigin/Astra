@@ -15,8 +15,6 @@ use std::time::{Duration, Instant};
 
 const MAX_CHUNK_LEN: usize = 3800;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
-/// Kill CLI only if no stderr activity for this long (process likely dead).
-const CLI_STALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Outbound message from cron scheduler or other background tasks.
 pub type OutboundMessage = (String, String, String); // (platform, chat_id, text)
@@ -360,11 +358,9 @@ impl GatewayRunner {
         });
 
         let start = Instant::now();
-        let mut last_activity = Instant::now();
         let mut tool_count: u32 = 0;
         let mut last_tool = String::new();
         let mut heartbeat_count: u32 = 0;
-        let mut stalled = false;
 
         loop {
             tokio::select! {
@@ -373,35 +369,19 @@ impl GatewayRunner {
                         Some(CliProgress::ToolCall(line)) => {
                             tool_count += 1;
                             last_tool = line;
-                            last_activity = Instant::now();
                         }
-                        Some(CliProgress::Status(_) | CliProgress::Stderr(_)) => {
-                            last_activity = Instant::now();
-                        }
+                        Some(CliProgress::Status(_) | CliProgress::Stderr(_)) => {}
                         None => break, // CLI finished
                     }
                 }
                 _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
                     let elapsed = start.elapsed();
-                    let idle = last_activity.elapsed();
                     heartbeat_count += 1;
 
-                    // Stall detection: no activity for CLI_STALL_TIMEOUT → kill
-                    if idle > CLI_STALL_TIMEOUT {
-                        tracing::error!(
-                            idle_secs = idle.as_secs(),
-                            "CLI stalled — no activity for {}s, aborting",
-                            CLI_STALL_TIMEOUT.as_secs()
-                        );
-                        let _ = adapter.send_text(
-                            &chat_id,
-                            &format!("⚠️ `{cli_name}` 无响应 ({}s)，已终止", idle.as_secs()),
-                            None,
-                        ).await;
-                        cli_handle.abort();
-                        stalled = true;
-                        break;
-                    }
+                    // No hard timeout — CLI runs until completion.
+                    // --json mode produces no stderr, so stall detection based on
+                    // stderr activity would kill every long-running task.
+                    // Users can interrupt via /new or sending a new message.
 
                     // Rich heartbeat
                     let elapsed_str = format_elapsed(elapsed);
@@ -431,11 +411,6 @@ impl GatewayRunner {
                 }
             }
         };
-
-        if stalled {
-            suspend_tasks(&self.durable_store, "CLI stalled — no activity".into()).await;
-            return Some(format!("⚠️ `{cli_name}` 执行超时，请重试或 `/new` 新建会话"));
-        }
 
         let result = match cli_handle.await {
             Ok(Ok(result)) => result,

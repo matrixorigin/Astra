@@ -305,7 +305,7 @@ mod tests {
     fn template_response_guidelines() {
         let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true);
         let prompt = ctx.to_system_prompt();
-        assert!(prompt.contains("Do NOT say you can't set reminders"));
+        assert!(prompt.contains("You CAN set reminders"));
     }
 
     #[test]
