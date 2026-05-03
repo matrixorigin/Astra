@@ -75,13 +75,19 @@ fn is_table_row(line: &str) -> bool {
 
 fn is_separator_row(line: &str) -> bool {
     let t = line.trim();
-    t.starts_with('|') && t.chars().all(|c| c == '|' || c == '-' || c == ':' || c == ' ')
+    t.starts_with('|')
+        && t.chars()
+            .all(|c| c == '|' || c == '-' || c == ':' || c == ' ')
 }
 
 fn split_table_row(line: &str) -> Vec<String> {
     let mut row = line.trim();
-    if row.starts_with('|') { row = &row[1..]; }
-    if row.ends_with('|') { row = &row[..row.len()-1]; }
+    if row.starts_with('|') {
+        row = &row[1..];
+    }
+    if row.ends_with('|') {
+        row = &row[..row.len() - 1];
+    }
     row.split('|').map(|c| c.trim().to_string()).collect()
 }
 
@@ -91,24 +97,34 @@ fn rewrite_table(lines: &[String]) -> String {
     }
     let headers = split_table_row(&lines[0]);
     // Skip separator row (line 1), process data rows
-    let data_start = if lines.len() > 1 && is_separator_row(&lines[1]) { 2 } else { 1 };
+    let data_start = if lines.len() > 1 && is_separator_row(&lines[1]) {
+        2
+    } else {
+        1
+    };
     let mut formatted = Vec::new();
 
     for line in &lines[data_start..] {
-        if is_separator_row(line) { continue; }
+        if is_separator_row(line) {
+            continue;
+        }
         let cells = split_table_row(line);
-        let pairs: Vec<_> = headers.iter()
+        let pairs: Vec<_> = headers
+            .iter()
             .zip(cells.iter())
             .filter(|(_, v)| !v.is_empty())
             .collect();
 
-        if pairs.is_empty() { continue; }
+        if pairs.is_empty() {
+            continue;
+        }
         if pairs.len() <= 2 {
             for (label, value) in &pairs {
                 formatted.push(format!("- {label}: {value}"));
             }
         } else {
-            let summary: String = pairs.iter()
+            let summary: String = pairs
+                .iter()
                 .map(|(l, v)| format!("{l}: {v}"))
                 .collect::<Vec<_>>()
                 .join(" | ");
@@ -174,7 +190,8 @@ mod tests {
 
     #[test]
     fn mixed_content() {
-        let input = "# Report\n\nSome text.\n\n| Key | Value |\n|-----|-------|\n| foo | bar |\n\nDone.";
+        let input =
+            "# Report\n\nSome text.\n\n| Key | Value |\n|-----|-------|\n| foo | bar |\n\nDone.";
         let result = rewrite_for_weixin(input);
         assert!(result.contains("【Report】"));
         assert!(result.contains("Some text."));

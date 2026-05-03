@@ -385,7 +385,9 @@ fn build_server_skill_executor(
     session_id: &str,
     edge_connection_pool: Option<&astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
-    #[cfg(feature = "harness")] harness_sink: Option<&std::sync::Arc<dyn astra_harness::SnapshotSink>>,
+    #[cfg(feature = "harness")] harness_sink: Option<
+        &std::sync::Arc<dyn astra_harness::SnapshotSink>,
+    >,
 ) -> Option<Arc<dyn crate::skills::traits::SkillExecutor>> {
     use super::server_skill_subrun::ServerSkillSubRunExecutor;
     use astra_skills::executor::isolated::{IsolatedSkillExecutor, SkillExecutionRouter};
@@ -2076,11 +2078,10 @@ impl AgenticRunLifecycleService {
             Option<std::sync::Arc<crate::server::harness_server_sink::ServerSnapshotSink>>,
             Option<std::sync::Arc<dyn astra_harness::SnapshotSink>>,
         ) = if self.harness_registry.is_some() {
-            let mut raw_sink =
-                crate::server::harness_server_sink::ServerSnapshotSink::new(
-                    session_id.to_string(),
-                    String::new(),
-                );
+            let mut raw_sink = crate::server::harness_server_sink::ServerSnapshotSink::new(
+                session_id.to_string(),
+                String::new(),
+            );
             if let Some(ref pool) = self.shared_pool {
                 raw_sink = raw_sink.with_pool(pool.get().clone());
             }
@@ -2231,12 +2232,18 @@ impl AgenticRunLifecycleService {
             harness: {
                 #[cfg(feature = "harness")]
                 {
-                    if let (Some(registry), Some(server_sink), Some(sink_arc)) =
-                        (&self.harness_registry, harness_server_sink, harness_sink_arc)
-                    {
+                    if let (Some(registry), Some(server_sink), Some(sink_arc)) = (
+                        &self.harness_registry,
+                        harness_server_sink,
+                        harness_sink_arc,
+                    ) {
                         let broadcaster_tx = server_sink.broadcaster_sender();
                         let limits = astra_harness::HarnessLimits {
-                            max_turns: if max_turns > 0 { Some(max_turns as u32) } else { None },
+                            max_turns: if max_turns > 0 {
+                                Some(max_turns as u32)
+                            } else {
+                                None
+                            },
                             ..Default::default()
                         };
                         let kernel = std::sync::Arc::new(
@@ -2260,7 +2267,9 @@ impl AgenticRunLifecycleService {
                     }
                 }
                 #[cfg(not(feature = "harness"))]
-                { crate::turn::harness_adapter::HarnessSlot::empty() }
+                {
+                    crate::turn::harness_adapter::HarnessSlot::empty()
+                }
             },
         }
     }
@@ -3954,7 +3963,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     }
                 }
                 #[cfg(not(feature = "harness"))]
-                { crate::turn::harness_adapter::HarnessSlot::empty() }
+                {
+                    crate::turn::harness_adapter::HarnessSlot::empty()
+                }
             },
         };
 

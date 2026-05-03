@@ -85,10 +85,9 @@ impl CronScheduler {
             let response = match tokio::time::timeout(CLI_TIMEOUT, cli_future).await {
                 Ok(Ok(r)) => {
                     if let Some(ref sid) = r.session_id {
-                        let _ = storage::set_current_session(
-                            &self.pool, &platform, &chat_id, "", sid,
-                        )
-                        .await;
+                        let _ =
+                            storage::set_current_session(&self.pool, &platform, &chat_id, "", sid)
+                                .await;
                     }
                     r.text.unwrap_or(r.stdout)
                 }
@@ -96,10 +95,7 @@ impl CronScheduler {
                 Err(_) => "⚠️ 执行超时 (5分钟)".into(),
             };
 
-            let prefix = format!(
-                "⏰ **定时任务 `{}`**\n\n",
-                &job_id[..8.min(job_id.len())]
-            );
+            let prefix = format!("⏰ **定时任务 `{}`**\n\n", &job_id[..8.min(job_id.len())]);
             let _ = self
                 .outbound_tx
                 .send((platform.clone(), chat_id, format!("{prefix}{response}")))

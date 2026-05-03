@@ -138,35 +138,52 @@ pub async fn save_pending_message(
     chat_id: &str,
     user_id: &str,
     text: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+) -> Result<i64, sqlx::Error> {
+    let result = sqlx::query(
         "INSERT INTO gw_pending_messages (platform, chat_id, user_id, text) VALUES (?, ?, ?, ?)",
     )
-    .bind(platform).bind(chat_id).bind(user_id).bind(text)
+    .bind(platform)
+    .bind(chat_id)
+    .bind(user_id)
+    .bind(text)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.last_insert_id() as i64)
 }
 
-pub async fn take_pending_messages(
+pub async fn list_pending_messages(
     pool: &MySqlPool,
+    platform: Option<&str>,
 ) -> Result<Vec<(i64, String, String, String, String)>, sqlx::Error> {
-    let rows: Vec<(i64, String, String, String, String)> = sqlx::query_as(
-        "SELECT id, platform, chat_id, user_id, text FROM gw_pending_messages ORDER BY created_at LIMIT 50",
-    )
-    .fetch_all(pool)
-    .await?;
-    // Delete fetched rows
-    if !rows.is_empty() {
-        let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
-        for id in &ids {
-            sqlx::query("DELETE FROM gw_pending_messages WHERE id = ?")
-                .bind(id)
-                .execute(pool)
-                .await?;
-        }
+    if let Some(platform) = platform {
+        sqlx::query_as(
+            "SELECT id, platform, chat_id, user_id, text
+             FROM gw_pending_messages
+             WHERE platform = ?
+             ORDER BY created_at
+             LIMIT 50",
+        )
+        .bind(platform)
+        .fetch_all(pool)
+        .await
+    } else {
+        sqlx::query_as(
+            "SELECT id, platform, chat_id, user_id, text
+             FROM gw_pending_messages
+             ORDER BY created_at
+             LIMIT 50",
+        )
+        .fetch_all(pool)
+        .await
     }
-    Ok(rows)
+}
+
+pub async fn delete_pending_message(pool: &MySqlPool, id: i64) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM gw_pending_messages WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
 }
 
 // ─── User operations ────────────────────────────────────────────────────────
@@ -330,12 +347,10 @@ pub async fn set_current_session_for_cli(
 
     if let Some((id,)) = existing {
         // Reactivate existing session
-        sqlx::query(
-            "UPDATE gw_sessions SET is_current = TRUE, last_active = NOW(6) WHERE id = ?",
-        )
-        .bind(id)
-        .execute(pool)
-        .await?;
+        sqlx::query("UPDATE gw_sessions SET is_current = TRUE, last_active = NOW(6) WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await?;
     } else {
         // Insert new
         sqlx::query(
@@ -353,11 +368,20 @@ pub async fn set_current_session_for_cli(
     Ok(())
 }
 
-pub async fn touch_session(pool: &MySqlPool, platform: &str, chat_id: &str) -> Result<(), sqlx::Error> {
+pub async fn touch_session(
+    pool: &MySqlPool,
+    platform: &str,
+    chat_id: &str,
+) -> Result<(), sqlx::Error> {
     touch_session_for_cli(pool, platform, chat_id, "astra").await
 }
 
-pub async fn touch_session_for_cli(pool: &MySqlPool, platform: &str, chat_id: &str, cli_profile: &str) -> Result<(), sqlx::Error> {
+pub async fn touch_session_for_cli(
+    pool: &MySqlPool,
+    platform: &str,
+    chat_id: &str,
+    cli_profile: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE gw_sessions SET last_active = NOW(6)
          WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND is_current = TRUE",
@@ -394,7 +418,10 @@ pub async fn list_sessions_for_cli(
     .bind(cli_profile)
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(|(sid, cur, created)| (sid, cur != 0, created)).collect())
+    Ok(rows
+        .into_iter()
+        .map(|(sid, cur, created)| (sid, cur != 0, created))
+        .collect())
 }
 
 pub async fn switch_session(
@@ -442,11 +469,20 @@ pub async fn switch_session(
     Ok(true)
 }
 
-pub async fn reset_session(pool: &MySqlPool, platform: &str, chat_id: &str) -> Result<(), sqlx::Error> {
+pub async fn reset_session(
+    pool: &MySqlPool,
+    platform: &str,
+    chat_id: &str,
+) -> Result<(), sqlx::Error> {
     reset_session_for_cli(pool, platform, chat_id, "astra").await
 }
 
-pub async fn reset_session_for_cli(pool: &MySqlPool, platform: &str, chat_id: &str, cli_profile: &str) -> Result<(), sqlx::Error> {
+pub async fn reset_session_for_cli(
+    pool: &MySqlPool,
+    platform: &str,
+    chat_id: &str,
+    cli_profile: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE gw_sessions SET is_current = FALSE
          WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND is_current = TRUE",
@@ -611,7 +647,10 @@ pub async fn list_cron_jobs(
     .bind(chat_id)
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(|(id, expr, desc, en)| (id, expr, desc, en != 0)).collect())
+    Ok(rows
+        .into_iter()
+        .map(|(id, expr, desc, en)| (id, expr, desc, en != 0))
+        .collect())
 }
 
 pub async fn delete_cron_job(pool: &MySqlPool, job_id: &str) -> Result<bool, sqlx::Error> {
@@ -635,15 +674,17 @@ pub async fn get_due_jobs(
     Ok(rows)
 }
 
-pub async fn mark_job_run(pool: &MySqlPool, job_id: &str, cron_expr: &str) -> Result<(), sqlx::Error> {
+pub async fn mark_job_run(
+    pool: &MySqlPool,
+    job_id: &str,
+    cron_expr: &str,
+) -> Result<(), sqlx::Error> {
     let next = next_cron_run_str(cron_expr);
-    sqlx::query(
-        "UPDATE gw_cron_jobs SET last_run = NOW(6), next_run = ? WHERE job_id = ?",
-    )
-    .bind(&next)
-    .bind(job_id)
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE gw_cron_jobs SET last_run = NOW(6), next_run = ? WHERE job_id = ?")
+        .bind(&next)
+        .bind(job_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

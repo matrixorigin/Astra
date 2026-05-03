@@ -13,14 +13,25 @@ use serde::{Deserialize, Serialize};
 pub enum ResetPolicy {
     #[default]
     None,
-    Daily { hour: u32 },
-    Idle { hours: u32 },
-    Both { daily_hour: u32, idle_hours: u32 },
+    Daily {
+        hour: u32,
+    },
+    Idle {
+        hours: u32,
+    },
+    Both {
+        daily_hour: u32,
+        idle_hours: u32,
+    },
 }
 
 impl ResetPolicy {
     /// Check if a session should be reset given its last activity time.
-    pub fn should_reset(&self, last_active: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> bool {
+    pub fn should_reset(
+        &self,
+        last_active: chrono::DateTime<chrono::Utc>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
         match self {
             Self::None => false,
             Self::Daily { hour } => crossed_daily_boundary(last_active, now, *hour),
@@ -28,7 +39,10 @@ impl ResetPolicy {
                 let idle_secs = (now - last_active).num_seconds();
                 idle_secs > (*hours as i64) * 3600
             }
-            Self::Both { daily_hour, idle_hours } => {
+            Self::Both {
+                daily_hour,
+                idle_hours,
+            } => {
                 crossed_daily_boundary(last_active, now, *daily_hour)
                     || (now - last_active).num_seconds() > (*idle_hours as i64) * 3600
             }
@@ -46,7 +60,9 @@ fn crossed_daily_boundary(
     }
     // Find the most recent reset boundary before `now`
     let today_reset = now.date_naive().and_hms_opt(reset_hour, 0, 0);
-    let yesterday_reset = (now - chrono::Duration::days(1)).date_naive().and_hms_opt(reset_hour, 0, 0);
+    let yesterday_reset = (now - chrono::Duration::days(1))
+        .date_naive()
+        .and_hms_opt(reset_hour, 0, 0);
 
     if let (Some(today), Some(yesterday)) = (today_reset, yesterday_reset) {
         let boundary = if now.naive_utc() >= today {
@@ -118,7 +134,10 @@ mod tests {
 
     #[test]
     fn both_resets_on_daily() {
-        let policy = ResetPolicy::Both { daily_hour: 4, idle_hours: 48 };
+        let policy = ResetPolicy::Both {
+            daily_hour: 4,
+            idle_hours: 48,
+        };
         // Last active yesterday, now is past 4 AM → daily triggers even though idle hasn't
         let last = Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 1, 2, 5, 0, 0).unwrap(); // 19 hours, < 48h idle
@@ -127,7 +146,10 @@ mod tests {
 
     #[test]
     fn both_resets_on_idle() {
-        let policy = ResetPolicy::Both { daily_hour: 4, idle_hours: 2 };
+        let policy = ResetPolicy::Both {
+            daily_hour: 4,
+            idle_hours: 2,
+        };
         // Last active 3 hours ago, same day, haven't crossed 4 AM → idle triggers
         let last = Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 13, 1, 0).unwrap();

@@ -455,7 +455,9 @@ pub(super) async fn execute_cli_command(
                 #[cfg(feature = "harness")]
                 harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
                 #[cfg(feature = "harness")]
-                harness_trace: Some(std::sync::Arc::new(std::sync::RwLock::new(astra_harness::SessionTrace::new(String::new())))),
+                harness_trace: Some(std::sync::Arc::new(std::sync::RwLock::new(
+                    astra_harness::SessionTrace::new(String::new()),
+                ))),
             };
             let mut params = ChatTurnParams::basic_cli(
                 &chat_ctx,
@@ -913,7 +915,9 @@ pub(super) async fn execute_cli_command(
                 #[cfg(feature = "harness")]
                 harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
                 #[cfg(feature = "harness")]
-                harness_trace: Some(std::sync::Arc::new(std::sync::RwLock::new(astra_harness::SessionTrace::new(String::new())))),
+                harness_trace: Some(std::sync::Arc::new(std::sync::RwLock::new(
+                    astra_harness::SessionTrace::new(String::new()),
+                ))),
             };
             let mut params = ChatTurnParams::basic_cli(
                 &chat_ctx,
@@ -1517,7 +1521,9 @@ pub(super) async fn run_print_mode(
         #[cfg(feature = "harness")]
         harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
         #[cfg(feature = "harness")]
-        harness_trace: Some(std::sync::Arc::new(std::sync::RwLock::new(astra_harness::SessionTrace::new(String::new())))),
+        harness_trace: Some(std::sync::Arc::new(std::sync::RwLock::new(
+            astra_harness::SessionTrace::new(String::new()),
+        ))),
     };
 
     let mut params = ChatTurnParams::basic_cli(

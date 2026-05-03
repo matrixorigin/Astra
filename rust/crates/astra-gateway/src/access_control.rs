@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 pub enum AccessPolicy {
     #[default]
     Open,
-    Allowlist { users: Vec<String> },
+    Allowlist {
+        users: Vec<String>,
+    },
     Disabled,
 }
 
@@ -21,9 +23,7 @@ impl AccessPolicy {
         match self {
             Self::Open => true,
             Self::Disabled => false,
-            Self::Allowlist { users } => {
-                users.iter().any(|u| u == user_id || user_id.contains(u))
-            }
+            Self::Allowlist { users } => users.iter().any(|u| u.trim() == user_id),
         }
     }
 
@@ -64,13 +64,11 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_partial_match() {
+    fn allowlist_does_not_allow_partial_match() {
         let policy = AccessPolicy::Allowlist {
             users: vec!["wxid_abc".into()],
         };
-        // iLink user IDs are like "o9cq80zNgY8wRuS5RyIdCU9VNAo0@im.wechat"
-        // Allow partial match so you can specify the readable part
-        assert!(policy.is_allowed("prefix_wxid_abc_suffix"));
+        assert!(!policy.is_allowed("prefix_wxid_abc_suffix"));
         assert!(!policy.is_allowed("wxid_xyz"));
     }
 
@@ -83,7 +81,11 @@ mod tests {
     #[test]
     fn rejection_messages() {
         assert!(!AccessPolicy::Disabled.rejection_message().is_empty());
-        assert!(!AccessPolicy::Allowlist { users: vec![] }.rejection_message().is_empty());
+        assert!(
+            !AccessPolicy::Allowlist { users: vec![] }
+                .rejection_message()
+                .is_empty()
+        );
         assert!(AccessPolicy::Open.rejection_message().is_empty());
     }
 
@@ -94,7 +96,9 @@ mod tests {
 
     #[test]
     fn serde_roundtrip() {
-        let policy = AccessPolicy::Allowlist { users: vec!["u1".into()] };
+        let policy = AccessPolicy::Allowlist {
+            users: vec!["u1".into()],
+        };
         let yaml = serde_yaml_ng::to_string(&policy).unwrap();
         let parsed: AccessPolicy = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(parsed, policy);

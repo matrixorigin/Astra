@@ -37,9 +37,7 @@ pub struct AdjustReceiver {
     rx: std::sync::mpsc::Receiver<(AdjustCommand, std::sync::mpsc::SyncSender<AdjustResponse>)>,
 }
 
-pub fn adjust_channel(
-    bound: usize,
-) -> (AdjustSender, AdjustReceiver) {
+pub fn adjust_channel(bound: usize) -> (AdjustSender, AdjustReceiver) {
     let (tx, rx) = std::sync::mpsc::sync_channel(bound);
     (AdjustSender { tx }, AdjustReceiver { rx })
 }
@@ -87,9 +85,7 @@ mod tests {
     fn send_and_receive() {
         let (sender, receiver) = adjust_channel(4);
 
-        let handle = std::thread::spawn(move || {
-            receiver.drain(&noop_handler)
-        });
+        let handle = std::thread::spawn(move || receiver.drain(&noop_handler));
 
         let resp = sender.send(AdjustCommand::ClearBreakpoints);
         assert!(matches!(resp, Some(AdjustResponse::Ok { .. })));

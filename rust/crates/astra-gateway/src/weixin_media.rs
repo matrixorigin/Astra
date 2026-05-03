@@ -30,14 +30,17 @@ pub fn parse_aes_key(aes_key_b64: &str) -> Result<[u8; 16], String> {
         && let Ok(text) = std::str::from_utf8(&decoded)
         && text.chars().all(|c| c.is_ascii_hexdigit())
     {
-                let bytes = hex::decode(text).map_err(|e| format!("hex decode: {e}"))?;
-            if bytes.len() == 16 {
-                let mut key = [0u8; 16];
-                key.copy_from_slice(&bytes);
-                return Ok(key);
-            }
+        let bytes = hex::decode(text).map_err(|e| format!("hex decode: {e}"))?;
+        if bytes.len() == 16 {
+            let mut key = [0u8; 16];
+            key.copy_from_slice(&bytes);
+            return Ok(key);
+        }
     }
-    Err(format!("unexpected aes_key format ({} decoded bytes)", decoded.len()))
+    Err(format!(
+        "unexpected aes_key format ({} decoded bytes)",
+        decoded.len()
+    ))
 }
 
 /// Encode AES key for the iLink API: base64(hex_string_of_key_bytes).
@@ -213,11 +216,15 @@ mod tests {
 
     #[test]
     fn encode_key_for_api_format() {
-        let key = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-                    0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let key = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
         let encoded = encode_aes_key_for_api(&key);
         // Should be base64(hex_string), not base64(raw_bytes)
-        let decoded = base64::engine::general_purpose::STANDARD.decode(&encoded).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&encoded)
+            .unwrap();
         let hex_str = String::from_utf8(decoded).unwrap();
         assert_eq!(hex_str, "00112233445566778899aabbccddeeff");
     }

@@ -39,15 +39,22 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             let pool = require_db!(ctx);
             let cli_name = ctx.resolved_cli.name();
             let _ = storage::reset_session_for_cli(pool, ctx.platform, ctx.chat_id, cli_name).await;
-            Some(format!("🔄 `{cli_name}` 会话已重置。发送新消息开始新对话。"))
+            Some(format!(
+                "🔄 `{cli_name}` 会话已重置。发送新消息开始新对话。"
+            ))
         }
 
         "/status" => {
             let cli_name = ctx.resolved_cli.name();
-            let session = storage::get_current_session_for_cli(require_db!(ctx), ctx.platform, ctx.chat_id, cli_name)
-                .await
-                .ok()
-                .flatten();
+            let session = storage::get_current_session_for_cli(
+                require_db!(ctx),
+                ctx.platform,
+                ctx.chat_id,
+                cli_name,
+            )
+            .await
+            .ok()
+            .flatten();
             let cli_model = match ctx.resolved_cli {
                 crate::cli_bridge::CliProfile::Astra { model, .. }
                 | crate::cli_bridge::CliProfile::Claude { model, .. } => model.as_deref(),
@@ -65,13 +72,18 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             ];
 
             if let Some(ref sid) = session
-                && let Some(snap) = fetch_harness_snapshot(ctx.astra, sid, &ctx.config.astra.api_key).await
+                && let Some(snap) =
+                    fetch_harness_snapshot(ctx.astra, sid, &ctx.config.astra.api_key).await
             {
-                    lines.push(String::new());
-                    lines.push("**🔭 Harness**".into());
-                    lines.push(format!("- 轮次: {}/{}", snap.turns_used, snap.turns_limit_str()));
-                    lines.push(format!("- Token: {}", format_tokens(snap.tokens)));
-                    lines.push(format!("- 工具: {}", snap.tool_calls));
+                lines.push(String::new());
+                lines.push("**🔭 Harness**".into());
+                lines.push(format!(
+                    "- 轮次: {}/{}",
+                    snap.turns_used,
+                    snap.turns_limit_str()
+                ));
+                lines.push(format!("- Token: {}", format_tokens(snap.tokens)));
+                lines.push(format!("- 工具: {}", snap.tool_calls));
                 if snap.consecutive_same_tool > 1 {
                     lines.push(format!("- ⚠️ 重复工具: {}次", snap.consecutive_same_tool));
                 }
@@ -81,7 +93,14 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
 
         "/inspect" => {
             let cli_name = ctx.resolved_cli.name();
-            let sid = match storage::get_current_session_for_cli(require_db!(ctx), ctx.platform, ctx.chat_id, cli_name).await {
+            let sid = match storage::get_current_session_for_cli(
+                require_db!(ctx),
+                ctx.platform,
+                ctx.chat_id,
+                cli_name,
+            )
+            .await
+            {
                 Ok(Some(s)) => s,
                 _ => return Some("❌ 当前无活跃会话。".into()),
             };
@@ -94,9 +113,12 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                      - 利用率: {}\n\
                      - 消息: {}\n\
                      - 耗时: {}",
-                    snap.turns_used, snap.turns_limit_str(),
-                    format_tokens(snap.tokens), snap.tool_calls,
-                    snap.utilization_str(), snap.message_count,
+                    snap.turns_used,
+                    snap.turns_limit_str(),
+                    format_tokens(snap.tokens),
+                    snap.tool_calls,
+                    snap.utilization_str(),
+                    snap.message_count,
                     format_duration(snap.elapsed_ms),
                 )),
                 None => Some("⚠️ 暂无 harness 数据。".into()),
@@ -106,8 +128,15 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
         "/session" => {
             let cli_name = ctx.resolved_cli.name();
             if arg.is_empty() || arg == "current" {
-                let sid = storage::get_current_session_for_cli(require_db!(ctx), ctx.platform, ctx.chat_id, cli_name)
-                    .await.ok().flatten();
+                let sid = storage::get_current_session_for_cli(
+                    require_db!(ctx),
+                    ctx.platform,
+                    ctx.chat_id,
+                    cli_name,
+                )
+                .await
+                .ok()
+                .flatten();
                 return Some(format!(
                     "📋 **当前会话** (CLI: `{cli_name}`)\n- ID: `{}`",
                     sid.as_deref().unwrap_or("(无)")
@@ -115,9 +144,14 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             }
 
             if arg == "list" {
-                let sessions = storage::list_sessions_for_cli(require_db!(ctx), ctx.platform, ctx.chat_id, cli_name)
-                    .await
-                    .unwrap_or_default();
+                let sessions = storage::list_sessions_for_cli(
+                    require_db!(ctx),
+                    ctx.platform,
+                    ctx.chat_id,
+                    cli_name,
+                )
+                .await
+                .unwrap_or_default();
                 if sessions.is_empty() {
                     return Some(format!("📋 `{cli_name}` 没有历史会话。"));
                 }
@@ -131,10 +165,18 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 return Some(lines.join("\n"));
             }
 
-            if let Some(target) = arg.strip_prefix("switch ").or_else(|| arg.strip_prefix("sw ")) {
+            if let Some(target) = arg
+                .strip_prefix("switch ")
+                .or_else(|| arg.strip_prefix("sw "))
+            {
                 let target = target.trim();
-                match storage::switch_session(require_db!(ctx), ctx.platform, ctx.chat_id, target).await {
-                    Ok(true) => Some(format!("✅ 已切换到会话 `{}`", &target[..8.min(target.len())])),
+                match storage::switch_session(require_db!(ctx), ctx.platform, ctx.chat_id, target)
+                    .await
+                {
+                    Ok(true) => Some(format!(
+                        "✅ 已切换到会话 `{}`",
+                        &target[..8.min(target.len())]
+                    )),
                     Ok(false) => Some(format!("❌ 找不到会话 `{target}`")),
                     Err(e) => Some(format!("⚠️ 切换失败: {e}")),
                 }
@@ -157,7 +199,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     let short_id = &id[..8.min(id.len())];
                     lines.push(format!("{status} `{short_id}` | `{expr}` | {desc}"));
                 }
-                lines.push("\n`/cron add <cron_expr> <消息>` — 创建\n`/cron del <id>` — 删除".into());
+                lines.push(
+                    "\n`/cron add <cron_expr> <消息>` — 创建\n`/cron del <id>` — 删除".into(),
+                );
                 return Some(lines.join("\n"));
             }
 
@@ -167,9 +211,17 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 let job_id = uuid::Uuid::new_v4().to_string();
                 let pool = require_db!(ctx);
                 match storage::create_cron_job(
-                    pool, &job_id, ctx.platform, ctx.chat_id, ctx.user_id,
-                    &cron_expr, &message, &message,
-                ).await {
+                    pool,
+                    &job_id,
+                    ctx.platform,
+                    ctx.chat_id,
+                    ctx.user_id,
+                    &cron_expr,
+                    &message,
+                    &message,
+                )
+                .await
+                {
                     Ok(()) => Some(format!(
                         "✅ 定时任务已创建\n- ID: `{}`\n- 表达式: `{cron_expr}`\n- 任务: {message}",
                         &job_id[..8]
@@ -216,7 +268,14 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             let target = resolve_model_shortcut(arg);
             if let Some(pool) = ctx.pool {
                 let model_key = format!("model_override:{}", ctx.resolved_cli.name());
-                let _ = storage::set_user_preference(pool, ctx.platform, ctx.user_id, &model_key, &target).await;
+                let _ = storage::set_user_preference(
+                    pool,
+                    ctx.platform,
+                    ctx.user_id,
+                    &model_key,
+                    &target,
+                )
+                .await;
             }
             Some(format!("🤖 模型已切换: `{target}`\n(下次消息生效)"))
         }
@@ -228,8 +287,12 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 let caps = ctx.config.cli.capabilities();
                 let workspace = if let Some(pool) = ctx.pool {
                     storage::get_user_preference(pool, ctx.platform, ctx.user_id, "workspace")
-                        .await.ok().flatten()
-                } else { None };
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
                 let ws_display = workspace.as_deref().unwrap_or("(默认)");
                 let mut lines = vec![
                     format!("🔧 **当前 CLI: `{current}`**"),
@@ -237,7 +300,11 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     format!(
                         "  能力: {}session {}model {}harness {}tools",
                         if caps.supports_session { "✅" } else { "❌" },
-                        if caps.supports_model_switch { "✅" } else { "❌" },
+                        if caps.supports_model_switch {
+                            "✅"
+                        } else {
+                            "❌"
+                        },
                         if caps.supports_harness { "✅" } else { "❌" },
                         if caps.supports_tools { "✅" } else { "❌" },
                     ),
@@ -264,7 +331,11 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 let cap_str = format!(
                     "session={} model={} harness={} tools={}",
                     if caps.supports_session { "✅" } else { "❌" },
-                    if caps.supports_model_switch { "✅" } else { "❌" },
+                    if caps.supports_model_switch {
+                        "✅"
+                    } else {
+                        "❌"
+                    },
                     if caps.supports_harness { "✅" } else { "❌" },
                     if caps.supports_tools { "✅" } else { "❌" },
                 );
@@ -273,7 +344,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     let _ = storage::set_user_preference(
                         pool,
                         ctx.platform,
-                    ctx.user_id,
+                        ctx.user_id,
                         "cli_profile",
                         arg,
                     )
@@ -284,10 +355,15 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     name = profile.name()
                 ))
             } else {
-                let available: Vec<&str> = ctx.config.cli_profiles.keys().map(|s| s.as_str()).collect();
+                let available: Vec<&str> =
+                    ctx.config.cli_profiles.keys().map(|s| s.as_str()).collect();
                 Some(format!(
                     "❌ 未找到 CLI `{arg}`\n可用: {}",
-                    if available.is_empty() { "(无配置)".into() } else { available.join(", ") }
+                    if available.is_empty() {
+                        "(无配置)".into()
+                    } else {
+                        available.join(", ")
+                    }
                 ))
             }
         }
@@ -298,7 +374,8 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              安全由 Harness 保障：\n\
              - 🛡 BudgetVerifier 限制轮次/token\n\
              - 🛡 TurnGuard 检测工具循环\n\
-             - 🛡 CostVerifier 限制成本".into(),
+             - 🛡 CostVerifier 限制成本"
+                .into(),
         ),
 
         "/help" => Some(
@@ -324,7 +401,8 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              `/cron add <expr> <msg>` — 创建\n\
              `/cron del <id>` — 删除\n\n\
              **安全**\n\
-             `/approve` — 权限说明".into(),
+             `/approve` — 权限说明"
+                .into(),
         ),
 
         "/task" => {
@@ -348,20 +426,37 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                             let icon = match t.status {
                                 astra_core::durable_task_store::DurableTaskStatus::Running => "🔄",
                                 astra_core::durable_task_store::DurableTaskStatus::Suspended => "⏸",
-                                astra_core::durable_task_store::DurableTaskStatus::Completed => "✅",
+                                astra_core::durable_task_store::DurableTaskStatus::Completed => {
+                                    "✅"
+                                }
                                 astra_core::durable_task_store::DurableTaskStatus::Failed => "❌",
-                                astra_core::durable_task_store::DurableTaskStatus::Cancelled => "🚫",
+                                astra_core::durable_task_store::DurableTaskStatus::Cancelled => {
+                                    "🚫"
+                                }
                                 _ => "📋",
                             };
-                            lines.push(format!("{icon} `{short_id}` | {} | {}%", t.name, t.progress_pct));
+                            lines.push(format!(
+                                "{icon} `{short_id}` | {} | {}%",
+                                t.name, t.progress_pct
+                            ));
                         }
                         Some(lines.join("\n"))
                     }
                     Err(e) => Some(format!("⚠️ 查询失败: {e}")),
                 }
-            } else if let Some(id) = arg.strip_prefix("cancel ").or_else(|| arg.strip_prefix("rm ")) {
+            } else if let Some(id) = arg
+                .strip_prefix("cancel ")
+                .or_else(|| arg.strip_prefix("rm "))
+            {
                 let tid = astra_core::durable_task_store::TaskId(id.trim().to_string());
-                match store.update_status(&tid, astra_core::durable_task_store::DurableTaskStatus::Cancelled, None).await {
+                match store
+                    .update_status(
+                        &tid,
+                        astra_core::durable_task_store::DurableTaskStatus::Cancelled,
+                        None,
+                    )
+                    .await
+                {
                     Ok(()) => Some("🚫 任务已取消".into()),
                     Err(e) => Some(format!("⚠️ {e}")),
                 }
@@ -369,8 +464,17 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 let tid = astra_core::durable_task_store::TaskId(id.trim().to_string());
                 match store.resume(&tid).await {
                     Ok(Some(cp)) => {
-                        let _ = store.update_status(&tid, astra_core::durable_task_store::DurableTaskStatus::Running, None).await;
-                        Some(format!("▶️ 任务已恢复\n检查点:\n```\n{}\n```", serde_json::to_string_pretty(&cp).unwrap_or_default()))
+                        let _ = store
+                            .update_status(
+                                &tid,
+                                astra_core::durable_task_store::DurableTaskStatus::Running,
+                                None,
+                            )
+                            .await;
+                        Some(format!(
+                            "▶️ 任务已恢复\n检查点:\n```\n{}\n```",
+                            serde_json::to_string_pretty(&cp).unwrap_or_default()
+                        ))
                     }
                     Ok(None) => Some("▶️ 任务无检查点，将从头开始".into()),
                     Err(e) => Some(format!("⚠️ {e}")),
@@ -418,7 +522,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     let short_user = &user[..8.min(user.len())];
                     let short_text = if text.chars().count() > 40 {
                         format!("{}…", text.chars().take(40).collect::<String>())
-                    } else { text.clone() };
+                    } else {
+                        text.clone()
+                    };
                     lines.push(format!("- `{short_user}…` | {short_text} | {created}"));
                 }
                 Some(lines.join("\n"))
@@ -428,9 +534,21 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
         "/usage" => {
             let pool = require_db!(ctx);
             let today = crate::usage::get_usage_today(pool, ctx.platform, ctx.user_id)
-                .await.unwrap_or(crate::usage::UsageSummary { messages: 0, tokens_prompt: 0, tokens_completion: 0, tool_calls: 0 });
+                .await
+                .unwrap_or(crate::usage::UsageSummary {
+                    messages: 0,
+                    tokens_prompt: 0,
+                    tokens_completion: 0,
+                    tool_calls: 0,
+                });
             let total = crate::usage::get_usage_total(pool, ctx.platform, ctx.user_id)
-                .await.unwrap_or(crate::usage::UsageSummary { messages: 0, tokens_prompt: 0, tokens_completion: 0, tool_calls: 0 });
+                .await
+                .unwrap_or(crate::usage::UsageSummary {
+                    messages: 0,
+                    tokens_prompt: 0,
+                    tokens_completion: 0,
+                    tool_calls: 0,
+                });
             Some(format!(
                 "📊 **用量统计**\n\n\
                  **今日**\n\
@@ -442,10 +560,12 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                  - Token: ↓{} ↑{}\n\
                  - 工具: {}",
                 today.messages,
-                format_usage_tokens(today.tokens_prompt), format_usage_tokens(today.tokens_completion),
+                format_usage_tokens(today.tokens_prompt),
+                format_usage_tokens(today.tokens_completion),
                 today.tool_calls,
                 total.messages,
-                format_usage_tokens(total.tokens_prompt), format_usage_tokens(total.tokens_completion),
+                format_usage_tokens(total.tokens_prompt),
+                format_usage_tokens(total.tokens_completion),
                 total.tool_calls,
             ))
         }
@@ -454,8 +574,13 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             let pool = require_db!(ctx);
             if arg.is_empty() {
                 let ws = storage::get_user_preference(pool, ctx.platform, ctx.user_id, "workspace")
-                    .await.ok().flatten();
-                return Some(format!("📂 当前工作目录: `{}`", ws.as_deref().unwrap_or("(默认)")));
+                    .await
+                    .ok()
+                    .flatten();
+                return Some(format!(
+                    "📂 当前工作目录: `{}`",
+                    ws.as_deref().unwrap_or("(默认)")
+                ));
             }
             // Expand ~ to home dir
             let target = if arg.starts_with('~') {
@@ -468,10 +593,18 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             if !path.is_dir() {
                 return Some(format!("❌ 目录不存在: `{target}`"));
             }
-            let canonical = path.canonicalize()
+            let canonical = path
+                .canonicalize()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or(target);
-            let _ = storage::set_user_preference(pool, ctx.platform, ctx.user_id, "workspace", &canonical).await;
+            let _ = storage::set_user_preference(
+                pool,
+                ctx.platform,
+                ctx.user_id,
+                "workspace",
+                &canonical,
+            )
+            .await;
             Some(format!("📂 工作目录已切换: `{canonical}`"))
         }
 
@@ -516,10 +649,14 @@ struct SnapshotSummary {
 
 impl SnapshotSummary {
     fn turns_limit_str(&self) -> String {
-        self.turns_limit.map(|l| l.to_string()).unwrap_or_else(|| "∞".into())
+        self.turns_limit
+            .map(|l| l.to_string())
+            .unwrap_or_else(|| "∞".into())
     }
     fn utilization_str(&self) -> String {
-        self.utilization.map(|u| format!("{:.0}%", u * 100.0)).unwrap_or_else(|| "—".into())
+        self.utilization
+            .map(|u| format!("{:.0}%", u * 100.0))
+            .unwrap_or_else(|| "—".into())
     }
 }
 
@@ -529,7 +666,10 @@ async fn fetch_harness_snapshot(
     api_key: &str,
 ) -> Option<SnapshotSummary> {
     let path = format!("/sessions/{session_id}/harness/snapshot");
-    let text = astra.get_bearer_path_query_text(api_key, &path, &[]).await.ok()?;
+    let text = astra
+        .get_bearer_path_query_text(api_key, &path, &[])
+        .await
+        .ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     Some(SnapshotSummary {
         turns_used: v["turns_used"].as_u64().unwrap_or(0) as u32,
@@ -544,26 +684,42 @@ async fn fetch_harness_snapshot(
 }
 
 fn format_tokens(n: u64) -> String {
-    if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1e6) }
-    else if n >= 1_000 { format!("{:.1}k", n as f64 / 1e3) }
-    else { format!("{n}") }
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1e3)
+    } else {
+        format!("{n}")
+    }
 }
 
 fn format_duration(ms: u64) -> String {
-    if ms >= 60_000 { format!("{}m {}s", ms / 60_000, (ms % 60_000) / 1000) }
-    else if ms >= 1_000 { format!("{:.1}s", ms as f64 / 1000.0) }
-    else { format!("{ms}ms") }
+    if ms >= 60_000 {
+        format!("{}m {}s", ms / 60_000, (ms % 60_000) / 1000)
+    } else if ms >= 1_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{ms}ms")
+    }
 }
 
 fn format_usage_tokens(n: u64) -> String {
-    if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1e6) }
-    else if n >= 1_000 { format!("{:.1}k", n as f64 / 1e3) }
-    else { format!("{n}") }
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1e3)
+    } else {
+        format!("{n}")
+    }
 }
 
 fn model_shortcuts() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
-        ("haiku", "us.anthropic.claude-haiku-4-5-20251001-v1:0", "快/便宜"),
+        (
+            "haiku",
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "快/便宜",
+        ),
         ("sonnet", "us.anthropic.claude-sonnet-4-6", "均衡"),
         ("opus", "us.anthropic.claude-opus-4-6-v1", "最强"),
         ("minimax", "MiniMax-M2.7", "MiniMax"),
@@ -617,20 +773,35 @@ mod tests {
 
     #[test]
     fn model_shortcut_resolves() {
-        assert_eq!(resolve_model_shortcut("haiku"), "us.anthropic.claude-haiku-4-5-20251001-v1:0");
-        assert_eq!(resolve_model_shortcut("opus"), "us.anthropic.claude-opus-4-6-v1");
+        assert_eq!(
+            resolve_model_shortcut("haiku"),
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        );
+        assert_eq!(
+            resolve_model_shortcut("opus"),
+            "us.anthropic.claude-opus-4-6-v1"
+        );
         assert_eq!(resolve_model_shortcut("minimax"), "MiniMax-M2.7");
         assert_eq!(resolve_model_shortcut("deepseek"), "deepseek-v4-pro");
     }
 
     #[test]
     fn model_shortcut_passthrough() {
-        assert_eq!(resolve_model_shortcut("some-custom-model"), "some-custom-model");
+        assert_eq!(
+            resolve_model_shortcut("some-custom-model"),
+            "some-custom-model"
+        );
     }
 
     #[test]
     fn model_shortcut_case_insensitive() {
-        assert_eq!(resolve_model_shortcut("Haiku"), "us.anthropic.claude-haiku-4-5-20251001-v1:0");
-        assert_eq!(resolve_model_shortcut("OPUS"), "us.anthropic.claude-opus-4-6-v1");
+        assert_eq!(
+            resolve_model_shortcut("Haiku"),
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        );
+        assert_eq!(
+            resolve_model_shortcut("OPUS"),
+            "us.anthropic.claude-opus-4-6-v1"
+        );
     }
 }

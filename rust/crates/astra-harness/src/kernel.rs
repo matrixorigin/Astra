@@ -86,30 +86,29 @@ impl HarnessKernel for StandardKernel {
             if !v.trigger_points().contains(&record.point) {
                 continue;
             }
-            let violations = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                v.check(record)
-            })) {
-                Ok(vs) => vs,
-                Err(_) => {
-                    if v.is_critical() {
+            let violations =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| v.check(record))) {
+                    Ok(vs) => vs,
+                    Err(_) => {
+                        if v.is_critical() {
+                            tracing::error!(
+                                verifier = v.name(),
+                                "critical verifier panicked — blocking session for safety"
+                            );
+                            return HookVerdict::Block {
+                                reason: format!(
+                                    "[{}] critical verifier crashed (panic); session blocked",
+                                    v.name()
+                                ),
+                            };
+                        }
                         tracing::error!(
                             verifier = v.name(),
-                            "critical verifier panicked — blocking session for safety"
+                            "verifier panicked — skipping, session continues"
                         );
-                        return HookVerdict::Block {
-                            reason: format!(
-                                "[{}] critical verifier crashed (panic); session blocked",
-                                v.name()
-                            ),
-                        };
+                        continue;
                     }
-                    tracing::error!(
-                        verifier = v.name(),
-                        "verifier panicked — skipping, session continues"
-                    );
-                    continue;
-                }
-            };
+                };
             for violation in violations {
                 tracing::warn!(
                     verifier = v.name(),
@@ -176,7 +175,10 @@ mod tests {
 
         // Over budget
         let record = make_record(HookPoint::PostTurn, 6, 0);
-        assert!(matches!(kernel.on_record(&record), HookVerdict::Block { .. }));
+        assert!(matches!(
+            kernel.on_record(&record),
+            HookVerdict::Block { .. }
+        ));
     }
 
     #[test]
@@ -196,7 +198,10 @@ mod tests {
 
         // Fatal stall
         let record = make_record(HookPoint::PostTurn, 1, 5);
-        assert!(matches!(kernel.on_record(&record), HookVerdict::Block { .. }));
+        assert!(matches!(
+            kernel.on_record(&record),
+            HookVerdict::Block { .. }
+        ));
     }
 
     #[test]
@@ -217,7 +222,10 @@ mod tests {
 
         // Same state at PostTurn → blocks
         let record = make_record(HookPoint::PostTurn, 10, 0);
-        assert!(matches!(kernel.on_record(&record), HookVerdict::Block { .. }));
+        assert!(matches!(
+            kernel.on_record(&record),
+            HookVerdict::Block { .. }
+        ));
     }
 
     #[test]
@@ -300,10 +308,7 @@ mod tests {
     #[test]
     fn panicking_verifier_does_not_crash_kernel() {
         let sink = InMemorySnapshotSink::arc();
-        let kernel = StandardKernel::new(
-            sink.clone(),
-            vec![Box::new(PanickingVerifier)],
-        );
+        let kernel = StandardKernel::new(sink.clone(), vec![Box::new(PanickingVerifier)]);
 
         // Should not panic — catch_unwind should absorb it
         let verdict = kernel.on_record(&make_record(HookPoint::PostTurn, 1, 0));

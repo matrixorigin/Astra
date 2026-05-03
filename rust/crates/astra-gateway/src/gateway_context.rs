@@ -19,12 +19,12 @@ pub struct GatewayContext {
     pub has_harness: bool,
     pub has_durable_tasks: bool,
     pub cron_jobs_count: usize,
-    pub cron_jobs: Vec<(String, String, String)>,  // (short_id, expr, description)
-    pub active_tasks: Vec<(String, String, String, u8)>,  // (short_id, name, status, progress)
+    pub cron_jobs: Vec<(String, String, String)>, // (short_id, expr, description)
+    pub active_tasks: Vec<(String, String, String, u8)>, // (short_id, name, status, progress)
     pub db_tables: Vec<String>,
     pub extra_skills: Vec<(String, String)>,
     pub current_workspace: Option<String>,
-    pub available_projects: Vec<String>,  // project summaries for prompt
+    pub available_projects: Vec<String>, // project summaries for prompt
 }
 
 impl GatewayContext {
@@ -125,7 +125,8 @@ pub fn load_skills_from_dir(dir: &str) -> Vec<(String, String)> {
             if p.extension().and_then(|e| e.to_str()) == Some("md")
                 && let Ok(content) = std::fs::read_to_string(&p)
             {
-                let name = p.file_stem()
+                let name = p
+                    .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("unknown")
                     .to_string();
@@ -148,14 +149,20 @@ fn render_template(template: &str, ctx: &GatewayContext) -> String {
         let trimmed = line.trim();
 
         // Handle {{#if var}} / {{#each var}} / {{/if}} / {{/each}}
-        if let Some(var) = trimmed.strip_prefix("{{#if ").and_then(|s| s.strip_suffix("}}")) {
+        if let Some(var) = trimmed
+            .strip_prefix("{{#if ")
+            .and_then(|s| s.strip_suffix("}}"))
+        {
             if skip_depth > 0 || !check_condition(var, ctx) {
                 skip_depth += 1;
             }
             i += 1;
             continue;
         }
-        if let Some(var) = trimmed.strip_prefix("{{#each ").and_then(|s| s.strip_suffix("}}")) {
+        if let Some(var) = trimmed
+            .strip_prefix("{{#each ")
+            .and_then(|s| s.strip_suffix("}}"))
+        {
             if skip_depth > 0 {
                 skip_depth += 1;
                 i += 1;
@@ -174,8 +181,16 @@ fn render_template(template: &str, ctx: &GatewayContext) -> String {
             // Render for each item
             let items: Vec<String> = match var {
                 "db_tables" => ctx.db_tables.clone(),
-                "cron_jobs" => ctx.cron_jobs.iter().map(|(id, expr, desc)| format!("`{id}` | `{expr}` | {desc}")).collect(),
-                "active_tasks" => ctx.active_tasks.iter().map(|(id, name, status, pct)| format!("`{id}` | {name} | {status} | {pct}%")).collect(),
+                "cron_jobs" => ctx
+                    .cron_jobs
+                    .iter()
+                    .map(|(id, expr, desc)| format!("`{id}` | `{expr}` | {desc}"))
+                    .collect(),
+                "active_tasks" => ctx
+                    .active_tasks
+                    .iter()
+                    .map(|(id, name, status, pct)| format!("`{id}` | {name} | {status} | {pct}%"))
+                    .collect(),
                 "available_projects" => ctx.available_projects.clone(),
                 _ => Vec::new(),
             };
@@ -207,11 +222,11 @@ fn render_template(template: &str, ctx: &GatewayContext) -> String {
             .replace("{{user_id}}", &ctx.user_id)
             .replace("{{cli_name}}", &ctx.cli_name)
             .replace("{{model}}", ctx.model.as_deref().unwrap_or("auto"))
-            .replace("{{current_workspace}}", ctx.current_workspace.as_deref().unwrap_or("(default)"))
             .replace(
-                "{{cron_jobs_count}}",
-                &ctx.cron_jobs_count.to_string(),
-            );
+                "{{current_workspace}}",
+                ctx.current_workspace.as_deref().unwrap_or("(default)"),
+            )
+            .replace("{{cron_jobs_count}}", &ctx.cron_jobs_count.to_string());
         out.push_str(&rendered);
         out.push('\n');
         i += 1;
@@ -274,7 +289,10 @@ mod tests {
 
     #[test]
     fn template_excludes_harness_for_claude() {
-        let cli = CliProfile::Claude { bin: "claude".into(), model: None };
+        let cli = CliProfile::Claude {
+            bin: "claude".into(),
+            model: None,
+        };
         let ctx = GatewayContext::new("u1", "Test", "weixin", &cli, true);
         let prompt = ctx.to_system_prompt();
         assert!(!prompt.contains("Harness Monitoring"));
@@ -283,9 +301,7 @@ mod tests {
     #[test]
     fn template_with_cron_jobs() {
         let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true)
-            .with_cron_jobs(vec![
-                ("abc123".into(), "0 9 * * *".into(), "早报".into()),
-            ]);
+            .with_cron_jobs(vec![("abc123".into(), "0 9 * * *".into(), "早报".into())]);
         let prompt = ctx.to_system_prompt();
         assert!(prompt.contains("abc123"), "should show job ID");
         assert!(prompt.contains("早报"), "should show description");
@@ -310,7 +326,10 @@ mod tests {
 
     #[test]
     fn template_session_only_when_supported() {
-        let codex = CliProfile::Codex { bin: "codex".into(), approval_mode: "full-auto".into() };
+        let codex = CliProfile::Codex {
+            bin: "codex".into(),
+            approval_mode: "full-auto".into(),
+        };
         let ctx = GatewayContext::new("u1", "Test", "weixin", &codex, true);
         let prompt = ctx.to_system_prompt();
         assert!(!prompt.contains("/session list"));
@@ -355,72 +374,79 @@ mod tests {
     }
 }
 
-    #[test]
-    fn load_skills_empty_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let skills = load_skills_from_dir(dir.path().to_str().unwrap());
-        assert!(skills.is_empty());
-    }
+#[test]
+fn load_skills_empty_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let skills = load_skills_from_dir(dir.path().to_str().unwrap());
+    assert!(skills.is_empty());
+}
 
-    #[test]
-    fn load_skills_nonexistent_dir() {
-        let skills = load_skills_from_dir("/nonexistent/path/12345");
-        assert!(skills.is_empty());
-    }
+#[test]
+fn load_skills_nonexistent_dir() {
+    let skills = load_skills_from_dir("/nonexistent/path/12345");
+    assert!(skills.is_empty());
+}
 
-    #[test]
-    fn load_skills_from_dir_basic() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("report.md"), "# Weekly Report\nCollect stats.").unwrap();
-        std::fs::write(dir.path().join("alert.md"), "# Alert Rules").unwrap();
-        std::fs::write(dir.path().join("ignore.txt"), "not a skill").unwrap();
+#[test]
+fn load_skills_from_dir_basic() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("report.md"),
+        "# Weekly Report\nCollect stats.",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("alert.md"), "# Alert Rules").unwrap();
+    std::fs::write(dir.path().join("ignore.txt"), "not a skill").unwrap();
 
-        let skills = load_skills_from_dir(dir.path().to_str().unwrap());
-        assert_eq!(skills.len(), 2);
-        assert_eq!(skills[0].0, "alert"); // sorted
-        assert_eq!(skills[1].0, "report");
-        assert!(skills[1].1.contains("Weekly Report"));
-    }
+    let skills = load_skills_from_dir(dir.path().to_str().unwrap());
+    assert_eq!(skills.len(), 2);
+    assert_eq!(skills[0].0, "alert"); // sorted
+    assert_eq!(skills[1].0, "report");
+    assert!(skills[1].1.contains("Weekly Report"));
+}
 
-    #[test]
-    fn extra_skills_appended_to_prompt() {
-        let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), false)
-            .with_extra_skills(vec![("myskill".into(), "Do X then Y.".into())]);
-        let prompt = ctx.to_system_prompt();
-        assert!(prompt.contains("### Skill: myskill"));
-        assert!(prompt.contains("Do X then Y."));
-    }
+#[test]
+fn extra_skills_appended_to_prompt() {
+    let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), false)
+        .with_extra_skills(vec![("myskill".into(), "Do X then Y.".into())]);
+    let prompt = ctx.to_system_prompt();
+    assert!(prompt.contains("### Skill: myskill"));
+    assert!(prompt.contains("Do X then Y."));
+}
 
-    #[test]
-    fn template_includes_durable_tasks_when_db() {
-        let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true);
-        let prompt = ctx.to_system_prompt();
-        assert!(prompt.contains("Durable Tasks"));
-        assert!(prompt.contains("dtask_create"));
-    }
+#[test]
+fn template_includes_durable_tasks_when_db() {
+    let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true);
+    let prompt = ctx.to_system_prompt();
+    assert!(prompt.contains("Durable Tasks"));
+    assert!(prompt.contains("dtask_create"));
+}
 
-    #[test]
-    fn template_excludes_durable_tasks_without_db() {
-        let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), false);
-        let prompt = ctx.to_system_prompt();
-        assert!(!prompt.contains("Durable Tasks"));
-    }
+#[test]
+fn template_excludes_durable_tasks_without_db() {
+    let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), false);
+    let prompt = ctx.to_system_prompt();
+    assert!(!prompt.contains("Durable Tasks"));
+}
 
-    #[test]
-    fn active_tasks_in_prompt() {
-        let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true)
-            .with_active_tasks(vec![
-                ("abc12345".into(), "weekly report".into(), "running".into(), 50),
-            ]);
-        let prompt = ctx.to_system_prompt();
-        assert!(prompt.contains("abc12345"), "should show task ID");
-        assert!(prompt.contains("weekly report"), "should show task name");
-        assert!(prompt.contains("50%"), "should show progress");
-    }
+#[test]
+fn active_tasks_in_prompt() {
+    let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true)
+        .with_active_tasks(vec![(
+            "abc12345".into(),
+            "weekly report".into(),
+            "running".into(),
+            50,
+        )]);
+    let prompt = ctx.to_system_prompt();
+    assert!(prompt.contains("abc12345"), "should show task ID");
+    assert!(prompt.contains("weekly report"), "should show task name");
+    assert!(prompt.contains("50%"), "should show progress");
+}
 
-    #[test]
-    fn no_active_tasks_no_section() {
-        let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true);
-        let prompt = ctx.to_system_prompt();
-        assert!(!prompt.contains("Current durable tasks"));
-    }
+#[test]
+fn no_active_tasks_no_section() {
+    let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true);
+    let prompt = ctx.to_system_prompt();
+    assert!(!prompt.contains("Current durable tasks"));
+}

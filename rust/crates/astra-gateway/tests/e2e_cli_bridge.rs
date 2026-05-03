@@ -43,14 +43,8 @@ async fn e2e_astra_chat_simple() {
         .expect("astra chat should succeed");
 
     assert_eq!(result.exit_code, 0, "exit code should be 0");
-    assert!(
-        result.session_id.is_some(),
-        "should return a session_id"
-    );
-    assert!(
-        result.text.is_some(),
-        "should return text"
-    );
+    assert!(result.session_id.is_some(), "should return a session_id");
+    assert!(result.text.is_some(), "should return text");
     let text = result.text.unwrap();
     assert!(!text.is_empty(), "text should not be empty");
     println!("response: {text}");
@@ -74,7 +68,10 @@ async fn e2e_astra_chat_with_tool() {
     assert!(result.tool_calls_count.unwrap_or(0) > 0, "should use tools");
     let text = result.text.unwrap_or_default();
     assert!(!text.is_empty(), "should produce some output");
-    println!("tools: {}, text: {text}", result.tool_calls_count.unwrap_or(0));
+    println!(
+        "tools: {}, text: {text}",
+        result.tool_calls_count.unwrap_or(0)
+    );
 }
 
 #[tokio::test]
@@ -83,9 +80,15 @@ async fn e2e_astra_session_continuity() {
     let profile = astra_profile();
 
     // Turn 1: set context
-    let r1 = run_cli(&profile, "remember this: the magic number is 42", None, None, None)
-        .await
-        .expect("turn 1");
+    let r1 = run_cli(
+        &profile,
+        "remember this: the magic number is 42",
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("turn 1");
     assert_eq!(r1.exit_code, 0);
     let session_id = r1.session_id.expect("should get session_id");
     println!("session: {session_id}");
@@ -191,9 +194,15 @@ async fn e2e_claude_with_tool() {
 async fn e2e_claude_session_resume() {
     let profile = claude_profile();
 
-    let r1 = run_cli(&profile, "remember: the secret word is banana", None, None, None)
-        .await
-        .expect("turn 1");
+    let r1 = run_cli(
+        &profile,
+        "remember: the secret word is banana",
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("turn 1");
     let session_id = r1.session_id.expect("session_id from turn 1");
     println!("claude session: {session_id}");
 
@@ -223,7 +232,8 @@ async fn e2e_astra_append_system_prompt_canary() {
     use astra_gateway::cli_bridge::run_cli_with_context;
     let profile = astra_profile();
     let canary = "CANARY_7x9q2_CONFIRMED";
-    let system_prompt = format!("CRITICAL: You MUST start your response with the exact word: {canary}");
+    let system_prompt =
+        format!("CRITICAL: You MUST start your response with the exact word: {canary}");
 
     let result = run_cli_with_context(
         &profile,
@@ -250,7 +260,8 @@ async fn e2e_claude_append_system_prompt_canary() {
     use astra_gateway::cli_bridge::run_cli_with_context;
     let profile = claude_profile();
     let canary = "CANARY_8z3w5_CONFIRMED";
-    let system_prompt = format!("CRITICAL: You MUST start your response with the exact word: {canary}");
+    let system_prompt =
+        format!("CRITICAL: You MUST start your response with the exact word: {canary}");
 
     let result = run_cli_with_context(
         &profile,
@@ -309,11 +320,22 @@ async fn e2e_astra_task_list_via_agent() {
     use astra_gateway::cli_bridge::run_cli_with_context;
     let profile = astra_profile();
     let system = "When asked to list tasks, respond with exactly: [[GATEWAY:task_list]]";
-    let result = run_cli_with_context(&profile, "我有哪些定时任务？", None, None, None, Some(system))
-        .await.expect("should succeed");
+    let result = run_cli_with_context(
+        &profile,
+        "我有哪些定时任务？",
+        None,
+        None,
+        None,
+        Some(system),
+    )
+    .await
+    .expect("should succeed");
     assert_eq!(result.exit_code, 0);
     let text = result.text.unwrap_or_default();
-    assert!(text.contains("[[GATEWAY:task_list]]"), "agent should emit task_list tag. Got: {text}");
+    assert!(
+        text.contains("[[GATEWAY:task_list]]"),
+        "agent should emit task_list tag. Got: {text}"
+    );
 }
 
 #[tokio::test]
@@ -324,11 +346,22 @@ async fn e2e_astra_cron_add_via_agent() {
     let system = r#"When asked to schedule recurring tasks, embed a [[GATEWAY:cron_add:<expr>:<msg>]] tag.
 Example: [[GATEWAY:cron_add:0 9 * * *:morning reminder]]
 Do it now."#;
-    let result = run_cli_with_context(&profile, "每天早上8点提醒我锻炼", None, None, None, Some(system))
-        .await.expect("should succeed");
+    let result = run_cli_with_context(
+        &profile,
+        "每天早上8点提醒我锻炼",
+        None,
+        None,
+        None,
+        Some(system),
+    )
+    .await
+    .expect("should succeed");
     assert_eq!(result.exit_code, 0);
     let text = result.text.unwrap_or_default();
-    assert!(text.contains("[[GATEWAY:cron_add:"), "agent should emit cron_add. Got: {text}");
+    assert!(
+        text.contains("[[GATEWAY:cron_add:"),
+        "agent should emit cron_add. Got: {text}"
+    );
 }
 
 #[tokio::test]
@@ -339,9 +372,20 @@ async fn e2e_astra_remind_after_via_agent() {
     let system = r#"When asked for a one-time reminder, embed [[GATEWAY:remind_after:<minutes>:<message>]].
 Example: [[GATEWAY:remind_after:5:time to go]]
 Do it now for the user's request."#;
-    let result = run_cli_with_context(&profile, "10分钟后提醒我取快递", None, None, None, Some(system))
-        .await.expect("should succeed");
+    let result = run_cli_with_context(
+        &profile,
+        "10分钟后提醒我取快递",
+        None,
+        None,
+        None,
+        Some(system),
+    )
+    .await
+    .expect("should succeed");
     assert_eq!(result.exit_code, 0);
     let text = result.text.unwrap_or_default();
-    assert!(text.contains("[[GATEWAY:remind_after:"), "agent should emit remind_after. Got: {text}");
+    assert!(
+        text.contains("[[GATEWAY:remind_after:"),
+        "agent should emit remind_after. Got: {text}"
+    );
 }

@@ -14,13 +14,20 @@ impl MysqlDurableTaskStore {
 }
 
 type TaskRow = (
-    String, String, Option<String>, String, String,
-    u8, Option<String>, Option<String>, Option<String>,
-    String, String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    u8,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
 );
 
-const SELECT_COLS: &str =
-    "SELECT task_id, name, description, owner_id, status, \
+const SELECT_COLS: &str = "SELECT task_id, name, description, owner_id, status, \
      progress_pct, step_description, checkpoint_json, error_message, \
      CAST(created_at AS CHAR), CAST(updated_at AS CHAR)";
 
@@ -50,9 +57,9 @@ impl DurableTaskStore for MysqlDurableTaskStore {
     }
 
     async fn get(&self, id: &TaskId) -> Result<Option<DurableTask>, String> {
-        let row: Option<TaskRow> = sqlx::query_as(
-            &format!("{SELECT_COLS} FROM gw_durable_tasks WHERE task_id = ?"),
-        )
+        let row: Option<TaskRow> = sqlx::query_as(&format!(
+            "{SELECT_COLS} FROM gw_durable_tasks WHERE task_id = ?"
+        ))
         .bind(&id.0)
         .fetch_optional(&self.pool)
         .await
@@ -137,7 +144,7 @@ impl DurableTaskStore for MysqlDurableTaskStore {
     ) -> Result<(), String> {
         let result = sqlx::query(
             "UPDATE gw_durable_tasks SET status = ?, error_message = ?, updated_at = NOW(6)
-             WHERE task_id = ?",
+             WHERE task_id = ? AND status IN ('created', 'running', 'suspended')",
         )
         .bind(status.as_str())
         .bind(error_message)
@@ -147,14 +154,14 @@ impl DurableTaskStore for MysqlDurableTaskStore {
         .map_err(|e| format!("update status failed: {e}"))?;
 
         if result.rows_affected() == 0 {
-            return Err(format!("task {} not found", id.0));
+            return Err(format!("task {} not found or already terminal", id.0));
         }
         Ok(())
     }
 
     async fn resume(&self, id: &TaskId) -> Result<Option<serde_json::Value>, String> {
-        let row: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT checkpoint_json FROM gw_durable_tasks WHERE task_id = ?",
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, checkpoint_json FROM gw_durable_tasks WHERE task_id = ?",
         )
         .bind(&id.0)
         .fetch_optional(&self.pool)
@@ -163,8 +170,20 @@ impl DurableTaskStore for MysqlDurableTaskStore {
 
         match row {
             None => Err(format!("task {} not found", id.0)),
-            Some((None,)) => Ok(None),
-            Some((Some(json_str),)) => {
+            Some((status, _))
+                if matches!(
+                    DurableTaskStatus::parse(&status),
+                    Some(
+                        DurableTaskStatus::Completed
+                            | DurableTaskStatus::Failed
+                            | DurableTaskStatus::Cancelled
+                    )
+                ) =>
+            {
+                Err(format!("task {} is terminal and cannot be resumed", id.0))
+            }
+            Some((_status, None)) => Ok(None),
+            Some((_status, Some(json_str))) => {
                 let value = serde_json::from_str(&json_str)
                     .map_err(|e| format!("checkpoint parse error: {e}"))?;
                 Ok(Some(value))
@@ -238,9 +257,17 @@ mod tests {
     #[test]
     fn row_to_task_basic() {
         let row: TaskRow = (
-            "id-1".into(), "test".into(), Some("desc".into()), "owner".into(), "running".into(),
-            50u8, Some("step 2".into()), Some(r#"{"k":"v"}"#.into()), None,
-            "2026-01-01".into(), "2026-01-02".into(),
+            "id-1".into(),
+            "test".into(),
+            Some("desc".into()),
+            "owner".into(),
+            "running".into(),
+            50u8,
+            Some("step 2".into()),
+            Some(r#"{"k":"v"}"#.into()),
+            None,
+            "2026-01-01".into(),
+            "2026-01-02".into(),
         );
         let task = row_to_task(row);
         assert_eq!(task.id, TaskId("id-1".into()));
@@ -252,9 +279,17 @@ mod tests {
     #[test]
     fn row_to_task_null_checkpoint() {
         let row: TaskRow = (
-            "id-2".into(), "t".into(), None, "o".into(), "created".into(),
-            0u8, None, None, None,
-            "2026-01-01".into(), "2026-01-01".into(),
+            "id-2".into(),
+            "t".into(),
+            None,
+            "o".into(),
+            "created".into(),
+            0u8,
+            None,
+            None,
+            None,
+            "2026-01-01".into(),
+            "2026-01-01".into(),
         );
         let task = row_to_task(row);
         assert!(task.checkpoint.is_none());
@@ -263,9 +298,17 @@ mod tests {
     #[test]
     fn row_to_task_unknown_status_defaults() {
         let row: TaskRow = (
-            "id-3".into(), "t".into(), None, "o".into(), "garbage".into(),
-            0u8, None, None, None,
-            "2026-01-01".into(), "2026-01-01".into(),
+            "id-3".into(),
+            "t".into(),
+            None,
+            "o".into(),
+            "garbage".into(),
+            0u8,
+            None,
+            None,
+            None,
+            "2026-01-01".into(),
+            "2026-01-01".into(),
         );
         let task = row_to_task(row);
         assert_eq!(task.status, DurableTaskStatus::Created);

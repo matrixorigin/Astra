@@ -8,8 +8,8 @@ use crate::config::WeComConfig;
 use crate::dedup::MessageDeduplicator;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use serde_json::{Value, json};
+use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
@@ -27,7 +27,7 @@ struct OutboundMessage {
 pub struct WeComAdapter {
     config: WeComConfig,
     msg_tx: mpsc::Sender<InboundMessage>,
-    msg_rx: Option<mpsc::Receiver<InboundMessage>>,
+    msg_rx: Mutex<mpsc::Receiver<InboundMessage>>,
     out_tx: mpsc::Sender<OutboundMessage>,
     shutdown: Option<tokio::sync::broadcast::Sender<()>>,
 }
@@ -39,7 +39,7 @@ impl WeComAdapter {
         Self {
             config: config.resolve(),
             msg_tx,
-            msg_rx: Some(msg_rx),
+            msg_rx: Mutex::new(msg_rx),
             out_tx,
             shutdown: None,
         }
@@ -110,7 +110,7 @@ impl PlatformAdapter for WeComAdapter {
         reply_token: Option<&str>,
     ) -> Result<(), String> {
         let text = if text.len() > MAX_TEXT_LENGTH {
-            format!("{}…\n\n(truncated)", &text[..MAX_TEXT_LENGTH - 20])
+            crate::text::truncate_with_suffix(text, MAX_TEXT_LENGTH, "…\n\n(truncated)")
         } else {
             text.to_string()
         };
@@ -125,8 +125,22 @@ impl PlatformAdapter for WeComAdapter {
             .map_err(|e| format!("outbound channel send failed: {e}"))
     }
 
-    async fn recv(&mut self) -> Option<InboundMessage> {
-        self.msg_rx.as_mut()?.recv().await
+    async fn recv(&self) -> Option<InboundMessage> {
+        self.msg_rx.lock().await.recv().await
+    }
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::*;
+
+    #[test]
+    fn outbound_truncation_preserves_utf8() {
+        let long = "企业微信".repeat(1200);
+        let truncated =
+            crate::text::truncate_with_suffix(&long, MAX_TEXT_LENGTH, "…\n\n(truncated)");
+        assert!(truncated.len() <= MAX_TEXT_LENGTH);
+        assert!(truncated.ends_with("(truncated)"));
     }
 }
 
@@ -266,7 +280,10 @@ async fn handle_wecom_message(
     }
 
     let chat_id = body["chatid"].as_str().unwrap_or("").to_string();
-    let user_id = body["from"]["userid"].as_str().unwrap_or("unknown").to_string();
+    let user_id = body["from"]["userid"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
     let chat_type = if body["chattype"].as_str() == Some("group") {
         ChatType::Group
     } else {
@@ -509,10 +526,8 @@ mod tests {
 
     #[test]
     fn unknown_cmd_ignored() {
-        let data: Value = serde_json::from_str(
-            r#"{"cmd": "pong", "headers": {}, "body": {}}"#,
-        )
-        .unwrap();
+        let data: Value =
+            serde_json::from_str(r#"{"cmd": "pong", "headers": {}, "body": {}}"#).unwrap();
 
         let (tx, mut rx) = mpsc::channel(10);
         let mut dedup = MessageDeduplicator::new();

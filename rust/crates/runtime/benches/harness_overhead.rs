@@ -68,11 +68,9 @@ fn bench_no_kernel(c: &mut Criterion) {
     let kernel: Option<Arc<dyn HarnessKernel>> = None;
 
     group.bench_function("hook_dispatch_none", |b| {
-        b.iter(|| {
-            match &kernel {
-                Some(k) => k.on_record(black_box(&make_record(HookPoint::PostTurn))),
-                None => HookVerdict::Continue,
-            }
+        b.iter(|| match &kernel {
+            Some(k) => k.on_record(black_box(&make_record(HookPoint::PostTurn))),
+            None => HookVerdict::Continue,
         });
     });
 
@@ -83,10 +81,7 @@ fn bench_empty_verifiers(c: &mut Criterion) {
     let mut group = c.benchmark_group("harness_empty_verifiers");
 
     let sink = InMemorySnapshotSink::arc();
-    let kernel = Arc::new(StandardKernel::new(
-        sink as Arc<dyn SnapshotSink>,
-        vec![],
-    ));
+    let kernel = Arc::new(StandardKernel::new(sink as Arc<dyn SnapshotSink>, vec![]));
 
     // Target: per-hook p50 < 5μs
     for point in [

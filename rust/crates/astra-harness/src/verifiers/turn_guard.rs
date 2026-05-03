@@ -108,9 +108,6 @@ mod tests {
             v.check(&record_with_streak(2))[0].severity,
             Severity::Warning
         );
-        assert_eq!(
-            v.check(&record_with_streak(4))[0].severity,
-            Severity::Fatal
-        );
+        assert_eq!(v.check(&record_with_streak(4))[0].severity, Severity::Fatal);
     }
 }

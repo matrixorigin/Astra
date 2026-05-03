@@ -1,5 +1,5 @@
-use crate::trace::SessionTrace;
 use crate::HookPoint;
+use crate::trace::SessionTrace;
 
 /// Assessment of what would need to be reversed to rollback to a target turn.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -25,11 +25,7 @@ pub enum RollbackFeasibility {
 
 impl SessionTrace {
     pub fn assess_rollback(&self, target_turn: u32) -> RollbackAssessment {
-        let current_turn = self
-            .records
-            .back()
-            .map(|r| r.turn)
-            .unwrap_or(0);
+        let current_turn = self.records.back().map(|r| r.turn).unwrap_or(0);
 
         if target_turn > current_turn || self.records.is_empty() {
             return RollbackAssessment {
@@ -43,17 +39,24 @@ impl SessionTrace {
             };
         }
 
-        let target_snap = self
-            .records
-            .iter()
-            .rfind(|r| r.turn == target_turn);
+        let target_snap = self.records.iter().rfind(|r| r.turn == target_turn);
         let current_snap = self.records.back();
 
         let (target_tokens, target_tools) = target_snap
-            .map(|r| (r.snapshot.tokens_used_session, r.snapshot.tool_calls_this_session))
+            .map(|r| {
+                (
+                    r.snapshot.tokens_used_session,
+                    r.snapshot.tool_calls_this_session,
+                )
+            })
             .unwrap_or((0, 0));
         let (current_tokens, current_tools) = current_snap
-            .map(|r| (r.snapshot.tokens_used_session, r.snapshot.tool_calls_this_session))
+            .map(|r| {
+                (
+                    r.snapshot.tokens_used_session,
+                    r.snapshot.tool_calls_this_session,
+                )
+            })
             .unwrap_or((0, 0));
 
         let mut tools_after: Vec<String> = Vec::new();
@@ -132,7 +135,9 @@ mod tests {
 
     fn sample_trace() -> SessionTrace {
         let mut trace = SessionTrace::new("rollback-test".into());
-        trace.records.push_back(make_record(0, HookPoint::SessionStart, 0, 0, &[]));
+        trace
+            .records
+            .push_back(make_record(0, HookPoint::SessionStart, 0, 0, &[]));
         trace.records.push_back(make_record(
             1,
             HookPoint::PostToolBatch,
@@ -140,7 +145,13 @@ mod tests {
             2,
             &["read_file"],
         ));
-        trace.records.push_back(make_record(1, HookPoint::PostTurn, 5_000, 2, &["read_file"]));
+        trace.records.push_back(make_record(
+            1,
+            HookPoint::PostTurn,
+            5_000,
+            2,
+            &["read_file"],
+        ));
         trace.records.push_back(make_record(
             2,
             HookPoint::PostToolBatch,

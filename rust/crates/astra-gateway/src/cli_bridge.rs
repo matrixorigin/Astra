@@ -5,6 +5,7 @@
 //! and extract session/text/metadata.
 
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -67,11 +68,21 @@ pub enum CliProfile {
     },
 }
 
-fn default_astra_bin() -> String { "astra".into() }
-fn default_claude_bin() -> String { "claude".into() }
-fn default_codex_bin() -> String { "codex".into() }
-fn default_permission_mode() -> String { "auto".into() }
-fn default_codex_approval() -> String { "full-auto".into() }
+fn default_astra_bin() -> String {
+    "astra".into()
+}
+fn default_claude_bin() -> String {
+    "claude".into()
+}
+fn default_codex_bin() -> String {
+    "codex".into()
+}
+fn default_permission_mode() -> String {
+    "auto".into()
+}
+fn default_codex_approval() -> String {
+    "full-auto".into()
+}
 
 impl Default for CliProfile {
     fn default() -> Self {
@@ -196,10 +207,7 @@ impl CliProfile {
                 }
                 cmd
             }
-            Self::Codex {
-                bin,
-                approval_mode,
-            } => {
+            Self::Codex { bin, approval_mode } => {
                 let mut cmd = Command::new(bin);
                 cmd.arg(message)
                     .arg(format!("--{approval_mode}"))
@@ -210,9 +218,7 @@ impl CliProfile {
                 cmd
             }
             Self::Custom {
-                bin,
-                args_template,
-                ..
+                bin, args_template, ..
             } => {
                 let mut cmd = Command::new(bin);
                 for arg in args_template {
@@ -372,10 +378,34 @@ pub async fn run_cli_with_context(
     progress_tx: Option<mpsc::Sender<CliProgress>>,
     system_prompt: Option<&str>,
 ) -> Result<CliResult, String> {
-    let mut cmd = profile.build_command_with_context(message, session_id, working_dir, system_prompt);
+    run_cli_with_context_and_timeout(
+        profile,
+        message,
+        session_id,
+        working_dir,
+        progress_tx,
+        system_prompt,
+        None,
+    )
+    .await
+}
+
+pub async fn run_cli_with_context_and_timeout(
+    profile: &CliProfile,
+    message: &str,
+    session_id: Option<&str>,
+    working_dir: Option<&std::path::Path>,
+    progress_tx: Option<mpsc::Sender<CliProgress>>,
+    system_prompt: Option<&str>,
+    timeout: Option<Duration>,
+) -> Result<CliResult, String> {
+    let mut cmd =
+        profile.build_command_with_context(message, session_id, working_dir, system_prompt);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| format!("failed to spawn {}: {e}", profile.name()))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn {}: {e}", profile.name()))?;
 
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let stderr = child.stderr.take().ok_or("no stderr")?;
@@ -419,7 +449,28 @@ pub async fn run_cli_with_context(
         output
     });
 
-    let status = child.wait().await.map_err(|e| format!("wait failed: {e}"))?;
+    let status = if let Some(timeout) = timeout {
+        tokio::select! {
+            status = child.wait() => status.map_err(|e| format!("wait failed: {e}"))?,
+            _ = tokio::time::sleep(timeout) => {
+                let _ = child.kill().await;
+                let stderr_text = stderr_task.await.unwrap_or_default();
+                let _stdout_text = stdout_task.await.unwrap_or_default();
+                return Err(format!(
+                    "{} timed out after {}s\n{}{}",
+                    profile.name(),
+                    timeout.as_secs(),
+                    if stderr_text.is_empty() { "" } else { "stderr: " },
+                    stderr_text.lines().take(10).collect::<Vec<_>>().join("\n")
+                ).trim().to_string());
+            }
+        }
+    } else {
+        child
+            .wait()
+            .await
+            .map_err(|e| format!("wait failed: {e}"))?
+    };
     let stderr_text = stderr_task.await.unwrap_or_default();
     let stdout_text = stdout_task.await.unwrap_or_default();
     let exit_code = status.code().unwrap_or(-1);
@@ -493,7 +544,11 @@ async fn probe_cli_uncached(profile: &CliProfile) -> CliAvailability {
             Ok(output) => {
                 let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 CliAvailability::Available {
-                    version: if version.is_empty() { None } else { Some(version) },
+                    version: if version.is_empty() {
+                        None
+                    } else {
+                        Some(version)
+                    },
                 }
             }
             Err(e) => CliAvailability::NotExecutable(e.to_string()),
@@ -624,7 +679,10 @@ mod tests {
         }"#;
         let r = parse_claude_json(json, 0);
         assert_eq!(r.text.as_deref(), Some("Hello!"));
-        assert_eq!(r.session_id.as_deref(), Some("28246761-888a-4d37-a694-c740f843f49d"));
+        assert_eq!(
+            r.session_id.as_deref(),
+            Some("28246761-888a-4d37-a694-c740f843f49d")
+        );
         assert_eq!(r.tool_calls_count, Some(1));
         assert_eq!(r.tokens_prompt, Some(3));
         assert_eq!(r.tokens_completion, Some(5));
@@ -711,7 +769,12 @@ mod tests {
     fn build_custom_command() {
         let p = CliProfile::Custom {
             bin: "my-agent".into(),
-            args_template: vec!["--msg".into(), "{message}".into(), "--sid".into(), "{session_id}".into()],
+            args_template: vec![
+                "--msg".into(),
+                "{message}".into(),
+                "--sid".into(),
+                "{session_id}".into(),
+            ],
             json_output: true,
             text_field: Some("output".into()),
             session_id_field: Some("id".into()),
@@ -773,6 +836,29 @@ model: claude-sonnet-4-6"#;
     }
 
     #[tokio::test]
+    async fn run_kills_cli_on_timeout() {
+        let p = CliProfile::Custom {
+            bin: "sh".into(),
+            args_template: vec!["-c".into(), "sleep 5".into()],
+            json_output: false,
+            text_field: None,
+            session_id_field: None,
+        };
+        let err = run_cli_with_context_and_timeout(
+            &p,
+            "ignored",
+            None,
+            None,
+            None,
+            None,
+            Some(Duration::from_millis(50)),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
     async fn run_nonexistent() {
         let p = CliProfile::Custom {
             bin: "/nonexistent/xyz".into(),
@@ -824,7 +910,12 @@ model: claude-sonnet-4-6"#;
     #[test]
     fn onboarding_available_is_empty() {
         let p = CliProfile::default();
-        let msg = onboarding_message(&p, &CliAvailability::Available { version: Some("1.0".into()) });
+        let msg = onboarding_message(
+            &p,
+            &CliAvailability::Available {
+                version: Some("1.0".into()),
+            },
+        );
         assert!(msg.is_empty());
     }
 

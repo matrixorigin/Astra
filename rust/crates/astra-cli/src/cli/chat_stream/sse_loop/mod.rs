@@ -743,7 +743,7 @@ pub(crate) async fn stream_chat_sse(
                     Some(sink) => {
                         let base_kernel = std::sync::Arc::new(
                             astra_harness::StandardKernel::with_default_verifiers(
-                                sink.clone() as std::sync::Arc<dyn astra_harness::SnapshotSink>,
+                                sink.clone() as std::sync::Arc<dyn astra_harness::SnapshotSink>
                             ),
                         );
                         let session_id = p.session_id.unwrap_or("unknown").to_string();
@@ -771,7 +771,9 @@ pub(crate) async fn stream_chat_sse(
                 }
             }
             #[cfg(not(feature = "harness"))]
-            { astra_runtime::turn::harness_adapter::HarnessSlot::empty() }
+            {
+                astra_runtime::turn::harness_adapter::HarnessSlot::empty()
+            }
         },
     };
 

@@ -130,7 +130,9 @@ impl RuntimeSnapshot {
 pub enum SnapshotAccessPolicy {
     #[default]
     MetadataOnly,
-    DebugPreview { max_chars: usize },
+    DebugPreview {
+        max_chars: usize,
+    },
 }
 
 // ─── Hook Points ────────────────────────────────────────────────────────────
@@ -204,7 +206,12 @@ pub trait SnapshotSink: Send + Sync + 'static {
     fn latest(&self) -> Option<RuntimeSnapshot>;
     /// Return the most recent `n` snapshots (newest first).
     fn history(&self, n: usize) -> Vec<RuntimeSnapshot> {
-        self.latest().into_iter().collect::<Vec<_>>().into_iter().take(n).collect()
+        self.latest()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .take(n)
+            .collect()
     }
 }
 

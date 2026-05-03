@@ -29,6 +29,8 @@ mod delegation_handlers;
 mod edge_callback_handlers;
 mod edge_status_handler;
 mod edge_ws_handler;
+pub mod harness_handlers;
+pub mod harness_server_sink;
 pub(crate) mod header_utils;
 mod http_helpers;
 mod learning_handlers;
@@ -52,8 +54,6 @@ mod task_handlers;
 mod team_handlers;
 pub mod team_orchestrator;
 mod ws_handler;
-pub mod harness_handlers;
-pub mod harness_server_sink;
 
 use self::{bridge_prep::prepare_chat_turn_bridge_body, http_helpers::*};
 use astra_server_types::*;

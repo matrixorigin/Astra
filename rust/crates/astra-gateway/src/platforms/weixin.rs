@@ -63,7 +63,7 @@ pub struct WeixinAdapter {
     config: WeixinConfig,
     pool: Option<sqlx::MySqlPool>,
     msg_tx: mpsc::Sender<InboundMessage>,
-    msg_rx: Option<mpsc::Receiver<InboundMessage>>,
+    msg_rx: Mutex<mpsc::Receiver<InboundMessage>>,
     context_tokens: ContextTokens,
     typing_tickets: TypingTickets,
     shutdown: Option<tokio::sync::broadcast::Sender<()>>,
@@ -76,7 +76,7 @@ impl WeixinAdapter {
             config: config.resolve(),
             pool: None,
             msg_tx: tx,
-            msg_rx: Some(rx),
+            msg_rx: Mutex::new(rx),
             context_tokens: Arc::new(Mutex::new(HashMap::new())),
             typing_tickets: Arc::new(Mutex::new(HashMap::new())),
             shutdown: None,
@@ -88,7 +88,9 @@ impl WeixinAdapter {
         self
     }
 
-    async fn resolve_credentials(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn resolve_credentials(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !self.config.token.is_empty() {
             return Ok(());
         }
@@ -178,7 +180,8 @@ impl PlatformAdapter for WeixinAdapter {
 
         // Restore persisted context_tokens from DB
         if let Some(ref pool) = pool
-            && let Ok(Some(cred)) = crate::storage::get_credential(pool, "weixin", "default", "context_tokens").await
+            && let Ok(Some(cred)) =
+                crate::storage::get_credential(pool, "weixin", "default", "context_tokens").await
             && let Some(map) = cred.credentials.as_object()
         {
             let mut t = tokens.lock().await;
@@ -199,7 +202,8 @@ impl PlatformAdapter for WeixinAdapter {
             let mut shutdown_rx = shutdown_tx.subscribe();
             // Restore sync cursor from DB
             let mut sync_buf = if let Some(ref pool) = pool
-                && let Ok(Some(cred)) = crate::storage::get_credential(pool, "weixin", "default", "sync_buf").await
+                && let Ok(Some(cred)) =
+                    crate::storage::get_credential(pool, "weixin", "default", "sync_buf").await
                 && let Some(s) = cred.credentials.as_str()
             {
                 tracing::info!("restored sync cursor from DB");
@@ -253,7 +257,7 @@ impl PlatformAdapter for WeixinAdapter {
     ) -> Result<(), String> {
         let text = crate::markdown::rewrite_for_weixin(text);
         let text = if text.len() > MAX_MESSAGE_LENGTH {
-            format!("{}…", &text[..MAX_MESSAGE_LENGTH - 5])
+            crate::text::truncate_with_suffix(&text, MAX_MESSAGE_LENGTH, "…")
         } else {
             text
         };
@@ -263,19 +267,15 @@ impl PlatformAdapter for WeixinAdapter {
             tokens.get(chat_id).cloned().unwrap_or_default()
         };
 
-        send_text_with_retry(
-            &self.config.token,
-            chat_id,
-            &text,
-            &context_token,
-        ).await
+        send_text_with_retry(&self.config.token, chat_id, &text, &context_token).await
     }
 
     async fn send_typing(&self, chat_id: &str) -> Result<(), String> {
         // Get or fetch typing ticket
         let ticket = {
             let cache = self.typing_tickets.lock().await;
-            cache.get(chat_id)
+            cache
+                .get(chat_id)
                 .filter(|(_, ts)| ts.elapsed().as_secs() < TYPING_TICKET_TTL_SECS)
                 .map(|(t, _)| t.clone())
         };
@@ -287,7 +287,9 @@ impl PlatformAdapter for WeixinAdapter {
                     let tokens = self.context_tokens.lock().await;
                     tokens.get(chat_id).cloned()
                 };
-                match fetch_typing_ticket(&self.config.token, chat_id, context_token.as_deref()).await {
+                match fetch_typing_ticket(&self.config.token, chat_id, context_token.as_deref())
+                    .await
+                {
                     Ok(t) => {
                         let mut cache = self.typing_tickets.lock().await;
                         cache.insert(chat_id.to_string(), (t.clone(), std::time::Instant::now()));
@@ -316,8 +318,8 @@ impl PlatformAdapter for WeixinAdapter {
         Ok(())
     }
 
-    async fn recv(&mut self) -> Option<InboundMessage> {
-        self.msg_rx.as_mut()?.recv().await
+    async fn recv(&self) -> Option<InboundMessage> {
+        self.msg_rx.lock().await.recv().await
     }
 }
 
@@ -377,9 +379,14 @@ async fn poll_updates(
         *sync_buf = buf.to_string();
         if let Some(pool) = pool {
             let _ = crate::storage::save_credential(
-                pool, "weixin", "default", "sync_buf",
-                &serde_json::Value::String(buf.to_string()), None,
-            ).await;
+                pool,
+                "weixin",
+                "default",
+                "sync_buf",
+                &serde_json::Value::String(buf.to_string()),
+                None,
+            )
+            .await;
         }
     }
 
@@ -421,12 +428,19 @@ async fn poll_updates(
                 tokens.insert(from_id.clone(), ct.to_string());
                 // Persist to DB for crash recovery
                 if let Some(pool) = pool {
-                    let map: serde_json::Value = tokens.iter()
+                    let map: serde_json::Value = tokens
+                        .iter()
                         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                         .collect();
                     let _ = crate::storage::save_credential(
-                        pool, "weixin", "default", "context_tokens", &map, None,
-                    ).await;
+                        pool,
+                        "weixin",
+                        "default",
+                        "context_tokens",
+                        &map,
+                        None,
+                    )
+                    .await;
                 }
             }
 
@@ -507,9 +521,7 @@ fn extract_text(msg: &Value) -> String {
                     }
                 }
                 Some(4) => {
-                    let name = item["file_item"]["file_name"]
-                        .as_str()
-                        .unwrap_or("unknown");
+                    let name = item["file_item"]["file_name"].as_str().unwrap_or("unknown");
                     parts.push(format!("📎 [文件: {name}]"));
                 }
                 Some(5) => {
@@ -570,7 +582,10 @@ async fn send_text_with_retry(
             Err(e) => {
                 last_error = format!("HTTP error: {e}");
                 if attempt < SEND_MAX_RETRIES {
-                    tokio::time::sleep(std::time::Duration::from_millis(SEND_RETRY_DELAY_MS * (attempt as u64 + 1))).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        SEND_RETRY_DELAY_MS * (attempt as u64 + 1),
+                    ))
+                    .await;
                 }
                 continue;
             }
@@ -584,7 +599,10 @@ async fn send_text_with_retry(
             }
         };
 
-        let errcode = data["errcode"].as_i64().or_else(|| data["ret"].as_i64()).unwrap_or(0);
+        let errcode = data["errcode"]
+            .as_i64()
+            .or_else(|| data["ret"].as_i64())
+            .unwrap_or(0);
         if errcode == 0 {
             return Ok(());
         }
@@ -615,7 +633,11 @@ async fn send_text_with_retry(
     Err(format!("weixin send failed after retries: {last_error}"))
 }
 
-async fn fetch_typing_ticket(token: &str, user_id: &str, context_token: Option<&str>) -> Result<String, String> {
+async fn fetch_typing_ticket(
+    token: &str,
+    user_id: &str,
+    context_token: Option<&str>,
+) -> Result<String, String> {
     let client = reqwest::Client::new();
     let mut body = json!({ "ilink_user_id": user_id });
     if let Some(ct) = context_token {
@@ -629,7 +651,10 @@ async fn fetch_typing_ticket(token: &str, user_id: &str, context_token: Option<&
         .send()
         .await
         .map_err(|e| format!("getconfig: {e}"))?;
-    let data: Value = resp.json().await.map_err(|e| format!("getconfig parse: {e}"))?;
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("getconfig parse: {e}"))?;
     data["typing_ticket"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -655,9 +680,7 @@ pub async fn qr_login() -> Result<(String, String), Box<dyn std::error::Error + 
     if data["ret"].as_i64().unwrap_or(-1) != 0 {
         return Err(format!("get_bot_qrcode failed: {data}").into());
     }
-    let qrcode = data["qrcode"]
-        .as_str()
-        .ok_or("no qrcode in response")?;
+    let qrcode = data["qrcode"].as_str().ok_or("no qrcode in response")?;
     let qr_url = data["qrcode_img_content"]
         .as_str()
         .ok_or("no qrcode_img_content in response")?;
@@ -689,14 +712,8 @@ pub async fn qr_login() -> Result<(String, String), Box<dyn std::error::Error + 
             }
             "confirmed" | "authorized" => {
                 println!("✅ 登录成功！");
-                let token = status["bot_token"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                let account_id = status["ilink_bot_id"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
+                let token = status["bot_token"].as_str().unwrap_or("").to_string();
+                let account_id = status["ilink_bot_id"].as_str().unwrap_or("").to_string();
                 return Ok((token, account_id));
             }
             other => {
@@ -724,25 +741,31 @@ mod tests {
 
     #[test]
     fn extract_text_from_item_list() {
-        let msg: Value = serde_json::from_str(r#"{
+        let msg: Value = serde_json::from_str(
+            r#"{
             "message_id": "msg-1",
             "from_user_id": "wxid_abc",
             "item_list": [
                 {"type": 1, "text_item": {"text": "hello from wechat"}}
             ]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         assert_eq!(extract_text(&msg), "hello from wechat");
     }
 
     #[test]
     fn extract_text_multi_items() {
-        let msg: Value = serde_json::from_str(r#"{
+        let msg: Value = serde_json::from_str(
+            r#"{
             "item_list": [
                 {"type": 1, "text_item": {"text": "line1"}},
                 {"type": 2, "image_item": {}},
                 {"type": 1, "text_item": {"text": "line2"}}
             ]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         assert_eq!(extract_text(&msg), "line1\n🖼 [图片]\nline2");
     }
 
@@ -754,31 +777,40 @@ mod tests {
 
     #[test]
     fn extract_text_voice_transcription() {
-        let msg: Value = serde_json::from_str(r#"{
+        let msg: Value = serde_json::from_str(
+            r#"{
             "item_list": [
                 {"type": 3, "voice_item": {"text": "你好", "playtime": 2764}}
             ]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         assert_eq!(extract_text(&msg), "🎤 你好");
     }
 
     #[test]
     fn extract_text_voice_no_transcription() {
-        let msg: Value = serde_json::from_str(r#"{
+        let msg: Value = serde_json::from_str(
+            r#"{
             "item_list": [
                 {"type": 3, "voice_item": {"playtime": 2764}}
             ]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         assert_eq!(extract_text(&msg), "🎤 [语音消息]");
     }
 
     #[test]
     fn extract_text_image_no_url() {
-        let msg: Value = serde_json::from_str(r#"{
+        let msg: Value = serde_json::from_str(
+            r#"{
             "item_list": [
                 {"type": 2, "image_item": {"media": {}}}
             ]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         assert_eq!(extract_text(&msg), "🖼 [图片]");
     }
 
@@ -796,22 +828,28 @@ mod tests {
 
     #[test]
     fn extract_text_file() {
-        let msg: Value = serde_json::from_str(r#"{
+        let msg: Value = serde_json::from_str(
+            r#"{
             "item_list": [
                 {"type": 4, "file_item": {"file_name": "report.pdf"}}
             ]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         assert_eq!(extract_text(&msg), "📎 [文件: report.pdf]");
     }
 
     #[test]
     fn extract_text_mixed_voice_and_text() {
-        let msg: Value = serde_json::from_str(r#"{
+        let msg: Value = serde_json::from_str(
+            r#"{
             "item_list": [
                 {"type": 3, "voice_item": {"text": "说的话"}},
                 {"type": 1, "text_item": {"text": "打的字"}}
             ]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let text = extract_text(&msg);
         assert!(text.contains("说的话"));
         assert!(text.contains("打的字"));
@@ -820,12 +858,17 @@ mod tests {
     #[test]
     fn max_message_truncation() {
         let long = "x".repeat(3000);
-        let truncated = if long.len() > MAX_MESSAGE_LENGTH {
-            format!("{}…", &long[..MAX_MESSAGE_LENGTH - 5])
-        } else {
-            long.clone()
-        };
+        let truncated = crate::text::truncate_with_suffix(&long, MAX_MESSAGE_LENGTH, "…");
         assert!(truncated.len() < 3000);
+        assert!(truncated.len() <= MAX_MESSAGE_LENGTH);
+    }
+
+    #[test]
+    fn max_message_truncation_preserves_utf8() {
+        let long = "中文".repeat(1200);
+        let truncated = crate::text::truncate_with_suffix(&long, MAX_MESSAGE_LENGTH, "…");
+        assert!(truncated.len() <= MAX_MESSAGE_LENGTH);
+        assert!(truncated.ends_with('…'));
     }
 
     #[tokio::test]
@@ -835,11 +878,15 @@ mod tests {
         // Insert a fresh ticket
         {
             let mut c = cache.lock().await;
-            c.insert(user.to_string(), ("ticket_abc".into(), std::time::Instant::now()));
+            c.insert(
+                user.to_string(),
+                ("ticket_abc".into(), std::time::Instant::now()),
+            );
         }
         // Should hit cache
         let c = cache.lock().await;
-        let entry = c.get(user)
+        let entry = c
+            .get(user)
             .filter(|(_, ts)| ts.elapsed().as_secs() < TYPING_TICKET_TTL_SECS);
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().0, "ticket_abc");
@@ -852,11 +899,13 @@ mod tests {
         // Insert an expired ticket (fake old timestamp)
         {
             let mut c = cache.lock().await;
-            let old = std::time::Instant::now() - std::time::Duration::from_secs(TYPING_TICKET_TTL_SECS + 10);
+            let old = std::time::Instant::now()
+                - std::time::Duration::from_secs(TYPING_TICKET_TTL_SECS + 10);
             c.insert(user.to_string(), ("old_ticket".into(), old));
         }
         let c = cache.lock().await;
-        let entry = c.get(user)
+        let entry = c
+            .get(user)
             .filter(|(_, ts)| ts.elapsed().as_secs() < TYPING_TICKET_TTL_SECS);
         assert!(entry.is_none(), "expired ticket should not hit cache");
     }
@@ -905,16 +954,22 @@ mod tests {
         // Must NOT panic
         let safe = safe_truncate(text, 60);
         assert!(safe.len() <= 60);
-        assert!(text.is_char_boundary(safe.len()), "must end on char boundary");
+        assert!(
+            text.is_char_boundary(safe.len()),
+            "must end on char boundary"
+        );
     }
 
     #[test]
     fn truncate_chinese_various_boundaries() {
-        let text = "你好世界测试中文截断";  // 10 chars × 3 bytes = 30 bytes
+        let text = "你好世界测试中文截断"; // 10 chars × 3 bytes = 30 bytes
         for max in 0..35 {
             let safe = safe_truncate(text, max);
             assert!(safe.len() <= max, "max={max}, got len={}", safe.len());
-            assert!(text.is_char_boundary(safe.len()), "max={max}: not a char boundary");
+            assert!(
+                text.is_char_boundary(safe.len()),
+                "max={max}: not a char boundary"
+            );
         }
     }
 

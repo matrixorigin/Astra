@@ -785,10 +785,13 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     // ─── Gateway context: inject as system message at start of conversation ───
     if let Some(extra) = ctx.append_system_prompt {
         if let Some(arr) = payload.get_mut("messages").and_then(Value::as_array_mut) {
-            arr.insert(0, json!({
-                "role": "system",
-                "content": extra,
-            }));
+            arr.insert(
+                0,
+                json!({
+                    "role": "system",
+                    "content": extra,
+                }),
+            );
         }
     }
     log_chat_turn_timing_phase(timing, "self_awareness_inject", &mut mark);

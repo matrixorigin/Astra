@@ -161,13 +161,27 @@ mod tests {
 
     fn sample_trace() -> SessionTrace {
         let mut trace = SessionTrace::new("forensics-test".into());
-        trace.records.push_back(make_record(0, HookPoint::SessionStart, 0, 0));
-        trace.records.push_back(make_record(1, HookPoint::PreLlmRequest, 0, 0));
-        trace.records.push_back(make_record(1, HookPoint::PostLlmResponse, 5_000, 0));
-        trace.records.push_back(make_record(1, HookPoint::PostToolBatch, 5_000, 2));
-        trace.records.push_back(make_record(1, HookPoint::PostTurn, 5_000, 2));
-        trace.records.push_back(make_record(2, HookPoint::PostLlmResponse, 12_000, 2));
-        trace.records.push_back(make_record(2, HookPoint::PostTurn, 12_000, 4));
+        trace
+            .records
+            .push_back(make_record(0, HookPoint::SessionStart, 0, 0));
+        trace
+            .records
+            .push_back(make_record(1, HookPoint::PreLlmRequest, 0, 0));
+        trace
+            .records
+            .push_back(make_record(1, HookPoint::PostLlmResponse, 5_000, 0));
+        trace
+            .records
+            .push_back(make_record(1, HookPoint::PostToolBatch, 5_000, 2));
+        trace
+            .records
+            .push_back(make_record(1, HookPoint::PostTurn, 5_000, 2));
+        trace
+            .records
+            .push_back(make_record(2, HookPoint::PostLlmResponse, 12_000, 2));
+        trace
+            .records
+            .push_back(make_record(2, HookPoint::PostTurn, 12_000, 4));
         trace.total_turns = 3;
         trace
     }
@@ -209,7 +223,10 @@ mod tests {
 
         let summary = trace.forensics_summary();
         assert_eq!(summary.warnings.len(), 1);
-        assert_eq!(summary.warnings[0].kind, WarningKind::HighContextUtilization);
+        assert_eq!(
+            summary.warnings[0].kind,
+            WarningKind::HighContextUtilization
+        );
         assert_eq!(summary.peak_context_utilization, Some(0.95));
     }
 
@@ -221,24 +238,32 @@ mod tests {
         trace.records.push_back(r);
 
         let summary = trace.forensics_summary();
-        assert!(summary
-            .warnings
-            .iter()
-            .any(|w| w.kind == WarningKind::ToolStallDetected));
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.kind == WarningKind::ToolStallDetected)
+        );
         assert_eq!(summary.peak_consecutive_same_tool, 4);
     }
 
     #[test]
     fn forensics_warns_on_rapid_token_growth() {
         let mut trace = SessionTrace::new("s1".into());
-        trace.records.push_back(make_record(1, HookPoint::PostTurn, 1_000, 1));
-        trace.records.push_back(make_record(2, HookPoint::PostTurn, 10_000, 2));
+        trace
+            .records
+            .push_back(make_record(1, HookPoint::PostTurn, 1_000, 1));
+        trace
+            .records
+            .push_back(make_record(2, HookPoint::PostTurn, 10_000, 2));
 
         let summary = trace.forensics_summary();
-        assert!(summary
-            .warnings
-            .iter()
-            .any(|w| w.kind == WarningKind::RapidTokenGrowth));
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.kind == WarningKind::RapidTokenGrowth)
+        );
     }
 
     #[test]

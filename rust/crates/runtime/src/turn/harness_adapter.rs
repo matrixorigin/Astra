@@ -33,8 +33,7 @@ mod enabled {
         /// Session ID used to unregister from the registry on cleanup.
         pub(crate) session_id_for_cleanup: Option<String>,
         /// Concrete server sink reference for deferred user_id injection.
-        pub(crate) server_sink:
-            Option<Arc<crate::server::harness_server_sink::ServerSnapshotSink>>,
+        pub(crate) server_sink: Option<Arc<crate::server::harness_server_sink::ServerSnapshotSink>>,
     }
 
     impl HarnessSlot {
@@ -50,10 +49,7 @@ mod enabled {
             }
         }
 
-        pub fn new(
-            kernel: Arc<dyn HarnessKernel>,
-            sink: Arc<dyn SnapshotSink>,
-        ) -> Self {
+        pub fn new(kernel: Arc<dyn HarnessKernel>, sink: Arc<dyn SnapshotSink>) -> Self {
             Self {
                 kernel: Some(kernel),
                 sink: Some(sink),
@@ -378,7 +374,10 @@ mod enabled {
                 .collect();
 
             let snap = capture_snapshot(&state, 0);
-            assert_eq!(snap.unique_tools_used, vec!["bash", "edit_file", "read_file"]);
+            assert_eq!(
+                snap.unique_tools_used,
+                vec!["bash", "edit_file", "read_file"]
+            );
         }
 
         #[test]
@@ -396,9 +395,8 @@ mod enabled {
         #[test]
         fn observe_only_slot_writes_to_sink() {
             let sink = InMemorySnapshotSink::arc();
-            let slot = HarnessSlot::observe_only(
-                sink.clone() as Arc<dyn astra_harness::SnapshotSink>,
-            );
+            let slot =
+                HarnessSlot::observe_only(sink.clone() as Arc<dyn astra_harness::SnapshotSink>);
             assert!(slot.kernel.is_none());
             let state = make_state();
             let verdict = harness_fire(&slot, HookPoint::PostTurn, &state);
@@ -425,9 +423,7 @@ mod disabled {
 
 #[cfg(feature = "harness")]
 macro_rules! harness_at {
-    ($slot:expr, $point:expr, $state:expr) => {{
-        $crate::turn::harness_adapter::harness_fire($slot, $point, $state)
-    }};
+    ($slot:expr, $point:expr, $state:expr) => {{ $crate::turn::harness_adapter::harness_fire($slot, $point, $state) }};
 }
 
 #[cfg(not(feature = "harness"))]

@@ -11,6 +11,9 @@ pub struct GatewayConfig {
     /// Named CLI profiles available for /cli switch.
     #[serde(default)]
     pub cli_profiles: std::collections::HashMap<String, crate::cli_bridge::CliProfile>,
+    /// Maximum seconds a spawned CLI may run for one gateway message.
+    #[serde(default = "default_cli_timeout_secs")]
+    pub cli_timeout_secs: u64,
     #[serde(default)]
     pub platforms: PlatformConfigs,
     /// Directory containing user-defined skill markdown files.
@@ -47,7 +50,13 @@ impl Default for DatabaseConfig {
     }
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
+
+fn default_cli_timeout_secs() -> u64 {
+    60 * 60
+}
 
 fn default_db_url() -> String {
     std::env::var("GATEWAY_DATABASE_URL")

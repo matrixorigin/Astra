@@ -463,17 +463,29 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
 
     // ── Harness: PreLlmRequest — Block/Pause prevents LLM call ──
     #[cfg(feature = "harness")]
-    match super::harness_adapter::harness_at!(&state.harness, astra_harness::HookPoint::PreLlmRequest, state) {
+    match super::harness_adapter::harness_at!(
+        &state.harness,
+        astra_harness::HookPoint::PreLlmRequest,
+        state
+    ) {
         astra_harness::HookVerdict::Block { reason } => {
             tracing::warn!(reason = %reason, "harness blocked LLM call at PreLlmRequest");
-            super::agentic_loop_host::set_harness_interruption(state, astra_turn_core::interruption::InterruptionKind::HarnessBlocked, &reason);
+            super::agentic_loop_host::set_harness_interruption(
+                state,
+                astra_turn_core::interruption::InterruptionKind::HarnessBlocked,
+                &reason,
+            );
             return Ok(TurnExecutionControl::Return(
                 super::agentic_loop_host::AgenticLoopOutcome::Completed,
             ));
         }
         astra_harness::HookVerdict::Pause { reason } => {
             tracing::info!(reason = %reason, "harness paused LLM call at PreLlmRequest");
-            super::agentic_loop_host::set_harness_interruption(state, astra_turn_core::interruption::InterruptionKind::HarnessPaused, &reason);
+            super::agentic_loop_host::set_harness_interruption(
+                state,
+                astra_turn_core::interruption::InterruptionKind::HarnessPaused,
+                &reason,
+            );
             return Ok(TurnExecutionControl::Return(
                 super::agentic_loop_host::AgenticLoopOutcome::Completed,
             ));
@@ -481,7 +493,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         astra_harness::HookVerdict::Continue => {}
     }
     #[cfg(not(feature = "harness"))]
-    super::harness_adapter::harness_at!(&state.harness, astra_harness::HookPoint::PreLlmRequest, state);
+    super::harness_adapter::harness_at!(
+        &state.harness,
+        astra_harness::HookPoint::PreLlmRequest,
+        state
+    );
 
     let llm_wall_start = Instant::now();
     // Increment the LLM-round counter regardless of outcome so retry/error

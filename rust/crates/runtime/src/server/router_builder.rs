@@ -163,7 +163,10 @@ pub(super) fn build_router(state: AppState) -> Router {
             get(session_handlers::download_session_artifact_handler),
         )
         // ── Harness observation endpoints (Phase 2A) ──
-        .nest("/sessions/{session_id}/harness", harness_routes(state.clone()))
+        .nest(
+            "/sessions/{session_id}/harness",
+            harness_routes(state.clone()),
+        )
         .nest("/admin/harness", admin_harness_routes(state.clone()))
         .route("/admin/init", post(admin_handlers::admin_init_handler))
         .route(

@@ -1,5 +1,4 @@
 pub mod agentic_adaptive_tuning;
-pub mod harness_adapter;
 pub mod agentic_auto_reflection;
 pub mod agentic_delegate_interception;
 pub mod agentic_headless_round;
@@ -20,6 +19,7 @@ pub mod chat_turn_selection_context;
 pub mod cloud;
 pub mod compaction_replay;
 pub mod context_compression;
+pub mod harness_adapter;
 pub mod headless_tool_pipeline;
 /// Re-exported from astra-turn-types
 pub mod implicit_feedback {

@@ -73,12 +73,19 @@ pub async fn get_usage_today(
     .bind(user_id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(m, p, c, t)| UsageSummary {
-        messages: m as u64,
-        tokens_prompt: p as u64,
-        tokens_completion: c as u64,
-        tool_calls: t as u64,
-    }).unwrap_or(UsageSummary { messages: 0, tokens_prompt: 0, tokens_completion: 0, tool_calls: 0 }))
+    Ok(row
+        .map(|(m, p, c, t)| UsageSummary {
+            messages: m as u64,
+            tokens_prompt: p as u64,
+            tokens_completion: c as u64,
+            tool_calls: t as u64,
+        })
+        .unwrap_or(UsageSummary {
+            messages: 0,
+            tokens_prompt: 0,
+            tokens_completion: 0,
+            tool_calls: 0,
+        }))
 }
 
 pub async fn get_usage_total(
@@ -94,12 +101,19 @@ pub async fn get_usage_total(
     .bind(user_id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(m, p, c, t)| UsageSummary {
-        messages: m as u64,
-        tokens_prompt: p as u64,
-        tokens_completion: c as u64,
-        tool_calls: t as u64,
-    }).unwrap_or(UsageSummary { messages: 0, tokens_prompt: 0, tokens_completion: 0, tool_calls: 0 }))
+    Ok(row
+        .map(|(m, p, c, t)| UsageSummary {
+            messages: m as u64,
+            tokens_prompt: p as u64,
+            tokens_completion: c as u64,
+            tool_calls: t as u64,
+        })
+        .unwrap_or(UsageSummary {
+            messages: 0,
+            tokens_prompt: 0,
+            tokens_completion: 0,
+            tool_calls: 0,
+        }))
 }
 
 #[cfg(test)]
@@ -108,7 +122,12 @@ mod tests {
 
     #[test]
     fn usage_summary_default() {
-        let s = UsageSummary { messages: 0, tokens_prompt: 0, tokens_completion: 0, tool_calls: 0 };
+        let s = UsageSummary {
+            messages: 0,
+            tokens_prompt: 0,
+            tokens_completion: 0,
+            tool_calls: 0,
+        };
         assert_eq!(s.messages, 0);
     }
 

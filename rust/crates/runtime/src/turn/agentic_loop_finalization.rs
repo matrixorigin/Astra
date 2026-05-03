@@ -462,10 +462,18 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     #[cfg(feature = "harness")]
     if !state.harness.session_ended {
         state.harness.session_ended = true;
-        super::harness_adapter::harness_at!(&state.harness, astra_harness::HookPoint::SessionEnd, state);
+        super::harness_adapter::harness_at!(
+            &state.harness,
+            astra_harness::HookPoint::SessionEnd,
+            state
+        );
     }
     #[cfg(not(feature = "harness"))]
-    super::harness_adapter::harness_at!(&state.harness, astra_harness::HookPoint::SessionEnd, state);
+    super::harness_adapter::harness_at!(
+        &state.harness,
+        astra_harness::HookPoint::SessionEnd,
+        state
+    );
 
     finalize_turn_trace(state).await;
     // Drop any execution-retry corrective messages now that the loop has

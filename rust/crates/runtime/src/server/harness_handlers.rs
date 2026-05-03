@@ -9,8 +9,8 @@ pub use enabled::*;
 
 #[cfg(feature = "harness")]
 mod enabled {
-    use astra_harness::{RuntimeSnapshot, SnapshotDiff, SnapshotSink};
     use astra_core::ErrorResponse;
+    use astra_harness::{RuntimeSnapshot, SnapshotDiff, SnapshotSink};
     use axum::extract::{Path, Query, State};
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::Json;
@@ -59,10 +59,7 @@ mod enabled {
             self.sinks.get(session_id).map(|r| r.value().clone())
         }
 
-        pub fn subscribe(
-            &self,
-            session_id: &str,
-        ) -> Option<broadcast::Receiver<RuntimeSnapshot>> {
+        pub fn subscribe(&self, session_id: &str) -> Option<broadcast::Receiver<RuntimeSnapshot>> {
             self.broadcasters
                 .get(session_id)
                 .map(|r| r.value().subscribe())
@@ -93,6 +90,42 @@ mod enabled {
         }
     }
 
+    async fn persisted_history(
+        state: &AppState,
+        session_id: &str,
+        n: usize,
+    ) -> Vec<RuntimeSnapshot> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let Some(pool) = state.shared_pool.as_ref() else {
+            return Vec::new();
+        };
+        let limit = n.min(1000) as i64;
+        let rows: Vec<(String,)> = match sqlx::query_as(
+            "SELECT snapshot_json
+             FROM harness_snapshots
+             WHERE session_id = ?
+             ORDER BY created_at DESC
+             LIMIT ?",
+        )
+        .bind(session_id)
+        .bind(limit)
+        .fetch_all(pool.get())
+        .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(session_id, error = %e, "failed to read persisted harness snapshots");
+                return Vec::new();
+            }
+        };
+
+        rows.into_iter()
+            .filter_map(|(json,)| serde_json::from_str::<RuntimeSnapshot>(&json).ok())
+            .collect()
+    }
+
     pub async fn get_harness_snapshot(
         State(state): State<AppState>,
         headers: HeaderMap,
@@ -104,18 +137,24 @@ mod enabled {
             .get_session(session_id.clone(), user.user_id)
             .await?;
         let registry = &state.harness_registry;
-        let sink = registry.get(&session_id).ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new("session not found in harness registry")),
-            )
-        })?;
-        let snapshot = sink.latest().ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new("no snapshot available yet")),
-            )
-        })?;
+        let snapshot = if let Some(sink) = registry.get(&session_id) {
+            sink.latest()
+        } else {
+            None
+        };
+        let snapshot = match snapshot {
+            Some(snapshot) => snapshot,
+            None => persisted_history(&state, &session_id, 1)
+                .await
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse::new("no snapshot available yet")),
+                    )
+                })?,
+        };
         Ok(Json(sanitize_snapshot(snapshot)))
     }
 
@@ -131,17 +170,14 @@ mod enabled {
             .get_session(session_id.clone(), user.user_id)
             .await?;
         let registry = &state.harness_registry;
-        let sink = registry.get(&session_id).ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new("session not found in harness registry")),
-            )
-        })?;
-        let history: Vec<RuntimeSnapshot> = sink
-            .history(params.n)
-            .into_iter()
-            .map(sanitize_snapshot)
-            .collect();
+        let mut history: Vec<RuntimeSnapshot> = registry
+            .get(&session_id)
+            .map(|sink| sink.history(params.n))
+            .unwrap_or_default();
+        if history.is_empty() {
+            history = persisted_history(&state, &session_id, params.n).await;
+        }
+        let history: Vec<RuntimeSnapshot> = history.into_iter().map(sanitize_snapshot).collect();
         if history.is_empty() {
             return Err((
                 StatusCode::NOT_FOUND,
@@ -297,13 +333,13 @@ mod enabled {
             .get_session(session_id.clone(), user.user_id)
             .await?;
         let registry = &state.harness_registry;
-        let sink = registry.get(&session_id).ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new("session not found in harness registry")),
-            )
-        })?;
-        let history = sink.history(2);
+        let mut history = registry
+            .get(&session_id)
+            .map(|sink| sink.history(2))
+            .unwrap_or_default();
+        if history.len() < 2 {
+            history = persisted_history(&state, &session_id, 2).await;
+        }
         if history.len() < 2 {
             return Err((
                 StatusCode::NOT_FOUND,
@@ -413,11 +449,7 @@ mod enabled {
             let reg = HarnessSinkRegistry::new();
             let sink = InMemorySnapshotSink::arc();
             let (tx, _) = broadcast::channel::<RuntimeSnapshot>(16);
-            reg.register_with_broadcast(
-                "s2".into(),
-                sink as Arc<dyn SnapshotSink>,
-                tx,
-            );
+            reg.register_with_broadcast("s2".into(), sink as Arc<dyn SnapshotSink>, tx);
             assert!(reg.subscribe("s2").is_some());
             assert!(reg.subscribe("unknown").is_none());
         }
@@ -427,11 +459,7 @@ mod enabled {
             let reg = HarnessSinkRegistry::new();
             let sink = InMemorySnapshotSink::arc();
             let (tx, _) = broadcast::channel::<RuntimeSnapshot>(16);
-            reg.register_with_broadcast(
-                "s3".into(),
-                sink as Arc<dyn SnapshotSink>,
-                tx.clone(),
-            );
+            reg.register_with_broadcast("s3".into(), sink as Arc<dyn SnapshotSink>, tx.clone());
 
             let mut rx = reg.subscribe("s3").unwrap();
             let snap = RuntimeSnapshot {
@@ -449,11 +477,7 @@ mod enabled {
             let reg = HarnessSinkRegistry::new();
             let sink = InMemorySnapshotSink::arc();
             let (tx, _) = broadcast::channel::<RuntimeSnapshot>(16);
-            reg.register_with_broadcast(
-                "s4".into(),
-                sink as Arc<dyn SnapshotSink>,
-                tx,
-            );
+            reg.register_with_broadcast("s4".into(), sink as Arc<dyn SnapshotSink>, tx);
             reg.unregister("s4");
             assert!(reg.subscribe("s4").is_none());
         }

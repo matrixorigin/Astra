@@ -47,7 +47,10 @@ async fn full_lifecycle() {
 
     // Checkpoint
     let state = serde_json::json!({"completed": ["alice", "bob"], "pending": 18});
-    store.checkpoint(&id, &state, Some(25), Some("2/20 users done")).await.unwrap();
+    store
+        .checkpoint(&id, &state, Some(25), Some("2/20 users done"))
+        .await
+        .unwrap();
 
     let task = store.get(&id).await.unwrap().unwrap();
     assert_eq!(task.status, DurableTaskStatus::Running);
@@ -60,12 +63,21 @@ async fn full_lifecycle() {
     assert_eq!(cp["completed"][0], "alice");
 
     // Complete
-    store.update_status(&id, DurableTaskStatus::Completed, None).await.unwrap();
+    store
+        .update_status(&id, DurableTaskStatus::Completed, None)
+        .await
+        .unwrap();
     let task = store.get(&id).await.unwrap().unwrap();
     assert_eq!(task.status, DurableTaskStatus::Completed);
 
     // List by owner
-    let tasks = store.list(TaskFilter { owner_id: Some(owner), ..Default::default() }).await.unwrap();
+    let tasks = store
+        .list(TaskFilter {
+            owner_id: Some(owner),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     assert!(tasks.iter().any(|t| t.id == id));
 
     // Delete
@@ -147,21 +159,30 @@ async fn list_filters_by_status() {
 
     let id1 = store.create(&spec).await.unwrap();
     let id2 = store.create(&spec).await.unwrap();
-    store.update_status(&id1, DurableTaskStatus::Completed, None).await.unwrap();
+    store
+        .update_status(&id1, DurableTaskStatus::Completed, None)
+        .await
+        .unwrap();
 
-    let active = store.list(TaskFilter {
-        owner_id: Some(owner.clone()),
-        status: Some(DurableTaskStatus::Created),
-        ..Default::default()
-    }).await.unwrap();
+    let active = store
+        .list(TaskFilter {
+            owner_id: Some(owner.clone()),
+            status: Some(DurableTaskStatus::Created),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].id, id2);
 
-    let completed = store.list(TaskFilter {
-        owner_id: Some(owner),
-        status: Some(DurableTaskStatus::Completed),
-        ..Default::default()
-    }).await.unwrap();
+    let completed = store
+        .list(TaskFilter {
+            owner_id: Some(owner),
+            status: Some(DurableTaskStatus::Completed),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].id, id1);
 
@@ -175,7 +196,10 @@ async fn checkpoint_terminal_task_rejected() {
     let store = setup().await;
     let spec = test_spec("terminal checkpoint");
     let id = store.create(&spec).await.unwrap();
-    store.update_status(&id, DurableTaskStatus::Completed, None).await.unwrap();
+    store
+        .update_status(&id, DurableTaskStatus::Completed, None)
+        .await
+        .unwrap();
 
     let state = serde_json::json!({"x": 1});
     let result = store.checkpoint(&id, &state, None, None).await;
@@ -208,18 +232,38 @@ async fn sweep_stale_running_tasks() {
     let owner = format!("test:{}", uuid::Uuid::new_v4());
 
     // Create two tasks and checkpoint them to running
-    let s = |n: &str| TaskSpec { name: n.into(), description: None, owner_id: owner.clone(), initial_state: None };
+    let s = |n: &str| TaskSpec {
+        name: n.into(),
+        description: None,
+        owner_id: owner.clone(),
+        initial_state: None,
+    };
     let id1 = store.create(&s("stale-1")).await.unwrap();
     let id2 = store.create(&s("stale-2")).await.unwrap();
-    store.checkpoint(&id1, &serde_json::json!({"step":1}), Some(10), None).await.unwrap();
-    store.checkpoint(&id2, &serde_json::json!({"step":2}), Some(50), None).await.unwrap();
+    store
+        .checkpoint(&id1, &serde_json::json!({"step":1}), Some(10), None)
+        .await
+        .unwrap();
+    store
+        .checkpoint(&id2, &serde_json::json!({"step":2}), Some(50), None)
+        .await
+        .unwrap();
 
     // Both should be running
-    assert_eq!(store.get(&id1).await.unwrap().unwrap().status, DurableTaskStatus::Running);
-    assert_eq!(store.get(&id2).await.unwrap().unwrap().status, DurableTaskStatus::Running);
+    assert_eq!(
+        store.get(&id1).await.unwrap().unwrap().status,
+        DurableTaskStatus::Running
+    );
+    assert_eq!(
+        store.get(&id2).await.unwrap().unwrap().status,
+        DurableTaskStatus::Running
+    );
 
     // Sweep
-    let count = store.suspend_stale_running_tasks("gateway restarted").await.unwrap();
+    let count = store
+        .suspend_stale_running_tasks("gateway restarted")
+        .await
+        .unwrap();
     assert!(count >= 2, "should suspend at least 2 tasks, got {count}");
 
     // Both should be suspended with reason
@@ -244,20 +288,45 @@ async fn suspend_running_tasks_for_owner() {
     let owner_a = format!("test:{}", uuid::Uuid::new_v4());
     let owner_b = format!("test:{}", uuid::Uuid::new_v4());
 
-    let spec_a = TaskSpec { name: "a-task".into(), description: None, owner_id: owner_a.clone(), initial_state: None };
-    let spec_b = TaskSpec { name: "b-task".into(), description: None, owner_id: owner_b.clone(), initial_state: None };
+    let spec_a = TaskSpec {
+        name: "a-task".into(),
+        description: None,
+        owner_id: owner_a.clone(),
+        initial_state: None,
+    };
+    let spec_b = TaskSpec {
+        name: "b-task".into(),
+        description: None,
+        owner_id: owner_b.clone(),
+        initial_state: None,
+    };
     let id_a = store.create(&spec_a).await.unwrap();
     let id_b = store.create(&spec_b).await.unwrap();
-    store.checkpoint(&id_a, &serde_json::json!({}), None, None).await.unwrap();
-    store.checkpoint(&id_b, &serde_json::json!({}), None, None).await.unwrap();
+    store
+        .checkpoint(&id_a, &serde_json::json!({}), None, None)
+        .await
+        .unwrap();
+    store
+        .checkpoint(&id_b, &serde_json::json!({}), None, None)
+        .await
+        .unwrap();
 
     // Suspend only owner_a's tasks
-    let count = store.suspend_running_tasks_for_owner(&owner_a, "CLI crashed").await.unwrap();
+    let count = store
+        .suspend_running_tasks_for_owner(&owner_a, "CLI crashed")
+        .await
+        .unwrap();
     assert_eq!(count, 1);
 
     // owner_a suspended, owner_b still running
-    assert_eq!(store.get(&id_a).await.unwrap().unwrap().status, DurableTaskStatus::Suspended);
-    assert_eq!(store.get(&id_b).await.unwrap().unwrap().status, DurableTaskStatus::Running);
+    assert_eq!(
+        store.get(&id_a).await.unwrap().unwrap().status,
+        DurableTaskStatus::Suspended
+    );
+    assert_eq!(
+        store.get(&id_b).await.unwrap().unwrap().status,
+        DurableTaskStatus::Running
+    );
 
     store.delete(&id_a).await.unwrap();
     store.delete(&id_b).await.unwrap();
@@ -282,13 +351,21 @@ async fn context_token_persist_and_restore() {
         "user_b": "token_bbb",
     });
     astra_gateway::storage::save_credential(
-        &pool, "weixin", "default", "context_tokens", &tokens, None,
-    ).await.unwrap();
+        &pool,
+        "weixin",
+        "default",
+        "context_tokens",
+        &tokens,
+        None,
+    )
+    .await
+    .unwrap();
 
     // Restore
-    let cred = astra_gateway::storage::get_credential(
-        &pool, "weixin", "default", "context_tokens",
-    ).await.unwrap().unwrap();
+    let cred = astra_gateway::storage::get_credential(&pool, "weixin", "default", "context_tokens")
+        .await
+        .unwrap()
+        .unwrap();
 
     assert_eq!(cred.credentials["user_a"], "token_aaa");
     assert_eq!(cred.credentials["user_b"], "token_bbb");
@@ -299,12 +376,21 @@ async fn context_token_persist_and_restore() {
         "user_c": "token_ccc",
     });
     astra_gateway::storage::save_credential(
-        &pool, "weixin", "default", "context_tokens", &tokens2, None,
-    ).await.unwrap();
+        &pool,
+        "weixin",
+        "default",
+        "context_tokens",
+        &tokens2,
+        None,
+    )
+    .await
+    .unwrap();
 
-    let cred2 = astra_gateway::storage::get_credential(
-        &pool, "weixin", "default", "context_tokens",
-    ).await.unwrap().unwrap();
+    let cred2 =
+        astra_gateway::storage::get_credential(&pool, "weixin", "default", "context_tokens")
+            .await
+            .unwrap()
+            .unwrap();
     assert_eq!(cred2.credentials["user_a"], "token_aaa_updated");
     assert_eq!(cred2.credentials["user_c"], "token_ccc");
     // user_b gone (full replacement)

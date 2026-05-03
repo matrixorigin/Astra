@@ -2594,8 +2594,8 @@ impl DelegationEngine {
                         mailbox: None,
                         cancel_token: cancel_for_retry.clone(),
                         inherited_prefix: None,
-                #[cfg(feature = "harness")]
-                harness_sink: None,
+                        #[cfg(feature = "harness")]
+                        harness_sink: None,
                     },
                 )
                 .await
@@ -2883,8 +2883,8 @@ impl DelegationEngine {
                         mailbox: None,
                         cancel_token: cancel_for_retry.clone(),
                         inherited_prefix: None,
-                #[cfg(feature = "harness")]
-                harness_sink: None,
+                        #[cfg(feature = "harness")]
+                        harness_sink: None,
                     },
                 )
                 .await

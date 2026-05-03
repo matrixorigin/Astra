@@ -9,12 +9,8 @@
 use astra_gateway::cli_bridge::CliProfile;
 
 fn load_fixture(name: &str) -> String {
-    let path = format!(
-        "{}/tests/fixtures/{name}",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("fixture {path} not found: {e}"))
+    let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("fixture {path} not found: {e}"))
 }
 
 // ─── Astra fixtures ─────────────────────────────────────────────────────────
@@ -30,10 +26,7 @@ fn offline_astra_hello_parse() {
     let text = result.text.unwrap();
     assert!(!text.is_empty(), "text non-empty");
     assert_eq!(result.exit_code, 0);
-    assert!(
-        result.tokens_prompt.unwrap_or(0) > 0,
-        "prompt tokens > 0"
-    );
+    assert!(result.tokens_prompt.unwrap_or(0) > 0, "prompt tokens > 0");
 }
 
 #[test]
@@ -56,7 +49,10 @@ fn offline_astra_session_id_stable() {
     let profile = CliProfile::default();
     let r1 = profile.parse_output(&json, 0);
     let r2 = profile.parse_output(&json, 0);
-    assert_eq!(r1.session_id, r2.session_id, "same fixture = same session_id");
+    assert_eq!(
+        r1.session_id, r2.session_id,
+        "same fixture = same session_id"
+    );
 }
 
 // ─── Claude fixtures ────────────────────────────────────────────────────────
@@ -78,7 +74,10 @@ fn offline_claude_hello_parse() {
         result.tokens_completion.unwrap_or(0) > 0,
         "output tokens > 0"
     );
-    println!("claude fixture: text={text}, tokens={:?}", result.tokens_completion);
+    println!(
+        "claude fixture: text={text}, tokens={:?}",
+        result.tokens_completion
+    );
 }
 
 #[test]
@@ -104,7 +103,11 @@ fn offline_both_clis_return_session_id() {
     };
     let claude = {
         let json = load_fixture("claude_hello.json");
-        CliProfile::Claude { bin: "claude".into(), model: None }.parse_output(&json, 0)
+        CliProfile::Claude {
+            bin: "claude".into(),
+            model: None,
+        }
+        .parse_output(&json, 0)
     };
 
     assert!(astra.session_id.is_some(), "astra has session_id");
@@ -121,7 +124,11 @@ fn offline_both_clis_return_text() {
     };
     let claude = {
         let json = load_fixture("claude_hello.json");
-        CliProfile::Claude { bin: "claude".into(), model: None }.parse_output(&json, 0)
+        CliProfile::Claude {
+            bin: "claude".into(),
+            model: None,
+        }
+        .parse_output(&json, 0)
     };
 
     assert!(astra.text.is_some() && !astra.text.as_ref().unwrap().is_empty());

@@ -22,14 +22,20 @@ pub enum HarnessQueryResponse {
 
 /// Handle held by the loop (or the sink owner) to receive queries.
 pub struct HarnessQueryReceiver {
-    rx: std::sync::mpsc::Receiver<(HarnessQuery, std::sync::mpsc::SyncSender<HarnessQueryResponse>)>,
+    rx: std::sync::mpsc::Receiver<(
+        HarnessQuery,
+        std::sync::mpsc::SyncSender<HarnessQueryResponse>,
+    )>,
     sink: Arc<dyn SnapshotSink>,
 }
 
 /// Handle held by the CLI / external caller to send queries.
 #[derive(Clone)]
 pub struct HarnessQuerySender {
-    tx: std::sync::mpsc::SyncSender<(HarnessQuery, std::sync::mpsc::SyncSender<HarnessQueryResponse>)>,
+    tx: std::sync::mpsc::SyncSender<(
+        HarnessQuery,
+        std::sync::mpsc::SyncSender<HarnessQueryResponse>,
+    )>,
 }
 
 /// Create a query channel pair with bounded capacity.
@@ -38,10 +44,7 @@ pub fn query_channel(
     bound: usize,
 ) -> (HarnessQuerySender, HarnessQueryReceiver) {
     let (tx, rx) = std::sync::mpsc::sync_channel(bound);
-    (
-        HarnessQuerySender { tx },
-        HarnessQueryReceiver { rx, sink },
-    )
+    (HarnessQuerySender { tx }, HarnessQueryReceiver { rx, sink })
 }
 
 impl HarnessQuerySender {
@@ -211,7 +214,10 @@ mod tests {
         let (resp_tx1, resp_rx1) = std::sync::mpsc::sync_channel(1);
         let (resp_tx2, resp_rx2) = std::sync::mpsc::sync_channel(1);
         sender.tx.send((HarnessQuery::Latest, resp_tx1)).unwrap();
-        sender.tx.send((HarnessQuery::History(2), resp_tx2)).unwrap();
+        sender
+            .tx
+            .send((HarnessQuery::History(2), resp_tx2))
+            .unwrap();
 
         // Drain all at once
         receiver.drain();

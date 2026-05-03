@@ -1,5 +1,5 @@
-use crate::trace::{SessionTrace, TraceOutcome};
 use crate::HookPoint;
+use crate::trace::{SessionTrace, TraceOutcome};
 
 /// A scenario defines expected behavior and runs assertions against a trace.
 #[derive(Debug, Clone)]
@@ -81,10 +81,7 @@ impl Scenario {
     }
 }
 
-fn check_assertion(
-    assertion: &Assertion,
-    trace: &SessionTrace,
-) -> (String, bool, Option<String>) {
+fn check_assertion(assertion: &Assertion, trace: &SessionTrace) -> (String, bool, Option<String>) {
     match assertion {
         Assertion::MinRecords(n) => {
             let actual = trace.record_count();
@@ -186,11 +183,21 @@ mod tests {
         trace.ended_at_unix_millis = Some(1_005_000);
         trace.total_turns = 3;
         trace.outcome = TraceOutcome::Completed;
-        trace.records.push_back(make_record(0, HookPoint::SessionStart, 0));
-        trace.records.push_back(make_record(1, HookPoint::PostLlmResponse, 5_000));
-        trace.records.push_back(make_record(1, HookPoint::PostTurn, 5_000));
-        trace.records.push_back(make_record(2, HookPoint::PostLlmResponse, 10_000));
-        trace.records.push_back(make_record(2, HookPoint::PostTurn, 10_000));
+        trace
+            .records
+            .push_back(make_record(0, HookPoint::SessionStart, 0));
+        trace
+            .records
+            .push_back(make_record(1, HookPoint::PostLlmResponse, 5_000));
+        trace
+            .records
+            .push_back(make_record(1, HookPoint::PostTurn, 5_000));
+        trace
+            .records
+            .push_back(make_record(2, HookPoint::PostLlmResponse, 10_000));
+        trace
+            .records
+            .push_back(make_record(2, HookPoint::PostTurn, 10_000));
         trace
     }
 
@@ -212,8 +219,8 @@ mod tests {
 
     #[test]
     fn scenario_fails_on_wrong_outcome() {
-        let scenario = Scenario::new("expect blocked")
-            .assert(Assertion::Outcome(TraceOutcome::Blocked));
+        let scenario =
+            Scenario::new("expect blocked").assert(Assertion::Outcome(TraceOutcome::Blocked));
 
         let result = scenario.run(&sample_trace());
         assert!(!result.passed);
@@ -221,8 +228,7 @@ mod tests {
 
     #[test]
     fn scenario_fails_on_token_limit() {
-        let scenario = Scenario::new("token budget")
-            .assert(Assertion::MaxTokens(3_000));
+        let scenario = Scenario::new("token budget").assert(Assertion::MaxTokens(3_000));
 
         let result = scenario.run(&sample_trace());
         assert!(!result.passed);
@@ -232,8 +238,8 @@ mod tests {
 
     #[test]
     fn scenario_fails_on_turn_range() {
-        let scenario = Scenario::new("too many turns")
-            .assert(Assertion::TurnRange { min: 10, max: 20 });
+        let scenario =
+            Scenario::new("too many turns").assert(Assertion::TurnRange { min: 10, max: 20 });
 
         let result = scenario.run(&sample_trace());
         assert!(!result.passed);
@@ -241,11 +247,10 @@ mod tests {
 
     #[test]
     fn scenario_custom_assertion() {
-        let scenario = Scenario::new("custom check")
-            .assert(Assertion::Custom {
-                description: "has session start".into(),
-                check: |t| t.records_at_point(HookPoint::SessionStart).len() == 1,
-            });
+        let scenario = Scenario::new("custom check").assert(Assertion::Custom {
+            description: "has session start".into(),
+            check: |t| t.records_at_point(HookPoint::SessionStart).len() == 1,
+        });
 
         let result = scenario.run(&sample_trace());
         assert!(result.passed);
@@ -253,10 +258,9 @@ mod tests {
 
     #[test]
     fn scenario_no_forensics_warning() {
-        let scenario = Scenario::new("no stalls")
-            .assert(Assertion::NoForensicsWarning(
-                crate::forensics::WarningKind::ToolStallDetected,
-            ));
+        let scenario = Scenario::new("no stalls").assert(Assertion::NoForensicsWarning(
+            crate::forensics::WarningKind::ToolStallDetected,
+        ));
 
         let result = scenario.run(&sample_trace());
         assert!(result.passed);
@@ -264,11 +268,13 @@ mod tests {
 
     #[test]
     fn scenario_result_details() {
-        let scenario = Scenario::new("detail check")
-            .assert(Assertion::MinRecords(100));
+        let scenario = Scenario::new("detail check").assert(Assertion::MinRecords(100));
 
         let result = scenario.run(&sample_trace());
         assert!(!result.passed);
-        assert_eq!(result.assertion_results[0].detail.as_deref(), Some("actual: 5"));
+        assert_eq!(
+            result.assertion_results[0].detail.as_deref(),
+            Some("actual: 5")
+        );
     }
 }

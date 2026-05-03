@@ -455,7 +455,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                     }
                 }
                 #[cfg(not(feature = "harness"))]
-                { crate::turn::harness_adapter::HarnessSlot::empty() }
+                {
+                    crate::turn::harness_adapter::HarnessSlot::empty()
+                }
             },
         };
 

@@ -107,10 +107,7 @@ fn print_context(s: &astra_harness::RuntimeSnapshot) {
 
 #[cfg(feature = "harness")]
 fn print_tools(s: &astra_harness::RuntimeSnapshot) {
-    let last = s
-        .last_tool_called
-        .as_deref()
-        .unwrap_or("—");
+    let last = s.last_tool_called.as_deref().unwrap_or("—");
     eprintln!(
         "  {:<20} {}",
         "Tool calls:".bold(),
@@ -147,7 +144,11 @@ fn print_history(state: &ReplState, n: usize) {
 
     eprintln!(
         "\n{}",
-        format!("─── Snapshot History (last {}) ──────────────────", history.len()).bold()
+        format!(
+            "─── Snapshot History (last {}) ──────────────────",
+            history.len()
+        )
+        .bold()
     );
 
     for (i, snap) in history.iter().enumerate() {
@@ -200,11 +201,7 @@ fn print_diff(state: &ReplState) {
         eprintln!("  {:<20} {:+}", "Turns:".bold(), diff.turns_delta);
     }
     if diff.tokens_delta != 0 {
-        eprintln!(
-            "  {:<20} {:+}",
-            "Tokens:".bold(),
-            diff.tokens_delta
-        );
+        eprintln!("  {:<20} {:+}", "Tokens:".bold(), diff.tokens_delta);
     }
     if diff.elapsed_delta_millis != 0 {
         eprintln!(
@@ -214,11 +211,7 @@ fn print_diff(state: &ReplState) {
         );
     }
     if diff.tool_calls_delta != 0 {
-        eprintln!(
-            "  {:<20} {:+}",
-            "Tool calls:".bold(),
-            diff.tool_calls_delta
-        );
+        eprintln!("  {:<20} {:+}", "Tool calls:".bold(), diff.tool_calls_delta);
     }
     if !diff.new_tools.is_empty() {
         eprintln!(
@@ -228,11 +221,7 @@ fn print_diff(state: &ReplState) {
         );
     }
     if let Some(delta) = diff.context_utilization_delta {
-        eprintln!(
-            "  {:<20} {:+.1}%",
-            "Utilization:".bold(),
-            delta * 100.0
-        );
+        eprintln!("  {:<20} {:+.1}%", "Utilization:".bold(), delta * 100.0);
     }
     if diff.consecutive_same_tool_changed {
         eprintln!(
@@ -330,7 +319,11 @@ fn print_forensics(state: &ReplState) {
     );
     eprintln!("  {:<24} {}", "Session:".bold(), summary.session_id);
     eprintln!("  {:<24} {}", "Total turns:".bold(), summary.total_turns);
-    eprintln!("  {:<24} {}", "Total records:".bold(), summary.total_records);
+    eprintln!(
+        "  {:<24} {}",
+        "Total records:".bold(),
+        summary.total_records
+    );
     eprintln!(
         "  {:<24} {}",
         "Total tokens:".bold(),
@@ -342,11 +335,7 @@ fn print_forensics(state: &ReplState) {
         summary.total_tool_calls
     );
     if let Some(peak) = summary.peak_context_utilization {
-        eprintln!(
-            "  {:<24} {:.1}%",
-            "Peak utilization:".bold(),
-            peak * 100.0
-        );
+        eprintln!("  {:<24} {:.1}%", "Peak utilization:".bold(), peak * 100.0);
     }
     if summary.peak_consecutive_same_tool > 0 {
         eprintln!(
@@ -386,7 +375,10 @@ fn export_trace(state: &ReplState, path_arg: &str) {
     }
 
     let (policy, path_part) = if path_arg.contains("--full") {
-        (astra_harness::PrivacyPolicy::Full, path_arg.replace("--full", ""))
+        (
+            astra_harness::PrivacyPolicy::Full,
+            path_arg.replace("--full", ""),
+        )
     } else if path_arg.contains("--metadata") {
         (
             astra_harness::PrivacyPolicy::MetadataOnly,

@@ -16,7 +16,8 @@ pub fn discover_projects(base_dir: &str) -> Vec<ProjectInfo> {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_dir() && p.join(".git").exists() {
-                let name = p.file_name()
+                let name = p
+                    .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("unknown")
                     .to_string();

@@ -129,10 +129,7 @@ mod tests {
 
     fn make_debug_kernel() -> DebugKernel {
         let sink = InMemorySnapshotSink::arc();
-        let inner = Arc::new(StandardKernel::new(
-            sink as Arc<dyn SnapshotSink>,
-            vec![],
-        ));
+        let inner = Arc::new(StandardKernel::new(sink as Arc<dyn SnapshotSink>, vec![]));
         DebugKernel::new(inner)
     }
 

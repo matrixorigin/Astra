@@ -55,8 +55,15 @@ async fn main() {
                                     "account_id": account_id,
                                 });
                                 match astra_gateway::storage::save_credential(
-                                    &pool, "weixin", "default", "bot_token", &creds, None,
-                                ).await {
+                                    &pool,
+                                    "weixin",
+                                    "default",
+                                    "bot_token",
+                                    &creds,
+                                    None,
+                                )
+                                .await
+                                {
                                     Ok(()) => {
                                         println!("✅ 凭证已保存到数据库 (换机器无需重新扫码)");
                                         true
@@ -69,8 +76,12 @@ async fn main() {
                             }
                             Err(_) => false,
                         }
-                    } else { false }
-                } else { false };
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
 
                 if !db_saved {
                     // Fallback: write to yaml
@@ -78,7 +89,8 @@ async fn main() {
                         if let Ok(content) = std::fs::read_to_string(&cli.config) {
                             use regex::Regex;
                             let token_re = Regex::new(r#"(?m)(    token: )"[^"]*""#).unwrap();
-                            let account_re = Regex::new(r#"(?m)(    account_id: )"[^"]*""#).unwrap();
+                            let account_re =
+                                Regex::new(r#"(?m)(    account_id: )"[^"]*""#).unwrap();
                             let patched = token_re
                                 .replace(&content, &format!("${{1}}\"{token}\""))
                                 .to_string();

@@ -83,7 +83,8 @@ mod enabled {
 
         /// Number of snapshot writes dropped due to DB channel backpressure.
         pub fn dropped_write_count(&self) -> u64 {
-            self.dropped_writes.load(std::sync::atomic::Ordering::Relaxed)
+            self.dropped_writes
+                .load(std::sync::atomic::Ordering::Relaxed)
         }
 
         /// Subscribe to live snapshot updates.
