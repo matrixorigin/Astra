@@ -432,7 +432,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         // ── Wire ServerToolExecutor for skill sub-run tool execution ────
         {
             let workspace = self.provision_skill_workspace(skill_name, &subrun_session_id);
-            let memoria_base = std::env::var("MEMORIA_BASE_URL").ok();
+            let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let mut executor = super::server_tool_executor::ServerToolExecutor::new(
                 workspace,
                 String::new(), // skill sub-runs don't track user_id

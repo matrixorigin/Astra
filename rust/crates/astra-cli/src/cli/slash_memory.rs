@@ -279,23 +279,19 @@ pub(super) async fn handle_memory_domain_command(
                                             .unwrap_or("?");
                                         let preview: String = content.chars().take(60).collect();
                                         // Send "irrelevant" feedback to lower retrieval score
+                                        let mem = astra_core::MemoriaSettings::from_env();
                                         let fb_url = format!(
                                             "{}/v1/memories/{mid}/feedback",
-                                            std::env::var("MEMORIA_BASE_URL").unwrap_or_else(
-                                                |_| astra_core::config::DEFAULT_MEMORIA_URL
-                                                    .to_string()
-                                            )
+                                            mem.base_url
                                         );
-                                        let key =
-                                            std::env::var("MEMORIA_MASTER_KEY").unwrap_or_default();
-                                        if let Ok(client) = reqwest::Client::builder()
+                                        if let (Ok(client), Some(token)) = (reqwest::Client::builder()
                                             .timeout(std::time::Duration::from_secs(3))
                                             .no_proxy()
-                                            .build()
+                                            .build(), mem.bearer_token())
                                         {
                                             let _ = client
                                                 .post(&fb_url)
-                                                .header("Authorization", format!("Bearer {key}"))
+                                                .header("Authorization", token)
                                                 .json(&serde_json::json!({"signal": "irrelevant", "context": "user /memory dismiss"}))
                                                 .send()
                                                 .await;

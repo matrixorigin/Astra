@@ -2564,7 +2564,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // When no edge tools are provided (no CLI connected), use the
         // already-provisioned workspace for the ServerToolExecutor.
         if let Some(workspace) = server_workspace {
-            let memoria_base = std::env::var("MEMORIA_BASE_URL").ok();
+            let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let mut executor = super::server_tool_executor::ServerToolExecutor::new(
                 workspace,
                 user_id.clone(),
@@ -3012,7 +3012,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // Wire ServerToolExecutor when no edge agent is connected (web-agent mode).
         if let Some(workspace) = server_workspace {
-            let memoria_base = std::env::var("MEMORIA_BASE_URL").ok();
+            let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let mut executor = super::server_tool_executor::ServerToolExecutor::new(
                 workspace,
                 user_id.clone(),
@@ -3865,7 +3865,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         // server-side and sub-agents would get edge-protocol errors.
         {
             let workspace = self.provision_subrun_workspace(&config.session_id, &config.run_id);
-            let memoria_base = std::env::var("MEMORIA_BASE_URL").ok();
+            let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let mut executor = super::server_tool_executor::ServerToolExecutor::new(
                 workspace,
                 config.user_id.clone(),

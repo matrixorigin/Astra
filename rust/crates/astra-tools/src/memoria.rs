@@ -181,9 +181,8 @@ impl MemoriaClient {
                 HttpMethod::Post,
             )
         } else {
-            let base = std::env::var("MEMORIA_BASE_URL")
-                .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
-            let key = match std::env::var("MEMORIA_MASTER_KEY").ok() {
+            let mem = astra_core::MemoriaSettings::from_env();
+            let key = match mem.master_key {
                 Some(k) => k,
                 None => {
                     return json!({
@@ -193,7 +192,7 @@ impl MemoriaClient {
                         .to_string();
                 }
             };
-            let (ep, pl, m) = Self::build_direct_request(&base, op, args);
+            let (ep, pl, m) = Self::build_direct_request(&mem.base_url, op, args);
             if ep.is_empty() {
                 return pl.to_string();
             }
@@ -242,10 +241,9 @@ impl MemoriaClient {
         if query.trim().is_empty() || self.is_circuit_open() {
             return vec![];
         }
-        let base = std::env::var("MEMORIA_BASE_URL")
-            .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
-        let key = match std::env::var("MEMORIA_MASTER_KEY").ok() {
-            Some(k) => k,
+        let mem = astra_core::MemoriaSettings::from_env();
+        let token = match mem.bearer_token() {
+            Some(t) => t,
             None => return vec![],
         };
         let client = match reqwest::Client::builder()
@@ -257,8 +255,8 @@ impl MemoriaClient {
             Err(_) => return vec![],
         };
         match client
-            .post(format!("{base}/v1/memories/retrieve"))
-            .header("Authorization", format!("Bearer {key}"))
+            .post(format!("{}/v1/memories/retrieve", mem.base_url))
+            .header("Authorization", token)
             .json(&json!({
                 "query": query,
                 "top_k": top_k,
@@ -424,15 +422,14 @@ impl MemoriaClient {
 
 /// Build a one-shot Memoria HTTP client + auth header.
 pub fn memoria_oneshot_client(timeout_secs: u64) -> Option<(reqwest::Client, String, String)> {
-    let base = std::env::var("MEMORIA_BASE_URL")
-        .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
-    let key = std::env::var("MEMORIA_MASTER_KEY").ok()?;
+    let mem = astra_core::MemoriaSettings::from_env();
+    let key = mem.master_key?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .no_proxy()
         .build()
         .ok()?;
-    Some((client, base, key))
+    Some((client, mem.base_url, key))
 }
 
 /// Fire-and-forget: trigger Memoria governance.

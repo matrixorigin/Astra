@@ -99,11 +99,10 @@ impl ToolExecutor {
         {
             return vec![];
         }
-        let base = std::env::var("MEMORIA_BASE_URL")
-            .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
-        let key = match std::env::var("MEMORIA_MASTER_KEY").ok() {
-            Some(k) => k,
-            None => return vec![], // No key = no Memoria
+        let mem = astra_core::MemoriaSettings::from_env();
+        let token = match mem.bearer_token() {
+            Some(t) => t,
+            None => return vec![],
         };
         let client = match reqwest::Client::builder()
             .timeout(Duration::from_millis(800))
@@ -114,8 +113,8 @@ impl ToolExecutor {
             Err(_) => return vec![],
         };
         match client
-            .post(format!("{base}/v1/memories/retrieve"))
-            .header("Authorization", format!("Bearer {key}"))
+            .post(format!("{}/v1/memories/retrieve", mem.base_url))
+            .header("Authorization", token)
             .json(&json!({
                 "query": query,
                 "top_k": top_k,
@@ -153,10 +152,9 @@ impl ToolExecutor {
         {
             return;
         }
-        let base = std::env::var("MEMORIA_BASE_URL")
-            .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
-        let key = match std::env::var("MEMORIA_MASTER_KEY").ok() {
-            Some(k) => k,
+        let mem = astra_core::MemoriaSettings::from_env();
+        let token = match mem.bearer_token() {
+            Some(t) => t,
             None => return,
         };
         tokio::spawn(async move {
@@ -169,10 +167,10 @@ impl ToolExecutor {
                 Err(_) => return,
             };
             for mid in memory_ids {
-                let url = format!("{base}/v1/memories/{mid}/feedback");
+                let url = format!("{}/v1/memories/{mid}/feedback", mem.base_url);
                 if let Err(e) = client
                     .post(&url)
-                    .header("Authorization", format!("Bearer {key}"))
+                    .header("Authorization", &token)
                     .json(&json!({
                         "signal": "useful",
                         "context": "boost_search retrieval"

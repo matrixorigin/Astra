@@ -302,6 +302,19 @@ impl MemoriaSettings {
             master_key: env::var("MEMORIA_MASTER_KEY").ok(),
         }
     }
+
+    /// Returns `true` when a master key is configured (Memoria is usable).
+    pub fn is_configured(&self) -> bool {
+        self.master_key.as_ref().is_some_and(|k| !k.is_empty())
+    }
+
+    /// `Authorization: Bearer <key>` header value, or `None` if unconfigured.
+    pub fn bearer_token(&self) -> Option<String> {
+        self.master_key
+            .as_ref()
+            .filter(|k| !k.is_empty())
+            .map(|k| format!("Bearer {k}"))
+    }
 }
 
 impl fmt::Debug for MemoriaSettings {

@@ -307,9 +307,8 @@ async fn run_extraction(
         })
         .collect();
 
-    let base = std::env::var("MEMORIA_BASE_URL")
-        .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
-    let key = match std::env::var("MEMORIA_MASTER_KEY").ok() {
+    let mem = astra_core::MemoriaSettings::from_env();
+    let key = match mem.master_key {
         Some(k) => k,
         None => {
             return ExtractionOutcome::Extracted {
@@ -321,7 +320,7 @@ async fn run_extraction(
     };
 
     match client
-        .post(format!("{base}/v1/memories/batch"))
+        .post(format!("{}/v1/memories/batch", mem.base_url))
         .header("Authorization", format!("Bearer {key}"))
         .json(&serde_json::json!({ "memories": memories }))
         .send()
