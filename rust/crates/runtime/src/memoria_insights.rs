@@ -36,7 +36,10 @@ pub fn render_digest(contents: &[String]) -> Option<String> {
         // Decode business type prefix for categorized display.
         let (cat, body) = astra_prompts::memory_types::decode(&cleaned);
         let label = match cat {
-            Some(c) => format!("[{}] ", c.content_prefix().trim_matches(|ch| ch == '[' || ch == ']')),
+            Some(c) => format!(
+                "[{}] ",
+                c.content_prefix().trim_matches(|ch| ch == '[' || ch == ']')
+            ),
             None => String::new(),
         };
         bullets.push(format!(

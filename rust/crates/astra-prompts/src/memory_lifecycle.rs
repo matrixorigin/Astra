@@ -7,10 +7,29 @@
 // ─── Negation detection ─────────────────────────────────────────────────────
 
 const NEGATION_PREFIXES: &[&str] = &[
-    "don't ", "dont ", "do not ", "not ", "never ", "no longer ",
-    "won't ", "wont ", "cannot ", "can't ", "didn't ", "didnt ",
-    "wouldn't ", "shouldn't ", "isn't ", "stop ",
-    "不", "没", "别", "不要", "不再", "不想", "没有",
+    "don't ",
+    "dont ",
+    "do not ",
+    "not ",
+    "never ",
+    "no longer ",
+    "won't ",
+    "wont ",
+    "cannot ",
+    "can't ",
+    "didn't ",
+    "didnt ",
+    "wouldn't ",
+    "shouldn't ",
+    "isn't ",
+    "stop ",
+    "不",
+    "没",
+    "别",
+    "不要",
+    "不再",
+    "不想",
+    "没有",
 ];
 
 fn contains_unnegated(text: &str, patterns: &[&str]) -> bool {
@@ -32,9 +51,21 @@ fn contains_unnegated(text: &str, patterns: &[&str]) -> bool {
 // ─── Context filtering for ambiguous tracking keywords ──────────────────────
 
 const FOLLOW_NON_TRACKING: &[&str] = &[
-    "these", "the ", "this", "up", "my ", "your ", "along", "through",
-    "ing step", "ing instruction", "ing the", "ing this", "ing my",
-    "ing your", "ing along",
+    "these",
+    "the ",
+    "this",
+    "up",
+    "my ",
+    "your ",
+    "along",
+    "through",
+    "ing step",
+    "ing instruction",
+    "ing the",
+    "ing this",
+    "ing my",
+    "ing your",
+    "ing along",
 ];
 const WATCH_NON_TRACKING: &[&str] = &["out", "it ", "ing out", "ing it"];
 const TRACK_NON_TRACKING: &[&str] = &["down", "back", " record", "ing down", "ing back"];
@@ -55,10 +86,26 @@ fn is_tracking_context(text: &str, keyword: &str, pos: usize, bad_suffixes: &[&s
 
 fn contains_tracking_signal(text: &str) -> bool {
     let clear_patterns = [
-        "关注", "跟踪", "留意", "感兴趣", "想了解", "想关注", "想跟踪",
-        "想看", "想知道", "在意", "看好",
-        "interested in", "care about", "keep an eye on", "keeping track",
-        "i'm following", "i follow", "i watch", "star ", "subscribe",
+        "关注",
+        "跟踪",
+        "留意",
+        "感兴趣",
+        "想了解",
+        "想关注",
+        "想跟踪",
+        "想看",
+        "想知道",
+        "在意",
+        "看好",
+        "interested in",
+        "care about",
+        "keep an eye on",
+        "keeping track",
+        "i'm following",
+        "i follow",
+        "i watch",
+        "star ",
+        "subscribe",
     ];
     if contains_unnegated(text, &clear_patterns) {
         return true;

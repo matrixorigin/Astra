@@ -1291,7 +1291,10 @@ mod tests {
             .unwrap();
         let score = tfidf_score(&terms, mem_idx);
         // CJK terms should match Chinese triggers in memory_retrieve
-        assert!(score > 0.0, "CJK query should match memory_retrieve triggers");
+        assert!(
+            score > 0.0,
+            "CJK query should match memory_retrieve triggers"
+        );
     }
 
     // --- file_context_tool_boost edge cases ---

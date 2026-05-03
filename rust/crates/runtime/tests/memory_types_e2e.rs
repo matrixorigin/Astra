@@ -26,7 +26,12 @@ fn encode_produces_valid_memoria_payload() {
     });
     assert_eq!(payload["memory_type"], "semantic");
     assert_eq!(payload["trust_tier"], "T2");
-    assert!(payload["content"].as_str().unwrap().starts_with("[feedback]"));
+    assert!(
+        payload["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("[feedback]")
+    );
 }
 
 #[test]
@@ -86,7 +91,10 @@ fn decode_unknown_future_prefix_graceful_degradation() {
     let future_content = "[v2_new_type] some content from a future Memoria version";
     let (cat, text) = memory_types::decode(future_content);
     assert_eq!(cat, None, "unknown prefix must degrade to None");
-    assert_eq!(text, future_content, "full text preserved on unknown prefix");
+    assert_eq!(
+        text, future_content,
+        "full text preserved on unknown prefix"
+    );
 }
 
 #[test]
@@ -100,7 +108,7 @@ fn decode_empty_string() {
 
 #[test]
 fn extraction_to_batch_payload_full_pipeline() {
-    use astra_prompts::memory_types::{encode, MemoryCategory};
+    use astra_prompts::memory_types::{MemoryCategory, encode};
 
     let llm_response = r#"[
         {"type": "feedback", "content": "prefers compact JSON output"},
@@ -201,12 +209,7 @@ fn system_prompt_full_mode_exercises_all_business_types() {
 
 #[test]
 fn system_prompt_minimal_mode_omits_taxonomy() {
-    let prompt = astra_runtime::prompts::build_main_system_prompt(
-        &["memory_store"],
-        "",
-        1.0,
-        None,
-    );
+    let prompt = astra_runtime::prompts::build_main_system_prompt(&["memory_store"], "", 1.0, None);
 
     assert!(prompt.contains("Memory Rules"));
     assert!(!prompt.contains("<types>"));
@@ -215,12 +218,8 @@ fn system_prompt_minimal_mode_omits_taxonomy() {
 
 #[test]
 fn system_prompt_no_memory_tools_omits_everything() {
-    let prompt = astra_runtime::prompts::build_main_system_prompt(
-        &["bash", "read_file"],
-        "",
-        1.0,
-        None,
-    );
+    let prompt =
+        astra_runtime::prompts::build_main_system_prompt(&["bash", "read_file"], "", 1.0, None);
 
     assert!(!prompt.contains("Memory Rules"));
     assert!(!prompt.contains("<types>"));
@@ -282,12 +281,8 @@ fn v2_tag_names_are_unique() {
 
 #[test]
 fn system_prompt_without_lessons_has_no_lessons_header() {
-    let prompt = astra_runtime::prompts::build_main_system_prompt(
-        &["bash", "memory_store"],
-        "",
-        1.0,
-        None,
-    );
+    let prompt =
+        astra_runtime::prompts::build_main_system_prompt(&["bash", "memory_store"], "", 1.0, None);
     assert!(
         !prompt.contains("📚 Lessons"),
         "prompt without lesson injection should not render Lessons header"

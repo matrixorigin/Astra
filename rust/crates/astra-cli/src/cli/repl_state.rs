@@ -3,12 +3,12 @@
 //! This module defines `ReplState`, the central struct that holds all session state
 //! for the CLI REPL. It also includes helper types like `ExplainMode` and `SkillDevState`.
 
+use crate::PermissionManager;
 use crate::durable_bridge;
 use crate::mcp_client;
 use crate::plan_executor;
 use crate::prompts;
 use crate::slash_team;
-use crate::PermissionManager;
 use astra_runtime::plan_decompose;
 use astra_runtime::tool_registry;
 use astra_services::session_journal;

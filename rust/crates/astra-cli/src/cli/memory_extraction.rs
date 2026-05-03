@@ -172,9 +172,7 @@ impl MemoryExtractor {
 
     /// Check if extraction is in progress.
     pub fn is_busy(&self) -> bool {
-        self.in_flight
-            .as_ref()
-            .is_some_and(|h| !h.is_finished())
+        self.in_flight.as_ref().is_some_and(|h| !h.is_finished())
     }
 
     /// Fire extraction for the current turn.
@@ -206,9 +204,8 @@ impl MemoryExtractor {
         );
         let sid = ctx.session_id.map(String::from);
 
-        let handle = tokio::spawn(async move {
-            run_extraction(&params, &query, sid.as_deref()).await
-        });
+        let handle =
+            tokio::spawn(async move { run_extraction(&params, &query, sid.as_deref()).await });
         self.in_flight = Some(handle);
         ExtractionOutcome::Started
     }
@@ -319,7 +316,7 @@ async fn run_extraction(
                 count: quality_filtered.len(),
                 categories,
                 duration_ms: start.elapsed().as_millis() as u64,
-            }
+            };
         }
     };
 
@@ -401,7 +398,8 @@ mod tests {
 
     #[test]
     fn parse_unknown_type_skipped() {
-        let resp = r#"[{"type":"unknown","content":"something"},{"type":"user","content":"valid"}]"#;
+        let resp =
+            r#"[{"type":"unknown","content":"something"},{"type":"user","content":"valid"}]"#;
         let result = parse_extraction_response(resp);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].category, MemoryCategory::User);
@@ -554,8 +552,14 @@ mod tests {
             .tag(),
             "extracted"
         );
-        assert_eq!(ExtractionOutcome::SkippedMainWrote.tag(), "skipped_main_wrote");
-        assert_eq!(ExtractionOutcome::SkippedNoSelector.tag(), "skipped_no_selector");
+        assert_eq!(
+            ExtractionOutcome::SkippedMainWrote.tag(),
+            "skipped_main_wrote"
+        );
+        assert_eq!(
+            ExtractionOutcome::SkippedNoSelector.tag(),
+            "skipped_no_selector"
+        );
         assert_eq!(ExtractionOutcome::SkippedDisabled.tag(), "skipped_disabled");
         assert_eq!(ExtractionOutcome::Error("x".into()).tag(), "error");
     }

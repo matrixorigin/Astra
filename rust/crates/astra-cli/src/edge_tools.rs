@@ -62,8 +62,8 @@ use astra_tools::passive_tsc_check;
 #[allow(clippy::needless_range_loop)]
 mod shell;
 use astra_tools::env_tools;
-pub use env_tools::apply_overlay as apply_env_overlay;
 pub use astra_tools::schemas::all_tool_schemas;
+pub use env_tools::apply_overlay as apply_env_overlay;
 #[path = "edge_tools/code_analysis.rs"]
 mod code_analysis;
 #[path = "edge_tools/config_tool.rs"]

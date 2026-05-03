@@ -403,12 +403,30 @@ mod tests {
 
     #[test]
     fn from_prefix_all_variants() {
-        assert_eq!(MemoryCategory::from_prefix("[user]"), Some(MemoryCategory::User));
-        assert_eq!(MemoryCategory::from_prefix("[feedback]"), Some(MemoryCategory::Feedback));
-        assert_eq!(MemoryCategory::from_prefix("[project]"), Some(MemoryCategory::Project));
-        assert_eq!(MemoryCategory::from_prefix("[ref]"), Some(MemoryCategory::Reference));
-        assert_eq!(MemoryCategory::from_prefix("[lesson]"), Some(MemoryCategory::Lesson));
-        assert_eq!(MemoryCategory::from_prefix("[episode]"), Some(MemoryCategory::Episode));
+        assert_eq!(
+            MemoryCategory::from_prefix("[user]"),
+            Some(MemoryCategory::User)
+        );
+        assert_eq!(
+            MemoryCategory::from_prefix("[feedback]"),
+            Some(MemoryCategory::Feedback)
+        );
+        assert_eq!(
+            MemoryCategory::from_prefix("[project]"),
+            Some(MemoryCategory::Project)
+        );
+        assert_eq!(
+            MemoryCategory::from_prefix("[ref]"),
+            Some(MemoryCategory::Reference)
+        );
+        assert_eq!(
+            MemoryCategory::from_prefix("[lesson]"),
+            Some(MemoryCategory::Lesson)
+        );
+        assert_eq!(
+            MemoryCategory::from_prefix("[episode]"),
+            Some(MemoryCategory::Episode)
+        );
         assert_eq!(MemoryCategory::from_prefix("[unknown]"), None);
     }
 
@@ -424,7 +442,10 @@ mod tests {
         let prompt = build_memory_prompt(MemoryPromptMode::Minimal);
         assert!(prompt.contains("Memory Rules"));
         assert!(prompt.contains("Do NOT ask"));
-        assert!(!prompt.contains("<types>"), "minimal should not include type taxonomy");
+        assert!(
+            !prompt.contains("<types>"),
+            "minimal should not include type taxonomy"
+        );
     }
 
     #[test]

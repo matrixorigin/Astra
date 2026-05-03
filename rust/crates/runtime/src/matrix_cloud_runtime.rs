@@ -189,9 +189,7 @@ impl MatrixCloudRuntime {
 
     /// Resolve the cheapest selector-tagged model from the registry.
     /// Returns `None` if no encryptor is configured or resolution fails.
-    pub async fn resolve_selector_model(
-        &self,
-    ) -> Option<crate::memory_relevance::LlmConnParams> {
+    pub async fn resolve_selector_model(&self) -> Option<crate::memory_relevance::LlmConnParams> {
         let enc = self.encryptor.as_ref()?;
         let settings = self.shared_pool.settings();
         let pool = self.shared_pool.get();

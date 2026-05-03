@@ -16,7 +16,11 @@ pub(crate) enum ReplExit {
     Shutdown(ShutdownSignal),
 }
 
-pub(crate) async fn finalize_repl_exit(state: &mut ReplState, profile: Option<&str>, reason: ReplExit) {
+pub(crate) async fn finalize_repl_exit(
+    state: &mut ReplState,
+    profile: Option<&str>,
+    reason: ReplExit,
+) {
     finalize_session(state).await;
 
     if should_show_resume_hint(reason)

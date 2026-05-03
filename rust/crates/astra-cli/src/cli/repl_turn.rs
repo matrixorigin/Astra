@@ -608,7 +608,8 @@ async fn filter_lessons_by_relevance(
     };
 
     let texts: Vec<String> = lessons.iter().map(|l| l.action.clone()).collect();
-    let filtered = astra_runtime::memory_relevance::filter_memories(&params, user_message, &texts).await;
+    let filtered =
+        astra_runtime::memory_relevance::filter_memories(&params, user_message, &texts).await;
 
     if filtered.len() == texts.len() {
         return lessons;
@@ -1745,17 +1746,18 @@ async fn apply_turn_success_async(
     // Background memory extraction: analyze this turn for durable memories.
     let tools_used: Vec<String> = state.recent_tools.to_vec();
     let extraction_turn = state.turn;
-    let outcome = state.memory_extractor.maybe_extract(
-        super::memory_extraction::ExtractionContext {
-            turn: extraction_turn,
-            selector_params: state.selector_model_params.as_ref(),
-            user_message: line,
-            assistant_response: state.last_response.as_deref().unwrap_or(""),
-            tools_used: &tools_used,
-            session_id: state.session_id.as_deref(),
-            existing_manifest: "",
-        },
-    );
+    let outcome =
+        state
+            .memory_extractor
+            .maybe_extract(super::memory_extraction::ExtractionContext {
+                turn: extraction_turn,
+                selector_params: state.selector_model_params.as_ref(),
+                user_message: line,
+                assistant_response: state.last_response.as_deref().unwrap_or(""),
+                tools_used: &tools_used,
+                session_id: state.session_id.as_deref(),
+                existing_manifest: "",
+            });
     // Journal: record extraction skip reasons for audit trail.
     // Started outcomes are journaled when drain() completes (session end).
     match &outcome {

@@ -5,11 +5,12 @@
 
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::ToolExecutor;
 
 pub use astra_tools::memoria::{
+    BoostSearchHit,
     memoria_branch_checkout,
     memoria_branch_create,
     memoria_branch_diff,
@@ -24,7 +25,6 @@ pub use astra_tools::memoria::{
     memoria_snapshot_rollback,
     memoria_snapshots_list,
     parse_memory_search_hits,
-    BoostSearchHit,
 };
 
 impl ToolExecutor {

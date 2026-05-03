@@ -102,10 +102,10 @@ mod journal_diff;
 mod journal_digest;
 #[path = "cli/journal_tree.rs"]
 mod journal_tree;
-#[path = "cli/mock_llm.rs"]
-mod mock_llm;
 #[path = "cli/memory_extraction.rs"]
 mod memory_extraction;
+#[path = "cli/mock_llm.rs"]
+mod mock_llm;
 #[path = "cli/permission_manager.rs"]
 mod permission_manager;
 #[path = "cli/picker_echo.rs"]

@@ -40,7 +40,9 @@ fn client() -> reqwest::Client {
 #[tokio::test]
 #[ignore]
 async fn store_and_retrieve_semantic_lesson() {
-    let Some((base, key)) = require_memoria_env() else { return; };
+    let Some((base, key)) = require_memoria_env() else {
+        return;
+    };
     let user_id = unique_user_id();
     let client = client();
 
@@ -106,7 +108,9 @@ async fn store_and_retrieve_semantic_lesson() {
 #[tokio::test]
 #[ignore]
 async fn batch_store_session_end_pattern() {
-    let Some((base, key)) = require_memoria_env() else { return; };
+    let Some((base, key)) = require_memoria_env() else {
+        return;
+    };
     let user_id = unique_user_id();
     let client = client();
 
@@ -191,7 +195,9 @@ async fn batch_store_session_end_pattern() {
 #[tokio::test]
 #[ignore]
 async fn governance_and_consolidate_paths_reachable() {
-    let Some((base, key)) = require_memoria_env() else { return; };
+    let Some((base, key)) = require_memoria_env() else {
+        return;
+    };
     let user_id = unique_user_id();
     let client = client();
 
@@ -234,7 +240,9 @@ async fn governance_and_consolidate_paths_reachable() {
 #[tokio::test]
 #[ignore]
 async fn cross_session_lesson_appears_in_self_model_prompt() {
-    let Some((base, key)) = require_memoria_env() else { return; };
+    let Some((base, key)) = require_memoria_env() else {
+        return;
+    };
     let user_id = unique_user_id();
     let client = client();
 
@@ -372,7 +380,9 @@ async fn cross_session_lesson_appears_in_self_model_prompt() {
 #[tokio::test]
 #[ignore]
 async fn memory_correct_by_query_works() {
-    let Some((base, key)) = require_memoria_env() else { return; };
+    let Some((base, key)) = require_memoria_env() else {
+        return;
+    };
     let user_id = unique_user_id();
     let client = client();
 
@@ -430,7 +440,9 @@ async fn memory_correct_by_query_works() {
 #[tokio::test]
 #[ignore]
 async fn memory_profile_endpoint_reachable() {
-    let Some((base, key)) = require_memoria_env() else { return; };
+    let Some((base, key)) = require_memoria_env() else {
+        return;
+    };
     let user_id = unique_user_id();
     let client = client();
 

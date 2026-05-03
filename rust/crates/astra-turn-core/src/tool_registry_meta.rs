@@ -1445,7 +1445,10 @@ mod tests {
             .iter()
             .find(|t| t.name == "memory_store")
             .unwrap();
-        assert!(tool.pinned, "memory_store must be pinned — intrinsic store capability");
+        assert!(
+            tool.pinned,
+            "memory_store must be pinned — intrinsic store capability"
+        );
     }
 
     #[test]
@@ -1454,7 +1457,10 @@ mod tests {
             .iter()
             .find(|t| t.name == "memory_retrieve")
             .unwrap();
-        assert!(!tool.pinned, "memory_retrieve should be dynamic — per-turn boost_search is the capability layer");
+        assert!(
+            !tool.pinned,
+            "memory_retrieve should be dynamic — per-turn boost_search is the capability layer"
+        );
     }
 
     #[test]

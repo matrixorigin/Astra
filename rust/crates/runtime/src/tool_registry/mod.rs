@@ -93,8 +93,14 @@ mod tests {
         assert!(pinned.contains(&"read_file"));
         assert!(pinned.contains(&"str_replace"));
         assert!(pinned.contains(&"list_dir"));
-        assert!(pinned.contains(&"memory_store"), "memory_store must be pinned — intrinsic store capability");
-        assert!(!pinned.contains(&"memory_retrieve"), "memory_retrieve is dynamic — boost_search is the capability layer");
+        assert!(
+            pinned.contains(&"memory_store"),
+            "memory_store must be pinned — intrinsic store capability"
+        );
+        assert!(
+            !pinned.contains(&"memory_retrieve"),
+            "memory_retrieve is dynamic — boost_search is the capability layer"
+        );
         assert!(!pinned.contains(&"write_file"));
         assert!(!pinned.contains(&"grep"));
         assert!(!pinned.contains(&"glob"));

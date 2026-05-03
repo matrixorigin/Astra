@@ -1623,7 +1623,10 @@ mod tests {
         let p = build_main_system_prompt(&["memory_store"], "", 0.5, None);
         assert!(p.contains("Memory Rules"));
         assert!(p.contains("Do NOT ask"));
-        assert!(!p.contains("<types>"), "minimal mode should not include type taxonomy");
+        assert!(
+            !p.contains("<types>"),
+            "minimal mode should not include type taxonomy"
+        );
     }
 
     #[test]
@@ -1960,7 +1963,10 @@ mod tests {
             0.5,
             None,
         );
-        assert!(p.contains("<types>"), "User Memories should upgrade to full mode");
+        assert!(
+            p.contains("<types>"),
+            "User Memories should upgrade to full mode"
+        );
         assert!(p.contains("memory_correct"));
     }
 
