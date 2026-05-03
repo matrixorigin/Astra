@@ -762,7 +762,14 @@ fn pre_filter_dynamic_core(
     outcome_bias: &HashMap<String, f64>,
 ) -> Vec<(usize, f64)> {
     // Short-circuit: pure conversational queries don't need dynamic tools.
-    if state.is_conversational && !state.is_fetch && !state.is_mutate && !state.is_analytical {
+    // BUT: if recent_tools is non-empty, the session has active tool context
+    // and the next turn likely needs related tools (co-occurrence signal).
+    if state.is_conversational
+        && !state.is_fetch
+        && !state.is_mutate
+        && !state.is_analytical
+        && state.recent_tools.is_empty()
+    {
         return vec![];
     }
 

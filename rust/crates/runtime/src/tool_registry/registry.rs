@@ -888,8 +888,31 @@ mod tests {
         let ctx_count = report_ctx.selected_count;
 
         assert!(
-            ctx_count >= bare_count,
-            "with recent_tools, dynamic path should select >= pinned count: bare={bare_count} ctx={ctx_count}"
+            ctx_count > bare_count,
+            "with recent_tools, dynamic path should select MORE than pinned-only: bare={bare_count} ctx={ctx_count}"
+        );
+    }
+
+    #[test]
+    fn quality_path_conversational_with_recent_tools_runs_dynamic() {
+        // Symmetric test: select_with_quality must also respect recent_tools guard.
+        let schemas: Vec<Value> = TOOL_CATALOG.iter().map(|t| sample_schema(t.name)).collect();
+        let registry = ToolRegistry::new(schemas);
+
+        // Without recent tools: quality conversational short-circuit → pinned only
+        let ((_, report_bare), _) =
+            with_obs_capture(|| registry.select_with_quality("好的", 2, 800, &[], None));
+        let bare_count = report_bare.selected_count;
+
+        // With recent tools: dynamic path
+        let recent = vec!["github_ci_status".to_string()];
+        let ((_, report_ctx), _) =
+            with_obs_capture(|| registry.select_with_quality("好的", 2, 800, &recent, None));
+        let ctx_count = report_ctx.selected_count;
+
+        assert!(
+            ctx_count > bare_count,
+            "quality path with recent_tools should select MORE than pinned-only: bare={bare_count} ctx={ctx_count}"
         );
     }
 
