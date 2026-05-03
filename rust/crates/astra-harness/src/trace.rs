@@ -291,14 +291,17 @@ impl HarnessKernel for RecordingKernel {
                 if trace.session_id.is_none() && !record.session_id.is_empty() {
                     trace.session_id = Some(record.session_id.clone());
                 }
-                debug_assert!(
-                    trace.session_id.is_none()
-                        || record.session_id.is_empty()
-                        || trace.session_id.as_deref() == Some(&record.session_id),
-                    "RecordingKernel session mismatch: trace={:?}, record={}",
-                    trace.session_id,
-                    record.session_id,
-                );
+                if let Some(bound_session_id) = trace.session_id.as_deref() {
+                    if !record.session_id.is_empty() && bound_session_id != record.session_id {
+                        tracing::error!(
+                            trace_session_id = bound_session_id,
+                            record_session_id = %record.session_id,
+                            "RecordingKernel rejected mismatched session_id"
+                        );
+                        trace.outcome = TraceOutcome::Error;
+                        return HookVerdict::Continue;
+                    }
+                }
                 if record.point == HookPoint::SessionStart {
                     trace.started_at_unix_millis = record.wall_time_unix_millis;
                     trace.model = record.snapshot.model.clone();
@@ -564,6 +567,41 @@ mod tests {
     }
 
     #[test]
+    fn recording_kernel_adopts_first_non_empty_session_id() {
+        let sink = InMemorySnapshotSink::arc();
+        let inner = Arc::new(StandardKernel::new(sink as Arc<dyn SnapshotSink>, vec![]));
+        let kernel = RecordingKernel::new(inner, None);
+
+        kernel.on_record(&make_record("", 0, HookPoint::SessionStart));
+        kernel.on_record(&make_record("late-bound-session", 1, HookPoint::PostTurn));
+        kernel.on_record(&make_record("", 2, HookPoint::PostTurn));
+
+        let trace = kernel.into_trace();
+        assert_eq!(trace.session_id, Some("late-bound-session".into()));
+        assert_eq!(trace.record_count(), 3);
+    }
+
+    #[test]
+    fn recording_kernel_rejects_mismatched_session_id_after_binding() {
+        let sink = InMemorySnapshotSink::arc();
+        let inner = Arc::new(StandardKernel::new(
+            sink.clone() as Arc<dyn SnapshotSink>,
+            vec![],
+        ));
+        let kernel = RecordingKernel::new(inner, None);
+
+        kernel.on_record(&make_record("session-a", 0, HookPoint::SessionStart));
+        kernel.on_record(&make_record("session-b", 1, HookPoint::PostTurn));
+
+        let trace = kernel.into_trace();
+        assert_eq!(trace.session_id, Some("session-a".into()));
+        assert_eq!(trace.outcome, TraceOutcome::Error);
+        assert_eq!(trace.record_count(), 1);
+        assert_eq!(trace.records[0].session_id, "session-a");
+        assert_eq!(sink.latest().unwrap().session_id, "session-a");
+    }
+
+    #[test]
     fn recording_kernel_sets_start_and_end_times() {
         let (kernel, _sink) = make_recording_kernel();
 
@@ -655,6 +693,48 @@ mod tests {
         assert_eq!(loaded.total_turns, 2);
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn load_json_accepts_legacy_string_session_id() {
+        let json = r#"{
+            "session_id": "legacy-session",
+            "model": null,
+            "started_at_unix_millis": 0,
+            "ended_at_unix_millis": null,
+            "total_turns": 0,
+            "outcome": "InProgress",
+            "records": []
+        }"#;
+
+        let trace: SessionTrace = serde_json::from_str(json).unwrap();
+        assert_eq!(trace.session_id, Some("legacy-session".into()));
+    }
+
+    #[test]
+    fn load_json_accepts_null_and_missing_session_id() {
+        let null_json = r#"{
+            "session_id": null,
+            "model": null,
+            "started_at_unix_millis": 0,
+            "ended_at_unix_millis": null,
+            "total_turns": 0,
+            "outcome": "InProgress",
+            "records": []
+        }"#;
+        let missing_json = r#"{
+            "model": null,
+            "started_at_unix_millis": 0,
+            "ended_at_unix_millis": null,
+            "total_turns": 0,
+            "outcome": "InProgress",
+            "records": []
+        }"#;
+
+        let null_trace: SessionTrace = serde_json::from_str(null_json).unwrap();
+        let missing_trace: SessionTrace = serde_json::from_str(missing_json).unwrap();
+        assert_eq!(null_trace.session_id, None);
+        assert_eq!(missing_trace.session_id, None);
     }
 
     #[test]

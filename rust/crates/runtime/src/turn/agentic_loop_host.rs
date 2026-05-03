@@ -8750,7 +8750,7 @@ mod parallel_execution_tests {
                 limits,
             ));
             let trace = Arc::new(std::sync::RwLock::new(astra_harness::SessionTrace::new(
-                "e2e-test".into(),
+                Some("e2e-test".into()),
             )));
             let recording = Arc::new(RecordingKernel::with_trace(
                 kernel as Arc<dyn HarnessKernel>,
@@ -8840,7 +8840,7 @@ mod parallel_execution_tests {
         #[tokio::test]
         async fn harness_stall_detection_blocks_on_repeated_tool() {
             let limits = HarnessLimits::default();
-            let (mut state, sink, _trace) = setup_harness_state(limits, 20);
+            let (mut state, _sink, _trace) = setup_harness_state(limits, 20);
 
             // 10 turns of the same bash tool — TurnGuardVerifierAdapter
             // should detect stall (default fatal_threshold=5)
