@@ -321,7 +321,8 @@ impl MemoriaClient {
                     } else if let Some(s) = ids.as_str() {
                         json!(s.split(',').map(str::trim).collect::<Vec<_>>())
                     } else {
-                        ids.clone()
+                        // Unexpected type (number, bool, etc.) — stringify and wrap in array.
+                        json!([ids.to_string()])
                     };
                 } else if let Some(topic) = args.get("topic").and_then(Value::as_str) {
                     pl["topic"] = json!(topic);
@@ -331,7 +332,19 @@ impl MemoriaClient {
                 if let Some(reason) = args.get("reason").and_then(Value::as_str) {
                     pl["reason"] = json!(reason);
                 }
-                (format!("{base}/v1/memories/purge"), pl, HttpMethod::Post)
+                // Guard: purge without any filter is ambiguous — Memoria would 422.
+                let has_filter = pl.as_object().map_or(false, |m| {
+                    m.contains_key("memory_ids") || m.contains_key("topic") || m.contains_key("session_id")
+                });
+                if has_filter {
+                    (format!("{base}/v1/memories/purge"), pl, HttpMethod::Post)
+                } else {
+                    (
+                        String::new(),
+                        json!({"error": "memory_purge requires one of: memory_ids, topic, or session_id"}),
+                        HttpMethod::Post,
+                    )
+                }
             }
             "correct" => {
                 let new_content = args.get("new_content").and_then(Value::as_str).unwrap_or("");

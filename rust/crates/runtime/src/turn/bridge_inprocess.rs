@@ -1252,17 +1252,20 @@ impl InProcessChatTurnBridge {
                                 let c = mc.clone();
                                 let sid = session_id.clone();
                                 tokio::spawn(async move {
-                                    match c
-                                        .store(
+                                    match tokio::time::timeout(
+                                        std::time::Duration::from_secs(5),
+                                        c.store(
                                             &lesson.content,
                                             lesson.memory_type,
                                             Some(&sid),
                                             Some(lesson.trust_tier),
-                                        )
-                                        .await
+                                        ),
+                                    )
+                                    .await
                                     {
-                                        Ok(_) => tracing::debug!("Persisted feedback rule to Memoria"),
-                                        Err(e) => tracing::debug!("Failed to persist feedback rule: {e}"),
+                                        Ok(Ok(_)) => tracing::debug!("Persisted feedback rule to Memoria"),
+                                        Ok(Err(e)) => tracing::debug!("Failed to persist feedback rule: {e}"),
+                                        Err(_) => tracing::debug!("Timed out persisting feedback rule to Memoria"),
                                     }
                                 });
                             }
