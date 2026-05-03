@@ -1,29 +1,43 @@
+#[cfg(feature = "server")]
 pub mod agent_mailbox;
+#[cfg(feature = "server")]
 pub mod agent_mcp;
+#[cfg(feature = "server")]
 mod chat_route;
+#[cfg(feature = "server")]
 pub mod conflict_resolver;
+#[cfg(feature = "server")]
 pub mod edge_connection_pool;
 pub mod edge_ws_protocol;
+#[cfg(feature = "server")]
 pub mod team_orchestrator_traits;
+#[cfg(feature = "server")]
 pub mod team_orchestrator_types;
+#[cfg(feature = "server")]
 pub mod worktree_isolation;
+#[cfg(feature = "server")]
 pub mod ws_progress_callback;
 
+#[cfg(feature = "server")]
 use astra_services::auth::SessionActivityRecord;
+#[cfg(feature = "server")]
 use astra_services::{
     AdminAuditRecord, AdminFeedbackStatsRecord, AdminInitRecord, AdminTokenRecord,
     AdminUserRoleRecord, AuthTokenRecord, AuthUserRecord, CancelRunRecord, ChatRequestData,
     ChatRunRecord, RunListRecord, RunMutationRecord, RunStatusRecord, SessionListRecord,
     SessionRecord,
 };
+#[cfg(feature = "server")]
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "server")]
 pub use chat_route::{ChatRouteResponse, classify_chat_route};
 pub use edge_ws_protocol::{
     EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS, EDGE_TOOL_TIMEOUT_SECS,
     EdgeClientMessage, EdgeServerMessage,
 };
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct RootResponse {
     pub name: String,
@@ -31,6 +45,7 @@ pub struct RootResponse {
     pub docs: String,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize)]
 pub struct AuthRegisterRequest {
     pub username: String,
@@ -39,23 +54,27 @@ pub struct AuthRegisterRequest {
     pub display_name: Option<String>,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize)]
 pub struct AuthLoginRequest {
     pub username: String,
     pub password: String,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize)]
 pub struct AuthRefreshRequest {
     pub refresh_token: String,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize, Default)]
 pub struct ChatRouteRequest {
     #[serde(default)]
     pub query: String,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize)]
 pub struct ChatRequest {
     pub message: String,
@@ -82,12 +101,14 @@ pub struct ChatRequest {
     pub is_plan_subtask: Option<bool>,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize, Default)]
 pub struct RunStreamQuery {
     #[serde(default)]
     pub last_index: u32,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize)]
 pub struct SessionCreateRequest {
     pub agent_id: Option<String>,
@@ -95,6 +116,7 @@ pub struct SessionCreateRequest {
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize)]
 pub struct SessionUpdateRequest {
     pub title: Option<String>,
@@ -102,6 +124,7 @@ pub struct SessionUpdateRequest {
     pub status: Option<String>,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize, Default)]
 pub struct SessionListQuery {
     pub agent_id: Option<String>,
@@ -112,6 +135,7 @@ pub struct SessionListQuery {
     pub offset: u32,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize, Default)]
 pub struct SessionActivityQuery {
     #[serde(default = "default_session_activity_limit")]
@@ -120,6 +144,7 @@ pub struct SessionActivityQuery {
     pub offset: u32,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct SessionActivityEntry {
     pub log_id: String,
@@ -128,6 +153,7 @@ pub struct SessionActivityEntry {
     pub created_at: String,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct SessionActivityResponse {
     pub session_id: String,
@@ -135,6 +161,7 @@ pub struct SessionActivityResponse {
     pub total: i64,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize, Default)]
 pub struct SessionArtifactListQuery {
     pub artifact_kind: Option<String>,
@@ -142,6 +169,7 @@ pub struct SessionArtifactListQuery {
     pub limit: u32,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq)]
 pub struct SessionArtifactResponse {
     pub artifact_id: String,
@@ -156,6 +184,7 @@ pub struct SessionArtifactResponse {
     pub created_at: Option<String>,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq)]
 pub struct SessionArtifactListResponse {
     pub session_id: String,
@@ -163,6 +192,7 @@ pub struct SessionArtifactListResponse {
     pub limit: u32,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct AuthUserResponse {
     pub user_id: String,
@@ -173,6 +203,7 @@ pub struct AuthUserResponse {
 
 /// Returned by POST /auth/register — includes the user record plus ready-to-use tokens
 /// so callers don't need a separate login round-trip.
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct AuthRegisterResponse {
     pub user_id: String,
@@ -185,6 +216,7 @@ pub struct AuthRegisterResponse {
     pub expires_in: u32,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct AuthTokenResponse {
     pub access_token: String,
@@ -193,11 +225,13 @@ pub struct AuthTokenResponse {
     pub expires_in: u32,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct AuthLogoutResponse {
     pub message: String,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq)]
 pub struct SessionResponse {
     pub session_id: String,
@@ -212,6 +246,7 @@ pub struct SessionResponse {
     pub ended_at: Option<String>,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq)]
 pub struct SessionListResponse {
     pub sessions: Vec<SessionResponse>,
@@ -220,6 +255,7 @@ pub struct SessionListResponse {
     pub offset: u32,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq)]
 pub struct ChatResponse {
     pub session_id: String,
@@ -228,6 +264,7 @@ pub struct ChatResponse {
     pub explain: Option<serde_json::Value>,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct RunStatusResponse {
     pub run_id: String,
@@ -237,12 +274,14 @@ pub struct RunStatusResponse {
     pub events_count: i64,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct CancelRunResponse {
     pub run_id: String,
     pub status: String,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct RunMutationResponse {
     pub run_id: String,
@@ -250,6 +289,7 @@ pub struct RunMutationResponse {
     pub previous_status: String,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize, Default)]
 pub struct RunListQuery {
     #[serde(default = "default_run_list_limit")]
@@ -258,6 +298,7 @@ pub struct RunListQuery {
     pub offset: u32,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct RunListResponse {
     pub runs: Vec<RunStatusResponse>,
@@ -266,6 +307,7 @@ pub struct RunListResponse {
     pub offset: u32,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct HealthResponse {
     pub status: String,
@@ -274,6 +316,7 @@ pub struct HealthResponse {
     pub persist_fail: u64,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct LearningHealthResponse {
     pub status: String,
@@ -286,12 +329,14 @@ pub struct LearningHealthResponse {
     pub retired_count: Option<u64>,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct LearningSignalsResponse {
     pub signal_types: Vec<&'static str>,
     pub descriptions: LearningSignalDescriptions,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct LearningSignalDescriptions {
     pub wrong_skill: &'static str,
@@ -300,6 +345,7 @@ pub struct LearningSignalDescriptions {
     pub low_satisfaction: &'static str,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq)]
 pub struct LearningStatsResponse {
     pub total_learnings: i32,
@@ -319,6 +365,7 @@ pub struct LearningStatsResponse {
     pub last_learning_time: Option<String>,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize)]
 pub struct LearningTriggerRequest {
     #[serde(default = "default_days")]
@@ -331,6 +378,7 @@ pub struct LearningTriggerRequest {
     pub weights: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq)]
 pub struct LearningTriggerResponse {
     pub status: &'static str,
@@ -344,12 +392,14 @@ pub struct LearningTriggerResponse {
     pub model_version: &'static str,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize, Default)]
 pub struct AdminTokenListQuery {
     pub token_type: Option<String>,
     pub scope: Option<String>,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize)]
 pub struct AdminTokenCreateRequest {
     pub token_type: String,
@@ -360,6 +410,7 @@ pub struct AdminTokenCreateRequest {
     pub token_value: Option<String>,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize)]
 pub struct PromptOptimizeRequest {
     pub agent_id: String,
@@ -367,6 +418,7 @@ pub struct PromptOptimizeRequest {
     pub optimization_type: String,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct PromptOptimizeResponse {
     pub job_id: String,
@@ -374,6 +426,7 @@ pub struct PromptOptimizeResponse {
     pub message: String,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize)]
 pub struct FeedbackExportRequest {
     pub agent_id: Option<String>,
@@ -381,6 +434,7 @@ pub struct FeedbackExportRequest {
     pub format: String,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct FeedbackExportResponse {
     pub job_id: String,
@@ -388,12 +442,14 @@ pub struct FeedbackExportResponse {
     pub download_url: Option<String>,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize)]
 pub struct AdminFeedbackStatsQuery {
     pub agent_id: Option<String>,
     pub since: Option<String>,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize)]
 pub struct AdminAuditListQuery {
     pub user_id: Option<String>,
@@ -402,6 +458,7 @@ pub struct AdminAuditListQuery {
     pub limit: u32,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct AdminTokenResponse {
     pub token_id: String,
@@ -412,6 +469,7 @@ pub struct AdminTokenResponse {
     pub created_at: String,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq)]
 pub struct AdminAuditResponse {
     pub log_id: String,
@@ -423,6 +481,7 @@ pub struct AdminAuditResponse {
     pub details: Option<serde_json::Value>,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq)]
 pub struct AdminFeedbackStatsResponse {
     pub total_feedback: i64,
@@ -432,18 +491,21 @@ pub struct AdminFeedbackStatsResponse {
     pub feedback_by_type: serde_json::Map<String, serde_json::Value>,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct AdminInitResponse {
     pub message: String,
     pub tables_created: i64,
 }
 
+#[cfg(feature = "server")]
 #[derive(Deserialize)]
 pub struct AdminUserRoleRequest {
     pub username: String,
     pub role_name: String,
 }
 
+#[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct AdminUserRoleResponse {
     pub username: String,
@@ -452,6 +514,7 @@ pub struct AdminUserRoleResponse {
 }
 
 /// Messages sent from browser client to server.
+#[cfg(feature = "server")]
 #[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum WsClientMessage {
@@ -510,6 +573,7 @@ pub enum WsClientMessage {
 }
 
 /// Messages sent from server to browser client.
+#[cfg(feature = "server")]
 #[derive(Serialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum WsServerMessage {
@@ -597,6 +661,7 @@ pub enum WsServerMessage {
 }
 
 /// Query params for WebSocket upgrade — allows token in URL for browser compat.
+#[cfg(feature = "server")]
 #[derive(Deserialize, Default)]
 pub struct WsUpgradeQuery {
     /// Optional Bearer token (alternative to sending auth message).
@@ -605,6 +670,7 @@ pub struct WsUpgradeQuery {
     pub session_id: Option<String>,
 }
 
+#[cfg(feature = "server")]
 #[doc(hidden)]
 pub fn merge_plan_subtask_context(
     mut context: Option<serde_json::Map<String, serde_json::Value>>,
@@ -628,56 +694,67 @@ pub fn merge_plan_subtask_context(
     context
 }
 
+#[cfg(feature = "server")]
 #[doc(hidden)]
 pub fn default_days() -> i32 {
     7
 }
 
+#[cfg(feature = "server")]
 #[doc(hidden)]
 pub fn default_admin_scope() -> String {
     "global".to_string()
 }
 
+#[cfg(feature = "server")]
 #[doc(hidden)]
 pub fn default_session_limit() -> u32 {
     50
 }
 
+#[cfg(feature = "server")]
 #[doc(hidden)]
 pub fn default_run_list_limit() -> u32 {
     50
 }
 
+#[cfg(feature = "server")]
 #[doc(hidden)]
 pub fn default_session_activity_limit() -> u32 {
     100
 }
 
+#[cfg(feature = "server")]
 #[doc(hidden)]
 pub fn default_session_artifact_limit() -> u32 {
     20
 }
 
+#[cfg(feature = "server")]
 #[doc(hidden)]
 pub fn default_prompt_optimization_type() -> String {
     "compression".to_string()
 }
 
+#[cfg(feature = "server")]
 #[doc(hidden)]
 pub fn default_feedback_export_format() -> String {
     "jsonl".to_string()
 }
 
+#[cfg(feature = "server")]
 #[doc(hidden)]
 pub fn default_admin_audit_limit() -> u32 {
     100
 }
 
+#[cfg(feature = "server")]
 #[doc(hidden)]
 pub fn default_signal_types() -> Vec<String> {
     vec!["wrong_skill".to_string()]
 }
 
+#[cfg(feature = "server")]
 pub fn sse_error_code_for_status(status: u16) -> &'static str {
     match status {
         401 | 403 => "AUTH_ERROR",
@@ -687,10 +764,12 @@ pub fn sse_error_code_for_status(status: u16) -> &'static str {
     }
 }
 
+#[cfg(feature = "server")]
 pub fn sse_retryable_for_status(status: u16) -> bool {
     status >= 500 || status == 429
 }
 
+#[cfg(feature = "server")]
 pub fn build_sse_error_event_payload(status: u16, message: impl Into<String>) -> serde_json::Value {
     serde_json::json!({
         "type": "error",
@@ -700,6 +779,7 @@ pub fn build_sse_error_event_payload(status: u16, message: impl Into<String>) ->
     })
 }
 
+#[cfg(feature = "server")]
 impl From<AdminTokenRecord> for AdminTokenResponse {
     fn from(value: AdminTokenRecord) -> Self {
         Self {
@@ -713,6 +793,7 @@ impl From<AdminTokenRecord> for AdminTokenResponse {
     }
 }
 
+#[cfg(feature = "server")]
 impl From<AdminAuditRecord> for AdminAuditResponse {
     fn from(value: AdminAuditRecord) -> Self {
         Self {
@@ -727,6 +808,7 @@ impl From<AdminAuditRecord> for AdminAuditResponse {
     }
 }
 
+#[cfg(feature = "server")]
 impl From<AdminFeedbackStatsRecord> for AdminFeedbackStatsResponse {
     fn from(value: AdminFeedbackStatsRecord) -> Self {
         Self {
@@ -739,6 +821,7 @@ impl From<AdminFeedbackStatsRecord> for AdminFeedbackStatsResponse {
     }
 }
 
+#[cfg(feature = "server")]
 impl From<AdminInitRecord> for AdminInitResponse {
     fn from(value: AdminInitRecord) -> Self {
         Self {
@@ -748,6 +831,7 @@ impl From<AdminInitRecord> for AdminInitResponse {
     }
 }
 
+#[cfg(feature = "server")]
 impl From<AdminUserRoleRecord> for AdminUserRoleResponse {
     fn from(value: AdminUserRoleRecord) -> Self {
         Self {
@@ -758,6 +842,7 @@ impl From<AdminUserRoleRecord> for AdminUserRoleResponse {
     }
 }
 
+#[cfg(feature = "server")]
 impl From<SessionRecord> for SessionResponse {
     fn from(value: SessionRecord) -> Self {
         Self {
@@ -775,6 +860,7 @@ impl From<SessionRecord> for SessionResponse {
     }
 }
 
+#[cfg(feature = "server")]
 impl From<SessionListRecord> for SessionListResponse {
     fn from(value: SessionListRecord) -> Self {
         Self {
@@ -790,6 +876,7 @@ impl From<SessionListRecord> for SessionListResponse {
     }
 }
 
+#[cfg(feature = "server")]
 impl From<SessionActivityRecord> for SessionActivityResponse {
     fn from(value: SessionActivityRecord) -> Self {
         Self {
@@ -809,6 +896,7 @@ impl From<SessionActivityRecord> for SessionActivityResponse {
     }
 }
 
+#[cfg(feature = "server")]
 impl From<ChatRunRecord> for ChatResponse {
     fn from(value: ChatRunRecord) -> Self {
         Self {
@@ -820,6 +908,7 @@ impl From<ChatRunRecord> for ChatResponse {
     }
 }
 
+#[cfg(feature = "server")]
 impl From<RunStatusRecord> for RunStatusResponse {
     fn from(value: RunStatusRecord) -> Self {
         Self {
@@ -832,6 +921,7 @@ impl From<RunStatusRecord> for RunStatusResponse {
     }
 }
 
+#[cfg(feature = "server")]
 impl From<CancelRunRecord> for CancelRunResponse {
     fn from(value: CancelRunRecord) -> Self {
         Self {
@@ -841,6 +931,7 @@ impl From<CancelRunRecord> for CancelRunResponse {
     }
 }
 
+#[cfg(feature = "server")]
 impl From<RunMutationRecord> for RunMutationResponse {
     fn from(value: RunMutationRecord) -> Self {
         Self {
@@ -851,6 +942,7 @@ impl From<RunMutationRecord> for RunMutationResponse {
     }
 }
 
+#[cfg(feature = "server")]
 impl From<RunListRecord> for RunListResponse {
     fn from(value: RunListRecord) -> Self {
         Self {
@@ -866,6 +958,7 @@ impl From<RunListRecord> for RunListResponse {
     }
 }
 
+#[cfg(feature = "server")]
 impl From<AuthUserRecord> for AuthUserResponse {
     fn from(value: AuthUserRecord) -> Self {
         Self {
@@ -877,6 +970,7 @@ impl From<AuthUserRecord> for AuthUserResponse {
     }
 }
 
+#[cfg(feature = "server")]
 impl From<AuthTokenRecord> for AuthTokenResponse {
     fn from(value: AuthTokenRecord) -> Self {
         Self {
@@ -888,6 +982,7 @@ impl From<AuthTokenRecord> for AuthTokenResponse {
     }
 }
 
+#[cfg(feature = "server")]
 #[doc(hidden)]
 pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
     let context = merge_plan_subtask_context(
@@ -913,7 +1008,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 mod sse_error_payload_tests {
     use super::*;
 
@@ -935,5 +1030,5 @@ mod sse_error_payload_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 mod http_type_tests;
