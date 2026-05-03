@@ -314,6 +314,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              `/cli` — 查看当前 CLI + 能力 + 工作目录\n\
              `/cli <name>` — 切换 CLI (astra/claude)\n\
              `/workspace <path>` — 切换工作目录\n\
+             `/running` — 查看正在执行的任务\n\
              `/usage` — 用量统计\n\n\
              **监控**\n\
              `/status` — 状态 + harness\n\
@@ -396,6 +397,31 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 }
             } else {
                 Some("用法: `/task [list|cancel <id>|resume <id>|status <id>]`".into())
+            }
+        }
+
+        "/running" => {
+            let pool = require_db!(ctx);
+            let rows: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT user_id, text, CAST(created_at AS CHAR) FROM gw_pending_messages
+                 WHERE platform = ? ORDER BY created_at",
+            )
+            .bind(ctx.platform)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+            if rows.is_empty() {
+                Some("✅ 当前没有正在执行的任务。".into())
+            } else {
+                let mut lines = vec![format!("🔄 **正在执行** ({} 个)", rows.len())];
+                for (user, text, created) in &rows {
+                    let short_user = &user[..8.min(user.len())];
+                    let short_text = if text.chars().count() > 40 {
+                        format!("{}…", text.chars().take(40).collect::<String>())
+                    } else { text.clone() };
+                    lines.push(format!("- `{short_user}…` | {short_text} | {created}"));
+                }
+                Some(lines.join("\n"))
             }
         }
 
