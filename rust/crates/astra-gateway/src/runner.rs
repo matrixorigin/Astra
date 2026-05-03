@@ -265,6 +265,16 @@ impl GatewayRunner {
         };
         let system_prompt = gw_context.to_system_prompt();
 
+        // Resolve workspace directory for CLI
+        let workspace: Option<std::path::PathBuf> = if let Some(ref pool) = self.pool
+            && let Ok(Some(ws)) = storage::get_user_preference(pool, msg.platform, &msg.user_id, "workspace").await
+        {
+            let path = std::path::PathBuf::from(&ws);
+            if path.is_dir() { Some(path) } else { None }
+        } else {
+            None
+        };
+
         // Run CLI with rich progress heartbeats (no hard timeout — only stall detection).
         let message_text = msg.text.clone();
         let sid = session_id.clone();
@@ -277,12 +287,13 @@ impl GatewayRunner {
             let profile = cli_profile.clone();
             let message_text = message_text.clone();
             let system_prompt = system_prompt.clone();
+            let ws = workspace.clone();
             async move {
                 cli_bridge::run_cli_with_context(
                     &profile,
                     &message_text,
                     sid.as_deref(),
-                    None,
+                    ws.as_deref(),
                     Some(progress_tx),
                     Some(&system_prompt),
                 ).await

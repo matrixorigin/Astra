@@ -223,11 +223,17 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
 
         "/cli" => {
             if arg.is_empty() {
-                // Show current CLI + available profiles
+                // Show current CLI + available profiles + workspace
                 let current = ctx.config.cli.name();
                 let caps = ctx.config.cli.capabilities();
+                let workspace = if let Some(pool) = ctx.pool {
+                    storage::get_user_preference(pool, ctx.platform, ctx.user_id, "workspace")
+                        .await.ok().flatten()
+                } else { None };
+                let ws_display = workspace.as_deref().unwrap_or("(默认)");
                 let mut lines = vec![
                     format!("🔧 **当前 CLI: `{current}`**"),
+                    format!("📂 工作目录: `{ws_display}`"),
                     format!(
                         "  能力: {}session {}model {}harness {}tools",
                         if caps.supports_session { "✅" } else { "❌" },
@@ -305,8 +311,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              `/model` — 当前模型 + 快捷列表\n\
              `/model <name>` — 切换 (haiku/sonnet/opus/minimax/deepseek/qwen/glm)\n\n\
              **CLI**\n\
-             `/cli` — 查看当前 CLI + 能力\n\
-             `/cli <name>` — 切换 CLI (astra/claude)\n\n\
+             `/cli` — 查看当前 CLI + 能力 + 工作目录\n\
+             `/cli <name>` — 切换 CLI (astra/claude)\n\
+             `/workspace <path>` — 切换工作目录\n\n\
              **监控**\n\
              `/status` — 状态 + harness\n\
              `/inspect` — harness 详情\n\n\
@@ -389,6 +396,31 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             } else {
                 Some("用法: `/task [list|cancel <id>|resume <id>|status <id>]`".into())
             }
+        }
+
+        "/workspace" | "/ws" => {
+            let pool = require_db!(ctx);
+            if arg.is_empty() {
+                let ws = storage::get_user_preference(pool, ctx.platform, ctx.user_id, "workspace")
+                    .await.ok().flatten();
+                return Some(format!("📂 当前工作目录: `{}`", ws.as_deref().unwrap_or("(默认)")));
+            }
+            // Expand ~ to home dir
+            let target = if arg.starts_with('~') {
+                let home = std::env::var("HOME").unwrap_or_default();
+                arg.replacen('~', &home, 1)
+            } else {
+                arg.to_string()
+            };
+            let path = std::path::Path::new(&target);
+            if !path.is_dir() {
+                return Some(format!("❌ 目录不存在: `{target}`"));
+            }
+            let canonical = path.canonicalize()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or(target);
+            let _ = storage::set_user_preference(pool, ctx.platform, ctx.user_id, "workspace", &canonical).await;
+            Some(format!("📂 工作目录已切换: `{canonical}`"))
         }
 
         _ => None,
