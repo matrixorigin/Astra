@@ -21,9 +21,8 @@ Use these files as the canonical configuration references:
 
 ### Application
 
-- `ASTRA_APP_ENV` — `development` | `staging` | `production`
-- `ASTRA_LOG_LEVEL`
 - `ASTRA_ALLOW_INSECURE_DEFAULTS` — dev-only opt-in for bundled defaults on required keys
+- `RUST_LOG` — standard tracing filter (e.g. `warn,astra_runtime=info`)
 
 ### API server
 
@@ -33,11 +32,11 @@ Use these files as the canonical configuration references:
 
 - `ASTRA_JWT_SECRET`
 - `ASTRA_JWT_ALGORITHM` (default `HS256`)
-- `ASTRA_JWT_ACCESS_TTL_MINUTES` (default `60`)
+- `ASTRA_JWT_ACCESS_TTL_MINUTES` (default `10080` in code; production should override)
 - `ASTRA_JWT_REFRESH_TTL_DAYS` (default `7`)
 - `ASTRA_TOKEN_ENCRYPTION_KEY` (Fernet key)
-- `ASTRA_BRIDGE_SECRET`, `ASTRA_BRIDGE_URL` (optional)
-- `ASTRA_AUTH_MODE` — `local_jwt` (default) or `trusted_external`
+- `ASTRA_BRIDGE_SECRET`
+- `ASTRA_AUTH_MODE` — `local_jwt` (default) or `trusted_moi`
 - External-IdP mode only: `ASTRA_EXTERNAL_JWT_SECRET`, `ASTRA_EXTERNAL_JWT_ALGORITHM`, `ASTRA_EXTERNAL_JWT_ISSUER`, `ASTRA_EXTERNAL_JWT_AUDIENCE`, `ASTRA_EXTERNAL_JWT_LEEWAY_SECS`
 
 ### LLM

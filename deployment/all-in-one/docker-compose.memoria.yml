@@ -39,7 +39,7 @@ services:
     ports:
       - "8100:8000"
     environment:
-      - DATABASE_URL=mysql://root:111@matrixone:6001/memoria
+      - DATABASE_URL=mysql://${MATRIXONE_USER:-root}:${MATRIXONE_PASSWORD:-111}@matrixone:6001/memoria
       - MASTER_KEY=${MEMORIA_MASTER_KEY:-dev-master-key-change-in-production}
       - EMBEDDING_PROVIDER=${MEMORIA_EMBEDDING_PROVIDER:-openai}
       - EMBEDDING_API_KEY=${MEMORIA_EMBEDDING_API_KEY}

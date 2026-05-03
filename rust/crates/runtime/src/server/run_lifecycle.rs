@@ -4215,7 +4215,7 @@ mod tests {
     fn runtime_db_it_settings(database: &str) -> MatrixOneSettings {
         dotenvy::dotenv().ok();
         MatrixOneSettings {
-            host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+            host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".into()),
             port: std::env::var("MATRIXONE_PORT")
                 .ok()
                 .and_then(|s| s.parse().ok())
