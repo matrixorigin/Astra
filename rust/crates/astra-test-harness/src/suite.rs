@@ -420,9 +420,22 @@ impl<'a> SuiteRunner<'a> {
                 outcome.turn_rounds += step_outcome.turn_rounds;
                 outcome.total_tool_calls += step_outcome.total_tool_calls;
                 outcome.cache_hits += step_outcome.cache_hits;
-                // Last step's text/exit_code wins.
-                outcome.text = step_outcome.text;
-                outcome.exit_code = step_outcome.exit_code;
+                // Accumulate text across turns so global criteria
+                // (text_contains, judger) see ALL steps, not just the
+                // last one. Previous behavior silently dropped earlier
+                // turns' output, causing text_contains to miss content
+                // from turn 0 or intermediate steps.
+                if !step_outcome.text.is_empty() {
+                    if !outcome.text.is_empty() {
+                        outcome.text.push_str("\n\n");
+                    }
+                    outcome.text.push_str(&step_outcome.text);
+                }
+                // First non-zero exit_code wins. A step that fails
+                // should not be masked by a later step that succeeds.
+                if outcome.exit_code == 0 {
+                    outcome.exit_code = step_outcome.exit_code;
+                }
                 if !step_outcome.stderr.is_empty() {
                     outcome.stderr.push('\n');
                     outcome.stderr.push_str(&step_outcome.stderr);
@@ -1060,6 +1073,12 @@ mod tests {
         assert_eq!(report.runs[0].steps.len(), 1);
         assert_eq!(report.runs[0].steps[0].step_index, 0);
         assert_eq!(report.runs[0].steps[0].prompt, "follow up");
+        // Text accumulates across turns (not last-step-wins).
+        let merged = &report.runs[0].outcome.text;
+        assert!(
+            merged.contains("step0-text") && merged.contains("step1-text"),
+            "accumulated text should contain both turns; got: {merged:?}"
+        );
     }
 
     #[tokio::test]
