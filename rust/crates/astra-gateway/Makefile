@@ -42,12 +42,12 @@ build:
 
 # ── Foreground (dev) ──
 
-run: build _ensure_config
+run: build _ensure_config _ensure_astra_auth
 	@$(RELEASE_BIN) --config $(CONFIG)
 
 # ── Background (production) ──
 
-start: build _ensure_config
+start: build _ensure_config _ensure_astra_auth
 	@if [ -f $(PID_FILE) ] && kill -0 $$(cat $(PID_FILE)) 2>/dev/null; then \
 		echo "✅ Gateway already running (PID $$(cat $(PID_FILE)))"; \
 		exit 0; \
@@ -117,6 +117,20 @@ _ensure_config:
 		echo "No $(CONFIG) found — copying from template..."; \
 		cp gateway.example.yaml $(CONFIG); \
 		echo "Created $(CONFIG). Edit it or run: make login-weixin"; \
+	fi
+
+ASTRA_BIN = ../../target/release/astra
+
+_ensure_astra_auth:
+	@if [ -f $(ASTRA_BIN) ]; then \
+		no_proxy=127.0.0.1,localhost $(ASTRA_BIN) whoami >/dev/null 2>&1 || { \
+			echo "Astra CLI auth expired — refreshing..."; \
+			USER=$${ASTRA_USERNAME:-gateway}; \
+			PASS=$${ASTRA_PASSWORD:-gateway123}; \
+			no_proxy=127.0.0.1,localhost $(ASTRA_BIN) login --username $$USER --password $$PASS >/dev/null 2>&1 || \
+			no_proxy=127.0.0.1,localhost $(ASTRA_BIN) register --username $$USER --email $$USER@gateway.local --password $$PASS >/dev/null 2>&1 || \
+			echo "⚠️  Astra auth failed — astra CLI may not work. Set ASTRA_USERNAME/ASTRA_PASSWORD or run: astra login"; \
+		}; \
 	fi
 
 # ── Testing ──
