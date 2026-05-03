@@ -1270,6 +1270,11 @@ pub(super) async fn handle_info_command(
                 turn_index: 0,
                 evolution_service: state.evolution_service.clone(),
                 pre_loaded_messages: None,
+                    append_system_prompt: None,
+                #[cfg(feature = "harness")]
+                harness_sink: Some(state.harness_sink.clone()),
+                #[cfg(feature = "harness")]
+                harness_trace: Some(state.harness_trace.clone()),
             })
             .await
             .map_err(|f| f.error)?;

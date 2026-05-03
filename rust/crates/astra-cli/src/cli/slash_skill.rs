@@ -1784,6 +1784,11 @@ Follow these steps:
                 turn_index: state.turn,
                 evolution_service: None,
                 pre_loaded_messages: None,
+                    append_system_prompt: None,
+                #[cfg(feature = "harness")]
+                harness_sink: Some(state.harness_sink.clone()),
+                #[cfg(feature = "harness")]
+                harness_trace: Some(state.harness_trace.clone()),
             })
             .await
             .map_err(|e| e.to_string())?;

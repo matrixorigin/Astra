@@ -360,6 +360,19 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
 ) -> Result<AgenticLoopOutcome, astra_core::ClassifiedError> {
     let result = run_agentic_loop_impl(host, state).await;
 
+    // Ensure SessionEnd fires even on error returns that skip finalize_and_render.
+    #[cfg(feature = "harness")]
+    if !state.harness.session_ended {
+        state.harness.session_ended = true;
+        super::harness_adapter::harness_at!(
+            &state.harness,
+            astra_harness::HookPoint::SessionEnd,
+            state
+        );
+    }
+
+    // Registry cleanup is handled by HarnessSlot::Drop (single ownership).
+
     // On error, best-effort flush turn observability events.
     if result.is_err() {
         if let Some(sid) = state.current_session_id.as_deref() {
@@ -445,6 +458,15 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) {
+    // ── Harness: SessionEnd (observe only, fire at most once) ──
+    #[cfg(feature = "harness")]
+    if !state.harness.session_ended {
+        state.harness.session_ended = true;
+        super::harness_adapter::harness_at!(&state.harness, astra_harness::HookPoint::SessionEnd, state);
+    }
+    #[cfg(not(feature = "harness"))]
+    super::harness_adapter::harness_at!(&state.harness, astra_harness::HookPoint::SessionEnd, state);
+
     finalize_turn_trace(state).await;
     // Drop any execution-retry corrective messages now that the loop has
     // finished. Keeping them in `state.messages` would pollute every

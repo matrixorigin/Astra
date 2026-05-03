@@ -144,6 +144,7 @@ dependencies = [
  "astra-config",
  "astra-core",
  "astra-evolution",
+ "astra-harness",
  "astra-learning",
  "astra-logging",
  "astra-messaging",
@@ -270,6 +271,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "astra-gateway"
+version = "0.1.0"
+dependencies = [
+ "astra-thin-client",
+ "async-trait",
+ "base64",
+ "chrono",
+ "clap",
+ "dashmap",
+ "futures-util",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "astra-harness"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "astra-learning"
 version = "0.1.0"
 dependencies = [
@@ -367,6 +402,7 @@ dependencies = [
  "astra-config",
  "astra-core",
  "astra-evolution",
+ "astra-harness",
  "astra-learning",
  "astra-logging",
  "astra-messaging",

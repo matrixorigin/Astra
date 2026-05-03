@@ -160,6 +160,8 @@ mod slash_debug;
 mod slash_health;
 #[path = "cli/slash_info.rs"]
 mod slash_info;
+#[path = "cli/slash_inspect.rs"]
+mod slash_inspect;
 #[path = "cli/slash_mcp.rs"]
 mod slash_mcp;
 #[path = "cli/slash_memory.rs"]

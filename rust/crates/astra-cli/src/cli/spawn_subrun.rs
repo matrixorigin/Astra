@@ -385,6 +385,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             bridge_turn_chain_id: None,
             bridge_user_query_event_id: None,
             turn_event_buffer: None,
+            harness: astra_runtime::turn::harness_adapter::HarnessSlot::empty(),
         };
 
         // Inherit skills from parent: pre-populate discovered skills

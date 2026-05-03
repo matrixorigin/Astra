@@ -1031,6 +1031,11 @@ async fn run_chat_turn(
             turn_index: state.turn,
             evolution_service: state.evolution_service.clone(),
             pre_loaded_messages: None,
+                    append_system_prompt: None,
+            #[cfg(feature = "harness")]
+            harness_sink: Some(state.harness_sink.clone()),
+            #[cfg(feature = "harness")]
+            harness_trace: Some(state.harness_trace.clone()),
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             // Trigger cancellation to interrupt any in-flight SSE streaming.

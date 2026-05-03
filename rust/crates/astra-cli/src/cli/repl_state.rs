@@ -353,6 +353,12 @@ pub(crate) struct ReplState {
     /// Unified CSL manager for persisting/restoring conversation state.
     /// Created lazily when session_id is first known.
     pub csl_manager: Option<CslManager>,
+
+    // ── Harness (observation + verification layer) ──
+    #[cfg(feature = "harness")]
+    pub harness_sink: std::sync::Arc<astra_harness::InMemorySnapshotSink>,
+    #[cfg(feature = "harness")]
+    pub harness_trace: std::sync::Arc<std::sync::RwLock<astra_harness::SessionTrace>>,
 }
 
 impl Default for ReplState {
@@ -508,6 +514,12 @@ impl Default for ReplState {
             },
             evolution_service: None,
             csl_manager: None,
+            #[cfg(feature = "harness")]
+            harness_sink: astra_harness::InMemorySnapshotSink::arc(),
+            #[cfg(feature = "harness")]
+            harness_trace: std::sync::Arc::new(std::sync::RwLock::new(
+                astra_harness::SessionTrace::new(String::new()),
+            )),
         }
     }
 }

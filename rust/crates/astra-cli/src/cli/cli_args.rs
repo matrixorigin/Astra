@@ -283,6 +283,9 @@ pub(crate) struct ChatArgs {
     /// Disable ANSI colors in output
     #[arg(long, default_value_t = false)]
     pub no_color: bool,
+    /// Append extra context to the system prompt (used by gateway)
+    #[arg(long = "append-system-prompt", hide = true)]
+    pub append_system_prompt: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]

@@ -304,6 +304,9 @@ pub async fn build_server_state(
     .with_observer_worker(state.turn_observer_worker.clone())
     .with_tool_event_writer(state.turn_tool_event_writer.clone());
 
+    #[cfg(feature = "harness")]
+    let run_lifecycle = run_lifecycle.with_harness_registry(state.harness_registry.clone());
+
     // Wire team persistence store backed by MatrixOne.
     let team_store =
         astra_services::team_persistence::MatrixOneTeamStore::new(shared_pool.get().clone());

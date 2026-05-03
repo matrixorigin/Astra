@@ -451,6 +451,11 @@ pub(super) async fn execute_cli_command(
                 // spawning too.
                 agent_spawner: None,
                 root_agent_id: None,
+                // Non-REPL path — no harness context available.
+                #[cfg(feature = "harness")]
+                harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
+                #[cfg(feature = "harness")]
+                harness_trace: Some(std::sync::Arc::new(std::sync::RwLock::new(astra_harness::SessionTrace::new(String::new())))),
             };
             let mut params = ChatTurnParams::basic_cli(
                 &chat_ctx,
@@ -904,6 +909,11 @@ pub(super) async fn execute_cli_command(
                 skill_search: &skill_search,
                 agent_spawner: Some(one_shot_spawner),
                 root_agent_id: Some(&root_agent_id),
+                // Non-REPL one-shot path — no harness context available.
+                #[cfg(feature = "harness")]
+                harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
+                #[cfg(feature = "harness")]
+                harness_trace: Some(std::sync::Arc::new(std::sync::RwLock::new(astra_harness::SessionTrace::new(String::new())))),
             };
             let mut params = ChatTurnParams::basic_cli(
                 &chat_ctx,
@@ -913,6 +923,7 @@ pub(super) async fn execute_cli_command(
                 &mut skill_qt,
             );
             params.pre_loaded_messages = continuation_messages.take();
+            params.append_system_prompt = args.append_system_prompt.clone();
             let mut sr = match stream_chat_sse(params).await {
                 Ok(sr) => sr,
                 Err(e) if is_session_not_found_error(&e.error) && session_id.is_some() => {
@@ -1502,6 +1513,11 @@ pub(super) async fn run_print_mode(
         // Print/headless mode — no spawn_agent support by design.
         agent_spawner: None,
         root_agent_id: None,
+        // Print/headless path — no harness context available.
+        #[cfg(feature = "harness")]
+        harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
+        #[cfg(feature = "harness")]
+        harness_trace: Some(std::sync::Arc::new(std::sync::RwLock::new(astra_harness::SessionTrace::new(String::new())))),
     };
 
     let mut params = ChatTurnParams::basic_cli(

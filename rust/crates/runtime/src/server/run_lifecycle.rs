@@ -385,6 +385,7 @@ fn build_server_skill_executor(
     session_id: &str,
     edge_connection_pool: Option<&astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+    #[cfg(feature = "harness")] harness_sink: Option<&std::sync::Arc<dyn astra_harness::SnapshotSink>>,
 ) -> Option<Arc<dyn crate::skills::traits::SkillExecutor>> {
     use super::server_skill_subrun::ServerSkillSubRunExecutor;
     use astra_skills::executor::isolated::{IsolatedSkillExecutor, SkillExecutionRouter};
@@ -405,6 +406,10 @@ fn build_server_skill_executor(
     .with_cancel_token(cancel_token);
     if let Some(pool) = edge_connection_pool {
         subrun_executor = subrun_executor.with_edge_connection_pool(pool.clone());
+    }
+    #[cfg(feature = "harness")]
+    if let Some(sink) = harness_sink {
+        subrun_executor = subrun_executor.with_harness_sink(Some(sink.clone()));
     }
 
     let isolated = Arc::new(IsolatedSkillExecutor::new(Arc::new(subrun_executor)));
@@ -1430,6 +1435,9 @@ pub struct AgenticRunLifecycleService {
     /// Incremented before spawn, decremented when the task exits.
     /// Used by `drain_background_tasks` for graceful shutdown.
     background_task_count: Arc<AtomicUsize>,
+    /// Harness sink registry for server-side harness observation (Phase 2A).
+    #[cfg(feature = "harness")]
+    harness_registry: Option<crate::server::harness_handlers::HarnessSinkRegistry>,
 }
 
 impl AgenticRunLifecycleService {
@@ -1457,7 +1465,18 @@ impl AgenticRunLifecycleService {
             observer_worker: None,
             tool_event_writer: None,
             background_task_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(feature = "harness")]
+            harness_registry: None,
         }
+    }
+
+    #[cfg(feature = "harness")]
+    pub fn with_harness_registry(
+        mut self,
+        registry: crate::server::harness_handlers::HarnessSinkRegistry,
+    ) -> Self {
+        self.harness_registry = Some(registry);
+        self
     }
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
@@ -2051,6 +2070,27 @@ impl AgenticRunLifecycleService {
             .unwrap_or_default();
         let runtime_continuity = Self::continuity_from_chat_context(&request.context);
 
+        // Create harness sink early so sub-run executors can share it.
+        #[cfg(feature = "harness")]
+        let (harness_server_sink, harness_sink_arc): (
+            Option<std::sync::Arc<crate::server::harness_server_sink::ServerSnapshotSink>>,
+            Option<std::sync::Arc<dyn astra_harness::SnapshotSink>>,
+        ) = if self.harness_registry.is_some() {
+            let mut raw_sink =
+                crate::server::harness_server_sink::ServerSnapshotSink::new(
+                    session_id.to_string(),
+                    String::new(),
+                );
+            if let Some(ref pool) = self.shared_pool {
+                raw_sink = raw_sink.with_pool(pool.get().clone());
+            }
+            let concrete = std::sync::Arc::new(raw_sink);
+            let dyn_sink = concrete.clone() as std::sync::Arc<dyn astra_harness::SnapshotSink>;
+            (Some(concrete), Some(dyn_sink))
+        } else {
+            (None, None)
+        };
+
         // Build the server-side skill fork executor so skills with
         // execution_context: Fork can run in isolated sub-agent loops.
         let edge_tools = Self::extract_edge_tools(request);
@@ -2069,8 +2109,9 @@ impl AgenticRunLifecycleService {
             session_id,
             self.edge_connection_pool.as_ref(),
             cancel_token,
+            #[cfg(feature = "harness")]
+            harness_sink_arc.as_ref(),
         );
-
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_selection
             .resolve_for_model(request.model.as_deref());
@@ -2184,9 +2225,43 @@ impl AgenticRunLifecycleService {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            bridge_turn_chain_id: None,
+            bridge_turn_chain_id: Some(format!("{}:harness", session_id)),
             bridge_user_query_event_id: None,
             turn_event_buffer: None,
+            harness: {
+                #[cfg(feature = "harness")]
+                {
+                    if let (Some(registry), Some(server_sink), Some(sink_arc)) =
+                        (&self.harness_registry, harness_server_sink, harness_sink_arc)
+                    {
+                        let broadcaster_tx = server_sink.broadcaster_sender();
+                        let limits = astra_harness::HarnessLimits {
+                            max_turns: if max_turns > 0 { Some(max_turns as u32) } else { None },
+                            ..Default::default()
+                        };
+                        let kernel = std::sync::Arc::new(
+                            astra_harness::StandardKernel::configured(sink_arc.clone(), limits),
+                        );
+                        registry.register_with_broadcast(
+                            session_id.to_string(),
+                            sink_arc.clone(),
+                            broadcaster_tx,
+                        );
+                        let mut slot = crate::turn::harness_adapter::HarnessSlot::new(
+                            kernel as std::sync::Arc<dyn astra_harness::HarnessKernel>,
+                            sink_arc,
+                        );
+                        slot.registry = Some(registry.clone());
+                        slot.session_id_for_cleanup = Some(session_id.to_string());
+                        slot.server_sink = Some(server_sink);
+                        slot
+                    } else {
+                        crate::turn::harness_adapter::HarnessSlot::empty()
+                    }
+                }
+                #[cfg(not(feature = "harness"))]
+                { crate::turn::harness_adapter::HarnessSlot::empty() }
+            },
         }
     }
 
@@ -2519,6 +2594,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             server_workspace.as_deref(),
             Some(llm_cancel_token.clone()),
         );
+        // Inject user_id into harness sink for DB persistence (deferred
+        // because build_initial_state does not receive user_id).
+        #[cfg(feature = "harness")]
+        loop_state.harness.set_user_id(&user_id);
+
         if request.session_id.is_some()
             && loop_state.continuity == astra_turn_types::continuity::ContinuityState::default()
         {
@@ -2926,6 +3006,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             server_workspace.as_deref(),
             Some(llm_cancel_token.clone()),
         );
+        // Inject user_id into harness sink for DB persistence (deferred
+        // because build_initial_state does not receive user_id).
+        #[cfg(feature = "harness")]
+        state.harness.set_user_id(&user_id);
+
         if request.session_id.is_some()
             && state.continuity == astra_turn_types::continuity::ContinuityState::default()
         {
@@ -3858,6 +3943,19 @@ impl SubRunExecutor for ServerSubRunExecutor {
             bridge_turn_chain_id: None,
             bridge_user_query_event_id: None,
             turn_event_buffer: None,
+            harness: {
+                #[cfg(feature = "harness")]
+                {
+                    match config.harness_sink {
+                        Some(ref sink) => {
+                            crate::turn::harness_adapter::HarnessSlot::observe_only(sink.clone())
+                        }
+                        None => crate::turn::harness_adapter::HarnessSlot::empty(),
+                    }
+                }
+                #[cfg(not(feature = "harness"))]
+                { crate::turn::harness_adapter::HarnessSlot::empty() }
+            },
         };
 
         // ── Wire ServerToolExecutor for sub-run tool execution ──────────

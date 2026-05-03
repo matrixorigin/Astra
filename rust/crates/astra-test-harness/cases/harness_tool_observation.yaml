@@ -1,0 +1,23 @@
+name: harness_tool_observation
+description: |
+  **What**: Verify harness captures tool usage data across multiple turns.
+  **Tests**: Snapshot accuracy — tool_calls_this_session, unique_tools_used, consecutive_same_tool.
+  **Why**: Observation is the foundation — if snapshots don't reflect reality, all verifiers are wrong.
+  **Pass means**: Harness accurately tracks tool usage.
+  **Fail means**: capture_snapshot() not reading from AgenticLoopState correctly.
+prompt: |
+  Use bash to run: echo "hello"
+  Then use bash to run: echo "world"
+  Then tell me what you ran.
+timeout_seconds: 120
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: bash
+  - type: turn_rounds_between
+    min: 1
+    max: 30
+  - type: tokens_between
+    min: 1
+    max: 100000

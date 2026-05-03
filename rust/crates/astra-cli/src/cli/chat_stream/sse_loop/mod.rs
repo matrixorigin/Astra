@@ -486,6 +486,7 @@ pub(crate) async fn stream_chat_sse(
             resolved_tool_policy.max_identical_tool_calls,
         ),
         prefix_store: prefix_store_for_host,
+        append_system_prompt: p.append_system_prompt.take(),
     };
 
     let hook_sets = detect_turn_hook_sets(&project_root, task_profile, p.is_plan_subtask);
@@ -735,6 +736,43 @@ pub(crate) async fn stream_chat_sse(
         bridge_turn_chain_id: Some(uuid::Uuid::now_v7().to_string()),
         bridge_user_query_event_id: Some(uuid::Uuid::now_v7().to_string()),
         turn_event_buffer: None,
+        harness: {
+            #[cfg(feature = "harness")]
+            {
+                match p.harness_sink.as_ref() {
+                    Some(sink) => {
+                        let base_kernel = std::sync::Arc::new(
+                            astra_harness::StandardKernel::with_default_verifiers(
+                                sink.clone() as std::sync::Arc<dyn astra_harness::SnapshotSink>,
+                            ),
+                        );
+                        let session_id = p.session_id.unwrap_or("unknown").to_string();
+                        let recording = if let Some(ref trace_arc) = p.harness_trace {
+                            // Share ReplState's trace Arc so /inspect reads live data
+                            if let Ok(mut t) = trace_arc.write() {
+                                t.session_id = session_id;
+                            }
+                            std::sync::Arc::new(astra_harness::RecordingKernel::with_trace(
+                                base_kernel,
+                                trace_arc.clone(),
+                            ))
+                        } else {
+                            std::sync::Arc::new(astra_harness::RecordingKernel::new(
+                                base_kernel,
+                                session_id,
+                            ))
+                        };
+                        astra_runtime::turn::harness_adapter::HarnessSlot::new(
+                            recording as std::sync::Arc<dyn astra_harness::HarnessKernel>,
+                            sink.clone() as std::sync::Arc<dyn astra_harness::SnapshotSink>,
+                        )
+                    }
+                    None => astra_runtime::turn::harness_adapter::HarnessSlot::empty(),
+                }
+            }
+            #[cfg(not(feature = "harness"))]
+            { astra_runtime::turn::harness_adapter::HarnessSlot::empty() }
+        },
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────

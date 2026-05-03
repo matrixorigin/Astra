@@ -24,6 +24,8 @@ members = [
     "crates/astra-learning",
     "crates/astra-sync-adapters",
     "crates/astra-test-harness",
+    "crates/astra-harness",
+    "crates/astra-gateway",
 ]
 resolver = "2"
 
@@ -33,6 +35,7 @@ edition = "2024"
 
 [workspace.dependencies]
 astra-core = { path = "crates/core" }
+astra-harness = { path = "crates/astra-harness" }
 astra-logging = { path = "crates/astra-logging" }
 astra-config = { path = "crates/astra-config" }
 astra-evolution = { path = "crates/astra-evolution" }

@@ -466,6 +466,26 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
+    // Harness diagnostic snapshots — separated from agent_events to avoid
+    // polluting session event counts and to carry causal_chain_id natively.
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_snapshots (
+            snapshot_id VARCHAR(64) PRIMARY KEY,
+            session_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(64) NOT NULL,
+            hook_point VARCHAR(32) NOT NULL,
+            turn_number INT UNSIGNED NOT NULL DEFAULT 0,
+            snapshot_json LONGTEXT NOT NULL,
+            causal_chain_id VARCHAR(128),
+            created_at DATETIME(6) DEFAULT NOW(6),
+            INDEX idx_harness_session (session_id),
+            INDEX idx_harness_session_turn (session_id, turn_number),
+            INDEX idx_harness_chain (causal_chain_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // Context / decisions / evaluation essentials used by turn persistence
     query(
         "CREATE TABLE IF NOT EXISTS ctx_snapshots (

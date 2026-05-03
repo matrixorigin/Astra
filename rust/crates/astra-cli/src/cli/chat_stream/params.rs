@@ -174,6 +174,15 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Pre-loaded CSL messages (from CslManager.load() in repl_turn).
     /// When present, these are used instead of converting history pairs.
     pub(crate) pre_loaded_messages: Option<Vec<serde_json::Value>>,
+    /// Extra context appended to the system prompt (gateway injects cron/session context here).
+    pub(crate) append_system_prompt: Option<String>,
+    /// Shared harness snapshot sink for /inspect command.
+    #[cfg(feature = "harness")]
+    pub(crate) harness_sink: Option<std::sync::Arc<astra_harness::InMemorySnapshotSink>>,
+    /// Shared harness trace for /inspect trace command.
+    #[cfg(feature = "harness")]
+    pub(crate) harness_trace:
+        Option<std::sync::Arc<std::sync::RwLock<astra_harness::SessionTrace>>>,
 }
 
 /// Bundle of "basic CLI" fields shared across one-shot CLI chat invocations
@@ -207,6 +216,12 @@ pub(crate) struct BasicCliChatContext<'a> {
     /// Passed through to `sse_loop::mod` for `SpawnAgentContext`
     /// wiring. When `agent_spawner` is None this is ignored.
     pub root_agent_id: Option<&'a str>,
+    /// Shared harness snapshot sink for /inspect command (non-REPL one-shot paths).
+    #[cfg(feature = "harness")]
+    pub harness_sink: Option<std::sync::Arc<astra_harness::InMemorySnapshotSink>>,
+    /// Shared harness trace for /inspect trace command (non-REPL one-shot paths).
+    #[cfg(feature = "harness")]
+    pub harness_trace: Option<std::sync::Arc<std::sync::RwLock<astra_harness::SessionTrace>>>,
 }
 
 impl<'a> ChatTurnParams<'a> {
@@ -271,6 +286,11 @@ impl<'a> ChatTurnParams<'a> {
             turn_index: 0,
             evolution_service: None,
             pre_loaded_messages: None,
+            append_system_prompt: None,
+            #[cfg(feature = "harness")]
+            harness_sink: ctx.harness_sink.clone(),
+            #[cfg(feature = "harness")]
+            harness_trace: ctx.harness_trace.clone(),
         }
     }
 }

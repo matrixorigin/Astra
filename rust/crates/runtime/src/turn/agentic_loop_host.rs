@@ -849,6 +849,9 @@ pub struct AgenticLoopState {
     pub bridge_user_query_event_id: Option<String>,
     /// Created at turn start, flushed at turn end or on interruption.
     pub turn_event_buffer: Option<astra_services::session_journal::TurnEventBuffer>,
+
+    // ── Harness (observation + verification layer) ──
+    pub harness: super::harness_adapter::HarnessSlot,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -920,12 +923,54 @@ pub(crate) use super::agentic_loop_lifecycle::{
 };
 #[allow(unused_imports)]
 pub(crate) use super::agentic_loop_tool_phase::{TurnToolPhaseControl, execute_tool_phase};
+#[allow(unused_imports)]
+use super::harness_adapter::harness_at;
+
+#[cfg(feature = "harness")]
+pub(crate) fn set_harness_interruption(
+    state: &mut AgenticLoopState,
+    kind: astra_turn_core::interruption::InterruptionKind,
+    reason: &str,
+) {
+    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+        kind,
+        if kind.is_resumable() {
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately
+        } else {
+            astra_turn_core::interruption::ResumeAction::StartNewSession
+        },
+        super::agentic_loop_lifecycle::interruption_state_summary(
+            state,
+            Some(reason.to_string()),
+        ),
+    ));
+}
 
 pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<AgenticLoopOutcome, astra_core::ClassifiedError> {
     run_loop_preamble(host, state).await;
+
+    // ── Harness: SessionStart — Block prevents any turns ──
+    #[cfg(feature = "harness")]
+    match harness_at!(&state.harness, astra_harness::HookPoint::SessionStart, state) {
+        astra_harness::HookVerdict::Block { reason } => {
+            tracing::warn!(reason = %reason, "harness blocked session at SessionStart");
+            set_harness_interruption(state, astra_turn_core::interruption::InterruptionKind::HarnessBlocked, &reason);
+            finalize_and_render(host, state).await;
+            return Ok(AgenticLoopOutcome::Completed);
+        }
+        astra_harness::HookVerdict::Pause { reason } => {
+            tracing::info!(reason = %reason, "harness paused session at SessionStart");
+            set_harness_interruption(state, astra_turn_core::interruption::InterruptionKind::HarnessPaused, &reason);
+            finalize_and_render(host, state).await;
+            return Ok(AgenticLoopOutcome::Completed);
+        }
+        astra_harness::HookVerdict::Continue => {}
+    }
+    #[cfg(not(feature = "harness"))]
+    harness_at!(&state.harness, astra_harness::HookPoint::SessionStart, state);
 
     let mut turn_index = 0usize;
     while turn_index < state.max_turns || state.remaining_turns == 0 {
@@ -964,9 +1009,75 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 turn_index += 1;
                 continue;
             }
-            TurnExecutionControl::Return(outcome) => return Ok(outcome),
+            TurnExecutionControl::Return(outcome) => {
+                finalize_and_render(host, state).await;
+                return Ok(outcome);
+            }
         };
 
+        // ── Harness: PostLlmResponse — Block/Pause halts session ──
+        #[cfg(feature = "harness")]
+        match harness_at!(&state.harness, astra_harness::HookPoint::PostLlmResponse, state) {
+            astra_harness::HookVerdict::Block { reason } => {
+                tracing::warn!(reason = %reason, "harness blocked session at PostLlmResponse");
+                set_harness_interruption(state, astra_turn_core::interruption::InterruptionKind::HarnessBlocked, &reason);
+                finalize_and_render(host, state).await;
+                return Ok(AgenticLoopOutcome::Completed);
+            }
+            astra_harness::HookVerdict::Pause { reason } => {
+                tracing::info!(reason = %reason, "harness paused session at PostLlmResponse");
+                set_harness_interruption(state, astra_turn_core::interruption::InterruptionKind::HarnessPaused, &reason);
+                finalize_and_render(host, state).await;
+                return Ok(AgenticLoopOutcome::Completed);
+            }
+            astra_harness::HookVerdict::Continue => {}
+        }
+
+        // ── Harness: PreToolBatch — Block/Pause skips tool execution ──
+        #[cfg(feature = "harness")]
+        let harness_blocked_tools = if !turn_result.accum.tool_calls.is_empty() {
+            match harness_at!(&state.harness, astra_harness::HookPoint::PreToolBatch, state) {
+                astra_harness::HookVerdict::Block { reason }
+                | astra_harness::HookVerdict::Pause { reason } => {
+                    tracing::warn!(reason = %reason, "harness blocked tool batch at PreToolBatch");
+                    for tc in &turn_result.accum.tool_calls {
+                        let tc_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        state.tool_results.push(serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": tc_id,
+                            "content": format!("[harness] Tool batch blocked: {reason}"),
+                            "is_error": true,
+                        }));
+                    }
+                    true
+                }
+                astra_harness::HookVerdict::Continue => false,
+            }
+        } else {
+            false
+        };
+
+        #[cfg(feature = "harness")]
+        let tool_phase_control = if harness_blocked_tools {
+            TurnToolPhaseControl::ContinueLoop
+        } else {
+            execute_tool_phase(
+                host,
+                state,
+                turn_index,
+                TurnIterationPrep {
+                    quiet,
+                    turn_start_time,
+                },
+                TurnExecutionPhase {
+                    llm_wall_start,
+                    turn_result,
+                },
+            )
+            .await?
+        };
+
+        #[cfg(not(feature = "harness"))]
         let tool_phase_control = execute_tool_phase(
             host,
             state,
@@ -982,11 +1093,49 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         )
         .await?;
 
+        // ── Harness: PostToolBatch — Block/Pause halts session ──
+        #[cfg(feature = "harness")]
+        if !harness_blocked_tools {
+            match harness_at!(&state.harness, astra_harness::HookPoint::PostToolBatch, state) {
+                astra_harness::HookVerdict::Block { reason } => {
+                    tracing::warn!(reason = %reason, "harness blocked session at PostToolBatch");
+                    set_harness_interruption(state, astra_turn_core::interruption::InterruptionKind::HarnessBlocked, &reason);
+                    finalize_and_render(host, state).await;
+                    return Ok(AgenticLoopOutcome::Completed);
+                }
+                astra_harness::HookVerdict::Pause { reason } => {
+                    tracing::info!(reason = %reason, "harness paused session at PostToolBatch");
+                    set_harness_interruption(state, astra_turn_core::interruption::InterruptionKind::HarnessPaused, &reason);
+                    finalize_and_render(host, state).await;
+                    return Ok(AgenticLoopOutcome::Completed);
+                }
+                astra_harness::HookVerdict::Continue => {}
+            }
+        }
+
         // Drain evolution signals / trigger auto-reflection on the production
         // agentic loop path. Previously this was only reached via tests, which
         // caused `reflect` / auto-tuning capabilities to appear regressed at
         // runtime.
         maybe_trigger_auto_reflection(host, state).await;
+
+        // ── Harness: PostTurn — Block/Pause halts session ──
+        #[cfg(feature = "harness")]
+        match harness_at!(&state.harness, astra_harness::HookPoint::PostTurn, state) {
+            astra_harness::HookVerdict::Block { reason } => {
+                tracing::warn!(reason = %reason, "harness blocked session at PostTurn");
+                set_harness_interruption(state, astra_turn_core::interruption::InterruptionKind::HarnessBlocked, &reason);
+                finalize_and_render(host, state).await;
+                return Ok(AgenticLoopOutcome::Completed);
+            }
+            astra_harness::HookVerdict::Pause { reason } => {
+                tracing::info!(reason = %reason, "harness paused session at PostTurn");
+                set_harness_interruption(state, astra_turn_core::interruption::InterruptionKind::HarnessPaused, &reason);
+                finalize_and_render(host, state).await;
+                return Ok(AgenticLoopOutcome::Completed);
+            }
+            astra_harness::HookVerdict::Continue => {}
+        }
 
         match tool_phase_control {
             TurnToolPhaseControl::ContinueLoop => {}
@@ -1208,6 +1357,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         bridge_turn_chain_id: None,
         bridge_user_query_event_id: None,
         turn_event_buffer: None,
+        harness: super::harness_adapter::HarnessSlot::empty(),
     }
 }
 
@@ -1573,6 +1723,7 @@ pub(crate) mod tests {
             bridge_turn_chain_id: None,
             bridge_user_query_event_id: None,
             turn_event_buffer: None,
+            harness: crate::turn::harness_adapter::HarnessSlot::empty(),
         }
     }
 
@@ -8521,5 +8672,305 @@ mod parallel_execution_tests {
             source.contains("state.max_turns.saturating_sub(state.remaining_turns)"),
             "expected saturating_sub in agentic_loop_host"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Harness E2E tests — prove enforcement works through real loop
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[cfg(feature = "harness")]
+    mod harness_e2e {
+        use super::*;
+        use astra_harness::{
+            HarnessKernel, HarnessLimits, HookPoint, InMemorySnapshotSink,
+            RecordingKernel, SnapshotSink, StandardKernel,
+        };
+        use std::sync::Arc;
+
+        fn setup_harness_state(
+            limits: HarnessLimits,
+            turns: usize,
+        ) -> (AgenticLoopState, Arc<InMemorySnapshotSink>, Arc<std::sync::RwLock<astra_harness::SessionTrace>>) {
+            let sink = InMemorySnapshotSink::arc();
+            let kernel = Arc::new(StandardKernel::configured(
+                sink.clone() as Arc<dyn SnapshotSink>,
+                limits,
+            ));
+            let trace = Arc::new(std::sync::RwLock::new(
+                astra_harness::SessionTrace::new("e2e-test".into()),
+            ));
+            let recording = Arc::new(RecordingKernel::with_trace(
+                kernel as Arc<dyn HarnessKernel>,
+                trace.clone(),
+            ));
+            let mut state = make_state();
+            state.current_session_id = Some("e2e-test".into());
+            state.message = "test query".into();
+            state.messages.push(json!({"role": "user", "content": "test query"}));
+            state.max_turns = turns;
+            state.remaining_turns = turns;
+            state.harness = crate::turn::harness_adapter::HarnessSlot::new(
+                recording as Arc<dyn HarnessKernel>,
+                sink.clone() as Arc<dyn SnapshotSink>,
+            );
+            (state, sink, trace)
+        }
+
+        // ── E2E 1: Budget verifier blocks loop on turn limit ────────────
+
+        #[tokio::test]
+        async fn harness_budget_blocks_on_turn_limit() {
+            let limits = HarnessLimits {
+                max_turns: Some(2),
+                ..Default::default()
+            };
+            let (mut state, sink, trace) = setup_harness_state(limits, 10);
+
+            // Use tool calls to keep the loop iterating (text_result ends the loop immediately).
+            // Turn 0: tool call → continues. Turn 1: tool call → continues.
+            // Turn 2: PostTurn sees turns_used=3 > max_turns=2 → Block.
+            let mut host = MockHost::new(vec![
+                edge_tool_result(vec![make_edge_tool("bash", "output 0")], 100, 20, Some(50)),
+                edge_tool_result(vec![make_edge_tool("bash", "output 1")], 100, 20, Some(50)),
+                edge_tool_result(vec![make_edge_tool("bash", "output 2")], 100, 20, Some(50)),
+                edge_tool_result(vec![make_edge_tool("bash", "output 3")], 100, 20, Some(50)),
+                text_result("should never reach here", 100, 20, Some(50)),
+            ]);
+            host = host.with_valid_tools(&["bash"]);
+
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            assert!(outcome.is_ok());
+
+            // Verify: loop stopped before consuming all 5 turns
+            assert!(
+                host.turn_count() < 5,
+                "harness should have blocked before all 5 turns; ran {}",
+                host.turn_count()
+            );
+
+            // Verify: interruption was set with HarnessBlocked
+            assert!(
+                state.interruption.is_some(),
+                "interruption must be set when harness blocks"
+            );
+            let interruption = state.interruption.as_ref().unwrap();
+            assert_eq!(
+                interruption.kind,
+                astra_turn_core::interruption::InterruptionKind::HarnessBlocked,
+                "interruption kind must be HarnessBlocked"
+            );
+
+            // Verify: snapshot was captured
+            assert!(
+                sink.latest().is_some(),
+                "sink must have at least one snapshot"
+            );
+
+            // Verify: trace recorded hook invocations
+            let trace = trace.read().unwrap();
+            assert!(
+                trace.record_count() > 0,
+                "trace must have recorded hooks"
+            );
+            // SessionStart + at least one PostTurn
+            assert!(
+                trace.records_at_point(HookPoint::SessionStart).len() == 1,
+                "exactly one SessionStart"
+            );
+            assert!(
+                !trace.records_at_point(HookPoint::PostTurn).is_empty(),
+                "at least one PostTurn recorded"
+            );
+        }
+
+        // ── E2E 2: TurnGuard stall detection blocks loop ───────────────
+
+        #[tokio::test]
+        async fn harness_stall_detection_blocks_on_repeated_tool() {
+            let limits = HarnessLimits::default();
+            let (mut state, sink, _trace) = setup_harness_state(limits, 20);
+
+            // 10 turns of the same bash tool — TurnGuardVerifierAdapter
+            // should detect stall (default fatal_threshold=5)
+            let mut host = MockHost::new(
+                (0..10)
+                    .map(|i| {
+                        edge_tool_result(
+                            vec![make_edge_tool("bash", &format!("output {i}"))],
+                            100,
+                            20,
+                            Some(50),
+                        )
+                    })
+                    .collect(),
+            );
+            host = host.with_valid_tools(&["bash"]);
+
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            assert!(outcome.is_ok());
+
+            // TurnGuardVerifierAdapter fatal_threshold=5 should block before 10 turns
+            assert!(
+                host.turn_count() < 10,
+                "stall detection should have blocked before 10 turns; ran {}",
+                host.turn_count()
+            );
+
+            // Verify interruption was set
+            assert!(
+                state.interruption.is_some(),
+                "stall block must set interruption"
+            );
+        }
+
+        // ── E2E 3: Observe-only sink captures data ──────────────────────
+
+        #[tokio::test]
+        async fn harness_observe_only_captures_snapshots() {
+            let sink = InMemorySnapshotSink::arc();
+            let mut state = make_state();
+            state.current_session_id = Some("observe-test".into());
+            state.message = "hello".into();
+            state.messages.push(json!({"role": "user", "content": "hello"}));
+            state.max_turns = 3;
+            state.remaining_turns = 3;
+            // observe_only: sink only, no kernel/verifiers
+            state.harness = crate::turn::harness_adapter::HarnessSlot::observe_only(
+                sink.clone() as Arc<dyn SnapshotSink>,
+            );
+
+            let mut host = MockHost::new(vec![
+                text_result("response 1", 100, 20, Some(50)),
+            ]);
+
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            assert!(outcome.is_ok());
+
+            // Verify: sink captured at least one snapshot despite no kernel
+            assert!(
+                sink.latest().is_some(),
+                "observe_only must still write snapshots to sink"
+            );
+            let snap = sink.latest().unwrap();
+            assert_eq!(snap.session_id, "observe-test");
+        }
+
+        // ── E2E 4: SessionEnd fires even on normal completion ───────────
+
+        #[tokio::test]
+        async fn harness_session_end_fires_on_normal_completion() {
+            let limits = HarnessLimits::default();
+            let (mut state, _sink, trace) = setup_harness_state(limits, 2);
+
+            let mut host = MockHost::new(vec![
+                text_result("done", 100, 20, Some(50)),
+            ]);
+
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            assert!(outcome.is_ok());
+
+            let trace = trace.read().unwrap();
+            let session_ends = trace.records_at_point(HookPoint::SessionEnd);
+            assert_eq!(
+                session_ends.len(),
+                1,
+                "exactly one SessionEnd must fire on normal completion"
+            );
+        }
+
+        // ── E2E 5: SessionEnd fires on harness block ───────────────────
+
+        #[tokio::test]
+        async fn harness_session_end_fires_on_block() {
+            let limits = HarnessLimits {
+                max_turns: Some(1),
+                ..Default::default()
+            };
+            let (mut state, _sink, trace) = setup_harness_state(limits, 10);
+
+            let mut host = MockHost::new(vec![
+                text_result("turn 1", 100, 20, Some(50)),
+                text_result("turn 2 blocked", 100, 20, Some(50)),
+                text_result("turn 3 blocked", 100, 20, Some(50)),
+            ]);
+
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            assert!(outcome.is_ok());
+
+            let trace = trace.read().unwrap();
+            let session_ends = trace.records_at_point(HookPoint::SessionEnd);
+            assert_eq!(
+                session_ends.len(),
+                1,
+                "exactly one SessionEnd must fire even when harness blocks"
+            );
+        }
+
+        // ── E2E 6: Snapshot history accumulates across turns ────────────
+
+        #[tokio::test]
+        async fn harness_snapshot_history_across_turns() {
+            let limits = HarnessLimits::default();
+            let (mut state, sink, _trace) = setup_harness_state(limits, 5);
+
+            let mut host = MockHost::new(vec![
+                edge_tool_result(
+                    vec![make_edge_tool("bash", "hello")],
+                    100, 20, Some(50),
+                ),
+                text_result("done after tool", 200, 40, Some(30)),
+            ]);
+            host = host.with_valid_tools(&["bash"]);
+
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            assert!(outcome.is_ok());
+
+            // Multiple hooks fire per turn, so history should have many entries
+            let history = sink.history(20);
+            assert!(
+                history.len() >= 2,
+                "history should have at least 2 snapshots; got {}",
+                history.len()
+            );
+            // Newest first
+            assert!(
+                history[0].captured_at_unix_millis >= history.last().unwrap().captured_at_unix_millis,
+                "history must be newest-first"
+            );
+        }
+
+        // ── E2E 7: Hook ordering invariant ──────────────────────────────
+
+        #[tokio::test]
+        async fn harness_hook_ordering_invariant() {
+            let limits = HarnessLimits::default();
+            let (mut state, _sink, trace) = setup_harness_state(limits, 3);
+
+            let mut host = MockHost::new(vec![
+                edge_tool_result(
+                    vec![make_edge_tool("bash", "ok")],
+                    100, 20, Some(50),
+                ),
+                text_result("done", 100, 20, Some(50)),
+            ]);
+            host = host.with_valid_tools(&["bash"]);
+
+            let _outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+            let trace = trace.read().unwrap();
+            let points: Vec<HookPoint> = trace.records.iter().map(|r| r.point).collect();
+
+            // SessionStart must be first
+            assert_eq!(points[0], HookPoint::SessionStart, "first hook must be SessionStart");
+            // SessionEnd must be last
+            assert_eq!(*points.last().unwrap(), HookPoint::SessionEnd, "last hook must be SessionEnd");
+
+            // PreLlmRequest must come before PostLlmResponse in each turn
+            let pre_llm = points.iter().position(|p| *p == HookPoint::PreLlmRequest);
+            let post_llm = points.iter().position(|p| *p == HookPoint::PostLlmResponse);
+            if let (Some(pre), Some(post)) = (pre_llm, post_llm) {
+                assert!(pre < post, "PreLlmRequest must come before PostLlmResponse");
+            }
+        }
     }
 }

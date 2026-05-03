@@ -34,6 +34,12 @@ help:
 	@echo "  make test-contract      - Run contract tests (http/admin/config)"
 	@echo "  (also: test-sdk-offline, test-sdk-online — @astra/sdk; offline in test-offline; remote E2E opt-in on test-online)"
 	@echo ""
+	@echo "Gateway (Chat Platform Bridge):"
+	@echo "  make gateway-setup      - Interactive setup wizard (config + build)"
+	@echo "  make gateway            - Start the gateway (uses gateway.yaml)"
+	@echo "  make gateway-build      - Build gateway binary (release)"
+	@echo "  make test-gateway-live  - Live e2e tests (astra + claude, requires LLM)"
+	@echo ""
 	@echo "Code Quality:"
 	@echo "  make check              - Run all static checks (lint + format + type)"
 	@echo "  make ci                 - Run CI checks (check + test)"
@@ -426,6 +432,35 @@ build-server-release: sweep
 	@echo "Binary: $(RUST_RELEASE_BIN_DIR)/$(API_SERVER_BIN)"
 
 # ============================================================================
+# Gateway
+# ============================================================================
+
+.PHONY: gateway-setup gateway gateway-build gateway-login-weixin
+
+gateway-setup:
+	@bash gateway-setup.sh
+
+gateway-build:
+	@echo "Building astra-gateway + astra CLI (release)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-gateway -p astra-cli --release
+	@echo "Binary: $(RUST_RELEASE_BIN_DIR)/astra-gateway"
+
+gateway-login-weixin: gateway-build
+	@$(RUST_RELEASE_BIN_DIR)/astra-gateway login-weixin
+
+gateway: gateway-build
+	@if [ ! -f gateway.yaml ]; then \
+		echo "No gateway.yaml found — generating default config..."; \
+		cp rust/crates/astra-gateway/gateway.example.yaml gateway.yaml; \
+		echo "Created gateway.yaml from template. Edit it to add your platform credentials."; \
+		echo "  For WeCom: set WECOM_BOT_ID and WECOM_SECRET env vars"; \
+		echo "  For WeChat: set WEIXIN_TOKEN and WEIXIN_ACCOUNT_ID env vars"; \
+		echo "  Or run: make gateway-setup"; \
+	fi
+	@echo "Starting gateway..."
+	@$(RUST_RELEASE_BIN_DIR)/astra-gateway --config gateway.yaml
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 
@@ -583,6 +618,27 @@ test-live-llm:
 	@echo "Running live-LLM token usage tests (reads .models.yaml; one model per provider)..."
 	@ASTRA_LIVE_LLM=1 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
 		--test live_token_usage_e2e -- --ignored --nocapture
+
+# Gateway live e2e — real CLI invocations (astra + claude)
+# Requires: astra binary built, .models.yaml configured, claude CLI installed
+.PHONY: test-gateway-live
+test-gateway-live:
+	@echo "Running gateway live e2e tests (real LLM: astra + claude)..."
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-gateway \
+		--test e2e_cli_bridge -- --ignored --test-threads=1 --nocapture
+
+# Gateway harness YAML tests — real LLM via astra-test-harness
+.PHONY: test-gateway-harness
+test-gateway-harness:
+	@echo "Running gateway harness YAML tests with $${MODELS:-MiniMax-M2.7}..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-test-harness --release
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli --release
+	@MODELS="$${MODELS:-MiniMax-M2.7}"; \
+	./rust/target/release/astra-test \
+		--suite rust/crates/astra-test-harness/cases \
+		--force-model "$$MODELS" \
+		--filter "harness_*" \
+		--no-judger --parallel 1 --runs 1
 
 # @astra/sdk — no real HTTP API (Mode A in-process runs via ASTRA_SDK_E2E=1 in test:coverage)
 .PHONY: test-sdk-offline

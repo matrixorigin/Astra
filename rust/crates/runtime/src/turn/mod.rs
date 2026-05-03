@@ -1,4 +1,5 @@
 pub mod agentic_adaptive_tuning;
+pub mod harness_adapter;
 pub mod agentic_auto_reflection;
 pub mod agentic_delegate_interception;
 pub mod agentic_headless_round;

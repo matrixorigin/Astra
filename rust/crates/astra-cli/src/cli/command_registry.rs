@@ -543,6 +543,12 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::Observability,
     ),
     CommandMeta::new(
+        "/inspect",
+        "Harness: /inspect [budget|tools|context|json|diff|history|trace|forensics|export]",
+        CommandGroup::Observability,
+    )
+    .with_arg_hint("[budget|tools|context|json|diff|history N|trace|forensics|export path]"),
+    CommandMeta::new(
         "/stats",
         "Session analytics: /stats [history|tools|cost|health|learn]",
         CommandGroup::Observability,

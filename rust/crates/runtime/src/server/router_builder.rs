@@ -162,6 +162,9 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/sessions/{session_id}/artifacts/{artifact_id}/download",
             get(session_handlers::download_session_artifact_handler),
         )
+        // ── Harness observation endpoints (Phase 2A) ──
+        .nest("/sessions/{session_id}/harness", harness_routes(state.clone()))
+        .nest("/admin/harness", admin_harness_routes(state.clone()))
         .route("/admin/init", post(admin_handlers::admin_init_handler))
         .route(
             "/admin/audit",
@@ -731,6 +734,38 @@ pub(super) fn build_router(state: AppState) -> Router {
             post(plan_handlers::finish_step_run_handler),
         )
         .with_state(state)
+}
+
+#[cfg(feature = "harness")]
+fn harness_routes(state: AppState) -> Router<AppState> {
+    use axum::routing::get;
+    Router::new()
+        .route("/snapshot", get(harness_handlers::get_harness_snapshot))
+        .route("/history", get(harness_handlers::get_harness_history))
+        .route("/diff", get(harness_handlers::get_harness_diff))
+        .route("/stream", get(harness_handlers::stream_harness_snapshots))
+        .with_state(state.clone())
+}
+
+#[cfg(not(feature = "harness"))]
+fn harness_routes(_state: AppState) -> Router<AppState> {
+    Router::new()
+}
+
+#[cfg(feature = "harness")]
+fn admin_harness_routes(state: AppState) -> Router<AppState> {
+    use axum::routing::get;
+    Router::new()
+        .route(
+            "/sessions",
+            get(harness_handlers::list_active_harness_sessions),
+        )
+        .with_state(state.clone())
+}
+
+#[cfg(not(feature = "harness"))]
+fn admin_harness_routes(_state: AppState) -> Router<AppState> {
+    Router::new()
 }
 
 #[cfg(test)]

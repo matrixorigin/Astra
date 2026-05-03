@@ -1,0 +1,19 @@
+name: harness_inspect_snapshot
+description: |
+  **What**: Verify /inspect command shows harness snapshot data after a tool call.
+  **Tests**: Harness observation pipeline: hook fires → snapshot captured → /inspect reads it.
+  **Why**: Core harness UX — if /inspect shows nothing, the feature is useless.
+  **Pass means**: Harness is wired end-to-end in the CLI.
+  **Fail means**: Harness sink not connected, or /inspect not reading from sink.
+prompt: |
+  Use bash to run: echo "harness-test-ok"
+  Then use /inspect to show the harness snapshot.
+timeout_seconds: 120
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: bash
+  - type: turn_rounds_between
+    min: 1
+    max: 10

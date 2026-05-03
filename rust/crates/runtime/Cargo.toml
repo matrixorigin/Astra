@@ -4,11 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = []
+default = ["harness"]
 # Full `/chat/turn` ledger inject tests (see `tests/chat_turn_bridge_ledger_inject_e2e.rs`).
 bridge-e2e-hooks = []
 # Enables OTLP trace export via `astra-logging` (build with `--features otel`).
 otel = ["astra-logging/otel"]
+# Observation + verification harness (zero cost when disabled).
+harness = ["dep:astra-harness"]
 
 [[test]]
 name = "chat_turn_bridge_ledger_inject_e2e"
@@ -76,6 +78,7 @@ tracing.workspace = true
 http-body-util.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
+astra-harness = { workspace = true, optional = true }
 notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
 dashmap = "6.1.0"
 toml = { version = "1.1.2", features = ["preserve_order"] }
@@ -98,6 +101,11 @@ proptest = "1"
 [[bench]]
 name = "hot_paths"
 harness = false
+
+[[bench]]
+name = "harness_overhead"
+harness = false
+required-features = ["harness"]
 
 [[bench]]
 name = "messaging"

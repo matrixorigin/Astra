@@ -52,6 +52,8 @@ mod task_handlers;
 mod team_handlers;
 pub mod team_orchestrator;
 mod ws_handler;
+pub mod harness_handlers;
+pub mod harness_server_sink;
 
 use self::{bridge_prep::prepare_chat_turn_bridge_body, http_helpers::*};
 use astra_server_types::*;

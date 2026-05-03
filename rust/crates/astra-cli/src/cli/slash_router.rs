@@ -345,6 +345,10 @@ pub(super) async fn handle_slash_command(
 
         "/debug" => handle_debug_command(arg, state),
 
+        "/inspect" => {
+            slash_inspect::handle_inspect_command(arg, state);
+        }
+
         "/style" => {
             slash_style::handle_style_command(arg);
         }

@@ -110,6 +110,8 @@ pub struct AppState {
     /// [`astra_plan::CloudPlanRepository`] backed by the MatrixOne pool.
     pub(crate) plan_repo: Arc<dyn astra_plan::PlanRepository>,
     pub(crate) cors_origins: Option<String>,
+    #[cfg(feature = "harness")]
+    pub harness_registry: crate::server::harness_handlers::HarnessSinkRegistry,
 }
 
 impl AppState {
@@ -213,6 +215,8 @@ impl AppState {
                 .expect("failed to build shared HTTP client"),
             plan_repo: Arc::new(astra_plan::LocalCachePlanRepository::new()),
             cors_origins: None,
+            #[cfg(feature = "harness")]
+            harness_registry: crate::server::harness_handlers::HarnessSinkRegistry::new(),
         }
     }
 

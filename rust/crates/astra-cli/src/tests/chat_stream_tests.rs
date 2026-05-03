@@ -88,6 +88,11 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
         turn_index: 0,
         evolution_service: None,
         pre_loaded_messages: None,
+                    append_system_prompt: None,
+        #[cfg(feature = "harness")]
+        harness_sink: None,
+        #[cfg(feature = "harness")]
+        harness_trace: None,
     })
     .await
     .unwrap();
@@ -178,6 +183,11 @@ async fn stream_chat_sse_simple_text_response() {
         turn_index: 0,
         evolution_service: None,
         pre_loaded_messages: None,
+                    append_system_prompt: None,
+        #[cfg(feature = "harness")]
+        harness_sink: None,
+        #[cfg(feature = "harness")]
+        harness_trace: None,
     })
     .await
     .unwrap();
@@ -271,6 +281,11 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         turn_index: 0,
         evolution_service: None,
         pre_loaded_messages: None,
+                    append_system_prompt: None,
+        #[cfg(feature = "harness")]
+        harness_sink: None,
+        #[cfg(feature = "harness")]
+        harness_trace: None,
     })
     .await
     .unwrap();
@@ -368,6 +383,11 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             turn_index: 0,
             evolution_service: None,
             pre_loaded_messages: None,
+                    append_system_prompt: None,
+            #[cfg(feature = "harness")]
+            harness_sink: None,
+            #[cfg(feature = "harness")]
+            harness_trace: None,
         })
         .await
         .unwrap();
@@ -457,6 +477,11 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         turn_index: 0,
         evolution_service: None,
         pre_loaded_messages: None,
+                    append_system_prompt: None,
+        #[cfg(feature = "harness")]
+        harness_sink: None,
+        #[cfg(feature = "harness")]
+        harness_trace: None,
     })
     .await
     .unwrap();
@@ -574,6 +599,11 @@ async fn stream_chat_sse_api_error_propagated() {
         turn_index: 0,
         evolution_service: None,
         pre_loaded_messages: None,
+                    append_system_prompt: None,
+        #[cfg(feature = "harness")]
+        harness_sink: None,
+        #[cfg(feature = "harness")]
+        harness_trace: None,
     })
     .await;
     assert!(result.is_err());
@@ -667,6 +697,11 @@ async fn stream_chat_sse_with_tool_call_loop() {
         turn_index: 0,
         evolution_service: None,
         pre_loaded_messages: None,
+                    append_system_prompt: None,
+        #[cfg(feature = "harness")]
+        harness_sink: None,
+        #[cfg(feature = "harness")]
+        harness_trace: None,
     })
     .await
     .unwrap();
@@ -783,6 +818,11 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         turn_index: 0,
         evolution_service: None,
         pre_loaded_messages: None,
+                    append_system_prompt: None,
+        #[cfg(feature = "harness")]
+        harness_sink: None,
+        #[cfg(feature = "harness")]
+        harness_trace: None,
     })
     .await
     .unwrap();
@@ -942,6 +982,11 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
         turn_index: 0,
         evolution_service: None,
         pre_loaded_messages: None,
+                    append_system_prompt: None,
+        #[cfg(feature = "harness")]
+        harness_sink: None,
+        #[cfg(feature = "harness")]
+        harness_trace: None,
     })
     .await
     .unwrap();
