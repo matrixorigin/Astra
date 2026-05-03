@@ -12,6 +12,7 @@ pub mod composite_snapshot;
 pub mod confidence;
 pub mod config;
 pub mod drift;
+pub mod durable_task_store;
 pub mod error_kind;
 pub mod log;
 pub mod net;
