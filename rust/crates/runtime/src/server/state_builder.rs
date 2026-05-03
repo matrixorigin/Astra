@@ -43,6 +43,7 @@ pub async fn build_server_state(
         ServiceInfo::default(),
         Arc::new(MatrixOneHealthChecker::new(settings.matrixone.clone())),
     )
+    .with_cors_origins(settings.api.cors_origins.clone())
     .with_shared_pool(shared_pool.clone())
     .with_plan_repository(Arc::new(astra_plan::CloudPlanRepository::new(
         shared_pool.get().clone(),

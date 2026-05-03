@@ -46,12 +46,9 @@ impl SkillSearchSettings {
 #[derive(Clone, PartialEq, Eq)]
 pub struct AppSettings {
     pub matrixone: MatrixOneSettings,
-    pub application: ApplicationSettings,
     pub jwt: JwtSettings,
     pub api: ApiSettings,
     pub memoria: MemoriaSettings,
-    pub github_token: Option<String>,
-    pub bridge_url: Option<String>,
     pub bridge_secret: String,
     pub token_encryption_key: Option<String>,
     pub database_bootstrap_catalog: String,
@@ -61,15 +58,9 @@ impl fmt::Debug for AppSettings {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AppSettings")
             .field("matrixone", &self.matrixone)
-            .field("application", &self.application)
             .field("jwt", &self.jwt)
             .field("api", &self.api)
             .field("memoria", &self.memoria)
-            .field(
-                "github_token",
-                &self.github_token.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field("bridge_url", &self.bridge_url)
             .field("bridge_secret", &"[REDACTED]")
             .field(
                 "token_encryption_key",
@@ -106,10 +97,6 @@ impl AppSettings {
                 "ASTRA_DATABASE_BOOTSTRAP_CATALOG",
                 "mysql",
             ),
-            application: ApplicationSettings {
-                app_env: value_or_default(&lookup, "ASTRA_APP_ENV", "development"),
-                log_level: value_or_default(&lookup, "ASTRA_LOG_LEVEL", "DEBUG"),
-            },
             jwt: JwtSettings::from_lookup(&lookup)?,
             api: ApiSettings {
                 host: value_or_default(&lookup, "ASTRA_API_HOST", "0.0.0.0"),
@@ -120,8 +107,6 @@ impl AppSettings {
                 base_url: value_or_default(&lookup, "MEMORIA_BASE_URL", DEFAULT_MEMORIA_URL),
                 master_key: optional_value(&lookup, "MEMORIA_MASTER_KEY"),
             },
-            github_token: optional_value(&lookup, "GITHUB_TOKEN"),
-            bridge_url: optional_value(&lookup, "ASTRA_BRIDGE_URL"),
             bridge_secret: required_value(
                 &lookup,
                 "ASTRA_BRIDGE_SECRET",
@@ -172,31 +157,6 @@ impl MatrixOneSettings {
             "mysql://{}:{}@{}:{}/{}",
             self.user, self.password, self.host, self.port, self.database
         )
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct ApplicationSettings {
-    pub app_env: String,
-    pub log_level: String,
-}
-
-impl fmt::Debug for ApplicationSettings {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ApplicationSettings")
-            .field("app_env", &self.app_env)
-            .field("log_level", &self.log_level)
-            .finish()
-    }
-}
-
-impl ApplicationSettings {
-    pub fn is_development(&self) -> bool {
-        self.app_env == "development"
-    }
-
-    pub fn is_production(&self) -> bool {
-        self.app_env == "production"
     }
 }
 
@@ -411,23 +371,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn application_mode_helpers_match_runtime_modes() {
-        let development = ApplicationSettings {
-            app_env: "development".into(),
-            log_level: "DEBUG".into(),
-        };
-        let production = ApplicationSettings {
-            app_env: "production".into(),
-            log_level: "INFO".into(),
-        };
-
-        assert!(development.is_development());
-        assert!(!development.is_production());
-        assert!(production.is_production());
-        assert!(!production.is_development());
-    }
-
-    #[test]
     fn matrixone_settings_build_mysql_url() {
         let settings = MatrixOneSettings {
             host: "db".into(),
@@ -504,14 +447,9 @@ mod tests {
     fn app_settings_debug_redacts_optional_secrets() {
         let mut m = HashMap::new();
         m.insert("ASTRA_ALLOW_INSECURE_DEFAULTS".into(), "1".into());
-        m.insert("GITHUB_TOKEN".into(), "ghp_supersecret_token".into());
         m.insert("MEMORIA_MASTER_KEY".into(), "memoria-master-key-xyz".into());
         let settings = AppSettings::from_map(&m).unwrap();
         let debug_str = format!("{settings:?}");
-        assert!(
-            !debug_str.contains("ghp_supersecret_token"),
-            "github_token should be redacted: {debug_str}"
-        );
         assert!(
             !debug_str.contains("memoria-master-key-xyz"),
             "memoria master_key should be redacted: {debug_str}"
@@ -638,10 +576,6 @@ mod settings_contract_tests {
         matrixone_user: String,
         matrixone_password: String,
         matrixone_database: String,
-        app_env: String,
-        log_level: String,
-        github_token: Option<String>,
-        bridge_url: Option<String>,
         bridge_secret: String,
     }
 
@@ -660,10 +594,6 @@ mod settings_contract_tests {
             matrixone_user: settings.matrixone.user,
             matrixone_password: settings.matrixone.password,
             matrixone_database: settings.matrixone.database,
-            app_env: settings.application.app_env,
-            log_level: settings.application.log_level,
-            github_token: settings.github_token,
-            bridge_url: settings.bridge_url,
             bridge_secret: settings.bridge_secret,
         }
     }

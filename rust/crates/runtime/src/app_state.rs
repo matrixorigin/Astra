@@ -109,6 +109,7 @@ pub struct AppState {
     /// Defaults to [`astra_plan::LocalCachePlanRepository`]; production wires
     /// [`astra_plan::CloudPlanRepository`] backed by the MatrixOne pool.
     pub(crate) plan_repo: Arc<dyn astra_plan::PlanRepository>,
+    pub(crate) cors_origins: Option<String>,
 }
 
 impl AppState {
@@ -211,7 +212,13 @@ impl AppState {
                 .build()
                 .expect("failed to build shared HTTP client"),
             plan_repo: Arc::new(astra_plan::LocalCachePlanRepository::new()),
+            cors_origins: None,
         }
+    }
+
+    pub fn with_cors_origins(mut self, cors_origins: Option<String>) -> Self {
+        self.cors_origins = cors_origins;
+        self
     }
 
     /// Inject the plan repository — production wires

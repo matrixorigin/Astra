@@ -24,10 +24,10 @@ services:
     networks:
       - mo-net
     healthcheck:
-      test: ["CMD-SHELL", "mysql -h127.0.0.1 -P6001 -uroot -p111 -e 'SELECT 1' || exit 1"]
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:6060/debug/vars"]
       interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 12
       start_period: 30s
     restart: unless-stopped
 
@@ -91,7 +91,6 @@ services:
     environment:
       - ASTRA_API_HOST=0.0.0.0
       - ASTRA_API_PORT=8000
-      - ASTRA_APP_ENV=${ASTRA_APP_ENV:-production}
       - MATRIXONE_HOST=matrixone
       - MATRIXONE_PORT=6001
       - MATRIXONE_PASSWORD=${MATRIXONE_PASSWORD}
