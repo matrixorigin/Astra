@@ -26,8 +26,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          shared-key: ci-test
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: ci-test-${{ github.base_ref || github.ref_name }}
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       # Compile all test binaries (default + bridge-e2e-hooks) without running
       - name: Compile test binaries
         run: |
@@ -39,8 +39,8 @@ jobs:
   # Shard balance (test counts):
   #   shard-a: astra-cli (split by edge_tools group) — shell tests need process isolation
   #   shard-b: astra-runtime (3151) + contracts (19) + trusted_moi (4)
-  #   shard-c: astra-turn-core (2167) + astra-services (1186)
-  #   shard-d: core crates ~2460 + bridge-e2e-hooks (3176, mostly overlaps runtime)
+  #   shard-c: astra-turn-core (2167) + astra-services (1186) + plan/prompts
+  #   shard-d: remaining core crates + bridge-e2e-hooks (3176, mostly overlaps runtime)
 
   shard-a:
     name: "Test: astra-cli (${{ matrix.segment }})"
@@ -74,7 +74,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          shared-key: ci-test
+          shared-key: ci-test-${{ github.base_ref || github.ref_name }}
           save-if: false
       - name: "Test astra-cli (${{ matrix.segment }})"
         env:
@@ -99,7 +99,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          shared-key: ci-test
+          shared-key: ci-test-${{ github.base_ref || github.ref_name }}
           save-if: false
       - name: Test astra-runtime
         run: >-
@@ -126,7 +126,7 @@ jobs:
             });
 
   shard-c:
-    name: "Test: turn-core + services"
+    name: "Test: turn-core + services + plan"
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -137,12 +137,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          shared-key: ci-test
+          shared-key: ci-test-${{ github.base_ref || github.ref_name }}
           save-if: false
-      - name: Test astra-turn-core + astra-services
+      - name: Test astra-turn-core + astra-services + astra-plan
         run: >-
           cargo nextest run --manifest-path rust/Cargo.toml
           -p astra-turn-core -p astra-services
+          -p astra-plan -p astra-prompts
           --profile ci
 
   shard-d:
@@ -157,7 +158,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          shared-key: ci-test
+          shared-key: ci-test-${{ github.base_ref || github.ref_name }}
           save-if: false
       - name: Test core crates
         run: >-
@@ -167,7 +168,6 @@ jobs:
           -p astra-skills -p astra-sandbox -p astra-server-types
           -p astra-messaging -p astra-text-utils
           -p astra-config -p astra-learning
-          -p astra-plan -p astra-prompts
           --profile ci
       - name: Test bridge-e2e-hooks
         run: >-
@@ -216,7 +216,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          shared-key: ci-test
+          shared-key: ci-test-${{ github.base_ref || github.ref_name }}
           save-if: false
       - name: Wait for dependencies
         run: make dev-deps-wait
