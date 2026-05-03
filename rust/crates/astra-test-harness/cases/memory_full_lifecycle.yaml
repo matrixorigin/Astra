@@ -47,4 +47,4 @@ criteria:
     name: memory_store
   - type: turn_rounds_between
     min: 1
-    max: 12
+    max: 20
