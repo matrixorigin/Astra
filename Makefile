@@ -35,12 +35,13 @@ help:
 	@echo "  (also: test-sdk-offline, test-sdk-online — @astra/sdk; offline in test-offline; remote E2E opt-in on test-online)"
 	@echo ""
 	@echo "Gateway (Chat Platform Bridge):"
-	@echo "  make gateway            - Build + run gateway"
-	@echo "  make gateway-build      - Build gateway binary (release)"
+	@echo "  make gateway            - Build + start gateway (background)"
+	@echo "  make gateway-stop       - Stop gateway"
+	@echo "  make gateway-restart    - Restart gateway"
+	@echo "  make gateway-status     - Show gateway status"
+	@echo "  make gateway-logs       - Tail gateway logs"
 	@echo "  make gateway-login      - WeChat QR login"
-	@echo "  make gateway-setup      - Interactive setup wizard"
 	@echo "  make gateway-test       - Gateway unit tests"
-	@echo "  make gateway-lint       - Gateway clippy + fmt"
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  make check              - Run all static checks (lint + format + type)"
@@ -439,12 +440,24 @@ build-server-release: sweep
 
 # Gateway targets delegate to the gateway crate's own Makefile.
 # For full gateway dev workflow: cd rust/crates/astra-gateway && make help
-.PHONY: gateway gateway-build gateway-login gateway-setup gateway-test gateway-lint gateway-docker
+.PHONY: gateway gateway-stop gateway-restart gateway-status gateway-logs gateway-build gateway-login gateway-setup gateway-test gateway-lint gateway-docker
 
 GATEWAY_DIR = rust/crates/astra-gateway
 
 gateway:
-	@cd $(GATEWAY_DIR) && make run
+	@cd $(GATEWAY_DIR) && make start
+
+gateway-stop:
+	@cd $(GATEWAY_DIR) && make stop
+
+gateway-restart:
+	@cd $(GATEWAY_DIR) && make restart
+
+gateway-status:
+	@cd $(GATEWAY_DIR) && make status
+
+gateway-logs:
+	@cd $(GATEWAY_DIR) && make logs
 
 gateway-build:
 	@cd $(GATEWAY_DIR) && make build
