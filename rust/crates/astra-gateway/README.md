@@ -32,12 +32,12 @@ make run
 | **Sessions** | Per-CLI isolation, auto-reset (daily/idle), history, switch |
 | **Tasks** | Cron jobs, one-time reminders, durable tasks (checkpoint/resume) |
 | **Workspace** | `/workspace` to switch project directories, auto-discovery |
-| **Observability** | `/inspect` (harness), `/audit` (decision chain), `/usage` (cost) |
+| **Observability** | `/trace`, `/running`, `/inspect` (harness), `/audit` (decision chain), `/usage` (cost) |
 | **Skills** | Built-in gateway skill + user-defined `.md` files + agent self-creation |
 | **Access** | Allowlist, open, disabled — per gateway |
 | **Groups** | Per-user session isolation, @mention filtering |
 | **WeChat** | Typing indicator, markdown rendering, voice transcription, media |
-| **Reliability** | Crash recovery, PID lock, retry with backoff, concurrent processing |
+| **Reliability** | Per-conversation queues, durable delivery outbox, traceable retry/cancel, bounded parallelism |
 
 ## Configuration
 
@@ -80,6 +80,11 @@ session_reset:
   idle:
     hours: 24
 access: open                               # or: allowlist / disabled
+action_policy:
+  allow_slash_mutations: true
+  allow_model_generated_mutations: true
+  workspace_roots: []                       # optional allowed /workspace roots
+max_concurrent_runs: 4                      # cross-conversation parallelism cap
 group_sessions_per_user: true
 group_require_mention: false
 ```
@@ -99,7 +104,9 @@ See `.env.example` for environment variable reference.
 | `/session list\|switch` | Session history |
 | `/inspect` | Harness: tokens, cost, tools, warnings |
 | `/audit` | Decision chain (last N turns) |
-| `/running` | Currently executing tasks |
+| `/running` | Queued/running gateway requests |
+| `/trace <id>` | Request lifecycle and events |
+| `/cancel <id>` | Cancel a queued request |
 | `/task list\|cancel\|resume` | Durable task management |
 | `/cron list\|add\|del` | Scheduled tasks |
 | `/usage` | Token/cost statistics |
@@ -144,9 +151,9 @@ WeChat/WeCom ──→ PlatformAdapter ──→ GatewayRunner
               handle_fast          handle_message (async)
            (slash commands)        (CLI spawn in tokio::spawn)
               instant ↓                  ↓
-                                   CLI bridge → astra/claude/codex
-                                         ↓
-                                   [[GATEWAY:action]] parsing
+                                    CLI bridge → astra/claude/codex
+                                          ↓
+                                    trace/run/outbox + policy checks
                                          ↓
                                    DB ops + response
                                          ↓
@@ -155,7 +162,9 @@ WeChat/WeCom ──→ PlatformAdapter ──→ GatewayRunner
               PlatformAdapter.send_text() ──→ WeChat/WeCom
 ```
 
-Slash commands respond instantly even while CLI is running (concurrent architecture).
+Slash commands respond instantly while regular chat requests are serialized per conversation.
+Different conversations run concurrently up to `max_concurrent_runs`; final responses are written
+to the durable outbox before platform delivery is acknowledged.
 
 ## Database
 
@@ -169,4 +178,8 @@ Auto-created on first run. Tables:
 | `gw_durable_tasks` | Checkpointable long-running tasks |
 | `gw_platform_credentials` | WeChat tokens, context tokens, sync cursors |
 | `gw_pending_messages` | Crash recovery queue |
+| `gw_trace_requests` | User/scheduler request state |
+| `gw_trace_runs` | CLI/runtime attempt state |
+| `gw_trace_events` | Append-only trace/audit event stream |
+| `gw_trace_outbox` | Durable platform delivery queue |
 | `gw_usage` | Per-message token/cost tracking |

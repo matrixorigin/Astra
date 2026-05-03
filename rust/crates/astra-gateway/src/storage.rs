@@ -128,6 +128,8 @@ pub async fn ensure_schema(pool: &MySqlPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    crate::trace_model::ensure_schema(pool).await?;
+
     tracing::info!("gateway schema ensured");
     Ok(())
 }

@@ -20,6 +20,15 @@ astra:
 database:
   url: "mysql://root:111@127.0.0.1:6001/astra_gateway"  # Gateway 独立数据库
 
+# 全局并发上限；同一会话仍会按顺序串行执行，避免 session race
+max_concurrent_runs: 4
+
+# 网关动作安全策略
+action_policy:
+  allow_slash_mutations: true             # 允许用户手动 slash 修改操作
+  allow_model_generated_mutations: true   # 是否允许模型输出 [[GATEWAY:...]] 修改状态
+  workspace_roots: []                     # 非空时 /workspace 和 workspace_set 只能指向这些根目录
+
 # 至少启用一个平台
 platforms:
   # ── 微信个人号 (iLink Bot API) ──

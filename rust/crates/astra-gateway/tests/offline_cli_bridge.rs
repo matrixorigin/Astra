@@ -22,6 +22,11 @@ fn offline_astra_hello_parse() {
     let result = profile.parse_output(&json, 0);
 
     assert!(result.session_id.is_some(), "session_id present");
+    assert_eq!(result.trace_id.as_deref(), Some("fixture-trace-hello"));
+    assert_eq!(result.request_id.as_deref(), Some("fixture-request-hello"));
+    assert!(result.run_id.is_some(), "run_id present");
+    assert!(result.success, "success true");
+    assert!(result.error_kind.is_none(), "error_kind null on success");
     assert!(result.text.is_some(), "text present");
     let text = result.text.unwrap();
     assert!(!text.is_empty(), "text non-empty");
@@ -40,6 +45,9 @@ fn offline_astra_tool_parse() {
         result.tool_calls_count.unwrap_or(0) > 0,
         "should have tool calls"
     );
+    assert_eq!(result.trace_id.as_deref(), Some("fixture-trace-tool"));
+    assert_eq!(result.request_id.as_deref(), Some("fixture-request-tool"));
+    assert_eq!(result.tools_used, vec!["bash", "str_replace", "read_file"]);
     assert!(result.text.is_some());
 }
 

@@ -1,7 +1,11 @@
 //! Slash command handlers for the gateway.
 
+use crate::access_control::{ActionCapability, ActionSource};
 use crate::config::GatewayConfig;
 use crate::storage;
+use crate::trace_model::{
+    CancelRequestOutcome, ConversationKey, GatewayEvent, GatewayEventKind, TraceId, TraceRepository,
+};
 use sqlx::MySqlPool;
 
 pub struct CommandContext<'a> {
@@ -13,6 +17,7 @@ pub struct CommandContext<'a> {
     pub user_id: &'a str,
     pub resolved_cli: &'a crate::cli_bridge::CliProfile,
     pub durable_store: Option<&'a dyn astra_core::durable_task_store::DurableTaskStore>,
+    pub trace_repo: Option<&'a dyn TraceRepository>,
 }
 
 /// Helper: get pool or return error message for DB-dependent commands.
@@ -20,6 +25,15 @@ macro_rules! require_db {
     ($ctx:expr) => {
         match $ctx.pool {
             Some(p) => p,
+            None => return Some("⚠️ 此命令需要数据库。当前以无数据库模式运行。".into()),
+        }
+    };
+}
+
+macro_rules! require_trace_repo {
+    ($ctx:expr) => {
+        match $ctx.trace_repo {
+            Some(repo) => repo,
             None => return Some("⚠️ 此命令需要数据库。当前以无数据库模式运行。".into()),
         }
     };
@@ -36,6 +50,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
 
     match cmd {
         "/new" | "/reset" => {
+            if let Some(denial) = slash_denial(ctx, ActionCapability::SessionMutation) {
+                return Some(denial);
+            }
             let pool = require_db!(ctx);
             let cli_name = ctx.resolved_cli.name();
             let _ = storage::reset_session_for_cli(pool, ctx.platform, ctx.chat_id, cli_name).await;
@@ -46,15 +63,14 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
 
         "/status" => {
             let cli_name = ctx.resolved_cli.name();
-            let session = storage::get_current_session_for_cli(
-                require_db!(ctx),
-                ctx.platform,
-                ctx.chat_id,
-                cli_name,
-            )
-            .await
-            .ok()
-            .flatten();
+            let session = if let Some(pool) = ctx.pool {
+                storage::get_current_session_for_cli(pool, ctx.platform, ctx.chat_id, cli_name)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
             let cli_model = match ctx.resolved_cli {
                 crate::cli_bridge::CliProfile::Astra { model, .. }
                 | crate::cli_bridge::CliProfile::Claude { model, .. } => model.as_deref(),
@@ -69,7 +85,31 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 format!("- 模型: `{model}`"),
                 format!("- 用户: `{}`", ctx.user_id),
                 format!("- 会话: `{}`", session.as_deref().unwrap_or("(无)")),
+                format!(
+                    "- 数据库: `{}`",
+                    if ctx.pool.is_some() { "on" } else { "off" }
+                ),
             ];
+
+            if let Some(repo) = ctx.trace_repo {
+                let conversation = ConversationKey::new(ctx.platform, ctx.chat_id, cli_name);
+                if let Ok(status) = repo.gateway_status(&conversation).await {
+                    lines.push(format!(
+                        "- 队列: queued={} running={} outbox_pending={} retrying={}",
+                        status.queued_count,
+                        status.running_count,
+                        status.pending_outbox_count,
+                        status.retrying_outbox_count
+                    ));
+                    if let Some(last) = status.last_trace {
+                        lines.push(format!(
+                            "- 最近 trace: `{}` ({})",
+                            short_id(last.trace_id.as_str()),
+                            last.status.as_str()
+                        ));
+                    }
+                }
+            }
 
             if let Some(ref sid) = session
                 && let Some(snap) =
@@ -200,6 +240,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             }
 
             if let Some(rest) = arg.strip_prefix("add ") {
+                if let Some(denial) = slash_denial(ctx, ActionCapability::CronMutation) {
+                    return Some(denial);
+                }
                 // Parse: /cron add "0 9 * * 1-5" 每天早上9点汇报
                 let (cron_expr, message) = parse_cron_add(rest)?;
                 let job_id = uuid::Uuid::new_v4().to_string();
@@ -223,6 +266,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     Err(e) => Some(format!("⚠️ 创建失败: {e}")),
                 }
             } else if let Some(id) = arg.strip_prefix("del ").or_else(|| arg.strip_prefix("rm ")) {
+                if let Some(denial) = slash_denial(ctx, ActionCapability::CronMutation) {
+                    return Some(denial);
+                }
                 match storage::delete_cron_job(require_db!(ctx), id.trim()).await {
                     Ok(true) => Some("✅ 任务已删除".into()),
                     Ok(false) => Some("❌ 找不到该任务".into()),
@@ -259,6 +305,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             }
 
             // Resolve shortcut or use as-is
+            if let Some(denial) = slash_denial(ctx, ActionCapability::ModelMutation) {
+                return Some(denial);
+            }
             let target = resolve_model_shortcut(arg);
             if let Some(pool) = ctx.pool {
                 let model_key = format!("model_override:{}", ctx.resolved_cli.name());
@@ -321,6 +370,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
 
             // Switch to a named profile
             if let Some(profile) = ctx.config.cli_profiles.get(arg) {
+                if let Some(denial) = slash_denial(ctx, ActionCapability::CliMutation) {
+                    return Some(denial);
+                }
                 let caps = profile.capabilities();
                 let cap_str = format!(
                     "session={} model={} harness={} tools={}",
@@ -443,6 +495,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 .strip_prefix("cancel ")
                 .or_else(|| arg.strip_prefix("rm "))
             {
+                if let Some(denial) = slash_denial(ctx, ActionCapability::DurableTaskMutation) {
+                    return Some(denial);
+                }
                 let tid = astra_core::durable_task_store::TaskId(id.trim().to_string());
                 match store
                     .update_status(
@@ -456,6 +511,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     Err(e) => Some(format!("⚠️ {e}")),
                 }
             } else if let Some(id) = arg.strip_prefix("resume ") {
+                if let Some(denial) = slash_denial(ctx, ActionCapability::DurableTaskMutation) {
+                    return Some(denial);
+                }
                 let tid = astra_core::durable_task_store::TaskId(id.trim().to_string());
                 match store.resume(&tid).await {
                     Ok(Some(cp)) => {
@@ -521,29 +579,116 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
         }
 
         "/running" => {
-            let pool = require_db!(ctx);
-            let rows: Vec<(String, String, String)> = sqlx::query_as(
-                "SELECT user_id, text, CAST(created_at AS CHAR) FROM gw_pending_messages
-                 WHERE platform = ? ORDER BY created_at",
-            )
-            .bind(ctx.platform)
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
+            let repo = require_trace_repo!(ctx);
+            let conversation =
+                ConversationKey::new(ctx.platform, ctx.chat_id, ctx.resolved_cli.name());
+            let rows = repo
+                .list_active_requests(&conversation, 20)
+                .await
+                .unwrap_or_default();
             if rows.is_empty() {
                 Some("✅ 当前没有正在执行的任务。".into())
             } else {
                 let mut lines = vec![format!("🔄 **正在执行** ({} 个)", rows.len())];
-                for (user, text, created) in &rows {
-                    let short_user = &user[..8.min(user.len())];
-                    let short_text = if text.chars().count() > 40 {
-                        format!("{}…", text.chars().take(40).collect::<String>())
+                for row in &rows {
+                    let short_user = short_id(&row.user_id);
+                    let short_text = if row.text_preview.chars().count() > 40 {
+                        format!("{}…", row.text_preview.chars().take(40).collect::<String>())
                     } else {
-                        text.clone()
+                        row.text_preview.clone()
                     };
-                    lines.push(format!("- `{short_user}…` | {short_text} | {created}"));
+                    lines.push(format!(
+                        "- `{}` `{}` | {} | {} | {}",
+                        short_id(row.trace_id.as_str()),
+                        short_user,
+                        row.display_status(),
+                        short_text,
+                        row.created_at
+                    ));
                 }
                 Some(lines.join("\n"))
+            }
+        }
+
+        "/trace" => {
+            let repo = require_trace_repo!(ctx);
+            let conversation =
+                ConversationKey::new(ctx.platform, ctx.chat_id, ctx.resolved_cli.name());
+            if arg.is_empty() || arg == "list" {
+                let traces = repo
+                    .list_recent_traces(&conversation, 10)
+                    .await
+                    .unwrap_or_default();
+                if traces.is_empty() {
+                    return Some("📋 暂无 trace。".into());
+                }
+                let mut lines = vec![format!("🧭 **最近 Trace** ({} 个)", traces.len())];
+                for trace in traces {
+                    lines.push(format!(
+                        "- `{}` {} | {} | {} events | {}",
+                        short_id(trace.trace_id.as_str()),
+                        trace.status.as_str(),
+                        trace.text_preview,
+                        trace.event_count,
+                        trace.created_at
+                    ));
+                }
+                lines.push("\n用 `/trace <trace_id>` 查看详情".into());
+                return Some(lines.join("\n"));
+            }
+
+            let trace_id = resolve_trace_selector(repo, &conversation, arg).await;
+            let Some(trace_id) = trace_id else {
+                return Some(format!("❌ 找不到 trace `{arg}`"));
+            };
+            let events = repo
+                .list_events_for_trace(&trace_id, 80)
+                .await
+                .unwrap_or_default();
+            if events.is_empty() {
+                return Some(format!(
+                    "📋 Trace `{}` 暂无事件。",
+                    short_id(trace_id.as_str())
+                ));
+            }
+            Some(format_trace_events(&trace_id, events))
+        }
+
+        "/cancel" => {
+            let repo = require_trace_repo!(ctx);
+            let conversation =
+                ConversationKey::new(ctx.platform, ctx.chat_id, ctx.resolved_cli.name());
+            let selector = if arg.is_empty() {
+                match repo.list_active_requests(&conversation, 20).await {
+                    Ok(rows) => rows
+                        .into_iter()
+                        .find(|row| row.is_cancellable())
+                        .map(|row| row.trace_id.to_string()),
+                    Err(_) => None,
+                }
+            } else {
+                Some(arg.to_string())
+            };
+            let Some(selector) = selector else {
+                return Some("✅ 当前没有可取消的排队请求。运行中的请求不会被强制中断。".into());
+            };
+            match repo
+                .cancel_accepted_request(&conversation, &selector, "cancelled by user")
+                .await
+            {
+                Ok(CancelRequestOutcome::Cancelled(row)) => Some(format!(
+                    "🚫 已取消排队请求 `{}`: {}",
+                    short_id(row.trace_id.as_str()),
+                    row.text_preview
+                )),
+                Ok(CancelRequestOutcome::AlreadyRunning(row)) => Some(format!(
+                    "⚠️ 请求 `{}` 已在运行，不能安全取消。",
+                    short_id(row.trace_id.as_str())
+                )),
+                Ok(CancelRequestOutcome::NotFound) => {
+                    Some(format!("❌ 找不到可取消请求 `{selector}`"))
+                }
+                Err(e) => Some(format!("⚠️ 取消失败: {e}")),
             }
         }
 
@@ -609,6 +754,12 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             if !path.is_dir() {
                 return Some(format!("❌ 目录不存在: `{target}`"));
             }
+            if let Some(denial) = slash_denial(ctx, ActionCapability::WorkspaceMutation) {
+                return Some(denial);
+            }
+            if let Err(denial) = ctx.config.action_policy.workspace_allowed(path) {
+                return Some(denial);
+            }
             let canonical = path
                 .canonicalize()
                 .map(|p| p.to_string_lossy().to_string())
@@ -648,6 +799,81 @@ fn parse_cron_add(input: &str) -> Option<(String, String)> {
         return Some((expr, msg));
     }
     None
+}
+
+fn slash_denial(ctx: &CommandContext<'_>, capability: ActionCapability) -> Option<String> {
+    ctx.config
+        .action_policy
+        .check(ActionSource::SlashCommand, capability)
+        .err()
+}
+
+async fn resolve_trace_selector(
+    repo: &dyn TraceRepository,
+    conversation: &ConversationKey,
+    selector: &str,
+) -> Option<TraceId> {
+    let traces = repo.list_recent_traces(conversation, 50).await.ok()?;
+    traces
+        .into_iter()
+        .find(|trace| {
+            trace.trace_id.as_str() == selector
+                || trace.request_id.as_str() == selector
+                || trace.trace_id.as_str().starts_with(selector)
+                || trace.request_id.as_str().starts_with(selector)
+        })
+        .map(|trace| trace.trace_id)
+        .or_else(|| Some(TraceId::from_string(selector.to_string())))
+}
+
+fn format_trace_events(trace_id: &TraceId, events: Vec<GatewayEvent>) -> String {
+    let mut lines = vec![format!("🧭 **Trace `{}`**", short_id(trace_id.as_str()))];
+    for event in events {
+        let payload = compact_event_payload(event.kind, &event.payload);
+        lines.push(format!(
+            "- #{} `{}` {} {}",
+            event.sequence,
+            event.kind.as_str(),
+            event.created_at,
+            payload
+        ));
+    }
+    lines.join("\n")
+}
+
+fn compact_event_payload(kind: GatewayEventKind, payload: &serde_json::Value) -> String {
+    match kind {
+        GatewayEventKind::RequestQueued => payload["queue_depth"]
+            .as_u64()
+            .map(|depth| format!("depth={depth}"))
+            .unwrap_or_default(),
+        GatewayEventKind::RunStarted => payload["session_id"]
+            .as_str()
+            .map(|sid| format!("session={}", short_id(sid)))
+            .unwrap_or_default(),
+        GatewayEventKind::RunFailed
+        | GatewayEventKind::RequestFailed
+        | GatewayEventKind::OutboxFailed => payload["error"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(80)
+            .collect(),
+        GatewayEventKind::OutboxQueued => payload["outbox_id"]
+            .as_str()
+            .map(|id| format!("outbox={}", short_id(id)))
+            .unwrap_or_default(),
+        GatewayEventKind::OutboxSent => "sent".into(),
+        _ => String::new(),
+    }
+}
+
+fn short_id(id: &str) -> String {
+    if id.len() <= 8 {
+        id.to_string()
+    } else {
+        format!("{}…", &id[..8])
+    }
 }
 
 // ─── Harness snapshot ───────────────────────────────────────────────────────

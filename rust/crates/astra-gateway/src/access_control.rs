@@ -36,6 +36,117 @@ impl AccessPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionSource {
+    SlashCommand,
+    ModelGenerated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionCapability {
+    SessionMutation,
+    CronMutation,
+    DurableTaskMutation,
+    SkillMutation,
+    WorkspaceMutation,
+    CliMutation,
+    ModelMutation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionPolicy {
+    /// Allow user-issued slash command mutations.
+    #[serde(default = "default_allow_slash_mutations")]
+    pub allow_slash_mutations: bool,
+    /// Allow model-generated [[GATEWAY:...]] mutation tags. Slash commands stay allowed.
+    #[serde(default = "default_allow_model_generated_mutations")]
+    pub allow_model_generated_mutations: bool,
+    /// If non-empty, /workspace and workspace_set may only target these roots.
+    #[serde(default)]
+    pub workspace_roots: Vec<String>,
+}
+
+fn default_allow_model_generated_mutations() -> bool {
+    true
+}
+
+fn default_allow_slash_mutations() -> bool {
+    true
+}
+
+impl Default for ActionPolicy {
+    fn default() -> Self {
+        Self {
+            allow_slash_mutations: default_allow_slash_mutations(),
+            allow_model_generated_mutations: default_allow_model_generated_mutations(),
+            workspace_roots: Vec::new(),
+        }
+    }
+}
+
+impl ActionPolicy {
+    pub fn check(&self, source: ActionSource, capability: ActionCapability) -> Result<(), String> {
+        if source == ActionSource::SlashCommand
+            && !self.allow_slash_mutations
+            && capability.is_mutation()
+        {
+            return Err("🔒 网关策略已禁用 slash 修改操作。请联系管理员。".into());
+        }
+        if source == ActionSource::ModelGenerated
+            && !self.allow_model_generated_mutations
+            && capability.is_mutation()
+        {
+            return Err("🔒 为安全起见，模型生成的修改操作已被网关策略拒绝。请使用对应的 slash 命令手动执行。".into());
+        }
+        Ok(())
+    }
+
+    pub fn workspace_allowed(&self, path: &std::path::Path) -> Result<(), String> {
+        if self.workspace_roots.is_empty() {
+            return Ok(());
+        }
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| format!("⚠️ 无法解析工作目录: {e}"))?;
+        let allowed = self.workspace_roots.iter().any(|root| {
+            let expanded = expand_home(root);
+            std::path::Path::new(&expanded)
+                .canonicalize()
+                .map(|root| canonical.starts_with(root))
+                .unwrap_or(false)
+        });
+        if allowed {
+            Ok(())
+        } else {
+            Err("🔒 工作目录不在允许的 workspace_roots 内。请联系管理员调整网关配置。".into())
+        }
+    }
+}
+
+impl ActionCapability {
+    pub fn is_mutation(self) -> bool {
+        matches!(
+            self,
+            Self::SessionMutation
+                | Self::CronMutation
+                | Self::DurableTaskMutation
+                | Self::SkillMutation
+                | Self::WorkspaceMutation
+                | Self::CliMutation
+                | Self::ModelMutation
+        )
+    }
+}
+
+fn expand_home(path: &str) -> String {
+    if path.starts_with('~') {
+        let home = std::env::var("HOME").unwrap_or_default();
+        path.replacen('~', &home, 1)
+    } else {
+        path.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +213,25 @@ mod tests {
         let yaml = serde_yaml_ng::to_string(&policy).unwrap();
         let parsed: AccessPolicy = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(parsed, policy);
+    }
+
+    #[test]
+    fn action_policy_denies_model_mutations_when_disabled() {
+        let policy = ActionPolicy {
+            allow_slash_mutations: true,
+            allow_model_generated_mutations: false,
+            workspace_roots: Vec::new(),
+        };
+        assert!(
+            policy
+                .check(ActionSource::SlashCommand, ActionCapability::CronMutation)
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(ActionSource::ModelGenerated, ActionCapability::CronMutation)
+                .unwrap_err()
+                .contains("拒绝")
+        );
     }
 }

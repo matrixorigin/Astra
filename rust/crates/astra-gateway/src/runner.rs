@@ -9,19 +9,70 @@ use crate::config::GatewayConfig;
 use crate::gateway_context::GatewayContext;
 use crate::platforms::{InboundMessage, PlatformAdapter};
 use crate::storage;
+use crate::trace_model::{
+    ConversationKey, GatewayRequest, MysqlTraceRepository, OutboxId, RequestId, RequestStatus,
+    RunStatus, TraceId, TraceRepository, TraceWriter,
+};
 use astra_core::durable_task_store::DurableTaskStore as _;
 use futures_util::future::select_all;
 use sqlx::MySqlPool;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MAX_CHUNK_LEN: usize = 3800;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 
-/// Outbound message from cron scheduler or other background tasks.
-pub type OutboundMessage = (String, String, String); // (platform, chat_id, text)
+/// Outbound message from CLI, scheduler, or other background tasks.
+#[derive(Debug, Clone)]
+pub struct OutboundMessage {
+    pub platform: String,
+    pub chat_id: String,
+    pub text: String,
+    pub reply_token: Option<String>,
+    pub outbox: Option<OutboxDelivery>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutboxDelivery {
+    pub outbox_id: OutboxId,
+    pub trace_id: TraceId,
+    pub request_id: RequestId,
+}
+
+impl OutboundMessage {
+    pub fn plain(
+        platform: impl Into<String>,
+        chat_id: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Self {
+        Self {
+            platform: platform.into(),
+            chat_id: chat_id.into(),
+            text: text.into(),
+            reply_token: None,
+            outbox: None,
+        }
+    }
+
+    pub fn with_outbox(
+        platform: impl Into<String>,
+        chat_id: impl Into<String>,
+        text: impl Into<String>,
+        reply_token: Option<String>,
+        outbox: OutboxDelivery,
+    ) -> Self {
+        Self {
+            platform: platform.into(),
+            chat_id: chat_id.into(),
+            text: text.into(),
+            reply_token,
+            outbox: Some(outbox),
+        }
+    }
+}
 
 pub struct GatewayRunner {
     config: GatewayConfig,
@@ -32,6 +83,10 @@ pub struct GatewayRunner {
     durable_store: Option<std::sync::Arc<crate::durable_task_store::MysqlDurableTaskStore>>,
     user_skills: Vec<(String, String)>,
     projects: Vec<String>,
+    trace_repo: Option<Arc<MysqlTraceRepository>>,
+    queue_senders:
+        tokio::sync::Mutex<HashMap<ConversationKey, tokio::sync::mpsc::Sender<QueuedRequest>>>,
+    global_run_limiter: Arc<tokio::sync::Semaphore>,
 }
 
 /// No-op adapter used in spawned CLI tasks (typing/heartbeats not available in background).
@@ -55,11 +110,19 @@ impl PlatformAdapter for NullAdapter {
 }
 
 /// Response from a background CLI task, routed back to the adapter.
-struct CliResponse {
-    platform: &'static str,
-    chat_id: String,
-    text: String,
-    reply_token: Option<String>,
+type CliResponse = OutboundMessage;
+
+#[derive(Debug)]
+struct QueuedRequest {
+    msg: InboundMessage,
+    conversation: ConversationKey,
+    trace: Option<OutboxDeliveryTrace>,
+}
+
+#[derive(Debug, Clone)]
+struct OutboxDeliveryTrace {
+    trace_id: TraceId,
+    request_id: RequestId,
 }
 
 enum AdapterRecv {
@@ -98,6 +161,9 @@ impl GatewayRunner {
                 p.clone(),
             ))
         });
+        let trace_repo = pool
+            .as_ref()
+            .map(|p| Arc::new(MysqlTraceRepository::new(p.clone())));
 
         let user_skills = config
             .skills_dir
@@ -124,6 +190,7 @@ impl GatewayRunner {
         if let Some(ref pool) = pool {
             let _ = crate::usage::ensure_usage_table(pool).await;
         }
+        let max_concurrent_runs = config.max_concurrent_runs.max(1);
 
         Ok(Self {
             config,
@@ -134,6 +201,9 @@ impl GatewayRunner {
             durable_store,
             user_skills,
             projects,
+            trace_repo,
+            queue_senders: tokio::sync::Mutex::new(HashMap::new()),
+            global_run_limiter: Arc::new(tokio::sync::Semaphore::new(max_concurrent_runs)),
         })
     }
 
@@ -164,10 +234,10 @@ impl GatewayRunner {
                             reply_token: None,
                         };
                         if let Some(response) = self
-                            .handle_message_inner(&msg, adapter, Some(*id), false)
+                            .handle_message_inner(&msg, adapter, Some(*id), false, None)
                             .await
                         {
-                            for chunk in split_message(&response) {
+                            for chunk in split_message(&response.text) {
                                 let _ = adapter.send_text(chat_id, chunk, None).await;
                             }
                         }
@@ -266,6 +336,10 @@ impl GatewayRunner {
                 .durable_store
                 .as_ref()
                 .map(|s| s.as_ref() as &dyn astra_core::durable_task_store::DurableTaskStore),
+            trace_repo: self
+                .trace_repo
+                .as_ref()
+                .map(|repo| repo.as_ref() as &dyn TraceRepository),
         };
         if let Some(response) = commands::handle_command(&cmd_ctx, &msg.text).await {
             return Ok(Some(response));
@@ -281,7 +355,9 @@ impl GatewayRunner {
         msg: &InboundMessage,
         adapter: &dyn PlatformAdapter,
     ) -> Option<String> {
-        self.handle_message_inner(msg, adapter, None, true).await
+        self.handle_message_inner(msg, adapter, None, true, None)
+            .await
+            .map(|outbound| outbound.text)
     }
 
     async fn handle_message_inner(
@@ -290,7 +366,8 @@ impl GatewayRunner {
         adapter: &dyn PlatformAdapter,
         existing_pending_id: Option<i64>,
         save_pending: bool,
-    ) -> Option<String> {
+        trace: Option<OutboxDeliveryTrace>,
+    ) -> Option<OutboundMessage> {
         // Group chat: per-user session isolation
         let effective_chat_id = if msg.chat_type == crate::platforms::ChatType::Group
             && self.config.group_sessions_per_user
@@ -340,6 +417,29 @@ impl GatewayRunner {
             None
         };
 
+        let trace_writer = trace.as_ref().and_then(|trace| {
+            self.trace_repo.as_ref().map(|repo| {
+                TraceWriter::from_existing(
+                    repo.as_ref() as &dyn TraceRepository,
+                    trace.trace_id.clone(),
+                    trace.request_id.clone(),
+                )
+            })
+        });
+        let mut run_id = None;
+        if let Some(writer) = trace_writer.as_ref() {
+            match writer.start_run(&cli_name, session_id.clone()).await {
+                Ok(id) => {
+                    let _ = writer.mark_running().await;
+                    run_id = Some(id);
+                }
+                Err(e) => {
+                    tracing::info!(error = %e, "queued request skipped before CLI start");
+                    return None;
+                }
+            }
+        }
+
         tracing::info!(
             platform = msg.platform,
             chat_id = %safe_id(&msg.chat_id),
@@ -354,7 +454,25 @@ impl GatewayRunner {
         // Check CLI is available before spawning
         let availability = cli_bridge::probe_cli(&cli_profile).await;
         if !availability.is_available() {
-            return Some(cli_bridge::onboarding_message(&cli_profile, &availability));
+            if let Some(writer) = trace_writer.as_ref() {
+                if let Some(ref run_id) = run_id {
+                    let _ = writer
+                        .finish_run(run_id, RunStatus::Failed, None, Some("CLI unavailable"))
+                        .await;
+                }
+                let _ = writer.fail_request("CLI unavailable").await;
+            }
+            let text = cli_bridge::onboarding_message(&cli_profile, &availability);
+            return Some(
+                self.outbound_response(
+                    trace.as_ref(),
+                    msg.platform,
+                    &msg.chat_id,
+                    msg.reply_token.clone(),
+                    text,
+                )
+                .await,
+            );
         }
 
         // Resolve workspace directory for CLI
@@ -475,6 +593,8 @@ impl GatewayRunner {
                     ws.as_deref(),
                     Some(progress_tx),
                     Some(&system_prompt),
+                    // TODO(cli_bridge): pass gateway trace_id/request_id once the
+                    // bridge exposes a stable metadata API.
                     Some(cli_timeout),
                 )
                 .await
@@ -516,7 +636,13 @@ impl GatewayRunner {
                     };
                     // Use outbound channel (works in both main loop and spawned tasks)
                     if let Some(ref tx) = self.outbound_tx {
-                        let _ = tx.send((msg.platform.to_string(), chat_id.clone(), heartbeat)).await;
+                        let _ = tx
+                            .send(OutboundMessage::plain(
+                                msg.platform.to_string(),
+                                chat_id.clone(),
+                                heartbeat,
+                            ))
+                            .await;
                     }
                 }
             }
@@ -550,13 +676,48 @@ impl GatewayRunner {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
                 suspend_tasks(&self.durable_store, format!("CLI error: {e}")).await;
+                if let Some(writer) = trace_writer.as_ref() {
+                    if let Some(ref run_id) = run_id {
+                        let _ = writer
+                            .finish_run(run_id, RunStatus::Failed, None, Some(&e))
+                            .await;
+                    }
+                    let _ = writer.fail_request(&e).await;
+                }
                 self.clear_pending_message(pending_id).await;
-                return Some(cli_bridge::translate_cli_error(&cli_profile, -1, &e));
+                let text = cli_bridge::translate_cli_error(&cli_profile, -1, &e);
+                return Some(
+                    self.outbound_response(
+                        trace.as_ref(),
+                        msg.platform,
+                        &msg.chat_id,
+                        msg.reply_token.clone(),
+                        text,
+                    )
+                    .await,
+                );
             }
             Err(e) => {
                 suspend_tasks(&self.durable_store, format!("CLI interrupted: {e}")).await;
+                if let Some(writer) = trace_writer.as_ref() {
+                    if let Some(ref run_id) = run_id {
+                        let _ = writer
+                            .finish_run(run_id, RunStatus::Failed, None, Some(&e.to_string()))
+                            .await;
+                    }
+                    let _ = writer.fail_request(&e.to_string()).await;
+                }
                 self.clear_pending_message(pending_id).await;
-                return Some(format!("⚠️ 任务中断: {e}"));
+                return Some(
+                    self.outbound_response(
+                        trace.as_ref(),
+                        msg.platform,
+                        &msg.chat_id,
+                        msg.reply_token.clone(),
+                        format!("⚠️ 任务中断: {e}"),
+                    )
+                    .await,
+                );
             }
         };
 
@@ -566,9 +727,30 @@ impl GatewayRunner {
                 || result.stderr.contains("session not found"))
             && session_id.is_some()
         {
-            tracing::info!(cli = cli_name, "stale session detected — clearing and retrying");
+            if let Some(writer) = trace_writer.as_ref()
+                && let Some(ref run_id) = run_id
+            {
+                let _ = writer
+                    .finish_run(
+                        run_id,
+                        RunStatus::Failed,
+                        Some(result.exit_code),
+                        Some("stale session"),
+                    )
+                    .await;
+            }
+            tracing::info!(
+                cli = cli_name,
+                "stale session detected — clearing and retrying"
+            );
             if let Some(ref pool) = self.pool {
-                let _ = storage::reset_session_for_cli(pool, msg.platform, &effective_chat_id, &cli_name).await;
+                let _ = storage::reset_session_for_cli(
+                    pool,
+                    msg.platform,
+                    &effective_chat_id,
+                    &cli_name,
+                )
+                .await;
             }
             // Retry without session-id
             let retry_handle = tokio::spawn({
@@ -584,27 +766,69 @@ impl GatewayRunner {
                         ws.as_deref(),
                         None,
                         Some(&system_prompt),
-                    ).await
+                    )
+                    .await
                 }
             });
+            let retry_run_id = if let Some(writer) = trace_writer.as_ref() {
+                writer.start_run(&cli_name, None).await.ok()
+            } else {
+                None
+            };
             match retry_handle.await {
                 Ok(Ok(retry_result)) if retry_result.exit_code == 0 => {
+                    if let Some(writer) = trace_writer.as_ref()
+                        && let Some(ref retry_run_id) = retry_run_id
+                    {
+                        let _ = writer
+                            .finish_run(
+                                retry_run_id,
+                                RunStatus::Succeeded,
+                                Some(retry_result.exit_code),
+                                None,
+                            )
+                            .await;
+                    }
                     // Save new session
                     if let Some(ref pool) = self.pool {
                         if let Some(ref sid) = retry_result.session_id {
                             let _ = storage::set_current_session_for_cli(
-                                pool, msg.platform, &effective_chat_id, &msg.user_id, sid, &cli_name,
-                            ).await;
+                                pool,
+                                msg.platform,
+                                &effective_chat_id,
+                                &msg.user_id,
+                                sid,
+                                &cli_name,
+                            )
+                            .await;
                         }
                     }
-                    let text = retry_result.text.as_deref().unwrap_or(retry_result.stdout.trim());
+                    let text = retry_result
+                        .text
+                        .as_deref()
+                        .unwrap_or(retry_result.stdout.trim());
                     self.clear_pending_message(pending_id).await;
-                    if text.is_empty() {
-                        return Some("(无回复)".into());
-                    }
-                    return Some(text.to_string());
+                    let text = if text.is_empty() { "(无回复)" } else { text };
+                    return Some(
+                        self.outbound_response(
+                            trace.as_ref(),
+                            msg.platform,
+                            &msg.chat_id,
+                            msg.reply_token.clone(),
+                            text.to_string(),
+                        )
+                        .await,
+                    );
                 }
-                _ => {} // fall through to normal error handling
+                _ => {
+                    if let Some(writer) = trace_writer.as_ref()
+                        && let Some(ref retry_run_id) = retry_run_id
+                    {
+                        let _ = writer
+                            .finish_run(retry_run_id, RunStatus::Failed, None, Some("retry failed"))
+                            .await;
+                    }
+                } // fall through to normal error handling
             }
         }
 
@@ -628,12 +852,53 @@ impl GatewayRunner {
                     &result.stderr
                 };
                 self.clear_pending_message(pending_id).await;
-                return Some(cli_bridge::translate_cli_error(
+                if let Some(writer) = trace_writer.as_ref() {
+                    if let Some(ref run_id) = run_id {
+                        let _ = writer
+                            .finish_run(
+                                run_id,
+                                RunStatus::Failed,
+                                Some(result.exit_code),
+                                Some(error_text.trim()),
+                            )
+                            .await;
+                    }
+                    let _ = writer.fail_request(error_text.trim()).await;
+                }
+                let text = cli_bridge::translate_cli_error(
                     &cli_profile,
                     result.exit_code,
                     error_text.trim(),
-                ));
+                );
+                return Some(
+                    self.outbound_response(
+                        trace.as_ref(),
+                        msg.platform,
+                        &msg.chat_id,
+                        msg.reply_token.clone(),
+                        text,
+                    )
+                    .await,
+                );
             }
+        }
+
+        if let Some(writer) = trace_writer.as_ref()
+            && let Some(ref run_id) = run_id
+        {
+            let status = if result.exit_code == 0 {
+                RunStatus::Succeeded
+            } else {
+                RunStatus::Failed
+            };
+            let error = if result.exit_code == 0 {
+                None
+            } else {
+                Some(result.stderr.as_str())
+            };
+            let _ = writer
+                .finish_run(run_id, status, Some(result.exit_code), error)
+                .await;
         }
 
         // Save session_id to DB (if available), scoped by CLI profile
@@ -669,7 +934,7 @@ impl GatewayRunner {
         // Execute gateway actions embedded in agent response
         if text.contains("[[GATEWAY:") {
             let mut action_results = Vec::new();
-            text = execute_gateway_actions(
+            text = execute_gateway_actions_with_policy(
                 &text,
                 self.pool.as_ref(),
                 msg.platform,
@@ -679,6 +944,7 @@ impl GatewayRunner {
                     .as_ref()
                     .map(|s| s.as_ref() as &dyn astra_core::durable_task_store::DurableTaskStore),
                 self.config.skills_dir.as_deref(),
+                &self.config.action_policy,
                 &mut action_results,
             )
             .await;
@@ -746,11 +1012,21 @@ impl GatewayRunner {
         // Clear pending message (successfully processed)
         self.clear_pending_message(pending_id).await;
 
-        if text.is_empty() {
-            Some("(无回复)".into())
+        let text = if text.is_empty() {
+            "(无回复)".to_string()
         } else {
-            Some(text)
-        }
+            text
+        };
+        Some(
+            self.outbound_response(
+                trace.as_ref(),
+                msg.platform,
+                &msg.chat_id,
+                msg.reply_token.clone(),
+                text,
+            )
+            .await,
+        )
     }
 
     async fn clear_pending_message(&self, pending_id: Option<i64>) {
@@ -759,6 +1035,267 @@ impl GatewayRunner {
         };
         if let Err(e) = storage::delete_pending_message(pool, id).await {
             tracing::warn!(id, error = %e, "failed to delete pending message");
+        }
+    }
+
+    async fn outbound_response(
+        &self,
+        trace: Option<&OutboxDeliveryTrace>,
+        platform: &str,
+        chat_id: &str,
+        reply_token: Option<String>,
+        text: String,
+    ) -> OutboundMessage {
+        let Some(trace) = trace else {
+            return OutboundMessage {
+                platform: platform.to_string(),
+                chat_id: chat_id.to_string(),
+                text,
+                reply_token,
+                outbox: None,
+            };
+        };
+        let Some(repo) = self.trace_repo.as_ref() else {
+            return OutboundMessage {
+                platform: platform.to_string(),
+                chat_id: chat_id.to_string(),
+                text,
+                reply_token,
+                outbox: None,
+            };
+        };
+        let writer = TraceWriter::from_existing(
+            repo.as_ref() as &dyn TraceRepository,
+            trace.trace_id.clone(),
+            trace.request_id.clone(),
+        );
+        match writer
+            .enqueue_outbox(platform, chat_id, reply_token.clone(), &text)
+            .await
+        {
+            Ok(outbox_id) => OutboundMessage::with_outbox(
+                platform.to_string(),
+                chat_id.to_string(),
+                text,
+                reply_token,
+                OutboxDelivery {
+                    outbox_id,
+                    trace_id: trace.trace_id.clone(),
+                    request_id: trace.request_id.clone(),
+                },
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to enqueue outbox; falling back to direct send");
+                OutboundMessage {
+                    platform: platform.to_string(),
+                    chat_id: chat_id.to_string(),
+                    text,
+                    reply_token,
+                    outbox: None,
+                }
+            }
+        }
+    }
+
+    fn effective_chat_id(&self, msg: &InboundMessage) -> String {
+        if msg.chat_type == crate::platforms::ChatType::Group && self.config.group_sessions_per_user
+        {
+            format!("{}:{}", msg.chat_id, msg.user_id)
+        } else {
+            msg.chat_id.clone()
+        }
+    }
+
+    async fn build_queued_request(&self, msg: InboundMessage) -> QueuedRequest {
+        let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
+        let effective_chat_id = self.effective_chat_id(&msg);
+        let conversation =
+            ConversationKey::new(msg.platform, effective_chat_id, cli_profile.name());
+        let trace = if let Some(repo) = self.trace_repo.as_ref() {
+            let request = GatewayRequest::new(
+                conversation.clone(),
+                msg.msg_id.clone(),
+                msg.user_id.clone(),
+                msg.text.clone(),
+            );
+            let trace = OutboxDeliveryTrace {
+                trace_id: request.trace_id.clone(),
+                request_id: request.request_id.clone(),
+            };
+            match TraceWriter::begin(repo.as_ref(), request).await {
+                Ok(writer) => {
+                    let depth = repo
+                        .list_active_requests(&conversation, 100)
+                        .await
+                        .map(|rows| rows.len().saturating_sub(1))
+                        .unwrap_or(0);
+                    let _ = writer.mark_queued(depth).await;
+                    Some(trace)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to create trace request");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        QueuedRequest {
+            msg,
+            conversation,
+            trace,
+        }
+    }
+
+    async fn enqueue_cli_request(
+        self: &Arc<Self>,
+        msg: InboundMessage,
+        cli_resp_tx: tokio::sync::mpsc::Sender<CliResponse>,
+    ) {
+        let queued = self.build_queued_request(msg).await;
+        let key = queued.conversation.clone();
+        let tx = {
+            let mut queues = self.queue_senders.lock().await;
+            if let Some(tx) = queues.get(&key) {
+                tx.clone()
+            } else {
+                let (tx, rx) = tokio::sync::mpsc::channel(128);
+                queues.insert(key.clone(), tx.clone());
+                let runner = self.clone();
+                tokio::spawn(async move {
+                    runner.run_conversation_worker(key, rx, cli_resp_tx).await;
+                });
+                tx
+            }
+        };
+        if let Err(e) = tx.send(queued).await {
+            tracing::warn!(error = %e, "failed to enqueue gateway request");
+        }
+    }
+
+    async fn run_conversation_worker(
+        self: Arc<Self>,
+        key: ConversationKey,
+        mut rx: tokio::sync::mpsc::Receiver<QueuedRequest>,
+        cli_resp_tx: tokio::sync::mpsc::Sender<CliResponse>,
+    ) {
+        while let Some(queued) = rx.recv().await {
+            let Ok(_permit) = self.global_run_limiter.clone().acquire_owned().await else {
+                break;
+            };
+            if !self.should_execute_queued(&queued).await {
+                continue;
+            }
+            if let Some(outbound) = self
+                .handle_message_inner(&queued.msg, &NullAdapter, None, true, queued.trace.clone())
+                .await
+            {
+                let _ = cli_resp_tx.send(outbound).await;
+            }
+        }
+        tracing::debug!(conversation = %key, "conversation worker stopped");
+    }
+
+    async fn should_execute_queued(&self, queued: &QueuedRequest) -> bool {
+        let Some(trace) = queued.trace.as_ref() else {
+            return true;
+        };
+        let Some(repo) = self.trace_repo.as_ref() else {
+            return true;
+        };
+        match repo.get_request(&trace.request_id).await {
+            Ok(Some(request)) if request.status == RequestStatus::Accepted => true,
+            Ok(Some(request)) => {
+                tracing::info!(
+                    request_id = %trace.request_id,
+                    status = request.status.as_str(),
+                    "skipping queued request"
+                );
+                false
+            }
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to verify queued request status");
+                false
+            }
+        }
+    }
+
+    async fn replay_retryable_outbox(
+        &self,
+        adapters: &[Box<dyn PlatformAdapter>],
+        adapter_indices: &HashMap<&'static str, usize>,
+    ) {
+        let Some(repo) = self.trace_repo.as_ref() else {
+            return;
+        };
+        match repo.list_retryable_outbox(None, 100).await {
+            Ok(rows) if rows.is_empty() => {}
+            Ok(rows) => {
+                tracing::info!(count = rows.len(), "replaying retryable outbox");
+                for row in rows {
+                    let outbound = OutboundMessage::with_outbox(
+                        row.platform.clone(),
+                        row.chat_id.clone(),
+                        row.body.clone(),
+                        row.reply_token.clone(),
+                        OutboxDelivery {
+                            outbox_id: row.outbox_id,
+                            trace_id: row.trace_id,
+                            request_id: row.request_id,
+                        },
+                    );
+                    self.deliver_outbound(adapters, adapter_indices, outbound)
+                        .await;
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to load retryable outbox"),
+        }
+    }
+
+    async fn deliver_outbound(
+        &self,
+        adapters: &[Box<dyn PlatformAdapter>],
+        adapter_indices: &HashMap<&'static str, usize>,
+        outbound: OutboundMessage,
+    ) {
+        let result = send_text_to_platform(
+            adapters,
+            adapter_indices,
+            &outbound.platform,
+            &outbound.chat_id,
+            &outbound.text,
+            outbound.reply_token.as_deref(),
+        )
+        .await;
+        let Some(outbox) = outbound.outbox else {
+            return;
+        };
+        let Some(repo) = self.trace_repo.as_ref() else {
+            return;
+        };
+        let writer = TraceWriter::from_existing(
+            repo.as_ref() as &dyn TraceRepository,
+            outbox.trace_id,
+            outbox.request_id,
+        );
+        match result {
+            Ok(chunk_count) => {
+                if let Err(e) = writer
+                    .mark_outbox_sent(&outbox.outbox_id, chunk_count)
+                    .await
+                {
+                    tracing::warn!(error = %e, "failed to ack sent outbox");
+                }
+            }
+            Err((failed_chunk, error)) => {
+                if let Err(e) = writer
+                    .mark_outbox_failed(&outbox.outbox_id, &error, failed_chunk)
+                    .await
+                {
+                    tracing::warn!(error = %e, "failed to mark outbox retryable");
+                }
+            }
         }
     }
 
@@ -791,6 +1328,10 @@ impl GatewayRunner {
         let mut adapter_indices = HashMap::new();
         for (idx, adapter) in adapters.iter().enumerate() {
             adapter_indices.insert(adapter.name(), idx);
+        }
+        self.replay_retryable_outbox(&adapters, &adapter_indices)
+            .await;
+        for adapter in &adapters {
             self.replay_pending_messages(adapter.as_ref()).await;
         }
 
@@ -802,27 +1343,15 @@ impl GatewayRunner {
                             // Fast path: slash commands — instant, no CLI
                             match self.handle_fast(&msg).await {
                                 Ok(Some(text)) => {
-                                    send_text_to_platform(&adapters, &adapter_indices, msg.platform, &msg.chat_id, &text, msg.reply_token.as_deref()).await;
+                                    let _ = send_text_to_platform(&adapters, &adapter_indices, msg.platform, &msg.chat_id, &text, msg.reply_token.as_deref()).await;
                                 }
                                 Ok(None) => {}
                                 Err(msg) => {
-                                    // Slow path: spawn CLI task in background
-                                    let runner = self.clone();
-                                    let tx = cli_resp_tx.clone();
+                                    // Slow path: enqueue by conversation. Workers serialize each
+                                    // conversation while a global semaphore allows cross-chat concurrency.
                                     let platform = msg.platform;
-                                    let chat_id = msg.chat_id.clone();
-                                    let reply_token = msg.reply_token.clone();
                                     send_typing_to_platform(&adapters, &adapter_indices, platform, &msg.chat_id).await;
-                                    tokio::spawn(async move {
-                                        if let Some(text) = runner.handle_message(&msg, &NullAdapter).await {
-                                            let _ = tx.send(CliResponse {
-                                                platform,
-                                                chat_id,
-                                                text,
-                                                reply_token,
-                                            }).await;
-                                        }
-                                    });
+                                    self.enqueue_cli_request(msg, cli_resp_tx.clone()).await;
                                 }
                             }
                         }
@@ -846,12 +1375,12 @@ impl GatewayRunner {
                 // CLI task completed — send response to user
                 resp = cli_resp_rx.recv() => {
                     if let Some(resp) = resp {
-                        send_text_to_platform(&adapters, &adapter_indices, resp.platform, &resp.chat_id, &resp.text, resp.reply_token.as_deref()).await;
+                        self.deliver_outbound(&adapters, &adapter_indices, resp).await;
                     }
                 }
                 outbound = cron_rx.recv() => {
-                    if let Some((platform, chat_id, text)) = outbound {
-                        send_text_to_platform(&adapters, &adapter_indices, &platform, &chat_id, &text, None).await;
+                    if let Some(outbound) = outbound {
+                        self.deliver_outbound(&adapters, &adapter_indices, outbound).await;
                     }
                 }
                 _ = shutdown.recv() => break,
@@ -891,20 +1420,24 @@ async fn send_text_to_platform(
     chat_id: &str,
     text: &str,
     reply_token: Option<&str>,
-) {
+) -> Result<usize, (usize, String)> {
     let Some(idx) = adapter_indices.get(platform).copied() else {
         tracing::warn!(platform, chat_id = %safe_id(chat_id), "no adapter for outbound message");
-        return;
+        return Err((0, "no adapter for outbound message".into()));
     };
     let Some(adapter) = adapters.get(idx) else {
         tracing::warn!(platform, chat_id = %safe_id(chat_id), "adapter index missing for outbound message");
-        return;
+        return Err((0, "adapter index missing for outbound message".into()));
     };
-    for chunk in split_message(text) {
+    let chunks = split_message(text);
+    let chunk_count = chunks.len();
+    for (idx, chunk) in chunks.into_iter().enumerate() {
         if let Err(e) = adapter.send_text(chat_id, chunk, reply_token).await {
             tracing::warn!(platform, chat_id = %safe_id(chat_id), error = %e, "failed to send platform message");
+            return Err((idx, e));
         }
     }
+    Ok(chunk_count)
 }
 
 async fn send_typing_to_platform(
@@ -1054,6 +1587,7 @@ async fn connect_db(url: &str) -> Result<MySqlPool, sqlx::Error> {
 /// Parse and execute `[[GATEWAY:action:args]]` tags in agent response text.
 /// Returns the text with tags removed, and populates action_results with status messages.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn execute_gateway_actions(
     text: &str,
     pool: Option<&sqlx::MySqlPool>,
@@ -1064,6 +1598,32 @@ async fn execute_gateway_actions(
     skills_dir: Option<&str>,
     action_results: &mut Vec<String>,
 ) -> String {
+    execute_gateway_actions_with_policy(
+        text,
+        pool,
+        platform,
+        chat_id,
+        user_id,
+        durable_store,
+        skills_dir,
+        &crate::access_control::ActionPolicy::default(),
+        action_results,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_gateway_actions_with_policy(
+    text: &str,
+    pool: Option<&sqlx::MySqlPool>,
+    platform: &str,
+    chat_id: &str,
+    user_id: &str,
+    durable_store: Option<&dyn astra_core::durable_task_store::DurableTaskStore>,
+    skills_dir: Option<&str>,
+    action_policy: &crate::access_control::ActionPolicy,
+    action_results: &mut Vec<String>,
+) -> String {
     let re = regex::Regex::new(r"\[\[GATEWAY:([^\]]+)\]\]").unwrap();
     let mut clean = text.to_string();
 
@@ -1071,6 +1631,16 @@ async fn execute_gateway_actions(
         let full_match = cap.get(0).unwrap().as_str();
         let inner = &cap[1];
         let parts: Vec<&str> = inner.splitn(3, ':').collect();
+        if let Some(capability) = action_capability(parts.first().copied().unwrap_or_default()) {
+            if let Err(denial) = action_policy.check(
+                crate::access_control::ActionSource::ModelGenerated,
+                capability,
+            ) {
+                action_results.push(denial);
+                clean = clean.replace(full_match, "");
+                continue;
+            }
+        }
 
         let result = match parts.first().copied() {
             Some("cron_add") if parts.len() == 3 => {
@@ -1498,6 +2068,8 @@ async fn execute_gateway_actions(
                 let path = std::path::Path::new(&expanded);
                 if !path.is_dir() {
                     format!("❌ 目录不存在: `{expanded}`")
+                } else if let Err(denial) = action_policy.workspace_allowed(path) {
+                    denial
                 } else if let Some(pool) = pool {
                     let canonical = path
                         .canonicalize()
@@ -1530,6 +2102,18 @@ async fn execute_gateway_actions(
 
     // Clean up extra whitespace from removed tags
     clean.trim().to_string()
+}
+
+fn action_capability(action: &str) -> Option<crate::access_control::ActionCapability> {
+    use crate::access_control::ActionCapability as Cap;
+    match action {
+        "cron_add" | "remind_after" | "task_del" | "cron_del" => Some(Cap::CronMutation),
+        "dtask_create" | "dtask_checkpoint" | "dtask_resume" | "dtask_complete" | "dtask_fail"
+        | "dtask_cancel" => Some(Cap::DurableTaskMutation),
+        "skill_add" => Some(Cap::SkillMutation),
+        "workspace_set" => Some(Cap::WorkspaceMutation),
+        _ => None,
+    }
 }
 
 fn is_valid_cron_expr(expr: &str) -> bool {
@@ -1987,10 +2571,11 @@ fn null_adapter_is_send_sync() {
 #[test]
 fn cli_response_fields() {
     let r = CliResponse {
-        platform: "weixin",
+        platform: "weixin".into(),
         chat_id: "c1".into(),
         text: "hello".into(),
         reply_token: Some("tok".into()),
+        outbox: None,
     };
     assert_eq!(r.platform, "weixin");
     assert_eq!(r.chat_id, "c1");
@@ -2055,7 +2640,10 @@ async fn send_text_routes_to_matching_platform_only() {
         indices.insert(adapter.name(), idx);
     }
 
-    send_text_to_platform(&adapters, &indices, "weixin", "chat", "hello", None).await;
+    let sent = send_text_to_platform(&adapters, &indices, "weixin", "chat", "hello", None)
+        .await
+        .unwrap();
+    assert_eq!(sent, 1);
 
     assert!(wecom_sent.lock().await.is_empty());
     assert_eq!(
@@ -2079,10 +2667,11 @@ async fn handle_fast_slash_command_returns_ok() {
 async fn cli_response_channel_roundtrip() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<CliResponse>(8);
     tx.send(CliResponse {
-        platform: "weixin",
+        platform: "weixin".into(),
         chat_id: "c1".into(),
         text: "result".into(),
         reply_token: None,
+        outbox: None,
     })
     .await
     .unwrap();
@@ -2100,20 +2689,22 @@ async fn concurrent_cli_responses_ordered() {
     let h1 = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         tx.send(CliResponse {
-            platform: "weixin",
+            platform: "weixin".into(),
             chat_id: "user1".into(),
             text: "response1".into(),
             reply_token: None,
+            outbox: None,
         })
         .await
         .unwrap();
     });
     let h2 = tokio::spawn(async move {
         tx2.send(CliResponse {
-            platform: "wecom",
+            platform: "wecom".into(),
             chat_id: "user2".into(),
             text: "response2".into(),
             reply_token: None,
+            outbox: None,
         })
         .await
         .unwrap();
@@ -2137,13 +2728,13 @@ async fn heartbeat_via_channel_not_adapter() {
     // Heartbeats in spawned tasks should go through outbound channel,
     // not NullAdapter (which drops them silently)
     let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(8);
-    tx.send(("weixin".into(), "chat1".into(), "🤔 thinking…".into()))
+    tx.send(OutboundMessage::plain("weixin", "chat1", "🤔 thinking…"))
         .await
         .unwrap();
     let msg = rx.recv().await.unwrap();
-    assert_eq!(msg.0, "weixin");
-    assert_eq!(msg.1, "chat1");
-    assert!(msg.2.contains("thinking"));
+    assert_eq!(msg.platform, "weixin");
+    assert_eq!(msg.chat_id, "chat1");
+    assert!(msg.text.contains("thinking"));
 }
 
 #[tokio::test]

@@ -973,23 +973,26 @@ pub(super) async fn execute_cli_command(
                 // Compute exit code for JSON output
                 let exit_code = compute_exit_code(&sr);
                 // Pure JSON output for scripting
-                let json_output = serde_json::json!({
-                    "session_id": sr.session_id,
-                    "run_id": sr.run_id,
-                    "text": sr.full_text,
-                    "prompt_tokens": sr.prompt_tokens + sr.cache_read_tokens + sr.cache_creation_tokens,
-                    "completion_tokens": sr.completion_tokens,
-                    "tool_calls_count": sr.tool_calls_count,
-                    "tools_used": sr.tools_used,
-                    "ttft_ms": sr.ttft_ms,
-                    "context_ms": sr.context_ms,
-                    "selector_strategy": sr.selector_strategy,
-                    "exit_code": i32::from(exit_code),
-                    "success": exit_code == ExitCode::Success,
-                    "background_agent_results": sr.background_agent_results.iter()
-                        .map(|(id, text)| serde_json::json!({"agent_id": id, "result": text}))
-                        .collect::<Vec<_>>(),
-                });
+                let mut json_output = final_json_output(&sr, exit_code);
+                if let Some(obj) = json_output.as_object_mut() {
+                    obj.insert("ttft_ms".to_string(), serde_json::json!(sr.ttft_ms));
+                    obj.insert("context_ms".to_string(), serde_json::json!(sr.context_ms));
+                    obj.insert(
+                        "selector_strategy".to_string(),
+                        serde_json::json!(sr.selector_strategy),
+                    );
+                    obj.insert(
+                        "background_agent_results".to_string(),
+                        serde_json::json!(
+                            sr.background_agent_results
+                                .iter()
+                                .map(
+                                    |(id, text)| serde_json::json!({"agent_id": id, "result": text})
+                                )
+                                .collect::<Vec<_>>()
+                        ),
+                    );
+                }
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json_output).unwrap_or_default()
@@ -1457,6 +1460,53 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
     ExitCode::Success
 }
 
+fn error_kind_for_exit_code(exit_code: ExitCode) -> Option<&'static str> {
+    match exit_code {
+        ExitCode::Success => None,
+        ExitCode::ToolFailure => Some("tool_failure"),
+        ExitCode::ForceStop => Some("force_stop"),
+        ExitCode::ApiError => Some("api_error"),
+    }
+}
+
+fn gateway_env_context() -> (Option<String>, Option<String>) {
+    (
+        std::env::var("ASTRA_GATEWAY_TRACE_ID")
+            .ok()
+            .filter(|value| !value.is_empty()),
+        std::env::var("ASTRA_GATEWAY_REQUEST_ID")
+            .ok()
+            .filter(|value| !value.is_empty()),
+    )
+}
+
+fn final_json_output(sr: &StreamResult, exit_code: ExitCode) -> serde_json::Value {
+    let (trace_id, request_id) = gateway_env_context();
+    final_json_output_with_context(sr, exit_code, trace_id, request_id)
+}
+
+fn final_json_output_with_context(
+    sr: &StreamResult,
+    exit_code: ExitCode,
+    trace_id: Option<String>,
+    request_id: Option<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "trace_id": trace_id,
+        "request_id": request_id,
+        "run_id": sr.run_id,
+        "session_id": sr.session_id,
+        "text": sr.full_text,
+        "prompt_tokens": sr.prompt_tokens + sr.cache_read_tokens + sr.cache_creation_tokens,
+        "completion_tokens": sr.completion_tokens,
+        "tool_calls_count": sr.tool_calls_count,
+        "tools_used": sr.tools_used,
+        "exit_code": i32::from(exit_code),
+        "success": exit_code == ExitCode::Success,
+        "error_kind": error_kind_for_exit_code(exit_code),
+    })
+}
+
 /// `--print` / `-p` mode: headless single-shot query, prints response and exits.
 /// Reads message from positional args (Message variant) or stdin.
 pub(super) async fn run_print_mode(
@@ -1562,17 +1612,7 @@ pub(super) async fn run_print_mode(
 
     match output_format {
         "json" | "stream-json" => {
-            let json_output = serde_json::json!({
-                "session_id": sr.session_id,
-                "run_id": sr.run_id,
-                "text": sr.full_text,
-                "prompt_tokens": sr.prompt_tokens + sr.cache_read_tokens + sr.cache_creation_tokens,
-                "completion_tokens": sr.completion_tokens,
-                "tool_calls_count": sr.tool_calls_count,
-                "tools_used": sr.tools_used,
-                "exit_code": i32::from(exit_code),
-                "success": exit_code == ExitCode::Success,
-            });
+            let json_output = final_json_output(&sr, exit_code);
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json_output).unwrap_or_default()
@@ -3064,6 +3104,111 @@ mod exit_code_tests {
             flaky_count: 0,
         });
         assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+    }
+}
+
+#[cfg(test)]
+mod final_json_output_tests {
+    use super::*;
+
+    fn stream_result_for_json() -> StreamResult {
+        StreamResult {
+            session_id: Some("session-1".to_string()),
+            run_id: Some("run-1".to_string()),
+            full_text: "hello".to_string(),
+            prompt_tokens: 10,
+            completion_tokens: 3,
+            cache_read_tokens: 2,
+            cache_creation_tokens: 1,
+            tool_calls_count: 2,
+            tools_selected: vec![],
+            selected_skills: vec![],
+            tools_used: vec!["bash".to_string(), "read_file".to_string()],
+            tool_call_records: vec![],
+            budget_used: 0,
+            budget_pressure: 0.0,
+            stall_events: vec![],
+            verdict_events: vec![],
+            step_recorder_summary: None,
+            tool_health_export: vec![],
+            last_heavy_checkpoint: None,
+            runtime_continuity: Default::default(),
+            ttft_ms: None,
+            context_ms: None,
+            selector_strategy: None,
+            selector_ms: None,
+            selector_tokens_in: 0,
+            selector_tokens_out: 0,
+            memoria_ms: None,
+            selector_confidence: None,
+            routing_domain_hint: None,
+            entity_learn_skipped_no_domain: false,
+            pending_context_assembly_trace: None,
+            turn_observability_events: Vec::new(),
+            llm_rounds: None,
+            interruption: None,
+            final_messages: Vec::new(),
+            background_agent_results: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn final_json_output_contains_gateway_contract_fields() {
+        let sr = stream_result_for_json();
+        let output = final_json_output_with_context(
+            &sr,
+            ExitCode::Success,
+            Some("trace-1".to_string()),
+            Some("request-1".to_string()),
+        );
+
+        assert_eq!(output["trace_id"], "trace-1");
+        assert_eq!(output["request_id"], "request-1");
+        assert_eq!(output["run_id"], "run-1");
+        assert_eq!(output["session_id"], "session-1");
+        assert_eq!(output["text"], "hello");
+        assert_eq!(output["prompt_tokens"], 13);
+        assert_eq!(output["completion_tokens"], 3);
+        assert_eq!(output["tool_calls_count"], 2);
+        assert_eq!(
+            output["tools_used"],
+            serde_json::json!(["bash", "read_file"])
+        );
+        assert_eq!(output["exit_code"], 0);
+        assert_eq!(output["success"], true);
+        assert!(output["error_kind"].is_null());
+
+        for field in [
+            "trace_id",
+            "request_id",
+            "run_id",
+            "session_id",
+            "text",
+            "prompt_tokens",
+            "completion_tokens",
+            "tool_calls_count",
+            "tools_used",
+            "exit_code",
+            "success",
+            "error_kind",
+        ] {
+            assert!(output.get(field).is_some(), "missing {field}");
+        }
+    }
+
+    #[test]
+    fn final_json_output_sets_error_kind_on_failure() {
+        let sr = stream_result_for_json();
+        let output = final_json_output_with_context(
+            &sr,
+            ExitCode::ToolFailure,
+            Some("trace-1".to_string()),
+            Some("request-1".to_string()),
+        );
+
+        assert_eq!(output["exit_code"], 1);
+        assert_eq!(output["success"], false);
+        assert_eq!(output["error_kind"], "tool_failure");
     }
 }
 

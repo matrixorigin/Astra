@@ -149,6 +149,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let scheduler_config = config.clone();
 
     let mut adapters: Vec<Box<dyn astra_gateway::platforms::PlatformAdapter>> = Vec::new();
 
@@ -184,11 +185,8 @@ async fn main() {
 
     // Start cron scheduler (only if DB available)
     if let Some(pool) = runner.pool() {
-        let scheduler = astra_gateway::scheduler::CronScheduler::new(
-            pool.clone(),
-            runner.cli_profile().clone(),
-            cron_tx,
-        );
+        let scheduler =
+            astra_gateway::scheduler::CronScheduler::new(pool.clone(), scheduler_config, cron_tx);
         let _scheduler_handle = scheduler.spawn(shutdown_tx.subscribe());
     } else {
         tracing::info!("cron scheduler disabled (no DB)");

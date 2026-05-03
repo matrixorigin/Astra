@@ -22,9 +22,15 @@ pub struct CliResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+    pub success: bool,
+    pub error_kind: Option<String>,
+    pub trace_id: Option<String>,
+    pub request_id: Option<String>,
+    pub run_id: Option<String>,
     pub session_id: Option<String>,
     pub text: Option<String>,
     pub tool_calls_count: Option<u32>,
+    pub tools_used: Vec<String>,
     pub tokens_prompt: Option<u64>,
     pub tokens_completion: Option<u64>,
 }
@@ -259,9 +265,15 @@ impl CliProfile {
                         stdout: String::new(),
                         stderr: String::new(),
                         exit_code,
+                        success: exit_code == 0,
+                        error_kind: default_error_kind(exit_code),
+                        trace_id: None,
+                        request_id: None,
+                        run_id: None,
                         session_id: None,
                         text: Some(stdout.to_string()),
                         tool_calls_count: None,
+                        tools_used: Vec::new(),
                         tokens_prompt: None,
                         tokens_completion: None,
                     }
@@ -282,20 +294,141 @@ impl CliProfile {
 
 // ─── JSON parsers ───────────────────────────────────────────────────────────
 
+const ASTRA_REQUIRED_FIELDS: &[&str] = &[
+    "trace_id",
+    "request_id",
+    "run_id",
+    "session_id",
+    "text",
+    "prompt_tokens",
+    "completion_tokens",
+    "tool_calls_count",
+    "tools_used",
+    "exit_code",
+    "success",
+    "error_kind",
+];
+
 fn parse_astra_json(stdout: &str, exit_code: i32) -> CliResult {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout) {
-        CliResult {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: v["exit_code"].as_i64().unwrap_or(exit_code as i64) as i32,
-            session_id: v["session_id"].as_str().map(String::from),
-            text: v["text"].as_str().map(String::from),
-            tool_calls_count: v["tool_calls_count"].as_u64().map(|n| n as u32),
-            tokens_prompt: v["prompt_tokens"].as_u64(),
-            tokens_completion: v["completion_tokens"].as_u64(),
+    match serde_json::from_str::<serde_json::Value>(stdout) {
+        Ok(v) => parse_strict_astra_envelope(&v, exit_code)
+            .unwrap_or_else(|reason| malformed_astra_result(exit_code, reason)),
+        Err(e) => malformed_astra_result(exit_code, format!("invalid JSON: {e}")),
+    }
+}
+
+fn parse_strict_astra_envelope(
+    v: &serde_json::Value,
+    fallback_exit_code: i32,
+) -> Result<CliResult, String> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| "envelope must be a JSON object".to_string())?;
+    for field in ASTRA_REQUIRED_FIELDS {
+        if !obj.contains_key(*field) {
+            return Err(format!("missing required field `{field}`"));
         }
-    } else {
-        plain_result(stdout, exit_code)
+    }
+
+    let exit_code = required_i32(v, "exit_code")?.unwrap_or(fallback_exit_code);
+    let tools_used = v["tools_used"]
+        .as_array()
+        .ok_or_else(|| "`tools_used` must be an array".to_string())?
+        .iter()
+        .map(|tool| {
+            tool.as_str()
+                .map(String::from)
+                .ok_or_else(|| "`tools_used` entries must be strings".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let success = required_bool(v, "success")?;
+    let error_kind = required_nullable_string(v, "error_kind")?;
+    if success && error_kind.is_some() {
+        return Err("`error_kind` must be null when `success` is true".to_string());
+    }
+    if !success && error_kind.is_none() {
+        return Err("`error_kind` must be a string when `success` is false".to_string());
+    }
+    if success != (exit_code == 0) {
+        return Err("`success` must match whether `exit_code` is zero".to_string());
+    }
+
+    Ok(CliResult {
+        stdout: String::new(),
+        stderr: String::new(),
+        exit_code,
+        success,
+        error_kind,
+        trace_id: required_nullable_string(v, "trace_id")?,
+        request_id: required_nullable_string(v, "request_id")?,
+        run_id: required_nullable_string(v, "run_id")?,
+        session_id: required_nullable_string(v, "session_id")?,
+        text: Some(required_string(v, "text")?),
+        tool_calls_count: Some(required_u32(v, "tool_calls_count")?),
+        tools_used,
+        tokens_prompt: Some(required_u64(v, "prompt_tokens")?),
+        tokens_completion: Some(required_u64(v, "completion_tokens")?),
+    })
+}
+
+fn required_nullable_string(v: &serde_json::Value, field: &str) -> Result<Option<String>, String> {
+    match &v[field] {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) => Ok(Some(s.clone())),
+        _ => Err(format!("`{field}` must be a string or null")),
+    }
+}
+
+fn required_string(v: &serde_json::Value, field: &str) -> Result<String, String> {
+    v[field]
+        .as_str()
+        .map(String::from)
+        .ok_or_else(|| format!("`{field}` must be a string"))
+}
+
+fn required_bool(v: &serde_json::Value, field: &str) -> Result<bool, String> {
+    v[field]
+        .as_bool()
+        .ok_or_else(|| format!("`{field}` must be a boolean"))
+}
+
+fn required_i32(v: &serde_json::Value, field: &str) -> Result<Option<i32>, String> {
+    let raw = v[field]
+        .as_i64()
+        .ok_or_else(|| format!("`{field}` must be an integer"))?;
+    i32::try_from(raw)
+        .map(Some)
+        .map_err(|_| format!("`{field}` is outside i32 range"))
+}
+
+fn required_u64(v: &serde_json::Value, field: &str) -> Result<u64, String> {
+    v[field]
+        .as_u64()
+        .ok_or_else(|| format!("`{field}` must be an unsigned integer"))
+}
+
+fn required_u32(v: &serde_json::Value, field: &str) -> Result<u32, String> {
+    let raw = required_u64(v, field)?;
+    u32::try_from(raw).map_err(|_| format!("`{field}` is outside u32 range"))
+}
+
+fn malformed_astra_result(exit_code: i32, reason: String) -> CliResult {
+    CliResult {
+        stdout: String::new(),
+        stderr: String::new(),
+        exit_code: if exit_code == 0 { 1 } else { exit_code },
+        success: false,
+        error_kind: Some("malformed_envelope".to_string()),
+        trace_id: None,
+        request_id: None,
+        run_id: None,
+        session_id: None,
+        text: Some(format!("malformed Astra JSON envelope: {reason}")),
+        tool_calls_count: None,
+        tools_used: Vec::new(),
+        tokens_prompt: None,
+        tokens_completion: None,
     }
 }
 
@@ -306,9 +439,15 @@ fn parse_claude_json(stdout: &str, exit_code: i32) -> CliResult {
             stdout: String::new(),
             stderr: String::new(),
             exit_code,
+            success: exit_code == 0,
+            error_kind: default_error_kind(exit_code),
+            trace_id: None,
+            request_id: None,
+            run_id: None,
             session_id: v["session_id"].as_str().map(String::from),
             text: v["result"].as_str().map(String::from),
             tool_calls_count: v["num_turns"].as_u64().map(|n| n as u32),
+            tools_used: Vec::new(),
             tokens_prompt: usage["input_tokens"]
                 .as_u64()
                 .or_else(|| usage["cache_creation_input_tokens"].as_u64()),
@@ -330,9 +469,15 @@ fn parse_generic_json(
             stdout: String::new(),
             stderr: String::new(),
             exit_code,
+            success: exit_code == 0,
+            error_kind: default_error_kind(exit_code),
+            trace_id: None,
+            request_id: None,
+            run_id: None,
             session_id: v[session_field].as_str().map(String::from),
             text: v[text_field].as_str().map(String::from),
             tool_calls_count: None,
+            tools_used: Vec::new(),
             tokens_prompt: None,
             tokens_completion: None,
         }
@@ -346,6 +491,11 @@ fn plain_result(stdout: &str, exit_code: i32) -> CliResult {
         stdout: String::new(),
         stderr: String::new(),
         exit_code,
+        success: exit_code == 0,
+        error_kind: default_error_kind(exit_code),
+        trace_id: None,
+        request_id: None,
+        run_id: None,
         session_id: None,
         text: if stdout.trim().is_empty() {
             None
@@ -353,9 +503,14 @@ fn plain_result(stdout: &str, exit_code: i32) -> CliResult {
             Some(stdout.trim().to_string())
         },
         tool_calls_count: None,
+        tools_used: Vec::new(),
         tokens_prompt: None,
         tokens_completion: None,
     }
+}
+
+fn default_error_kind(exit_code: i32) -> Option<String> {
+    (exit_code != 0).then(|| "process_exit".to_string())
 }
 
 // ─── Run ────────────────────────────────────────────────────────────────────
@@ -399,8 +554,40 @@ pub async fn run_cli_with_context_and_timeout(
     system_prompt: Option<&str>,
     timeout: Option<Duration>,
 ) -> Result<CliResult, String> {
+    run_cli_with_context_trace_and_timeout(
+        profile,
+        message,
+        session_id,
+        working_dir,
+        progress_tx,
+        system_prompt,
+        None,
+        None,
+        timeout,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_cli_with_context_trace_and_timeout(
+    profile: &CliProfile,
+    message: &str,
+    session_id: Option<&str>,
+    working_dir: Option<&std::path::Path>,
+    progress_tx: Option<mpsc::Sender<CliProgress>>,
+    system_prompt: Option<&str>,
+    trace_id: Option<&str>,
+    request_id: Option<&str>,
+    timeout: Option<Duration>,
+) -> Result<CliResult, String> {
     let mut cmd =
         profile.build_command_with_context(message, session_id, working_dir, system_prompt);
+    if let Some(trace_id) = trace_id {
+        cmd.env("ASTRA_GATEWAY_TRACE_ID", trace_id);
+    }
+    if let Some(request_id) = request_id {
+        cmd.env("ASTRA_GATEWAY_REQUEST_ID", request_id);
+    }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = cmd
@@ -628,35 +815,75 @@ mod tests {
     #[test]
     fn parse_astra_valid() {
         let r = parse_astra_json(
-            r#"{"session_id":"ses-1","text":"Hello","tool_calls_count":2,"prompt_tokens":100,"completion_tokens":50}"#,
+            r#"{"trace_id":"trace-1","request_id":"req-1","run_id":"run-1","session_id":"ses-1","text":"Hello","tool_calls_count":2,"tools_used":["bash"],"prompt_tokens":100,"completion_tokens":50,"exit_code":0,"success":true,"error_kind":null}"#,
             0,
         );
+        assert!(r.success);
+        assert_eq!(r.trace_id.as_deref(), Some("trace-1"));
+        assert_eq!(r.request_id.as_deref(), Some("req-1"));
+        assert_eq!(r.run_id.as_deref(), Some("run-1"));
         assert_eq!(r.session_id.as_deref(), Some("ses-1"));
         assert_eq!(r.text.as_deref(), Some("Hello"));
         assert_eq!(r.tool_calls_count, Some(2));
+        assert_eq!(r.tools_used, vec!["bash"]);
     }
 
     #[test]
     fn parse_astra_real_output() {
         let json = r#"{
+            "trace_id": "trace-real",
+            "request_id": "req-real",
+            "run_id": "run-real",
             "session_id": "a0fc41a0-3176-480d-99fd-d52007cdb2ce",
             "text": "\nHello! 👋",
             "tool_calls_count": 0,
+            "tools_used": [],
             "prompt_tokens": 7367,
             "completion_tokens": 44,
             "exit_code": 0,
-            "success": true
+            "success": true,
+            "error_kind": null
         }"#;
         let r = parse_astra_json(json, 0);
         assert!(r.text.as_ref().unwrap().contains("Hello!"));
         assert_eq!(r.tokens_prompt, Some(7367));
+        assert_eq!(r.error_kind, None);
     }
 
     #[test]
     fn parse_astra_malformed() {
         let r = parse_astra_json("not json", 1);
-        assert!(r.text.is_some()); // plain text fallback
-        assert_eq!(r.text.as_deref(), Some("not json"));
+        assert!(!r.success);
+        assert_eq!(r.error_kind.as_deref(), Some("malformed_envelope"));
+        assert!(
+            r.text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("invalid JSON")
+        );
+    }
+
+    #[test]
+    fn parse_astra_missing_required_field_is_typed_failure() {
+        let r = parse_astra_json(
+            r#"{"trace_id":"trace-1","request_id":"req-1","run_id":"run-1","session_id":"ses-1","text":"Hello","tool_calls_count":2,"tools_used":[],"prompt_tokens":100,"completion_tokens":50,"exit_code":0,"success":true}"#,
+            0,
+        );
+        assert!(!r.success);
+        assert_eq!(r.exit_code, 1);
+        assert_eq!(r.error_kind.as_deref(), Some("malformed_envelope"));
+        assert!(r.text.as_deref().unwrap_or_default().contains("error_kind"));
+    }
+
+    #[test]
+    fn parse_astra_failure_envelope_preserves_error_kind() {
+        let r = parse_astra_json(
+            r#"{"trace_id":"trace-1","request_id":"req-1","run_id":"run-1","session_id":"ses-1","text":"tool failed","tool_calls_count":1,"tools_used":["bash"],"prompt_tokens":100,"completion_tokens":50,"exit_code":1,"success":false,"error_kind":"tool_failure"}"#,
+            1,
+        );
+        assert!(!r.success);
+        assert_eq!(r.error_kind.as_deref(), Some("tool_failure"));
+        assert_eq!(r.exit_code, 1);
     }
 
     // ── Claude JSON parsing ─────────────────────────────────────────
@@ -856,6 +1083,34 @@ model: claude-sonnet-4-6"#;
         .await
         .unwrap_err();
         assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_injects_gateway_trace_env() {
+        let p = CliProfile::Custom {
+            bin: "sh".into(),
+            args_template: vec![
+                "-c".into(),
+                "printf '%s/%s' \"$ASTRA_GATEWAY_TRACE_ID\" \"$ASTRA_GATEWAY_REQUEST_ID\"".into(),
+            ],
+            json_output: false,
+            text_field: None,
+            session_id_field: None,
+        };
+        let r = run_cli_with_context_trace_and_timeout(
+            &p,
+            "ignored",
+            None,
+            None,
+            None,
+            None,
+            Some("trace-1"),
+            Some("req-1"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.text.as_deref(), Some("trace-1/req-1"));
     }
 
     #[tokio::test]

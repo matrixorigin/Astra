@@ -12,7 +12,10 @@
 //!       token: ""              # from QR login (bot_token), or WEIXIN_TOKEN env
 //!       account_id: ""         # from QR login (ilink_bot_id), or WEIXIN_ACCOUNT_ID env
 
-use super::{ChatType, InboundMessage, PlatformAdapter};
+use super::{
+    AdapterCapability, AdapterHealthEvent, AdapterHealthEventType, ChatType, InboundMessage,
+    PlatformAdapter, emit_adapter_health,
+};
 use crate::dedup::MessageDeduplicator;
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -26,6 +29,17 @@ const ILINK_CLIENT_VERSION: &str = "131072";
 const CHANNEL_VERSION: &str = "2.2.0";
 const POLL_TIMEOUT_SECS: u64 = 35;
 const MAX_MESSAGE_LENGTH: usize = 2000;
+const MAX_RESTORED_TOKEN_LEN: usize = 8192;
+const MAX_RESTORED_ID_LEN: usize = 512;
+const MAX_RESTORED_SYNC_BUF_LEN: usize = 64 * 1024;
+const MAX_RESTORED_CONTEXT_TOKENS: usize = 4096;
+const WEIXIN_CAPABILITIES: &[AdapterCapability] = &[
+    AdapterCapability::ReceiveText,
+    AdapterCapability::SendText,
+    AdapterCapability::SendTyping,
+    AdapterCapability::LongPoll,
+    AdapterCapability::PersistentState,
+];
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct WeixinConfig {
@@ -92,6 +106,7 @@ impl WeixinAdapter {
         &mut self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !self.config.token.is_empty() {
+            validate_weixin_credentials(&self.config.token, &self.config.account_id)?;
             return Ok(());
         }
         if let Some(ref pool) = self.pool
@@ -99,20 +114,147 @@ impl WeixinAdapter {
                 crate::storage::get_credential(pool, "weixin", "default", "bot_token").await
         {
             if let Some(token) = cred.credentials["token"].as_str() {
-                self.config.token = token.to_string();
+                if validate_restored_token(token) {
+                    self.config.token = token.to_string();
+                } else {
+                    emit_adapter_health(AdapterHealthEvent::new(
+                        "weixin",
+                        AdapterHealthEventType::CredentialInvalid,
+                        Some("stored bot_token token is invalid".to_string()),
+                    ));
+                }
             }
             if let Some(aid) = cred.credentials["account_id"].as_str()
                 && self.config.account_id.is_empty()
             {
-                self.config.account_id = aid.to_string();
+                if validate_restored_id(aid) {
+                    self.config.account_id = aid.to_string();
+                } else {
+                    emit_adapter_health(AdapterHealthEvent::new(
+                        "weixin",
+                        AdapterHealthEventType::CredentialInvalid,
+                        Some("stored account_id is invalid".to_string()),
+                    ));
+                }
             }
             if !self.config.token.is_empty() {
+                validate_weixin_credentials(&self.config.token, &self.config.account_id)?;
+                emit_adapter_health(AdapterHealthEvent::new(
+                    "weixin",
+                    AdapterHealthEventType::CredentialRestored,
+                    Some("bot_token".to_string()),
+                ));
                 tracing::info!("weixin credentials loaded from database");
                 return Ok(());
             }
         }
         Err("weixin: token required — run `astra-gateway login-weixin` to scan QR code".into())
     }
+}
+
+fn validate_weixin_credentials(
+    token: &str,
+    account_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !validate_restored_token(token) {
+        emit_adapter_health(AdapterHealthEvent::new(
+            "weixin",
+            AdapterHealthEventType::CredentialInvalid,
+            Some("token is empty or cannot be used in an authorization header".to_string()),
+        ));
+        return Err("weixin: invalid token".into());
+    }
+    if !account_id.is_empty() && !validate_restored_id(account_id) {
+        emit_adapter_health(AdapterHealthEvent::new(
+            "weixin",
+            AdapterHealthEventType::CredentialInvalid,
+            Some("account_id contains invalid characters".to_string()),
+        ));
+        return Err("weixin: invalid account_id".into());
+    }
+    Ok(())
+}
+
+fn validate_restored_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_RESTORED_TOKEN_LEN
+        && token.trim() == token
+        && !token.chars().any(char::is_control)
+        && reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).is_ok()
+}
+
+fn validate_restored_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_RESTORED_ID_LEN
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+fn restore_sync_buf_value(value: &Value) -> Option<String> {
+    let Some(sync_buf) = value.as_str() else {
+        emit_adapter_health(AdapterHealthEvent::new(
+            "weixin",
+            AdapterHealthEventType::StateInvalid,
+            Some("sync_buf is not a string".to_string()),
+        ));
+        return None;
+    };
+    if sync_buf.len() > MAX_RESTORED_SYNC_BUF_LEN || sync_buf.chars().any(char::is_control) {
+        emit_adapter_health(AdapterHealthEvent::new(
+            "weixin",
+            AdapterHealthEventType::StateInvalid,
+            Some("sync_buf failed validation".to_string()),
+        ));
+        return None;
+    }
+    emit_adapter_health(AdapterHealthEvent::new(
+        "weixin",
+        AdapterHealthEventType::StateRestored,
+        Some("sync_buf".to_string()),
+    ));
+    Some(sync_buf.to_string())
+}
+
+fn restore_context_tokens_value(value: &Value) -> HashMap<String, String> {
+    let Some(map) = value.as_object() else {
+        emit_adapter_health(AdapterHealthEvent::new(
+            "weixin",
+            AdapterHealthEventType::StateInvalid,
+            Some("context_tokens is not an object".to_string()),
+        ));
+        return HashMap::new();
+    };
+
+    let mut restored = HashMap::new();
+    let mut invalid = 0usize;
+    for (key, value) in map.iter().take(MAX_RESTORED_CONTEXT_TOKENS) {
+        let Some(token) = value.as_str() else {
+            invalid += 1;
+            continue;
+        };
+        if validate_restored_id(key) && validate_restored_token(token) {
+            restored.insert(key.clone(), token.to_string());
+        } else {
+            invalid += 1;
+        }
+    }
+    invalid += map.len().saturating_sub(MAX_RESTORED_CONTEXT_TOKENS);
+
+    if !restored.is_empty() {
+        emit_adapter_health(AdapterHealthEvent::new(
+            "weixin",
+            AdapterHealthEventType::StateRestored,
+            Some(format!("context_tokens={}", restored.len())),
+        ));
+    }
+    if invalid > 0 {
+        emit_adapter_health(AdapterHealthEvent::new(
+            "weixin",
+            AdapterHealthEventType::StateInvalid,
+            Some(format!("context_tokens_invalid={invalid}")),
+        ));
+    }
+    restored
 }
 
 fn build_headers(token: &str) -> reqwest::header::HeaderMap {
@@ -167,8 +309,15 @@ impl PlatformAdapter for WeixinAdapter {
         "weixin"
     }
 
+    fn capabilities(&self) -> &'static [AdapterCapability] {
+        WEIXIN_CAPABILITIES
+    }
+
     async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.resolve_credentials().await?;
+        for capability in self.capabilities() {
+            emit_adapter_health(AdapterHealthEvent::capability("weixin", *capability));
+        }
 
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         self.shutdown = Some(shutdown_tx.clone());
@@ -182,14 +331,10 @@ impl PlatformAdapter for WeixinAdapter {
         if let Some(ref pool) = pool
             && let Ok(Some(cred)) =
                 crate::storage::get_credential(pool, "weixin", "default", "context_tokens").await
-            && let Some(map) = cred.credentials.as_object()
         {
+            let restored = restore_context_tokens_value(&cred.credentials);
             let mut t = tokens.lock().await;
-            for (k, v) in map {
-                if let Some(s) = v.as_str() {
-                    t.insert(k.clone(), s.to_string());
-                }
-            }
+            t.extend(restored);
             tracing::info!(count = t.len(), "restored context_tokens from DB");
         }
 
@@ -204,10 +349,10 @@ impl PlatformAdapter for WeixinAdapter {
             let mut sync_buf = if let Some(ref pool) = pool
                 && let Ok(Some(cred)) =
                     crate::storage::get_credential(pool, "weixin", "default", "sync_buf").await
-                && let Some(s) = cred.credentials.as_str()
+                && let Some(s) = restore_sync_buf_value(&cred.credentials)
             {
                 tracing::info!("restored sync cursor from DB");
-                s.to_string()
+                s
             } else {
                 String::new()
             };
@@ -221,16 +366,36 @@ impl PlatformAdapter for WeixinAdapter {
                             Err(e) => {
                                 consecutive_errors += 1;
                                 let msg = e.to_string();
-                                if msg.contains("-14") || msg.contains("session timeout") {
+                                let (delay, event_type, health_msg) = if msg.contains("-14") || msg.contains("session timeout") {
                                     tracing::error!(error = %e, "weixin session expired — token may need refresh");
-                                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                                    (
+                                        std::time::Duration::from_secs(60),
+                                        AdapterHealthEventType::PollError,
+                                        format!("session expired: {e}"),
+                                    )
                                 } else if consecutive_errors > 3 {
                                     tracing::warn!(error = %e, failures = consecutive_errors, "weixin poll backoff");
-                                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                                    (
+                                        std::time::Duration::from_secs(10),
+                                        AdapterHealthEventType::PollBackoff,
+                                        format!("failures={consecutive_errors}: {e}"),
+                                    )
                                 } else {
                                     tracing::warn!(error = %e, "weixin poll error, retrying in 2s");
-                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                                }
+                                    (
+                                        std::time::Duration::from_secs(2),
+                                        AdapterHealthEventType::PollError,
+                                        e.to_string(),
+                                    )
+                                };
+                                emit_adapter_health(AdapterHealthEvent::new(
+                                    "weixin",
+                                    event_type,
+                                    Some(health_msg),
+                                ));
+                                if poll_backoff_or_shutdown(delay, &mut shutdown_rx).await {
+                                    break;
+                                };
                             }
                         }
                     }
@@ -245,6 +410,11 @@ impl PlatformAdapter for WeixinAdapter {
 
     async fn stop(&mut self) {
         if let Some(tx) = self.shutdown.take() {
+            emit_adapter_health(AdapterHealthEvent::new(
+                "weixin",
+                AdapterHealthEventType::Shutdown,
+                None,
+            ));
             let _ = tx.send(());
         }
     }
@@ -320,6 +490,48 @@ impl PlatformAdapter for WeixinAdapter {
 
     async fn recv(&self) -> Option<InboundMessage> {
         self.msg_rx.lock().await.recv().await
+    }
+}
+
+async fn poll_backoff_or_shutdown(
+    delay: std::time::Duration,
+    shutdown: &mut tokio::sync::broadcast::Receiver<()>,
+) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => false,
+        _ = shutdown.recv() => true,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundDelivery {
+    Delivered,
+    DroppedFull,
+    Closed,
+}
+
+fn deliver_weixin_inbound(
+    msg_tx: &mpsc::Sender<InboundMessage>,
+    inbound: InboundMessage,
+) -> InboundDelivery {
+    match msg_tx.try_send(inbound) {
+        Ok(()) => InboundDelivery::Delivered,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            emit_adapter_health(AdapterHealthEvent::new(
+                "weixin",
+                AdapterHealthEventType::InboundDropped,
+                Some("inbound channel full".to_string()),
+            ));
+            InboundDelivery::DroppedFull
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            emit_adapter_health(AdapterHealthEvent::new(
+                "weixin",
+                AdapterHealthEventType::InboundDropped,
+                Some("inbound channel closed".to_string()),
+            ));
+            InboundDelivery::Closed
+        }
     }
 }
 
@@ -473,8 +685,9 @@ async fn poll_updates(
                 reply_token: None,
             };
 
-            if msg_tx.send(inbound).await.is_err() {
-                break;
+            match deliver_weixin_inbound(msg_tx, inbound) {
+                InboundDelivery::Delivered | InboundDelivery::DroppedFull => {}
+                InboundDelivery::Closed => break,
             }
         }
     }
@@ -727,6 +940,8 @@ pub async fn qr_login() -> Result<(String, String), Box<dyn std::error::Error + 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::broadcast;
+    use tokio::time::{Duration, timeout};
 
     #[test]
     fn config_resolve_env() {
@@ -932,6 +1147,82 @@ mod tests {
         assert_eq!(h.get("iLink-App-ClientVersion").unwrap(), "131072");
         assert!(h.get("authorizationtype").is_some());
         assert!(h.get("x-wechat-uin").is_some());
+    }
+
+    #[test]
+    fn validates_restored_credentials() {
+        assert!(validate_restored_token("token_abc"));
+        assert!(!validate_restored_token(""));
+        assert!(!validate_restored_token(" token"));
+        assert!(!validate_restored_token("bad\nvalue"));
+        assert!(validate_restored_id("wxid_abc"));
+        assert!(!validate_restored_id("wxid\nabc"));
+    }
+
+    #[test]
+    fn restore_state_filters_invalid_values() {
+        let sync = Value::String("cursor-1".into());
+        assert_eq!(restore_sync_buf_value(&sync).unwrap(), "cursor-1");
+        assert!(restore_sync_buf_value(&json!({"bad": true})).is_none());
+
+        let restored = restore_context_tokens_value(&json!({
+            "user_ok": "ctx_ok",
+            "bad\nuser": "ctx_bad",
+            "user_bad": "ctx\nbad",
+            "not_string": 42
+        }));
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored.get("user_ok").unwrap(), "ctx_ok");
+    }
+
+    #[tokio::test]
+    async fn poll_backoff_is_shutdown_interruptible() {
+        let (tx, mut rx) = broadcast::channel(1);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = tx.send(());
+        });
+
+        let interrupted = timeout(
+            Duration::from_millis(200),
+            poll_backoff_or_shutdown(Duration::from_secs(60), &mut rx),
+        )
+        .await
+        .unwrap();
+
+        assert!(interrupted);
+    }
+
+    #[tokio::test]
+    async fn inbound_backpressure_drops_when_channel_full() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let first = InboundMessage {
+            platform: "weixin",
+            chat_id: "chat".into(),
+            user_id: "user".into(),
+            text: "first".into(),
+            msg_id: "msg-1".into(),
+            chat_type: ChatType::DirectMessage,
+            reply_token: None,
+        };
+        tx.send(first).await.unwrap();
+
+        let second = InboundMessage {
+            platform: "weixin",
+            chat_id: "chat".into(),
+            user_id: "user".into(),
+            text: "second".into(),
+            msg_id: "msg-2".into(),
+            chat_type: ChatType::DirectMessage,
+            reply_token: None,
+        };
+
+        assert_eq!(
+            deliver_weixin_inbound(&tx, second),
+            InboundDelivery::DroppedFull
+        );
+        assert_eq!(rx.recv().await.unwrap().text, "first");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

@@ -25,6 +25,12 @@ pub struct GatewayConfig {
     /// Access control policy (who can send messages).
     #[serde(default)]
     pub access: crate::access_control::AccessPolicy,
+    /// Action policy (which gateway mutations are allowed from slash/model sources).
+    #[serde(default)]
+    pub action_policy: crate::access_control::ActionPolicy,
+    /// Maximum concurrent CLI runs across all conversations.
+    #[serde(default = "default_max_concurrent_runs")]
+    pub max_concurrent_runs: usize,
     /// Group chat: isolate sessions per user (true) or share per group (false).
     #[serde(default = "default_true")]
     pub group_sessions_per_user: bool,
@@ -56,6 +62,10 @@ fn default_true() -> bool {
 
 fn default_cli_timeout_secs() -> u64 {
     60 * 60
+}
+
+fn default_max_concurrent_runs() -> usize {
+    4
 }
 
 fn default_db_url() -> String {
@@ -157,6 +167,8 @@ astra:
         assert_eq!(cfg.astra.base_url, "http://localhost:8080");
         assert_eq!(cfg.astra.api_key, "test-key");
         assert!(cfg.platforms.wecom.is_none());
+        assert_eq!(cfg.max_concurrent_runs, 4);
+        assert!(cfg.action_policy.allow_model_generated_mutations);
     }
 
     #[test]
