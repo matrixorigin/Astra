@@ -31,6 +31,7 @@ ecb = "0.1"
 hex = "0.4"
 urlencoding = "2"
 rand = "0.9"
+dotenvy.workspace = true
 dashmap = "6.1.0"
 
 [dev-dependencies]

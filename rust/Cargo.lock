@@ -294,6 +294,7 @@ dependencies = [
  "chrono",
  "clap",
  "dashmap",
+ "dotenvy",
  "ecb",
  "futures-util",
  "hex",

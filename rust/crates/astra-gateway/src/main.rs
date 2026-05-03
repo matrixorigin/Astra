@@ -6,6 +6,9 @@ use std::path::PathBuf;
 struct Cli {
     #[arg(long, default_value = "gateway.yaml")]
     config: PathBuf,
+    /// Override database URL (also: GATEWAY_DATABASE_URL env var)
+    #[arg(long)]
+    database_url: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -19,6 +22,9 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
+    // Load .env file if present (before logging init so RUST_LOG works)
+    let _ = dotenvy::dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -123,13 +129,18 @@ async fn main() {
         return;
     }
 
-    let config = match astra_gateway::config::GatewayConfig::load(&cli.config) {
+    let mut config = match astra_gateway::config::GatewayConfig::load(&cli.config) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(path = %cli.config.display(), error = %e, "config load failed");
             std::process::exit(1);
         }
     };
+
+    // CLI flag overrides config file
+    if let Some(ref db_url) = cli.database_url {
+        config.database.url = db_url.clone();
+    }
 
     let mut runner = match astra_gateway::runner::GatewayRunner::new(config.clone()).await {
         Ok(r) => r,
