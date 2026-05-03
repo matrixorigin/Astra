@@ -1,6 +1,13 @@
 # Astra Gateway — standalone Makefile
 # Usage: cd rust/crates/astra-gateway && make <target>
 
+# Load .env into shell commands (if present)
+DOT_ENV := $(shell [ -f .env ] && echo .env)
+ifdef DOT_ENV
+  include .env
+  export
+endif
+
 CARGO ?= cargo
 RELEASE_BIN = ../../target/release/astra-gateway
 CONFIG ?= gateway.yaml
