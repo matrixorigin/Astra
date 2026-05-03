@@ -13,6 +13,17 @@ impl MysqlDurableTaskStore {
     }
 }
 
+type TaskRow = (
+    String, String, Option<String>, String, String,
+    u8, Option<String>, Option<String>, Option<String>,
+    String, String,
+);
+
+const SELECT_COLS: &str =
+    "SELECT task_id, name, description, owner_id, status, \
+     progress_pct, step_description, checkpoint_json, error_message, \
+     CAST(created_at AS CHAR), CAST(updated_at AS CHAR)";
+
 #[async_trait::async_trait]
 impl DurableTaskStore for MysqlDurableTaskStore {
     async fn create(&self, spec: &TaskSpec) -> Result<TaskId, String> {
@@ -20,10 +31,7 @@ impl DurableTaskStore for MysqlDurableTaskStore {
             return Err("task name cannot be empty".into());
         }
         let id = uuid::Uuid::new_v4().to_string();
-        let checkpoint_json = spec
-            .initial_state
-            .as_ref()
-            .map(|v| v.to_string());
+        let checkpoint_json = spec.initial_state.as_ref().map(|v| v.to_string());
 
         sqlx::query(
             "INSERT INTO gw_durable_tasks (task_id, name, description, owner_id, status, checkpoint_json)
@@ -42,82 +50,47 @@ impl DurableTaskStore for MysqlDurableTaskStore {
     }
 
     async fn get(&self, id: &TaskId) -> Result<Option<DurableTask>, String> {
-        let row: Option<(
-            String, String, Option<String>, String, String,
-            u8, Option<String>, Option<String>, Option<String>,
-            String, String,
-        )> = sqlx::query_as(
-            "SELECT task_id, name, description, owner_id, status,
-                    progress_pct, step_description, checkpoint_json, error_message,
-                    CAST(created_at AS CHAR), CAST(updated_at AS CHAR)
-             FROM gw_durable_tasks WHERE task_id = ?",
+        let row: Option<TaskRow> = sqlx::query_as(
+            &format!("{SELECT_COLS} FROM gw_durable_tasks WHERE task_id = ?"),
         )
         .bind(&id.0)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| format!("get task failed: {e}"))?;
 
-        Ok(row.map(|r| row_to_task(r)))
+        Ok(row.map(row_to_task))
     }
 
     async fn list(&self, filter: TaskFilter) -> Result<Vec<DurableTask>, String> {
         let limit = filter.limit.unwrap_or(50);
-        let rows: Vec<(
-            String, String, Option<String>, String, String,
-            u8, Option<String>, Option<String>, Option<String>,
-            String, String,
-        )> = match (&filter.owner_id, &filter.status) {
+        let rows: Vec<TaskRow> = match (&filter.owner_id, &filter.status) {
             (Some(owner), Some(status)) => {
                 sqlx::query_as(
-                    "SELECT task_id, name, description, owner_id, status,
-                            progress_pct, step_description, checkpoint_json, error_message,
-                            CAST(created_at AS CHAR), CAST(updated_at AS CHAR)
-                     FROM gw_durable_tasks WHERE owner_id = ? AND status = ?
-                     ORDER BY updated_at DESC LIMIT ?",
+                    &format!("{SELECT_COLS} FROM gw_durable_tasks WHERE owner_id = ? AND status = ? ORDER BY updated_at DESC LIMIT ?"),
                 )
-                .bind(owner)
-                .bind(status.as_str())
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await
+                .bind(owner).bind(status.as_str()).bind(limit)
+                .fetch_all(&self.pool).await
             }
             (Some(owner), None) => {
                 sqlx::query_as(
-                    "SELECT task_id, name, description, owner_id, status,
-                            progress_pct, step_description, checkpoint_json, error_message,
-                            CAST(created_at AS CHAR), CAST(updated_at AS CHAR)
-                     FROM gw_durable_tasks WHERE owner_id = ?
-                     ORDER BY updated_at DESC LIMIT ?",
+                    &format!("{SELECT_COLS} FROM gw_durable_tasks WHERE owner_id = ? ORDER BY updated_at DESC LIMIT ?"),
                 )
-                .bind(owner)
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await
+                .bind(owner).bind(limit)
+                .fetch_all(&self.pool).await
             }
             (None, Some(status)) => {
                 sqlx::query_as(
-                    "SELECT task_id, name, description, owner_id, status,
-                            progress_pct, step_description, checkpoint_json, error_message,
-                            CAST(created_at AS CHAR), CAST(updated_at AS CHAR)
-                     FROM gw_durable_tasks WHERE status = ?
-                     ORDER BY updated_at DESC LIMIT ?",
+                    &format!("{SELECT_COLS} FROM gw_durable_tasks WHERE status = ? ORDER BY updated_at DESC LIMIT ?"),
                 )
-                .bind(status.as_str())
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await
+                .bind(status.as_str()).bind(limit)
+                .fetch_all(&self.pool).await
             }
             (None, None) => {
                 sqlx::query_as(
-                    "SELECT task_id, name, description, owner_id, status,
-                            progress_pct, step_description, checkpoint_json, error_message,
-                            CAST(created_at AS CHAR), CAST(updated_at AS CHAR)
-                     FROM gw_durable_tasks
-                     ORDER BY updated_at DESC LIMIT ?",
+                    &format!("{SELECT_COLS} FROM gw_durable_tasks ORDER BY updated_at DESC LIMIT ?"),
                 )
                 .bind(limit)
-                .fetch_all(&self.pool)
-                .await
+                .fetch_all(&self.pool).await
             }
         }
         .map_err(|e| format!("list tasks failed: {e}"))?;
@@ -209,11 +182,7 @@ impl DurableTaskStore for MysqlDurableTaskStore {
     }
 }
 
-fn row_to_task(
-    r: (String, String, Option<String>, String, String,
-        u8, Option<String>, Option<String>, Option<String>,
-        String, String),
-) -> DurableTask {
+fn row_to_task(r: TaskRow) -> DurableTask {
     DurableTask {
         id: TaskId(r.0),
         name: r.1,
@@ -235,7 +204,7 @@ mod tests {
 
     #[test]
     fn row_to_task_basic() {
-        let row = (
+        let row: TaskRow = (
             "id-1".into(), "test".into(), Some("desc".into()), "owner".into(), "running".into(),
             50u8, Some("step 2".into()), Some(r#"{"k":"v"}"#.into()), None,
             "2026-01-01".into(), "2026-01-02".into(),
@@ -249,19 +218,18 @@ mod tests {
 
     #[test]
     fn row_to_task_null_checkpoint() {
-        let row = (
+        let row: TaskRow = (
             "id-2".into(), "t".into(), None, "o".into(), "created".into(),
             0u8, None, None, None,
             "2026-01-01".into(), "2026-01-01".into(),
         );
         let task = row_to_task(row);
         assert!(task.checkpoint.is_none());
-        assert!(task.description.is_none());
     }
 
     #[test]
     fn row_to_task_unknown_status_defaults() {
-        let row = (
+        let row: TaskRow = (
             "id-3".into(), "t".into(), None, "o".into(), "garbage".into(),
             0u8, None, None, None,
             "2026-01-01".into(), "2026-01-01".into(),

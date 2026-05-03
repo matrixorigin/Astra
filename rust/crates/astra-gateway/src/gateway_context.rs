@@ -17,6 +17,7 @@ pub struct GatewayContext {
     pub has_cron: bool,
     pub has_session: bool,
     pub has_harness: bool,
+    pub has_durable_tasks: bool,
     pub cron_jobs_count: usize,
     pub db_tables: Vec<String>,
 }
@@ -44,6 +45,7 @@ impl GatewayContext {
             has_cron: has_db,
             has_session: caps.supports_session,
             has_harness: caps.supports_harness,
+            has_durable_tasks: has_db,
             cron_jobs_count: 0,
             db_tables: Vec::new(),
         }
@@ -146,6 +148,7 @@ fn check_condition(var: &str, ctx: &GatewayContext) -> bool {
         "has_session" => ctx.has_session,
         "has_cron" => ctx.has_cron,
         "has_harness" => ctx.has_harness,
+        "has_durable_tasks" => ctx.has_durable_tasks,
         "db_tables" => !ctx.db_tables.is_empty(),
         "cron_jobs_count" => ctx.cron_jobs_count > 0,
         "model" => ctx.model.is_some(),

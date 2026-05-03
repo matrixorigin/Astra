@@ -223,6 +223,7 @@ dependencies = [
 name = "astra-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum 0.8.9",
  "chrono",
  "dotenvy",
@@ -274,6 +275,7 @@ dependencies = [
 name = "astra-gateway"
 version = "0.1.0"
 dependencies = [
+ "astra-core",
  "astra-thin-client",
  "async-trait",
  "base64",

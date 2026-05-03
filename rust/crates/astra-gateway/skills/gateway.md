@@ -75,6 +75,41 @@ Currently {{cron_jobs_count}} scheduled task(s) active.
 {{/if}}
 {{/if}}
 
+{{#if has_durable_tasks}}
+### Durable Tasks (Long-Running)
+
+For complex multi-step tasks that may take a long time or be interrupted:
+
+**Create:**
+```
+[[GATEWAY:dtask_create:<name>:<description>]]
+```
+
+**Checkpoint (save progress):**
+```
+[[GATEWAY:dtask_checkpoint:<task_id>:<json_state>]]
+```
+Save your intermediate results as JSON. If interrupted, you can resume from this point.
+
+**Resume (continue from checkpoint):**
+```
+[[GATEWAY:dtask_resume:<task_id>]]
+```
+Returns the last saved JSON state so you can continue.
+
+**Status / List / Complete / Fail / Cancel:**
+```
+[[GATEWAY:dtask_status:<task_id>]]
+[[GATEWAY:dtask_list]]
+[[GATEWAY:dtask_complete:<task_id>]]
+[[GATEWAY:dtask_fail:<task_id>:<error>]]
+[[GATEWAY:dtask_cancel:<task_id>]]
+```
+
+Use durable tasks for: weekly reports, multi-repo analysis, batch data collection.
+Always checkpoint after each major step so work is not lost on interruption.
+{{/if}}
+
 {{#if has_harness}}
 ### Harness Monitoring
 

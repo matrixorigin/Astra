@@ -26,6 +26,7 @@ pub struct GatewayRunner {
     cli_profile: CliProfile,
     thin: astra_thin_client::ThinClient,
     outbound_tx: Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
+    durable_store: Option<std::sync::Arc<crate::durable_task_store::MysqlDurableTaskStore>>,
 }
 
 impl GatewayRunner {
@@ -52,12 +53,17 @@ impl GatewayRunner {
 
         let cli_profile = config.cli.clone();
 
+        let durable_store = pool.as_ref().map(|p| {
+            std::sync::Arc::new(crate::durable_task_store::MysqlDurableTaskStore::new(p.clone()))
+        });
+
         Ok(Self {
             config,
             pool,
             cli_profile,
             thin,
             outbound_tx: None,
+            durable_store,
         })
     }
 
@@ -308,6 +314,7 @@ impl GatewayRunner {
                 &msg.chat_id,
                 &msg.user_id,
                 self.outbound_tx.as_ref(),
+                self.durable_store.as_ref().map(|s| s.as_ref() as &dyn astra_core::durable_task_store::DurableTaskStore),
                 &mut action_results,
             ).await;
             if !action_results.is_empty() {
@@ -463,6 +470,7 @@ async fn connect_db(url: &str) -> Result<MySqlPool, sqlx::Error> {
 
 /// Parse and execute `[[GATEWAY:action:args]]` tags in agent response text.
 /// Returns the text with tags removed, and populates action_results with status messages.
+#[allow(clippy::too_many_arguments)]
 async fn execute_gateway_actions(
     text: &str,
     pool: Option<&sqlx::MySqlPool>,
@@ -470,6 +478,7 @@ async fn execute_gateway_actions(
     chat_id: &str,
     user_id: &str,
     outbound_tx: Option<&tokio::sync::mpsc::Sender<OutboundMessage>>,
+    durable_store: Option<&dyn astra_core::durable_task_store::DurableTaskStore>,
     action_results: &mut Vec<String>,
 ) -> String {
     let re = regex::Regex::new(r"\[\[GATEWAY:([^\]]+)\]\]").unwrap();
@@ -597,6 +606,166 @@ async fn execute_gateway_actions(
                 }
             }
 
+            Some("dtask_create") if parts.len() >= 2 => {
+                let name = parts[1].trim();
+                let desc = if parts.len() >= 3 { Some(parts[2].trim().to_string()) } else { None };
+                if name.is_empty() {
+                    "⚠️ 任务名称不能为空".into()
+                } else if let Some(store) = durable_store {
+                    let spec = astra_core::durable_task_store::TaskSpec {
+                        name: name.to_string(),
+                        description: desc,
+                        owner_id: format!("{platform}:{chat_id}"),
+                        initial_state: None,
+                    };
+                    match store.create(&spec).await {
+                        Ok(id) => {
+                            tracing::info!(task_id = %id, name, "dtask created");
+                            format!("📋 任务已创建\n- ID: `{}`\n- 名称: {name}", &id.0[..8.min(id.0.len())])
+                        }
+                        Err(e) => format!("⚠️ 创建失败: {e}"),
+                    }
+                } else {
+                    "⚠️ 需要数据库支持".into()
+                }
+            }
+
+            Some("dtask_checkpoint") if parts.len() == 3 => {
+                let task_id = parts[1].trim();
+                let json_str = parts[2].trim();
+                if task_id.is_empty() {
+                    "⚠️ 请指定任务 ID".into()
+                } else {
+                    match serde_json::from_str::<serde_json::Value>(json_str) {
+                        Err(e) => format!("⚠️ checkpoint JSON 无效: {e}"),
+                        Ok(state) => {
+                            if let Some(store) = durable_store {
+                                let tid = astra_core::durable_task_store::TaskId(task_id.to_string());
+                                match store.checkpoint(&tid, &state, None, None).await {
+                                    Ok(()) => {
+                                        tracing::info!(task_id, "dtask checkpoint saved");
+                                        format!("💾 检查点已保存 (`{}`)", &task_id[..8.min(task_id.len())])
+                                    }
+                                    Err(e) => format!("⚠️ 保存失败: {e}"),
+                                }
+                            } else {
+                                "⚠️ 需要数据库支持".into()
+                            }
+                        }
+                    }
+                }
+            }
+
+            Some("dtask_status") if parts.len() >= 2 => {
+                let task_id = parts[1].trim();
+                if let Some(store) = durable_store {
+                    let tid = astra_core::durable_task_store::TaskId(task_id.to_string());
+                    match store.get(&tid).await {
+                        Ok(Some(t)) => {
+                            let mut lines = vec![
+                                format!("📋 **任务: {}**", t.name),
+                                format!("- 状态: {}", t.status.as_str()),
+                                format!("- 进度: {}%", t.progress_pct),
+                            ];
+                            if let Some(ref step) = t.step_description {
+                                lines.push(format!("- 当前: {step}"));
+                            }
+                            if let Some(ref err) = t.error_message {
+                                lines.push(format!("- 错误: {err}"));
+                            }
+                            lines.join("\n")
+                        }
+                        Ok(None) => format!("❌ 任务 `{task_id}` 不存在"),
+                        Err(e) => format!("⚠️ 查询失败: {e}"),
+                    }
+                } else {
+                    "⚠️ 需要数据库支持".into()
+                }
+            }
+
+            Some("dtask_resume") if parts.len() >= 2 => {
+                let task_id = parts[1].trim();
+                if let Some(store) = durable_store {
+                    let tid = astra_core::durable_task_store::TaskId(task_id.to_string());
+                    match store.resume(&tid).await {
+                        Ok(Some(checkpoint)) => {
+                            let _ = store.update_status(
+                                &tid, astra_core::durable_task_store::DurableTaskStatus::Running, None,
+                            ).await;
+                            format!("▶️ 任务已恢复，检查点:\n```json\n{}\n```", serde_json::to_string_pretty(&checkpoint).unwrap_or_default())
+                        }
+                        Ok(None) => format!("▶️ 任务 `{task_id}` 无检查点，从头开始"),
+                        Err(e) => format!("⚠️ 恢复失败: {e}"),
+                    }
+                } else {
+                    "⚠️ 需要数据库支持".into()
+                }
+            }
+
+            Some("dtask_list") => {
+                if let Some(store) = durable_store {
+                    let filter = astra_core::durable_task_store::TaskFilter {
+                        owner_id: Some(format!("{platform}:{chat_id}")),
+                        ..Default::default()
+                    };
+                    match store.list(filter).await {
+                        Ok(tasks) if tasks.is_empty() => "📋 没有持久任务。".into(),
+                        Ok(tasks) => {
+                            let mut lines = vec![format!("📋 **持久任务** ({} 个)", tasks.len())];
+                            for t in &tasks {
+                                let short_id = &t.id.0[..8.min(t.id.0.len())];
+                                let icon = match t.status {
+                                    astra_core::durable_task_store::DurableTaskStatus::Running => "🔄",
+                                    astra_core::durable_task_store::DurableTaskStatus::Suspended => "⏸",
+                                    astra_core::durable_task_store::DurableTaskStatus::Completed => "✅",
+                                    astra_core::durable_task_store::DurableTaskStatus::Failed => "❌",
+                                    _ => "📋",
+                                };
+                                lines.push(format!("{icon} `{short_id}` | {} | {}%", t.name, t.progress_pct));
+                            }
+                            lines.join("\n")
+                        }
+                        Err(e) => format!("⚠️ 查询失败: {e}"),
+                    }
+                } else {
+                    "⚠️ 需要数据库支持".into()
+                }
+            }
+
+            Some("dtask_complete") if parts.len() >= 2 => {
+                let task_id = parts[1].trim();
+                if let Some(store) = durable_store {
+                    let tid = astra_core::durable_task_store::TaskId(task_id.to_string());
+                    match store.update_status(&tid, astra_core::durable_task_store::DurableTaskStatus::Completed, None).await {
+                        Ok(()) => "✅ 任务已完成".into(),
+                        Err(e) => format!("⚠️ {e}"),
+                    }
+                } else { "⚠️ 需要数据库支持".into() }
+            }
+
+            Some("dtask_fail") if parts.len() >= 2 => {
+                let task_id = parts[1].trim();
+                let error = if parts.len() >= 3 { Some(parts[2].trim()) } else { None };
+                if let Some(store) = durable_store {
+                    let tid = astra_core::durable_task_store::TaskId(task_id.to_string());
+                    match store.update_status(&tid, astra_core::durable_task_store::DurableTaskStatus::Failed, error).await {
+                        Ok(()) => "❌ 任务已标记失败".into(),
+                        Err(e) => format!("⚠️ {e}"),
+                    }
+                } else { "⚠️ 需要数据库支持".into() }
+            }
+
+            Some("dtask_cancel") if parts.len() >= 2 => {
+                let task_id = parts[1].trim();
+                if let Some(store) = durable_store {
+                    let tid = astra_core::durable_task_store::TaskId(task_id.to_string());
+                    match store.update_status(&tid, astra_core::durable_task_store::DurableTaskStatus::Cancelled, None).await {
+                        Ok(()) => "🚫 任务已取消".into(),
+                        Err(e) => format!("⚠️ {e}"),
+                    }
+                } else { "⚠️ 需要数据库支持".into() }
+            }
+
             _ => {
                 tracing::warn!(action = inner, "unknown gateway action");
                 format!("⚠️ 未知操作: {inner}")
@@ -695,7 +864,7 @@ mod tests {
     async fn action_cron_add_no_db() {
         let text = "好的\n[[GATEWAY:cron_add:0 9 * * *:早上好]]";
         let mut r = Vec::new();
-        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
+        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
         assert_eq!(clean, "好的");
         assert!(r[0].contains("数据库"), "{}", r[0]);
     }
@@ -704,7 +873,7 @@ mod tests {
     async fn action_cron_add_invalid_expr() {
         let text = "[[GATEWAY:cron_add:bad expr:msg]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
         assert!(r[0].contains("无效"), "{}", r[0]);
     }
 
@@ -712,7 +881,7 @@ mod tests {
     async fn action_cron_add_empty_message() {
         let text = "[[GATEWAY:cron_add:0 9 * * *:]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
         assert!(r[0].contains("不能为空"), "{}", r[0]);
     }
 
@@ -720,7 +889,7 @@ mod tests {
     async fn action_cron_add_missing_parts() {
         let text = "[[GATEWAY:cron_add:only_one_part]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
         assert!(r[0].contains("格式错误"), "{}", r[0]);
     }
 
@@ -729,7 +898,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let text = "好的\n[[GATEWAY:remind_after:5:喝水]]";
         let mut r = Vec::new();
-        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", Some(&tx), &mut r).await;
+        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", Some(&tx), None, &mut r).await;
         assert_eq!(clean, "好的");
         assert!(r[0].contains("5分钟"), "{}", r[0]);
         assert!(r[0].contains("喝水"), "{}", r[0]);
@@ -740,7 +909,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let text = "[[GATEWAY:remind_after:120:吃药]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", Some(&tx), &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", Some(&tx), None, &mut r).await;
         assert!(r[0].contains("2小时"), "{}", r[0]);
     }
 
@@ -748,7 +917,7 @@ mod tests {
     async fn action_remind_after_zero_minutes() {
         let text = "[[GATEWAY:remind_after:0:msg]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
         assert!(r[0].contains("无效"), "{}", r[0]);
     }
 
@@ -757,7 +926,7 @@ mod tests {
         let text = "[[GATEWAY:remind_after:99999:msg]]";
         let mut r = Vec::new();
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        execute_gateway_actions(text, None, "wx", "c1", "u1", Some(&tx), &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", Some(&tx), None, &mut r).await;
         assert!(r[0].contains("过长"), "{}", r[0]);
     }
 
@@ -766,7 +935,7 @@ mod tests {
         let text = "[[GATEWAY:remind_after:5:]]";
         let mut r = Vec::new();
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        execute_gateway_actions(text, None, "wx", "c1", "u1", Some(&tx), &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", Some(&tx), None, &mut r).await;
         assert!(r[0].contains("不能为空"), "{}", r[0]);
     }
 
@@ -774,7 +943,7 @@ mod tests {
     async fn action_remind_after_no_outbound() {
         let text = "[[GATEWAY:remind_after:5:test]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
         assert!(r[0].contains("不可用"), "{}", r[0]);
     }
 
@@ -782,7 +951,7 @@ mod tests {
     async fn action_remind_after_non_numeric() {
         let text = "[[GATEWAY:remind_after:abc:msg]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
         assert!(r[0].contains("无效"), "{}", r[0]);
     }
 
@@ -790,7 +959,7 @@ mod tests {
     async fn action_task_list_no_db() {
         let text = "[[GATEWAY:task_list]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
         assert!(r[0].contains("数据库"), "{}", r[0]);
     }
 
@@ -798,7 +967,7 @@ mod tests {
     async fn action_task_del_empty_id() {
         let text = "[[GATEWAY:task_del:]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
         assert!(r[0].contains("请指定"), "{}", r[0]);
     }
 
@@ -806,7 +975,7 @@ mod tests {
     async fn action_task_del_no_db() {
         let text = "[[GATEWAY:task_del:abc123]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
         assert!(r[0].contains("数据库"), "{}", r[0]);
     }
 
@@ -815,7 +984,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let text = "好的，帮你设置：\n[[GATEWAY:cron_add:0 9 * * 1-5:工作日早报]]\n[[GATEWAY:remind_after:30:半小时后开会]]";
         let mut r = Vec::new();
-        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", Some(&tx), &mut r).await;
+        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", Some(&tx), None, &mut r).await;
         assert_eq!(clean, "好的，帮你设置：");
         assert_eq!(r.len(), 2);
     }
@@ -824,7 +993,7 @@ mod tests {
     async fn action_unknown_type() {
         let text = "[[GATEWAY:fly_to_moon:now]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
         assert!(r[0].contains("未知"), "{}", r[0]);
     }
 
@@ -832,7 +1001,7 @@ mod tests {
     async fn action_no_tags_passthrough() {
         let text = "普通回复";
         let mut r = Vec::new();
-        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
+        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
         assert_eq!(clean, "普通回复");
         assert!(r.is_empty());
     }
@@ -864,3 +1033,85 @@ mod tests {
         assert_eq!(p.name(), "astra");
     }
 }
+
+    // ── Durable task action tests ───────────────────────────────
+
+    #[tokio::test]
+    async fn action_dtask_create_no_db() {
+        let text = "[[GATEWAY:dtask_create:weekly report:collect stats]]";
+        let mut r = Vec::new();
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        assert!(r[0].contains("数据库"), "{}", r[0]);
+    }
+
+    #[tokio::test]
+    async fn action_dtask_create_empty_name() {
+        let text = "[[GATEWAY:dtask_create::desc]]";
+        let mut r = Vec::new();
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        assert!(r[0].contains("不能为空"), "{}", r[0]);
+    }
+
+    #[tokio::test]
+    async fn action_dtask_checkpoint_bad_json() {
+        let text = "[[GATEWAY:dtask_checkpoint:tid:not-json]]";
+        let mut r = Vec::new();
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        assert!(r[0].contains("JSON 无效"), "{}", r[0]);
+    }
+
+    #[tokio::test]
+    async fn action_dtask_checkpoint_empty_id() {
+        let text = r#"[[GATEWAY:dtask_checkpoint::{"k":1}]]"#;
+        let mut r = Vec::new();
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        assert!(r[0].contains("请指定"), "{}", r[0]);
+    }
+
+    #[tokio::test]
+    async fn action_dtask_status_no_db() {
+        let text = "[[GATEWAY:dtask_status:some-id]]";
+        let mut r = Vec::new();
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        assert!(r[0].contains("数据库"), "{}", r[0]);
+    }
+
+    #[tokio::test]
+    async fn action_dtask_resume_no_db() {
+        let text = "[[GATEWAY:dtask_resume:some-id]]";
+        let mut r = Vec::new();
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        assert!(r[0].contains("数据库"), "{}", r[0]);
+    }
+
+    #[tokio::test]
+    async fn action_dtask_list_no_db() {
+        let text = "[[GATEWAY:dtask_list]]";
+        let mut r = Vec::new();
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        assert!(r[0].contains("数据库"), "{}", r[0]);
+    }
+
+    #[tokio::test]
+    async fn action_dtask_complete_no_db() {
+        let text = "[[GATEWAY:dtask_complete:some-id]]";
+        let mut r = Vec::new();
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        assert!(r[0].contains("数据库"), "{}", r[0]);
+    }
+
+    #[tokio::test]
+    async fn action_dtask_fail_no_db() {
+        let text = "[[GATEWAY:dtask_fail:some-id:oops]]";
+        let mut r = Vec::new();
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        assert!(r[0].contains("数据库"), "{}", r[0]);
+    }
+
+    #[tokio::test]
+    async fn action_dtask_cancel_no_db() {
+        let text = "[[GATEWAY:dtask_cancel:some-id]]";
+        let mut r = Vec::new();
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        assert!(r[0].contains("数据库"), "{}", r[0]);
+    }
