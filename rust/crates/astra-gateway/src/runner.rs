@@ -402,7 +402,6 @@ impl GatewayRunner {
                 msg.platform,
                 &msg.chat_id,
                 &msg.user_id,
-                self.outbound_tx.as_ref(),
                 self.durable_store.as_ref().map(|s| s.as_ref() as &dyn astra_core::durable_task_store::DurableTaskStore),
                 &mut action_results,
             ).await;
@@ -618,7 +617,6 @@ async fn execute_gateway_actions(
     platform: &str,
     chat_id: &str,
     user_id: &str,
-    outbound_tx: Option<&tokio::sync::mpsc::Sender<OutboundMessage>>,
     durable_store: Option<&dyn astra_core::durable_task_store::DurableTaskStore>,
     action_results: &mut Vec<String>,
 ) -> String {
@@ -665,27 +663,39 @@ async fn execute_gateway_actions(
                     "⚠️ 提醒时间无效（需要大于 0 的分钟数）".into()
                 } else if minutes > 1440 * 7 {
                     "⚠️ 提醒时间过长（最多 7 天 = 10080 分钟）".into()
-                } else if let Some(tx) = outbound_tx {
-                    let tx = tx.clone();
-                    let plat = platform.to_string();
-                    let cid = chat_id.to_string();
-                    let msg_clone = message.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(minutes * 60)).await;
-                        let text = format!("⏰ 提醒: {msg_clone}");
-                        let _ = tx.send((plat, cid, text)).await;
-                    });
-                    tracing::info!(minutes, msg = %message, "gateway action: remind_after");
-                    let time_str = if minutes >= 60 {
-                        let h = minutes / 60;
-                        let m = minutes % 60;
-                        if m == 0 { format!("{h}小时") } else { format!("{h}小时{m}分钟") }
-                    } else {
-                        format!("{minutes}分钟")
-                    };
-                    format!("⏰ {time_str}后提醒: {message}")
+                } else if let Some(pool) = pool {
+                    // Store as one-shot cron job with computed next_run time
+                    let job_id = uuid::Uuid::new_v4().to_string();
+                    let next_run = chrono::Utc::now() + chrono::Duration::minutes(minutes as i64);
+                    let next_run_str = next_run.format("%Y-%m-%d %H:%M:%S").to_string();
+                    // Use special cron_expr "once" to mark as one-shot
+                    match storage::create_cron_job(
+                        pool, &job_id, platform, chat_id, user_id,
+                        "once", &message, &format!("⏰ {message} (一次性)"),
+                    ).await {
+                        Ok(()) => {
+                            // Override next_run to the computed time
+                            let _ = sqlx::query(
+                                "UPDATE gw_cron_jobs SET next_run = ? WHERE job_id = ?",
+                            )
+                            .bind(&next_run_str)
+                            .bind(&job_id)
+                            .execute(pool)
+                            .await;
+                            tracing::info!(minutes, msg = %message, job_id = &job_id[..8], "remind_after → cron job");
+                            let time_str = if minutes >= 60 {
+                                let h = minutes / 60;
+                                let m = minutes % 60;
+                                if m == 0 { format!("{h}小时") } else { format!("{h}小时{m}分钟") }
+                            } else {
+                                format!("{minutes}分钟")
+                            };
+                            format!("⏰ {time_str}后提醒: {message}\n(ID: `{}`)", &job_id[..8])
+                        }
+                        Err(e) => format!("⚠️ 创建提醒失败: {e}"),
+                    }
                 } else {
-                    "⚠️ 延时提醒功能不可用".into()
+                    "⚠️ 延时提醒需要数据库支持".into()
                 }
             }
             Some("remind_after") => "⚠️ remind_after 格式错误（需要: remind_after:分钟数:消息）".into(),
@@ -1049,7 +1059,7 @@ mod tests {
     async fn action_cron_add_no_db() {
         let text = "好的\n[[GATEWAY:cron_add:0 9 * * *:早上好]]";
         let mut r = Vec::new();
-        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert_eq!(clean, "好的");
         assert!(r[0].contains("数据库"), "{}", r[0]);
     }
@@ -1058,7 +1068,7 @@ mod tests {
     async fn action_cron_add_invalid_expr() {
         let text = "[[GATEWAY:cron_add:bad expr:msg]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("无效"), "{}", r[0]);
     }
 
@@ -1066,7 +1076,7 @@ mod tests {
     async fn action_cron_add_empty_message() {
         let text = "[[GATEWAY:cron_add:0 9 * * *:]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("不能为空"), "{}", r[0]);
     }
 
@@ -1074,35 +1084,24 @@ mod tests {
     async fn action_cron_add_missing_parts() {
         let text = "[[GATEWAY:cron_add:only_one_part]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("格式错误"), "{}", r[0]);
     }
 
     #[tokio::test]
-    async fn action_remind_after_valid() {
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    async fn action_remind_after_no_db() {
         let text = "好的\n[[GATEWAY:remind_after:5:喝水]]";
         let mut r = Vec::new();
-        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", Some(&tx), None, &mut r).await;
+        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert_eq!(clean, "好的");
-        assert!(r[0].contains("5分钟"), "{}", r[0]);
-        assert!(r[0].contains("喝水"), "{}", r[0]);
-    }
-
-    #[tokio::test]
-    async fn action_remind_after_hours() {
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let text = "[[GATEWAY:remind_after:120:吃药]]";
-        let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", Some(&tx), None, &mut r).await;
-        assert!(r[0].contains("2小时"), "{}", r[0]);
+        assert!(r[0].contains("数据库"), "{}", r[0]);
     }
 
     #[tokio::test]
     async fn action_remind_after_zero_minutes() {
         let text = "[[GATEWAY:remind_after:0:msg]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("无效"), "{}", r[0]);
     }
 
@@ -1110,8 +1109,7 @@ mod tests {
     async fn action_remind_after_too_long() {
         let text = "[[GATEWAY:remind_after:99999:msg]]";
         let mut r = Vec::new();
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        execute_gateway_actions(text, None, "wx", "c1", "u1", Some(&tx), None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("过长"), "{}", r[0]);
     }
 
@@ -1119,24 +1117,15 @@ mod tests {
     async fn action_remind_after_empty_message() {
         let text = "[[GATEWAY:remind_after:5:]]";
         let mut r = Vec::new();
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        execute_gateway_actions(text, None, "wx", "c1", "u1", Some(&tx), None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("不能为空"), "{}", r[0]);
-    }
-
-    #[tokio::test]
-    async fn action_remind_after_no_outbound() {
-        let text = "[[GATEWAY:remind_after:5:test]]";
-        let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-        assert!(r[0].contains("不可用"), "{}", r[0]);
     }
 
     #[tokio::test]
     async fn action_remind_after_non_numeric() {
         let text = "[[GATEWAY:remind_after:abc:msg]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("无效"), "{}", r[0]);
     }
 
@@ -1144,7 +1133,7 @@ mod tests {
     async fn action_task_list_no_db() {
         let text = "[[GATEWAY:task_list]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("数据库"), "{}", r[0]);
     }
 
@@ -1152,7 +1141,7 @@ mod tests {
     async fn action_task_del_empty_id() {
         let text = "[[GATEWAY:task_del:]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("请指定"), "{}", r[0]);
     }
 
@@ -1160,16 +1149,15 @@ mod tests {
     async fn action_task_del_no_db() {
         let text = "[[GATEWAY:task_del:abc123]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("数据库"), "{}", r[0]);
     }
 
     #[tokio::test]
     async fn action_multiple_mixed() {
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let text = "好的，帮你设置：\n[[GATEWAY:cron_add:0 9 * * 1-5:工作日早报]]\n[[GATEWAY:remind_after:30:半小时后开会]]";
         let mut r = Vec::new();
-        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", Some(&tx), None, &mut r).await;
+        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert_eq!(clean, "好的，帮你设置：");
         assert_eq!(r.len(), 2);
     }
@@ -1178,7 +1166,7 @@ mod tests {
     async fn action_unknown_type() {
         let text = "[[GATEWAY:fly_to_moon:now]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("未知"), "{}", r[0]);
     }
 
@@ -1186,7 +1174,7 @@ mod tests {
     async fn action_no_tags_passthrough() {
         let text = "普通回复";
         let mut r = Vec::new();
-        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert_eq!(clean, "普通回复");
         assert!(r.is_empty());
     }
@@ -1225,7 +1213,7 @@ mod tests {
     async fn action_dtask_create_no_db() {
         let text = "[[GATEWAY:dtask_create:weekly report:collect stats]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("数据库"), "{}", r[0]);
     }
 
@@ -1233,7 +1221,7 @@ mod tests {
     async fn action_dtask_create_empty_name() {
         let text = "[[GATEWAY:dtask_create::desc]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("不能为空"), "{}", r[0]);
     }
 
@@ -1241,7 +1229,7 @@ mod tests {
     async fn action_dtask_checkpoint_bad_json() {
         let text = "[[GATEWAY:dtask_checkpoint:tid:not-json]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("JSON 无效"), "{}", r[0]);
     }
 
@@ -1249,7 +1237,7 @@ mod tests {
     async fn action_dtask_checkpoint_empty_id() {
         let text = r#"[[GATEWAY:dtask_checkpoint::{"k":1}]]"#;
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("请指定"), "{}", r[0]);
     }
 
@@ -1257,7 +1245,7 @@ mod tests {
     async fn action_dtask_status_no_db() {
         let text = "[[GATEWAY:dtask_status:some-id]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("数据库"), "{}", r[0]);
     }
 
@@ -1265,7 +1253,7 @@ mod tests {
     async fn action_dtask_resume_no_db() {
         let text = "[[GATEWAY:dtask_resume:some-id]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("数据库"), "{}", r[0]);
     }
 
@@ -1273,7 +1261,7 @@ mod tests {
     async fn action_dtask_list_no_db() {
         let text = "[[GATEWAY:dtask_list]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("数据库"), "{}", r[0]);
     }
 
@@ -1281,7 +1269,7 @@ mod tests {
     async fn action_dtask_complete_no_db() {
         let text = "[[GATEWAY:dtask_complete:some-id]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("数据库"), "{}", r[0]);
     }
 
@@ -1289,7 +1277,7 @@ mod tests {
     async fn action_dtask_fail_no_db() {
         let text = "[[GATEWAY:dtask_fail:some-id:oops]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("数据库"), "{}", r[0]);
     }
 
@@ -1297,6 +1285,6 @@ mod tests {
     async fn action_dtask_cancel_no_db() {
         let text = "[[GATEWAY:dtask_cancel:some-id]]";
         let mut r = Vec::new();
-        execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+        execute_gateway_actions(text, None, "wx", "c1", "u1", None, &mut r).await;
         assert!(r[0].contains("数据库"), "{}", r[0]);
     }

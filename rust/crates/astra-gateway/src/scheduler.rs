@@ -59,7 +59,15 @@ impl CronScheduler {
         };
 
         for (job_id, platform, chat_id, message, cron_expr) in jobs {
-            tracing::info!(job_id = %job_id, "cron: executing");
+            tracing::info!(job_id = %job_id, expr = %cron_expr, "cron: executing");
+
+            if cron_expr == "once" {
+                // One-shot reminder: just send the message, then delete the job
+                let text = format!("⏰ 提醒: {message}");
+                let _ = self.outbound_tx.send((platform, chat_id, text)).await;
+                let _ = storage::delete_cron_job(&self.pool, &job_id).await;
+                continue;
+            }
 
             let session_id = storage::get_current_session(&self.pool, &platform, &chat_id)
                 .await
