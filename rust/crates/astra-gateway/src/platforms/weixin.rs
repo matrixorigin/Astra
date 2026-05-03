@@ -500,7 +500,11 @@ fn extract_text(msg: &Value) -> String {
                     }
                 }
                 Some(2) => {
-                    parts.push("🖼 [图片]".to_string());
+                    if let Some(url) = item["image_item"]["media"]["full_url"].as_str() {
+                        parts.push(format!("🖼 [图片: {url}]"));
+                    } else {
+                        parts.push("🖼 [图片]".to_string());
+                    }
                 }
                 Some(4) => {
                     let name = item["file_item"]["file_name"]
@@ -509,7 +513,11 @@ fn extract_text(msg: &Value) -> String {
                     parts.push(format!("📎 [文件: {name}]"));
                 }
                 Some(5) => {
-                    parts.push("🎬 [视频]".to_string());
+                    if let Some(url) = item["video_item"]["media"]["full_url"].as_str() {
+                        parts.push(format!("🎬 [视频: {url}]"));
+                    } else {
+                        parts.push("🎬 [视频]".to_string());
+                    }
                 }
                 _ => {}
             }
@@ -765,13 +773,25 @@ mod tests {
     }
 
     #[test]
-    fn extract_text_image() {
+    fn extract_text_image_no_url() {
         let msg: Value = serde_json::from_str(r#"{
             "item_list": [
                 {"type": 2, "image_item": {"media": {}}}
             ]
         }"#).unwrap();
         assert_eq!(extract_text(&msg), "🖼 [图片]");
+    }
+
+    #[test]
+    fn extract_text_image_with_url() {
+        let msg: Value = serde_json::from_str(r#"{
+            "item_list": [
+                {"type": 2, "image_item": {"media": {"full_url": "https://cdn.example.com/img.jpg"}}}
+            ]
+        }"#).unwrap();
+        let text = extract_text(&msg);
+        assert!(text.contains("🖼"));
+        assert!(text.contains("https://cdn.example.com/img.jpg"));
     }
 
     #[test]

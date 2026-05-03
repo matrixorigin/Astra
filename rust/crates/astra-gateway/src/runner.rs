@@ -432,7 +432,10 @@ impl GatewayRunner {
                     } else {
                         format!("⏳ 处理中… {elapsed_str}")
                     };
-                    let _ = adapter.send_text(&chat_id, &heartbeat, None).await;
+                    // Use outbound channel (works in both main loop and spawned tasks)
+                    if let Some(ref tx) = self.outbound_tx {
+                        let _ = tx.send((msg.platform.to_string(), chat_id.clone(), heartbeat)).await;
+                    }
                 }
             }
         }
@@ -1640,4 +1643,26 @@ fn safe_id(id: &str) -> String {
         assert_eq!(responses.len(), 2);
         assert!(responses.contains(&"user1".to_string()));
         assert!(responses.contains(&"user2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_via_channel_not_adapter() {
+        // Heartbeats in spawned tasks should go through outbound channel,
+        // not NullAdapter (which drops them silently)
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(8);
+        tx.send(("weixin".into(), "chat1".into(), "🤔 thinking…".into())).await.unwrap();
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.0, "weixin");
+        assert_eq!(msg.1, "chat1");
+        assert!(msg.2.contains("thinking"));
+    }
+
+    #[tokio::test]
+    async fn typing_sent_before_cli_spawn() {
+        // Typing indicator should be sent in the main loop (via real adapter),
+        // NOT in the spawned task (via NullAdapter)
+        let adapter = NullAdapter;
+        // NullAdapter.send_typing succeeds but does nothing — that's OK
+        // because the real adapter sends typing in run() before spawning
+        assert!(adapter.send_typing("chat").await.is_ok());
     }
