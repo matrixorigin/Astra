@@ -1817,7 +1817,11 @@ impl ServerAgenticLoopHost {
         // Runtime identity: model, workspace, session, user, date.
         let runtime_ctx = crate::prompts::AgentRuntimeContext {
             model_name: self.resolved_model_name.clone(),
-            workspace_cwd: self.edge_profile.get("cwd").and_then(Value::as_str).map(String::from),
+            workspace_cwd: self
+                .edge_profile
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(String::from),
             git_branch: self
                 .edge_profile
                 .get("git_branch")
@@ -2036,7 +2040,11 @@ impl ServerAgenticLoopHost {
             .unwrap_or_default();
         let runtime_ctx = crate::prompts::AgentRuntimeContext {
             model_name: self.resolved_model_name.clone(),
-            workspace_cwd: self.edge_profile.get("cwd").and_then(Value::as_str).map(String::from),
+            workspace_cwd: self
+                .edge_profile
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(String::from),
             git_branch: self
                 .edge_profile
                 .get("git_branch")

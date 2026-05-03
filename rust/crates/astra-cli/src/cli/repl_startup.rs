@@ -233,8 +233,7 @@ pub(crate) async fn complete_repl_startup(
     }) {
         state.matrix_runtime = match SharedPool::new(&settings).await {
             Ok(pool) => {
-                let user_id =
-                    astra_core::cli_user_id();
+                let user_id = astra_core::cli_user_id();
                 let th =
                     std::sync::Arc::new(std::sync::Mutex::new(state.tool_health_entries.clone()));
                 let lease = std::sync::Arc::new(astra_services::TaskLeaseHoldCache::default());
@@ -270,8 +269,7 @@ pub(crate) async fn complete_repl_startup(
         };
         if let Some(ref mc) = state.matrix_runtime {
             let pool = mc.shared_pool().get().clone();
-            let user_id =
-                astra_core::cli_user_id();
+            let user_id = astra_core::cli_user_id();
             let mo_team_store = astra_services::team_persistence::MatrixOneTeamStore::new(pool);
             if let Err(e) = mo_team_store.ensure_builtins(&user_id).await {
                 eprintln!("  {} team store builtins: {e}", theme::icon_warn());

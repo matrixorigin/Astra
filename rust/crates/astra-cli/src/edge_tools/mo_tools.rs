@@ -181,11 +181,8 @@ fn is_mo_error(output: &str) -> bool {
 }
 
 fn mo_mysql_cmd(database: Option<&str>) -> Result<Command, String> {
-    let settings = astra_core::MatrixOneSettings::from_env_strict().map_err(|e| {
-        format!(
-            "Error: {e}. Set MATRIXONE_PASSWORD before using MatrixOne tools."
-        )
-    })?;
+    let settings = astra_core::MatrixOneSettings::from_env_strict()
+        .map_err(|e| format!("Error: {e}. Set MATRIXONE_PASSWORD before using MatrixOne tools."))?;
     Ok(settings.mysql_cmd(database))
 }
 

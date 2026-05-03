@@ -6,9 +6,7 @@
 
 use std::time::Duration;
 
-use astra_core::{
-    DEV_MATRIXONE_PASSWORD, MatrixOneSettings, SharedPool, connect_matrixone, resolve_database_name,
-};
+use astra_core::{MatrixOneSettings, SharedPool, connect_matrixone};
 use astra_runtime::bridge::side_effects::run_bridge_hook_side_effects;
 use astra_runtime::{
     DatabaseTurnHookDbWriter, TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest,
@@ -29,7 +27,6 @@ fn require_db_it_env() -> MatrixOneSettings {
         "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
     );
     MatrixOneSettings::from_env()
-}
 }
 
 /// Shared test DB across the 4 selector-metric tests in this binary.

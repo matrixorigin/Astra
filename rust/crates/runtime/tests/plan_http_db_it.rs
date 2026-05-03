@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use astra_core::{DEV_MATRIXONE_PASSWORD, MatrixOneSettings, SharedPool, resolve_database_name};
+use astra_core::{MatrixOneSettings, SharedPool};
 use astra_plan::CloudPlanRepository;
 use astra_runtime::{AppState, HealthChecker, ServiceInfo, build_app};
 use astra_services::ensure_core_schema;

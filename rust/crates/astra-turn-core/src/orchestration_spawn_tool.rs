@@ -231,7 +231,7 @@ pub fn spawn_agent_schema() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "spawn_agent",
-            "description": "Launch a specialized sub-agent to perform a task. Agents run autonomously and return results. Use for parallel work, independent research, code review, or any task that benefits from dedicated focus. Agent types: 'explore' (fast codebase research), 'code-review' (analyze changes), 'task' (run commands), 'general-purpose' (full capabilities). When the child task builds on the current conversation (summarize, follow-up, drill-down), pass `inherit_prefix: {}` to reuse the parent's prompt cache — cuts child input cost and latency substantially on every supported provider.",
+            "description": "Launch a sub-agent for independent work. Types: explore, code-review, task, general-purpose. Use `inherit_prefix: {}` when the child builds on current context.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -246,16 +246,16 @@ pub fn spawn_agent_schema() -> serde_json::Value {
                     "agent_type": {
                         "type": "string",
                         "enum": ["explore", "code-review", "task", "general-purpose"],
-                        "description": "Type of specialized agent. 'explore' for research, 'code-review' for reviewing changes, 'task' for running commands, 'general-purpose' for complex multi-step tasks.",
+                        "description": "Agent type: explore (research), code-review, task, or general-purpose.",
                         "default": "general-purpose"
                     },
                     "model": {
                         "type": "string",
-                        "description": "Optional model override (e.g., 'claude-sonnet', 'claude-opus', 'claude-haiku')."
+                        "description": "Optional model override."
                     },
                     "background": {
                         "type": "boolean",
-                        "description": "Run in background (async). If true, returns immediately with agent_id; use send_message to get results later. Default: false (synchronous — waits for child to complete and returns result directly).",
+                        "description": "If true, return immediately with agent_id. Default false waits for the result.",
                         "default": false
                     },
                     "name": {
@@ -280,20 +280,20 @@ pub fn spawn_agent_schema() -> serde_json::Value {
                     },
                     "max_output_tokens": {
                         "type": "integer",
-                        "description": "Max output tokens for the child's first API call. Interacts with prefix inheritance — see inherit_prefix.",
+                        "description": "Max output tokens for the child's first API call.",
                         "minimum": 1
                     },
                     "inherit_prefix": {
                         "type": "object",
-                        "description": "RECOMMENDED when the child task builds on what you just analyzed: inherit the parent's cacheable prompt prefix so the child's first API call hits the provider's prompt cache. Cuts child's first-turn input tokens and latency substantially (typical 70-95% token reuse on Anthropic, Kimi, DeepSeek, OpenAI). Must be a JSON OBJECT (not a string!): pass the object `{}` with no properties to opt in with defaults — the runtime infers the parent run id and soft-falls-back if the prefix isn't available. Pass `{\"required\": true}` when correctness depends on the child seeing the parent's context. Safe to OMIT this field entirely when the child task is truly independent of the parent's conversation.",
+                        "description": "RECOMMENDED when the child builds on current context: pass `{}` to inherit the parent's prompt-cache prefix, cutting first-turn input tokens and latency (often 70-95% reuse). Omit for independent tasks. Use {\"required\": true} only when missing inherited context should fail the spawn.",
                         "properties": {
                             "from_run_id": {
                                 "type": "string",
-                                "description": "Parent run id to inherit from. Omit to inherit from the caller's own run (the common case)."
+                                "description": "Parent run id. Omit to use the caller's run."
                             },
                             "required": {
                                 "type": "boolean",
-                                "description": "If true, spawn fails when the prefix is missing or incompatible (use when the child needs parent context to be correct). Default false: spawn proceeds without cache reuse on failure — recommended for opportunistic reuse.",
+                                "description": "If true, fail when the prefix is missing or incompatible. Default false.",
                                 "default": false
                             }
                         }

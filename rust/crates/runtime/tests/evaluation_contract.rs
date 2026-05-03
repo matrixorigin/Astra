@@ -80,8 +80,8 @@ fn build_unconfigured_app() -> axum::Router {
 }
 
 fn dummy_matrixone() -> MatrixOneSettings {
-        MatrixOneSettings::mock()
-    }
+    MatrixOneSettings::mock()
+}
 
 async fn start_mock_memoria_health() -> String {
     let app = Router::new()

@@ -258,7 +258,9 @@ mod tests {
         }))
         .unwrap();
         match msg {
-            EdgeServerMessage::ToolRequest { tool, timeout_secs, .. } => {
+            EdgeServerMessage::ToolRequest {
+                tool, timeout_secs, ..
+            } => {
                 assert_eq!(tool, "bash");
                 assert_eq!(timeout_secs, 120);
             }
@@ -292,8 +294,7 @@ mod tests {
 
     #[test]
     fn edge_server_pong_deserializes() {
-        let msg: EdgeServerMessage =
-            serde_json::from_value(json!({"type": "edge_pong"})).unwrap();
+        let msg: EdgeServerMessage = serde_json::from_value(json!({"type": "edge_pong"})).unwrap();
         assert!(matches!(msg, EdgeServerMessage::Pong));
     }
 

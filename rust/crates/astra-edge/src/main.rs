@@ -10,7 +10,7 @@
 //! ```
 
 use astra_server_types::edge_ws_protocol::{
-    EdgeClientMessage, EdgeServerMessage, EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS,
+    EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS, EdgeClientMessage, EdgeServerMessage,
 };
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};

@@ -280,15 +280,15 @@ pub(super) async fn handle_memory_domain_command(
                                         let preview: String = content.chars().take(60).collect();
                                         // Send "irrelevant" feedback to lower retrieval score
                                         let mem = astra_core::MemoriaSettings::from_env();
-                                        let fb_url = format!(
-                                            "{}/v1/memories/{mid}/feedback",
-                                            mem.base_url
-                                        );
-                                        if let (Ok(client), Some(token)) = (reqwest::Client::builder()
-                                            .timeout(std::time::Duration::from_secs(3))
-                                            .no_proxy()
-                                            .build(), mem.bearer_token())
-                                        {
+                                        let fb_url =
+                                            format!("{}/v1/memories/{mid}/feedback", mem.base_url);
+                                        if let (Ok(client), Some(token)) = (
+                                            reqwest::Client::builder()
+                                                .timeout(std::time::Duration::from_secs(3))
+                                                .no_proxy()
+                                                .build(),
+                                            mem.bearer_token(),
+                                        ) {
                                             let _ = client
                                                 .post(&fb_url)
                                                 .header("Authorization", token)

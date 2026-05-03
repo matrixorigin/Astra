@@ -554,65 +554,53 @@ pub fn execute_discover_skills(
     )
 }
 
+fn skill_enum_names(skills: &[SkillToolInfo]) -> Vec<String> {
+    let mut seen: HashSet<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+    let mut names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
+    for skill in skills {
+        for alias in &skill.aliases {
+            if seen.insert(alias.as_str()) {
+                names.push(alias.clone());
+            }
+        }
+    }
+    names
+}
+
 /// Generate the OpenAI-compatible tool schema for the `skill` tool.
 ///
 /// When `open_skill_name` is true (dynamic surfacing), `skill_name` is a free string
 /// (no JSON `enum`) so the catalog can grow mid-session via `discover_skills` without
 /// re-injecting schemas. Otherwise an enum lists all callable aliases.
 ///
-/// Descriptions are budget-capped to avoid blowing up the context window.
-pub fn skill_tool_schema(
-    skills: &[SkillToolInfo],
-    quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
-    pinned_skills: Option<&std::collections::HashSet<String>>,
-    open_skill_name: bool,
-) -> Value {
-    let (skill_entries, all_names) = format_skills_within_budget(
-        skills,
-        DEFAULT_SKILL_LISTING_BUDGET,
-        quality_tracker,
-        pinned_skills,
-    );
-
+/// The catalog itself is injected by `skill_listing_system_message`; keep this
+/// schema description short so we don't duplicate the same list in tool JSON.
+pub fn skill_tool_schema(skills: &[SkillToolInfo], open_skill_name: bool) -> Value {
     let mut skill_name_prop = serde_json::json!({
         "type": "string",
         "description": "The name of the skill to execute (canonical name or alias)."
     });
     if !open_skill_name {
-        let skill_names: Vec<Value> = all_names.into_iter().map(Value::String).collect();
+        let skill_names = skill_enum_names(skills)
+            .into_iter()
+            .map(Value::String)
+            .collect();
         if let Some(obj) = skill_name_prop.as_object_mut() {
             obj.insert("enum".to_string(), Value::Array(skill_names));
         }
     }
 
     let dynamic_note = if open_skill_name {
-        "\n\nOnly a subset of skills is listed below. If none apply, call `discover_skills` with a specific description of your next action before improvising."
+        " If no visible skill applies, call `discover_skills` before improvising."
     } else {
         ""
     };
 
     let description = format!(
-        "Execute a skill within the current conversation.\n\n\
-         When users ask you to perform tasks, check if any of the available skills \
-         below can help complete the task more effectively. Skills provide specialized \
-         capabilities and domain knowledge.\n\n\
-         How to invoke:\n\
-         - Use this tool with the skill name only (no arguments) for most skills\n\
-         - Optionally provide a task description for additional context\n\n\
-         Important:\n\
-         - When a skill is relevant to the user's request, invoke it IMMEDIATELY \
-         as your first action\n\
-         - When a skill matches the user's request, this is a BLOCKING REQUIREMENT: \
-         invoke the relevant skill tool BEFORE generating any other response about the task. \
-         Do NOT call any other tools in the same response as a skill invocation — the skill \
-         must be loaded first so you can follow its instructions\n\
-         - NEVER just mention a skill in your text response without actually calling this tool\n\
-         - If the user explicitly references a skill by name, invoke it\n\
-         - If you see a `<skill-loaded name=\"...\"/>` tag in a tool result, the skill \
-         has already executed. Follow those instructions directly — do NOT call any \
-         other tools or re-invoke the skill\n\n\
-         Available skills:\n{}{}",
-        skill_entries.join("\n"),
+        "Execute a specialized skill in the current conversation. Use a skill from the \
+         <available_skills> system listing or a skill returned by discover_skills. Invoke \
+         before other tools when the user's request matches a skill; optionally include \
+         task for extra context. Do not re-invoke after a <skill-loaded/> result.{}",
         dynamic_note
     );
 
@@ -639,7 +627,8 @@ pub fn skill_tool_schema(
 /// Build a system-reminder message listing available skills.
 ///
 /// Injected into the conversation so the LLM is aware skills exist even
-/// before inspecting tool schemas. Uses the same budget as the tool schema.
+/// before inspecting tool schemas. This is the single place where the visible
+/// skill catalog is listed; the `skill` tool schema only references it.
 pub fn skill_listing_system_message(
     skills: &[SkillToolInfo],
     quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
@@ -2211,7 +2200,7 @@ mod tests {
     fn schema_has_correct_structure() {
         let resolver = stub_resolver();
         let skills = resolver.available_skills();
-        let schema = skill_tool_schema(&skills, None, None, false);
+        let schema = skill_tool_schema(&skills, false);
 
         assert_eq!(schema["function"]["name"], SKILL_TOOL_NAME);
         let params = &schema["function"]["parameters"];
@@ -2219,13 +2208,51 @@ mod tests {
 
         let skill_enum = &params["properties"]["skill_name"]["enum"];
         assert!(skill_enum.is_array());
-        let names: Vec<&str> = skill_enum
+        let names: Vec<String> = skill_enum
             .as_array()
             .unwrap()
             .iter()
-            .map(|v| v.as_str().unwrap())
+            .map(|v| v.as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, vec!["code-review", "test-writer"]);
+        let expected = skill_enum_names(&skills);
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn skill_enum_names_include_unique_aliases() {
+        let skills = vec![
+            SkillToolInfo {
+                name: "review".into(),
+                aliases: vec!["inspect".into(), "audit".into()],
+                ..Default::default()
+            },
+            SkillToolInfo {
+                name: "audit".into(),
+                aliases: vec!["inspect".into(), "check".into()],
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            skill_enum_names(&skills),
+            vec!["review", "audit", "inspect", "check"]
+        );
+    }
+
+    #[test]
+    fn schema_description_does_not_duplicate_skill_listing() {
+        let resolver = stub_resolver();
+        let skills = resolver.available_skills();
+        let schema = skill_tool_schema(&skills, false);
+        let desc = schema["function"]["description"].as_str().unwrap();
+
+        assert!(!desc.contains("code-review"), "{desc}");
+        assert!(!desc.contains("Available skills:"), "{desc}");
+
+        let listing = skill_listing_system_message(&skills, None, None, false);
+        let content = listing["content"].as_str().unwrap();
+        assert!(content.contains("code-review"), "{content}");
+        assert!(content.contains("<available_skills>"), "{content}");
     }
 
     #[test]
@@ -2235,7 +2262,7 @@ mod tests {
             description: "test".into(),
             ..Default::default()
         }];
-        let schema = skill_tool_schema(&skills, None, None, true);
+        let schema = skill_tool_schema(&skills, true);
         assert!(
             schema["function"]["parameters"]["properties"]["skill_name"]
                 .get("enum")
@@ -2413,7 +2440,7 @@ mod tests {
 
     #[test]
     fn schema_empty_when_no_skills() {
-        let schema = skill_tool_schema(&[], None, None, false);
+        let schema = skill_tool_schema(&[], false);
         let skill_enum = &schema["function"]["parameters"]["properties"]["skill_name"]["enum"];
         assert_eq!(skill_enum.as_array().unwrap().len(), 0);
     }
@@ -3607,7 +3634,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_includes_when_to_use() {
+    fn system_listing_includes_when_to_use() {
         let skills = vec![SkillToolInfo {
             name: "deployer".into(),
             description: "Deploy services".into(),
@@ -3618,9 +3645,9 @@ mod tests {
             tags: Vec::new(),
             triggers: Vec::new(),
         }];
-        let schema = skill_tool_schema(&skills, None, None, false);
-        let desc = schema["function"]["description"].as_str().unwrap();
-        assert!(desc.contains("when user asks to deploy"));
+        let listing = skill_listing_system_message(&skills, None, None, false);
+        let content = listing["content"].as_str().unwrap();
+        assert!(content.contains("when user asks to deploy"));
     }
 
     #[test]

@@ -1221,8 +1221,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     );
                 host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(
                     &visible,
-                    Some(&state.skills.quality_tracker),
-                    Some(&state.skills.pinned),
                     open_skill_name,
                 ));
                 if open_skill_name {

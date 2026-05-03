@@ -199,8 +199,8 @@ impl TurnToolEventWriter for CapturingTurnToolWriter {
 }
 
 fn matrixone_dummy() -> MatrixOneSettings {
-        MatrixOneSettings::mock()
-    }
+    MatrixOneSettings::mock()
+}
 
 fn ledger_inject_app(capture: ToolPersistCapture) -> Router {
     let encryptor =

@@ -12,7 +12,7 @@
 //! as `services_db_integration.rs`). Tests are `#[ignore]` so the normal
 //! `cargo test` is unaffected.
 
-use astra_core::{DEV_MATRIXONE_PASSWORD, MatrixOneSettings, SharedPool, resolve_database_name};
+use astra_core::{MatrixOneSettings, SharedPool};
 use astra_plan::{
     CloudPlanRepository, NewStepRun, PlanListFilter, PlanLoadError, PlanModeState, PlanRepository,
     ProjectContext,
@@ -30,7 +30,6 @@ fn require_db_it_env() -> MatrixOneSettings {
         "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
     );
     MatrixOneSettings::from_env()
-}
 }
 
 /// Per-binary cached schema-bootstrap + pool. `ensure_core_schema` costs

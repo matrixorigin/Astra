@@ -21,7 +21,7 @@
 
 #![allow(dead_code)]
 
-use astra_core::{DEV_MATRIXONE_PASSWORD, MatrixOneSettings, SharedPool, resolve_database_name};
+use astra_core::{MatrixOneSettings, SharedPool};
 use astra_services::storage::ensure_core_schema;
 
 /// Asserts `ASTRA_TEST_DB_IT=1` is set, loads `.env`, returns MatrixOneSettings.
@@ -32,7 +32,6 @@ pub fn require_db_it_env() -> MatrixOneSettings {
         "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
     );
     MatrixOneSettings::from_env()
-}
 }
 
 /// Shared per-binary bootstrap. Runs `ensure_core_schema` + `SharedPool::new`

@@ -142,7 +142,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read file contents with optional line range. Output includes line numbers (tab-separated). IMPORTANT: If you are NOT certain the file exists, use list_dir or glob FIRST to verify the path — do NOT guess paths. Large files (over ~80KB) will return an error when read without a range — use start_line/end_line or outline=true. For files over 500 lines, prefer targeted reads. Set outline=true to get only function/class/struct/trait signatures (saves tokens). Common image types return a data URI; known binary formats are refused and should be inspected via bash instead. When using str_replace, provide old_str WITHOUT line numbers — only the actual file content.",
+                "description": "Read file contents with optional line range. Verify uncertain paths with list_dir/glob first. Large files (>80KB) require start_line/end_line or outline=true for signatures only. Output includes line numbers; pass content without line numbers to str_replace. Common images return a data URI; binary files are refused.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1539,7 +1539,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "spawn_agent",
-                "description": "Launch a specialized sub-agent to perform a task. Agents run autonomously and return results. Use for parallel work, independent research, code review, or any task that benefits from dedicated focus. Agent types: 'explore' (fast codebase research), 'code-review' (analyze changes), 'task' (run commands), 'general-purpose' (full capabilities).",
+                "description": "Launch a sub-agent for independent work. Types: explore, code-review, task, general-purpose.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1554,7 +1554,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "agent_type": {
                             "type": "string",
                             "enum": ["explore", "code-review", "task", "general-purpose"],
-                            "description": "Type of specialized agent. 'explore' for research, 'code-review' for reviewing changes, 'task' for running commands, 'general-purpose' for complex multi-step tasks.",
+                            "description": "Agent type: explore, code-review, task, or general-purpose.",
                             "default": "general-purpose"
                         },
                         "model": {
