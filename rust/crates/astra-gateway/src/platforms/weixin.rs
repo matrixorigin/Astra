@@ -242,10 +242,11 @@ impl PlatformAdapter for WeixinAdapter {
         text: &str,
         _reply_token: Option<&str>,
     ) -> Result<(), String> {
+        let text = crate::markdown::rewrite_for_weixin(text);
         let text = if text.len() > MAX_MESSAGE_LENGTH {
             format!("{}…", &text[..MAX_MESSAGE_LENGTH - 5])
         } else {
-            text.to_string()
+            text
         };
 
         let context_token = {

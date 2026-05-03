@@ -3,6 +3,7 @@ pub mod commands;
 pub mod config;
 pub mod dedup;
 pub mod durable_task_store;
+pub mod markdown;
 pub mod gateway_context;
 pub mod platforms;
 pub mod runner;
