@@ -435,30 +435,23 @@ build-server-release: sweep
 # Gateway
 # ============================================================================
 
+# Gateway targets delegate to the gateway crate's own Makefile.
+# For full gateway dev workflow: cd rust/crates/astra-gateway && make help
 .PHONY: gateway-setup gateway gateway-build gateway-login-weixin
 
+GATEWAY_DIR = rust/crates/astra-gateway
+
 gateway-setup:
-	@bash gateway-setup.sh
+	@cd $(GATEWAY_DIR) && make setup
 
 gateway-build:
-	@echo "Building astra-gateway + astra CLI (release)..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-gateway -p astra-cli --release
-	@echo "Binary: $(RUST_RELEASE_BIN_DIR)/astra-gateway"
+	@cd $(GATEWAY_DIR) && make build
 
-gateway-login-weixin: gateway-build
-	@$(RUST_RELEASE_BIN_DIR)/astra-gateway login-weixin
+gateway-login-weixin:
+	@cd $(GATEWAY_DIR) && make login-weixin
 
-gateway: gateway-build
-	@if [ ! -f gateway.yaml ]; then \
-		echo "No gateway.yaml found — generating default config..."; \
-		cp rust/crates/astra-gateway/gateway.example.yaml gateway.yaml; \
-		echo "Created gateway.yaml from template. Edit it to add your platform credentials."; \
-		echo "  For WeCom: set WECOM_BOT_ID and WECOM_SECRET env vars"; \
-		echo "  For WeChat: set WEIXIN_TOKEN and WEIXIN_ACCOUNT_ID env vars"; \
-		echo "  Or run: make gateway-setup"; \
-	fi
-	@echo "Starting gateway..."
-	@$(RUST_RELEASE_BIN_DIR)/astra-gateway --config gateway.yaml
+gateway:
+	@cd $(GATEWAY_DIR) && make run
 
 # ============================================================================
 # Cleanup

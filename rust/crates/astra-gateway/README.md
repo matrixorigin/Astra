@@ -1,92 +1,172 @@
-# astra-gateway
+# Astra Gateway
 
-通过企业微信远程操控 Astra agent 的网关服务。
+Chat platform gateway bridging WeChat/WeCom to AI agent CLIs (astra, claude, codex).
 
-## 架构
-
-```
-企微用户发消息
-  ↓ WeCom AI Bot WebSocket
-astra-gateway
-  ├── /command → 直接响应 (会话管理、状态查询、定时任务)
-  ├── /cron → DB 业务层 (gw_cron_jobs 表)
-  └── 普通消息 → spawn astra chat CLI → 完整 agent 能力
-      ↓
-      astra CLI (harness + tools + session + memory)
-      ↓
-      stdout JSON → gateway 解析 session_id + text
-  ↓
-astra-gateway 回复到企微
-```
-
-## 快速开始
+## Quick Start
 
 ```bash
-# 1. 创建 gateway 数据库
-mysql -h 127.0.0.1 -P 6001 -u root -p111 -e "CREATE DATABASE IF NOT EXISTS astra_gateway"
+cd rust/crates/astra-gateway
 
-# 2. 启动 Astra server
-make dev-start
+# 1. Build
+make build
 
-# 3. 配置
-cp rust/crates/astra-gateway/gateway.example.yaml gateway.yaml
-export WECOM_BOT_ID="your-bot-id"
-export WECOM_SECRET="your-secret"
+# 2. WeChat login (scan QR code)
+make login-weixin
 
-# 4. 启动网关
-cargo run -p astra-gateway --release -- --config gateway.yaml
+# 3. Run
+make run
 ```
 
-## 用户命令
-
-| 命令 | 说明 |
-|------|------|
-| `/new` | 新建会话 |
-| `/status` | 模型 + 会话 + harness 状态 |
-| `/inspect` | harness 详细快照 |
-| `/session list` | 历史会话 |
-| `/session switch <id>` | 切换会话 |
-| `/model` | 当前模型 |
-| `/cron list` | 查看定时任务 |
-| `/cron add "<expr>" <msg>` | 创建定时任务 |
-| `/cron del <id>` | 删除定时任务 |
-| `/approve` | 权限说明 |
-| `/help` | 帮助 |
-
-## 多用户
-
-每个企微用户 (platform_user_id) 有独立的:
-- 会话隔离: 不同用户的 session 互不影响
-- 会话历史: 可以切换回之前的对话
-- 定时任务: 每个用户有自己的 cron jobs
-
-用户身份由企微平台保证（gateway 信任 platform_user_id）。
-
-## 定时任务
-
-```
-用户: /cron add "0 9 * * 1-5" 汇报昨天的 git commit
-Bot:  ✅ 定时任务已创建
-      - ID: abc12345
-      - 表达式: 0 9 * * 1-5
-      - 任务: 汇报昨天的 git commit
+Or with environment variables:
+```bash
+cp .env.example .env   # edit credentials
+make run
 ```
 
-每个工作日早上 9 点，scheduler 自动执行 `astra chat -m "汇报昨天的 git commit"` 并将结果发到企微。
+## Features
 
-## 数据库
+| Category | Features |
+|----------|----------|
+| **Multi-CLI** | astra, claude, codex — switch via `/cli` |
+| **Multi-model** | `/model haiku\|sonnet\|opus\|minimax\|deepseek\|qwen\|glm` |
+| **Sessions** | Per-CLI isolation, auto-reset (daily/idle), history, switch |
+| **Tasks** | Cron jobs, one-time reminders, durable tasks (checkpoint/resume) |
+| **Workspace** | `/workspace` to switch project directories, auto-discovery |
+| **Observability** | `/inspect` (harness), `/audit` (decision chain), `/usage` (cost) |
+| **Skills** | Built-in gateway skill + user-defined `.md` files + agent self-creation |
+| **Access** | Allowlist, open, disabled — per gateway |
+| **Groups** | Per-user session isolation, @mention filtering |
+| **WeChat** | Typing indicator, markdown rendering, voice transcription, media |
+| **Reliability** | Crash recovery, PID lock, retry with backoff, concurrent processing |
 
-Gateway 使用独立的 MatrixOne 数据库 (`astra_gateway`)，与 Astra server 数据库隔离。
-
-| 表 | 用途 |
-|----|------|
-| `gw_users` | 用户 profile |
-| `gw_sessions` | 会话映射 + 历史 |
-| `gw_cron_jobs` | 定时任务 |
-
-## 测试
+## Configuration
 
 ```bash
-cargo test -p astra-gateway
-# 33 tests: config, session, dedup, wecom, commands, scheduler
+cp gateway.example.yaml gateway.yaml
 ```
+
+```yaml
+astra:
+  base_url: "http://127.0.0.1:8000"      # astra server
+
+database:
+  url: "mysql://root:111@127.0.0.1:6001/astra_gateway"
+
+cli:                                       # default CLI
+  type: astra
+  bin: /path/to/astra
+  permission_mode: auto
+  model: "MiniMax-M2.7"
+
+cli_profiles:                              # /cli switch targets
+  claude:
+    type: claude
+    bin: claude
+  astra:
+    type: astra
+    bin: /path/to/astra
+    permission_mode: auto
+
+platforms:
+  weixin:
+    enabled: true
+    token: ""                              # from `make login-weixin`
+    account_id: ""
+
+# Optional
+skills_dir: "~/.astra-gateway/skills"      # user-defined skills
+project_dirs: ["~/github", "~/work"]       # auto-discover git projects
+session_reset:
+  idle:
+    hours: 24
+access: open                               # or: allowlist / disabled
+group_sessions_per_user: true
+group_require_mention: false
+```
+
+See `.env.example` for environment variable reference.
+
+## User Commands
+
+| Command | Description |
+|---------|-------------|
+| `/help` | All commands |
+| `/status` | CLI + model + session + harness summary |
+| `/new` | New conversation |
+| `/cli` / `/cli claude` | Show/switch CLI backend |
+| `/model` / `/model opus` | Show/switch model |
+| `/workspace <path>` | Switch working directory |
+| `/session list\|switch` | Session history |
+| `/inspect` | Harness: tokens, cost, tools, warnings |
+| `/audit` | Decision chain (last N turns) |
+| `/running` | Currently executing tasks |
+| `/task list\|cancel\|resume` | Durable task management |
+| `/cron list\|add\|del` | Scheduled tasks |
+| `/usage` | Token/cost statistics |
+
+Natural language also works — agent handles cron/remind/task/workspace via `[[GATEWAY:action]]` tags.
+
+## Development
+
+```bash
+make test          # unit tests (236+)
+make test-live     # e2e with real LLM (requires astra server + DB)
+make test-offline  # fixture-based, no LLM
+make lint          # clippy + rustfmt
+```
+
+## Deployment
+
+### Docker
+```bash
+make docker
+docker run -v ./gateway.yaml:/app/gateway.yaml astra-gateway
+```
+
+### Binary
+```bash
+make build
+../../target/release/astra-gateway --config gateway.yaml
+```
+
+### First-time Setup
+```bash
+make setup         # interactive wizard
+```
+
+## Architecture
+
+```
+WeChat/WeCom ──→ PlatformAdapter ──→ GatewayRunner
+                                         │
+                    ┌────────────────────┤
+                    ↓                    ↓
+              handle_fast          handle_message (async)
+           (slash commands)        (CLI spawn in tokio::spawn)
+              instant ↓                  ↓
+                                   CLI bridge → astra/claude/codex
+                                         ↓
+                                   [[GATEWAY:action]] parsing
+                                         ↓
+                                   DB ops + response
+                                         ↓
+              ←── cli_resp channel ←─────┘
+                    ↓
+              PlatformAdapter.send_text() ──→ WeChat/WeCom
+```
+
+Slash commands respond instantly even while CLI is running (concurrent architecture).
+
+## Database
+
+Auto-created on first run. Tables:
+
+| Table | Purpose |
+|-------|---------|
+| `gw_users` | Profiles + preferences (CLI, model, workspace) |
+| `gw_sessions` | Chat → CLI session mapping (per-CLI isolation) |
+| `gw_cron_jobs` | Recurring + one-time scheduled tasks |
+| `gw_durable_tasks` | Checkpointable long-running tasks |
+| `gw_platform_credentials` | WeChat tokens, context tokens, sync cursors |
+| `gw_pending_messages` | Crash recovery queue |
+| `gw_usage` | Per-message token/cost tracking |
