@@ -141,6 +141,23 @@ The gateway has access to these tables (read-only context):
 {{/each}}
 {{/if}}
 
+{{#if current_workspace}}
+### Current Workspace
+
+Working directory: `{{current_workspace}}`
+{{/if}}
+
+{{#if available_projects}}
+### Available Projects
+
+The user has these git projects. They can switch workspace by asking
+"切到 X 项目" and you emit `[[GATEWAY:workspace_set:<path>]]`.
+
+{{#each available_projects}}
+- {{this}}
+{{/each}}
+{{/if}}
+
 ### Response Guidelines
 
 - You are chatting on a mobile messaging platform. Keep responses concise.

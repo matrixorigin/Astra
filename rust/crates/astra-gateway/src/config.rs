@@ -28,6 +28,9 @@ pub struct GatewayConfig {
     /// Group chat: require @mention to activate (reduces noise).
     #[serde(default)]
     pub group_require_mention: bool,
+    /// Directories to scan for git projects (e.g. ["~/github", "~/work"]).
+    #[serde(default)]
+    pub project_dirs: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

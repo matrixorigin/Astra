@@ -313,7 +313,8 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              **CLI**\n\
              `/cli` — 查看当前 CLI + 能力 + 工作目录\n\
              `/cli <name>` — 切换 CLI (astra/claude)\n\
-             `/workspace <path>` — 切换工作目录\n\n\
+             `/workspace <path>` — 切换工作目录\n\
+             `/usage` — 用量统计\n\n\
              **监控**\n\
              `/status` — 状态 + harness\n\
              `/inspect` — harness 详情\n\n\
@@ -396,6 +397,31 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             } else {
                 Some("用法: `/task [list|cancel <id>|resume <id>|status <id>]`".into())
             }
+        }
+
+        "/usage" => {
+            let pool = require_db!(ctx);
+            let today = crate::usage::get_usage_today(pool, ctx.platform, ctx.user_id)
+                .await.unwrap_or(crate::usage::UsageSummary { messages: 0, tokens_prompt: 0, tokens_completion: 0, tool_calls: 0 });
+            let total = crate::usage::get_usage_total(pool, ctx.platform, ctx.user_id)
+                .await.unwrap_or(crate::usage::UsageSummary { messages: 0, tokens_prompt: 0, tokens_completion: 0, tool_calls: 0 });
+            Some(format!(
+                "📊 **用量统计**\n\n\
+                 **今日**\n\
+                 - 消息: {}\n\
+                 - Token: ↓{} ↑{}\n\
+                 - 工具: {}\n\n\
+                 **累计**\n\
+                 - 消息: {}\n\
+                 - Token: ↓{} ↑{}\n\
+                 - 工具: {}",
+                today.messages,
+                format_usage_tokens(today.tokens_prompt), format_usage_tokens(today.tokens_completion),
+                today.tool_calls,
+                total.messages,
+                format_usage_tokens(total.tokens_prompt), format_usage_tokens(total.tokens_completion),
+                total.tool_calls,
+            ))
         }
 
         "/workspace" | "/ws" => {
@@ -501,6 +527,12 @@ fn format_duration(ms: u64) -> String {
     if ms >= 60_000 { format!("{}m {}s", ms / 60_000, (ms % 60_000) / 1000) }
     else if ms >= 1_000 { format!("{:.1}s", ms as f64 / 1000.0) }
     else { format!("{ms}ms") }
+}
+
+fn format_usage_tokens(n: u64) -> String {
+    if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1e6) }
+    else if n >= 1_000 { format!("{:.1}k", n as f64 / 1e3) }
+    else { format!("{n}") }
 }
 
 fn model_shortcuts() -> Vec<(&'static str, &'static str, &'static str)> {

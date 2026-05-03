@@ -23,6 +23,8 @@ pub struct GatewayContext {
     pub active_tasks: Vec<(String, String, String, u8)>,  // (short_id, name, status, progress)
     pub db_tables: Vec<String>,
     pub extra_skills: Vec<(String, String)>,
+    pub current_workspace: Option<String>,
+    pub available_projects: Vec<String>,  // project summaries for prompt
 }
 
 impl GatewayContext {
@@ -54,6 +56,8 @@ impl GatewayContext {
             active_tasks: Vec::new(),
             db_tables: Vec::new(),
             extra_skills: Vec::new(),
+            current_workspace: None,
+            available_projects: Vec::new(),
         }
     }
 
@@ -75,6 +79,16 @@ impl GatewayContext {
 
     pub fn with_db_tables(mut self, tables: Vec<String>) -> Self {
         self.db_tables = tables;
+        self
+    }
+
+    pub fn with_workspace(mut self, ws: Option<String>) -> Self {
+        self.current_workspace = ws;
+        self
+    }
+
+    pub fn with_projects(mut self, projects: Vec<String>) -> Self {
+        self.available_projects = projects;
         self
     }
 
@@ -162,6 +176,7 @@ fn render_template(template: &str, ctx: &GatewayContext) -> String {
                 "db_tables" => ctx.db_tables.clone(),
                 "cron_jobs" => ctx.cron_jobs.iter().map(|(id, expr, desc)| format!("`{id}` | `{expr}` | {desc}")).collect(),
                 "active_tasks" => ctx.active_tasks.iter().map(|(id, name, status, pct)| format!("`{id}` | {name} | {status} | {pct}%")).collect(),
+                "available_projects" => ctx.available_projects.clone(),
                 _ => Vec::new(),
             };
             for item in &items {
@@ -192,6 +207,7 @@ fn render_template(template: &str, ctx: &GatewayContext) -> String {
             .replace("{{user_id}}", &ctx.user_id)
             .replace("{{cli_name}}", &ctx.cli_name)
             .replace("{{model}}", ctx.model.as_deref().unwrap_or("auto"))
+            .replace("{{current_workspace}}", ctx.current_workspace.as_deref().unwrap_or("(default)"))
             .replace(
                 "{{cron_jobs_count}}",
                 &ctx.cron_jobs_count.to_string(),
@@ -211,6 +227,8 @@ fn check_condition(var: &str, ctx: &GatewayContext) -> bool {
         "has_harness" => ctx.has_harness,
         "has_durable_tasks" => ctx.has_durable_tasks,
         "active_tasks" => !ctx.active_tasks.is_empty(),
+        "available_projects" => !ctx.available_projects.is_empty(),
+        "current_workspace" => ctx.current_workspace.is_some(),
         "db_tables" => !ctx.db_tables.is_empty(),
         "cron_jobs_count" => ctx.cron_jobs_count > 0,
         "model" => ctx.model.is_some(),

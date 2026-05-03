@@ -29,6 +29,7 @@ pub struct GatewayRunner {
     outbound_tx: Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
     durable_store: Option<std::sync::Arc<crate::durable_task_store::MysqlDurableTaskStore>>,
     user_skills: Vec<(String, String)>,
+    projects: Vec<String>,
 }
 
 impl GatewayRunner {
@@ -66,6 +67,20 @@ impl GatewayRunner {
             tracing::info!(count = user_skills.len(), "loaded user skills from directory");
         }
 
+        // Discover available projects
+        let projects: Vec<String> = crate::workspace::discover_all_projects(&config.project_dirs)
+            .iter()
+            .map(|p| p.summary())
+            .collect();
+        if !projects.is_empty() {
+            tracing::info!(count = projects.len(), "discovered projects");
+        }
+
+        // Ensure usage tracking table
+        if let Some(ref pool) = pool {
+            let _ = crate::usage::ensure_usage_table(pool).await;
+        }
+
         Ok(Self {
             config,
             pool,
@@ -74,6 +89,7 @@ impl GatewayRunner {
             outbound_tx: None,
             durable_store,
             user_skills,
+            projects,
         })
     }
 
@@ -222,6 +238,16 @@ impl GatewayRunner {
             return Some(cli_bridge::onboarding_message(&cli_profile, &availability));
         }
 
+        // Resolve workspace directory for CLI
+        let workspace: Option<std::path::PathBuf> = if let Some(ref pool) = self.pool
+            && let Ok(Some(ws)) = storage::get_user_preference(pool, msg.platform, &msg.user_id, "workspace").await
+        {
+            let path = std::path::PathBuf::from(&ws);
+            if path.is_dir() { Some(path) } else { None }
+        } else {
+            None
+        };
+
         // Build gateway context for CLI system prompt
         let gw_context = {
             let mut ctx = GatewayContext::new(
@@ -261,19 +287,15 @@ impl GatewayRunner {
             if !self.user_skills.is_empty() {
                 ctx = ctx.with_extra_skills(self.user_skills.clone());
             }
+            if !self.projects.is_empty() {
+                ctx = ctx.with_projects(self.projects.clone());
+            }
+            if let Some(ref ws) = workspace {
+                ctx = ctx.with_workspace(Some(ws.to_string_lossy().to_string()));
+            }
             ctx
         };
         let system_prompt = gw_context.to_system_prompt();
-
-        // Resolve workspace directory for CLI
-        let workspace: Option<std::path::PathBuf> = if let Some(ref pool) = self.pool
-            && let Ok(Some(ws)) = storage::get_user_preference(pool, msg.platform, &msg.user_id, "workspace").await
-        {
-            let path = std::path::PathBuf::from(&ws);
-            if path.is_dir() { Some(path) } else { None }
-        } else {
-            None
-        };
 
         // Run CLI with rich progress heartbeats (no hard timeout — only stall detection).
         let message_text = msg.text.clone();
@@ -463,6 +485,23 @@ impl GatewayRunner {
         stats_parts.push(format_elapsed(elapsed));
         if !text.is_empty() && !stats_parts.is_empty() {
             text.push_str(&format!("\n\n`{}`", stats_parts.join(" | ")));
+        }
+
+        // Record usage to DB
+        if let Some(ref pool) = self.pool {
+            let _ = crate::usage::record_usage(pool, &crate::usage::UsageRecord {
+                platform: msg.platform.to_string(),
+                user_id: msg.user_id.clone(),
+                cli_profile: cli_name.clone(),
+                model: match &cli_profile {
+                    CliProfile::Astra { model, .. } | CliProfile::Claude { model, .. } => model.clone(),
+                    _ => None,
+                },
+                tokens_prompt: result.tokens_prompt.unwrap_or(0),
+                tokens_completion: result.tokens_completion.unwrap_or(0),
+                tool_calls: result.tool_calls_count.unwrap_or(0),
+                elapsed_ms: elapsed.as_millis() as u64,
+            }).await;
         }
 
         if text.is_empty() {
@@ -960,6 +999,29 @@ async fn execute_gateway_actions(
                         Err(e) => format!("⚠️ {e}"),
                     }
                 } else { "⚠️ 需要数据库支持".into() }
+            }
+
+            Some("workspace_set") if parts.len() >= 2 => {
+                let target = parts[1].trim();
+                let expanded = if target.starts_with('~') {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    target.replacen('~', &home, 1)
+                } else {
+                    target.to_string()
+                };
+                let path = std::path::Path::new(&expanded);
+                if !path.is_dir() {
+                    format!("❌ 目录不存在: `{expanded}`")
+                } else if let Some(pool) = pool {
+                    let canonical = path.canonicalize()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or(expanded);
+                    let _ = storage::set_user_preference(pool, platform, user_id, "workspace", &canonical).await;
+                    tracing::info!(workspace = %canonical, "gateway action: workspace_set");
+                    format!("📂 工作目录已切换: `{canonical}`")
+                } else {
+                    "⚠️ 需要数据库支持".into()
+                }
             }
 
             _ => {
