@@ -13,6 +13,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # Limit linker parallelism to prevent OOM on GitHub Actions runners (7GB RAM).
+  # rust-lld crashes with Bus error (signal 7) when linking large test binaries
+  # like bridge_e2e_comprehensive and structured_feedback_e2e concurrently.
+  CARGO_BUILD_JOBS: "4"
 
 jobs:
   # ── Stage 1: compile once, cache for all downstream jobs ───────────
@@ -21,6 +25,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Add swap
+        run: |
+          sudo fallocate -l 4G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
@@ -149,9 +159,16 @@ jobs:
     name: "Test: core crates + bridge hooks"
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+      # Add swap to prevent linker OOM on large bridge-e2e test binaries.
+      - name: Add swap
+        run: |
+          sudo fallocate -l 4G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
