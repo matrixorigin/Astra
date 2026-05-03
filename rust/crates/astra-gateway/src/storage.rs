@@ -333,8 +333,8 @@ pub async fn list_sessions_for_cli(
     chat_id: &str,
     cli_profile: &str,
 ) -> Result<Vec<(String, bool, String)>, sqlx::Error> {
-    let rows: Vec<(String, bool, String)> = sqlx::query_as(
-        "SELECT astra_session_id, is_current, CAST(created_at AS CHAR) as created
+    let rows: Vec<(String, i32, String)> = sqlx::query_as(
+        "SELECT astra_session_id, CAST(is_current AS SIGNED), CAST(created_at AS CHAR) as created
          FROM gw_sessions WHERE platform = ? AND chat_id = ? AND cli_profile = ?
          ORDER BY last_active DESC LIMIT 20",
     )
@@ -343,7 +343,7 @@ pub async fn list_sessions_for_cli(
     .bind(cli_profile)
     .fetch_all(pool)
     .await?;
-    Ok(rows)
+    Ok(rows.into_iter().map(|(sid, cur, created)| (sid, cur != 0, created)).collect())
 }
 
 pub async fn switch_session(
@@ -550,8 +550,9 @@ pub async fn list_cron_jobs(
     platform: &str,
     chat_id: &str,
 ) -> Result<Vec<(String, String, String, bool)>, sqlx::Error> {
-    let rows: Vec<(String, String, String, bool)> = sqlx::query_as(
-        "SELECT job_id, cron_expr, description, enabled
+    // MatrixOne returns BOOL as string, so CAST to SIGNED for SQLx compatibility
+    let rows: Vec<(String, String, String, i32)> = sqlx::query_as(
+        "SELECT job_id, cron_expr, description, CAST(enabled AS SIGNED)
          FROM gw_cron_jobs WHERE platform = ? AND chat_id = ?
          ORDER BY created_at",
     )
@@ -559,7 +560,7 @@ pub async fn list_cron_jobs(
     .bind(chat_id)
     .fetch_all(pool)
     .await?;
-    Ok(rows)
+    Ok(rows.into_iter().map(|(id, expr, desc, en)| (id, expr, desc, en != 0)).collect())
 }
 
 pub async fn delete_cron_job(pool: &MySqlPool, job_id: &str) -> Result<bool, sqlx::Error> {
