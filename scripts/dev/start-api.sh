@@ -46,42 +46,6 @@ echo "Building release API binary..."
 cargo build -q --manifest-path rust/Cargo.toml -p astra-runtime --release --bin astra-server
 echo "✅ Using $BIN_PATH"
 
-# Best-effort bridge autodiscovery for local dev.
-# Keeps explicit ASTRA_BRIDGE_URL untouched when already configured.
-if [ -z "${ASTRA_BRIDGE_URL:-}" ]; then
-    echo "Detecting chat turn bridge endpoint..."
-    for candidate in \
-        "http://127.0.0.1:3001/internal/chat/turn" \
-        "http://127.0.0.1:3001/api/chat/turn" \
-        "http://127.0.0.1:18100/internal/chat/turn"; do
-        resp_file=$(mktemp)
-        header_file=$(mktemp)
-        code=$(curl -s --noproxy '*' -m 2 -D "$header_file" -o "$resp_file" -w '%{http_code}' \
-            -X POST "$candidate" \
-            -H 'content-type: application/json' \
-            -H "x-mo-bridge-secret: ${ASTRA_BRIDGE_SECRET:-}" \
-            -d '{"messages":[{"role":"user","content":"ping"}]}' || true)
-        ctype=$(grep -i '^content-type:' "$header_file" | head -1 | tr -d '\r' | cut -d' ' -f2- | tr '[:upper:]' '[:lower:]')
-        body=$(cat "$resp_file" 2>/dev/null)
-        rm -f "$header_file" "$resp_file"
-        # Reject HTML responses and non-bridge JSON services (e.g. Grafana returns messageId field)
-        if [[ "$ctype" == text/html* ]]; then
-            continue
-        fi
-        if echo "$body" | grep -q '"messageId"'; then
-            continue
-        fi
-        if [ "$code" = "200" ] || [ "$code" = "401" ] || [ "$code" = "403" ] || [ "$code" = "422" ]; then
-            export ASTRA_BRIDGE_URL="$candidate"
-            echo "✅ ASTRA_BRIDGE_URL auto-set to $ASTRA_BRIDGE_URL (probe status: $code, content-type: ${ctype:-unknown})"
-            break
-        fi
-    done
-    if [ -z "${ASTRA_BRIDGE_URL:-}" ]; then
-        echo "⚠️  No local chat-turn bridge detected; chat will return actionable bridge-disabled error."
-    fi
-fi
-
 start_detached() {
     if command -v setsid >/dev/null 2>&1; then
         setsid "$@" >> "$LOG_FILE" 2>&1 &

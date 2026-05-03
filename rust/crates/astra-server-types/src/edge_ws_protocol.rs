@@ -225,6 +225,23 @@ mod tests {
     }
 
     #[test]
+    fn edge_client_tool_result_none_duration_serializes_as_null() {
+        let msg = EdgeClientMessage::ToolResult {
+            request_id: "r1".into(),
+            output: "ok".into(),
+            is_error: false,
+            duration_ms: None,
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert!(v["duration_ms"].is_null());
+        let rt: EdgeClientMessage = serde_json::from_value(v).unwrap();
+        match rt {
+            EdgeClientMessage::ToolResult { duration_ms, .. } => assert_eq!(duration_ms, None),
+            _ => panic!("expected ToolResult"),
+        }
+    }
+
+    #[test]
     fn edge_client_ping_serializes() {
         let v = serde_json::to_value(&EdgeClientMessage::Ping).unwrap();
         assert_eq!(v["type"], "edge_ping");
