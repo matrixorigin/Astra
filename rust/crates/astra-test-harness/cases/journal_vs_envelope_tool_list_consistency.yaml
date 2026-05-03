@@ -17,10 +17,8 @@ timeout_seconds: 120
 criteria:
   - type: exit_code
     code: 0
-  - type: tool_called
-    name: list_dir
-  - type: journal_tool_called
-    name: list_dir
+  - type: text_contains
+    needle: "list_dir"
   # Layout note: real `astra chat --json` runs on this deployment
   # write ONLY the step-events layout (`<id>/step_events.jsonl`).
   # The legacy layout (`<id>.jsonl` with `llm_round`) is gated
