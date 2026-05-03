@@ -1,12 +1,12 @@
-//! End-to-end verification of the lesson L3 integration:
-//!
-//! 1. Session-end backflow: L1b narrative → extracted lessons → Memoria-ready
-//! 2. Incremental checkpoint: tool failures → delta extraction → dedup
-//! 3. LLM synthesis: prompt template + quality gate
-//! 4. Compact/detail content model
-//!
-//! These tests prove the full data loop WITHOUT live Memoria or LLM —
-//! they verify the pure logic at each stage.
+// End-to-end verification of the lesson L3 integration:
+//
+// 1. Session-end backflow: L1b narrative → extracted lessons → Memoria-ready
+// 2. Incremental checkpoint: tool failures → delta extraction → dedup
+// 3. LLM synthesis: prompt template + quality gate
+// 4. Compact/detail content model
+//
+// These tests prove the full data loop WITHOUT live Memoria or LLM —
+// they verify the pure logic at each stage.
 
 use astra_runtime::lesson_checkpoint::LessonCheckpointer;
 use astra_runtime::lesson_extractor::{self, SessionSummary};

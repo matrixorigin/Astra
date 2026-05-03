@@ -1,15 +1,15 @@
-//! E2E test: verify that all memory types reach the prompt assembly layer
-//! and measure their token impact.
-//!
-//! Instead of mocking the full LLM round-trip (which requires the server path
-//! and misses CLI-only injections), this test directly exercises the same
-//! functions that the CLI's `bridge_inprocess.rs` uses to build the system
-//! prompt sections — proving the data reaches the prompt and measuring its
-//! token cost.
-//!
-//! ```text
-//! cargo test -p astra-runtime --test memory_prompt_assembly_e2e
-//! ```
+// E2E test: verify that all memory types reach the prompt assembly layer
+// and measure their token impact.
+//
+// Instead of mocking the full LLM round-trip (which requires the server path
+// and misses CLI-only injections), this test directly exercises the same
+// functions that the CLI's `bridge_inprocess.rs` uses to build the system
+// prompt sections — proving the data reaches the prompt and measuring its
+// token cost.
+//
+// ```text
+// cargo test -p astra-runtime --test memory_prompt_assembly_e2e
+// ```
 
 use astra_runtime::self_model::SelfModel;
 use astra_services::LessonHint;

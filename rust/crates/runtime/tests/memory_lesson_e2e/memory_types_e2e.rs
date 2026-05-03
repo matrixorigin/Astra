@@ -1,11 +1,11 @@
-//! End-to-end verification of the memory business type system.
-//!
-//! Tests the full data loop WITHOUT live Memoria or LLM:
-//! 1. Business type → encode → Memoria payload structure
-//! 2. Memoria response → decode → category identification
-//! 3. Extraction response → parse → encode → batch payload
-//! 4. System prompt includes type taxonomy when memory tools present
-//! 5. Quality gate filters extraction output correctly
+// End-to-end verification of the memory business type system.
+//
+// Tests the full data loop WITHOUT live Memoria or LLM:
+// 1. Business type → encode → Memoria payload structure
+// 2. Memoria response → decode → category identification
+// 3. Extraction response → parse → encode → batch payload
+// 4. System prompt includes type taxonomy when memory tools present
+// 5. Quality gate filters extraction output correctly
 
 use astra_prompts::memory_types::{self, MemoryCategory, MemoryPromptMode};
 
@@ -312,7 +312,7 @@ fn system_prompt_with_no_tools_still_valid() {
 
 #[test]
 fn session_cleanup_sequences_store_before_purge() {
-    let src = include_str!("../../astra-cli/src/cli/session_cleanup.rs");
+    let src = include_str!("../../../astra-cli/src/cli/session_cleanup.rs");
     let store_pos = src.find("memoria_store_lessons_fire_and_forget");
     let purge_pos = src.find("/v1/memories/purge");
     assert!(
@@ -331,7 +331,7 @@ fn session_cleanup_sequences_store_before_purge() {
 
 #[test]
 fn signal_lessons_use_strict_quality_gate() {
-    let src = include_str!("../../astra-cli/src/cli/session_cleanup.rs");
+    let src = include_str!("../../../astra-cli/src/cli/session_cleanup.rs");
     assert!(
         src.contains("is_synthesized_lesson_acceptable"),
         "signal lessons must use is_synthesized_lesson_acceptable (strict gate with blocklist), not is_high_quality_lesson"

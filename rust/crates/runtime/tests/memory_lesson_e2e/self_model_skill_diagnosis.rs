@@ -1,10 +1,10 @@
-//! Contract: when an auto-invoked diagnostic skill produces a
-//! [`SkillDiagnosis`], it must (1) attach to [`SelfModel`] via a dedicated
-//! builder, (2) appear in the self-awareness prompt section, and (3) clear
-//! cleanly on `None` so stale diagnoses never linger.
-//!
-//! This is the load-bearing end of P0.2: without the prompt-injection step,
-//! automatic skill invocation would be a write-only event.
+// Contract: when an auto-invoked diagnostic skill produces a
+// [`SkillDiagnosis`], it must (1) attach to [`SelfModel`] via a dedicated
+// builder, (2) appear in the self-awareness prompt section, and (3) clear
+// cleanly on `None` so stale diagnoses never linger.
+//
+// This is the load-bearing end of P0.2: without the prompt-injection step,
+// automatic skill invocation would be a write-only event.
 
 use astra_runtime::self_model::SelfModel;
 use astra_skills::auto_invoke::{AutoInvokeCause, SKILL_DIAGNOSIS_SCHEMA_VERSION, SkillDiagnosis};

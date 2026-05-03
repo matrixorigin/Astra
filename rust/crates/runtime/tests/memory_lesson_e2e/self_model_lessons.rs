@@ -1,10 +1,10 @@
-//! Contract: cross-session lessons must flow from `agent_lessons` into the
-//! next session's [`SelfModel`] and appear in the self-awareness prompt, so
-//! the agent can act on what it learned in prior sessions.
-//!
-//! The unit layer (no DB) pins the [`SelfModel::with_lessons`] builder and
-//! the render shape. The live DB E2E lives in `self_model_lessons_db_it.rs`
-//! and is gated on `ASTRA_TEST_DB_IT=1`.
+// Contract: cross-session lessons must flow from `agent_lessons` into the
+// next session's [`SelfModel`] and appear in the self-awareness prompt, so
+// the agent can act on what it learned in prior sessions.
+//
+// The unit layer (no DB) pins the [`SelfModel::with_lessons`] builder and
+// the render shape. The live DB E2E lives in `self_model_lessons_db_it.rs`
+// and is gated on `ASTRA_TEST_DB_IT=1`.
 
 use astra_runtime::self_model::{LessonHint, SelfModel};
 
