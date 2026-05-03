@@ -82,8 +82,16 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     snap.turns_used,
                     snap.turns_limit_str()
                 ));
-                lines.push(format!("- Token: ↓{} ↑{}", format_tokens(snap.tokens_prompt), format_tokens(snap.tokens_completion)));
-                lines.push(format!("- 工具: {} ({})", snap.tool_calls, snap.tool_summary()));
+                lines.push(format!(
+                    "- Token: ↓{} ↑{}",
+                    format_tokens(snap.tokens_prompt),
+                    format_tokens(snap.tokens_completion)
+                ));
+                lines.push(format!(
+                    "- 工具: {} ({})",
+                    snap.tool_calls,
+                    snap.tool_summary()
+                ));
                 lines.push(format!("- 成本: ~${:.4}", snap.cost_estimate_usd()));
                 for w in snap.warnings() {
                     lines.push(format!("- {w}"));
@@ -494,37 +502,22 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
         "/audit" => {
             let cli_name = ctx.resolved_cli.name();
             let sid = match storage::get_current_session_for_cli(
-                require_db!(ctx), ctx.platform, ctx.chat_id, cli_name,
-            ).await {
+                require_db!(ctx),
+                ctx.platform,
+                ctx.chat_id,
+                cli_name,
+            )
+            .await
+            {
                 Ok(Some(s)) => s,
                 _ => return Some("❌ 当前无活跃会话。".into()),
             };
-            let history = fetch_harness_history(ctx.astra, &sid, &ctx.config.astra.api_key, 10).await;
+            let history =
+                fetch_harness_history(ctx.astra, &sid, &ctx.config.astra.api_key, 50).await;
             if history.is_empty() {
                 return Some("📋 暂无审计记录。".into());
             }
-            let mut lines = vec![format!("📋 **审计记录** (最近 {} 轮)", history.len())];
-            for snap in &history {
-                let tools = if snap.unique_tools.is_empty() {
-                    "—".into()
-                } else {
-                    snap.unique_tools.join(", ")
-                };
-                lines.push(format!(
-                    "**Turn {}** ↓{} ↑{} | 🔧 {} ({}) | ctx:{} | ${:.4}",
-                    snap.turn_number,
-                    format_tokens(snap.tokens_prompt),
-                    format_tokens(snap.tokens_completion),
-                    snap.tool_calls, tools,
-                    snap.utilization_pct(),
-                    snap.cost_estimate_usd(),
-                ));
-                let warnings = snap.warnings();
-                for w in &warnings {
-                    lines.push(format!("  {w}"));
-                }
-            }
-            Some(lines.join("\n"))
+            Some(format_audit_history(history))
         }
 
         "/running" => {
@@ -690,23 +683,42 @@ struct HarnessSnapshot {
 
 impl HarnessSnapshot {
     fn turns_limit_str(&self) -> String {
-        self.turns_limit.map(|l| l.to_string()).unwrap_or_else(|| "∞".into())
+        self.turns_limit
+            .map(|l| l.to_string())
+            .unwrap_or_else(|| "∞".into())
     }
     fn utilization_pct(&self) -> String {
-        self.context_utilization.map(|u| format!("{:.0}%", u * 100.0)).unwrap_or_else(|| "—".into())
+        self.context_utilization
+            .map(|u| format!("{:.0}%", u * 100.0))
+            .unwrap_or_else(|| "—".into())
     }
     fn cost_estimate_usd(&self) -> f64 {
         // Rough estimate: $3/M input, $15/M output (Sonnet-class pricing)
         (self.tokens_prompt as f64 * 3.0 + self.tokens_completion as f64 * 15.0) / 1_000_000.0
     }
     fn tool_summary(&self) -> String {
-        if self.unique_tools.is_empty() { return "—".into(); }
-        self.unique_tools.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+        if self.unique_tools.is_empty() {
+            return if self.tool_calls > 0 {
+                "详情已脱敏".into()
+            } else {
+                "—".into()
+            };
+        }
+        self.unique_tools
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
     }
     fn warnings(&self) -> Vec<String> {
         let mut w = Vec::new();
         if self.consecutive_same_tool > 2 {
-            w.push(format!("⚠️ 重复工具 {}次: {}", self.consecutive_same_tool, self.last_tool.as_deref().unwrap_or("?")));
+            w.push(format!(
+                "⚠️ 重复工具 {}次: {}",
+                self.consecutive_same_tool,
+                self.last_tool.as_deref().unwrap_or("详情已脱敏")
+            ));
         }
         if let Some(u) = self.context_utilization
             && u > 0.85
@@ -721,25 +733,45 @@ impl HarnessSnapshot {
 
     fn format_full(&self) -> String {
         let mut lines = vec![
-            format!("🔭 **Harness — Session `{}`**", &self.session_id[..8.min(self.session_id.len())]),
+            format!(
+                "🔭 **Harness — Session `{}`**",
+                &self.session_id[..8.min(self.session_id.len())]
+            ),
             String::new(),
-            format!("**状态** Turn {}/{} | {} | 🔧 {}",
-                self.turns_used, self.turns_limit_str(),
-                format_duration(self.elapsed_ms), self.tool_calls),
+            format!(
+                "**状态** Turn {}/{} | {} | 🔧 {}",
+                self.turns_used,
+                self.turns_limit_str(),
+                format_duration(self.elapsed_ms),
+                self.tool_calls
+            ),
             String::new(),
-            format!("**Token** ↓{} ↑{} 缓存↩{} | 总{}",
-                format_tokens(self.tokens_prompt), format_tokens(self.tokens_completion),
-                format_tokens(self.tokens_cache_read), format_tokens(self.tokens_used)),
-            format!("**Context** {} msgs | {} | {}",
-                self.context_message_count, self.utilization_pct(),
-                self.context_total_tokens.map(|t| format_tokens(t as u64)).unwrap_or_else(|| "—".into())),
+            format!(
+                "**Token** ↓{} ↑{} 缓存↩{} | 总{}",
+                format_tokens(self.tokens_prompt),
+                format_tokens(self.tokens_completion),
+                format_tokens(self.tokens_cache_read),
+                format_tokens(self.tokens_used)
+            ),
+            format!(
+                "**Context** {} msgs | {} | {}",
+                self.context_message_count,
+                self.utilization_pct(),
+                self.context_total_tokens
+                    .map(|t| format_tokens(t as u64))
+                    .unwrap_or_else(|| "—".into())
+            ),
             format!("**成本** ~${:.4}", self.cost_estimate_usd()),
         ];
         if let Some(ref model) = self.model {
             lines.push(format!("**模型** `{model}`"));
         }
-        if !self.unique_tools.is_empty() {
-            lines.push(format!("**工具** {}", self.tool_summary()));
+        if self.tool_calls > 0 {
+            lines.push(format!(
+                "**工具** {} ({})",
+                self.tool_calls,
+                self.tool_summary()
+            ));
         }
         let warnings = self.warnings();
         if !warnings.is_empty() {
@@ -754,7 +786,11 @@ impl HarnessSnapshot {
     #[allow(dead_code)]
     fn format_compact(&self) -> String {
         let mut parts = vec![
-            format!("↓{} ↑{}", format_tokens(self.tokens_prompt), format_tokens(self.tokens_completion)),
+            format!(
+                "↓{} ↑{}",
+                format_tokens(self.tokens_prompt),
+                format_tokens(self.tokens_completion)
+            ),
             format!("🔧{}", self.tool_calls),
             format!("ctx:{}", self.utilization_pct()),
             format!("${:.3}", self.cost_estimate_usd()),
@@ -767,13 +803,44 @@ impl HarnessSnapshot {
     }
 }
 
+fn format_audit_history(history: Vec<HarnessSnapshot>) -> String {
+    let mut latest_by_turn = std::collections::BTreeMap::new();
+    for snap in history {
+        // The harness history endpoint returns newest-first snapshots.
+        latest_by_turn.entry(snap.turn_number).or_insert(snap);
+    }
+
+    let turns: Vec<_> = latest_by_turn.into_values().rev().take(10).collect();
+    let mut turns: Vec<_> = turns.into_iter().rev().collect();
+    let mut lines = vec![format!("📋 **审计记录** (最近 {} 轮)", turns.len())];
+    for snap in turns.drain(..) {
+        lines.push(format!(
+            "**Turn {}** ↓{} ↑{} | 🔧 {} ({}) | ctx:{} | ${:.4}",
+            snap.turn_number,
+            format_tokens(snap.tokens_prompt),
+            format_tokens(snap.tokens_completion),
+            snap.tool_calls,
+            snap.tool_summary(),
+            snap.utilization_pct(),
+            snap.cost_estimate_usd(),
+        ));
+        for w in snap.warnings() {
+            lines.push(format!("  {w}"));
+        }
+    }
+    lines.join("\n")
+}
+
 async fn fetch_harness_snapshot(
     astra: &astra_thin_client::ThinClient,
     session_id: &str,
     api_key: &str,
 ) -> Option<HarnessSnapshot> {
     let path = format!("/sessions/{session_id}/harness/snapshot");
-    let text = astra.get_bearer_path_query_text(api_key, &path, &[]).await.ok()?;
+    let text = astra
+        .get_bearer_path_query_text(api_key, &path, &[])
+        .await
+        .ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     Some(parse_harness_snapshot(&v, session_id))
 }
@@ -794,7 +861,11 @@ async fn fetch_harness_history(
         Err(_) => return Vec::new(),
     };
     v.as_array()
-        .map(|arr| arr.iter().map(|s| parse_harness_snapshot(s, session_id)).collect())
+        .map(|arr| {
+            arr.iter()
+                .map(|s| parse_harness_snapshot(s, session_id))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -814,8 +885,13 @@ fn parse_harness_snapshot(v: &serde_json::Value, session_id: &str) -> HarnessSna
         tokens_cache_read: v["tokens_cache_read"].as_u64().unwrap_or(0),
         elapsed_ms: v["elapsed_millis"].as_u64().unwrap_or(0),
         tool_calls: v["tool_calls_this_session"].as_u64().unwrap_or(0) as u32,
-        unique_tools: v["unique_tools_used"].as_array()
-            .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+        unique_tools: v["unique_tools_used"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default(),
         last_tool: v["last_tool_called"].as_str().map(String::from),
         consecutive_same_tool: v["consecutive_same_tool"].as_u64().unwrap_or(0) as u32,
@@ -1064,5 +1140,51 @@ mod tests {
         assert_eq!(snap.turn_number, 3);
         assert_eq!(snap.tokens_prompt, 12000);
         assert_eq!(snap.unique_tools.len(), 2);
+    }
+
+    #[test]
+    fn sanitized_snapshot_tool_summary_does_not_look_empty() {
+        let mut s = test_snapshot();
+        s.tool_calls = 4;
+        s.unique_tools.clear();
+        s.last_tool = None;
+
+        assert_eq!(s.tool_summary(), "详情已脱敏");
+        let full = s.format_full();
+        assert!(
+            full.contains("🔧 4"),
+            "tool call count should remain visible"
+        );
+        assert!(
+            full.contains("详情已脱敏"),
+            "sanitized details should be explicit"
+        );
+    }
+
+    #[test]
+    fn audit_history_dedupes_same_turn_and_sorts_chronologically() {
+        let mut newest_turn_2 = test_snapshot();
+        newest_turn_2.turn_number = 2;
+        newest_turn_2.tokens_prompt = 2_000;
+        newest_turn_2.tool_calls = 3;
+
+        let mut older_turn_2 = test_snapshot();
+        older_turn_2.turn_number = 2;
+        older_turn_2.tokens_prompt = 1_000;
+        older_turn_2.tool_calls = 1;
+
+        let mut turn_1 = test_snapshot();
+        turn_1.turn_number = 1;
+        turn_1.tokens_prompt = 500;
+
+        let audit = format_audit_history(vec![newest_turn_2, older_turn_2, turn_1]);
+
+        assert_eq!(audit.matches("**Turn 2**").count(), 1);
+        assert!(audit.find("**Turn 1**").unwrap() < audit.find("**Turn 2**").unwrap());
+        assert!(
+            audit.contains("↓2.0k"),
+            "keeps latest snapshot for duplicate turn"
+        );
+        assert!(!audit.contains("↓1.0k"), "drops older duplicate snapshot");
     }
 }
