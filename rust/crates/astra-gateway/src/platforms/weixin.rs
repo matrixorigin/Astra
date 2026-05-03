@@ -457,10 +457,35 @@ fn extract_text(msg: &Value) -> String {
     let mut parts = Vec::new();
     if let Some(items) = msg["item_list"].as_array() {
         for item in items {
-            if item["type"].as_i64() == Some(1)
-                && let Some(t) = item["text_item"]["text"].as_str()
-            {
-                parts.push(t.to_string());
+            match item["type"].as_i64() {
+                Some(1) => {
+                    if let Some(t) = item["text_item"]["text"].as_str() {
+                        parts.push(t.to_string());
+                    }
+                }
+                Some(3) => {
+                    // Voice — use transcription if available
+                    if let Some(t) = item["voice_item"]["text"].as_str()
+                        && !t.trim().is_empty()
+                    {
+                        parts.push(format!("🎤 {t}"));
+                    } else {
+                        parts.push("🎤 [语音消息]".to_string());
+                    }
+                }
+                Some(2) => {
+                    parts.push("🖼 [图片]".to_string());
+                }
+                Some(4) => {
+                    let name = item["file_item"]["file_name"]
+                        .as_str()
+                        .unwrap_or("unknown");
+                    parts.push(format!("📎 [文件: {name}]"));
+                }
+                Some(5) => {
+                    parts.push("🎬 [视频]".to_string());
+                }
+                _ => {}
             }
         }
     }
@@ -684,13 +709,66 @@ mod tests {
                 {"type": 1, "text_item": {"text": "line2"}}
             ]
         }"#).unwrap();
-        assert_eq!(extract_text(&msg), "line1\nline2");
+        assert_eq!(extract_text(&msg), "line1\n🖼 [图片]\nline2");
     }
 
     #[test]
     fn extract_text_empty() {
         let msg: Value = serde_json::from_str(r#"{"item_list": []}"#).unwrap();
         assert_eq!(extract_text(&msg), "");
+    }
+
+    #[test]
+    fn extract_text_voice_transcription() {
+        let msg: Value = serde_json::from_str(r#"{
+            "item_list": [
+                {"type": 3, "voice_item": {"text": "你好", "playtime": 2764}}
+            ]
+        }"#).unwrap();
+        assert_eq!(extract_text(&msg), "🎤 你好");
+    }
+
+    #[test]
+    fn extract_text_voice_no_transcription() {
+        let msg: Value = serde_json::from_str(r#"{
+            "item_list": [
+                {"type": 3, "voice_item": {"playtime": 2764}}
+            ]
+        }"#).unwrap();
+        assert_eq!(extract_text(&msg), "🎤 [语音消息]");
+    }
+
+    #[test]
+    fn extract_text_image() {
+        let msg: Value = serde_json::from_str(r#"{
+            "item_list": [
+                {"type": 2, "image_item": {"media": {}}}
+            ]
+        }"#).unwrap();
+        assert_eq!(extract_text(&msg), "🖼 [图片]");
+    }
+
+    #[test]
+    fn extract_text_file() {
+        let msg: Value = serde_json::from_str(r#"{
+            "item_list": [
+                {"type": 4, "file_item": {"file_name": "report.pdf"}}
+            ]
+        }"#).unwrap();
+        assert_eq!(extract_text(&msg), "📎 [文件: report.pdf]");
+    }
+
+    #[test]
+    fn extract_text_mixed_voice_and_text() {
+        let msg: Value = serde_json::from_str(r#"{
+            "item_list": [
+                {"type": 3, "voice_item": {"text": "说的话"}},
+                {"type": 1, "text_item": {"text": "打的字"}}
+            ]
+        }"#).unwrap();
+        let text = extract_text(&msg);
+        assert!(text.contains("说的话"));
+        assert!(text.contains("打的字"));
     }
 
     #[test]
