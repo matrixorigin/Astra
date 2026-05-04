@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 const MAX_CHUNK_LEN: usize = 3800;
@@ -101,6 +102,8 @@ pub struct GatewayRunner {
     auth_failures: Arc<dashmap::DashMap<String, (u32, Instant)>>,
     /// Shared access token — gateway validates once, all CLI spawns reuse via env var.
     shared_auth: Option<SharedAuthToken>,
+    /// Monotonic counter for generating short request tags when no trace exists.
+    request_counter: AtomicU32,
 }
 
 /// No-op adapter used in spawned CLI tasks (typing/heartbeats not available in background).
@@ -246,6 +249,7 @@ impl GatewayRunner {
             cli_availability,
             auth_failures: Arc::new(dashmap::DashMap::new()),
             shared_auth,
+            request_counter: AtomicU32::new(0),
         })
     }
 
@@ -554,10 +558,20 @@ impl GatewayRunner {
             }
         }
 
+        // Generate short request tag for user-facing message correlation
+        let request_tag = match trace.as_ref() {
+            Some(t) => short_request_tag(t.trace_id.as_str()),
+            None => {
+                let n = self.request_counter.fetch_add(1, Ordering::Relaxed);
+                format!("#{:02X}", n % 256)
+            }
+        };
+
         tracing::info!(
             platform = msg.platform,
             chat_id = %safe_id(&msg.chat_id),
             user = %safe_id(&msg.user_id),
+            tag = %request_tag,
             "→ {}",
             truncate(&msg.text, 80),
         );
@@ -753,6 +767,7 @@ impl GatewayRunner {
         let mut think_filter = ThinkTagStreamFilter::default();
         let mut gateway_action_filter = GatewayActionStreamFilter::default();
         let mut progressive_text_len: usize = 0;
+        let mut chunk_counter: u32 = 0;
         let next_timer = tokio::time::sleep(INITIAL_ACK_DELAY);
         tokio::pin!(next_timer);
 
@@ -760,7 +775,9 @@ impl GatewayRunner {
         let flush_buf = |buf: &mut String,
                          tx: &Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
                          platform: &str,
-                         chat: &str|
+                         chat: &str,
+                         tag: &str,
+                         chunk_num: u32|
          -> Option<(
             std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>,
             usize,
@@ -771,13 +788,16 @@ impl GatewayRunner {
                 return None;
             }
             let len = text.len();
+            let tagged = format!("[{tag}:{chunk_num}] {text}");
             let tx = tx.clone();
             let platform = platform.to_string();
             let chat = chat.to_string();
             Some((
                 Box::pin(async move {
                     if let Some(tx) = tx {
-                        let _ = tx.send(OutboundMessage::plain(platform, chat, text)).await;
+                        let _ = tx
+                            .send(OutboundMessage::plain(platform, chat, tagged))
+                            .await;
                     }
                 }),
                 len,
@@ -794,7 +814,8 @@ impl GatewayRunner {
                             if !filtered.is_empty() {
                                 token_buf.push_str(&filtered);
                                 if token_buf.len() >= PROGRESSIVE_MIN_CHARS {
-                                    if let Some(fut) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
+                                    chunk_counter += 1;
+                                    if let Some(fut) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter) {
                                         progressive_text_len += fut.1;
                                         fut.0.await;
                                     }
@@ -825,7 +846,8 @@ impl GatewayRunner {
                             if !tail.is_empty() {
                                 token_buf.push_str(&tail);
                             }
-                            if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
+                            chunk_counter += 1;
+                            if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter) {
                                 progressive_text_len += len;
                                 fut.await;
                             }
@@ -836,14 +858,15 @@ impl GatewayRunner {
                 _ = &mut next_timer => {
                     // Timer-based flush: either initial ack or periodic token flush
                     if !token_buf.is_empty() {
-                        if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
+                        chunk_counter += 1;
+                        if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter) {
                             progressive_text_len += len;
                             fut.await;
                         }
                         next_timer.as_mut().reset(tokio::time::Instant::now() + PROGRESSIVE_FLUSH_INTERVAL);
                     } else if !sent_initial_ack {
                         sent_initial_ack = true;
-                        let heartbeat = format!("🤔 {cli_name} 思考中…");
+                        let heartbeat = format!("[{request_tag}] 🤔 {cli_name} 思考中…");
                         if let Some(ref tx) = self.outbound_tx {
                             let _ = tx
                                 .send(OutboundMessage::plain(msg.platform.to_string(), chat_id.clone(), heartbeat))
@@ -854,9 +877,9 @@ impl GatewayRunner {
                         let elapsed_str = format_elapsed(start.elapsed());
                         let heartbeat = if tool_count > 0 {
                             let tool_short = truncate(&last_tool, 40);
-                            format!("⏳ {elapsed_str} | 🔧 {tool_count}个工具 | {tool_short}")
+                            format!("[{request_tag}] ⏳ {elapsed_str} | 🔧 {tool_count}个工具 | {tool_short}")
                         } else {
-                            format!("⏳ 处理中… {elapsed_str}")
+                            format!("[{request_tag}] ⏳ 处理中… {elapsed_str}")
                         };
                         if let Some(ref tx) = self.outbound_tx {
                             let _ = tx
@@ -914,6 +937,7 @@ impl GatewayRunner {
                 }
                 self.clear_pending_message(pending_id).await;
                 let text = cli_bridge::translate_cli_error(&cli_profile, -1, &e);
+                let text = format!("[{request_tag}] {text}");
                 return Some(
                     self.outbound_response(
                         trace.as_ref(),
@@ -942,7 +966,7 @@ impl GatewayRunner {
                         msg.platform,
                         &msg.chat_id,
                         msg.reply_token.clone(),
-                        format!("⚠️ 任务中断: {e}"),
+                        format!("[{request_tag}] ⚠️ 任务中断: {e}"),
                     )
                     .await,
                 );
@@ -1128,6 +1152,7 @@ impl GatewayRunner {
                     result.exit_code,
                     error_text.trim(),
                 );
+                let text = format!("[{request_tag}] {text}");
                 return Some(
                     self.outbound_response(
                         trace.as_ref(),
@@ -1258,6 +1283,7 @@ impl GatewayRunner {
             &action_results_text,
             &stats_parts,
             progressive_text_len,
+            &request_tag,
         );
 
         // Record usage to DB
@@ -3174,8 +3200,10 @@ fn build_final_message(
     action_results: &str,
     stats_parts: &[String],
     progressive_text_len: usize,
+    request_tag: &str,
 ) -> String {
     if progressive_text_len > 0 {
+        // Progressive mode: main content already streamed; final msg is stats footer only
         let mut parts = Vec::new();
         if !action_results.is_empty() {
             parts.push(action_results.to_string());
@@ -3183,11 +3211,21 @@ fn build_final_message(
         if !stats_parts.is_empty() {
             parts.push(format!("`{}`", stats_parts.join(" | ")));
         }
-        parts.join("\n\n")
+        let body = parts.join("\n\n");
+        if body.is_empty() {
+            body
+        } else {
+            format!("[{request_tag}] {body}")
+        }
     } else {
+        // Non-progressive: full text + stats in one message (no tag prefix —
+        // the response was not streamed, so there is no chunk sequence to correlate).
         let mut result = text.to_string();
         if !result.is_empty() && !stats_parts.is_empty() {
-            result.push_str(&format!("\n\n`{}`", stats_parts.join(" | ")));
+            result.push_str(&format!(
+                "\n\n`[{request_tag}] {}`",
+                stats_parts.join(" | ")
+            ));
         }
         result
     }
@@ -3209,6 +3247,21 @@ fn strip_think_blocks(text: &str) -> String {
         }
     }
     result
+}
+
+/// Derive a short request tag like `#A7` from the first two hex digits of a
+/// trace ID (UUID).  Returns `#??` when the input has fewer than two hex chars.
+pub(crate) fn short_request_tag(trace_id: &str) -> String {
+    let hex: String = trace_id
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(2)
+        .collect();
+    if hex.len() == 2 {
+        format!("#{}", hex.to_uppercase())
+    } else {
+        "#??".to_string()
+    }
 }
 
 fn format_elapsed(d: Duration) -> String {
@@ -3323,6 +3376,53 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_secs(130)), "2m10s");
     }
 
+    // ── Short request tag ──────────────────────────────────────
+
+    #[test]
+    fn short_request_tag_from_uuid() {
+        assert_eq!(
+            short_request_tag("a7bc1234-5678-9abc-def0-123456789abc"),
+            "#A7"
+        );
+        assert_eq!(
+            short_request_tag("3f001122-3344-5566-7788-99aabbccddee"),
+            "#3F"
+        );
+    }
+
+    #[test]
+    fn short_request_tag_empty_input() {
+        assert_eq!(short_request_tag(""), "#??");
+    }
+
+    #[test]
+    fn short_request_tag_single_hex_char() {
+        assert_eq!(short_request_tag("a"), "#??");
+    }
+
+    #[test]
+    fn short_request_tag_always_uppercase() {
+        assert_eq!(
+            short_request_tag("abcdef12-0000-0000-0000-000000000000"),
+            "#AB"
+        );
+    }
+
+    #[test]
+    fn short_request_tag_skips_dashes() {
+        // UUID dashes should be skipped, so "a-b-c" should pick up 'a' and 'b'
+        assert_eq!(short_request_tag("a-b-c"), "#AB");
+    }
+
+    #[test]
+    fn short_request_tag_counter_fallback_format() {
+        // Verify the counter-based format matches expectations
+        assert_eq!(format!("#{:02X}", 0u32), "#00");
+        assert_eq!(format!("#{:02X}", 167u32), "#A7");
+        assert_eq!(format!("#{:02X}", 255u32), "#FF");
+        assert_eq!(format!("#{:02X}", 256u32 % 256), "#00"); // wraps
+    }
+
     #[test]
     fn initial_ack_delay_is_shorter_than_heartbeat() {
         assert!(INITIAL_ACK_DELAY < HEARTBEAT_INTERVAL);
@@ -3428,37 +3528,46 @@ mod tests {
     #[test]
     fn final_message_no_progressive_includes_full_text() {
         let stats = vec!["↓8.4k".into(), "↑95".into(), "8s".into()];
-        let msg = build_final_message("Hello world", "", &stats, 0);
+        let msg = build_final_message("Hello world", "", &stats, 0, "#A7");
         assert!(msg.contains("Hello world"));
         assert!(msg.contains("↓8.4k"));
+        assert!(msg.contains("[#A7]"), "stats footer should have tag: {msg}");
     }
 
     #[test]
     fn final_message_progressive_skips_body() {
         let stats = vec!["↓8.4k".into(), "↑95".into()];
-        let msg = build_final_message("Hello world (already sent)", "", &stats, 500);
+        let msg = build_final_message("Hello world (already sent)", "", &stats, 500, "#3F");
         assert!(
             !msg.contains("Hello world"),
             "body should not repeat: {msg}"
         );
         assert!(msg.contains("↓8.4k"), "stats should still appear: {msg}");
+        assert!(
+            msg.starts_with("[#3F]"),
+            "progressive footer should be tagged: {msg}"
+        );
     }
 
     #[test]
     fn final_message_progressive_with_actions() {
         let stats = vec!["8s".into()];
-        let msg = build_final_message("body", "⏰ 提醒已创建", &stats, 100);
+        let msg = build_final_message("body", "⏰ 提醒已创建", &stats, 100, "#B2");
         assert!(
             msg.contains("⏰ 提醒已创建"),
             "action results should appear"
         );
         assert!(msg.contains("8s"), "stats should appear");
         assert!(!msg.contains("body"), "body should not repeat");
+        assert!(
+            msg.starts_with("[#B2]"),
+            "progressive footer should be tagged: {msg}"
+        );
     }
 
     #[test]
     fn final_message_progressive_empty_stats() {
-        let msg = build_final_message("body", "", &[], 100);
+        let msg = build_final_message("body", "", &[], 100, "#C0");
         assert!(
             msg.is_empty(),
             "nothing to send if progressive + no actions + no stats"

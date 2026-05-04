@@ -655,13 +655,15 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 let mut stuck_outbox_count = 0usize;
                 for (i, row) in rows.iter().enumerate() {
                     let icon = status_icon(row.display_status());
+                    let tag = crate::runner::short_request_tag(row.trace_id.as_str());
                     let short_text = truncate_text(&row.text_preview, 40);
                     let ts = short_timestamp(&row.created_at);
                     lines.push(format!(
-                        "[{}] {} {} | {} | {}",
+                        "[{}] {} {} | {} | {} | {}",
                         i + 1,
                         icon,
                         row.display_status(),
+                        tag,
                         short_text,
                         ts,
                     ));
