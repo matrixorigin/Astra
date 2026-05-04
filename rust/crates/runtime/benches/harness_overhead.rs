@@ -44,6 +44,7 @@ fn make_snapshot() -> RuntimeSnapshot {
         consecutive_errors: 0,
         captured_at_unix_millis: 1_700_000_000_000,
         session_start_unix_millis: 1_700_000_000_000 - 30_000,
+        causal_chain_id: None,
         schema_version: 2,
     }
 }

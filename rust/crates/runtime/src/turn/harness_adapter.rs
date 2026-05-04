@@ -296,7 +296,7 @@ mod enabled {
             assert_eq!(compute_consecutive_same_tool(&[]), 0);
 
             let a: BTreeSet<String> = ["bash".to_string()].into();
-            assert_eq!(compute_consecutive_same_tool(&[a.clone()]), 0);
+            assert_eq!(compute_consecutive_same_tool(std::slice::from_ref(&a)), 0);
             assert_eq!(compute_consecutive_same_tool(&[a.clone(), a.clone()]), 2);
             assert_eq!(
                 compute_consecutive_same_tool(&[a.clone(), a.clone(), a.clone()]),

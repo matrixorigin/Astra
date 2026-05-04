@@ -65,6 +65,6 @@ mod tests {
         write_health(&status);
         let read = read_health().unwrap();
         assert_eq!(read.pid, status.pid);
-        assert_eq!(read.db_connected, false);
+        assert!(!read.db_connected);
     }
 }

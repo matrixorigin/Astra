@@ -747,12 +747,12 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                  - Token: ↓{} ↑{}\n\
                  - 工具: {}",
                 today.messages,
-                format_usage_tokens(today.tokens_prompt),
-                format_usage_tokens(today.tokens_completion),
+                format_tokens(today.tokens_prompt),
+                format_tokens(today.tokens_completion),
                 today.tool_calls,
                 total.messages,
-                format_usage_tokens(total.tokens_prompt),
-                format_usage_tokens(total.tokens_completion),
+                format_tokens(total.tokens_prompt),
+                format_tokens(total.tokens_completion),
                 total.tool_calls,
             ))
         }
@@ -1037,25 +1037,6 @@ impl HarnessSnapshot {
         }
         lines.join("\n")
     }
-
-    #[allow(dead_code)]
-    fn format_compact(&self) -> String {
-        let mut parts = vec![
-            format!(
-                "↓{} ↑{}",
-                format_tokens(self.tokens_prompt),
-                format_tokens(self.tokens_completion)
-            ),
-            format!("🔧{}", self.tool_calls),
-            format!("ctx:{}", self.utilization_pct()),
-            format!("${:.3}", self.cost_estimate_usd()),
-        ];
-        let warnings = self.warnings();
-        if !warnings.is_empty() {
-            parts.push(warnings[0].clone());
-        }
-        format!("`{}`", parts.join(" | "))
-    }
 }
 
 fn format_audit_history(history: Vec<HarnessSnapshot>) -> String {
@@ -1172,16 +1153,6 @@ fn format_duration(ms: u64) -> String {
         format!("{:.1}s", ms as f64 / 1000.0)
     } else {
         format!("{ms}ms")
-    }
-}
-
-fn format_usage_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1e6)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1e3)
-    } else {
-        format!("{n}")
     }
 }
 
@@ -1317,17 +1288,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_format_compact() {
-        let s = test_snapshot();
-        let compact = s.format_compact();
-        assert!(compact.contains("↓"), "prompt tokens");
-        assert!(compact.contains("↑"), "completion tokens");
-        assert!(compact.contains("🔧"), "tools");
-        assert!(compact.contains("ctx:"), "context");
-        assert!(compact.contains("$"), "cost");
-    }
-
-    #[test]
     fn snapshot_warnings_consecutive_tool() {
         let mut s = test_snapshot();
         s.consecutive_same_tool = 5;
@@ -1442,4 +1402,113 @@ mod tests {
         );
         assert!(!audit.contains("↓1.0k"), "drops older duplicate snapshot");
     }
+
+    // ── handle_command dispatch tests ──────────────────────────────
+
+    fn test_config() -> GatewayConfig {
+        GatewayConfig {
+            astra: crate::config::AstraServerConfig {
+                base_url: "http://localhost:8080".into(),
+                api_key: String::new(),
+                default_model: None,
+            },
+            database: Default::default(),
+            cli: Default::default(),
+            cli_profiles: Default::default(),
+            cli_timeout_secs: 3600,
+            platforms: Default::default(),
+            skills_dir: None,
+            session_reset: Default::default(),
+            access: Default::default(),
+            action_policy: Default::default(),
+            max_concurrent_runs: 4,
+            group_sessions_per_user: true,
+            group_require_mention: false,
+            project_dirs: vec![],
+        }
+    }
+
+    macro_rules! cmd_test {
+        ($name:ident, $input:expr, $check:expr) => {
+            #[tokio::test]
+            async fn $name() {
+                let config = test_config();
+                let cli = crate::cli_bridge::CliProfile::default();
+                let astra =
+                    astra_thin_client::ThinClient::new("http://localhost:8080", None).unwrap();
+                let ctx = CommandContext {
+                    astra: &astra,
+                    config: &config,
+                    pool: None,
+                    platform: "test",
+                    chat_id: "chat_1",
+                    user_id: "user_1",
+                    resolved_cli: &cli,
+                    durable_store: None,
+                    trace_repo: None,
+                };
+                let result = handle_command(&ctx, $input).await;
+                let check: fn(Option<String>) = $check;
+                check(result);
+            }
+        };
+    }
+
+    cmd_test!(cmd_non_slash_returns_none, "hello world", |r| assert!(
+        r.is_none()
+    ));
+    cmd_test!(cmd_unknown_returns_none, "/nonexistent", |r| assert!(
+        r.is_none()
+    ));
+    cmd_test!(cmd_help_returns_command_list, "/help", |r| {
+        let s = r.unwrap();
+        assert!(s.contains("命令列表"));
+        assert!(s.contains("/new"));
+        assert!(s.contains("/model"));
+        assert!(s.contains("/session"));
+    });
+    cmd_test!(cmd_approve_returns_info, "/approve", |r| {
+        assert!(r.unwrap().contains("工具权限"));
+    });
+    cmd_test!(cmd_model_no_arg_shows_current, "/model", |r| {
+        let s = r.unwrap();
+        assert!(s.contains("当前模型"));
+        assert!(s.contains("快捷切换"));
+        assert!(s.contains("haiku"));
+        assert!(s.contains("opus"));
+    });
+    cmd_test!(
+        cmd_model_set_without_db_still_succeeds,
+        "/model opus",
+        |r| {
+            assert!(r.unwrap().contains("模型已切换"));
+        }
+    );
+    cmd_test!(cmd_cli_no_arg_shows_current, "/cli", |r| {
+        assert!(r.unwrap().contains("astra"));
+    });
+    cmd_test!(cmd_new_requires_db, "/new", |r| {
+        assert!(r.unwrap().contains("数据库"));
+    });
+    cmd_test!(cmd_session_requires_db, "/session list", |r| {
+        assert!(r.unwrap().contains("数据库"));
+    });
+    cmd_test!(cmd_cron_requires_db, "/cron list", |r| {
+        assert!(r.unwrap().contains("数据库"));
+    });
+    cmd_test!(cmd_usage_requires_db, "/usage", |r| {
+        assert!(r.unwrap().contains("数据库"));
+    });
+    cmd_test!(cmd_workspace_requires_db, "/workspace", |r| {
+        assert!(r.unwrap().contains("数据库"));
+    });
+    cmd_test!(cmd_running_requires_trace_repo, "/running", |r| {
+        assert!(r.unwrap().contains("数据库"));
+    });
+    cmd_test!(cmd_task_requires_durable_store, "/task list", |r| {
+        assert!(r.is_some());
+    });
+    cmd_test!(cmd_status_works_without_db, "/status", |r| {
+        assert!(r.unwrap().contains("astra"));
+    });
 }

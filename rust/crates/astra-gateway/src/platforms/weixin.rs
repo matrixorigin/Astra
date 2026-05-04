@@ -1260,14 +1260,14 @@ mod tests {
 
     #[test]
     fn send_retry_constants() {
-        assert!(SEND_MAX_RETRIES >= 2, "should retry at least twice");
-        assert!(SEND_RETRY_DELAY_MS >= 1000, "delay should be >= 1s");
+        const { assert!(SEND_MAX_RETRIES >= 2) };
+        const { assert!(SEND_RETRY_DELAY_MS >= 1000) };
     }
 
     #[test]
     fn typing_ticket_ttl_reasonable() {
-        assert!(TYPING_TICKET_TTL_SECS >= 300, "TTL should be >= 5min");
-        assert!(TYPING_TICKET_TTL_SECS <= 1800, "TTL should be <= 30min");
+        const { assert!(TYPING_TICKET_TTL_SECS >= 300) };
+        const { assert!(TYPING_TICKET_TTL_SECS <= 1800) };
     }
 
     #[test]

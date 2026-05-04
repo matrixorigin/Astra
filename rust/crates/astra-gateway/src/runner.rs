@@ -243,7 +243,9 @@ impl GatewayRunner {
                             .await
                         {
                             for chunk in split_message(&response.text) {
-                                let _ = adapter.send_text(chat_id, chunk, None).await;
+                                if let Err(e) = adapter.send_text(chat_id, chunk, None).await {
+                                    tracing::warn!(error = %e, chat_id, "failed to deliver pending replay");
+                                }
                             }
                         }
                     }
@@ -882,8 +884,7 @@ impl GatewayRunner {
                     // Save new session
                     if let Some(ref pool) = self.pool
                         && let Some(ref sid) = retry_result.session_id
-                    {
-                        let _ = storage::set_current_session_for_cli(
+                        && let Err(e) = storage::set_current_session_for_cli(
                             pool,
                             msg.platform,
                             &effective_chat_id,
@@ -891,7 +892,9 @@ impl GatewayRunner {
                             sid,
                             &cli_name,
                         )
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(error = %e, "failed to persist session after retry");
                     }
                     let text = retry_result
                         .text
@@ -994,7 +997,7 @@ impl GatewayRunner {
         // Save session_id to DB (if available), scoped by CLI profile
         if let Some(ref pool) = self.pool {
             if let Some(ref sid) = result.session_id {
-                let _ = storage::set_current_session_for_cli(
+                if let Err(e) = storage::set_current_session_for_cli(
                     pool,
                     msg.platform,
                     &effective_chat_id,
@@ -1002,15 +1005,15 @@ impl GatewayRunner {
                     sid,
                     &cli_name,
                 )
-                .await;
-            } else {
-                let _ = storage::touch_session_for_cli(
-                    pool,
-                    msg.platform,
-                    &effective_chat_id,
-                    &cli_name,
-                )
-                .await;
+                .await
+                {
+                    tracing::warn!(error = %e, "failed to persist session");
+                }
+            } else if let Err(e) =
+                storage::touch_session_for_cli(pool, msg.platform, &effective_chat_id, &cli_name)
+                    .await
+            {
+                tracing::warn!(error = %e, "failed to touch session");
             }
         }
 
@@ -1085,8 +1088,8 @@ impl GatewayRunner {
         );
 
         // Record usage to DB
-        if let Some(ref pool) = self.pool {
-            let _ = crate::usage::record_usage(
+        if let Some(ref pool) = self.pool
+            && let Err(e) = crate::usage::record_usage(
                 pool,
                 &crate::usage::UsageRecord {
                     platform: msg.platform.to_string(),
@@ -1104,7 +1107,9 @@ impl GatewayRunner {
                     elapsed_ms: elapsed.as_millis() as u64,
                 },
             )
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, "failed to record usage");
         }
 
         // Clear pending message (successfully processed)
@@ -2568,19 +2573,11 @@ mod tests {
 
     #[test]
     fn progressive_flush_interval_is_reasonable() {
-        assert!(
-            PROGRESSIVE_FLUSH_INTERVAL.as_secs() >= 2,
-            "too fast = flood WeChat"
-        );
-        assert!(
-            PROGRESSIVE_FLUSH_INTERVAL.as_secs() <= 10,
-            "too slow = feels laggy"
-        );
-        assert!(PROGRESSIVE_MIN_CHARS > 0);
-        assert!(
-            PROGRESSIVE_MIN_CHARS <= 200,
-            "threshold too high = no progressive delivery"
-        );
+        const { assert!(PROGRESSIVE_MIN_CHARS > 0) };
+        const { assert!(PROGRESSIVE_MIN_CHARS <= 200) };
+        let secs = PROGRESSIVE_FLUSH_INTERVAL.as_secs();
+        assert!(secs >= 2, "too fast = flood WeChat");
+        assert!(secs <= 10, "too slow = feels laggy");
     }
 
     // ── Think tag filtering ──────────────────────────────────────
