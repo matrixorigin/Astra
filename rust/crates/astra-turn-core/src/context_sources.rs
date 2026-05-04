@@ -134,7 +134,8 @@ impl StaticSections {
 
 impl StaticSections {
     /// Build a minimal StaticSections for testing.
-    #[cfg(test)]
+    /// Build a minimal StaticSections for testing.
+    /// Available in tests (both unit and integration).
     pub fn test_default() -> Self {
         use crate::context_assembly_trace::PromptTraceSignals;
         use crate::section_types::CacheScope;
