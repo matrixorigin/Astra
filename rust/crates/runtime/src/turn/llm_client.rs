@@ -1580,6 +1580,60 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
     }
 }
 
+fn anthropic_content_as_blocks(content: &Value) -> Vec<Value> {
+    match content {
+        Value::String(text) if !text.is_empty() => vec![json!({"type": "text", "text": text})],
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                if let Some(text) = part.as_str() {
+                    return (!text.is_empty()).then(|| json!({"type": "text", "text": text}));
+                }
+                part.as_object().map(|_| part.clone())
+            })
+            .collect(),
+        Value::Object(_) => vec![content.clone()],
+        _ => Vec::new(),
+    }
+}
+
+fn merge_consecutive_anthropic_messages(messages: Vec<Value>) -> Vec<Value> {
+    let mut merged: Vec<Value> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let Some(role) = msg.get("role").and_then(Value::as_str) else {
+            astra_core::agent_warn!("llm", "dropped Anthropic message without role: {msg}");
+            continue;
+        };
+        if let Some(last) = merged.last_mut()
+            && last.get("role").and_then(Value::as_str) == Some(role)
+        {
+            let mut blocks = last
+                .get("content")
+                .map(anthropic_content_as_blocks)
+                .unwrap_or_default();
+            blocks.extend(
+                msg.get("content")
+                    .map(anthropic_content_as_blocks)
+                    .unwrap_or_default(),
+            );
+            last["content"] = Value::Array(blocks);
+            if last.get("cache_control").is_none()
+                && let Some(cache_control) = msg.get("cache_control")
+            {
+                last["cache_control"] = cache_control.clone();
+            }
+            if last.get("cache_reference").is_none()
+                && let Some(cache_reference) = msg.get("cache_reference")
+            {
+                last["cache_reference"] = cache_reference.clone();
+            }
+            continue;
+        }
+        merged.push(msg);
+    }
+    merged
+}
+
 fn anthropic_content_blocks_from_openai_user(msg: &Value) -> Vec<Value> {
     let Some(content) = msg.get("content") else {
         return Vec::new();
@@ -1609,9 +1663,11 @@ fn build_anthropic_system_and_messages(messages: &[Value]) -> (Vec<Value>, Vec<V
             system.extend(anthropic_text_blocks_from_content(msg.get("content")));
         } else if let Some(converted) = anthropic_message_from_openai(msg) {
             out_messages.push(converted);
+        } else {
+            astra_core::agent_warn!("llm", "dropped unsupported Anthropic message role: {msg}");
         }
     }
-    (system, out_messages)
+    (system, merge_consecutive_anthropic_messages(out_messages))
 }
 
 fn build_anthropic_tools(tools: &[Value]) -> Vec<Value> {
@@ -2801,7 +2857,18 @@ async fn collect_anthropic_llm_stream(
                         u,
                     )
                 {
-                    usage_tokens.output_tokens = extracted.output_tokens;
+                    if u.contains_key("input_tokens") {
+                        usage_tokens.input_tokens = extracted.input_tokens;
+                    }
+                    if u.contains_key("cache_read_input_tokens") {
+                        usage_tokens.cached_input_tokens = extracted.cached_input_tokens;
+                    }
+                    if u.contains_key("cache_creation_input_tokens") {
+                        usage_tokens.cache_creation_tokens = extracted.cache_creation_tokens;
+                    }
+                    if u.contains_key("output_tokens") {
+                        usage_tokens.output_tokens = extracted.output_tokens;
+                    }
                     made_progress = true;
                 }
             }
@@ -4586,6 +4653,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_anthropic_stream_message_delta_updates_all_usage_buckets() {
+        let events = vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}),
+            json!({
+                "type":"message_delta",
+                "delta":{"stop_reason":"end_turn"},
+                "usage":{
+                    "input_tokens":11,
+                    "cache_read_input_tokens":6,
+                    "cache_creation_input_tokens":3,
+                    "output_tokens":7
+                }
+            }),
+            json!({"type":"message_stop"}),
+        ];
+        let stream = stream::iter(vec![Ok(Bytes::from(anthropic_sse(&events)))]);
+        let r = collect_anthropic_llm_stream(
+            stream,
+            "claude-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("stream should succeed");
+
+        assert_eq!(
+            r.usage.get("input_tokens").and_then(Value::as_u64),
+            Some(11)
+        );
+        assert_eq!(
+            r.usage.get("cached_input_tokens").and_then(Value::as_u64),
+            Some(6)
+        );
+        assert_eq!(
+            r.usage.get("cache_creation_tokens").and_then(Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            r.usage.get("total_tokens").and_then(Value::as_u64),
+            Some(27)
+        );
+    }
+
+    #[tokio::test]
     async fn collect_anthropic_stream_thinking_delta() {
         let events = vec![
             json!({"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}),
@@ -4768,11 +4882,74 @@ mod tests {
         let (system, msgs) = build_anthropic_system_and_messages(&messages);
         assert_eq!(system[0]["cache_control"]["ttl"], "1h");
         assert_eq!(system[1]["text"], "dynamic");
-        assert_eq!(msgs.len(), 2);
-        let user_blocks = msgs[0]["content"].as_array().unwrap();
-        assert_eq!(user_blocks[0]["cache_control"]["type"], "ephemeral");
-        let tool_msg = &msgs[1];
-        assert_eq!(tool_msg["cache_reference"], "tc1");
+        // user + tool(→user) are consecutive user messages → merged into one
+        assert_eq!(msgs.len(), 1, "consecutive users must be merged: {msgs:#?}");
+        let merged_blocks = msgs[0]["content"].as_array().unwrap();
+        assert!(
+            merged_blocks
+                .iter()
+                .any(|b| b.get("cache_control").is_some()),
+            "cache_control from original user block must survive merge"
+        );
+        assert!(
+            merged_blocks
+                .iter()
+                .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result")),
+            "tool_result block must be present after merge"
+        );
+    }
+
+    #[test]
+    fn build_anthropic_system_and_messages_merges_consecutive_user_messages() {
+        let messages = vec![
+            json!({"role": "user", "content": "run tools"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "a", "type": "function", "function": {"name": "bash", "arguments": "{}"}},
+                    {"id": "b", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+                    {"id": "c", "type": "function", "function": {"name": "grep", "arguments": "{}"}}
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "a", "content": "a ok"}),
+            json!({"role": "tool", "tool_call_id": "b", "content": "b ok"}),
+            json!({"role": "tool", "tool_call_id": "c", "content": "c ok"}),
+            json!({"role": "user", "content": "continue"}),
+        ];
+
+        let (_, msgs) = build_anthropic_system_and_messages(&messages);
+        assert!(
+            msgs.windows(2)
+                .all(|pair| pair[0]["role"] != pair[1]["role"]),
+            "Anthropic Messages API requires role alternation: {msgs:#?}"
+        );
+        assert_eq!(msgs.len(), 3, "{msgs:#?}");
+        assert_eq!(msgs[2]["role"], "user");
+        let merged = msgs[2]["content"].as_array().expect("merged user blocks");
+        let tool_result_ids: Vec<&str> = merged
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+            .filter_map(|block| block.get("tool_use_id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(tool_result_ids, vec!["a", "b", "c"]);
+        assert!(
+            merged
+                .iter()
+                .any(|block| block.get("text").and_then(Value::as_str) == Some("continue")),
+            "final user text should be merged after tool results: {msgs:#?}"
+        );
+    }
+
+    #[test]
+    fn build_anthropic_tools_preserves_native_schema() {
+        let native = json!({
+            "name": "read_file",
+            "description": "Read a file",
+            "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+            "cache_control": {"type": "ephemeral", "ttl": "1h"}
+        });
+        assert_eq!(build_anthropic_tools(std::slice::from_ref(&native)), vec![native]);
     }
 
     #[tokio::test]

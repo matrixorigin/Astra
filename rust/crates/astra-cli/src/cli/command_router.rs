@@ -1514,8 +1514,6 @@ fn final_json_output_with_context(
         "text": sr.full_text,
         "prompt_tokens": total_prompt_tokens,
         "fresh_prompt_tokens": sr.prompt_tokens,
-        "cached_input_tokens": sr.cache_read_tokens,
-        "cache_creation_tokens": sr.cache_creation_tokens,
         "cache": {
             "hit": sr.cache_read_tokens > 0,
             "read_tokens": sr.cache_read_tokens,
@@ -3191,8 +3189,8 @@ mod final_json_output_tests {
         assert_eq!(output["text"], "hello");
         assert_eq!(output["prompt_tokens"], 13);
         assert_eq!(output["fresh_prompt_tokens"], 10);
-        assert_eq!(output["cached_input_tokens"], 2);
-        assert_eq!(output["cache_creation_tokens"], 1);
+        assert!(output.get("cached_input_tokens").is_none());
+        assert!(output.get("cache_creation_tokens").is_none());
         assert_eq!(output["cache"]["hit"], true);
         assert_eq!(output["cache"]["read_tokens"], 2);
         assert_eq!(output["cache"]["creation_tokens"], 1);
@@ -3214,8 +3212,6 @@ mod final_json_output_tests {
             "text",
             "prompt_tokens",
             "fresh_prompt_tokens",
-            "cached_input_tokens",
-            "cache_creation_tokens",
             "cache",
             "completion_tokens",
             "tool_calls_count",

@@ -93,7 +93,7 @@ pub(crate) fn section_cache_key(
     task_type: Option<&str>,
     confidence: f64,
 ) -> u64 {
-    section_cache_key_with_customization(tool_names, task_type, confidence, 0)
+    section_cache_key_with_customization(tool_names, task_type, confidence, 0, 0)
 }
 
 fn section_cache_key_with_customization(
@@ -101,6 +101,7 @@ fn section_cache_key_with_customization(
     task_type: Option<&str>,
     confidence: f64,
     overrides_fingerprint: u64,
+    output_style_fingerprint: u64,
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -111,6 +112,19 @@ fn section_cache_key_with_customization(
     let bucket = if confidence < 0.3 { "low" } else { "normal" };
     bucket.hash(&mut hasher);
     overrides_fingerprint.hash(&mut hasher);
+    output_style_fingerprint.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn output_style_fingerprint(
+    output_style: Option<&astra_text_utils::output_style::OutputStyle>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    if let Some(style) = output_style {
+        style.name.hash(&mut hasher);
+        style.prompt.hash(&mut hasher);
+    }
     hasher.finish()
 }
 
@@ -176,6 +190,7 @@ pub(crate) fn build_system_message_with_dynamic_sections(
         task_type,
         confidence,
         prompt_overrides_fingerprint(&overrides),
+        output_style_fingerprint(output_style),
     );
 
     // Try cache for the stable (Global + Session) + dynamic (None-scoped) sections
@@ -669,6 +684,58 @@ mod tests {
                 && !stable.contains("FIRST_OVERRIDE_SENTINEL"),
             "stable prompt cache must invalidate when override files change: {stable}"
         );
+    }
+
+    #[test]
+    fn structured_prompt_cache_key_tracks_output_style_changes() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let home = tempfile::tempdir().expect("temp home");
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+        if let Ok(mut cache) = section_cache().lock() {
+            cache.clear();
+        }
+
+        unsafe {
+            std::env::set_var("ASTRA_OUTPUT_STYLE", "concise");
+        }
+        let (_, first_dynamic, _) = build_system_message(
+            &["prompt_cache_style_reload_tool"],
+            "",
+            0.8,
+            Some("prompt-cache-style-reload"),
+            &PromptCacheConfig::default(),
+        );
+        let first = first_dynamic
+            .as_ref()
+            .and_then(|m| m["content"].as_str())
+            .expect("first dynamic prompt");
+        assert!(first.contains("# Output Style: Concise"), "{first}");
+
+        unsafe {
+            std::env::set_var("ASTRA_OUTPUT_STYLE", "verbose");
+        }
+        let (_, second_dynamic, _) = build_system_message(
+            &["prompt_cache_style_reload_tool"],
+            "",
+            0.8,
+            Some("prompt-cache-style-reload"),
+            &PromptCacheConfig::default(),
+        );
+        let second = second_dynamic
+            .as_ref()
+            .and_then(|m| m["content"].as_str())
+            .expect("second dynamic prompt");
+        assert!(
+            second.contains("# Output Style: Verbose")
+                && !second.contains("# Output Style: Concise"),
+            "dynamic prompt cache must invalidate when output style changes: {second}"
+        );
+
+        unsafe {
+            std::env::remove_var("ASTRA_OUTPUT_STYLE");
+        }
     }
 
     #[test]

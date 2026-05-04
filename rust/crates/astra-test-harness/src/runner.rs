@@ -307,15 +307,31 @@ mod tests {
             "tool_calls_count": 2,
             "tools_used": ["a", "b"],
             "completion_tokens": 10,
-            "prompt_tokens": 20,
-            "cached_input_tokens": 7,
-            "cache_creation_tokens": 3
+            "prompt_tokens": 30,
+            "fresh_prompt_tokens": 20,
+            "cache": {"read_tokens": 7, "creation_tokens": 3}
         }"#;
         let out = parse_json_outcome(stdout, "m");
         assert_eq!(out.model, "m");
         assert_eq!(out.session_id.as_deref(), Some("s1"));
         assert_eq!(out.tool_calls_count, 2);
         assert_eq!(out.tools_used, vec!["a", "b"]);
+        assert_eq!(out.prompt_tokens, 20);
+        assert_eq!(out.cached_input_tokens, 7);
+        assert_eq!(out.cache_creation_tokens, 3);
+    }
+
+    #[test]
+    fn parse_json_outcome_uses_prompt_tokens_when_fresh_bucket_missing() {
+        let stdout = r#"{
+            "text": "legacy",
+            "exit_code": 0,
+            "completion_tokens": 5,
+            "prompt_tokens": 20,
+            "cache": {"read_tokens": 7, "creation_tokens": 3}
+        }"#;
+        let out = parse_json_outcome(stdout, "m");
+        assert_eq!(out.prompt_tokens, 20);
         assert_eq!(out.cached_input_tokens, 7);
         assert_eq!(out.cache_creation_tokens, 3);
     }
