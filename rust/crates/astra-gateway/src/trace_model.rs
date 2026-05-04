@@ -11,6 +11,10 @@ use std::fmt;
 
 pub type TraceResult<T> = Result<T, String>;
 
+/// Maximum number of delivery attempts for an outbox entry before it is
+/// considered expired and excluded from future retries.
+pub const OUTBOX_MAX_RETRIES: u32 = 3;
+
 macro_rules! id_type {
     ($name:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -359,6 +363,7 @@ pub struct OutboxRecord {
     pub body: String,
     pub status: OutboxStatus,
     pub error_message: Option<String>,
+    pub retry_count: u32,
 }
 
 impl OutboxRecord {
@@ -380,6 +385,7 @@ impl OutboxRecord {
             body: body.into(),
             status: OutboxStatus::Pending,
             error_message: None,
+            retry_count: 0,
         }
     }
 }
@@ -930,6 +936,7 @@ pub async fn ensure_schema(pool: &MySqlPool) -> Result<(), sqlx::Error> {
             body LONGTEXT NOT NULL,
             status VARCHAR(20) NOT NULL,
             error_message TEXT,
+            retry_count INT NOT NULL DEFAULT 0,
             created_at DATETIME(6) DEFAULT NOW(6),
             sent_at DATETIME(6),
             INDEX idx_trace_outbox_pending (status, created_at),
@@ -938,6 +945,12 @@ pub async fn ensure_schema(pool: &MySqlPool) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+
+    // Migration: add retry_count column if missing (existing deployments)
+    let _ =
+        sqlx::query("ALTER TABLE gw_trace_outbox ADD COLUMN retry_count INT NOT NULL DEFAULT 0")
+            .execute(pool)
+            .await;
 
     Ok(())
 }
@@ -1153,8 +1166,9 @@ impl TraceRepository for MysqlTraceRepository {
             String,
             String,
             Option<String>,
+            i32,
         )> = sqlx::query_as(
-            "SELECT outbox_id, request_id, trace_id, platform, chat_id, reply_token, body, status, error_message
+            "SELECT outbox_id, request_id, trace_id, platform, chat_id, reply_token, body, status, error_message, retry_count
              FROM gw_trace_outbox WHERE outbox_id = ?",
         )
         .bind(outbox_id.as_str())
@@ -1173,6 +1187,7 @@ impl TraceRepository for MysqlTraceRepository {
                 body,
                 status,
                 error_message,
+                retry_count,
             )| OutboxRecord {
                 outbox_id: OutboxId::from(outbox_id),
                 request_id: RequestId::from(request_id),
@@ -1183,6 +1198,7 @@ impl TraceRepository for MysqlTraceRepository {
                 body,
                 status: OutboxStatus::parse(&status).unwrap_or(OutboxStatus::Failed),
                 error_message,
+                retry_count: retry_count.max(0) as u32,
             },
         ))
     }
@@ -1193,6 +1209,7 @@ impl TraceRepository for MysqlTraceRepository {
         limit: u32,
     ) -> TraceResult<Vec<OutboxRecord>> {
         let limit = limit.min(200);
+        let max_retries = OUTBOX_MAX_RETRIES as i32;
         let rows: Vec<(
             String,
             String,
@@ -1203,26 +1220,33 @@ impl TraceRepository for MysqlTraceRepository {
             String,
             String,
             Option<String>,
+            i32,
         )> = if let Some(platform) = platform {
             sqlx::query_as(
-                "SELECT outbox_id, request_id, trace_id, platform, chat_id, reply_token, body, status, error_message
+                "SELECT outbox_id, request_id, trace_id, platform, chat_id, reply_token, body, status, error_message, retry_count
                  FROM gw_trace_outbox
                  WHERE platform = ? AND status IN ('pending', 'failed')
+                   AND retry_count < ?
+                   AND created_at > DATE_SUB(NOW(6), INTERVAL 1 HOUR)
                  ORDER BY created_at ASC
                  LIMIT ?",
             )
             .bind(platform)
+            .bind(max_retries)
             .bind(limit)
             .fetch_all(&self.pool)
             .await
         } else {
             sqlx::query_as(
-                "SELECT outbox_id, request_id, trace_id, platform, chat_id, reply_token, body, status, error_message
+                "SELECT outbox_id, request_id, trace_id, platform, chat_id, reply_token, body, status, error_message, retry_count
                  FROM gw_trace_outbox
                  WHERE status IN ('pending', 'failed')
+                   AND retry_count < ?
+                   AND created_at > DATE_SUB(NOW(6), INTERVAL 1 HOUR)
                  ORDER BY created_at ASC
                  LIMIT ?",
             )
+            .bind(max_retries)
             .bind(limit)
             .fetch_all(&self.pool)
             .await
@@ -1242,6 +1266,7 @@ impl TraceRepository for MysqlTraceRepository {
                     body,
                     status,
                     error_message,
+                    retry_count,
                 )| OutboxRecord {
                     outbox_id: OutboxId::from(outbox_id),
                     request_id: RequestId::from(request_id),
@@ -1252,6 +1277,7 @@ impl TraceRepository for MysqlTraceRepository {
                     body,
                     status: OutboxStatus::parse(&status).unwrap_or(OutboxStatus::Failed),
                     error_message,
+                    retry_count: retry_count.max(0) as u32,
                 },
             )
             .collect())
@@ -1283,6 +1309,25 @@ impl TraceRepository for MysqlTraceRepository {
         if status == OutboxStatus::Sent {
             let result = sqlx::query(
                 "UPDATE gw_trace_outbox SET status = ?, error_message = ?, sent_at = NOW(6) WHERE outbox_id = ? AND status = ?",
+            )
+            .bind(status.as_str())
+            .bind(error_message)
+            .bind(outbox_id.as_str())
+            .bind(current.as_str())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("update outbox status failed: {e}"))?;
+            if result.rows_affected() != 1 {
+                return Err(format!(
+                    "concurrent outbox status update for {outbox_id}; expected {}",
+                    current.as_str()
+                ));
+            }
+        } else if status == OutboxStatus::Failed {
+            // Increment retry_count on failure; auto-expire if exhausted
+            let result = sqlx::query(
+                "UPDATE gw_trace_outbox SET status = ?, error_message = ?, retry_count = retry_count + 1
+                 WHERE outbox_id = ? AND status = ?",
             )
             .bind(status.as_str())
             .bind(error_message)
@@ -1433,20 +1478,23 @@ impl TraceRepository for MysqlTraceRepository {
                     CASE WHEN CHAR_LENGTH(r.text) > 120 THEN CONCAT(SUBSTRING(r.text, 1, 120), '…') ELSE r.text END,
                     CAST(r.created_at AS CHAR), r.error_message,
                     (SELECT rr.status FROM gw_trace_runs rr WHERE rr.request_id = r.request_id ORDER BY rr.started_at DESC LIMIT 1),
-                    (SELECT o.status FROM gw_trace_outbox o WHERE o.request_id = r.request_id AND o.status IN ('pending', 'failed') ORDER BY o.created_at DESC LIMIT 1),
-                    (SELECT o.error_message FROM gw_trace_outbox o WHERE o.request_id = r.request_id AND o.status IN ('pending', 'failed') ORDER BY o.created_at DESC LIMIT 1),
+                    (SELECT o.status FROM gw_trace_outbox o WHERE o.request_id = r.request_id AND o.status IN ('pending', 'failed') AND o.retry_count < ? ORDER BY o.created_at DESC LIMIT 1),
+                    (SELECT o.error_message FROM gw_trace_outbox o WHERE o.request_id = r.request_id AND o.status IN ('pending', 'failed') AND o.retry_count < ? ORDER BY o.created_at DESC LIMIT 1),
                     (SELECT COUNT(*) FROM gw_trace_events e WHERE e.trace_id = r.trace_id),
                     (SELECT e.kind FROM gw_trace_events e WHERE e.trace_id = r.trace_id ORDER BY e.event_id DESC LIMIT 1)
              FROM gw_trace_requests r
              WHERE r.platform = ? AND r.chat_id = ? AND r.cli_profile = ?
                AND (r.status IN ('accepted', 'running')
-                    OR EXISTS (SELECT 1 FROM gw_trace_outbox o WHERE o.request_id = r.request_id AND o.status IN ('pending', 'failed')))
+                    OR EXISTS (SELECT 1 FROM gw_trace_outbox o WHERE o.request_id = r.request_id AND o.status IN ('pending', 'failed') AND o.retry_count < ?))
              ORDER BY CASE r.status WHEN 'running' THEN 0 WHEN 'accepted' THEN 1 ELSE 2 END, r.created_at ASC
              LIMIT ?",
         )
+        .bind(OUTBOX_MAX_RETRIES as i32)
+        .bind(OUTBOX_MAX_RETRIES as i32)
         .bind(conversation.platform())
         .bind(conversation.chat_id())
         .bind(conversation.cli_profile())
+        .bind(OUTBOX_MAX_RETRIES as i32)
         .bind(limit.min(100))
         .fetch_all(&self.pool)
         .await
@@ -1664,6 +1712,7 @@ impl TraceRepository for InMemoryTraceRepository {
             .values()
             .filter(|outbox| {
                 matches!(outbox.status, OutboxStatus::Pending | OutboxStatus::Failed)
+                    && outbox.retry_count < OUTBOX_MAX_RETRIES
                     && platform
                         .map(|platform| outbox.platform == platform)
                         .unwrap_or(true)
@@ -1694,6 +1743,9 @@ impl TraceRepository for InMemoryTraceRepository {
         }
         outbox.status = status;
         outbox.error_message = error_message.map(str::to_string);
+        if status == OutboxStatus::Failed {
+            outbox.retry_count += 1;
+        }
         Ok(())
     }
 
@@ -1777,6 +1829,7 @@ impl TraceRepository for InMemoryTraceRepository {
                 ) || state.outbox.values().any(|outbox| {
                     outbox.request_id == request.request_id
                         && matches!(outbox.status, OutboxStatus::Pending | OutboxStatus::Failed)
+                        && outbox.retry_count < OUTBOX_MAX_RETRIES
                 })
             })
             .collect();
@@ -1804,6 +1857,7 @@ impl TraceRepository for InMemoryTraceRepository {
                     .find(|outbox| {
                         outbox.request_id == request.request_id
                             && matches!(outbox.status, OutboxStatus::Pending | OutboxStatus::Failed)
+                            && outbox.retry_count < OUTBOX_MAX_RETRIES
                     })
                     .cloned();
                 let request_events: Vec<_> = state
@@ -2340,5 +2394,119 @@ mod tests {
 
         let r = repo.get_request(&req_id).await.unwrap().unwrap();
         assert_eq!(r.status, RequestStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn outbox_retry_count_increments_and_stops_retrying() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wecom", "chat-1", "astra");
+        let req = GatewayRequest::new(conv.clone(), "msg-1", "u1", "hello");
+        let request_id = req.request_id.clone();
+        let writer = TraceWriter::begin(&repo, req).await.unwrap();
+        let run_id = writer.start_run("astra", None).await.unwrap();
+        writer
+            .finish_run(&run_id, RunStatus::Succeeded, Some(0), None)
+            .await
+            .unwrap();
+        let outbox_id = writer
+            .enqueue_outbox("wecom", "chat-1", None, "retry body")
+            .await
+            .unwrap();
+
+        // Fail it OUTBOX_MAX_RETRIES times
+        for i in 0..OUTBOX_MAX_RETRIES {
+            // Before exhaustion, it should still be retryable
+            let retryable = repo.list_retryable_outbox(Some("wecom"), 10).await.unwrap();
+            assert_eq!(
+                retryable.len(),
+                1,
+                "should be retryable before exhaustion (attempt {i})"
+            );
+
+            writer
+                .mark_outbox_failed(&outbox_id, &format!("error attempt {i}"), 0)
+                .await
+                .unwrap();
+        }
+
+        // After max retries, retry_count == OUTBOX_MAX_RETRIES
+        let outbox = repo.get_outbox(&outbox_id).await.unwrap().unwrap();
+        assert_eq!(outbox.retry_count, OUTBOX_MAX_RETRIES);
+        assert_eq!(outbox.status, OutboxStatus::Failed);
+
+        // Should no longer appear in retryable list
+        let retryable = repo.list_retryable_outbox(Some("wecom"), 10).await.unwrap();
+        assert!(
+            retryable.is_empty(),
+            "should stop retrying after max retries"
+        );
+
+        // Should also not appear in active requests (request is completed via run)
+        let active = repo.list_active_requests(&conv, 10).await.unwrap();
+        let has_outbox_retrying = active
+            .iter()
+            .any(|r| r.request_id == request_id && r.outbox_status == Some(OutboxStatus::Failed));
+        assert!(
+            !has_outbox_retrying,
+            "exhausted outbox should not show as retrying in active requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbox_retry_count_resets_on_successful_send() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wecom", "chat-1", "astra");
+        let req = GatewayRequest::new(conv, "msg-1", "u1", "hello");
+        let writer = TraceWriter::begin(&repo, req).await.unwrap();
+        let run_id = writer.start_run("astra", None).await.unwrap();
+        writer
+            .finish_run(&run_id, RunStatus::Succeeded, Some(0), None)
+            .await
+            .unwrap();
+        let outbox_id = writer
+            .enqueue_outbox("wecom", "chat-1", None, "body")
+            .await
+            .unwrap();
+
+        // Fail twice (below max)
+        writer
+            .mark_outbox_failed(&outbox_id, "error 1", 0)
+            .await
+            .unwrap();
+        writer
+            .mark_outbox_failed(&outbox_id, "error 2", 0)
+            .await
+            .unwrap();
+
+        // Should still be retryable
+        let retryable = repo.list_retryable_outbox(Some("wecom"), 10).await.unwrap();
+        assert_eq!(retryable.len(), 1);
+
+        // Successfully send
+        writer.mark_outbox_sent(&outbox_id, 1).await.unwrap();
+
+        // Should no longer be retryable (status is Sent)
+        let retryable = repo.list_retryable_outbox(Some("wecom"), 10).await.unwrap();
+        assert!(retryable.is_empty());
+    }
+
+    #[tokio::test]
+    async fn outbox_new_entry_has_zero_retry_count() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wecom", "chat-1", "astra");
+        let req = GatewayRequest::new(conv, "msg-1", "u1", "hello");
+        let writer = TraceWriter::begin(&repo, req).await.unwrap();
+        let run_id = writer.start_run("astra", None).await.unwrap();
+        writer
+            .finish_run(&run_id, RunStatus::Succeeded, Some(0), None)
+            .await
+            .unwrap();
+        let outbox_id = writer
+            .enqueue_outbox("wecom", "chat-1", None, "body")
+            .await
+            .unwrap();
+
+        let outbox = repo.get_outbox(&outbox_id).await.unwrap().unwrap();
+        assert_eq!(outbox.retry_count, 0);
     }
 }

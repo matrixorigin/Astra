@@ -454,7 +454,16 @@ impl PlatformAdapter for WeixinAdapter {
             tokens.get(chat_id).cloned().unwrap_or_default()
         };
 
-        send_text_with_retry(&self.config.token, chat_id, &text, &context_token).await
+        match send_text_with_retry(&self.config.token, chat_id, &text, &context_token).await {
+            Ok(new_ct) => {
+                if let Some(ct) = new_ct {
+                    let mut tokens = self.context_tokens.lock().await;
+                    tokens.insert(chat_id.to_string(), ct);
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn send_typing(&self, chat_id: &str) -> Result<(), String> {
@@ -767,12 +776,14 @@ fn extract_text(msg: &Value) -> String {
 const SEND_MAX_RETRIES: usize = 3;
 const SEND_RETRY_DELAY_MS: u64 = 1500;
 
+/// Send a text message via iLink API with retries.
+/// Returns the updated context_token from the response (if any).
 async fn send_text_with_retry(
     token: &str,
     chat_id: &str,
     text: &str,
     context_token: &str,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let client = reqwest::Client::new();
     let url = format!("{ILINK_BASE_URL}/ilink/bot/sendmessage");
     let mut last_error = String::new();
@@ -828,7 +839,12 @@ async fn send_text_with_retry(
             .or_else(|| data["ret"].as_i64())
             .unwrap_or(0);
         if errcode == 0 {
-            return Ok(());
+            let new_ct = data["context_token"]
+                .as_str()
+                .or_else(|| data["data"]["context_token"].as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            return Ok(new_ct);
         }
 
         let errmsg = data["errmsg"].as_str().unwrap_or("unknown");
