@@ -815,19 +815,37 @@ pub fn onboarding_message(profile: &CliProfile, availability: &CliAvailability) 
     }
 }
 
+/// Check whether stderr output indicates an authentication / credentials failure.
+pub fn is_auth_error(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("could not validate credentials")
+        || lower.contains("invalid_api_key")
+        || lower.contains("invalid api key")
+        || lower.contains("401 unauthorized")
+        || lower.contains("authentication failed")
+        || lower.contains("token expired")
+        || lower.contains("token has expired")
+        // Match bare "401" only when it looks like an HTTP status, not a random number.
+        // We check for "401" preceded by a space, start-of-line, or common prefix.
+        || lower.contains("status: 401")
+        || lower.contains("http 401")
+        || lower.contains("error 401")
+}
+
+/// Invalidate the CLI probe cache so the next `probe_cli` call re-checks.
+pub fn invalidate_probe_cache() {
+    CLI_PROBE_CACHE.clear();
+}
+
 pub fn translate_cli_error(profile: &CliProfile, exit_code: i32, stderr: &str) -> String {
     let name = profile.name();
-    if stderr.contains("could not validate credentials")
-        || stderr.contains("Could not validate credentials")
-        || stderr.contains("invalid_api_key")
-        || stderr.contains("401")
-    {
+    if is_auth_error(stderr) {
         return format!(
-            "🔑 `{name}` API 密钥无效或过期\n\n\
-             请检查对应的环境变量或配置:\n\
-             - **astra**: ASTRA_API_KEY\n\
-             - **claude**: ANTHROPIC_API_KEY\n\
-             - **codex**: OPENAI_API_KEY"
+            "🔑 `{name}` 认证失败\n\n\
+             请尝试:\n\
+             1. 发送 `/auth` 重置认证\n\
+             2. 运行 `astra /login` 重新登录\n\
+             3. 或 `/cli claude` 切换到其他 CLI"
         );
     }
     if stderr.contains("rate limit") || stderr.contains("429") {
@@ -1229,7 +1247,43 @@ model: claude-sonnet-4-6"#;
     fn translate_auth_error() {
         let p = CliProfile::default();
         let msg = translate_cli_error(&p, 1, "Error: Could not validate credentials");
-        assert!(msg.contains("API 密钥"));
+        assert!(msg.contains("认证失败"));
+        assert!(msg.contains("/auth"));
+    }
+
+    // ── is_auth_error tests ──────────────────────────────────────
+
+    #[test]
+    fn is_auth_error_validates_credentials() {
+        assert!(is_auth_error("Could not validate credentials"));
+        assert!(is_auth_error("could not validate credentials"));
+    }
+
+    #[test]
+    fn is_auth_error_invalid_api_key() {
+        assert!(is_auth_error("Error: invalid_api_key"));
+        assert!(is_auth_error("invalid api key provided"));
+    }
+
+    #[test]
+    fn is_auth_error_401_status() {
+        assert!(is_auth_error("status: 401"));
+        assert!(is_auth_error("HTTP 401 response"));
+        assert!(is_auth_error("error 401"));
+    }
+
+    #[test]
+    fn is_auth_error_token_expired() {
+        assert!(is_auth_error("token expired"));
+        assert!(is_auth_error("Token has expired"));
+    }
+
+    #[test]
+    fn is_auth_error_false_positives_avoided() {
+        assert!(!is_auth_error("port 4010 is in use"));
+        assert!(!is_auth_error("some random error"));
+        assert!(!is_auth_error("timeout after 30s"));
+        assert!(!is_auth_error("rate limit exceeded"));
     }
 
     #[test]

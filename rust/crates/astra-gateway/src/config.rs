@@ -83,6 +83,11 @@ pub struct AstraServerConfig {
     #[serde(default)]
     pub api_key: String,
     pub default_model: Option<String>,
+    /// Optional login credentials for gateway-level auto-recovery when CLI tokens expire.
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 impl std::fmt::Debug for AstraServerConfig {
@@ -98,6 +103,15 @@ impl std::fmt::Debug for AstraServerConfig {
                 },
             )
             .field("default_model", &self.default_model)
+            .field("username", &self.username.as_deref())
+            .field(
+                "password",
+                &if self.password.is_some() {
+                    Some("[REDACTED]")
+                } else {
+                    None
+                },
+            )
             .finish()
     }
 }
@@ -273,6 +287,8 @@ platforms:
             base_url: "http://localhost:8080".into(),
             api_key: "super-secret-key".into(),
             default_model: None,
+            username: Some("admin".into()),
+            password: Some("hunter2".into()),
         };
         let dbg = format!("{cfg:?}");
         assert!(
@@ -283,6 +299,8 @@ platforms:
             !dbg.contains("super-secret"),
             "api_key leaked in debug: {dbg}"
         );
+        assert!(!dbg.contains("hunter2"), "password leaked in debug: {dbg}");
+        assert!(dbg.contains("admin"), "username should be visible: {dbg}");
 
         let db = DatabaseConfig {
             url: "mysql://root:password@host/db".into(),
@@ -427,5 +445,31 @@ database:
         let resolved = cfg.resolve();
         // Can't assert env vars in unit tests, but verify no panic
         assert!(resolved.websocket_url.starts_with("wss://"));
+    }
+
+    #[test]
+    fn parse_config_with_auth_credentials() {
+        let yaml = r#"
+astra:
+  base_url: "http://localhost:8080"
+  api_key: "key"
+  username: "admin"
+  password: "secret123"
+"#;
+        let cfg: GatewayConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(cfg.astra.username.as_deref(), Some("admin"));
+        assert_eq!(cfg.astra.password.as_deref(), Some("secret123"));
+    }
+
+    #[test]
+    fn parse_config_without_auth_credentials() {
+        let yaml = r#"
+astra:
+  base_url: "http://localhost:8080"
+  api_key: "key"
+"#;
+        let cfg: GatewayConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert!(cfg.astra.username.is_none());
+        assert!(cfg.astra.password.is_none());
     }
 }

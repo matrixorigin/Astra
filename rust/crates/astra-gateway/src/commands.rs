@@ -504,6 +504,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              `/cron add <expr> <msg>` — 创建\n\
              `/cron del <id>` — 删除\n\n\
              **其他**\n\
+             `/auth` — 认证状态 + 重置 + 自动重登录\n\
              `/gateway` — 完整能力概览\n\
              `/approve` — 权限说明"
                 .into(),
@@ -1090,6 +1091,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             lines.push("| `/usage` | Token/cost stats |".to_string());
             lines.push("| `/inspect` | Harness details |".to_string());
             lines.push("| `/audit` | Decision chain |".to_string());
+            lines.push("| `/auth` | Auth status + reset + auto-relogin |".to_string());
             lines.push("| `/gateway` | This context dump |".to_string());
 
             if ctx.config.action_policy.allow_model_generated_mutations && has_store {
@@ -1814,6 +1816,8 @@ mod tests {
                 base_url: "http://localhost:8080".into(),
                 api_key: String::new(),
                 default_model: None,
+                username: None,
+                password: None,
             },
             storage: Default::default(),
             database: None,

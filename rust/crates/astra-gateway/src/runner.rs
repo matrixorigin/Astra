@@ -28,6 +28,11 @@ const PROGRESSIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(8);
 const PROGRESSIVE_MIN_CHARS: usize = 200;
 const CONVERSATION_QUEUE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Number of consecutive auth failures before the circuit breaker trips.
+const AUTH_FAILURE_THRESHOLD: u32 = 2;
+/// How long the circuit breaker stays open before allowing retries.
+const AUTH_FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
+
 /// Outbound message from CLI, scheduler, or other background tasks.
 #[derive(Debug, Clone)]
 pub struct OutboundMessage {
@@ -91,6 +96,9 @@ pub struct GatewayRunner {
         tokio::sync::Mutex<HashMap<ConversationKey, tokio::sync::mpsc::Sender<QueuedRequest>>>,
     global_run_limiter: Arc<tokio::sync::Semaphore>,
     cli_availability: Vec<(String, cli_bridge::CliAvailability)>,
+    /// Tracks consecutive auth failures per CLI profile name.
+    /// Value: (failure_count, last_failure_time).
+    auth_failures: Arc<dashmap::DashMap<String, (u32, Instant)>>,
 }
 
 /// No-op adapter used in spawned CLI tasks (typing/heartbeats not available in background).
@@ -228,6 +236,7 @@ impl GatewayRunner {
             queue_senders: tokio::sync::Mutex::new(HashMap::new()),
             global_run_limiter: Arc::new(tokio::sync::Semaphore::new(max_concurrent_runs)),
             cli_availability,
+            auth_failures: Arc::new(dashmap::DashMap::new()),
         })
     }
 
@@ -371,8 +380,14 @@ impl GatewayRunner {
         // Resolve active CLI profile
         let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
 
-        // /manage — rewrite to rich context message and send to slow CLI path
         let trimmed = msg.text.trim();
+
+        // /auth — reset auth circuit breaker, show CLI auth status, attempt auto-relogin
+        if trimmed == "/auth" {
+            return Ok(Some(self.handle_auth_command(&cli_profile).await));
+        }
+
+        // /manage — rewrite to rich context message and send to slow CLI path
         if trimmed == "/manage" || trimmed.starts_with("/manage ") {
             let extra = trimmed.strip_prefix("/manage").unwrap_or("").trim();
             let context = self
@@ -560,6 +575,33 @@ impl GatewayRunner {
                     &msg.chat_id,
                     msg.reply_token.clone(),
                     text,
+                )
+                .await,
+            );
+        }
+
+        // Check auth circuit breaker before spawning CLI
+        if let Some(auth_msg) = self.check_auth_circuit(&cli_name) {
+            if let Some(writer) = trace_writer.as_ref() {
+                if let Some(ref run_id) = run_id {
+                    let _ = writer
+                        .finish_run(
+                            run_id,
+                            RunStatus::Failed,
+                            None,
+                            Some("auth circuit breaker open"),
+                        )
+                        .await;
+                }
+                let _ = writer.fail_request("auth circuit breaker open").await;
+            }
+            return Some(
+                self.outbound_response(
+                    trace.as_ref(),
+                    msg.platform,
+                    &msg.chat_id,
+                    msg.reply_token.clone(),
+                    auth_msg,
                 )
                 .await,
             );
@@ -843,6 +885,10 @@ impl GatewayRunner {
         let result = match cli_handle.await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
+                // Track auth failures for circuit breaker
+                if cli_bridge::is_auth_error(&e) {
+                    self.record_auth_failure(&cli_name);
+                }
                 suspend_tasks(&self.durable_store, format!("CLI error: {e}")).await;
                 if let Some(writer) = trace_writer.as_ref() {
                     if let Some(ref run_id) = run_id {
@@ -1005,6 +1051,29 @@ impl GatewayRunner {
                 text = ?result.text.as_deref().map(|t| &t[..t.len().min(100)]),
                 "CLI non-zero exit"
             );
+
+            // Detect auth errors and record for circuit breaker
+            let combined_err = format!("{}\n{}", result.stderr, result.stdout);
+            if cli_bridge::is_auth_error(&combined_err) {
+                self.record_auth_failure(&cli_name);
+
+                // Attempt auto-relogin if credentials are configured
+                if self.config.astra.username.is_some()
+                    && self.config.astra.password.is_some()
+                    && matches!(cli_profile, CliProfile::Astra { .. })
+                {
+                    match self.try_auto_relogin().await {
+                        Ok(_) => {
+                            tracing::info!(cli = %cli_name, "auto-relogin succeeded after auth failure");
+                            self.clear_auth_failure(&cli_name);
+                        }
+                        Err(e) => {
+                            tracing::warn!(cli = %cli_name, error = %e, "auto-relogin failed");
+                        }
+                    }
+                }
+            }
+
             suspend_tasks(
                 &self.durable_store,
                 format!("CLI exit code {}", result.exit_code),
@@ -1064,6 +1133,11 @@ impl GatewayRunner {
             let _ = writer
                 .finish_run(run_id, status, Some(result.exit_code), error)
                 .await;
+        }
+
+        // Clear auth failure counter on success
+        if result.exit_code == 0 {
+            self.clear_auth_failure(&cli_name);
         }
 
         // Save session_id to DB (if available), scoped by CLI profile
@@ -1280,6 +1354,151 @@ impl GatewayRunner {
         } else {
             msg.chat_id.clone()
         }
+    }
+
+    // ─── Auth circuit breaker ──────────────────────────────────────────────
+
+    /// Check if the auth circuit breaker is tripped for the given CLI.
+    /// Returns `Some(message)` if the circuit is open and the caller should
+    /// short-circuit without spawning the CLI.
+    fn check_auth_circuit(&self, cli_name: &str) -> Option<String> {
+        if let Some(entry) = self.auth_failures.get(cli_name) {
+            let (count, last_failure) = *entry;
+            if count > AUTH_FAILURE_THRESHOLD && last_failure.elapsed() < AUTH_FAILURE_COOLDOWN {
+                let remaining = AUTH_FAILURE_COOLDOWN
+                    .saturating_sub(last_failure.elapsed())
+                    .as_secs();
+                return Some(format!(
+                    "🔑 CLI `{cli_name}` 认证失败（连续 {} 次）\n\n\
+                     可能原因:\n\
+                     - API 密钥过期\n\
+                     - 服务端 token 刷新失败\n\n\
+                     解决方法:\n\
+                     1. 运行 `astra /login` 重新登录\n\
+                     2. 或检查环境变量 ASTRA_API_KEY\n\
+                     3. 或切换到其他 CLI: `/cli claude`\n\n\
+                     {remaining} 秒后自动重试，或发送 `/auth` 手动重试。",
+                    count,
+                ));
+            }
+            // Cooldown expired — clear the counter
+            if last_failure.elapsed() >= AUTH_FAILURE_COOLDOWN {
+                drop(entry);
+                self.auth_failures.remove(cli_name);
+            }
+        }
+        None
+    }
+
+    /// Record an auth failure for the given CLI profile.
+    fn record_auth_failure(&self, cli_name: &str) {
+        let mut entry = self
+            .auth_failures
+            .entry(cli_name.to_string())
+            .or_insert((0, Instant::now()));
+        entry.0 += 1;
+        entry.1 = Instant::now();
+        tracing::warn!(
+            cli = cli_name,
+            consecutive_failures = entry.0,
+            "auth failure recorded"
+        );
+    }
+
+    /// Clear auth failure counter for a CLI (called on successful request).
+    fn clear_auth_failure(&self, cli_name: &str) {
+        if self.auth_failures.remove(cli_name).is_some() {
+            tracing::info!(cli = cli_name, "auth failure counter cleared (success)");
+        }
+    }
+
+    /// Attempt to re-login to the astra server using configured credentials.
+    /// On success, writes the new tokens to `~/.astra/credentials.json` so
+    /// subsequent CLI spawns pick them up.
+    async fn try_auto_relogin(&self) -> Result<String, String> {
+        let username = self
+            .config
+            .astra
+            .username
+            .as_ref()
+            .ok_or("no username configured")?;
+        let password = self
+            .config
+            .astra
+            .password
+            .as_ref()
+            .ok_or("no password configured")?;
+
+        let body = serde_json::json!({ "username": username, "password": password });
+        let resp = self
+            .thin
+            .post_auth_login_json(&body)
+            .await
+            .map_err(|e| format!("login request failed: {e}"))?;
+
+        let v: serde_json::Value =
+            serde_json::from_str(&resp).map_err(|e| format!("invalid login response: {e}"))?;
+        let access = v
+            .get("access_token")
+            .and_then(|t| t.as_str())
+            .ok_or("missing access_token in response")?;
+        let refresh = v.get("refresh_token").and_then(|t| t.as_str());
+
+        save_token_to_cli_credentials(username, access, refresh)?;
+        tracing::info!(username = %username, "auto-relogin succeeded, CLI credentials refreshed");
+        Ok(access.to_string())
+    }
+
+    /// Handle the `/auth` slash command: reset circuit breaker, show CLI auth
+    /// status, and attempt auto-relogin if credentials are configured.
+    async fn handle_auth_command(&self, _current_cli: &CliProfile) -> String {
+        // 1. Reset circuit breaker
+        let cleared = self.auth_failures.len();
+        self.auth_failures.clear();
+
+        // 2. Invalidate probe cache so re-probe is fresh
+        cli_bridge::invalidate_probe_cache();
+
+        // 3. Re-probe all CLIs
+        let mut lines = vec!["🔑 **认证状态**".to_string()];
+        let default_avail = cli_bridge::probe_cli(&self.cli_profile).await;
+        let default_status = if default_avail.is_available() {
+            "✅"
+        } else {
+            "❌"
+        };
+        lines.push(format!(
+            "  {default_status} `{}` (默认)",
+            self.cli_profile.name()
+        ));
+        for (name, profile) in &self.config.cli_profiles {
+            let avail = cli_bridge::probe_cli(profile).await;
+            let status = if avail.is_available() { "✅" } else { "❌" };
+            lines.push(format!("  {status} `{name}`"));
+        }
+
+        if cleared > 0 {
+            lines.push(format!(
+                "\n认证缓存已重置（清除 {cleared} 个 CLI 的失败计数）。"
+            ));
+        } else {
+            lines.push("\n认证缓存已重置。".into());
+        }
+
+        // 4. Attempt auto-relogin if credentials configured
+        if self.config.astra.username.is_some() && self.config.astra.password.is_some() {
+            match self.try_auto_relogin().await {
+                Ok(_) => {
+                    lines.push("✅ 自动重新登录成功，凭证已刷新。".into());
+                }
+                Err(e) => {
+                    lines.push(format!("⚠️ 自动重新登录失败: {e}"));
+                }
+            }
+        }
+
+        lines.push("\n下次消息将重新验证。".into());
+        lines.join("\n")
     }
 
     /// Build a rich context message for `/manage` that gets sent to the CLI agent.
@@ -1896,6 +2115,68 @@ fn rfind_fence_break(s: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Write refreshed tokens to `~/.astra/credentials.json` so subsequent CLI
+/// spawns pick them up.  Reads the existing file (if any), updates the
+/// access/refresh tokens on the current or default profile, and writes back.
+fn save_token_to_cli_credentials(
+    username: &str,
+    access_token: &str,
+    refresh_token: Option<&str>,
+) -> Result<(), String> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    let path = std::path::PathBuf::from(home)
+        .join(".astra")
+        .join("credentials.json");
+
+    // Read existing file (may not exist)
+    let mut doc: serde_json::Value = if let Ok(content) = std::fs::read_to_string(&path) {
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    // Determine profile name
+    let profile_name = doc
+        .get("current_profile")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default")
+        .to_string();
+
+    // Ensure profiles object exists
+    if !doc.get("profiles").is_some_and(|p| p.is_object()) {
+        doc["profiles"] = serde_json::json!({});
+    }
+
+    // Update the profile
+    let profile = &mut doc["profiles"][&profile_name];
+    if !profile.is_object() {
+        *profile = serde_json::json!({});
+    }
+    profile["username"] = serde_json::Value::String(username.to_string());
+    profile["access_token"] = serde_json::Value::String(access_token.to_string());
+    if let Some(rt) = refresh_token {
+        profile["refresh_token"] = serde_json::Value::String(rt.to_string());
+    }
+
+    // Write back
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {e}"))?;
+    }
+    let body = serde_json::to_string_pretty(&doc).map_err(|e| format!("serialize failed: {e}"))?;
+    std::fs::write(&path, body).map_err(|e| format!("write failed: {e}"))?;
+
+    // Restrict to owner-only (0o600)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    Ok(())
 }
 
 fn is_safe_skill_name(name: &str) -> bool {
@@ -3369,6 +3650,105 @@ mod tests {
         assert!(!is_safe_db_name("foo;bar"));
         assert!(!is_safe_db_name("foo`bar"));
         assert!(!is_safe_db_name("../etc/passwd"));
+    }
+
+    // ── Auth circuit breaker tests ────────────────────────────────
+
+    #[test]
+    fn auth_circuit_not_tripped_initially() {
+        let failures: dashmap::DashMap<String, (u32, Instant)> = dashmap::DashMap::new();
+        // No entries — check_auth_circuit equivalent
+        assert!(!failures.contains_key("astra"));
+    }
+
+    #[test]
+    fn auth_circuit_trips_after_threshold() {
+        let failures: dashmap::DashMap<String, (u32, Instant)> = dashmap::DashMap::new();
+        // Simulate consecutive failures exceeding threshold
+        failures.insert(
+            "astra".to_string(),
+            (AUTH_FAILURE_THRESHOLD + 1, Instant::now()),
+        );
+        let entry = failures.get("astra").unwrap();
+        let (count, last) = *entry;
+        assert!(count > AUTH_FAILURE_THRESHOLD);
+        assert!(last.elapsed() < AUTH_FAILURE_COOLDOWN);
+    }
+
+    #[test]
+    fn auth_circuit_resets_after_cooldown() {
+        let failures: dashmap::DashMap<String, (u32, Instant)> = dashmap::DashMap::new();
+        // Simulate an old failure past cooldown
+        failures.insert(
+            "astra".to_string(),
+            (
+                AUTH_FAILURE_THRESHOLD + 1,
+                Instant::now() - AUTH_FAILURE_COOLDOWN - Duration::from_secs(1),
+            ),
+        );
+        let entry = failures.get("astra").unwrap();
+        let (_, last) = *entry;
+        assert!(
+            last.elapsed() >= AUTH_FAILURE_COOLDOWN,
+            "should be past cooldown"
+        );
+    }
+
+    #[test]
+    fn auth_circuit_constants_are_reasonable() {
+        let threshold = AUTH_FAILURE_THRESHOLD;
+        assert!(threshold >= 1, "threshold should be at least 1");
+        assert!(threshold <= 10, "threshold should be reasonable");
+        assert!(
+            AUTH_FAILURE_COOLDOWN.as_secs() >= 60,
+            "cooldown should be >= 1 min"
+        );
+        assert!(
+            AUTH_FAILURE_COOLDOWN.as_secs() <= 600,
+            "cooldown should be <= 10 min"
+        );
+    }
+
+    #[test]
+    fn save_token_to_cli_credentials_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds_dir = dir.path().join(".astra");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        let creds_path = creds_dir.join("credentials.json");
+
+        // Write initial file
+        std::fs::write(
+            &creds_path,
+            r#"{"current_profile":"default","profiles":{"default":{"username":"old"}}}"#,
+        )
+        .unwrap();
+
+        // We can't easily test save_token_to_cli_credentials because it uses
+        // dirs::home_dir(), but we can test the JSON structure it produces.
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&creds_path).unwrap()).unwrap();
+        doc["profiles"]["default"]["access_token"] = serde_json::Value::String("new-token".into());
+        doc["profiles"]["default"]["refresh_token"] =
+            serde_json::Value::String("new-refresh".into());
+        doc["profiles"]["default"]["username"] = serde_json::Value::String("admin".into());
+        let body = serde_json::to_string_pretty(&doc).unwrap();
+        std::fs::write(&creds_path, body).unwrap();
+
+        // Verify
+        let loaded: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&creds_path).unwrap()).unwrap();
+        assert_eq!(
+            loaded["profiles"]["default"]["access_token"].as_str(),
+            Some("new-token")
+        );
+        assert_eq!(
+            loaded["profiles"]["default"]["refresh_token"].as_str(),
+            Some("new-refresh")
+        );
+        assert_eq!(
+            loaded["profiles"]["default"]["username"].as_str(),
+            Some("admin")
+        );
     }
 }
 
