@@ -975,6 +975,13 @@ pub(super) async fn execute_cli_command(
                 .shutdown_and_wait(std::time::Duration::from_secs(30))
                 .await;
 
+            // Drain stream event writer: drop sender, then await writer task
+            // so all JSONL events are flushed to stderr before stdout output.
+            drop(chat_ctx);
+            if let Some(handle) = _stream_event_writer {
+                let _ = handle.await;
+            }
+
             // Output result
             if args.json {
                 // Compute exit code for JSON output

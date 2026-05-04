@@ -41,7 +41,7 @@ const WEIXIN_CAPABILITIES: &[AdapterCapability] = &[
     AdapterCapability::PersistentState,
 ];
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 pub struct WeixinConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -49,6 +49,16 @@ pub struct WeixinConfig {
     pub token: String,
     #[serde(default)]
     pub account_id: String,
+}
+
+impl std::fmt::Debug for WeixinConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeixinConfig")
+            .field("enabled", &self.enabled)
+            .field("token", &if self.token.is_empty() { "(empty)" } else { "[REDACTED]" })
+            .field("account_id", &self.account_id)
+            .finish()
+    }
 }
 
 impl WeixinConfig {
@@ -942,6 +952,19 @@ mod tests {
     use super::*;
     use tokio::sync::broadcast;
     use tokio::time::{Duration, timeout};
+
+    #[test]
+    fn config_debug_redacts_token() {
+        let cfg = WeixinConfig {
+            enabled: true,
+            token: "secret-bot-token-12345".into(),
+            account_id: "wxid_abc".into(),
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("secret-bot-token"), "token leaked in Debug: {dbg}");
+        assert!(dbg.contains("[REDACTED]"), "token not redacted: {dbg}");
+        assert!(dbg.contains("wxid_abc"), "account_id should be visible");
+    }
 
     #[test]
     fn config_resolve_env() {

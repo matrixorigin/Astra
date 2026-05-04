@@ -1329,6 +1329,12 @@ model: claude-sonnet-4-6"#;
     }
 
     #[test]
+    fn parse_thinking_chunk_event() {
+        let line = r#"{"type":"thinking_chunk","text":"let me consider..."}"#;
+        assert!(matches!(parse_stderr_line(line), CliProgress::Status(t) if t == "let me consider..."));
+    }
+
+    #[test]
     fn parse_waiting_for_model() {
         let line = r#"{"type":"waiting_for_model"}"#;
         assert!(matches!(parse_stderr_line(line), CliProgress::Status(_)));

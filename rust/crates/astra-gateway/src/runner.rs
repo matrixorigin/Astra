@@ -2306,9 +2306,23 @@ fn build_final_message(
 }
 
 /// Strip `<think>...</think>` blocks from complete text.
+/// Unclosed `<think>` at EOF: the tag is removed but content after it is
+/// preserved — a malicious or buggy model cannot suppress all output.
 fn strip_think_blocks(text: &str) -> String {
     let mut in_think = false;
-    filter_think_tags(text, &mut in_think)
+    let mut result = filter_think_tags(text, &mut in_think);
+    if in_think
+        && let Some(pos) = text.rfind("<think>")
+    {
+        let after = &text[pos + 7..];
+        if !after.is_empty() {
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(after);
+        }
+    }
+    result
 }
 
 fn format_elapsed(d: Duration) -> String {
@@ -2475,6 +2489,28 @@ mod tests {
     fn strip_think_blocks_removes_all() {
         let text = "<think>hmm</think>Answer is 42<think>double check</think>.";
         assert_eq!(strip_think_blocks(text), "Answer is 42.");
+    }
+
+    #[test]
+    fn strip_think_blocks_unclosed_preserves_content() {
+        // Malicious/buggy model: <think> without </think> should NOT suppress output
+        let text = "Before<think>suppressed content that should still appear";
+        let result = strip_think_blocks(text);
+        assert!(result.contains("Before"), "text before think lost: {result}");
+        assert!(
+            result.contains("suppressed content"),
+            "unclosed think suppressed output: {result}"
+        );
+    }
+
+    #[test]
+    fn strip_think_blocks_unclosed_at_start() {
+        let text = "<think>all content here, no close tag";
+        let result = strip_think_blocks(text);
+        assert!(
+            result.contains("all content here"),
+            "unclosed think at start suppressed everything: {result}"
+        );
     }
 
     // ── Progressive delivery dedup ─────────────────────────────────
