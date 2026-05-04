@@ -804,14 +804,9 @@ impl GatewayRunner {
                         }
                         Some(CliProgress::ToolStarted { ref name }) => {
                             tool_count += 1;
-                            if !token_buf.is_empty() {
-                                token_buf.push('\n');
-                            }
-                            token_buf.push_str(&format!("🔧 {name}…\n"));
                             last_tool = name.clone();
                         }
-                        Some(CliProgress::ToolDone { name, duration_ms }) => {
-                            token_buf.push_str(&format!("✅ {name} ({duration_ms}ms)\n"));
+                        Some(CliProgress::ToolDone { name, .. }) => {
                             last_tool = name;
                         }
                         Some(CliProgress::ToolCall(line)) => {

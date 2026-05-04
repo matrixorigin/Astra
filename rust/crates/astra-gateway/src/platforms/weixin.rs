@@ -848,6 +848,7 @@ async fn send_text_with_retry(
         }
 
         let errmsg = data["errmsg"].as_str().unwrap_or("unknown");
+        tracing::debug!(errcode, errmsg, body = %data, "iLink send response (non-zero)");
         last_error = format!("{errcode}: {errmsg}");
 
         // Session / context_token expired — retry without it.
