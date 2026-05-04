@@ -271,12 +271,12 @@ impl JwtSettings {
             access_token_expire_minutes: parse_or_default(
                 lookup,
                 "ASTRA_JWT_ACCESS_TTL_MINUTES",
-                10080_u32, // 1 week (was 60 min — too short for dev/harness use)
+                10080_u32, // 7 days (was 60 min — too short for dev/harness use)
             )?,
             refresh_token_expire_days: parse_or_default(
                 lookup,
                 "ASTRA_JWT_REFRESH_TTL_DAYS",
-                7_u32,
+                30_u32, // 30 days — must be longer than access token for refresh to work
             )?,
         })
     }
@@ -593,7 +593,7 @@ mod tests {
 
         assert_eq!(settings.jwt.algorithm, "HS256");
         assert_eq!(settings.jwt.access_token_expire_minutes, 10080);
-        assert_eq!(settings.jwt.refresh_token_expire_days, 7);
+        assert_eq!(settings.jwt.refresh_token_expire_days, 30);
         assert_eq!(settings.jwt.secret_key.len(), 32);
         assert!(
             settings
