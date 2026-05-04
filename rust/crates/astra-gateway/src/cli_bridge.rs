@@ -15,6 +15,14 @@ pub enum CliProgress {
     Status(String),
     ToolCall(String),
     Stderr(String),
+    /// Streamed text token from LLM (via --stream-events JSONL).
+    Token(String),
+    /// Tool execution started.
+    ToolStarted { name: String },
+    /// Tool execution completed.
+    ToolDone { name: String, duration_ms: u64 },
+    /// Thinking state changed.
+    Thinking(bool),
 }
 
 #[derive(Debug)]
@@ -176,6 +184,7 @@ impl CliProfile {
                     .arg(message)
                     .arg("--json")
                     .arg("--quiet")
+                    .arg("--stream-events")
                     .arg("--permission-mode")
                     .arg(permission_mode);
                 if let Some(sid) = session_id {
@@ -513,6 +522,51 @@ fn default_error_kind(exit_code: i32) -> Option<String> {
     (exit_code != 0).then(|| "process_exit".to_string())
 }
 
+/// Parse a stderr line as a structured JSONL event (from --stream-events)
+/// or fall back to heuristic classification.
+fn parse_stderr_line(line: &str) -> CliProgress {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("token") => {
+                let text = v["text"].as_str().unwrap_or_default().to_string();
+                return CliProgress::Token(text);
+            }
+            Some("thinking") => {
+                let active = v["active"].as_bool().unwrap_or(false);
+                return CliProgress::Thinking(active);
+            }
+            Some("thinking_chunk") => {
+                return CliProgress::Status(
+                    v["text"].as_str().unwrap_or_default().to_string(),
+                );
+            }
+            Some("tool_started") => {
+                let name = v["name"].as_str().unwrap_or_default().to_string();
+                return CliProgress::ToolStarted { name };
+            }
+            Some("tool_completed") => {
+                let name = v["name"].as_str().unwrap_or_default().to_string();
+                let duration_ms = v["duration_ms"].as_u64().unwrap_or(0);
+                return CliProgress::ToolDone { name, duration_ms };
+            }
+            Some("status") => {
+                return CliProgress::Status(
+                    v["text"].as_str().unwrap_or_default().to_string(),
+                );
+            }
+            Some("waiting_for_model" | "model_responding") => {
+                return CliProgress::Status(line.to_string());
+            }
+            _ => {}
+        }
+    }
+    if line.contains('⚡') || line.contains("tool") {
+        CliProgress::ToolCall(line.to_string())
+    } else {
+        CliProgress::Status(line.to_string())
+    }
+}
+
 // ─── Run ────────────────────────────────────────────────────────────────────
 
 pub async fn run_cli(
@@ -611,11 +665,7 @@ pub async fn run_cli_with_context_trace_and_timeout(
                 collected.push('\n');
             }
             collected.push_str(&line);
-            let event = if line.contains('⚡') || line.contains("tool") {
-                CliProgress::ToolCall(line)
-            } else {
-                CliProgress::Status(line)
-            };
+            let event = parse_stderr_line(&line);
             if let Some(ref tx) = progress_tx_clone {
                 let _ = tx.send(event).await;
             }
@@ -1208,5 +1258,43 @@ model: claude-sonnet-4-6"#;
         let _ = run_cli(&p, "", None, None, Some(tx)).await;
         while rx.try_recv().is_ok() {}
         assert!(rx.recv().await.is_none());
+    }
+
+    // ── Stream events JSONL parsing ──
+
+    #[test]
+    fn parse_token_event() {
+        let line = r#"{"type":"token","text":"hello"}"#;
+        assert!(matches!(parse_stderr_line(line), CliProgress::Token(t) if t == "hello"));
+    }
+
+    #[test]
+    fn parse_thinking_event() {
+        let line = r#"{"type":"thinking","active":true}"#;
+        assert!(matches!(parse_stderr_line(line), CliProgress::Thinking(true)));
+    }
+
+    #[test]
+    fn parse_tool_started_event() {
+        let line = r#"{"type":"tool_started","name":"bash","description":"ls"}"#;
+        assert!(matches!(parse_stderr_line(line), CliProgress::ToolStarted { name } if name == "bash"));
+    }
+
+    #[test]
+    fn parse_tool_completed_event() {
+        let line = r#"{"type":"tool_completed","name":"read_file","description":"x","status":"ok","duration_ms":42,"output_summary":null}"#;
+        assert!(matches!(parse_stderr_line(line), CliProgress::ToolDone { name, duration_ms } if name == "read_file" && duration_ms == 42));
+    }
+
+    #[test]
+    fn parse_fallback_for_plain_stderr() {
+        let line = "some random log line";
+        assert!(matches!(parse_stderr_line(line), CliProgress::Status(_)));
+    }
+
+    #[test]
+    fn parse_fallback_for_tool_heuristic() {
+        let line = "⚡ running tool bash";
+        assert!(matches!(parse_stderr_line(line), CliProgress::ToolCall(_)));
     }
 }

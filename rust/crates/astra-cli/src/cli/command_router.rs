@@ -451,7 +451,7 @@ pub(super) async fn execute_cli_command(
                 // spawning too.
                 agent_spawner: None,
                 root_agent_id: None,
-                // Non-REPL path — no harness context available.
+                stream_event_tx: None,
                 #[cfg(feature = "harness")]
                 harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
                 #[cfg(feature = "harness")]
@@ -896,6 +896,13 @@ pub(super) async fn execute_cli_command(
             // ForkCacheEvent / child telemetry they would have
             // emitted on their first response.
             let spawner_handle_for_drain = one_shot_spawner.clone();
+            let (stream_event_tx, _stream_event_writer) = if args.stream_events {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let handle = crate::stream_events_writer::spawn_stderr_writer(rx);
+                (Some(tx), Some(handle))
+            } else {
+                (None, None)
+            };
             let chat_ctx = crate::chat_stream::BasicCliChatContext {
                 api,
                 auth_profile: profile.as_deref(),
@@ -911,7 +918,7 @@ pub(super) async fn execute_cli_command(
                 skill_search: &skill_search,
                 agent_spawner: Some(one_shot_spawner),
                 root_agent_id: Some(&root_agent_id),
-                // Non-REPL one-shot path — no harness context available.
+                stream_event_tx,
                 #[cfg(feature = "harness")]
                 harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
                 #[cfg(feature = "harness")]
@@ -1564,10 +1571,9 @@ pub(super) async fn run_print_mode(
         selector: &*selector.0,
         unified_skill_registry: astra_runtime::skills::default_unified_registry(),
         skill_search: &skill_search,
-        // Print/headless mode — no spawn_agent support by design.
         agent_spawner: None,
         root_agent_id: None,
-        // Print/headless path — no harness context available.
+        stream_event_tx: None,
         #[cfg(feature = "harness")]
         harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
         #[cfg(feature = "harness")]

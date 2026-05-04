@@ -200,6 +200,8 @@ mod spawn_subrun;
 mod sse_utils;
 #[path = "cli/startup_trace.rs"]
 mod startup_trace;
+#[path = "cli/stream_events_writer.rs"]
+mod stream_events_writer;
 #[path = "cli/stream_render.rs"]
 mod stream_render;
 #[path = "cli/streaming_md.rs"]

@@ -286,6 +286,11 @@ pub(crate) struct ChatArgs {
     /// Append extra context to the system prompt (used by gateway)
     #[arg(long = "append-system-prompt", hide = true)]
     pub append_system_prompt: Option<String>,
+    /// Emit structured JSONL events to stderr for gateway integration.
+    /// Each line is a JSON object with a "type" field (token, thinking,
+    /// tool_started, tool_completed, status).
+    #[arg(long = "stream-events", hide = true, default_value_t = false)]
+    pub stream_events: bool,
 }
 
 #[derive(Args, Debug, Clone)]

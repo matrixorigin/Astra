@@ -216,6 +216,8 @@ pub(crate) struct BasicCliChatContext<'a> {
     /// Passed through to `sse_loop::mod` for `SpawnAgentContext`
     /// wiring. When `agent_spawner` is None this is ignored.
     pub root_agent_id: Option<&'a str>,
+    /// Optional channel for forwarding stream events (used by --stream-events).
+    pub stream_event_tx: Option<StreamEventTx>,
     /// Shared harness snapshot sink for /inspect command (non-REPL one-shot paths).
     #[cfg(feature = "harness")]
     pub harness_sink: Option<std::sync::Arc<astra_harness::InMemorySnapshotSink>>,
@@ -262,7 +264,7 @@ impl<'a> ChatTurnParams<'a> {
             delegation_engine: None,
             cancel_token: None,
             plan_assemble_line_release: None,
-            stream_event_tx: None,
+            stream_event_tx: ctx.stream_event_tx.clone(),
             approval_request_tx: None,
             mcp_manager: None,
             skill_search: ctx.skill_search,

@@ -623,8 +623,16 @@ impl GatewayRunner {
                             tool_count += 1;
                             last_tool = line;
                         }
+                        Some(CliProgress::ToolStarted { name }) => {
+                            tool_count += 1;
+                            last_tool = name;
+                        }
+                        Some(CliProgress::ToolDone { name, .. }) => {
+                            last_tool = name;
+                        }
+                        Some(CliProgress::Token(_) | CliProgress::Thinking(_)) => {}
                         Some(CliProgress::Status(_) | CliProgress::Stderr(_)) => {}
-                        None => break, // CLI finished
+                        None => break,
                     }
                 }
                 _ = &mut next_heartbeat => {
