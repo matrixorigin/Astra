@@ -205,7 +205,7 @@ impl GatewayStore for SqliteGatewayStore {
         let pref_json = serde_json::json!({ key: value }).to_string();
 
         // First: if preferences is NULL, set the whole JSON object.
-        sqlx::query(
+        let initialized = sqlx::query(
             "UPDATE gw_users SET preferences = ?, updated_at = datetime('now')
              WHERE platform = ? AND platform_user_id = ? AND preferences IS NULL",
         )
@@ -216,10 +216,10 @@ impl GatewayStore for SqliteGatewayStore {
         .await?;
 
         // Second: if preferences already exists, merge the key in.
-        sqlx::query(
+        let merged = sqlx::query(
             "UPDATE gw_users
              SET preferences = json_set(preferences, '$.' || ?, ?),
-                 updated_at = datetime('now')
+                  updated_at = datetime('now')
              WHERE platform = ? AND platform_user_id = ? AND preferences IS NOT NULL",
         )
         .bind(key)
@@ -228,6 +228,12 @@ impl GatewayStore for SqliteGatewayStore {
         .bind(user_id)
         .execute(&self.pool)
         .await?;
+
+        if initialized.rows_affected() + merged.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!(
+                "user not found: {platform}:{user_id}"
+            )));
+        }
 
         Ok(())
     }
@@ -912,6 +918,19 @@ mod tests {
             .await
             .unwrap();
         assert!(val.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_preference_for_missing_user_fails() {
+        let store = make_store().await;
+        let err = store
+            .set_user_preference("wx", "ghost", "lang", "en")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("user not found"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

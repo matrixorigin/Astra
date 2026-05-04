@@ -161,22 +161,18 @@ impl GatewayRunner {
         )?;
 
         let storage_config = config.resolve_storage();
-        let (store, durable_store, trace_repo) = match store::open_store_bundle(&storage_config)
-            .await
-        {
-            Ok(Some(bundle)) => {
-                tracing::info!(backend = ?storage_config, "storage connected");
-                (Some(bundle.store), bundle.durable_store, bundle.trace_repo)
-            }
-            Ok(None) => {
-                tracing::info!("running without persistence (storage: none)");
-                (None, None, None)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "storage not available — running without persistence");
-                (None, None, None)
-            }
-        };
+        let (store, durable_store, trace_repo) =
+            match store::open_store_bundle(&storage_config).await {
+                Ok(Some(bundle)) => {
+                    tracing::info!(backend = ?storage_config, "storage connected");
+                    (Some(bundle.store), bundle.durable_store, bundle.trace_repo)
+                }
+                Ok(None) => {
+                    tracing::info!("running without persistence (storage: none)");
+                    (None, None, None)
+                }
+                Err(e) => return Err(e),
+            };
 
         let cli_profile = config.cli.clone();
 
@@ -430,6 +426,7 @@ impl GatewayRunner {
                 .map(|repo| repo.as_ref() as &dyn TraceRepository),
             project_dirs: &self.config.project_dirs,
             cli_availability: &self.cli_availability,
+            auth_status: self.auth_status_line(cli_profile.name()),
         };
         if let Some(response) = commands::handle_command(&cmd_ctx, &msg.text).await {
             return Ok(Some(response));
@@ -1271,8 +1268,9 @@ impl GatewayRunner {
         if completion_tok > 0 {
             stats_parts.push(format!("↑{}", format_tokens(completion_tok)));
         }
-        if result.tool_calls_count.unwrap_or(0) > 0 {
-            stats_parts.push(format!("🔧{}", result.tool_calls_count.unwrap()));
+        let tool_count_total = result.tool_calls_count.unwrap_or(0);
+        if tool_count_total > 0 {
+            stats_parts.push(format!("🔧{tool_count_total}"));
         }
         stats_parts.push(format_elapsed(elapsed));
         if cost > 0.001 {
@@ -1456,6 +1454,25 @@ impl GatewayRunner {
             }
         }
         None
+    }
+
+    fn auth_status_line(&self, cli_name: &str) -> Option<String> {
+        let entry = self.auth_failures.get(cli_name)?;
+        let (count, last_failure) = *entry;
+        if last_failure.elapsed() >= AUTH_FAILURE_COOLDOWN {
+            drop(entry);
+            self.auth_failures.remove(cli_name);
+            return None;
+        }
+
+        if count > AUTH_FAILURE_THRESHOLD {
+            let remaining = AUTH_FAILURE_COOLDOWN
+                .saturating_sub(last_failure.elapsed())
+                .as_secs();
+            Some(format!("⚠️ 暂停 (剩余 {remaining}s, 连续失败 {count} 次)"))
+        } else {
+            Some(format!("✅ 正常 (最近失败 {count} 次)"))
+        }
     }
 
     /// Record an auth failure for the given CLI profile.
@@ -2492,7 +2509,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => format!("⚠️ 定时任务创建失败: {e}"),
                     }
                 } else {
-                    "⚠️ 定时任务需要数据库支持".into()
+                    "⚠️ 定时任务需要 MySQL 存储支持".into()
                 }
             }
             Some("cron_add") => "⚠️ cron_add 格式错误（需要: cron_add:表达式:消息）".into(),
@@ -2547,7 +2564,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => format!("⚠️ 创建提醒失败: {e}"),
                     }
                 } else {
-                    "⚠️ 延时提醒需要数据库支持".into()
+                    "⚠️ 延时提醒需要 MySQL 存储支持".into()
                 }
             }
             Some("remind_after") => {
@@ -2573,7 +2590,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => format!("⚠️ 查询失败: {e}"),
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
 
@@ -2592,7 +2609,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => format!("⚠️ 删除失败: {e}"),
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
             Some("task_del") => "⚠️ task_del 格式错误（需要: task_del:任务ID）".into(),
@@ -2610,7 +2627,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => format!("⚠️ 删除失败: {e}"),
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
 
@@ -2641,7 +2658,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => format!("⚠️ 创建失败: {e}"),
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
 
@@ -2672,7 +2689,7 @@ async fn execute_gateway_actions_with_policy(
                                     Err(e) => e,
                                 }
                             } else {
-                                "⚠️ 需要数据库支持".into()
+                                "⚠️ 需要 MySQL 存储支持".into()
                             }
                         }
                     }
@@ -2701,7 +2718,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => e,
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
 
@@ -2744,7 +2761,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => e,
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
 
@@ -2777,7 +2794,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => format!("⚠️ 查询失败: {e}"),
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
 
@@ -2800,7 +2817,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => e,
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
 
@@ -2828,7 +2845,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => e,
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
 
@@ -2851,7 +2868,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => e,
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
 
@@ -2926,7 +2943,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => format!("⚠️ 保存工作目录失败: {e}"),
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
 
@@ -3006,15 +3023,7 @@ fn action_capability(action: &str) -> Option<crate::access_control::ActionCapabi
 }
 
 fn is_valid_cron_expr(expr: &str) -> bool {
-    let parts: Vec<&str> = expr.split_whitespace().collect();
-    if parts.len() != 5 {
-        return false;
-    }
-    // Each field should be *, a number, a range, a list, or a step
-    parts.iter().all(|p| {
-        p.chars()
-            .all(|c| c.is_ascii_digit() || c == '*' || c == ',' || c == '-' || c == '/')
-    })
+    store::is_valid_cron_expr(expr)
 }
 
 async fn find_and_delete_job(
@@ -3758,7 +3767,7 @@ mod tests {
         let mut r = Vec::new();
         let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
         assert_eq!(clean, "好的");
-        assert!(r[0].contains("数据库"), "{}", r[0]);
+        assert!(r[0].contains("存储"), "{}", r[0]);
     }
 
     #[tokio::test]
@@ -3791,7 +3800,7 @@ mod tests {
         let mut r = Vec::new();
         let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
         assert_eq!(clean, "好的");
-        assert!(r[0].contains("数据库"), "{}", r[0]);
+        assert!(r[0].contains("存储"), "{}", r[0]);
     }
 
     #[tokio::test]
@@ -3831,7 +3840,7 @@ mod tests {
         let text = "[[GATEWAY:task_list]]";
         let mut r = Vec::new();
         execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-        assert!(r[0].contains("数据库"), "{}", r[0]);
+        assert!(r[0].contains("存储"), "{}", r[0]);
     }
 
     #[tokio::test]
@@ -3847,7 +3856,7 @@ mod tests {
         let text = "[[GATEWAY:task_del:abc123]]";
         let mut r = Vec::new();
         execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-        assert!(r[0].contains("数据库"), "{}", r[0]);
+        assert!(r[0].contains("存储"), "{}", r[0]);
     }
 
     #[tokio::test]
@@ -4130,7 +4139,7 @@ async fn action_dtask_create_no_db() {
     let text = "[[GATEWAY:dtask_create:weekly report:collect stats]]";
     let mut r = Vec::new();
     execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("数据库"), "{}", r[0]);
+    assert!(r[0].contains("存储"), "{}", r[0]);
 }
 
 #[tokio::test]
@@ -4162,7 +4171,7 @@ async fn action_dtask_status_no_db() {
     let text = "[[GATEWAY:dtask_status:some-id]]";
     let mut r = Vec::new();
     execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("数据库"), "{}", r[0]);
+    assert!(r[0].contains("存储"), "{}", r[0]);
 }
 
 #[tokio::test]
@@ -4170,7 +4179,7 @@ async fn action_dtask_resume_no_db() {
     let text = "[[GATEWAY:dtask_resume:some-id]]";
     let mut r = Vec::new();
     execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("数据库"), "{}", r[0]);
+    assert!(r[0].contains("存储"), "{}", r[0]);
 }
 
 #[tokio::test]
@@ -4178,7 +4187,7 @@ async fn action_dtask_list_no_db() {
     let text = "[[GATEWAY:dtask_list]]";
     let mut r = Vec::new();
     execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("数据库"), "{}", r[0]);
+    assert!(r[0].contains("存储"), "{}", r[0]);
 }
 
 #[tokio::test]
@@ -4186,7 +4195,7 @@ async fn action_dtask_complete_no_db() {
     let text = "[[GATEWAY:dtask_complete:some-id]]";
     let mut r = Vec::new();
     execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("数据库"), "{}", r[0]);
+    assert!(r[0].contains("存储"), "{}", r[0]);
 }
 
 #[tokio::test]
@@ -4194,7 +4203,7 @@ async fn action_dtask_fail_no_db() {
     let text = "[[GATEWAY:dtask_fail:some-id:oops]]";
     let mut r = Vec::new();
     execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("数据库"), "{}", r[0]);
+    assert!(r[0].contains("存储"), "{}", r[0]);
 }
 
 #[tokio::test]
@@ -4202,7 +4211,7 @@ async fn action_dtask_cancel_no_db() {
     let text = "[[GATEWAY:dtask_cancel:some-id]]";
     let mut r = Vec::new();
     execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("数据库"), "{}", r[0]);
+    assert!(r[0].contains("存储"), "{}", r[0]);
 }
 
 // ── trace_kill / outbox_dismiss GATEWAY actions ──
@@ -4288,11 +4297,7 @@ async fn action_dtask_checkpoint_json_with_array() {
     let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
     assert!(clean.is_empty(), "tags should be stripped, got: {clean}");
     assert_eq!(r.len(), 1);
-    assert!(
-        r[0].contains("数据库"),
-        "expected no-db error, got: {}",
-        r[0]
-    );
+    assert!(r[0].contains("存储"), "expected no-db error, got: {}", r[0]);
 }
 
 #[tokio::test]
@@ -4353,7 +4358,7 @@ async fn action_policy_allows_when_enabled() {
     assert!(clean.is_empty());
     assert_eq!(r.len(), 1);
     assert!(
-        r[0].contains("数据库"),
+        r[0].contains("存储"),
         "expected no-db fallback, got: {}",
         r[0]
     );

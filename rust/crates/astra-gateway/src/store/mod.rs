@@ -26,6 +26,9 @@ pub enum StoreError {
 
     #[error("serialization error: {0}")]
     Serialization(String),
+
+    #[error("not found: {0}")]
+    NotFound(String),
 }
 
 impl From<sqlx::Error> for StoreError {
@@ -304,6 +307,55 @@ pub trait GatewayStore: Send + Sync + 'static {
 
 // ─── Shared helpers ────────────────────────────────────────────────────────
 
+/// Validate the gateway-supported 5-field cron subset.
+pub fn is_valid_cron_expr(expr: &str) -> bool {
+    let parts: Vec<&str> = expr.split_whitespace().collect();
+    if parts.len() != 5 {
+        return false;
+    }
+
+    validate_cron_field(parts[0], 0, 59)
+        && validate_cron_field(parts[1], 0, 23)
+        && validate_cron_field(parts[2], 1, 31)
+        && validate_cron_field(parts[3], 1, 12)
+        && validate_cron_field(parts[4], 0, 7)
+}
+
+fn validate_cron_field(field: &str, min: u32, max: u32) -> bool {
+    if field.is_empty() {
+        return false;
+    }
+    field
+        .split(',')
+        .all(|part| validate_cron_part(part, min, max))
+}
+
+fn validate_cron_part(part: &str, min: u32, max: u32) -> bool {
+    let (base, step) = part.split_once('/').unwrap_or((part, ""));
+    if !step.is_empty() {
+        match step.parse::<u32>() {
+            Ok(step) if step > 0 => {}
+            _ => return false,
+        }
+    }
+
+    if base == "*" {
+        return true;
+    }
+
+    if let Some((start, end)) = base.split_once('-') {
+        let (Ok(start), Ok(end)) = (start.parse::<u32>(), end.parse::<u32>()) else {
+            return false;
+        };
+        return start <= end && start >= min && end <= max;
+    }
+
+    match base.parse::<u32>() {
+        Ok(value) => value >= min && value <= max,
+        Err(_) => false,
+    }
+}
+
 /// Compute the next run time from a cron expression as a datetime string
 /// (`YYYY-MM-DD HH:MM:SS`).
 ///
@@ -416,15 +468,22 @@ fn default_file_dir() -> String {
 }
 
 impl Default for StorageConfig {
-    /// Auto-detect: if `GATEWAY_DATABASE_URL` is set, use MySQL; otherwise
-    /// fall back to SQLite at `~/.astra-gateway/gateway.db`.
+    /// Auto-detect: if `GATEWAY_DATABASE_URL` is set to a non-empty value, use
+    /// MySQL; otherwise run without persistence until storage is explicit.
     fn default() -> Self {
-        match std::env::var("GATEWAY_DATABASE_URL") {
-            Ok(url) => Self::Mysql { url },
-            Err(_) => Self::Sqlite {
-                path: default_sqlite_path(),
-            },
-        }
+        Self::from_database_url_env_value(std::env::var("GATEWAY_DATABASE_URL").ok().as_deref())
+    }
+}
+
+impl StorageConfig {
+    pub(crate) fn from_database_url_env_value(value: Option<&str>) -> Self {
+        value
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(|url| Self::Mysql {
+                url: url.to_string(),
+            })
+            .unwrap_or(Self::None)
     }
 }
 
@@ -455,9 +514,9 @@ pub async fn open_store(
 
 /// Everything the runner needs from the storage layer.
 ///
-/// `durable_store` and `trace_repo` currently require a MySQL pool, so they
-/// are only available when the backend is MySQL. SQLite / file backends set
-/// them to `None`.
+/// `durable_store` and `trace_repo` require the MySQL pool. Backends that
+/// cannot provide full gateway durability are rejected before a bundle is
+/// created.
 pub struct StoreBundle {
     pub store: std::sync::Arc<dyn GatewayStore>,
     pub durable_store: Option<std::sync::Arc<crate::durable_task_store::MysqlDurableTaskStore>>,
@@ -470,8 +529,10 @@ pub struct StoreBundle {
 
 /// Create a [`StoreBundle`] from config — or `None` for [`StorageConfig::None`].
 ///
-/// For MySQL backends the bundle also provisions the durable-task store and
-/// trace repository backed by the same connection pool.
+/// For MySQL backends the bundle provisions the durable-task store and trace
+/// repository backed by the same connection pool. SQLite and file stores remain
+/// usable through [`open_store`] for local tooling/tests, but not for the
+/// gateway runner.
 pub async fn open_store_bundle(
     config: &StorageConfig,
 ) -> Result<Option<StoreBundle>, Box<dyn std::error::Error + Send + Sync>> {
@@ -499,25 +560,12 @@ pub async fn open_store_bundle(
                 mysql_pool: Some(pool),
             }))
         }
-        StorageConfig::Sqlite { path } => {
-            let store = sqlite::SqliteGatewayStore::connect(path).await?;
-            store.ensure_schema().await?;
-            Ok(Some(StoreBundle {
-                store: std::sync::Arc::new(store),
-                durable_store: None,
-                trace_repo: None,
-                mysql_pool: None,
-            }))
-        }
-        StorageConfig::File { dir } => {
-            let store = file::FileGatewayStore::open(dir).await?;
-            Ok(Some(StoreBundle {
-                store: std::sync::Arc::new(store),
-                durable_store: None,
-                trace_repo: None,
-                mysql_pool: None,
-            }))
-        }
+        StorageConfig::Sqlite { .. } => Err(
+            "sqlite storage does not support gateway durability; use storage.backend: mysql or storage.backend: none".into(),
+        ),
+        StorageConfig::File { .. } => Err(
+            "file storage does not support gateway durability; use storage.backend: mysql or storage.backend: none".into(),
+        ),
         StorageConfig::None => Ok(None),
     }
 }
@@ -646,14 +694,68 @@ mod tests {
             StorageConfig::Mysql { url } => {
                 assert!(!url.is_empty(), "MySQL URL should not be empty");
             }
-            StorageConfig::Sqlite { path } => {
-                assert!(
-                    path.ends_with("gateway.db"),
-                    "SQLite path should end with gateway.db, got: {path}"
-                );
-            }
-            other => panic!("expected Mysql or Sqlite default, got: {other:?}"),
+            StorageConfig::None => {}
+            other => panic!("expected Mysql or None default, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn storage_config_env_value_ignores_empty_urls() {
+        assert!(matches!(
+            StorageConfig::from_database_url_env_value(None),
+            StorageConfig::None
+        ));
+        assert!(matches!(
+            StorageConfig::from_database_url_env_value(Some("")),
+            StorageConfig::None
+        ));
+        assert!(matches!(
+            StorageConfig::from_database_url_env_value(Some("   ")),
+            StorageConfig::None
+        ));
+        match StorageConfig::from_database_url_env_value(Some(" mysql://host/db ")) {
+            StorageConfig::Mysql { url } => assert_eq!(url, "mysql://host/db"),
+            other => panic!("expected Mysql, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn store_bundle_rejects_non_durable_backends() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let sqlite = StorageConfig::Sqlite {
+            path: dir.path().join("gateway.db").to_string_lossy().to_string(),
+        };
+        let err = match open_store_bundle(&sqlite).await {
+            Ok(_) => panic!("sqlite bundle must be rejected"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("does not support gateway durability"),
+            "unexpected sqlite error: {err}"
+        );
+
+        let file = StorageConfig::File {
+            dir: dir.path().join("data").to_string_lossy().to_string(),
+        };
+        let err = match open_store_bundle(&file).await {
+            Ok(_) => panic!("file bundle must be rejected"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("does not support gateway durability"),
+            "unexpected file error: {err}"
+        );
+    }
+
+    #[test]
+    fn cron_expr_validation_rejects_invalid_ranges() {
+        assert!(is_valid_cron_expr("0 9 * * 1-5"));
+        assert!(is_valid_cron_expr("*/5 * * * *"));
+        assert!(!is_valid_cron_expr("99 9 * * *"));
+        assert!(!is_valid_cron_expr("0 24 * * *"));
+        assert!(!is_valid_cron_expr("0 9 * * 9"));
+        assert!(!is_valid_cron_expr("bad expr"));
     }
 
     #[test]

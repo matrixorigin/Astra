@@ -215,7 +215,7 @@ impl GatewayStore for MysqlGatewayStore {
         let pref_json = serde_json::json!({key: value}).to_string();
 
         // First ensure preferences is not NULL, then JSON_SET
-        sqlx::query(
+        let initialized = sqlx::query(
             "UPDATE gw_users SET preferences = ?, updated_at = NOW(6)
              WHERE platform = ? AND platform_user_id = ? AND preferences IS NULL",
         )
@@ -226,7 +226,7 @@ impl GatewayStore for MysqlGatewayStore {
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
-        sqlx::query(
+        let merged = sqlx::query(
             "UPDATE gw_users SET preferences = JSON_SET(preferences, CONCAT('$.', ?), ?), updated_at = NOW(6)
              WHERE platform = ? AND platform_user_id = ? AND preferences IS NOT NULL",
         )
@@ -237,6 +237,12 @@ impl GatewayStore for MysqlGatewayStore {
         .execute(&self.pool)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        if initialized.rows_affected() + merged.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!(
+                "user not found: {platform}:{user_id}"
+            )));
+        }
 
         Ok(())
     }

@@ -827,7 +827,6 @@ async fn send_text_with_retry(
     }
     tracing::debug!(
         text_len = text.len(),
-        text_preview = %&text[..text.len().min(80)],
         has_context_token = !context_token.is_empty(),
         "iLink send attempt"
     );
@@ -1388,6 +1387,16 @@ mod tests {
     fn typing_ticket_ttl_reasonable() {
         const { assert!(TYPING_TICKET_TTL_SECS >= 300) };
         const { assert!(TYPING_TICKET_TTL_SECS <= 1800) };
+    }
+
+    #[test]
+    fn send_diagnostics_do_not_log_message_preview() {
+        let source = include_str!("weixin.rs");
+        let needle = concat!("text_", "preview");
+        assert!(
+            !source.contains(needle),
+            "send diagnostics must not log outbound message content previews"
+        );
     }
 
     #[test]

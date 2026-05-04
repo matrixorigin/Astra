@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
-use tokio::sync::RwLock;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{Mutex, RwLock};
 
 pub struct FileGatewayStore {
     base_dir: PathBuf,
@@ -28,6 +29,7 @@ pub struct FileGatewayStore {
     cron_jobs: RwLock<HashMap<String, CronJobEntry>>,
     credentials: RwLock<HashMap<String, CredentialEntry>>,
     pending_counter: AtomicI64,
+    disk_write_lock: Mutex<()>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,7 +123,7 @@ impl FileGatewayStore {
         let cron_jobs = load_json_map(&base_dir.join("cron_jobs.json")).await?;
         let credentials = load_json_map(&base_dir.join("credentials.json")).await?;
 
-        let pending_counter = count_pending_files(&base_dir.join("pending")).await;
+        let pending_counter = load_pending_counter(&base_dir.join("pending")).await?;
 
         Ok(Self {
             base_dir,
@@ -130,27 +132,40 @@ impl FileGatewayStore {
             cron_jobs: RwLock::new(cron_jobs),
             credentials: RwLock::new(credentials),
             pending_counter: AtomicI64::new(pending_counter),
+            disk_write_lock: Mutex::new(()),
         })
     }
 
     async fn flush_users(&self) -> Result<(), StoreError> {
+        let _guard = self.disk_write_lock.lock().await;
         let data = self.users.read().await;
         save_json_map(&self.base_dir.join("users.json"), &*data).await
     }
 
     async fn flush_sessions(&self) -> Result<(), StoreError> {
+        let _guard = self.disk_write_lock.lock().await;
         let data = self.sessions.read().await;
         save_json_map(&self.base_dir.join("sessions.json"), &*data).await
     }
 
     async fn flush_cron_jobs(&self) -> Result<(), StoreError> {
+        let _guard = self.disk_write_lock.lock().await;
         let data = self.cron_jobs.read().await;
         save_json_map(&self.base_dir.join("cron_jobs.json"), &*data).await
     }
 
     async fn flush_credentials(&self) -> Result<(), StoreError> {
+        let _guard = self.disk_write_lock.lock().await;
         let data = self.credentials.read().await;
         save_json_map(&self.base_dir.join("credentials.json"), &*data).await
+    }
+
+    async fn persist_pending_counter_locked(&self, value: i64) -> Result<(), StoreError> {
+        atomic_write(
+            &self.base_dir.join("pending").join(".counter"),
+            value.to_string().as_bytes(),
+        )
+        .await
     }
 }
 
@@ -190,9 +205,12 @@ impl GatewayStore for FileGatewayStore {
     ) -> Result<(), StoreError> {
         let ukey = user_key(platform, user_id);
         let mut users = self.users.write().await;
-        if let Some(entry) = users.get_mut(&ukey) {
-            entry.preferences.insert(key.to_string(), value.to_string());
-        }
+        let Some(entry) = users.get_mut(&ukey) else {
+            return Err(StoreError::NotFound(format!(
+                "user not found: {platform}:{user_id}"
+            )));
+        };
+        entry.preferences.insert(key.to_string(), value.to_string());
         drop(users);
         self.flush_users().await
     }
@@ -385,7 +403,9 @@ impl GatewayStore for FileGatewayStore {
         user_id: &str,
         text: &str,
     ) -> Result<i64, StoreError> {
+        let _guard = self.disk_write_lock.lock().await;
         let id = self.pending_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        self.persist_pending_counter_locked(id).await?;
         let entry = serde_json::json!({
             "id": id,
             "platform": platform,
@@ -397,7 +417,7 @@ impl GatewayStore for FileGatewayStore {
         let path = self.base_dir.join("pending").join(format!("{id}.json"));
         let data = serde_json::to_string_pretty(&entry)
             .map_err(|e| StoreError::Serialization(e.to_string()))?;
-        tokio::fs::write(&path, data).await?;
+        atomic_write(&path, data.as_bytes()).await?;
         Ok(id)
     }
 
@@ -709,8 +729,43 @@ async fn save_json_map<T: serde::Serialize>(
 ) -> Result<(), StoreError> {
     let json =
         serde_json::to_string_pretty(data).map_err(|e| StoreError::Serialization(e.to_string()))?;
-    tokio::fs::write(path, json).await?;
+    atomic_write(path, json.as_bytes()).await?;
     Ok(())
+}
+
+async fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StoreError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| StoreError::Io(std::io::Error::other("path has no parent directory")))?;
+    tokio::fs::create_dir_all(parent).await?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| StoreError::Io(std::io::Error::other("path has no valid file name")))?;
+    let tmp_path = parent.join(format!(
+        ".{file_name}.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+
+    let mut file = tokio::fs::File::create(&tmp_path).await?;
+    file.write_all(data).await?;
+    file.sync_all().await?;
+    drop(file);
+
+    tokio::fs::rename(&tmp_path, path).await?;
+    if let Ok(dir) = tokio::fs::File::open(parent).await {
+        let _ = dir.sync_all().await;
+    }
+    Ok(())
+}
+
+async fn load_pending_counter(dir: &Path) -> Result<i64, StoreError> {
+    let from_counter = match tokio::fs::read_to_string(dir.join(".counter")).await {
+        Ok(value) => value.trim().parse::<i64>().unwrap_or(0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(e.into()),
+    };
+    Ok(from_counter.max(count_pending_files(dir).await))
 }
 
 async fn count_pending_files(dir: &Path) -> i64 {
@@ -796,6 +851,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(val.as_deref(), Some("dark"));
+    }
+
+    #[tokio::test]
+    async fn setting_preference_for_missing_user_fails() {
+        let (_dir, store) = test_store().await;
+        let err = store
+            .set_user_preference("wx", "missing", "theme", "dark")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("user not found"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -995,6 +1063,35 @@ mod tests {
             assert_eq!(msgs[0].text, "persist me");
             assert_eq!(msgs[0].id, msg_id);
         }
+    }
+
+    #[tokio::test]
+    async fn pending_message_ids_remain_monotonic_after_reopen_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let second_id;
+        {
+            let store = FileGatewayStore::open(dir.path()).await.unwrap();
+            let first_id = store
+                .save_pending_message("wx", "c1", "u1", "first")
+                .await
+                .unwrap();
+            second_id = store
+                .save_pending_message("wx", "c1", "u1", "second")
+                .await
+                .unwrap();
+            assert!(second_id > first_id);
+            assert_eq!(store.delete_pending_message(second_id).await.unwrap(), 1);
+        }
+
+        let store = FileGatewayStore::open(dir.path()).await.unwrap();
+        let next_id = store
+            .save_pending_message("wx", "c1", "u1", "third")
+            .await
+            .unwrap();
+        assert!(
+            next_id > second_id,
+            "pending ids must be monotonic across restarts even after deleting the highest file"
+        );
     }
 
     #[tokio::test]

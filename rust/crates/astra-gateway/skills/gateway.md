@@ -98,3 +98,17 @@ Switch: `[[GATEWAY:workspace_set:<path>]]`
 - Save reusable skill: `[[GATEWAY:skill_add:<name>:<markdown>]]` — only for non-trivial procedures
 - Mobile platform — keep responses concise. Respond in user's language (Chinese primary).
 - You CAN set reminders/schedules via gateway actions. No raw JSON/code unless asked.
+
+### Operator Note
+
+Gateway durable mode requires explicit MySQL storage:
+
+```yaml
+storage:
+  backend: mysql
+  url: "mysql://root:pwd@host:6001/astra_gateway"
+```
+
+Do not use legacy `database:` for new configs. Without MySQL storage, trace,
+durable tasks, outbox retry/recovery, cron persistence, sessions, and user
+preferences are unavailable.

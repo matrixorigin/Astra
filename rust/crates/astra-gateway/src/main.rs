@@ -57,13 +57,14 @@ async fn main() {
                 let db_saved = if cli.config.exists() {
                     if let Ok(cfg) = astra_gateway::config::GatewayConfig::load(&cli.config) {
                         let storage_config = cfg.resolve_storage();
-                        match astra_gateway::store::open_store(&storage_config).await {
-                            Ok(Some(store)) => {
+                        match astra_gateway::store::open_store_bundle(&storage_config).await {
+                            Ok(Some(bundle)) => {
                                 let creds = serde_json::json!({
                                     "token": token,
                                     "account_id": account_id,
                                 });
-                                match store
+                                match bundle
+                                    .store
                                     .save_credential("weixin", "default", "bot_token", &creds, None)
                                     .await
                                 {

@@ -1229,9 +1229,8 @@ impl TraceRepository for MysqlTraceRepository {
             sqlx::query_as(
                 "SELECT outbox_id, request_id, trace_id, platform, chat_id, reply_token, body, status, error_message, retry_count
                  FROM gw_trace_outbox
-                 WHERE platform = ? AND status IN ('pending', 'failed')
-                   AND retry_count < ?
-                   AND created_at > DATE_SUB(NOW(6), INTERVAL 1 HOUR)
+                  WHERE platform = ? AND status IN ('pending', 'failed')
+                    AND retry_count < ?
                  ORDER BY created_at ASC
                  LIMIT ?",
             )
@@ -1244,9 +1243,8 @@ impl TraceRepository for MysqlTraceRepository {
             sqlx::query_as(
                 "SELECT outbox_id, request_id, trace_id, platform, chat_id, reply_token, body, status, error_message, retry_count
                  FROM gw_trace_outbox
-                 WHERE status IN ('pending', 'failed')
-                   AND retry_count < ?
-                   AND created_at > DATE_SUB(NOW(6), INTERVAL 1 HOUR)
+                  WHERE status IN ('pending', 'failed')
+                    AND retry_count < ?
                  ORDER BY created_at ASC
                  LIMIT ?",
             )
@@ -1293,13 +1291,13 @@ impl TraceRepository for MysqlTraceRepository {
         status: OutboxStatus,
         error_message: Option<&str>,
     ) -> TraceResult<()> {
-        let current: Option<(String,)> =
-            sqlx::query_as("SELECT status FROM gw_trace_outbox WHERE outbox_id = ?")
+        let current: Option<(String, i32)> =
+            sqlx::query_as("SELECT status, retry_count FROM gw_trace_outbox WHERE outbox_id = ?")
                 .bind(outbox_id.as_str())
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| format!("load outbox status failed: {e}"))?;
-        let Some((current,)) = current else {
+        let Some((current, retry_count)) = current else {
             return Err(format!("outbox {outbox_id} not found"));
         };
         let current = OutboxStatus::parse(&current).unwrap_or(OutboxStatus::Failed);
@@ -1328,15 +1326,21 @@ impl TraceRepository for MysqlTraceRepository {
                 ));
             }
         } else if status == OutboxStatus::Failed {
+            if retry_count >= OUTBOX_MAX_RETRIES as i32 {
+                return Err(format!(
+                    "outbox {outbox_id} retry limit reached ({OUTBOX_MAX_RETRIES})"
+                ));
+            }
             // Increment retry_count on failure; auto-expire if exhausted
             let result = sqlx::query(
                 "UPDATE gw_trace_outbox SET status = ?, error_message = ?, retry_count = retry_count + 1
-                 WHERE outbox_id = ? AND status = ?",
+                 WHERE outbox_id = ? AND status = ? AND retry_count < ?",
             )
             .bind(status.as_str())
             .bind(error_message)
             .bind(outbox_id.as_str())
             .bind(current.as_str())
+            .bind(OUTBOX_MAX_RETRIES as i32)
             .execute(&self.pool)
             .await
             .map_err(|e| format!("update outbox status failed: {e}"))?;
@@ -1743,6 +1747,11 @@ impl TraceRepository for InMemoryTraceRepository {
                 "invalid outbox transition {} -> {}",
                 outbox.status.as_str(),
                 status.as_str()
+            ));
+        }
+        if status == OutboxStatus::Failed && outbox.retry_count >= OUTBOX_MAX_RETRIES {
+            return Err(format!(
+                "outbox {outbox_id} retry limit reached ({OUTBOX_MAX_RETRIES})"
             ));
         }
         outbox.status = status;
@@ -2453,6 +2462,44 @@ mod tests {
         assert!(
             !has_outbox_retrying,
             "exhausted outbox should not show as retrying in active requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_outbox_rejects_additional_failures() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wecom", "chat-1", "astra");
+        let req = GatewayRequest::new(conv, "msg-1", "u1", "hello");
+        let writer = TraceWriter::begin(&repo, req).await.unwrap();
+        let outbox_id = writer
+            .enqueue_outbox("wecom", "chat-1", None, "retry body")
+            .await
+            .unwrap();
+
+        for i in 0..OUTBOX_MAX_RETRIES {
+            writer
+                .mark_outbox_failed(&outbox_id, &format!("error attempt {i}"), 0)
+                .await
+                .unwrap();
+        }
+
+        let err = writer
+            .mark_outbox_failed(&outbox_id, "one too many", 0)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("retry limit"),
+            "unexpected exhausted outbox error: {err}"
+        );
+    }
+
+    #[test]
+    fn mysql_retryable_outbox_query_has_no_one_hour_expiry() {
+        let source = include_str!("trace_model.rs");
+        let needle = concat!("INTERVAL ", "1 HOUR");
+        assert!(
+            !source.contains(needle),
+            "retryable outbox must not silently expire valid retries by age"
         );
     }
 

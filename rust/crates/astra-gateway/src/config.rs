@@ -6,7 +6,8 @@ pub struct GatewayConfig {
     /// New multi-backend storage configuration.
     #[serde(default)]
     pub storage: crate::store::StorageConfig,
-    /// Legacy database config — kept for backward compatibility with existing YAML files.
+    /// Legacy database config. Parsed only to produce clear diagnostics; storage
+    /// must be configured through `storage:`.
     #[serde(default)]
     pub database: Option<DatabaseConfig>,
     /// Default CLI profile (used when no /cli switch active).
@@ -185,29 +186,11 @@ impl GatewayConfig {
         Ok(config)
     }
 
-    /// Merge `storage` and legacy `database` fields into a single [`StorageConfig`].
+    /// Resolve the configured storage backend.
     ///
-    /// Priority: if `storage` is explicitly set (not default-derived) or the
-    /// `GATEWAY_DATABASE_URL` env var is present, `storage` wins.
-    /// Otherwise, a legacy `database.url` value is promoted to
-    /// [`StorageConfig::Mysql`] for backward compat.
+    /// `database:` is intentionally ignored. Gateway durability needs explicit
+    /// `storage:` configuration or a non-empty `GATEWAY_DATABASE_URL`.
     pub fn resolve_storage(&self) -> crate::store::StorageConfig {
-        // If `storage` was explicitly set to a non-default variant *or* the env
-        // var is present, prefer it as-is.
-        if !matches!(self.storage, crate::store::StorageConfig::Sqlite { .. })
-            || std::env::var("GATEWAY_DATABASE_URL").is_ok()
-        {
-            return self.storage.clone();
-        }
-        // Legacy path: `database:` section in YAML.
-        if let Some(ref db) = self.database
-            && !db.url.is_empty()
-        {
-            return crate::store::StorageConfig::Mysql {
-                url: db.url.clone(),
-            };
-        }
-        // Fall through to the default (SQLite).
         self.storage.clone()
     }
 }
@@ -331,7 +314,7 @@ platforms:
     // ── resolve_storage tests ────────────────────────────────────────────
 
     #[test]
-    fn resolve_storage_legacy_database_url() {
+    fn resolve_storage_ignores_legacy_database_url() {
         let yaml = r#"
 astra:
   base_url: "http://localhost:8080"
@@ -341,10 +324,14 @@ database:
 "#;
         let cfg: GatewayConfig = serde_yaml_ng::from_str(yaml).unwrap();
         let resolved = cfg.resolve_storage();
-        assert!(
-            matches!(resolved, crate::store::StorageConfig::Mysql { .. }),
-            "expected Mysql, got {resolved:?}"
-        );
+        match resolved {
+            crate::store::StorageConfig::None => {}
+            crate::store::StorageConfig::Mysql { url } => assert_ne!(
+                url, "mysql://root:111@localhost/gw",
+                "legacy database must not silently configure storage"
+            ),
+            other => panic!("unexpected storage from legacy database: {other:?}"),
+        }
     }
 
     #[test]
@@ -373,7 +360,7 @@ database:
     }
 
     #[test]
-    fn resolve_storage_no_storage_no_database_defaults_to_sqlite() {
+    fn resolve_storage_no_storage_no_database_defaults_to_none() {
         let yaml = r#"
 astra:
   base_url: "http://localhost:8080"
@@ -381,14 +368,12 @@ astra:
 "#;
         let cfg: GatewayConfig = serde_yaml_ng::from_str(yaml).unwrap();
         let resolved = cfg.resolve_storage();
-        // Depends on whether GATEWAY_DATABASE_URL env var is set
         assert!(
             matches!(
                 resolved,
-                crate::store::StorageConfig::Sqlite { .. }
-                    | crate::store::StorageConfig::Mysql { .. }
+                crate::store::StorageConfig::None | crate::store::StorageConfig::Mysql { .. }
             ),
-            "expected Sqlite or Mysql, got {resolved:?}"
+            "expected None or env-derived Mysql, got {resolved:?}"
         );
     }
 

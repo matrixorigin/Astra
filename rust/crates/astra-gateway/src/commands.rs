@@ -23,6 +23,7 @@ pub struct CommandContext<'a> {
     pub trace_repo: Option<&'a dyn TraceRepository>,
     pub project_dirs: &'a [String],
     pub cli_availability: &'a [(String, crate::cli_bridge::CliAvailability)],
+    pub auth_status: Option<String>,
 }
 
 /// Helper: get store or return error message for storage-dependent commands.
@@ -30,7 +31,7 @@ macro_rules! require_store {
     ($ctx:expr) => {
         match $ctx.store {
             Some(s) => s,
-            None => return Some("⚠️ 此命令需要存储后端。当前以无持久化模式运行。".into()),
+            None => return Some("⚠️ 此命令需要存储。当前以无持久化模式运行。".into()),
         }
     };
 }
@@ -39,7 +40,7 @@ macro_rules! require_trace_repo {
     ($ctx:expr) => {
         match $ctx.trace_repo {
             Some(repo) => repo,
-            None => return Some("⚠️ 此命令需要数据库。当前以无数据库模式运行。".into()),
+            None => return Some("⚠️ 此命令需要 MySQL 存储。当前没有启用 trace/durable 能力。".into()),
         }
     };
 }
@@ -111,6 +112,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     if ctx.store.is_some() { "on" } else { "off" }
                 ),
             ];
+            if let Some(auth_status) = ctx.auth_status.as_deref() {
+                lines.push(format!("- 认证: {auth_status}"));
+            }
 
             if let Some(repo) = ctx.trace_repo {
                 let conversation = ConversationKey::new(ctx.platform, ctx.chat_id, cli_name);
@@ -513,7 +517,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
         "/task" => {
             let store = match ctx.durable_store {
                 Some(s) => s,
-                None => return Some("⚠️ 持久任务需要数据库支持".into()),
+                None => return Some("⚠️ 持久任务需要 MySQL 存储支持".into()),
             };
             let owner_id = format!("{}:{}", ctx.platform, ctx.chat_id);
 
@@ -1149,7 +1153,7 @@ fn parse_cron_add(input: &str) -> Option<(String, String)> {
     {
         let expr = after_quote[..end].to_string();
         let msg = after_quote[end + 1..].trim().to_string();
-        if !expr.is_empty() && !msg.is_empty() {
+        if !expr.is_empty() && !msg.is_empty() && store::is_valid_cron_expr(&expr) {
             return Some((expr, msg));
         }
     }
@@ -1158,7 +1162,9 @@ fn parse_cron_add(input: &str) -> Option<(String, String)> {
     if parts.len() >= 6 {
         let expr = parts[..5].join(" ");
         let msg = parts[5].to_string();
-        return Some((expr, msg));
+        if !msg.is_empty() && store::is_valid_cron_expr(&expr) {
+            return Some((expr, msg));
+        }
     }
     None
 }
@@ -1209,9 +1215,11 @@ async fn resolve_active_request(
         {
             return Some(rows[idx - 1].clone());
         }
-        // Pure number that's out of range — don't fall through to ID prefix match
-        // (short numbers like "3" would spuriously match UUID prefixes)
-        return None;
+        // Short pure numbers are task indices only; longer numeric strings may
+        // be valid UUID prefixes.
+        if selector.len() < 4 {
+            return None;
+        }
     }
 
     // Try trace ID or request ID prefix match (only for non-numeric selectors)
@@ -1859,6 +1867,7 @@ mod tests {
                     trace_repo: None,
                     project_dirs: &config.project_dirs,
                     cli_availability: &[],
+                    auth_status: None,
                 };
                 let result = handle_command(&ctx, $input).await;
                 let check: fn(Option<String>) = $check;
@@ -1908,53 +1917,38 @@ mod tests {
     cmd_test!(cmd_new_requires_db, "/new", |r| {
         {
             let msg = r.unwrap();
-            assert!(
-                msg.contains("存储后端") || msg.contains("数据库"),
-                "expected storage error, got: {msg}"
-            );
+            assert!(msg.contains("存储"), "expected storage error, got: {msg}");
         }
     });
     cmd_test!(cmd_session_requires_db, "/session list", |r| {
         {
             let msg = r.unwrap();
-            assert!(
-                msg.contains("存储后端") || msg.contains("数据库"),
-                "expected storage error, got: {msg}"
-            );
+            assert!(msg.contains("存储"), "expected storage error, got: {msg}");
         }
     });
     cmd_test!(cmd_cron_requires_db, "/cron list", |r| {
         {
             let msg = r.unwrap();
-            assert!(
-                msg.contains("存储后端") || msg.contains("数据库"),
-                "expected storage error, got: {msg}"
-            );
+            assert!(msg.contains("存储"), "expected storage error, got: {msg}");
         }
     });
     cmd_test!(cmd_usage_requires_db, "/usage", |r| {
         {
             let msg = r.unwrap();
-            assert!(
-                msg.contains("存储后端") || msg.contains("数据库"),
-                "expected storage error, got: {msg}"
-            );
+            assert!(msg.contains("存储"), "expected storage error, got: {msg}");
         }
     });
     cmd_test!(cmd_workspace_requires_db, "/workspace", |r| {
         {
             let msg = r.unwrap();
-            assert!(
-                msg.contains("存储后端") || msg.contains("数据库"),
-                "expected storage error, got: {msg}"
-            );
+            assert!(msg.contains("存储"), "expected storage error, got: {msg}");
         }
     });
     cmd_test!(cmd_running_requires_trace_repo, "/running", |r| {
         {
             let msg = r.unwrap();
             assert!(
-                msg.contains("存储后端") || msg.contains("数据库"),
+                msg.contains("存储") || msg.contains("MySQL"),
                 "expected storage error, got: {msg}"
             );
         }
@@ -1965,6 +1959,30 @@ mod tests {
     cmd_test!(cmd_status_works_without_db, "/status", |r| {
         assert!(r.unwrap().contains("astra"));
     });
+
+    #[tokio::test]
+    async fn cmd_status_includes_auth_circuit_status_when_available() {
+        let config = test_config();
+        let cli = crate::cli_bridge::CliProfile::default();
+        let astra = astra_thin_client::ThinClient::new("http://localhost:8080", None).unwrap();
+        let ctx = CommandContext {
+            astra: &astra,
+            config: &config,
+            store: None,
+            platform: "test",
+            chat_id: "chat_1",
+            user_id: "user_1",
+            resolved_cli: &cli,
+            durable_store: None,
+            trace_repo: None,
+            project_dirs: &config.project_dirs,
+            cli_availability: &[],
+            auth_status: Some("⚠️ 暂停 (剩余 3m 42s)".to_string()),
+        };
+
+        let result = handle_command(&ctx, "/status").await.unwrap();
+        assert!(result.contains("- 认证: ⚠️ 暂停 (剩余 3m 42s)"), "{result}");
+    }
     cmd_test!(
         cmd_cron_add_malformed_gives_error,
         "/cron add badformat",
@@ -1977,7 +1995,7 @@ mod tests {
         {
             let msg = r.unwrap();
             assert!(
-                msg.contains("存储后端") || msg.contains("数据库"),
+                msg.contains("存储") || msg.contains("MySQL"),
                 "expected storage error, got: {msg}"
             );
         }
@@ -1986,7 +2004,7 @@ mod tests {
         {
             let msg = r.unwrap();
             assert!(
-                msg.contains("存储后端") || msg.contains("数据库"),
+                msg.contains("存储") || msg.contains("MySQL"),
                 "expected storage error, got: {msg}"
             );
         }
@@ -1995,7 +2013,7 @@ mod tests {
         {
             let msg = r.unwrap();
             assert!(
-                msg.contains("存储后端") || msg.contains("数据库"),
+                msg.contains("存储") || msg.contains("MySQL"),
                 "expected storage error, got: {msg}"
             );
         }
@@ -2004,7 +2022,7 @@ mod tests {
         {
             let msg = r.unwrap();
             assert!(
-                msg.contains("存储后端") || msg.contains("数据库"),
+                msg.contains("存储") || msg.contains("MySQL"),
                 "expected storage error, got: {msg}"
             );
         }
@@ -2013,7 +2031,7 @@ mod tests {
         {
             let msg = r.unwrap();
             assert!(
-                msg.contains("存储后端") || msg.contains("数据库"),
+                msg.contains("存储") || msg.contains("MySQL"),
                 "expected storage error, got: {msg}"
             );
         }
@@ -2022,7 +2040,7 @@ mod tests {
         {
             let msg = r.unwrap();
             assert!(
-                msg.contains("数据库") || msg.contains("没有运行中"),
+                msg.contains("存储") || msg.contains("没有运行中"),
                 "expected db error or no running message, got: {msg}"
             );
         }
@@ -2056,7 +2074,7 @@ mod tests {
     cmd_test!(cmd_retry_requires_trace_repo, "/retry", |r| {
         {
             let msg = r.unwrap();
-            assert!(msg.contains("数据库"), "expected db error, got: {msg}");
+            assert!(msg.contains("存储"), "expected storage error, got: {msg}");
         }
     });
     cmd_test!(
@@ -2065,7 +2083,7 @@ mod tests {
         |r| {
             {
                 let msg = r.unwrap();
-                assert!(msg.contains("数据库"), "expected db error, got: {msg}");
+                assert!(msg.contains("存储"), "expected storage error, got: {msg}");
             }
         }
     );
@@ -2080,7 +2098,7 @@ mod tests {
 
     cmd_test!(cmd_ws_no_arg_requires_store, "/ws", |r| {
         let s = r.unwrap();
-        assert!(s.contains("存储后端"), "expected storage error, got: {s}");
+        assert!(s.contains("存储"), "expected storage error, got: {s}");
     });
 
     cmd_test!(
@@ -2090,7 +2108,7 @@ mod tests {
             let s = r.unwrap();
             // Without store, /ws <arg> requires store first
             assert!(
-                s.contains("存储后端") || s.contains("不存在"),
+                s.contains("存储") || s.contains("不存在"),
                 "expected storage error or not-found, got: {s}"
             );
         }
@@ -2336,5 +2354,11 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[test]
+    fn parse_cron_add_rejects_invalid_cron_expression() {
+        assert!(parse_cron_add("99 99 99 99 99 impossible").is_none());
+        assert!(parse_cron_add("\"bad expr\" impossible").is_none());
     }
 }
