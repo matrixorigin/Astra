@@ -821,6 +821,21 @@ impl DatabaseModelService {
 
         let thinking_cap_str: Option<String> = row.try_get("thinking_capability").ok().flatten();
         let thinking_capability = ThinkingCapability::from_db(thinking_cap_str.as_deref());
+        let thinking_probe_error: Option<String> =
+            row.try_get("thinking_probe_error").ok().flatten();
+
+        // Build ThinkingProbeResult when the model has been probed (capability is known).
+        // If capability is unknown but an error exists, the probe partially failed — log it.
+        if thinking_capability.is_none() && thinking_probe_error.is_some() {
+            tracing::warn!(
+                error = ?thinking_probe_error,
+                "thinking_probe_error present but thinking_capability is NULL; probe result dropped"
+            );
+        }
+        let thinking_probe = thinking_capability.map(|cap| ThinkingProbeResult {
+            capability: cap,
+            error: thinking_probe_error,
+        });
 
         Ok(ModelRecord {
             model_id: row.try_get("model_id").map_err(internal_error)?,
@@ -850,7 +865,7 @@ impl DatabaseModelService {
             quirks: parse_json_column("quirks_json", &quirks_json, Default::default),
             connectivity: None,
             thinking_capability,
-            thinking_probe: None,
+            thinking_probe,
         })
     }
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
@@ -875,7 +890,7 @@ pub const MODEL_SELECT_COLS: &str = "\
     IFNULL(CAST(pricing AS CHAR), '{}') AS pricing_json, \
     IFNULL(CAST(tags AS CHAR), '[]') AS tags_json, \
     IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json, \
-    thinking_capability";
+    thinking_capability, thinking_probe_error";
 const MODEL_LIST_SELECT_COLS: &str = "\
     model_id, model_name, provider, description, is_active, \
     IFNULL(context_window, 128000) AS context_window, max_completion_tokens, architecture, \
@@ -2482,6 +2497,177 @@ mod tests {
         assert!(resp.max_completion_tokens.is_none());
         assert!(resp.architecture.is_none());
         assert!(resp.thinking_capability.is_none());
+    }
+
+    /// After the thinking probe UPDATE writes `thinking_capability` and
+    /// `thinking_probe_error`, GET /models/:name must surface BOTH via
+    /// `ModelResponse.thinking_probe`.  Regression: before this fix
+    /// `thinking_probe` was always `None` because `model_record_from_row`
+    /// never read `thinking_probe_error`.
+    #[test]
+    fn model_response_includes_thinking_probe_when_probed() {
+        let record = ModelRecord {
+            model_id: "m-probe".into(),
+            name: "test-model".into(),
+            provider: "openai".into(),
+            base_url: Some("https://api.openai.com".into()),
+            description: None,
+            is_active: true,
+            context_window: 128000,
+            max_completion_tokens: Some(16384),
+            input_modalities: vec!["text".into()],
+            output_modalities: vec!["text".into()],
+            supported_parameters: vec![],
+            pricing: PricingData::default(),
+            architecture: None,
+            tags: vec![],
+            quirks: QuirksData::default(),
+            connectivity: None,
+            thinking_capability: Some(ThinkingCapability::Both),
+            thinking_probe: Some(ThinkingProbeResult {
+                capability: ThinkingCapability::Both,
+                error: None,
+            }),
+        };
+        let resp = ModelResponse::from(record);
+        assert_eq!(resp.thinking_capability, Some(ThinkingCapability::Both));
+        let probe = resp
+            .thinking_probe
+            .expect("thinking_probe must be Some after probe");
+        assert_eq!(probe.capability, ThinkingCapability::Both);
+        assert!(probe.error.is_none());
+    }
+
+    /// When the probe fails, `thinking_probe_error` is preserved through
+    /// the round-trip into `ModelResponse`.
+    #[test]
+    fn model_response_includes_thinking_probe_error() {
+        let record = ModelRecord {
+            model_id: "m-err".into(),
+            name: "err-model".into(),
+            provider: "openai".into(),
+            base_url: None,
+            description: None,
+            is_active: true,
+            context_window: 4096,
+            max_completion_tokens: None,
+            input_modalities: vec!["text".into()],
+            output_modalities: vec!["text".into()],
+            supported_parameters: vec![],
+            pricing: PricingData::default(),
+            architecture: None,
+            tags: vec![],
+            quirks: QuirksData::default(),
+            connectivity: None,
+            thinking_capability: Some(ThinkingCapability::None),
+            thinking_probe: Some(ThinkingProbeResult {
+                capability: ThinkingCapability::None,
+                error: Some("connection refused".into()),
+            }),
+        };
+        let resp = ModelResponse::from(record);
+        let probe = resp
+            .thinking_probe
+            .expect("thinking_probe must be Some even on error");
+        assert_eq!(probe.capability, ThinkingCapability::None);
+        assert_eq!(probe.error.as_deref(), Some("connection refused"));
+    }
+
+    /// Unprobed model (thinking_capability = NULL) → thinking_probe is None.
+    #[test]
+    fn model_response_no_probe_when_unprobed() {
+        let record = ModelRecord {
+            model_id: "m-none".into(),
+            name: "unprobed".into(),
+            provider: "local".into(),
+            base_url: None,
+            description: None,
+            is_active: true,
+            context_window: 4096,
+            max_completion_tokens: None,
+            input_modalities: vec!["text".into()],
+            output_modalities: vec!["text".into()],
+            supported_parameters: vec![],
+            pricing: PricingData::default(),
+            architecture: None,
+            tags: vec![],
+            quirks: QuirksData::default(),
+            connectivity: None,
+            thinking_capability: None,
+            thinking_probe: None,
+        };
+        let resp = ModelResponse::from(record);
+        assert!(resp.thinking_capability.is_none());
+        assert!(resp.thinking_probe.is_none());
+    }
+
+    /// JSON serialization must omit `thinking_probe` when null (skip_serializing_if).
+    #[test]
+    fn model_response_json_omits_thinking_probe_when_none() {
+        let record = ModelRecord {
+            model_id: "m-json".into(),
+            name: "json-test".into(),
+            provider: "openai".into(),
+            base_url: None,
+            description: None,
+            is_active: true,
+            context_window: 128000,
+            max_completion_tokens: None,
+            input_modalities: vec!["text".into()],
+            output_modalities: vec!["text".into()],
+            supported_parameters: vec![],
+            pricing: PricingData::default(),
+            architecture: None,
+            tags: vec![],
+            quirks: QuirksData::default(),
+            connectivity: None,
+            thinking_capability: None,
+            thinking_probe: None,
+        };
+        let resp = ModelResponse::from(record);
+        let v = serde_json::to_value(&resp).expect("serialize");
+        assert!(
+            v.get("thinking_probe").is_none(),
+            "thinking_probe should be omitted from JSON when None"
+        );
+    }
+
+    /// JSON serialization includes `thinking_probe` when present.
+    #[test]
+    fn model_response_json_includes_thinking_probe_when_present() {
+        let record = ModelRecord {
+            model_id: "m-json2".into(),
+            name: "json-test2".into(),
+            provider: "openai".into(),
+            base_url: None,
+            description: None,
+            is_active: true,
+            context_window: 128000,
+            max_completion_tokens: None,
+            input_modalities: vec!["text".into()],
+            output_modalities: vec!["text".into()],
+            supported_parameters: vec![],
+            pricing: PricingData::default(),
+            architecture: None,
+            tags: vec![],
+            quirks: QuirksData::default(),
+            connectivity: None,
+            thinking_capability: Some(ThinkingCapability::Both),
+            thinking_probe: Some(ThinkingProbeResult {
+                capability: ThinkingCapability::Both,
+                error: None,
+            }),
+        };
+        let resp = ModelResponse::from(record);
+        let v = serde_json::to_value(&resp).expect("serialize");
+        let probe = v
+            .get("thinking_probe")
+            .expect("thinking_probe should be in JSON");
+        assert_eq!(probe.get("capability").unwrap(), "both");
+        assert!(
+            probe.get("error").is_none(),
+            "error should be omitted when None"
+        );
     }
 
     /// CLI and other clients must read `is_active` from GET /models — not `active`.

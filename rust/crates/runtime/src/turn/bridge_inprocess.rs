@@ -1011,8 +1011,6 @@ impl InProcessChatTurnBridge {
                         &fallback_chain,
                         reason,
                         |fb_name| {
-                            let mx = mx;
-                            let enc = enc;
                             async move {
                                 astra_services::resolve_active_llm_model(
                                     mx,
