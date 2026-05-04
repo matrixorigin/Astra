@@ -693,19 +693,31 @@ pub fn build_system_prompt_sections_with_style(
     output_style: Option<&OutputStyle>,
 ) -> Vec<PromptSection> {
     if tool_names.is_empty() {
-        return vec![
-            PromptSection::stable(
-                format!(
-                    "{SYSTEM_PROMPT_BASE}\n\n\
+        let mut sections = vec![PromptSection::stable(
+            format!(
+                "{SYSTEM_PROMPT_BASE}\n\n\
                  ## CRITICAL\n\
                  You have NO tools available in this turn. \
                  Do NOT generate fake data (PRs, issues, commits, file contents). \
                  If the user asks for real-time data, say: \"I don't have tools available to look that up.\""
-                ),
-                CacheScope::Global,
             ),
-            PromptSection::dynamic(profile_desc.to_string(), PromptTokenBucket::Environment),
-        ];
+            CacheScope::Global,
+        )];
+        if let Some(style) = output_style
+            && !style.prompt.is_empty()
+        {
+            sections.push(PromptSection::dynamic(
+                format!("\n{}\n", style.prompt),
+                PromptTokenBucket::UserPreferences,
+            ));
+        }
+        if !profile_desc.is_empty() {
+            sections.push(PromptSection::dynamic(
+                profile_desc.to_string(),
+                PromptTokenBucket::Environment,
+            ));
+        }
+        return sections;
     }
 
     // ── Global sections (stable across sessions) ──
@@ -815,6 +827,7 @@ const SECTION_NAMES: &[&str] = &[
     "core_rules",
     "planning",
     "coding_discipline",
+    "turn_discipline",
     "parallel_and_efficiency",
     "plan_execution",
     "output_format",
@@ -2586,17 +2599,23 @@ mod tests {
     // ── Empty-tools + empty-profile section behavior ─────────────
 
     #[test]
-    fn sections_empty_tools_empty_profile_still_has_profile_section() {
-        // Empty-tools code path always returns a profile section (even empty).
+    fn sections_empty_tools_empty_profile_returns_global_only() {
         let sections = build_system_prompt_sections(&[], "", 0.5, None);
         assert_eq!(
             sections.len(),
-            2,
-            "empty tools path always returns 2 sections"
+            1,
+            "empty tools + empty profile → only the global section"
         );
         assert_eq!(sections[0].scope, CacheScope::Global);
+    }
+
+    #[test]
+    fn sections_empty_tools_with_profile_returns_two_sections() {
+        let sections = build_system_prompt_sections(&[], "profile text", 0.5, None);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].scope, CacheScope::Global);
         assert_eq!(sections[1].scope, CacheScope::None);
-        assert!(sections[1].text.is_empty());
+        assert_eq!(sections[1].text, "profile text");
     }
 
     // ── Output style injection ───────────────────────────────────────

@@ -139,6 +139,7 @@ fn shipped_cases_reference_only_known_criterion_variants() {
         "tool_sequence",
         "turn_rounds_between",
         "cache_rate_above",
+        "prompt_cache_tokens",
     ];
     // Concatenate every shipped YAML body and grep for `type:` tag
     // occurrences at column-1-after-indent. Cheap + doesn't require

@@ -29,7 +29,9 @@ use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
 use crate::prompts;
+#[cfg(test)]
 use astra_text_utils::output_style::current_output_style;
 use astra_turn_core::bridge_rate_limit_cooldown::{
     RateLimitAction, is_overload_status, is_rate_limit_status, parse_retry_after_ms,
@@ -191,6 +193,7 @@ fn is_valid_tool_name(name: &str) -> bool {
 
 /// Build a system prompt for the given tool+profile context.
 /// The underlying section builders are cached in bridge_inprocess::section_cache.
+#[cfg(test)]
 pub(crate) fn cached_system_prompt(
     tool_names: &[&str],
     profile_desc: &str,
@@ -1239,35 +1242,49 @@ pub(crate) fn build_provider_request_body(
         }
         LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::OpenAiCompatible => {
             let is_anthropic = provider_uses_anthropic_messages(provider);
+            if is_anthropic {
+                let (system, anthropic_messages) = build_anthropic_system_and_messages(messages);
+                let mut body = json!({
+                    "model": model_name,
+                    "messages": anthropic_messages,
+                    "stream": streaming,
+                });
+                if !system.is_empty() {
+                    body["system"] = Value::Array(system);
+                }
+                if let Some(max_out) = max_output_tokens {
+                    body["max_tokens"] = json!(max_out);
+                }
+                if let Some(temp) = temperature {
+                    body["temperature"] = json!(temp);
+                }
+                let anthropic_tools = build_anthropic_tools(tools);
+                if !anthropic_tools.is_empty() {
+                    body["tools"] = Value::Array(anthropic_tools);
+                    body["tool_choice"] = json!({"type": "auto"});
+                }
+                thinking.apply_anthropic(&mut body);
+                return body;
+            }
             let mut body = json!({
                 "model": model_name,
                 "messages": messages,
                 "stream": streaming,
             });
-            if streaming && !is_anthropic {
+            if streaming {
                 body["stream_options"] = json!({"include_usage": true});
             }
             if let Some(max_out) = max_output_tokens {
-                if is_anthropic {
-                    body["max_tokens"] = json!(max_out);
-                } else {
-                    body["max_completion_tokens"] = json!(max_out);
-                }
+                body["max_completion_tokens"] = json!(max_out);
             }
             if let Some(temp) = temperature {
                 body["temperature"] = json!(temp);
             }
             if !tools.is_empty() {
                 body["tools"] = Value::Array(tools.to_vec());
-                if is_anthropic {
-                    body["tool_choice"] = json!({"type": "auto"});
-                } else {
-                    body["tool_choice"] = Value::String("auto".to_string());
-                }
+                body["tool_choice"] = Value::String("auto".to_string());
             }
-            if is_anthropic {
-                thinking.apply_anthropic(&mut body);
-            } else if provider_uses_dashscope_thinking(provider) {
+            if provider_uses_dashscope_thinking(provider) {
                 // DashScope/Qwen uses a binary `enable_thinking` flag; there is no
                 // equivalent of `reasoning_effort`.
                 match thinking {
@@ -1443,6 +1460,187 @@ pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
     }
 
     out
+}
+
+fn anthropic_text_blocks_from_content(content: Option<&Value>) -> Vec<Value> {
+    match content {
+        Some(Value::String(text)) if !text.is_empty() => {
+            vec![json!({"type": "text", "text": text})]
+        }
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                if let Some(text) = part.as_str() {
+                    return Some(json!({"type": "text", "text": text}));
+                }
+                let obj = part.as_object()?;
+                if obj.get("type").and_then(Value::as_str) == Some("text") {
+                    return Some(Value::Object(obj.clone()));
+                }
+                None
+            })
+            .collect(),
+        Some(Value::Object(obj)) if obj.get("type").and_then(Value::as_str) == Some("text") => {
+            vec![Value::Object(obj.clone())]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn openai_tool_call_to_anthropic_block(tool_call: &Value) -> Option<Value> {
+    let id = tool_call.get("id").and_then(Value::as_str)?;
+    let function = tool_call.get("function")?.as_object()?;
+    let name = function.get("name").and_then(Value::as_str)?;
+    let input = function
+        .get("arguments")
+        .and_then(Value::as_str)
+        .map(json_string_to_value_or_string)
+        .unwrap_or_else(|| json!({}));
+    Some(json!({
+        "type": "tool_use",
+        "id": id,
+        "name": name,
+        "input": input,
+    }))
+}
+
+fn carry_cache_annotations(src: &Value, dst: &mut Value) {
+    if let Some(cc) = src.get("cache_control") {
+        dst["cache_control"] = cc.clone();
+    }
+    if let Some(cr) = src.get("cache_reference") {
+        dst["cache_reference"] = cr.clone();
+    }
+}
+
+fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
+    let role = msg.get("role").and_then(Value::as_str)?;
+    match role {
+        "user" => {
+            let mut content = anthropic_content_blocks_from_openai_user(msg);
+            if content.is_empty() {
+                let blocks = anthropic_text_blocks_from_content(msg.get("content"));
+                content = if blocks.len() == 1
+                    && blocks[0].get("cache_control").is_none()
+                    && blocks[0].get("type").and_then(Value::as_str) == Some("text")
+                {
+                    vec![blocks[0]["text"].clone()]
+                } else {
+                    blocks
+                };
+            }
+            let mut out = if content.len() == 1 && content[0].is_string() {
+                json!({"role": "user", "content": content[0].clone()})
+            } else {
+                json!({"role": "user", "content": content})
+            };
+            carry_cache_annotations(msg, &mut out);
+            Some(out)
+        }
+        "assistant" => {
+            let mut blocks = anthropic_text_blocks_from_content(msg.get("content"));
+            if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
+                blocks.extend(
+                    tool_calls
+                        .iter()
+                        .filter_map(openai_tool_call_to_anthropic_block),
+                );
+            }
+            let mut out = json!({"role": "assistant", "content": blocks});
+            carry_cache_annotations(msg, &mut out);
+            Some(out)
+        }
+        "tool" => {
+            let tool_use_id = msg.get("tool_call_id").and_then(Value::as_str)?;
+            let content = msg
+                .get("content")
+                .and_then(Value::as_str)
+                .map(|text| Value::String(text.to_string()))
+                .unwrap_or_else(|| {
+                    msg.get("content")
+                        .cloned()
+                        .unwrap_or(Value::String(String::new()))
+                });
+            let mut tool_result_block = json!({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": content,
+            });
+            if let Some(cr) = msg.get("cache_reference") {
+                tool_result_block["cache_reference"] = cr.clone();
+            }
+            let mut out = json!({
+                "role": "user",
+                "content": [tool_result_block]
+            });
+            carry_cache_annotations(msg, &mut out);
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+fn anthropic_content_blocks_from_openai_user(msg: &Value) -> Vec<Value> {
+    let Some(content) = msg.get("content") else {
+        return Vec::new();
+    };
+    let arr = match content {
+        Value::Array(arr) => arr,
+        _ => return Vec::new(),
+    };
+    let has_anthropic_types = arr.iter().any(|block| {
+        let ty = block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        matches!(ty, "tool_result" | "cache_edits" | "image" | "document")
+    });
+    if !has_anthropic_types {
+        return Vec::new();
+    }
+    arr.clone()
+}
+
+fn build_anthropic_system_and_messages(messages: &[Value]) -> (Vec<Value>, Vec<Value>) {
+    let mut system = Vec::new();
+    let mut out_messages = Vec::new();
+    for msg in messages {
+        if msg.get("role").and_then(Value::as_str) == Some("system") {
+            system.extend(anthropic_text_blocks_from_content(msg.get("content")));
+        } else if let Some(converted) = anthropic_message_from_openai(msg) {
+            out_messages.push(converted);
+        }
+    }
+    (system, out_messages)
+}
+
+fn build_anthropic_tools(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .filter_map(|tool| {
+            if tool.get("name").is_some() && tool.get("input_schema").is_some() {
+                return Some(tool.clone());
+            }
+            let function = tool.get("function")?.as_object()?;
+            let name = function.get("name")?.clone();
+            let mut out = Map::new();
+            out.insert("name".to_string(), name);
+            if let Some(description) = function.get("description").cloned() {
+                out.insert("description".to_string(), description);
+            }
+            out.insert(
+                "input_schema".to_string(),
+                function
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+            );
+            if let Some(cache_control) = tool.get("cache_control").cloned() {
+                out.insert("cache_control".to_string(), cache_control);
+            }
+            Some(Value::Object(out))
+        })
+        .collect()
 }
 
 /// Split a streaming content chunk into (text, is_reasoning) segments,
@@ -1802,16 +2000,28 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
                 }
             }
             let byte_stream = response.bytes_stream();
-            match collect_llm_stream(
-                byte_stream,
-                model_name,
-                started,
-                cancel,
-                idle_pre,
-                idle_post,
-            )
-            .await
-            {
+            let stream_result = if provider_uses_anthropic_messages(provider) {
+                collect_anthropic_llm_stream(
+                    byte_stream,
+                    model_name,
+                    started,
+                    cancel,
+                    idle_pre,
+                    idle_post,
+                )
+                .await
+            } else {
+                collect_llm_stream(
+                    byte_stream,
+                    model_name,
+                    started,
+                    cancel,
+                    idle_pre,
+                    idle_post,
+                )
+                .await
+            };
+            match stream_result {
                 Ok(result) => return Ok(result),
                 Err(StreamCollectError::Cancelled { partial }) => {
                     return Err(attach_partial_details(
@@ -2357,6 +2567,279 @@ async fn collect_llm_stream(
     })
 }
 
+async fn collect_anthropic_llm_stream(
+    stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
+    model_name: &str,
+    started: Instant,
+    cancel: LlmCancel<'_>,
+    idle_pre: std::time::Duration,
+    idle_post: std::time::Duration,
+) -> Result<LlmCallResult, StreamCollectError> {
+    let mut full_text = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls_map: HashMap<usize, Map<String, Value>> = HashMap::new();
+    let mut usage_tokens = crate::turn::token_usage::TokenUsage::default();
+    let mut finish_reason: Option<String> = None;
+    let mut accumulated_bytes: usize = 0;
+    let mut made_progress = false;
+    let partial_result = |full_text: &String,
+                          reasoning: &String,
+                          tool_calls_map: &HashMap<usize, Map<String, Value>>,
+                          usage_tokens: &crate::turn::token_usage::TokenUsage,
+                          finish_reason: &Option<String>| {
+        let mut sorted_tcs: Vec<_> = tool_calls_map.iter().collect();
+        sorted_tcs.sort_by_key(|(idx, _)| **idx);
+        let tool_calls = sorted_tcs
+            .into_iter()
+            .map(|(_, value)| Value::Object(value.clone()))
+            .collect();
+        LlmCallResult {
+            full_text: full_text.clone(),
+            reasoning: reasoning.clone(),
+            reasoning_signature: String::new(),
+            tool_calls,
+            usage: usage_tokens.to_json_map(),
+            model_used: model_name.to_string(),
+            duration_ms: started.elapsed().as_millis() as u64,
+            finish_reason: finish_reason.clone(),
+        }
+    };
+
+    let sse = parse_openai_sse_json_stream(stream);
+    tokio::pin!(sse);
+    loop {
+        let idle = if made_progress { idle_post } else { idle_pre };
+        let item = tokio::select! {
+            biased;
+            _ = wait_llm_cancel(cancel) => return Err(StreamCollectError::Cancelled {
+                partial: partial_result(
+                    &full_text,
+                    &reasoning,
+                    &tool_calls_map,
+                    &usage_tokens,
+                    &finish_reason,
+                ),
+            }),
+            r = tokio::time::timeout(idle, sse.next()) => match r {
+                Ok(v) => v,
+                Err(_elapsed) => {
+                    return Err(StreamCollectError::IdleTimeout {
+                        elapsed_ms: idle.as_millis() as u64,
+                        made_progress,
+                        partial: partial_result(
+                            &full_text,
+                            &reasoning,
+                            &tool_calls_map,
+                            &usage_tokens,
+                            &finish_reason,
+                        ),
+                    });
+                }
+            },
+        };
+        let Some(item) = item else { break };
+        let event = match item {
+            Ok(v) => v,
+            Err(error) => {
+                return Err(StreamCollectError::Transport {
+                    error,
+                    partial: partial_result(
+                        &full_text,
+                        &reasoning,
+                        &tool_calls_map,
+                        &usage_tokens,
+                        &finish_reason,
+                    ),
+                });
+            }
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("message_start") => {
+                if let Some(u) = event
+                    .get("message")
+                    .and_then(|m| m.get("usage"))
+                    .and_then(Value::as_object)
+                    && let Some(extracted) = crate::turn::token_usage::extract_usage(
+                        crate::turn::token_usage::UsageDialect::AnthropicMessages,
+                        u,
+                    )
+                {
+                    usage_tokens.input_tokens = extracted.input_tokens;
+                    usage_tokens.cached_input_tokens = extracted.cached_input_tokens;
+                    usage_tokens.cache_creation_tokens = extracted.cache_creation_tokens;
+                    usage_tokens.output_tokens =
+                        usage_tokens.output_tokens.max(extracted.output_tokens);
+                    made_progress = true;
+                }
+            }
+            Some("content_block_start") => {
+                if let Some(block) = event.get("content_block").and_then(Value::as_object)
+                    && block.get("type").and_then(Value::as_str) == Some("tool_use")
+                {
+                    let index = event.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    if tool_calls_map.len() >= MAX_STREAM_TOOL_CALLS
+                        && !tool_calls_map.contains_key(&index)
+                    {
+                        astra_core::agent_warn!(
+                            "llm",
+                            "stream tool_calls exceeded {MAX_STREAM_TOOL_CALLS} — ignoring extra"
+                        );
+                        continue;
+                    }
+                    let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
+                    let name = block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("_unknown");
+                    tool_calls_map.insert(
+                        index,
+                        Map::from_iter([
+                            ("id".to_string(), Value::String(id.to_string())),
+                            ("type".to_string(), Value::String("function".to_string())),
+                            (
+                                "function".to_string(),
+                                json!({"name": name, "arguments": ""}),
+                            ),
+                        ]),
+                    );
+                    made_progress = true;
+                }
+            }
+            Some("content_block_delta") => {
+                let Some(delta) = event.get("delta").and_then(Value::as_object) else {
+                    continue;
+                };
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                            accumulated_bytes += text.len();
+                            if accumulated_bytes > MAX_STREAM_ACCUMULATION_BYTES {
+                                return Err(StreamCollectError::Transport {
+                                    error: format!(
+                                        "LLM stream exceeded {MAX_STREAM_ACCUMULATION_BYTES} bytes — aborting"
+                                    ),
+                                    partial: partial_result(
+                                        &full_text,
+                                        &reasoning,
+                                        &tool_calls_map,
+                                        &usage_tokens,
+                                        &finish_reason,
+                                    ),
+                                });
+                            }
+                            full_text.push_str(text);
+                            made_progress = true;
+                        }
+                    }
+                    Some("thinking_delta") => {
+                        if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
+                            accumulated_bytes += text.len();
+                            if accumulated_bytes > MAX_STREAM_ACCUMULATION_BYTES {
+                                return Err(StreamCollectError::Transport {
+                                    error: format!(
+                                        "LLM stream exceeded {MAX_STREAM_ACCUMULATION_BYTES} bytes — aborting"
+                                    ),
+                                    partial: partial_result(
+                                        &full_text,
+                                        &reasoning,
+                                        &tool_calls_map,
+                                        &usage_tokens,
+                                        &finish_reason,
+                                    ),
+                                });
+                            }
+                            reasoning.push_str(text);
+                            made_progress = true;
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        let index =
+                            event.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                        let args = delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        accumulated_bytes += args.len();
+                        if accumulated_bytes > MAX_STREAM_ACCUMULATION_BYTES {
+                            return Err(StreamCollectError::Transport {
+                                error: format!(
+                                    "stream tool-call arguments exceeded {MAX_STREAM_ACCUMULATION_BYTES} byte limit"
+                                ),
+                                partial: partial_result(
+                                    &full_text,
+                                    &reasoning,
+                                    &tool_calls_map,
+                                    &usage_tokens,
+                                    &finish_reason,
+                                ),
+                            });
+                        }
+                        if let Some(entry) = tool_calls_map.get_mut(&index)
+                            && let Some(function) =
+                                entry.get_mut("function").and_then(Value::as_object_mut)
+                            && let Some(Value::String(existing)) = function.get_mut("arguments")
+                        {
+                            existing.push_str(args);
+                            made_progress = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("message_delta") => {
+                if let Some(stop_reason) = event
+                    .get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .and_then(Value::as_str)
+                {
+                    finish_reason = Some(stop_reason.to_string());
+                    made_progress = true;
+                }
+                if let Some(u) = event.get("usage").and_then(Value::as_object)
+                    && let Some(extracted) = crate::turn::token_usage::extract_usage(
+                        crate::turn::token_usage::UsageDialect::AnthropicMessages,
+                        u,
+                    )
+                {
+                    usage_tokens.output_tokens = extracted.output_tokens;
+                    made_progress = true;
+                }
+            }
+            Some("message_stop") => break,
+            Some("error") => {
+                return Err(StreamCollectError::Transport {
+                    error: event.to_string(),
+                    partial: partial_result(
+                        &full_text,
+                        &reasoning,
+                        &tool_calls_map,
+                        &usage_tokens,
+                        &finish_reason,
+                    ),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let mut sorted_tcs: Vec<_> = tool_calls_map.into_iter().collect();
+    sorted_tcs.sort_by_key(|(idx, _)| *idx);
+    let tool_calls = sorted_tcs
+        .into_iter()
+        .map(|(_, v)| Value::Object(v))
+        .collect();
+    Ok(LlmCallResult {
+        full_text,
+        reasoning,
+        reasoning_signature: String::new(),
+        tool_calls,
+        usage: usage_tokens.to_json_map(),
+        model_used: model_name.to_string(),
+        duration_ms: started.elapsed().as_millis() as u64,
+        finish_reason,
+    })
+}
+
 #[derive(Debug)]
 #[allow(dead_code)] // Transport variant reserved for future network error handling
 enum StreamCollectError {
@@ -2685,6 +3168,74 @@ fn parse_openai_compatible_nonstream_response(
     }
 }
 
+fn parse_anthropic_nonstream_response(
+    v: &Value,
+    model_name: &str,
+    started: Instant,
+) -> LlmCallResult {
+    let mut full_text = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls = Vec::new();
+    if let Some(content) = v.get("content").and_then(Value::as_array) {
+        for block in content {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                        full_text.push_str(text);
+                    }
+                }
+                Some("thinking") => {
+                    if let Some(text) = block.get("thinking").and_then(Value::as_str) {
+                        reasoning.push_str(text);
+                    }
+                }
+                Some("tool_use") => {
+                    let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
+                    let name = block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("_unknown");
+                    let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                    tool_calls.push(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": input.to_string(),
+                        }
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+    let usage = v
+        .get("usage")
+        .and_then(Value::as_object)
+        .and_then(|u| {
+            crate::turn::token_usage::extract_usage(
+                crate::turn::token_usage::UsageDialect::AnthropicMessages,
+                u,
+            )
+        })
+        .map(|u| u.to_json_map())
+        .unwrap_or_default();
+
+    LlmCallResult {
+        full_text,
+        reasoning,
+        reasoning_signature: String::new(),
+        tool_calls,
+        usage,
+        model_used: model_name.to_string(),
+        duration_ms: started.elapsed().as_millis() as u64,
+        finish_reason: v
+            .get("stop_reason")
+            .and_then(Value::as_str)
+            .map(String::from),
+    }
+}
+
 pub(crate) fn parse_nonstream_response_for_provider(
     v: &Value,
     provider: &str,
@@ -2695,7 +3246,10 @@ pub(crate) fn parse_nonstream_response_for_provider(
         LlmProviderProtocol::BedrockConverse => {
             parse_bedrock_nonstream_response(v, model_name, started)
         }
-        LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::OpenAiCompatible => {
+        LlmProviderProtocol::AnthropicMessages => {
+            parse_anthropic_nonstream_response(v, model_name, started)
+        }
+        LlmProviderProtocol::OpenAiCompatible => {
             parse_openai_compatible_nonstream_response(v, model_name, started)
         }
     }
@@ -3974,6 +4528,251 @@ mod tests {
         .await
         .expect("collect");
         assert_eq!(res.full_text, "a\u{FFFD}");
+    }
+
+    // ── Anthropic native stream tests ──────────────────────────────────────
+
+    fn anthropic_sse(events: &[Value]) -> String {
+        events
+            .iter()
+            .map(|e| format!("data: {e}\n\n"))
+            .collect::<String>()
+    }
+
+    #[tokio::test]
+    async fn collect_anthropic_stream_text_and_usage() {
+        let events = vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":5,"cache_creation_input_tokens":2,"output_tokens":0}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}),
+            json!({"type":"message_stop"}),
+        ];
+        let body = anthropic_sse(&events);
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let r = collect_anthropic_llm_stream(
+            stream,
+            "claude-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("stream should succeed");
+        assert_eq!(r.full_text, "Hello world");
+        assert_eq!(r.finish_reason.as_deref(), Some("end_turn"));
+        assert_eq!(
+            r.usage.get("input_tokens").and_then(Value::as_u64),
+            Some(10)
+        );
+        assert_eq!(
+            r.usage.get("cached_input_tokens").and_then(Value::as_u64),
+            Some(5)
+        );
+        assert_eq!(
+            r.usage.get("cache_creation_tokens").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            r.usage.get("output_tokens").and_then(Value::as_u64),
+            Some(7)
+        );
+        assert_eq!(
+            r.usage.get("total_tokens").and_then(Value::as_u64),
+            Some(24)
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_anthropic_stream_thinking_delta() {
+        let events = vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me think"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"..."}}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}),
+            json!({"type":"message_stop"}),
+        ];
+        let body = anthropic_sse(&events);
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let r = collect_anthropic_llm_stream(
+            stream,
+            "claude-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("stream should succeed");
+        assert_eq!(r.reasoning, "Let me think...");
+        assert_eq!(r.full_text, "answer");
+    }
+
+    #[tokio::test]
+    async fn collect_anthropic_stream_tool_use() {
+        let events = vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"calling tool"}}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"bash"}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"com"}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"mand\":\"ls\"}"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":20}}),
+            json!({"type":"message_stop"}),
+        ];
+        let body = anthropic_sse(&events);
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let r = collect_anthropic_llm_stream(
+            stream,
+            "claude-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("stream should succeed");
+        assert_eq!(r.full_text, "calling tool");
+        assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.tool_calls[0]["id"], "toolu_1");
+        assert_eq!(r.tool_calls[0]["function"]["name"], "bash");
+        assert_eq!(
+            r.tool_calls[0]["function"]["arguments"].as_str(),
+            Some(r#"{"command":"ls"}"#)
+        );
+        assert_eq!(r.finish_reason.as_deref(), Some("tool_use"));
+    }
+
+    #[tokio::test]
+    async fn collect_anthropic_stream_error_event() {
+        let events = vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}),
+            json!({"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}),
+        ];
+        let body = anthropic_sse(&events);
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let r = collect_anthropic_llm_stream(
+            stream,
+            "claude-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await;
+        assert!(
+            matches!(r, Err(StreamCollectError::Transport { .. })),
+            "error event should produce transport error, got: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_anthropic_stream_transport_error_carries_partial() {
+        let d1 = json!({"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}});
+        let d2 = json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}});
+        let body = format!("data: {d1}\n\ndata: {d2}\n\n");
+        let err = sample_reqwest_stream_error().await;
+        let stream = stream::iter(vec![Ok(Bytes::from(body)), Err(err)]);
+        let r = collect_anthropic_llm_stream(
+            stream,
+            "claude-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await;
+        match r {
+            Err(StreamCollectError::Transport { partial, .. }) => {
+                assert_eq!(partial.full_text, "partial");
+            }
+            other => panic!("expected transport error with partial, got: {other:?}"),
+        }
+    }
+
+    // ── Anthropic message conversion tests ──────────────────────────────────
+
+    #[test]
+    fn anthropic_message_conversion_preserves_cache_control() {
+        let msg = json!({
+            "role": "user",
+            "content": "hello",
+            "cache_control": {"type": "ephemeral"},
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        assert_eq!(converted["role"], "user");
+        assert_eq!(converted["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn anthropic_message_conversion_preserves_cache_reference_on_tool() {
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "result text",
+            "cache_reference": "call_1",
+            "cache_control": {"type": "ephemeral"},
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        assert_eq!(converted["role"], "user");
+        assert_eq!(converted["cache_control"]["type"], "ephemeral");
+        assert_eq!(converted["cache_reference"], "call_1");
+        let blocks = converted["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["cache_reference"], "call_1");
+    }
+
+    #[test]
+    fn anthropic_message_conversion_user_with_cache_edits_block() {
+        let msg = json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "continue", "cache_control": {"type": "ephemeral"}},
+                {"type": "cache_edits", "edits": [{"type": "delete", "cache_reference": "tool-2"}]}
+            ],
+        });
+        let converted = anthropic_message_from_openai(&msg).unwrap();
+        let blocks = converted["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(blocks[1]["type"], "cache_edits");
+    }
+
+    #[test]
+    fn anthropic_system_and_messages_preserves_cache_control_on_system_blocks() {
+        let messages = vec![
+            json!({
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "stable", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                    {"type": "text", "text": "dynamic"}
+                ]
+            }),
+            json!({
+                "role": "user",
+                "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "tc1",
+                "content": "result",
+                "cache_reference": "tc1"
+            }),
+        ];
+        let (system, msgs) = build_anthropic_system_and_messages(&messages);
+        assert_eq!(system[0]["cache_control"]["ttl"], "1h");
+        assert_eq!(system[1]["text"], "dynamic");
+        assert_eq!(msgs.len(), 2);
+        let user_blocks = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(user_blocks[0]["cache_control"]["type"], "ephemeral");
+        let tool_msg = &msgs[1];
+        assert_eq!(tool_msg["cache_reference"], "tc1");
     }
 
     #[tokio::test]
@@ -6109,6 +6908,113 @@ mod tests {
         // Thinking config
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 4000);
+    }
+
+    #[test]
+    fn build_anthropic_body_uses_native_system_and_tool_shape() {
+        let messages = vec![
+            json!({
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "stable", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                    {"type": "text", "text": "dynamic"}
+                ]
+            }),
+            json!({"role": "user", "content": "hello"}),
+        ];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Run shell",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}
+            },
+            "cache_control": {"type": "ephemeral", "ttl": "1h"}
+        })];
+        let body = build_provider_request_body(
+            &messages,
+            &tools,
+            "claude-sonnet-4-20250514",
+            "anthropic",
+            Some(1024),
+            None,
+            true,
+            &ThinkingConfig::Off,
+        );
+
+        assert!(
+            body.get("system").is_some(),
+            "Anthropic native body needs top-level system: {body:#?}"
+        );
+        assert_eq!(body["system"][0]["text"], "stable");
+        assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h");
+        assert!(
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["role"] != "system"),
+            "system-role messages are invalid in Anthropic Messages API: {body:#?}"
+        );
+        assert_eq!(body["tools"][0]["name"], "bash");
+        assert_eq!(
+            body["tools"][0]["input_schema"]["properties"]["command"]["type"],
+            "string"
+        );
+        assert_eq!(body["tools"][0]["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn parse_anthropic_nonstream_response_extracts_text_tool_calls_and_cache_usage() {
+        let v = json!({
+            "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "tool_use", "id": "toolu_1", "name": "bash", "input": {"command": "pwd"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {
+                "input_tokens": 10,
+                "cache_read_input_tokens": 7,
+                "cache_creation_input_tokens": 3,
+                "output_tokens": 5
+            }
+        });
+        let r = parse_nonstream_response_for_provider(
+            &v,
+            "anthropic",
+            "claude-sonnet-4-20250514",
+            Instant::now(),
+        );
+
+        assert_eq!(r.full_text, "hello");
+        assert_eq!(r.finish_reason.as_deref(), Some("tool_use"));
+        assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.tool_calls[0]["id"], "toolu_1");
+        assert_eq!(r.tool_calls[0]["function"]["name"], "bash");
+        assert_eq!(
+            r.tool_calls[0]["function"]["arguments"].as_str(),
+            Some(r#"{"command":"pwd"}"#)
+        );
+        assert_eq!(
+            r.usage.get("input_tokens").and_then(Value::as_u64),
+            Some(10)
+        );
+        assert_eq!(
+            r.usage.get("cached_input_tokens").and_then(Value::as_u64),
+            Some(7)
+        );
+        assert_eq!(
+            r.usage.get("cache_creation_tokens").and_then(Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            r.usage.get("output_tokens").and_then(Value::as_u64),
+            Some(5)
+        );
+        assert_eq!(
+            r.usage.get("total_tokens").and_then(Value::as_u64),
+            Some(25)
+        );
     }
 
     #[test]

@@ -1505,13 +1505,22 @@ fn final_json_output_with_context(
     trace_id: Option<String>,
     request_id: Option<String>,
 ) -> serde_json::Value {
+    let total_prompt_tokens = sr.prompt_tokens + sr.cache_read_tokens + sr.cache_creation_tokens;
     serde_json::json!({
         "trace_id": trace_id,
         "request_id": request_id,
         "run_id": sr.run_id,
         "session_id": sr.session_id,
         "text": sr.full_text,
-        "prompt_tokens": sr.prompt_tokens + sr.cache_read_tokens + sr.cache_creation_tokens,
+        "prompt_tokens": total_prompt_tokens,
+        "fresh_prompt_tokens": sr.prompt_tokens,
+        "cached_input_tokens": sr.cache_read_tokens,
+        "cache_creation_tokens": sr.cache_creation_tokens,
+        "cache": {
+            "hit": sr.cache_read_tokens > 0,
+            "read_tokens": sr.cache_read_tokens,
+            "creation_tokens": sr.cache_creation_tokens,
+        },
         "completion_tokens": sr.completion_tokens,
         "tool_calls_count": sr.tool_calls_count,
         "tools_used": sr.tools_used,
@@ -3181,6 +3190,12 @@ mod final_json_output_tests {
         assert_eq!(output["session_id"], "session-1");
         assert_eq!(output["text"], "hello");
         assert_eq!(output["prompt_tokens"], 13);
+        assert_eq!(output["fresh_prompt_tokens"], 10);
+        assert_eq!(output["cached_input_tokens"], 2);
+        assert_eq!(output["cache_creation_tokens"], 1);
+        assert_eq!(output["cache"]["hit"], true);
+        assert_eq!(output["cache"]["read_tokens"], 2);
+        assert_eq!(output["cache"]["creation_tokens"], 1);
         assert_eq!(output["completion_tokens"], 3);
         assert_eq!(output["tool_calls_count"], 2);
         assert_eq!(
@@ -3198,6 +3213,10 @@ mod final_json_output_tests {
             "session_id",
             "text",
             "prompt_tokens",
+            "fresh_prompt_tokens",
+            "cached_input_tokens",
+            "cache_creation_tokens",
+            "cache",
             "completion_tokens",
             "tool_calls_count",
             "tools_used",

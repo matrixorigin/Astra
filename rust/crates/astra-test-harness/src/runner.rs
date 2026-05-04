@@ -39,7 +39,12 @@ pub struct RunOutcome {
     pub tool_calls_count: u32,
     pub tools_used: Vec<String>,
     pub completion_tokens: u64,
+    /// Fresh prompt/input tokens, excluding cache reads and cache writes.
     pub prompt_tokens: u64,
+    /// Prompt/input tokens served from provider prompt cache.
+    pub cached_input_tokens: u64,
+    /// Prompt/input tokens written into provider prompt cache.
+    pub cache_creation_tokens: u64,
     pub duration_ms: u64,
     /// Number of LLM round-trips (StepStarted events in step_events).
     pub turn_rounds: u32,
@@ -172,6 +177,8 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
                 tools_used: vec![],
                 completion_tokens: 0,
                 prompt_tokens: 0,
+                cached_input_tokens: 0,
+                cache_creation_tokens: 0,
                 duration_ms: 0,
                 turn_rounds: 0,
                 cache_hits: 0,
@@ -242,7 +249,24 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
             .get("completion_tokens")
             .and_then(|x| x.as_u64())
             .unwrap_or(0),
-        prompt_tokens: v.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+        prompt_tokens: v
+            .get("fresh_prompt_tokens")
+            .or_else(|| v.get("prompt_tokens"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+        cached_input_tokens: v
+            .get("cached_input_tokens")
+            .or_else(|| v.get("cache").and_then(|cache| cache.get("read_tokens")))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+        cache_creation_tokens: v
+            .get("cache_creation_tokens")
+            .or_else(|| {
+                v.get("cache")
+                    .and_then(|cache| cache.get("creation_tokens"))
+            })
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
         duration_ms: 0,
         turn_rounds: 0,
         cache_hits: 0,
@@ -283,13 +307,17 @@ mod tests {
             "tool_calls_count": 2,
             "tools_used": ["a", "b"],
             "completion_tokens": 10,
-            "prompt_tokens": 20
+            "prompt_tokens": 20,
+            "cached_input_tokens": 7,
+            "cache_creation_tokens": 3
         }"#;
         let out = parse_json_outcome(stdout, "m");
         assert_eq!(out.model, "m");
         assert_eq!(out.session_id.as_deref(), Some("s1"));
         assert_eq!(out.tool_calls_count, 2);
         assert_eq!(out.tools_used, vec!["a", "b"]);
+        assert_eq!(out.cached_input_tokens, 7);
+        assert_eq!(out.cache_creation_tokens, 3);
     }
 
     #[test]

@@ -294,6 +294,80 @@ async fn call_bedrock_converse(
     })
 }
 
+async fn call_anthropic_messages(
+    client: &reqwest::Client,
+    model: &ModelDef,
+    user_message: &str,
+) -> Option<LiveResult> {
+    let base = model.base_url.trim_end_matches('/');
+    let url = if base.ends_with("/v1") {
+        format!("{base}/messages")
+    } else {
+        format!("{base}/v1/messages")
+    };
+    let body = json!({
+        "model": model.name,
+        "messages": [{"role": "user", "content": user_message}],
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "stream": false,
+    });
+    let resp = match client
+        .post(&url)
+        .header("x-api-key", &model.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "SKIP [{}/{}]: HTTP send failed: {e}",
+                model.provider, model.name
+            );
+            return None;
+        }
+    };
+    let status = resp.status();
+    let raw: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "SKIP [{}/{}]: json parse failed: {e}",
+                model.provider, model.name
+            );
+            return None;
+        }
+    };
+    if !status.is_success() {
+        eprintln!(
+            "SKIP [{}/{}]: upstream {status}: {raw}",
+            model.provider, model.name
+        );
+        return None;
+    }
+    let Some(usage_obj) = raw.get("usage").and_then(Value::as_object) else {
+        eprintln!(
+            "SKIP [{}/{}]: response missing `usage` object: {raw}",
+            model.provider, model.name
+        );
+        return None;
+    };
+    let Some(normalized) = extract_usage(UsageDialect::AnthropicMessages, usage_obj) else {
+        eprintln!(
+            "SKIP [{}/{}]: extract_usage returned None for: {raw}",
+            model.provider, model.name
+        );
+        return None;
+    };
+    Some(LiveResult {
+        raw_usage: raw.get("usage").cloned().unwrap_or(Value::Null),
+        normalized,
+    })
+}
+
 // ── Shared invariant assertions ──────────────────────────────────────────────
 
 fn assert_disjoint_sum_identity(u: &TokenUsage, tag: &str) {
@@ -341,6 +415,17 @@ fn assert_bedrock_disjoint_identity(raw_usage: &Value, u: &TokenUsage, tag: &str
     );
 }
 
+fn assert_anthropic_disjoint_identity(raw_usage: &Value, u: &TokenUsage, tag: &str) {
+    let Some(raw_input) = raw_usage.get("input_tokens").and_then(Value::as_u64) else {
+        eprintln!("{tag}: raw_usage has no input_tokens — skipping disjoint identity check");
+        return;
+    };
+    assert_eq!(
+        raw_input, u.input_tokens,
+        "{tag}: Anthropic disjoint identity broken: raw input_tokens={raw_input}, normalized={u:?}"
+    );
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 /// Per-provider invariant sweep. Picks one model per distinct provider from
@@ -383,6 +468,9 @@ async fn per_provider_token_usage_invariants() {
             UsageDialect::BedrockConverse => {
                 call_bedrock_converse(&client, model, "Say hi in 3 words.").await
             }
+            UsageDialect::AnthropicMessages => {
+                call_anthropic_messages(&client, model, "Say hi in 3 words.").await
+            }
             UsageDialect::OpenAi => {
                 call_openai_compatible(&client, model, "Say hi in 3 words.").await
             }
@@ -399,6 +487,9 @@ async fn per_provider_token_usage_invariants() {
             }
             UsageDialect::BedrockConverse => {
                 assert_bedrock_disjoint_identity(&r.raw_usage, &r.normalized, &tag)
+            }
+            UsageDialect::AnthropicMessages => {
+                assert_anthropic_disjoint_identity(&r.raw_usage, &r.normalized, &tag)
             }
         }
         any_succeeded = true;

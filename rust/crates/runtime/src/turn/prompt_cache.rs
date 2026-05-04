@@ -67,12 +67,14 @@ impl Default for PromptCacheConfig {
 // - Global+Session sections are cached by (tool_names, task_type, confidence) — stable within a session
 // - Per-turn profile_desc is NOT cached (changes every turn with skills/memory/environment)
 
-/// Cached prompt sections (Global + Session scoped).
+/// Cached prompt sections split by cache scope.
 struct CachedSections {
     /// Concatenated text of Global+Session sections (for non-Anthropic providers).
     text: String,
-    /// Individual sections with scope metadata (for Anthropic cache_control).
+    /// Individual stable sections with scope metadata (for Anthropic cache_control).
     sections: Vec<prompts::PromptSection>,
+    /// Dynamic sections (CacheScope::None) from the prompt builder — output style, etc.
+    dynamic_sections: Vec<prompts::PromptSection>,
 }
 
 fn section_cache() -> &'static Mutex<HashMap<u64, CachedSections>> {
@@ -85,10 +87,20 @@ fn pinned_cache_edits() -> &'static Mutex<HashMap<String, Vec<String>>> {
     PINS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(test)]
 pub(crate) fn section_cache_key(
     tool_names: &[&str],
     task_type: Option<&str>,
     confidence: f64,
+) -> u64 {
+    section_cache_key_with_customization(tool_names, task_type, confidence, 0)
+}
+
+fn section_cache_key_with_customization(
+    tool_names: &[&str],
+    task_type: Option<&str>,
+    confidence: f64,
+    overrides_fingerprint: u64,
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -98,6 +110,19 @@ pub(crate) fn section_cache_key(
     task_type.unwrap_or("none").hash(&mut hasher);
     let bucket = if confidence < 0.3 { "low" } else { "normal" };
     bucket.hash(&mut hasher);
+    overrides_fingerprint.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn prompt_overrides_fingerprint(overrides: &prompts::PromptOverrides) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut entries: Vec<_> = overrides.iter().collect();
+    entries.sort_by_key(|(left, _)| *left);
+    for (name, text) in entries {
+        name.hash(&mut hasher);
+        text.hash(&mut hasher);
+    }
     hasher.finish()
 }
 
@@ -144,25 +169,47 @@ pub(crate) fn build_system_message_with_dynamic_sections(
     task_type: Option<&str>,
     cache_cfg: &PromptCacheConfig,
 ) -> (Value, Option<Value>, Vec<prompts::PromptSection>) {
-    let key = section_cache_key(tool_names, task_type, confidence);
+    let output_style = astra_text_utils::output_style::current_output_style();
+    let overrides = prompts::load_overrides(&prompts::default_overrides_dir());
+    let key = section_cache_key_with_customization(
+        tool_names,
+        task_type,
+        confidence,
+        prompt_overrides_fingerprint(&overrides),
+    );
 
-    // Try cache for the stable (Global + Session) sections
+    // Try cache for the stable (Global + Session) + dynamic (None-scoped) sections
     let cached = if let Ok(cache) = section_cache().lock() {
-        cache
-            .get(&key)
-            .map(|c| (c.text.clone(), c.sections.clone()))
+        cache.get(&key).map(|c| {
+            (
+                c.text.clone(),
+                c.sections.clone(),
+                c.dynamic_sections.clone(),
+            )
+        })
     } else {
         None
     };
 
-    let (stable_text, sections) = cached.unwrap_or_else(|| {
+    let (stable_text, sections, runtime_dynamic_sections) = cached.unwrap_or_else(|| {
         // Build all sections (profile_desc is "" for cache — we'll append it separately)
-        let all = prompts::build_system_prompt_sections(tool_names, "", confidence, task_type);
-        // Only cache Global + Session sections (not None-scoped profile)
-        let stable: Vec<prompts::PromptSection> = all
-            .into_iter()
-            .filter(|s| s.scope != prompts::CacheScope::None)
-            .collect();
+        let mut all = prompts::build_system_prompt_sections_with_style(
+            tool_names,
+            "",
+            confidence,
+            task_type,
+            output_style,
+        );
+        prompts::apply_overrides(&mut all, &overrides);
+        let mut stable = Vec::new();
+        let mut dynamic = Vec::new();
+        for s in all {
+            if s.scope != prompts::CacheScope::None {
+                stable.push(s);
+            } else if !s.text.is_empty() {
+                dynamic.push(s);
+            }
+        }
         let text = stable
             .iter()
             .map(|s| s.text.as_str())
@@ -178,18 +225,23 @@ pub(crate) fn build_system_message_with_dynamic_sections(
                 CachedSections {
                     text: text.clone(),
                     sections: stable.clone(),
+                    dynamic_sections: dynamic.clone(),
                 },
             );
         }
-        (text, stable)
+        (text, stable, dynamic)
     });
 
     let is_anthropic = cache_cfg.is_anthropic;
-    let dynamic_text = prompts::sections_to_string(dynamic_sections);
+    let mut all_dynamic_sections =
+        Vec::with_capacity(runtime_dynamic_sections.len() + dynamic_sections.len());
+    all_dynamic_sections.extend(runtime_dynamic_sections);
+    all_dynamic_sections.extend(dynamic_sections.iter().cloned());
+    let dynamic_text = prompts::sections_to_string(&all_dynamic_sections);
 
     // Build complete sections list (stable + dynamic) for trace.
     let append_dynamic = |mut secs: Vec<prompts::PromptSection>| -> Vec<prompts::PromptSection> {
-        secs.extend(dynamic_sections.iter().cloned());
+        secs.extend(all_dynamic_sections.iter().cloned());
         secs
     };
 
@@ -236,7 +288,7 @@ pub(crate) fn build_system_message_with_dynamic_sections(
             blocks.push(block);
         }
         // Dynamic section (profile + per-turn hints) — no cache_control
-        for section in dynamic_sections {
+        for section in &all_dynamic_sections {
             blocks.push(json!({
                 "type": "text",
                 "text": section.text,
@@ -516,6 +568,107 @@ mod tests {
         // Both in low bucket should match
         let k_low2 = section_cache_key(&["bash"], None, 0.1);
         assert_eq!(k_low, k_low2);
+    }
+
+    #[test]
+    fn structured_prompt_includes_runtime_style_and_prompt_overrides() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let home = tempfile::tempdir().expect("temp home");
+        let prompts_dir = home.path().join(".astra").join("prompts");
+        std::fs::create_dir_all(&prompts_dir).expect("prompts dir");
+        std::fs::write(
+            prompts_dir.join("core_rules.txt"),
+            "\n## Core Rules Override\nOVERRIDE_SENTINEL\n",
+        )
+        .expect("override file");
+        if let Ok(mut cache) = section_cache().lock() {
+            cache.clear();
+        }
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("ASTRA_OUTPUT_STYLE", "concise");
+        }
+
+        let (msg, dynamic_msg, sections) = build_system_message(
+            &["prompt_cache_test_tool"],
+            "\n\n# Project Profile\ncwd: /tmp/prompt-cache-test",
+            0.8,
+            Some("prompt-cache-style-override"),
+            &PromptCacheConfig {
+                cache_enabled: true,
+                is_anthropic: false,
+            },
+        );
+
+        let stable = msg["content"].as_str().expect("stable system text");
+        assert!(
+            stable.contains("OVERRIDE_SENTINEL"),
+            "structured stable prompt must include prompt overrides: {stable}"
+        );
+        let dynamic = dynamic_msg
+            .as_ref()
+            .and_then(|m| m["content"].as_str())
+            .expect("dynamic system text");
+        assert!(
+            dynamic.contains("# Output Style: Concise"),
+            "structured dynamic prompt must include active output style: {dynamic}"
+        );
+        assert!(
+            sections
+                .iter()
+                .any(|section| section.text.contains("# Output Style: Concise")),
+            "trace sections must include the same output style sent to the provider"
+        );
+
+        unsafe {
+            std::env::remove_var("ASTRA_OUTPUT_STYLE");
+        }
+    }
+
+    #[test]
+    fn structured_prompt_cache_key_tracks_prompt_override_changes() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let home = tempfile::tempdir().expect("temp home");
+        let prompts_dir = home.path().join(".astra").join("prompts");
+        std::fs::create_dir_all(&prompts_dir).expect("prompts dir");
+        let override_path = prompts_dir.join("core_rules.txt");
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::remove_var("ASTRA_OUTPUT_STYLE");
+        }
+        if let Ok(mut cache) = section_cache().lock() {
+            cache.clear();
+        }
+
+        std::fs::write(&override_path, "\nFIRST_OVERRIDE_SENTINEL\n").expect("first override");
+        let (first, _, _) = build_system_message(
+            &["prompt_cache_override_reload_tool"],
+            "",
+            0.8,
+            Some("prompt-cache-override-reload"),
+            &PromptCacheConfig::default(),
+        );
+        assert!(
+            first["content"]
+                .as_str()
+                .unwrap()
+                .contains("FIRST_OVERRIDE_SENTINEL")
+        );
+
+        std::fs::write(&override_path, "\nSECOND_OVERRIDE_SENTINEL\n").expect("second override");
+        let (second, _, _) = build_system_message(
+            &["prompt_cache_override_reload_tool"],
+            "",
+            0.8,
+            Some("prompt-cache-override-reload"),
+            &PromptCacheConfig::default(),
+        );
+        let stable = second["content"].as_str().unwrap();
+        assert!(
+            stable.contains("SECOND_OVERRIDE_SENTINEL")
+                && !stable.contains("FIRST_OVERRIDE_SENTINEL"),
+            "stable prompt cache must invalidate when override files change: {stable}"
+        );
     }
 
     #[test]

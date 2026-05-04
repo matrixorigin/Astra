@@ -22,6 +22,9 @@
 //!   `prompt_tokens_details.cache_creation_input_tokens` we subtract too.
 //! - **Bedrock Converse**: `usage.inputTokens` EXCLUDES both
 //!   `cacheReadInputTokens` and `cacheWriteInputTokens`. Use values directly.
+//! - **Anthropic Messages**: `usage.input_tokens` EXCLUDES both
+//!   `cache_read_input_tokens` and `cache_creation_input_tokens`. Use values
+//!   directly.
 
 use serde_json::{Map, Value};
 
@@ -91,12 +94,17 @@ pub enum UsageDialect {
     /// Bedrock Converse: `inputTokens`, `outputTokens`, `cacheReadInputTokens`,
     /// `cacheWriteInputTokens`. `inputTokens` EXCLUDES cache.
     BedrockConverse,
+    /// Anthropic Messages: `input_tokens`, `output_tokens`,
+    /// `cache_read_input_tokens`, `cache_creation_input_tokens`.
+    /// `input_tokens` EXCLUDES cache read/write buckets.
+    AnthropicMessages,
 }
 
 impl UsageDialect {
     pub fn for_provider(provider: &str) -> Self {
         match provider {
             "bedrock" => Self::BedrockConverse,
+            "anthropic" => Self::AnthropicMessages,
             _ => Self::OpenAi,
         }
     }
@@ -111,6 +119,7 @@ pub fn extract_usage(dialect: UsageDialect, usage_obj: &Map<String, Value>) -> O
     match dialect {
         UsageDialect::OpenAi => extract_openai(usage_obj),
         UsageDialect::BedrockConverse => extract_bedrock(usage_obj),
+        UsageDialect::AnthropicMessages => extract_anthropic(usage_obj),
     }
 }
 
@@ -189,6 +198,22 @@ fn extract_bedrock(u: &Map<String, Value>) -> Option<TokenUsage> {
     })
 }
 
+fn extract_anthropic(u: &Map<String, Value>) -> Option<TokenUsage> {
+    let input = as_u64(u.get("input_tokens"));
+    let output = as_u64(u.get("output_tokens"));
+    let cached = as_u64(u.get("cache_read_input_tokens")).unwrap_or(0);
+    let cache_creation = as_u64(u.get("cache_creation_input_tokens")).unwrap_or(0);
+    if input.is_none() && output.is_none() && cached == 0 && cache_creation == 0 {
+        return None;
+    }
+    Some(TokenUsage {
+        input_tokens: input.unwrap_or(0),
+        cached_input_tokens: cached,
+        cache_creation_tokens: cache_creation,
+        output_tokens: output.unwrap_or(0),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +266,14 @@ mod tests {
         assert_eq!(
             UsageDialect::for_provider("bedrock"),
             UsageDialect::BedrockConverse
+        );
+    }
+
+    #[test]
+    fn dialect_anthropic_for_anthropic_provider() {
+        assert_eq!(
+            UsageDialect::for_provider("anthropic"),
+            UsageDialect::AnthropicMessages
         );
     }
 
@@ -478,6 +511,30 @@ mod tests {
     fn bedrock_empty_usage_returns_none() {
         let u = obj(json!({}));
         assert!(extract_usage(UsageDialect::BedrockConverse, &u).is_none());
+    }
+
+    // ── Anthropic Messages extractor ───────────────────────────────────────
+
+    #[test]
+    fn anthropic_messages_usage_is_disjoint() {
+        let u = obj(json!({
+            "input_tokens": 200,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 800,
+            "cache_creation_input_tokens": 100
+        }));
+        let t = extract_usage(UsageDialect::AnthropicMessages, &u).unwrap();
+        assert_eq!(t.input_tokens, 200);
+        assert_eq!(t.cached_input_tokens, 800);
+        assert_eq!(t.cache_creation_tokens, 100);
+        assert_eq!(t.output_tokens, 50);
+        assert_eq!(t.total_tokens(), 1150);
+    }
+
+    #[test]
+    fn anthropic_messages_empty_usage_returns_none() {
+        let u = obj(json!({}));
+        assert!(extract_usage(UsageDialect::AnthropicMessages, &u).is_none());
     }
 
     // ── Canonical JSON shape used in SSE events ────────────────────────────

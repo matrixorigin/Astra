@@ -99,6 +99,9 @@ criteria:
     pattern: '\[fork-cache\]'
   - type: fork_cache_outcome
     expect: [hit]
+  - type: prompt_cache_tokens
+    min_read: 1
+    min_creation: 1
   - type: judger
     question: Did the child's reply appear in the final answer?
     threshold: 0.7
@@ -116,6 +119,7 @@ criteria:
 | `duration_between { min_ms, max_ms }` | wall-clock duration in range | envelope |
 | `turn_rounds_between { min, max }` | LLM round-trips (StepStarted events) in range | step_events |
 | `cache_rate_above { threshold }` | tool cache hit rate ≥ threshold (0.0–1.0) | step_events |
+| `prompt_cache_tokens { min_read, min_creation }` | provider prompt-cache read/write token buckets meet minimums | envelope |
 | `stderr_matches { pattern }` | multi-line regex on stderr | stderr |
 | `text_contains { needle }` | substring in final text | envelope |
 | `fork_cache_outcome { expect }` | `[fork-cache]` event `outcome` ∈ `expect` | stderr |
@@ -130,7 +134,7 @@ Each criterion has a severity that controls how failures are treated:
 | Severity | Meaning | Criteria types |
 |----------|---------|----------------|
 | **Hard** | Fundamental correctness — failure means the case did not work. Blocks the LLM judger from running (no point scoring a broken run). | `exit_code`, `tool_called`, `text_contains`, `tool_sequence`, `fork_cache_outcome` |
-| **Soft** | Efficiency / performance bounds — failure means the case worked but outside acceptable limits. Does NOT block the judger. | `tools_count_between`, `tokens_between`, `duration_between`, `turn_rounds_between`, `cache_rate_above`, `stderr_matches` |
+| **Soft** | Efficiency / performance bounds — failure means the case worked but outside acceptable limits. Does NOT block the judger. | `tools_count_between`, `tokens_between`, `duration_between`, `turn_rounds_between`, `cache_rate_above`, `prompt_cache_tokens`, `stderr_matches` |
 | **Quality** | Continuous quality score (0.0-1.0) rather than binary pass/fail. | `judger`, `session_event_count`, `journal_tool_called` |
 
 Severity is assigned automatically based on criterion type (see
