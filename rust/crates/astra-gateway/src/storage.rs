@@ -259,9 +259,14 @@ pub async fn get_user_preference(
 }
 
 /// Build a JSON-path-safe preference key for per-CLI model overrides.
-/// Uses underscore separator — colon is invalid in MatrixOne JSON paths.
+/// Non-alphanumeric characters are replaced with underscores so the key is
+/// always valid in MatrixOne / MySQL JSON paths.
 pub fn model_preference_key(cli_name: &str) -> String {
-    format!("model_override_{cli_name}")
+    let safe: String = cli_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("model_override_{safe}")
 }
 
 // ─── Session operations ─────────────────────────────────────────────────────
@@ -885,14 +890,22 @@ mod tests {
         for cli_name in &["astra", "claude", "codex"] {
             let key = super::model_preference_key(cli_name);
             assert!(
-                !key.contains(':'),
-                "key must not contain colon (invalid in JSON path): {key}"
-            );
-            assert!(
                 key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
                 "key must be alphanumeric + underscore only: {key}"
             );
         }
+    }
+
+    #[test]
+    fn model_override_key_sanitizes_special_chars() {
+        assert_eq!(
+            super::model_preference_key("/opt/my-cli.v2"),
+            "model_override__opt_my_cli_v2"
+        );
+        assert_eq!(
+            super::model_preference_key("some:tool"),
+            "model_override_some_tool"
+        );
     }
 
     #[tokio::test]
