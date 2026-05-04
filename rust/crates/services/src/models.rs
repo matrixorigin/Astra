@@ -997,7 +997,15 @@ impl ModelService for DatabaseModelService {
                 base_url.as_deref(),
             )
             .await;
-            let cap_str = probe.capability.as_db_str();
+            // Only persist capability when probe succeeded without errors.
+            // A failed probe (client error, unreachable server) should leave
+            // capability=NULL (unprobed) rather than permanently marking the
+            // model as non-thinking due to a transient failure.
+            let cap_str: Option<&str> = if probe.error.is_none() {
+                Some(probe.capability.as_db_str())
+            } else {
+                None
+            };
             let err_str = probe.error.as_deref();
             if let Err(e) = query(
                 "UPDATE infra_llm_models SET thinking_capability = ?, \
@@ -1554,103 +1562,132 @@ pub async fn probe_thinking_behavior(
 
     // ── DeepSeek: always thinks, supports reasoning_effort (low/high) but can't disable ──
     if url_lower.contains("deepseek") {
-        let thinks = send_openai_probe(&client, &probe_url, api_key, &base_body)
-            .await
-            .unwrap_or(false);
-        return ThinkingProbeResult {
-            capability: if thinks {
-                ThinkingCapability::EffortOnly
-            } else {
-                ThinkingCapability::None
+        return match send_openai_probe(&client, &probe_url, api_key, &base_body).await {
+            Ok(true) => ThinkingProbeResult {
+                capability: ThinkingCapability::EffortOnly,
+                error: None,
             },
-            error: None,
+            Ok(false) => ThinkingProbeResult {
+                capability: ThinkingCapability::None,
+                error: None,
+            },
+            Err(e) => ThinkingProbeResult {
+                capability: ThinkingCapability::None,
+                error: Some(e),
+            },
         };
     }
 
     // ── MiniMax: always thinks via <think> tags, can't disable ──
     if url_lower.contains("minimax") {
-        let thinks = send_openai_probe(&client, &probe_url, api_key, &base_body)
-            .await
-            .unwrap_or(false);
-        return ThinkingProbeResult {
-            capability: if thinks {
-                ThinkingCapability::NativeOnly
-            } else {
-                ThinkingCapability::None
+        return match send_openai_probe(&client, &probe_url, api_key, &base_body).await {
+            Ok(true) => ThinkingProbeResult {
+                capability: ThinkingCapability::NativeOnly,
+                error: None,
             },
-            error: None,
+            Ok(false) => ThinkingProbeResult {
+                capability: ThinkingCapability::None,
+                error: None,
+            },
+            Err(e) => ThinkingProbeResult {
+                capability: ThinkingCapability::None,
+                error: Some(e),
+            },
         };
     }
 
     // ── DashScope (Qwen, GLM-5.1): default=no thinking, enable_thinking toggles ──
     if url_lower.contains("dashscope") || url_lower.contains("aliyun") {
         // First check if it thinks by default (GLM-5.1 does)
-        let default_thinks = send_openai_probe(&client, &probe_url, api_key, &base_body)
-            .await
-            .unwrap_or(false);
+        let default_thinks = match send_openai_probe(&client, &probe_url, api_key, &base_body).await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return ThinkingProbeResult {
+                    capability: ThinkingCapability::None,
+                    error: Some(e),
+                };
+            }
+        };
         if default_thinks {
             // Thinks by default — test suppression
             let mut body_disable = base_body;
             body_disable["enable_thinking"] = serde_json::json!(false);
-            let still_thinks = send_openai_probe(&client, &probe_url, api_key, &body_disable)
-                .await
-                .unwrap_or(true);
+            let (still_thinks, suppress_err) =
+                match send_openai_probe(&client, &probe_url, api_key, &body_disable).await {
+                    Ok(v) => (v, None),
+                    Err(e) => (true, Some(e)), // conservative: assume can't suppress on error
+                };
             return ThinkingProbeResult {
                 capability: if still_thinks {
                     ThinkingCapability::NativeOnly
                 } else {
                     ThinkingCapability::Both
                 },
-                error: None,
+                error: suppress_err,
             };
         }
         // Doesn't think by default — try enabling
         let mut body_enable = base_body;
         body_enable["enable_thinking"] = serde_json::json!(true);
-        let enabled_thinks = send_openai_probe(&client, &probe_url, api_key, &body_enable)
-            .await
-            .unwrap_or(false);
-        return ThinkingProbeResult {
-            capability: if enabled_thinks {
-                ThinkingCapability::Both
-            } else {
-                ThinkingCapability::None
+        return match send_openai_probe(&client, &probe_url, api_key, &body_enable).await {
+            Ok(true) => ThinkingProbeResult {
+                capability: ThinkingCapability::Both,
+                error: None,
             },
-            error: None,
+            Ok(false) => ThinkingProbeResult {
+                capability: ThinkingCapability::None,
+                error: None,
+            },
+            Err(e) => ThinkingProbeResult {
+                capability: ThinkingCapability::None,
+                error: Some(e),
+            },
         };
     }
 
     // ── Generic OpenAI-compatible: probe default, then try enable_thinking ──
-    let default_thinks = send_openai_probe(&client, &probe_url, api_key, &base_body)
-        .await
-        .unwrap_or(false);
+    let default_thinks = match send_openai_probe(&client, &probe_url, api_key, &base_body).await {
+        Ok(v) => v,
+        Err(e) => {
+            return ThinkingProbeResult {
+                capability: ThinkingCapability::None,
+                error: Some(e),
+            };
+        }
+    };
     if default_thinks {
         let mut body_suppress = base_body;
         body_suppress["enable_thinking"] = serde_json::json!(false);
-        let still_thinks = send_openai_probe(&client, &probe_url, api_key, &body_suppress)
-            .await
-            .unwrap_or(true);
+        let (still_thinks, suppress_err) =
+            match send_openai_probe(&client, &probe_url, api_key, &body_suppress).await {
+                Ok(v) => (v, None),
+                Err(e) => (true, Some(e)), // conservative: assume can't suppress on error
+            };
         return ThinkingProbeResult {
             capability: if still_thinks {
                 ThinkingCapability::NativeOnly
             } else {
                 ThinkingCapability::Both
             },
-            error: None,
+            error: suppress_err,
         };
     }
     let mut body_enable = base_body;
     body_enable["enable_thinking"] = serde_json::json!(true);
-    let enabled_thinks = send_openai_probe(&client, &probe_url, api_key, &body_enable)
-        .await
-        .unwrap_or(false);
-    ThinkingProbeResult {
-        capability: if enabled_thinks {
-            ThinkingCapability::Both
-        } else {
-            ThinkingCapability::None
+    match send_openai_probe(&client, &probe_url, api_key, &body_enable).await {
+        Ok(true) => ThinkingProbeResult {
+            capability: ThinkingCapability::Both,
+            error: None,
         },
-        error: None,
+        Ok(false) => ThinkingProbeResult {
+            capability: ThinkingCapability::None,
+            error: None,
+        },
+        Err(e) => ThinkingProbeResult {
+            capability: ThinkingCapability::None,
+            error: Some(e),
+        },
     }
 }
 
@@ -3026,6 +3063,11 @@ mod tests {
     async fn probe_unreachable_server_returns_none() {
         let result = probe_thinking_behavior("openai", "m", "k", Some("http://127.0.0.1:1")).await;
         assert_eq!(result.capability, ThinkingCapability::None);
+        // After fix: error is surfaced, not silently swallowed
+        assert!(
+            result.error.is_some(),
+            "unreachable server should surface error, got None"
+        );
     }
 
     #[tokio::test]
