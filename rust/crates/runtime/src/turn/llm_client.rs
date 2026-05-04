@@ -1538,7 +1538,19 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
             Some(out)
         }
         "assistant" => {
-            let mut blocks = anthropic_text_blocks_from_content(msg.get("content"));
+            let mut blocks = Vec::new();
+            if let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str) {
+                if !rc.is_empty() {
+                    let mut thinking = json!({"type": "thinking", "thinking": rc});
+                    if let Some(sig) = msg.get("reasoning_signature").and_then(Value::as_str) {
+                        if !sig.is_empty() {
+                            thinking["signature"] = Value::String(sig.to_string());
+                        }
+                    }
+                    blocks.push(thinking);
+                }
+            }
+            blocks.extend(anthropic_text_blocks_from_content(msg.get("content")));
             if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
                 blocks.extend(
                     tool_calls
@@ -7541,36 +7553,7 @@ mod tests {
         }
 
         // ── Row: Anthropic + Thinking::Enabled + tool_call + turn-2 ──
-        //
-        // KNOWN GAP — tracked (created 2026-05-01): Anthropic native API
-        // requires assistant.content as an array of typed blocks
-        // (`{"type":"thinking","thinking":"...","signature":"..."}`,
-        // `{"type":"tool_use",...}`). Today's code path passes OpenAI-shape
-        // `reasoning_content` / `reasoning_signature` directly, which
-        // Anthropic will reject with the same class of 400 as Bedrock's
-        // `thinking.signature: Field required`.
-        //
-        // Pinned here as `#[should_panic]` + `#[ignore]` so: (a) nobody
-        // accidentally ships Anthropic native multi-turn thinking in a broken
-        // state, and (b) when a future PR implements the typed-block
-        // serializer (equivalent to `build_bedrock_messages` for Anthropic)
-        // plus the matching SSE signature capture, this test becomes real
-        // coverage by flipping to a normal `#[test]`.
-        //
-        // Today the request body is OpenAI-shape, so `body["messages"][1]
-        // ["content"].as_array()` returns `None` and the first assertion
-        // panics with "called `Option::unwrap()` on a `None` value". That
-        // panic is the canary — `#[should_panic]` pins the current broken
-        // state so `make test-online`'s `--run-ignored only` stage doesn't
-        // surface it as a false failure. Remove both attributes together
-        // with the serializer implementation.
-        //
-        // TODO(anthropic-thinking): remove `#[ignore]` + `#[should_panic]`
-        // and implement the typed-block serializer + SSE signature capture
-        // before enabling native Anthropic multi-turn thinking.
         #[test]
-        #[ignore = "blocked on typed-block serializer for native Anthropic thinking"]
-        #[should_panic(expected = "called `Option::unwrap()` on a `None` value")]
         fn anthropic_thinking_tool_call_multi_turn_needs_typed_blocks() {
             let messages = vec![
                 user("compute 2+2"),
@@ -7589,9 +7572,6 @@ mod tests {
                     budget_tokens: 4000,
                 },
             );
-            // When this is implemented, the assistant message content MUST be
-            // a typed-block array: first a thinking block carrying signature,
-            // then the tool_use block.
             let assistant_content = body["messages"][1]["content"].as_array().unwrap();
             assert_eq!(assistant_content[0]["type"], "thinking");
             assert_eq!(assistant_content[0]["thinking"], "thinking...");
