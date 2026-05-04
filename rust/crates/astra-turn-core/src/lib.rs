@@ -29,6 +29,7 @@ pub mod context_assembly_trace;
 pub mod context_binder;
 pub mod context_budget;
 pub mod context_feedback;
+pub mod context_optimizer;
 pub mod context_planner;
 pub mod context_pressure;
 pub mod context_sources;

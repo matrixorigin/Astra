@@ -137,6 +137,7 @@ impl StaticSections {
     #[cfg(test)]
     pub fn test_default() -> Self {
         use crate::context_assembly_trace::PromptTraceSignals;
+        use crate::section_types::CacheScope;
         Self {
             core_rules: PromptSection {
                 text: "You are an expert.".into(),
