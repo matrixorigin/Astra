@@ -2001,6 +2001,12 @@ impl GatewayRunner {
         for adapter in &adapters {
             self.replay_pending_messages(adapter.as_ref()).await;
         }
+        // Drain any progressive chunks that accumulated in the outbound channel
+        // during replay (the main select loop wasn't consuming yet).
+        while let Ok(outbound) = cron_rx.try_recv() {
+            self.deliver_outbound(&adapters, &adapter_indices, outbound)
+                .await;
+        }
 
         loop {
             tokio::select! {
