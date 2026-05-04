@@ -9,7 +9,8 @@ Model: `{{model}}`
 
 - `/new` — new conversation  `/status` — status + model  `/help` — all commands
 - `/model <name>` — switch model (haiku/sonnet/opus/minimax/deepseek/qwen/glm)
-- `/cli` — show/switch CLI backend
+- `/cli` — show/switch CLI backend  `/gateway` — full capability overview
+- `/ws ls` — list projects  `/ws <name>` — switch workspace
 {{#if has_session}}
 - `/session list` — history  `/session switch <id>` — resume
 {{/if}}

@@ -2,33 +2,34 @@
 
 use crate::access_control::{ActionCapability, ActionSource};
 use crate::config::GatewayConfig;
-use crate::storage;
+use crate::store::{self, GatewayStore};
 use crate::trace_model::{
     CancelRequestOutcome, ConversationKey, GatewayEvent, GatewayEventKind, TraceId, TraceRepository,
 };
 use astra_core::durable_task_store::{
     DurableTask, DurableTaskStatus, DurableTaskStore, TaskFilter, resolve_task_for_owner,
 };
-use sqlx::MySqlPool;
 
 pub struct CommandContext<'a> {
     pub astra: &'a astra_thin_client::ThinClient,
     pub config: &'a GatewayConfig,
-    pub pool: Option<&'a MySqlPool>,
+    pub store: Option<&'a dyn GatewayStore>,
     pub platform: &'a str,
     pub chat_id: &'a str,
     pub user_id: &'a str,
     pub resolved_cli: &'a crate::cli_bridge::CliProfile,
     pub durable_store: Option<&'a dyn astra_core::durable_task_store::DurableTaskStore>,
     pub trace_repo: Option<&'a dyn TraceRepository>,
+    pub project_dirs: &'a [String],
+    pub cli_availability: &'a [(String, crate::cli_bridge::CliAvailability)],
 }
 
-/// Helper: get pool or return error message for DB-dependent commands.
-macro_rules! require_db {
+/// Helper: get store or return error message for storage-dependent commands.
+macro_rules! require_store {
     ($ctx:expr) => {
-        match $ctx.pool {
-            Some(p) => p,
-            None => return Some("⚠️ 此命令需要数据库。当前以无数据库模式运行。".into()),
+        match $ctx.store {
+            Some(s) => s,
+            None => return Some("⚠️ 此命令需要存储后端。当前以无持久化模式运行。".into()),
         }
     };
 }
@@ -66,9 +67,12 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             if let Some(denial) = slash_denial(ctx, ActionCapability::SessionMutation) {
                 return Some(denial);
             }
-            let pool = require_db!(ctx);
+            let store = require_store!(ctx);
             let cli_name = ctx.resolved_cli.name();
-            match storage::reset_session_for_cli(pool, ctx.platform, ctx.chat_id, cli_name).await {
+            match store
+                .reset_session(ctx.platform, ctx.chat_id, cli_name)
+                .await
+            {
                 Ok(()) => Some(format!(
                     "🔄 `{cli_name}` 会话已重置。发送新消息开始新对话。"
                 )),
@@ -78,8 +82,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
 
         "/status" => {
             let cli_name = ctx.resolved_cli.name();
-            let session = if let Some(pool) = ctx.pool {
-                storage::get_current_session_for_cli(pool, ctx.platform, ctx.chat_id, cli_name)
+            let session = if let Some(store) = ctx.store {
+                store
+                    .get_current_session(ctx.platform, ctx.chat_id, cli_name)
                     .await
                     .ok()
                     .flatten()
@@ -101,8 +106,8 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 format!("- 用户: `{}`", ctx.user_id),
                 format!("- 会话: `{}`", session.as_deref().unwrap_or("(无)")),
                 format!(
-                    "- 数据库: `{}`",
-                    if ctx.pool.is_some() { "on" } else { "off" }
+                    "- 存储: `{}`",
+                    if ctx.store.is_some() { "on" } else { "off" }
                 ),
             ];
 
@@ -157,13 +162,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
 
         "/inspect" => {
             let cli_name = ctx.resolved_cli.name();
-            let sid = match storage::get_current_session_for_cli(
-                require_db!(ctx),
-                ctx.platform,
-                ctx.chat_id,
-                cli_name,
-            )
-            .await
+            let sid = match require_store!(ctx)
+                .get_current_session(ctx.platform, ctx.chat_id, cli_name)
+                .await
             {
                 Ok(Some(s)) => s,
                 _ => return Some("❌ 当前无活跃会话。".into()),
@@ -177,15 +178,11 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
         "/session" => {
             let cli_name = ctx.resolved_cli.name();
             if arg.is_empty() || arg == "current" {
-                let sid = storage::get_current_session_for_cli(
-                    require_db!(ctx),
-                    ctx.platform,
-                    ctx.chat_id,
-                    cli_name,
-                )
-                .await
-                .ok()
-                .flatten();
+                let sid = require_store!(ctx)
+                    .get_current_session(ctx.platform, ctx.chat_id, cli_name)
+                    .await
+                    .ok()
+                    .flatten();
                 return Some(format!(
                     "📋 **当前会话** (CLI: `{cli_name}`)\n- ID: `{}`",
                     sid.as_deref().unwrap_or("(无)")
@@ -193,22 +190,18 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             }
 
             if arg == "list" {
-                let sessions = storage::list_sessions_for_cli(
-                    require_db!(ctx),
-                    ctx.platform,
-                    ctx.chat_id,
-                    cli_name,
-                )
-                .await
-                .unwrap_or_default();
+                let sessions = require_store!(ctx)
+                    .list_sessions(ctx.platform, ctx.chat_id, cli_name)
+                    .await
+                    .unwrap_or_default();
                 if sessions.is_empty() {
                     return Some(format!("📋 `{cli_name}` 没有历史会话。"));
                 }
                 let mut lines = vec![format!("📋 **`{cli_name}` 会话列表**")];
-                for (sid, current, created) in &sessions {
-                    let marker = if *current { "→ " } else { "  " };
-                    let short = &sid[..8.min(sid.len())];
-                    lines.push(format!("{marker}`{short}…` ({created})"));
+                for s in &sessions {
+                    let marker = if s.is_current { "→ " } else { "  " };
+                    let short = &s.session_id[..8.min(s.session_id.len())];
+                    lines.push(format!("{marker}`{short}…` ({})", s.created_at));
                 }
                 lines.push("\n使用 `/session switch <id>` 切换".into());
                 return Some(lines.join("\n"));
@@ -219,7 +212,8 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 .or_else(|| arg.strip_prefix("sw "))
             {
                 let target = target.trim();
-                match storage::switch_session(require_db!(ctx), ctx.platform, ctx.chat_id, target)
+                match require_store!(ctx)
+                    .switch_session(ctx.platform, ctx.chat_id, target)
                     .await
                 {
                     Ok(true) => Some(format!(
@@ -236,17 +230,21 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
 
         "/cron" => {
             if arg.is_empty() || arg == "list" {
-                let jobs = storage::list_cron_jobs(require_db!(ctx), ctx.platform, ctx.chat_id)
+                let jobs = require_store!(ctx)
+                    .list_cron_jobs(ctx.platform, ctx.chat_id)
                     .await
                     .unwrap_or_default();
                 if jobs.is_empty() {
                     return Some("⏰ 没有定时任务。用 `/cron add` 创建。".into());
                 }
                 let mut lines = vec!["⏰ **定时任务**".to_string()];
-                for (id, expr, desc, enabled) in &jobs {
-                    let status = if *enabled { "✅" } else { "⏸" };
-                    let short_id = &id[..8.min(id.len())];
-                    lines.push(format!("{status} `{short_id}` | `{expr}` | {desc}"));
+                for j in &jobs {
+                    let status = if j.enabled { "✅" } else { "⏸" };
+                    let short_id = &j.job_id[..8.min(j.job_id.len())];
+                    lines.push(format!(
+                        "{status} `{short_id}` | `{}` | {}",
+                        j.cron_expr, j.description
+                    ));
                 }
                 lines.push(
                     "\n`/cron add <cron_expr> <消息>` — 创建\n`/cron del <id>` — 删除".into(),
@@ -271,18 +269,18 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     }
                 };
                 let job_id = uuid::Uuid::new_v4().to_string();
-                let pool = require_db!(ctx);
-                match storage::create_cron_job(
-                    pool,
-                    &job_id,
-                    ctx.platform,
-                    ctx.chat_id,
-                    ctx.user_id,
-                    &cron_expr,
-                    &message,
-                    &message,
-                )
-                .await
+                let store = require_store!(ctx);
+                match store
+                    .create_cron_job(&store::CronJobSpec {
+                        job_id: job_id.clone(),
+                        platform: ctx.platform.to_string(),
+                        chat_id: ctx.chat_id.to_string(),
+                        user_id: ctx.user_id.to_string(),
+                        cron_expr: cron_expr.clone(),
+                        message: message.clone(),
+                        description: message.clone(),
+                    })
+                    .await
                 {
                     Ok(()) => Some(format!(
                         "✅ 定时任务已创建\n- ID: `{}`\n- 表达式: `{cron_expr}`\n- 任务: {message}",
@@ -294,7 +292,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 if let Some(denial) = slash_denial(ctx, ActionCapability::CronMutation) {
                     return Some(denial);
                 }
-                match storage::delete_cron_job(require_db!(ctx), id.trim()).await {
+                match require_store!(ctx).delete_cron_job(id.trim()).await {
                     Ok(true) => Some("✅ 任务已删除".into()),
                     Ok(false) => Some("❌ 找不到该任务".into()),
                     Err(e) => Some(format!("⚠️ 删除失败: {e}")),
@@ -334,16 +332,11 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 return Some(denial);
             }
             let target = resolve_model_shortcut(arg);
-            if let Some(pool) = ctx.pool {
-                let model_key = storage::model_preference_key(ctx.resolved_cli.name());
-                if let Err(e) = storage::set_user_preference(
-                    pool,
-                    ctx.platform,
-                    ctx.user_id,
-                    &model_key,
-                    &target,
-                )
-                .await
+            if let Some(store) = ctx.store {
+                let model_key = store::model_preference_key(ctx.resolved_cli.name());
+                if let Err(e) = store
+                    .set_user_preference(ctx.platform, ctx.user_id, &model_key, &target)
+                    .await
                 {
                     return Some(format!("⚠️ 模型设置失败: {e}"));
                 }
@@ -356,8 +349,8 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 // Show current CLI + available profiles + workspace
                 let current = ctx.config.cli.name();
                 let caps = ctx.config.cli.capabilities();
-                let workspace = if let Some(pool) = ctx.pool {
-                    storage::get_user_preference(pool, ctx.platform, ctx.user_id, "workspace")
+                let workspace = if let Some(s) = ctx.store {
+                    s.get_user_preference(ctx.platform, ctx.user_id, "workspace")
                         .await
                         .ok()
                         .flatten()
@@ -384,8 +377,32 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     lines.push("\n**可用 CLI:**".into());
                     for (name, profile) in &ctx.config.cli_profiles {
                         let c = profile.capabilities();
+                        // Look up availability from pre-probed list
+                        let (status_icon, version_info) = ctx
+                            .cli_availability
+                            .iter()
+                            .find(|(n, _)| n == name)
+                            .map(|(_, avail)| {
+                                let icon = if avail.is_available() { "✅" } else { "❌" };
+                                let ver = match avail {
+                                    crate::cli_bridge::CliAvailability::Available { version } => {
+                                        version
+                                            .as_deref()
+                                            .map(|v| format!(" {v}"))
+                                            .unwrap_or_default()
+                                    }
+                                    crate::cli_bridge::CliAvailability::NotInstalled => {
+                                        " — 未安装".into()
+                                    }
+                                    crate::cli_bridge::CliAvailability::NotExecutable(e) => {
+                                        format!(" — {e}")
+                                    }
+                                };
+                                (icon, ver)
+                            })
+                            .unwrap_or(("  ", String::new()));
                         lines.push(format!(
-                            "  `{name}` ({}{}{})",
+                            "  {status_icon} `{name}` ({}{}{}){version_info}",
                             profile.name(),
                             if c.supports_harness { " +harness" } else { "" },
                             if c.supports_session { " +session" } else { "" },
@@ -413,15 +430,10 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     if caps.supports_harness { "✅" } else { "❌" },
                     if caps.supports_tools { "✅" } else { "❌" },
                 );
-                if let Some(pool) = ctx.pool
-                    && let Err(e) = storage::set_user_preference(
-                        pool,
-                        ctx.platform,
-                        ctx.user_id,
-                        "cli_profile",
-                        arg,
-                    )
-                    .await
+                if let Some(s) = ctx.store
+                    && let Err(e) = s
+                        .set_user_preference(ctx.platform, ctx.user_id, "cli_profile", arg)
+                        .await
                 {
                     return Some(format!("⚠️ CLI 切换失败: {e}"));
                 }
@@ -462,12 +474,15 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              **模型**\n\
              `/model` — 当前模型 + 快捷列表\n\
              `/model <name>` — 切换 (haiku/sonnet/opus/minimax/deepseek/qwen/glm)\n\n\
-             **CLI**\n\
+             **CLI & 工作区**\n\
              `/cli` — 查看当前 CLI + 能力 + 工作目录\n\
              `/cli <name>` — 切换 CLI (astra/claude)\n\
-             `/workspace` (`/ws`) `<path>` — 切换工作目录\n\
+             `/ws` — 当前工作目录\n\
+             `/ws ls` — 列出可用项目\n\
+             `/ws <name|path>` — 切换工作目录\n\
              `/running` — 查看正在执行的任务\n\
              `/cancel` — 取消排队中的请求\n\
+             `/kill <trace_id>` — 强制终止运行中的请求\n\
              `/usage` — 用量统计\n\n\
              **监控**\n\
              `/status` — 状态 + harness\n\
@@ -483,7 +498,8 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              `/cron list` — 查看任务\n\
              `/cron add <expr> <msg>` — 创建\n\
              `/cron del <id>` — 删除\n\n\
-             **安全**\n\
+             **其他**\n\
+             `/gateway` — 完整能力概览\n\
              `/approve` — 权限说明"
                 .into(),
         ),
@@ -602,13 +618,10 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
 
         "/audit" => {
             let cli_name = ctx.resolved_cli.name();
-            let sid = match storage::get_current_session_for_cli(
-                require_db!(ctx),
-                ctx.platform,
-                ctx.chat_id,
-                cli_name,
-            )
-            .await
+            let store = require_store!(ctx);
+            let sid = match store
+                .get_current_session(ctx.platform, ctx.chat_id, cli_name)
+                .await
             {
                 Ok(Some(s)) => s,
                 _ => return Some("❌ 当前无活跃会话。".into()),
@@ -735,24 +748,45 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             }
         }
 
+        "/kill" => {
+            let repo = require_trace_repo!(ctx);
+            let conversation =
+                ConversationKey::new(ctx.platform, ctx.chat_id, ctx.resolved_cli.name());
+            if arg.is_empty() {
+                return Some("用法: `/kill <trace_id>` — 强制终止运行中的请求".into());
+            }
+            // Resolve the trace ID (support prefix match)
+            let trace_id = resolve_trace_selector(repo, &conversation, arg).await;
+            let Some(trace_id) = trace_id else {
+                return Some(format!("❌ 找不到 trace `{arg}`"));
+            };
+            // Force-fail the request regardless of current status
+            match repo
+                .force_fail_request(&trace_id, "killed by user via /kill")
+                .await
+            {
+                Ok(true) => Some(format!(
+                    "💀 已强制终止请求 `{}`",
+                    short_id(trace_id.as_str())
+                )),
+                Ok(false) => Some(format!(
+                    "⚠️ 请求 `{}` 已经是终态",
+                    short_id(trace_id.as_str())
+                )),
+                Err(e) => Some(format!("⚠️ 终止失败: {e}")),
+            }
+        }
+
         "/usage" => {
-            let pool = require_db!(ctx);
-            let today = crate::usage::get_usage_today(pool, ctx.platform, ctx.user_id)
+            let store = require_store!(ctx);
+            let today = store
+                .get_usage_today(ctx.platform, ctx.user_id)
                 .await
-                .unwrap_or(crate::usage::UsageSummary {
-                    messages: 0,
-                    tokens_prompt: 0,
-                    tokens_completion: 0,
-                    tool_calls: 0,
-                });
-            let total = crate::usage::get_usage_total(pool, ctx.platform, ctx.user_id)
+                .unwrap_or_default();
+            let total = store
+                .get_usage_total(ctx.platform, ctx.user_id)
                 .await
-                .unwrap_or(crate::usage::UsageSummary {
-                    messages: 0,
-                    tokens_prompt: 0,
-                    tokens_completion: 0,
-                    tool_calls: 0,
-                });
+                .unwrap_or_default();
             Some(format!(
                 "📊 **用量统计**\n\n\
                  **今日**\n\
@@ -775,9 +809,24 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
         }
 
         "/workspace" | "/ws" => {
-            let pool = require_db!(ctx);
+            // /ws ls | /ws list — list discovered projects (no store needed)
+            if arg == "ls" || arg == "list" {
+                let projects = crate::workspace::discover_all_projects(ctx.project_dirs);
+                if projects.is_empty() {
+                    return Some("📂 没有发现项目。配置 `project_dirs` 后重试。".into());
+                }
+                let mut lines = vec![format!("📂 **可用项目** ({} 个)", projects.len())];
+                for p in &projects {
+                    lines.push(format!("  {}", p.summary()));
+                }
+                lines.push("\n用 `/ws <项目名>` 切换".into());
+                return Some(lines.join("\n"));
+            }
+
+            let store = require_store!(ctx);
             if arg.is_empty() {
-                let ws = storage::get_user_preference(pool, ctx.platform, ctx.user_id, "workspace")
+                let ws = store
+                    .get_user_preference(ctx.platform, ctx.user_id, "workspace")
                     .await
                     .ok()
                     .flatten();
@@ -786,13 +835,39 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     ws.as_deref().unwrap_or("(默认)")
                 ));
             }
-            // Expand ~ to home dir
-            let target = if arg.starts_with('~') {
-                let home = std::env::var("HOME").unwrap_or_default();
-                arg.replacen('~', &home, 1)
-            } else {
-                arg.to_string()
+
+            // Try name-based fuzzy match against discovered projects
+            let projects = crate::workspace::discover_all_projects(ctx.project_dirs);
+            let arg_lower = arg.to_lowercase();
+            let matches: Vec<_> = projects
+                .iter()
+                .filter(|p| {
+                    p.name.eq_ignore_ascii_case(arg) || p.name.to_lowercase().contains(&arg_lower)
+                })
+                .collect();
+            let target = match matches.len() {
+                1 => matches[0].path.clone(),
+                0 => {
+                    // No project match — fall through to path-based logic
+                    if arg.starts_with('~') {
+                        let home = std::env::var("HOME").unwrap_or_default();
+                        arg.replacen('~', &home, 1)
+                    } else {
+                        arg.to_string()
+                    }
+                }
+                _ => {
+                    let names: Vec<_> = matches
+                        .iter()
+                        .map(|p| format!("  {}", p.summary()))
+                        .collect();
+                    return Some(format!(
+                        "⚠️ 多个匹配:\n{}\n请更精确指定。",
+                        names.join("\n")
+                    ));
+                }
             };
+
             let path = std::path::Path::new(&target);
             if !path.is_dir() {
                 return Some(format!("❌ 目录不存在: `{target}`"));
@@ -807,18 +882,139 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 .canonicalize()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or(target);
-            match storage::set_user_preference(
-                pool,
-                ctx.platform,
-                ctx.user_id,
-                "workspace",
-                &canonical,
-            )
-            .await
+            match store
+                .set_user_preference(ctx.platform, ctx.user_id, "workspace", &canonical)
+                .await
             {
                 Ok(()) => Some(format!("📂 工作目录已切换: `{canonical}`")),
                 Err(e) => Some(format!("⚠️ 工作目录设置失败: {e}")),
             }
+        }
+
+        "/gateway" => {
+            let cli_name = ctx.resolved_cli.name();
+            let caps = ctx.resolved_cli.capabilities();
+            let has_store = ctx.store.is_some();
+
+            let model = match ctx.resolved_cli {
+                crate::cli_bridge::CliProfile::Astra { model, .. }
+                | crate::cli_bridge::CliProfile::Claude { model, .. } => model.as_deref(),
+                _ => None,
+            }
+            .or(ctx.config.astra.default_model.as_deref())
+            .unwrap_or("default");
+
+            let workspace = if let Some(store) = ctx.store {
+                store
+                    .get_user_preference(ctx.platform, ctx.user_id, "workspace")
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+
+            let mut lines = vec![
+                "🌐 **Gateway Context**".to_string(),
+                String::new(),
+                "**Identity**".to_string(),
+                format!("- Platform: `{}`", ctx.platform),
+                format!("- User: `{}`", ctx.user_id),
+                format!("- CLI: `{cli_name}`"),
+                format!("- Model: `{model}`"),
+                format!(
+                    "- Storage: {}",
+                    if has_store { "✅ active" } else { "❌ none" }
+                ),
+                format!(
+                    "- Workspace: `{}`",
+                    workspace.as_deref().unwrap_or("(default)")
+                ),
+                String::new(),
+                "**Capabilities**".to_string(),
+                format!(
+                    "- Session management: {}",
+                    if caps.supports_session { "✅" } else { "❌" }
+                ),
+                format!(
+                    "- Model switching: {}",
+                    if caps.supports_model_switch {
+                        "✅"
+                    } else {
+                        "❌"
+                    }
+                ),
+                format!(
+                    "- Harness monitoring: {}",
+                    if caps.supports_harness { "✅" } else { "❌" }
+                ),
+                format!("- Cron/scheduling: {}", if has_store { "✅" } else { "❌" }),
+                format!("- Durable tasks: {}", if has_store { "✅" } else { "❌" }),
+                format!(
+                    "- Tool execution: {}",
+                    if caps.supports_tools { "✅" } else { "❌" }
+                ),
+            ];
+
+            lines.push(String::new());
+            lines.push("**Commands**".to_string());
+            lines.push("| Command | Description |".to_string());
+            lines.push("|---------|-------------|".to_string());
+            lines.push("| `/new` | Reset conversation |".to_string());
+            lines.push("| `/status` | Status + harness |".to_string());
+            lines.push("| `/model <name>` | Switch model |".to_string());
+            lines.push("| `/cli <name>` | Switch CLI backend |".to_string());
+            lines.push("| `/ws ls` | List projects |".to_string());
+            lines.push("| `/ws <name>` | Switch workspace |".to_string());
+            lines.push("| `/session list` | Session history |".to_string());
+            lines.push("| `/cron list` | Scheduled tasks |".to_string());
+            lines.push("| `/task list` | Durable tasks |".to_string());
+            lines.push("| `/running` | Active requests |".to_string());
+            lines.push("| `/cancel` | Cancel queued request |".to_string());
+            lines.push("| `/kill <id>` | Force-kill running request |".to_string());
+            lines.push("| `/trace [id]` | Request trace |".to_string());
+            lines.push("| `/usage` | Token/cost stats |".to_string());
+            lines.push("| `/inspect` | Harness details |".to_string());
+            lines.push("| `/audit` | Decision chain |".to_string());
+            lines.push("| `/gateway` | This context dump |".to_string());
+
+            if ctx.config.action_policy.allow_model_generated_mutations && has_store {
+                lines.push(String::new());
+                lines.push(
+                    "**Gateway Actions** (embed `[[GATEWAY:...]]` tags in response)".to_string(),
+                );
+                lines.push("| Tag | Effect |".to_string());
+                lines.push("|-----|--------|".to_string());
+                lines.push("| `cron_add:<expr>:<msg>` | Create recurring task |".to_string());
+                lines.push("| `remind_after:<min>:<msg>` | One-time reminder |".to_string());
+                lines.push("| `task_list` | List scheduled tasks |".to_string());
+                lines.push("| `task_del:<id>` | Delete task |".to_string());
+                lines.push("| `dtask_create:<name>:<desc>` | Create durable task |".to_string());
+                lines.push("| `dtask_checkpoint:<id>:<json>` | Save checkpoint |".to_string());
+                lines.push("| `dtask_complete:<id>` | Mark complete |".to_string());
+                lines.push("| `workspace_set:<path>` | Switch workspace |".to_string());
+                lines.push("| `skill_add:<name>:<md>` | Save reusable skill |".to_string());
+            }
+
+            if let Some(store) = ctx.store {
+                let cron_jobs = store
+                    .list_cron_jobs(ctx.platform, ctx.chat_id)
+                    .await
+                    .unwrap_or_default();
+                if !cron_jobs.is_empty() {
+                    lines.push(String::new());
+                    lines.push(format!("**Scheduled Tasks** ({} 个)", cron_jobs.len()));
+                    for j in &cron_jobs {
+                        let short = &j.job_id[..8.min(j.job_id.len())];
+                        lines.push(format!(
+                            "- `{short}` | `{}` | {}",
+                            j.cron_expr, j.description
+                        ));
+                    }
+                }
+            }
+
+            Some(lines.join("\n"))
         }
 
         _ => None,
@@ -1429,7 +1625,8 @@ mod tests {
                 api_key: String::new(),
                 default_model: None,
             },
-            database: Default::default(),
+            storage: Default::default(),
+            database: None,
             cli: Default::default(),
             cli_profiles: Default::default(),
             cli_timeout_secs: 3600,
@@ -1457,13 +1654,15 @@ mod tests {
                 let ctx = CommandContext {
                     astra: &astra,
                     config: &config,
-                    pool: None,
+                    store: None,
                     platform: "test",
                     chat_id: "chat_1",
                     user_id: "user_1",
                     resolved_cli: &cli,
                     durable_store: None,
                     trace_repo: None,
+                    project_dirs: &config.project_dirs,
+                    cli_availability: &[],
                 };
                 let result = handle_command(&ctx, $input).await;
                 let check: fn(Option<String>) = $check;
@@ -1511,22 +1710,58 @@ mod tests {
         assert!(r.unwrap().contains("astra"));
     });
     cmd_test!(cmd_new_requires_db, "/new", |r| {
-        assert!(r.unwrap().contains("数据库"));
+        {
+            let msg = r.unwrap();
+            assert!(
+                msg.contains("存储后端") || msg.contains("数据库"),
+                "expected storage error, got: {msg}"
+            );
+        }
     });
     cmd_test!(cmd_session_requires_db, "/session list", |r| {
-        assert!(r.unwrap().contains("数据库"));
+        {
+            let msg = r.unwrap();
+            assert!(
+                msg.contains("存储后端") || msg.contains("数据库"),
+                "expected storage error, got: {msg}"
+            );
+        }
     });
     cmd_test!(cmd_cron_requires_db, "/cron list", |r| {
-        assert!(r.unwrap().contains("数据库"));
+        {
+            let msg = r.unwrap();
+            assert!(
+                msg.contains("存储后端") || msg.contains("数据库"),
+                "expected storage error, got: {msg}"
+            );
+        }
     });
     cmd_test!(cmd_usage_requires_db, "/usage", |r| {
-        assert!(r.unwrap().contains("数据库"));
+        {
+            let msg = r.unwrap();
+            assert!(
+                msg.contains("存储后端") || msg.contains("数据库"),
+                "expected storage error, got: {msg}"
+            );
+        }
     });
     cmd_test!(cmd_workspace_requires_db, "/workspace", |r| {
-        assert!(r.unwrap().contains("数据库"));
+        {
+            let msg = r.unwrap();
+            assert!(
+                msg.contains("存储后端") || msg.contains("数据库"),
+                "expected storage error, got: {msg}"
+            );
+        }
     });
     cmd_test!(cmd_running_requires_trace_repo, "/running", |r| {
-        assert!(r.unwrap().contains("数据库"));
+        {
+            let msg = r.unwrap();
+            assert!(
+                msg.contains("存储后端") || msg.contains("数据库"),
+                "expected storage error, got: {msg}"
+            );
+        }
     });
     cmd_test!(cmd_task_requires_durable_store, "/task list", |r| {
         assert!(r.is_some());
@@ -1543,15 +1778,100 @@ mod tests {
         }
     );
     cmd_test!(cmd_inspect_requires_db, "/inspect", |r| {
-        assert!(r.unwrap().contains("数据库"));
+        {
+            let msg = r.unwrap();
+            assert!(
+                msg.contains("存储后端") || msg.contains("数据库"),
+                "expected storage error, got: {msg}"
+            );
+        }
     });
     cmd_test!(cmd_audit_requires_db, "/audit", |r| {
-        assert!(r.unwrap().contains("数据库"));
+        {
+            let msg = r.unwrap();
+            assert!(
+                msg.contains("存储后端") || msg.contains("数据库"),
+                "expected storage error, got: {msg}"
+            );
+        }
     });
     cmd_test!(cmd_trace_requires_trace_repo, "/trace", |r| {
-        assert!(r.unwrap().contains("数据库"));
+        {
+            let msg = r.unwrap();
+            assert!(
+                msg.contains("存储后端") || msg.contains("数据库"),
+                "expected storage error, got: {msg}"
+            );
+        }
     });
     cmd_test!(cmd_cancel_requires_trace_repo, "/cancel", |r| {
-        assert!(r.unwrap().contains("数据库"));
+        {
+            let msg = r.unwrap();
+            assert!(
+                msg.contains("存储后端") || msg.contains("数据库"),
+                "expected storage error, got: {msg}"
+            );
+        }
     });
+    cmd_test!(cmd_kill_requires_trace_repo, "/kill abc123", |r| {
+        {
+            let msg = r.unwrap();
+            assert!(
+                msg.contains("存储后端") || msg.contains("数据库"),
+                "expected storage error, got: {msg}"
+            );
+        }
+    });
+    cmd_test!(cmd_kill_no_arg_shows_usage, "/kill", |r| {
+        {
+            let msg = r.unwrap();
+            assert!(
+                msg.contains("存储后端") || msg.contains("数据库") || msg.contains("用法"),
+                "expected usage or storage error, got: {msg}"
+            );
+        }
+    });
+    cmd_test!(cmd_help_includes_kill, "/help", |r| {
+        let s = r.unwrap();
+        assert!(s.contains("/kill"), "help should include /kill");
+    });
+    cmd_test!(cmd_help_includes_gateway, "/help", |r| {
+        let s = r.unwrap();
+        assert!(s.contains("/gateway"), "help should include /gateway");
+    });
+    cmd_test!(cmd_help_includes_ws_ls, "/help", |r| {
+        let s = r.unwrap();
+        assert!(s.contains("/ws ls"), "help should include /ws ls");
+    });
+    cmd_test!(cmd_gateway_shows_context, "/gateway", |r| {
+        let s = r.unwrap();
+        assert!(s.contains("Gateway Context"), "missing header");
+        assert!(s.contains("Identity"), "missing identity section");
+        assert!(s.contains("Capabilities"), "missing capabilities section");
+        assert!(s.contains("Commands"), "missing commands section");
+        assert!(s.contains("astra"), "missing CLI name");
+        assert!(s.contains("test"), "missing platform");
+    });
+    cmd_test!(cmd_ws_ls_empty_projects, "/ws ls", |r| {
+        let s = r.unwrap();
+        assert!(s.contains("没有发现项目"), "expected empty project message");
+    });
+
+    cmd_test!(cmd_ws_no_arg_requires_store, "/ws", |r| {
+        let s = r.unwrap();
+        assert!(s.contains("存储后端"), "expected storage error, got: {s}");
+    });
+
+    cmd_test!(
+        cmd_ws_nonexistent_path,
+        "/ws /nonexistent/path/12345",
+        |r| {
+            let s = r.unwrap();
+            // Without store, /ws <arg> requires store first
+            assert!(
+                s.contains("存储后端") || s.contains("不存在"),
+                "expected storage error or not-found, got: {s}"
+            );
+        }
+    );
 }

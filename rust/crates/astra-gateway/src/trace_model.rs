@@ -517,6 +517,18 @@ pub trait TraceRepository: Send + Sync {
     /// Returns the count of swept requests.
     async fn sweep_stale_requests(&self, reason: &str) -> TraceResult<u64>;
 
+    /// Fail all Accepted/Running requests for a specific conversation.
+    /// Used when a conversation worker exits to clean up orphaned traces.
+    async fn sweep_conversation_stale_requests(
+        &self,
+        conversation: &ConversationKey,
+        reason: &str,
+    ) -> TraceResult<u64>;
+
+    /// Force-fail a request regardless of current status (unless already terminal).
+    /// Returns `Ok(true)` if the request was transitioned, `Ok(false)` if already terminal.
+    async fn force_fail_request(&self, trace_id: &TraceId, reason: &str) -> TraceResult<bool>;
+
     async fn gateway_status(
         &self,
         conversation: &ConversationKey,
@@ -1481,6 +1493,38 @@ impl TraceRepository for MysqlTraceRepository {
         .map_err(|e| format!("sweep stale requests failed: {e}"))?;
         Ok(result.rows_affected())
     }
+
+    async fn sweep_conversation_stale_requests(
+        &self,
+        conversation: &ConversationKey,
+        reason: &str,
+    ) -> TraceResult<u64> {
+        let result = sqlx::query(
+            "UPDATE gw_trace_requests SET status = 'failed', error_message = ?, updated_at = NOW(6)
+             WHERE platform = ? AND chat_id = ? AND cli_profile = ? AND status IN ('accepted', 'running')",
+        )
+        .bind(reason)
+        .bind(conversation.platform())
+        .bind(conversation.chat_id())
+        .bind(conversation.cli_profile())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("sweep conversation stale requests failed: {e}"))?;
+        Ok(result.rows_affected())
+    }
+
+    async fn force_fail_request(&self, trace_id: &TraceId, reason: &str) -> TraceResult<bool> {
+        let result = sqlx::query(
+            "UPDATE gw_trace_requests SET status = 'failed', error_message = ?, updated_at = NOW(6)
+             WHERE trace_id = ? AND status IN ('accepted', 'running')",
+        )
+        .bind(reason)
+        .bind(trace_id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("force fail request failed: {e}"))?;
+        Ok(result.rows_affected() > 0)
+    }
 }
 
 #[cfg(test)]
@@ -1782,6 +1826,41 @@ impl TraceRepository for InMemoryTraceRepository {
         }
         Ok(count)
     }
+
+    async fn sweep_conversation_stale_requests(
+        &self,
+        conversation: &ConversationKey,
+        reason: &str,
+    ) -> TraceResult<u64> {
+        let mut state = self.state.lock().unwrap();
+        let mut count = 0u64;
+        for (request, _) in state.requests.values_mut() {
+            if &request.conversation == conversation
+                && (request.status == RequestStatus::Accepted
+                    || request.status == RequestStatus::Running)
+            {
+                request.status = RequestStatus::Failed;
+                request.error_message = Some(reason.to_string());
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn force_fail_request(&self, trace_id: &TraceId, reason: &str) -> TraceResult<bool> {
+        let mut state = self.state.lock().unwrap();
+        for (request, _) in state.requests.values_mut() {
+            if request.trace_id == *trace_id
+                && (request.status == RequestStatus::Accepted
+                    || request.status == RequestStatus::Running)
+            {
+                request.status = RequestStatus::Failed;
+                request.error_message = Some(reason.to_string());
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 #[cfg(test)]
@@ -2078,5 +2157,96 @@ mod tests {
         // Second sweep should return 0
         let swept2 = repo.sweep_stale_requests("again").await.unwrap();
         assert_eq!(swept2, 0);
+    }
+
+    #[tokio::test]
+    async fn sweep_conversation_stale_requests_only_affects_matching_conversation() {
+        let repo = InMemoryTraceRepository::default();
+        let conv_a = ConversationKey::new("wecom", "chat-1", "astra");
+        let conv_b = ConversationKey::new("wecom", "chat-2", "astra");
+
+        // Create requests in both conversations
+        let req_a = GatewayRequest::new(conv_a.clone(), "msg-1", "u1", "hello");
+        let req_a_id = req_a.request_id.clone();
+        TraceWriter::begin(&repo, req_a).await.unwrap();
+
+        let req_b = GatewayRequest::new(conv_b.clone(), "msg-2", "u1", "world");
+        let req_b_id = req_b.request_id.clone();
+        TraceWriter::begin(&repo, req_b).await.unwrap();
+
+        // Sweep only conv_a
+        let swept = repo
+            .sweep_conversation_stale_requests(&conv_a, "worker exited")
+            .await
+            .unwrap();
+        assert_eq!(swept, 1);
+
+        // conv_a request should be Failed
+        let r_a = repo.get_request(&req_a_id).await.unwrap().unwrap();
+        assert_eq!(r_a.status, RequestStatus::Failed);
+        assert_eq!(r_a.error_message.as_deref(), Some("worker exited"));
+
+        // conv_b request should still be Accepted
+        let r_b = repo.get_request(&req_b_id).await.unwrap().unwrap();
+        assert_eq!(r_b.status, RequestStatus::Accepted);
+    }
+
+    #[tokio::test]
+    async fn force_fail_request_transitions_running_to_failed() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wecom", "chat-1", "astra");
+
+        let req = GatewayRequest::new(conv.clone(), "msg-1", "u1", "hello");
+        let trace_id = req.trace_id.clone();
+        let req_id = req.request_id.clone();
+        let writer = TraceWriter::begin(&repo, req).await.unwrap();
+        let _ = writer.start_run("astra", None).await.unwrap();
+
+        // Force-fail while Running
+        let result = repo
+            .force_fail_request(&trace_id, "killed by user")
+            .await
+            .unwrap();
+        assert!(result, "should return true for Running -> Failed");
+
+        let r = repo.get_request(&req_id).await.unwrap().unwrap();
+        assert_eq!(r.status, RequestStatus::Failed);
+        assert_eq!(r.error_message.as_deref(), Some("killed by user"));
+    }
+
+    #[tokio::test]
+    async fn force_fail_request_returns_false_for_terminal() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wecom", "chat-1", "astra");
+
+        let req = GatewayRequest::new(conv, "msg-1", "u1", "hello");
+        let trace_id = req.trace_id.clone();
+        let writer = TraceWriter::begin(&repo, req).await.unwrap();
+        writer.complete_request().await.unwrap();
+
+        // Already Completed — force_fail should return false
+        let result = repo
+            .force_fail_request(&trace_id, "too late")
+            .await
+            .unwrap();
+        assert!(!result, "should return false for already-terminal request");
+    }
+
+    #[tokio::test]
+    async fn force_fail_request_works_on_accepted() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wecom", "chat-1", "astra");
+
+        let req = GatewayRequest::new(conv, "msg-1", "u1", "hello");
+        let trace_id = req.trace_id.clone();
+        let req_id = req.request_id.clone();
+        TraceWriter::begin(&repo, req).await.unwrap();
+
+        // Force-fail while Accepted
+        let result = repo.force_fail_request(&trace_id, "killed").await.unwrap();
+        assert!(result);
+
+        let r = repo.get_request(&req_id).await.unwrap().unwrap();
+        assert_eq!(r.status, RequestStatus::Failed);
     }
 }

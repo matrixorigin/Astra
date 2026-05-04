@@ -8,14 +8,13 @@ use crate::commands::{self, CommandContext};
 use crate::config::GatewayConfig;
 use crate::gateway_context::GatewayContext;
 use crate::platforms::{InboundMessage, PlatformAdapter};
-use crate::storage;
+use crate::store::{self, GatewayStore};
 use crate::trace_model::{
     ConversationKey, GatewayRequest, MysqlTraceRepository, OutboxId, RequestId, RequestStatus,
     RunStatus, TraceId, TraceRepository, TraceWriter,
 };
 use astra_core::durable_task_store::DurableTaskStore as _;
 use futures_util::future::select_all;
-use sqlx::MySqlPool;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -80,7 +79,7 @@ impl OutboundMessage {
 
 pub struct GatewayRunner {
     config: GatewayConfig,
-    pool: Option<MySqlPool>,
+    store: Option<Arc<dyn GatewayStore>>,
     cli_profile: CliProfile,
     thin: astra_thin_client::ThinClient,
     outbound_tx: Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
@@ -91,6 +90,7 @@ pub struct GatewayRunner {
     queue_senders:
         tokio::sync::Mutex<HashMap<ConversationKey, tokio::sync::mpsc::Sender<QueuedRequest>>>,
     global_run_limiter: Arc<tokio::sync::Semaphore>,
+    cli_availability: Vec<(String, cli_bridge::CliAvailability)>,
 }
 
 /// No-op adapter used in spawned CLI tasks (typing/heartbeats not available in background).
@@ -147,27 +147,25 @@ impl GatewayRunner {
             },
         )?;
 
-        let pool = match connect_db(&config.database.url).await {
-            Ok(pool) => {
-                tracing::info!("database connected");
-                Some(pool)
+        let storage_config = config.resolve_storage();
+        let (store, durable_store, trace_repo) = match store::open_store_bundle(&storage_config)
+            .await
+        {
+            Ok(Some(bundle)) => {
+                tracing::info!(backend = ?storage_config, "storage connected");
+                (Some(bundle.store), bundle.durable_store, bundle.trace_repo)
+            }
+            Ok(None) => {
+                tracing::info!("running without persistence (storage: none)");
+                (None, None, None)
             }
             Err(e) => {
-                tracing::warn!(error = %e, "DB not available — running without persistence (sessions in-memory, no cron)");
-                None
+                tracing::warn!(error = %e, "storage not available — running without persistence");
+                (None, None, None)
             }
         };
 
         let cli_profile = config.cli.clone();
-
-        let durable_store = pool.as_ref().map(|p| {
-            std::sync::Arc::new(crate::durable_task_store::MysqlDurableTaskStore::new(
-                p.clone(),
-            ))
-        });
-        let trace_repo = pool
-            .as_ref()
-            .map(|p| Arc::new(MysqlTraceRepository::new(p.clone())));
 
         let user_skills = config
             .skills_dir
@@ -190,17 +188,37 @@ impl GatewayRunner {
             tracing::info!(count = projects.len(), "discovered projects");
         }
 
-        if let Some(ref pool) = pool
-            && let Err(e) = crate::usage::ensure_usage_table(pool).await
-        {
-            tracing::warn!(error = %e, "failed to ensure usage tracking table");
-        }
         let max_concurrent_runs = config.max_concurrent_runs.max(1);
+
+        // Probe all configured CLI profiles for availability
+        let mut cli_availability = Vec::new();
+        let default_avail = cli_bridge::probe_cli(&cli_profile).await;
+        cli_availability.push((cli_profile.name().to_string(), default_avail.clone()));
+        for (name, profile) in &config.cli_profiles {
+            let avail = cli_bridge::probe_cli(profile).await;
+            cli_availability.push((name.clone(), avail));
+        }
+
+        // If default CLI not available, auto-select first available
+        let effective_cli = if !default_avail.is_available() {
+            if let Some((name, _)) = cli_availability.iter().find(|(_, a)| a.is_available()) {
+                if let Some(profile) = config.cli_profiles.get(name) {
+                    tracing::info!(cli = %name, "default CLI unavailable, auto-selected");
+                    profile.clone()
+                } else {
+                    cli_profile.clone()
+                }
+            } else {
+                cli_profile.clone()
+            }
+        } else {
+            cli_profile.clone()
+        };
 
         Ok(Self {
             config,
-            pool,
-            cli_profile,
+            store,
+            cli_profile: effective_cli,
             thin,
             outbound_tx: None,
             durable_store,
@@ -209,11 +227,23 @@ impl GatewayRunner {
             trace_repo,
             queue_senders: tokio::sync::Mutex::new(HashMap::new()),
             global_run_limiter: Arc::new(tokio::sync::Semaphore::new(max_concurrent_runs)),
+            cli_availability,
         })
     }
 
-    pub fn pool(&self) -> Option<&MySqlPool> {
-        self.pool.as_ref()
+    /// Whether any storage backend is active.
+    pub fn has_store(&self) -> bool {
+        self.store.is_some()
+    }
+
+    /// Clone the Arc-wrapped store for use by external components (e.g. scheduler).
+    pub fn store(&self) -> Option<Arc<dyn GatewayStore>> {
+        self.store.clone()
+    }
+
+    /// Clone the Arc-wrapped trace repository.
+    pub fn trace_repo(&self) -> Option<Arc<MysqlTraceRepository>> {
+        self.trace_repo.clone()
     }
 
     pub fn cli_profile(&self) -> &CliProfile {
@@ -222,29 +252,29 @@ impl GatewayRunner {
 
     /// Replay messages that were pending when gateway crashed.
     pub async fn replay_pending_messages(&self, adapter: &dyn PlatformAdapter) {
-        if let Some(ref pool) = self.pool {
+        if let Some(ref store) = self.store {
             let platform = adapter.name();
-            match storage::list_pending_messages(pool, Some(platform)).await {
+            match store.list_pending_messages(Some(platform)).await {
                 Ok(msgs) if msgs.is_empty() => {}
                 Ok(msgs) => {
                     tracing::info!(platform, count = msgs.len(), "replaying pending messages");
-                    for (id, _platform, chat_id, user_id, text) in &msgs {
+                    for pm in &msgs {
                         let msg = crate::platforms::InboundMessage {
                             platform,
-                            chat_id: chat_id.clone(),
-                            user_id: user_id.clone(),
-                            text: text.clone(),
-                            msg_id: format!("replay-{id}"),
+                            chat_id: pm.chat_id.clone(),
+                            user_id: pm.user_id.clone(),
+                            text: pm.text.clone(),
+                            msg_id: format!("replay-{}", pm.id),
                             chat_type: crate::platforms::ChatType::DirectMessage,
                             reply_token: None,
                         };
                         if let Some(response) = self
-                            .handle_message_inner(&msg, adapter, Some(*id), false, None)
+                            .handle_message_inner(&msg, adapter, Some(pm.id), false, None)
                             .await
                         {
                             for chunk in split_message(&response.text) {
-                                if let Err(e) = adapter.send_text(chat_id, chunk, None).await {
-                                    tracing::warn!(error = %e, chat_id, "failed to deliver pending replay");
+                                if let Err(e) = adapter.send_text(&pm.chat_id, chunk, None).await {
+                                    tracing::warn!(error = %e, chat_id = %pm.chat_id, "failed to deliver pending replay");
                                 }
                             }
                         }
@@ -281,9 +311,10 @@ impl GatewayRunner {
 
     /// Resolve the active CLI profile for a user (may be overridden via /cli + /model).
     async fn resolve_cli_profile(&self, platform: &str, user_id: &str) -> CliProfile {
-        let mut profile = if let Some(ref pool) = self.pool
-            && let Ok(Some(name)) =
-                storage::get_user_preference(pool, platform, user_id, "cli_profile").await
+        let mut profile = if let Some(ref store) = self.store
+            && let Ok(Some(name)) = store
+                .get_user_preference(platform, user_id, "cli_profile")
+                .await
             && let Some(p) = self.config.cli_profiles.get(&name)
         {
             p.clone()
@@ -292,10 +323,11 @@ impl GatewayRunner {
         };
 
         // Apply per-user model override scoped to this CLI
-        let model_key = storage::model_preference_key(profile.name());
-        if let Some(ref pool) = self.pool
-            && let Ok(Some(model_name)) =
-                storage::get_user_preference(pool, platform, user_id, &model_key).await
+        let model_key = store::model_preference_key(profile.name());
+        if let Some(ref store) = self.store
+            && let Ok(Some(model_name)) = store
+                .get_user_preference(platform, user_id, &model_key)
+                .await
         {
             match &mut profile {
                 CliProfile::Astra { model, .. } | CliProfile::Claude { model, .. } => {
@@ -343,7 +375,7 @@ impl GatewayRunner {
         let cmd_ctx = CommandContext {
             astra: &self.thin,
             config: &self.config,
-            pool: self.pool.as_ref(),
+            store: self.store.as_deref(),
             platform: msg.platform,
             chat_id: &effective_chat_id,
             user_id: &msg.user_id,
@@ -356,6 +388,8 @@ impl GatewayRunner {
                 .trace_repo
                 .as_ref()
                 .map(|repo| repo.as_ref() as &dyn TraceRepository),
+            project_dirs: &self.config.project_dirs,
+            cli_availability: &self.cli_availability,
         };
         if let Some(response) = commands::handle_command(&cmd_ctx, &msg.text).await {
             return Ok(Some(response));
@@ -395,33 +429,54 @@ impl GatewayRunner {
 
         let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
 
-        if let Some(ref pool) = self.pool
-            && let Err(e) =
-                storage::upsert_user(pool, msg.platform, &msg.user_id, &msg.user_id).await
+        // Check first-time user BEFORE upsert (upsert creates the row)
+        let is_first = if let Some(ref store) = self.store {
+            store
+                .is_first_message(msg.platform, &msg.user_id)
+                .await
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if let Some(ref store) = self.store
+            && let Err(e) = store
+                .upsert_user(msg.platform, &msg.user_id, &msg.user_id)
+                .await
         {
             tracing::warn!(error = %e, "failed to upsert user");
+        }
+
+        // Send first-time welcome after upsert
+        if is_first {
+            let welcome = build_welcome_message(&cli_profile);
+            if let Some(ref tx) = self.outbound_tx {
+                let _ = tx
+                    .send(OutboundMessage::plain(
+                        msg.platform.to_string(),
+                        msg.chat_id.clone(),
+                        welcome,
+                    ))
+                    .await;
+            }
         }
 
         let cli_name = cli_profile.name().to_string();
 
         // Auto-reset session if policy triggers
-        if let Some(ref pool) = self.pool
-            && let Ok(Some(last_active_str)) =
-                storage::get_session_last_active(pool, msg.platform, &effective_chat_id, &cli_name)
-                    .await
+        if let Some(ref store) = self.store
+            && let Ok(Some(last_active_str)) = store
+                .get_session_last_active(msg.platform, &effective_chat_id, &cli_name)
+                .await
             && let Ok(last_active) =
                 chrono::NaiveDateTime::parse_from_str(&last_active_str, "%Y-%m-%d %H:%M:%S%.f")
         {
             let last_utc = last_active.and_utc();
             let now = chrono::Utc::now();
             if self.config.session_reset.should_reset(last_utc, now) {
-                if let Err(e) = storage::reset_session_for_cli(
-                    pool,
-                    msg.platform,
-                    &effective_chat_id,
-                    &cli_name,
-                )
-                .await
+                if let Err(e) = store
+                    .reset_session(msg.platform, &effective_chat_id, &cli_name)
+                    .await
                 {
                     tracing::warn!(error = %e, "session auto-reset failed");
                 } else {
@@ -430,8 +485,9 @@ impl GatewayRunner {
             }
         }
 
-        let session_id = if let Some(ref pool) = self.pool {
-            storage::get_current_session_for_cli(pool, msg.platform, &effective_chat_id, &cli_name)
+        let session_id = if let Some(ref store) = self.store {
+            store
+                .get_current_session(msg.platform, &effective_chat_id, &cli_name)
                 .await
                 .ok()
                 .flatten()
@@ -498,9 +554,10 @@ impl GatewayRunner {
         }
 
         // Resolve workspace directory for CLI
-        let workspace: Option<std::path::PathBuf> = if let Some(ref pool) = self.pool
-            && let Ok(Some(ws)) =
-                storage::get_user_preference(pool, msg.platform, &msg.user_id, "workspace").await
+        let workspace: Option<std::path::PathBuf> = if let Some(ref store) = self.store
+            && let Ok(Some(ws)) = store
+                .get_user_preference(msg.platform, &msg.user_id, "workspace")
+                .await
         {
             let path = std::path::PathBuf::from(&ws);
             if path.is_dir() { Some(path) } else { None }
@@ -515,20 +572,19 @@ impl GatewayRunner {
                 &msg.user_id,
                 msg.platform,
                 &cli_profile,
-                self.pool.is_some(),
+                self.store.is_some(),
             )
             .with_model_actions_allowed(self.config.action_policy.allow_model_generated_mutations);
-            if let Some(ref pool) = self.pool
-                && let Ok(jobs) =
-                    storage::list_cron_jobs(pool, msg.platform, &effective_chat_id).await
+            if let Some(ref store) = self.store
+                && let Ok(jobs) = store.list_cron_jobs(msg.platform, &effective_chat_id).await
             {
                 let cron_list: Vec<_> = jobs
                     .iter()
-                    .map(|(id, expr, desc, _)| {
+                    .map(|j| {
                         (
-                            id[..8.min(id.len())].to_string(),
-                            expr.clone(),
-                            desc.clone(),
+                            j.job_id[..8.min(j.job_id.len())].to_string(),
+                            j.cron_expr.clone(),
+                            j.description.clone(),
                         )
                     })
                     .collect();
@@ -571,15 +627,10 @@ impl GatewayRunner {
 
         // Save as pending (for crash recovery)
         let pending_id = if save_pending {
-            if let Some(ref pool) = self.pool {
-                match storage::save_pending_message(
-                    pool,
-                    msg.platform,
-                    &effective_chat_id,
-                    &msg.user_id,
-                    &msg.text,
-                )
-                .await
+            if let Some(ref store) = self.store {
+                match store
+                    .save_pending_message(msg.platform, &effective_chat_id, &msg.user_id, &msg.text)
+                    .await
                 {
                     Ok(id) => Some(id),
                     Err(e) => {
@@ -844,14 +895,10 @@ impl GatewayRunner {
                 cli = cli_name,
                 "stale session detected — clearing and retrying"
             );
-            if let Some(ref pool) = self.pool {
-                let _ = storage::reset_session_for_cli(
-                    pool,
-                    msg.platform,
-                    &effective_chat_id,
-                    &cli_name,
-                )
-                .await;
+            if let Some(ref store) = self.store {
+                let _ = store
+                    .reset_session(msg.platform, &effective_chat_id, &cli_name)
+                    .await;
             }
             // Retry without session-id
             let retry_handle = tokio::spawn({
@@ -891,17 +938,17 @@ impl GatewayRunner {
                             .await;
                     }
                     // Save new session
-                    if let Some(ref pool) = self.pool
+                    if let Some(ref store) = self.store
                         && let Some(ref sid) = retry_result.session_id
-                        && let Err(e) = storage::set_current_session_for_cli(
-                            pool,
-                            msg.platform,
-                            &effective_chat_id,
-                            &msg.user_id,
-                            sid,
-                            &cli_name,
-                        )
-                        .await
+                        && let Err(e) = store
+                            .set_current_session(
+                                msg.platform,
+                                &effective_chat_id,
+                                &msg.user_id,
+                                sid,
+                                &cli_name,
+                            )
+                            .await
                     {
                         tracing::warn!(error = %e, "failed to persist session after retry");
                     }
@@ -1004,23 +1051,23 @@ impl GatewayRunner {
         }
 
         // Save session_id to DB (if available), scoped by CLI profile
-        if let Some(ref pool) = self.pool {
+        if let Some(ref store) = self.store {
             if let Some(ref sid) = result.session_id {
-                if let Err(e) = storage::set_current_session_for_cli(
-                    pool,
-                    msg.platform,
-                    &effective_chat_id,
-                    &msg.user_id,
-                    sid,
-                    &cli_name,
-                )
-                .await
+                if let Err(e) = store
+                    .set_current_session(
+                        msg.platform,
+                        &effective_chat_id,
+                        &msg.user_id,
+                        sid,
+                        &cli_name,
+                    )
+                    .await
                 {
                     tracing::warn!(error = %e, "failed to persist session");
                 }
-            } else if let Err(e) =
-                storage::touch_session_for_cli(pool, msg.platform, &effective_chat_id, &cli_name)
-                    .await
+            } else if let Err(e) = store
+                .touch_session(msg.platform, &effective_chat_id, &cli_name)
+                .await
             {
                 tracing::warn!(error = %e, "failed to touch session");
             }
@@ -1042,7 +1089,7 @@ impl GatewayRunner {
             let mut action_results = Vec::new();
             text = execute_gateway_actions_with_policy(
                 &text,
-                self.pool.as_ref(),
+                self.store.as_deref(),
                 msg.platform,
                 &msg.chat_id,
                 &msg.user_id,
@@ -1097,10 +1144,9 @@ impl GatewayRunner {
         );
 
         // Record usage to DB
-        if let Some(ref pool) = self.pool
-            && let Err(e) = crate::usage::record_usage(
-                pool,
-                &crate::usage::UsageRecord {
+        if let Some(ref store) = self.store
+            && let Err(e) = store
+                .record_usage(&store::UsageRecord {
                     platform: msg.platform.to_string(),
                     user_id: msg.user_id.clone(),
                     cli_profile: cli_name.clone(),
@@ -1114,9 +1160,8 @@ impl GatewayRunner {
                     tokens_completion: result.tokens_completion.unwrap_or(0),
                     tool_calls: result.tool_calls_count.unwrap_or(0),
                     elapsed_ms: elapsed.as_millis() as u64,
-                },
-            )
-            .await
+                })
+                .await
         {
             tracing::warn!(error = %e, "failed to record usage");
         }
@@ -1142,10 +1187,10 @@ impl GatewayRunner {
     }
 
     async fn clear_pending_message(&self, pending_id: Option<i64>) {
-        let (Some(id), Some(pool)) = (pending_id, self.pool.as_ref()) else {
+        let (Some(id), Some(store)) = (pending_id, self.store.as_ref()) else {
             return;
         };
-        if let Err(e) = storage::delete_pending_message(pool, id).await {
+        if let Err(e) = store.delete_pending_message(id).await {
             tracing::warn!(id, error = %e, "failed to delete pending message");
         }
     }
@@ -1315,11 +1360,41 @@ impl GatewayRunner {
             if !self.should_execute_queued(&queued).await {
                 continue;
             }
-            if let Some(outbound) = self
+            match self
                 .handle_message_inner(&queued.msg, &NullAdapter, None, true, queued.trace.clone())
                 .await
             {
-                let _ = cli_resp_tx.send(outbound).await;
+                Some(outbound) => {
+                    let _ = cli_resp_tx.send(outbound).await;
+                }
+                None => {
+                    // Fix A: Never leave a trace stuck in Running when no response is produced.
+                    if let Some(trace) = queued.trace.as_ref()
+                        && let Some(repo) = self.trace_repo.as_ref()
+                    {
+                        let writer = TraceWriter::from_existing(
+                            repo.as_ref() as &dyn TraceRepository,
+                            trace.trace_id.clone(),
+                            trace.request_id.clone(),
+                        );
+                        let _ = writer.fail_request("request produced no response").await;
+                    }
+                }
+            }
+        }
+        // Fix C: Sweep any Running/Accepted traces for this conversation before exiting.
+        if let Some(repo) = self.trace_repo.as_ref() {
+            match repo
+                .sweep_conversation_stale_requests(&key, "conversation worker exited")
+                .await
+            {
+                Ok(0) => {}
+                Ok(n) => {
+                    tracing::info!(conversation = %key, count = n, "swept stale traces on worker exit");
+                }
+                Err(e) => {
+                    tracing::warn!(conversation = %key, error = %e, "failed to sweep stale traces on worker exit");
+                }
             }
         }
         self.queue_senders.lock().await.remove(&key);
@@ -1335,18 +1410,39 @@ impl GatewayRunner {
         };
         match repo.get_request(&trace.request_id).await {
             Ok(Some(request)) if request.status == RequestStatus::Accepted => true,
-            Ok(Some(request)) => {
+            Ok(Some(request)) if request.status.is_terminal() => {
                 tracing::info!(
                     request_id = %trace.request_id,
                     status = request.status.as_str(),
-                    "skipping queued request"
+                    "skipping queued request (terminal status)"
                 );
+                false
+            }
+            Ok(Some(request)) => {
+                // Non-terminal, non-Accepted (e.g. Running from a previous crash) — mark failed
+                tracing::info!(
+                    request_id = %trace.request_id,
+                    status = request.status.as_str(),
+                    "skipping queued request with unexpected status; marking failed"
+                );
+                let writer = TraceWriter::from_existing(
+                    repo.as_ref() as &dyn TraceRepository,
+                    trace.trace_id.clone(),
+                    trace.request_id.clone(),
+                );
+                let _ = writer
+                    .fail_request(&format!(
+                        "queued request had unexpected status: {}",
+                        request.status.as_str()
+                    ))
+                    .await;
                 false
             }
             Ok(None) => false,
             Err(e) => {
-                tracing::warn!(error = %e, "failed to verify queued request status");
-                false
+                // Execute on DB error rather than silently dropping the request
+                tracing::warn!(error = %e, "failed to verify queued request status; executing anyway");
+                true
             }
         }
     }
@@ -1668,54 +1764,7 @@ fn is_safe_skill_name(name: &str) -> bool {
             .all(|ch| ch.is_alphanumeric() || matches!(ch, ' ' | '_' | '-'))
 }
 
-async fn connect_db(url: &str) -> Result<MySqlPool, sqlx::Error> {
-    match sqlx::mysql::MySqlPoolOptions::new()
-        .max_connections(5)
-        .connect(url)
-        .await
-    {
-        Ok(pool) => {
-            storage::ensure_schema(&pool).await?;
-            Ok(pool)
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if !msg.contains("1049") && !msg.contains("Unknown database") {
-                return Err(e);
-            }
-            // Extract DB name from URL and create it
-            let (base_url, db_name) = match url.rfind('/') {
-                Some(pos) if pos > url.find("://").map(|p| p + 2).unwrap_or(0) => {
-                    (&url[..pos], &url[pos + 1..])
-                }
-                _ => return Err(e),
-            };
-            // Strip query params from db_name
-            let db_name = db_name.split('?').next().unwrap_or(db_name);
-            if !is_safe_db_name(db_name) {
-                return Err(e);
-            }
-
-            tracing::info!(db = db_name, "database does not exist — creating");
-            let tmp_pool = sqlx::mysql::MySqlPoolOptions::new()
-                .max_connections(1)
-                .connect(base_url)
-                .await?;
-            sqlx::query(&format!("CREATE DATABASE IF NOT EXISTS `{db_name}`"))
-                .execute(&tmp_pool)
-                .await?;
-            tmp_pool.close().await;
-
-            let pool = sqlx::mysql::MySqlPoolOptions::new()
-                .max_connections(5)
-                .connect(url)
-                .await?;
-            storage::ensure_schema(&pool).await?;
-            Ok(pool)
-        }
-    }
-}
-
+#[cfg(test)]
 fn is_safe_db_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
@@ -1736,7 +1785,7 @@ async fn resolve_gateway_task(
 #[cfg(test)]
 async fn execute_gateway_actions(
     text: &str,
-    pool: Option<&sqlx::MySqlPool>,
+    store: Option<&dyn GatewayStore>,
     platform: &str,
     chat_id: &str,
     user_id: &str,
@@ -1746,7 +1795,7 @@ async fn execute_gateway_actions(
 ) -> String {
     execute_gateway_actions_with_policy(
         text,
-        pool,
+        store,
         platform,
         chat_id,
         user_id,
@@ -1765,7 +1814,7 @@ async fn execute_gateway_actions(
 #[allow(clippy::too_many_arguments)]
 async fn execute_gateway_actions_with_policy(
     text: &str,
-    pool: Option<&sqlx::MySqlPool>,
+    store: Option<&dyn GatewayStore>,
     platform: &str,
     chat_id: &str,
     user_id: &str,
@@ -1802,12 +1851,19 @@ async fn execute_gateway_actions_with_policy(
                     "⚠️ 任务消息不能为空".into()
                 } else if !is_valid_cron_expr(cron_expr) {
                     format!("⚠️ 无效的 cron 表达式: `{cron_expr}`（需要 5 个字段: 分 时 日 月 周）")
-                } else if let Some(pool) = pool {
+                } else if let Some(store) = store {
                     let job_id = uuid::Uuid::new_v4().to_string();
-                    match storage::create_cron_job(
-                        pool, &job_id, platform, chat_id, user_id, cron_expr, message, message,
-                    )
-                    .await
+                    match store
+                        .create_cron_job(&store::CronJobSpec {
+                            job_id: job_id.clone(),
+                            platform: platform.to_string(),
+                            chat_id: chat_id.to_string(),
+                            user_id: user_id.to_string(),
+                            cron_expr: cron_expr.to_string(),
+                            message: message.to_string(),
+                            description: message.to_string(),
+                        })
+                        .await
                     {
                         Ok(()) => {
                             tracing::info!(
@@ -1838,31 +1894,27 @@ async fn execute_gateway_actions_with_policy(
                     "⚠️ 提醒时间无效（需要大于 0 的分钟数）".into()
                 } else if minutes > 1440 * 7 {
                     "⚠️ 提醒时间过长（最多 7 天 = 10080 分钟）".into()
-                } else if let Some(pool) = pool {
+                } else if let Some(store) = store {
                     // Store as one-shot cron job with computed next_run time
                     let job_id = uuid::Uuid::new_v4().to_string();
                     let next_run = chrono::Utc::now() + chrono::Duration::minutes(minutes as i64);
                     let next_run_str = next_run.format("%Y-%m-%d %H:%M:%S").to_string();
                     // Use special cron_expr "once" to mark as one-shot
-                    match storage::create_cron_job(
-                        pool,
-                        &job_id,
-                        platform,
-                        chat_id,
-                        user_id,
-                        "once",
-                        &message,
-                        &format!("⏰ {message} (一次性)"),
-                    )
-                    .await
+                    match store
+                        .create_cron_job(&store::CronJobSpec {
+                            job_id: job_id.clone(),
+                            platform: platform.to_string(),
+                            chat_id: chat_id.to_string(),
+                            user_id: user_id.to_string(),
+                            cron_expr: "once".to_string(),
+                            message: message.clone(),
+                            description: format!("⏰ {message} (一次性)"),
+                        })
+                        .await
                     {
                         Ok(()) => {
-                            if let Err(e) =
-                                sqlx::query("UPDATE gw_cron_jobs SET next_run = ? WHERE job_id = ?")
-                                    .bind(&next_run_str)
-                                    .bind(&job_id)
-                                    .execute(pool)
-                                    .await
+                            // Update next_run via the trait method (works on all backends)
+                            if let Err(e) = store.update_cron_next_run(&job_id, &next_run_str).await
                             {
                                 tracing::warn!(job_id = %&job_id[..8], error = %e, "failed to set remind_after next_run");
                             }
@@ -1891,15 +1943,18 @@ async fn execute_gateway_actions_with_policy(
             }
 
             Some("task_list") => {
-                if let Some(pool) = pool {
-                    match storage::list_cron_jobs(pool, platform, chat_id).await {
+                if let Some(store) = store {
+                    match store.list_cron_jobs(platform, chat_id).await {
                         Ok(jobs) if jobs.is_empty() => "📋 当前没有定时任务。".into(),
                         Ok(jobs) => {
                             let mut lines = vec![format!("📋 **定时任务** ({} 个)", jobs.len())];
-                            for (id, expr, desc, enabled) in &jobs {
-                                let status = if *enabled { "✅" } else { "⏸" };
-                                let short_id = &id[..8.min(id.len())];
-                                lines.push(format!("{status} `{short_id}` | `{expr}` | {desc}"));
+                            for j in &jobs {
+                                let status = if j.enabled { "✅" } else { "⏸" };
+                                let short_id = &j.job_id[..8.min(j.job_id.len())];
+                                lines.push(format!(
+                                    "{status} `{short_id}` | `{}` | {}",
+                                    j.cron_expr, j.description
+                                ));
                             }
                             lines.join("\n")
                         }
@@ -1914,9 +1969,9 @@ async fn execute_gateway_actions_with_policy(
                 let target = parts[1].trim();
                 if target.is_empty() {
                     "⚠️ 请指定任务 ID".into()
-                } else if let Some(pool) = pool {
+                } else if let Some(store) = store {
                     // Support prefix match
-                    match find_and_delete_job(pool, platform, chat_id, target).await {
+                    match find_and_delete_job(store, platform, chat_id, target).await {
                         Ok(Some(desc)) => {
                             tracing::info!(target, "gateway action: task_del");
                             format!("✅ 已删除任务: {desc}")
@@ -1933,8 +1988,8 @@ async fn execute_gateway_actions_with_policy(
             // Legacy alias
             Some("cron_del") if parts.len() >= 2 => {
                 let job_id = parts[1].trim();
-                if let Some(pool) = pool {
-                    match find_and_delete_job(pool, platform, chat_id, job_id).await {
+                if let Some(store) = store {
+                    match find_and_delete_job(store, platform, chat_id, job_id).await {
                         Ok(Some(desc)) => {
                             tracing::info!(job_id, "gateway action: cron_del");
                             format!("✅ 已删除任务: {desc}")
@@ -2243,19 +2298,14 @@ async fn execute_gateway_actions_with_policy(
                     format!("❌ 目录不存在: `{expanded}`")
                 } else if let Err(denial) = action_policy.workspace_allowed(path) {
                     denial
-                } else if let Some(pool) = pool {
+                } else if let Some(store) = store {
                     let canonical = path
                         .canonicalize()
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or(expanded);
-                    match storage::set_user_preference(
-                        pool,
-                        platform,
-                        user_id,
-                        "workspace",
-                        &canonical,
-                    )
-                    .await
+                    match store
+                        .set_user_preference(platform, user_id, "workspace", &canonical)
+                        .await
                     {
                         Ok(()) => {
                             tracing::info!(workspace = %canonical, "gateway action: workspace_set");
@@ -2307,19 +2357,19 @@ fn is_valid_cron_expr(expr: &str) -> bool {
 }
 
 async fn find_and_delete_job(
-    pool: &sqlx::MySqlPool,
+    store: &dyn GatewayStore,
     platform: &str,
     chat_id: &str,
     target: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    let jobs = storage::list_cron_jobs(pool, platform, chat_id).await?;
+) -> Result<Option<String>, store::StoreError> {
+    let jobs = store.list_cron_jobs(platform, chat_id).await?;
     // Exact or prefix match
     let matched = jobs
         .iter()
-        .find(|(id, _, _, _)| id == target || id.starts_with(target));
-    if let Some((id, _, desc, _)) = matched {
-        let desc = desc.clone();
-        storage::delete_cron_job(pool, id).await?;
+        .find(|j| j.job_id == target || j.job_id.starts_with(target));
+    if let Some(j) = matched {
+        let desc = j.description.clone();
+        store.delete_cron_job(&j.job_id).await?;
         Ok(Some(desc))
     } else {
         Ok(None)
@@ -3140,6 +3190,22 @@ async fn action_policy_allows_when_enabled() {
         "expected no-db fallback, got: {}",
         r[0]
     );
+}
+
+fn build_welcome_message(cli: &CliProfile) -> String {
+    format!(
+        "👋 **欢迎使用 Astra Gateway!**\n\n\
+         当前 CLI: `{cli_name}`\n\
+         发送任意消息开始对话，或使用命令:\n\n\
+         - `/help` — 所有命令\n\
+         - `/status` — 当前状态\n\
+         - `/cli` — 切换 CLI 后端\n\
+         - `/model` — 切换模型\n\
+         - `/ws ls` — 可用项目\n\
+         - `/gateway` — 完整能力概览\n\n\
+         发送消息开始 🚀",
+        cli_name = cli.name()
+    )
 }
 
 fn format_tokens(n: u64) -> String {

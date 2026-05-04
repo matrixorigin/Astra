@@ -17,6 +17,7 @@ use super::{
     PlatformAdapter, emit_adapter_health,
 };
 use crate::dedup::MessageDeduplicator;
+use crate::store::GatewayStore;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -92,7 +93,7 @@ const TYPING_TICKET_TTL_SECS: u64 = 600; // 10 minutes
 
 pub struct WeixinAdapter {
     config: WeixinConfig,
-    pool: Option<sqlx::MySqlPool>,
+    store: Option<Arc<dyn GatewayStore>>,
     msg_tx: mpsc::Sender<InboundMessage>,
     msg_rx: Mutex<mpsc::Receiver<InboundMessage>>,
     context_tokens: ContextTokens,
@@ -105,7 +106,7 @@ impl WeixinAdapter {
         let (tx, rx) = mpsc::channel(256);
         Self {
             config: config.resolve(),
-            pool: None,
+            store: None,
             msg_tx: tx,
             msg_rx: Mutex::new(rx),
             context_tokens: Arc::new(Mutex::new(HashMap::new())),
@@ -114,8 +115,8 @@ impl WeixinAdapter {
         }
     }
 
-    pub fn with_pool(mut self, pool: sqlx::MySqlPool) -> Self {
-        self.pool = Some(pool);
+    pub fn with_store(mut self, store: Arc<dyn GatewayStore>) -> Self {
+        self.store = Some(store);
         self
     }
 
@@ -126,9 +127,8 @@ impl WeixinAdapter {
             validate_weixin_credentials(&self.config.token, &self.config.account_id)?;
             return Ok(());
         }
-        if let Some(ref pool) = self.pool
-            && let Ok(Some(cred)) =
-                crate::storage::get_credential(pool, "weixin", "default", "bot_token").await
+        if let Some(ref store) = self.store
+            && let Ok(Some(cred)) = store.get_credential("weixin", "default", "bot_token").await
         {
             if let Some(token) = cred.credentials["token"].as_str() {
                 if validate_restored_token(token) {
@@ -342,12 +342,13 @@ impl PlatformAdapter for WeixinAdapter {
         let config = self.config.clone();
         let msg_tx = self.msg_tx.clone();
         let tokens = self.context_tokens.clone();
-        let pool = self.pool.clone();
+        let store = self.store.clone();
 
         // Restore persisted context_tokens from DB
-        if let Some(ref pool) = pool
-            && let Ok(Some(cred)) =
-                crate::storage::get_credential(pool, "weixin", "default", "context_tokens").await
+        if let Some(ref store) = store
+            && let Ok(Some(cred)) = store
+                .get_credential("weixin", "default", "context_tokens")
+                .await
         {
             let restored = restore_context_tokens_value(&cred.credentials);
             let mut t = tokens.lock().await;
@@ -363,9 +364,8 @@ impl PlatformAdapter for WeixinAdapter {
             let mut dedup = MessageDeduplicator::new();
             let mut shutdown_rx = shutdown_tx.subscribe();
             // Restore sync cursor from DB
-            let mut sync_buf = if let Some(ref pool) = pool
-                && let Ok(Some(cred)) =
-                    crate::storage::get_credential(pool, "weixin", "default", "sync_buf").await
+            let mut sync_buf = if let Some(ref store) = store
+                && let Ok(Some(cred)) = store.get_credential("weixin", "default", "sync_buf").await
                 && let Some(s) = restore_sync_buf_value(&cred.credentials)
             {
                 tracing::info!("restored sync cursor from DB");
@@ -377,7 +377,7 @@ impl PlatformAdapter for WeixinAdapter {
 
             loop {
                 tokio::select! {
-                    result = poll_updates(&client, &config, &mut sync_buf, &msg_tx, &mut dedup, &tokens, &pool) => {
+                    result = poll_updates(&client, &config, &mut sync_buf, &msg_tx, &mut dedup, &tokens, &store) => {
                         match result {
                             Ok(()) => { consecutive_errors = 0; }
                             Err(e) => {
@@ -559,7 +559,7 @@ async fn poll_updates(
     msg_tx: &mpsc::Sender<InboundMessage>,
     dedup: &mut MessageDeduplicator,
     context_tokens: &ContextTokens,
-    pool: &Option<sqlx::MySqlPool>,
+    store: &Option<Arc<dyn GatewayStore>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{ILINK_BASE_URL}/ilink/bot/getupdates");
 
@@ -606,16 +606,16 @@ async fn poll_updates(
     // Update sync cursor and persist to DB
     if let Some(buf) = data["get_updates_buf"].as_str() {
         *sync_buf = buf.to_string();
-        if let Some(pool) = pool {
-            let _ = crate::storage::save_credential(
-                pool,
-                "weixin",
-                "default",
-                "sync_buf",
-                &serde_json::Value::String(buf.to_string()),
-                None,
-            )
-            .await;
+        if let Some(store) = store {
+            let _ = store
+                .save_credential(
+                    "weixin",
+                    "default",
+                    "sync_buf",
+                    &serde_json::Value::String(buf.to_string()),
+                    None,
+                )
+                .await;
         }
     }
 
@@ -656,20 +656,14 @@ async fn poll_updates(
                 let mut tokens = context_tokens.lock().await;
                 tokens.insert(from_id.clone(), ct.to_string());
                 // Persist to DB for crash recovery
-                if let Some(pool) = pool {
+                if let Some(store) = store {
                     let map: serde_json::Value = tokens
                         .iter()
                         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                         .collect();
-                    let _ = crate::storage::save_credential(
-                        pool,
-                        "weixin",
-                        "default",
-                        "context_tokens",
-                        &map,
-                        None,
-                    )
-                    .await;
+                    let _ = store
+                        .save_credential("weixin", "default", "context_tokens", &map, None)
+                        .await;
                 }
             }
 
@@ -840,9 +834,15 @@ async fn send_text_with_retry(
         let errmsg = data["errmsg"].as_str().unwrap_or("unknown");
         last_error = format!("{errcode}: {errmsg}");
 
-        // Session expired — retry without context_token
-        if errcode == -14 && !tried_tokenless {
-            tracing::debug!("send got -14, retrying without context_token");
+        // Session / context_token expired — retry without it.
+        // -14 = explicit session expiry; -2 with non-freq message usually
+        // means the context_token is stale or invalidated server-side.
+        if !tried_tokenless && (errcode == -14 || (errcode == -2 && !errmsg.contains("freq"))) {
+            tracing::debug!(
+                errcode,
+                errmsg,
+                "send failed, retrying without context_token"
+            );
             tried_tokenless = true;
             continue;
         }

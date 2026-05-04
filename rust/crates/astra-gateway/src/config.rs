@@ -3,8 +3,12 @@ use std::path::Path;
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct GatewayConfig {
     pub astra: AstraServerConfig,
+    /// New multi-backend storage configuration.
     #[serde(default)]
-    pub database: DatabaseConfig,
+    pub storage: crate::store::StorageConfig,
+    /// Legacy database config — kept for backward compatibility with existing YAML files.
+    #[serde(default)]
+    pub database: Option<DatabaseConfig>,
     /// Default CLI profile (used when no /cli switch active).
     #[serde(default)]
     pub cli: crate::cli_bridge::CliProfile,
@@ -46,9 +50,9 @@ pub struct GatewayConfig {
     pub project_dirs: Vec<String>,
 }
 
-#[derive(Clone, serde::Deserialize)]
+#[derive(Clone, Default, serde::Deserialize)]
 pub struct DatabaseConfig {
-    #[serde(default = "default_db_url")]
+    #[serde(default)]
     pub url: String,
 }
 
@@ -57,14 +61,6 @@ impl std::fmt::Debug for DatabaseConfig {
         f.debug_struct("DatabaseConfig")
             .field("url", &"[REDACTED]")
             .finish()
-    }
-}
-
-impl Default for DatabaseConfig {
-    fn default() -> Self {
-        Self {
-            url: default_db_url(),
-        }
     }
 }
 
@@ -78,11 +74,6 @@ fn default_cli_timeout_secs() -> u64 {
 
 fn default_max_concurrent_runs() -> usize {
     4
-}
-
-fn default_db_url() -> String {
-    std::env::var("GATEWAY_DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@127.0.0.1:6001/astra_gateway".into())
 }
 
 #[derive(Clone, serde::Deserialize)]
@@ -178,6 +169,32 @@ impl GatewayConfig {
         let content = std::fs::read_to_string(path)?;
         let config: Self = serde_yaml_ng::from_str(&content)?;
         Ok(config)
+    }
+
+    /// Merge `storage` and legacy `database` fields into a single [`StorageConfig`].
+    ///
+    /// Priority: if `storage` is explicitly set (not default-derived) or the
+    /// `GATEWAY_DATABASE_URL` env var is present, `storage` wins.
+    /// Otherwise, a legacy `database.url` value is promoted to
+    /// [`StorageConfig::Mysql`] for backward compat.
+    pub fn resolve_storage(&self) -> crate::store::StorageConfig {
+        // If `storage` was explicitly set to a non-default variant *or* the env
+        // var is present, prefer it as-is.
+        if !matches!(self.storage, crate::store::StorageConfig::Sqlite { .. })
+            || std::env::var("GATEWAY_DATABASE_URL").is_ok()
+        {
+            return self.storage.clone();
+        }
+        // Legacy path: `database:` section in YAML.
+        if let Some(ref db) = self.database
+            && !db.url.is_empty()
+        {
+            return crate::store::StorageConfig::Mysql {
+                url: db.url.clone(),
+            };
+        }
+        // Fall through to the default (SQLite).
+        self.storage.clone()
     }
 }
 
@@ -290,6 +307,111 @@ platforms:
         assert!(
             !dbg.contains("bot123:AABBCC"),
             "telegram token leaked: {dbg}"
+        );
+    }
+
+    // ── resolve_storage tests ────────────────────────────────────────────
+
+    #[test]
+    fn resolve_storage_legacy_database_url() {
+        let yaml = r#"
+astra:
+  base_url: "http://localhost:8080"
+  api_key: ""
+database:
+  url: "mysql://root:111@localhost/gw"
+"#;
+        let cfg: GatewayConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let resolved = cfg.resolve_storage();
+        assert!(
+            matches!(resolved, crate::store::StorageConfig::Mysql { .. }),
+            "expected Mysql, got {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_storage_explicit_mysql_storage_wins() {
+        let yaml = r#"
+astra:
+  base_url: "http://localhost:8080"
+  api_key: ""
+storage:
+  backend: mysql
+  url: "mysql://explicit@host/db"
+database:
+  url: "mysql://legacy@host/db"
+"#;
+        let cfg: GatewayConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let resolved = cfg.resolve_storage();
+        match resolved {
+            crate::store::StorageConfig::Mysql { url } => {
+                assert!(
+                    url.contains("explicit"),
+                    "storage: section should win, got {url}"
+                );
+            }
+            other => panic!("expected Mysql, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_storage_no_storage_no_database_defaults_to_sqlite() {
+        let yaml = r#"
+astra:
+  base_url: "http://localhost:8080"
+  api_key: ""
+"#;
+        let cfg: GatewayConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let resolved = cfg.resolve_storage();
+        // Depends on whether GATEWAY_DATABASE_URL env var is set
+        assert!(
+            matches!(
+                resolved,
+                crate::store::StorageConfig::Sqlite { .. }
+                    | crate::store::StorageConfig::Mysql { .. }
+            ),
+            "expected Sqlite or Mysql, got {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_storage_explicit_file_not_overridden() {
+        let yaml = r#"
+astra:
+  base_url: "http://localhost:8080"
+  api_key: ""
+storage:
+  backend: file
+  dir: "/custom/data"
+database:
+  url: "mysql://root:111@localhost/gw"
+"#;
+        let cfg: GatewayConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let resolved = cfg.resolve_storage();
+        match resolved {
+            crate::store::StorageConfig::File { dir } => {
+                assert_eq!(dir, "/custom/data");
+            }
+            other => panic!("expected File, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_storage_none_not_overridden() {
+        let yaml = r#"
+astra:
+  base_url: "http://localhost:8080"
+  api_key: ""
+storage:
+  backend: none
+database:
+  url: "mysql://root:111@localhost/gw"
+"#;
+        let cfg: GatewayConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let resolved = cfg.resolve_storage();
+        assert!(
+            matches!(resolved, crate::store::StorageConfig::None),
+            "expected None, got {resolved:?}"
         );
     }
 

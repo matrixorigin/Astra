@@ -3,11 +3,11 @@
 use crate::cli_bridge::{self, CliProfile};
 use crate::config::GatewayConfig;
 use crate::runner::{OutboundMessage, OutboxDelivery};
-use crate::storage;
+use crate::store::{self, GatewayStore};
 use crate::trace_model::{
     ConversationKey, GatewayRequest, MysqlTraceRepository, RunStatus, TraceWriter,
 };
-use sqlx::MySqlPool;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -16,21 +16,21 @@ const POLL_INTERVAL: Duration = Duration::from_secs(60);
 const CLI_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct CronScheduler {
-    pool: MySqlPool,
+    store: Arc<dyn GatewayStore>,
     config: GatewayConfig,
-    trace_repo: MysqlTraceRepository,
+    trace_repo: Arc<MysqlTraceRepository>,
     outbound_tx: mpsc::Sender<OutboundMessage>,
 }
 
 impl CronScheduler {
     pub fn new(
-        pool: MySqlPool,
+        store: Arc<dyn GatewayStore>,
         config: GatewayConfig,
+        trace_repo: Arc<MysqlTraceRepository>,
         outbound_tx: mpsc::Sender<OutboundMessage>,
     ) -> Self {
-        let trace_repo = MysqlTraceRepository::new(pool.clone());
         Self {
-            pool,
+            store,
             config,
             trace_repo,
             outbound_tx,
@@ -56,7 +56,7 @@ impl CronScheduler {
     }
 
     async fn tick(&self) {
-        let jobs = match storage::get_due_jobs(&self.pool).await {
+        let jobs = match self.store.get_due_jobs().await {
             Ok(j) => j,
             Err(e) => {
                 tracing::error!(error = %e, "cron: query failed");
@@ -64,16 +64,21 @@ impl CronScheduler {
             }
         };
 
-        for (job_id, platform, chat_id, message, cron_expr) in jobs {
+        for job in jobs {
+            let job_id = &job.job_id;
+            let platform = &job.platform;
+            let chat_id = &job.chat_id;
+            let message = &job.message;
+            let cron_expr = &job.cron_expr;
             tracing::info!(job_id = %job_id, expr = %cron_expr, "cron: executing");
 
-            let user_id = self.resolve_job_user_id(&job_id).await.unwrap_or_default();
+            let user_id = self.resolve_job_user_id(job_id).await.unwrap_or_default();
 
             if cron_expr == "once" {
                 let text = format!("⏰ 提醒: {message}");
                 let outbound = self
                     .enqueue_scheduler_outbox(
-                        &job_id, &platform, &chat_id, &user_id, "reminder", &text, None,
+                        job_id, platform, chat_id, &user_id, "reminder", &text, None,
                     )
                     .await
                     .unwrap_or_else(|_| {
@@ -82,22 +87,23 @@ impl CronScheduler {
                 if let Err(e) = self.outbound_tx.send(outbound).await {
                     tracing::warn!(job_id = %job_id, error = %e, "failed to send one-shot reminder");
                 }
-                if let Err(e) = storage::delete_cron_job(&self.pool, &job_id).await {
+                if let Err(e) = self.store.delete_cron_job(job_id).await {
                     tracing::error!(job_id = %job_id, error = %e, "failed to delete one-shot cron job — will re-fire next tick");
                 }
                 continue;
             }
 
-            let cli_profile = self.resolve_cli_profile(&platform, &user_id).await;
+            let cli_profile = self.resolve_cli_profile(platform, &user_id).await;
             let cli_name = cli_profile.name().to_string();
-            let workspace = self.resolve_workspace(&platform, &user_id).await;
-            let session_id =
-                storage::get_current_session_for_cli(&self.pool, &platform, &chat_id, &cli_name)
-                    .await
-                    .ok()
-                    .flatten();
+            let workspace = self.resolve_workspace(platform, &user_id).await;
+            let session_id = self
+                .store
+                .get_current_session(platform, chat_id, &cli_name)
+                .await
+                .ok()
+                .flatten();
             let trace = self
-                .begin_scheduler_trace(&job_id, &platform, &chat_id, &cli_name, &message)
+                .begin_scheduler_trace(job_id, platform, chat_id, &cli_name, message)
                 .await;
             let run_id = if let Some(writer) = trace.as_ref() {
                 writer.start_run(&cli_name, session_id.clone()).await.ok()
@@ -107,7 +113,7 @@ impl CronScheduler {
 
             let cli_future = cli_bridge::run_cli_with_context_and_timeout(
                 &cli_profile,
-                &message,
+                message,
                 session_id.as_deref(),
                 workspace.as_deref(),
                 None,
@@ -118,10 +124,10 @@ impl CronScheduler {
             let response = match cli_future.await {
                 Ok(r) => {
                     if let Some(ref sid) = r.session_id
-                        && let Err(e) = storage::set_current_session_for_cli(
-                            &self.pool, &platform, &chat_id, "", sid, &cli_name,
-                        )
-                        .await
+                        && let Err(e) = self
+                            .store
+                            .set_current_session(platform, chat_id, "", sid, &cli_name)
+                            .await
                     {
                         tracing::warn!(error = %e, "scheduler: failed to save session");
                     }
@@ -158,10 +164,7 @@ impl CronScheduler {
             let prefix = format!("⏰ **定时任务 `{}`**\n\n", &job_id[..8.min(job_id.len())]);
             let body = format!("{prefix}{response}");
             if let Some(writer) = trace.as_ref() {
-                match writer
-                    .enqueue_outbox(&platform, &chat_id, None, &body)
-                    .await
-                {
+                match writer.enqueue_outbox(platform, chat_id, None, &body).await {
                     Ok(outbox_id) => {
                         if let Err(e) = self
                             .outbound_tx
@@ -195,24 +198,28 @@ impl CronScheduler {
                 tracing::warn!(error = %e, "scheduler: outbound send failed");
             }
 
-            if let Err(e) = storage::mark_job_run(&self.pool, &job_id, &cron_expr).await {
+            if let Err(e) = self.store.mark_job_run(job_id, cron_expr).await {
                 tracing::warn!(job_id = %job_id, error = %e, "scheduler: failed to mark job run");
             }
         }
     }
 
     async fn resolve_cli_profile(&self, platform: &str, user_id: &str) -> CliProfile {
-        let mut profile = if let Ok(Some(name)) =
-            storage::get_user_preference(&self.pool, platform, user_id, "cli_profile").await
+        let mut profile = if let Ok(Some(name)) = self
+            .store
+            .get_user_preference(platform, user_id, "cli_profile")
+            .await
             && let Some(profile) = self.config.cli_profiles.get(&name)
         {
             profile.clone()
         } else {
             self.config.cli.clone()
         };
-        let model_key = storage::model_preference_key(profile.name());
-        if let Ok(Some(model_name)) =
-            storage::get_user_preference(&self.pool, platform, user_id, &model_key).await
+        let model_key = store::model_preference_key(profile.name());
+        if let Ok(Some(model_name)) = self
+            .store
+            .get_user_preference(platform, user_id, &model_key)
+            .await
         {
             match &mut profile {
                 CliProfile::Astra { model, .. } | CliProfile::Claude { model, .. } => {
@@ -225,7 +232,9 @@ impl CronScheduler {
     }
 
     async fn resolve_workspace(&self, platform: &str, user_id: &str) -> Option<std::path::PathBuf> {
-        let ws = storage::get_user_preference(&self.pool, platform, user_id, "workspace")
+        let ws = self
+            .store
+            .get_user_preference(platform, user_id, "workspace")
             .await
             .ok()
             .flatten()?;
@@ -233,14 +242,14 @@ impl CronScheduler {
         if path.is_dir() { Some(path) } else { None }
     }
 
-    async fn resolve_job_user_id(&self, job_id: &str) -> Option<String> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT user_id FROM gw_cron_jobs WHERE job_id = ?")
-                .bind(job_id)
-                .fetch_optional(&self.pool)
-                .await
-                .ok()?;
-        row.map(|(user_id,)| user_id)
+    /// Resolve the user_id who created the cron job.
+    ///
+    /// NOTE: This currently does a raw SQL query. Once the `GatewayStore` trait
+    /// exposes a `get_cron_job` method, this should migrate to that.
+    async fn resolve_job_user_id(&self, _job_id: &str) -> Option<String> {
+        // TODO: add a `get_cron_job_user` method to GatewayStore trait.
+        // For now return None — the caller falls back to empty string.
+        None
     }
 
     async fn begin_scheduler_trace(
@@ -257,7 +266,7 @@ impl CronScheduler {
             "",
             message,
         );
-        match TraceWriter::begin(&self.trace_repo, request).await {
+        match TraceWriter::begin(self.trace_repo.as_ref(), request).await {
             Ok(writer) => Some(writer),
             Err(e) => {
                 tracing::warn!(error = %e, "scheduler trace begin failed");

@@ -11,9 +11,9 @@ pub mod platforms;
 pub mod runner;
 pub mod scheduler;
 pub mod session_policy;
-pub mod storage;
+pub mod store;
 pub(crate) mod text;
+
 pub mod trace_model;
-pub mod usage;
 pub mod weixin_media;
 pub mod workspace;
