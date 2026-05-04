@@ -824,18 +824,22 @@ impl DatabaseModelService {
         let thinking_probe_error: Option<String> =
             row.try_get("thinking_probe_error").ok().flatten();
 
-        // Build ThinkingProbeResult when the model has been probed (capability is known).
-        // If capability is unknown but an error exists, the probe partially failed — log it.
-        if thinking_capability.is_none() && thinking_probe_error.is_some() {
-            tracing::warn!(
-                error = ?thinking_probe_error,
-                "thinking_probe_error present but thinking_capability is NULL; probe result dropped"
-            );
-        }
-        let thinking_probe = thinking_capability.map(|cap| ThinkingProbeResult {
-            capability: cap,
-            error: thinking_probe_error,
-        });
+        // Build ThinkingProbeResult when the model has been probed (capability is known)
+        // OR when a probe error exists (probe ran but failed — surface the error).
+        let thinking_probe = match (thinking_capability, thinking_probe_error) {
+            (Some(cap), err) => Some(ThinkingProbeResult {
+                capability: cap,
+                error: err,
+            }),
+            // Probe failed: no capability determined, but error must be surfaced.
+            // Default to ThinkingCapability::None so the picker stays safe.
+            (None, Some(err)) => Some(ThinkingProbeResult {
+                capability: ThinkingCapability::None,
+                error: Some(err),
+            }),
+            // Never probed.
+            (None, None) => None,
+        };
 
         Ok(ModelRecord {
             model_id: row.try_get("model_id").map_err(internal_error)?,
@@ -1288,8 +1292,15 @@ impl ModelService for DatabaseModelService {
             let result =
                 probe_thinking_behavior(&provider, &model_name, &api_key, base_url.as_deref())
                     .await;
-            // Persist probe result to DB
-            let cap_str = result.capability.as_db_str();
+            // Persist probe result to DB.
+            // Only write capability when the probe succeeded (no error).
+            // A failed probe should leave capability=NULL (re-probable)
+            // rather than permanently marking the model as non-thinking.
+            let cap_str: Option<&str> = if result.error.is_none() {
+                Some(result.capability.as_db_str())
+            } else {
+                None
+            };
             let err_str = result.error.as_deref();
             if let Err(e) = query(
                 "UPDATE infra_llm_models SET thinking_capability = ?, \
@@ -2608,6 +2619,44 @@ mod tests {
             .expect("thinking_probe must be Some even on error");
         assert_eq!(probe.capability, ThinkingCapability::None);
         assert_eq!(probe.error.as_deref(), Some("connection refused"));
+    }
+
+    /// Probe failed: DB has thinking_capability=NULL but thinking_probe_error is set.
+    /// The new `model_record_from_row` match arm surfaces this as a ThinkingProbeResult
+    /// with capability=None + the error, so the API caller sees the failure reason.
+    #[test]
+    fn model_response_surfaces_orphan_probe_error() {
+        let record = ModelRecord {
+            model_id: "m-orphan".into(),
+            name: "orphan-err".into(),
+            provider: "openai".into(),
+            base_url: None,
+            description: None,
+            is_active: true,
+            context_window: 4096,
+            max_completion_tokens: None,
+            input_modalities: vec!["text".into()],
+            output_modalities: vec!["text".into()],
+            supported_parameters: vec![],
+            pricing: PricingData::default(),
+            architecture: None,
+            tags: vec![],
+            quirks: QuirksData::default(),
+            connectivity: None,
+            // DB: thinking_capability = NULL (unprobed/failed)
+            thinking_capability: None,
+            // But model_record_from_row now constructs this when error exists
+            thinking_probe: Some(ThinkingProbeResult {
+                capability: ThinkingCapability::None,
+                error: Some("connection timeout".into()),
+            }),
+        };
+        let resp = ModelResponse::from(record);
+        let probe = resp
+            .thinking_probe
+            .expect("orphan probe error must be surfaced");
+        assert_eq!(probe.capability, ThinkingCapability::None);
+        assert_eq!(probe.error.as_deref(), Some("connection timeout"));
     }
 
     /// Unprobed model (thinking_capability = NULL) → thinking_probe is None.
