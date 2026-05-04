@@ -28,6 +28,10 @@ jobs:
           workspaces: rust
           shared-key: ci-test-${{ github.base_ref || github.ref_name }}
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
       # Compile all test binaries (default + bridge-e2e-hooks) without running
       - name: Compile test binaries
         run: |
