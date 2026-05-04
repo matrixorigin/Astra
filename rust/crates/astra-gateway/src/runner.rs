@@ -1267,16 +1267,34 @@ impl GatewayRunner {
         } else {
             text
         };
-        Some(
-            self.outbound_response(
-                trace.as_ref(),
-                msg.platform,
-                &msg.chat_id,
-                msg.reply_token.clone(),
+
+        // When progressive streaming already delivered the main content, the
+        // final message is just a stats footer + action results.  Sending it
+        // as a plain message (no durable outbox) avoids retry storms: if this
+        // low-value footer fails to deliver it is simply dropped rather than
+        // retried on every restart.
+        if progressive_text_len > 0 {
+            // Still mark the trace request as completed (even without outbox).
+            if let Some(writer) = trace_writer.as_ref() {
+                let _ = writer.complete_request().await;
+            }
+            Some(OutboundMessage::plain(
+                msg.platform.to_string(),
+                msg.chat_id.clone(),
                 text,
+            ))
+        } else {
+            Some(
+                self.outbound_response(
+                    trace.as_ref(),
+                    msg.platform,
+                    &msg.chat_id,
+                    msg.reply_token.clone(),
+                    text,
+                )
+                .await,
             )
-            .await,
-        )
+        }
     }
 
     async fn clear_pending_message(&self, pending_id: Option<i64>) {
