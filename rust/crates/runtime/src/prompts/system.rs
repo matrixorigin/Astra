@@ -52,63 +52,10 @@ pub const LOW_CONFIDENCE_THRESHOLD: f64 = 0.3;
 
 // ── Static/Dynamic prompt boundary for provider-level caching ────────
 
-/// Cache scope for a prompt section, indicating how stable it is across turns.
-///
-/// Providers like Anthropic can cache content blocks annotated with
-/// `cache_control: {type: "ephemeral"}`.  Separating static from dynamic
-/// sections maximises prefix-cache hit rates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CacheScope {
-    /// Stable across sessions — identity, core rules, output format.
-    /// Changes only on agent code updates (weeks/months).
-    Global,
-    /// Stable within a session — tool-conditional guidance, task-type rules.
-    /// Changes when tool set or task type changes (per turn, but usually stable).
-    Session,
-    /// Changes every turn — project profile, skills, memory signals.
-    None,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromptTokenBucket {
-    BasePersona,
-    Environment,
-    UserPreferences,
-}
-
-/// A section of the system prompt with cache scope metadata.
-#[derive(Debug, Clone)]
-pub struct PromptSection {
-    pub text: String,
-    pub scope: CacheScope,
-    pub token_bucket: PromptTokenBucket,
-    pub trace_signals: PromptTraceSignals,
-}
-
-impl PromptSection {
-    pub fn stable(text: impl Into<String>, scope: CacheScope) -> Self {
-        Self {
-            text: text.into(),
-            scope,
-            token_bucket: PromptTokenBucket::BasePersona,
-            trace_signals: PromptTraceSignals::default(),
-        }
-    }
-
-    pub fn dynamic(text: impl Into<String>, token_bucket: PromptTokenBucket) -> Self {
-        Self {
-            text: text.into(),
-            scope: CacheScope::None,
-            token_bucket,
-            trace_signals: PromptTraceSignals::default(),
-        }
-    }
-
-    pub fn with_trace_signals(mut self, trace_signals: PromptTraceSignals) -> Self {
-        self.trace_signals = trace_signals;
-        self
-    }
-}
+// CacheScope, PromptTokenBucket, and PromptSection now live in astra-turn-core
+// so they can be used by both turn-core (optimizer, planner) and runtime
+// (prompt builders) without a circular dependency.
+pub use astra_turn_core::section_types::{CacheScope, PromptSection, PromptTokenBucket};
 
 // ── Section builder functions ─────────────────────────────────────────────
 // Each returns a prompt fragment. These are the shared building blocks for

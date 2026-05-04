@@ -25,7 +25,7 @@ const ARGS_PREVIEW_MAX: usize = 120;
 /// Controls how cleared tool results are replaced:
 /// - `Normalized`: stable `key=value` placeholder (OpenAI/GLM/DeepSeek — prefix caching)
 /// - `Minimal`: shortest possible placeholder (Anthropic — protocol-level caching)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum CompactStrategy {
     /// `[Cleared: tool_name key=value — re-run if needed]`
     /// Stable, normalized args (no raw JSON). Good for prefix-caching providers.
@@ -38,7 +38,7 @@ pub enum CompactStrategy {
 }
 
 /// Provider prompt-cache protocol class.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PromptCacheProtocol {
     /// Provider benefits from stable deterministic prompt prefixes.
     #[default]
