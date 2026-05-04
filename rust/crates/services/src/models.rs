@@ -989,44 +989,54 @@ impl ModelService for DatabaseModelService {
         .await
         .map_err(internal_error)?;
 
-        // Thinking probe runs AFTER INSERT so the model is immediately
-        // available. Probe result is written via UPDATE — if probe is slow
-        // or fails, the model still works (picker defaults to no thinking
-        // until probed).
+        // Fire-and-forget thinking probe — never blocks create_model.
+        // Result is written via background UPDATE; thinking_capability
+        // stays NULL until probe completes. `model check` re-probes
+        // synchronously if needed.
         if conn_result.is_none() {
-            let probe = probe_thinking_behavior(
-                &request.provider,
-                &request.name,
-                &request.api_key,
-                base_url.as_deref(),
-            )
-            .await;
-            // Only persist capability when probe succeeded without errors.
-            // A failed probe (client error, unreachable server) should leave
-            // capability=NULL (unprobed) rather than permanently marking the
-            // model as non-thinking due to a transient failure.
-            let cap_str: Option<&str> = if probe.error.is_none() {
-                Some(probe.capability.as_db_str())
-            } else {
-                None
-            };
-            let err_str = probe.error.as_deref();
-            if let Err(e) = query(
-                "UPDATE infra_llm_models SET thinking_capability = ?, \
-                 thinking_probe_error = ? WHERE model_id = ?",
-            )
-            .bind(cap_str)
-            .bind(err_str)
-            .bind(&model_id)
-            .execute(&pool)
-            .await
-            {
-                tracing::warn!(
-                    model = %request.name,
-                    err = %e,
-                    "failed to persist thinking_capability after create"
+            let probe_provider = request.provider.clone();
+            let probe_model = request.name.clone();
+            let probe_key = request.api_key.clone();
+            let probe_url = base_url.clone();
+            let probe_pool = pool.clone();
+            let probe_id = model_id.clone();
+            tokio::spawn(async move {
+                let probe = probe_thinking_behavior(
+                    &probe_provider,
+                    &probe_model,
+                    &probe_key,
+                    probe_url.as_deref(),
+                )
+                .await;
+                tracing::debug!(
+                    model = %probe_model,
+                    capability = %probe.capability.as_db_str(),
+                    error = ?probe.error,
+                    "thinking probe completed"
                 );
-            }
+                let cap_str: Option<&str> = if probe.error.is_none() {
+                    Some(probe.capability.as_db_str())
+                } else {
+                    None
+                };
+                let err_str = probe.error.as_deref();
+                if let Err(e) = query(
+                    "UPDATE infra_llm_models SET thinking_capability = ?, \
+                     thinking_probe_error = ? WHERE model_id = ?",
+                )
+                .bind(cap_str)
+                .bind(err_str)
+                .bind(&probe_id)
+                .execute(&probe_pool)
+                .await
+                {
+                    tracing::warn!(
+                        model = %probe_model,
+                        err = %e,
+                        "failed to persist thinking_capability after create"
+                    );
+                }
+            });
         }
 
         let select_sql = format!(
@@ -1530,6 +1540,13 @@ pub async fn probe_thinking_behavior(
     api_key: &str,
     base_url: Option<&str>,
 ) -> ThinkingProbeResult {
+    if provider == "mock" {
+        return ThinkingProbeResult {
+            capability: ThinkingCapability::None,
+            error: None,
+        };
+    }
+
     let probe_builder = astra_core::net::apply_env_proxy(
         reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
     );
@@ -3124,5 +3141,33 @@ mod tests {
         let result = probe_thinking_behavior("dashscope", "m", "k", None).await;
         assert!(result.error.is_some());
         assert!(result.error.unwrap().contains("No base_url"));
+    }
+
+    // ── Fire-and-forget probe (create_model must not block on probe) ────
+
+    /// Spawned probe eventually completes and produces a result.
+    #[tokio::test]
+    async fn probe_spawned_eventually_completes() {
+        let base = spawn_dashscope_mock(true).await;
+
+        let handle = tokio::spawn(async move {
+            probe_thinking_behavior("openai", "qwen-plus", "k", Some(&base)).await
+        });
+
+        let probe = handle.await.expect("spawned probe should not panic");
+        assert_eq!(probe.capability, ThinkingCapability::Both);
+        assert!(probe.error.is_none());
+    }
+
+    /// Mock provider skips probe entirely — no network I/O.
+    #[tokio::test]
+    async fn probe_mock_provider_skips_network() {
+        let result =
+            probe_thinking_behavior("mock", "test-model", "k", Some("http://127.0.0.1:1")).await;
+        assert_eq!(result.capability, ThinkingCapability::None);
+        assert!(
+            result.error.is_none(),
+            "mock provider should skip cleanly, not error"
+        );
     }
 }
