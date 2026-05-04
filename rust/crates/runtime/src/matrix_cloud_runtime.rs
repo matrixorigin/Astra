@@ -190,6 +190,7 @@ impl MatrixCloudRuntime {
             base_url: resolved.base_url,
             api_key: resolved.api_key,
             model_name: resolved.model_name,
+            provider: resolved.provider,
         })
     }
 

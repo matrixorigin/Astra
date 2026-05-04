@@ -67,6 +67,7 @@ pub struct LlmConnParams {
     pub base_url: String,
     pub api_key: String,
     pub model_name: String,
+    pub provider: String,
 }
 
 /// Filter a list of text items through the selector model.
@@ -93,18 +94,27 @@ pub async fn filter_memories(
         Err(_) => return items.to_vec(),
     };
 
+    let mut req_body = serde_json::json!({
+        "model": params.model_name,
+        "messages": [
+            {"role": "system", "content": RELEVANCE_FILTER_PROMPT},
+            {"role": "user", "content": query},
+        ],
+        "max_tokens": 50,
+        "temperature": 0.0,
+    });
+    // Always suppress thinking for selector/memory calls — no point
+    // spending tokens on reasoning for simple JSON tasks.
+    astra_turn_core::thinking_config::ThinkingConfig::Off.apply_openai_suppression(
+        &mut req_body,
+        &params.provider,
+        &params.base_url,
+    );
+
     let resp = match client
         .post(format!("{}/chat/completions", params.base_url))
         .header("Authorization", format!("Bearer {}", params.api_key))
-        .json(&serde_json::json!({
-            "model": params.model_name,
-            "messages": [
-                {"role": "system", "content": RELEVANCE_FILTER_PROMPT},
-                {"role": "user", "content": query},
-            ],
-            "max_tokens": 50,
-            "temperature": 0.0,
-        }))
+        .json(&req_body)
         .send()
         .await
     {
@@ -128,6 +138,15 @@ pub async fn filter_memories(
     if text.is_empty() {
         return items.to_vec();
     }
+
+    // Safety net: strip <think> tags that native thinkers may emit despite suppression.
+    // If stripping empties the text, fall back to the original.
+    let stripped = astra_turn_core::thinking_config::strip_think_tags(&text);
+    let text = if stripped.trim().is_empty() {
+        text
+    } else {
+        stripped
+    };
 
     let indices = parse_relevance_response(&text, items.len());
     if indices.is_empty() {
@@ -243,6 +262,7 @@ mod tests {
             base_url: "https://api.example.com/v1".into(),
             api_key: "sk-test".into(),
             model_name: "qwen-flash".into(),
+            provider: "openai".into(),
         };
         let cloned = params.clone();
         assert_eq!(cloned.base_url, "https://api.example.com/v1");
@@ -256,6 +276,7 @@ mod tests {
             base_url: "http://localhost:8080".into(),
             api_key: "key".into(),
             model_name: "model".into(),
+            provider: "openai".into(),
         };
         let debug = format!("{params:?}");
         assert!(debug.contains("LlmConnParams"));
@@ -270,6 +291,7 @@ mod tests {
             base_url: "http://nonexistent:9999".into(),
             api_key: "key".into(),
             model_name: "model".into(),
+            provider: "openai".into(),
         };
         let result = filter_memories(&params, "query", &[]).await;
         assert!(result.is_empty());
@@ -281,9 +303,129 @@ mod tests {
             base_url: "http://127.0.0.1:1".into(),
             api_key: "key".into(),
             model_name: "model".into(),
+            provider: "openai".into(),
         };
         let items = vec!["a".into(), "b".into(), "c".into()];
         let result = filter_memories(&params, "query", &items).await;
         assert_eq!(result, items, "unreachable server should return all items");
+    }
+
+    // ── Mock server integration tests ────────────────────────────────────
+
+    use std::sync::{Arc, Mutex};
+
+    async fn spawn_mock_completions(
+        captured: Arc<Mutex<Option<serde_json::Value>>>,
+        response_content: &'static str,
+    ) -> String {
+        use axum::{Router, routing::post};
+
+        let handler = move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let captured = captured.clone();
+            async move {
+                *captured.lock().unwrap() = Some(body);
+                axum::Json(serde_json::json!({
+                    "choices": [{"message": {"content": response_content}}]
+                }))
+            }
+        };
+        let app = Router::new().route("/chat/completions", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn filter_memories_native_thinker_sends_suppression() {
+        let captured = Arc::new(Mutex::new(None));
+        let base = spawn_mock_completions(captured.clone(), "[0]").await;
+        let params = LlmConnParams {
+            base_url: base,
+            api_key: "k".into(),
+            model_name: "qwen3.5-flash".into(),
+            provider: "dashscope".into(),
+        };
+        let items = vec!["mem-a".into(), "mem-b".into()];
+        let _ = filter_memories(&params, "test query", &items).await;
+
+        let body = captured.lock().unwrap().take().expect("request captured");
+        assert_eq!(
+            body["enable_thinking"], false,
+            "native thinker should send enable_thinking: false"
+        );
+    }
+
+    #[tokio::test]
+    async fn filter_memories_non_native_does_not_send_suppression() {
+        let captured = Arc::new(Mutex::new(None));
+        let base = spawn_mock_completions(captured.clone(), "[0]").await;
+        let params = LlmConnParams {
+            base_url: base,
+            api_key: "k".into(),
+            model_name: "gpt-4o-mini".into(),
+            provider: "openai".into(),
+        };
+        let items = vec!["mem-a".into()];
+        let _ = filter_memories(&params, "test", &items).await;
+
+        let body = captured.lock().unwrap().take().expect("request captured");
+        assert!(
+            body.get("enable_thinking").is_none(),
+            "non-native should not have enable_thinking: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn filter_memories_strips_think_tags_from_response() {
+        let captured = Arc::new(Mutex::new(None));
+        let base = spawn_mock_completions(captured.clone(), "<think>reasoning</think>[0, 2]").await;
+        let params = LlmConnParams {
+            base_url: base,
+            api_key: "k".into(),
+            model_name: "m".into(),
+            provider: "openai".into(),
+        };
+        let items: Vec<String> = (0..3).map(|i| format!("mem-{i}")).collect();
+        let result = filter_memories(&params, "query", &items).await;
+        assert_eq!(result, vec!["mem-0", "mem-2"]);
+    }
+
+    #[tokio::test]
+    async fn filter_memories_think_wrapping_json_falls_back_to_original() {
+        let captured = Arc::new(Mutex::new(None));
+        // Model wraps JSON inside think tags — strip would empty it
+        let base = spawn_mock_completions(captured.clone(), "<think>[0, 1]</think>").await;
+        let params = LlmConnParams {
+            base_url: base,
+            api_key: "k".into(),
+            model_name: "m".into(),
+            provider: "openai".into(),
+        };
+        let items: Vec<String> = (0..3).map(|i| format!("mem-{i}")).collect();
+        let result = filter_memories(&params, "query", &items).await;
+        // Fallback to original text which contains the think-wrapped JSON
+        // parse_relevance_response will extract digits from "<think>[0, 1]</think>"
+        assert!(!result.is_empty(), "should fall back and parse something");
+    }
+
+    #[tokio::test]
+    async fn filter_memories_successful_filtering() {
+        let captured = Arc::new(Mutex::new(None));
+        let base = spawn_mock_completions(captured.clone(), "[1]").await;
+        let params = LlmConnParams {
+            base_url: base,
+            api_key: "k".into(),
+            model_name: "m".into(),
+            provider: "openai".into(),
+        };
+        let items = vec!["irrelevant".into(), "relevant".into(), "noise".into()];
+        let result = filter_memories(&params, "query", &items).await;
+        assert_eq!(result, vec!["relevant"]);
     }
 }

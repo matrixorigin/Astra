@@ -118,8 +118,7 @@ pub(crate) fn provider_uses_bedrock_converse(provider: &str) -> bool {
 /// accept `enable_thinking` and may 400 on unknown top-level fields. Matching the
 /// provider name alone avoids false positives on those deployments.
 pub(crate) fn provider_uses_dashscope_thinking(provider: &str) -> bool {
-    let provider = provider.to_ascii_lowercase();
-    provider.contains("dashscope") || provider.contains("aliyun") || provider.contains("alibaba")
+    astra_turn_core::thinking_config::provider_may_think_natively(provider)
 }
 
 /// Global HTTP client for LLM requests (connection pooling, reuse).
@@ -1269,20 +1268,27 @@ pub(crate) fn build_provider_request_body(
             if is_anthropic {
                 thinking.apply_anthropic(&mut body);
             } else if provider_uses_dashscope_thinking(provider) {
-                // DashScope/Qwen uses a binary `enable_thinking` flag; there is no equivalent
-                // of `reasoning_effort`. For `Enabled` this is a direct mapping. For `Adaptive`
-                // we enable thinking but the `effort` level is silently dropped — warn so
-                // operators can diagnose unexpected latency or cost behaviour.
-                if thinking.is_enabled() {
-                    body["enable_thinking"] = json!(true);
-                } else if let ThinkingConfig::Adaptive { effort } = thinking {
-                    tracing::warn!(
-                        provider,
-                        effort = ?effort,
-                        "DashScope/Qwen does not support `reasoning_effort`; \
-                         Adaptive mode mapped to `enable_thinking: true` — effort level ignored"
-                    );
-                    body["enable_thinking"] = json!(true);
+                // DashScope/Qwen uses a binary `enable_thinking` flag; there is no
+                // equivalent of `reasoning_effort`.
+                match thinking {
+                    ThinkingConfig::Off => {
+                        // Native thinkers (Qwen3, Qwen3.5) think by default.
+                        // Explicitly suppress to avoid wasting tokens on reasoning
+                        // when the caller requested Off.
+                        body["enable_thinking"] = json!(false);
+                    }
+                    ThinkingConfig::Enabled { .. } => {
+                        body["enable_thinking"] = json!(true);
+                    }
+                    ThinkingConfig::Adaptive { effort } => {
+                        tracing::warn!(
+                            provider,
+                            effort = ?effort,
+                            "DashScope/Qwen does not support `reasoning_effort`; \
+                             Adaptive mode mapped to `enable_thinking: true` — effort level ignored"
+                        );
+                        body["enable_thinking"] = json!(true);
+                    }
                 }
             } else {
                 thinking.apply_openai(&mut body);
@@ -6192,6 +6198,27 @@ mod tests {
         assert_eq!(body["enable_thinking"], true);
         assert!(body.get("reasoning_effort").is_none());
         assert_eq!(body["temperature"], 0.7);
+    }
+
+    /// ThinkingConfig::Off must explicitly suppress thinking for DashScope
+    /// native thinkers (Qwen3, Qwen3.5) — otherwise they think by default.
+    #[test]
+    fn build_dashscope_body_with_thinking_off_suppresses() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "qwen3.5-flash",
+            "dashscope",
+            Some(200),
+            Some(0.0),
+            false,
+            &ThinkingConfig::Off,
+        );
+
+        assert_eq!(body["model"], "qwen3.5-flash");
+        assert_eq!(body["enable_thinking"], false);
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     /// Same Qwen model through a generic OpenAI-compatible proxy must NOT get

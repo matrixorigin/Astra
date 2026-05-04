@@ -117,8 +117,6 @@ pub(crate) enum ModelCmd {
     Load(ModelLoadArgs),
     /// Update model fields (api-key, base-url, quirks, active status).
     Update(ModelUpdateArgs),
-    /// Set the fallback model for rate-limit recovery.
-    SetFallback(ModelSetFallbackArgs),
 }
 
 #[derive(Args, Debug)]
@@ -141,7 +139,7 @@ pub(crate) struct ModelUpdateArgs {
     /// Set stored `is_active` without re-probing. Prefer `model check` to activate only when connectivity succeeds.
     #[arg(long)]
     pub active: Option<bool>,
-    /// JSON string for quirks, e.g. '{"fallback_model":"gpt-4o-mini"}'
+    /// JSON string for quirks, e.g. '{"fallback_chain":["gpt-4o-mini"]}'
     #[arg(long)]
     pub quirks: Option<String>,
 }
@@ -164,14 +162,6 @@ pub(crate) struct ModelLoadArgs {
     /// server re-runs connectivity and refreshes `is_active`.
     #[arg(long)]
     pub update_existing: bool,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct ModelSetFallbackArgs {
-    /// Primary model name.
-    pub model_name: String,
-    /// Fallback model name (use "none" to clear).
-    pub fallback_model: String,
 }
 
 #[derive(Subcommand, Debug)]

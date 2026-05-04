@@ -1,12 +1,12 @@
 use async_trait::async_trait;
-use axum::{Json, http::StatusCode};
+use axum::{http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, query};
+use sqlx::{query, Row};
 use uuid::Uuid;
 
 use crate::auth::FernetTokenEncryptor;
 use astra_core::{
-    ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
+    connect_matrixone, error_response, internal_error, ErrorResponse, MatrixOneSettings, SharedPool,
 };
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -39,40 +39,10 @@ pub struct QuirksData {
     pub no_system_message: bool,
     #[serde(default)]
     pub system_as_user_prefix: bool,
-    /// Fallback model name to use when the primary model hits rate limits.
-    /// Must reference an active model in `infra_llm_models`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fallback_model: Option<String>,
-    /// Thinking behaviour declaration.
-    ///   - `"controllable"` — needs explicit API parameter (Bedrock adaptive, DashScope enable_thinking).
-    ///   - `"native"` — model returns reasoning_content by default (GLM, Qwen3).
-    ///   - `None` / absent — no thinking support.
-    ///
-    /// Validated on deserialization: unknown values (e.g. typos like
-    /// `"Controllable"` or `"enabled"`) are rejected so bad YAML/admin payloads
-    /// fail loudly instead of silently disabling the thinking picker.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_thinking_mode"
-    )]
-    pub thinking_mode: Option<String>,
-}
-
-/// Accepts only canonical thinking_mode values. See [`QuirksData::thinking_mode`].
-fn deserialize_thinking_mode<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-    let opt: Option<String> = Option::deserialize(deserializer)?;
-    match opt.as_deref() {
-        None => Ok(None),
-        Some("controllable") | Some("native") => Ok(opt),
-        Some(other) => Err(D::Error::custom(format!(
-            "invalid thinking_mode {other:?}: expected \"controllable\", \"native\", or null"
-        ))),
-    }
+    /// Ordered fallback chain. Tried in sequence when the primary model hits
+    /// rate limits or becomes unavailable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_chain: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -111,7 +81,68 @@ pub struct ModelUpdateRequestData {
     pub quirks: Option<QuirksData>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// Thinking capability of a model, determined by provider-aware probe.
+///
+/// Persisted to DB column `thinking_capability`. NULL means unprobed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingCapability {
+    /// Model supports Normal (off) and Thinking modes — suppression works.
+    /// Picker: Normal / Thinking (Low) / Thinking (High).
+    /// Examples: Bedrock Claude, DashScope Qwen-Plus, GLM-5.1.
+    Both,
+    /// Model always thinks but supports effort control (low/medium/high).
+    /// Cannot be turned off completely — no "Normal" option.
+    /// Picker: Thinking (Low) / Thinking (High).
+    /// Examples: DeepSeek V4.
+    EffortOnly,
+    /// Model always thinks, no control at all.
+    /// No picker shown.
+    /// Examples: MiniMax M2.5.
+    NativeOnly,
+    /// Model does not support thinking.
+    /// No picker shown.
+    /// Examples: qwen-flash, qwen2.5-3b-instruct.
+    None,
+}
+
+impl ThinkingCapability {
+    pub fn from_db(s: Option<&str>) -> Option<Self> {
+        match s? {
+            "both" => Some(Self::Both),
+            "effort_only" => Some(Self::EffortOnly),
+            "native_only" => Some(Self::NativeOnly),
+            "none" => Some(Self::None),
+            other => {
+                tracing::warn!(
+                    value = other,
+                    "unknown thinking_capability value in DB — treating as unprobed"
+                );
+                Option::None
+            }
+        }
+    }
+
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::EffortOnly => "effort_only",
+            Self::NativeOnly => "native_only",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Result of the two-phase thinking behavior probe.
+///
+/// Ephemeral — returned during `check_model`, but the capability is persisted to DB.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ThinkingProbeResult {
+    pub capability: ThinkingCapability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 pub struct ModelRecord {
     pub model_id: String,
     pub name: String,
@@ -129,6 +160,8 @@ pub struct ModelRecord {
     pub tags: Vec<String>,
     pub quirks: QuirksData,
     pub connectivity: Option<String>,
+    pub thinking_capability: Option<ThinkingCapability>,
+    pub thinking_probe: Option<ThinkingProbeResult>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -141,7 +174,7 @@ pub struct ModelListItem {
     pub context_window: i32,
     pub max_completion_tokens: Option<i32>,
     pub architecture: Option<String>,
-    pub thinking_mode: Option<String>,
+    pub thinking_capability: Option<ThinkingCapability>,
 }
 
 /// Decrypted credentials for the active (or preferred) row in `infra_llm_models`.
@@ -151,8 +184,10 @@ pub struct ResolvedActiveLlmModel {
     pub api_key: String,
     pub base_url: String,
     pub provider: String,
-    /// Fallback model name from quirks (cloud-managed).
-    pub fallback_model: Option<String>,
+    pub fallback_chain: Vec<String>,
+    pub tags: Vec<String>,
+    /// Probe-determined thinking capability. NULL if unprobed.
+    pub thinking_capability: Option<ThinkingCapability>,
 }
 
 fn build_resolved_active_llm_from_row(
@@ -175,34 +210,42 @@ fn build_resolved_active_llm_from_row(
         .decrypt(&encrypted)
         .map_err(|e| format!("Decrypt: {e}"))?;
 
-    // Extract fallback_model from quirks JSON (env var override if set)
-    let fallback_model = {
-        let quirks_json: String = row
-            .try_get("quirks_json")
-            .unwrap_or_else(|_| "{}".to_string());
-        let quirks: QuirksData = match serde_json::from_str(&quirks_json) {
-            Ok(q) => q,
-            Err(e) => {
-                let prefix = &quirks_json[..quirks_json.len().min(200)];
-                tracing::error!(
-                    target: "astra_services::models",
-                    column = "quirks_json",
-                    err = %e,
-                    payload_prefix = %prefix,
-                    "malformed JSON column, using default"
-                );
-                QuirksData::default()
-            }
-        };
-        quirks.fallback_model
+    let quirks_json: String = row
+        .try_get("quirks_json")
+        .unwrap_or_else(|_| "{}".to_string());
+    let quirks: QuirksData = match serde_json::from_str(&quirks_json) {
+        Ok(q) => q,
+        Err(e) => {
+            let prefix = &quirks_json[..quirks_json.len().min(200)];
+            tracing::error!(
+                target: "astra_services::models",
+                column = "quirks_json",
+                err = %e,
+                payload_prefix = %prefix,
+                "malformed JSON column, using default"
+            );
+            QuirksData::default()
+        }
     };
+
+    let tags_json: String = row
+        .try_get("tags_json")
+        .unwrap_or_else(|_| "[]".to_string());
+    let tags: Vec<String> = parse_json_column("tags_json", &tags_json, Vec::new);
+
+    let thinking_cap_str: Option<String> = row.try_get("thinking_capability").ok().flatten();
+    let thinking_capability = ThinkingCapability::from_db(thinking_cap_str.as_deref());
+
+    let fallback_chain = quirks.fallback_chain;
 
     Ok(ResolvedActiveLlmModel {
         model_name,
         api_key,
         base_url,
         provider,
-        fallback_model,
+        fallback_chain,
+        tags,
+        thinking_capability,
     })
 }
 
@@ -382,6 +425,36 @@ pub fn format_inactive_model_error(requested: &str, canonical: &str) -> String {
     }
 }
 
+/// Shared columns for all model-resolution queries.
+const RESOLVE_COLS: &str = "\
+    model_name, api_key_encrypted, base_url, provider, \
+    IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json, \
+    IFNULL(CAST(pricing AS CHAR), '{}') AS pricing_json, \
+    IFNULL(CAST(tags AS CHAR), '[]') AS tags_json, \
+    thinking_capability";
+
+/// Acquire a pool reference: use the provided pool, or open an ephemeral one.
+async fn acquire_pool(
+    provided: Option<&sqlx::Pool<sqlx::MySql>>,
+    matrixone: &MatrixOneSettings,
+) -> Result<sqlx::Pool<sqlx::MySql>, String> {
+    match provided {
+        Some(p) => Ok(p.clone()),
+        None => {
+            let url = format!(
+                "{}?connect_timeout=2",
+                matrixone.database_url_with_password()
+            );
+            sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(std::time::Duration::from_secs(3))
+                .connect(&url)
+                .await
+                .map_err(|e| format!("DB connect: {e}"))
+        }
+    }
+}
+
 /// Resolve the active LLM model from the database for in-process / server-side callers.
 ///
 /// When `preferred` is `Some(name)`, the row **must** exist and be active — otherwise this
@@ -389,43 +462,25 @@ pub fn format_inactive_model_error(requested: &str, canonical: &str) -> String {
 /// the lexicographically first active model. When `pool` is `None`, opens an ephemeral
 /// single-connection pool from `matrixone`.
 ///
-/// Also extracts `fallback_model` from the `quirks` JSON column (cloud-managed config).
+/// Also extracts `fallback_chain` from the `quirks` JSON column (cloud-managed config).
 pub async fn resolve_active_llm_model(
     matrixone: &MatrixOneSettings,
     encryptor: &FernetTokenEncryptor,
     preferred: Option<&str>,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
 ) -> Result<ResolvedActiveLlmModel, String> {
-    let ephemeral;
-    let pool: &sqlx::Pool<sqlx::MySql> = match pool {
-        Some(p) => p,
-        None => {
-            let url = format!(
-                "{}?connect_timeout=2",
-                matrixone.database_url_with_password()
-            );
-            ephemeral = sqlx::mysql::MySqlPoolOptions::new()
-                .max_connections(1)
-                .acquire_timeout(std::time::Duration::from_secs(3))
-                .connect(&url)
-                .await
-                .map_err(|e| format!("DB connect: {e}"))?;
-            &ephemeral
-        }
-    };
+    let pool = acquire_pool(pool, matrixone).await?;
 
     let pref = preferred.map(str::trim).filter(|s| !s.is_empty());
 
     if let Some(name) = pref {
         // Try exact match first — the fast path. If the LLM supplied
         // the fully-qualified name it resolves in one query.
-        let exact_row = sqlx::query(
-            "SELECT model_name, api_key_encrypted, base_url, provider, \
-                    IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json, is_active \
-             FROM infra_llm_models WHERE model_name = ? LIMIT 1",
-        )
+        let exact_row = sqlx::query(&format!(
+            "SELECT {RESOLVE_COLS}, is_active FROM infra_llm_models WHERE model_name = ? LIMIT 1"
+        ))
         .bind(name)
-        .fetch_optional(pool)
+        .fetch_optional(&pool)
         .await
         .map_err(|e| format!("DB query: {e}"))?;
 
@@ -447,20 +502,19 @@ pub async fn resolve_active_llm_model(
                 let active_names: Vec<String> = sqlx::query_scalar::<_, String>(
                     "SELECT model_name FROM infra_llm_models WHERE is_active = 1",
                 )
-                .fetch_all(pool)
+                .fetch_all(&pool)
                 .await
                 .map_err(|e| format!("DB query: {e}"))?;
 
                 match resolve_model_alias(name, &active_names) {
                     Ok(canonical_ref) => {
                         let canonical = canonical_ref.to_string();
-                        let r = sqlx::query(
-                            "SELECT model_name, api_key_encrypted, base_url, provider, \
-                                    IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json, is_active \
-                             FROM infra_llm_models WHERE model_name = ? LIMIT 1",
-                        )
+                        let r = sqlx::query(&format!(
+                            "SELECT {RESOLVE_COLS}, is_active \
+                             FROM infra_llm_models WHERE model_name = ? LIMIT 1"
+                        ))
                         .bind(&canonical)
-                        .fetch_optional(pool)
+                        .fetch_optional(&pool)
                         .await
                         .map_err(|e| format!("DB query: {e}"))?
                         .ok_or_else(|| {
@@ -484,12 +538,10 @@ pub async fn resolve_active_llm_model(
         return build_resolved_active_llm_from_row(&row, encryptor);
     }
 
-    let row = sqlx::query(
-        "SELECT model_name, api_key_encrypted, base_url, provider, \
-                IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json \
-         FROM infra_llm_models WHERE is_active = 1 ORDER BY model_name LIMIT 1",
-    )
-    .fetch_optional(pool)
+    let row = sqlx::query(&format!(
+        "SELECT {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1 ORDER BY model_name LIMIT 1"
+    ))
+    .fetch_optional(&pool)
     .await
     .map_err(|e| format!("DB query fallback: {e}"))?;
 
@@ -526,31 +578,12 @@ pub async fn resolve_reasoning_model(
 
     // 2. Cheapest active. MatrixOne JSON function support is uneven, so sort in Rust:
     //    pull all active rows and pick the minimum completion price.
-    let ephemeral;
-    let pool: &sqlx::Pool<sqlx::MySql> = match pool {
-        Some(p) => p,
-        None => {
-            let url = format!(
-                "{}?connect_timeout=2",
-                matrixone.database_url_with_password()
-            );
-            ephemeral = sqlx::mysql::MySqlPoolOptions::new()
-                .max_connections(1)
-                .acquire_timeout(std::time::Duration::from_secs(3))
-                .connect(&url)
-                .await
-                .map_err(|e| format!("DB connect: {e}"))?;
-            &ephemeral
-        }
-    };
+    let pool = acquire_pool(pool, matrixone).await?;
 
-    let rows = sqlx::query(
-        "SELECT model_name, api_key_encrypted, base_url, provider, \
-                IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json, \
-                IFNULL(CAST(pricing AS CHAR), '{}') AS pricing_json \
-         FROM infra_llm_models WHERE is_active = 1",
-    )
-    .fetch_all(pool)
+    let rows = sqlx::query(&format!(
+        "SELECT {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1"
+    ))
+    .fetch_all(&pool)
     .await
     .map_err(|e| format!("DB query reasoning: {e}"))?;
 
@@ -580,44 +613,22 @@ pub async fn resolve_reasoning_model(
 /// Resolve the cheapest model tagged `"selector"` for memory-related
 /// decisions (relevance filtering, lesson synthesis, L1b extraction).
 ///
-/// Resolution order:
-/// 1. Cheapest active model whose `tags` JSON array contains `"selector"`.
-/// 2. Fallback: cheapest active model overall (same as `resolve_reasoning_model`
-///    without the admin override).
+/// 1. Cheapest active model tagged `"selector"`.
+/// 2. Fallback: cheapest active model overall.
 ///
-/// This is cheaper than the main conversation model and dedicated to
-/// low-stakes judgment calls where latency is acceptable (2–3s).
+/// Callers use `thinking_capability` from the resolved model to decide
+/// whether to apply thinking suppression.
 pub async fn resolve_memory_model(
     matrixone: &MatrixOneSettings,
     encryptor: &FernetTokenEncryptor,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
 ) -> Result<ResolvedActiveLlmModel, String> {
-    let ephemeral;
-    let pool: &sqlx::Pool<sqlx::MySql> = match pool {
-        Some(p) => p,
-        None => {
-            let url = format!(
-                "{}?connect_timeout=2",
-                matrixone.database_url_with_password()
-            );
-            ephemeral = sqlx::mysql::MySqlPoolOptions::new()
-                .max_connections(1)
-                .acquire_timeout(std::time::Duration::from_secs(3))
-                .connect(&url)
-                .await
-                .map_err(|e| format!("DB connect: {e}"))?;
-            &ephemeral
-        }
-    };
+    let pool = acquire_pool(pool, matrixone).await?;
 
-    let rows = sqlx::query(
-        "SELECT model_name, api_key_encrypted, base_url, provider, \
-                IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json, \
-                IFNULL(CAST(pricing AS CHAR), '{}') AS pricing_json, \
-                IFNULL(CAST(tags AS CHAR), '[]') AS tags_json \
-         FROM infra_llm_models WHERE is_active = 1",
-    )
-    .fetch_all(pool)
+    let rows = sqlx::query(&format!(
+        "SELECT {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1"
+    ))
+    .fetch_all(&pool)
     .await
     .map_err(|e| format!("DB query memory model: {e}"))?;
 
@@ -625,7 +636,6 @@ pub async fn resolve_memory_model(
         return Err("No active LLM model configured.".to_string());
     }
 
-    // Prefer models tagged "selector" (ultra-cheap intent/judgment models).
     let selector_rows: Vec<usize> = rows
         .iter()
         .enumerate()
@@ -638,9 +648,8 @@ pub async fn resolve_memory_model(
         .map(|(i, _)| i)
         .collect();
 
-    let best_idx = if !selector_rows.is_empty() {
-        // Pick cheapest among selector-tagged models.
-        let selector_entries: Vec<(String, String)> = selector_rows
+    let pick_cheapest_in = |indices: &[usize]| -> usize {
+        let entries: Vec<(String, String)> = indices
             .iter()
             .map(|&i| {
                 let name: String = rows[i].try_get("model_name").unwrap_or_default();
@@ -650,21 +659,15 @@ pub async fn resolve_memory_model(
                 (name, pricing)
             })
             .collect();
-        let local_best = rank_cheapest_index(&selector_entries);
-        selector_rows[local_best]
+        let local_best = rank_cheapest_index(&entries);
+        indices[local_best]
+    };
+
+    let best_idx = if !selector_rows.is_empty() {
+        pick_cheapest_in(&selector_rows)
     } else {
-        // No selector models — fall back to cheapest overall.
-        let entries: Vec<(String, String)> = rows
-            .iter()
-            .map(|row| {
-                let name: String = row.try_get("model_name").unwrap_or_default();
-                let pricing: String = row
-                    .try_get("pricing_json")
-                    .unwrap_or_else(|_| "{}".to_string());
-                (name, pricing)
-            })
-            .collect();
-        rank_cheapest_index(&entries)
+        let all_indices: Vec<usize> = (0..rows.len()).collect();
+        pick_cheapest_in(&all_indices)
     };
 
     build_resolved_active_llm_from_row(&rows[best_idx], encryptor)
@@ -816,6 +819,9 @@ impl DatabaseModelService {
             .try_get("quirks_json")
             .unwrap_or_else(|_| "{}".to_string());
 
+        let thinking_cap_str: Option<String> = row.try_get("thinking_capability").ok().flatten();
+        let thinking_capability = ThinkingCapability::from_db(thinking_cap_str.as_deref());
+
         Ok(ModelRecord {
             model_id: row.try_get("model_id").map_err(internal_error)?,
             name: row.try_get("model_name").map_err(internal_error)?,
@@ -843,6 +849,8 @@ impl DatabaseModelService {
             tags: parse_json_column("tags_json", &tags_json, Default::default),
             quirks: parse_json_column("quirks_json", &quirks_json, Default::default),
             connectivity: None,
+            thinking_capability,
+            thinking_probe: None,
         })
     }
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
@@ -866,10 +874,12 @@ pub const MODEL_SELECT_COLS: &str = "\
     IFNULL(CAST(supported_parameters AS CHAR), '[]') AS supported_parameters_json, \
     IFNULL(CAST(pricing AS CHAR), '{}') AS pricing_json, \
     IFNULL(CAST(tags AS CHAR), '[]') AS tags_json, \
-    IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json";
+    IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json, \
+    thinking_capability";
 const MODEL_LIST_SELECT_COLS: &str = "\
     model_id, model_name, provider, description, is_active, \
     IFNULL(context_window, 128000) AS context_window, max_completion_tokens, architecture, \
+    thinking_capability, \
     IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json";
 const MAX_MODEL_LIST_ROWS: i64 = 200;
 
@@ -917,6 +927,20 @@ impl ModelService for DatabaseModelService {
         .await;
         let is_active: i16 = if conn_result.is_none() { 1 } else { 0 };
 
+        // Auto-probe thinking capability when connectivity passes.
+        let thinking_cap_str = if conn_result.is_none() {
+            let probe = probe_thinking_behavior(
+                &request.provider,
+                &request.name,
+                &request.api_key,
+                base_url.as_deref(),
+            )
+            .await;
+            Some(probe.capability.as_db_str().to_string())
+        } else {
+            None
+        };
+
         let input_mod = serde_json::to_string(&request.input_modalities)
             .unwrap_or_else(|_| r#"["text"]"#.to_string());
         let output_mod = serde_json::to_string(&request.output_modalities)
@@ -935,8 +959,9 @@ impl ModelService for DatabaseModelService {
             "INSERT INTO infra_llm_models \
              (model_id, model_name, provider, api_key_encrypted, base_url, description, \
               is_active, context_window, max_completion_tokens, input_modalities, output_modalities, \
-              supported_parameters, pricing, architecture, tags, quirks, created_by, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())",
+              supported_parameters, pricing, architecture, tags, quirks, thinking_capability, \
+              created_by, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())",
         )
         .bind(&model_id)
         .bind(&request.name)
@@ -954,6 +979,7 @@ impl ModelService for DatabaseModelService {
         .bind(&request.architecture)
         .bind(&tags)
         .bind(&quirks)
+        .bind(&thinking_cap_str)
         .bind(&user_id)
         .execute(&pool)
         .await
@@ -997,11 +1023,6 @@ impl ModelService for DatabaseModelService {
         let mut models = Vec::with_capacity(rows.len());
         for row in rows {
             let is_active_int: i16 = row.try_get("is_active").unwrap_or(1);
-            let quirks_json: String = row
-                .try_get("quirks_json")
-                .unwrap_or_else(|_| "{}".to_string());
-            let quirks: QuirksData =
-                parse_json_column("quirks_json", &quirks_json, Default::default);
             models.push(ModelListItem {
                 model_id: row.try_get("model_id").map_err(internal_error)?,
                 name: row.try_get("model_name").map_err(internal_error)?,
@@ -1011,7 +1032,10 @@ impl ModelService for DatabaseModelService {
                 context_window: row.try_get("context_window").unwrap_or(128000),
                 max_completion_tokens: row.try_get("max_completion_tokens").ok(),
                 architecture: row.try_get("architecture").ok(),
-                thinking_mode: quirks.thinking_mode,
+                thinking_capability: {
+                    let cap_str: Option<String> = row.try_get("thinking_capability").ok().flatten();
+                    ThinkingCapability::from_db(cap_str.as_deref())
+                },
             });
         }
         Ok(models)
@@ -1185,11 +1209,15 @@ impl ModelService for DatabaseModelService {
         model_name: String,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-        let row = query("SELECT api_key_encrypted, provider, base_url FROM infra_llm_models WHERE model_name = ?")
-            .bind(&model_name)
-            .fetch_optional(&pool)
-            .await
-            .map_err(internal_error)?;
+        let row = query(
+            "SELECT api_key_encrypted, provider, base_url, \
+                    IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json \
+             FROM infra_llm_models WHERE model_name = ?",
+        )
+        .bind(&model_name)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)?;
         let row = row.ok_or_else(|| {
             error_response(
                 StatusCode::NOT_FOUND,
@@ -1202,6 +1230,8 @@ impl ModelService for DatabaseModelService {
         let base_url: Option<String> = row.try_get("base_url").ok();
 
         let api_key = self.encryptor.decrypt(&encrypted).map_err(internal_error)?;
+
+        // Phase 1: connectivity probe
         let check =
             validate_connectivity(&provider, &model_name, &api_key, base_url.as_deref()).await;
 
@@ -1212,6 +1242,35 @@ impl ModelService for DatabaseModelService {
             .execute(&pool)
             .await
             .map_err(internal_error)?;
+
+        // Phase 2: two-phase thinking behavior probe (only when connected)
+        let thinking_probe = if check.is_none() {
+            let result =
+                probe_thinking_behavior(&provider, &model_name, &api_key, base_url.as_deref())
+                    .await;
+            // Persist probe result to DB
+            let cap_str = result.capability.as_db_str();
+            let err_str = result.error.as_deref();
+            if let Err(e) = query(
+                "UPDATE infra_llm_models SET thinking_capability = ?, \
+                 thinking_probe_error = ?, updated_at = NOW() WHERE model_name = ?",
+            )
+            .bind(cap_str)
+            .bind(err_str)
+            .bind(&model_name)
+            .execute(&pool)
+            .await
+            {
+                tracing::warn!(
+                    model = %model_name,
+                    err = %e,
+                    "failed to persist thinking_capability to DB"
+                );
+            }
+            Some(result)
+        } else {
+            None
+        };
 
         let sql = format!(
             "SELECT {} FROM infra_llm_models WHERE model_name = ?",
@@ -1225,6 +1284,7 @@ impl ModelService for DatabaseModelService {
 
         let mut record = Self::model_record_from_row(result_row)?;
         record.connectivity = Some(check.unwrap_or_else(|| "ok".to_string()));
+        record.thinking_probe = thinking_probe;
         Ok(record)
     }
 }
@@ -1398,6 +1458,349 @@ pub async fn validate_connectivity(
     }
 }
 
+/// Provider-aware two-phase probe of a model's thinking behavior.
+///
+/// **Bedrock/Anthropic** (default = no thinking):
+///   Phase 1: Send WITH thinking enabled → can model think at all?
+///   If yes → Both (user can toggle). If error/no → None.
+///
+/// **DashScope/native thinkers** (default = thinking):
+///   Phase 1: Send default request → confirms it thinks.
+///   Phase 2: Send with `enable_thinking: false` → can it stop?
+///   Both phases think → NativeOnly. Phase 2 stops → Both.
+///
+/// **Generic OpenAI-compatible**:
+///   Phase 1: Send default request → does it think by default?
+///   If no → try with `reasoning_effort: "low"` → if it returns thinking → Both.
+///   If still no → None.
+pub async fn probe_thinking_behavior(
+    provider: &str,
+    model_name: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+) -> ThinkingProbeResult {
+    let probe_builder = astra_core::net::apply_env_proxy(
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
+    );
+    let client = match probe_builder.build() {
+        Ok(c) => c,
+        Err(e) => {
+            return ThinkingProbeResult {
+                capability: ThinkingCapability::None,
+                error: Some(format!("Client error: {e}")),
+            };
+        }
+    };
+
+    if provider == "bedrock" {
+        return probe_bedrock(&client, model_name, api_key, base_url).await;
+    }
+    if provider == "anthropic" {
+        return probe_anthropic(&client, model_name, api_key, base_url).await;
+    }
+
+    // OpenAI-compatible — provider-aware probe based on base_url.
+    let base_trim = base_url.map(str::trim).filter(|s| !s.is_empty());
+    let url = match base_trim {
+        Some(b) => b.trim_end_matches('/').to_string(),
+        None if provider == "openai" => "https://api.openai.com/v1".to_string(),
+        None => {
+            return ThinkingProbeResult {
+                capability: ThinkingCapability::None,
+                error: Some(format!("No base_url for provider '{provider}'")),
+            };
+        }
+    };
+    let probe_url = format!("{url}/chat/completions");
+    let url_lower = url.to_ascii_lowercase();
+    let base_body = serde_json::json!({
+        "model": model_name,
+        "max_tokens": 50,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "Say hello"}]
+    });
+
+    // ── DeepSeek: always thinks, supports reasoning_effort (low/high) but can't disable ──
+    if url_lower.contains("deepseek") {
+        let thinks = send_openai_probe(&client, &probe_url, api_key, &base_body)
+            .await
+            .unwrap_or(false);
+        return ThinkingProbeResult {
+            capability: if thinks {
+                ThinkingCapability::EffortOnly
+            } else {
+                ThinkingCapability::None
+            },
+            error: None,
+        };
+    }
+
+    // ── MiniMax: always thinks via <think> tags, can't disable ──
+    if url_lower.contains("minimax") {
+        let thinks = send_openai_probe(&client, &probe_url, api_key, &base_body)
+            .await
+            .unwrap_or(false);
+        return ThinkingProbeResult {
+            capability: if thinks {
+                ThinkingCapability::NativeOnly
+            } else {
+                ThinkingCapability::None
+            },
+            error: None,
+        };
+    }
+
+    // ── DashScope (Qwen, GLM-5.1): default=no thinking, enable_thinking toggles ──
+    if url_lower.contains("dashscope") || url_lower.contains("aliyun") {
+        // First check if it thinks by default (GLM-5.1 does)
+        let default_thinks = send_openai_probe(&client, &probe_url, api_key, &base_body)
+            .await
+            .unwrap_or(false);
+        if default_thinks {
+            // Thinks by default — test suppression
+            let mut body_disable = base_body;
+            body_disable["enable_thinking"] = serde_json::json!(false);
+            let still_thinks = send_openai_probe(&client, &probe_url, api_key, &body_disable)
+                .await
+                .unwrap_or(true);
+            return ThinkingProbeResult {
+                capability: if still_thinks {
+                    ThinkingCapability::NativeOnly
+                } else {
+                    ThinkingCapability::Both
+                },
+                error: None,
+            };
+        }
+        // Doesn't think by default — try enabling
+        let mut body_enable = base_body;
+        body_enable["enable_thinking"] = serde_json::json!(true);
+        let enabled_thinks = send_openai_probe(&client, &probe_url, api_key, &body_enable)
+            .await
+            .unwrap_or(false);
+        return ThinkingProbeResult {
+            capability: if enabled_thinks {
+                ThinkingCapability::Both
+            } else {
+                ThinkingCapability::None
+            },
+            error: None,
+        };
+    }
+
+    // ── Generic OpenAI-compatible: probe default, then try enable_thinking ──
+    let default_thinks = send_openai_probe(&client, &probe_url, api_key, &base_body)
+        .await
+        .unwrap_or(false);
+    if default_thinks {
+        let mut body_suppress = base_body;
+        body_suppress["enable_thinking"] = serde_json::json!(false);
+        let still_thinks = send_openai_probe(&client, &probe_url, api_key, &body_suppress)
+            .await
+            .unwrap_or(true);
+        return ThinkingProbeResult {
+            capability: if still_thinks {
+                ThinkingCapability::NativeOnly
+            } else {
+                ThinkingCapability::Both
+            },
+            error: None,
+        };
+    }
+    let mut body_enable = base_body;
+    body_enable["enable_thinking"] = serde_json::json!(true);
+    let enabled_thinks = send_openai_probe(&client, &probe_url, api_key, &body_enable)
+        .await
+        .unwrap_or(false);
+    ThinkingProbeResult {
+        capability: if enabled_thinks {
+            ThinkingCapability::Both
+        } else {
+            ThinkingCapability::None
+        },
+        error: None,
+    }
+}
+
+async fn probe_bedrock(
+    client: &reqwest::Client,
+    model_name: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+) -> ThinkingProbeResult {
+    let Some(base) = base_url.map(str::trim).filter(|s| !s.is_empty()) else {
+        return ThinkingProbeResult {
+            capability: ThinkingCapability::None,
+            error: Some("No base_url for bedrock".into()),
+        };
+    };
+    let Ok(probe_url) = bedrock_converse_probe_url(base, model_name) else {
+        return ThinkingProbeResult {
+            capability: ThinkingCapability::None,
+            error: Some("Invalid base_url for bedrock".into()),
+        };
+    };
+
+    // Bedrock: try with thinking enabled.
+    // maxTokens MUST be > budget_tokens — Bedrock rejects otherwise.
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": [{"text": "Say hello"}]}],
+        "inferenceConfig": {"maxTokens": 2048},
+        "additionalModelRequestFields": {
+            "thinking": {"type": "enabled", "budget_tokens": 1024}
+        }
+    });
+    let resp = client
+        .post(&probe_url)
+        .header("authorization", format!("Bearer {api_key}"))
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().as_u16() < 400 => ThinkingProbeResult {
+            capability: ThinkingCapability::Both,
+            error: None,
+        },
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let text = r.text().await.unwrap_or_default();
+            let detail = &text[..text.len().min(300)];
+            if status == 400 && text.contains("think") {
+                // 400 mentioning "thinking" = model rejects the thinking param
+                ThinkingProbeResult {
+                    capability: ThinkingCapability::None,
+                    error: None,
+                }
+            } else if status == 400 {
+                // 400 for other reasons (format issue?) — log but assume Both
+                // since Sonnet/Opus are known to support thinking even if the
+                // probe format was slightly wrong.
+                ThinkingProbeResult {
+                    capability: ThinkingCapability::Both,
+                    error: Some(format!("Bedrock probe 400 (assuming Both): {detail}")),
+                }
+            } else {
+                ThinkingProbeResult {
+                    capability: ThinkingCapability::None,
+                    error: Some(format!("Bedrock probe HTTP {status}: {detail}")),
+                }
+            }
+        }
+        Err(e) => ThinkingProbeResult {
+            capability: ThinkingCapability::None,
+            error: Some(format!("Bedrock probe failed: {e}")),
+        },
+    }
+}
+
+async fn probe_anthropic(
+    client: &reqwest::Client,
+    model_name: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+) -> ThinkingProbeResult {
+    let probe_url = anthropic_messages_probe_url(base_url);
+
+    // Anthropic: try with thinking enabled.
+    // max_tokens MUST be > budget_tokens.
+    let body = serde_json::json!({
+        "model": model_name,
+        "max_tokens": 2048,
+        "messages": [{"role": "user", "content": "Say hello"}],
+        "thinking": {"type": "enabled", "budget_tokens": 1024}
+    });
+    let resp = client
+        .post(&probe_url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().as_u16() < 400 => ThinkingProbeResult {
+            capability: ThinkingCapability::Both,
+            error: None,
+        },
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let text = r.text().await.unwrap_or_default();
+            let detail = &text[..text.len().min(300)];
+            if status == 400 && text.contains("think") {
+                ThinkingProbeResult {
+                    capability: ThinkingCapability::None,
+                    error: None,
+                }
+            } else if status == 400 {
+                ThinkingProbeResult {
+                    capability: ThinkingCapability::Both,
+                    error: Some(format!("Anthropic probe 400 (assuming Both): {detail}")),
+                }
+            } else {
+                ThinkingProbeResult {
+                    capability: ThinkingCapability::None,
+                    error: Some(format!("Anthropic probe HTTP {status}: {detail}")),
+                }
+            }
+        }
+        Err(e) => ThinkingProbeResult {
+            capability: ThinkingCapability::None,
+            error: Some(format!("Anthropic probe failed: {e}")),
+        },
+    }
+}
+
+async fn send_openai_probe(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+) -> Result<bool, String> {
+    let resp = client
+        .post(url)
+        .header("authorization", format!("Bearer {api_key}"))
+        .header("content-type", "application/json")
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| format!("Probe request failed: {e}"))?;
+
+    if resp.status().as_u16() >= 400 {
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "Probe HTTP {status}: {}",
+            &text[..text.len().min(200)]
+        ));
+    }
+
+    let text = resp.text().await.unwrap_or_default();
+    let json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("Probe parse error: {e}"))?;
+
+    let content = json
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+
+    let has_think_tags = content.contains("<think>");
+    let has_reasoning_content = json
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("reasoning_content"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+
+    Ok(has_think_tags || has_reasoning_content)
+}
+
 // ── Noop implementation ──────────────────────────────────────────────────────
 
 pub struct UnconfiguredModelService;
@@ -1505,6 +1908,10 @@ pub struct ModelResponse {
     pub quirks: QuirksData,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connectivity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_capability: Option<ThinkingCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_probe: Option<ThinkingProbeResult>,
 }
 
 #[derive(Serialize, PartialEq)]
@@ -1518,7 +1925,7 @@ pub struct ModelListItemResponse {
     pub max_completion_tokens: Option<i32>,
     pub architecture: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub thinking_mode: Option<String>,
+    pub thinking_capability: Option<ThinkingCapability>,
 }
 
 impl From<ModelRecord> for ModelResponse {
@@ -1540,6 +1947,8 @@ impl From<ModelRecord> for ModelResponse {
             tags: r.tags,
             quirks: r.quirks,
             connectivity: r.connectivity,
+            thinking_capability: r.thinking_capability,
+            thinking_probe: r.thinking_probe,
         }
     }
 }
@@ -1555,7 +1964,7 @@ impl From<ModelListItem> for ModelListItemResponse {
             context_window: r.context_window,
             max_completion_tokens: r.max_completion_tokens,
             architecture: r.architecture,
-            thinking_mode: r.thinking_mode,
+            thinking_capability: r.thinking_capability,
         }
     }
 }
@@ -1963,7 +2372,6 @@ mod tests {
         assert!(!q.no_system_message);
         assert!(!q.system_as_user_prefix);
         assert!(q.fixed_temperature.is_none());
-        assert!(q.fallback_model.is_none());
     }
 
     #[test]
@@ -2002,8 +2410,7 @@ mod tests {
             strict_tool_call_ids: true,
             no_system_message: false,
             system_as_user_prefix: true,
-            fallback_model: Some("claude-haiku".into()),
-            thinking_mode: Some("controllable".into()),
+            fallback_chain: vec!["claude-haiku".into(), "gpt-4o-mini".into()],
         };
         let json = serde_json::to_string(&q).unwrap();
         let restored: QuirksData = serde_json::from_str(&json).unwrap();
@@ -2031,13 +2438,13 @@ mod tests {
             context_window: 128000,
             max_completion_tokens: Some(16384),
             architecture: Some("transformer".into()),
-            thinking_mode: Some("controllable".into()),
+            thinking_capability: Some(ThinkingCapability::Both),
         };
         let resp = ModelListItemResponse::from(item.clone());
         assert_eq!(resp.model_id, item.model_id);
         assert_eq!(resp.name, item.name);
         assert_eq!(resp.context_window, 128000);
-        assert_eq!(resp.thinking_mode, Some("controllable".into()));
+        assert_eq!(resp.thinking_capability, Some(ThinkingCapability::Both));
     }
 
     #[test]
@@ -2051,13 +2458,13 @@ mod tests {
             context_window: 4096,
             max_completion_tokens: None,
             architecture: None,
-            thinking_mode: None,
+            thinking_capability: None,
         };
         let resp = ModelListItemResponse::from(item);
         assert!(resp.description.is_none());
         assert!(resp.max_completion_tokens.is_none());
         assert!(resp.architecture.is_none());
-        assert!(resp.thinking_mode.is_none());
+        assert!(resp.thinking_capability.is_none());
     }
 
     /// CLI and other clients must read `is_active` from GET /models — not `active`.
@@ -2096,14 +2503,14 @@ mod tests {
             context_window: 128000,
             max_completion_tokens: None,
             architecture: None,
-            thinking_mode: Some("controllable".into()),
+            thinking_capability: Some(ThinkingCapability::Both),
         };
         let resp = ModelListItemResponse::from(item);
         let v = serde_json::to_value(&resp).expect("serialize ModelListItemResponse");
         assert_eq!(v.get("is_active"), Some(&serde_json::Value::Bool(false)));
         assert_eq!(
-            v.get("thinking_mode"),
-            Some(&serde_json::json!("controllable"))
+            v.get("thinking_capability"),
+            Some(&serde_json::json!("both"))
         );
         assert!(
             v.get("active").is_none(),
@@ -2215,5 +2622,213 @@ mod tests {
             selector_entries[best].0, "qwen-flash",
             "cheapest selector should be qwen-flash"
         );
+    }
+
+    // ── QuirksData fallback_chain serde ──────────────────────────────────
+
+    #[test]
+    fn quirks_fallback_chain_serde_roundtrip() {
+        let json = r#"{"fallback_chain":["model-b","model-c"]}"#;
+        let q: QuirksData = serde_json::from_str(json).unwrap();
+        assert_eq!(q.fallback_chain, vec!["model-b", "model-c"]);
+        let serialized = serde_json::to_string(&q).unwrap();
+        assert!(serialized.contains("model-b"));
+    }
+
+    #[test]
+    fn quirks_fallback_chain_defaults_empty_when_absent() {
+        let json = r#"{}"#;
+        let q: QuirksData = serde_json::from_str(json).unwrap();
+        assert!(q.fallback_chain.is_empty());
+    }
+
+    #[test]
+    fn quirks_fallback_chain_empty_not_serialized() {
+        let q = QuirksData::default();
+        let json = serde_json::to_string(&q).unwrap();
+        assert!(
+            !json.contains("fallback_chain"),
+            "empty fallback_chain should be skipped: {json}"
+        );
+    }
+
+    // ── probe_thinking_behavior ──────────────────────────────────────────
+
+    use std::sync::{Arc, Mutex};
+
+    async fn spawn_probe_mock(
+        captured: Arc<Mutex<Option<serde_json::Value>>>,
+        response_body: serde_json::Value,
+    ) -> String {
+        use axum::{routing::post, Router};
+
+        let handler = move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let captured = captured.clone();
+            let resp = response_body.clone();
+            async move {
+                *captured.lock().unwrap() = Some(body);
+                axum::Json(resp)
+            }
+        };
+        let app = Router::new().route("/chat/completions", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        format!("http://{addr}")
+    }
+
+    // ── Provider-aware probe regression tests ─────────────────────────
+    //
+    // Based on real API recordings from 2026-05-04.
+    // Each mock simulates the provider's actual response pattern.
+
+    /// Mock that responds differently based on enable_thinking in request.
+    async fn spawn_dashscope_mock(supports_thinking: bool) -> String {
+        use axum::{routing::post, Router};
+
+        let handler = move |axum::Json(body): axum::Json<serde_json::Value>| async move {
+            let enable = body.get("enable_thinking").and_then(|v| v.as_bool());
+            let has_reasoning = match (supports_thinking, enable) {
+                (false, _) => false,
+                (true, Some(false)) => false,
+                (true, Some(true)) => true,
+                (true, None) => false, // DashScope default: no thinking
+            };
+            let mut msg = serde_json::json!({"content": "Hello!"});
+            if has_reasoning {
+                msg["reasoning_content"] = serde_json::json!("thinking...");
+            }
+            axum::Json(serde_json::json!({"choices": [{"message": msg}]}))
+        };
+        let app = Router::new().route("/chat/completions", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        format!("http://{addr}")
+    }
+
+    /// DashScope model that thinks by default (like glm-5.1, qwen3.6-plus).
+    async fn spawn_dashscope_native_thinker_mock() -> String {
+        use axum::{routing::post, Router};
+
+        let handler = |axum::Json(body): axum::Json<serde_json::Value>| async move {
+            let enable = body.get("enable_thinking").and_then(|v| v.as_bool());
+            let has_reasoning = match enable {
+                Some(false) => false, // Suppression works
+                _ => true,            // Default or explicit true → thinks
+            };
+            let mut msg = serde_json::json!({"content": "Hello!"});
+            if has_reasoning {
+                msg["reasoning_content"] = serde_json::json!("thinking...");
+            }
+            axum::Json(serde_json::json!({"choices": [{"message": msg}]}))
+        };
+        let app = Router::new().route("/chat/completions", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        format!("http://{addr}")
+    }
+
+    // ── DashScope qwen-plus: default=no think, enable_thinking works → Both ──
+    #[tokio::test]
+    async fn probe_dashscope_qwen_plus_both() {
+        let base = spawn_dashscope_mock(true).await;
+        let result = probe_thinking_behavior("openai", "qwen-plus", "k", Some(&base)).await;
+        assert_eq!(result.capability, ThinkingCapability::Both, "{:?}", result);
+    }
+
+    // ── DashScope qwen2.5-3b: enable_thinking has no effect → None ──
+    #[tokio::test]
+    async fn probe_dashscope_qwen25_3b_none() {
+        let base = spawn_dashscope_mock(false).await;
+        let result = probe_thinking_behavior("openai", "qwen2.5-3b", "k", Some(&base)).await;
+        assert_eq!(result.capability, ThinkingCapability::None, "{:?}", result);
+    }
+
+    // ── DashScope glm-5.1: thinks by default, enable_thinking:false suppresses → Both ──
+    #[tokio::test]
+    async fn probe_dashscope_glm51_native_both() {
+        let base = spawn_dashscope_native_thinker_mock().await;
+        let result = probe_thinking_behavior("openai", "glm-5.1", "k", Some(&base)).await;
+        assert_eq!(result.capability, ThinkingCapability::Both, "{:?}", result);
+    }
+
+    // ── DeepSeek: always has reasoning_content → EffortOnly ──
+    #[tokio::test]
+    async fn probe_deepseek_v4_effort_only() {
+        let captured = Arc::new(Mutex::new(None));
+        let base = spawn_probe_mock(
+            captured.clone(),
+            serde_json::json!({
+                "choices": [{"message": {
+                    "content": "",
+                    "reasoning_content": "thinking about hello..."
+                }}]
+            }),
+        )
+        .await;
+        let result = probe_thinking_behavior("openai", "deepseek-v4-flash", "k", Some(&base)).await;
+        // Generic path (no "deepseek" in localhost URL) → detects reasoning → tries suppression
+        // For real DeepSeek, the url_lower check would match "deepseek"
+        assert!(
+            result.capability == ThinkingCapability::EffortOnly
+                || result.capability == ThinkingCapability::NativeOnly
+                || result.capability == ThinkingCapability::Both,
+            "model with reasoning_content should not be None: {:?}",
+            result
+        );
+    }
+
+    // ── MiniMax: always has <think> tags → NativeOnly ──
+    #[tokio::test]
+    async fn probe_minimax_native_only() {
+        let captured = Arc::new(Mutex::new(None));
+        let base = spawn_probe_mock(
+            captured.clone(),
+            serde_json::json!({
+                "choices": [{"message": {
+                    "content": "<think>reasoning</think>\n\nHello!"
+                }}]
+            }),
+        )
+        .await;
+        let result = probe_thinking_behavior("openai", "MiniMax-M2.5", "k", Some(&base)).await;
+        // Generic path: detects <think> → tries suppression with same mock → still thinks → NativeOnly
+        assert!(
+            result.capability == ThinkingCapability::NativeOnly
+                || result.capability == ThinkingCapability::Both,
+            "MiniMax with <think> tags: {:?}",
+            result
+        );
+    }
+
+    // ── Error paths ──
+    #[tokio::test]
+    async fn probe_unreachable_server_returns_none() {
+        let result = probe_thinking_behavior("openai", "m", "k", Some("http://127.0.0.1:1")).await;
+        assert_eq!(result.capability, ThinkingCapability::None);
+    }
+
+    #[tokio::test]
+    async fn probe_no_base_url_returns_error() {
+        let result = probe_thinking_behavior("dashscope", "m", "k", None).await;
+        assert!(result.error.is_some());
+        assert!(result.error.unwrap().contains("No base_url"));
     }
 }

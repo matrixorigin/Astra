@@ -6310,7 +6310,9 @@ mod tests {
             api_key: "sk-test".into(),
             base_url: "https://api.openai.com/v1".into(),
             provider: "openai".into(),
-            fallback_model: None,
+            fallback_chain: vec![],
+            tags: vec![],
+            thinking_capability: None,
         };
         let config = CloudLlmConfig::from_resolved(resolved);
         assert_eq!(config.model, "gpt-4o-mini");

@@ -242,18 +242,27 @@ async fn run_extraction(
         Err(e) => return ExtractionOutcome::Error(format!("client build: {e}")),
     };
 
+    let mut req_body = serde_json::json!({
+        "model": params.model_name,
+        "messages": [
+            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+            {"role": "user", "content": query},
+        ],
+        "max_tokens": 200,
+        "temperature": 0.0,
+    });
+    {
+        astra_turn_core::thinking_config::ThinkingConfig::Off.apply_openai_suppression(
+            &mut req_body,
+            &params.provider,
+            &params.base_url,
+        );
+    }
+
     let resp = match client
         .post(format!("{}/chat/completions", params.base_url))
         .header("Authorization", format!("Bearer {}", params.api_key))
-        .json(&serde_json::json!({
-            "model": params.model_name,
-            "messages": [
-                {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": query},
-            ],
-            "max_tokens": 200,
-            "temperature": 0.0,
-        }))
+        .json(&req_body)
         .send()
         .await
     {
@@ -273,6 +282,16 @@ async fn run_extraction(
                 .map(String::from)
         })
         .unwrap_or_default();
+
+    // Strip <think> tags that native thinkers may emit despite suppression.
+    // If stripping empties the text, fall back to the original (the model may
+    // have wrapped the actual JSON inside think tags).
+    let stripped = astra_turn_core::thinking_config::strip_think_tags(&text);
+    let text = if stripped.trim().is_empty() {
+        text
+    } else {
+        stripped
+    };
 
     let extracted = parse_extraction_response(&text);
     let quality_filtered: Vec<ExtractedMemory> = extracted
@@ -504,6 +523,7 @@ mod tests {
             base_url: "http://x".into(),
             api_key: "k".into(),
             model_name: "m".into(),
+            provider: "openai".into(),
         };
         let tools = vec!["memory_store".into()];
         let outcome = ext.maybe_extract(ctx(1, Some(&params), &tools));
@@ -525,6 +545,7 @@ mod tests {
             base_url: "http://x".into(),
             api_key: "k".into(),
             model_name: "m".into(),
+            provider: "openai".into(),
         };
         let outcome = ext.maybe_extract(ctx(5, Some(&params), &[]));
         assert_eq!(outcome.tag(), "skipped_disabled");
@@ -660,5 +681,168 @@ mod tests {
             src.contains("pub fn memory_extraction("),
             "JournalEvent must have memory_extraction factory method"
         );
+    }
+
+    // ── Mock server integration tests ────────────────────────────────────
+
+    use std::sync::{Arc, Mutex};
+
+    async fn spawn_extraction_mock(
+        captured: Arc<Mutex<Option<serde_json::Value>>>,
+        response_content: &'static str,
+    ) -> String {
+        use axum::{Router, routing::post};
+
+        let handler = move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let captured = captured.clone();
+            async move {
+                *captured.lock().unwrap() = Some(body);
+                axum::Json(serde_json::json!({
+                    "choices": [{"message": {"content": response_content}}]
+                }))
+            }
+        };
+        let app = Router::new().route("/chat/completions", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn extraction_native_thinker_sends_suppression() {
+        let captured = Arc::new(Mutex::new(None));
+        let base = spawn_extraction_mock(captured.clone(), "[]").await;
+        let params = LlmConnParams {
+            base_url: base,
+            api_key: "k".into(),
+            model_name: "qwen3.5-flash".into(),
+            provider: "dashscope".into(),
+        };
+        let mut ext = MemoryExtractor::new();
+        let outcome = ext.maybe_extract(ExtractionContext {
+            turn: 1,
+            selector_params: Some(&params),
+            user_message: "hello",
+            assistant_response: "world",
+            tools_used: &[],
+            session_id: None,
+            existing_manifest: "",
+        });
+        assert_eq!(outcome.tag(), "started");
+        let _ = ext.drain(std::time::Duration::from_secs(3)).await;
+
+        let body = captured.lock().unwrap().take().expect("request captured");
+        assert_eq!(
+            body["enable_thinking"], false,
+            "native thinker should send enable_thinking: false"
+        );
+    }
+
+    #[tokio::test]
+    async fn extraction_strips_think_tags_before_parse() {
+        let captured = Arc::new(Mutex::new(None));
+        let base = spawn_extraction_mock(
+            captured.clone(),
+            r#"<think>reasoning</think>[{"type":"user","content":"prefers Rust"}]"#,
+        )
+        .await;
+        let params = LlmConnParams {
+            base_url: base,
+            api_key: "k".into(),
+            model_name: "m".into(),
+            provider: "openai".into(),
+        };
+        let mut ext = MemoryExtractor::new();
+        let _ = ext.maybe_extract(ExtractionContext {
+            turn: 1,
+            selector_params: Some(&params),
+            user_message: "I prefer Rust",
+            assistant_response: "Noted",
+            tools_used: &[],
+            session_id: None,
+            existing_manifest: "",
+        });
+        let result = ext.drain(std::time::Duration::from_secs(3)).await;
+        match result {
+            Some(ExtractionOutcome::Extracted { count, .. }) => {
+                assert!(count > 0, "should extract at least one memory");
+            }
+            other => panic!("expected Extracted, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn extraction_think_wrapping_json_degrades_gracefully() {
+        let captured = Arc::new(Mutex::new(None));
+        // JSON is wrapped entirely inside think tags — strip empties it,
+        // fallback to original which has <think> prefix → JSON parse fails.
+        // This is graceful degradation: count=0, no panic.
+        let base = spawn_extraction_mock(
+            captured.clone(),
+            r#"<think>[{"type":"user","content":"prefers Rust"}]</think>"#,
+        )
+        .await;
+        let params = LlmConnParams {
+            base_url: base,
+            api_key: "k".into(),
+            model_name: "m".into(),
+            provider: "openai".into(),
+        };
+        let mut ext = MemoryExtractor::new();
+        let _ = ext.maybe_extract(ExtractionContext {
+            turn: 1,
+            selector_params: Some(&params),
+            user_message: "I prefer Rust",
+            assistant_response: "Noted",
+            tools_used: &[],
+            session_id: None,
+            existing_manifest: "",
+        });
+        let result = ext.drain(std::time::Duration::from_secs(3)).await;
+        match result {
+            Some(ExtractionOutcome::Extracted { count, .. }) => {
+                assert_eq!(count, 0, "think-wrapped JSON should degrade to count=0");
+            }
+            other => panic!("expected Extracted(0), got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn extraction_normal_json_response() {
+        let captured = Arc::new(Mutex::new(None));
+        let base = spawn_extraction_mock(
+            captured.clone(),
+            r#"[{"type":"feedback","content":"prefers concise code"}]"#,
+        )
+        .await;
+        let params = LlmConnParams {
+            base_url: base,
+            api_key: "k".into(),
+            model_name: "m".into(),
+            provider: "openai".into(),
+        };
+        let mut ext = MemoryExtractor::new();
+        let _ = ext.maybe_extract(ExtractionContext {
+            turn: 1,
+            selector_params: Some(&params),
+            user_message: "keep it concise",
+            assistant_response: "ok",
+            tools_used: &[],
+            session_id: None,
+            existing_manifest: "",
+        });
+        let result = ext.drain(std::time::Duration::from_secs(3)).await;
+        match result {
+            Some(ExtractionOutcome::Extracted { count, .. }) => {
+                assert_eq!(count, 1);
+            }
+            other => panic!("expected Extracted(1), got: {other:?}"),
+        }
     }
 }

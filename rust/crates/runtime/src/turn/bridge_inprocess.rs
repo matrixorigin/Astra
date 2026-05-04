@@ -945,15 +945,15 @@ impl InProcessChatTurnBridge {
                     .unwrap_or(false);
 
             // Resolve LLM model (skipped when `test_llm_rounds` drives the turn — feature `bridge-e2e-hooks`).
-            // Also capture fallback_model name for rate-limit-triggered fallback.
+            // Also capture fallback_chain for rate-limit-triggered fallback.
             let pool_ref = shared_pool.as_ref().map(SharedPool::get);
-            let (mut model_name, mut api_key, mut base_url, mut provider, fallback_model_name) = if use_e2e_llm {
+            let (mut model_name, mut api_key, mut base_url, mut provider, fallback_chain) = if use_e2e_llm {
                 (
                     "bridge-e2e-mock".to_string(),
                     "unused".to_string(),
                     "http://127.0.0.1:1".to_string(),
                     "openai".to_string(),
-                    None::<String>,
+                    Vec::<String>::new(),
                 )
             } else {
                 match astra_services::resolve_active_llm_model(
@@ -964,7 +964,7 @@ impl InProcessChatTurnBridge {
                 )
                 .await
                 {
-                    Ok(m) => (m.model_name, m.api_key, m.base_url, m.provider, m.fallback_model),
+                    Ok(m) => (m.model_name, m.api_key, m.base_url, m.provider, m.fallback_chain),
                     Err(e) => {
                         yield render_sse_map(&build_stream_error_event(&e, "MODEL_NOT_AVAILABLE", false));
                         mark_disconnect_capture_finalized(&disconnect_capture_state);
@@ -972,7 +972,7 @@ impl InProcessChatTurnBridge {
                     }
                 }
             };
-            let has_fallback = fallback_model_name.is_some();
+            let has_fallback = !fallback_chain.is_empty();
 
             // Latch cache config at session init — prevents mid-session env var
             // changes from busting the KV cache.
@@ -1002,14 +1002,21 @@ impl InProcessChatTurnBridge {
                     }
                 }
                 RateLimitAction::UseFallback { reason } => {
-                    if let Some(ref fb_name) = fallback_model_name {
+                    let mut resolved = false;
+                    for fb_name in &fallback_chain {
+                        let fb_ok = cooldown.with(fb_name, |c| c.check_request(false));
+                        if !matches!(
+                            fb_ok,
+                            RateLimitAction::Proceed | RateLimitAction::WaitAndRetry { .. }
+                        ) {
+                            continue;
+                        }
                         astra_core::agent_info!(
                             "llm",
-                            "rate-limit cooldown: switching to fallback model '{}' ({})",
+                            "rate-limit cooldown: trying fallback model '{}' ({})",
                             fb_name,
                             reason.as_str()
                         );
-                        // Resolve fallback model credentials
                         match astra_services::resolve_active_llm_model(
                             &matrixone,
                             encryptor.as_ref(),
@@ -1023,6 +1030,8 @@ impl InProcessChatTurnBridge {
                                 api_key = fb.api_key;
                                 base_url = fb.base_url;
                                 provider = fb.provider;
+                                resolved = true;
+                                break;
                             }
                             Err(e) => {
                                 astra_core::agent_warn!(
@@ -1031,15 +1040,24 @@ impl InProcessChatTurnBridge {
                                     fb_name,
                                     e
                                 );
-                                // Continue with primary model (best effort)
                             }
                         }
-                    } else {
-                        astra_core::agent_warn!(
-                            "llm",
-                            "rate-limit cooldown: fallback requested ({}) but no fallback configured",
-                            reason.as_str()
-                        );
+                    }
+                    if !resolved {
+                        if fallback_chain.is_empty() {
+                            astra_core::agent_warn!(
+                                "llm",
+                                "rate-limit cooldown: fallback requested ({}) but no fallback configured",
+                                reason.as_str()
+                            );
+                        } else {
+                            astra_core::agent_warn!(
+                                "llm",
+                                "rate-limit cooldown: all {} fallback models exhausted ({})",
+                                fallback_chain.len(),
+                                reason.as_str()
+                            );
+                        }
                     }
                 }
                 RateLimitAction::Reject {

@@ -236,7 +236,7 @@ struct ResolvedTurnLlmConfig {
     api_key: String,
     base_url: String,
     provider: String,
-    fallback_model: Option<String>,
+    fallback_chain: Vec<String>,
     header_overrides: HashMap<String, String>,
     completions_url_override: Option<String>,
     request_timeout: Option<Duration>,
@@ -316,7 +316,7 @@ async fn resolve_llm_model_for_turn(
             api_key: String::new(),
             base_url: "https://api.openai.com/v1".to_string(),
             provider: "openai".to_string(),
-            fallback_model: None,
+            fallback_chain: Vec::new(),
             header_overrides: forward_headers.clone(),
             completions_url_override: Some(config.url.clone()),
             request_timeout: config.timeout_ms.map(Duration::from_millis),
@@ -330,7 +330,7 @@ async fn resolve_llm_model_for_turn(
         api_key: resolved.api_key,
         base_url: resolved.base_url,
         provider: resolved.provider,
-        fallback_model: resolved.fallback_model,
+        fallback_chain: resolved.fallback_chain,
         header_overrides: HashMap::new(),
         completions_url_override: None,
         request_timeout: None,
@@ -2317,7 +2317,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 ));
             }
         };
-        let has_fallback = llm_cfg.fallback_model.is_some();
+        let has_fallback = !llm_cfg.fallback_chain.is_empty();
 
         // ── 1b. Check rate-limit cooldown and handle fallback model resolution ──
         let cooldown = rate_limit_cooldown();
@@ -2331,14 +2331,22 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state)).await?;
             }
             RateLimitAction::UseFallback { reason } => {
-                if let Some(ref fb_name) = llm_cfg.fallback_model {
+                let mut resolved = false;
+                for fb_name in &llm_cfg.fallback_chain {
+                    // Skip fallback models that are themselves in cooldown.
+                    let fb_ok = cooldown.with(fb_name, |c| c.check_request(false));
+                    if !matches!(
+                        fb_ok,
+                        RateLimitAction::Proceed | RateLimitAction::WaitAndRetry { .. }
+                    ) {
+                        continue;
+                    }
                     astra_core::agent_info!(
                         "llm",
-                        "rate-limit cooldown: switching to fallback model '{}' ({})",
+                        "rate-limit cooldown: trying fallback model '{}' ({})",
                         fb_name,
                         reason.as_str()
                     );
-                    // Resolve fallback model credentials
                     match resolve_llm_model_for_turn(
                         &self.matrixone,
                         self.encryptor.as_ref(),
@@ -2349,7 +2357,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     )
                     .await
                     {
-                        Ok(fb) => llm_cfg = fb,
+                        Ok(fb) => {
+                            llm_cfg = fb;
+                            resolved = true;
+                            break;
+                        }
                         Err(e) => {
                             astra_core::agent_warn!(
                                 "llm",
@@ -2357,15 +2369,24 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                 fb_name,
                                 e
                             );
-                            // Continue with primary model (best effort)
                         }
                     }
-                } else {
-                    astra_core::agent_warn!(
-                        "llm",
-                        "rate-limit cooldown: fallback requested ({}) but no fallback configured",
-                        reason.as_str()
-                    );
+                }
+                if !resolved {
+                    if llm_cfg.fallback_chain.is_empty() {
+                        astra_core::agent_warn!(
+                            "llm",
+                            "rate-limit cooldown: fallback requested ({}) but no fallback configured",
+                            reason.as_str()
+                        );
+                    } else {
+                        astra_core::agent_warn!(
+                            "llm",
+                            "rate-limit cooldown: all {} fallback models exhausted ({})",
+                            llm_cfg.fallback_chain.len(),
+                            reason.as_str()
+                        );
+                    }
                 }
             }
             RateLimitAction::Reject {
@@ -2805,16 +2826,25 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             Ok(m) => m,
             Err(e) => return Err(format!("Model resolution failed: {e}").into()),
         };
-        let has_fallback = llm_cfg.fallback_model.is_some();
+        let has_fallback = !llm_cfg.fallback_chain.is_empty();
 
         match rate_limit_cooldown().with(&llm_cfg.model_name, |c| c.check_request(has_fallback)) {
             RateLimitAction::Proceed => {}
             RateLimitAction::WaitAndRetry { delay_ms } => {
                 sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state)).await?;
             }
-            RateLimitAction::UseFallback { .. } => {
-                if let Some(ref fb_name) = llm_cfg.fallback_model
-                    && let Ok(fb) = resolve_llm_model_for_turn(
+            RateLimitAction::UseFallback { reason } => {
+                let cooldown = rate_limit_cooldown();
+                let mut resolved = false;
+                for fb_name in &llm_cfg.fallback_chain {
+                    let fb_ok = cooldown.with(fb_name, |c| c.check_request(false));
+                    if !matches!(
+                        fb_ok,
+                        RateLimitAction::Proceed | RateLimitAction::WaitAndRetry { .. }
+                    ) {
+                        continue;
+                    }
+                    if let Ok(fb) = resolve_llm_model_for_turn(
                         &self.matrixone,
                         self.encryptor.as_ref(),
                         Some(fb_name.as_str()),
@@ -2823,8 +2853,19 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         &state.hooks.forward_headers,
                     )
                     .await
-                {
-                    llm_cfg = fb;
+                    {
+                        llm_cfg = fb;
+                        resolved = true;
+                        break;
+                    }
+                }
+                if !resolved && !llm_cfg.fallback_chain.is_empty() {
+                    astra_core::agent_warn!(
+                        "llm",
+                        "reflection fallback: all {} models exhausted ({})",
+                        llm_cfg.fallback_chain.len(),
+                        reason.as_str()
+                    );
                 }
             }
             RateLimitAction::Reject {

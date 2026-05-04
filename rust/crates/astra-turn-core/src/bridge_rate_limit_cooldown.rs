@@ -1056,4 +1056,67 @@ mod tests {
     fn default_cooldown_is_at_most_30_seconds() {
         const _: () = assert!(DEFAULT_COOLDOWN_MS <= 30_000);
     }
+
+    // ── Fallback chain walk decision tests ───────────────────────────────
+
+    #[test]
+    fn fallback_chain_skips_cooldown_model_picks_active() {
+        let pmc = PerModelCooldown::new();
+        // Push model-a into cooldown (3 consecutive 429s)
+        pmc.with("model-a", |rl| {
+            rl.record_429(None, true);
+            rl.record_429(None, true);
+            rl.record_429(None, true);
+        });
+        // model-b should still be available
+        let a_action = pmc.with("model-a", |rl| rl.check_request(true));
+        assert!(
+            matches!(a_action, RateLimitAction::UseFallback { .. }),
+            "model-a should trigger fallback, got: {a_action:?}"
+        );
+        let b_action = pmc.with("model-b", |rl| rl.check_request(false));
+        assert_eq!(b_action, RateLimitAction::Proceed);
+    }
+
+    #[test]
+    fn fallback_chain_all_models_in_cooldown() {
+        let pmc = PerModelCooldown::new();
+        for model in &["model-a", "model-b", "model-c"] {
+            pmc.with(model, |rl| {
+                rl.record_429(None, false);
+                rl.record_429(None, false);
+                rl.record_429(None, false);
+            });
+        }
+        for model in &["model-a", "model-b", "model-c"] {
+            let action = pmc.with(model, |rl| rl.check_request(false));
+            assert!(
+                matches!(action, RateLimitAction::Reject { .. }),
+                "{model} should reject, got: {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_chain_first_available_wins() {
+        let pmc = PerModelCooldown::new();
+        // model-a: in cooldown
+        pmc.with("model-a", |rl| {
+            rl.record_429(None, true);
+            rl.record_429(None, true);
+            rl.record_429(None, true);
+        });
+        // model-b: active, model-c: also active
+        // Simulate the chain walk: check each in order, pick first Proceed
+        let chain = ["model-b", "model-c"];
+        let mut picked = None;
+        for fb in &chain {
+            let action = pmc.with(fb, |rl| rl.check_request(false));
+            if matches!(action, RateLimitAction::Proceed) {
+                picked = Some(*fb);
+                break;
+            }
+        }
+        assert_eq!(picked, Some("model-b"), "first available should win");
+    }
 }

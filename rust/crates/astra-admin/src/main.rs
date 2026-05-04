@@ -37,15 +37,15 @@ fn print_model_load_server_result(body: &str, model_name: &str) {
     } else if !active {
         println!("  connectivity: (not in response; run: astra-admin model check {model_name})");
     }
-    let thinking_mode = value
-        .get("quirks")
-        .and_then(|q| q.get("thinking_mode"))
+    let thinking_cap = value
+        .get("thinking_capability")
         .and_then(serde_json::Value::as_str);
-    match thinking_mode {
-        Some("controllable") => println!("  thinking: controllable (picker enabled) ✓"),
-        Some("native") => println!("  thinking: native (model thinks by default)"),
+    match thinking_cap {
+        Some("both") => println!("  thinking: both (Normal/Thinking picker enabled) ✓"),
+        Some("native_only") => println!("  thinking: native_only (model always thinks)"),
+        Some("none") => println!("  thinking: none"),
         Some(other) => println!("  thinking: {other}"),
-        None => {}
+        None => println!("  thinking: unprobed (run: astra-admin model check {model_name})"),
     }
     if !active {
         eprintln!(
@@ -111,20 +111,10 @@ fn apply_optional_yaml_fields(
             }),
         );
     }
-    if let Some(thinking_mode) = yaml_str(entry, "thinking_mode") {
-        match thinking_mode.as_str() {
-            "controllable" | "native" => {
-                let quirks = obj.entry("quirks").or_insert_with(|| serde_json::json!({}));
-                if let Some(qobj) = quirks.as_object_mut() {
-                    qobj.insert("thinking_mode".into(), serde_json::json!(thinking_mode));
-                }
-            }
-            other => {
-                eprintln!(
-                    "  warning: ignoring invalid thinking_mode {other:?} \
-                     (expected \"controllable\" or \"native\")"
-                );
-            }
+    if let Some(chain) = yaml_str_vec(entry, "fallback_chain") {
+        let quirks = obj.entry("quirks").or_insert_with(|| serde_json::json!({}));
+        if let Some(qobj) = quirks.as_object_mut() {
+            qobj.insert("fallback_chain".into(), serde_json::json!(chain));
         }
     }
 }
@@ -518,24 +508,6 @@ async fn main() -> Result<(), String> {
             print_json_or_raw(&body);
             Ok(())
         }
-        Command::Model(ModelCmd::SetFallback(args)) => {
-            let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
-            // "none" clears the fallback
-            let fallback = if args.fallback_model.eq_ignore_ascii_case("none") {
-                serde_json::json!(null)
-            } else {
-                serde_json::json!(args.fallback_model)
-            };
-            let payload = serde_json::json!({
-                "quirks": { "fallback_model": fallback }
-            });
-            let body = api
-                .put_bearer_path_json_text(&token, &paths::model(&args.model_name), &payload)
-                .await
-                .map_err(map_thin_err)?;
-            print_json_or_raw(&body);
-            Ok(())
-        }
         Command::Token(TokenCmd::List(args)) => {
             let (_, _, _, token) = get_profile_and_token(cli.profile.as_deref())?;
             let mut q: Vec<(&str, String)> = Vec::new();
@@ -706,111 +678,6 @@ mod tests {
         serde_yaml_ng::from_str(s).unwrap()
     }
 
-    // ── thinking_mode propagation (TDD: red → green) ────────────────────
-
-    #[test]
-    fn create_payload_includes_thinking_mode_controllable() {
-        let entry = yaml(
-            r#"
-            name: us.anthropic.claude-sonnet-4-6
-            provider: bedrock
-            thinking_mode: controllable
-            api_key: test-key
-            tags: [code, chat, reasoning]
-            "#,
-        );
-        let payload = build_model_create_payload(
-            &entry,
-            "us.anthropic.claude-sonnet-4-6",
-            "bedrock",
-            "test-key",
-            None,
-        );
-        let quirks = payload.get("quirks").expect("quirks must be present");
-        assert_eq!(
-            quirks.get("thinking_mode").and_then(|v| v.as_str()),
-            Some("controllable"),
-            "explicit thinking_mode: controllable must be forwarded in quirks"
-        );
-    }
-
-    #[test]
-    fn create_payload_includes_thinking_mode_native() {
-        let entry = yaml(
-            r#"
-            name: qwen3-235b
-            provider: dashscope
-            thinking_mode: native
-            api_key: test-key
-            "#,
-        );
-        let payload =
-            build_model_create_payload(&entry, "qwen3-235b", "dashscope", "test-key", None);
-        let quirks = payload.get("quirks").expect("quirks must be present");
-        assert_eq!(
-            quirks.get("thinking_mode").and_then(|v| v.as_str()),
-            Some("native"),
-        );
-    }
-
-    #[test]
-    fn create_payload_no_quirks_when_thinking_mode_absent() {
-        let entry = yaml(
-            r#"
-            name: gpt-4o
-            provider: openai
-            api_key: test-key
-            "#,
-        );
-        let payload = build_model_create_payload(&entry, "gpt-4o", "openai", "test-key", None);
-        // No thinking_mode in YAML → no quirks key (server fallback handles tags)
-        let quirks = payload.get("quirks");
-        assert!(
-            quirks.is_none()
-                || quirks
-                    .unwrap()
-                    .get("thinking_mode")
-                    .is_none_or(|v| v.is_null()),
-            "no thinking_mode in YAML should not inject one into quirks"
-        );
-    }
-
-    #[test]
-    fn update_payload_includes_thinking_mode() {
-        let entry = yaml(
-            r#"
-            provider: bedrock
-            thinking_mode: controllable
-            api_key: test-key
-            "#,
-        );
-        let payload = build_model_update_payload(&entry, "bedrock", "test-key", None);
-        let quirks = payload
-            .get("quirks")
-            .expect("quirks must be present in update");
-        assert_eq!(
-            quirks.get("thinking_mode").and_then(|v| v.as_str()),
-            Some("controllable"),
-        );
-    }
-
-    #[test]
-    fn create_payload_rejects_invalid_thinking_mode() {
-        let entry = yaml(
-            r#"
-            name: test
-            provider: x
-            api_key: k
-            thinking_mode: Controllable
-            "#,
-        );
-        let payload = build_model_create_payload(&entry, "test", "x", "k", None);
-        assert!(
-            payload.get("quirks").is_none(),
-            "invalid thinking_mode must not be forwarded to quirks"
-        );
-    }
-
     // ── existing field propagation (regression guard) ───────────────────
 
     #[test]
@@ -828,7 +695,6 @@ mod tests {
             architecture: transformer
             pricing_prompt: 0.001
             pricing_completion: 0.002
-            thinking_mode: controllable
             "#,
         );
         let payload = build_model_create_payload(
@@ -848,9 +714,5 @@ mod tests {
         );
         assert_eq!(payload["architecture"], "transformer");
         assert!(payload["pricing"]["prompt"].as_f64().unwrap() > 0.0);
-        assert_eq!(
-            payload["quirks"]["thinking_mode"].as_str(),
-            Some("controllable")
-        );
     }
 }

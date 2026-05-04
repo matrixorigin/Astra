@@ -5,6 +5,18 @@
 #
 # Load into the running server:
 #   astra-admin model load .models.yaml
+#
+# Thinking capability is auto-detected at load time (provider-aware probe).
+# No YAML declaration needed.
+#
+# Tags:
+#   selector  — cheap model used for memory extraction / relevance filtering
+#   code      — suitable for coding tasks
+#   chat      — suitable for conversational tasks
+#   reasoning — suitable for complex reasoning tasks
+#
+# fallback_chain: ordered list of fallback models for rate-limit recovery.
+# Example: fallback_chain: [qwen-turbo, qwen-flash]
 
 # ── AWS Bedrock / Claude via Converse ───────────────────────
 # Current Astra Bedrock integration expects a Bedrock bearer token
@@ -38,6 +50,7 @@
   pricing_prompt: 0.0000008     # ¥0.8/1M (≤128K)
   pricing_completion: 0.000002  # ¥2/1M
   tags: [code, chat, reasoning]
+  fallback_chain: [qwen-turbo, qwen-flash]
   context_window: 1000000
   max_completion_tokens: 32768
   supported_parameters: [tools]

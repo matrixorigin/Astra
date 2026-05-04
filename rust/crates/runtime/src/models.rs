@@ -15,31 +15,6 @@ pub async fn create_model_handler(
 ) -> Result<(StatusCode, Json<ModelResponse>), (StatusCode, Json<ErrorResponse>)> {
     let admin = state.admin_authorizer.require_admin(&headers).await?;
 
-    // Auto-infer thinking_mode at load time. Priority order:
-    //   1. Explicit `quirks.thinking_mode` in the request body (highest).
-    //   2. Tags: "thinking" → "controllable", "reasoning" (without "thinking") → "native".
-    let quirks = {
-        let mut q = request.quirks.unwrap_or_default();
-        if q.thinking_mode.is_none() {
-            let has_thinking = request
-                .tags
-                .iter()
-                .any(|t| t.eq_ignore_ascii_case("thinking"));
-            let has_reasoning = request
-                .tags
-                .iter()
-                .any(|t| t.eq_ignore_ascii_case("reasoning"));
-            q.thinking_mode = if has_thinking {
-                Some("controllable".into())
-            } else if has_reasoning {
-                Some("native".into())
-            } else {
-                None
-            };
-        }
-        Some(q)
-    };
-
     let model = state
         .model_service
         .create_model(
@@ -58,7 +33,7 @@ pub async fn create_model_handler(
                 pricing: request.pricing,
                 architecture: request.architecture,
                 tags: request.tags,
-                quirks,
+                quirks: request.quirks,
             },
         )
         .await?;
