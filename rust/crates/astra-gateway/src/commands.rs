@@ -4,8 +4,8 @@ use crate::access_control::{ActionCapability, ActionSource};
 use crate::config::GatewayConfig;
 use crate::store::{self, GatewayStore};
 use crate::trace_model::{
-    CancelRequestOutcome, ConversationKey, GatewayEvent, GatewayEventKind, OutboxStatus,
-    RequestStatus, TraceId, TraceRepository,
+    ActiveRequestSummary, CancelRequestOutcome, ConversationKey, GatewayEvent, GatewayEventKind,
+    OutboxStatus, RequestStatus, TraceId, TraceRepository,
 };
 use astra_core::durable_task_store::{
     DurableTask, DurableTaskStatus, DurableTaskStore, TaskFilter, resolve_task_for_owner,
@@ -480,12 +480,14 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              `/cli <name>` — 切换 CLI (astra/claude)\n\
              `/ws` — 当前工作目录\n\
              `/ws ls` — 列出可用项目\n\
-             `/ws <name|path>` — 切换工作目录\n\
-             `/running` — 查看正在执行的任务\n\
-             `/cancel [text]` — 取消排队中的请求 (支持文本匹配)\n\
-             `/kill [text]` — 强制终止运行中的请求 (无参数=自动选择)\n\
+             `/ws <name|path>` — 切换工作目录\n\n\
+             **任务管理**\n\
+             `/running` — 查看正在执行的任务 (带编号)\n\
+             `/cancel [N|text]` — 取消排队请求 (序号/文本/ID)\n\
+             `/kill [N|text]` — 终止运行中请求 (序号/文本/ID)\n\
              `/retry` — 查看发送失败的消息\n\
              `/retry dismiss` — 清除所有失败消息\n\
+             `/manage [指令]` — AI 辅助任务管理\n\
              `/usage` — 用量统计\n\n\
              **监控**\n\
              `/status` — 状态 + harness\n\
@@ -650,20 +652,17 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             } else {
                 let mut lines = vec![format!("🔄 **正在执行** ({} 个)", rows.len())];
                 let mut stuck_outbox_count = 0usize;
-                for row in &rows {
-                    let short_user = short_id(&row.user_id);
-                    let short_text = if row.text_preview.chars().count() > 40 {
-                        format!("{}…", row.text_preview.chars().take(40).collect::<String>())
-                    } else {
-                        row.text_preview.clone()
-                    };
+                for (i, row) in rows.iter().enumerate() {
+                    let icon = status_icon(row.display_status());
+                    let short_text = truncate_text(&row.text_preview, 40);
+                    let ts = short_timestamp(&row.created_at);
                     lines.push(format!(
-                        "- `{}` `{}` | {} | {} | {}",
-                        short_id(row.trace_id.as_str()),
-                        short_user,
+                        "[{}] {} {} | {} | {}",
+                        i + 1,
+                        icon,
                         row.display_status(),
                         short_text,
-                        row.created_at
+                        ts,
                     ));
                     if row.status.is_terminal() && row.outbox_status == Some(OutboxStatus::Failed) {
                         stuck_outbox_count += 1;
@@ -671,9 +670,10 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 }
                 if stuck_outbox_count > 0 {
                     lines.push(format!(
-                        "\n📬 提示: 有 {stuck_outbox_count} 个消息发送失败。用 `/retry` 查看，`/retry dismiss` 清除。"
+                        "\n📬 有 {stuck_outbox_count} 个消息发送失败。用 `/retry` 查看，`/retry dismiss` 清除。"
                     ));
                 }
+                lines.push("\n💡 `/kill 1` 终止 | `/cancel 2` 取消 | `/manage` AI 辅助管理".into());
                 Some(lines.join("\n"))
             }
         }
@@ -726,40 +726,63 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             let repo = require_trace_repo!(ctx);
             let conversation =
                 ConversationKey::new(ctx.platform, ctx.chat_id, ctx.resolved_cli.name());
-            let selector = if arg.is_empty() {
-                match repo.list_active_requests(&conversation, 20).await {
-                    Ok(rows) => rows
-                        .into_iter()
-                        .find(|row| row.is_cancellable())
-                        .map(|row| row.trace_id.to_string()),
-                    Err(_) => None,
+            if arg.is_empty() {
+                // Auto-pick first cancellable
+                let row = repo
+                    .list_active_requests(&conversation, 20)
+                    .await
+                    .ok()
+                    .and_then(|rows| rows.into_iter().find(|r| r.is_cancellable()));
+                let Some(row) = row else {
+                    return Some("✅ 当前没有可取消的排队请求。运行中的请求请用 `/kill`。".into());
+                };
+                match repo
+                    .cancel_accepted_request(
+                        &conversation,
+                        row.trace_id.as_str(),
+                        "cancelled by user",
+                    )
+                    .await
+                {
+                    Ok(CancelRequestOutcome::Cancelled(r)) => {
+                        Some(format!("🚫 已取消: {}", truncate_text(&r.text_preview, 40)))
+                    }
+                    Ok(CancelRequestOutcome::AlreadyRunning(_)) => {
+                        Some("⚠️ 请求已在运行，用 `/kill` 终止。".into())
+                    }
+                    Ok(CancelRequestOutcome::NotFound) => Some("❌ 找不到可取消请求".into()),
+                    Err(e) => Some(format!("⚠️ 取消失败: {e}")),
                 }
             } else {
-                match resolve_trace_by_text_or_id(repo, &conversation, arg).await {
-                    Some(id) => Some(id.to_string()),
-                    None => return Some(format!("❌ 找不到匹配 `{arg}` 的请求")),
+                // Resolve by number, text, or ID
+                let Some(row) = resolve_active_request(repo, &conversation, arg).await else {
+                    return Some(format!("❌ 找不到匹配 `{arg}` 的请求"));
+                };
+                if !row.is_cancellable() {
+                    return Some(format!(
+                        "⚠️ 请求 [{}] 已在运行，用 `/kill` 终止。",
+                        truncate_text(&row.text_preview, 30)
+                    ));
                 }
-            };
-            let Some(selector) = selector else {
-                return Some("✅ 当前没有可取消的排队请求。运行中的请求不会被强制中断。".into());
-            };
-            match repo
-                .cancel_accepted_request(&conversation, &selector, "cancelled by user")
-                .await
-            {
-                Ok(CancelRequestOutcome::Cancelled(row)) => Some(format!(
-                    "🚫 已取消排队请求 `{}`: {}",
-                    short_id(row.trace_id.as_str()),
-                    row.text_preview
-                )),
-                Ok(CancelRequestOutcome::AlreadyRunning(row)) => Some(format!(
-                    "⚠️ 请求 `{}` 已在运行，不能安全取消。",
-                    short_id(row.trace_id.as_str())
-                )),
-                Ok(CancelRequestOutcome::NotFound) => {
-                    Some(format!("❌ 找不到可取消请求 `{selector}`"))
+                match repo
+                    .cancel_accepted_request(
+                        &conversation,
+                        row.trace_id.as_str(),
+                        "cancelled by user",
+                    )
+                    .await
+                {
+                    Ok(CancelRequestOutcome::Cancelled(r)) => {
+                        Some(format!("🚫 已取消: {}", truncate_text(&r.text_preview, 40)))
+                    }
+                    Ok(CancelRequestOutcome::AlreadyRunning(_)) => {
+                        Some("⚠️ 请求已在运行，用 `/kill` 终止。".into())
+                    }
+                    Ok(CancelRequestOutcome::NotFound) => {
+                        Some(format!("❌ 找不到可取消请求 `{arg}`"))
+                    }
+                    Err(e) => Some(format!("⚠️ 取消失败: {e}")),
                 }
-                Err(e) => Some(format!("⚠️ 取消失败: {e}")),
             }
         }
 
@@ -768,38 +791,37 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             let conversation =
                 ConversationKey::new(ctx.platform, ctx.chat_id, ctx.resolved_cli.name());
 
-            let target = if arg.is_empty() {
+            let row = if arg.is_empty() {
                 // Auto-pick the most recent running request
-                match repo.list_active_requests(&conversation, 20).await {
-                    Ok(rows) => rows
-                        .into_iter()
-                        .find(|row| row.status == RequestStatus::Running)
-                        .map(|row| row.trace_id.to_string()),
-                    Err(_) => None,
-                }
+                repo.list_active_requests(&conversation, 20)
+                    .await
+                    .ok()
+                    .and_then(|rows| {
+                        rows.into_iter()
+                            .find(|r| r.status == RequestStatus::Running)
+                    })
             } else {
-                // Support text-based fuzzy match against text_preview
-                match resolve_trace_by_text_or_id(repo, &conversation, arg).await {
-                    Some(id) => Some(id.to_string()),
-                    None => return Some(format!("❌ 找不到匹配 `{arg}` 的请求")),
-                }
+                // Resolve by number, text, or ID
+                resolve_active_request(repo, &conversation, arg).await
             };
 
-            let Some(target) = target else {
-                return Some("✅ 当前没有运行中的请求。".into());
+            let Some(row) = row else {
+                if arg.is_empty() {
+                    return Some("✅ 当前没有运行中的请求。".into());
+                }
+                return Some(format!("❌ 找不到匹配 `{arg}` 的请求"));
             };
-            let trace_id = TraceId::from_string(target);
             match repo
-                .force_fail_request(&trace_id, "killed by user via /kill")
+                .force_fail_request(&row.trace_id, "killed by user via /kill")
                 .await
             {
                 Ok(true) => Some(format!(
-                    "💀 已强制终止请求 `{}`",
-                    short_id(trace_id.as_str())
+                    "💀 已终止: {}",
+                    truncate_text(&row.text_preview, 40)
                 )),
                 Ok(false) => Some(format!(
-                    "⚠️ 请求 `{}` 已经是终态",
-                    short_id(trace_id.as_str())
+                    "⚠️ 请求已是终态: {}",
+                    truncate_text(&row.text_preview, 30)
                 )),
                 Err(e) => Some(format!("⚠️ 终止失败: {e}")),
             }
@@ -834,18 +856,36 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 return Some(format!("🧹 已清除 {dismissed} 个失败消息。"));
             }
 
+            // Support `/retry 1` to dismiss a specific item by index
+            if let Ok(idx) = arg.parse::<usize>() {
+                if idx >= 1 && idx <= stuck.len() {
+                    let row = stuck[idx - 1];
+                    match repo.dismiss_failed_outbox(&row.request_id).await {
+                        Ok(()) => {
+                            return Some(format!(
+                                "🧹 已清除: {}",
+                                truncate_text(&row.text_preview, 40)
+                            ));
+                        }
+                        Err(e) => return Some(format!("⚠️ 清除失败: {e}")),
+                    }
+                } else {
+                    return Some(format!("❌ 序号 {idx} 超出范围 (1-{})", stuck.len()));
+                }
+            }
+
             let mut lines = vec![format!("📬 **待重试消息** ({} 个)", stuck.len())];
-            for row in &stuck {
+            for (i, row) in stuck.iter().enumerate() {
                 lines.push(format!(
-                    "- `{}` | {} | {}",
-                    short_id(row.trace_id.as_str()),
+                    "[{}] 📬 {} | {}",
+                    i + 1,
                     truncate_text(&row.text_preview, 40),
                     row.outbox_error_message
                         .as_deref()
                         .unwrap_or("unknown error"),
                 ));
             }
-            lines.push("\n`/retry dismiss` — 清除所有失败消息".into());
+            lines.push("\n`/retry dismiss` 清除全部 | `/retry 1` 清除指定".into());
             Some(lines.join("\n"))
         }
 
@@ -1041,10 +1081,11 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             lines.push("| `/session list` | Session history |".to_string());
             lines.push("| `/cron list` | Scheduled tasks |".to_string());
             lines.push("| `/task list` | Durable tasks |".to_string());
-            lines.push("| `/running` | Active requests |".to_string());
-            lines.push("| `/cancel [text]` | Cancel queued request |".to_string());
-            lines.push("| `/kill [text]` | Force-kill running request |".to_string());
+            lines.push("| `/running` | Active requests (numbered) |".to_string());
+            lines.push("| `/cancel [N\\|text]` | Cancel queued request |".to_string());
+            lines.push("| `/kill [N\\|text]` | Force-kill running request |".to_string());
             lines.push("| `/retry` | View/dismiss failed outbox |".to_string());
+            lines.push("| `/manage [hint]` | AI-assisted task management |".to_string());
             lines.push("| `/trace [id]` | Request trace |".to_string());
             lines.push("| `/usage` | Token/cost stats |".to_string());
             lines.push("| `/inspect` | Harness details |".to_string());
@@ -1067,6 +1108,8 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 lines.push("| `dtask_complete:<id>` | Mark complete |".to_string());
                 lines.push("| `workspace_set:<path>` | Switch workspace |".to_string());
                 lines.push("| `skill_add:<name>:<md>` | Save reusable skill |".to_string());
+                lines.push("| `trace_kill:<trace_id>` | Force-kill request |".to_string());
+                lines.push("| `outbox_dismiss:<request_id>` | Dismiss failed outbox |".to_string());
             }
 
             if let Some(store) = ctx.store {
@@ -1141,33 +1184,70 @@ async fn resolve_trace_selector(
         .or_else(|| Some(TraceId::from_string(selector.to_string())))
 }
 
-async fn resolve_trace_by_text_or_id(
+/// Resolve a selector to an active request. Supports:
+/// - Numeric index "1", "2" (from `/running` output order)
+/// - Trace ID or prefix match
+/// - Text substring match against message content
+async fn resolve_active_request(
     repo: &dyn TraceRepository,
     conversation: &ConversationKey,
     selector: &str,
-) -> Option<TraceId> {
-    // First try exact/prefix ID match (existing behavior)
-    if let Some(id) = resolve_trace_selector(repo, conversation, selector).await {
-        // resolve_trace_selector falls back to constructing a TraceId from any string,
-        // so we need to verify the returned ID is a real match — not just a passthrough.
-        let traces = repo.list_recent_traces(conversation, 50).await.ok()?;
-        let is_real_match = traces.iter().any(|t| {
-            t.trace_id.as_str() == id.as_str()
-                && (t.trace_id.as_str() == selector
-                    || t.request_id.as_str() == selector
-                    || t.trace_id.as_str().starts_with(selector)
-                    || t.request_id.as_str().starts_with(selector))
-        });
-        if is_real_match {
-            return Some(id);
-        }
-    }
-    // Then try text_preview fuzzy match against active requests
+) -> Option<ActiveRequestSummary> {
     let rows = repo.list_active_requests(conversation, 50).await.ok()?;
+
+    let is_numeric = selector.chars().all(|c| c.is_ascii_digit()) && !selector.is_empty();
+
+    // Try numeric index first (1-based)
+    if is_numeric {
+        if let Ok(idx) = selector.parse::<usize>()
+            && idx >= 1
+            && idx <= rows.len()
+        {
+            return Some(rows[idx - 1].clone());
+        }
+        // Pure number that's out of range — don't fall through to ID prefix match
+        // (short numbers like "3" would spuriously match UUID prefixes)
+        return None;
+    }
+
+    // Try trace ID or request ID prefix match (only for non-numeric selectors)
+    if let Some(row) = rows.iter().find(|r| {
+        r.trace_id.as_str() == selector
+            || r.trace_id.as_str().starts_with(selector)
+            || r.request_id.as_str() == selector
+            || r.request_id.as_str().starts_with(selector)
+    }) {
+        return Some(row.clone());
+    }
+
+    // Try text fuzzy match
     let lower = selector.to_lowercase();
     rows.into_iter()
-        .find(|row| row.text_preview.to_lowercase().contains(&lower))
-        .map(|row| row.trace_id)
+        .find(|r| r.text_preview.to_lowercase().contains(&lower))
+}
+
+fn status_icon(status: &str) -> &'static str {
+    match status {
+        "running" => "\u{1f504}",
+        "queued" => "\u{231b}",
+        "completed" => "\u{2705}",
+        "failed" => "\u{274c}",
+        "reply_retrying" => "\u{1f4ec}",
+        "reply_pending" => "\u{1f4e4}",
+        _ => "\u{2753}",
+    }
+}
+
+/// Format timestamp: strip date prefix if it's today.
+fn short_timestamp(ts: &str) -> &str {
+    // created_at is typically "YYYY-MM-DD HH:MM:SS.ffffff" or similar.
+    // If it starts with today's date, strip to just time.
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    if let Some(rest) = ts.strip_prefix(&today) {
+        rest.trim_start_matches([' ', 'T'])
+    } else {
+        ts
+    }
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> String {
@@ -2009,4 +2089,136 @@ mod tests {
             );
         }
     );
+
+    // ── /manage is NOT a fast-path command (goes to slow path) ──
+
+    cmd_test!(cmd_manage_not_handled_as_command, "/manage", |r| {
+        assert!(r.is_none(), "/manage should not be a fast-path command");
+    });
+    cmd_test!(
+        cmd_manage_with_arg_not_handled,
+        "/manage 清理所有卡住的任务",
+        |r| {
+            assert!(
+                r.is_none(),
+                "/manage with arg should not be a fast-path command"
+            );
+        }
+    );
+
+    // ── /help and /gateway include /manage ──
+
+    cmd_test!(cmd_help_includes_manage, "/help", |r| {
+        let s = r.unwrap();
+        assert!(s.contains("/manage"), "help should include /manage");
+    });
+    cmd_test!(cmd_gateway_includes_manage, "/gateway", |r| {
+        let s = r.unwrap();
+        assert!(s.contains("/manage"), "gateway should include /manage");
+    });
+    // Note: trace_kill and outbox_dismiss GATEWAY action tags are only visible
+    // when model_generated_mutations is allowed AND store is available (tested below).
+
+    // ── status_icon ──
+
+    #[test]
+    fn status_icon_maps_known_statuses() {
+        assert_eq!(status_icon("running"), "\u{1f504}");
+        assert_eq!(status_icon("queued"), "\u{231b}");
+        assert_eq!(status_icon("completed"), "\u{2705}");
+        assert_eq!(status_icon("failed"), "\u{274c}");
+        assert_eq!(status_icon("reply_retrying"), "\u{1f4ec}");
+        assert_eq!(status_icon("reply_pending"), "\u{1f4e4}");
+        assert_eq!(status_icon("unknown"), "\u{2753}");
+    }
+
+    // ── short_timestamp ──
+
+    #[test]
+    fn short_timestamp_strips_today() {
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let ts = format!("{today} 12:34:56.789");
+        let short = short_timestamp(&ts);
+        assert_eq!(short, "12:34:56.789");
+    }
+
+    #[test]
+    fn short_timestamp_keeps_other_dates() {
+        let ts = "2020-01-01 12:34:56";
+        assert_eq!(short_timestamp(ts), ts);
+    }
+
+    // ── resolve_active_request ──
+
+    #[tokio::test]
+    async fn resolve_active_request_by_index() {
+        use crate::trace_model::InMemoryTraceRepository;
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("test", "chat", "astra");
+
+        // Create two requests
+        let req1 = crate::trace_model::GatewayRequest::new(
+            conv.clone(),
+            "msg-1",
+            "user-1",
+            "first request",
+        );
+        let trace1 = req1.trace_id.clone();
+        crate::trace_model::TraceWriter::begin(&repo, req1)
+            .await
+            .unwrap();
+
+        let req2 = crate::trace_model::GatewayRequest::new(
+            conv.clone(),
+            "msg-2",
+            "user-1",
+            "second request",
+        );
+        let trace2 = req2.trace_id.clone();
+        crate::trace_model::TraceWriter::begin(&repo, req2)
+            .await
+            .unwrap();
+
+        // Index 1 → first (both are Accepted, sorted by status then order)
+        let r1 = resolve_active_request(&repo, &conv, "1").await.unwrap();
+        assert_eq!(r1.trace_id, trace1);
+
+        // Index 2 → second
+        let r2 = resolve_active_request(&repo, &conv, "2").await.unwrap();
+        assert_eq!(r2.trace_id, trace2);
+
+        // Index 0 → None (1-based)
+        assert!(resolve_active_request(&repo, &conv, "0").await.is_none());
+
+        // Index 3 → None (out of range; pure numbers don't fall through to ID match)
+        assert!(resolve_active_request(&repo, &conv, "3").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_active_request_by_text() {
+        use crate::trace_model::InMemoryTraceRepository;
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("test", "chat", "astra");
+
+        let req = crate::trace_model::GatewayRequest::new(
+            conv.clone(),
+            "msg-1",
+            "user-1",
+            "帮我写个周报",
+        );
+        let trace = req.trace_id.clone();
+        crate::trace_model::TraceWriter::begin(&repo, req)
+            .await
+            .unwrap();
+
+        let found = resolve_active_request(&repo, &conv, "周报").await.unwrap();
+        assert_eq!(found.trace_id, trace);
+
+        // No match
+        assert!(
+            resolve_active_request(&repo, &conv, "不存在的内容")
+                .await
+                .is_none()
+        );
+    }
 }
