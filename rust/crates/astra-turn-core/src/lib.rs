@@ -28,6 +28,7 @@ pub mod confidence_contract;
 pub mod context_assembly_trace;
 pub mod context_budget;
 pub mod context_feedback;
+pub mod context_planner;
 pub mod context_pressure;
 pub mod emergent_context;
 pub mod optimize_limits;
