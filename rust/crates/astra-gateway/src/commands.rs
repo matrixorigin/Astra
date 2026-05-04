@@ -2119,6 +2119,116 @@ mod tests {
     // Note: trace_kill and outbox_dismiss GATEWAY action tags are only visible
     // when model_generated_mutations is allowed AND store is available (tested below).
 
+    // ── GAP 4: /gateway content completeness ────────────────────
+
+    cmd_test!(cmd_gateway_content_completeness, "/gateway", |r| {
+        let s = r.unwrap();
+        assert!(s.contains("Gateway Context"), "missing header");
+        assert!(s.contains("Identity"), "missing identity section");
+        assert!(s.contains("Capabilities"), "missing capabilities section");
+        assert!(s.contains("Commands"), "missing commands section");
+        assert!(s.contains("astra"), "missing CLI name");
+        assert!(s.contains("test"), "missing platform");
+        // Verify capabilities matrix
+        assert!(
+            s.contains("Session management"),
+            "missing session capability"
+        );
+        assert!(s.contains("Model switching"), "missing model capability");
+        assert!(s.contains("Tool execution"), "missing tool capability");
+        // Verify commands table
+        assert!(s.contains("/new"), "missing /new in commands table");
+        assert!(s.contains("/model"), "missing /model in commands table");
+        assert!(s.contains("/kill"), "missing /kill in commands table");
+        assert!(s.contains("/manage"), "missing /manage in commands table");
+        assert!(s.contains("/retry"), "missing /retry in commands table");
+        assert!(s.contains("/trace"), "missing /trace in commands table");
+        assert!(s.contains("/usage"), "missing /usage in commands table");
+        assert!(s.contains("/inspect"), "missing /inspect in commands table");
+        assert!(s.contains("/audit"), "missing /audit in commands table");
+        // Verify storage status (no store in test)
+        assert!(
+            s.contains("none"),
+            "should show no storage when store is None"
+        );
+    });
+
+    // ── GAP 8: resolve_active_request edge cases ────────────────
+
+    #[tokio::test]
+    async fn resolve_active_request_returns_none_for_empty_list() {
+        use crate::trace_model::InMemoryTraceRepository;
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wx", "c1", "astra");
+        let result = resolve_active_request(&repo, &conv, "1").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_active_request_numeric_zero_returns_none() {
+        use crate::trace_model::InMemoryTraceRepository;
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wx", "c1", "astra");
+        let req = crate::trace_model::GatewayRequest::new(conv.clone(), "m1", "u1", "test");
+        crate::trace_model::TraceWriter::begin(&repo, req)
+            .await
+            .unwrap();
+        let result = resolve_active_request(&repo, &conv, "0").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_active_request_out_of_range_returns_none() {
+        use crate::trace_model::InMemoryTraceRepository;
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wx", "c1", "astra");
+        let req = crate::trace_model::GatewayRequest::new(conv.clone(), "m1", "u1", "test");
+        crate::trace_model::TraceWriter::begin(&repo, req)
+            .await
+            .unwrap();
+        // Only 1 request, asking for index 5
+        let result = resolve_active_request(&repo, &conv, "5").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_active_request_by_trace_id_prefix() {
+        use crate::trace_model::InMemoryTraceRepository;
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wx", "c1", "astra");
+        let req = crate::trace_model::GatewayRequest::new(conv.clone(), "m1", "u1", "test");
+        let trace_id = req.trace_id.clone();
+        crate::trace_model::TraceWriter::begin(&repo, req)
+            .await
+            .unwrap();
+
+        // Full trace ID
+        let found = resolve_active_request(&repo, &conv, trace_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(found.trace_id, trace_id);
+
+        // Prefix match (first 8 chars)
+        let prefix = &trace_id.as_str()[..8];
+        let found = resolve_active_request(&repo, &conv, prefix).await.unwrap();
+        assert_eq!(found.trace_id, trace_id);
+    }
+
+    #[tokio::test]
+    async fn resolve_active_request_no_match_returns_none() {
+        use crate::trace_model::InMemoryTraceRepository;
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wx", "c1", "astra");
+        let req =
+            crate::trace_model::GatewayRequest::new(conv.clone(), "m1", "u1", "something specific");
+        crate::trace_model::TraceWriter::begin(&repo, req)
+            .await
+            .unwrap();
+
+        let result = resolve_active_request(&repo, &conv, "nonexistent_text").await;
+        assert!(result.is_none());
+    }
+
     // ── status_icon ──
 
     #[test]

@@ -892,6 +892,111 @@ mod tests {
         );
     }
 
+    // ── GAP 3: persistence roundtrip ──────────────────────────────
+
+    #[tokio::test]
+    async fn persistence_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write
+        {
+            let store = FileGatewayStore::open(dir.path()).await.unwrap();
+            store.upsert_user("wx", "u1", "Alice").await.unwrap();
+            store
+                .set_user_preference("wx", "u1", "theme", "dark")
+                .await
+                .unwrap();
+            store
+                .set_current_session("wx", "c1", "u1", "s1", "astra")
+                .await
+                .unwrap();
+            store
+                .create_cron_job(&CronJobSpec {
+                    job_id: "j1".into(),
+                    platform: "wx".into(),
+                    chat_id: "c1".into(),
+                    user_id: "u1".into(),
+                    cron_expr: "0 9 * * *".into(),
+                    message: "hello".into(),
+                    description: "daily".into(),
+                })
+                .await
+                .unwrap();
+        }
+        // Store dropped -- all in-memory state gone
+
+        // Reopen
+        {
+            let store = FileGatewayStore::open(dir.path()).await.unwrap();
+            assert!(
+                !store.is_first_message("wx", "u1").await.unwrap(),
+                "user should persist"
+            );
+            assert_eq!(
+                store
+                    .get_user_preference("wx", "u1", "theme")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("dark"),
+                "preference should persist"
+            );
+            assert_eq!(
+                store
+                    .get_current_session("wx", "c1", "astra")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("s1"),
+                "session should persist"
+            );
+            let jobs = store.list_cron_jobs("wx", "c1").await.unwrap();
+            assert_eq!(jobs.len(), 1, "cron job should persist");
+            assert_eq!(jobs[0].job_id, "j1");
+        }
+    }
+
+    #[tokio::test]
+    async fn credentials_persist_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = FileGatewayStore::open(dir.path()).await.unwrap();
+            store
+                .save_credential("wx", "u1", "token", &serde_json::json!({"k": "v"}), None)
+                .await
+                .unwrap();
+        }
+        {
+            let store = FileGatewayStore::open(dir.path()).await.unwrap();
+            let cred = store
+                .get_credential("wx", "u1", "token")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(cred.credentials["k"], "v");
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_messages_persist_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let msg_id;
+        {
+            let store = FileGatewayStore::open(dir.path()).await.unwrap();
+            msg_id = store
+                .save_pending_message("wx", "c1", "u1", "persist me")
+                .await
+                .unwrap();
+        }
+        {
+            let store = FileGatewayStore::open(dir.path()).await.unwrap();
+            let msgs = store.list_pending_messages(Some("wx")).await.unwrap();
+            assert_eq!(msgs.len(), 1);
+            assert_eq!(msgs[0].text, "persist me");
+            assert_eq!(msgs[0].id, msg_id);
+        }
+    }
+
     #[tokio::test]
     async fn usage_recording() {
         let (_dir, store) = test_store().await;

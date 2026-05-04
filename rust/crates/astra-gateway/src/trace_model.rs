@@ -2452,6 +2452,374 @@ mod tests {
         );
     }
 
+    // ── GAP 1: gateway_status aggregation ─────────────────────────
+
+    #[tokio::test]
+    async fn gateway_status_aggregates_correctly() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wx", "c1", "astra");
+
+        // Empty status
+        let status = repo.gateway_status(&conv).await.unwrap();
+        assert_eq!(status.queued_count, 0);
+        assert_eq!(status.running_count, 0);
+        assert_eq!(status.active_count, 0);
+        assert_eq!(status.recent_trace_count, 0);
+        assert!(status.last_trace.is_none());
+
+        // Add an Accepted request (counts as "queued")
+        let req1 = GatewayRequest::new(conv.clone(), "m1", "u1", "hello");
+        let writer1 = TraceWriter::begin(&repo, req1).await.unwrap();
+
+        let status = repo.gateway_status(&conv).await.unwrap();
+        assert_eq!(status.queued_count, 1);
+        assert_eq!(status.running_count, 0);
+        assert_eq!(status.active_count, 1);
+        assert_eq!(status.recent_trace_count, 1);
+        assert!(status.last_trace.is_some());
+
+        // Move to Running via start_run (which updates status)
+        let _run_id = writer1.start_run("astra", None).await.unwrap();
+        let status = repo.gateway_status(&conv).await.unwrap();
+        assert_eq!(status.queued_count, 0);
+        assert_eq!(status.running_count, 1);
+
+        // Add another Accepted request
+        let req2 = GatewayRequest::new(conv.clone(), "m2", "u1", "world");
+        TraceWriter::begin(&repo, req2).await.unwrap();
+
+        let status = repo.gateway_status(&conv).await.unwrap();
+        assert_eq!(status.queued_count, 1);
+        assert_eq!(status.running_count, 1);
+        assert_eq!(status.active_count, 2);
+        assert_eq!(status.recent_trace_count, 2);
+    }
+
+    #[tokio::test]
+    async fn gateway_status_counts_outbox_states() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wx", "c1", "astra");
+
+        let req = GatewayRequest::new(conv.clone(), "m1", "u1", "outbox test");
+        let writer = TraceWriter::begin(&repo, req).await.unwrap();
+        let run_id = writer.start_run("astra", None).await.unwrap();
+        writer
+            .finish_run(&run_id, RunStatus::Succeeded, Some(0), None)
+            .await
+            .unwrap();
+
+        // Enqueue outbox -> pending
+        let outbox_id = writer
+            .enqueue_outbox("wx", "c1", None, "reply body")
+            .await
+            .unwrap();
+
+        let status = repo.gateway_status(&conv).await.unwrap();
+        assert_eq!(status.pending_outbox_count, 1);
+        assert_eq!(status.retrying_outbox_count, 0);
+
+        // Fail outbox -> retrying
+        writer
+            .mark_outbox_failed(&outbox_id, "send error", 0)
+            .await
+            .unwrap();
+        let status = repo.gateway_status(&conv).await.unwrap();
+        assert_eq!(status.retrying_outbox_count, 1);
+        assert_eq!(status.pending_outbox_count, 0);
+    }
+
+    // ── GAP 2: full request lifecycle chain ──────────────────────
+
+    #[tokio::test]
+    async fn full_request_lifecycle_begin_to_complete() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wx", "c1", "astra");
+        let req = GatewayRequest::new(conv.clone(), "m1", "u1", "do something");
+        let trace_id = req.trace_id.clone();
+        let req_id = req.request_id.clone();
+
+        let writer = TraceWriter::begin(&repo, req).await.unwrap();
+
+        // Initially Accepted
+        let r = repo.get_request(&req_id).await.unwrap().unwrap();
+        assert_eq!(r.status, RequestStatus::Accepted);
+
+        // Start and finish a run (transitions to Running, then we complete)
+        let run_id = writer
+            .start_run("astra", Some("session-1".into()))
+            .await
+            .unwrap();
+        let r = repo.get_request(&req_id).await.unwrap().unwrap();
+        assert_eq!(r.status, RequestStatus::Running);
+
+        writer
+            .finish_run(&run_id, RunStatus::Succeeded, Some(0), None)
+            .await
+            .unwrap();
+
+        // Complete
+        writer.complete_request().await.unwrap();
+        let r = repo.get_request(&req_id).await.unwrap().unwrap();
+        assert_eq!(r.status, RequestStatus::Completed);
+
+        // Verify events recorded
+        let events = repo.list_events_for_trace(&trace_id, 50).await.unwrap();
+        assert!(
+            events.len() >= 4,
+            "should have received, run_started, run_completed, request_completed; got {}",
+            events.len()
+        );
+        let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+        assert!(kinds.contains(&GatewayEventKind::RequestReceived));
+        assert!(kinds.contains(&GatewayEventKind::RunStarted));
+        assert!(kinds.contains(&GatewayEventKind::RunCompleted));
+        assert!(kinds.contains(&GatewayEventKind::RequestCompleted));
+    }
+
+    #[tokio::test]
+    async fn full_request_lifecycle_with_failure() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wx", "c1", "astra");
+        let req = GatewayRequest::new(conv.clone(), "m1", "u1", "fail me");
+        let req_id = req.request_id.clone();
+        let trace_id = req.trace_id.clone();
+
+        let writer = TraceWriter::begin(&repo, req).await.unwrap();
+        let run_id = writer.start_run("astra", None).await.unwrap();
+        writer
+            .finish_run(&run_id, RunStatus::Failed, Some(1), Some("CLI error"))
+            .await
+            .unwrap();
+        writer.fail_request("something broke").await.unwrap();
+
+        let r = repo.get_request(&req_id).await.unwrap().unwrap();
+        assert_eq!(r.status, RequestStatus::Failed);
+        assert_eq!(r.error_message.as_deref(), Some("something broke"));
+
+        let events = repo.list_events_for_trace(&trace_id, 50).await.unwrap();
+        let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+        assert!(kinds.contains(&GatewayEventKind::RunFailed));
+        assert!(kinds.contains(&GatewayEventKind::RequestFailed));
+    }
+
+    // ── GAP 5: cancel_accepted_request coverage ─────────────────
+
+    #[tokio::test]
+    async fn cancel_accepted_request_transitions_to_cancelled() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wx", "c1", "astra");
+        let req = GatewayRequest::new(conv.clone(), "m1", "u1", "cancel me");
+        let req_id = req.request_id.clone();
+        TraceWriter::begin(&repo, req).await.unwrap();
+
+        match repo
+            .cancel_accepted_request(&conv, req_id.as_str(), "user cancelled")
+            .await
+            .unwrap()
+        {
+            CancelRequestOutcome::Cancelled(row) => {
+                assert_eq!(row.request_id, req_id);
+                assert_eq!(row.status, RequestStatus::Failed);
+                assert_eq!(row.error_message.as_deref(), Some("user cancelled"));
+            }
+            other => panic!("expected Cancelled, got {:?}", other),
+        }
+
+        // Verify underlying request was updated
+        let r = repo.get_request(&req_id).await.unwrap().unwrap();
+        assert_eq!(r.status, RequestStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn cancel_running_request_returns_already_running() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wx", "c1", "astra");
+        let req = GatewayRequest::new(conv.clone(), "m1", "u1", "running");
+        let req_id = req.request_id.clone();
+        let writer = TraceWriter::begin(&repo, req).await.unwrap();
+        // Use start_run to actually transition status to Running
+        let _run_id = writer.start_run("astra", None).await.unwrap();
+
+        match repo
+            .cancel_accepted_request(&conv, req_id.as_str(), "user cancelled")
+            .await
+            .unwrap()
+        {
+            CancelRequestOutcome::AlreadyRunning(row) => {
+                assert_eq!(row.request_id, req_id);
+                assert_eq!(row.status, RequestStatus::Running);
+            }
+            other => panic!("expected AlreadyRunning, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_nonexistent_returns_not_found() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wx", "c1", "astra");
+        match repo
+            .cancel_accepted_request(&conv, "nonexistent", "reason")
+            .await
+            .unwrap()
+        {
+            CancelRequestOutcome::NotFound => {}
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_completed_request_returns_not_found() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wx", "c1", "astra");
+        let req = GatewayRequest::new(conv.clone(), "m1", "u1", "done");
+        let req_id = req.request_id.clone();
+        let writer = TraceWriter::begin(&repo, req).await.unwrap();
+        writer.complete_request().await.unwrap();
+
+        // Completed requests are not in active list, so cancel returns NotFound
+        match repo
+            .cancel_accepted_request(&conv, req_id.as_str(), "too late")
+            .await
+            .unwrap()
+        {
+            CancelRequestOutcome::NotFound => {}
+            other => panic!("expected NotFound for completed request, got {:?}", other),
+        }
+    }
+
+    // ── GAP 6: list_recent_traces ────────────────────────────────
+
+    #[tokio::test]
+    async fn list_recent_traces_returns_newest_first() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wx", "c1", "astra");
+
+        let req1 = GatewayRequest::new(conv.clone(), "m1", "u1", "first");
+        let trace1 = req1.trace_id.clone();
+        TraceWriter::begin(&repo, req1).await.unwrap();
+
+        let req2 = GatewayRequest::new(conv.clone(), "m2", "u1", "second");
+        let trace2 = req2.trace_id.clone();
+        TraceWriter::begin(&repo, req2).await.unwrap();
+
+        let traces = repo.list_recent_traces(&conv, 10).await.unwrap();
+        assert_eq!(traces.len(), 2);
+        // Newest first
+        assert_eq!(traces[0].trace_id, trace2);
+        assert_eq!(traces[1].trace_id, trace1);
+    }
+
+    #[tokio::test]
+    async fn list_recent_traces_respects_limit() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wx", "c1", "astra");
+
+        for i in 0..5 {
+            let req = GatewayRequest::new(conv.clone(), format!("m{i}"), "u1", format!("msg {i}"));
+            TraceWriter::begin(&repo, req).await.unwrap();
+        }
+
+        let traces = repo.list_recent_traces(&conv, 3).await.unwrap();
+        assert_eq!(traces.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_recent_traces_filters_by_conversation() {
+        let repo = InMemoryTraceRepository::default();
+        let conv_a = ConversationKey::new("wx", "c1", "astra");
+        let conv_b = ConversationKey::new("wx", "c2", "astra");
+
+        TraceWriter::begin(
+            &repo,
+            GatewayRequest::new(conv_a.clone(), "m1", "u1", "in conv_a"),
+        )
+        .await
+        .unwrap();
+        TraceWriter::begin(
+            &repo,
+            GatewayRequest::new(conv_b.clone(), "m2", "u1", "in conv_b"),
+        )
+        .await
+        .unwrap();
+
+        let traces_a = repo.list_recent_traces(&conv_a, 10).await.unwrap();
+        assert_eq!(traces_a.len(), 1);
+        assert_eq!(traces_a[0].text_preview, "in conv_a");
+
+        let traces_b = repo.list_recent_traces(&conv_b, 10).await.unwrap();
+        assert_eq!(traces_b.len(), 1);
+        assert_eq!(traces_b[0].text_preview, "in conv_b");
+    }
+
+    // ── GAP 7: outbox enqueue → send → complete chain ────────────
+
+    #[tokio::test]
+    async fn outbox_enqueue_send_completes_request() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wx", "c1", "astra");
+        let req = GatewayRequest::new(conv.clone(), "m1", "u1", "test");
+        let req_id = req.request_id.clone();
+        let writer = TraceWriter::begin(&repo, req).await.unwrap();
+        let run_id = writer.start_run("astra", None).await.unwrap();
+        writer
+            .finish_run(&run_id, RunStatus::Succeeded, Some(0), None)
+            .await
+            .unwrap();
+
+        // Enqueue outbox
+        let outbox_id = writer
+            .enqueue_outbox("wx", "c1", None, "hello world")
+            .await
+            .unwrap();
+
+        // Verify it appears in retryable list (status: pending)
+        let retryable = repo.list_retryable_outbox(Some("wx"), 10).await.unwrap();
+        assert_eq!(retryable.len(), 1);
+        assert_eq!(retryable[0].body, "hello world");
+
+        // Send successfully (mark_outbox_sent also calls complete_request)
+        writer.mark_outbox_sent(&outbox_id, 1).await.unwrap();
+
+        // No longer retryable
+        let retryable = repo.list_retryable_outbox(Some("wx"), 10).await.unwrap();
+        assert!(retryable.is_empty());
+
+        // Request should be completed
+        let r = repo.get_request(&req_id).await.unwrap().unwrap();
+        assert_eq!(r.status, RequestStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn outbox_platform_filter_works() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wx", "c1", "astra");
+        let req = GatewayRequest::new(conv.clone(), "m1", "u1", "test");
+        let writer = TraceWriter::begin(&repo, req).await.unwrap();
+        let run_id = writer.start_run("astra", None).await.unwrap();
+        writer
+            .finish_run(&run_id, RunStatus::Succeeded, Some(0), None)
+            .await
+            .unwrap();
+        writer
+            .enqueue_outbox("wx", "c1", None, "wx msg")
+            .await
+            .unwrap();
+
+        // Filter by platform
+        let wx = repo.list_retryable_outbox(Some("wx"), 10).await.unwrap();
+        assert_eq!(wx.len(), 1);
+
+        let telegram = repo
+            .list_retryable_outbox(Some("telegram"), 10)
+            .await
+            .unwrap();
+        assert!(telegram.is_empty());
+
+        // No filter returns all
+        let all = repo.list_retryable_outbox(None, 10).await.unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
     #[tokio::test]
     async fn outbox_retry_count_resets_on_successful_send() {
         let repo = InMemoryTraceRepository::default();
