@@ -776,6 +776,39 @@ fn extract_text(msg: &Value) -> String {
 const SEND_MAX_RETRIES: usize = 3;
 const SEND_RETRY_DELAY_MS: u64 = 1500;
 
+/// What to do when iLink returns a non-zero error code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendRetryAction {
+    /// Retry the same request without context_token (session expired).
+    DropContextToken,
+    /// Back off longer — server indicated rate limiting.
+    RateLimitBackoff,
+    /// Normal retry with delay (keep context_token).
+    NormalRetry,
+}
+
+/// Decide how to handle an iLink send error. Pure function — no I/O.
+///
+/// Key invariant: `-2` ("unknown") must NOT drop context_token.
+/// iLink requires context_token for session routing; dropping it makes
+/// the error permanent. Only `-14` (explicit session expiry) should drop.
+fn classify_send_error(
+    errcode: i64,
+    errmsg: &str,
+    already_tried_tokenless: bool,
+) -> SendRetryAction {
+    // -14 = explicit session expiry — retry once without context_token
+    if errcode == -14 && !already_tried_tokenless {
+        return SendRetryAction::DropContextToken;
+    }
+    // -2 + "freq" = rate limit — backoff
+    if errcode == -2 && errmsg.contains("freq") {
+        return SendRetryAction::RateLimitBackoff;
+    }
+    // Everything else: normal retry with original context_token
+    SendRetryAction::NormalRetry
+}
+
 /// Send a text message via iLink API with retries.
 /// Returns the updated context_token from the response (if any).
 async fn send_text_with_retry(
@@ -788,6 +821,16 @@ async fn send_text_with_retry(
     let url = format!("{ILINK_BASE_URL}/ilink/bot/sendmessage");
     let mut last_error = String::new();
     let mut tried_tokenless = false;
+
+    if text.is_empty() {
+        return Err("empty message text".into());
+    }
+    tracing::debug!(
+        text_len = text.len(),
+        text_preview = %&text[..text.len().min(80)],
+        has_context_token = !context_token.is_empty(),
+        "iLink send attempt"
+    );
 
     for attempt in 0..=SEND_MAX_RETRIES {
         let ct = if tried_tokenless { "" } else { context_token };
@@ -851,24 +894,18 @@ async fn send_text_with_retry(
         tracing::debug!(errcode, errmsg, body = %data, "iLink send response (non-zero)");
         last_error = format!("{errcode}: {errmsg}");
 
-        // Session / context_token expired — retry without it.
-        // -14 = explicit session expiry; -2 with non-freq message usually
-        // means the context_token is stale or invalidated server-side.
-        if !tried_tokenless && (errcode == -14 || (errcode == -2 && !errmsg.contains("freq"))) {
-            tracing::debug!(
-                errcode,
-                errmsg,
-                "send failed, retrying without context_token"
-            );
-            tried_tokenless = true;
-            continue;
-        }
-
-        // Rate limit — backoff
-        if errcode == -2 && errmsg.contains("freq") {
-            tracing::warn!("send rate limited, backing off");
-            tokio::time::sleep(std::time::Duration::from_millis(SEND_RETRY_DELAY_MS * 3)).await;
-            continue;
+        match classify_send_error(errcode, errmsg, tried_tokenless) {
+            SendRetryAction::DropContextToken => {
+                tracing::debug!(errcode, "retrying without context_token");
+                tried_tokenless = true;
+                continue;
+            }
+            SendRetryAction::RateLimitBackoff => {
+                tracing::warn!("send rate limited, backing off");
+                tokio::time::sleep(std::time::Duration::from_millis(SEND_RETRY_DELAY_MS * 3)).await;
+                continue;
+            }
+            SendRetryAction::NormalRetry => {}
         }
 
         // Other error — retry with delay
@@ -1279,6 +1316,72 @@ mod tests {
     fn send_retry_constants() {
         const { assert!(SEND_MAX_RETRIES >= 2) };
         const { assert!(SEND_RETRY_DELAY_MS >= 1000) };
+    }
+
+    // ── classify_send_error regression tests ───────────────────────
+
+    #[test]
+    fn error_minus2_unknown_keeps_context_token() {
+        // CRITICAL: -2 "unknown" must NOT drop context_token.
+        // Dropping it causes permanent send failures.
+        assert_eq!(
+            classify_send_error(-2, "unknown", false),
+            SendRetryAction::NormalRetry,
+        );
+    }
+
+    #[test]
+    fn error_minus2_unknown_still_normal_even_after_tokenless() {
+        assert_eq!(
+            classify_send_error(-2, "unknown", true),
+            SendRetryAction::NormalRetry,
+        );
+    }
+
+    #[test]
+    fn error_minus2_freq_triggers_rate_limit_backoff() {
+        assert_eq!(
+            classify_send_error(-2, "freq limit exceeded", false),
+            SendRetryAction::RateLimitBackoff,
+        );
+    }
+
+    #[test]
+    fn error_minus14_drops_context_token_once() {
+        assert_eq!(
+            classify_send_error(-14, "session expired", false),
+            SendRetryAction::DropContextToken,
+        );
+    }
+
+    #[test]
+    fn error_minus14_does_not_drop_twice() {
+        assert_eq!(
+            classify_send_error(-14, "session expired", true),
+            SendRetryAction::NormalRetry,
+        );
+    }
+
+    #[test]
+    fn error_other_codes_normal_retry() {
+        assert_eq!(
+            classify_send_error(-1, "unknown", false),
+            SendRetryAction::NormalRetry,
+        );
+        assert_eq!(
+            classify_send_error(-99, "server error", false),
+            SendRetryAction::NormalRetry,
+        );
+    }
+
+    #[test]
+    fn error_zero_would_not_reach_classify() {
+        // errcode 0 is success — classify is never called.
+        // But if it were, it should be normal retry (harmless).
+        assert_eq!(
+            classify_send_error(0, "", false),
+            SendRetryAction::NormalRetry,
+        );
     }
 
     #[test]
