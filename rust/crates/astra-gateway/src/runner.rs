@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MAX_CHUNK_LEN: usize = 3800;
+const INITIAL_ACK_DELAY: Duration = Duration::from_secs(3);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 
 /// Outbound message from CLI, scheduler, or other background tasks.
@@ -610,7 +611,9 @@ impl GatewayRunner {
         let start = Instant::now();
         let mut tool_count: u32 = 0;
         let mut last_tool = String::new();
-        let mut heartbeat_count: u32 = 0;
+        let mut sent_initial_ack = false;
+        let next_heartbeat = tokio::time::sleep(INITIAL_ACK_DELAY);
+        tokio::pin!(next_heartbeat);
 
         loop {
             tokio::select! {
@@ -624,23 +627,20 @@ impl GatewayRunner {
                         None => break, // CLI finished
                     }
                 }
-                _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
+                _ = &mut next_heartbeat => {
                     let elapsed = start.elapsed();
-                    heartbeat_count += 1;
 
-                    // Heartbeats are informational; timeout enforcement lives in cli_bridge.
-
-                    // Rich heartbeat
-                    let elapsed_str = format_elapsed(elapsed);
-                    let heartbeat = if tool_count > 0 {
+                    let heartbeat = if !sent_initial_ack {
+                        sent_initial_ack = true;
+                        format!("🤔 {cli_name} 思考中…")
+                    } else if tool_count > 0 {
+                        let elapsed_str = format_elapsed(elapsed);
                         let tool_short = truncate(&last_tool, 40);
                         format!("⏳ {elapsed_str} | 🔧 {tool_count}个工具 | {tool_short}")
-                    } else if heartbeat_count == 1 {
-                        format!("🤔 {cli_name} 思考中… ({elapsed_str})")
                     } else {
+                        let elapsed_str = format_elapsed(elapsed);
                         format!("⏳ 处理中… {elapsed_str}")
                     };
-                    // Use outbound channel (works in both main loop and spawned tasks)
                     if let Some(ref tx) = self.outbound_tx {
                         let _ = tx
                             .send(OutboundMessage::plain(
@@ -650,6 +650,7 @@ impl GatewayRunner {
                             ))
                             .await;
                     }
+                    next_heartbeat.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
                 }
             }
         }
@@ -2282,6 +2283,12 @@ mod tests {
     fn format_elapsed_minutes() {
         assert_eq!(format_elapsed(Duration::from_secs(65)), "1m5s");
         assert_eq!(format_elapsed(Duration::from_secs(130)), "2m10s");
+    }
+
+    #[test]
+    fn initial_ack_delay_is_shorter_than_heartbeat() {
+        assert!(INITIAL_ACK_DELAY < HEARTBEAT_INTERVAL);
+        assert!(INITIAL_ACK_DELAY.as_secs() <= 5, "initial ack should be <= 5s for good UX");
     }
 
     // ── Gateway action tests ──────────────────────────────────────

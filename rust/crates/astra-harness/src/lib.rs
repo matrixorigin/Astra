@@ -206,14 +206,7 @@ pub trait SnapshotSink: Send + Sync + 'static {
     fn update(&self, record: &DecisionRecord);
     fn latest(&self) -> Option<RuntimeSnapshot>;
     /// Return the most recent `n` snapshots (newest first).
-    fn history(&self, n: usize) -> Vec<RuntimeSnapshot> {
-        self.latest()
-            .into_iter()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .take(n)
-            .collect()
-    }
+    fn history(&self, n: usize) -> Vec<RuntimeSnapshot>;
 }
 
 const DEFAULT_HISTORY_CAPACITY: usize = 64;
