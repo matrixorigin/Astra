@@ -39,6 +39,7 @@ pub mod pipeline_config;
 pub mod pipeline_stats;
 pub mod recovery_state;
 pub mod section_types;
+pub mod shadow_diff;
 pub mod session_latches;
 pub mod token_accounting;
 pub mod trace_alert;
