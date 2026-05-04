@@ -692,7 +692,7 @@ impl GatewayRunner {
         let mut last_tool = String::new();
         let mut sent_initial_ack = false;
         let mut token_buf = String::new();
-        let mut in_think_block = false;
+        let mut think_filter = ThinkTagStreamFilter::default();
         let mut gateway_action_filter = GatewayActionStreamFilter::default();
         let mut progressive_text_len: usize = 0;
         let next_timer = tokio::time::sleep(INITIAL_ACK_DELAY);
@@ -731,8 +731,7 @@ impl GatewayRunner {
                 progress = progress_rx.recv() => {
                     match progress {
                         Some(CliProgress::Token(text)) => {
-                            // Filter <think>...</think> blocks from token stream
-                            let filtered = filter_think_tags(&text, &mut in_think_block);
+                            let filtered = think_filter.push(&text);
                             let filtered = gateway_action_filter.push(&filtered);
                             if !filtered.is_empty() {
                                 token_buf.push_str(&filtered);
@@ -764,6 +763,11 @@ impl GatewayRunner {
                         Some(CliProgress::Thinking(_)) => {}
                         Some(CliProgress::Status(_) | CliProgress::Stderr(_)) => {}
                         None => {
+                            let think_tail = think_filter.finish();
+                            if !think_tail.is_empty() {
+                                let filtered = gateway_action_filter.push(&think_tail);
+                                token_buf.push_str(&filtered);
+                            }
                             let tail = gateway_action_filter.finish();
                             if !tail.is_empty() {
                                 token_buf.push_str(&tail);
@@ -2565,8 +2569,79 @@ async fn find_and_delete_job(
     }
 }
 
-/// Filter `<think>...</think>` blocks from streaming token text.
-/// `in_think` tracks state across calls (tokens arrive in small chunks).
+/// Streaming filter for `<think>...</think>` blocks.
+///
+/// Buffers partial tag fragments across token boundaries so that a `<think>`
+/// split across two chunks (e.g. `"<thi"` + `"nk>..."`) is correctly detected
+/// and suppressed, instead of leaking the partial tag to the user.
+#[derive(Default)]
+struct ThinkTagStreamFilter {
+    pending: String,
+    in_think: bool,
+}
+
+impl ThinkTagStreamFilter {
+    fn push(&mut self, text: &str) -> String {
+        self.pending.push_str(text);
+        let mut out = String::new();
+
+        loop {
+            if self.in_think {
+                if let Some(end) = self.pending.find("</think>") {
+                    self.pending.drain(..end + 8);
+                    self.in_think = false;
+                    continue;
+                }
+                // No closing tag yet — keep all pending content. finish()
+                // will return it if the block is never closed.
+                break;
+            }
+
+            if let Some(start) = self.pending.find("<think>") {
+                out.push_str(&self.pending[..start]);
+                self.pending.drain(..start + 7);
+                self.in_think = true;
+                continue;
+            }
+
+            let keep = open_think_prefix_len(&self.pending);
+            let emit_len = self.pending.len().saturating_sub(keep);
+            out.push_str(&self.pending[..emit_len]);
+            self.pending.drain(..emit_len);
+            break;
+        }
+
+        out
+    }
+
+    fn finish(&mut self) -> String {
+        if self.in_think {
+            // Unclosed <think> — return accumulated content so it's not lost
+            let leftover = std::mem::take(&mut self.pending);
+            self.in_think = false;
+            leftover
+        } else {
+            std::mem::take(&mut self.pending)
+        }
+    }
+}
+
+/// Suffix of `text` that could be a prefix of `<think>` (when outside a think block).
+fn open_think_prefix_len(text: &str) -> usize {
+    tag_suffix_prefix_len(text, "<think>")
+}
+
+fn tag_suffix_prefix_len(text: &str, tag: &str) -> usize {
+    let max = text.len().min(tag.len() - 1);
+    for len in (1..=max).rev() {
+        if text.is_char_boundary(text.len() - len) && tag.starts_with(&text[text.len() - len..]) {
+            return len;
+        }
+    }
+    0
+}
+
+/// Simple non-streaming filter for complete text. Used on the final CLI output.
 fn filter_think_tags(text: &str, in_think: &mut bool) -> String {
     let mut result = String::new();
     let mut remaining = text;
@@ -3044,6 +3119,84 @@ mod tests {
             "visible "
         );
         assert_eq!(filter.finish(), "");
+    }
+
+    // ── ThinkTagStreamFilter tests ────────────────────────────────
+
+    #[test]
+    fn think_stream_filter_complete_block() {
+        let mut f = ThinkTagStreamFilter::default();
+        assert_eq!(f.push("<think>reasoning</think>Hello!"), "Hello!");
+        assert_eq!(f.finish(), "");
+    }
+
+    #[test]
+    fn think_stream_filter_split_open_tag() {
+        let mut f = ThinkTagStreamFilter::default();
+        let r1 = f.push("before<thi");
+        assert_eq!(r1, "before");
+        let r2 = f.push("nk>hidden</think>visible");
+        assert_eq!(r2, "visible");
+    }
+
+    #[test]
+    fn think_stream_filter_split_close_tag() {
+        let mut f = ThinkTagStreamFilter::default();
+        assert_eq!(f.push("<think>hidden</thi"), "");
+        assert_eq!(f.push("nk>after"), "after");
+    }
+
+    #[test]
+    fn think_stream_filter_no_think_passthrough() {
+        let mut f = ThinkTagStreamFilter::default();
+        assert_eq!(f.push("just normal text"), "just normal text");
+        assert_eq!(f.finish(), "");
+    }
+
+    #[test]
+    fn think_stream_filter_unclosed_at_finish_preserves_content() {
+        let mut f = ThinkTagStreamFilter::default();
+        assert_eq!(f.push("before<think>hidden"), "before");
+        let tail = f.finish();
+        assert_eq!(tail, "hidden");
+    }
+
+    #[test]
+    fn think_stream_filter_single_char_chunks() {
+        let mut f = ThinkTagStreamFilter::default();
+        let input = "A<think>secret</think>B";
+        let mut output = String::new();
+        for ch in input.chars() {
+            output.push_str(&f.push(&ch.to_string()));
+        }
+        output.push_str(&f.finish());
+        assert_eq!(output, "AB", "single-char chunking must still filter");
+    }
+
+    #[test]
+    fn think_stream_filter_multiple_blocks() {
+        let mut f = ThinkTagStreamFilter::default();
+        let out = f.push("A<think>x</think>B<think>y</think>C");
+        assert_eq!(out, "ABC");
+    }
+
+    #[test]
+    fn open_think_prefix_len_values() {
+        assert_eq!(open_think_prefix_len("hello"), 0);
+        assert_eq!(open_think_prefix_len("hello<"), 1);
+        assert_eq!(open_think_prefix_len("hello<t"), 2);
+        assert_eq!(open_think_prefix_len("hello<th"), 3);
+        assert_eq!(open_think_prefix_len("hello<thi"), 4);
+        assert_eq!(open_think_prefix_len("hello<thin"), 5);
+        assert_eq!(open_think_prefix_len("hello<think"), 6);
+    }
+
+    #[test]
+    fn tag_suffix_prefix_len_for_close_tag() {
+        assert_eq!(tag_suffix_prefix_len("text</", "</think>"), 2);
+        assert_eq!(tag_suffix_prefix_len("text</t", "</think>"), 3);
+        assert_eq!(tag_suffix_prefix_len("text</think", "</think>"), 7);
+        assert_eq!(tag_suffix_prefix_len("text", "</think>"), 0);
     }
 
     // ── Gateway action tests ──────────────────────────────────────
