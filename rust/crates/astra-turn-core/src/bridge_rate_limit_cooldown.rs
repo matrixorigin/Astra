@@ -1172,10 +1172,11 @@ mod tests {
             rl.record_429(None, true);
         });
         let chain: Vec<String> = vec!["model-a".into(), "model-b".into(), "model-c".into()];
-        let outcome = try_resolve_fallback(&pmc, &chain, CooldownReason::RateLimit, |name| {
-            async move { Ok::<_, String>(name) }
-        })
-        .await;
+        let outcome =
+            try_resolve_fallback(&pmc, &chain, CooldownReason::RateLimit, |name| async move {
+                Ok::<_, String>(name)
+            })
+            .await;
         match outcome {
             FallbackOutcome::Resolved(name) => assert_eq!(name, "model-b"),
             other => panic!("expected Resolved, got: {other:?}"),
@@ -1186,10 +1187,11 @@ mod tests {
     async fn try_resolve_fallback_empty_chain() {
         let pmc = PerModelCooldown::new();
         let chain: Vec<String> = vec![];
-        let outcome = try_resolve_fallback(&pmc, &chain, CooldownReason::RateLimit, |name| {
-            async move { Ok::<_, String>(name) }
-        })
-        .await;
+        let outcome =
+            try_resolve_fallback(&pmc, &chain, CooldownReason::RateLimit, |name| async move {
+                Ok::<_, String>(name)
+            })
+            .await;
         assert!(matches!(outcome, FallbackOutcome::NoFallbackConfigured));
     }
 
@@ -1204,9 +1206,12 @@ mod tests {
             });
         }
         let chain: Vec<String> = vec!["model-a".into(), "model-b".into()];
-        let outcome = try_resolve_fallback(&pmc, &chain, CooldownReason::Overloaded, |name| {
-            async move { Ok::<_, String>(name) }
-        })
+        let outcome = try_resolve_fallback(
+            &pmc,
+            &chain,
+            CooldownReason::Overloaded,
+            |name| async move { Ok::<_, String>(name) },
+        )
         .await;
         match outcome {
             FallbackOutcome::AllExhausted { chain_len } => assert_eq!(chain_len, 2),
@@ -1218,16 +1223,15 @@ mod tests {
     async fn try_resolve_fallback_skips_resolution_failure() {
         let pmc = PerModelCooldown::new();
         let chain: Vec<String> = vec!["bad-model".into(), "good-model".into()];
-        let outcome = try_resolve_fallback(&pmc, &chain, CooldownReason::RateLimit, |name| {
-            async move {
+        let outcome =
+            try_resolve_fallback(&pmc, &chain, CooldownReason::RateLimit, |name| async move {
                 if name == "bad-model" {
                     Err("not found".to_string())
                 } else {
                     Ok(name)
                 }
-            }
-        })
-        .await;
+            })
+            .await;
         match outcome {
             FallbackOutcome::Resolved(name) => assert_eq!(name, "good-model"),
             other => panic!("expected Resolved, got: {other:?}"),

@@ -1,12 +1,12 @@
 use async_trait::async_trait;
-use axum::{http::StatusCode, Json};
+use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
-use sqlx::{query, Row};
+use sqlx::{Row, query};
 use uuid::Uuid;
 
 use crate::auth::FernetTokenEncryptor;
 use astra_core::{
-    connect_matrixone, error_response, internal_error, ErrorResponse, MatrixOneSettings, SharedPool,
+    ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -927,20 +927,6 @@ impl ModelService for DatabaseModelService {
         .await;
         let is_active: i16 = if conn_result.is_none() { 1 } else { 0 };
 
-        // Auto-probe thinking capability when connectivity passes.
-        let thinking_cap_str = if conn_result.is_none() {
-            let probe = probe_thinking_behavior(
-                &request.provider,
-                &request.name,
-                &request.api_key,
-                base_url.as_deref(),
-            )
-            .await;
-            Some(probe.capability.as_db_str().to_string())
-        } else {
-            None
-        };
-
         let input_mod = serde_json::to_string(&request.input_modalities)
             .unwrap_or_else(|_| r#"["text"]"#.to_string());
         let output_mod = serde_json::to_string(&request.output_modalities)
@@ -959,9 +945,9 @@ impl ModelService for DatabaseModelService {
             "INSERT INTO infra_llm_models \
              (model_id, model_name, provider, api_key_encrypted, base_url, description, \
               is_active, context_window, max_completion_tokens, input_modalities, output_modalities, \
-              supported_parameters, pricing, architecture, tags, quirks, thinking_capability, \
+              supported_parameters, pricing, architecture, tags, quirks, \
               created_by, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())",
         )
         .bind(&model_id)
         .bind(&request.name)
@@ -979,11 +965,42 @@ impl ModelService for DatabaseModelService {
         .bind(&request.architecture)
         .bind(&tags)
         .bind(&quirks)
-        .bind(&thinking_cap_str)
         .bind(&user_id)
         .execute(&pool)
         .await
         .map_err(internal_error)?;
+
+        // Thinking probe runs AFTER INSERT so the model is immediately
+        // available. Probe result is written via UPDATE — if probe is slow
+        // or fails, the model still works (picker defaults to no thinking
+        // until probed).
+        if conn_result.is_none() {
+            let probe = probe_thinking_behavior(
+                &request.provider,
+                &request.name,
+                &request.api_key,
+                base_url.as_deref(),
+            )
+            .await;
+            let cap_str = probe.capability.as_db_str();
+            let err_str = probe.error.as_deref();
+            if let Err(e) = query(
+                "UPDATE infra_llm_models SET thinking_capability = ?, \
+                 thinking_probe_error = ? WHERE model_id = ?",
+            )
+            .bind(cap_str)
+            .bind(err_str)
+            .bind(&model_id)
+            .execute(&pool)
+            .await
+            {
+                tracing::warn!(
+                    model = %request.name,
+                    err = %e,
+                    "failed to persist thinking_capability after create"
+                );
+            }
+        }
 
         let select_sql = format!(
             "SELECT {} FROM infra_llm_models WHERE model_id = ?",
@@ -2660,7 +2677,7 @@ mod tests {
         captured: Arc<Mutex<Option<serde_json::Value>>>,
         response_body: serde_json::Value,
     ) -> String {
-        use axum::{routing::post, Router};
+        use axum::{Router, routing::post};
 
         let handler = move |axum::Json(body): axum::Json<serde_json::Value>| {
             let captured = captured.clone();
@@ -2689,7 +2706,7 @@ mod tests {
 
     /// Mock that responds differently based on enable_thinking in request.
     async fn spawn_dashscope_mock(supports_thinking: bool) -> String {
-        use axum::{routing::post, Router};
+        use axum::{Router, routing::post};
 
         let handler = move |axum::Json(body): axum::Json<serde_json::Value>| async move {
             let enable = body.get("enable_thinking").and_then(|v| v.as_bool());
@@ -2719,7 +2736,7 @@ mod tests {
 
     /// DashScope model that thinks by default (like glm-5.1, qwen3.6-plus).
     async fn spawn_dashscope_native_thinker_mock() -> String {
-        use axum::{routing::post, Router};
+        use axum::{Router, routing::post};
 
         let handler = |axum::Json(body): axum::Json<serde_json::Value>| async move {
             let enable = body.get("enable_thinking").and_then(|v| v.as_bool());
