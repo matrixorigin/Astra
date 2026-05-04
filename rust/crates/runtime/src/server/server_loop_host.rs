@@ -43,7 +43,9 @@ use crate::turn::prompt_cache::{
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_core::SharedPool;
 use astra_services::LlmTokenServiceConfig;
-use astra_turn_core::bridge_rate_limit_cooldown::RateLimitAction;
+use astra_turn_core::bridge_rate_limit_cooldown::{
+    FallbackOutcome, RateLimitAction, try_resolve_fallback,
+};
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_core::tool_schema_prune::{
@@ -2331,59 +2333,43 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state)).await?;
             }
             RateLimitAction::UseFallback { reason } => {
-                let mut resolved = false;
-                for fb_name in &llm_cfg.fallback_chain {
-                    // Skip fallback models that are themselves in cooldown.
-                    let fb_ok = cooldown.with(fb_name, |c| c.check_request(false));
-                    if !matches!(
-                        fb_ok,
-                        RateLimitAction::Proceed | RateLimitAction::WaitAndRetry { .. }
-                    ) {
-                        continue;
+                let mx = &self.matrixone;
+                let enc = self.encryptor.as_ref();
+                let lts = self.llm_token_service.as_ref();
+                let fwd = &state.hooks.forward_headers;
+                match try_resolve_fallback(
+                    cooldown,
+                    &llm_cfg.fallback_chain,
+                    reason,
+                    |fb_name| async move {
+                        resolve_llm_model_for_turn(
+                            mx,
+                            enc,
+                            Some(fb_name.as_str()),
+                            pool_ref,
+                            lts,
+                            fwd,
+                        )
+                        .await
+                    },
+                )
+                .await
+                {
+                    FallbackOutcome::Resolved(fb) => {
+                        llm_cfg = fb;
                     }
-                    astra_core::agent_info!(
-                        "llm",
-                        "rate-limit cooldown: trying fallback model '{}' ({})",
-                        fb_name,
-                        reason.as_str()
-                    );
-                    match resolve_llm_model_for_turn(
-                        &self.matrixone,
-                        self.encryptor.as_ref(),
-                        Some(fb_name.as_str()),
-                        pool_ref,
-                        self.llm_token_service.as_ref(),
-                        &state.hooks.forward_headers,
-                    )
-                    .await
-                    {
-                        Ok(fb) => {
-                            llm_cfg = fb;
-                            resolved = true;
-                            break;
-                        }
-                        Err(e) => {
-                            astra_core::agent_warn!(
-                                "llm",
-                                "fallback model '{}' resolution failed: {}",
-                                fb_name,
-                                e
-                            );
-                        }
-                    }
-                }
-                if !resolved {
-                    if llm_cfg.fallback_chain.is_empty() {
+                    FallbackOutcome::NoFallbackConfigured => {
                         astra_core::agent_warn!(
                             "llm",
                             "rate-limit cooldown: fallback requested ({}) but no fallback configured",
                             reason.as_str()
                         );
-                    } else {
+                    }
+                    FallbackOutcome::AllExhausted { chain_len } => {
                         astra_core::agent_warn!(
                             "llm",
                             "rate-limit cooldown: all {} fallback models exhausted ({})",
-                            llm_cfg.fallback_chain.len(),
+                            chain_len,
                             reason.as_str()
                         );
                     }

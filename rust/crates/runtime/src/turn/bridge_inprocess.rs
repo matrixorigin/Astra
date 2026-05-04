@@ -429,7 +429,9 @@ use super::bridge_observability::{
 // ── LLM streaming — delegated to turn::bridge_llm_stream ─────────────────────
 use super::bridge_llm_stream::call_llm_stream;
 use super::bridge_llm_stream::rate_limit_cooldown;
-use astra_turn_core::bridge_rate_limit_cooldown::RateLimitAction;
+use astra_turn_core::bridge_rate_limit_cooldown::{
+    FallbackOutcome, RateLimitAction, try_resolve_fallback,
+};
 
 #[cfg(test)]
 async fn await_with_client_disconnect<T, F>(
@@ -1002,59 +1004,46 @@ impl InProcessChatTurnBridge {
                     }
                 }
                 RateLimitAction::UseFallback { reason } => {
-                    let mut resolved = false;
-                    for fb_name in &fallback_chain {
-                        let fb_ok = cooldown.with(fb_name, |c| c.check_request(false));
-                        if !matches!(
-                            fb_ok,
-                            RateLimitAction::Proceed | RateLimitAction::WaitAndRetry { .. }
-                        ) {
-                            continue;
-                        }
-                        astra_core::agent_info!(
-                            "llm",
-                            "rate-limit cooldown: trying fallback model '{}' ({})",
-                            fb_name,
-                            reason.as_str()
-                        );
-                        match astra_services::resolve_active_llm_model(
-                            &matrixone,
-                            encryptor.as_ref(),
-                            Some(fb_name.as_str()),
-                            pool_ref,
-                        )
-                        .await
-                        {
-                            Ok(fb) => {
-                                model_name = fb.model_name;
-                                api_key = fb.api_key;
-                                base_url = fb.base_url;
-                                provider = fb.provider;
-                                resolved = true;
-                                break;
+                    let mx = &matrixone;
+                    let enc = encryptor.as_ref();
+                    match try_resolve_fallback(
+                        cooldown,
+                        &fallback_chain,
+                        reason,
+                        |fb_name| {
+                            let mx = mx;
+                            let enc = enc;
+                            async move {
+                                astra_services::resolve_active_llm_model(
+                                    mx,
+                                    enc,
+                                    Some(fb_name.as_str()),
+                                    pool_ref,
+                                )
+                                .await
                             }
-                            Err(e) => {
-                                astra_core::agent_warn!(
-                                    "llm",
-                                    "fallback model '{}' resolution failed: {}",
-                                    fb_name,
-                                    e
-                                );
-                            }
+                        },
+                    )
+                    .await
+                    {
+                        FallbackOutcome::Resolved(fb) => {
+                            model_name = fb.model_name;
+                            api_key = fb.api_key;
+                            base_url = fb.base_url;
+                            provider = fb.provider;
                         }
-                    }
-                    if !resolved {
-                        if fallback_chain.is_empty() {
+                        FallbackOutcome::NoFallbackConfigured => {
                             astra_core::agent_warn!(
                                 "llm",
                                 "rate-limit cooldown: fallback requested ({}) but no fallback configured",
                                 reason.as_str()
                             );
-                        } else {
+                        }
+                        FallbackOutcome::AllExhausted { chain_len } => {
                             astra_core::agent_warn!(
                                 "llm",
                                 "rate-limit cooldown: all {} fallback models exhausted ({})",
-                                fallback_chain.len(),
+                                chain_len,
                                 reason.as_str()
                             );
                         }
