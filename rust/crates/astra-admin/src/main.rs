@@ -40,12 +40,14 @@ fn print_model_load_server_result(body: &str, model_name: &str) {
     let thinking_cap = value
         .get("thinking_capability")
         .and_then(serde_json::Value::as_str);
-    match thinking_cap {
-        Some("both") => println!("  thinking: both (Normal/Thinking picker enabled) ✓"),
-        Some("native_only") => println!("  thinking: native_only (model always thinks)"),
-        Some("none") => println!("  thinking: none"),
-        Some(other) => println!("  thinking: {other}"),
-        None => println!("  thinking: unprobed (run: astra-admin model check {model_name})"),
+    if let Some(cap) = thinking_cap {
+        match cap {
+            "both" => println!("  thinking: both (Normal/Thinking picker enabled) ✓"),
+            "effort_only" => println!("  thinking: effort_only (Low/High effort) ✓"),
+            "native_only" => println!("  thinking: native_only (model always thinks)"),
+            "none" => println!("  thinking: none"),
+            other => println!("  thinking: {other}"),
+        }
     }
     if !active {
         eprintln!(
@@ -429,13 +431,14 @@ async fn main() -> Result<(), String> {
                     api_key,
                     base_url.as_deref(),
                 );
-                match api
+                let needs_check = match api
                     .post_bearer_path_json_text(&token, paths::MODELS, &payload)
                     .await
                 {
                     Ok(body) => {
                         println!("loaded model: {model_name}");
                         print_model_load_server_result(&body, model_name);
+                        true
                     }
                     Err(astra_thin_client::ThinClientError::Api { body, .. })
                         if body.contains("already exists") =>
@@ -445,6 +448,7 @@ async fn main() -> Result<(), String> {
                                 eprintln!(
                                     "skipped (already exists): {model_name} — need non-empty api_key in YAML to use --update-existing"
                                 );
+                                false
                             } else {
                                 let upd = build_model_update_payload(
                                     entry,
@@ -462,15 +466,48 @@ async fn main() -> Result<(), String> {
                                     .map_err(map_thin_err)?;
                                 println!("re-synced existing model: {model_name}");
                                 print_model_load_server_result(&body, model_name);
+                                true
                             }
                         } else {
                             println!(
                                 "skipped (already exists): {model_name} — use `astra-admin model load {} --update-existing` to push YAML credentials and re-run connectivity",
                                 args.path
                             );
+                            false
                         }
                     }
                     Err(e) => return Err(map_thin_err(e)),
+                };
+                if needs_check {
+                    match api
+                        .post_bearer_path_empty_text(&token, &paths::model_check(model_name))
+                        .await
+                    {
+                        Ok(body) => {
+                            let cap = serde_json::from_str::<serde_json::Value>(&body)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("thinking_capability")?.as_str().map(String::from)
+                                });
+                            match cap.as_deref() {
+                                Some("both") => {
+                                    println!("  thinking: both (Normal/Thinking picker) ✓")
+                                }
+                                Some("effort_only") => {
+                                    println!("  thinking: effort_only (Low/High effort) ✓")
+                                }
+                                Some("native_only") => {
+                                    println!("  thinking: native_only (always thinks)")
+                                }
+                                Some("none") => println!("  thinking: none"),
+                                Some(other) => println!("  thinking: {other}"),
+                                None => println!("  thinking: probe returned no capability"),
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("  thinking probe failed for {model_name}: {e}");
+                        }
+                    }
                 }
             }
             Ok(())

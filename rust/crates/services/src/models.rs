@@ -989,55 +989,9 @@ impl ModelService for DatabaseModelService {
         .await
         .map_err(internal_error)?;
 
-        // Fire-and-forget thinking probe — never blocks create_model.
-        // Result is written via background UPDATE; thinking_capability
-        // stays NULL until probe completes. `model check` re-probes
-        // synchronously if needed.
-        if conn_result.is_none() {
-            let probe_provider = request.provider.clone();
-            let probe_model = request.name.clone();
-            let probe_key = request.api_key.clone();
-            let probe_url = base_url.clone();
-            let probe_pool = pool.clone();
-            let probe_id = model_id.clone();
-            tokio::spawn(async move {
-                let probe = probe_thinking_behavior(
-                    &probe_provider,
-                    &probe_model,
-                    &probe_key,
-                    probe_url.as_deref(),
-                )
-                .await;
-                tracing::debug!(
-                    model = %probe_model,
-                    capability = %probe.capability.as_db_str(),
-                    error = ?probe.error,
-                    "thinking probe completed"
-                );
-                let cap_str: Option<&str> = if probe.error.is_none() {
-                    Some(probe.capability.as_db_str())
-                } else {
-                    None
-                };
-                let err_str = probe.error.as_deref();
-                if let Err(e) = query(
-                    "UPDATE infra_llm_models SET thinking_capability = ?, \
-                     thinking_probe_error = ? WHERE model_id = ?",
-                )
-                .bind(cap_str)
-                .bind(err_str)
-                .bind(&probe_id)
-                .execute(&probe_pool)
-                .await
-                {
-                    tracing::warn!(
-                        model = %probe_model,
-                        err = %e,
-                        "failed to persist thinking_capability after create"
-                    );
-                }
-            });
-        }
+        // Thinking probe is NOT run during create — it's a separate
+        // concern triggered by `model check`.  create_model only validates
+        // connectivity; thinking_capability stays NULL until probed.
 
         let select_sql = format!(
             "SELECT {} FROM infra_llm_models WHERE model_id = ?",
@@ -3143,21 +3097,7 @@ mod tests {
         assert!(result.error.unwrap().contains("No base_url"));
     }
 
-    // ── Fire-and-forget probe (create_model must not block on probe) ────
-
-    /// Spawned probe eventually completes and produces a result.
-    #[tokio::test]
-    async fn probe_spawned_eventually_completes() {
-        let base = spawn_dashscope_mock(true).await;
-
-        let handle = tokio::spawn(async move {
-            probe_thinking_behavior("openai", "qwen-plus", "k", Some(&base)).await
-        });
-
-        let probe = handle.await.expect("spawned probe should not panic");
-        assert_eq!(probe.capability, ThinkingCapability::Both);
-        assert!(probe.error.is_none());
-    }
+    // ── create_model does NOT probe; check_model does ─────────────────
 
     /// Mock provider skips probe entirely — no network I/O.
     #[tokio::test]
