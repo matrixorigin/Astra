@@ -25,6 +25,8 @@ use std::time::{Duration, Instant};
 const MAX_CHUNK_LEN: usize = 3800;
 const INITIAL_ACK_DELAY: Duration = Duration::from_secs(3);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
+const PROGRESSIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(4);
+const PROGRESSIVE_MIN_CHARS: usize = 80;
 
 /// Outbound message from CLI, scheduler, or other background tasks.
 #[derive(Debug, Clone)]
@@ -612,53 +614,128 @@ impl GatewayRunner {
         let mut tool_count: u32 = 0;
         let mut last_tool = String::new();
         let mut sent_initial_ack = false;
-        let next_heartbeat = tokio::time::sleep(INITIAL_ACK_DELAY);
-        tokio::pin!(next_heartbeat);
+        let mut token_buf = String::new();
+        let mut streaming = false;
+        let next_timer = tokio::time::sleep(INITIAL_ACK_DELAY);
+        tokio::pin!(next_timer);
+
+        // Flush accumulated token buffer to the user.
+        let flush_buf = |buf: &mut String,
+                         tx: &Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
+                         platform: &str,
+                         chat: &str| {
+            let text = std::mem::take(buf);
+            let text = text.trim().to_string();
+            if text.is_empty() {
+                return None;
+            }
+            let tx = tx.clone();
+            let platform = platform.to_string();
+            let chat = chat.to_string();
+            Some(async move {
+                if let Some(tx) = tx {
+                    let _ = tx
+                        .send(OutboundMessage::plain(platform, chat, text))
+                        .await;
+                }
+            })
+        };
 
         loop {
             tokio::select! {
                 progress = progress_rx.recv() => {
                     match progress {
+                        Some(CliProgress::Token(text)) => {
+                            streaming = true;
+                            token_buf.push_str(&text);
+                            if token_buf.len() >= PROGRESSIVE_MIN_CHARS {
+                                if let Some(fut) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
+                                    fut.await;
+                                }
+                                next_timer.as_mut().reset(tokio::time::Instant::now() + PROGRESSIVE_FLUSH_INTERVAL);
+                            }
+                        }
+                        Some(CliProgress::ToolStarted { ref name }) => {
+                            tool_count += 1;
+                            // Flush any pending tokens before tool status
+                            if let Some(fut) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
+                                fut.await;
+                            }
+                            let status = format!("🔧 {name}…");
+                            if let Some(ref tx) = self.outbound_tx {
+                                let _ = tx
+                                    .send(OutboundMessage::plain(msg.platform.to_string(), chat_id.clone(), status))
+                                    .await;
+                            }
+                            last_tool = name.clone();
+                            next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
+                        }
+                        Some(CliProgress::ToolDone { name, duration_ms }) => {
+                            let status = format!("✅ {name} ({duration_ms}ms)");
+                            if let Some(ref tx) = self.outbound_tx {
+                                let _ = tx
+                                    .send(OutboundMessage::plain(msg.platform.to_string(), chat_id.clone(), status))
+                                    .await;
+                            }
+                            last_tool = name;
+                            next_timer.as_mut().reset(tokio::time::Instant::now() + PROGRESSIVE_FLUSH_INTERVAL);
+                        }
                         Some(CliProgress::ToolCall(line)) => {
                             tool_count += 1;
                             last_tool = line;
                         }
-                        Some(CliProgress::ToolStarted { name }) => {
-                            tool_count += 1;
-                            last_tool = name;
+                        Some(CliProgress::Thinking(active)) => {
+                            if active && !streaming {
+                                if let Some(ref tx) = self.outbound_tx {
+                                    let _ = tx
+                                        .send(OutboundMessage::plain(msg.platform.to_string(), chat_id.clone(), format!("💭 {cli_name} 思考中…")))
+                                        .await;
+                                }
+                                sent_initial_ack = true;
+                                next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
+                            }
                         }
-                        Some(CliProgress::ToolDone { name, .. }) => {
-                            last_tool = name;
-                        }
-                        Some(CliProgress::Token(_) | CliProgress::Thinking(_)) => {}
                         Some(CliProgress::Status(_) | CliProgress::Stderr(_)) => {}
-                        None => break,
+                        None => {
+                            // CLI finished — flush remaining buffer
+                            if let Some(fut) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
+                                fut.await;
+                            }
+                            break;
+                        }
                     }
                 }
-                _ = &mut next_heartbeat => {
-                    let elapsed = start.elapsed();
-
-                    let heartbeat = if !sent_initial_ack {
+                _ = &mut next_timer => {
+                    // Timer-based flush: either initial ack or periodic token flush
+                    if !token_buf.is_empty() {
+                        if let Some(fut) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
+                            fut.await;
+                        }
+                        next_timer.as_mut().reset(tokio::time::Instant::now() + PROGRESSIVE_FLUSH_INTERVAL);
+                    } else if !sent_initial_ack {
                         sent_initial_ack = true;
-                        format!("🤔 {cli_name} 思考中…")
-                    } else if tool_count > 0 {
-                        let elapsed_str = format_elapsed(elapsed);
-                        let tool_short = truncate(&last_tool, 40);
-                        format!("⏳ {elapsed_str} | 🔧 {tool_count}个工具 | {tool_short}")
+                        let heartbeat = format!("🤔 {cli_name} 思考中…");
+                        if let Some(ref tx) = self.outbound_tx {
+                            let _ = tx
+                                .send(OutboundMessage::plain(msg.platform.to_string(), chat_id.clone(), heartbeat))
+                                .await;
+                        }
+                        next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
                     } else {
-                        let elapsed_str = format_elapsed(elapsed);
-                        format!("⏳ 处理中… {elapsed_str}")
-                    };
-                    if let Some(ref tx) = self.outbound_tx {
-                        let _ = tx
-                            .send(OutboundMessage::plain(
-                                msg.platform.to_string(),
-                                chat_id.clone(),
-                                heartbeat,
-                            ))
-                            .await;
+                        let elapsed_str = format_elapsed(start.elapsed());
+                        let heartbeat = if tool_count > 0 {
+                            let tool_short = truncate(&last_tool, 40);
+                            format!("⏳ {elapsed_str} | 🔧 {tool_count}个工具 | {tool_short}")
+                        } else {
+                            format!("⏳ 处理中… {elapsed_str}")
+                        };
+                        if let Some(ref tx) = self.outbound_tx {
+                            let _ = tx
+                                .send(OutboundMessage::plain(msg.platform.to_string(), chat_id.clone(), heartbeat))
+                                .await;
+                        }
+                        next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
                     }
-                    next_heartbeat.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
                 }
             }
         }
@@ -2297,6 +2374,14 @@ mod tests {
     fn initial_ack_delay_is_shorter_than_heartbeat() {
         assert!(INITIAL_ACK_DELAY < HEARTBEAT_INTERVAL);
         assert!(INITIAL_ACK_DELAY.as_secs() <= 5, "initial ack should be <= 5s for good UX");
+    }
+
+    #[test]
+    fn progressive_flush_interval_is_reasonable() {
+        assert!(PROGRESSIVE_FLUSH_INTERVAL.as_secs() >= 2, "too fast = flood WeChat");
+        assert!(PROGRESSIVE_FLUSH_INTERVAL.as_secs() <= 10, "too slow = feels laggy");
+        assert!(PROGRESSIVE_MIN_CHARS > 0);
+        assert!(PROGRESSIVE_MIN_CHARS <= 200, "threshold too high = no progressive delivery");
     }
 
     // ── Gateway action tests ──────────────────────────────────────
