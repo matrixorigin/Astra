@@ -6,6 +6,9 @@ use crate::storage;
 use crate::trace_model::{
     CancelRequestOutcome, ConversationKey, GatewayEvent, GatewayEventKind, TraceId, TraceRepository,
 };
+use astra_core::durable_task_store::{
+    DurableTask, DurableTaskStatus, DurableTaskStore, TaskFilter, resolve_task_for_owner,
+};
 use sqlx::MySqlPool;
 
 pub struct CommandContext<'a> {
@@ -37,6 +40,16 @@ macro_rules! require_trace_repo {
             None => return Some("⚠️ 此命令需要数据库。当前以无数据库模式运行。".into()),
         }
     };
+}
+
+async fn resolve_owned_task(
+    store: &dyn DurableTaskStore,
+    owner_id: &str,
+    selector: &str,
+) -> Result<DurableTask, String> {
+    resolve_task_for_owner(store, owner_id, selector)
+        .await
+        .map_err(|e| format!("⚠️ {e}"))
 }
 
 pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<String> {
@@ -466,8 +479,8 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             let owner_id = format!("{}:{}", ctx.platform, ctx.chat_id);
 
             if arg.is_empty() || arg == "list" {
-                let filter = astra_core::durable_task_store::TaskFilter {
-                    owner_id: Some(owner_id),
+                let filter = TaskFilter {
+                    owner_id: Some(owner_id.clone()),
                     ..Default::default()
                 };
                 match store.list(filter).await {
@@ -504,13 +517,12 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 if let Some(denial) = slash_denial(ctx, ActionCapability::DurableTaskMutation) {
                     return Some(denial);
                 }
-                let tid = astra_core::durable_task_store::TaskId(id.trim().to_string());
+                let task = match resolve_owned_task(store, &owner_id, id).await {
+                    Ok(task) => task,
+                    Err(e) => return Some(e),
+                };
                 match store
-                    .update_status(
-                        &tid,
-                        astra_core::durable_task_store::DurableTaskStatus::Cancelled,
-                        None,
-                    )
+                    .update_status(&task.id, DurableTaskStatus::Cancelled, None)
                     .await
                 {
                     Ok(()) => Some("🚫 任务已取消".into()),
@@ -520,15 +532,14 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 if let Some(denial) = slash_denial(ctx, ActionCapability::DurableTaskMutation) {
                     return Some(denial);
                 }
-                let tid = astra_core::durable_task_store::TaskId(id.trim().to_string());
-                match store.resume(&tid).await {
+                let task = match resolve_owned_task(store, &owner_id, id).await {
+                    Ok(task) => task,
+                    Err(e) => return Some(e),
+                };
+                match store.resume(&task.id).await {
                     Ok(Some(cp)) => {
                         if let Err(e) = store
-                            .update_status(
-                                &tid,
-                                astra_core::durable_task_store::DurableTaskStatus::Running,
-                                None,
-                            )
+                            .update_status(&task.id, DurableTaskStatus::Running, None)
                             .await
                         {
                             return Some(format!("⚠️ 恢复失败: {e}"));
@@ -538,13 +549,20 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                             serde_json::to_string_pretty(&cp).unwrap_or_default()
                         ))
                     }
-                    Ok(None) => Some("▶️ 任务无检查点，将从头开始".into()),
+                    Ok(None) => {
+                        if let Err(e) = store
+                            .update_status(&task.id, DurableTaskStatus::Running, None)
+                            .await
+                        {
+                            return Some(format!("⚠️ 恢复失败: {e}"));
+                        }
+                        Some("▶️ 任务无检查点，将从头开始".into())
+                    }
                     Err(e) => Some(format!("⚠️ {e}")),
                 }
             } else if let Some(id) = arg.strip_prefix("status ") {
-                let tid = astra_core::durable_task_store::TaskId(id.trim().to_string());
-                match store.get(&tid).await {
-                    Ok(Some(t)) => {
+                match resolve_owned_task(store, &owner_id, id).await {
+                    Ok(t) => {
                         let mut lines = vec![
                             format!("📋 **{}**", t.name),
                             format!("- 状态: {}", t.status.as_str()),
@@ -558,8 +576,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                         }
                         Some(lines.join("\n"))
                     }
-                    Ok(None) => Some(format!("❌ 任务 `{}` 不存在", id.trim())),
-                    Err(e) => Some(format!("⚠️ {e}")),
+                    Err(e) => Some(e),
                 }
             } else {
                 Some("用法: `/task [list|cancel <id>|resume <id>|status <id>]`".into())

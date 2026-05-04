@@ -67,7 +67,7 @@ pub struct ActionPolicy {
 }
 
 fn default_allow_model_generated_mutations() -> bool {
-    true
+    false
 }
 
 fn default_allow_slash_mutations() -> bool {
@@ -325,6 +325,23 @@ mod tests {
                 .check(ActionSource::ModelGenerated, ActionCapability::CronMutation)
                 .unwrap_err()
                 .contains("拒绝")
+        );
+    }
+
+    #[test]
+    fn action_policy_default_denies_model_mutations_but_allows_slash() {
+        let policy = ActionPolicy::default();
+        assert!(
+            policy
+                .check(ActionSource::ModelGenerated, ActionCapability::CronMutation)
+                .is_err(),
+            "model-generated mutations must be opt-in"
+        );
+        assert!(
+            policy
+                .check(ActionSource::SlashCommand, ActionCapability::CronMutation)
+                .is_ok(),
+            "user slash mutations remain allowed by default"
         );
     }
 }

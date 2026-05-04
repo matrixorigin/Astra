@@ -317,7 +317,11 @@ fn print_forensics(state: &ReplState) {
         "\n{}",
         "─── Forensics Summary ──────────────────────────".bold()
     );
-    eprintln!("  {:<24} {}", "Session:".bold(), summary.session_id.as_deref().unwrap_or("(none)"));
+    eprintln!(
+        "  {:<24} {}",
+        "Session:".bold(),
+        summary.session_id.as_deref().unwrap_or("(none)")
+    );
     eprintln!("  {:<24} {}", "Total turns:".bold(), summary.total_turns);
     eprintln!(
         "  {:<24} {}",
@@ -392,7 +396,13 @@ fn export_trace(state: &ReplState, path_arg: &str) {
     let sanitized = trace.with_privacy(policy);
 
     let path = if path_part.is_empty() {
-        let sid = trace.session_id.as_deref().unwrap_or("none").chars().take(8).collect::<String>();
+        let sid = trace
+            .session_id
+            .as_deref()
+            .unwrap_or("none")
+            .chars()
+            .take(8)
+            .collect::<String>();
         format!("harness_trace_{sid}.json")
     } else {
         path_part.to_string()

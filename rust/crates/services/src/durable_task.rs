@@ -35,7 +35,7 @@ fn build_client_for_url(_url: &str) -> reqwest::Client {
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("durable-task HTTP client config must be valid")
 }
 
 /// Maximum `task_verification_results` rows loaded per task (unbounded `fetch_all` guard).
@@ -310,17 +310,17 @@ impl CloudLlmJudge {
             // 401/403: redact provider secrets from logs and return a generic
             // error message instead of echoing the upstream body.
             if status.as_u16() == 401 || status.as_u16() == 403 {
-                let truncated = &text[..text.len().min(80)];
+                let truncated = truncate(&text, 80);
                 tracing::debug!(
                     target: "astra_services::durable_task",
                     "LLM judge auth error ({status}): {}",
-                    redact_judge_secrets(truncated)
+                    redact_judge_secrets(&truncated)
                 );
                 return Err("LLM judge unavailable (auth error)".to_string());
             }
             return Err(format!(
                 "Cloud LLM API error {status}: {}",
-                &text[..text.len().min(200)]
+                truncate(&text, 200)
             ));
         }
 
@@ -372,12 +372,7 @@ impl LlmJudge for CloudLlmJudge {
             Ok(score) => {
                 let passed = *score >= 0.7; // default threshold for persistence
                 self.persist_result(
-                    &format!(
-                        "llm-{}",
-                        &prompt[..prompt.len().min(32)]
-                            .replace(' ', "-")
-                            .to_lowercase()
-                    ),
+                    &llm_criterion_id(prompt),
                     passed,
                     *score,
                     &format!("Cloud LLM score: {score:.2}"),
@@ -388,12 +383,7 @@ impl LlmJudge for CloudLlmJudge {
             }
             Err(e) => {
                 self.persist_result(
-                    &format!(
-                        "llm-{}",
-                        &prompt[..prompt.len().min(32)]
-                            .replace(' ', "-")
-                            .to_lowercase()
-                    ),
+                    &llm_criterion_id(prompt),
                     false,
                     0.0,
                     "Cloud LLM evaluation failed",
@@ -569,8 +559,22 @@ fn parse_judge_score(text: &str) -> Result<f64, String> {
 
     Err(format!(
         "Could not extract score from LLM response: {}",
-        &text[..text.len().min(200)]
+        truncate(text, 200)
     ))
+}
+
+fn llm_criterion_id(prompt: &str) -> String {
+    let prefix: String = prompt
+        .chars()
+        .take(32)
+        .map(|ch| if ch.is_whitespace() { '-' } else { ch })
+        .collect::<String>()
+        .to_lowercase();
+    if prefix.is_empty() {
+        "llm-empty".into()
+    } else {
+        format!("llm-{prefix}")
+    }
 }
 
 // ─── Contract ───────────────────────────────────────────────────────────────
@@ -1403,10 +1407,10 @@ async fn run_shell_cmd_buffered(
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…[truncated]", &s[..max])
+        format!("{}…[truncated]", s.chars().take(max).collect::<String>())
     }
 }
 
@@ -7232,6 +7236,18 @@ Time:        3.456 s
         let result = truncate("hello world", 5);
         assert!(result.starts_with("hello"));
         assert!(result.contains("[truncated]"));
+    }
+
+    #[test]
+    fn truncate_is_utf8_safe() {
+        let result = truncate("中文提示内容", 3);
+        assert!(result.starts_with("中文提"));
+        assert!(result.contains("[truncated]"));
+    }
+
+    #[test]
+    fn llm_criterion_id_is_utf8_safe() {
+        assert_eq!(llm_criterion_id("中文 prompt"), "llm-中文-prompt");
     }
 
     // ─── Snapshot exclusion tests ─────────────────────────────────────────────

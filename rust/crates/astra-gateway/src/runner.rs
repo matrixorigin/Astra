@@ -27,6 +27,7 @@ const INITIAL_ACK_DELAY: Duration = Duration::from_secs(3);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 const PROGRESSIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(8);
 const PROGRESSIVE_MIN_CHARS: usize = 200;
+const CONVERSATION_QUEUE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Outbound message from CLI, scheduler, or other background tasks.
 #[derive(Debug, Clone)]
@@ -384,7 +385,8 @@ impl GatewayRunner {
         let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
 
         if let Some(ref pool) = self.pool
-            && let Err(e) = storage::upsert_user(pool, msg.platform, &msg.user_id, &msg.user_id).await
+            && let Err(e) =
+                storage::upsert_user(pool, msg.platform, &msg.user_id, &msg.user_id).await
         {
             tracing::warn!(error = %e, "failed to upsert user");
         }
@@ -503,7 +505,8 @@ impl GatewayRunner {
                 msg.platform,
                 &cli_profile,
                 self.pool.is_some(),
-            );
+            )
+            .with_model_actions_allowed(self.config.action_policy.allow_model_generated_mutations);
             if let Some(ref pool) = self.pool
                 && let Ok(jobs) =
                     storage::list_cron_jobs(pool, msg.platform, &effective_chat_id).await
@@ -616,6 +619,7 @@ impl GatewayRunner {
         let mut sent_initial_ack = false;
         let mut token_buf = String::new();
         let mut in_think_block = false;
+        let mut gateway_action_filter = GatewayActionStreamFilter::default();
         let mut progressive_text_len: usize = 0;
         let next_timer = tokio::time::sleep(INITIAL_ACK_DELAY);
         tokio::pin!(next_timer);
@@ -641,9 +645,7 @@ impl GatewayRunner {
             Some((
                 Box::pin(async move {
                     if let Some(tx) = tx {
-                        let _ = tx
-                            .send(OutboundMessage::plain(platform, chat, text))
-                            .await;
+                        let _ = tx.send(OutboundMessage::plain(platform, chat, text)).await;
                     }
                 }),
                 len,
@@ -657,6 +659,7 @@ impl GatewayRunner {
                         Some(CliProgress::Token(text)) => {
                             // Filter <think>...</think> blocks from token stream
                             let filtered = filter_think_tags(&text, &mut in_think_block);
+                            let filtered = gateway_action_filter.push(&filtered);
                             if !filtered.is_empty() {
                                 token_buf.push_str(&filtered);
                                 if token_buf.len() >= PROGRESSIVE_MIN_CHARS {
@@ -687,6 +690,10 @@ impl GatewayRunner {
                         Some(CliProgress::Thinking(_)) => {}
                         Some(CliProgress::Status(_) | CliProgress::Stderr(_)) => {}
                         None => {
+                            let tail = gateway_action_filter.finish();
+                            if !tail.is_empty() {
+                                token_buf.push_str(&tail);
+                            }
                             if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
                                 progressive_text_len += len;
                                 fut.await;
@@ -1070,7 +1077,12 @@ impl GatewayRunner {
         if cost > 0.001 {
             stats_parts.push(format!("${cost:.3}"));
         }
-        text = build_final_message(&text, &action_results_text, &stats_parts, progressive_text_len);
+        text = build_final_message(
+            &text,
+            &action_results_text,
+            &stats_parts,
+            progressive_text_len,
+        );
 
         // Record usage to DB
         if let Some(ref pool) = self.pool {
@@ -1265,7 +1277,24 @@ impl GatewayRunner {
         mut rx: tokio::sync::mpsc::Receiver<QueuedRequest>,
         cli_resp_tx: tokio::sync::mpsc::Sender<CliResponse>,
     ) {
-        while let Some(queued) = rx.recv().await {
+        loop {
+            let queued = match tokio::time::timeout(CONVERSATION_QUEUE_IDLE_TIMEOUT, rx.recv())
+                .await
+            {
+                Ok(Some(queued)) => queued,
+                Ok(None) => break,
+                Err(_) => {
+                    let mut queues = self.queue_senders.lock().await;
+                    if let Ok(queued) = rx.try_recv() {
+                        drop(queues);
+                        queued
+                    } else {
+                        queues.remove(&key);
+                        tracing::debug!(conversation = %key, "conversation worker idle timeout");
+                        break;
+                    }
+                }
+            };
             let Ok(_permit) = self.global_run_limiter.clone().acquire_owned().await else {
                 break;
             };
@@ -1675,6 +1704,16 @@ fn is_safe_db_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+async fn resolve_gateway_task(
+    store: &dyn astra_core::durable_task_store::DurableTaskStore,
+    owner_id: &str,
+    selector: &str,
+) -> Result<astra_core::durable_task_store::DurableTask, String> {
+    astra_core::durable_task_store::resolve_task_for_owner(store, owner_id, selector)
+        .await
+        .map_err(|e| format!("⚠️ {e}"))
+}
+
 /// Parse and execute `[[GATEWAY:action:args]]` tags in agent response text.
 /// Returns the text with tags removed, and populates action_results with status messages.
 #[allow(clippy::too_many_arguments)]
@@ -1697,7 +1736,11 @@ async fn execute_gateway_actions(
         user_id,
         durable_store,
         skills_dir,
-        &crate::access_control::ActionPolicy::default(),
+        &crate::access_control::ActionPolicy {
+            allow_slash_mutations: true,
+            allow_model_generated_mutations: true,
+            workspace_roots: Vec::new(),
+        },
         action_results,
     )
     .await
@@ -1798,13 +1841,12 @@ async fn execute_gateway_actions_with_policy(
                     .await
                     {
                         Ok(()) => {
-                            if let Err(e) = sqlx::query(
-                                "UPDATE gw_cron_jobs SET next_run = ? WHERE job_id = ?",
-                            )
-                            .bind(&next_run_str)
-                            .bind(&job_id)
-                            .execute(pool)
-                            .await
+                            if let Err(e) =
+                                sqlx::query("UPDATE gw_cron_jobs SET next_run = ? WHERE job_id = ?")
+                                    .bind(&next_run_str)
+                                    .bind(&job_id)
+                                    .execute(pool)
+                                    .await
                             {
                                 tracing::warn!(job_id = %&job_id[..8], error = %e, "failed to set remind_after next_run");
                             }
@@ -1930,17 +1972,21 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => format!("⚠️ checkpoint JSON 无效: {e}"),
                         Ok(state) => {
                             if let Some(store) = durable_store {
-                                let tid =
-                                    astra_core::durable_task_store::TaskId(task_id.to_string());
-                                match store.checkpoint(&tid, &state, None, None).await {
-                                    Ok(()) => {
-                                        tracing::info!(task_id, "dtask checkpoint saved");
-                                        format!(
-                                            "💾 检查点已保存 (`{}`)",
-                                            &task_id[..8.min(task_id.len())]
-                                        )
+                                let owner_id = format!("{platform}:{chat_id}");
+                                match resolve_gateway_task(store, &owner_id, task_id).await {
+                                    Ok(task) => {
+                                        match store.checkpoint(&task.id, &state, None, None).await {
+                                            Ok(()) => {
+                                                tracing::info!(task_id, "dtask checkpoint saved");
+                                                format!(
+                                                    "💾 检查点已保存 (`{}`)",
+                                                    &task.id.0[..8.min(task.id.0.len())]
+                                                )
+                                            }
+                                            Err(e) => format!("⚠️ 保存失败: {e}"),
+                                        }
                                     }
-                                    Err(e) => format!("⚠️ 保存失败: {e}"),
+                                    Err(e) => e,
                                 }
                             } else {
                                 "⚠️ 需要数据库支持".into()
@@ -1953,9 +1999,9 @@ async fn execute_gateway_actions_with_policy(
             Some("dtask_status") if parts.len() >= 2 => {
                 let task_id = parts[1].trim();
                 if let Some(store) = durable_store {
-                    let tid = astra_core::durable_task_store::TaskId(task_id.to_string());
-                    match store.get(&tid).await {
-                        Ok(Some(t)) => {
+                    let owner_id = format!("{platform}:{chat_id}");
+                    match resolve_gateway_task(store, &owner_id, task_id).await {
+                        Ok(t) => {
                             let mut lines = vec![
                                 format!("📋 **任务: {}**", t.name),
                                 format!("- 状态: {}", t.status.as_str()),
@@ -1969,8 +2015,7 @@ async fn execute_gateway_actions_with_policy(
                             }
                             lines.join("\n")
                         }
-                        Ok(None) => format!("❌ 任务 `{task_id}` 不存在"),
-                        Err(e) => format!("⚠️ 查询失败: {e}"),
+                        Err(e) => e,
                     }
                 } else {
                     "⚠️ 需要数据库支持".into()
@@ -1980,36 +2025,40 @@ async fn execute_gateway_actions_with_policy(
             Some("dtask_resume") if parts.len() >= 2 => {
                 let task_id = parts[1].trim();
                 if let Some(store) = durable_store {
-                    let tid = astra_core::durable_task_store::TaskId(task_id.to_string());
-                    match store.resume(&tid).await {
-                        Ok(Some(checkpoint)) => {
-                            match store
+                    let owner_id = format!("{platform}:{chat_id}");
+                    match resolve_gateway_task(store, &owner_id, task_id).await {
+                        Ok(task) => match store.resume(&task.id).await {
+                            Ok(Some(checkpoint)) => {
+                                match store
+                                    .update_status(
+                                        &task.id,
+                                        astra_core::durable_task_store::DurableTaskStatus::Running,
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => format!(
+                                        "▶️ 任务已恢复，检查点:\n```json\n{}\n```",
+                                        serde_json::to_string_pretty(&checkpoint)
+                                            .unwrap_or_default()
+                                    ),
+                                    Err(e) => format!("⚠️ 恢复失败: {e}"),
+                                }
+                            }
+                            Ok(None) => match store
                                 .update_status(
-                                    &tid,
+                                    &task.id,
                                     astra_core::durable_task_store::DurableTaskStatus::Running,
                                     None,
                                 )
                                 .await
                             {
-                                Ok(()) => format!(
-                                    "▶️ 任务已恢复，检查点:\n```json\n{}\n```",
-                                    serde_json::to_string_pretty(&checkpoint).unwrap_or_default()
-                                ),
+                                Ok(()) => format!("▶️ 任务 `{task_id}` 无检查点，从头开始"),
                                 Err(e) => format!("⚠️ 恢复失败: {e}"),
-                            }
-                        }
-                        Ok(None) => match store
-                            .update_status(
-                                &tid,
-                                astra_core::durable_task_store::DurableTaskStatus::Running,
-                                None,
-                            )
-                            .await
-                        {
-                            Ok(()) => format!("▶️ 任务 `{task_id}` 无检查点，从头开始"),
+                            },
                             Err(e) => format!("⚠️ 恢复失败: {e}"),
                         },
-                        Err(e) => format!("⚠️ 恢复失败: {e}"),
+                        Err(e) => e,
                     }
                 } else {
                     "⚠️ 需要数据库支持".into()
@@ -2052,17 +2101,20 @@ async fn execute_gateway_actions_with_policy(
             Some("dtask_complete") if parts.len() >= 2 => {
                 let task_id = parts[1].trim();
                 if let Some(store) = durable_store {
-                    let tid = astra_core::durable_task_store::TaskId(task_id.to_string());
-                    match store
-                        .update_status(
-                            &tid,
-                            astra_core::durable_task_store::DurableTaskStatus::Completed,
-                            None,
-                        )
-                        .await
-                    {
-                        Ok(()) => "✅ 任务已完成".into(),
-                        Err(e) => format!("⚠️ {e}"),
+                    let owner_id = format!("{platform}:{chat_id}");
+                    match resolve_gateway_task(store, &owner_id, task_id).await {
+                        Ok(task) => match store
+                            .update_status(
+                                &task.id,
+                                astra_core::durable_task_store::DurableTaskStatus::Completed,
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(()) => "✅ 任务已完成".into(),
+                            Err(e) => format!("⚠️ {e}"),
+                        },
+                        Err(e) => e,
                     }
                 } else {
                     "⚠️ 需要数据库支持".into()
@@ -2077,17 +2129,20 @@ async fn execute_gateway_actions_with_policy(
                     None
                 };
                 if let Some(store) = durable_store {
-                    let tid = astra_core::durable_task_store::TaskId(task_id.to_string());
-                    match store
-                        .update_status(
-                            &tid,
-                            astra_core::durable_task_store::DurableTaskStatus::Failed,
-                            error,
-                        )
-                        .await
-                    {
-                        Ok(()) => "❌ 任务已标记失败".into(),
-                        Err(e) => format!("⚠️ {e}"),
+                    let owner_id = format!("{platform}:{chat_id}");
+                    match resolve_gateway_task(store, &owner_id, task_id).await {
+                        Ok(task) => match store
+                            .update_status(
+                                &task.id,
+                                astra_core::durable_task_store::DurableTaskStatus::Failed,
+                                error,
+                            )
+                            .await
+                        {
+                            Ok(()) => "❌ 任务已标记失败".into(),
+                            Err(e) => format!("⚠️ {e}"),
+                        },
+                        Err(e) => e,
                     }
                 } else {
                     "⚠️ 需要数据库支持".into()
@@ -2097,17 +2152,20 @@ async fn execute_gateway_actions_with_policy(
             Some("dtask_cancel") if parts.len() >= 2 => {
                 let task_id = parts[1].trim();
                 if let Some(store) = durable_store {
-                    let tid = astra_core::durable_task_store::TaskId(task_id.to_string());
-                    match store
-                        .update_status(
-                            &tid,
-                            astra_core::durable_task_store::DurableTaskStatus::Cancelled,
-                            None,
-                        )
-                        .await
-                    {
-                        Ok(()) => "🚫 任务已取消".into(),
-                        Err(e) => format!("⚠️ {e}"),
+                    let owner_id = format!("{platform}:{chat_id}");
+                    match resolve_gateway_task(store, &owner_id, task_id).await {
+                        Ok(task) => match store
+                            .update_status(
+                                &task.id,
+                                astra_core::durable_task_store::DurableTaskStatus::Cancelled,
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(()) => "🚫 任务已取消".into(),
+                            Err(e) => format!("⚠️ {e}"),
+                        },
+                        Err(e) => e,
                     }
                 } else {
                     "⚠️ 需要数据库支持".into()
@@ -2278,6 +2336,70 @@ fn filter_think_tags(text: &str, in_think: &mut bool) -> String {
     result
 }
 
+#[derive(Default)]
+struct GatewayActionStreamFilter {
+    pending: String,
+    in_tag: bool,
+}
+
+impl GatewayActionStreamFilter {
+    fn push(&mut self, text: &str) -> String {
+        const TAG_START: &str = "[[GATEWAY:";
+        self.pending.push_str(text);
+        let mut out = String::new();
+
+        loop {
+            if self.in_tag {
+                if let Some(end) = self.pending.find("]]") {
+                    self.pending.drain(..end + 2);
+                    self.in_tag = false;
+                    continue;
+                }
+                self.pending.clear();
+                break;
+            }
+
+            if let Some(start) = self.pending.find(TAG_START) {
+                out.push_str(&self.pending[..start]);
+                self.pending.drain(..start + TAG_START.len());
+                self.in_tag = true;
+                continue;
+            }
+
+            let keep = gateway_tag_prefix_suffix_len(&self.pending);
+            let emit_len = self.pending.len().saturating_sub(keep);
+            out.push_str(&self.pending[..emit_len]);
+            self.pending.drain(..emit_len);
+            break;
+        }
+
+        out
+    }
+
+    fn finish(&mut self) -> String {
+        if self.in_tag {
+            self.pending.clear();
+            self.in_tag = false;
+            String::new()
+        } else {
+            std::mem::take(&mut self.pending)
+        }
+    }
+}
+
+fn gateway_tag_prefix_suffix_len(text: &str) -> usize {
+    const TAG_START: &str = "[[GATEWAY:";
+    let max = text.len().min(TAG_START.len() - 1);
+    for len in (1..=max).rev() {
+        if text.is_char_boundary(text.len() - len)
+            && TAG_START.starts_with(&text[text.len() - len..])
+        {
+            return len;
+        }
+    }
+    0
+}
+
 /// Build the final message to send after CLI finishes.
 /// When `progressive_text_len > 0`, text was already streamed — send only
 /// action results + stats footer. Otherwise send full text + stats.
@@ -2311,9 +2433,7 @@ fn build_final_message(
 fn strip_think_blocks(text: &str) -> String {
     let mut in_think = false;
     let mut result = filter_think_tags(text, &mut in_think);
-    if in_think
-        && let Some(pos) = text.rfind("<think>")
-    {
+    if in_think && let Some(pos) = text.rfind("<think>") {
         let after = &text[pos + 7..];
         if !after.is_empty() {
             if !result.is_empty() {
@@ -2440,15 +2560,27 @@ mod tests {
     #[test]
     fn initial_ack_delay_is_shorter_than_heartbeat() {
         assert!(INITIAL_ACK_DELAY < HEARTBEAT_INTERVAL);
-        assert!(INITIAL_ACK_DELAY.as_secs() <= 5, "initial ack should be <= 5s for good UX");
+        assert!(
+            INITIAL_ACK_DELAY.as_secs() <= 5,
+            "initial ack should be <= 5s for good UX"
+        );
     }
 
     #[test]
     fn progressive_flush_interval_is_reasonable() {
-        assert!(PROGRESSIVE_FLUSH_INTERVAL.as_secs() >= 2, "too fast = flood WeChat");
-        assert!(PROGRESSIVE_FLUSH_INTERVAL.as_secs() <= 10, "too slow = feels laggy");
+        assert!(
+            PROGRESSIVE_FLUSH_INTERVAL.as_secs() >= 2,
+            "too fast = flood WeChat"
+        );
+        assert!(
+            PROGRESSIVE_FLUSH_INTERVAL.as_secs() <= 10,
+            "too slow = feels laggy"
+        );
         assert!(PROGRESSIVE_MIN_CHARS > 0);
-        assert!(PROGRESSIVE_MIN_CHARS <= 200, "threshold too high = no progressive delivery");
+        assert!(
+            PROGRESSIVE_MIN_CHARS <= 200,
+            "threshold too high = no progressive delivery"
+        );
     }
 
     // ── Think tag filtering ──────────────────────────────────────
@@ -2496,7 +2628,10 @@ mod tests {
         // Malicious/buggy model: <think> without </think> should NOT suppress output
         let text = "Before<think>suppressed content that should still appear";
         let result = strip_think_blocks(text);
-        assert!(result.contains("Before"), "text before think lost: {result}");
+        assert!(
+            result.contains("Before"),
+            "text before think lost: {result}"
+        );
         assert!(
             result.contains("suppressed content"),
             "unclosed think suppressed output: {result}"
@@ -2527,7 +2662,10 @@ mod tests {
     fn final_message_progressive_skips_body() {
         let stats = vec!["↓8.4k".into(), "↑95".into()];
         let msg = build_final_message("Hello world (already sent)", "", &stats, 500);
-        assert!(!msg.contains("Hello world"), "body should not repeat: {msg}");
+        assert!(
+            !msg.contains("Hello world"),
+            "body should not repeat: {msg}"
+        );
         assert!(msg.contains("↓8.4k"), "stats should still appear: {msg}");
     }
 
@@ -2535,7 +2673,10 @@ mod tests {
     fn final_message_progressive_with_actions() {
         let stats = vec!["8s".into()];
         let msg = build_final_message("body", "⏰ 提醒已创建", &stats, 100);
-        assert!(msg.contains("⏰ 提醒已创建"), "action results should appear");
+        assert!(
+            msg.contains("⏰ 提醒已创建"),
+            "action results should appear"
+        );
         assert!(msg.contains("8s"), "stats should appear");
         assert!(!msg.contains("body"), "body should not repeat");
     }
@@ -2543,7 +2684,10 @@ mod tests {
     #[test]
     fn final_message_progressive_empty_stats() {
         let msg = build_final_message("body", "", &[], 100);
-        assert!(msg.is_empty(), "nothing to send if progressive + no actions + no stats");
+        assert!(
+            msg.is_empty(),
+            "nothing to send if progressive + no actions + no stats"
+        );
     }
 
     // ── Tool status merged into buffer ──────────────────────────
@@ -2610,6 +2754,32 @@ mod tests {
         // First </think> closes, "c" is visible
         assert_eq!(r, "c");
         assert!(!state);
+    }
+
+    #[test]
+    fn gateway_action_stream_filter_removes_complete_tag() {
+        let mut filter = GatewayActionStreamFilter::default();
+        let out = filter.push("before [[GATEWAY:dtask_complete:abc]] after");
+        assert_eq!(out, "before  after");
+        assert_eq!(filter.finish(), "");
+    }
+
+    #[test]
+    fn gateway_action_stream_filter_handles_split_tag_start() {
+        let mut filter = GatewayActionStreamFilter::default();
+        assert_eq!(filter.push("hello [["), "hello ");
+        assert_eq!(filter.push("GATEWAY:dtask_cancel:abc]] done"), " done");
+        assert_eq!(filter.finish(), "");
+    }
+
+    #[test]
+    fn gateway_action_stream_filter_drops_unclosed_tag_at_finish() {
+        let mut filter = GatewayActionStreamFilter::default();
+        assert_eq!(
+            filter.push("visible [[GATEWAY:dtask_complete:abc"),
+            "visible "
+        );
+        assert_eq!(filter.finish(), "");
     }
 
     // ── Gateway action tests ──────────────────────────────────────
@@ -2876,7 +3046,11 @@ async fn action_dtask_checkpoint_json_with_array() {
     let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
     assert!(clean.is_empty(), "tags should be stripped, got: {clean}");
     assert_eq!(r.len(), 1);
-    assert!(r[0].contains("数据库"), "expected no-db error, got: {}", r[0]);
+    assert!(
+        r[0].contains("数据库"),
+        "expected no-db error, got: {}",
+        r[0]
+    );
 }
 
 #[tokio::test]
@@ -2913,15 +3087,7 @@ async fn action_policy_blocks_model_mutations_when_disabled() {
     };
     let mut r = Vec::new();
     let clean = execute_gateway_actions_with_policy(
-        text,
-        None,
-        "wx",
-        "c1",
-        "u1",
-        None,
-        None,
-        &policy,
-        &mut r,
+        text, None, "wx", "c1", "u1", None, None, &policy, &mut r,
     )
     .await;
     assert!(clean.is_empty(), "tag should be stripped: {clean}");
@@ -2932,23 +3098,23 @@ async fn action_policy_blocks_model_mutations_when_disabled() {
 #[tokio::test]
 async fn action_policy_allows_when_enabled() {
     let text = "[[GATEWAY:cron_add:0 9 * * *:test]]";
-    let policy = crate::access_control::ActionPolicy::default();
+    let policy = crate::access_control::ActionPolicy {
+        allow_slash_mutations: true,
+        allow_model_generated_mutations: true,
+        workspace_roots: Vec::new(),
+    };
     let mut r = Vec::new();
     let clean = execute_gateway_actions_with_policy(
-        text,
-        None,
-        "wx",
-        "c1",
-        "u1",
-        None,
-        None,
-        &policy,
-        &mut r,
+        text, None, "wx", "c1", "u1", None, None, &policy, &mut r,
     )
     .await;
     assert!(clean.is_empty());
     assert_eq!(r.len(), 1);
-    assert!(r[0].contains("数据库"), "expected no-db fallback, got: {}", r[0]);
+    assert!(
+        r[0].contains("数据库"),
+        "expected no-db fallback, got: {}",
+        r[0]
+    );
 }
 
 fn format_tokens(n: u64) -> String {

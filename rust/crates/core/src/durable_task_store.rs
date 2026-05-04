@@ -72,6 +72,7 @@ pub struct TaskSpec {
 pub struct TaskFilter {
     pub owner_id: Option<String>,
     pub status: Option<DurableTaskStatus>,
+    pub id_prefix: Option<String>,
     pub limit: Option<u32>,
 }
 
@@ -124,6 +125,86 @@ pub trait DurableTaskStore: Send + Sync {
     ) -> Result<(), String>;
     async fn resume(&self, id: &TaskId) -> Result<Option<serde_json::Value>, String>;
     async fn delete(&self, id: &TaskId) -> Result<bool, String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskSelectorError {
+    Empty,
+    NotFound { selector: String },
+    Ambiguous { selector: String, matches: usize },
+}
+
+impl std::fmt::Display for TaskSelectorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("task id cannot be empty"),
+            Self::NotFound { selector } => write!(f, "task `{selector}` not found"),
+            Self::Ambiguous { selector, matches } => {
+                write!(f, "task `{selector}` is ambiguous ({matches} matches)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TaskSelectorError {}
+
+pub fn resolve_task_selector<'a>(
+    tasks: &'a [DurableTask],
+    selector: &str,
+) -> Result<&'a DurableTask, TaskSelectorError> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return Err(TaskSelectorError::Empty);
+    }
+
+    if let Some(exact) = tasks.iter().find(|task| task.id.0 == selector) {
+        return Ok(exact);
+    }
+
+    let matches: Vec<&DurableTask> = tasks
+        .iter()
+        .filter(|task| task.id.0.starts_with(selector))
+        .collect();
+
+    match matches.as_slice() {
+        [] => Err(TaskSelectorError::NotFound {
+            selector: selector.to_string(),
+        }),
+        [task] => Ok(task),
+        many => Err(TaskSelectorError::Ambiguous {
+            selector: selector.to_string(),
+            matches: many.len(),
+        }),
+    }
+}
+
+pub async fn resolve_task_for_owner(
+    store: &dyn DurableTaskStore,
+    owner_id: &str,
+    selector: &str,
+) -> Result<DurableTask, String> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return Err(TaskSelectorError::Empty.to_string());
+    }
+
+    if let Some(task) = store.get(&TaskId(selector.to_string())).await?
+        && task.owner_id == owner_id
+    {
+        return Ok(task);
+    }
+
+    let tasks = store
+        .list(TaskFilter {
+            owner_id: Some(owner_id.to_string()),
+            id_prefix: Some(selector.to_string()),
+            limit: Some(2),
+            ..Default::default()
+        })
+        .await?;
+    resolve_task_selector(&tasks, selector)
+        .cloned()
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -248,6 +329,73 @@ mod tests {
         let a = TaskId("abc".into());
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    fn task(id: &str, owner: &str) -> DurableTask {
+        DurableTask {
+            id: TaskId(id.into()),
+            name: format!("task-{id}"),
+            description: None,
+            owner_id: owner.into(),
+            status: DurableTaskStatus::Running,
+            progress_pct: 0,
+            step_description: None,
+            checkpoint: None,
+            error_message: None,
+            created_at: "2026-01-01".into(),
+            updated_at: "2026-01-01".into(),
+        }
+    }
+
+    #[test]
+    fn resolve_task_selector_accepts_full_or_short_id() {
+        let tasks = vec![task("abcdef12-0000", "owner")];
+        assert_eq!(
+            resolve_task_selector(&tasks, "abcdef12-0000").unwrap().id.0,
+            "abcdef12-0000"
+        );
+        assert_eq!(
+            resolve_task_selector(&tasks, "abcdef12").unwrap().id.0,
+            "abcdef12-0000"
+        );
+    }
+
+    #[test]
+    fn resolve_task_selector_rejects_ambiguous_prefix() {
+        let tasks = vec![
+            task("abcdef12-0000", "owner"),
+            task("abcdef34-0000", "owner"),
+        ];
+        let err = resolve_task_selector(&tasks, "abcdef").unwrap_err();
+        assert_eq!(
+            err,
+            TaskSelectorError::Ambiguous {
+                selector: "abcdef".into(),
+                matches: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_task_selector_prefers_exact_match() {
+        let tasks = vec![
+            task("abcdef", "owner"),
+            task("abcdef12-0000", "owner"),
+            task("abcdef34-0000", "owner"),
+        ];
+        assert_eq!(
+            resolve_task_selector(&tasks, "abcdef").unwrap().id.0,
+            "abcdef"
+        );
+    }
+
+    #[test]
+    fn resolve_task_selector_only_sees_provided_owner_scope() {
+        let owner_a_tasks = vec![task("abcdef12-0000", "owner-a")];
+        assert!(matches!(
+            resolve_task_selector(&owner_a_tasks, "99999999"),
+            Err(TaskSelectorError::NotFound { .. })
+        ));
     }
 
     #[test]

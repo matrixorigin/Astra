@@ -18,6 +18,7 @@ pub struct GatewayContext {
     pub has_session: bool,
     pub has_harness: bool,
     pub has_durable_tasks: bool,
+    pub model_actions_allowed: bool,
     pub cron_jobs_count: usize,
     pub cron_jobs: Vec<(String, String, String)>, // (short_id, expr, description)
     pub active_tasks: Vec<(String, String, String, u8)>, // (short_id, name, status, progress)
@@ -51,6 +52,7 @@ impl GatewayContext {
             has_session: caps.supports_session,
             has_harness: caps.supports_harness,
             has_durable_tasks: has_db,
+            model_actions_allowed: true,
             cron_jobs_count: 0,
             cron_jobs: Vec::new(),
             active_tasks: Vec::new(),
@@ -94,6 +96,11 @@ impl GatewayContext {
 
     pub fn with_extra_skills(mut self, skills: Vec<(String, String)>) -> Self {
         self.extra_skills = skills;
+        self
+    }
+
+    pub fn with_model_actions_allowed(mut self, allowed: bool) -> Self {
+        self.model_actions_allowed = allowed;
         self
     }
 
@@ -238,9 +245,9 @@ fn render_template(template: &str, ctx: &GatewayContext) -> String {
 fn check_condition(var: &str, ctx: &GatewayContext) -> bool {
     match var {
         "has_session" => ctx.has_session,
-        "has_cron" => ctx.has_cron,
+        "has_cron" => ctx.has_cron && ctx.model_actions_allowed,
         "has_harness" => ctx.has_harness,
-        "has_durable_tasks" => ctx.has_durable_tasks,
+        "has_durable_tasks" => ctx.has_durable_tasks && ctx.model_actions_allowed,
         "active_tasks" => !ctx.active_tasks.is_empty(),
         "available_projects" => !ctx.available_projects.is_empty(),
         "current_workspace" => ctx.current_workspace.is_some(),
@@ -427,6 +434,15 @@ fn template_excludes_durable_tasks_without_db() {
     let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), false);
     let prompt = ctx.to_system_prompt();
     assert!(!prompt.contains("Durable Tasks"));
+}
+
+#[test]
+fn template_hides_model_generated_actions_when_policy_disallows() {
+    let ctx = GatewayContext::new("u1", "Test", "weixin", &CliProfile::default(), true)
+        .with_model_actions_allowed(false);
+    let prompt = ctx.to_system_prompt();
+    assert!(!prompt.contains("GATEWAY:cron_add"));
+    assert!(!prompt.contains("dtask_create"));
 }
 
 #[test]

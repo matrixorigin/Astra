@@ -94,7 +94,14 @@ impl std::fmt::Debug for AstraServerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AstraServerConfig")
             .field("base_url", &self.base_url)
-            .field("api_key", &if self.api_key.is_empty() { "(empty)" } else { "[REDACTED]" })
+            .field(
+                "api_key",
+                &if self.api_key.is_empty() {
+                    "(empty)"
+                } else {
+                    "[REDACTED]"
+                },
+            )
             .field("default_model", &self.default_model)
             .finish()
     }
@@ -150,7 +157,14 @@ impl std::fmt::Debug for TelegramConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TelegramConfig")
             .field("enabled", &self.enabled)
-            .field("token", &if self.token.is_empty() { "(empty)" } else { "[REDACTED]" })
+            .field(
+                "token",
+                &if self.token.is_empty() {
+                    "(empty)"
+                } else {
+                    "[REDACTED]"
+                },
+            )
             .finish()
     }
 }
@@ -206,7 +220,7 @@ astra:
         assert_eq!(cfg.astra.api_key, "test-key");
         assert!(cfg.platforms.wecom.is_none());
         assert_eq!(cfg.max_concurrent_runs, 4);
-        assert!(cfg.action_policy.allow_model_generated_mutations);
+        assert!(!cfg.action_policy.allow_model_generated_mutations);
     }
 
     #[test]
@@ -240,8 +254,14 @@ platforms:
             default_model: None,
         };
         let dbg = format!("{cfg:?}");
-        assert!(dbg.contains("[REDACTED]"), "api_key should be redacted: {dbg}");
-        assert!(!dbg.contains("super-secret"), "api_key leaked in debug: {dbg}");
+        assert!(
+            dbg.contains("[REDACTED]"),
+            "api_key should be redacted: {dbg}"
+        );
+        assert!(
+            !dbg.contains("super-secret"),
+            "api_key leaked in debug: {dbg}"
+        );
 
         let db = DatabaseConfig {
             url: "mysql://root:password@host/db".into(),
@@ -263,7 +283,10 @@ platforms:
             token: "bot123:AABBCC".into(),
         };
         let dbg = format!("{tg:?}");
-        assert!(!dbg.contains("bot123:AABBCC"), "telegram token leaked: {dbg}");
+        assert!(
+            !dbg.contains("bot123:AABBCC"),
+            "telegram token leaked: {dbg}"
+        );
     }
 
     #[test]

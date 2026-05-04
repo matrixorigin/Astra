@@ -18,9 +18,14 @@ pub enum CliProgress {
     /// Streamed text token from LLM (via --stream-events JSONL).
     Token(String),
     /// Tool execution started.
-    ToolStarted { name: String },
+    ToolStarted {
+        name: String,
+    },
     /// Tool execution completed.
-    ToolDone { name: String, duration_ms: u64 },
+    ToolDone {
+        name: String,
+        duration_ms: u64,
+    },
     /// Thinking state changed.
     Thinking(bool),
 }
@@ -536,9 +541,7 @@ fn parse_stderr_line(line: &str) -> CliProgress {
                 return CliProgress::Thinking(active);
             }
             Some("thinking_chunk") => {
-                return CliProgress::Status(
-                    v["text"].as_str().unwrap_or_default().to_string(),
-                );
+                return CliProgress::Status(v["text"].as_str().unwrap_or_default().to_string());
             }
             Some("tool_started") => {
                 let name = v["name"].as_str().unwrap_or_default().to_string();
@@ -550,9 +553,7 @@ fn parse_stderr_line(line: &str) -> CliProgress {
                 return CliProgress::ToolDone { name, duration_ms };
             }
             Some("status") => {
-                return CliProgress::Status(
-                    v["text"].as_str().unwrap_or_default().to_string(),
-                );
+                return CliProgress::Status(v["text"].as_str().unwrap_or_default().to_string());
             }
             Some("waiting_for_model" | "model_responding") => {
                 return CliProgress::Status(line.to_string());
@@ -1271,19 +1272,26 @@ model: claude-sonnet-4-6"#;
     #[test]
     fn parse_thinking_event() {
         let line = r#"{"type":"thinking","active":true}"#;
-        assert!(matches!(parse_stderr_line(line), CliProgress::Thinking(true)));
+        assert!(matches!(
+            parse_stderr_line(line),
+            CliProgress::Thinking(true)
+        ));
     }
 
     #[test]
     fn parse_tool_started_event() {
         let line = r#"{"type":"tool_started","name":"bash","description":"ls"}"#;
-        assert!(matches!(parse_stderr_line(line), CliProgress::ToolStarted { name } if name == "bash"));
+        assert!(
+            matches!(parse_stderr_line(line), CliProgress::ToolStarted { name } if name == "bash")
+        );
     }
 
     #[test]
     fn parse_tool_completed_event() {
         let line = r#"{"type":"tool_completed","name":"read_file","description":"x","status":"ok","duration_ms":42,"output_summary":null}"#;
-        assert!(matches!(parse_stderr_line(line), CliProgress::ToolDone { name, duration_ms } if name == "read_file" && duration_ms == 42));
+        assert!(
+            matches!(parse_stderr_line(line), CliProgress::ToolDone { name, duration_ms } if name == "read_file" && duration_ms == 42)
+        );
     }
 
     #[test]
@@ -1319,19 +1327,25 @@ model: claude-sonnet-4-6"#;
     #[test]
     fn parse_unicode_tool_name() {
         let line = r#"{"type":"tool_started","name":"读取文件","description":"src/main.rs"}"#;
-        assert!(matches!(parse_stderr_line(line), CliProgress::ToolStarted { name } if name == "读取文件"));
+        assert!(
+            matches!(parse_stderr_line(line), CliProgress::ToolStarted { name } if name == "读取文件")
+        );
     }
 
     #[test]
     fn parse_null_fields_handled() {
         let line = r#"{"type":"tool_completed","name":"bash","description":null,"status":"ok","duration_ms":0,"output_summary":null}"#;
-        assert!(matches!(parse_stderr_line(line), CliProgress::ToolDone { name, .. } if name == "bash"));
+        assert!(
+            matches!(parse_stderr_line(line), CliProgress::ToolDone { name, .. } if name == "bash")
+        );
     }
 
     #[test]
     fn parse_thinking_chunk_event() {
         let line = r#"{"type":"thinking_chunk","text":"let me consider..."}"#;
-        assert!(matches!(parse_stderr_line(line), CliProgress::Status(t) if t == "let me consider..."));
+        assert!(
+            matches!(parse_stderr_line(line), CliProgress::Status(t) if t == "let me consider...")
+        );
     }
 
     #[test]

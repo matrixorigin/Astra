@@ -1,7 +1,7 @@
 //! MySQL-backed DurableTaskStore implementation for the gateway.
 
 use astra_core::durable_task_store::*;
-use sqlx::MySqlPool;
+use sqlx::{MySql, MySqlPool, QueryBuilder};
 
 pub struct MysqlDurableTaskStore {
     pool: MySqlPool,
@@ -30,6 +30,17 @@ type TaskRow = (
 const SELECT_COLS: &str = "SELECT task_id, name, description, owner_id, status, \
      progress_pct, step_description, checkpoint_json, error_message, \
      CAST(created_at AS CHAR), CAST(updated_at AS CHAR)";
+
+fn escape_like_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
 
 #[async_trait::async_trait]
 impl DurableTaskStore for MysqlDurableTaskStore {
@@ -70,37 +81,36 @@ impl DurableTaskStore for MysqlDurableTaskStore {
 
     async fn list(&self, filter: TaskFilter) -> Result<Vec<DurableTask>, String> {
         let limit = filter.limit.unwrap_or(50);
-        let rows: Vec<TaskRow> = match (&filter.owner_id, &filter.status) {
-            (Some(owner), Some(status)) => {
-                sqlx::query_as(
-                    &format!("{SELECT_COLS} FROM gw_durable_tasks WHERE owner_id = ? AND status = ? ORDER BY updated_at DESC LIMIT ?"),
-                )
-                .bind(owner).bind(status.as_str()).bind(limit)
-                .fetch_all(&self.pool).await
-            }
-            (Some(owner), None) => {
-                sqlx::query_as(
-                    &format!("{SELECT_COLS} FROM gw_durable_tasks WHERE owner_id = ? ORDER BY updated_at DESC LIMIT ?"),
-                )
-                .bind(owner).bind(limit)
-                .fetch_all(&self.pool).await
-            }
-            (None, Some(status)) => {
-                sqlx::query_as(
-                    &format!("{SELECT_COLS} FROM gw_durable_tasks WHERE status = ? ORDER BY updated_at DESC LIMIT ?"),
-                )
-                .bind(status.as_str()).bind(limit)
-                .fetch_all(&self.pool).await
-            }
-            (None, None) => {
-                sqlx::query_as(
-                    &format!("{SELECT_COLS} FROM gw_durable_tasks ORDER BY updated_at DESC LIMIT ?"),
-                )
-                .bind(limit)
-                .fetch_all(&self.pool).await
-            }
+        let mut query = QueryBuilder::<MySql>::new(SELECT_COLS);
+        query.push(" FROM gw_durable_tasks");
+
+        let mut has_where = false;
+        if let Some(owner) = &filter.owner_id {
+            query.push(if has_where { " AND " } else { " WHERE " });
+            has_where = true;
+            query.push("owner_id = ").push_bind(owner);
         }
-        .map_err(|e| format!("list tasks failed: {e}"))?;
+        if let Some(status) = filter.status {
+            query.push(if has_where { " AND " } else { " WHERE " });
+            has_where = true;
+            query.push("status = ").push_bind(status.as_str());
+        }
+        if let Some(prefix) = &filter.id_prefix {
+            query.push(if has_where { " AND " } else { " WHERE " });
+            query
+                .push("task_id LIKE ")
+                .push_bind(format!("{}%", escape_like_literal(prefix)))
+                .push(" ESCAPE '\\\\'");
+        }
+        query
+            .push(" ORDER BY updated_at DESC LIMIT ")
+            .push_bind(limit);
+
+        let rows: Vec<TaskRow> = query
+            .build_query_as()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("list tasks failed: {e}"))?;
 
         Ok(rows.into_iter().map(row_to_task).collect())
     }
@@ -312,5 +322,10 @@ mod tests {
         );
         let task = row_to_task(row);
         assert_eq!(task.status, DurableTaskStatus::Created);
+    }
+
+    #[test]
+    fn escape_like_literal_escapes_wildcards() {
+        assert_eq!(escape_like_literal(r"a%b_c\d"), r"a\%b\_c\\d");
     }
 }

@@ -182,9 +182,6 @@ async fn main() {
     let (cron_tx, cron_rx) = tokio::sync::mpsc::channel(64);
     runner.set_outbound_tx(cron_tx.clone());
 
-    // Sweep stale running tasks from previous gateway process
-    runner.sweep_stale_tasks().await;
-
     // Start cron scheduler (only if DB available)
     if let Some(pool) = runner.pool() {
         let scheduler =
