@@ -833,7 +833,11 @@ impl<'a> TraceWriter<'a> {
             }),
         )
         .await?;
-        self.complete_request().await
+        // Try to mark request completed, but ignore failures — the request
+        // may already be in a terminal state (e.g. failed by startup sweep)
+        // and the outbox delivery still succeeded.
+        let _ = self.complete_request().await;
+        Ok(())
     }
 
     pub async fn mark_outbox_failed(
@@ -2876,5 +2880,41 @@ mod tests {
 
         let outbox = repo.get_outbox(&outbox_id).await.unwrap().unwrap();
         assert_eq!(outbox.retry_count, 0);
+    }
+
+    #[tokio::test]
+    async fn mark_outbox_sent_succeeds_when_request_already_failed() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wx", "c1", "astra");
+        let req = GatewayRequest::new(conv.clone(), "m1", "u1", "test");
+        let req_id = req.request_id.clone();
+        let writer = TraceWriter::begin(&repo, req).await.unwrap();
+        let run_id = writer.start_run("astra", None).await.unwrap();
+        writer
+            .finish_run(&run_id, RunStatus::Succeeded, Some(0), None)
+            .await
+            .unwrap();
+        let outbox_id = writer
+            .enqueue_outbox("wx", "c1", None, "hello")
+            .await
+            .unwrap();
+
+        // Simulate startup sweep: force request to failed (as sweep_stale_requests does)
+        repo.update_request_status(&req_id, RequestStatus::Failed, Some("gateway restarted"))
+            .await
+            .unwrap();
+        let r = repo.get_request(&req_id).await.unwrap().unwrap();
+        assert_eq!(r.status, RequestStatus::Failed);
+
+        // Now outbox replay delivers successfully — mark_outbox_sent must NOT fail
+        writer.mark_outbox_sent(&outbox_id, 1).await.unwrap();
+
+        // Outbox is marked sent
+        let outbox = repo.get_outbox(&outbox_id).await.unwrap().unwrap();
+        assert_eq!(outbox.status, OutboxStatus::Sent);
+
+        // Request stays failed (terminal state unchanged — that's correct)
+        let r = repo.get_request(&req_id).await.unwrap().unwrap();
+        assert_eq!(r.status, RequestStatus::Failed);
     }
 }
