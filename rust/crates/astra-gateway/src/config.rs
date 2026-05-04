@@ -37,6 +37,10 @@ pub struct GatewayConfig {
     /// Group chat: require @mention to activate (reduces noise).
     #[serde(default)]
     pub group_require_mention: bool,
+    /// Bot display name for @mention matching in group chats (e.g. "Astra").
+    /// When empty, any @mention triggers the bot.
+    #[serde(default)]
+    pub bot_name: String,
     /// Directories to scan for git projects (e.g. ["~/github", "~/work"]).
     #[serde(default)]
     pub project_dirs: Vec<String>,

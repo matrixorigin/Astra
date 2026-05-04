@@ -259,7 +259,17 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     return Some(denial);
                 }
                 // Parse: /cron add "0 9 * * 1-5" 每天早上9点汇报
-                let (cron_expr, message) = parse_cron_add(rest)?;
+                let (cron_expr, message) = match parse_cron_add(rest) {
+                    Some(parsed) => parsed,
+                    None => {
+                        return Some(
+                            "⚠️ 格式错误。用法:\n\
+                             `/cron add \"0 9 * * 1-5\" 每天早上9点汇报`\n\
+                             `/cron add 0 9 * * * 每天早上9点汇报`"
+                                .into(),
+                        );
+                    }
+                };
                 let job_id = uuid::Uuid::new_v4().to_string();
                 let pool = require_db!(ctx);
                 match storage::create_cron_job(
@@ -446,7 +456,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
         "/help" => Some(
             "💡 **命令列表**\n\n\
              **对话**\n\
-             `/new` — 新建会话\n\
+             `/new` (`/reset`) — 新建会话\n\
              `/session list` — 历史会话\n\
              `/session switch <id>` — 切换会话\n\n\
              **模型**\n\
@@ -455,13 +465,20 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              **CLI**\n\
              `/cli` — 查看当前 CLI + 能力 + 工作目录\n\
              `/cli <name>` — 切换 CLI (astra/claude)\n\
-             `/workspace <path>` — 切换工作目录\n\
+             `/workspace` (`/ws`) `<path>` — 切换工作目录\n\
              `/running` — 查看正在执行的任务\n\
+             `/cancel` — 取消排队中的请求\n\
              `/usage` — 用量统计\n\n\
              **监控**\n\
              `/status` — 状态 + harness\n\
              `/inspect` — harness 详情 (token/cost/tools/warnings)\n\
-             `/audit` — 审计记录 (最近 N 轮决策链)\n\n\
+             `/audit` — 审计记录 (最近 N 轮决策链)\n\
+             `/trace [id]` — 查看 trace 详情\n\n\
+             **持久任务**\n\
+             `/task list` — 查看任务\n\
+             `/task status <id>` — 任务状态\n\
+             `/task cancel <id>` — 取消任务\n\
+             `/task resume <id>` — 恢复任务\n\n\
              **定时任务**\n\
              `/cron list` — 查看任务\n\
              `/cron add <expr> <msg>` — 创建\n\
@@ -1424,6 +1441,7 @@ mod tests {
             max_concurrent_runs: 4,
             group_sessions_per_user: true,
             group_require_mention: false,
+            bot_name: String::new(),
             project_dirs: vec![],
         }
     }
@@ -1463,9 +1481,14 @@ mod tests {
     cmd_test!(cmd_help_returns_command_list, "/help", |r| {
         let s = r.unwrap();
         assert!(s.contains("命令列表"));
-        assert!(s.contains("/new"));
-        assert!(s.contains("/model"));
-        assert!(s.contains("/session"));
+        assert!(s.contains("/new"), "missing /new");
+        assert!(s.contains("/reset"), "missing /reset alias");
+        assert!(s.contains("/model"), "missing /model");
+        assert!(s.contains("/session"), "missing /session");
+        assert!(s.contains("/task"), "missing /task");
+        assert!(s.contains("/trace"), "missing /trace");
+        assert!(s.contains("/cancel"), "missing /cancel");
+        assert!(s.contains("/ws"), "missing /ws alias");
     });
     cmd_test!(cmd_approve_returns_info, "/approve", |r| {
         assert!(r.unwrap().contains("工具权限"));
@@ -1510,5 +1533,25 @@ mod tests {
     });
     cmd_test!(cmd_status_works_without_db, "/status", |r| {
         assert!(r.unwrap().contains("astra"));
+    });
+    cmd_test!(
+        cmd_cron_add_malformed_gives_error,
+        "/cron add badformat",
+        |r| {
+            let s = r.unwrap();
+            assert!(s.contains("格式错误"), "should show format error, got: {s}");
+        }
+    );
+    cmd_test!(cmd_inspect_requires_db, "/inspect", |r| {
+        assert!(r.unwrap().contains("数据库"));
+    });
+    cmd_test!(cmd_audit_requires_db, "/audit", |r| {
+        assert!(r.unwrap().contains("数据库"));
+    });
+    cmd_test!(cmd_trace_requires_trace_repo, "/trace", |r| {
+        assert!(r.unwrap().contains("数据库"));
+    });
+    cmd_test!(cmd_cancel_requires_trace_repo, "/cancel", |r| {
+        assert!(r.unwrap().contains("数据库"));
     });
 }

@@ -513,6 +513,10 @@ pub trait TraceRepository: Send + Sync {
         limit: u32,
     ) -> TraceResult<Vec<ActiveRequestSummary>>;
 
+    /// Fail all requests stuck in Accepted or Running (orphaned by restart).
+    /// Returns the count of swept requests.
+    async fn sweep_stale_requests(&self, reason: &str) -> TraceResult<u64>;
+
     async fn gateway_status(
         &self,
         conversation: &ConversationKey,
@@ -1465,6 +1469,18 @@ impl TraceRepository for MysqlTraceRepository {
             )
             .collect())
     }
+
+    async fn sweep_stale_requests(&self, reason: &str) -> TraceResult<u64> {
+        let result = sqlx::query(
+            "UPDATE gw_trace_requests SET status = 'failed', error_message = ?, updated_at = NOW(6)
+             WHERE status IN ('accepted', 'running')",
+        )
+        .bind(reason)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("sweep stale requests failed: {e}"))?;
+        Ok(result.rows_affected())
+    }
 }
 
 #[cfg(test)]
@@ -1752,6 +1768,20 @@ impl TraceRepository for InMemoryTraceRepository {
             })
             .collect())
     }
+
+    async fn sweep_stale_requests(&self, reason: &str) -> TraceResult<u64> {
+        let mut state = self.state.lock().unwrap();
+        let mut count = 0u64;
+        for (request, _) in state.requests.values_mut() {
+            if request.status == RequestStatus::Accepted || request.status == RequestStatus::Running
+            {
+                request.status = RequestStatus::Failed;
+                request.error_message = Some(reason.to_string());
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
 }
 
 #[cfg(test)]
@@ -2013,5 +2043,40 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn sweep_stale_requests_fails_accepted_and_running() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wecom", "chat-1", "astra");
+
+        // Create one Accepted, one Running
+        let req1 = GatewayRequest::new(conv.clone(), "msg-1", "u1", "hello");
+        let req1_id = req1.request_id.clone();
+        TraceWriter::begin(&repo, req1).await.unwrap();
+
+        let req2 = GatewayRequest::new(conv.clone(), "msg-2", "u1", "world");
+        let req2_id = req2.request_id.clone();
+        let writer2 = TraceWriter::begin(&repo, req2).await.unwrap();
+        writer2.mark_running().await.unwrap();
+
+        // Sweep
+        let swept = repo
+            .sweep_stale_requests("gateway restarted")
+            .await
+            .unwrap();
+        assert_eq!(swept, 2);
+
+        // Both should be Failed
+        let r1 = repo.get_request(&req1_id).await.unwrap().unwrap();
+        assert_eq!(r1.status, RequestStatus::Failed);
+        assert_eq!(r1.error_message.as_deref(), Some("gateway restarted"));
+
+        let r2 = repo.get_request(&req2_id).await.unwrap().unwrap();
+        assert_eq!(r2.status, RequestStatus::Failed);
+
+        // Second sweep should return 0
+        let swept2 = repo.sweep_stale_requests("again").await.unwrap();
+        assert_eq!(swept2, 0);
     }
 }

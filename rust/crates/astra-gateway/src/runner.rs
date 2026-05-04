@@ -265,6 +265,16 @@ impl GatewayRunner {
         }
     }
 
+    pub async fn sweep_stale_traces(&self) {
+        if let Some(ref repo) = self.trace_repo {
+            match repo.sweep_stale_requests("gateway restarted").await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(count = n, "swept stale trace requests → failed"),
+                Err(e) => tracing::warn!(error = %e, "failed to sweep stale traces"),
+            }
+        }
+    }
+
     pub fn set_outbound_tx(&mut self, tx: tokio::sync::mpsc::Sender<OutboundMessage>) {
         self.outbound_tx = Some(tx);
     }
@@ -312,8 +322,7 @@ impl GatewayRunner {
         // Group chat: require @mention if configured
         if msg.chat_type == crate::platforms::ChatType::Group
             && self.config.group_require_mention
-            && !msg.text.contains("@bot")
-            && !msg.text.contains("@Bot")
+            && !is_mentioned(&msg.text, &self.config.bot_name)
         {
             return Ok(None);
         }
@@ -1450,6 +1459,8 @@ impl GatewayRunner {
         for (idx, adapter) in adapters.iter().enumerate() {
             adapter_indices.insert(adapter.name(), idx);
         }
+        self.sweep_stale_tasks().await;
+        self.sweep_stale_traces().await;
         self.replay_retryable_outbox(&adapters, &adapter_indices)
             .await;
         for adapter in &adapters {
@@ -2580,6 +2591,23 @@ mod tests {
         assert!(secs <= 10, "too slow = feels laggy");
     }
 
+    // ── is_mentioned tests ────────────────────────────────────
+
+    #[test]
+    fn mentioned_with_bot_name() {
+        assert!(is_mentioned("hello @Astra help", "Astra"));
+        assert!(is_mentioned("@astra", "Astra"));
+        assert!(!is_mentioned("hello world", "Astra"));
+        assert!(!is_mentioned("@someone else", "Astra"));
+    }
+
+    #[test]
+    fn mentioned_empty_bot_name_matches_any_at() {
+        assert!(is_mentioned("@anyone", ""));
+        assert!(is_mentioned("hey @bot", ""));
+        assert!(!is_mentioned("hello world", ""));
+    }
+
     // ── Think tag filtering ──────────────────────────────────────
 
     #[test]
@@ -3121,6 +3149,18 @@ fn format_tokens(n: u64) -> String {
         format!("{:.1}k", n as f64 / 1e3)
     } else {
         format!("{n}")
+    }
+}
+
+/// Check if the message text contains an @mention for the bot.
+/// When `bot_name` is non-empty, matches `@{bot_name}` (case-insensitive).
+/// When `bot_name` is empty, matches any `@` followed by a word character.
+fn is_mentioned(text: &str, bot_name: &str) -> bool {
+    if bot_name.is_empty() {
+        text.contains('@')
+    } else {
+        let pattern = format!("@{}", bot_name);
+        text.to_lowercase().contains(&pattern.to_lowercase())
     }
 }
 
