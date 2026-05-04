@@ -591,7 +591,8 @@ pub(super) async fn fetch_model_list(
 ) -> Result<Vec<String>, String> {
     let tok = token.ok_or_else(|| "Not logged in".to_string())?;
     let body = api.get_models_text(tok).await.map_err(|e| format!("{e}"))?;
-    let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("Failed to parse model list response: {e}"))?;
     let models = value
         .as_array()
         .cloned()

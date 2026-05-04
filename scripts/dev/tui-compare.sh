@@ -4,7 +4,7 @@
 
 set -e
 
-ASTRA_BIN="/home/mo/hanfeng/astra/rust/target/release/astra"
+ASTRA_BIN="${ASTRA_BIN:-$(cd "$(dirname "$0")/../.." && pwd)/rust/target/release/astra}"
 CODEX_BIN=$(which codex 2>/dev/null || echo "")
 WIDTH=100
 HEIGHT=30
@@ -58,8 +58,9 @@ rm -rf /tmp/tui-compare
 mkdir -p /tmp/tui-compare
 
 # Run Astra
+ASTRA_DIR=$(dirname "$ASTRA_BIN")
 capture_session "astra" "$ASTRA_BIN --tui --yes" \
-  'PATH="/home/mo/hanfeng/astra/rust/target/release:$PATH" NO_PROXY="*" ASTRA_API_URL=http://localhost:28000'
+  "PATH=\"${ASTRA_DIR}:\$PATH\" NO_PROXY=\"*\" ASTRA_API_URL=http://localhost:28000"
 
 # Run Codex (if available)
 if [ -n "$CODEX_BIN" ]; then
@@ -87,7 +88,7 @@ if [ -d "/tmp/tui-compare/codex" ]; then
   echo "  SIDE-BY-SIDE DIFF (last 10 lines)"
   echo "============================================"
   for f in /tmp/tui-compare/astra/*.txt; do
-    local base=$(basename "$f")
+    base=$(basename "$f")
     if [ -f "/tmp/tui-compare/codex/$base" ]; then
       echo ""
       echo "--- $base ---"

@@ -464,7 +464,14 @@ async fn run_chat_repl(
                         let autorun = trimmed == "!" || trimmed == "all" || trimmed == "yolo";
                         let denied = trimmed == "n" || trimmed == "no";
                         if approved || autorun || denied {
-                            let response = if autorun { chat_stream::ApprovalResponse::AutoRunSession } else { chat_stream::ApprovalResponse::AllowOnce }; let _ = tx.send(response);
+                            let response = if autorun {
+                                chat_stream::ApprovalResponse::AutoRunSession
+                            } else if denied {
+                                chat_stream::ApprovalResponse::Deny
+                            } else {
+                                chat_stream::ApprovalResponse::AllowOnce
+                            };
+                            let _ = tx.send(response);
                             if autorun {
                                 state
                                     .perm_manager

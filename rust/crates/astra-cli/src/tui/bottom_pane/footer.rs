@@ -56,8 +56,9 @@ impl Footer {
             if !right_parts.is_empty() {
                 right_parts.push(sep.clone());
             }
-            let display = if cwd.len() > 25 {
-                format!("…{}", &cwd[cwd.len() - 24..])
+            let display = if cwd.chars().count() > 25 {
+                let suffix: String = cwd.chars().rev().take(24).collect::<Vec<_>>().into_iter().rev().collect();
+                format!("…{suffix}")
             } else {
                 cwd.clone()
             };

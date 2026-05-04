@@ -128,8 +128,9 @@ pub fn render_diff_lines(diff_text: &str, max_lines: usize) -> Vec<Line<'static>
         }
     }
 
-    if diff_text.lines().count() > max_lines {
-        let remaining = diff_text.lines().count() - max_lines;
+    let total_lines = diff_text.lines().count();
+    if total_lines > max_lines {
+        let remaining = total_lines - max_lines;
         lines.push(Line::from(Span::styled(
             format!("    … +{remaining} more lines"),
             Style::default().fg(Color::DarkGray),
