@@ -216,6 +216,99 @@ mod tests {
     }
 
     #[test]
+    fn action_policy_denies_slash_mutations_when_disabled() {
+        let policy = ActionPolicy {
+            allow_slash_mutations: false,
+            allow_model_generated_mutations: true,
+            workspace_roots: Vec::new(),
+        };
+        assert!(
+            policy
+                .check(ActionSource::SlashCommand, ActionCapability::CronMutation)
+                .is_err(),
+            "slash mutations should be denied"
+        );
+        assert!(
+            policy
+                .check(ActionSource::ModelGenerated, ActionCapability::CronMutation)
+                .is_ok(),
+            "model mutations should still be allowed"
+        );
+    }
+
+    #[test]
+    fn workspace_roots_blocks_outside_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().join("projects");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let outside = dir.path().join("secrets");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let policy = ActionPolicy {
+            allow_slash_mutations: true,
+            allow_model_generated_mutations: true,
+            workspace_roots: vec![allowed.to_string_lossy().to_string()],
+        };
+
+        assert!(policy.workspace_allowed(&allowed).is_ok());
+        assert!(
+            policy.workspace_allowed(&outside).is_err(),
+            "path outside workspace_roots should be denied"
+        );
+    }
+
+    #[test]
+    fn workspace_roots_allows_subdirectories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        let sub = root.join("project-a");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let policy = ActionPolicy {
+            allow_slash_mutations: true,
+            allow_model_generated_mutations: true,
+            workspace_roots: vec![root.to_string_lossy().to_string()],
+        };
+
+        assert!(
+            policy.workspace_allowed(&sub).is_ok(),
+            "subdirectory of workspace root should be allowed"
+        );
+    }
+
+    #[test]
+    fn workspace_roots_empty_allows_any() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = ActionPolicy::default();
+        assert!(
+            policy.workspace_allowed(dir.path()).is_ok(),
+            "empty workspace_roots should allow any path"
+        );
+    }
+
+    #[test]
+    fn workspace_roots_rejects_traversal_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("safe");
+        std::fs::create_dir_all(&root).unwrap();
+        let traversal = root.join("../../etc");
+
+        let policy = ActionPolicy {
+            allow_slash_mutations: true,
+            allow_model_generated_mutations: true,
+            workspace_roots: vec![root.to_string_lossy().to_string()],
+        };
+
+        // /etc exists on linux, but it's not under root
+        if traversal.exists() {
+            assert!(
+                policy.workspace_allowed(&traversal).is_err(),
+                "path traversal should be blocked"
+            );
+        }
+    }
+
+    #[test]
     fn action_policy_denies_model_mutations_when_disabled() {
         let policy = ActionPolicy {
             allow_slash_mutations: true,

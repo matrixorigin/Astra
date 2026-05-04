@@ -291,16 +291,17 @@ impl HarnessKernel for RecordingKernel {
                 if trace.session_id.is_none() && !record.session_id.is_empty() {
                     trace.session_id = Some(record.session_id.clone());
                 }
-                if let Some(bound_session_id) = trace.session_id.as_deref() {
-                    if !record.session_id.is_empty() && bound_session_id != record.session_id {
-                        tracing::error!(
-                            trace_session_id = bound_session_id,
-                            record_session_id = %record.session_id,
-                            "RecordingKernel rejected mismatched session_id"
-                        );
-                        trace.outcome = TraceOutcome::Error;
-                        return HookVerdict::Continue;
-                    }
+                if let Some(bound_session_id) = trace.session_id.as_deref()
+                    && !record.session_id.is_empty()
+                    && bound_session_id != record.session_id
+                {
+                    tracing::error!(
+                        trace_session_id = bound_session_id,
+                        record_session_id = %record.session_id,
+                        "RecordingKernel rejected mismatched session_id"
+                    );
+                    trace.outcome = TraceOutcome::Error;
+                    return HookVerdict::Continue;
                 }
                 if record.point == HookPoint::SessionStart {
                     trace.started_at_unix_millis = record.wall_time_unix_millis;

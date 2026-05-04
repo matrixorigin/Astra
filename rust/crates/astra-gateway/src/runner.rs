@@ -186,9 +186,10 @@ impl GatewayRunner {
             tracing::info!(count = projects.len(), "discovered projects");
         }
 
-        // Ensure usage tracking table
-        if let Some(ref pool) = pool {
-            let _ = crate::usage::ensure_usage_table(pool).await;
+        if let Some(ref pool) = pool
+            && let Err(e) = crate::usage::ensure_usage_table(pool).await
+        {
+            tracing::warn!(error = %e, "failed to ensure usage tracking table");
         }
         let max_concurrent_runs = config.max_concurrent_runs.max(1);
 
@@ -379,9 +380,10 @@ impl GatewayRunner {
 
         let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
 
-        // Ensure user exists (if DB available)
-        if let Some(ref pool) = self.pool {
-            let _ = storage::upsert_user(pool, msg.platform, &msg.user_id, &msg.user_id).await;
+        if let Some(ref pool) = self.pool
+            && let Err(e) = storage::upsert_user(pool, msg.platform, &msg.user_id, &msg.user_id).await
+        {
+            tracing::warn!(error = %e, "failed to upsert user");
         }
 
         let cli_name = cli_profile.name().to_string();
@@ -397,14 +399,18 @@ impl GatewayRunner {
             let last_utc = last_active.and_utc();
             let now = chrono::Utc::now();
             if self.config.session_reset.should_reset(last_utc, now) {
-                let _ = storage::reset_session_for_cli(
+                if let Err(e) = storage::reset_session_for_cli(
                     pool,
                     msg.platform,
                     &effective_chat_id,
                     &cli_name,
                 )
-                .await;
-                tracing::info!(cli = cli_name, "session auto-reset by policy");
+                .await
+                {
+                    tracing::warn!(error = %e, "session auto-reset failed");
+                } else {
+                    tracing::info!(cli = cli_name, "session auto-reset by policy");
+                }
             }
         }
 
@@ -790,18 +796,18 @@ impl GatewayRunner {
                             .await;
                     }
                     // Save new session
-                    if let Some(ref pool) = self.pool {
-                        if let Some(ref sid) = retry_result.session_id {
-                            let _ = storage::set_current_session_for_cli(
-                                pool,
-                                msg.platform,
-                                &effective_chat_id,
-                                &msg.user_id,
-                                sid,
-                                &cli_name,
-                            )
-                            .await;
-                        }
+                    if let Some(ref pool) = self.pool
+                        && let Some(ref sid) = retry_result.session_id
+                    {
+                        let _ = storage::set_current_session_for_cli(
+                            pool,
+                            msg.platform,
+                            &effective_chat_id,
+                            &msg.user_id,
+                            sid,
+                            &cli_name,
+                        )
+                        .await;
                     }
                     let text = retry_result
                         .text
@@ -1193,6 +1199,7 @@ impl GatewayRunner {
                 let _ = cli_resp_tx.send(outbound).await;
             }
         }
+        self.queue_senders.lock().await.remove(&key);
         tracing::debug!(conversation = %key, "conversation worker stopped");
     }
 
@@ -1624,22 +1631,24 @@ async fn execute_gateway_actions_with_policy(
     action_policy: &crate::access_control::ActionPolicy,
     action_results: &mut Vec<String>,
 ) -> String {
-    let re = regex::Regex::new(r"\[\[GATEWAY:([^\]]+)\]\]").unwrap();
+    static RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?s)\[\[GATEWAY:(.*?)\]\]").unwrap());
+    let re = &*RE;
     let mut clean = text.to_string();
 
     for cap in re.captures_iter(text) {
         let full_match = cap.get(0).unwrap().as_str();
         let inner = &cap[1];
         let parts: Vec<&str> = inner.splitn(3, ':').collect();
-        if let Some(capability) = action_capability(parts.first().copied().unwrap_or_default()) {
-            if let Err(denial) = action_policy.check(
+        if let Some(capability) = action_capability(parts.first().copied().unwrap_or_default())
+            && let Err(denial) = action_policy.check(
                 crate::access_control::ActionSource::ModelGenerated,
                 capability,
-            ) {
-                action_results.push(denial);
-                clean = clean.replace(full_match, "");
-                continue;
-            }
+            )
+        {
+            action_results.push(denial);
+            clean = clean.replace(full_match, "");
+            continue;
         }
 
         let result = match parts.first().copied() {
@@ -1705,14 +1714,16 @@ async fn execute_gateway_actions_with_policy(
                     .await
                     {
                         Ok(()) => {
-                            // Override next_run to the computed time
-                            let _ = sqlx::query(
+                            if let Err(e) = sqlx::query(
                                 "UPDATE gw_cron_jobs SET next_run = ? WHERE job_id = ?",
                             )
                             .bind(&next_run_str)
                             .bind(&job_id)
                             .execute(pool)
-                            .await;
+                            .await
+                            {
+                                tracing::warn!(job_id = %&job_id[..8], error = %e, "failed to set remind_after next_run");
+                            }
                             tracing::info!(minutes, msg = %message, job_id = &job_id[..8], "remind_after → cron job");
                             let time_str = if minutes >= 60 {
                                 let h = minutes / 60;
@@ -2041,8 +2052,12 @@ async fn execute_gateway_actions_with_policy(
                         dir.to_string()
                     };
                     let path = std::path::Path::new(&expanded);
-                    if !path.is_dir() {
-                        let _ = std::fs::create_dir_all(path);
+                    if !path.is_dir()
+                        && let Err(e) = std::fs::create_dir_all(path)
+                    {
+                        action_results.push(format!("⚠️ 创建 skill 目录失败: {e}"));
+                        clean = clean.replace(full_match, "");
+                        continue;
                     }
                     let file = path.join(format!("{name}.md"));
                     match std::fs::write(&file, content) {
@@ -2075,16 +2090,21 @@ async fn execute_gateway_actions_with_policy(
                         .canonicalize()
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or(expanded);
-                    let _ = storage::set_user_preference(
+                    match storage::set_user_preference(
                         pool,
                         platform,
                         user_id,
                         "workspace",
                         &canonical,
                     )
-                    .await;
-                    tracing::info!(workspace = %canonical, "gateway action: workspace_set");
-                    format!("📂 工作目录已切换: `{canonical}`")
+                    .await
+                    {
+                        Ok(()) => {
+                            tracing::info!(workspace = %canonical, "gateway action: workspace_set");
+                            format!("📂 工作目录已切换: `{canonical}`")
+                        }
+                        Err(e) => format!("⚠️ 保存工作目录失败: {e}"),
+                    }
                 } else {
                     "⚠️ 需要数据库支持".into()
                 }
@@ -2494,6 +2514,90 @@ async fn action_dtask_cancel_no_db() {
     let mut r = Vec::new();
     execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
     assert!(r[0].contains("数据库"), "{}", r[0]);
+}
+
+// ── Fix #1: Regex handles JSON with `]` chars (arrays/nested) ──
+
+#[tokio::test]
+async fn action_dtask_checkpoint_json_with_array() {
+    let text = r#"[[GATEWAY:dtask_checkpoint:tid:{"items":[1,2,3]}]]"#;
+    let mut r = Vec::new();
+    let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+    assert!(clean.is_empty(), "tags should be stripped, got: {clean}");
+    assert_eq!(r.len(), 1);
+    assert!(r[0].contains("数据库"), "expected no-db error, got: {}", r[0]);
+}
+
+#[tokio::test]
+async fn action_dtask_checkpoint_json_with_nested_brackets() {
+    let text = r#"[[GATEWAY:dtask_checkpoint:tid:{"a":{"b":[true]}}]]"#;
+    let mut r = Vec::new();
+    let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+    assert!(clean.is_empty(), "tags should be stripped, got: {clean}");
+    assert_eq!(r.len(), 1);
+}
+
+#[tokio::test]
+async fn action_tag_with_text_around_bracket_json() {
+    let text = r#"OK here:
+[[GATEWAY:dtask_checkpoint:tid:{"steps":["a","b"]}]]
+done"#;
+    let mut r = Vec::new();
+    let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+    assert_eq!(r.len(), 1);
+    assert!(!clean.contains("GATEWAY"), "tag should be removed: {clean}");
+    assert!(clean.contains("OK here"));
+    assert!(clean.contains("done"));
+}
+
+// ── Fix #4: allow_slash_mutations=false denial ──
+
+#[tokio::test]
+async fn action_policy_blocks_model_mutations_when_disabled() {
+    let text = "[[GATEWAY:cron_add:0 9 * * *:早上好]]";
+    let policy = crate::access_control::ActionPolicy {
+        allow_slash_mutations: true,
+        allow_model_generated_mutations: false,
+        workspace_roots: Vec::new(),
+    };
+    let mut r = Vec::new();
+    let clean = execute_gateway_actions_with_policy(
+        text,
+        None,
+        "wx",
+        "c1",
+        "u1",
+        None,
+        None,
+        &policy,
+        &mut r,
+    )
+    .await;
+    assert!(clean.is_empty(), "tag should be stripped: {clean}");
+    assert_eq!(r.len(), 1);
+    assert!(r[0].contains("拒绝"), "expected denial, got: {}", r[0]);
+}
+
+#[tokio::test]
+async fn action_policy_allows_when_enabled() {
+    let text = "[[GATEWAY:cron_add:0 9 * * *:test]]";
+    let policy = crate::access_control::ActionPolicy::default();
+    let mut r = Vec::new();
+    let clean = execute_gateway_actions_with_policy(
+        text,
+        None,
+        "wx",
+        "c1",
+        "u1",
+        None,
+        None,
+        &policy,
+        &mut r,
+    )
+    .await;
+    assert!(clean.is_empty());
+    assert_eq!(r.len(), 1);
+    assert!(r[0].contains("数据库"), "expected no-db fallback, got: {}", r[0]);
 }
 
 fn format_tokens(n: u64) -> String {

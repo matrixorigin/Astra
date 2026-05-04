@@ -79,8 +79,12 @@ impl CronScheduler {
                     .unwrap_or_else(|_| {
                         OutboundMessage::plain(platform.clone(), chat_id.clone(), text)
                     });
-                let _ = self.outbound_tx.send(outbound).await;
-                let _ = storage::delete_cron_job(&self.pool, &job_id).await;
+                if let Err(e) = self.outbound_tx.send(outbound).await {
+                    tracing::warn!(job_id = %job_id, error = %e, "failed to send one-shot reminder");
+                }
+                if let Err(e) = storage::delete_cron_job(&self.pool, &job_id).await {
+                    tracing::error!(job_id = %job_id, error = %e, "failed to delete one-shot cron job — will re-fire next tick");
+                }
                 continue;
             }
 
@@ -113,11 +117,13 @@ impl CronScheduler {
 
             let response = match cli_future.await {
                 Ok(r) => {
-                    if let Some(ref sid) = r.session_id {
-                        let _ = storage::set_current_session_for_cli(
+                    if let Some(ref sid) = r.session_id
+                        && let Err(e) = storage::set_current_session_for_cli(
                             &self.pool, &platform, &chat_id, "", sid, &cli_name,
                         )
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(error = %e, "scheduler: failed to save session");
                     }
                     if let Some(writer) = trace.as_ref()
                         && let Some(ref run_id) = run_id
@@ -127,19 +133,23 @@ impl CronScheduler {
                         } else {
                             RunStatus::Failed
                         };
-                        let _ = writer
+                        if let Err(e) = writer
                             .finish_run(run_id, status, Some(r.exit_code), Some(&r.stderr))
-                            .await;
+                            .await
+                        {
+                            tracing::warn!(error = %e, "scheduler: failed to finish run trace");
+                        }
                     }
                     r.text.unwrap_or(r.stdout)
                 }
                 Err(e) => {
                     if let Some(writer) = trace.as_ref()
                         && let Some(ref run_id) = run_id
-                    {
-                        let _ = writer
+                        && let Err(te) = writer
                             .finish_run(run_id, RunStatus::Failed, None, Some(&e))
-                            .await;
+                            .await
+                    {
+                        tracing::warn!(error = %te, "scheduler: failed to finish run trace");
                     }
                     format!("⚠️ 执行失败: {e}")
                 }
@@ -153,7 +163,7 @@ impl CronScheduler {
                     .await
                 {
                     Ok(outbox_id) => {
-                        let _ = self
+                        if let Err(e) = self
                             .outbound_tx
                             .send(OutboundMessage::with_outbox(
                                 platform.clone(),
@@ -166,22 +176,28 @@ impl CronScheduler {
                                     request_id: writer.request_id().clone(),
                                 },
                             ))
-                            .await;
+                            .await
+                        {
+                            tracing::warn!(error = %e, "scheduler: outbound send failed");
+                        }
                     }
                     Err(e) => tracing::warn!(error = %e, "scheduler outbox enqueue failed"),
                 }
-            } else {
-                let _ = self
-                    .outbound_tx
-                    .send(OutboundMessage::plain(
-                        platform.clone(),
-                        chat_id.clone(),
-                        body,
-                    ))
-                    .await;
+            } else if let Err(e) = self
+                .outbound_tx
+                .send(OutboundMessage::plain(
+                    platform.clone(),
+                    chat_id.clone(),
+                    body,
+                ))
+                .await
+            {
+                tracing::warn!(error = %e, "scheduler: outbound send failed");
             }
 
-            let _ = storage::mark_job_run(&self.pool, &job_id, &cron_expr).await;
+            if let Err(e) = storage::mark_job_run(&self.pool, &job_id, &cron_expr).await {
+                tracing::warn!(job_id = %job_id, error = %e, "scheduler: failed to mark job run");
+            }
         }
     }
 
@@ -250,6 +266,7 @@ impl CronScheduler {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn enqueue_scheduler_outbox(
         &self,
         job_id: &str,
