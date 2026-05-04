@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 const MAX_CHUNK_LEN: usize = 3800;
 const INITIAL_ACK_DELAY: Duration = Duration::from_secs(3);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
-const PROGRESSIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(4);
-const PROGRESSIVE_MIN_CHARS: usize = 80;
+const PROGRESSIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(8);
+const PROGRESSIVE_MIN_CHARS: usize = 200;
 
 /// Outbound message from CLI, scheduler, or other background tasks.
 #[derive(Debug, Clone)]
@@ -615,7 +615,6 @@ impl GatewayRunner {
         let mut last_tool = String::new();
         let mut sent_initial_ack = false;
         let mut token_buf = String::new();
-        let mut streaming = false;
         let mut in_think_block = false;
         let mut progressive_text_len: usize = 0;
         let next_timer = tokio::time::sleep(INITIAL_ACK_DELAY);
@@ -656,7 +655,6 @@ impl GatewayRunner {
                 progress = progress_rx.recv() => {
                     match progress {
                         Some(CliProgress::Token(text)) => {
-                            streaming = true;
                             // Filter <think>...</think> blocks from token stream
                             let filtered = filter_think_tags(&text, &mut in_think_block);
                             if !filtered.is_empty() {
@@ -672,44 +670,21 @@ impl GatewayRunner {
                         }
                         Some(CliProgress::ToolStarted { ref name }) => {
                             tool_count += 1;
-                            if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
-                                progressive_text_len += len;
-                                fut.await;
+                            if !token_buf.is_empty() {
+                                token_buf.push('\n');
                             }
-                            let status = format!("🔧 {name}…");
-                            if let Some(ref tx) = self.outbound_tx {
-                                let _ = tx
-                                    .send(OutboundMessage::plain(msg.platform.to_string(), chat_id.clone(), status))
-                                    .await;
-                            }
+                            token_buf.push_str(&format!("🔧 {name}…\n"));
                             last_tool = name.clone();
-                            next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
                         }
                         Some(CliProgress::ToolDone { name, duration_ms }) => {
-                            let status = format!("✅ {name} ({duration_ms}ms)");
-                            if let Some(ref tx) = self.outbound_tx {
-                                let _ = tx
-                                    .send(OutboundMessage::plain(msg.platform.to_string(), chat_id.clone(), status))
-                                    .await;
-                            }
+                            token_buf.push_str(&format!("✅ {name} ({duration_ms}ms)\n"));
                             last_tool = name;
-                            next_timer.as_mut().reset(tokio::time::Instant::now() + PROGRESSIVE_FLUSH_INTERVAL);
                         }
                         Some(CliProgress::ToolCall(line)) => {
                             tool_count += 1;
                             last_tool = line;
                         }
-                        Some(CliProgress::Thinking(active)) => {
-                            if active && !streaming {
-                                if let Some(ref tx) = self.outbound_tx {
-                                    let _ = tx
-                                        .send(OutboundMessage::plain(msg.platform.to_string(), chat_id.clone(), format!("💭 {cli_name} 思考中…")))
-                                        .await;
-                                }
-                                sent_initial_ack = true;
-                                next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
-                            }
-                        }
+                        Some(CliProgress::Thinking(_)) => {}
                         Some(CliProgress::Status(_) | CliProgress::Stderr(_)) => {}
                         None => {
                             if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
