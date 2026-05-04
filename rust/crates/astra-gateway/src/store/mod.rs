@@ -437,13 +437,19 @@ pub fn model_preference_key(cli_name: &str) -> String {
 ///
 /// ```yaml
 /// storage:
-///   backend: mysql
+///   backend: matrixone          # or: mysql, sqlite, file, none
 ///   url: "mysql://root:111@127.0.0.1:6001/astra_gateway"
 /// ```
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "backend", rename_all = "snake_case")]
 pub enum StorageConfig {
+    /// MySQL-compatible backend (MySQL, MariaDB, MatrixOne, etc.).
     Mysql {
+        url: String,
+    },
+    /// Alias for `mysql` — MatrixOne is MySQL-protocol compatible.
+    #[serde(rename = "matrixone")]
+    MatrixOne {
         url: String,
     },
     Sqlite {
@@ -492,7 +498,7 @@ pub async fn open_store(
     config: &StorageConfig,
 ) -> Result<Option<Box<dyn GatewayStore>>, Box<dyn std::error::Error + Send + Sync>> {
     match config {
-        StorageConfig::Mysql { url } => {
+        StorageConfig::Mysql { url } | StorageConfig::MatrixOne { url } => {
             let store = mysql::MysqlGatewayStore::connect(url).await?;
             store.ensure_schema().await?;
             Ok(Some(Box::new(store)))
@@ -537,7 +543,7 @@ pub async fn open_store_bundle(
     config: &StorageConfig,
 ) -> Result<Option<StoreBundle>, Box<dyn std::error::Error + Send + Sync>> {
     match config {
-        StorageConfig::Mysql { url } => {
+        StorageConfig::Mysql { url } | StorageConfig::MatrixOne { url } => {
             let store = mysql::MysqlGatewayStore::connect(url).await?;
             store.ensure_schema().await?;
             store.ensure_usage_table().await?;
@@ -776,6 +782,26 @@ mod tests {
 url: "mysql://root:111@localhost/gw""#;
         let cfg: StorageConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(matches!(cfg, StorageConfig::Mysql { .. }));
+    }
+
+    #[test]
+    fn storage_config_deserialize_matrixone() {
+        let yaml = r#"backend: matrixone
+url: "mysql://root:111@127.0.0.1:6001/astra_gateway""#;
+        let cfg: StorageConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        match cfg {
+            StorageConfig::MatrixOne { url } => {
+                assert!(url.contains("6001"));
+            }
+            other => panic!("expected MatrixOne, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn storage_config_deserialize_matrixone_json() {
+        let json = r#"{"backend":"matrixone","url":"mysql://root@host/db"}"#;
+        let cfg: StorageConfig = serde_json::from_str(json).unwrap();
+        assert!(matches!(cfg, StorageConfig::MatrixOne { .. }));
     }
 
     #[test]
