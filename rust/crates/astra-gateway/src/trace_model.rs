@@ -529,6 +529,10 @@ pub trait TraceRepository: Send + Sync {
     /// Returns `Ok(true)` if the request was transitioned, `Ok(false)` if already terminal.
     async fn force_fail_request(&self, trace_id: &TraceId, reason: &str) -> TraceResult<bool>;
 
+    /// Dismiss all failed outbox entries for a request by marking them as `sent`.
+    /// Used by `/retry dismiss` to clear stuck outbox entries without re-sending.
+    async fn dismiss_failed_outbox(&self, request_id: &RequestId) -> TraceResult<()>;
+
     async fn gateway_status(
         &self,
         conversation: &ConversationKey,
@@ -1525,6 +1529,18 @@ impl TraceRepository for MysqlTraceRepository {
         .map_err(|e| format!("force fail request failed: {e}"))?;
         Ok(result.rows_affected() > 0)
     }
+
+    async fn dismiss_failed_outbox(&self, request_id: &RequestId) -> TraceResult<()> {
+        sqlx::query(
+            "UPDATE gw_trace_outbox SET status = 'sent', sent_at = NOW(6)
+             WHERE request_id = ? AND status = 'failed'",
+        )
+        .bind(request_id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("dismiss failed outbox failed: {e}"))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1860,6 +1876,17 @@ impl TraceRepository for InMemoryTraceRepository {
             }
         }
         Ok(false)
+    }
+
+    async fn dismiss_failed_outbox(&self, request_id: &RequestId) -> TraceResult<()> {
+        let mut state = self.state.lock().unwrap();
+        for outbox in state.outbox.values_mut() {
+            if outbox.request_id == *request_id && outbox.status == OutboxStatus::Failed {
+                outbox.status = OutboxStatus::Sent;
+                outbox.error_message = None;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2230,6 +2257,71 @@ mod tests {
             .await
             .unwrap();
         assert!(!result, "should return false for already-terminal request");
+    }
+
+    #[tokio::test]
+    async fn dismiss_failed_outbox_marks_as_sent() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wecom", "chat-1", "astra");
+        let req = GatewayRequest::new(conv, "msg-1", "u1", "hello");
+        let request_id = req.request_id.clone();
+        let writer = TraceWriter::begin(&repo, req).await.unwrap();
+        let run_id = writer.start_run("astra", None).await.unwrap();
+        writer
+            .finish_run(&run_id, RunStatus::Succeeded, Some(0), None)
+            .await
+            .unwrap();
+        let outbox_id = writer
+            .enqueue_outbox("wecom", "chat-1", None, "reply body")
+            .await
+            .unwrap();
+
+        // Mark outbox as failed
+        writer
+            .mark_outbox_failed(&outbox_id, "send error", 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.get_outbox(&outbox_id).await.unwrap().unwrap().status,
+            OutboxStatus::Failed
+        );
+
+        // Dismiss it
+        repo.dismiss_failed_outbox(&request_id).await.unwrap();
+        let outbox = repo.get_outbox(&outbox_id).await.unwrap().unwrap();
+        assert_eq!(outbox.status, OutboxStatus::Sent);
+        assert!(outbox.error_message.is_none());
+
+        // Should no longer appear in retryable list
+        assert!(
+            repo.list_retryable_outbox(Some("wecom"), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn dismiss_failed_outbox_ignores_non_failed() {
+        let repo = InMemoryTraceRepository::default();
+        let conv = ConversationKey::new("wecom", "chat-1", "astra");
+        let req = GatewayRequest::new(conv, "msg-1", "u1", "hello");
+        let request_id = req.request_id.clone();
+        let writer = TraceWriter::begin(&repo, req).await.unwrap();
+        let run_id = writer.start_run("astra", None).await.unwrap();
+        writer
+            .finish_run(&run_id, RunStatus::Succeeded, Some(0), None)
+            .await
+            .unwrap();
+        let outbox_id = writer
+            .enqueue_outbox("wecom", "chat-1", None, "pending body")
+            .await
+            .unwrap();
+
+        // Outbox is Pending, not Failed — dismiss should not change it
+        repo.dismiss_failed_outbox(&request_id).await.unwrap();
+        let outbox = repo.get_outbox(&outbox_id).await.unwrap().unwrap();
+        assert_eq!(outbox.status, OutboxStatus::Pending);
     }
 
     #[tokio::test]

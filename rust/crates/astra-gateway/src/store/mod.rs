@@ -240,6 +240,9 @@ pub trait GatewayStore: Send + Sync + 'static {
     /// from a cron expression.
     async fn update_cron_next_run(&self, job_id: &str, next_run: &str) -> Result<(), StoreError>;
 
+    /// Return the `user_id` that created a cron job, or `None` if not found.
+    async fn get_cron_job_user_id(&self, job_id: &str) -> Result<Option<String>, StoreError>;
+
     // ── Platform credentials ────────────────────────────────────────────
     async fn save_credential(
         &self,
@@ -1074,6 +1077,23 @@ url: "mysql://root:111@localhost/gw""#;
             .update_cron_next_run("j-test", "2099-12-31 23:59:59")
             .await
             .unwrap();
+
+        // get_cron_job_user_id
+        assert_eq!(
+            store
+                .get_cron_job_user_id("j-test")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("u1")
+        );
+        assert!(
+            store
+                .get_cron_job_user_id("nonexistent")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // Delete
         assert!(store.delete_cron_job("j-test").await.unwrap());

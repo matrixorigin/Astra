@@ -553,6 +553,15 @@ impl GatewayStore for SqliteGatewayStore {
         Ok(())
     }
 
+    async fn get_cron_job_user_id(&self, job_id: &str) -> Result<Option<String>, StoreError> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT user_id FROM gw_cron_jobs WHERE job_id = ?")
+                .bind(job_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(uid,)| uid))
+    }
+
     // ── Platform credentials ────────────────────────────────────────────
 
     async fn save_credential(

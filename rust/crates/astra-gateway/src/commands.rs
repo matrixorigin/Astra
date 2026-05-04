@@ -4,7 +4,8 @@ use crate::access_control::{ActionCapability, ActionSource};
 use crate::config::GatewayConfig;
 use crate::store::{self, GatewayStore};
 use crate::trace_model::{
-    CancelRequestOutcome, ConversationKey, GatewayEvent, GatewayEventKind, TraceId, TraceRepository,
+    CancelRequestOutcome, ConversationKey, GatewayEvent, GatewayEventKind, OutboxStatus,
+    RequestStatus, TraceId, TraceRepository,
 };
 use astra_core::durable_task_store::{
     DurableTask, DurableTaskStatus, DurableTaskStore, TaskFilter, resolve_task_for_owner,
@@ -481,8 +482,10 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              `/ws ls` — 列出可用项目\n\
              `/ws <name|path>` — 切换工作目录\n\
              `/running` — 查看正在执行的任务\n\
-             `/cancel` — 取消排队中的请求\n\
-             `/kill <trace_id>` — 强制终止运行中的请求\n\
+             `/cancel [text]` — 取消排队中的请求 (支持文本匹配)\n\
+             `/kill [text]` — 强制终止运行中的请求 (无参数=自动选择)\n\
+             `/retry` — 查看发送失败的消息\n\
+             `/retry dismiss` — 清除所有失败消息\n\
              `/usage` — 用量统计\n\n\
              **监控**\n\
              `/status` — 状态 + harness\n\
@@ -646,6 +649,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 Some("✅ 当前没有正在执行的任务。".into())
             } else {
                 let mut lines = vec![format!("🔄 **正在执行** ({} 个)", rows.len())];
+                let mut stuck_outbox_count = 0usize;
                 for row in &rows {
                     let short_user = short_id(&row.user_id);
                     let short_text = if row.text_preview.chars().count() > 40 {
@@ -660,6 +664,14 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                         row.display_status(),
                         short_text,
                         row.created_at
+                    ));
+                    if row.status.is_terminal() && row.outbox_status == Some(OutboxStatus::Failed) {
+                        stuck_outbox_count += 1;
+                    }
+                }
+                if stuck_outbox_count > 0 {
+                    lines.push(format!(
+                        "\n📬 提示: 有 {stuck_outbox_count} 个消息发送失败。用 `/retry` 查看，`/retry dismiss` 清除。"
                     ));
                 }
                 Some(lines.join("\n"))
@@ -723,7 +735,10 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     Err(_) => None,
                 }
             } else {
-                Some(arg.to_string())
+                match resolve_trace_by_text_or_id(repo, &conversation, arg).await {
+                    Some(id) => Some(id.to_string()),
+                    None => return Some(format!("❌ 找不到匹配 `{arg}` 的请求")),
+                }
             };
             let Some(selector) = selector else {
                 return Some("✅ 当前没有可取消的排队请求。运行中的请求不会被强制中断。".into());
@@ -752,15 +767,28 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             let repo = require_trace_repo!(ctx);
             let conversation =
                 ConversationKey::new(ctx.platform, ctx.chat_id, ctx.resolved_cli.name());
-            if arg.is_empty() {
-                return Some("用法: `/kill <trace_id>` — 强制终止运行中的请求".into());
-            }
-            // Resolve the trace ID (support prefix match)
-            let trace_id = resolve_trace_selector(repo, &conversation, arg).await;
-            let Some(trace_id) = trace_id else {
-                return Some(format!("❌ 找不到 trace `{arg}`"));
+
+            let target = if arg.is_empty() {
+                // Auto-pick the most recent running request
+                match repo.list_active_requests(&conversation, 20).await {
+                    Ok(rows) => rows
+                        .into_iter()
+                        .find(|row| row.status == RequestStatus::Running)
+                        .map(|row| row.trace_id.to_string()),
+                    Err(_) => None,
+                }
+            } else {
+                // Support text-based fuzzy match against text_preview
+                match resolve_trace_by_text_or_id(repo, &conversation, arg).await {
+                    Some(id) => Some(id.to_string()),
+                    None => return Some(format!("❌ 找不到匹配 `{arg}` 的请求")),
+                }
             };
-            // Force-fail the request regardless of current status
+
+            let Some(target) = target else {
+                return Some("✅ 当前没有运行中的请求。".into());
+            };
+            let trace_id = TraceId::from_string(target);
             match repo
                 .force_fail_request(&trace_id, "killed by user via /kill")
                 .await
@@ -775,6 +803,50 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 )),
                 Err(e) => Some(format!("⚠️ 终止失败: {e}")),
             }
+        }
+
+        "/retry" => {
+            let repo = require_trace_repo!(ctx);
+            let conversation =
+                ConversationKey::new(ctx.platform, ctx.chat_id, ctx.resolved_cli.name());
+
+            // Find requests with failed outbox
+            let rows = repo
+                .list_active_requests(&conversation, 20)
+                .await
+                .unwrap_or_default();
+            let stuck: Vec<_> = rows
+                .iter()
+                .filter(|r| r.status.is_terminal() && r.outbox_status == Some(OutboxStatus::Failed))
+                .collect();
+
+            if stuck.is_empty() {
+                return Some("✅ 没有需要重试的消息。".into());
+            }
+
+            if arg == "dismiss" || arg == "clear" {
+                let mut dismissed = 0usize;
+                for row in &stuck {
+                    if repo.dismiss_failed_outbox(&row.request_id).await.is_ok() {
+                        dismissed += 1;
+                    }
+                }
+                return Some(format!("🧹 已清除 {dismissed} 个失败消息。"));
+            }
+
+            let mut lines = vec![format!("📬 **待重试消息** ({} 个)", stuck.len())];
+            for row in &stuck {
+                lines.push(format!(
+                    "- `{}` | {} | {}",
+                    short_id(row.trace_id.as_str()),
+                    truncate_text(&row.text_preview, 40),
+                    row.outbox_error_message
+                        .as_deref()
+                        .unwrap_or("unknown error"),
+                ));
+            }
+            lines.push("\n`/retry dismiss` — 清除所有失败消息".into());
+            Some(lines.join("\n"))
         }
 
         "/usage" => {
@@ -970,8 +1042,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             lines.push("| `/cron list` | Scheduled tasks |".to_string());
             lines.push("| `/task list` | Durable tasks |".to_string());
             lines.push("| `/running` | Active requests |".to_string());
-            lines.push("| `/cancel` | Cancel queued request |".to_string());
-            lines.push("| `/kill <id>` | Force-kill running request |".to_string());
+            lines.push("| `/cancel [text]` | Cancel queued request |".to_string());
+            lines.push("| `/kill [text]` | Force-kill running request |".to_string());
+            lines.push("| `/retry` | View/dismiss failed outbox |".to_string());
             lines.push("| `/trace [id]` | Request trace |".to_string());
             lines.push("| `/usage` | Token/cost stats |".to_string());
             lines.push("| `/inspect` | Harness details |".to_string());
@@ -1066,6 +1139,43 @@ async fn resolve_trace_selector(
         })
         .map(|trace| trace.trace_id)
         .or_else(|| Some(TraceId::from_string(selector.to_string())))
+}
+
+async fn resolve_trace_by_text_or_id(
+    repo: &dyn TraceRepository,
+    conversation: &ConversationKey,
+    selector: &str,
+) -> Option<TraceId> {
+    // First try exact/prefix ID match (existing behavior)
+    if let Some(id) = resolve_trace_selector(repo, conversation, selector).await {
+        // resolve_trace_selector falls back to constructing a TraceId from any string,
+        // so we need to verify the returned ID is a real match — not just a passthrough.
+        let traces = repo.list_recent_traces(conversation, 50).await.ok()?;
+        let is_real_match = traces.iter().any(|t| {
+            t.trace_id.as_str() == id.as_str()
+                && (t.trace_id.as_str() == selector
+                    || t.request_id.as_str() == selector
+                    || t.trace_id.as_str().starts_with(selector)
+                    || t.request_id.as_str().starts_with(selector))
+        });
+        if is_real_match {
+            return Some(id);
+        }
+    }
+    // Then try text_preview fuzzy match against active requests
+    let rows = repo.list_active_requests(conversation, 50).await.ok()?;
+    let lower = selector.to_lowercase();
+    rows.into_iter()
+        .find(|row| row.text_preview.to_lowercase().contains(&lower))
+        .map(|row| row.trace_id)
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() > max_chars {
+        format!("{}…", text.chars().take(max_chars).collect::<String>())
+    } else {
+        text.to_string()
+    }
 }
 
 fn format_trace_events(trace_id: &TraceId, events: Vec<GatewayEvent>) -> String {
@@ -1822,12 +1932,12 @@ mod tests {
             );
         }
     });
-    cmd_test!(cmd_kill_no_arg_shows_usage, "/kill", |r| {
+    cmd_test!(cmd_kill_no_arg_auto_pick_or_no_db, "/kill", |r| {
         {
             let msg = r.unwrap();
             assert!(
-                msg.contains("存储后端") || msg.contains("数据库") || msg.contains("用法"),
-                "expected usage or storage error, got: {msg}"
+                msg.contains("数据库") || msg.contains("没有运行中"),
+                "expected db error or no running message, got: {msg}"
             );
         }
     });
@@ -1855,6 +1965,31 @@ mod tests {
     cmd_test!(cmd_ws_ls_empty_projects, "/ws ls", |r| {
         let s = r.unwrap();
         assert!(s.contains("没有发现项目"), "expected empty project message");
+    });
+
+    cmd_test!(cmd_retry_requires_trace_repo, "/retry", |r| {
+        {
+            let msg = r.unwrap();
+            assert!(msg.contains("数据库"), "expected db error, got: {msg}");
+        }
+    });
+    cmd_test!(
+        cmd_retry_dismiss_requires_trace_repo,
+        "/retry dismiss",
+        |r| {
+            {
+                let msg = r.unwrap();
+                assert!(msg.contains("数据库"), "expected db error, got: {msg}");
+            }
+        }
+    );
+    cmd_test!(cmd_help_includes_retry, "/help", |r| {
+        let s = r.unwrap();
+        assert!(s.contains("/retry"), "help should include /retry");
+    });
+    cmd_test!(cmd_gateway_includes_retry, "/gateway", |r| {
+        let s = r.unwrap();
+        assert!(s.contains("/retry"), "gateway should include /retry");
     });
 
     cmd_test!(cmd_ws_no_arg_requires_store, "/ws", |r| {

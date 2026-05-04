@@ -660,6 +660,16 @@ impl GatewayStore for MysqlGatewayStore {
         Ok(())
     }
 
+    async fn get_cron_job_user_id(&self, job_id: &str) -> Result<Option<String>, StoreError> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT user_id FROM gw_cron_jobs WHERE job_id = ?")
+                .bind(job_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(row.map(|(uid,)| uid))
+    }
+
     // ── Credential operations ───────────────────────────────────────────
 
     async fn save_credential(

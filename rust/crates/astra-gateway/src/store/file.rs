@@ -538,6 +538,11 @@ impl GatewayStore for FileGatewayStore {
         self.flush_cron_jobs().await
     }
 
+    async fn get_cron_job_user_id(&self, job_id: &str) -> Result<Option<String>, StoreError> {
+        let jobs = self.cron_jobs.read().await;
+        Ok(jobs.get(job_id).map(|j| j.user_id.clone()))
+    }
+
     // ─── Platform Credentials ─────────────────────────────────────────
     async fn save_credential(
         &self,

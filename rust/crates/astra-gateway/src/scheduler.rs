@@ -243,13 +243,8 @@ impl CronScheduler {
     }
 
     /// Resolve the user_id who created the cron job.
-    ///
-    /// NOTE: This currently does a raw SQL query. Once the `GatewayStore` trait
-    /// exposes a `get_cron_job` method, this should migrate to that.
-    async fn resolve_job_user_id(&self, _job_id: &str) -> Option<String> {
-        // TODO: add a `get_cron_job_user` method to GatewayStore trait.
-        // For now return None — the caller falls back to empty string.
-        None
+    async fn resolve_job_user_id(&self, job_id: &str) -> Option<String> {
+        self.store.get_cron_job_user_id(job_id).await.ok().flatten()
     }
 
     async fn begin_scheduler_trace(
