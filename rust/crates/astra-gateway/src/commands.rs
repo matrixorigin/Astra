@@ -55,10 +55,12 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             }
             let pool = require_db!(ctx);
             let cli_name = ctx.resolved_cli.name();
-            let _ = storage::reset_session_for_cli(pool, ctx.platform, ctx.chat_id, cli_name).await;
-            Some(format!(
-                "🔄 `{cli_name}` 会话已重置。发送新消息开始新对话。"
-            ))
+            match storage::reset_session_for_cli(pool, ctx.platform, ctx.chat_id, cli_name).await {
+                Ok(()) => Some(format!(
+                    "🔄 `{cli_name}` 会话已重置。发送新消息开始新对话。"
+                )),
+                Err(e) => Some(format!("⚠️ 会话重置失败: {e}")),
+            }
         }
 
         "/status" => {
@@ -311,14 +313,17 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             let target = resolve_model_shortcut(arg);
             if let Some(pool) = ctx.pool {
                 let model_key = format!("model_override:{}", ctx.resolved_cli.name());
-                let _ = storage::set_user_preference(
+                if let Err(e) = storage::set_user_preference(
                     pool,
                     ctx.platform,
                     ctx.user_id,
                     &model_key,
                     &target,
                 )
-                .await;
+                .await
+                {
+                    return Some(format!("⚠️ 模型设置失败: {e}"));
+                }
             }
             Some(format!("🤖 模型已切换: `{target}`\n(下次消息生效)"))
         }
@@ -385,16 +390,17 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     if caps.supports_harness { "✅" } else { "❌" },
                     if caps.supports_tools { "✅" } else { "❌" },
                 );
-                // Save preference to DB
-                if let Some(pool) = ctx.pool {
-                    let _ = storage::set_user_preference(
+                if let Some(pool) = ctx.pool
+                    && let Err(e) = storage::set_user_preference(
                         pool,
                         ctx.platform,
                         ctx.user_id,
                         "cli_profile",
                         arg,
                     )
-                    .await;
+                    .await
+                {
+                    return Some(format!("⚠️ CLI 切换失败: {e}"));
                 }
                 Some(format!(
                     "✅ 已切换到 `{arg}` ({name})\n{cap_str}",
@@ -517,13 +523,16 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 let tid = astra_core::durable_task_store::TaskId(id.trim().to_string());
                 match store.resume(&tid).await {
                     Ok(Some(cp)) => {
-                        let _ = store
+                        if let Err(e) = store
                             .update_status(
                                 &tid,
                                 astra_core::durable_task_store::DurableTaskStatus::Running,
                                 None,
                             )
-                            .await;
+                            .await
+                        {
+                            return Some(format!("⚠️ 恢复失败: {e}"));
+                        }
                         Some(format!(
                             "▶️ 任务已恢复\n检查点:\n```\n{}\n```",
                             serde_json::to_string_pretty(&cp).unwrap_or_default()
@@ -764,15 +773,18 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 .canonicalize()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or(target);
-            let _ = storage::set_user_preference(
+            match storage::set_user_preference(
                 pool,
                 ctx.platform,
                 ctx.user_id,
                 "workspace",
                 &canonical,
             )
-            .await;
-            Some(format!("📂 工作目录已切换: `{canonical}`"))
+            .await
+            {
+                Ok(()) => Some(format!("📂 工作目录已切换: `{canonical}`")),
+                Err(e) => Some(format!("⚠️ 工作目录设置失败: {e}")),
+            }
         }
 
         _ => None,

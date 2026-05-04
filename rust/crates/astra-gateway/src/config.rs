@@ -42,10 +42,18 @@ pub struct GatewayConfig {
     pub project_dirs: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 pub struct DatabaseConfig {
     #[serde(default = "default_db_url")]
     pub url: String,
+}
+
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseConfig")
+            .field("url", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl Default for DatabaseConfig {
@@ -73,13 +81,23 @@ fn default_db_url() -> String {
         .unwrap_or_else(|_| "mysql://root:111@127.0.0.1:6001/astra_gateway".into())
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 pub struct AstraServerConfig {
     #[serde(default = "default_base_url")]
     pub base_url: String,
     #[serde(default)]
     pub api_key: String,
     pub default_model: Option<String>,
+}
+
+impl std::fmt::Debug for AstraServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AstraServerConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key", &if self.api_key.is_empty() { "(empty)" } else { "[REDACTED]" })
+            .field("default_model", &self.default_model)
+            .finish()
+    }
 }
 
 fn default_base_url() -> String {
@@ -93,7 +111,7 @@ pub struct PlatformConfigs {
     pub telegram: Option<TelegramConfig>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 pub struct WeComConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -105,16 +123,36 @@ pub struct WeComConfig {
     pub websocket_url: String,
 }
 
+impl std::fmt::Debug for WeComConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeComConfig")
+            .field("enabled", &self.enabled)
+            .field("bot_id", &self.bot_id)
+            .field("secret", &"[REDACTED]")
+            .field("websocket_url", &self.websocket_url)
+            .finish()
+    }
+}
+
 fn default_wecom_ws_url() -> String {
     "wss://openws.work.weixin.qq.com".into()
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 pub struct TelegramConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub token: String,
+}
+
+impl std::fmt::Debug for TelegramConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelegramConfig")
+            .field("enabled", &self.enabled)
+            .field("token", &if self.token.is_empty() { "(empty)" } else { "[REDACTED]" })
+            .finish()
+    }
 }
 
 impl GatewayConfig {
@@ -192,6 +230,40 @@ platforms:
         assert!(wecom.enabled);
         assert_eq!(wecom.bot_id, "bot-123");
         assert_eq!(cfg.astra.default_model.as_deref(), Some("MiniMax-M2.7"));
+    }
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let cfg = AstraServerConfig {
+            base_url: "http://localhost:8080".into(),
+            api_key: "super-secret-key".into(),
+            default_model: None,
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(dbg.contains("[REDACTED]"), "api_key should be redacted: {dbg}");
+        assert!(!dbg.contains("super-secret"), "api_key leaked in debug: {dbg}");
+
+        let db = DatabaseConfig {
+            url: "mysql://root:password@host/db".into(),
+        };
+        let dbg = format!("{db:?}");
+        assert!(!dbg.contains("password"), "db url leaked in debug: {dbg}");
+
+        let wecom = WeComConfig {
+            enabled: true,
+            bot_id: "bot-123".into(),
+            secret: "my-secret".into(),
+            websocket_url: "wss://example.com".into(),
+        };
+        let dbg = format!("{wecom:?}");
+        assert!(!dbg.contains("my-secret"), "wecom secret leaked: {dbg}");
+
+        let tg = TelegramConfig {
+            enabled: true,
+            token: "bot123:AABBCC".into(),
+        };
+        let dbg = format!("{tg:?}");
+        assert!(!dbg.contains("bot123:AABBCC"), "telegram token leaked: {dbg}");
     }
 
     #[test]

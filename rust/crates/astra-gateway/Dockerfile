@@ -12,16 +12,17 @@ RUN cd rust && cargo build -p astra-gateway --release \
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl && rm -rf /var/lib/apt/lists/*
+    ca-certificates curl && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r gateway && useradd -r -g gateway -d /app gateway
 
 COPY --from=builder /build/rust/target/release/astra-gateway /usr/local/bin/astra-gateway
-
-# Also copy astra CLI for the default backend
 COPY --from=builder /build/rust/target/release/astra /usr/local/bin/astra
 
 WORKDIR /app
 COPY rust/crates/astra-gateway/gateway.example.yaml /app/gateway.yaml
+RUN chown -R gateway:gateway /app
 
+USER gateway
 EXPOSE 8088
 ENV RUST_LOG=info,astra_gateway=debug
 

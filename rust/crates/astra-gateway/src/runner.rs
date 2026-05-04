@@ -1567,7 +1567,7 @@ async fn connect_db(url: &str) -> Result<MySqlPool, sqlx::Error> {
             };
             // Strip query params from db_name
             let db_name = db_name.split('?').next().unwrap_or(db_name);
-            if db_name.is_empty() {
+            if !is_safe_db_name(db_name) {
                 return Err(e);
             }
 
@@ -1589,6 +1589,10 @@ async fn connect_db(url: &str) -> Result<MySqlPool, sqlx::Error> {
             Ok(pool)
         }
     }
+}
+
+fn is_safe_db_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Parse and execute `[[GATEWAY:action:args]]` tags in agent response text.
@@ -2431,6 +2435,25 @@ mod tests {
         use crate::cli_bridge::CliProfile;
         let p = CliProfile::default();
         assert_eq!(p.name(), "astra");
+    }
+
+    // ── C1: SQL injection prevention in CREATE DATABASE ──
+
+    #[test]
+    fn safe_db_name_accepts_valid() {
+        assert!(is_safe_db_name("astra_gateway"));
+        assert!(is_safe_db_name("test123"));
+        assert!(is_safe_db_name("DB_NAME"));
+    }
+
+    #[test]
+    fn safe_db_name_rejects_injection() {
+        assert!(!is_safe_db_name(""));
+        assert!(!is_safe_db_name("foo`; DROP TABLE users; --"));
+        assert!(!is_safe_db_name("db name"));
+        assert!(!is_safe_db_name("foo;bar"));
+        assert!(!is_safe_db_name("foo`bar"));
+        assert!(!is_safe_db_name("../etc/passwd"));
     }
 }
 

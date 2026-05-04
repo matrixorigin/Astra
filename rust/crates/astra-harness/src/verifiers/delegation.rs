@@ -30,7 +30,7 @@ impl Verifier for DelegationVerifier {
 
         if snap.delegations_this_turn > self.max_delegations_per_turn {
             violations.push(Violation {
-                severity: Severity::Error,
+                severity: Severity::Fatal,
                 verifier: self.name().to_string(),
                 message: format!(
                     "delegation loop detected: {} delegations this turn (limit: {})",
@@ -85,7 +85,7 @@ mod tests {
         let v = DelegationVerifier::default();
         let violations = v.check(&record_with(6, 0));
         assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0].severity, Severity::Error);
+        assert_eq!(violations[0].severity, Severity::Fatal);
         assert!(violations[0].message.contains("delegation loop"));
     }
 

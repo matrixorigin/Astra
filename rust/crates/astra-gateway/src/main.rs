@@ -34,13 +34,15 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    // Prevent duplicate instances — kill stale gateway if PID file exists
     let pid_file = std::path::PathBuf::from("/tmp/astra-gateway.pid");
     if pid_file.exists()
         && let Ok(old_pid) = std::fs::read_to_string(&pid_file)
     {
         let old_pid = old_pid.trim();
-        if std::path::Path::new(&format!("/proc/{old_pid}")).exists() {
+        let cmdline_path = format!("/proc/{old_pid}/cmdline");
+        if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path)
+            && cmdline.contains("astra-gateway")
+        {
             tracing::warn!(pid = old_pid, "killing stale gateway process");
             let _ = std::process::Command::new("kill").arg(old_pid).status();
             std::thread::sleep(std::time::Duration::from_secs(1));

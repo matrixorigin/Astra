@@ -179,6 +179,7 @@ pub enum Severity {
 
 // ─── Hook Verdict ───────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub enum HookVerdict {
     Continue,
     Block { reason: String },
