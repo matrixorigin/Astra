@@ -201,15 +201,14 @@ impl Writer {
                 };
                 self.push_style(style);
             }
-            Tag::Paragraph => {
-                if !self.lines.is_empty() && self.list_stack.is_empty() {
+            Tag::Paragraph
+                if !self.lines.is_empty() && self.list_stack.is_empty() => {
                     if let Some(last) = self.lines.last() {
                         if !last.spans.is_empty() {
                             self.lines.push(Line::default());
                         }
                     }
                 }
-            }
             Tag::CodeBlock(kind) => {
                 let lang = match kind {
                     CodeBlockKind::Fenced(info) => {
@@ -282,11 +281,10 @@ impl Writer {
                     self.lines.push(Line::default());
                 }
             }
-            TagEnd::Item => {
-                if !self.current_spans.is_empty() {
+            TagEnd::Item
+                if !self.current_spans.is_empty() => {
                     self.flush_line();
                 }
-            }
             TagEnd::Emphasis => {
                 self.pop_style();
             }

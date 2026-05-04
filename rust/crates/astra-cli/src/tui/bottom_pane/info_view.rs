@@ -134,11 +134,10 @@ impl BottomPaneView for InfoView {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.scroll = self.scroll.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.scroll + MAX_VISIBLE < self.lines.len() {
+            KeyCode::Down | KeyCode::Char('j')
+                if self.scroll + MAX_VISIBLE < self.lines.len() => {
                     self.scroll += 1;
                 }
-            }
             KeyCode::PageUp => {
                 self.scroll = self.scroll.saturating_sub(MAX_VISIBLE);
             }

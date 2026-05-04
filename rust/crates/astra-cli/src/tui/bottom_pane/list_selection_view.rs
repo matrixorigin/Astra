@@ -165,20 +165,18 @@ impl BottomPaneView for ListSelectionView {
     fn handle_key(&mut self, key: KeyEvent) {
         let filtered_len = self.filtered_items().len();
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                if filtered_len > 0 {
+            KeyCode::Up | KeyCode::Char('k')
+                if filtered_len > 0 => {
                     self.selected = if self.selected == 0 {
                         filtered_len - 1
                     } else {
                         self.selected - 1
                     };
                 }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if filtered_len > 0 {
+            KeyCode::Down | KeyCode::Char('j')
+                if filtered_len > 0 => {
                     self.selected = (self.selected + 1) % filtered_len;
                 }
-            }
             KeyCode::Enter => self.accept(),
             KeyCode::Esc => {
                 self.completed = true;

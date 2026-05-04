@@ -160,20 +160,18 @@ impl BottomPaneView for HelpView {
                 self.active_tab = (self.active_tab + 1) % self.groups.len();
                 self.selected_cmd = 0;
             }
-            KeyCode::Up => {
-                if cmd_count > 0 {
+            KeyCode::Up
+                if cmd_count > 0 => {
                     self.selected_cmd = if self.selected_cmd == 0 {
                         cmd_count - 1
                     } else {
                         self.selected_cmd - 1
                     };
                 }
-            }
-            KeyCode::Down => {
-                if cmd_count > 0 {
+            KeyCode::Down
+                if cmd_count > 0 => {
                     self.selected_cmd = (self.selected_cmd + 1) % cmd_count;
                 }
-            }
             KeyCode::Enter => {
                 if let Some(meta) = self.active_commands().get(self.selected_cmd) {
                     self.accepted = Some(meta.name.to_string());

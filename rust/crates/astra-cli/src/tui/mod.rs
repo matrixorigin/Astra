@@ -346,11 +346,10 @@ pub(crate) async fn run_tui_repl(
                                                 Some(ae) = tui_rx.recv() => {
                                                     // Track per-turn metrics
                                                     match &ae {
-                                                        TuiAppEvent::Token(_) => {
-                                                            if turn_ttft.is_none() {
+                                                        TuiAppEvent::Token(_)
+                                                            if turn_ttft.is_none() => {
                                                                 turn_ttft = Some(std::time::Instant::now());
                                                             }
-                                                        }
                                                         TuiAppEvent::ToolStarted { .. } => {
                                                             turn_tool_count += 1;
                                                         }

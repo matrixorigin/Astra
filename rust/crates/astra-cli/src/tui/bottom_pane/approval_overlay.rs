@@ -163,12 +163,10 @@ impl BottomPaneView for ApprovalOverlay {
             KeyCode::Char('!') => self.respond(ApprovalResponse::AutoRunSession),
             KeyCode::Char('s') | KeyCode::Char('S') => self.respond(ApprovalResponse::Skip),
             // Arrow navigation
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.selected > 0 { self.selected -= 1; }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.selected + 1 < OPTIONS.len() { self.selected += 1; }
-            }
+            KeyCode::Up | KeyCode::Char('k')
+                if self.selected > 0 => { self.selected -= 1; }
+            KeyCode::Down | KeyCode::Char('j')
+                if self.selected + 1 < OPTIONS.len() => { self.selected += 1; }
             KeyCode::Enter => {
                 self.respond(OPTIONS[self.selected].response);
             }

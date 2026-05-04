@@ -206,11 +206,10 @@ impl BottomPaneView for HistoryView {
             KeyCode::Up => {
                 self.scroll = self.scroll.saturating_sub(1);
             }
-            KeyCode::Down => {
-                if self.scroll + MAX_VISIBLE_ENTRIES < filtered_len {
+            KeyCode::Down
+                if self.scroll + MAX_VISIBLE_ENTRIES < filtered_len => {
                     self.scroll += 1;
                 }
-            }
             KeyCode::PageUp => {
                 self.scroll = self.scroll.saturating_sub(MAX_VISIBLE_ENTRIES);
             }
