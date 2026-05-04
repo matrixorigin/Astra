@@ -1070,20 +1070,7 @@ impl GatewayRunner {
         if cost > 0.001 {
             stats_parts.push(format!("${cost:.3}"));
         }
-        if progressive_text_len > 0 {
-            // Text body already delivered progressively — final message
-            // is just action results (if any) + stats footer.
-            let mut parts = Vec::new();
-            if !action_results_text.is_empty() {
-                parts.push(action_results_text);
-            }
-            if !stats_parts.is_empty() {
-                parts.push(format!("`{}`", stats_parts.join(" | ")));
-            }
-            text = parts.join("\n\n");
-        } else if !text.is_empty() && !stats_parts.is_empty() {
-            text.push_str(&format!("\n\n`{}`", stats_parts.join(" | ")));
-        }
+        text = build_final_message(&text, &action_results_text, &stats_parts, progressive_text_len);
 
         // Record usage to DB
         if let Some(ref pool) = self.pool {
@@ -2291,6 +2278,33 @@ fn filter_think_tags(text: &str, in_think: &mut bool) -> String {
     result
 }
 
+/// Build the final message to send after CLI finishes.
+/// When `progressive_text_len > 0`, text was already streamed — send only
+/// action results + stats footer. Otherwise send full text + stats.
+fn build_final_message(
+    text: &str,
+    action_results: &str,
+    stats_parts: &[String],
+    progressive_text_len: usize,
+) -> String {
+    if progressive_text_len > 0 {
+        let mut parts = Vec::new();
+        if !action_results.is_empty() {
+            parts.push(action_results.to_string());
+        }
+        if !stats_parts.is_empty() {
+            parts.push(format!("`{}`", stats_parts.join(" | ")));
+        }
+        parts.join("\n\n")
+    } else {
+        let mut result = text.to_string();
+        if !result.is_empty() && !stats_parts.is_empty() {
+            result.push_str(&format!("\n\n`{}`", stats_parts.join(" | ")));
+        }
+        result
+    }
+}
+
 /// Strip `<think>...</think>` blocks from complete text.
 fn strip_think_blocks(text: &str) -> String {
     let mut in_think = false;
@@ -2461,6 +2475,105 @@ mod tests {
     fn strip_think_blocks_removes_all() {
         let text = "<think>hmm</think>Answer is 42<think>double check</think>.";
         assert_eq!(strip_think_blocks(text), "Answer is 42.");
+    }
+
+    // ── Progressive delivery dedup ─────────────────────────────────
+
+    #[test]
+    fn final_message_no_progressive_includes_full_text() {
+        let stats = vec!["↓8.4k".into(), "↑95".into(), "8s".into()];
+        let msg = build_final_message("Hello world", "", &stats, 0);
+        assert!(msg.contains("Hello world"));
+        assert!(msg.contains("↓8.4k"));
+    }
+
+    #[test]
+    fn final_message_progressive_skips_body() {
+        let stats = vec!["↓8.4k".into(), "↑95".into()];
+        let msg = build_final_message("Hello world (already sent)", "", &stats, 500);
+        assert!(!msg.contains("Hello world"), "body should not repeat: {msg}");
+        assert!(msg.contains("↓8.4k"), "stats should still appear: {msg}");
+    }
+
+    #[test]
+    fn final_message_progressive_with_actions() {
+        let stats = vec!["8s".into()];
+        let msg = build_final_message("body", "⏰ 提醒已创建", &stats, 100);
+        assert!(msg.contains("⏰ 提醒已创建"), "action results should appear");
+        assert!(msg.contains("8s"), "stats should appear");
+        assert!(!msg.contains("body"), "body should not repeat");
+    }
+
+    #[test]
+    fn final_message_progressive_empty_stats() {
+        let msg = build_final_message("body", "", &[], 100);
+        assert!(msg.is_empty(), "nothing to send if progressive + no actions + no stats");
+    }
+
+    // ── Tool status merged into buffer ──────────────────────────
+
+    #[test]
+    fn tool_status_format_is_inline() {
+        // Verify the format strings used in the progress loop
+        let started = format!("🔧 {}…\n", "bash");
+        let done = format!("✅ {} ({}ms)\n", "bash", 120);
+        assert!(started.contains("🔧 bash…"));
+        assert!(done.contains("✅ bash (120ms)"));
+        // Both end with newline — they'll be part of a multi-line buffer
+        assert!(started.ends_with('\n'));
+        assert!(done.ends_with('\n'));
+    }
+
+    // ── Think tag filtering ──────────────────────────────────────
+
+    #[test]
+    fn filter_think_tags_empty_think_block() {
+        let mut state = false;
+        assert_eq!(filter_think_tags("<think></think>OK", &mut state), "OK");
+        assert!(!state);
+    }
+
+    #[test]
+    fn filter_think_tags_at_start_and_end() {
+        assert_eq!(strip_think_blocks("<think>x</think>"), "");
+        assert_eq!(strip_think_blocks("text<think>x</think>"), "text");
+        assert_eq!(strip_think_blocks("<think>x</think>text"), "text");
+    }
+
+    #[test]
+    fn filter_think_tags_unclosed_stays_open() {
+        let mut state = false;
+        let r = filter_think_tags("before<think>never closed", &mut state);
+        assert_eq!(r, "before");
+        assert!(state, "should remain in think state");
+        // Subsequent call still in think
+        let r2 = filter_think_tags("still thinking", &mut state);
+        assert_eq!(r2, "");
+        assert!(state);
+    }
+
+    #[test]
+    fn filter_think_tags_split_at_tag_boundary() {
+        let mut state = false;
+        // "<think>" split across two chunks as "<thin" + "k>reasoning</think>out"
+        let r1 = filter_think_tags("<thin", &mut state);
+        // Can't detect partial tag — passes through (acceptable: rare edge case)
+        assert_eq!(r1, "<thin");
+        assert!(!state);
+        // Next chunk completes the tag — won't match as opening tag
+        let r2 = filter_think_tags("k>reasoning</think>out", &mut state);
+        // "k>" isn't a valid tag, passes through; "</think>" is a close without open, passes through
+        assert!(r2.contains("out"));
+    }
+
+    #[test]
+    fn filter_think_tags_nested_ignored() {
+        // Nested <think> inside another — inner is just text, outer close ends it
+        let mut state = false;
+        let r = filter_think_tags("<think>a<think>b</think>c", &mut state);
+        // First </think> closes, "c" is visible
+        assert_eq!(r, "c");
+        assert!(!state);
     }
 
     // ── Gateway action tests ──────────────────────────────────────

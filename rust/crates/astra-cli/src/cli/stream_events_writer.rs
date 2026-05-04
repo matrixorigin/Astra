@@ -138,4 +138,50 @@ mod tests {
         drop(tx);
         handle.await.unwrap();
     }
+
+    #[test]
+    fn token_with_chinese_and_emoji() {
+        let json = event_to_json(&StreamEvent::Token("你好世界 🌍".into()));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["text"], "你好世界 🌍");
+    }
+
+    #[test]
+    fn token_empty_string() {
+        let json = event_to_json(&StreamEvent::Token("".into()));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["text"], "");
+    }
+
+    #[test]
+    fn tool_name_with_special_chars() {
+        let json = event_to_json(&StreamEvent::ToolStarted {
+            name: "mcp__memoria/search".into(),
+            description: "query=\"test\"".into(),
+        });
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["name"], "mcp__memoria/search");
+        assert!(v["description"].as_str().unwrap().contains("query="));
+    }
+
+    #[test]
+    fn tool_completed_null_summary() {
+        let json = event_to_json(&StreamEvent::ToolCompleted {
+            name: "bash".into(),
+            description: "ls".into(),
+            status: "ok".into(),
+            duration_ms: 5,
+            output_summary: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v["output_summary"].is_null());
+    }
+
+    #[test]
+    fn status_line_preserves_content() {
+        let json = event_to_json(&StreamEvent::StatusLine("⚠️ warning: 1 clippy lint".into()));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "status");
+        assert!(v["text"].as_str().unwrap().contains("clippy"));
+    }
 }

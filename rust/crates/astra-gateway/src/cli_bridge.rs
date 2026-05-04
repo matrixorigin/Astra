@@ -1297,4 +1297,46 @@ model: claude-sonnet-4-6"#;
         let line = "⚡ running tool bash";
         assert!(matches!(parse_stderr_line(line), CliProgress::ToolCall(_)));
     }
+
+    #[test]
+    fn parse_malformed_json_falls_back() {
+        let line = r#"{"type":"token","text":"he"#; // truncated JSON
+        assert!(matches!(parse_stderr_line(line), CliProgress::Status(_)));
+    }
+
+    #[test]
+    fn parse_unknown_type_falls_back() {
+        let line = r#"{"type":"future_event","data":42}"#;
+        assert!(matches!(parse_stderr_line(line), CliProgress::Status(_)));
+    }
+
+    #[test]
+    fn parse_empty_token_text() {
+        let line = r#"{"type":"token","text":""}"#;
+        assert!(matches!(parse_stderr_line(line), CliProgress::Token(t) if t.is_empty()));
+    }
+
+    #[test]
+    fn parse_unicode_tool_name() {
+        let line = r#"{"type":"tool_started","name":"读取文件","description":"src/main.rs"}"#;
+        assert!(matches!(parse_stderr_line(line), CliProgress::ToolStarted { name } if name == "读取文件"));
+    }
+
+    #[test]
+    fn parse_null_fields_handled() {
+        let line = r#"{"type":"tool_completed","name":"bash","description":null,"status":"ok","duration_ms":0,"output_summary":null}"#;
+        assert!(matches!(parse_stderr_line(line), CliProgress::ToolDone { name, .. } if name == "bash"));
+    }
+
+    #[test]
+    fn parse_waiting_for_model() {
+        let line = r#"{"type":"waiting_for_model"}"#;
+        assert!(matches!(parse_stderr_line(line), CliProgress::Status(_)));
+    }
+
+    #[test]
+    fn parse_status_event() {
+        let line = r#"{"type":"status","text":"compiling..."}"#;
+        assert!(matches!(parse_stderr_line(line), CliProgress::Status(t) if t == "compiling..."));
+    }
 }
