@@ -616,29 +616,39 @@ impl GatewayRunner {
         let mut sent_initial_ack = false;
         let mut token_buf = String::new();
         let mut streaming = false;
+        let mut in_think_block = false;
+        let mut progressive_text_len: usize = 0;
         let next_timer = tokio::time::sleep(INITIAL_ACK_DELAY);
         tokio::pin!(next_timer);
 
-        // Flush accumulated token buffer to the user.
+        #[allow(clippy::type_complexity)]
         let flush_buf = |buf: &mut String,
                          tx: &Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
                          platform: &str,
-                         chat: &str| {
+                         chat: &str|
+         -> Option<(
+            std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>,
+            usize,
+        )> {
             let text = std::mem::take(buf);
             let text = text.trim().to_string();
             if text.is_empty() {
                 return None;
             }
+            let len = text.len();
             let tx = tx.clone();
             let platform = platform.to_string();
             let chat = chat.to_string();
-            Some(async move {
-                if let Some(tx) = tx {
-                    let _ = tx
-                        .send(OutboundMessage::plain(platform, chat, text))
-                        .await;
-                }
-            })
+            Some((
+                Box::pin(async move {
+                    if let Some(tx) = tx {
+                        let _ = tx
+                            .send(OutboundMessage::plain(platform, chat, text))
+                            .await;
+                    }
+                }),
+                len,
+            ))
         };
 
         loop {
@@ -647,18 +657,23 @@ impl GatewayRunner {
                     match progress {
                         Some(CliProgress::Token(text)) => {
                             streaming = true;
-                            token_buf.push_str(&text);
-                            if token_buf.len() >= PROGRESSIVE_MIN_CHARS {
-                                if let Some(fut) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
-                                    fut.await;
+                            // Filter <think>...</think> blocks from token stream
+                            let filtered = filter_think_tags(&text, &mut in_think_block);
+                            if !filtered.is_empty() {
+                                token_buf.push_str(&filtered);
+                                if token_buf.len() >= PROGRESSIVE_MIN_CHARS {
+                                    if let Some(fut) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
+                                        progressive_text_len += fut.1;
+                                        fut.0.await;
+                                    }
+                                    next_timer.as_mut().reset(tokio::time::Instant::now() + PROGRESSIVE_FLUSH_INTERVAL);
                                 }
-                                next_timer.as_mut().reset(tokio::time::Instant::now() + PROGRESSIVE_FLUSH_INTERVAL);
                             }
                         }
                         Some(CliProgress::ToolStarted { ref name }) => {
                             tool_count += 1;
-                            // Flush any pending tokens before tool status
-                            if let Some(fut) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
+                            if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
+                                progressive_text_len += len;
                                 fut.await;
                             }
                             let status = format!("🔧 {name}…");
@@ -697,8 +712,8 @@ impl GatewayRunner {
                         }
                         Some(CliProgress::Status(_) | CliProgress::Stderr(_)) => {}
                         None => {
-                            // CLI finished — flush remaining buffer
-                            if let Some(fut) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
+                            if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
+                                progressive_text_len += len;
                                 fut.await;
                             }
                             break;
@@ -708,7 +723,8 @@ impl GatewayRunner {
                 _ = &mut next_timer => {
                     // Timer-based flush: either initial ack or periodic token flush
                     if !token_buf.is_empty() {
-                        if let Some(fut) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
+                        if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
+                            progressive_text_len += len;
                             fut.await;
                         }
                         next_timer.as_mut().reset(tokio::time::Instant::now() + PROGRESSIVE_FLUSH_INTERVAL);
@@ -1023,7 +1039,11 @@ impl GatewayRunner {
             .unwrap_or(result.stdout.trim())
             .to_string();
 
+        // Strip <think>...</think> blocks that some models emit as plain text
+        text = strip_think_blocks(&text);
+
         // Execute gateway actions embedded in agent response
+        let mut action_results_text = String::new();
         if text.contains("[[GATEWAY:") {
             let mut action_results = Vec::new();
             text = execute_gateway_actions_with_policy(
@@ -1041,8 +1061,9 @@ impl GatewayRunner {
             )
             .await;
             if !action_results.is_empty() {
+                action_results_text = action_results.join("\n");
                 text.push_str("\n\n");
-                text.push_str(&action_results.join("\n"));
+                text.push_str(&action_results_text);
             }
         }
 
@@ -1074,7 +1095,18 @@ impl GatewayRunner {
         if cost > 0.001 {
             stats_parts.push(format!("${cost:.3}"));
         }
-        if !text.is_empty() && !stats_parts.is_empty() {
+        if progressive_text_len > 0 {
+            // Text body already delivered progressively — final message
+            // is just action results (if any) + stats footer.
+            let mut parts = Vec::new();
+            if !action_results_text.is_empty() {
+                parts.push(action_results_text);
+            }
+            if !stats_parts.is_empty() {
+                parts.push(format!("`{}`", stats_parts.join(" | ")));
+            }
+            text = parts.join("\n\n");
+        } else if !text.is_empty() && !stats_parts.is_empty() {
             text.push_str(&format!("\n\n`{}`", stats_parts.join(" | ")));
         }
 
@@ -2258,6 +2290,38 @@ async fn find_and_delete_job(
     }
 }
 
+/// Filter `<think>...</think>` blocks from streaming token text.
+/// `in_think` tracks state across calls (tokens arrive in small chunks).
+fn filter_think_tags(text: &str, in_think: &mut bool) -> String {
+    let mut result = String::new();
+    let mut remaining = text;
+
+    while !remaining.is_empty() {
+        if *in_think {
+            if let Some(end) = remaining.find("</think>") {
+                *in_think = false;
+                remaining = &remaining[end + 8..];
+            } else {
+                break;
+            }
+        } else if let Some(start) = remaining.find("<think>") {
+            result.push_str(&remaining[..start]);
+            *in_think = true;
+            remaining = &remaining[start + 7..];
+        } else {
+            result.push_str(remaining);
+            break;
+        }
+    }
+    result
+}
+
+/// Strip `<think>...</think>` blocks from complete text.
+fn strip_think_blocks(text: &str) -> String {
+    let mut in_think = false;
+    filter_think_tags(text, &mut in_think)
+}
+
 fn format_elapsed(d: Duration) -> String {
     let secs = d.as_secs();
     if secs >= 60 {
@@ -2382,6 +2446,46 @@ mod tests {
         assert!(PROGRESSIVE_FLUSH_INTERVAL.as_secs() <= 10, "too slow = feels laggy");
         assert!(PROGRESSIVE_MIN_CHARS > 0);
         assert!(PROGRESSIVE_MIN_CHARS <= 200, "threshold too high = no progressive delivery");
+    }
+
+    // ── Think tag filtering ──────────────────────────────────────
+
+    #[test]
+    fn filter_think_tags_strips_complete_block() {
+        let mut state = false;
+        let result = filter_think_tags("<think>internal reasoning</think>Hello!", &mut state);
+        assert_eq!(result, "Hello!");
+        assert!(!state);
+    }
+
+    #[test]
+    fn filter_think_tags_handles_streaming_chunks() {
+        let mut state = false;
+        // Chunk 1: start of think block
+        let r1 = filter_think_tags("Hi <think>reasoning", &mut state);
+        assert_eq!(r1, "Hi ");
+        assert!(state);
+        // Chunk 2: still inside
+        let r2 = filter_think_tags(" more thinking", &mut state);
+        assert_eq!(r2, "");
+        assert!(state);
+        // Chunk 3: end of think block + visible text
+        let r3 = filter_think_tags("</think>Visible", &mut state);
+        assert_eq!(r3, "Visible");
+        assert!(!state);
+    }
+
+    #[test]
+    fn filter_think_tags_no_think_passthrough() {
+        let mut state = false;
+        let result = filter_think_tags("Just normal text", &mut state);
+        assert_eq!(result, "Just normal text");
+    }
+
+    #[test]
+    fn strip_think_blocks_removes_all() {
+        let text = "<think>hmm</think>Answer is 42<think>double check</think>.";
+        assert_eq!(strip_think_blocks(text), "Answer is 42.");
     }
 
     // ── Gateway action tests ──────────────────────────────────────
