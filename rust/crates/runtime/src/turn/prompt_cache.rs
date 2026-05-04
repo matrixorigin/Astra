@@ -557,6 +557,18 @@ mod tests {
 
     static CACHE_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Safe wrapper for `std::env::set_var` in single-threaded tests guarded by `CACHE_ENV_MUTEX`.
+    fn set_test_env(key: &str, val: &str) {
+        // SAFETY: all tests that mutate env vars hold CACHE_ENV_MUTEX and run with
+        // `-- --test-threads=1` or the mutex serialises access within this module.
+        unsafe { std::env::set_var(key, val) }
+    }
+
+    /// Safe wrapper for `std::env::remove_var` in single-threaded tests.
+    fn remove_test_env(key: &str) {
+        unsafe { std::env::remove_var(key) }
+    }
+
     #[test]
     fn section_cache_key_varies_by_tools_and_task() {
         let key1 = section_cache_key(&["bash"], Some("implementation"), 0.8);
@@ -599,10 +611,8 @@ mod tests {
         if let Ok(mut cache) = section_cache().lock() {
             cache.clear();
         }
-        unsafe {
-            std::env::set_var("HOME", home.path());
-            std::env::set_var("ASTRA_OUTPUT_STYLE", "concise");
-        }
+        set_test_env("HOME", home.path().to_str().unwrap());
+        set_test_env("ASTRA_OUTPUT_STYLE", "concise");
 
         let (msg, dynamic_msg, sections) = build_system_message(
             &["prompt_cache_test_tool"],
@@ -635,9 +645,7 @@ mod tests {
             "trace sections must include the same output style sent to the provider"
         );
 
-        unsafe {
-            std::env::remove_var("ASTRA_OUTPUT_STYLE");
-        }
+        remove_test_env("ASTRA_OUTPUT_STYLE");
     }
 
     #[test]
@@ -647,10 +655,8 @@ mod tests {
         let prompts_dir = home.path().join(".astra").join("prompts");
         std::fs::create_dir_all(&prompts_dir).expect("prompts dir");
         let override_path = prompts_dir.join("core_rules.txt");
-        unsafe {
-            std::env::set_var("HOME", home.path());
-            std::env::remove_var("ASTRA_OUTPUT_STYLE");
-        }
+        set_test_env("HOME", home.path().to_str().unwrap());
+        remove_test_env("ASTRA_OUTPUT_STYLE");
         if let Ok(mut cache) = section_cache().lock() {
             cache.clear();
         }
@@ -690,16 +696,12 @@ mod tests {
     fn structured_prompt_cache_key_tracks_output_style_changes() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         let home = tempfile::tempdir().expect("temp home");
-        unsafe {
-            std::env::set_var("HOME", home.path());
-        }
+        set_test_env("HOME", home.path().to_str().unwrap());
         if let Ok(mut cache) = section_cache().lock() {
             cache.clear();
         }
 
-        unsafe {
-            std::env::set_var("ASTRA_OUTPUT_STYLE", "concise");
-        }
+        set_test_env("ASTRA_OUTPUT_STYLE", "concise");
         let (_, first_dynamic, _) = build_system_message(
             &["prompt_cache_style_reload_tool"],
             "",
@@ -713,9 +715,7 @@ mod tests {
             .expect("first dynamic prompt");
         assert!(first.contains("# Output Style: Concise"), "{first}");
 
-        unsafe {
-            std::env::set_var("ASTRA_OUTPUT_STYLE", "verbose");
-        }
+        set_test_env("ASTRA_OUTPUT_STYLE", "verbose");
         let (_, second_dynamic, _) = build_system_message(
             &["prompt_cache_style_reload_tool"],
             "",
@@ -733,9 +733,7 @@ mod tests {
             "dynamic prompt cache must invalidate when output style changes: {second}"
         );
 
-        unsafe {
-            std::env::remove_var("ASTRA_OUTPUT_STYLE");
-        }
+        remove_test_env("ASTRA_OUTPUT_STYLE");
     }
 
     #[test]
@@ -750,9 +748,7 @@ mod tests {
     #[test]
     fn build_system_message_anthropic_has_cache_control() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        }
+        remove_test_env("ASTRA_TEST_PROMPT_CACHE_DISABLED");
 
         let (msg, _, _) = build_system_message(
             &["bash", "read_file"],
@@ -797,9 +793,7 @@ mod tests {
     #[test]
     fn build_system_message_cache_disabled_env() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::set_var("ASTRA_TEST_PROMPT_CACHE_DISABLED", "1");
-        }
+        set_test_env("ASTRA_TEST_PROMPT_CACHE_DISABLED", "1");
         let (msg, _, _) = build_system_message(
             &["bash"],
             "profile",
@@ -815,9 +809,7 @@ mod tests {
             content.iter().all(|b| b.get("cache_control").is_none()),
             "cache disabled should not annotate"
         );
-        unsafe {
-            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        }
+        remove_test_env("ASTRA_TEST_PROMPT_CACHE_DISABLED");
     }
 
     #[test]
@@ -925,9 +917,7 @@ mod tests {
     #[test]
     fn latch_enables_anthropic_style_cache_for_bedrock_claude() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        }
+        remove_test_env("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         let cfg = PromptCacheConfig::latch("bedrock", "anthropic.claude-sonnet-4-20250514-v1:0");
         assert!(cfg.cache_enabled);
         assert!(cfg.is_anthropic);
@@ -936,9 +926,7 @@ mod tests {
     #[test]
     fn latch_keeps_non_claude_bedrock_on_openai_style_cache() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        }
+        remove_test_env("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         let cfg = PromptCacheConfig::latch("bedrock", "us.amazon.nova-micro-v1:0");
         assert!(cfg.cache_enabled);
         assert!(!cfg.is_anthropic);

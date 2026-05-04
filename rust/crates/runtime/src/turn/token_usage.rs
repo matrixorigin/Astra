@@ -206,11 +206,17 @@ fn extract_anthropic(u: &Map<String, Value>) -> Option<TokenUsage> {
     if input.is_none() && output.is_none() && cached == 0 && cache_creation == 0 {
         return None;
     }
+    // Guard against all-zero usage (e.g. empty response body parsed as zeros).
+    let i = input.unwrap_or(0);
+    let o = output.unwrap_or(0);
+    if i == 0 && o == 0 && cached == 0 && cache_creation == 0 {
+        return None;
+    }
     Some(TokenUsage {
-        input_tokens: input.unwrap_or(0),
+        input_tokens: i,
         cached_input_tokens: cached,
         cache_creation_tokens: cache_creation,
-        output_tokens: output.unwrap_or(0),
+        output_tokens: o,
     })
 }
 
@@ -535,6 +541,32 @@ mod tests {
     fn anthropic_messages_empty_usage_returns_none() {
         let u = obj(json!({}));
         assert!(extract_usage(UsageDialect::AnthropicMessages, &u).is_none());
+    }
+
+    #[test]
+    fn anthropic_messages_cache_only_usage_returns_some() {
+        // A response with cache_read but zero input/output should still be Some
+        let u = obj(json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 500
+        }));
+        let t = extract_usage(UsageDialect::AnthropicMessages, &u).unwrap();
+        assert_eq!(t.cached_input_tokens, 500);
+    }
+
+    #[test]
+    fn anthropic_messages_all_zero_returns_none() {
+        let u = obj(json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0
+        }));
+        assert!(
+            extract_usage(UsageDialect::AnthropicMessages, &u).is_none(),
+            "all-zero Anthropic usage should return None"
+        );
     }
 
     // ── Canonical JSON shape used in SSE events ────────────────────────────

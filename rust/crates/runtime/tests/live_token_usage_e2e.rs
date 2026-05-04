@@ -424,6 +424,23 @@ fn assert_anthropic_disjoint_identity(raw_usage: &Value, u: &TokenUsage, tag: &s
         raw_input, u.input_tokens,
         "{tag}: Anthropic disjoint identity broken: raw input_tokens={raw_input}, normalized={u:?}"
     );
+    // Verify cache fields round-trip correctly (Anthropic reports them disjointly).
+    let raw_cached = raw_usage
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    assert_eq!(
+        raw_cached, u.cached_input_tokens,
+        "{tag}: Anthropic cache_read mismatch: raw={raw_cached}, normalized={u:?}"
+    );
+    let raw_creation = raw_usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    assert_eq!(
+        raw_creation, u.cache_creation_tokens,
+        "{tag}: Anthropic cache_creation mismatch: raw={raw_creation}, normalized={u:?}"
+    );
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

@@ -4949,7 +4949,10 @@ mod tests {
             "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
             "cache_control": {"type": "ephemeral", "ttl": "1h"}
         });
-        assert_eq!(build_anthropic_tools(std::slice::from_ref(&native)), vec![native]);
+        assert_eq!(
+            build_anthropic_tools(std::slice::from_ref(&native)),
+            vec![native]
+        );
     }
 
     #[tokio::test]
