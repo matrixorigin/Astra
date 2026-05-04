@@ -99,6 +99,8 @@ pub struct GatewayRunner {
     /// Tracks consecutive auth failures per CLI profile name.
     /// Value: (failure_count, last_failure_time).
     auth_failures: Arc<dashmap::DashMap<String, (u32, Instant)>>,
+    /// Shared access token — gateway validates once, all CLI spawns reuse via env var.
+    shared_auth: Option<SharedAuthToken>,
 }
 
 /// No-op adapter used in spawned CLI tasks (typing/heartbeats not available in background).
@@ -223,6 +225,12 @@ impl GatewayRunner {
             cli_profile.clone()
         };
 
+        let shared_auth = Some(SharedAuthToken::new(
+            thin.clone(),
+            config.astra.username.clone(),
+            config.astra.password.clone(),
+        ));
+
         Ok(Self {
             config,
             store,
@@ -237,6 +245,7 @@ impl GatewayRunner {
             global_run_limiter: Arc::new(tokio::sync::Semaphore::new(max_concurrent_runs)),
             cli_availability,
             auth_failures: Arc::new(dashmap::DashMap::new()),
+            shared_auth,
         })
     }
 
@@ -706,6 +715,13 @@ impl GatewayRunner {
         let cli_name = cli_profile.name().to_string();
         let cli_timeout = Duration::from_secs(self.config.cli_timeout_secs.max(1));
 
+        // Pre-fetch shared access token so the CLI can skip per-spawn auth.
+        let access_token = if let Some(ref auth) = self.shared_auth {
+            auth.get().await
+        } else {
+            None
+        };
+
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<CliProgress>(64);
 
         let cli_handle = tokio::spawn({
@@ -713,6 +729,7 @@ impl GatewayRunner {
             let message_text = message_text.clone();
             let system_prompt = system_prompt.clone();
             let ws = workspace.clone();
+            let token = access_token.clone();
             async move {
                 cli_bridge::run_cli_with_context_and_timeout(
                     &profile,
@@ -721,9 +738,8 @@ impl GatewayRunner {
                     ws.as_deref(),
                     Some(progress_tx),
                     Some(&system_prompt),
-                    // TODO(cli_bridge): pass gateway trace_id/request_id once the
-                    // bridge exposes a stable metadata API.
                     Some(cli_timeout),
+                    token.as_deref(),
                 )
                 .await
             }
@@ -888,6 +904,9 @@ impl GatewayRunner {
                 // Track auth failures for circuit breaker
                 if cli_bridge::is_auth_error(&e) {
                     self.record_auth_failure(&cli_name);
+                    if let Some(ref auth) = self.shared_auth {
+                        auth.invalidate().await;
+                    }
                 }
                 suspend_tasks(&self.durable_store, format!("CLI error: {e}")).await;
                 if let Some(writer) = trace_writer.as_ref() {
@@ -968,6 +987,7 @@ impl GatewayRunner {
                 let message_text = msg.text.clone();
                 let system_prompt = system_prompt.clone();
                 let ws = workspace.clone();
+                let access_token = access_token.clone();
                 async move {
                     cli_bridge::run_cli_with_context(
                         &profile,
@@ -976,6 +996,7 @@ impl GatewayRunner {
                         ws.as_deref(),
                         None,
                         Some(&system_prompt),
+                        access_token.as_deref(),
                     )
                     .await
                 }
@@ -1056,6 +1077,9 @@ impl GatewayRunner {
             let combined_err = format!("{}\n{}", result.stderr, result.stdout);
             if cli_bridge::is_auth_error(&combined_err) {
                 self.record_auth_failure(&cli_name);
+                if let Some(ref auth) = self.shared_auth {
+                    auth.invalidate().await;
+                }
 
                 // Attempt auto-relogin if credentials are configured
                 if self.config.astra.username.is_some()
@@ -1063,9 +1087,14 @@ impl GatewayRunner {
                     && matches!(cli_profile, CliProfile::Astra { .. })
                 {
                     match self.try_auto_relogin().await {
-                        Ok(_) => {
+                        Ok(ref token) => {
                             tracing::info!(cli = %cli_name, "auto-relogin succeeded after auth failure");
                             self.clear_auth_failure(&cli_name);
+                            // Update shared token cache with the fresh token
+                            if let Some(ref auth) = self.shared_auth {
+                                let mut guard = auth.token.write().await;
+                                *guard = Some(token.clone());
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(cli = %cli_name, error = %e, "auto-relogin failed");
@@ -1503,11 +1532,21 @@ impl GatewayRunner {
             lines.push("\n认证缓存已重置。".into());
         }
 
-        // 4. Attempt auto-relogin if credentials configured
+        // 4. Invalidate shared token cache so it refreshes on next message
+        if let Some(ref auth) = self.shared_auth {
+            auth.invalidate().await;
+        }
+
+        // 5. Attempt auto-relogin if credentials configured
         if self.config.astra.username.is_some() && self.config.astra.password.is_some() {
             match self.try_auto_relogin().await {
-                Ok(_) => {
+                Ok(ref token) => {
                     lines.push("✅ 自动重新登录成功，凭证已刷新。".into());
+                    // Warm shared token cache with the fresh token
+                    if let Some(ref auth) = self.shared_auth {
+                        let mut guard = auth.token.write().await;
+                        *guard = Some(token.clone());
+                    }
                 }
                 Err(e) => {
                     lines.push(format!("⚠️ 自动重新登录失败: {e}"));
@@ -2133,6 +2172,109 @@ fn rfind_fence_break(s: &str) -> Option<usize> {
         }
     }
     None
+}
+
+// ─── Shared auth token ─────────────────────────────────────────────────────
+//
+// Gateway manages a single cached access token that is injected into CLI
+// spawns via `ASTRA_ACCESS_TOKEN`.  This eliminates per-message auth
+// round-trips (`GET /auth/me`) inside the CLI.
+
+/// Thread-safe cached access token.  The gateway validates the token once,
+/// then all concurrent CLI spawns reuse it without any HTTP call.
+struct SharedAuthToken {
+    token: tokio::sync::RwLock<Option<String>>,
+    api: astra_thin_client::ThinClient,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+impl SharedAuthToken {
+    fn new(
+        api: astra_thin_client::ThinClient,
+        username: Option<String>,
+        password: Option<String>,
+    ) -> Self {
+        Self {
+            token: tokio::sync::RwLock::new(None),
+            api,
+            username,
+            password,
+        }
+    }
+
+    /// Return a cached valid token, or try to obtain one (from credentials file
+    /// or by logging in).
+    async fn get(&self) -> Option<String> {
+        // Fast path: return cached token
+        {
+            let guard = self.token.read().await;
+            if let Some(ref tok) = *guard {
+                return Some(tok.clone());
+            }
+        }
+        // Slow path: refresh
+        self.refresh().await
+    }
+
+    /// Force-refresh: read from `~/.astra/credentials.json`, validate via
+    /// `GET /auth/me`, and optionally re-login with username/password.
+    async fn refresh(&self) -> Option<String> {
+        // Read from CLI credentials file
+        if let Some(ref tok) = read_cli_access_token()
+            && let Ok(resp) = self
+                .api
+                .get_auth_me_text_timeout(tok, Duration::from_secs(3))
+                .await
+            && resp.status().is_success()
+        {
+            let mut guard = self.token.write().await;
+            *guard = Some(tok.clone());
+            return Some(tok.clone());
+        }
+        // Token invalid — try login if credentials available
+        if let (Some(username), Some(password)) = (&self.username, &self.password)
+            && let Ok(body) = self
+                .api
+                .post_auth_login_json(&serde_json::json!({
+                    "username": username,
+                    "password": password,
+                }))
+                .await
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+            && let Some(access) = v["access_token"].as_str()
+        {
+            let refresh = v["refresh_token"].as_str();
+            let _ = save_token_to_cli_credentials(username, access, refresh);
+            let tok = access.to_string();
+            let mut guard = self.token.write().await;
+            *guard = Some(tok.clone());
+            return Some(tok);
+        }
+        None
+    }
+
+    /// Clear the cached token (e.g. after an auth failure from the CLI).
+    async fn invalidate(&self) {
+        let mut guard = self.token.write().await;
+        *guard = None;
+    }
+}
+
+/// Read the access token for the current profile from `~/.astra/credentials.json`.
+fn read_cli_access_token() -> Option<String> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    let path = std::path::Path::new(&home)
+        .join(".astra")
+        .join("credentials.json");
+    let content = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let current = v["current_profile"].as_str().unwrap_or("default");
+    v["profiles"][current]["access_token"]
+        .as_str()
+        .map(String::from)
 }
 
 /// Write refreshed tokens to `~/.astra/credentials.json` so subsequent CLI
@@ -3767,6 +3909,107 @@ mod tests {
             loaded["profiles"]["default"]["username"].as_str(),
             Some("admin")
         );
+    }
+
+    // ── SharedAuthToken ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn shared_auth_token_get_returns_none_without_credentials() {
+        // With no credentials file and no username/password, get() should return None
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let auth = SharedAuthToken::new(api, None, None);
+        // get() will try to read credentials file and validate — both fail → None
+        assert!(auth.get().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shared_auth_token_invalidate_clears_cached() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let auth = SharedAuthToken::new(api, None, None);
+        // Manually set a cached token
+        {
+            let mut guard = auth.token.write().await;
+            *guard = Some("cached-token-abc".to_string());
+        }
+        assert_eq!(auth.get().await, Some("cached-token-abc".to_string()));
+
+        auth.invalidate().await;
+        // After invalidation, cached token is cleared (get returns None because
+        // refresh will fail with unreachable server)
+        let guard = auth.token.read().await;
+        assert!(guard.is_none());
+    }
+
+    #[tokio::test]
+    async fn shared_auth_token_get_returns_cached() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let auth = SharedAuthToken::new(api, None, None);
+        // Manually seed cache
+        {
+            let mut guard = auth.token.write().await;
+            *guard = Some("fast-path-token".to_string());
+        }
+        // get() should return the cached token without any network call
+        assert_eq!(auth.get().await, Some("fast-path-token".to_string()));
+    }
+
+    #[test]
+    fn read_cli_access_token_missing_file() {
+        // With a nonexistent HOME, read_cli_access_token should return None
+        let _guard = EnvGuard::set("HOME", "/nonexistent/path/xyz");
+        assert!(read_cli_access_token().is_none());
+    }
+
+    #[test]
+    fn read_cli_access_token_valid_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let astra_dir = tmp.path().join(".astra");
+        std::fs::create_dir_all(&astra_dir).unwrap();
+        let creds = serde_json::json!({
+            "current_profile": "default",
+            "profiles": {
+                "default": {
+                    "access_token": "my-token-123",
+                    "refresh_token": "my-refresh"
+                }
+            }
+        });
+        std::fs::write(
+            astra_dir.join("credentials.json"),
+            serde_json::to_string(&creds).unwrap(),
+        )
+        .unwrap();
+
+        let _guard = EnvGuard::set("HOME", tmp.path().to_str().unwrap());
+        assert_eq!(read_cli_access_token(), Some("my-token-123".to_string()));
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => unsafe {
+                    std::env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
+            }
+        }
     }
 }
 

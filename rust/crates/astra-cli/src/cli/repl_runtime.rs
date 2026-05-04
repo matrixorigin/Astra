@@ -295,6 +295,14 @@ impl SilentRefreshError {
 /// Clears credentials only when the server definitively rejects auth (after handling
 /// refresh-token rotation races — see `recover_credentials_after_refresh_race`).
 pub(super) async fn try_silent_auth(api: &astra_thin_client::ThinClient, profile: Option<&str>) {
+    // When gateway provides a pre-validated token via env, skip auth entirely —
+    // the gateway owns token lifecycle and the HTTP round-trip is wasteful.
+    if std::env::var("ASTRA_ACCESS_TOKEN")
+        .map(|t| !t.is_empty())
+        .unwrap_or(false)
+    {
+        return;
+    }
     let creds = load_credentials();
     let name = profile_name(profile, &creds);
     let prof = creds.profiles.get(&name);
@@ -975,6 +983,12 @@ fn print_startup_logo() {
 }
 
 pub(super) fn current_access_token(profile: Option<&str>) -> Option<String> {
+    // Gateway injects a pre-validated token — skip file I/O and auth check
+    if let Ok(token) = std::env::var("ASTRA_ACCESS_TOKEN") {
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
     let creds = load_credentials();
     let name = profile_name(profile, &creds);
     creds
@@ -1776,6 +1790,61 @@ mod tests {
             direct, wrapped,
             "SilentRefreshError::Thin wrapper must defer to \
              should_keep_credentials_on_refresh_error"
+        );
+    }
+
+    // ── ASTRA_ACCESS_TOKEN env var ──────────────────────────────
+
+    #[test]
+    fn current_access_token_prefers_env_var() {
+        let _g = isolate_credentials();
+        let _env = EnvGuard::set("ASTRA_ACCESS_TOKEN", "env-token-xyz");
+        assert_eq!(
+            current_access_token(None),
+            Some("env-token-xyz".to_string()),
+            "should return env var token when ASTRA_ACCESS_TOKEN is set"
+        );
+    }
+
+    #[test]
+    fn current_access_token_ignores_empty_env_var() {
+        let _g = isolate_credentials();
+        let _env = EnvGuard::set("ASTRA_ACCESS_TOKEN", "");
+        // With empty env and no credentials file, should return None
+        assert_eq!(
+            current_access_token(None),
+            None,
+            "empty env var should be ignored"
+        );
+    }
+
+    #[test]
+    fn current_access_token_falls_back_to_file_without_env() {
+        let _g = isolate_credentials();
+        // Make sure ASTRA_ACCESS_TOKEN is not set (empty = ignored)
+        let _env_clear = EnvGuard::set("ASTRA_ACCESS_TOKEN", "");
+        // Write a credentials file to the isolated path
+        let creds = CredentialsFile {
+            current_profile: Some("default".into()),
+            profiles: std::collections::HashMap::from([(
+                "default".to_string(),
+                Profile {
+                    username: Some("user".into()),
+                    access_token: Some("file-token-abc".into()),
+                    refresh_token: None,
+                    ..Default::default()
+                },
+            )]),
+        };
+        let path = crate::cli_utils::credentials_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&path, serde_json::to_string(&creds).unwrap()).unwrap();
+        assert_eq!(
+            current_access_token(None),
+            Some("file-token-abc".to_string()),
+            "should fall back to credentials file when env var is empty"
         );
     }
 }

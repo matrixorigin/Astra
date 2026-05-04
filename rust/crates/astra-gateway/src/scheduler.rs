@@ -119,6 +119,7 @@ impl CronScheduler {
                 None,
                 None,
                 Some(Duration::from_secs(self.config.cli_timeout_secs.max(1))),
+                None, // scheduler does not use shared auth token
             );
 
             let response = match cli_future.await {

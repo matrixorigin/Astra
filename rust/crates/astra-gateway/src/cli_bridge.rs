@@ -577,7 +577,16 @@ pub async fn run_cli(
     working_dir: Option<&std::path::Path>,
     progress_tx: Option<mpsc::Sender<CliProgress>>,
 ) -> Result<CliResult, String> {
-    run_cli_with_context(profile, message, session_id, working_dir, progress_tx, None).await
+    run_cli_with_context(
+        profile,
+        message,
+        session_id,
+        working_dir,
+        progress_tx,
+        None,
+        None,
+    )
+    .await
 }
 
 pub async fn run_cli_with_context(
@@ -587,6 +596,7 @@ pub async fn run_cli_with_context(
     working_dir: Option<&std::path::Path>,
     progress_tx: Option<mpsc::Sender<CliProgress>>,
     system_prompt: Option<&str>,
+    access_token: Option<&str>,
 ) -> Result<CliResult, String> {
     run_cli_with_context_and_timeout(
         profile,
@@ -596,10 +606,12 @@ pub async fn run_cli_with_context(
         progress_tx,
         system_prompt,
         None,
+        access_token,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_cli_with_context_and_timeout(
     profile: &CliProfile,
     message: &str,
@@ -608,6 +620,7 @@ pub async fn run_cli_with_context_and_timeout(
     progress_tx: Option<mpsc::Sender<CliProgress>>,
     system_prompt: Option<&str>,
     timeout: Option<Duration>,
+    access_token: Option<&str>,
 ) -> Result<CliResult, String> {
     run_cli_with_context_trace_and_timeout(
         profile,
@@ -619,6 +632,7 @@ pub async fn run_cli_with_context_and_timeout(
         None,
         None,
         timeout,
+        access_token,
     )
     .await
 }
@@ -634,6 +648,7 @@ pub async fn run_cli_with_context_trace_and_timeout(
     trace_id: Option<&str>,
     request_id: Option<&str>,
     timeout: Option<Duration>,
+    access_token: Option<&str>,
 ) -> Result<CliResult, String> {
     let mut cmd =
         profile.build_command_with_context(message, session_id, working_dir, system_prompt);
@@ -642,6 +657,9 @@ pub async fn run_cli_with_context_trace_and_timeout(
     }
     if let Some(request_id) = request_id {
         cmd.env("ASTRA_GATEWAY_REQUEST_ID", request_id);
+    }
+    if let Some(token) = access_token {
+        cmd.env("ASTRA_ACCESS_TOKEN", token);
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -1148,6 +1166,7 @@ model: claude-sonnet-4-6"#;
             None,
             None,
             Some(Duration::from_millis(50)),
+            None,
         )
         .await
         .unwrap_err();
@@ -1176,10 +1195,57 @@ model: claude-sonnet-4-6"#;
             Some("trace-1"),
             Some("req-1"),
             None,
+            None,
         )
         .await
         .unwrap();
         assert_eq!(r.text.as_deref(), Some("trace-1/req-1"));
+    }
+
+    #[tokio::test]
+    async fn run_injects_access_token_env() {
+        let p = CliProfile::Custom {
+            bin: "sh".into(),
+            args_template: vec!["-c".into(), "printf '%s' \"$ASTRA_ACCESS_TOKEN\"".into()],
+            json_output: false,
+            text_field: None,
+            session_id_field: None,
+        };
+        let r = run_cli_with_context_trace_and_timeout(
+            &p,
+            "ignored",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("test-token-xyz"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.text.as_deref(), Some("test-token-xyz"));
+    }
+
+    #[tokio::test]
+    async fn run_no_access_token_when_none() {
+        let p = CliProfile::Custom {
+            bin: "sh".into(),
+            args_template: vec![
+                "-c".into(),
+                "printf '%s' \"${ASTRA_ACCESS_TOKEN:-unset}\"".into(),
+            ],
+            json_output: false,
+            text_field: None,
+            session_id_field: None,
+        };
+        let r = run_cli_with_context_trace_and_timeout(
+            &p, "ignored", None, None, None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.text.as_deref(), Some("unset"));
     }
 
     #[tokio::test]
