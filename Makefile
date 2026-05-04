@@ -410,7 +410,7 @@ build-release: sweep
 build-cli: build-cli-release
 
 .PHONY: build-cli-release
-build-cli-release:
+build-cli-release: sweep
 	@echo "Building astra + astra-admin (release)..."
 	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli -p astra-admin-cli --release
 	@echo "Binaries:"
@@ -420,7 +420,7 @@ build-cli-release:
 build-server: build-server-release
 
 .PHONY: build-server-release
-build-server-release:
+build-server-release: sweep
 	@echo "Building astra-server (release)..."
 	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --release --bin $(API_SERVER_BIN)
 	@echo "Binary: $(RUST_RELEASE_BIN_DIR)/$(API_SERVER_BIN)"
@@ -482,7 +482,7 @@ test-dashboard: ## Build astra-test and launch live dashboard
 test-offline: sweep test-workspace test-runtime-bridge-hooks test-sdk-offline
 
 .PHONY: test-workspace
-test-workspace:
+test-workspace: sweep
 	@echo "Running Rust workspace tests (nextest profile=$(NEXTEST_OFFLINE_PROFILE))..."
 	@CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) --workspace $(NEXTEST_OFFLINE_FLAGS)
 	@echo "Running workspace doctests (cargo test --doc; not covered by nextest)..."
@@ -498,7 +498,7 @@ check-server-tool-schemas:
 # Compiles chat/turn bridge hook paths and runs integration binaries that require
 # `required-features = ["bridge-e2e-hooks"]` (e.g. chat_turn_bridge_ledger_inject_e2e).
 .PHONY: test-runtime-bridge-hooks
-test-runtime-bridge-hooks:
+test-runtime-bridge-hooks: sweep
 	@echo "Running astra-runtime tests with feature bridge-e2e-hooks (nextest profile=$(NEXTEST_OFFLINE_PROFILE))..."
 	@CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
 		--features bridge-e2e-hooks $(NEXTEST_OFFLINE_FLAGS)
@@ -679,7 +679,7 @@ ci: check test
 	@echo "✅ All CI checks passed!"
 
 .PHONY: lint
-lint:
+lint: sweep
 	@echo "Running clippy..."
 	@$(CARGO) clippy $(CARGO_MANIFEST_FLAG) --all-targets -- -D warnings
 
@@ -703,7 +703,7 @@ audit:
 	@cd rust && cargo audit
 
 .PHONY: type-check
-type-check:
+type-check: sweep
 	@echo "Running compile checks..."
 	@$(CARGO) check $(CARGO_MANIFEST_FLAG) --all-targets
 

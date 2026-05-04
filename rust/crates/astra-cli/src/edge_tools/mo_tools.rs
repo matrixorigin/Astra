@@ -24,8 +24,6 @@ use uuid::Uuid;
 
 // ─── MatrixOne connection helper ────────────────────────────────────────────
 
-const ASTRA_CONNECT_TIMEOUT_SECS: u32 = 5;
-
 /// Cached account name — queried once via `SELECT current_account_name()`.
 fn mo_current_account() -> &'static str {
     use std::sync::OnceLock;
@@ -182,32 +180,10 @@ fn is_mo_error(output: &str) -> bool {
     output.trim_start().starts_with("Error:")
 }
 
-/// Build a mysql Command with connection parameters from environment.
-///
-/// Requires `MATRIXONE_PASSWORD` to be set — returns an error message string
-/// when missing rather than falling back to a hardcoded development password.
 fn mo_mysql_cmd(database: Option<&str>) -> Result<Command, String> {
-    let host = std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".to_string());
-    let port = std::env::var("MATRIXONE_PORT").unwrap_or_else(|_| "6001".to_string());
-    let user = std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".to_string());
-    let password = std::env::var("MATRIXONE_PASSWORD").map_err(|_| {
-        "Error: MATRIXONE_PASSWORD environment variable is required. \
-         Set it before using MatrixOne tools."
-            .to_string()
-    })?;
-    let db = database
-        .map(String::from)
-        .unwrap_or_else(|| astra_core::resolve_database_name(&|k| std::env::var(k).ok()));
-
-    let mut cmd = Command::new("mysql");
-    cmd.arg(format!("-h{}", host))
-        .arg(format!("-P{}", port))
-        .arg(format!("-u{}", user))
-        .env("MYSQL_PWD", &password) // pass via env, not CLI (hidden from ps)
-        .arg(&db)
-        .arg(format!("--connect-timeout={ASTRA_CONNECT_TIMEOUT_SECS}"))
-        .arg("--table"); // Pretty-print results
-    Ok(cmd)
+    let settings = astra_core::MatrixOneSettings::from_env_strict()
+        .map_err(|e| format!("Error: {e}. Set MATRIXONE_PASSWORD before using MatrixOne tools."))?;
+    Ok(settings.mysql_cmd(database))
 }
 
 /// Execute a SQL statement against MatrixOne via the mysql CLI.

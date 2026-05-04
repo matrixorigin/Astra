@@ -6,7 +6,7 @@
 //! replayed against each model in `models:` (or the CLI-provided
 //! fallback list).
 //!
-//! See `cases/spawn_agent_hello.yaml` for a worked example.
+//! See `cases/hello_text_contains.yaml` for a worked example.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;

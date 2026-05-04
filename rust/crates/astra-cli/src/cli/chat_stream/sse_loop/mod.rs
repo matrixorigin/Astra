@@ -271,6 +271,19 @@ pub(crate) async fn stream_chat_sse(
     if let Some(ref obs) = p.observability_session {
         executor.observability_session = Some(obs.clone());
     }
+    // P6: propagate cross-session lessons (loaded at first-turn bootstrap)
+    // into the ToolExecutor so every SelfModel snapshot this turn carries
+    // prior-session advice. No-op when the cache is empty.
+    if !p.session_lessons.is_empty() {
+        executor.set_session_lessons(p.session_lessons.to_vec());
+    }
+    // P8: propagate the previous turn's auto-invoke diagnosis so this
+    // turn's LLM reads "the system already noticed X" in the self-awareness
+    // section. Cloned because the setter takes ownership; the state-side
+    // cache keeps its copy for the next turn's render / eventual clear.
+    if let Some(diag) = p.latest_skill_diagnosis {
+        executor.set_latest_skill_diagnosis(Some(diag.clone()));
+    }
     let root_send_message_context = p.agent_spawner.as_ref().map(|spawner| {
         edge_tools::agent_messaging::SendMessageRuntimeContext {
             agent_id: root_agent_id.to_string(),

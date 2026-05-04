@@ -49,7 +49,7 @@ pub fn delegate_tool_schema() -> Value {
         "type": "function",
         "function": {
             "name": "delegate",
-            "description": "Delegate a task to one or more specialized sub-agents. Use this when a task benefits from parallel execution, pipeline processing, or adversarial review by specialized agents.",
+            "description": "Delegate a task to specialized sub-agents for parallel, sequential, pipeline, or review workflows.",
             "parameters": {
                 "type": "object",
                 "required": ["task", "agents"],
@@ -66,7 +66,7 @@ pub fn delegate_tool_schema() -> Value {
                     "pattern": {
                         "type": "string",
                         "enum": ["sequential", "fan_out", "pipeline", "adversarial"],
-                        "description": "Coordination pattern. 'sequential': agents run one by one. 'fan_out': agents run in parallel. 'pipeline': output of each feeds the next. 'adversarial': producer+reviewer iterate."
+                        "description": "Coordination pattern: sequential, fan_out, pipeline, or adversarial."
                     },
                     "max_rounds": {
                         "type": "integer",

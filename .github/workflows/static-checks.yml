@@ -23,8 +23,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          shared-key: ci-test
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: ci-test-${{ github.base_ref || github.ref_name }}
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - name: Run clippy
         run: make lint
       - name: Server tool schema guards (astra-tools)

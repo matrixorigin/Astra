@@ -25,3 +25,4 @@ uuid = { workspace = true }
 hostname = { workspace = true }
 reqwest = { workspace = true }
 astra-tools = { path = "../astra-tools" }
+astra-server-types.workspace = true

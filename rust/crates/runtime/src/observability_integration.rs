@@ -147,6 +147,19 @@ pub struct ObservabilitySession {
     /// corrections. Newest at the back. Capped by the publisher.
     pub recent_correction_excerpts: Vec<String>,
 
+    /// Cumulative session-wide stall event count. Incremented once per
+    /// pipeline-detected stall via [`Self::record_stall_event`]. Used by
+    /// the session-end lesson extractor to emit `PromptShape` lessons
+    /// when the agent loops too often.
+    pub stall_event_count: u32,
+
+    /// Cumulative session-wide count of postconditions that the most
+    /// recent `ActionPlan` runs failed to satisfy. Incremented via
+    /// [`Self::record_unmet_postconditions`]. Used by the session-end
+    /// lesson extractor to emit `PostconditionPattern` lessons when
+    /// plans systematically over-promise.
+    pub unmet_postcondition_count: u32,
+
     /// Gap 6: per-tool outcome bias currently applied by the selector
     /// (`ToolHealthTracker::outcome_bias_by_tool`). Sorted by tool name.
     pub outcome_bias: std::collections::BTreeMap<String, f64>,
@@ -270,6 +283,8 @@ impl ObservabilitySession {
             recent_failing_tests: Vec::new(),
             recent_rejections: Vec::new(),
             recent_correction_excerpts: Vec::new(),
+            stall_event_count: 0,
+            unmet_postcondition_count: 0,
             outcome_bias: std::collections::BTreeMap::new(),
             low_confidence_tools: Vec::new(),
             active_scenario: None,
@@ -313,6 +328,8 @@ impl ObservabilitySession {
             recent_failing_tests: Vec::new(),
             recent_rejections: Vec::new(),
             recent_correction_excerpts: Vec::new(),
+            stall_event_count: 0,
+            unmet_postcondition_count: 0,
             outcome_bias: std::collections::BTreeMap::new(),
             low_confidence_tools: Vec::new(),
             active_scenario: None,
@@ -529,6 +546,21 @@ impl ObservabilitySession {
             let drop = self.recent_correction_excerpts.len() - MAX_EXCERPTS;
             self.recent_correction_excerpts.drain(0..drop);
         }
+    }
+
+    /// Increment the cumulative stall counter. Call once per pipeline-
+    /// detected stall; saturates at `u32::MAX` (any sane session tops
+    /// out in single digits, so the cap is paranoia, not a constraint).
+    pub fn record_stall_event(&mut self) {
+        self.stall_event_count = self.stall_event_count.saturating_add(1);
+    }
+
+    /// Publish the number of unmet postconditions observed on the latest
+    /// `ActionPlan` run. Called after each plan execution. Accumulates
+    /// across turns; session-end extractor reads the total. Saturates
+    /// at `u32::MAX`.
+    pub fn record_unmet_postconditions(&mut self, count: u32) {
+        self.unmet_postcondition_count = self.unmet_postcondition_count.saturating_add(count);
     }
 
     /// Gap 2: publish names of tests that failed in a recent tool outcome.
@@ -1717,5 +1749,51 @@ mod tests {
         assert_eq!(stats.discarded, 1);
         assert_eq!(stats.total_saved_ms, 240);
         assert!((stats.hit_rate() - 0.5).abs() < 1e-9);
+    }
+
+    // ── P7a: cumulative counters for session-end lesson extraction ──────────
+
+    #[test]
+    fn fresh_session_starts_with_zero_stall_and_unmet_counts() {
+        let s = ObservabilitySession::new_simple("s-p7a-fresh");
+        assert_eq!(s.stall_event_count, 0);
+        assert_eq!(s.unmet_postcondition_count, 0);
+    }
+
+    #[test]
+    fn record_stall_event_increments_cumulative_counter() {
+        let mut s = ObservabilitySession::new_simple("s-p7a-stall");
+        s.record_stall_event();
+        s.record_stall_event();
+        s.record_stall_event();
+        assert_eq!(s.stall_event_count, 3);
+    }
+
+    #[test]
+    fn record_stall_event_saturates_at_u32_max() {
+        let mut s = ObservabilitySession::new_simple("s-p7a-sat");
+        s.stall_event_count = u32::MAX - 1;
+        s.record_stall_event();
+        assert_eq!(s.stall_event_count, u32::MAX);
+        // One more — must not overflow.
+        s.record_stall_event();
+        assert_eq!(s.stall_event_count, u32::MAX);
+    }
+
+    #[test]
+    fn record_unmet_postconditions_accumulates_across_plans() {
+        let mut s = ObservabilitySession::new_simple("s-p7a-unmet");
+        s.record_unmet_postconditions(2);
+        s.record_unmet_postconditions(3);
+        s.record_unmet_postconditions(0);
+        assert_eq!(s.unmet_postcondition_count, 5);
+    }
+
+    #[test]
+    fn record_unmet_postconditions_saturates_at_u32_max() {
+        let mut s = ObservabilitySession::new_simple("s-p7a-unmet-sat");
+        s.unmet_postcondition_count = u32::MAX - 2;
+        s.record_unmet_postconditions(100);
+        assert_eq!(s.unmet_postcondition_count, u32::MAX);
     }
 }

@@ -276,6 +276,50 @@ pub(crate) struct ReplState {
     /// Original user query at session start (for drift baseline comparison).
     pub drift_original_query: Option<String>,
 
+    /// Cross-session lessons loaded once at first-turn bootstrap. Empty
+    /// until a turn runs with `matrix_runtime` + `ingestion_user_id` set.
+    /// Passed through to every turn's ToolExecutor so the LLM sees prior
+    /// session's advice on every SelfModel snapshot.
+    pub session_lessons: Vec<astra_runtime::self_model::LessonHint>,
+    /// Set after the first bootstrap attempt regardless of result count.
+    /// Prevents per-turn DB calls for new users with zero lessons.
+    pub session_lessons_loaded: bool,
+    /// Incremental lesson extraction at natural breakpoints (corrections,
+    /// stalls, plan completion). Tracks which lessons have already been
+    /// recorded this session to prevent double-recording.
+    pub lesson_checkpointer: astra_runtime::lesson_checkpoint::LessonCheckpointer,
+
+    /// Resolved selector model connection parameters (cached at first use).
+    /// Used for memory relevance filtering with the cheapest model from the registry.
+    pub selector_model_params: Option<astra_runtime::memory_relevance::LlmConnParams>,
+    /// Background memory extraction agent.
+    pub memory_extractor: super::memory_extraction::MemoryExtractor,
+
+    /// P8: persistent auto-invoke handler. Owns the per-cause cooldowns
+    /// across turns of this session. Created lazily on first turn so
+    /// sessions that never trigger anything pay no cost. The REPL is
+    /// single-threaded per session so no Arc/Mutex needed.
+    pub auto_invoke_handler: Option<astra_runtime::auto_invoke_handler::AutoInvokeHandler>,
+
+    /// P8: most recent auto-invoke diagnosis, produced at the end of the
+    /// previous turn. Passed through to the next turn's ToolExecutor so
+    /// the LLM sees "the system already noticed X" in the prompt.
+    /// Cleared when no diagnosis is produced.
+    pub latest_skill_diagnosis: Option<astra_skills::auto_invoke::SkillDiagnosis>,
+
+    /// R1: tracks active diagnosis postconditions across turns. When a
+    /// diagnosis fires, its success_criteria are registered here. On each
+    /// subsequent turn, evaluate_turn checks whether the criteria are met.
+    /// Session cleanup reads the accumulated met/failed counts for the
+    /// DiagnosisOutcomeTracker.
+    pub diagnosis_outcome_tracker: astra_runtime::auto_invoke_handler::DiagnosisOutcomeTracker,
+
+    /// R1: cumulative met/failed diagnosis criteria for the session.
+    /// Incremented by `maybe_run_auto_invoke` when tracker completes a
+    /// diagnosis evaluation. Written to DiagnosisOutcomeTracker for observability.
+    pub diagnosis_criteria_met: u32,
+    pub diagnosis_criteria_failed: u32,
+
     // ── Observability (M1-M6) ──
     /// Global observability hub for M1-M6 integration (profiles, experiments, auto-tuning).
     /// Created at REPL startup, shared across sessions.
@@ -446,6 +490,17 @@ impl Default for ReplState {
             drift_compressed_turns: Vec::new(),
             drift_user_corrections: Vec::new(),
             drift_original_query: None,
+            session_lessons: Vec::new(),
+            session_lessons_loaded: false,
+            lesson_checkpointer: astra_runtime::lesson_checkpoint::LessonCheckpointer::new(),
+            selector_model_params: None,
+            memory_extractor: super::memory_extraction::MemoryExtractor::new(),
+            auto_invoke_handler: None,
+            latest_skill_diagnosis: None,
+            diagnosis_outcome_tracker:
+                astra_runtime::auto_invoke_handler::DiagnosisOutcomeTracker::new(),
+            diagnosis_criteria_met: 0,
+            diagnosis_criteria_failed: 0,
             // Observability: hub is created at REPL startup, session on first turn
             observability_hub: None,
             observability_session: None,

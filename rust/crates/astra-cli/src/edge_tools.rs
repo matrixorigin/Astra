@@ -58,14 +58,12 @@ pub(crate) use session_state::SessionStateRollbackJournal;
 #[path = "edge_tools/passive_lsp.rs"]
 mod passive_lsp;
 use astra_tools::passive_tsc_check;
-#[path = "edge_tools/schemas.rs"]
-mod schemas;
 #[path = "edge_tools/shell.rs"]
 #[allow(clippy::needless_range_loop)]
 mod shell;
 use astra_tools::env_tools;
+pub use astra_tools::schemas::all_tool_schemas;
 pub use env_tools::apply_overlay as apply_env_overlay;
-pub use schemas::all_tool_schemas;
 #[path = "edge_tools/code_analysis.rs"]
 mod code_analysis;
 #[path = "edge_tools/config_tool.rs"]
@@ -347,6 +345,9 @@ pub struct ToolExecutor {
     build_test_tracker: std::sync::Mutex<build_test::BuildTestTracker>,
     /// Circuit breaker: skip Memoria calls after consecutive failures.
     memoria_fail_count: std::sync::atomic::AtomicU32,
+    /// Whether the user has been notified about Memoria being down.
+    /// Prevents spamming the same warning every turn.
+    memoria_notified_down: std::sync::atomic::AtomicBool,
     /// File state tracker: records mtime after each read/write/edit.
     /// Used for staleness detection (prevent overwriting user edits)
     /// and dedup (skip re-reading unchanged files).
@@ -424,6 +425,16 @@ pub struct ToolExecutor {
     self_mod_pinned_tools: std::sync::Mutex<Vec<String>>,
     /// Self-modification deprioritized tool preferences (manual override hints).
     self_mod_deprioritized_tools: std::sync::Mutex<Vec<String>>,
+    /// P3.1 seam: cross-session lessons loaded at session bootstrap.
+    /// Populated once via `set_session_lessons`, then passed through on
+    /// every `build_self_model_snapshot` for the session's lifetime.
+    session_lessons: std::sync::Mutex<Vec<astra_runtime::self_model::LessonHint>>,
+    /// P3.3 seam: latest auto-invoked diagnostic skill output.
+    /// `AutoInvokeHandler::maybe_fire` writes each successful parse here;
+    /// the next `build_self_model_snapshot` injects it into the prompt and
+    /// `set_latest_skill_diagnosis(None)` clears it once the triggering
+    /// condition has resolved.
+    latest_skill_diagnosis: std::sync::Mutex<Option<astra_skills::auto_invoke::SkillDiagnosis>>,
     /// Per-turn mutation accounting for adjust_config governor.
     /// (turn_number, mutations_applied_on_turn)
     self_mod_mutation_counter: std::sync::Mutex<(u32, u32)>,
@@ -458,6 +469,7 @@ impl ToolExecutor {
             budget_pressure: std::sync::Mutex::new(0.0),
             build_test_tracker: std::sync::Mutex::new(build_test::BuildTestTracker::new()),
             memoria_fail_count: std::sync::atomic::AtomicU32::new(0),
+            memoria_notified_down: std::sync::atomic::AtomicBool::new(false),
             file_state: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             aggregate_output_bytes: std::sync::atomic::AtomicUsize::new(0),
             url_cache: std::sync::Mutex::new(HashMap::new()),
@@ -494,6 +506,8 @@ impl ToolExecutor {
             active_session_id: std::sync::Mutex::new(None),
             self_mod_pinned_tools: std::sync::Mutex::new(Vec::new()),
             self_mod_deprioritized_tools: std::sync::Mutex::new(Vec::new()),
+            session_lessons: std::sync::Mutex::new(Vec::new()),
+            latest_skill_diagnosis: std::sync::Mutex::new(None),
             self_mod_mutation_counter: std::sync::Mutex::new((0, 0)),
             default_executor: astra_tools::executor::DefaultToolExecutor::new(
                 astra_tools::ToolContext {
@@ -570,6 +584,27 @@ impl ToolExecutor {
 
     pub(crate) fn active_session_id(&self) -> Option<String> {
         self.active_session_id.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// P3.1 seam: stash cross-session lessons loaded at session bootstrap.
+    /// Every subsequent `build_self_model_snapshot` will project them via
+    /// [`astra_runtime::self_model::SelfModel::with_lessons`].
+    pub fn set_session_lessons(&self, lessons: Vec<astra_runtime::self_model::LessonHint>) {
+        if let Ok(mut g) = self.session_lessons.lock() {
+            *g = lessons;
+        }
+    }
+
+    /// P3.3 seam: stash the latest auto-invoke diagnosis. Pass `None` to
+    /// clear a stale diagnosis once the triggering condition resolves.
+    /// The next `build_self_model_snapshot` picks it up.
+    pub fn set_latest_skill_diagnosis(
+        &self,
+        diag: Option<astra_skills::auto_invoke::SkillDiagnosis>,
+    ) {
+        if let Ok(mut g) = self.latest_skill_diagnosis.lock() {
+            *g = diag;
+        }
     }
 
     /// Use a shared file edit journal (session-scoped) instead of the default.
@@ -1626,6 +1661,23 @@ impl ToolExecutor {
                     .collect(),
             );
         }
+
+        // P3.1 seam: attach cross-session lessons if bootstrap cached any.
+        if let Ok(lessons) = self.session_lessons.lock()
+            && !lessons.is_empty()
+        {
+            snapshot = snapshot.with_lessons(lessons.clone());
+        }
+
+        // P3.3 seam: attach the latest auto-invoke diagnosis (if any).
+        // `with_skill_diagnosis(None)` is a no-op — we only call it when
+        // something is stashed.
+        if let Ok(diag_guard) = self.latest_skill_diagnosis.lock()
+            && let Some(ref diag) = *diag_guard
+        {
+            snapshot = snapshot.with_skill_diagnosis(Some(diag.clone()));
+        }
+
         Some(snapshot)
     }
 }

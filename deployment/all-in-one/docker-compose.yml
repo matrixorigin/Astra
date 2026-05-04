@@ -65,7 +65,6 @@ services:
     environment:
       - ASTRA_API_HOST=0.0.0.0
       - ASTRA_API_PORT=8000
-      - ASTRA_APP_ENV=${ASTRA_APP_ENV:-production}
       - MATRIXONE_HOST=matrixone
       - MATRIXONE_PORT=6001
       - ASTRA_DATABASE=${ASTRA_DATABASE:-astra_runtime}

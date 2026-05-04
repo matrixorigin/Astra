@@ -844,6 +844,8 @@ pub enum JournalEventType {
     LlmRequestFull,
     /// Full LLM response payload for a single attempt within a round.
     LlmResponseFull,
+    /// Background memory extraction agent completed (extracted, skipped, or errored).
+    MemoryExtraction,
 }
 
 /// Writer that appends events to a session journal file.
@@ -3199,6 +3201,25 @@ impl JournalEvent {
                     serde_json::json!({ "name": name, "tokens_freed": freed })
                 }).collect::<Vec<_>>(),
             }
+        }));
+        evt
+    }
+
+    pub fn memory_extraction(
+        session_id: Option<&str>,
+        turn: u32,
+        outcome: &str,
+        memories_saved: usize,
+        categories: &[String],
+        duration_ms: u64,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::MemoryExtraction, session_id);
+        evt.turn = Some(turn);
+        evt.duration_ms = Some(duration_ms);
+        evt.metadata = Some(serde_json::json!({
+            "outcome": outcome,
+            "memories_saved": memories_saved,
+            "categories": categories,
         }));
         evt
     }

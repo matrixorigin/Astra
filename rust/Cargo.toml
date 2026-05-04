@@ -44,7 +44,7 @@ astra-pipeline = { path = "crates/astra-pipeline" }
 astra-plan = { path = "crates/astra-plan" }
 astra-prompts = { path = "crates/astra-prompts" }
 astra-sandbox = { path = "crates/astra-sandbox" }
-astra-server-types = { path = "crates/astra-server-types" }
+astra-server-types = { path = "crates/astra-server-types", default-features = false }
 astra-turn-core = { path = "crates/astra-turn-core" }
 astra-turn-types = { path = "crates/astra-turn-types" }
 astra-skills = { path = "crates/astra-skills" }

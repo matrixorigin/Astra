@@ -73,13 +73,13 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_8_pinned() {
-        assert_eq!(ToolRegistry::pinned_count(), 4);
+    fn catalog_has_6_pinned() {
+        assert_eq!(ToolRegistry::pinned_count(), 6);
     }
 
     #[test]
-    fn catalog_has_35_dynamic() {
-        assert_eq!(ToolRegistry::dynamic_count(), 39);
+    fn catalog_has_37_dynamic() {
+        assert_eq!(ToolRegistry::dynamic_count(), 37);
     }
 
     #[test]
@@ -93,12 +93,17 @@ mod tests {
         assert!(pinned.contains(&"read_file"));
         assert!(pinned.contains(&"str_replace"));
         assert!(pinned.contains(&"list_dir"));
-        assert!(!pinned.contains(&"memory_store"));
+        assert!(
+            pinned.contains(&"memory_store"),
+            "memory_store must be pinned — intrinsic store capability"
+        );
+        assert!(
+            pinned.contains(&"memory_retrieve"),
+            "memory_retrieve must be pinned — intrinsic recall capability"
+        );
         assert!(!pinned.contains(&"write_file"));
         assert!(!pinned.contains(&"grep"));
         assert!(!pinned.contains(&"glob"));
-        // memory_search is dynamic — selected only when query involves recall
-        assert!(!pinned.contains(&"memory_search"));
     }
 
     #[test]
@@ -185,21 +190,17 @@ mod tests {
     }
 
     #[test]
-    fn prefilter_ranks_memory_tools_for_recall() {
-        // memory_store, memory_search, and memory_purge are dynamic.
-        // For memory recall queries, memory_search should appear.
-        let state = ConversationState::from_message("之前我记住了什么偏好?", 1);
-        let ranked = pre_filter_dynamic(&state, "之前我记住了什么偏好?");
-
-        let top_names: Vec<&str> = ranked
+    fn pinned_memory_retrieve_always_available_for_recall() {
+        // memory_retrieve is now pinned — it no longer needs to rank in
+        // pre_filter_dynamic. Verify it IS pinned so memory lifecycle
+        // cases always have it available.
+        let tool = TOOL_CATALOG
             .iter()
-            .take(6)
-            .map(|&(idx, _)| TOOL_CATALOG[idx].name)
-            .collect();
+            .find(|t| t.name == "memory_retrieve")
+            .unwrap();
         assert!(
-            top_names.contains(&"memory_search"),
-            "memory_search should appear for recall query, got: {:?}",
-            top_names
+            tool.pinned,
+            "memory_retrieve must be pinned for reliable memory lifecycle"
         );
     }
 
@@ -253,13 +254,15 @@ mod tests {
 
     /// Regression: recall queries should surface recall-oriented memory tools.
     #[test]
-    fn select_memory_query_prefers_memory_search() {
+    fn select_memory_query_has_memory_retrieve() {
         let registry = ToolRegistry::new(mock_schemas());
         let selected = registry.select("我有哪些记忆？", 1);
         let names = ToolRegistry::selected_names(&selected);
+        let has_memory = names.contains(&"memory_retrieve".to_string())
+            || names.contains(&"memory_retrieve".to_string());
         assert!(
-            names.contains(&"memory_search".to_string()),
-            "memory_search must be in selection for '我有哪些记忆？', got: {:?}",
+            has_memory,
+            "memory query must select memory_retrieve (or legacy memory_retrieve), got: {:?}",
             names
         );
     }
@@ -472,8 +475,8 @@ mod tests {
         let selected = registry.select("我之前记住的偏好是什么?", 1);
         let names = ToolRegistry::selected_names(&selected);
         assert!(
-            names.contains(&"memory_search".to_string()),
-            "memory query should include memory_search, got: {:?}",
+            names.contains(&"memory_retrieve".to_string()),
+            "memory query should include memory_retrieve, got: {:?}",
             names
         );
     }
@@ -589,7 +592,7 @@ mod tests {
         let terms = tokenize("search memory recall preferences");
         let mem_idx = TOOL_CATALOG
             .iter()
-            .position(|t| t.name == "memory_search")
+            .position(|t| t.name == "memory_retrieve")
             .unwrap();
         let git_idx = TOOL_CATALOG
             .iter()
@@ -597,7 +600,7 @@ mod tests {
             .unwrap();
         assert!(
             tfidf_score(&terms, mem_idx) > tfidf_score(&terms, git_idx),
-            "memory_search should score higher than git_diff for memory query"
+            "memory_retrieve should score higher than git_diff for memory query"
         );
     }
 

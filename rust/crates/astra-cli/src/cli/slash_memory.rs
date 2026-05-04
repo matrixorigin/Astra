@@ -254,8 +254,184 @@ pub(super) async fn handle_memory_domain_command(
                         Err(e) => eprintln!("{}", format!("  ✗ Unreachable: {e}").red()),
                     }
                 }
+                "dismiss" if !sub_arg.is_empty() => {
+                    // Search for matching memories, then send "irrelevant" feedback.
+                    let payload = serde_json::json!({
+                        "query": sub_arg,
+                        "top_k": 3,
+                    });
+                    match api.post_memory_search_json(tok, &payload).await {
+                        Ok(r) if r.status().is_success() => {
+                            let body = r.text().await.unwrap_or_default();
+                            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&body) {
+                                if arr.is_empty() {
+                                    eprintln!("  {}", "No matching memories to dismiss.".dim());
+                                } else {
+                                    let mut dismissed = 0u32;
+                                    for m in &arr {
+                                        let Some(mid) = m.get("memory_id").and_then(|v| v.as_str())
+                                        else {
+                                            continue;
+                                        };
+                                        let content = m
+                                            .get("content")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("?");
+                                        let preview: String = content.chars().take(60).collect();
+                                        // Send "irrelevant" feedback to lower retrieval score
+                                        let mem = astra_core::MemoriaSettings::from_env();
+                                        let fb_url =
+                                            format!("{}/v1/memories/{mid}/feedback", mem.base_url);
+                                        if let (Ok(client), Some(token)) = (
+                                            reqwest::Client::builder()
+                                                .timeout(std::time::Duration::from_secs(3))
+                                                .no_proxy()
+                                                .build(),
+                                            mem.bearer_token(),
+                                        ) {
+                                            let _ = client
+                                                .post(&fb_url)
+                                                .header("Authorization", token)
+                                                .json(&serde_json::json!({"signal": "irrelevant", "context": "user /memory dismiss"}))
+                                                .send()
+                                                .await;
+                                        }
+                                        eprintln!("  {} dismissed: {preview}", "✗".red());
+                                        dismissed += 1;
+                                    }
+                                    eprintln!(
+                                        "  {} memories dismissed (retrieval score lowered)",
+                                        dismissed.to_string().cyan()
+                                    );
+                                }
+                            }
+                        }
+                        Ok(r) => {
+                            eprintln!("{}", format!("  ✗ Search failed ({})", r.status()).red())
+                        }
+                        Err(e) => eprintln!("{}", format!("  ✗ Unreachable: {e}").red()),
+                    }
+                }
+                // ─── Cloud: Snapshots ──────────────────────────────
+                "snapshot" => {
+                    let name = if sub_arg.is_empty() {
+                        format!("snap_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S"))
+                    } else {
+                        sub_arg.to_string()
+                    };
+                    match super::edge_tools::memoria::memoria_snapshot_create(&name).await {
+                        Ok(_) => {
+                            eprintln!("  {} Snapshot '{}' created", theme::icon_ok(), name.cyan())
+                        }
+                        Err(e) => eprintln!("  {} Snapshot failed: {e}", theme::icon_err()),
+                    }
+                }
+                "rollback" if !sub_arg.is_empty() => {
+                    match super::edge_tools::memoria::memoria_snapshot_rollback(sub_arg).await {
+                        Ok(_) => {
+                            eprintln!("  {} Rolled back to '{}'", theme::icon_ok(), sub_arg.cyan())
+                        }
+                        Err(e) => eprintln!("  {} Rollback failed: {e}", theme::icon_err()),
+                    }
+                }
+                "snapshots" => match super::edge_tools::memoria::memoria_snapshots_list().await {
+                    Ok(body) => print_json_or_raw(&body),
+                    Err(e) => eprintln!("  {} {e}", theme::icon_err()),
+                },
+                // ─── Cloud: Branches ──────────────────────────────
+                "branch" if !sub_arg.is_empty() => {
+                    match super::edge_tools::memoria::memoria_branch_create(sub_arg).await {
+                        Ok(_) => {
+                            eprintln!("  {} Branch '{}' created", theme::icon_ok(), sub_arg.cyan())
+                        }
+                        Err(e) => eprintln!("  {} Branch failed: {e}", theme::icon_err()),
+                    }
+                }
+                "checkout" if !sub_arg.is_empty() => {
+                    match super::edge_tools::memoria::memoria_branch_checkout(sub_arg).await {
+                        Ok(_) => eprintln!(
+                            "  {} Switched to branch '{}'",
+                            theme::icon_ok(),
+                            sub_arg.cyan()
+                        ),
+                        Err(e) => eprintln!("  {} Checkout failed: {e}", theme::icon_err()),
+                    }
+                }
+                "merge" if !sub_arg.is_empty() => {
+                    match super::edge_tools::memoria::memoria_branch_merge(sub_arg).await {
+                        Ok(_) => {
+                            eprintln!("  {} Branch '{}' merged", theme::icon_ok(), sub_arg.cyan())
+                        }
+                        Err(e) => eprintln!("  {} Merge failed: {e}", theme::icon_err()),
+                    }
+                }
+                "diff" if !sub_arg.is_empty() => {
+                    // Try branch diff first; fall back to snapshot diff on 404.
+                    match super::edge_tools::memoria::memoria_branch_diff(sub_arg).await {
+                        Ok(body) => print_json_or_raw(&body),
+                        Err(branch_err) => {
+                            match super::edge_tools::memoria::memoria_snapshot_diff(sub_arg).await {
+                                Ok(body) => print_json_or_raw(&body),
+                                Err(_) => eprintln!(
+                                    "  {} diff failed (branch: {branch_err})",
+                                    theme::icon_err()
+                                ),
+                            }
+                        }
+                    }
+                }
+                "branches" => match super::edge_tools::memoria::memoria_branches_list().await {
+                    Ok(body) => print_json_or_raw(&body),
+                    Err(e) => eprintln!("  {} {e}", theme::icon_err()),
+                },
+                // ─── Cloud: Analysis ─────────────────────────────
+                "reflect" => {
+                    eprintln!("  {} Analyzing memory patterns...", "⋯".dim());
+                    match super::edge_tools::memoria::memoria_reflect().await {
+                        Ok(body) => print_json_or_raw(&body),
+                        Err(e) => eprintln!("  {} {e}", theme::icon_err()),
+                    }
+                }
+                "health" => match super::edge_tools::memoria::memoria_health().await {
+                    Ok(body) => print_json_or_raw(&body),
+                    Err(e) => eprintln!("  {} {e}", theme::icon_err()),
+                },
                 _ => {
-                    eprintln!("  {} /memory [list | search <query>]", "Usage:".dim());
+                    eprintln!("  {} /memory <subcommand>", "Usage:".dim());
+                    eprintln!("  {}", "  list                    List all memories".dim());
+                    eprintln!("  {}", "  search <query>          Search memories".dim());
+                    eprintln!(
+                        "  {}",
+                        "  dismiss <query>         Mark memories as irrelevant".dim()
+                    );
+                    eprintln!(
+                        "  {}",
+                        "  snapshot [name]         Create memory checkpoint".dim()
+                    );
+                    eprintln!(
+                        "  {}",
+                        "  rollback <name>         Restore to checkpoint".dim()
+                    );
+                    eprintln!("  {}", "  snapshots               List checkpoints".dim());
+                    eprintln!(
+                        "  {}",
+                        "  branch <name>           Create experiment branch".dim()
+                    );
+                    eprintln!("  {}", "  checkout <name>         Switch branch".dim());
+                    eprintln!("  {}", "  merge <name>            Merge branch back".dim());
+                    eprintln!(
+                        "  {}",
+                        "  diff <name>             Preview branch changes".dim()
+                    );
+                    eprintln!("  {}", "  branches                List branches".dim());
+                    eprintln!(
+                        "  {}",
+                        "  reflect                 Analyze memory patterns".dim()
+                    );
+                    eprintln!(
+                        "  {}",
+                        "  health                  Memory hygiene status".dim()
+                    );
                 }
             }
         }
@@ -1714,6 +1890,57 @@ fn handle_plan_pause(state: &mut ReplState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── /memory subcommand contracts ──
+
+    #[test]
+    fn memory_help_lists_all_cloud_commands() {
+        let src = include_str!("slash_memory.rs");
+        let test_start = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..test_start];
+        for cmd in &[
+            "snapshot",
+            "rollback",
+            "snapshots",
+            "branch",
+            "checkout",
+            "merge",
+            "diff",
+            "branches",
+            "reflect",
+            "health",
+            "search",
+            "dismiss",
+            "list",
+        ] {
+            assert!(
+                prod.contains(&format!("\"{cmd}\"")),
+                "/memory {cmd} subcommand missing from match block"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_usage_text_covers_all_subcommands() {
+        let src = include_str!("slash_memory.rs");
+        for cmd in &[
+            "snapshot",
+            "rollback",
+            "snapshots",
+            "branch",
+            "checkout",
+            "merge",
+            "diff",
+            "branches",
+            "reflect",
+            "health",
+        ] {
+            assert!(
+                src.contains(&format!("  {cmd}")),
+                "/memory usage text missing {cmd}"
+            );
+        }
+    }
 
     // --- Empty / whitespace-only input ---
 

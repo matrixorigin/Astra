@@ -6,6 +6,7 @@ description = "Extracted tool execution library for astra-engine. Shared by CLI 
 
 [dependencies]
 astra-core.workspace = true
+astra-prompts.workspace = true
 astra-sandbox = { path = "../astra-sandbox" }
 async-trait.workspace = true
 chrono.workspace = true

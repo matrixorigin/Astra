@@ -294,10 +294,8 @@ impl HttpMemoriaClient {
 
     /// Create from environment variables.
     pub fn from_env() -> Option<Self> {
-        let base_url = std::env::var("MEMORIA_BASE_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8100".to_string());
-        let api_key = std::env::var("MEMORIA_MASTER_KEY").ok()?;
-        Some(Self::new(base_url, api_key))
+        let mem = astra_core::MemoriaSettings::from_env();
+        Some(Self::new(mem.base_url, mem.master_key?))
     }
 }
 

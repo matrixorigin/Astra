@@ -496,3 +496,108 @@ async fn shared_task_manager_and_session_state_journal_survive_across_executors(
     let listed_after = exe_a.execute("task_list", &json!({})).await;
     assert_eq!(listed_after, "No tasks found with status 'all'");
 }
+
+// ─── P4: P3 seams wired into SelfModel snapshot ─────────────────────────────
+
+#[tokio::test]
+async fn set_session_lessons_feeds_build_self_model_snapshot() {
+    // The session-bootstrap loader (P3.1) hands lessons to the ToolExecutor.
+    // `build_self_model_snapshot` must pass them through unchanged so the
+    // LLM sees prior-session advice on turn 1.
+    let (exe, _session) = executor_with_session();
+    let lessons = vec![
+        astra_runtime::self_model::LessonHint {
+            kind: astra_services::LessonKind::ToolDeprioritize,
+            trigger_signal: "3 stalls on grep".into(),
+            action: "switch to rg".into(),
+            workload_tag: None,
+            compact: None,
+        },
+        astra_runtime::self_model::LessonHint {
+            kind: astra_services::LessonKind::PromptShape,
+            trigger_signal: "repeated scope drift".into(),
+            action: "restate scope before tool call".into(),
+            workload_tag: Some("code-review".into()),
+            compact: None,
+        },
+    ];
+    exe.set_session_lessons(lessons.clone());
+
+    let model = exe.build_self_model_snapshot().unwrap();
+    assert_eq!(model.lessons, lessons);
+
+    // And the renderer must surface them — confirms end-to-end wiring.
+    let rendered = model.to_system_prompt_section();
+    assert!(
+        rendered.contains("Lessons from prior sessions"),
+        "lessons must reach the prompt, got:\n{rendered}"
+    );
+    assert!(rendered.contains("switch to rg"));
+}
+
+#[tokio::test]
+async fn set_skill_diagnosis_feeds_build_self_model_snapshot() {
+    // Auto-invoke handler (P3.3) deposits the latest SkillDiagnosis here.
+    // `build_self_model_snapshot` must pass it through so the next turn's
+    // LLM sees "the system already looked at this and noticed X".
+    let (exe, _session) = executor_with_session();
+    let cause = astra_skills::auto_invoke::AutoInvokeCause::SessionStalls { count: 3 };
+    let diag = astra_skills::auto_invoke::SkillDiagnosis::new(
+        "analyze_session",
+        &cause,
+        "agent looping on grep",
+        ["tried grep 3× with identical args".to_string()],
+        Some("narrow to src/".into()),
+    );
+    exe.set_latest_skill_diagnosis(Some(diag.clone()));
+
+    let model = exe.build_self_model_snapshot().unwrap();
+    assert_eq!(model.skill_diagnosis.as_ref(), Some(&diag));
+
+    let rendered = model.to_system_prompt_section();
+    assert!(
+        rendered.contains("⚙ Auto-diagnosis [analyze_session]"),
+        "diagnosis must reach the prompt, got:\n{rendered}"
+    );
+}
+
+#[tokio::test]
+async fn clearing_skill_diagnosis_removes_it_from_subsequent_snapshots() {
+    // Once the triggering condition has cleared, the stale diagnosis must
+    // stop showing up. This proves the setter is idempotent and None
+    // actually clears (not just overwrites with empty).
+    let (exe, _session) = executor_with_session();
+    let cause = astra_skills::auto_invoke::AutoInvokeCause::BudgetPressure { level: 0.9 };
+    let diag = astra_skills::auto_invoke::SkillDiagnosis::new(
+        "optimize_prompt",
+        &cause,
+        "prompt bloated",
+        [],
+        None,
+    );
+    exe.set_latest_skill_diagnosis(Some(diag));
+
+    let first = exe.build_self_model_snapshot().unwrap();
+    assert!(first.skill_diagnosis.is_some());
+
+    exe.set_latest_skill_diagnosis(None);
+
+    let second = exe.build_self_model_snapshot().unwrap();
+    assert!(
+        second.skill_diagnosis.is_none(),
+        "None must clear, got: {:?}",
+        second.skill_diagnosis
+    );
+    let rendered = second.to_system_prompt_section();
+    assert!(!rendered.contains("Auto-diagnosis"));
+}
+
+#[tokio::test]
+async fn snapshot_without_p3_seams_still_builds() {
+    // Backwards-compat smoke: callers that never touch the new setters
+    // must still get a valid SelfModel with no lessons and no diagnosis.
+    let (exe, _session) = executor_with_session();
+    let model = exe.build_self_model_snapshot().unwrap();
+    assert!(model.lessons.is_empty());
+    assert!(model.skill_diagnosis.is_none());
+}

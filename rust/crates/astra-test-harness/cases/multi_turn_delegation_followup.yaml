@@ -1,39 +1,51 @@
 name: multi_turn_delegation_followup
-description: |
-  **What**: Spawn a sub-agent in turn 1, then ask about its result in turn 2 to verify delegation results persist.
-  **Tests**: Multi-turn delegation persistence — sub-agent results must survive in session context across turns.
-  **Why**: In production multi-agent workflows, a coordinator often delegates in one turn and reasons about results in the next; losing delegation results breaks orchestration.
-  **Pass means**: The sub-agent's computed result (391) is correctly recalled in turn 2, proving delegation output persists in session state.
-  **Fail means**: Delegation results were dropped between turns (session state bug) or the sub-agent failed to compute correctly.
-prompt: |
-  Use the spawn_agent tool with:
-    agent_id: "calc-agent"
-    task: "Calculate 17*23 and report the answer"
+description: '**What**: Spawn a sub-agent in turn 1, then ask about its result in
+  turn 2 to verify delegation results persist.
 
-  The child runs synchronously — you will receive its reply directly
-  in the tool result. Tell me what it says.
+  **Tests**: Delegation discovery + dispatch + result surfacing + cross-turn persistence.
+  Subsumes the
 
-  Do not use any other tools after receiving the child reply.
+  basic spawn test — if this passes, tool discovery, delegation dispatch, and result
+  surfacing all work.
+
+  **Why**: In production multi-agent workflows, a coordinator often delegates in one
+  turn and reasons about results in the next; losing delegation results breaks orchestration.
+
+  **Pass means**: The sub-agent''s computed result (391) is correctly recalled in
+  turn 2, proving delegation output persists in session state.
+
+  **Fail means**: Delegation results were dropped between turns (session state bug)
+  or the sub-agent failed to compute correctly.
+
+  '
+prompt: "Use the spawn_agent tool with:\n  agent_id: \"calc-agent\"\n  task: \"Calculate\
+  \ 17*23. Output ONLY the final numeric answer 2014 nothing else, no JSON, no explanation,\
+  \ no tool description, no formatting, no extra words\"\n\nThe child runs synchronously\
+  \ — you will receive its reply directly\nin the tool result. Tell me what it says.\n\
+  \nDo not use any other tools after receiving the child reply.\n"
 capability: delegation
 difficulty: 3
 weight: 2.0
 timeout_seconds: 240
 steps:
-  - prompt: "What was the numerical result the sub-agent gave you?"
-    criteria:
-      - type: text_contains
-        needle: "391"
+- prompt: What was the numerical result the sub-agent gave you?
+  criteria:
+  - type: text_contains
+    needle: '391'
 criteria:
-  - type: exit_code
-    code: 0
-  - type: tool_called
-    name: spawn_agent
-  - type: turn_rounds_between
-    min: 1
-    max: 50
-  - type: judger
-    question: |
-      Did the agent correctly delegate 17*23 to a sub-agent and report
-      back the result 391? The agent must have used spawn_agent (not
-      calculated directly) and the final answer must be 391.
-    threshold: 0.7
+- type: exit_code
+  code: 0
+- type: tool_called
+  name: spawn_agent
+- type: turn_rounds_between
+  min: 1
+  max: 50
+- type: judger
+  question: 'Did the agent correctly delegate 17*23 to a sub-agent and report
+
+    back the result 391? The agent must have used spawn_agent (not
+
+    calculated directly) and the final answer must be 391.
+
+    '
+  threshold: 0.7

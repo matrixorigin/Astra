@@ -519,6 +519,7 @@ pub struct ServerAgenticLoopHost {
     shared_pool: Option<SharedPool>,
     model_override: Option<String>,
     llm_token_service: Option<LlmTokenServiceConfig>,
+    resolved_model_name: Option<String>,
 
     // ── Context ──
     edge_tools: Vec<Value>,
@@ -832,6 +833,7 @@ impl ServerAgenticLoopHostBuilder {
             shared_pool: self.shared_pool,
             model_override: self.model_override,
             llm_token_service: self.llm_token_service,
+            resolved_model_name: None,
             edge_tools,
             edge_profile: self.edge_profile,
             valid_tools,
@@ -1058,7 +1060,10 @@ impl ServerAgenticLoopHost {
         // loop host level — including Anthropic cache_control blocks and the
         // OpenAI stable-prefix / dynamic split.
         let cache_cfg = match &self.mock_provider {
-            Some((provider, model)) => PromptCacheConfig::latch(provider, model),
+            Some((provider, model)) => {
+                self.resolved_model_name = Some(model.clone());
+                PromptCacheConfig::latch(provider, model)
+            }
             None => PromptCacheConfig::default(),
         };
 
@@ -1661,18 +1666,8 @@ impl ServerAgenticLoopHost {
             ));
         }
 
-        // Memory signal detection
-        let memory_signal_hint = if let Some(category) =
-            astra_prompts::memory_lifecycle::detect_store_signal(user_content)
-        {
-            let ns = astra_prompts::memory_lifecycle::suggest_namespace(category);
-            format!(
-                "\n\n⚡ MEMORY SIGNAL DETECTED: category=\"{category}\", namespace=\"{ns}\". \
-                 Store the user's intent with memory_store BEFORE doing anything else."
-            )
-        } else {
-            String::new()
-        };
+        // Memory storage decisions are now LLM-driven via system prompt rules.
+        let memory_signal_hint = String::new();
 
         // System prompt override from delegation coordination context
         let system_override = self
@@ -1819,6 +1814,28 @@ impl ServerAgenticLoopHost {
                 ),
             );
         }
+        // Runtime identity: model, workspace, session, user, date.
+        let runtime_ctx = crate::prompts::AgentRuntimeContext {
+            model_name: self.resolved_model_name.clone(),
+            workspace_cwd: self
+                .edge_profile
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(String::from),
+            git_branch: self
+                .edge_profile
+                .get("git_branch")
+                .and_then(Value::as_str)
+                .map(String::from),
+            session_id: Some(self.session_id.clone()),
+            user_id: Some(self.user_id.clone()),
+            current_date: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+        };
+        dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+            runtime_ctx.to_prompt_section(),
+            crate::prompts::PromptTokenBucket::Environment,
+        ));
+
         let full_dynamic = crate::prompts::sections_to_string(&dynamic_sections);
 
         // Build structured system messages with Anthropic cache annotations.
@@ -2013,17 +2030,7 @@ impl ServerAgenticLoopHost {
         } else {
             format!("\n\n# Project Profile\n{}", profile_parts.join("\n"))
         };
-        let memory_signal_hint = if let Some(category) =
-            astra_prompts::memory_lifecycle::detect_store_signal(user_content)
-        {
-            let ns = astra_prompts::memory_lifecycle::suggest_namespace(category);
-            format!(
-                "\n\n⚡ MEMORY SIGNAL DETECTED: category=\"{category}\", namespace=\"{ns}\". \
-                 Store the user's intent with memory_store BEFORE doing anything else."
-            )
-        } else {
-            String::new()
-        };
+        let memory_signal_hint = String::new();
         let round_budget_hint = String::new(); // deprecated: circuit breaker replaces countdown budget
         let plan_resume = self
             .plan_resume_hint
@@ -2031,8 +2038,25 @@ impl ServerAgenticLoopHost {
             .ok()
             .and_then(|g| g.clone())
             .unwrap_or_default();
+        let runtime_ctx = crate::prompts::AgentRuntimeContext {
+            model_name: self.resolved_model_name.clone(),
+            workspace_cwd: self
+                .edge_profile
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(String::from),
+            git_branch: self
+                .edge_profile
+                .get("git_branch")
+                .and_then(Value::as_str)
+                .map(String::from),
+            session_id: Some(self.session_id.clone()),
+            user_id: Some(self.user_id.clone()),
+            current_date: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+        };
+        let runtime_identity = runtime_ctx.to_prompt_section();
         let full_dynamic = format!(
-            "{profile_desc}{skill_hint}{learned_context_hint}{memory_signal_hint}{round_budget_hint}{plan_resume}"
+            "{profile_desc}{skill_hint}{learned_context_hint}{memory_signal_hint}{round_budget_hint}{plan_resume}{runtime_identity}"
         );
 
         cached_system_prompt(
@@ -2390,6 +2414,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // Latch prompt cache config from provider info (once per turn is fine;
         // provider doesn't change within a turn).
         let cache_cfg = PromptCacheConfig::latch(&llm_cfg.provider, &llm_cfg.model_name);
+        self.resolved_model_name = Some(llm_cfg.model_name.clone());
 
         let (system_messages, system_prompt_plain, system_prompt_breakdown) =
             self.build_system_messages_cached(&user_content, &visible_tools, state, &cache_cfg);
@@ -3200,13 +3225,7 @@ mod tests {
     use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 
     fn mock_matrixone() -> MatrixOneSettings {
-        MatrixOneSettings {
-            host: "127.0.0.1".to_string(),
-            port: 6001,
-            user: "test".to_string(),
-            password: "test".to_string(),
-            database: "test".to_string(),
-        }
+        MatrixOneSettings::mock()
     }
 
     fn mock_encryptor() -> Arc<FernetTokenEncryptor> {
@@ -3652,9 +3671,11 @@ mod tests {
         .build();
 
         let prompt = host.build_system_prompt("remember that I prefer dark mode", &host.edge_tools);
+        // Memory signal detection removed — LLM decides via system prompt rules.
+        // The prompt should NOT contain the old keyword-triggered injection.
         assert!(
-            prompt.contains("MEMORY SIGNAL DETECTED"),
-            "should detect memory store signal"
+            !prompt.contains("MEMORY SIGNAL DETECTED"),
+            "keyword-based memory signal injection must be removed"
         );
     }
 
@@ -3754,7 +3775,10 @@ mod tests {
 
         assert!(breakdown.context_signals.active_output_skills);
         assert!(breakdown.context_signals.learned_runtime_context);
-        assert!(breakdown.context_signals.memory_signal_detected);
+        assert!(
+            !breakdown.context_signals.memory_signal_detected,
+            "memory signal detection removed — LLM-driven"
+        );
         assert!(breakdown.context_signals.system_prompt_override);
         assert!(breakdown.context_signals.effort_hint);
         assert!(breakdown.context_signals.agent_type_hint);

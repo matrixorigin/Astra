@@ -346,7 +346,7 @@ fn tool_relevance_score(
             IntentType::Memory if text_or_trigger > 0.05 => score += 0.2,
             // NOTE: references_history removed here — it conflates
             // "referring to earlier conversation" with "needs persistent memory",
-            // causing memory_search to be over-selected for conversational queries.
+            // causing memory_retrieve to be over-selected for conversational queries.
             IntentType::Memory if state.is_analytical => score += 0.1,
             IntentType::CodeEdit if state.is_mutate => score += 0.15,
             IntentType::CodeRead if state.is_fetch || state.is_analytical => score += 0.1,
@@ -762,7 +762,14 @@ fn pre_filter_dynamic_core(
     outcome_bias: &HashMap<String, f64>,
 ) -> Vec<(usize, f64)> {
     // Short-circuit: pure conversational queries don't need dynamic tools.
-    if state.is_conversational && !state.is_fetch && !state.is_mutate && !state.is_analytical {
+    // BUT: if recent_tools is non-empty, the session has active tool context
+    // and the next turn likely needs related tools (co-occurrence signal).
+    if state.is_conversational
+        && !state.is_fetch
+        && !state.is_mutate
+        && !state.is_analytical
+        && state.recent_tools.is_empty()
+    {
         return vec![];
     }
 
@@ -1287,11 +1294,14 @@ mod tests {
         let terms = vec!["记忆".to_string(), "搜索".to_string()];
         let mem_idx = TOOL_CATALOG
             .iter()
-            .position(|t| t.name == "memory_search")
+            .position(|t| t.name == "memory_retrieve")
             .unwrap();
         let score = tfidf_score(&terms, mem_idx);
-        // CJK terms should match Chinese triggers in memory_search
-        assert!(score > 0.0, "CJK query should match memory_search triggers");
+        // CJK terms should match Chinese triggers in memory_retrieve
+        assert!(
+            score > 0.0,
+            "CJK query should match memory_retrieve triggers"
+        );
     }
 
     // --- file_context_tool_boost edge cases ---

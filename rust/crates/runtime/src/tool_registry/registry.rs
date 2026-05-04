@@ -169,25 +169,26 @@ impl ToolRegistry {
 
         let state = ConversationState::from_message_with_context(query, turn_count, recent_tools);
 
+        // Conversational short-circuit: skip dynamic ranking for greetings/acks.
+        // BUT: if recent_tools is non-empty, the session has active tool context
+        // and the next turn likely needs related tools (e.g., memory_retrieve
+        // after memory_store). Don't short-circuit in that case.
         if state.is_conversational
             && !state.is_fetch
             && !state.is_mutate
             && !state.is_analytical
             && !state.references_history
+            && state.recent_tools.is_empty()
         {
             let schemas = self.pinned_only();
             let names = Self::selected_names(&schemas);
-            // Observability: conversational short-circuit — no
-            // dynamic ranking happened, `final` is just the pinned
-            // list. A G3-class bug shows up here when a tool the
-            // caller expected is missing from `final`.
             obs::emit_selector_trace(&obs::SelectionTrace {
                 query,
                 mode: "conversational",
                 top: None,
                 r#final: &names,
                 budget: None,
-                reason: Some("conversational query — pinned-only"),
+                reason: Some("conversational query — pinned-only (no active tool context)"),
             });
             let report = SelectionReport {
                 tools_selected: names,
@@ -270,6 +271,7 @@ impl ToolRegistry {
             && !state.is_mutate
             && !state.is_analytical
             && !state.references_history
+            && state.recent_tools.is_empty()
         {
             let schemas = self.pinned_only();
             let names = Self::selected_names(&schemas);
@@ -279,7 +281,7 @@ impl ToolRegistry {
                 top: None,
                 r#final: &names,
                 budget: None,
-                reason: Some("quality path — conversational, pinned-only"),
+                reason: Some("quality path — conversational, pinned-only (no active tool context)"),
             });
             let report = SelectionReport {
                 tools_selected: names,
@@ -867,6 +869,68 @@ mod tests {
     }
 
     #[test]
+    fn conversational_with_recent_tools_runs_dynamic_path() {
+        // Verify: the `recent_tools.is_empty()` guard prevents the
+        // conversational short-circuit. We test this by checking that
+        // "好的" (conversational) WITH recent_tools=["github_ci_status"]
+        // includes github_list_prs (same-category recency boost), while
+        // WITHOUT recent_tools it only returns pinned tools.
+        let schemas: Vec<Value> = TOOL_CATALOG.iter().map(|t| sample_schema(t.name)).collect();
+        let registry = ToolRegistry::new(schemas);
+
+        // Without recent tools: conversational short-circuit → pinned only
+        let (_, report_bare) = registry.select_with_report_ctx("好的", 2, 800, &[]);
+        let bare_count = report_bare.selected_count;
+
+        // With recent tools: dynamic path runs → recency boost can add tools
+        let recent = vec!["github_ci_status".to_string()];
+        let (_, report_ctx) = registry.select_with_report_ctx("好的", 2, 800, &recent);
+        let ctx_count = report_ctx.selected_count;
+
+        assert!(
+            ctx_count > bare_count,
+            "with recent_tools, dynamic path should select MORE than pinned-only: bare={bare_count} ctx={ctx_count}"
+        );
+    }
+
+    #[test]
+    fn quality_path_conversational_with_recent_tools_runs_dynamic() {
+        // Symmetric test: select_with_quality must also respect recent_tools guard.
+        let schemas: Vec<Value> = TOOL_CATALOG.iter().map(|t| sample_schema(t.name)).collect();
+        let registry = ToolRegistry::new(schemas);
+
+        // Without recent tools: quality conversational short-circuit → pinned only
+        let ((_, report_bare), _) =
+            with_obs_capture(|| registry.select_with_quality("好的", 2, 800, &[], None));
+        let bare_count = report_bare.selected_count;
+
+        // With recent tools: dynamic path
+        let recent = vec!["github_ci_status".to_string()];
+        let ((_, report_ctx), _) =
+            with_obs_capture(|| registry.select_with_quality("好的", 2, 800, &recent, None));
+        let ctx_count = report_ctx.selected_count;
+
+        assert!(
+            ctx_count > bare_count,
+            "quality path with recent_tools should select MORE than pinned-only: bare={bare_count} ctx={ctx_count}"
+        );
+    }
+
+    #[test]
+    fn conversational_without_recent_tools_shortcircuits() {
+        let schemas: Vec<Value> = TOOL_CATALOG.iter().map(|t| sample_schema(t.name)).collect();
+        let registry = ToolRegistry::new(schemas);
+        // "谢谢" with no recent_tools → should short-circuit to pinned-only.
+        let (out, report) = registry.select_with_report_ctx("谢谢", 1, 800, &[]);
+        assert_eq!(
+            report.selected_count,
+            ToolRegistry::pinned_count() as u32,
+            "conversational + no recent_tools should return only pinned"
+        );
+        let _ = out;
+    }
+
+    #[test]
     fn select_with_report_ctx_dynamic_path_does_not_panic_with_obs_on() {
         use astra_turn_core::selector_observability::{
             SELECTOR_OBS_TEST_MUTEX, restore_selector_observability_for_tests,
@@ -983,12 +1047,16 @@ mod tests {
             )
         });
         assert!(report.selected_count > 0);
+        let matching: Vec<_> = captured
+            .iter()
+            .filter(|t| t.contains("\"query\":\"search for TODO in source files\""))
+            .collect();
         assert_eq!(
-            captured.len(),
+            matching.len(),
             1,
-            "routed_with_pressure must emit exactly one selector trace; got {captured:?}"
+            "routed_with_pressure must emit exactly one selector trace for its query; got {captured:?}"
         );
-        let json = &captured[0];
+        let json = matching[0];
         assert!(
             json.contains("\"mode\":\"routed\"") || json.contains("\"mode\":\"routed_pressure\""),
             "expected routed mode label in trace; got {json}"
@@ -1056,15 +1124,19 @@ mod tests {
         let ((_out, report), captured) =
             with_obs_capture(|| registry.select_with_quality(query, 0, 800, &[], None));
         assert!(report.selected_count > 0);
+        let matching: Vec<_> = captured
+            .iter()
+            .filter(|t| t.contains("\"query\":\"search for TODO comments\""))
+            .collect();
         assert_eq!(
-            captured.len(),
+            matching.len(),
             1,
-            "select_with_quality dynamic branch must emit exactly one trace; got {captured:?}"
+            "select_with_quality dynamic branch must emit exactly one trace for its query; got {captured:?}"
         );
         assert!(
-            captured[0].contains("\"mode\":\"quality\""),
+            matching[0].contains("\"mode\":\"quality\""),
             "expected quality mode label; got {}",
-            captured[0]
+            matching[0]
         );
     }
 

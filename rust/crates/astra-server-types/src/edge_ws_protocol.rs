@@ -35,7 +35,7 @@ pub const EDGE_AUTH_TIMEOUT_SECS: u64 = 30;
 pub const EDGE_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
 /// Messages sent from edge agent to server.
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum EdgeClientMessage {
     /// Authenticate the edge agent (must be first message).
@@ -68,7 +68,7 @@ pub enum EdgeClientMessage {
 }
 
 /// Messages sent from server to edge agent.
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum EdgeServerMessage {
     /// Authentication succeeded.
@@ -86,6 +86,7 @@ pub enum EdgeServerMessage {
         tool: String,
         args: Value,
         /// Maximum execution time in seconds.
+        #[serde(default = "default_tool_timeout_secs")]
         timeout_secs: u64,
     },
 
@@ -96,6 +97,10 @@ pub enum EdgeServerMessage {
     /// Server is closing the connection.
     #[serde(rename = "edge_closing")]
     Closing { reason: String },
+}
+
+fn default_tool_timeout_secs() -> u64 {
+    EDGE_TOOL_TIMEOUT_SECS
 }
 
 #[cfg(test)]
@@ -189,6 +194,115 @@ mod tests {
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "edge_auth_ok");
         assert_eq!(v["user_id"], "u-123");
+    }
+
+    #[test]
+    fn edge_client_auth_serializes() {
+        let msg = EdgeClientMessage::Auth {
+            token: "Bearer tok".into(),
+            edge_agent_id: "e1".into(),
+            hostname: Some("h".into()),
+            workspace_dir: None,
+            capabilities: None,
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "edge_auth");
+        assert_eq!(v["token"], "Bearer tok");
+        assert_eq!(v["edge_agent_id"], "e1");
+    }
+
+    #[test]
+    fn edge_client_tool_result_serializes() {
+        let msg = EdgeClientMessage::ToolResult {
+            request_id: "r1".into(),
+            output: "ok".into(),
+            is_error: false,
+            duration_ms: Some(42),
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "edge_tool_result");
+        assert_eq!(v["duration_ms"], 42);
+    }
+
+    #[test]
+    fn edge_client_tool_result_none_duration_serializes_as_null() {
+        let msg = EdgeClientMessage::ToolResult {
+            request_id: "r1".into(),
+            output: "ok".into(),
+            is_error: false,
+            duration_ms: None,
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert!(v["duration_ms"].is_null());
+        let rt: EdgeClientMessage = serde_json::from_value(v).unwrap();
+        match rt {
+            EdgeClientMessage::ToolResult { duration_ms, .. } => assert_eq!(duration_ms, None),
+            _ => panic!("expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn edge_client_ping_serializes() {
+        let v = serde_json::to_value(&EdgeClientMessage::Ping).unwrap();
+        assert_eq!(v["type"], "edge_ping");
+    }
+
+    #[test]
+    fn edge_server_tool_request_deserializes() {
+        let msg: EdgeServerMessage = serde_json::from_value(json!({
+            "type": "edge_tool_request",
+            "request_id": "r1",
+            "tool": "bash",
+            "args": {"command": "ls"},
+            "timeout_secs": 120
+        }))
+        .unwrap();
+        match msg {
+            EdgeServerMessage::ToolRequest {
+                tool, timeout_secs, ..
+            } => {
+                assert_eq!(tool, "bash");
+                assert_eq!(timeout_secs, 120);
+            }
+            _ => panic!("expected ToolRequest"),
+        }
+    }
+
+    #[test]
+    fn edge_server_tool_request_default_timeout() {
+        let msg: EdgeServerMessage = serde_json::from_value(json!({
+            "type": "edge_tool_request",
+            "request_id": "r1",
+            "tool": "bash",
+            "args": {}
+        }))
+        .unwrap();
+        match msg {
+            EdgeServerMessage::ToolRequest { timeout_secs, .. } => {
+                assert_eq!(timeout_secs, EDGE_TOOL_TIMEOUT_SECS);
+            }
+            _ => panic!("expected ToolRequest"),
+        }
+    }
+
+    #[test]
+    fn edge_server_auth_ok_deserializes() {
+        let msg: EdgeServerMessage =
+            serde_json::from_value(json!({"type": "edge_auth_ok", "user_id": "u1"})).unwrap();
+        assert!(matches!(msg, EdgeServerMessage::AuthOk { .. }));
+    }
+
+    #[test]
+    fn edge_server_pong_deserializes() {
+        let msg: EdgeServerMessage = serde_json::from_value(json!({"type": "edge_pong"})).unwrap();
+        assert!(matches!(msg, EdgeServerMessage::Pong));
+    }
+
+    #[test]
+    fn edge_server_closing_deserializes() {
+        let msg: EdgeServerMessage =
+            serde_json::from_value(json!({"type": "edge_closing", "reason": "shutdown"})).unwrap();
+        assert!(matches!(msg, EdgeServerMessage::Closing { .. }));
     }
 
     const _: () = {

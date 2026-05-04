@@ -111,7 +111,7 @@ pub(super) async fn try_cloud_pull(
     );
     let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
     let svc = MatrixOneSyncService::new(pool, flusher.writer.clone());
-    let user_id = std::env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string());
+    let user_id = astra_core::cli_user_id();
     let out = StateSyncService::pull_learning_versioned(&svc, &user_id, profile_name).await;
     drain_ephemeral_audit(svc, flusher).await;
     match out {
@@ -155,7 +155,13 @@ async fn drain_ephemeral_audit(
     drop(svc);
     drop(flusher.writer);
     flusher.shutdown.cancel();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), flusher.join_handle).await;
+    match tokio::time::timeout(std::time::Duration::from_secs(5), flusher.join_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!(target: "cloud_sync", "audit flusher panicked: {e}"),
+        Err(_) => {
+            tracing::warn!(target: "cloud_sync", "audit flusher drain timed out (5s), some entries may be lost")
+        }
+    }
 }
 
 /// Push learning state to cloud with optimistic locking.
@@ -181,7 +187,7 @@ pub(super) async fn try_cloud_push_versioned(
     };
     let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
     let svc = MatrixOneSyncService::new(pool, flusher.writer.clone());
-    let user_id = std::env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string());
+    let user_id = astra_core::cli_user_id();
     let result = StateSyncService::push_learning_versioned(
         &svc,
         &user_id,
@@ -270,7 +276,7 @@ pub(super) async fn try_cloud_push_delta(
 
     let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
     let svc = MatrixOneSyncService::new(pool, flusher.writer.clone());
-    let user_id = std::env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string());
+    let user_id = astra_core::cli_user_id();
 
     let result =
         StateSyncService::push_delta(&svc, &user_id, profile_name, &delta_json, expected_version)
@@ -331,7 +337,7 @@ pub(super) async fn try_cloud_pull_preferences(state: &mut ReplState) -> Vec<Str
     };
     let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
     let svc = MatrixOneSyncService::new(pool, flusher.writer.clone());
-    let user_id = std::env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string());
+    let user_id = astra_core::cli_user_id();
     let out = StateSyncService::pull_all_preferences(&svc, &user_id).await;
     drain_ephemeral_audit(svc, flusher).await;
     match out {
@@ -392,7 +398,7 @@ pub(super) async fn try_cloud_push_preferences(state: &ReplState) {
     };
     let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
     let svc = MatrixOneSyncService::new(pool, flusher.writer.clone());
-    let user_id = std::env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string());
+    let user_id = astra_core::cli_user_id();
 
     let blocked: Vec<String> = state
         .tool_health_entries

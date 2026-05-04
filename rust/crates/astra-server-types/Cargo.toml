@@ -4,20 +4,37 @@ version.workspace = true
 edition.workspace = true
 description = "Server request and response types for astra runtime"
 
+[features]
+default = ["server"]
+server = [
+    "dep:astra-core",
+    "dep:astra-services",
+    "dep:astra-tools",
+    "dep:async-trait",
+    "dep:chrono",
+    "dep:dashmap",
+    "dep:regex",
+    "dep:serde_yaml_ng",
+    "dep:tokio",
+    "dep:tokio-util",
+    "dep:uuid",
+]
+
 [dependencies]
-astra-core.workspace = true
-astra-services.workspace = true
-astra-tools.workspace = true
-async-trait.workspace = true
-chrono.workspace = true
-dashmap = "6.1.0"
-regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml_ng.workspace = true
-tokio.workspace = true
-tokio-util.workspace = true
-uuid.workspace = true
+
+astra-core = { workspace = true, optional = true }
+astra-services = { workspace = true, optional = true }
+astra-tools = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+dashmap = { version = "6.1.0", optional = true }
+regex = { workspace = true, optional = true }
+serde_yaml_ng = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

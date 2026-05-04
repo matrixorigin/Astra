@@ -15,10 +15,8 @@ pub fn read_git_branch_abbrev() -> Option<String> {
 
 /// Memoria URL + API key from environment (same semantics as CLI `chat_stream`).
 pub fn memoria_env_for_edge_profile() -> (String, String) {
-    let memoria_url = std::env::var("MEMORIA_BASE_URL")
-        .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
-    let memoria_key = std::env::var("MEMORIA_MASTER_KEY").unwrap_or_default();
-    (memoria_url, memoria_key)
+    let mem = astra_core::MemoriaSettings::from_env();
+    (mem.base_url, mem.master_key.unwrap_or_default())
 }
 
 /// Retrieval top_k from environment (same semantics as RuntimeConfig).

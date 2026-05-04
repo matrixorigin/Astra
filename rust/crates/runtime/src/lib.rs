@@ -64,14 +64,19 @@ pub(crate) use storage::{
 // ── Public modules: runtime core ─────────────────────────────────────────────
 
 mod app_state;
+pub mod auto_invoke_handler;
 pub mod bash_intent;
 pub mod bridge;
 pub mod evaluation;
 pub mod evolution;
 pub mod guardrail_tuning;
 pub mod introspection;
+pub mod lesson_checkpoint;
+pub mod lesson_extractor;
+pub mod lesson_synthesizer;
 pub mod matrix_cloud_runtime;
 pub mod memoria_insights;
+pub mod memory_relevance;
 pub mod observability_integration;
 pub mod pipeline;
 pub use astra_plan as plan;
@@ -173,7 +178,7 @@ pub use astra_services::{
         UnconfiguredTaskLeaseService,
     },
     reflect::{
-        DatabaseReflectService, Diagnosis, ErrorClass, ReflectReport, ReflectService,
+        DatabaseReflectService, Diagnosis, ReflectReport, ReflectService,
         UnconfiguredReflectService,
     },
     replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService},

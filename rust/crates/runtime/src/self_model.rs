@@ -90,7 +90,25 @@ pub struct SelfModel {
     /// its own free-text plan.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmet_postconditions: Vec<UnmetPostCondition>,
+    /// Output of the most recent auto-invoked diagnostic skill
+    /// ([`astra_skills::auto_invoke::SkillDiagnosis`]). Stays attached until
+    /// a fresh auto-invoke replaces it or the caller explicitly clears.
+    /// Rendered as a bounded prompt block so the LLM sees "the system
+    /// already looked at this and noticed X".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_diagnosis: Option<astra_skills::auto_invoke::SkillDiagnosis>,
+    /// Cross-session lessons carried over from prior sessions with the same
+    /// `(user_id, persona, workload_tag)` scope (see
+    /// `astra_services::agent_lessons`). Bounded projection of the DAO's
+    /// `Lesson` rows — only the fields the LLM needs for prompt reasoning.
+    /// Empty when no prior lessons apply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lessons: Vec<LessonHint>,
 }
+
+// Re-export from canonical location (services::agent_lessons) so existing
+// `use astra_runtime::self_model::LessonHint` imports continue to compile.
+pub use astra_services::LessonHint;
 
 /// A single unmet postcondition, typed for prompt rendering and audit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -540,6 +558,8 @@ impl SelfModel {
             outcome_bias: std::collections::BTreeMap::new(),
             low_confidence_tools: Vec::new(),
             unmet_postconditions: Vec::new(),
+            skill_diagnosis: None,
+            lessons: Vec::new(),
         }
     }
 
@@ -639,6 +659,30 @@ impl SelfModel {
         diff: crate::turn::agentic_stage_bridge::SkillDiffEntry,
     ) -> Self {
         self.skill_diff = Some(diff);
+        self
+    }
+
+    /// Attach the most recent auto-invoked diagnostic skill output. The
+    /// diagnosis is rendered into the self-awareness section on the next
+    /// turn so the LLM can read what the system already concluded.
+    ///
+    /// Passing `None` clears any previously-attached diagnosis — stale
+    /// diagnoses must not linger once the triggering condition has cleared.
+    pub fn with_skill_diagnosis(
+        mut self,
+        diag: Option<astra_skills::auto_invoke::SkillDiagnosis>,
+    ) -> Self {
+        self.skill_diagnosis = diag;
+        self
+    }
+
+    /// Attach cross-session lessons retrieved via
+    /// `astra_services::AgentLessonsService::load_recent` at session
+    /// bootstrap. The lessons are rendered as a bounded prompt block so the
+    /// LLM carries prior learning forward. Empty input clears any
+    /// previously-attached set.
+    pub fn with_lessons(mut self, lessons: Vec<LessonHint>) -> Self {
+        self.lessons = lessons;
         self
     }
 }
@@ -1034,9 +1078,105 @@ impl SelfModel {
             }
         }
 
+        // ── Auto-invoked diagnostic skill output ──
+        if let Some(ref diag) = self.skill_diagnosis {
+            s.push_str(&diag.render_prompt_block());
+        }
+
+        // ── Cross-session lessons (from Memoria L3) ──
+        // Pressure-adaptive: under high pressure, show fewer lessons with
+        // compact text. Under low pressure, show more with full detail.
+        if !self.lessons.is_empty() {
+            let pressure = self
+                .state
+                .token_budget
+                .as_ref()
+                .map(|b| b.pressure)
+                .unwrap_or(0.0);
+            let (max_shown, use_compact) = if pressure > 0.75 {
+                (2, true)
+            } else if pressure > 0.5 {
+                (3, true)
+            } else {
+                (5, false)
+            };
+            let tool_set: std::collections::HashSet<&str> = self
+                .capabilities
+                .tool_names
+                .iter()
+                .map(String::as_str)
+                .collect();
+            // Filter relevant + dedup conflicting tool advice (e.g.,
+            // ToolDeprioritize("grep") + ToolBoost("grep")). Lessons are
+            // pre-sorted by confidence DESC, so the first occurrence for
+            // a tool name wins.
+            let mut seen_tools: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let relevant: Vec<&LessonHint> = self
+                .lessons
+                .iter()
+                .filter(|l| is_lesson_relevant(l, &tool_set))
+                .filter(|l| {
+                    if let Some(tool) = extract_tool_from_trigger(&l.trigger_signal) {
+                        seen_tools.insert(tool.to_string())
+                    } else {
+                        true // non-tool lessons always pass
+                    }
+                })
+                .collect();
+            if !relevant.is_empty() {
+                let total = relevant.len();
+                s.push_str("📚 Lessons from prior sessions:\n");
+                for l in relevant.iter().take(max_shown) {
+                    let scope = l
+                        .workload_tag
+                        .as_deref()
+                        .map(|t| format!(" @{t}"))
+                        .unwrap_or_default();
+                    let display_text = if use_compact {
+                        l.compact.as_deref().unwrap_or(&l.action)
+                    } else {
+                        &l.action
+                    };
+                    let _ = writeln!(
+                        s,
+                        "  - [{}{}] {} — {}",
+                        l.kind, scope, l.trigger_signal, display_text
+                    );
+                }
+                if total > max_shown {
+                    let _ = writeln!(s, "  … {} more", total - max_shown);
+                }
+            }
+        }
+
         s
     }
+}
 
+/// Extract the tool name from a trigger_signal like "tool_failures:grep".
+/// Returns None for non-tool-specific triggers.
+fn extract_tool_from_trigger(trigger: &str) -> Option<&str> {
+    trigger.split_once(':').map(|(_, tool)| tool)
+}
+
+/// Tool-specific lesson kinds whose trigger_signal encodes a tool name
+/// as `"tool_failures:<name>"` or similar. These are only relevant when
+/// the named tool is in the current session's capability set.
+fn is_lesson_relevant(l: &LessonHint, tool_set: &std::collections::HashSet<&str>) -> bool {
+    match l.kind {
+        astra_services::LessonKind::ToolDeprioritize | astra_services::LessonKind::ToolBoost => {
+            if let Some((_prefix, tool_name)) = l.trigger_signal.split_once(':') {
+                tool_set.is_empty() || tool_set.contains(tool_name)
+            } else {
+                true
+            }
+        }
+        _ => true,
+    }
+}
+
+impl SelfModel {
     /// Render detailed self-model as structured text for get_agent_info responses.
     pub fn to_detailed_text(&self) -> String {
         let mut s = String::with_capacity(4096);

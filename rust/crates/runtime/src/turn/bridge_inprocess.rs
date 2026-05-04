@@ -1203,21 +1203,8 @@ impl InProcessChatTurnBridge {
                 .map(|text| format!("\n\n{text}"))
                 .unwrap_or_default();
 
-            // ── Memory lifecycle: detect tracking/store signals in user input ──
-            // Injects a priority hint into the system prompt so the LLM stores
-            // the user's interest immediately rather than exploring the codebase.
-            // This wires the Rust-side detect_store_signal into the live pipeline.
-            let memory_signal_hint = if let Some(category) =
-                astra_prompts::memory_lifecycle::detect_store_signal(user_content_for_signal)
-            {
-                let ns = astra_prompts::memory_lifecycle::suggest_namespace(category);
-                format!(
-                    "\n\n⚡ MEMORY SIGNAL DETECTED: category=\"{category}\", namespace=\"{ns}\". \
-                     Store the user's intent with memory_store BEFORE doing anything else."
-                )
-            } else {
-                String::new()
-            };
+            // Memory storage decisions are now fully LLM-driven via system
+            // prompt rules. detect_store_signal keyword matching was removed.
 
             // ── Implicit feedback detection: inject correction/frustration context ──
             // When user expresses dissatisfaction (correction, frustration, rephrasing),
@@ -1254,6 +1241,35 @@ impl InProcessChatTurnBridge {
                         &signal.signal_type,
                         signal.confidence,
                     ) {
+                        // Persist feedback rule to Memoria L3 (fire-and-forget).
+                        // Closes the reflect→memory loop: correction detected in
+                        // this turn → stored durably → recalled in future sessions.
+                        if let Some(ref mc) = memoria_client_owned {
+                            use crate::turn::cloud::memoria_compact::MemoriaClient;
+                            if let Some(lesson) =
+                                crate::lesson_synthesizer::feedback_rule_to_lesson(&fb)
+                            {
+                                let c = mc.clone();
+                                let sid = session_id.clone();
+                                tokio::spawn(async move {
+                                    match tokio::time::timeout(
+                                        std::time::Duration::from_secs(5),
+                                        c.store(
+                                            &lesson.content,
+                                            lesson.memory_type,
+                                            Some(&sid),
+                                            Some(lesson.trust_tier),
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(_)) => tracing::debug!("Persisted feedback rule to Memoria"),
+                                        Ok(Err(e)) => tracing::debug!("Failed to persist feedback rule: {e}"),
+                                        Err(_) => tracing::debug!("Timed out persisting feedback rule to Memoria"),
+                                    }
+                                });
+                            }
+                        }
                         feedback_store.add(&session_id, fb);
                     }
                 }
@@ -1358,21 +1374,6 @@ impl InProcessChatTurnBridge {
                     .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
                         context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                             learned_runtime_context: true,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
-                );
-            }
-            if !memory_signal_hint.is_empty() {
-                dynamic_sections.push(
-                    prompts::PromptSection::dynamic(
-                        memory_signal_hint.clone(),
-                        prompts::PromptTokenBucket::Environment,
-                    )
-                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            memory_signal_detected: true,
                             ..Default::default()
                         },
                         ..Default::default()
@@ -3453,13 +3454,7 @@ mod tests {
 
     #[allow(dead_code)]
     fn bridge_test_matrixone() -> MatrixOneSettings {
-        MatrixOneSettings {
-            host: "127.0.0.1".to_string(),
-            port: 6001,
-            user: "test".to_string(),
-            password: "test".to_string(),
-            database: "test".to_string(),
-        }
+        MatrixOneSettings::mock()
     }
 
     #[allow(dead_code)]
@@ -4094,8 +4089,7 @@ mod tests {
     fn build_system_message_records_bridge_context_signals() {
         let active_skill_names = vec!["concise"];
         let learned_context_text = "matrixorigin => github";
-        let memory_signal_hint =
-            "\n\n⚡ MEMORY SIGNAL DETECTED: category=\"preference\", namespace=\"prefs\".";
+        // memory_signal_hint removed — LLM-driven via system prompt rules
         let implicit_feedback_hint =
             "\n\n## Implicit Feedback\nThe user is correcting the previous attempt.";
         let feedback_rules_hint = "\n\n[Learned Feedback Rules]\n- Rule: do not use mocks";
@@ -4143,7 +4137,7 @@ mod tests {
                 astra_turn_core::context_assembly_trace::PromptTraceSignals {
                     context_signals:
                         astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            memory_signal_detected: !memory_signal_hint.is_empty(),
+                            memory_signal_detected: false,
                             ..Default::default()
                         },
                     ..Default::default()
@@ -4231,7 +4225,10 @@ mod tests {
 
         assert!(breakdown.context_signals.active_output_skills);
         assert!(breakdown.context_signals.learned_runtime_context);
-        assert!(breakdown.context_signals.memory_signal_detected);
+        assert!(
+            !breakdown.context_signals.memory_signal_detected,
+            "memory signal detection removed — LLM-driven"
+        );
         assert!(breakdown.context_signals.self_awareness);
         assert!(breakdown.context_signals.implicit_feedback);
         assert!(breakdown.context_signals.learned_feedback_rules);

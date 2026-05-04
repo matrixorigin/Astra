@@ -59,8 +59,10 @@ services:
       - "${MEMORIA_PORT:-8100}:8100"
     volumes:
       - ${MEMORIA_LOG_DIR:-./data/logs/memoria}:/var/log/memoria
+    # Memoria container expects bare EMBEDDING_* / MASTER_KEY names internally.
+    # Host-side .env uses MEMORIA_EMBEDDING_* / MEMORIA_MASTER_KEY prefix.
     environment:
-      - DATABASE_URL=mysql://root:111@matrixone:6001/${MEMORIA_DB_NAME:-memoria}
+      - DATABASE_URL=mysql://${MATRIXONE_USER:-root}:${MATRIXONE_PASSWORD:-111}@matrixone:6001/${MEMORIA_DB_NAME:-memoria}
       - MASTER_KEY=${MEMORIA_MASTER_KEY:-}
       - EMBEDDING_PROVIDER=${MEMORIA_EMBEDDING_PROVIDER:-openai}
       - EMBEDDING_MODEL=${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3}

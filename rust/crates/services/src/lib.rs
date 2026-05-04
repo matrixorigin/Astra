@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod admin_config;
+pub mod agent_lessons;
 pub mod agents;
 pub mod auth;
 pub mod branches;
@@ -62,6 +63,7 @@ pub use admin_config::{
     ADMIN_CONFIG_ALLOWED_KEYS, ADMIN_CONFIG_KEY_REASONING_MODEL, AdminConfigService,
     DatabaseAdminConfigService, UnconfiguredAdminConfigService,
 };
+pub use agent_lessons::{Lesson, LessonHint, LessonKind, NewLesson, sanitize_for_prompt};
 pub use agents::{
     AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,
     AgentUpdateRequestData, DatabaseAgentService, InMemoryAgentService, UnconfiguredAgentService,
@@ -141,7 +143,8 @@ pub use marketplace_stats::{
 pub use models::{
     DatabaseModelService, ModelCreateRequestData, ModelListItem, ModelRecord, ModelService,
     ModelUpdateRequestData, PricingData, QuirksData, ResolvedActiveLlmModel,
-    UnconfiguredModelService, resolve_active_llm_model, resolve_reasoning_model,
+    UnconfiguredModelService, resolve_active_llm_model, resolve_memory_model,
+    resolve_reasoning_model,
 };
 pub use multi_agent::{
     DatabaseEdgeRegistryService, DatabaseTaskLeaseService, EdgeAgentRecord, EdgeRegistryService,
@@ -160,8 +163,7 @@ pub use pagination::{
     clamp_marketplace_search_offset,
 };
 pub use reflect::{
-    DatabaseReflectService, Diagnosis, ErrorClass, ReflectReport, ReflectService,
-    UnconfiguredReflectService,
+    DatabaseReflectService, Diagnosis, ReflectReport, ReflectService, UnconfiguredReflectService,
 };
 pub use replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService};
 pub use runs::{

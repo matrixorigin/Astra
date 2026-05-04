@@ -58,7 +58,7 @@ pub(crate) const LLM_MAX_RETRIES: u32 = 3;
 /// intentionally exhaust retries to assert error-surface behavior).
 pub(crate) const LLM_RETRY_BASE_MS: u64 = 1000;
 
-fn llm_retry_base_ms() -> u64 {
+pub(crate) fn llm_retry_base_ms() -> u64 {
     static VAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *VAL.get_or_init(|| {
         std::env::var("ASTRA_LLM_RETRY_BASE_MS")

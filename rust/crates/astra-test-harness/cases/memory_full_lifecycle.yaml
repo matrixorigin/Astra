@@ -1,0 +1,57 @@
+name: memory_full_lifecycle
+description: |
+  **What**: Full Memoria lifecycle in 3 turns: store → retrieve → purge.
+  **Tests**: All three core memory endpoints (store, retrieve, purge) work end-to-end through
+  the Memoria HTTP pipeline (auth → embedding → indexing → search → deletion).
+  **Why**: Each endpoint can fail independently (auth, circuit breaker, embedding service,
+  search pipeline). Testing the full lifecycle in one case catches integration failures
+  that unit tests cannot, while being cheaper to run than three separate cases.
+  **Pass means**: Turn 1 stores, turn 2 retrieves the stored fact, turn 3 purges it.
+  **Fail means**: Any endpoint in the pipeline is broken.
+prompt: |
+  Store this fact in your memory using memory_store:
+  "Project codename is NEPTUNE-2742 and launch date is June 15th."
+  Confirm when stored.
+capability: memory
+difficulty: 3
+weight: 2.5
+timeout_seconds: 240
+steps:
+  - prompt: |
+      Recall the project codename and launch date you stored earlier.
+      Tell me both values.
+    criteria:
+      - type: judger
+        question: |
+          The agent stored "NEPTUNE-2742, launch date June 15th" in turn 1.
+          Did it surface BOTH values (codename NEPTUNE-2742 + date June 15th)?
+          It may use memory_retrieve, memory_store lookup, or runtime-injected
+          context — any retrieval path counts.
+          Score 1.0 if both, 0.5 if one, 0.0 if neither.
+        threshold: 0.7
+  - prompt: |
+      That project was cancelled. Please purge/delete the NEPTUNE memory
+      using memory_purge with topic "NEPTUNE".
+    criteria:
+      - type: tool_called
+        name: memory_purge
+      - type: judger
+        question: |
+          Did memory_purge succeed (return a confirmation or deleted_count)?
+          A 422, error, or "Unprocessable Entity" response means failure.
+          Score 1.0 for a successful purge confirmation, 0.0 for any error.
+        threshold: 0.7
+        severity: Hard
+teardown_cmd: |
+  curl -sf -X POST "${MEMORIA_BASE_URL:-http://127.0.0.1:8100}/v1/memories/purge" \
+    -H "Authorization: Bearer ${MEMORIA_MASTER_KEY}" \
+    -H "Content-Type: application/json" \
+    -d '{"topic":"NEPTUNE","reason":"harness teardown"}' 2>/dev/null || true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: memory_store
+  - type: turn_rounds_between
+    min: 1
+    max: 20

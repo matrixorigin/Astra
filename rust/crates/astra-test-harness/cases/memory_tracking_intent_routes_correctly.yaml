@@ -1,0 +1,49 @@
+name: memory_tracking_intent_routes_correctly
+description: |
+  **What**: Express tracking/interest intent in Chinese ("我关注X") and verify the agent routes to
+  memory_store rather than codebase exploration tools.
+  **Tests**: Tool selection for tracking intents — "关注" (follow/track) should trigger memory persistence,
+  NOT file exploration (bash, list_dir, glob, grep). This is a regression test for session 292f7100 where
+  "我关注matrixorigin" caused the LLM to explore the codebase instead of storing the interest.
+  **Why**: Chinese-language tracking expressions ("关注", "追踪") are semantically memory-store operations,
+  not code search operations. The tool selector must route these to memory tools, not exploration tools.
+  After removing "关注" from github_list_prs triggers and deleting detect_store_signal, the system prompt
+  memory rules must carry the full burden of routing these intents correctly.
+  **Pass means**: The agent calls memory_store to persist the tracking interest, and does NOT waste turns
+  exploring the filesystem for "oceanbase" (which is just the name of what the user wants to track).
+  **Fail means**: The agent explored codebase files (bash/grep/glob/list_dir) trying to find information
+  about "oceanbase" instead of recognizing this as a memory-store intent.
+prompt: |
+  我关注oceanbase这个项目，帮我记住。
+capability: memory
+difficulty: 3
+weight: 2.0
+timeout_seconds: 120
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: memory_store
+  - type: tools_count_between
+    min: 1
+    max: 6
+  - type: turn_rounds_between
+    min: 1
+    max: 5
+  - type: judger
+    question: |
+      The user said "我关注oceanbase这个项目，帮我记住" which means
+      "I'm following/tracking the oceanbase project, please remember this."
+      This is a MEMORY STORE intent, not a code search intent.
+      Did the agent:
+      1. Call memory_store to persist the user's interest in oceanbase? (required)
+      2. Avoid unnecessary codebase exploration (bash, grep, glob, list_dir)? (required)
+      3. Confirm the interest was stored?
+      Score 1.0 if stored without exploration, 0.5 if stored but also explored,
+      0.0 if only explored without storing.
+    threshold: 0.6
+teardown_cmd: |
+  curl -sf -X POST "${MEMORIA_BASE_URL:-http://127.0.0.1:8100}/v1/memories/purge" \
+    -H "Authorization: Bearer ${MEMORIA_MASTER_KEY}" \
+    -H "Content-Type: application/json" \
+    -d '{"topic":"oceanbase","reason":"harness teardown"}' 2>/dev/null || true

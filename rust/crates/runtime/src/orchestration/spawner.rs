@@ -953,17 +953,27 @@ impl DynamicAgentSpawner {
             }
         }
 
-        // Get or create notifier.
+        // Get notifier and create the future BEFORE re-checking, so a
+        // notification that fires between the first check and .notified()
+        // is not lost.
         let notifier = {
             let map = self.completion_notifiers.read().await;
             map.get(agent_id).cloned()
         };
         let notifier = notifier?;
+        let notify_future = notifier.notified();
+
+        // Re-check after registering the future — catches completions
+        // that raced between the first check and notified() registration.
+        for s in self.completed_agents.read().await.iter() {
+            if s.agent_id == agent_id {
+                return Some(s.status.clone());
+            }
+        }
 
         // Wait for notification with timeout.
-        match tokio::time::timeout(timeout, notifier.notified()).await {
+        match tokio::time::timeout(timeout, notify_future).await {
             Ok(()) => {
-                // Check completed_agents now.
                 for s in self.completed_agents.read().await.iter() {
                     if s.agent_id == agent_id {
                         return Some(s.status.clone());

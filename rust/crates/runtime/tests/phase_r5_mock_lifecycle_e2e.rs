@@ -29,13 +29,7 @@ use serde_json::{Value, json};
 const VALID_FERNET_KEY: &str = "cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=";
 
 fn mock_matrixone() -> MatrixOneSettings {
-    MatrixOneSettings {
-        host: "127.0.0.1".to_string(),
-        port: 6001,
-        user: "t".to_string(),
-        password: "t".to_string(),
-        database: "t".to_string(),
-    }
+    MatrixOneSettings::mock()
 }
 
 fn mock_encryptor() -> Arc<FernetTokenEncryptor> {

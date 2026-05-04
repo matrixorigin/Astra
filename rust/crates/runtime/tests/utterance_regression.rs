@@ -1148,10 +1148,10 @@ mod trigger_quality {
     }
 
     #[test]
-    fn remember_not_on_search() {
+    fn remember_not_on_retrieve() {
         let ms = TOOL_CATALOG
             .iter()
-            .find(|t| t.name == "memory_search")
+            .find(|t| t.name == "memory_retrieve")
             .unwrap();
         assert!(!ms.triggers.contains(&"remember"));
     }

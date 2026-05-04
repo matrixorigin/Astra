@@ -1237,6 +1237,8 @@ pub(super) async fn handle_info_command(
                 selector: &*selector.0,
                 recent_tools: &state.recent_tools,
                 tool_health_entries: &state.tool_health_entries,
+                session_lessons: &state.session_lessons,
+                latest_skill_diagnosis: state.latest_skill_diagnosis.as_ref(),
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 plan_only_chat: false,
                 is_plan_subtask: false,
@@ -1440,10 +1442,9 @@ pub(super) async fn handle_info_command(
             }
 
             // Memoria
-            let memoria_key_set = std::env::var("MEMORIA_MASTER_KEY").is_ok();
-            if memoria_key_set {
-                let memoria_base = std::env::var("MEMORIA_BASE_URL")
-                    .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
+            let mem = astra_core::MemoriaSettings::from_env();
+            if mem.is_configured() {
+                let memoria_base = mem.base_url;
                 let memoria_health = format!("{}/health", memoria_base.trim_end_matches('/'));
                 match api.get_url(&memoria_health).await {
                     Ok(r) if r.status().is_success() => {

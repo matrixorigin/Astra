@@ -148,6 +148,7 @@ dependencies = [
  "astra-logging",
  "astra-messaging",
  "astra-pipeline",
+ "astra-prompts",
  "astra-runtime",
  "astra-services",
  "astra-skills",
@@ -248,6 +249,7 @@ name = "astra-edge"
 version = "0.1.0"
 dependencies = [
  "astra-logging",
+ "astra-server-types",
  "astra-tools",
  "clap",
  "futures-util",
@@ -588,6 +590,7 @@ name = "astra-tools"
 version = "0.1.0"
 dependencies = [
  "astra-core",
+ "astra-prompts",
  "astra-sandbox",
  "async-trait",
  "base64",

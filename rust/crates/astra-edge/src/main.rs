@@ -9,9 +9,11 @@
 //! astra-edge --server-url wss://astra.example.com --token <jwt> --workspace-dir ~/projects/my-app
 //! ```
 
+use astra_server_types::edge_ws_protocol::{
+    EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS, EdgeClientMessage, EdgeServerMessage,
+};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -50,54 +52,6 @@ fn default_edge_id() -> String {
     format!("edge-{hostname}-{}", &uuid::Uuid::new_v4().to_string()[..8])
 }
 
-// ─── Protocol types (mirroring server edge_ws_protocol.rs) ───────────────────
-
-#[derive(Serialize)]
-#[serde(tag = "type")]
-enum EdgeToServer {
-    #[serde(rename = "edge_auth")]
-    Auth {
-        token: String,
-        edge_agent_id: String,
-        hostname: Option<String>,
-        workspace_dir: Option<String>,
-    },
-    #[serde(rename = "edge_tool_result")]
-    ToolResult {
-        request_id: String,
-        output: String,
-        is_error: bool,
-        duration_ms: u64,
-    },
-    #[serde(rename = "edge_ping")]
-    Ping,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "type")]
-enum ServerToEdge {
-    #[serde(rename = "edge_auth_ok")]
-    AuthOk { user_id: String },
-    #[serde(rename = "edge_auth_error")]
-    AuthError { message: String },
-    #[serde(rename = "edge_tool_request")]
-    ToolRequest {
-        request_id: String,
-        tool: String,
-        args: serde_json::Value,
-        #[serde(rename = "timeout_secs", default = "default_timeout")]
-        _timeout_secs: u64,
-    },
-    #[serde(rename = "edge_pong")]
-    Pong,
-    #[serde(rename = "edge_closing")]
-    Closing { reason: String },
-}
-
-fn default_timeout() -> u64 {
-    300
-}
-
 // ─── Connection loop ─────────────────────────────────────────────────────────
 
 async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -125,7 +79,7 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
 
     // Send auth
     let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
-    let auth_msg = EdgeToServer::Auth {
+    let auth_msg = EdgeClientMessage::Auth {
         token: args.token.clone(),
         edge_agent_id: args.edge_id.clone(),
         hostname,
@@ -136,21 +90,23 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
                 .to_string_lossy()
                 .to_string(),
         ),
+        capabilities: None,
     };
     write
         .send(Message::Text(serde_json::to_string(&auth_msg)?.into()))
         .await?;
 
     // Wait for auth response
-    let auth_timeout = Duration::from_secs(30);
+    let auth_timeout = Duration::from_secs(EDGE_AUTH_TIMEOUT_SECS);
     let auth_response = tokio::time::timeout(auth_timeout, read.next()).await;
 
     match auth_response {
-        Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<ServerToEdge>(&text) {
-            Ok(ServerToEdge::AuthOk { user_id }) => {
+        Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<EdgeServerMessage>(&text)
+        {
+            Ok(EdgeServerMessage::AuthOk { user_id }) => {
                 tracing::info!(user_id = %user_id, "Authenticated successfully");
             }
-            Ok(ServerToEdge::AuthError { message }) => {
+            Ok(EdgeServerMessage::AuthError { message }) => {
                 tracing::error!(
                     target: "astra.edge",
                     edge_id = %args.edge_id,
@@ -183,35 +139,17 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
         .canonicalize()
         .unwrap_or_else(|_| args.workspace_dir.clone());
 
-    // Build a production ToolContext (not test) with HTTP client for web_fetch/GitHub
-    let http_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .user_agent("astra-edge/0.1")
-        .no_proxy()
-        .build()
-        .expect("Failed to create HTTP client");
-    let ctx = astra_tools::ToolContext {
-        project_root: workspace.clone(),
-        workspace_root: workspace.clone(),
-        user_id: args.edge_id.clone(),
-        session_id: format!("edge-{}", &uuid::Uuid::new_v4().to_string()[..8]),
-        sandbox: astra_tools::SandboxConfig::standard(&workspace),
-        http_client: Some(http_client.clone()),
-        logger: std::sync::Arc::new(astra_tools::TracingLogger),
-        cancel_token: None,
-    };
-
-    // Build executor with optional GitHub client (from GITHUB_TOKEN + gh auth token)
-    let mut executor = astra_tools::executor::DefaultToolExecutor::new(ctx);
-    let tokens = astra_tools::github::resolve_github_tokens();
-    if !tokens.is_empty() {
-        let github =
-            astra_tools::github::GitHubClient::from_tokens(http_client, tokens, Vec::new());
-        executor = executor.with_github_client(github);
-    }
+    let session_id = format!("edge-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let executor = astra_tools::executor::DefaultToolExecutor::for_workspace(
+        &workspace,
+        args.edge_id.clone(),
+        session_id,
+        "astra-edge/0.1",
+        Duration::from_secs(30),
+    );
 
     // Heartbeat ticker
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     tracing::info!(
@@ -224,12 +162,12 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<ServerToEdge>(&text) {
-                            Ok(ServerToEdge::ToolRequest {
+                        match serde_json::from_str::<EdgeServerMessage>(&text) {
+                            Ok(EdgeServerMessage::ToolRequest {
                                 request_id,
                                 tool,
                                 args: tool_args,
-                                _timeout_secs: _,
+                                timeout_secs: _,
                             }) => {
                                 tracing::info!(tool = %tool, request_id = %request_id, "Executing tool");
                                 let start = Instant::now();
@@ -245,22 +183,22 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
                                     output_len = output.len(),
                                     "Tool execution complete"
                                 );
-                                let result_msg = EdgeToServer::ToolResult {
+                                let result_msg = EdgeClientMessage::ToolResult {
                                     request_id,
                                     output,
                                     is_error,
-                                    duration_ms,
+                                    duration_ms: Some(duration_ms),
                                 };
                                 write.send(Message::Text(serde_json::to_string(&result_msg)?.into())).await?;
                             }
-                            Ok(ServerToEdge::Pong) => {
+                            Ok(EdgeServerMessage::Pong) => {
                                 // heartbeat ack
                             }
-                            Ok(ServerToEdge::Closing { reason }) => {
+                            Ok(EdgeServerMessage::Closing { reason }) => {
                                 tracing::info!(reason = %reason, "Server closing connection");
                                 break;
                             }
-                            Ok(ServerToEdge::AuthOk { .. } | ServerToEdge::AuthError { .. }) => {
+                            Ok(EdgeServerMessage::AuthOk { .. } | EdgeServerMessage::AuthError { .. }) => {
                                 // ignore duplicate auth
                             }
                             Err(e) => {
@@ -279,7 +217,7 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
                 }
             }
             _ = heartbeat.tick() => {
-                let ping = EdgeToServer::Ping;
+                let ping = EdgeClientMessage::Ping;
                 if write.send(Message::Text(serde_json::to_string(&ping)?.into())).await.is_err() {
                     tracing::warn!("Failed to send heartbeat");
                     break;

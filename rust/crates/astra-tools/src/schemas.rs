@@ -75,12 +75,14 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "ask_user",
     "memory_retrieve",
     "memory_store",
-    "memory_search",
+    // memory_search removed — duplicate of memory_retrieve (same endpoint).
+    // Dispatch still handles it for backwards compat.
     "memory_purge",
     "memory_correct",
     "memory_profile",
     "enter_plan_mode",
     "exit_plan_mode",
+    "get_agent_info",
 ];
 
 fn filter_tool_schemas_by_name(allowed_names: &[&str]) -> Vec<Value> {
@@ -140,7 +142,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read file contents with optional line range. Output includes line numbers (tab-separated). IMPORTANT: If you are NOT certain the file exists, use list_dir or glob FIRST to verify the path — do NOT guess paths. Large files (over ~80KB) will return an error when read without a range — use start_line/end_line or outline=true. For files over 500 lines, prefer targeted reads. Set outline=true to get only function/class/struct/trait signatures (saves tokens). Common image types return a data URI; known binary formats are refused and should be inspected via bash instead. When using str_replace, provide old_str WITHOUT line numbers — only the actual file content.",
+                "description": "Read file contents with optional line range. Verify uncertain paths with list_dir/glob first. Large files (>80KB) require start_line/end_line or outline=true for signatures only. Output includes line numbers; pass content without line numbers to str_replace. Common images return a data URI; binary files are refused.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -973,7 +975,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory_retrieve",
-                "description": "Retrieve the most relevant memories for a semantic query (hybrid / graph-backed when configured). Use at conversation start or when you need grounded context from Memoria before answering. Prefer memory_search when the user asks for keyword/topic browse; use memory_retrieve for focused semantic recall.",
+                "description": "Retrieve the most relevant memories for a semantic query (hybrid vector + fulltext + graph). Use at conversation start or when you need context from prior sessions. Supports both focused semantic recall and broad keyword/topic browsing.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1005,25 +1007,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "memory_search",
-                "description": "Search memories by keyword or topic. Use when user asks 'what do you know about X'. Supports session-scoped filtering via session_id and filter_session.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search query"},
-                        "top_k": {"type": "integer", "description": "Max results (default 10)"},
-                        "min_confidence": {"type": "number", "description": "Minimum confidence threshold 0.0-1.0 (default 0.3). Filters low-quality results."},
-                        "session_id": {"type": "string", "description": "Session ID for scoped search. When provided with filter_session=true, restricts results to this session."},
-                        "filter_session": {"type": "boolean", "description": "When true, restrict search to the given session_id. Requires session_id."},
-                        "include_cross_session": {"type": "boolean", "description": "Legacy flag. false is equivalent to filter_session=true when session_id is set. Default true."}
-                    },
-                    "required": ["query"]
-                }
-            }
-        }),
+        // memory_search schema removed — duplicate of memory_retrieve (same Memoria endpoint).
+        // Dispatch layer still handles memory_search calls for backwards compatibility.
         json!({
             "type": "function",
             "function": {
@@ -1554,7 +1539,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "spawn_agent",
-                "description": "Launch a specialized sub-agent to perform a task. Agents run autonomously and return results. Use for parallel work, independent research, code review, or any task that benefits from dedicated focus. Agent types: 'explore' (fast codebase research), 'code-review' (analyze changes), 'task' (run commands), 'general-purpose' (full capabilities).",
+                "description": "Launch a sub-agent for independent work. Types: explore, code-review, task, general-purpose.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1569,7 +1554,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "agent_type": {
                             "type": "string",
                             "enum": ["explore", "code-review", "task", "general-purpose"],
-                            "description": "Type of specialized agent. 'explore' for research, 'code-review' for reviewing changes, 'task' for running commands, 'general-purpose' for complex multi-step tasks.",
+                            "description": "Agent type: explore, code-review, task, or general-purpose.",
                             "default": "general-purpose"
                         },
                         "model": {

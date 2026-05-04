@@ -601,6 +601,18 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/introspection/memory",
             get(introspection::get_memory_introspection_handler),
         )
+        .route(
+            "/introspection/decision-trace",
+            get(introspection::get_decision_trace_handler),
+        )
+        .route(
+            "/introspection/tool-history",
+            get(introspection::get_tool_history_handler),
+        )
+        .route(
+            "/introspection/drift-check",
+            get(introspection::get_drift_check_handler),
+        )
         // Platform snapshot (aggregated dashboard data)
         .route(
             "/platform/snapshot",

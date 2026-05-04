@@ -2564,7 +2564,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // When no edge tools are provided (no CLI connected), use the
         // already-provisioned workspace for the ServerToolExecutor.
         if let Some(workspace) = server_workspace {
-            let memoria_base = std::env::var("MEMORIA_BASE_URL").ok();
+            let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let mut executor = super::server_tool_executor::ServerToolExecutor::new(
                 workspace,
                 user_id.clone(),
@@ -3012,7 +3012,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // Wire ServerToolExecutor when no edge agent is connected (web-agent mode).
         if let Some(workspace) = server_workspace {
-            let memoria_base = std::env::var("MEMORIA_BASE_URL").ok();
+            let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let mut executor = super::server_tool_executor::ServerToolExecutor::new(
                 workspace,
                 user_id.clone(),
@@ -3865,7 +3865,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         // server-side and sub-agents would get edge-protocol errors.
         {
             let workspace = self.provision_subrun_workspace(&config.session_id, &config.run_id);
-            let memoria_base = std::env::var("MEMORIA_BASE_URL").ok();
+            let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let mut executor = super::server_tool_executor::ServerToolExecutor::new(
                 workspace,
                 config.user_id.clone(),
@@ -4186,18 +4186,7 @@ mod tests {
     }
 
     fn test_settings() -> MatrixOneSettings {
-        dotenvy::dotenv().ok();
-        let lookup = |k: &str| std::env::var(k).ok();
-        MatrixOneSettings {
-            host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".into()),
-            port: std::env::var("MATRIXONE_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(6001),
-            user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
-            password: std::env::var("MATRIXONE_PASSWORD").unwrap_or_else(|_| "111".into()),
-            database: astra_core::resolve_database_name_or(&lookup, "test_astra_runtime"),
-        }
+        MatrixOneSettings::from_env_with_database("test_astra_runtime")
     }
 
     fn test_encryptor() -> Arc<FernetTokenEncryptor> {
@@ -4213,18 +4202,7 @@ mod tests {
     }
 
     fn runtime_db_it_settings(database: &str) -> MatrixOneSettings {
-        dotenvy::dotenv().ok();
-        MatrixOneSettings {
-            host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-            port: std::env::var("MATRIXONE_PORT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(6001),
-            user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
-            password: std::env::var("MATRIXONE_PASSWORD")
-                .unwrap_or_else(|_| astra_core::DEV_MATRIXONE_PASSWORD.to_string()),
-            database: database.to_string(),
-        }
+        MatrixOneSettings::from_env_with_database(database)
     }
 
     async fn setup_runtime_db_pool(database: &str) -> (MatrixOneSettings, SharedPool) {

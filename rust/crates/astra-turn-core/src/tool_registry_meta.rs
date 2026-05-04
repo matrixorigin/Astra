@@ -758,10 +758,10 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         scope: Scope::External,
         schema_tokens: 25,
     },
-    // memory_store is now selective, not baseline-pinned. We surface it for
-    // explicit remember/track language plus common preference phrasing, so
-    // implicit user preferences can still route without paying the schema tax
-    // on unrelated turns.
+    // memory_store is pinned — intrinsic memory capability. The model must
+    // always be able to store memories regardless of query content. Without
+    // this, implicit preferences and background extraction have no way to
+    // persist information.
     ToolMeta {
         name: "memory_store",
         description: "Store information to persistent memory",
@@ -792,22 +792,24 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "倾向",
             "好吃",
             "比较好",
-            // Disambiguate from write_file "保存"
             "保存到记忆",
             "存储到记忆",
             "存一下",
             "帮我记住",
         ],
-        pinned: false,
+        pinned: true,
         intents: &[IntentType::Memory],
         scope: Scope::CrossSession,
         schema_tokens: 35,
     },
-    // memory_search is dynamic: only needed when user explicitly asks about
-    // stored memories. Rich triggers ensure tfidf selects it reliably.
+    // memory_retrieve is dynamic but richly triggered. Per-turn
+    // memory_boost_search already provides automatic recall (capability
+    // layer). This tool is only needed when the user explicitly asks
+    // to browse or inspect memories. Rich triggers ensure selector
+    // scores it high for "我有哪些记忆?" etc.
     ToolMeta {
-        name: "memory_search",
-        description: "Search persistent memories for relevant information",
+        name: "memory_retrieve",
+        description: "Retrieve persistent memories via semantic search",
         triggers: &[
             "recall",
             "search memory",
@@ -833,8 +835,15 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "搜一下记忆",
             "我的偏好",
             "我记住了",
+            "有什么记忆",
+            "看看记忆",
+            "查记忆",
+            "what do you remember",
+            "what memories",
+            "show memories",
+            "list memories",
         ],
-        pinned: false,
+        pinned: true,
         intents: &[IntentType::Memory],
         scope: Scope::CrossSession,
         schema_tokens: 30,
@@ -1431,12 +1440,27 @@ mod tests {
     }
 
     #[test]
-    fn catalog_memory_store_is_not_pinned() {
-        let ms = TOOL_CATALOG
+    fn catalog_memory_store_is_pinned() {
+        let tool = TOOL_CATALOG
             .iter()
             .find(|t| t.name == "memory_store")
             .unwrap();
-        assert!(!ms.pinned, "memory_store should be selected dynamically");
+        assert!(
+            tool.pinned,
+            "memory_store must be pinned — intrinsic store capability"
+        );
+    }
+
+    #[test]
+    fn catalog_memory_retrieve_is_pinned() {
+        let tool = TOOL_CATALOG
+            .iter()
+            .find(|t| t.name == "memory_retrieve")
+            .unwrap();
+        assert!(
+            tool.pinned,
+            "memory_retrieve must be pinned — intrinsic recall capability"
+        );
     }
 
     #[test]
@@ -1444,7 +1468,8 @@ mod tests {
         assert!(is_pinned_tool("bash"));
         assert!(is_pinned_tool("read_file"));
         assert!(is_pinned_tool("str_replace"));
-        assert!(!is_pinned_tool("memory_store"));
+        assert!(is_pinned_tool("memory_store"));
+        assert!(is_pinned_tool("memory_retrieve"));
         assert!(!is_pinned_tool("nonexistent_tool"));
     }
 }

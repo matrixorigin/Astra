@@ -7,22 +7,20 @@
 //! - Triggering Memoria governance and consolidation
 //! - Clearing panic guards
 //!
-//! The session-end knowledge extraction feature (auto-append to `.astra/knowledge.md`) was
-//! removed during the env-var cleanup. The helper functions are retained for future use.
+//! Lessons are extracted from the L1b narrative and tool signals, then
+//! stored in Memoria as L3 durable memory (Session Memory Protocol §6.2).
 
+use astra_services::session_artifact_store::SessionArtifactStore;
 use astra_services::session_journal;
-use crossterm::style::Stylize;
-use std::path::Path;
 use std::time::Duration;
 
 use super::ReplState;
 use super::edge_tools;
 use super::repl_turn::enqueue_ingestion_pub;
 use super::session_guard::clear_panic_guard;
-use super::theme;
 
 /// Finalize a REPL session: journal end event, persist state, extract learnings.
-pub(super) async fn finalize_session(state: &ReplState) {
+pub(super) async fn finalize_session(state: &mut ReplState) {
     // 1. Journal: session end event (idempotent — panic hook may have already written it)
     if let Some(ref j) = state.journal {
         let wrote =
@@ -39,24 +37,160 @@ pub(super) async fn finalize_session(state: &ReplState) {
             astra_services::session_workspace::finalize_workspace_on_end(sid);
         }
     }
-    // 2b. End observability session and collect summary
-    if let (Some(hub), Some(session_id)) = (&state.observability_hub, &state.session_id) {
-        // End the session silently — summary is collected but not displayed
-        // (could be exposed via /telemetry command in future)
-        let _ = hub.end_session(session_id);
-    }
-    // 3. Session-end knowledge extraction (opt-in, async with timeout)
-    let knowledge_handle = session_end_extract_learnings(&state.history);
-    // 3b. Trigger Memoria governance + consolidation (best-effort with timeout)
+    // 3. Trigger Memoria governance + consolidation (best-effort with timeout)
     let gov_handle = tokio::spawn(edge_tools::memoria::memoria_governance_fire_and_forget());
     let con_handle = tokio::spawn(edge_tools::memoria::memoria_consolidate_fire_and_forget());
+    // 3c. L3 knowledge backflow (Session Memory Protocol §6.2).
+    //     Three sources merged into one batch Memoria write:
+    //     (a) L1b narrative Learnings + User Corrections → semantic T2/T3
+    //     (b) Checkpointer final flush (tool failures, stalls) → semantic T3
+    //     (c) Episodic session summary → episodic T3
+    if state.turn > 0 {
+        let narrative = state.session_id.as_deref().and_then(|sid| {
+            let raw = astra_services::local_session_artifact_store()
+                .session_path(sid, "session-memory.md")
+                .ok()
+                .and_then(|p| astra_runtime::read_session_memory_file(&p))
+                .or_else(|| {
+                    let cwd = std::env::current_dir().ok()?;
+                    let path = astra_runtime::resolve_resume_session_memory_file(
+                        sid,
+                        Some(cwd.to_str()?),
+                    )?;
+                    astra_runtime::read_session_memory_file(&path)
+                })?;
+            astra_runtime::turn::cloud::session_memory_protocol::SessionMemory::parse(&raw)
+        });
+
+        // (a) L1b narrative extraction
+        let mut all_lessons =
+            astra_runtime::lesson_synthesizer::extract_learnings_for_backflow(narrative.as_ref());
+
+        // (b) Final tool/stall lessons — extract directly from signals and
+        //     promote to semantic T3 (mid-session copies were working T4).
+        //     Quality gate applied to filter out generic template content.
+        let summary = match state
+            .observability_session
+            .as_ref()
+            .and_then(|arc| arc.read().ok())
+        {
+            Some(guard) => astra_runtime::lesson_extractor::summarise_from_runtime(
+                &state.tool_health_entries,
+                Some(&*guard),
+            ),
+            None => astra_runtime::lesson_extractor::summarise_from_runtime(
+                &state.tool_health_entries,
+                None,
+            ),
+        };
+        let signal_lessons = astra_runtime::lesson_extractor::extract_lessons(
+            &summary,
+            state.ingestion_user_id.as_deref().unwrap_or("unknown"),
+            "generic",
+            None,
+        );
+        for cl in signal_lessons {
+            // Template-generated lessons use the basic gate (hedging + length).
+            // The template blocklist is only for LLM-synthesized content.
+            if astra_runtime::lesson_synthesizer::is_synthesized_lesson_acceptable(&cl.action) {
+                all_lessons.push(astra_runtime::lesson_synthesizer::ExtractedLesson {
+                    memory_type: "semantic",
+                    content: format!("💡 LESSON: {}", cl.action),
+                    trust_tier: "T3",
+                });
+            }
+        }
+
+        // (c) Episodic summary
+        if let Some(episodic) = astra_runtime::lesson_synthesizer::build_episodic_summary(
+            state.session_id.as_deref().unwrap_or("unknown"),
+            state.turn,
+            narrative.as_ref(),
+        ) {
+            all_lessons.push(episodic);
+        }
+
+        if !all_lessons.is_empty() {
+            // Store T3 semantic lessons FIRST, then purge T4 working copies.
+            // Sequenced to prevent the purge from racing ahead and deleting
+            // in-flight T3 writes that share the same topic prefix.
+            let sid_for_purge = state.session_id.clone();
+            tokio::spawn(async move {
+                edge_tools::memoria::memoria_store_lessons_fire_and_forget(
+                    all_lessons,
+                    sid_for_purge.clone(),
+                )
+                .await;
+                // Only purge AFTER store completes.
+                if let Some(sid) = sid_for_purge {
+                    if let Some((client, base, key)) =
+                        edge_tools::memoria::memoria_oneshot_client_pub(5)
+                    {
+                        let _ = client
+                            .post(format!("{base}/v1/memories/purge"))
+                            .header("Authorization", format!("Bearer {key}"))
+                            .json(&serde_json::json!({
+                                "topic": format!("LESSON session:{sid}"),
+                                "reason": "session-end promotion to semantic T3",
+                            }))
+                            .send()
+                            .await;
+                    }
+                }
+            });
+        } else if let Some(ref sid) = state.session_id {
+            // No new lessons but still purge stale T4 working copies.
+            let sid = sid.clone();
+            tokio::spawn(async move {
+                if let Some((client, base, key)) =
+                    edge_tools::memoria::memoria_oneshot_client_pub(5)
+                {
+                    let _ = client
+                        .post(format!("{base}/v1/memories/purge"))
+                        .header("Authorization", format!("Bearer {key}"))
+                        .json(&serde_json::json!({
+                            "topic": format!("LESSON session:{sid}"),
+                            "reason": "session-end cleanup (no new lessons)",
+                        }))
+                        .send()
+                        .await;
+                }
+            });
+        }
+    }
+    // 3f. Drain any in-flight memory extraction (bounded 5s).
+    if let Some(outcome) = state.memory_extractor.drain(Duration::from_secs(5)).await {
+        if let Some(ref j) = state.journal {
+            let (saved, cats, dur) = match &outcome {
+                super::memory_extraction::ExtractionOutcome::Extracted {
+                    count,
+                    categories,
+                    duration_ms,
+                } => (*count, categories.clone(), *duration_ms),
+                _ => (0, vec![], 0),
+            };
+            let evt = session_journal::JournalEvent::memory_extraction(
+                state.session_id.as_deref(),
+                state.turn,
+                outcome.tag(),
+                saved,
+                &cats,
+                dur,
+            );
+            let _ = j.append(&evt);
+            enqueue_ingestion_pub(state, &evt);
+        }
+    }
+    // 3e. End observability only after session-derived lessons/outcomes have
+    // been persisted so the lifecycle boundary matches the data flow.
+    if let (Some(hub), Some(session_id)) = (&state.observability_hub, &state.session_id) {
+        let _ = hub.end_session(session_id);
+    }
     // 4. Graceful ingestion shutdown: await worker flush
     if let Some(mc) = state.matrix_runtime.as_ref() {
         mc.shutdown_ingestion_and_wait().await;
     }
-    // 5. Await knowledge extraction with timeout
-    await_knowledge_extraction(knowledge_handle).await;
-    // 5b. Await Memoria maintenance (bounded 5s so we don't hang on exit)
+    // 5. Await Memoria maintenance (bounded 5s so we don't hang on exit)
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         let _ = gov_handle.await;
         let _ = con_handle.await;
@@ -64,153 +198,4 @@ pub(super) async fn finalize_session(state: &ReplState) {
     .await;
     // 6. Clear panic guard
     clear_panic_guard();
-}
-
-// ---------------------------------------------------------------------------
-// Session-end knowledge extraction → .astra/knowledge.md
-// ---------------------------------------------------------------------------
-
-/// Extract learnings from the session (disabled — always no-op).
-pub(super) fn session_end_extract_learnings(
-    _history: &[(String, String)],
-) -> Option<tokio::task::JoinHandle<()>> {
-    None
-}
-
-/// Await a knowledge extraction handle with timeout.
-pub(super) async fn await_knowledge_extraction(handle: Option<tokio::task::JoinHandle<()>>) {
-    let Some(handle) = handle else { return };
-    match tokio::time::timeout(std::time::Duration::from_secs(30), handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            eprintln!(
-                "  {} Knowledge extraction task failed: {e}",
-                theme::icon_warn()
-            );
-        }
-        Err(_) => {
-            eprintln!("{}", "  Knowledge extraction timed out, skipping.".dim());
-        }
-    }
-}
-
-/// Append new learnings to `.astra/knowledge.md`, deduplicating against existing content.
-pub(super) fn append_to_knowledge_md(new_learnings: &str) -> std::io::Result<()> {
-    let cwd = std::env::current_dir()?;
-    let knowledge_path = cwd.join(".astra").join("knowledge.md");
-    append_to_knowledge_md_at(&knowledge_path, new_learnings)
-}
-
-/// Core logic: append learnings to a specific knowledge file path (testable).
-/// Note: read-dedup-write is not atomic. Concurrent session endings for the same
-/// project may produce duplicate lines. This is acceptable since the file is
-/// append-only and duplicates are cosmetic (capped at 8KB on injection).
-pub(super) fn append_to_knowledge_md_at(
-    knowledge_path: &Path,
-    new_learnings: &str,
-) -> std::io::Result<()> {
-    // Read existing content (if any)
-    let existing = std::fs::read_to_string(knowledge_path).unwrap_or_default();
-
-    // Dedup: skip lines that already exist (normalized comparison)
-    let existing_normalized: std::collections::HashSet<String> =
-        existing.lines().map(|l| l.trim().to_lowercase()).collect();
-    let new_lines: Vec<&str> = new_learnings
-        .lines()
-        .filter(|l| {
-            let norm = l.trim().to_lowercase();
-            !norm.is_empty() && !existing_normalized.contains(&norm)
-        })
-        .collect();
-
-    if new_lines.is_empty() {
-        return Ok(());
-    }
-
-    // Ensure .astra/ directory exists
-    if let Some(parent) = knowledge_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Build content to append
-    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let mut append_text = String::new();
-
-    // Add header if file is new
-    if existing.trim().is_empty() {
-        append_text.push_str("# Project Knowledge\n\n");
-        append_text.push_str("<!-- Auto-generated by astra session knowledge extraction. -->\n");
-        append_text.push_str("<!-- You can edit this file. It is injected into every session as project context. -->\n\n");
-    }
-
-    append_text.push_str(&format!("## Session learnings ({date})\n\n"));
-    for line in &new_lines {
-        append_text.push_str(line);
-        append_text.push('\n');
-    }
-    append_text.push('\n');
-
-    // Append (don't replace)
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(knowledge_path)?;
-    file.write_all(append_text.as_bytes())?;
-
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn append_to_knowledge_md_creates_file() {
-        let knowledge_path =
-            std::env::temp_dir().join(format!("knowledge-test-{}.md", uuid::Uuid::new_v4()));
-        append_to_knowledge_md_at(&knowledge_path, "- Learning one\n- Learning two").unwrap();
-        let content = std::fs::read_to_string(&knowledge_path).unwrap();
-        assert!(content.contains("- Learning one"));
-        assert!(content.contains("- Learning two"));
-        std::fs::remove_file(&knowledge_path).ok();
-    }
-
-    #[test]
-    fn append_to_knowledge_md_deduplicates() {
-        let knowledge_path =
-            std::env::temp_dir().join(format!("knowledge-dedup-{}.md", uuid::Uuid::new_v4()));
-        // First write
-        append_to_knowledge_md_at(&knowledge_path, "- Learning one").unwrap();
-        // Second write with overlap
-        append_to_knowledge_md_at(&knowledge_path, "- Learning one\n- Learning two").unwrap();
-        let content = std::fs::read_to_string(&knowledge_path).unwrap();
-        let count = content.matches("- Learning one").count();
-        assert_eq!(count, 1, "Duplicate line should not appear twice");
-        assert!(content.contains("- Learning two"));
-        std::fs::remove_file(&knowledge_path).ok();
-    }
-
-    #[test]
-    fn session_end_extract_learnings_is_always_none() {
-        let history: Vec<(String, String)> = vec![
-            ("Q1".into(), "A1".into()),
-            ("Q2".into(), "A2".into()),
-            ("Q3".into(), "A3".into()),
-        ];
-        assert!(
-            session_end_extract_learnings(&history).is_none(),
-            "feature disabled — should always return None"
-        );
-    }
-
-    #[test]
-    fn session_end_extract_learnings_returns_none_for_short_history() {
-        let short_history: Vec<(String, String)> = vec![("Q".into(), "A".into())];
-        let result = session_end_extract_learnings(&short_history);
-        assert!(
-            result.is_none(),
-            "Should return None for history shorter than 3 turns"
-        );
-    }
 }
