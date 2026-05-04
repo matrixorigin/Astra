@@ -90,7 +90,7 @@ async fn slash_exit_writes_session_end_to_journal() {
         .await
         .unwrap();
     assert!(exit);
-    finalize_repl_exit(&state, None, ReplExit::Command).await;
+    finalize_repl_exit(&mut state, None, ReplExit::Command).await;
 
     // Verify session_end was written to journal
     let events = session_journal::read_journal(&sid).unwrap();
@@ -133,7 +133,7 @@ async fn slash_quit_writes_session_end_to_journal() {
         .await
         .unwrap();
     assert!(exit);
-    finalize_repl_exit(&state, None, ReplExit::Command).await;
+    finalize_repl_exit(&mut state, None, ReplExit::Command).await;
 
     let events = session_journal::read_journal(&sid).unwrap();
     let has_session_end = events

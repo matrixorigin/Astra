@@ -554,6 +554,99 @@ fn contains_any_token(haystack: &str, tokens: &[&str]) -> bool {
     tokens.iter().any(|token| haystack.contains(token))
 }
 
+/// First-turn gate for cross-session lesson loading (P6). Returns true when
+/// the cache is empty AND the session has a populated lesson source. Kept
+/// pure so a unit test can pin the trigger condition.
+/// Run the lesson checkpointer against the current session signals.
+/// If new lessons are produced, fire-and-forget write them to both
+/// agent_lessons (local) and Memoria (L3). Never blocks the turn.
+fn maybe_checkpoint_lessons(state: &mut ReplState) {
+    let summary = match state
+        .observability_session
+        .as_ref()
+        .and_then(|arc| arc.read().ok())
+    {
+        Some(guard) => astra_runtime::lesson_extractor::summarise_from_runtime(
+            &state.tool_health_entries,
+            Some(&*guard),
+        ),
+        None => astra_runtime::lesson_extractor::summarise_from_runtime(
+            &state.tool_health_entries,
+            None,
+        ),
+    };
+
+    let delta = state.lesson_checkpointer.maybe_checkpoint(
+        &summary,
+        state.turn,
+        state.ingestion_user_id.as_deref().unwrap_or("unknown"),
+        "generic",
+        None,
+    );
+
+    if delta.is_empty() {
+        return;
+    }
+
+    // Write to Memoria as `working` memory (session-scoped, T4).
+    // Basic quality gate (hedging + length). Template blocklist NOT applied
+    // here — these are deterministic template lessons, not LLM output.
+    // Promoted to semantic T3 at session end via final checkpoint flush.
+    let memoria_lessons: Vec<astra_runtime::lesson_synthesizer::ExtractedLesson> = delta
+        .into_iter()
+        .filter(|l| astra_runtime::lesson_synthesizer::is_high_quality_lesson(&l.action))
+        .map(|l| astra_runtime::lesson_synthesizer::ExtractedLesson {
+            memory_type: "working",
+            content: format!("💡 LESSON: {}", l.action),
+            trust_tier: "T4",
+        })
+        .collect();
+    if memoria_lessons.is_empty() {
+        return;
+    }
+    let sid = state.session_id.clone();
+    tokio::spawn(
+        super::edge_tools::memoria::memoria_store_lessons_fire_and_forget(memoria_lessons, sid),
+    );
+}
+
+/// Filter lessons through a cheap selector model for relevance.
+/// Resolves the selector model from the DB model registry via `MatrixCloudRuntime`.
+/// Falls back to returning all lessons if no selector model is configured or on error.
+async fn filter_lessons_by_relevance(
+    user_message: &str,
+    lessons: Vec<astra_runtime::self_model::LessonHint>,
+    matrix_runtime: Option<&std::sync::Arc<astra_runtime::MatrixCloudRuntime>>,
+) -> Vec<astra_runtime::self_model::LessonHint> {
+    let params = match matrix_runtime {
+        Some(rt) => rt.resolve_selector_model().await,
+        None => None,
+    };
+    let Some(params) = params else {
+        return lessons;
+    };
+
+    let texts: Vec<String> = lessons.iter().map(|l| l.action.clone()).collect();
+    let filtered =
+        astra_runtime::memory_relevance::filter_memories(&params, user_message, &texts).await;
+
+    if filtered.len() == texts.len() {
+        return lessons;
+    }
+
+    // Map filtered texts back to LessonHint structs
+    let filtered_set: std::collections::HashSet<&str> =
+        filtered.iter().map(|s| s.as_str()).collect();
+    lessons
+        .into_iter()
+        .filter(|l| filtered_set.contains(l.action.as_str()))
+        .collect()
+}
+
+fn should_bootstrap_lessons(state: &ReplState) -> bool {
+    !state.session_lessons_loaded
+}
+
 fn is_low_information_followup(line: &str) -> bool {
     if is_short_continuation_prompt(line) {
         return true;
@@ -853,6 +946,33 @@ async fn run_chat_turn(
         state.drift_original_query = Some(message.to_string());
     }
 
+    // ─── Bootstrap cross-session lessons from Memoria on first turn ────────
+    // Memoria is the single source of truth for lessons (Session Memory
+    // Protocol L3). agent_lessons table is no longer used for bootstrap.
+    if should_bootstrap_lessons(state) {
+        // Resolve selector model on first bootstrap (cached for future turns).
+        if state.selector_model_params.is_none() {
+            if let Some(ref rt) = state.matrix_runtime {
+                state.selector_model_params = rt.resolve_selector_model().await;
+            }
+        }
+
+        let lessons = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            super::edge_tools::memoria::memoria_retrieve_lessons(6, Some(message)),
+        )
+        .await
+        .unwrap_or_default();
+        // Relevance filter: if we have lessons AND a selector model, filter noise.
+        // Best-effort: timeout or model unavailable → keep all lessons.
+        state.session_lessons = if lessons.len() > 1 {
+            filter_lessons_by_relevance(message, lessons, state.matrix_runtime.as_ref()).await
+        } else {
+            lessons
+        };
+        state.session_lessons_loaded = true;
+    }
+
     // ─── Drift Tracking: Detect user corrections ────────────────────────────
     // If this message looks like a correction, record the current turn index.
     if detect_correction_signal(message) {
@@ -864,6 +984,11 @@ async fn run_chat_turn(
         // only drift_user_corrections was recorded and no signal was ever
         // produced for user corrections in the production path.
         emit_user_correction_signal(state, message).await;
+
+        // Incremental lesson checkpoint: user correction is a high-value
+        // breakpoint — extract any new lessons NOW rather than waiting for
+        // session end. Fire-and-forget: never blocks the user's turn.
+        maybe_checkpoint_lessons(state);
     }
 
     // Create a cancellation token that can interrupt SSE streaming mid-flight.
@@ -874,7 +999,7 @@ async fn run_chat_turn(
     let obs_hub = state.observability_hub.clone();
     let obs_session = state.observability_session.clone();
 
-    tokio::select! {
+    let attempt = tokio::select! {
         result = stream_chat_sse(ChatTurnParams {
             api: ctx.api,
             token,
@@ -892,6 +1017,8 @@ async fn run_chat_turn(
             selector: ctx.selector,
             recent_tools: &state.recent_tools,
             tool_health_entries: &state.tool_health_entries,
+            session_lessons: &state.session_lessons,
+            latest_skill_diagnosis: state.latest_skill_diagnosis.as_ref(),
             unified_skill_registry: &state.unified_skill_registry,
             plan_only_chat: state.chat_plan_only && state.current_plan_subtask_id.is_none(),
             is_plan_subtask: state.current_plan_subtask_id.is_some(),
@@ -923,6 +1050,11 @@ async fn run_chat_turn(
             turn_index: state.turn,
             evolution_service: state.evolution_service.clone(),
             pre_loaded_messages: None,
+                    append_system_prompt: None,
+            #[cfg(feature = "harness")]
+            harness_sink: Some(state.harness_sink.clone()),
+            #[cfg(feature = "harness")]
+            harness_trace: Some(state.harness_trace.clone()),
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             cancel_token_for_signal.cancel();
@@ -940,7 +1072,113 @@ async fn run_chat_turn(
             cancel_token_for_signal.cancel();
             TurnAttempt::Interrupted
         }
+    };
+
+    // ─── P8: auto-invoke diagnostic skills at turn end ──────────────────────
+    // Compute SessionSignals from live observability, fire any triggered
+    // skills through the handler, stash the first diagnosis for the next
+    // turn's ToolExecutor seam. Best-effort: any failure at any step is
+    // logged and swallowed so an auto-invoke problem can never break the
+    // turn completion path.
+    // Skip auto-invoke on Ctrl+C — the user expects immediate return,
+    // and mutex acquisition + signal computation would add perceptible
+    // latency to the interrupt response path.
+    if !matches!(attempt, TurnAttempt::Interrupted) {
+        maybe_run_auto_invoke(state).await;
     }
+
+    attempt
+}
+
+/// Run the auto-invoke handler once per turn: compute signals, fire the
+/// gate, stash the first diagnosis in `state.latest_skill_diagnosis` for
+/// the next turn's prompt. Lazily creates the handler on first use so
+/// sessions that never trigger anything pay no cost.
+async fn maybe_run_auto_invoke(state: &mut ReplState) {
+    // Snapshot signals under a scoped read lock so we don't hold the
+    // observability lock across the await on maybe_fire.
+    let signals = match state.observability_session.as_ref() {
+        Some(arc) => match arc.read() {
+            Ok(guard) => astra_runtime::auto_invoke_handler::compute_session_signals(Some(&*guard)),
+            Err(_poison) => {
+                tracing::warn!(
+                    target: "auto_invoke",
+                    "observability_session lock poisoned; auto-invoke signals degraded",
+                );
+                astra_runtime::auto_invoke_handler::compute_session_signals(None)
+            }
+        },
+        None => astra_runtime::auto_invoke_handler::compute_session_signals(None),
+    };
+
+    // R1: evaluate active diagnosis postconditions BEFORE gating on
+    // default signals, because the tracker may have pending criteria
+    // even when no new signals fired this turn.
+    let outcomes = state
+        .diagnosis_outcome_tracker
+        .evaluate_turn(&signals, state.turn);
+    for outcome in &outcomes {
+        let met = outcome
+            .statuses
+            .iter()
+            .filter(|s| {
+                **s == astra_runtime::auto_invoke_handler::DiagnosisCriterionStatus::Satisfied
+            })
+            .count() as u32;
+        let failed = outcome
+            .statuses
+            .iter()
+            .filter(|s| **s == astra_runtime::auto_invoke_handler::DiagnosisCriterionStatus::Failed)
+            .count() as u32;
+        state.diagnosis_criteria_met = state.diagnosis_criteria_met.saturating_add(met);
+        state.diagnosis_criteria_failed = state.diagnosis_criteria_failed.saturating_add(failed);
+    }
+
+    // Fast-path: no signals worth even locking the handler for.
+    // Also clear any stale diagnosis so it doesn't linger in the prompt
+    // for the rest of a healthy session.
+    let default = astra_skills::auto_invoke::SessionSignals::default();
+    if signals == default {
+        state.latest_skill_diagnosis = None;
+        return;
+    }
+
+    // Lazy-create the handler on first use.
+    if state.auto_invoke_handler.is_none() {
+        let exec: std::sync::Arc<dyn astra_runtime::auto_invoke_handler::SkillExecutor> =
+            std::sync::Arc::new(
+                astra_runtime::auto_invoke_handler::SyntheticSkillDiagnosisExecutor,
+            );
+        state.auto_invoke_handler = Some(
+            astra_runtime::auto_invoke_handler::AutoInvokeHandler::new(exec),
+        );
+    }
+
+    let handler = state
+        .auto_invoke_handler
+        .as_mut()
+        .expect("just constructed above");
+    let diagnoses = handler
+        .maybe_fire(&signals, std::time::Instant::now())
+        .await;
+
+    // Activate ALL returned diagnoses in the tracker so their
+    // success_criteria are evaluated on subsequent turns, even if we
+    // only render the first in the prompt.
+    for diag in &diagnoses {
+        state
+            .diagnosis_outcome_tracker
+            .activate(diag.clone(), signals, state.turn);
+    }
+    // Render the first diagnosis in the prompt. If the handler returned
+    // nothing (cooldown), keep the previous diagnosis visible so the LLM
+    // sees what it's being measured against while the tracker evaluates.
+    if let Some(diag) = diagnoses.into_iter().next() {
+        state.latest_skill_diagnosis = Some(diag);
+    }
+    // Don't clear latest_skill_diagnosis on cooldown — the tracker is
+    // still evaluating. It gets cleared in the zero-signals fast path
+    // above, or when a new diagnosis replaces it.
 }
 
 /// Build a compact tool-call summary for cross-turn context continuity.
@@ -1007,6 +1245,9 @@ fn commit_turn_journal_workspace_and_sidecars(
     learning_snap: &ReplTurnLearningSnapshot,
     turn_start: Instant,
 ) {
+    // Capture stall flag before entering the journal borrow scope.
+    let has_stalls = !result.stall_events.is_empty();
+
     if let Some(journal) = state.journal.as_ref() {
         // Flush turn observability events (llm_round, tool timing) before the turn summary.
         if !result.turn_observability_events.is_empty() {
@@ -1370,6 +1611,13 @@ fn commit_turn_journal_workspace_and_sidecars(
         // main checkpoint's `cp.summary` when the interval fires, so we
         // skip the duplicate event.
     }
+
+    // Incremental lesson checkpoint: stall events signal that the agent
+    // struggled — extract any new lessons NOW. Runs outside the journal
+    // borrow scope so it can take &mut state.
+    if has_stalls {
+        maybe_checkpoint_lessons(state);
+    }
 }
 
 fn merge_interruption_metadata(
@@ -1528,6 +1776,43 @@ async fn apply_turn_success_async(
         }
     }
     check_skill_improvement_async(state).await;
+
+    // Background memory extraction: analyze this turn for durable memories.
+    let tools_used: Vec<String> = state.recent_tools.to_vec();
+    let extraction_turn = state.turn;
+    let outcome =
+        state
+            .memory_extractor
+            .maybe_extract(super::memory_extraction::ExtractionContext {
+                turn: extraction_turn,
+                selector_params: state.selector_model_params.as_ref(),
+                user_message: line,
+                assistant_response: state.last_response.as_deref().unwrap_or(""),
+                tools_used: &tools_used,
+                session_id: state.session_id.as_deref(),
+                existing_manifest: "",
+            });
+    // Journal: record extraction skip reasons for audit trail.
+    // Started outcomes are journaled when drain() completes (session end).
+    match &outcome {
+        super::memory_extraction::ExtractionOutcome::SkippedMainWrote
+        | super::memory_extraction::ExtractionOutcome::SkippedNoSelector
+        | super::memory_extraction::ExtractionOutcome::Error(_) => {
+            let evt = astra_services::session_journal::JournalEvent::memory_extraction(
+                state.session_id.as_deref(),
+                extraction_turn,
+                outcome.tag(),
+                0,
+                &[],
+                0,
+            );
+            enqueue_ingestion(state, &evt);
+            if let Some(ref j) = state.journal {
+                let _ = j.append(&evt);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn apply_turn_success_sync(
@@ -6038,5 +6323,213 @@ mod tests {
             Some(serde_json::json!({"kind": "budget_exhausted"})),
             "no-checkpoint path must preserve interruption from prev_state"
         );
+    }
+
+    // ─── P6: should_bootstrap_lessons gate ──────────────────────────────────
+
+    #[test]
+    fn should_bootstrap_lessons_true_on_fresh_state() {
+        let state = ReplState::default();
+        assert!(
+            should_bootstrap_lessons(&state),
+            "fresh state should bootstrap from Memoria"
+        );
+    }
+
+    #[test]
+    fn should_bootstrap_lessons_skips_when_already_loaded() {
+        let mut state = ReplState::default();
+        state.session_lessons_loaded = true;
+        assert!(
+            !should_bootstrap_lessons(&state),
+            "loaded flag must prevent re-bootstrap"
+        );
+    }
+
+    // ─── filter_lessons_by_relevance: no env vars ─────────────────────────
+
+    #[test]
+    fn filter_lessons_uses_matrix_runtime_not_env_vars() {
+        let source = include_str!("repl_turn.rs");
+        // Exclude the test module itself (everything after #[cfg(test)])
+        let prod_code = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
+        let selector_prefix = "ASTRA_SELECTOR";
+        assert!(
+            !prod_code.contains(selector_prefix),
+            "production code must not reference ASTRA_SELECTOR env vars"
+        );
+    }
+
+    #[test]
+    fn filter_lessons_resolves_via_matrix_runtime() {
+        let source = include_str!("repl_turn.rs");
+        assert!(
+            source.contains("resolve_selector_model"),
+            "filter_lessons_by_relevance should resolve model from matrix_runtime"
+        );
+        assert!(
+            source.contains("filter_memories"),
+            "filter_lessons_by_relevance should delegate to memory_relevance::filter_memories"
+        );
+    }
+
+    #[test]
+    fn selector_model_params_cached_in_repl_state() {
+        let state = ReplState::default();
+        assert!(
+            state.selector_model_params.is_none(),
+            "selector_model_params should start as None"
+        );
+    }
+
+    // ─── P8: maybe_run_auto_invoke ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn auto_invoke_noop_when_signals_are_zero() {
+        // No observability, no signals → handler should not even be
+        // instantiated; latest_skill_diagnosis must stay None.
+        let mut state = ReplState::default();
+        assert!(state.auto_invoke_handler.is_none());
+        assert!(state.latest_skill_diagnosis.is_none());
+
+        maybe_run_auto_invoke(&mut state).await;
+
+        assert!(
+            state.auto_invoke_handler.is_none(),
+            "zero-signals path must not construct a handler"
+        );
+        assert!(state.latest_skill_diagnosis.is_none());
+    }
+
+    #[tokio::test]
+    async fn auto_invoke_populates_latest_diagnosis_on_stall_signal() {
+        // Set up an ObservabilitySession with 3 stalls so the gate fires
+        // analyze_session. The SyntheticSkillDiagnosisExecutor produces a valid
+        // diagnosis block. The run must stash it into
+        // state.latest_skill_diagnosis for the next turn.
+        let mut state = ReplState::default();
+        let session = std::sync::Arc::new(std::sync::RwLock::new(
+            astra_runtime::observability_integration::ObservabilitySession::new_simple(
+                "p8-turn-end",
+            ),
+        ));
+        {
+            let mut g = session.write().unwrap();
+            g.record_stall_event();
+            g.record_stall_event();
+            g.record_stall_event();
+            g.record_stall_event();
+            g.record_stall_event();
+        }
+        state.observability_session = Some(session);
+
+        maybe_run_auto_invoke(&mut state).await;
+
+        let diag = state
+            .latest_skill_diagnosis
+            .as_ref()
+            .expect("3 stalls must produce a diagnosis");
+        assert_eq!(diag.skill, "analyze_session");
+        assert_eq!(diag.cause, "session_stalls");
+        // Handler must be cached for reuse next turn (cooldowns persist).
+        assert!(state.auto_invoke_handler.is_some());
+    }
+
+    #[tokio::test]
+    async fn auto_invoke_cooldown_prevents_refire_within_window() {
+        // Two consecutive calls with the same stall signal: first fires,
+        // second must be silenced by the gate's 60s cooldown. The cached
+        // handler is what makes this work — if we re-created it each turn
+        // the cooldown state would be lost.
+        let mut state = ReplState::default();
+        let session = std::sync::Arc::new(std::sync::RwLock::new(
+            astra_runtime::observability_integration::ObservabilitySession::new_simple(
+                "p8-cooldown",
+            ),
+        ));
+        {
+            let mut g = session.write().unwrap();
+            g.record_stall_event();
+            g.record_stall_event();
+            g.record_stall_event();
+            g.record_stall_event();
+            g.record_stall_event();
+        }
+        state.observability_session = Some(session);
+
+        maybe_run_auto_invoke(&mut state).await;
+        let first_diag = state.latest_skill_diagnosis.clone();
+        assert!(first_diag.is_some(), "first turn must fire");
+
+        // Second call: signals unchanged, but cooldown should block.
+        // The diagnosis stays visible in the prompt so the LLM knows
+        // what it's being measured against while the tracker evaluates.
+        maybe_run_auto_invoke(&mut state).await;
+        assert!(
+            state.latest_skill_diagnosis.is_some(),
+            "cooldown must NOT clear the diagnosis — tracker still evaluating"
+        );
+    }
+
+    // ─── R1: DiagnosisOutcomeTracker wiring ─────────────────────────────────
+
+    #[tokio::test]
+    async fn diagnosis_outcome_tracker_accumulates_met_failed() {
+        // Setup: session with 3 stalls → auto-invoke fires → diagnosis
+        // activated with success_criteria. Then simulate stall count
+        // staying flat (criterion "session_stalls_delta <= 0" satisfied).
+        let mut state = ReplState::default();
+        let session = std::sync::Arc::new(std::sync::RwLock::new(
+            astra_runtime::observability_integration::ObservabilitySession::new_simple(
+                "r1-tracker",
+            ),
+        ));
+        {
+            let mut g = session.write().unwrap();
+            g.record_stall_event();
+            g.record_stall_event();
+            g.record_stall_event();
+            g.record_stall_event();
+            g.record_stall_event();
+        }
+        state.observability_session = Some(session.clone());
+
+        // Turn N: diagnosis fires and is activated in the tracker.
+        state.turn = 5;
+        maybe_run_auto_invoke(&mut state).await;
+        let diag = state
+            .latest_skill_diagnosis
+            .as_ref()
+            .expect("should have fired");
+        assert!(
+            !diag.success_criteria.is_empty(),
+            "synthetic executor must produce criteria"
+        );
+
+        // Turn N+1..N+3: signals stay flat (no new stalls), so the
+        // "session_stalls_delta <= 0" criterion should become Satisfied
+        // once window_turns elapse.
+        for t in 6..=10 {
+            state.turn = t;
+            maybe_run_auto_invoke(&mut state).await;
+        }
+
+        // After enough turns, the tracker should have evaluated and
+        // accumulated met/failed counts.
+        let total = state.diagnosis_criteria_met + state.diagnosis_criteria_failed;
+        assert!(
+            total > 0,
+            "tracker must have evaluated at least one criterion; \
+             met={}, failed={}",
+            state.diagnosis_criteria_met,
+            state.diagnosis_criteria_failed
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnosis_criteria_start_at_zero() {
+        let state = ReplState::default();
+        assert_eq!(state.diagnosis_criteria_met, 0);
+        assert_eq!(state.diagnosis_criteria_failed, 0);
     }
 }

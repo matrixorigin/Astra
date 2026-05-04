@@ -20,8 +20,8 @@ pub use context::{
     estimate_tokens, estimate_tokens_cache_aware, estimate_tokens_precise,
 };
 pub use system::{
-    CacheScope, LOW_CONFIDENCE_THRESHOLD, PARALLEL_BATCHING_NUDGE_THRESHOLD, PromptSection,
-    PromptTokenBucket, ROUND_BUDGET_HARD_LIMIT, ROUND_BUDGET_THRESHOLD, STALL_NUDGE,
+    AgentRuntimeContext, CacheScope, LOW_CONFIDENCE_THRESHOLD, PARALLEL_BATCHING_NUDGE_THRESHOLD,
+    PromptSection, PromptTokenBucket, ROUND_BUDGET_HARD_LIMIT, ROUND_BUDGET_THRESHOLD, STALL_NUDGE,
     SYSTEM_PROMPT_BASE, build_main_system_prompt, build_main_system_prompt_with_style,
     build_system_prompt_sections, build_system_prompt_sections_with_style,
     build_system_prompt_trace, detect_task_type, parallel_batching_nudge_directive,
@@ -139,10 +139,10 @@ mod tests {
 
     #[test]
     fn memory_rules_include_negative_examples() {
-        let p = build_main_system_prompt(&["memory_store", "memory_search"], "", 1.0, None);
+        let p = build_main_system_prompt(&["memory_store", "memory_retrieve"], "", 1.0, None);
         assert!(
-            p.contains("SKIP:"),
-            "should have negative guidance (SKIP list)"
+            p.contains("What NOT to save"),
+            "should have negative guidance (What NOT to save)"
         );
     }
 
@@ -189,7 +189,7 @@ mod tests {
     /// Implicit preference instruction is present when memory tools available.
     #[test]
     fn memory_rules_include_store_guidance() {
-        let p = build_main_system_prompt(&["memory_store", "memory_search"], "", 1.0, None);
+        let p = build_main_system_prompt(&["memory_store", "memory_retrieve"], "", 1.0, None);
         assert!(
             p.contains("memory_store"),
             "should mention memory_store when memory tools available"
@@ -936,7 +936,7 @@ mod tests {
                 "github_list_prs",
                 "github_repo_stats",
                 "memory_store",
-                "memory_search",
+                "memory_retrieve",
             ],
             "",
             1.0,
@@ -953,8 +953,8 @@ mod tests {
         // Batching read-only tool calls, and Turn Discipline (announce/summary/no-narration)).
         // Headroom: ~200 chars above measured size. Bump when adding new rules.
         assert!(
-            p.len() < 19800,
-            "full toolset prompt should be under 19800 chars, got {}",
+            p.len() < 24000,
+            "full toolset prompt should be under 24000 chars, got {}",
             p.len()
         );
     }

@@ -1,7 +1,50 @@
 /// Agent persona / base identity.
 pub const SYSTEM_PROMPT_BASE: &str = "You are an expert software engineer. You write clean, correct code and use tools precisely to solve tasks.";
 
+use std::fmt::Write;
+
 use astra_text_utils::output_style::OutputStyle;
+
+/// Session-stable runtime context for the agent's self-knowledge.
+///
+/// Injected into the system prompt so the agent knows its identity,
+/// environment, and session context — enabling inquiry, reflection,
+/// and retrospection without hallucinating these details.
+#[derive(Debug, Clone, Default)]
+pub struct AgentRuntimeContext {
+    pub model_name: Option<String>,
+    pub workspace_cwd: Option<String>,
+    pub git_branch: Option<String>,
+    pub session_id: Option<String>,
+    pub user_id: Option<String>,
+    pub current_date: Option<String>,
+}
+
+impl AgentRuntimeContext {
+    pub fn to_prompt_section(&self) -> String {
+        let mut s = String::with_capacity(256);
+        s.push_str("\n## Runtime Identity\n");
+        if let Some(ref v) = self.model_name {
+            let _ = writeln!(s, "Model: {v}");
+        }
+        if let Some(ref v) = self.current_date {
+            let _ = writeln!(s, "Date: {v}");
+        }
+        if let Some(ref v) = self.workspace_cwd {
+            let _ = writeln!(s, "Workspace: {v}");
+        }
+        if let Some(ref v) = self.git_branch {
+            let _ = writeln!(s, "Git branch: {v}");
+        }
+        if let Some(ref v) = self.session_id {
+            let _ = writeln!(s, "Session: {v}");
+        }
+        if let Some(ref v) = self.user_id {
+            let _ = writeln!(s, "User: {v}");
+        }
+        s
+    }
+}
 
 /// Confidence threshold below which the system prompt includes an advisory
 /// telling the LLM to ask for clarification rather than guessing with wrong tools.
@@ -231,28 +274,31 @@ fn tool_error_recovery_section() -> &'static str {
      - **Network failure**: check connectivity if multiple tools fail. Report to user.\n\
      - **Auth/credential error**: do NOT retry with same creds. Ask user to re-authenticate.\n\
      - **DB connection error**: verify MATRIXONE_HOST/PORT config. Use `mo_query` with simple SELECT 1 to test.\n\
-     - **Empty results** (memory_search returns nothing): normal for new users — don't treat as error.\n\
+     - **Empty results** (memory_retrieve returns nothing): normal for new users — don't treat as error.\n\
      - **Unknown tool**: check get_agent_info for available tools. Do NOT invent tool names.\n"
 }
 
 /// Self-model (tool list). Session-scoped — changes when tool set changes.
 fn self_model_section(tool_names: &[&str]) -> String {
-    format!("\n## Self-Model\nTools: {}\n", tool_names.join(", "))
+    format!(
+        "\n## Self-Model\nTools: {}\n\
+         Refer to 'Runtime Identity' below for model, session, and environment details.\n",
+        tool_names.join(", ")
+    )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MemoryPromptMode {
-    None,
-    Minimal,
-    Full,
-}
+type MemoryPromptMode = astra_prompts::memory_types::MemoryPromptMode;
 
 fn memory_prompt_mode(tool_names: &[&str], profile_desc: &str) -> MemoryPromptMode {
     let has_memory_store = tool_names.contains(&"memory_store");
     let has_memory_ops = tool_names.iter().any(|name| {
         matches!(
             *name,
-            "memory_search" | "memory_correct" | "memory_purge" | "memory_profile"
+            "memory_retrieve"
+                | "memory_search"
+                | "memory_correct"
+                | "memory_purge"
+                | "memory_profile"
         )
     });
     let has_user_memories = profile_desc.contains("## User Memories");
@@ -417,29 +463,10 @@ fn tool_conditional_section(
             );
         }
     }
-    if memory_mode != MemoryPromptMode::None {
-        s.push_str(
-            "\n## Memory Rules (check BEFORE reasoning about tools)\n\
-             ### Triggers: 关注|跟踪|留意|记住|感兴趣|follow|watch|track|interested|prefer|remember\n\
-             When user expresses tracking, interest, or preference → call memory_store IMMEDIATELY.\n\
-             - Do NOT ask whether to store — just store, then confirm.\n\
-             - Do NOT explore codebase for interest expressions.\n",
-        );
-        if memory_mode == MemoryPromptMode::Full {
-            s.push_str(
-                "             Format: \"[@ns/status] content\" (ns: pref, fact, knowledge, task, plan, insight)\n\
-             Example: \"我关注matrixorigin\" → store \"[@pref/active] user follows matrixorigin\"\n\
-             - '## User Memories' (when present) = user context — check it BEFORE calling any tool.\n\
-             - If User Memories has a repo mapping, USE that exact repo.\n\
-             ### What to STORE: preferences, conventions, decisions, tracking interests.\n\
-             ### What to SKIP: ephemeral tool outputs, raw file contents, duplicates.\n\
-             ### Deduplication: before storing, consider if similar memory already exists. Use memory_correct to update instead of creating duplicates.\n\
-             ### Negative preferences: \"不喜欢\", \"别用\", \"don't want\", \"stop using\" → store as [@pref/negative]. Respect in future tool/approach selection.\n\
-             ### Staleness: if a stored memory seems outdated (e.g., old repo URL, changed preference), correct it with memory_correct rather than storing a new one.\n",
-            );
-            s.push_str(
-                "         - **Memory precedence**: check '## User Memories' → search → store/correct\n",
-            );
+    {
+        let memory_section = astra_prompts::memory_types::build_memory_prompt(memory_mode);
+        if !memory_section.is_empty() {
+            s.push_str(&memory_section);
         }
     }
     if selection_confidence < LOW_CONFIDENCE_THRESHOLD {
@@ -1623,19 +1650,30 @@ mod tests {
 
     #[test]
     fn prompt_includes_memory_rules_when_memory_tools_present() {
-        let p = build_main_system_prompt(&["memory_store", "memory_search"], "", 0.5, None);
+        let p = build_main_system_prompt(&["memory_store", "memory_retrieve"], "", 0.5, None);
         assert!(p.contains("Memory Rules"));
-        assert!(p.contains("memory_store IMMEDIATELY"));
+        assert!(p.contains("<types>"));
+        assert!(p.contains("<name>user</name>"));
+    }
+
+    #[test]
+    fn prompt_memory_search_alias_triggers_full_mode() {
+        let p = build_main_system_prompt(&["memory_store", "memory_search"], "", 0.5, None);
+        assert!(
+            p.contains("<types>"),
+            "memory_search (server-side alias) must trigger Full mode with type taxonomy"
+        );
     }
 
     #[test]
     fn prompt_memory_store_only_uses_minimal_rules() {
         let p = build_main_system_prompt(&["memory_store"], "", 0.5, None);
         assert!(p.contains("Memory Rules"));
-        assert!(p.contains("memory_store IMMEDIATELY"));
-        assert!(!p.contains("Deduplication"));
-        assert!(!p.contains("Negative preferences"));
-        assert!(!p.contains("Memory precedence"));
+        assert!(p.contains("Do NOT ask"));
+        assert!(
+            !p.contains("<types>"),
+            "minimal mode should not include type taxonomy"
+        );
     }
 
     #[test]
@@ -1958,12 +1996,10 @@ mod tests {
 
     #[test]
     fn prompt_memory_rules_include_dedup_and_negative() {
-        let p = build_main_system_prompt(&["memory_store", "memory_search"], "", 0.5, None);
-        assert!(p.contains("Deduplication"));
+        let p = build_main_system_prompt(&["memory_store", "memory_retrieve"], "", 0.5, None);
         assert!(p.contains("memory_correct"));
-        assert!(p.contains("Negative preferences"));
-        assert!(p.contains("不喜欢"));
-        assert!(p.contains("Staleness"));
+        assert!(p.contains("don't want"));
+        assert!(p.contains("What NOT to save"));
     }
 
     #[test]
@@ -1974,8 +2010,11 @@ mod tests {
             0.5,
             None,
         );
-        assert!(p.contains("Deduplication"));
-        assert!(p.contains("Memory precedence"));
+        assert!(
+            p.contains("<types>"),
+            "User Memories should upgrade to full mode"
+        );
+        assert!(p.contains("memory_correct"));
     }
 
     // ── Task type count invariant ──

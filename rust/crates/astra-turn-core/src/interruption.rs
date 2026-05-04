@@ -35,6 +35,10 @@ pub enum InterruptionKind {
     ApprovalRejected,
     /// Server overload (503 / 529).
     ServerOverload,
+    /// Harness verifier returned Fatal → session blocked.
+    HarnessBlocked,
+    /// Harness debug breakpoint hit → session paused.
+    HarnessPaused,
 }
 
 impl InterruptionKind {
@@ -53,6 +57,8 @@ impl InterruptionKind {
             Self::CriticalVerdict => "critical_verdict",
             Self::ApprovalRejected => "approval_rejected",
             Self::ServerOverload => "server_overload",
+            Self::HarnessBlocked => "harness_blocked",
+            Self::HarnessPaused => "harness_paused",
         }
     }
 
@@ -71,6 +77,8 @@ impl InterruptionKind {
             Self::ContextOverflow => true, // resumable with compaction
             Self::AuthFailure => false,    // needs external credential refresh
             Self::ApprovalRejected => true,
+            Self::HarnessBlocked => false,
+            Self::HarnessPaused => true,
         }
     }
 }

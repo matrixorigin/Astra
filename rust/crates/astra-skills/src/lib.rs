@@ -28,6 +28,7 @@
 
 pub mod activation;
 pub mod arguments;
+pub mod auto_invoke;
 pub mod composition;
 pub mod health_ranking;
 pub mod hooks;

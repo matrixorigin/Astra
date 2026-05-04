@@ -70,6 +70,45 @@ impl DefaultToolExecutor {
             task_manager: Arc::new(TaskManager::new()),
         }
     }
+
+    /// Build a ready-to-use executor from workspace parameters.
+    ///
+    /// Handles the full setup recipe shared by edge and cloud:
+    /// HTTP client, `ToolContext`, sandbox, and optional GitHub integration.
+    pub fn for_workspace(
+        workspace: &Path,
+        user_id: impl Into<String>,
+        session_id: impl Into<String>,
+        user_agent: &str,
+        timeout: std::time::Duration,
+    ) -> Self {
+        let http_client = reqwest::Client::builder()
+            .timeout(timeout)
+            .user_agent(user_agent.to_string())
+            .no_proxy()
+            .build()
+            .expect("failed to build HTTP client for tool executor");
+
+        let ctx = crate::ToolContext {
+            project_root: workspace.to_path_buf(),
+            workspace_root: workspace.to_path_buf(),
+            user_id: user_id.into(),
+            session_id: session_id.into(),
+            sandbox: crate::SandboxConfig::standard(workspace),
+            http_client: Some(http_client.clone()),
+            logger: Arc::new(crate::TracingLogger),
+            cancel_token: None,
+        };
+
+        let mut executor = Self::new(ctx);
+        let tokens = crate::github::resolve_github_tokens();
+        if !tokens.is_empty() {
+            let github = GitHubClient::from_tokens(http_client, tokens, Vec::new());
+            executor = executor.with_github_client(github);
+        }
+        executor
+    }
+
     pub fn with_github_client(mut self, client: GitHubClient) -> Self {
         self.github_client = Some(client);
         self

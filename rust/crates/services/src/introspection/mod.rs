@@ -132,6 +132,71 @@ pub trait IntrospectionService: Send + Sync {
         task_hint: &str,
         limit: i32,
     ) -> ServiceResult<Value>;
+
+    /// Recent decisions for a session — who picked what, why, and when.
+    /// Exposed to the LLM so it can read its own decision trace in-turn
+    /// instead of waiting for a human-facing dashboard.
+    ///
+    /// Response shape (schema_version = 1):
+    /// ```json
+    /// {
+    ///   "schema_version": 1,
+    ///   "session_id": "...",
+    ///   "user_id": "...",
+    ///   "last_n": 20,
+    ///   "decisions": [
+    ///     {"decision_id": "...", "decision_type": "tool_selection",
+    ///      "created_at": "...", "output": {...}},
+    ///     ...
+    ///   ]
+    /// }
+    /// ```
+    async fn get_decision_trace(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        last_n: i32,
+    ) -> ServiceResult<Value>;
+
+    /// Per-tool history across the caller's sessions within a rolling
+    /// `window_hours` (default 24).
+    ///
+    /// Response shape (schema_version = 1):
+    /// ```json
+    /// {
+    ///   "schema_version": 1,
+    ///   "user_id": "...", "tool": "...", "window_hours": 24,
+    ///   "total_calls": N, "ok_count": N, "fail_count": N,
+    ///   "success_rate": 0.0..=1.0,
+    ///   "recent_failures": [
+    ///     {"session_id": "...", "error_preview": "...", "created_at": "..."},
+    ///     ...
+    ///   ]
+    /// }
+    /// ```
+    async fn get_tool_history(
+        &self,
+        user_id: &str,
+        tool: &str,
+        window_hours: i32,
+    ) -> ServiceResult<Value>;
+
+    /// Intent-drift check for the active session — how far has the agent
+    /// moved from the user's original ask?
+    ///
+    /// Response shape (schema_version = 1):
+    /// ```json
+    /// {
+    ///   "schema_version": 1,
+    ///   "user_id": "...", "session_id": "...",
+    ///   "original_intent_preview": "...",
+    ///   "current_focus_preview": "...",
+    ///   "drift_score": 0.0..=1.0,
+    ///   "drift_level": "aligned" | "mild" | "moderate" | "high",
+    ///   "signals": ["..."]
+    /// }
+    /// ```
+    async fn get_drift_check(&self, user_id: &str, session_id: &str) -> ServiceResult<Value>;
 }
 
 // ── Unconfigured implementation ──────────────────────────────────────────────
@@ -178,6 +243,15 @@ impl IntrospectionService for UnconfiguredIntrospectionService {
         _: &str,
         _: i32,
     ) -> ServiceResult<Value> {
+        Err(internal_error("introspection service not configured"))
+    }
+    async fn get_decision_trace(&self, _: &str, _: &str, _: i32) -> ServiceResult<Value> {
+        Err(internal_error("introspection service not configured"))
+    }
+    async fn get_tool_history(&self, _: &str, _: &str, _: i32) -> ServiceResult<Value> {
+        Err(internal_error("introspection service not configured"))
+    }
+    async fn get_drift_check(&self, _: &str, _: &str) -> ServiceResult<Value> {
         Err(internal_error("introspection service not configured"))
     }
 }

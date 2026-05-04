@@ -101,6 +101,16 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) selector: &'a dyn ToolSelector,
     pub(crate) recent_tools: &'a [String],
     pub(crate) tool_health_entries: &'a [ToolHealthEntry],
+    /// P6 seam: cross-session lessons loaded once at session bootstrap.
+    /// Passed through to the ToolExecutor via `set_session_lessons` so
+    /// every SelfModel snapshot surfaces prior-session advice.
+    pub(crate) session_lessons: &'a [astra_runtime::self_model::LessonHint],
+    /// P8 seam: most recent auto-invoke diagnosis from the previous turn.
+    /// Injected into this turn's ToolExecutor via
+    /// `set_latest_skill_diagnosis` so the LLM sees "the system already
+    /// noticed X" in the self-awareness section. `None` → no diagnosis
+    /// pending; the ToolExecutor state is untouched.
+    pub(crate) latest_skill_diagnosis: Option<&'a astra_skills::auto_invoke::SkillDiagnosis>,
     /// Unified skill registry (single source of truth for all skill resolution).
     pub(crate) unified_skill_registry:
         &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
@@ -189,6 +199,15 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Pre-loaded CSL messages (from CslManager.load() in repl_turn).
     /// When present, these are used instead of converting history pairs.
     pub(crate) pre_loaded_messages: Option<Vec<serde_json::Value>>,
+    /// Extra context appended to the system prompt (gateway injects cron/session context here).
+    pub(crate) append_system_prompt: Option<String>,
+    /// Shared harness snapshot sink for /inspect command.
+    #[cfg(feature = "harness")]
+    pub(crate) harness_sink: Option<std::sync::Arc<astra_harness::InMemorySnapshotSink>>,
+    /// Shared harness trace for /inspect trace command.
+    #[cfg(feature = "harness")]
+    pub(crate) harness_trace:
+        Option<std::sync::Arc<std::sync::RwLock<astra_harness::SessionTrace>>>,
 }
 
 /// Bundle of "basic CLI" fields shared across one-shot CLI chat invocations
@@ -222,6 +241,14 @@ pub(crate) struct BasicCliChatContext<'a> {
     /// Passed through to `sse_loop::mod` for `SpawnAgentContext`
     /// wiring. When `agent_spawner` is None this is ignored.
     pub root_agent_id: Option<&'a str>,
+    /// Optional channel for forwarding stream events (used by --stream-events).
+    pub stream_event_tx: Option<StreamEventTx>,
+    /// Shared harness snapshot sink for /inspect command (non-REPL one-shot paths).
+    #[cfg(feature = "harness")]
+    pub harness_sink: Option<std::sync::Arc<astra_harness::InMemorySnapshotSink>>,
+    /// Shared harness trace for /inspect trace command (non-REPL one-shot paths).
+    #[cfg(feature = "harness")]
+    pub harness_trace: Option<std::sync::Arc<std::sync::RwLock<astra_harness::SessionTrace>>>,
 }
 
 impl<'a> ChatTurnParams<'a> {
@@ -253,6 +280,8 @@ impl<'a> ChatTurnParams<'a> {
             selector: ctx.selector,
             recent_tools: &[],
             tool_health_entries: &[],
+            session_lessons: &[],
+            latest_skill_diagnosis: None,
             unified_skill_registry: ctx.unified_skill_registry,
             plan_only_chat: false,
             is_plan_subtask: false,
@@ -260,7 +289,7 @@ impl<'a> ChatTurnParams<'a> {
             delegation_engine: None,
             cancel_token: None,
             plan_assemble_line_release: None,
-            stream_event_tx: None,
+            stream_event_tx: ctx.stream_event_tx.clone(),
             approval_request_tx: None,
             mcp_manager: None,
             skill_search: ctx.skill_search,
@@ -284,6 +313,11 @@ impl<'a> ChatTurnParams<'a> {
             turn_index: 0,
             evolution_service: None,
             pre_loaded_messages: None,
+            append_system_prompt: None,
+            #[cfg(feature = "harness")]
+            harness_sink: ctx.harness_sink.clone(),
+            #[cfg(feature = "harness")]
+            harness_trace: ctx.harness_trace.clone(),
         }
     }
 }

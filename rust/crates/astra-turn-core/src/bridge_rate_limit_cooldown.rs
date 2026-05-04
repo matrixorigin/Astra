@@ -486,6 +486,69 @@ impl Default for PerModelCooldown {
     }
 }
 
+// ── Fallback Chain Resolution ─────────────────────────────────────────────────
+
+/// Outcome of [`try_resolve_fallback`].
+#[derive(Debug)]
+pub enum FallbackOutcome<T> {
+    /// A fallback model was resolved successfully.
+    Resolved(T),
+    /// No fallback chain configured (chain was empty).
+    NoFallbackConfigured,
+    /// All fallback models were exhausted (cooldown or resolution failure).
+    AllExhausted { chain_len: usize },
+}
+
+/// Walk the fallback chain, skip models in cooldown, and resolve the first
+/// available one via the caller-supplied async `resolve` closure.
+///
+/// This is the shared logic behind both `server_loop_host` and
+/// `bridge_inprocess` fallback handling — extracted to eliminate duplication.
+pub async fn try_resolve_fallback<T, F, Fut>(
+    cooldown: &PerModelCooldown,
+    chain: &[String],
+    reason: CooldownReason,
+    mut resolve: F,
+) -> FallbackOutcome<T>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    if chain.is_empty() {
+        return FallbackOutcome::NoFallbackConfigured;
+    }
+    for fb_name in chain {
+        // Skip fallback models that are themselves in cooldown.
+        let fb_ok = cooldown.with(fb_name, |c| c.check_request(false));
+        if !matches!(
+            fb_ok,
+            RateLimitAction::Proceed | RateLimitAction::WaitAndRetry { .. }
+        ) {
+            continue;
+        }
+        astra_core::agent_info!(
+            "llm",
+            "rate-limit cooldown: trying fallback model '{}' ({})",
+            fb_name,
+            reason.as_str()
+        );
+        match resolve(fb_name.clone()).await {
+            Ok(resolved) => return FallbackOutcome::Resolved(resolved),
+            Err(e) => {
+                astra_core::agent_warn!(
+                    "llm",
+                    "fallback model '{}' resolution failed: {}",
+                    fb_name,
+                    e
+                );
+            }
+        }
+    }
+    FallbackOutcome::AllExhausted {
+        chain_len: chain.len(),
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1055,5 +1118,146 @@ mod tests {
     #[test]
     fn default_cooldown_is_at_most_30_seconds() {
         const _: () = assert!(DEFAULT_COOLDOWN_MS <= 30_000);
+    }
+
+    // ── Fallback chain walk decision tests ───────────────────────────────
+
+    #[test]
+    fn fallback_chain_skips_cooldown_model_picks_active() {
+        let pmc = PerModelCooldown::new();
+        // Push model-a into cooldown (3 consecutive 429s)
+        pmc.with("model-a", |rl| {
+            rl.record_429(None, true);
+            rl.record_429(None, true);
+            rl.record_429(None, true);
+        });
+        // model-b should still be available
+        let a_action = pmc.with("model-a", |rl| rl.check_request(true));
+        assert!(
+            matches!(a_action, RateLimitAction::UseFallback { .. }),
+            "model-a should trigger fallback, got: {a_action:?}"
+        );
+        let b_action = pmc.with("model-b", |rl| rl.check_request(false));
+        assert_eq!(b_action, RateLimitAction::Proceed);
+    }
+
+    #[test]
+    fn fallback_chain_all_models_in_cooldown() {
+        let pmc = PerModelCooldown::new();
+        for model in &["model-a", "model-b", "model-c"] {
+            pmc.with(model, |rl| {
+                rl.record_429(None, false);
+                rl.record_429(None, false);
+                rl.record_429(None, false);
+            });
+        }
+        for model in &["model-a", "model-b", "model-c"] {
+            let action = pmc.with(model, |rl| rl.check_request(false));
+            assert!(
+                matches!(action, RateLimitAction::Reject { .. }),
+                "{model} should reject, got: {action:?}"
+            );
+        }
+    }
+
+    // ── try_resolve_fallback tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn try_resolve_fallback_picks_first_available() {
+        let pmc = PerModelCooldown::new();
+        // model-a in cooldown
+        pmc.with("model-a", |rl| {
+            rl.record_429(None, true);
+            rl.record_429(None, true);
+            rl.record_429(None, true);
+        });
+        let chain: Vec<String> = vec!["model-a".into(), "model-b".into(), "model-c".into()];
+        let outcome =
+            try_resolve_fallback(&pmc, &chain, CooldownReason::RateLimit, |name| async move {
+                Ok::<_, String>(name)
+            })
+            .await;
+        match outcome {
+            FallbackOutcome::Resolved(name) => assert_eq!(name, "model-b"),
+            other => panic!("expected Resolved, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_resolve_fallback_empty_chain() {
+        let pmc = PerModelCooldown::new();
+        let chain: Vec<String> = vec![];
+        let outcome =
+            try_resolve_fallback(&pmc, &chain, CooldownReason::RateLimit, |name| async move {
+                Ok::<_, String>(name)
+            })
+            .await;
+        assert!(matches!(outcome, FallbackOutcome::NoFallbackConfigured));
+    }
+
+    #[tokio::test]
+    async fn try_resolve_fallback_all_in_cooldown() {
+        let pmc = PerModelCooldown::new();
+        for model in &["model-a", "model-b"] {
+            pmc.with(model, |rl| {
+                rl.record_429(None, false);
+                rl.record_429(None, false);
+                rl.record_429(None, false);
+            });
+        }
+        let chain: Vec<String> = vec!["model-a".into(), "model-b".into()];
+        let outcome = try_resolve_fallback(
+            &pmc,
+            &chain,
+            CooldownReason::Overloaded,
+            |name| async move { Ok::<_, String>(name) },
+        )
+        .await;
+        match outcome {
+            FallbackOutcome::AllExhausted { chain_len } => assert_eq!(chain_len, 2),
+            other => panic!("expected AllExhausted, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_resolve_fallback_skips_resolution_failure() {
+        let pmc = PerModelCooldown::new();
+        let chain: Vec<String> = vec!["bad-model".into(), "good-model".into()];
+        let outcome =
+            try_resolve_fallback(&pmc, &chain, CooldownReason::RateLimit, |name| async move {
+                if name == "bad-model" {
+                    Err("not found".to_string())
+                } else {
+                    Ok(name)
+                }
+            })
+            .await;
+        match outcome {
+            FallbackOutcome::Resolved(name) => assert_eq!(name, "good-model"),
+            other => panic!("expected Resolved, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_chain_first_available_wins() {
+        let pmc = PerModelCooldown::new();
+        // model-a: in cooldown
+        pmc.with("model-a", |rl| {
+            rl.record_429(None, true);
+            rl.record_429(None, true);
+            rl.record_429(None, true);
+        });
+        // model-b: active, model-c: also active
+        // Simulate the chain walk: check each in order, pick first Proceed
+        let chain = ["model-b", "model-c"];
+        let mut picked = None;
+        for fb in &chain {
+            let action = pmc.with(fb, |rl| rl.check_request(false));
+            if matches!(action, RateLimitAction::Proceed) {
+                picked = Some(*fb);
+                break;
+            }
+        }
+        assert_eq!(picked, Some("model-b"), "first available should win");
     }
 }

@@ -23,6 +23,7 @@ pub enum FailureClass {
     ModelCapability,
     ModelQualityLow,
     EfficiencyBoundsExceeded,
+    ToolUnavailable,
     Unknown,
 }
 
@@ -38,6 +39,7 @@ impl fmt::Display for FailureClass {
             Self::ModelCapability => write!(f, "ModelCapability"),
             Self::ModelQualityLow => write!(f, "ModelQualityLow"),
             Self::EfficiencyBoundsExceeded => write!(f, "EfficiencyBoundsExceeded"),
+            Self::ToolUnavailable => write!(f, "ToolUnavailable"),
             Self::Unknown => write!(f, "Unknown"),
         }
     }
@@ -102,6 +104,24 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
         }
     }
 
+    // Tool unavailable: the agent reported a required tool is missing.
+    let tool_missing_signals = [
+        "tool available in my current toolset",
+        "not available in my current tool",
+        "tool is not available",
+        "no such tool",
+    ];
+    let text_lower = outcome.text.to_lowercase();
+    // Generic pattern: "don't have a <tool_name> tool available/in my..."
+    // Requires "available" or "in my" to avoid false positives like
+    // "I don't have a good tool for this task".
+    let has_generic_dont_have = text_lower.contains("don't have a")
+        && text_lower.contains("tool")
+        && (text_lower.contains("available") || text_lower.contains("in my"));
+    if has_generic_dont_have || tool_missing_signals.iter().any(|s| text_lower.contains(s)) {
+        return FailureClass::ToolUnavailable;
+    }
+
     // All deterministic criteria failed → model can't do the task.
     let deterministic_results: Vec<_> = criteria_results
         .iter()
@@ -157,6 +177,9 @@ pub fn suggested_action(class: &FailureClass) -> &'static str {
         }
         FailureClass::EfficiencyBoundsExceeded => {
             "Task completed correctly but exceeded efficiency bounds (tokens/duration/turns)"
+        }
+        FailureClass::ToolUnavailable => {
+            "A required tool was not exposed at runtime; check tool registry and selector config"
         }
         FailureClass::Unknown => "Inspect stderr and session journal for clues",
     }
@@ -312,11 +335,40 @@ mod tests {
     }
 
     #[test]
-    fn suggested_action_not_empty() {
+    fn tool_unavailable_generic_tool_name() {
+        // Generic pattern: "don't have a <any_tool> tool available/in" should match
+        let outcome =
+            make_outcome().with_text("I don't have a grep tool available in my current toolset");
+        let class = classify(&outcome, &[]);
+        assert_eq!(class, FailureClass::ToolUnavailable);
+    }
+
+    #[test]
+    fn generic_tool_phrase_does_not_false_positive() {
+        // "I don't have a good tool for this" is NOT a tool-registry failure
+        let outcome = make_outcome()
+            .with_text("I don't have a good tool for this task, but I can try manually.");
+        let class = classify(&outcome, &[]);
+        assert_ne!(
+            class,
+            FailureClass::ToolUnavailable,
+            "casual 'tool' mention should not trigger ToolUnavailable"
+        );
+    }
+
+    #[test]
+    fn tool_unavailable_still_matches_specific_signals() {
+        let outcome = make_outcome().with_text("tool is not available");
+        assert_eq!(classify(&outcome, &[]), FailureClass::ToolUnavailable);
+    }
+
+    #[test]
+    fn every_class_has_suggested_action() {
         let classes = [
             FailureClass::InfraAuth,
             FailureClass::InfraTimeout,
             FailureClass::InfraRateLimit,
+            FailureClass::ToolUnavailable,
             FailureClass::Unknown,
         ];
         for class in &classes {

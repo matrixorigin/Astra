@@ -114,6 +114,11 @@ pub struct SubRunConfig {
     /// `ServerAgenticLoopHost`) can ignore this field — the child
     /// runs fresh, same behavior as pre-fork-prefix.
     pub inherited_prefix: Option<crate::orchestration::InheritedChildPrefix>,
+    /// Parent session's harness snapshot sink for observe-only sub-run
+    /// observation. When set, the sub-run creates a sink-only HarnessSlot
+    /// so sub-run snapshots appear in the parent's history.
+    #[cfg(feature = "harness")]
+    pub harness_sink: Option<Arc<dyn astra_harness::SnapshotSink>>,
 }
 
 impl std::fmt::Debug for SubRunConfig {
@@ -2018,6 +2023,8 @@ impl DelegationEngine {
                 mailbox,
                 cancel_token: Some(child_cancel),
                 inherited_prefix,
+                #[cfg(feature = "harness")]
+                harness_sink: None,
             });
         }
         drop(reg);
@@ -2300,6 +2307,8 @@ impl DelegationEngine {
                                 mailbox: None,
                                 cancel_token: cancel_for_retry.clone(),
                                 inherited_prefix,
+                                #[cfg(feature = "harness")]
+                                harness_sink: None,
                             }
                         },
                     )
@@ -2475,6 +2484,8 @@ impl DelegationEngine {
                 mailbox,
                 cancel_token: Some(child_cancel),
                 inherited_prefix: None,
+                #[cfg(feature = "harness")]
+                harness_sink: None,
             };
 
             let exec_result = match per_stage_timeout {
@@ -2583,6 +2594,8 @@ impl DelegationEngine {
                         mailbox: None,
                         cancel_token: cancel_for_retry.clone(),
                         inherited_prefix: None,
+                        #[cfg(feature = "harness")]
+                        harness_sink: None,
                     },
                 )
                 .await
@@ -2766,6 +2779,8 @@ impl DelegationEngine {
                 mailbox: prod_mailbox,
                 cancel_token: cancel_token.cloned(),
                 inherited_prefix: None,
+                #[cfg(feature = "harness")]
+                harness_sink: None,
             };
             let prod_exec = match per_round_timeout {
                 Some(dur) => {
@@ -2868,6 +2883,8 @@ impl DelegationEngine {
                         mailbox: None,
                         cancel_token: cancel_for_retry.clone(),
                         inherited_prefix: None,
+                        #[cfg(feature = "harness")]
+                        harness_sink: None,
                     },
                 )
                 .await
@@ -2972,6 +2989,8 @@ impl DelegationEngine {
                 mailbox: rev_mailbox,
                 cancel_token: cancel_token.cloned(),
                 inherited_prefix: None,
+                #[cfg(feature = "harness")]
+                harness_sink: None,
             };
             let rev_exec = match per_round_timeout {
                 Some(dur) => {
@@ -3206,6 +3225,8 @@ impl DelegationEngine {
                 mailbox: fork_mailbox,
                 cancel_token: cancel_token.cloned(),
                 inherited_prefix: None,
+                #[cfg(feature = "harness")]
+                harness_sink: None,
             };
 
             let executor = self.executor.clone();
@@ -4586,6 +4607,8 @@ mod tests {
             mailbox: None,
             cancel_token: None,
             inherited_prefix: None,
+            #[cfg(feature = "harness")]
+            harness_sink: None,
         };
 
         let result = executor.execute(config).await.unwrap();

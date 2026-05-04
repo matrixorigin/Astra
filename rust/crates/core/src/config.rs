@@ -46,12 +46,9 @@ impl SkillSearchSettings {
 #[derive(Clone, PartialEq, Eq)]
 pub struct AppSettings {
     pub matrixone: MatrixOneSettings,
-    pub application: ApplicationSettings,
     pub jwt: JwtSettings,
     pub api: ApiSettings,
     pub memoria: MemoriaSettings,
-    pub github_token: Option<String>,
-    pub bridge_url: Option<String>,
     pub bridge_secret: String,
     pub token_encryption_key: Option<String>,
     pub database_bootstrap_catalog: String,
@@ -61,15 +58,9 @@ impl fmt::Debug for AppSettings {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AppSettings")
             .field("matrixone", &self.matrixone)
-            .field("application", &self.application)
             .field("jwt", &self.jwt)
             .field("api", &self.api)
             .field("memoria", &self.memoria)
-            .field(
-                "github_token",
-                &self.github_token.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field("bridge_url", &self.bridge_url)
             .field("bridge_secret", &"[REDACTED]")
             .field(
                 "token_encryption_key",
@@ -106,10 +97,6 @@ impl AppSettings {
                 "ASTRA_DATABASE_BOOTSTRAP_CATALOG",
                 "mysql",
             ),
-            application: ApplicationSettings {
-                app_env: value_or_default(&lookup, "ASTRA_APP_ENV", "development"),
-                log_level: value_or_default(&lookup, "ASTRA_LOG_LEVEL", "DEBUG"),
-            },
             jwt: JwtSettings::from_lookup(&lookup)?,
             api: ApiSettings {
                 host: value_or_default(&lookup, "ASTRA_API_HOST", "0.0.0.0"),
@@ -120,8 +107,6 @@ impl AppSettings {
                 base_url: value_or_default(&lookup, "MEMORIA_BASE_URL", DEFAULT_MEMORIA_URL),
                 master_key: optional_value(&lookup, "MEMORIA_MASTER_KEY"),
             },
-            github_token: optional_value(&lookup, "GITHUB_TOKEN"),
-            bridge_url: optional_value(&lookup, "ASTRA_BRIDGE_URL"),
             bridge_secret: required_value(
                 &lookup,
                 "ASTRA_BRIDGE_SECRET",
@@ -153,7 +138,84 @@ impl fmt::Debug for MatrixOneSettings {
     }
 }
 
+/// MySQL CLI connect timeout (seconds) — shared between server and edge tool execution.
+pub const MO_CLI_CONNECT_TIMEOUT_SECS: u32 = 5;
+
 impl MatrixOneSettings {
+    /// Build a `mysql` CLI [`Command`](std::process::Command) pre-configured
+    /// with this settings' host/port/user/password.
+    ///
+    /// Password is passed via `MYSQL_PWD` env var (hidden from `ps`).
+    pub fn mysql_cmd(&self, database: Option<&str>) -> std::process::Command {
+        let db = database.unwrap_or(&self.database);
+        let mut cmd = std::process::Command::new("mysql");
+        cmd.arg(format!("-h{}", self.host))
+            .arg(format!("-P{}", self.port))
+            .arg(format!("-u{}", self.user))
+            .env("MYSQL_PWD", &self.password)
+            .arg(db)
+            .arg(format!("--connect-timeout={MO_CLI_CONNECT_TIMEOUT_SECS}"))
+            .arg("--table");
+        cmd
+    }
+
+    /// Build settings from environment with dev-safe defaults.
+    ///
+    /// Falls back to `localhost:6001`, `root`, and the bundled dev password.
+    /// Suitable for local dev and tests. Call `dotenvy::dotenv().ok()` first
+    /// if you need `.env` file loading (the server entry point already does this).
+    pub fn from_env() -> Self {
+        let lookup = |k: &str| env::var(k).ok();
+        Self {
+            host: env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".into()),
+            port: env::var("MATRIXONE_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(6001),
+            user: env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
+            password: env::var("MATRIXONE_PASSWORD").unwrap_or_else(|_| "111".into()),
+            database: resolve_database_name(&lookup),
+        }
+    }
+
+    /// Build settings from environment, **requiring** `MATRIXONE_PASSWORD`.
+    ///
+    /// Returns `Err` when the password is unset — suitable for production and
+    /// any code path that must not silently fall back to a dev password.
+    pub fn from_env_strict() -> Result<Self, String> {
+        let lookup = |k: &str| env::var(k).ok();
+        Ok(Self {
+            host: env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".into()),
+            port: env::var("MATRIXONE_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(6001),
+            user: env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
+            password: env::var("MATRIXONE_PASSWORD")
+                .map_err(|_| "MATRIXONE_PASSWORD environment variable is required".to_string())?,
+            database: resolve_database_name(&lookup),
+        })
+    }
+
+    /// Build settings with a specific database name (other values from env).
+    pub fn from_env_with_database(database: impl Into<String>) -> Self {
+        let mut s = Self::from_env();
+        s.database = database.into();
+        s
+    }
+
+    /// Fake settings for unit tests that never open a real DB connection.
+    #[cfg(any(test, feature = "dev-defaults"))]
+    pub fn mock() -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            port: 6001,
+            user: "test".into(),
+            password: "test".into(),
+            database: "test".into(),
+        }
+    }
+
     /// Returns the database URL with password REDACTED — safe for logging.
     ///
     /// Use [`MatrixOneSettings::database_url_with_password`] when an actual
@@ -172,31 +234,6 @@ impl MatrixOneSettings {
             "mysql://{}:{}@{}:{}/{}",
             self.user, self.password, self.host, self.port, self.database
         )
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct ApplicationSettings {
-    pub app_env: String,
-    pub log_level: String,
-}
-
-impl fmt::Debug for ApplicationSettings {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ApplicationSettings")
-            .field("app_env", &self.app_env)
-            .field("log_level", &self.log_level)
-            .finish()
-    }
-}
-
-impl ApplicationSettings {
-    pub fn is_development(&self) -> bool {
-        self.app_env == "development"
-    }
-
-    pub fn is_production(&self) -> bool {
-        self.app_env == "production"
     }
 }
 
@@ -266,6 +303,30 @@ impl fmt::Debug for ApiSettings {
 pub struct MemoriaSettings {
     pub base_url: String,
     pub master_key: Option<String>,
+}
+
+impl MemoriaSettings {
+    /// Read Memoria connection config from environment.
+    pub fn from_env() -> Self {
+        Self {
+            base_url: env::var("MEMORIA_BASE_URL")
+                .unwrap_or_else(|_| DEFAULT_MEMORIA_URL.to_string()),
+            master_key: env::var("MEMORIA_MASTER_KEY").ok(),
+        }
+    }
+
+    /// Returns `true` when a master key is configured (Memoria is usable).
+    pub fn is_configured(&self) -> bool {
+        self.master_key.as_ref().is_some_and(|k| !k.is_empty())
+    }
+
+    /// `Authorization: Bearer <key>` header value, or `None` if unconfigured.
+    pub fn bearer_token(&self) -> Option<String> {
+        self.master_key
+            .as_ref()
+            .filter(|k| !k.is_empty())
+            .map(|k| format!("Bearer {k}"))
+    }
 }
 
 impl fmt::Debug for MemoriaSettings {
@@ -394,6 +455,11 @@ where
     }
 }
 
+/// Read `ASTRA_CLI_USER_ID` from environment, defaulting to `"local"`.
+pub fn cli_user_id() -> String {
+    env::var("ASTRA_CLI_USER_ID").unwrap_or_else(|_| "local".to_string())
+}
+
 fn normalize_jwt_secret(secret: &str) -> String {
     if secret.len() >= 32 {
         secret.to_string()
@@ -409,23 +475,6 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-
-    #[test]
-    fn application_mode_helpers_match_runtime_modes() {
-        let development = ApplicationSettings {
-            app_env: "development".into(),
-            log_level: "DEBUG".into(),
-        };
-        let production = ApplicationSettings {
-            app_env: "production".into(),
-            log_level: "INFO".into(),
-        };
-
-        assert!(development.is_development());
-        assert!(!development.is_production());
-        assert!(production.is_production());
-        assert!(!production.is_development());
-    }
 
     #[test]
     fn matrixone_settings_build_mysql_url() {
@@ -504,14 +553,9 @@ mod tests {
     fn app_settings_debug_redacts_optional_secrets() {
         let mut m = HashMap::new();
         m.insert("ASTRA_ALLOW_INSECURE_DEFAULTS".into(), "1".into());
-        m.insert("GITHUB_TOKEN".into(), "ghp_supersecret_token".into());
         m.insert("MEMORIA_MASTER_KEY".into(), "memoria-master-key-xyz".into());
         let settings = AppSettings::from_map(&m).unwrap();
         let debug_str = format!("{settings:?}");
-        assert!(
-            !debug_str.contains("ghp_supersecret_token"),
-            "github_token should be redacted: {debug_str}"
-        );
         assert!(
             !debug_str.contains("memoria-master-key-xyz"),
             "memoria master_key should be redacted: {debug_str}"
@@ -638,10 +682,6 @@ mod settings_contract_tests {
         matrixone_user: String,
         matrixone_password: String,
         matrixone_database: String,
-        app_env: String,
-        log_level: String,
-        github_token: Option<String>,
-        bridge_url: Option<String>,
         bridge_secret: String,
     }
 
@@ -660,10 +700,6 @@ mod settings_contract_tests {
             matrixone_user: settings.matrixone.user,
             matrixone_password: settings.matrixone.password,
             matrixone_database: settings.matrixone.database,
-            app_env: settings.application.app_env,
-            log_level: settings.application.log_level,
-            github_token: settings.github_token,
-            bridge_url: settings.bridge_url,
             bridge_secret: settings.bridge_secret,
         }
     }

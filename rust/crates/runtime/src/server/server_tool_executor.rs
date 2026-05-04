@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{Value, json};
 
 use astra_tools::executor::DefaultToolExecutor;
-use astra_tools::{AskUserDecision, AskUserGate, ToolContext, ToolExecutor};
+use astra_tools::{AskUserDecision, AskUserGate, ToolExecutor};
 use async_trait::async_trait;
 
 use crate::tool_sandbox::{
@@ -30,8 +30,6 @@ use crate::tool_sandbox::{
     execute_isolated, filter_environment,
 };
 use astra_turn_core::file_edit_journal::{EditType, FileEditJournal};
-
-const ASTRA_CONNECT_TIMEOUT_SECS: u32 = 5;
 
 fn normalize_path(path: &Path) -> PathBuf {
     path.components()
@@ -938,23 +936,8 @@ fn is_mo_error(output: &str) -> bool {
 }
 
 fn mo_mysql_cmd(database: Option<&str>) -> Result<Command, String> {
-    let host = std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".to_string());
-    let port = std::env::var("MATRIXONE_PORT").unwrap_or_else(|_| "6001".to_string());
-    let user = std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".to_string());
-    let password = std::env::var("MATRIXONE_PASSWORD").unwrap_or_else(|_| "111".to_string());
-    let db = database
-        .map(ToString::to_string)
-        .unwrap_or_else(|| astra_core::resolve_database_name(&|k| std::env::var(k).ok()));
-
-    let mut cmd = Command::new("mysql");
-    cmd.arg(format!("-h{host}"))
-        .arg(format!("-P{port}"))
-        .arg(format!("-u{user}"))
-        .env("MYSQL_PWD", &password)
-        .arg(db)
-        .arg(format!("--connect-timeout={ASTRA_CONNECT_TIMEOUT_SECS}"))
-        .arg("--table");
-    Ok(cmd)
+    let settings = astra_core::MatrixOneSettings::from_env();
+    Ok(settings.mysql_cmd(database))
 }
 
 fn mo_execute_sql(sql: &str, database: Option<&str>) -> String {
@@ -1090,35 +1073,13 @@ impl ServerToolExecutor {
                 .map(|workspace| (workspace.pinned_tools, workspace.deprioritized_tools))
                 .unwrap_or_else(|_| (Vec::new(), Vec::new()));
 
-        let http_client = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(15))
-            .user_agent("astra-server/0.1.0")
-            .build()
-            .expect("Failed to build HTTP client");
-
-        let default_executor = DefaultToolExecutor::new(ToolContext {
-            project_root: workspace_root.clone(),
-            workspace_root: workspace_root.clone(),
-            user_id: user_id.clone(),
-            session_id: session_id.clone(),
-            sandbox: astra_tools::SandboxConfig::standard(workspace_root.clone()),
-            http_client: Some(http_client.clone()),
-            logger: std::sync::Arc::new(astra_tools::TracingLogger),
-            cancel_token: None,
-        });
-        // Wire GitHubClient into DefaultToolExecutor if any token is available
-        let github_tokens = astra_tools::github::resolve_github_tokens();
-        let default_executor = if !github_tokens.is_empty() {
-            let github = astra_tools::github::GitHubClient::from_tokens(
-                http_client.clone(),
-                github_tokens,
-                Vec::new(),
-            );
-            default_executor.with_github_client(github)
-        } else {
-            default_executor
-        };
+        let default_executor = DefaultToolExecutor::for_workspace(
+            &workspace_root,
+            user_id.clone(),
+            session_id.clone(),
+            "astra-server/0.1.0",
+            Duration::from_secs(15),
+        );
 
         Self {
             workspace_root,
@@ -1450,6 +1411,8 @@ impl ServerToolExecutor {
                     .execute("github_create_issue", args)
                     .await
             }
+            // ── Agent introspection ────────────────────────────────────
+            "get_agent_info" => tool_result_from_output(self.server_get_agent_info(args)),
             // ── Delegation placeholder ─────────────────────────────────
             "delegate" => astra_tools::ToolResult::text(
                 "Delegation request acknowledged. The delegation engine will execute \
@@ -1465,7 +1428,7 @@ impl ServerToolExecutor {
                      grep, glob, git_status, git_diff, git_log, git_file_history, git_contributors, git_log_search, \
                      git_show, git_blame, symbols, git_commit, git_stash, git_revert_commit, github_list_prs, github_get_pr, \
                      github_ci_status, github_list_issues, github_get_issue, github_repo_stats, github_create_issue, memory_*, web_fetch, \
-                     web_search, ask_user"
+                     web_search, ask_user, get_agent_info"
             )),
         };
 
@@ -2217,6 +2180,52 @@ impl ServerToolExecutor {
             );
         }
         output
+    }
+
+    fn server_get_agent_info(&self, args: &Value) -> String {
+        let dimension = args
+            .get("dimension")
+            .and_then(Value::as_str)
+            .unwrap_or("all");
+        let identity = || {
+            serde_json::json!({
+                "name": "astra",
+                "version": env!("CARGO_PKG_VERSION"),
+                "runtime": "cloud-server",
+                "user_id": self.user_id,
+                "session_id": self.session_id,
+                "workspace": self.workspace_root.display().to_string(),
+            })
+        };
+        let capability = || {
+            let schemas = astra_tools::schemas::server_executor_tool_schemas();
+            let tool_names: Vec<&str> = schemas
+                .iter()
+                .filter_map(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                })
+                .collect();
+            serde_json::json!({
+                "tool_count": tool_names.len(),
+                "tools": tool_names,
+            })
+        };
+        match dimension {
+            "identity" => identity().to_string(),
+            "capability" => capability().to_string(),
+            _ => {
+                let mut info = identity();
+                if let Value::Object(ref mut m) = info {
+                    let cap = capability();
+                    if let Value::Object(cap_m) = cap {
+                        m.extend(cap_m);
+                    }
+                }
+                info.to_string()
+            }
+        }
     }
 
     fn adjust_config(&self, args: &Value) -> String {

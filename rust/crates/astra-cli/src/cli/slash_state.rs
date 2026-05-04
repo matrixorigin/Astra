@@ -339,6 +339,8 @@ pub(super) async fn handle_state_command(
                     selector,
                     recent_tools: &[],
                     tool_health_entries: &[],
+                    session_lessons: &[],
+                    latest_skill_diagnosis: None,
                     unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                     plan_only_chat: false,
                     is_plan_subtask: false,
@@ -374,6 +376,11 @@ pub(super) async fn handle_state_command(
                     turn_index: 0,
                     evolution_service: state.evolution_service.clone(),
                     pre_loaded_messages: None,
+                    append_system_prompt: None,
+                    #[cfg(feature = "harness")]
+                    harness_sink: Some(state.harness_sink.clone()),
+                    #[cfg(feature = "harness")]
+                    harness_trace: Some(state.harness_trace.clone()),
                 }) => r,
                 _ = tokio::signal::ctrl_c() => {
                     if let Some(ref t) = _cancel_token_guard { t.cancel(); }
@@ -452,6 +459,8 @@ pub(super) async fn handle_state_command(
                             selector,
                             recent_tools: &[],
                             tool_health_entries: &[],
+                            session_lessons: &[],
+                            latest_skill_diagnosis: None,
                             unified_skill_registry: astra_runtime::skills::default_unified_registry(
                             ),
                             plan_only_chat: false,
@@ -484,6 +493,11 @@ pub(super) async fn handle_state_command(
                             turn_index: 0,
                             evolution_service: state.evolution_service.clone(),
                             pre_loaded_messages: None,
+                            append_system_prompt: None,
+                            #[cfg(feature = "harness")]
+                            harness_sink: Some(state.harness_sink.clone()),
+                            #[cfg(feature = "harness")]
+                            harness_trace: Some(state.harness_trace.clone()),
                         })
                         .await;
 
@@ -543,6 +557,8 @@ pub(super) async fn handle_state_command(
                                     selector,
                                     recent_tools: &[],
                                     tool_health_entries: &[],
+                                    session_lessons: &[],
+                                    latest_skill_diagnosis: None,
                                     unified_skill_registry:
                                         astra_runtime::skills::default_unified_registry(),
                                     plan_only_chat: false,
@@ -575,6 +591,11 @@ pub(super) async fn handle_state_command(
                                     turn_index: 0,
                                     evolution_service: state.evolution_service.clone(),
                                     pre_loaded_messages: None,
+                                    append_system_prompt: None,
+                                    #[cfg(feature = "harness")]
+                                    harness_sink: Some(state.harness_sink.clone()),
+                                    #[cfg(feature = "harness")]
+                                    harness_trace: Some(state.harness_trace.clone()),
                                 })
                                 .await;
                                 if let Ok(sr2) = synth_result {

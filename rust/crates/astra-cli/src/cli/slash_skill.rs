@@ -1751,6 +1751,8 @@ Follow these steps:
                 selector: selector.as_ref(),
                 recent_tools: &[],
                 tool_health_entries: &[],
+                session_lessons: &state.session_lessons,
+                latest_skill_diagnosis: state.latest_skill_diagnosis.as_ref(),
                 unified_skill_registry: &state.unified_skill_registry,
                 plan_only_chat: false,
                 is_plan_subtask: false,
@@ -1782,6 +1784,11 @@ Follow these steps:
                 turn_index: state.turn,
                 evolution_service: None,
                 pre_loaded_messages: None,
+                append_system_prompt: None,
+                #[cfg(feature = "harness")]
+                harness_sink: Some(state.harness_sink.clone()),
+                #[cfg(feature = "harness")]
+                harness_trace: Some(state.harness_trace.clone()),
             })
             .await
             .map_err(|e| e.to_string())?;

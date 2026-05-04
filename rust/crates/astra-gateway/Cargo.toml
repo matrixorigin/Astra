@@ -1,0 +1,38 @@
+[package]
+name = "astra-gateway"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "astra-gateway"
+path = "src/main.rs"
+
+[dependencies]
+astra-thin-client.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+clap.workspace = true
+chrono.workspace = true
+sqlx.workspace = true
+astra-core.workspace = true
+base64.workspace = true
+regex.workspace = true
+aes = "0.8"
+ecb = "0.1"
+hex = "0.4"
+urlencoding = "2"
+rand = "0.9"
+dotenvy.workspace = true
+dashmap = "6.1.0"
+
+[dev-dependencies]
+tempfile = "3"

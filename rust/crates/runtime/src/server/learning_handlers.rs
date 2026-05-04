@@ -1,11 +1,16 @@
 use super::*;
 
 pub(super) async fn learning_health_handler() -> Json<LearningHealthResponse> {
+    // Lessons are now stored in Memoria (Session Memory Protocol L3),
+    // not in the agent_lessons DB table. Health is reported by Memoria's
+    // own /health endpoint. This handler returns a static healthy status.
     Json(LearningHealthResponse {
         status: "healthy".to_string(),
         service: "learning".to_string(),
         version: "1.0.0".to_string(),
         timestamp: Utc::now().to_rfc3339(),
+        lesson_count: None,
+        retired_count: None,
     })
 }
 

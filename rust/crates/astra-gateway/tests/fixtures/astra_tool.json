@@ -1,0 +1,22 @@
+{
+  "background_agent_results": [],
+  "completion_tokens": 2612,
+  "context_ms": 146,
+  "error_kind": null,
+  "exit_code": 0,
+  "prompt_tokens": 342589,
+  "request_id": "fixture-request-tool",
+  "run_id": "5512030e-97a3-4199-b5b2-db531e6f8995",
+  "selector_strategy": "tfidf_routed (conf=0.65)",
+  "session_id": "906a591d-8797-419f-a3ac-613d5401fa3d",
+  "success": true,
+  "text": "\nAll checks pass. Summary:\n\n### Changes applied\n\n**`rust/crates/astra-test-harness/src/classify.rs`**\n\n| Fix | What changed |\n|---|---|\n| **Generic pattern tightened** | `has_generic_dont_have` now requires `\"available\" OR \"in my\"` after \"don't have a ... tool\" — blocks casual false positives like *\"I don't have a good tool for this\"*. |\n| **`generic_tool_phrase_does_not_false_positive` test added** | Explicitly tests that `\"don't have a good tool for this task\"` does **not** trigger `ToolUnavailable`. |\n| **Duplicate `tool_unavailable_generic_tool_name` removed** | Stale older definition cleaned up. |\n\n**`rust/crates/runtime/src/tool_registry/registry.rs`**\n\n- `>=` → `>` in assertion (proves dynamic tools added, not just not-decreased)\n- New `quality_path_conversational_with_recent_tools_runs_dynamic` test (symmetric to the existing `report_ctx` test)\n- Import alphabetical ordering only (cosmetic)\n\n**`rust/crates/runtime/src/tool_registry/scoring.rs`**\n\n- `pre_filter_dynamic_core` now checks `recent_tools.is_empty()` before short-circuiting — fixes the parallel code path that the previous commit only patched in `registry.rs`\n\n**Result**: 13/13 classify tests pass, 130/130 registry tests pass.\n\n[Turn context: tool_calls: 3 | verification: ✅ cargo test -p astra-test-harness --lib classify::tests — 13 passed]",
+  "trace_id": "fixture-trace-tool",
+  "tool_calls_count": 13,
+  "tools_used": [
+    "bash",
+    "str_replace",
+    "read_file"
+  ],
+  "ttft_ms": 2679
+}

@@ -238,6 +238,10 @@ pub(super) async fn handle_task_command(
             let bg_observability_hub = state.observability_hub.clone();
             let bg_observability_session = state.observability_session.clone();
             let bg_evolution_service = state.evolution_service.clone();
+            #[cfg(feature = "harness")]
+            let bg_harness_sink = state.harness_sink.clone();
+            #[cfg(feature = "harness")]
+            let bg_harness_trace = state.harness_trace.clone();
             let svc_clone = svc.clone();
             let workspace_root = std::env::current_dir().unwrap_or_default();
             let bg_root_agent_id = format!("task-{task_id}");
@@ -289,6 +293,8 @@ pub(super) async fn handle_task_command(
                     selector: &*selector,
                     recent_tools: &[],
                     tool_health_entries: &[],
+                    session_lessons: &[],
+                    latest_skill_diagnosis: None,
                     unified_skill_registry: &bg_unified_skill_registry,
                     plan_only_chat: false,
                     is_plan_subtask: false,
@@ -320,6 +326,11 @@ pub(super) async fn handle_task_command(
                     turn_index: 0,
                     evolution_service: bg_evolution_service.clone(),
                     pre_loaded_messages: None,
+                    append_system_prompt: None,
+                    #[cfg(feature = "harness")]
+                    harness_sink: Some(bg_harness_sink.clone()),
+                    #[cfg(feature = "harness")]
+                    harness_trace: Some(bg_harness_trace.clone()),
                 })
                 .await;
 

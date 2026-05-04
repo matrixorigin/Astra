@@ -7,9 +7,15 @@ edition.workspace = true
 name = "astra"
 path = "src/main.rs"
 
+[features]
+default = ["harness"]
+harness = ["astra-runtime/harness", "dep:astra-harness"]
+
 [dependencies]
 astra-core.workspace = true
+astra-harness = { workspace = true, optional = true }
 astra-logging.workspace = true
+astra-prompts.workspace = true
 astra-services.workspace = true
 astra-runtime.workspace = true
 astra-pipeline.workspace = true

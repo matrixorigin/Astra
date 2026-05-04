@@ -109,6 +109,9 @@ pub struct AppState {
     /// Defaults to [`astra_plan::LocalCachePlanRepository`]; production wires
     /// [`astra_plan::CloudPlanRepository`] backed by the MatrixOne pool.
     pub(crate) plan_repo: Arc<dyn astra_plan::PlanRepository>,
+    pub(crate) cors_origins: Option<String>,
+    #[cfg(feature = "harness")]
+    pub harness_registry: crate::server::harness_handlers::HarnessSinkRegistry,
 }
 
 impl AppState {
@@ -123,6 +126,7 @@ impl AppState {
     pub fn new(service_info: ServiceInfo, health_checker: Arc<dyn HealthChecker>) -> Self {
         let chat_turn_bridge_cache =
             Arc::new(tokio::sync::Mutex::new(SessionCache::new(1000, 86400.0)));
+        let default_memoria = astra_core::MemoriaSettings::from_env();
         Self {
             service_info,
             health_checker,
@@ -187,9 +191,8 @@ impl AppState {
             chat_turn_bridge_secret: "dev-bridge-secret-change-me".to_string(),
             chat_turn_bridge_cache,
             turn_learning_writer: None,
-            memoria_base_url: std::env::var("MEMORIA_BASE_URL")
-                .unwrap_or_else(|_| crate::config::DEFAULT_MEMORIA_URL.to_string()),
-            memoria_master_key: std::env::var("MEMORIA_MASTER_KEY").ok(),
+            memoria_base_url: default_memoria.base_url,
+            memoria_master_key: default_memoria.master_key,
             memoria_forwarder: Arc::new(NoopMemoriaForwarder),
             shared_pool: None,
             matrix_cloud_runtime: None,
@@ -211,7 +214,15 @@ impl AppState {
                 .build()
                 .expect("failed to build shared HTTP client"),
             plan_repo: Arc::new(astra_plan::LocalCachePlanRepository::new()),
+            cors_origins: None,
+            #[cfg(feature = "harness")]
+            harness_registry: crate::server::harness_handlers::HarnessSinkRegistry::new(),
         }
+    }
+
+    pub fn with_cors_origins(mut self, cors_origins: Option<String>) -> Self {
+        self.cors_origins = cors_origins;
+        self
     }
 
     /// Inject the plan repository — production wires

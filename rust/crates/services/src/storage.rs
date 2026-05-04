@@ -466,6 +466,26 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
+    // Harness diagnostic snapshots — separated from agent_events to avoid
+    // polluting session event counts and to carry causal_chain_id natively.
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_snapshots (
+            snapshot_id VARCHAR(64) PRIMARY KEY,
+            session_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(64) NOT NULL,
+            hook_point VARCHAR(32) NOT NULL,
+            turn_number INT UNSIGNED NOT NULL DEFAULT 0,
+            snapshot_json LONGTEXT NOT NULL,
+            causal_chain_id VARCHAR(128),
+            created_at DATETIME(6) DEFAULT NOW(6),
+            INDEX idx_harness_session (session_id),
+            INDEX idx_harness_session_turn (session_id, turn_number),
+            INDEX idx_harness_chain (causal_chain_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // Context / decisions / evaluation essentials used by turn persistence
     query(
         "CREATE TABLE IF NOT EXISTS ctx_snapshots (
@@ -590,6 +610,8 @@ pub async fn ensure_core_schema(
             architecture VARCHAR(100) NULL,
             tags JSON NULL,
             quirks JSON NULL,
+            thinking_capability VARCHAR(20) NULL,
+            thinking_probe_error TEXT NULL,
             created_by VARCHAR(36) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -598,6 +620,35 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
+
+    // Migration: add thinking_capability columns for existing deployments.
+    for alter in [
+        "ALTER TABLE infra_llm_models ADD COLUMN IF NOT EXISTS thinking_capability VARCHAR(20) NULL",
+        "ALTER TABLE infra_llm_models ADD COLUMN IF NOT EXISTS thinking_probe_error TEXT NULL",
+    ] {
+        if let Err(e) = query(alter).execute(&pool).await {
+            tracing::warn!("migration skip (may already exist): {e}");
+        }
+    }
+
+    // Migration: promote legacy quirks.fallback_model (string) → quirks.fallback_chain (array).
+    // Runs once — rows with the old key get it moved; rows already migrated are unaffected.
+    if let Err(e) = query(
+        "UPDATE infra_llm_models
+            SET quirks = JSON_REPLACE(
+                JSON_REMOVE(quirks, '$.fallback_model'),
+                '$.fallback_chain',
+                JSON_ARRAY(JSON_EXTRACT(quirks, '$.fallback_model'))
+            )
+          WHERE JSON_EXTRACT(quirks, '$.fallback_model') IS NOT NULL
+            AND (JSON_EXTRACT(quirks, '$.fallback_chain') IS NULL
+                 OR JSON_LENGTH(JSON_EXTRACT(quirks, '$.fallback_chain')) = 0)",
+    )
+    .execute(&pool)
+    .await
+    {
+        tracing::warn!("fallback_model→fallback_chain migration skip: {e}");
+    }
 
     // Server-wide admin config KV store. Holds settings that the admin explicitly manages
     // via `astra-admin config set/get/unset` (first key: `reasoning_model_name`).

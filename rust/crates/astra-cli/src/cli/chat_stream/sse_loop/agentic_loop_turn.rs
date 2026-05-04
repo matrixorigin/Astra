@@ -304,6 +304,7 @@ struct PrepareChatTurnRequest<'a> {
     /// Optional shared observability hub, forwarded from the SSE fetch request
     /// so the per-turn SelfModel ingest can read `hub.tuning().recent_signals()`.
     observability_hub: Option<&'a Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    append_system_prompt: Option<&'a str>,
 }
 
 pub(crate) fn turn_policy_from_payload_edge_tools(
@@ -781,6 +782,18 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     {
         ep_obj.insert("memoria_insights_text".to_string(), json!(insights));
     }
+    // ─── Gateway context: inject as system message at start of conversation ───
+    if let Some(extra) = ctx.append_system_prompt {
+        if let Some(arr) = payload.get_mut("messages").and_then(Value::as_array_mut) {
+            arr.insert(
+                0,
+                json!({
+                    "role": "system",
+                    "content": extra,
+                }),
+            );
+        }
+    }
     log_chat_turn_timing_phase(timing, "self_awareness_inject", &mut mark);
 
     // ─── Record token budget estimate to trace collector (M1 observability) ───
@@ -990,6 +1003,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     /// needing a global singleton.
     pub observability_hub:
         Option<&'a Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    pub append_system_prompt: Option<&'a str>,
 }
 struct ChatTurnSseFetchUi {
     timing: bool,
@@ -1117,6 +1131,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         turn_chain_id,
         user_query_event_id,
         observability_hub,
+        append_system_prompt,
     } = ctx;
 
     let ui = chat_turn_sse_fetch_ui(render_policy, plan_assemble_line_release.as_ref());
@@ -1170,6 +1185,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             denial_pressure: perm_manager.denial_pressure(),
             recent_rejections: perm_manager.recent_rejections(),
             observability_hub,
+            append_system_prompt,
         },
     )
     .await?;

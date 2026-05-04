@@ -78,36 +78,7 @@ fn shipped_case_names_are_unique() {
 
 // ── Class D regression: YAML criteria that don't match real CLI behavior ──
 
-#[test]
-fn text_rejects_hallucinated_file_claim_does_not_assert_exit_zero() {
-    let case =
-        Case::from_path(&shipped_cases_dir().join("text_rejects_hallucinated_file_claim.yaml"))
-            .expect("load case");
-    let has_exit_zero = case.criteria.iter().any(|c| {
-        matches!(
-            c,
-            astra_test_harness::criteria::Criterion::ExitCode { code: 0 }
-        )
-    });
-    assert!(
-        !has_exit_zero,
-        "text_rejects_hallucinated_file_claim must NOT assert exit_code=0. \
-         A tool failure (read_file on nonexistent path) correctly exits 1. \
-         The case should only check the judger criterion."
-    );
-}
-
-#[test]
-fn text_contains_simple_answer_has_adequate_timeout() {
-    let case = Case::from_path(&shipped_cases_dir().join("text_contains_simple_answer.yaml"))
-        .expect("load case");
-    assert!(
-        case.timeout_seconds >= 30,
-        "text_contains_simple_answer timeout_seconds={} is too short; \
-         a trivial factual question needs at least 30s.",
-        case.timeout_seconds
-    );
-}
+// text_rejects_hallucinated_file_claim removed — merged into anti_hallucination_two_vectors
 
 #[test]
 fn fork_prefix_hit_e2e_tool_count_allows_model_retry() {

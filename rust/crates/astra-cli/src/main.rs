@@ -102,6 +102,8 @@ mod journal_diff;
 mod journal_digest;
 #[path = "cli/journal_tree.rs"]
 mod journal_tree;
+#[path = "cli/memory_extraction.rs"]
+mod memory_extraction;
 #[path = "cli/mock_llm.rs"]
 mod mock_llm;
 #[path = "cli/permission_manager.rs"]
@@ -158,6 +160,8 @@ mod slash_debug;
 mod slash_health;
 #[path = "cli/slash_info.rs"]
 mod slash_info;
+#[path = "cli/slash_inspect.rs"]
+mod slash_inspect;
 #[path = "cli/slash_mcp.rs"]
 mod slash_mcp;
 #[path = "cli/slash_memory.rs"]
@@ -196,6 +200,8 @@ mod spawn_subrun;
 mod sse_utils;
 #[path = "cli/startup_trace.rs"]
 mod startup_trace;
+#[path = "cli/stream_events_writer.rs"]
+mod stream_events_writer;
 #[path = "cli/stream_render.rs"]
 mod stream_render;
 #[path = "cli/streaming_md.rs"]
@@ -913,7 +919,7 @@ async fn run_chat_repl(
         }
     };
 
-    finalize_repl_exit(&state, profile, repl_exit).await;
+    finalize_repl_exit(&mut state, profile, repl_exit).await;
 
     // Save cross-session learning state (including tool health)
     {
@@ -1577,7 +1583,7 @@ mod tests {
             .await
             .unwrap();
         assert!(exit);
-        finalize_repl_exit(&state, None, ReplExit::Command).await;
+        finalize_repl_exit(&mut state, None, ReplExit::Command).await;
 
         // Verify session_end was written to journal
         let events = session_journal::read_journal(&sid).unwrap();
@@ -1617,7 +1623,7 @@ mod tests {
             .await
             .unwrap();
         assert!(exit);
-        finalize_repl_exit(&state, None, ReplExit::Command).await;
+        finalize_repl_exit(&mut state, None, ReplExit::Command).await;
 
         let events = session_journal::read_journal(&sid).unwrap();
         let has_session_end = events

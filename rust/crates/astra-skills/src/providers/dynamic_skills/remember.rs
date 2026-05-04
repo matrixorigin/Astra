@@ -10,7 +10,7 @@ allowed_tools:
   - memoria-memory_profile
   - memoria-memory_purge
   - memoria-memory_correct
-  - memoria-memory_search
+  - memoria-memory_retrieve
   - memoria-memory_store
   - memoria-memory_governance
 triggers:
@@ -43,7 +43,7 @@ You help the user review, organize, and maintain persistent memories stored via 
 Use the Memoria MCP tools to gather the current state:
 - `memoria-memory_list` — list active memories (most recent first)
 - `memoria-memory_profile` — check usage patterns and profile summary
-- `memoria-memory_search` with broad query — find memories that might be stale or contradictory
+- `memoria-memory_retrieve` with broad query — find memories that might be stale or contradictory
 
 If Memoria tools are not available, tell the user and stop.
 

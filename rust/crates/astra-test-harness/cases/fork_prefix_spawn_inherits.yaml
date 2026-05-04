@@ -20,6 +20,10 @@ criteria:
     code: 0
   - type: tool_called
     name: spawn_agent
+  - type: text_contains
+    needle: "delegate-G2-ok"
+    # Direct structural check (mirrors judger question). Both check the same
+    # thing — either pass confirms the child's reply surfaced in output.
   - type: tools_count_between
     min: 1
     max: 6

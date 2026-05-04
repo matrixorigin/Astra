@@ -1,0 +1,23 @@
+name: harness_budget_enforcement
+description: |
+  **What**: Verify the harness BudgetVerifier enforces turn limits.
+  **Tests**: Enforcement pipeline: verifier checks → Fatal → Block → session halts.
+  **Why**: Core harness value — if budget doesn't stop runaway loops, it's observation-only.
+  **Pass means**: Session terminated before consuming excessive rounds.
+  **Fail means**: BudgetVerifier not wired, or Block verdict not handled.
+prompt: |
+  List the files in the current directory using bash, then read the first
+  file you find, then list again, then read again. Keep going — read as
+  many files as you can find.
+timeout_seconds: 120
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: bash
+  - type: turn_rounds_between
+    min: 1
+    max: 30
+  - type: tokens_between
+    min: 1
+    max: 500000

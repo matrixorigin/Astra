@@ -1132,6 +1132,14 @@ pub(super) struct BackgroundPlanContext {
     pub task_manager: Arc<crate::edge_tools::TaskManager>,
     pub evolution_service: Option<Arc<astra_runtime::evolution::service::EvolutionService>>,
 
+    // ─── Harness (test observability) ────────────────────────────────────
+    /// Shared harness snapshot sink for /inspect command.
+    #[cfg(feature = "harness")]
+    pub harness_sink: Option<std::sync::Arc<astra_harness::InMemorySnapshotSink>>,
+    /// Shared harness trace for /inspect trace command.
+    #[cfg(feature = "harness")]
+    pub harness_trace: Option<std::sync::Arc<std::sync::RwLock<astra_harness::SessionTrace>>>,
+
     // ─── Cloud + Learning Integration ────────────────────────────────────
     pub ingestion_user_id: Option<String>,
     pub matrix_runtime: Option<Arc<astra_runtime::MatrixCloudRuntime>>,
@@ -1748,6 +1756,8 @@ async fn plan_executor_task(
                     selector: &*selector,
                     recent_tools: &ctx.recent_tools,
                     tool_health_entries: &ctx.tool_health_entries,
+                    session_lessons: &[],
+                    latest_skill_diagnosis: None,
                     unified_skill_registry: &ctx.unified_skill_registry,
                     plan_only_chat: false,
                     is_plan_subtask: true,
@@ -1779,6 +1789,11 @@ async fn plan_executor_task(
                     turn_index: ctx.turn,
                     evolution_service: ctx.evolution_service.clone(),
                     pre_loaded_messages: None,
+                    append_system_prompt: None,
+                    #[cfg(feature = "harness")]
+                    harness_sink: ctx.harness_sink.clone(),
+                    #[cfg(feature = "harness")]
+                    harness_trace: ctx.harness_trace.clone(),
                 })
                 .await;
 
@@ -2348,6 +2363,10 @@ mod tests {
             )),
             task_manager: Arc::new(crate::edge_tools::TaskManager::new()),
             evolution_service: None,
+            #[cfg(feature = "harness")]
+            harness_sink: None,
+            #[cfg(feature = "harness")]
+            harness_trace: None,
             ingestion_user_id: None,
             matrix_runtime: None,
             entity_graph,

@@ -9,6 +9,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "aes"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -144,10 +155,12 @@ dependencies = [
  "astra-config",
  "astra-core",
  "astra-evolution",
+ "astra-harness",
  "astra-learning",
  "astra-logging",
  "astra-messaging",
  "astra-pipeline",
+ "astra-prompts",
  "astra-runtime",
  "astra-services",
  "astra-skills",
@@ -231,6 +244,7 @@ dependencies = [
 name = "astra-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum 0.8.9",
  "chrono",
  "dotenvy",
@@ -248,6 +262,7 @@ name = "astra-edge"
 version = "0.1.0"
 dependencies = [
  "astra-logging",
+ "astra-server-types",
  "astra-tools",
  "clap",
  "futures-util",
@@ -274,6 +289,47 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "astra-gateway"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "astra-core",
+ "astra-thin-client",
+ "async-trait",
+ "base64",
+ "chrono",
+ "clap",
+ "dashmap",
+ "dotenvy",
+ "ecb",
+ "futures-util",
+ "hex",
+ "rand 0.9.4",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "tracing-subscriber",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
+name = "astra-harness"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
  "tracing",
 ]
 
@@ -375,6 +431,7 @@ dependencies = [
  "astra-config",
  "astra-core",
  "astra-evolution",
+ "astra-harness",
  "astra-learning",
  "astra-logging",
  "astra-messaging",
@@ -588,6 +645,7 @@ name = "astra-tools"
 version = "0.1.0"
 dependencies = [
  "astra-core",
+ "astra-prompts",
  "astra-sandbox",
  "async-trait",
  "base64",
@@ -891,6 +949,15 @@ name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
+name = "block-padding"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8894febbff9f758034a5b8e12d87918f56dfc64a8e1fe757d65e29041538d93"
 dependencies = [
  "generic-array",
 ]
@@ -1594,6 +1661,15 @@ name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
+
+[[package]]
+name = "ecb"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a8bfa975b1aec2145850fcaa1c6fe269a16578c44705a532ae3edc92b8881c7"
+dependencies = [
+ "cipher",
+]
 
 [[package]]
 name = "either"
@@ -3387,6 +3463,7 @@ version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
+ "block-padding",
  "generic-array",
 ]
 

@@ -1,10 +1,9 @@
 //! Regression tests for session behavior issues found in session 292f7100.
 //!
-//! Four issues fixed:
+//! Issues addressed:
 //! 1. "我关注X" → LLM explored codebase instead of calling memory_store
-//!    Fix: system prompt now has HIGHEST PRIORITY memory section with explicit examples
-//! 2. Tracking intents not detected by detect_store_signal
-//!    Fix: "tracking" category added; 关注/follow/watch patterns fire BEFORE preference check
+//!    Fix: system prompt memory rules + LLM-driven store decisions
+//! 2. Tracking intent detection (detect_tracking_intent)
 //! 3. GitHub tools bleeding into memory-only queries via recency boost
 //!    Fix: GENERAL content-gated recency — recency amplifies textual relevance, never creates it.
 //!    Zero per-intent special cases. Gate = content_relevance / RECENCY_CONTENT_GATE.
@@ -12,7 +11,7 @@
 //!    Fix: system prompt now instructs proactive store + "DO NOT ask, just store"
 
 use astra_runtime::{
-    prompts::memory_lifecycle::{detect_store_signal, detect_tracking_intent, suggest_namespace},
+    prompts::memory_lifecycle::{detect_tracking_intent, suggest_namespace},
     tool_registry::{
         IntentType, TOOL_CATALOG, scoring::pre_filter_dynamic, state::ConversationState,
     },
@@ -51,53 +50,14 @@ fn tool_names(results: &[(usize, f64)]) -> Vec<&'static str> {
 mod tracking_intent_detection {
     use super::*;
 
-    /// The original session failure: "我关注matrixorigin" must be detected as tracking.
-    #[test]
-    fn guanzhu_is_tracking() {
-        assert_eq!(detect_store_signal("我关注matrixorigin"), Some("tracking"));
-    }
-
-    #[test]
-    fn follow_is_tracking() {
-        assert_eq!(
-            detect_store_signal("I follow this project"),
-            Some("tracking")
-        );
-    }
-
-    #[test]
-    fn watch_is_tracking() {
-        assert_eq!(detect_store_signal("I watch this repo"), Some("tracking"));
-    }
-
-    #[test]
-    fn interested_in_is_tracking() {
-        assert_eq!(
-            detect_store_signal("interested in matrixone"),
-            Some("tracking")
-        );
-    }
-
-    #[test]
-    fn genzong_is_tracking() {
-        assert_eq!(detect_store_signal("我跟踪这个项目"), Some("tracking"));
-    }
-
-    #[test]
-    fn tracking_beats_preference() {
-        // If message has both tracking AND preference signal, tracking wins
-        assert_eq!(
-            detect_store_signal("我关注matrixorigin，我喜欢这个项目"),
-            Some("tracking")
-        );
-    }
+    // detect_store_signal tests removed — keyword matching replaced by
+    // LLM-driven memory decisions via system prompt rules.
 
     #[test]
     fn tracking_namespace_is_interest_active() {
         assert_eq!(suggest_namespace("tracking"), "@interest/active");
     }
 
-    /// detect_tracking_intent works on raw user messages too
     #[test]
     fn detect_tracking_intent_raw_messages() {
         assert!(detect_tracking_intent("我关注matrixorigin"));
@@ -105,14 +65,6 @@ mod tracking_intent_detection {
         assert!(detect_tracking_intent("keep an eye on memoria"));
         assert!(!detect_tracking_intent("show me the diff"));
         assert!(!detect_tracking_intent("帮我修复这个bug"));
-    }
-
-    /// Normal queries are NOT tracking intents
-    #[test]
-    fn code_queries_not_tracking() {
-        assert_eq!(detect_store_signal("帮我修复这个bug"), None);
-        assert_eq!(detect_store_signal("show me the git diff"), None);
-        assert_eq!(detect_store_signal("what's the CI status"), None);
     }
 }
 
@@ -278,7 +230,7 @@ mod system_prompt_memory_rules {
 
     #[test]
     fn memory_section_present_when_memory_tools_selected() {
-        let tools = &["bash", "memory_store", "memory_search"];
+        let tools = &["bash", "memory_store", "memory_retrieve"];
         let prompt = build_main_system_prompt(tools, "", 1.0, None);
         assert!(
             prompt.contains("Memory Rules"),
@@ -291,18 +243,26 @@ mod system_prompt_memory_rules {
     }
 
     #[test]
-    fn prompt_contains_guanzhu_example() {
-        let tools = &["bash", "memory_store", "memory_search"];
+    fn prompt_contains_type_taxonomy() {
+        let tools = &["bash", "memory_store", "memory_retrieve"];
         let prompt = build_main_system_prompt(tools, "", 1.0, None);
         assert!(
-            prompt.contains("关注"),
-            "Prompt should include 关注 as a trigger example"
+            prompt.contains("<types>"),
+            "Prompt should include structured type taxonomy"
+        );
+        assert!(
+            prompt.contains("<name>user</name>"),
+            "Prompt should include user type"
+        );
+        assert!(
+            prompt.contains("<name>feedback</name>"),
+            "Prompt should include feedback type"
         );
     }
 
     #[test]
     fn prompt_contains_do_not_ask_instruction() {
-        let tools = &["bash", "memory_store", "memory_search"];
+        let tools = &["bash", "memory_store", "memory_retrieve"];
         let prompt = build_main_system_prompt(tools, "", 1.0, None);
         assert!(
             prompt.contains("Do NOT ask"),
@@ -312,7 +272,7 @@ mod system_prompt_memory_rules {
 
     #[test]
     fn prompt_contains_no_exploration_instruction() {
-        let tools = &["bash", "memory_store", "memory_search"];
+        let tools = &["bash", "memory_store", "memory_retrieve"];
         let prompt = build_main_system_prompt(tools, "", 1.0, None);
         assert!(
             prompt.contains("Do NOT explore"),
@@ -331,12 +291,30 @@ mod system_prompt_memory_rules {
     }
 
     #[test]
-    fn immediate_store_examples_present() {
-        let tools = &["bash", "memory_store", "memory_search"];
+    fn prompt_contains_what_not_to_save() {
+        let tools = &["bash", "memory_store", "memory_retrieve"];
         let prompt = build_main_system_prompt(tools, "", 1.0, None);
         assert!(
-            prompt.contains("IMMEDIATELY"),
-            "Prompt should say store IMMEDIATELY"
+            prompt.contains("What NOT to save"),
+            "Prompt should include What NOT to save section"
+        );
+        assert!(
+            prompt.contains("derivable from the codebase"),
+            "What NOT to save should exclude derivable content"
+        );
+    }
+
+    #[test]
+    fn prompt_contains_examples_with_real_scenarios() {
+        let tools = &["bash", "memory_store", "memory_retrieve"];
+        let prompt = build_main_system_prompt(tools, "", 1.0, None);
+        assert!(
+            prompt.contains("data scientist"),
+            "Prompt should include concrete user type example"
+        );
+        assert!(
+            prompt.contains("merge freeze"),
+            "Prompt should include concrete project type example"
         );
     }
 }

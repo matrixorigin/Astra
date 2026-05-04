@@ -29,6 +29,8 @@ mod delegation_handlers;
 mod edge_callback_handlers;
 mod edge_status_handler;
 mod edge_ws_handler;
+pub mod harness_handlers;
+pub mod harness_server_sink;
 pub(crate) mod header_utils;
 mod http_helpers;
 mod learning_handlers;
@@ -62,8 +64,19 @@ pub use request_trace::RequestTrace;
 pub use state_builder::build_server_state;
 
 pub fn build_app(state: AppState) -> Router {
+    let allow_origin = match state.cors_origins.as_deref() {
+        Some(origins) if !origins.is_empty() && origins != "*" => {
+            let parsed: Vec<HeaderValue> = origins
+                .split(',')
+                .filter_map(|o| o.trim().parse().ok())
+                .collect();
+            AllowOrigin::list(parsed)
+        }
+        _ => AllowOrigin::any(),
+    };
+
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::any())
+        .allow_origin(allow_origin)
         .allow_methods([
             Method::GET,
             Method::POST,

@@ -37,11 +37,7 @@ const ADMIN_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "model update",
-        "Update model fields  (e.g. model update <name> --quirks '{\"fallback_model\":\"gpt-4o-mini\"}')",
-    ),
-    (
-        "model set-fallback",
-        "Set fallback model  (e.g. model set-fallback <model> <fallback>)",
+        "Update model fields  (e.g. model update <name> --quirks '{\"fallback_chain\":[\"gpt-4o-mini\"]}')",
     ),
     (
         "user grant-role",
@@ -300,27 +296,6 @@ pub(crate) async fn run_interactive(api: &ThinClient, profile: Option<&str>) -> 
             let (_, _, _, token) = get_profile_and_token(profile)?;
             let body = api
                 .post_bearer_path_empty_text(&token, &paths::model_check(model_name.trim()))
-                .await
-                .map_err(map_thin_err)?;
-            print_json_or_raw(&body);
-            Ok(())
-        } else if let Some(rest) = line.strip_prefix("model set-fallback ") {
-            let mut parts = rest.split_whitespace();
-            let model_name = parts.next().ok_or_else(|| {
-                "usage: model set-fallback <model_name> <fallback_model|none>".to_string()
-            })?;
-            let fallback = parts.next().ok_or_else(|| {
-                "usage: model set-fallback <model_name> <fallback_model|none>".to_string()
-            })?;
-            let (_, _, _, token) = get_profile_and_token(profile)?;
-            let fallback_val = if fallback.eq_ignore_ascii_case("none") {
-                serde_json::json!(null)
-            } else {
-                serde_json::json!(fallback)
-            };
-            let payload = serde_json::json!({ "quirks": { "fallback_model": fallback_val } });
-            let body = api
-                .put_bearer_path_json_text(&token, &paths::model(model_name), &payload)
                 .await
                 .map_err(map_thin_err)?;
             print_json_or_raw(&body);

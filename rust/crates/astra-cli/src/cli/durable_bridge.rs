@@ -28,7 +28,7 @@ fn build_client_for_url(_url: &str) -> reqwest::Client {
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("durable-task bridge HTTP client config must be valid")
 }
 
 // ─── Active contract state held by the REPL ──────────────────────────────────
@@ -263,7 +263,7 @@ pub async fn on_subtask_complete(
                 subtask_id,
                 e,
             );
-            (true, None) // Don't block on verification infrastructure failures
+            (false, None)
         }
     }
 }
@@ -435,7 +435,7 @@ pub async fn on_plan_complete(durable: &mut DurableTaskState) -> bool {
         }
         Err(e) => {
             eprintln!("  {}  Global verification error: {}", theme::icon_warn(), e,);
-            true // Don't block plan on verification infra failure
+            false
         }
     }
 }

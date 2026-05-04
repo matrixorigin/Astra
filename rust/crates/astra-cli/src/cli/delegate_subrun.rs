@@ -460,6 +460,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             bridge_turn_chain_id: None,
             bridge_user_query_event_id: None,
             turn_event_buffer: None,
+            harness: astra_runtime::turn::harness_adapter::HarnessSlot::empty(),
         };
 
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;

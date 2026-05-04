@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinSet;
 
-use astra_core::{MatrixOneSettings, SharedPool, resolve_database_name};
+use astra_core::{MatrixOneSettings, SharedPool};
 use astra_services::{
     CloudTransport, SyncOrchestrator, SyncPolicy, TaskLeaseHoldCache, TaskRecord,
     event_ingestion::{self, IngestionConfig, IngestionEvent},
@@ -46,17 +46,7 @@ pub trait BridgePersistTracker: Send + Sync {
 /// Requires `MATRIXONE_PASSWORD` to be set — fails closed rather than
 /// substituting a hardcoded development password.
 pub fn matrix_settings_from_env() -> Result<MatrixOneSettings, String> {
-    Ok(MatrixOneSettings {
-        host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".into()),
-        port: std::env::var("MATRIXONE_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6001),
-        user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
-        password: std::env::var("MATRIXONE_PASSWORD")
-            .map_err(|_| "MATRIXONE_PASSWORD environment variable is required".to_string())?,
-        database: resolve_database_name(&|k| std::env::var(k).ok()),
-    })
+    MatrixOneSettings::from_env_strict()
 }
 
 /// Pool + ingestion + unified sync orchestrator. Safe to share behind `Arc`.
@@ -89,6 +79,7 @@ pub struct MatrixCloudRuntime {
     sync_service: Arc<MatrixOneSyncService>,
     audit_flusher_shutdown: tokio_util::sync::CancellationToken,
     audit_flusher_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    encryptor: Option<Arc<astra_services::FernetTokenEncryptor>>,
 }
 
 impl MatrixCloudRuntime {
@@ -175,7 +166,32 @@ impl MatrixCloudRuntime {
             sync_service: sync_svc,
             audit_flusher_shutdown: audit_flusher.shutdown,
             audit_flusher_handle: Mutex::new(Some(audit_flusher.join_handle)),
+            encryptor: None,
         }
+    }
+
+    /// Attach a token encryptor for decrypting model API keys from the DB.
+    /// Call this after `attach()` when the encryptor is available.
+    pub fn with_encryptor(mut self, enc: Arc<astra_services::FernetTokenEncryptor>) -> Self {
+        self.encryptor = Some(enc);
+        self
+    }
+
+    /// Resolve the cheapest selector-tagged model from the registry.
+    /// Returns `None` if no encryptor is configured or resolution fails.
+    pub async fn resolve_selector_model(&self) -> Option<crate::memory_relevance::LlmConnParams> {
+        let enc = self.encryptor.as_ref()?;
+        let settings = self.shared_pool.settings();
+        let pool = self.shared_pool.get();
+        let resolved = astra_services::models::resolve_memory_model(settings, enc, Some(pool))
+            .await
+            .ok()?;
+        Some(crate::memory_relevance::LlmConnParams {
+            base_url: resolved.base_url,
+            api_key: resolved.api_key,
+            model_name: resolved.model_name,
+            provider: resolved.provider,
+        })
     }
 
     pub fn preference_store(&self) -> Arc<Mutex<BTreeMap<String, String>>> {
@@ -572,6 +588,41 @@ mod tests {
         assert!(
             !source.contains("TODO(audit-#3)"),
             "audit-#3 TODO must be resolved — persist tasks should be tracked now"
+        );
+    }
+
+    #[test]
+    fn with_encryptor_stores_encryptor() {
+        let source = include_str!("matrix_cloud_runtime.rs");
+        assert!(
+            source.contains("encryptor: Option<Arc<astra_services::FernetTokenEncryptor>>"),
+            "MatrixCloudRuntime must store optional encryptor for model resolution"
+        );
+        assert!(
+            source.contains("fn with_encryptor"),
+            "MatrixCloudRuntime must expose with_encryptor builder method"
+        );
+        assert!(
+            source.contains("fn resolve_selector_model"),
+            "MatrixCloudRuntime must expose resolve_selector_model for memory relevance"
+        );
+    }
+
+    #[test]
+    fn resolve_selector_model_requires_encryptor() {
+        let source = include_str!("matrix_cloud_runtime.rs");
+        assert!(
+            source.contains("let enc = self.encryptor.as_ref()?;"),
+            "resolve_selector_model must early-return None when encryptor is missing"
+        );
+    }
+
+    #[test]
+    fn resolve_selector_model_returns_llm_conn_params() {
+        let source = include_str!("matrix_cloud_runtime.rs");
+        assert!(
+            source.contains("crate::memory_relevance::LlmConnParams"),
+            "resolve_selector_model must return LlmConnParams from memory_relevance module"
         );
     }
 }

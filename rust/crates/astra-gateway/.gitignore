@@ -1,0 +1,6 @@
+# Runtime config (contains credentials)
+gateway.yaml
+.env
+
+# Rust build artifacts
+target/

@@ -1,10 +1,12 @@
 name: hello_text_contains
 description: |
   **What**: Send a trivial prompt and verify the response contains a specific word.
-  **Tests**: Basic model responsiveness and instruction following.
+  **Tests**: Basic model responsiveness, instruction following, efficiency bounds, and
+  criteria plumbing (text_contains, tokens_between, duration_between, turn_rounds_between, judger).
   **Why**: Smoke test — if this fails, nothing else will work (auth, routing, model access).
-  **Pass means**: The model is reachable and can follow simple instructions.
-  **Fail means**: Infrastructure issue (auth expired, model unavailable) — not a model capability problem.
+  Also serves as the harness criteria self-test (all criterion types exercised on one case).
+  **Pass means**: The model is reachable, follows instructions, and all criteria types evaluate correctly.
+  **Fail means**: Infrastructure issue (auth expired, model unavailable) or harness criteria bug.
 prompt: |
   Please reply with a single short sentence that contains the word
   "astra-harness-ok" verbatim. Do not use any tools.
@@ -17,6 +19,9 @@ criteria:
   - type: tokens_between
     min: 1
     max: 15000
+  - type: duration_between
+    min_ms: 0
+    max_ms: 30000
   - type: turn_rounds_between
     min: 1
     max: 3

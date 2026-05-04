@@ -1,0 +1,18 @@
+{
+  "background_agent_results": [],
+  "completion_tokens": 16,
+  "context_ms": 113,
+  "error_kind": null,
+  "exit_code": 0,
+  "prompt_tokens": 23240,
+  "request_id": "fixture-request-hello",
+  "run_id": "899341e3-64ac-44cc-b0aa-f2daed5acd70",
+  "selector_strategy": "tfidf_routed (conf=0.65)",
+  "session_id": "906a591d-8797-419f-a3ac-613d5401fa3d",
+  "success": true,
+  "text": "\nhello",
+  "trace_id": "fixture-trace-hello",
+  "tool_calls_count": 0,
+  "tools_used": [],
+  "ttft_ms": 4771
+}

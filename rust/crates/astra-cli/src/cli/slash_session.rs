@@ -2012,6 +2012,31 @@ pub(super) async fn handle_session_command(
                                     evt.turn.unwrap_or(0),
                                 );
                             }
+                            session_journal::JournalEventType::MemoryExtraction => {
+                                let outcome = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("outcome"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let saved = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("memories_saved"))
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                eprintln!(
+                                    "  {} 🧠 T{} memory extraction: {} ({})",
+                                    ts_short.dim(),
+                                    evt.turn.unwrap_or(0),
+                                    outcome,
+                                    if saved > 0 {
+                                        format!("{saved} saved")
+                                    } else {
+                                        "none".to_string()
+                                    },
+                                );
+                            }
                         }
                     }
                     // Summary stats

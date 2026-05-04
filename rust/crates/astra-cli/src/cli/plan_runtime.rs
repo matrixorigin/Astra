@@ -99,6 +99,10 @@ fn take_plan_context(
         session_state_journal: state.session_state_journal.clone(),
         task_manager: state.task_manager.clone(),
         evolution_service: state.evolution_service.clone(),
+        #[cfg(feature = "harness")]
+        harness_sink: Some(state.harness_sink.clone()),
+        #[cfg(feature = "harness")]
+        harness_trace: Some(state.harness_trace.clone()),
         ingestion_user_id: state.ingestion_user_id.clone(),
         matrix_runtime: state.matrix_runtime.clone(),
         entity_graph: state.entity_graph.clone(),

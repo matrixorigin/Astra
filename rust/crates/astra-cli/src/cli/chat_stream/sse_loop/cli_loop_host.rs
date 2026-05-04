@@ -79,6 +79,8 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub repl_turn_index: u32,
     /// Cross-turn tool output cache for edge-path dedup.
     pub tool_cache: crate::stream_render::EdgeToolCache,
+    /// Extra context appended to the system prompt via edge_profile.system_prompt_override.
+    pub append_system_prompt: Option<String>,
     /// Optional fork-prefix store: when set + fork flag enabled,
     /// this host calls `capture_parent_prefix` in its
     /// `on_turn_completed` hook, feeding the store that the
@@ -270,6 +272,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             turn_chain_id: state.bridge_turn_chain_id.as_deref(),
             user_query_event_id: state.bridge_user_query_event_id.as_deref(),
             observability_hub: state.telemetry.observability_hub.as_ref(),
+            append_system_prompt: self.append_system_prompt.as_deref(),
         })
         .await;
 

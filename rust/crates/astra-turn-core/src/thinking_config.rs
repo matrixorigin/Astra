@@ -138,6 +138,21 @@ impl ThinkingConfig {
         }
     }
 
+    /// Apply thinking suppression to an OpenAI-compatible request body.
+    ///
+    /// For direct HTTP callers (memory extraction, relevance filtering) that
+    /// bypass the full LLM pipeline in `build_provider_request_body`.
+    /// Checks both `provider` string and `base_url` to detect DashScope,
+    /// since many configs use `provider: "openai"` with a DashScope base_url.
+    pub fn apply_openai_suppression(&self, body: &mut Value, provider: &str, base_url: &str) {
+        if !self.is_off() {
+            return;
+        }
+        if needs_dashscope_thinking_flag(provider, base_url) {
+            body["enable_thinking"] = json!(false);
+        }
+    }
+
     /// Serialize to JSON for inclusion in the chat payload sent to the server.
     pub fn to_payload_value(&self) -> Value {
         serde_json::to_value(self).unwrap_or(json!("off"))
@@ -443,37 +458,33 @@ pub struct ThinkingOption {
     pub is_default: bool,
 }
 
-/// Returns thinking options for a model based on its declared `thinking_mode` and provider.
+/// Returns thinking options for a model based on its probed `thinking_capability`.
 ///
-/// - `thinking_mode = Some("controllable")`: provider-appropriate picker.
-///   - `bedrock` / `anthropic` → adaptive (Low / High).
-///   - `dashscope` / `aliyun` / `alibaba` → budget (on/off).
-///   - other providers → adaptive reasoning (`reasoning_effort`).
-/// - `thinking_mode = Some("native")` → empty (model thinks by default, no picker).
-/// - `thinking_mode = None` → empty (no thinking support).
+/// - `"both"` → Normal / Thinking picker (provider-appropriate format).
+/// - `"effort_only"` → Thinking (Low) / Thinking (High) (no Normal — can't turn off).
+/// - `"native_only"` → no picker (always thinks, no control).
+/// - `"none"` → no picker (doesn't think).
+/// - `None` (unprobed) → no picker (safe default until probed).
 pub fn thinking_options_with_capability(
     _model_name: &str,
     provider: Option<&str>,
-    thinking_mode: Option<&str>,
+    thinking_capability: Option<&str>,
 ) -> Vec<ThinkingOption> {
-    match thinking_mode {
-        Some("controllable") => {
+    match thinking_capability {
+        Some("both") => {
             if provider_uses_budget_thinking(provider) {
                 thinking_options_for_budget_thinking()
             } else {
                 thinking_options_for_adaptive_reasoning()
             }
         }
-        // Known no-picker modes.
-        None | Some("native") => vec![],
-        // Unknown value — warn so operators notice typos in YAML/DB
-        // (e.g. "Controllable", "enabled") rather than silently disabling
-        // the picker.
+        Some("effort_only") => thinking_options_for_effort_only(),
+        None | Some("none") | Some("native_only") => vec![],
         Some(other) => {
             tracing::warn!(
-                thinking_mode = %other,
+                thinking_capability = %other,
                 provider = ?provider,
-                "unknown thinking_mode value; expected one of \"controllable\", \"native\", or null — picker disabled",
+                "unknown thinking_capability value — no picker",
             );
             vec![]
         }
@@ -487,6 +498,25 @@ fn thinking_options_for_adaptive_reasoning() -> Vec<ThinkingOption> {
             config: ThinkingConfig::Off,
             is_default: false,
         },
+        ThinkingOption {
+            label: "Thinking (Low)",
+            config: ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Low,
+            },
+            is_default: false,
+        },
+        ThinkingOption {
+            label: "Thinking (High)",
+            config: ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High,
+            },
+            is_default: true,
+        },
+    ]
+}
+
+fn thinking_options_for_effort_only() -> Vec<ThinkingOption> {
+    vec![
         ThinkingOption {
             label: "Thinking (Low)",
             config: ThinkingConfig::Adaptive {
@@ -522,12 +552,49 @@ fn thinking_options_for_budget_thinking() -> Vec<ThinkingOption> {
 }
 
 fn provider_uses_budget_thinking(provider: Option<&str>) -> bool {
-    provider
-        .map(|p| {
-            let p = p.to_ascii_lowercase();
-            p.contains("dashscope") || p.contains("aliyun") || p.contains("alibaba")
-        })
-        .unwrap_or(false)
+    provider.map(provider_may_think_natively).unwrap_or(false)
+}
+
+/// Returns `true` if the provider string alone identifies a DashScope endpoint.
+pub fn provider_may_think_natively(provider: &str) -> bool {
+    let p = provider.to_ascii_lowercase();
+    p.contains("dashscope") || p.contains("aliyun") || p.contains("alibaba")
+}
+
+/// Returns `true` if the endpoint needs `enable_thinking` flag.
+/// Checks both provider string and base_url since many configs use
+/// `provider: "openai"` with a DashScope base_url.
+pub fn needs_dashscope_thinking_flag(provider: &str, base_url: &str) -> bool {
+    if provider_may_think_natively(provider) {
+        return true;
+    }
+    let u = base_url.to_ascii_lowercase();
+    u.contains("dashscope") || u.contains("aliyun")
+}
+
+/// Strip `<think>...</think>` XML tags from model output, returning only
+/// the non-reasoning content.
+///
+/// Safety net for native-thinking models (DeepSeek, Qwen3) that may ignore
+/// API-level thinking suppression and still emit reasoning blocks.
+pub fn strip_think_tags(text: &str) -> String {
+    if !text.contains("<think>") {
+        return text.to_string();
+    }
+    let mut cleaned = String::with_capacity(text.len());
+    let mut pos = 0;
+    while let Some(start) = text[pos..].find("<think>") {
+        let abs_start = pos + start;
+        cleaned.push_str(&text[pos..abs_start]);
+        if let Some(end) = text[abs_start..].find("</think>") {
+            pos = abs_start + end + "</think>".len();
+        } else {
+            // Unclosed <think> — discard the rest as reasoning
+            pos = text.len();
+        }
+    }
+    cleaned.push_str(&text[pos..]);
+    cleaned
 }
 
 #[cfg(test)]
@@ -702,9 +769,8 @@ mod tests {
     // ─── Model inference ────────────────────────────────────────────────
 
     #[test]
-    fn controllable_dashscope_returns_budget() {
-        let opts =
-            thinking_options_with_capability("qwen-plus", Some("dashscope"), Some("controllable"));
+    fn both_dashscope_returns_budget() {
+        let opts = thinking_options_with_capability("qwen-plus", Some("dashscope"), Some("both"));
         assert_eq!(opts.len(), 2);
         assert_eq!(opts[0].label, "Normal");
         assert_eq!(opts[1].label, "Thinking");
@@ -717,27 +783,50 @@ mod tests {
     }
 
     #[test]
-    fn native_mode_returns_empty() {
-        let opts = thinking_options_with_capability("glm-5.1", Some("openai"), Some("native"));
+    fn effort_only_returns_effort_picker_no_normal() {
+        let opts = thinking_options_with_capability(
+            "deepseek-v4-flash",
+            Some("openai"),
+            Some("effort_only"),
+        );
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0].label, "Thinking (Low)");
+        assert_eq!(opts[1].label, "Thinking (High)");
+        assert!(opts[1].is_default);
+    }
+
+    #[test]
+    fn native_only_returns_empty() {
+        let opts =
+            thinking_options_with_capability("MiniMax-M2.5", Some("openai"), Some("native_only"));
         assert!(opts.is_empty());
     }
 
     #[test]
-    fn none_mode_returns_empty() {
+    fn none_capability_returns_empty() {
         let opts = thinking_options_with_capability(
             "us.anthropic.claude-sonnet-4-6",
             Some("bedrock"),
-            None,
+            Some("none"),
         );
         assert!(opts.is_empty());
     }
 
     #[test]
-    fn controllable_bedrock_returns_adaptive() {
+    fn null_capability_returns_empty() {
+        let opts = thinking_options_with_capability("qwen-plus", Some("openai"), None);
+        assert!(
+            opts.is_empty(),
+            "unprobed model with no YAML hint should not show picker"
+        );
+    }
+
+    #[test]
+    fn both_bedrock_returns_adaptive() {
         let opts = thinking_options_with_capability(
             "us.anthropic.claude-sonnet-4-6",
             Some("bedrock"),
-            Some("controllable"),
+            Some("both"),
         );
         assert_eq!(opts.len(), 3);
         assert_eq!(opts[0].label, "Normal");
@@ -747,19 +836,16 @@ mod tests {
     }
 
     #[test]
-    fn controllable_anthropic_returns_adaptive() {
-        let opts = thinking_options_with_capability(
-            "claude-sonnet-4",
-            Some("anthropic"),
-            Some("controllable"),
-        );
+    fn both_anthropic_returns_adaptive() {
+        let opts =
+            thinking_options_with_capability("claude-sonnet-4", Some("anthropic"), Some("both"));
         assert_eq!(opts.len(), 3);
         assert_eq!(opts[2].label, "Thinking (High)");
     }
 
     #[test]
-    fn controllable_openai_returns_adaptive() {
-        let opts = thinking_options_with_capability("gpt-5", Some("openai"), Some("controllable"));
+    fn both_openai_returns_adaptive() {
+        let opts = thinking_options_with_capability("gpt-5", Some("openai"), Some("both"));
         assert_eq!(opts.len(), 3);
         assert_eq!(opts[2].label, "Thinking (High)");
     }
@@ -1076,5 +1162,122 @@ mod tests {
             ThinkingEffort::Max.capped_at(ThinkingEffort::Medium),
             ThinkingEffort::Medium
         );
+    }
+
+    // ─── apply_openai_suppression ──────────────────────────────────────
+
+    #[test]
+    fn suppression_dashscope_provider_sets_flag() {
+        let mut body = json!({"model": "qwen3.5-flash", "messages": []});
+        ThinkingConfig::Off.apply_openai_suppression(&mut body, "dashscope", "");
+        assert_eq!(body["enable_thinking"], false);
+    }
+
+    #[test]
+    fn suppression_dashscope_base_url_sets_flag() {
+        let mut body = json!({"model": "qwen-plus", "messages": []});
+        ThinkingConfig::Off.apply_openai_suppression(
+            &mut body,
+            "openai",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        );
+        assert_eq!(
+            body["enable_thinking"], false,
+            "provider=openai + dashscope base_url should trigger suppression"
+        );
+    }
+
+    #[test]
+    fn suppression_generic_provider_off_is_noop() {
+        let mut body = json!({"model": "gpt-4o", "messages": []});
+        ThinkingConfig::Off.apply_openai_suppression(
+            &mut body,
+            "openai",
+            "https://api.openai.com/v1",
+        );
+        assert!(body.get("enable_thinking").is_none());
+    }
+
+    #[test]
+    fn suppression_enabled_thinking_is_noop() {
+        let mut body = json!({"model": "qwen3.5-flash", "messages": []});
+        ThinkingConfig::Enabled {
+            budget_tokens: 8000,
+        }
+        .apply_openai_suppression(&mut body, "dashscope", "");
+        assert!(body.get("enable_thinking").is_none());
+    }
+
+    // ─── strip_think_tags ──────────────────────────────────────────────
+
+    #[test]
+    fn strip_think_tags_removes_blocks() {
+        let input = "before\n<think>\nreasoning here\n</think>\nafter";
+        assert_eq!(strip_think_tags(input), "before\n\nafter");
+    }
+
+    #[test]
+    fn strip_think_tags_no_tags_passthrough() {
+        let input = "just normal text";
+        assert_eq!(strip_think_tags(input), "just normal text");
+    }
+
+    #[test]
+    fn strip_think_tags_unclosed_discards_rest() {
+        let input = "prefix<think>reasoning without end";
+        assert_eq!(strip_think_tags(input), "prefix");
+    }
+
+    #[test]
+    fn strip_think_tags_multiple_blocks() {
+        let input = "a<think>x</think>b<think>y</think>c";
+        assert_eq!(strip_think_tags(input), "abc");
+    }
+
+    // ─── provider_may_think_natively ───────────────────────────────────
+
+    #[test]
+    fn dashscope_provider_may_think() {
+        assert!(provider_may_think_natively("dashscope"));
+        assert!(provider_may_think_natively("aliyun"));
+        assert!(provider_may_think_natively("alibaba-cloud"));
+    }
+
+    #[test]
+    fn generic_provider_does_not_think() {
+        assert!(!provider_may_think_natively("openai"));
+        assert!(!provider_may_think_natively("bedrock"));
+        assert!(!provider_may_think_natively("deepseek"));
+    }
+
+    // ─── needs_dashscope_thinking_flag ─────────────────────────────────
+
+    #[test]
+    fn dashscope_detected_by_provider() {
+        assert!(needs_dashscope_thinking_flag("dashscope", ""));
+    }
+
+    #[test]
+    fn dashscope_detected_by_base_url() {
+        assert!(needs_dashscope_thinking_flag(
+            "openai",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        ));
+    }
+
+    #[test]
+    fn not_dashscope_for_generic_openai() {
+        assert!(!needs_dashscope_thinking_flag(
+            "openai",
+            "https://api.openai.com/v1"
+        ));
+    }
+
+    #[test]
+    fn not_dashscope_for_deepseek() {
+        assert!(!needs_dashscope_thinking_flag(
+            "openai",
+            "https://api.deepseek.com"
+        ));
     }
 }

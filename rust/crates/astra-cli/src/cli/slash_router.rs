@@ -36,21 +36,8 @@ fn model_list_entry_name(entry: &serde_json::Value) -> Option<&str> {
         .and_then(|v| v.as_str())
 }
 
-fn model_list_entry_thinking_mode(entry: &serde_json::Value) -> Option<&str> {
-    // Flattened `thinking_mode` is the canonical shape emitted by the current
-    // /models response. The `quirks.thinking_mode` branch is a transitional
-    // fallback for older server builds still nesting the value inside quirks.
-    // TODO: remove the nested-quirks fallback once all deployments are past
-    // the flattened-response rollout.
-    entry
-        .get("thinking_mode")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            entry
-                .get("quirks")
-                .and_then(|q| q.get("thinking_mode"))
-                .and_then(|v| v.as_str())
-        })
+fn model_list_entry_thinking_capability(entry: &serde_json::Value) -> Option<&str> {
+    entry.get("thinking_capability").and_then(|v| v.as_str())
 }
 
 fn model_list_entry_provider(entry: &serde_json::Value) -> Option<&str> {
@@ -179,12 +166,13 @@ pub(super) async fn handle_slash_command(
                             );
                         }
                     }
-                    let thinking_mode = selected_model.and_then(model_list_entry_thinking_mode);
+                    let thinking_cap =
+                        selected_model.and_then(model_list_entry_thinking_capability);
                     let provider = selected_model.and_then(model_list_entry_provider);
                     let opts = astra_turn_core::thinking_config::thinking_options_with_capability(
                         &chosen,
                         provider,
-                        thinking_mode,
+                        thinking_cap,
                     );
                     let model_with_suffix = if opts.is_empty() {
                         chosen.clone()
@@ -344,6 +332,10 @@ pub(super) async fn handle_slash_command(
         },
 
         "/debug" => handle_debug_command(arg, state),
+
+        "/inspect" => {
+            slash_inspect::handle_inspect_command(arg, state);
+        }
 
         "/style" => {
             slash_style::handle_style_command(arg);
@@ -645,33 +637,29 @@ mod model_list_json_tests {
     }
 
     #[test]
-    fn reads_flattened_thinking_mode_from_model_list() {
-        let v = serde_json::json!({"name": "claude", "thinking_mode": "controllable"});
-        assert_eq!(model_list_entry_thinking_mode(&v), Some("controllable"));
+    fn reads_thinking_capability_both() {
+        let v = serde_json::json!({"name": "claude", "thinking_capability": "both"});
+        assert_eq!(model_list_entry_thinking_capability(&v), Some("both"));
     }
 
     #[test]
-    fn reads_nested_quirks_thinking_mode() {
-        let v = serde_json::json!({
-            "name": "glm",
-            "quirks": { "thinking_mode": "native" }
-        });
-        assert_eq!(model_list_entry_thinking_mode(&v), Some("native"));
+    fn reads_thinking_capability_native_only() {
+        let v = serde_json::json!({"name": "glm", "thinking_capability": "native_only"});
+        assert_eq!(
+            model_list_entry_thinking_capability(&v),
+            Some("native_only")
+        );
     }
 
     #[test]
-    fn flattened_thinking_mode_wins_over_nested_quirks() {
-        let v = serde_json::json!({
-            "name": "claude",
-            "thinking_mode": "controllable",
-            "quirks": { "thinking_mode": "native" }
-        });
-        assert_eq!(model_list_entry_thinking_mode(&v), Some("controllable"));
-    }
-
-    #[test]
-    fn missing_thinking_mode_returns_none() {
+    fn missing_thinking_capability_returns_none() {
         let v = serde_json::json!({"name": "minimax"});
-        assert_eq!(model_list_entry_thinking_mode(&v), None);
+        assert_eq!(model_list_entry_thinking_capability(&v), None);
+    }
+
+    #[test]
+    fn null_thinking_capability_returns_none() {
+        let v = serde_json::json!({"name": "x", "thinking_capability": null});
+        assert_eq!(model_list_entry_thinking_capability(&v), None);
     }
 }

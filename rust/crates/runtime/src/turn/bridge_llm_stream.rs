@@ -18,8 +18,9 @@ use uuid::Uuid;
 
 use crate::turn::bridge_sse_helpers::render_sse;
 use crate::turn::llm_client::{
-    LlmCancel, apply_provider_auth, build_provider_request_body, consolidate_system_messages,
-    llm_request_url_for_provider, provider_uses_bedrock_converse, sleep_ms_or_llm_cancel,
+    LLM_MAX_RETRIES, LlmCancel, apply_provider_auth, build_provider_request_body,
+    consolidate_system_messages, llm_request_url_for_provider, llm_retry_base_ms,
+    provider_uses_bedrock_converse, sleep_ms_or_llm_cancel,
 };
 use astra_turn_core::bridge_rate_limit_cooldown::{
     PerModelCooldown, RateLimitAction, is_overload_status, is_rate_limit_status,
@@ -29,17 +30,8 @@ use astra_turn_core::edge_ledger::ensure_tool_call_ids;
 use futures_util::StreamExt;
 use std::sync::OnceLock;
 
-/// Maximum retries for transient LLM errors (429, 5xx, network).
-const LLM_MAX_RETRIES: u32 = 3;
-/// Base delay between retries (doubles each attempt: 1s, 2s, 4s).
-const LLM_RETRY_BASE_MS: u64 = 1000;
-
 #[cfg(test)]
 thread_local! {
-    /// Test override for the between-retry backoff. Flat value in ms; when
-    /// `Some`, replaces the exponential `LLM_RETRY_BASE_MS * 2^(attempt-1)`.
-    /// See `set_test_retry_backoff_ms` in llm_client.rs for the matching
-    /// pattern used elsewhere in the runtime.
     static TEST_BRIDGE_RETRY_BACKOFF_MS: std::cell::RefCell<Option<u64>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -49,14 +41,7 @@ fn bridge_retry_backoff_ms(attempt: u32) -> u64 {
     if let Some(ms) = TEST_BRIDGE_RETRY_BACKOFF_MS.with(|c| *c.borrow()) {
         return ms;
     }
-    static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let base = *BASE.get_or_init(|| {
-        std::env::var("ASTRA_LLM_RETRY_BASE_MS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(LLM_RETRY_BASE_MS)
-    });
-    base * (1 << (attempt - 1))
+    llm_retry_base_ms() * (1 << (attempt - 1))
 }
 
 /// Returns `true` if `name` looks like a valid tool function name.

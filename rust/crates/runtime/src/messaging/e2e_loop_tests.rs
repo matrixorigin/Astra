@@ -226,6 +226,7 @@ mod tests {
             bridge_turn_chain_id: None,
             bridge_user_query_event_id: None,
             turn_event_buffer: None,
+            harness: crate::turn::harness_adapter::HarnessSlot::empty(),
         }
     }
 

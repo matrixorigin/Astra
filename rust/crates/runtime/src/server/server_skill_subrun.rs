@@ -74,6 +74,11 @@ pub struct ServerSkillSubRunExecutor {
     /// same chat turn. Plumbed only under `bridge-e2e-hooks` (test observability).
     #[cfg(feature = "bridge-e2e-hooks")]
     dedup_state: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
+    /// Parent session's harness snapshot sink for observe-only sub-run
+    /// observation. When set, the sub-run creates a sink-only HarnessSlot
+    /// so sub-run snapshots appear in the parent's history.
+    #[cfg(feature = "harness")]
+    harness_sink: Option<std::sync::Arc<dyn astra_harness::SnapshotSink>>,
 }
 
 impl ServerSkillSubRunExecutor {
@@ -98,6 +103,8 @@ impl ServerSkillSubRunExecutor {
             edge_connection_pool: None,
             #[cfg(feature = "bridge-e2e-hooks")]
             dedup_state: None,
+            #[cfg(feature = "harness")]
+            harness_sink: None,
         }
     }
 
@@ -169,6 +176,16 @@ impl ServerSkillSubRunExecutor {
         pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
     ) -> Self {
         self.edge_connection_pool = Some(pool);
+        self
+    }
+
+    /// Set the parent session's harness sink for observe-only sub-run monitoring.
+    #[cfg(feature = "harness")]
+    pub fn with_harness_sink(
+        mut self,
+        sink: Option<std::sync::Arc<dyn astra_harness::SnapshotSink>>,
+    ) -> Self {
+        self.harness_sink = sink;
         self
     }
 }
@@ -427,12 +444,27 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             bridge_turn_chain_id: None,
             bridge_user_query_event_id: None,
             turn_event_buffer: None,
+            harness: {
+                #[cfg(feature = "harness")]
+                {
+                    match self.harness_sink {
+                        Some(ref sink) => {
+                            crate::turn::harness_adapter::HarnessSlot::observe_only(sink.clone())
+                        }
+                        None => crate::turn::harness_adapter::HarnessSlot::empty(),
+                    }
+                }
+                #[cfg(not(feature = "harness"))]
+                {
+                    crate::turn::harness_adapter::HarnessSlot::empty()
+                }
+            },
         };
 
         // ── Wire ServerToolExecutor for skill sub-run tool execution ────
         {
             let workspace = self.provision_skill_workspace(skill_name, &subrun_session_id);
-            let memoria_base = std::env::var("MEMORIA_BASE_URL").ok();
+            let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let mut executor = super::server_tool_executor::ServerToolExecutor::new(
                 workspace,
                 String::new(), // skill sub-runs don't track user_id
@@ -473,13 +505,7 @@ mod tests {
     use super::*;
 
     fn mock_matrixone() -> MatrixOneSettings {
-        MatrixOneSettings {
-            host: "127.0.0.1".to_string(),
-            port: 6001,
-            user: "test".to_string(),
-            password: "test".to_string(),
-            database: "test".to_string(),
-        }
+        MatrixOneSettings::mock()
     }
 
     fn mock_encryptor() -> Arc<FernetTokenEncryptor> {

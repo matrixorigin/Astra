@@ -39,9 +39,18 @@ pub struct SessionOverview {
 }
 
 /// A root-cause diagnosis: what actually went wrong, from error content analysis.
+///
+/// `category` uses the canonical [`astra_core::ErrorKind`] taxonomy. Before
+/// P0.1 we kept a parallel `ErrorClass` enum here; that duplication caused
+/// ambiguity for any consumer that also looked at upstream `ErrorKind`
+/// tags. Single source of truth now lives in `astra_core`.
+///
+/// **Wire format change**: `category` serializes as `snake_case`
+/// (`"resource_limit"`) instead of the old `PascalCase` (`"ResourceLimit"`).
+/// This is intentional — all enum tags in the codebase use snake_case.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Diagnosis {
-    pub category: ErrorClass,
+    pub category: astra_core::ErrorKind,
     pub severity: String,
     pub summary: String,
     /// Actual error content snippets (evidence)
@@ -49,36 +58,6 @@ pub struct Diagnosis {
     pub occurrences: i64,
     pub affected_tool: String,
     pub fix_hint: String,
-}
-
-/// Classified error category for root-cause analysis.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum ErrorClass {
-    ResourceLimit,
-    Auth,
-    Network,
-    FileNotFound,
-    ToolMisuse,
-    Timeout,
-    DatabaseError,
-    Stall,
-    Unknown,
-}
-
-impl std::fmt::Display for ErrorClass {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ResourceLimit => write!(f, "resource_limit"),
-            Self::Auth => write!(f, "auth"),
-            Self::Network => write!(f, "network"),
-            Self::FileNotFound => write!(f, "file_not_found"),
-            Self::ToolMisuse => write!(f, "tool_misuse"),
-            Self::Timeout => write!(f, "timeout"),
-            Self::DatabaseError => write!(f, "database"),
-            Self::Stall => write!(f, "stall"),
-            Self::Unknown => write!(f, "unknown"),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -390,71 +369,37 @@ pub trait ReflectService: Send + Sync {
 
 // ── Error classification (pure logic, no DB) ─────────────────────────────────
 
-/// Classify an error — considers both content text and event_type.
-pub fn classify_error(content: &str, event_type: &str) -> ErrorClass {
-    // Event-type based classification (high priority)
+/// Sole entry point for turning a `(content, event_type)` pair into an
+/// [`astra_core::ErrorKind`]. `event_type == "stall_detected"` short-circuits
+/// to [`ErrorKind::Stall`]; everything else delegates to
+/// [`astra_core::classify_tool_output`].
+pub fn classify_error(content: &str, event_type: &str) -> astra_core::ErrorKind {
     if event_type == "stall_detected" {
-        return ErrorClass::Stall;
+        return astra_core::ErrorKind::Stall;
     }
-
-    classify_error_content(content)
-}
-
-/// Classify an error string into a root-cause category (content only).
-///
-/// Delegates to [`astra_core::classify_tool_output`] for the core classification,
-/// then maps to the report-level [`ErrorClass`].
-pub fn classify_error_content(content: &str) -> ErrorClass {
-    let lower = content.to_lowercase();
-
-    // Database errors — domain-specific, not in ErrorKind
-    if lower.contains("sql syntax error")
-        || lower.contains("error returned from database")
-        || lower.contains("sqlx")
-        || lower.contains("deadlock")
-    {
-        return ErrorClass::DatabaseError;
-    }
-
-    // Delegate to the canonical classifier
-    match astra_core::classify_tool_output(content) {
-        astra_core::ErrorKind::ResourceLimit => ErrorClass::ResourceLimit,
-        astra_core::ErrorKind::Auth => ErrorClass::Auth,
-        astra_core::ErrorKind::Network
-        | astra_core::ErrorKind::RateLimit
-        | astra_core::ErrorKind::ServerError
-        | astra_core::ErrorKind::StreamIdle
-        | astra_core::ErrorKind::StreamTransport => ErrorClass::Network,
-        astra_core::ErrorKind::ToolTimeout => ErrorClass::Timeout,
-        astra_core::ErrorKind::ToolNotFound => ErrorClass::FileNotFound,
-        astra_core::ErrorKind::ToolInvalidArgs | astra_core::ErrorKind::InvalidRequest => {
-            ErrorClass::ToolMisuse
-        }
-        _ => ErrorClass::Unknown,
-    }
+    astra_core::classify_tool_output(content)
 }
 
 /// Build diagnoses from raw error records by classifying and grouping.
 pub fn build_diagnoses(raw_errors: &[RawError]) -> Vec<Diagnosis> {
+    use astra_core::ErrorKind;
     use std::collections::HashMap;
 
-    // Group by (ErrorClass, affected_tool)
-    let mut groups: HashMap<(ErrorClass, String), Vec<&RawError>> = HashMap::new();
+    let mut groups: HashMap<(ErrorKind, String), Vec<&RawError>> = HashMap::new();
     for err in raw_errors {
-        let class = classify_error(&err.content, &err.event_type);
+        let kind = classify_error(&err.content, &err.event_type);
         let tool = if err.skill_name.is_empty() || err.skill_name == "unknown" {
             "system".to_string()
         } else {
             err.skill_name.clone()
         };
-        groups.entry((class, tool)).or_default().push(err);
+        groups.entry((kind, tool)).or_default().push(err);
     }
 
     let mut diagnoses: Vec<Diagnosis> = groups
         .into_iter()
-        .map(|((class, tool), errors)| {
+        .map(|((kind, tool), errors)| {
             let count = errors.len() as i64;
-            // Take up to 3 unique sample snippets (truncated)
             let mut seen = std::collections::HashSet::new();
             let samples: Vec<String> = errors
                 .iter()
@@ -469,71 +414,18 @@ pub fn build_diagnoses(raw_errors: &[RawError]) -> Vec<Diagnosis> {
                 .take(3)
                 .collect();
 
-            let severity = match (&class, count) {
-                (ErrorClass::ResourceLimit, _) => "critical",
-                (ErrorClass::Stall, n) if n >= 3 => "warning",
-                (ErrorClass::Stall, _) => "info",
-                (_, n) if n >= 5 => "critical",
-                (_, n) if n >= 3 => "warning",
-                _ => "info",
-            }
-            .to_string();
-
-            let summary = match &class {
-                ErrorClass::ResourceLimit => format!(
-                    "System resource exhaustion ({tool}): OS cannot fork/allocate — {count} occurrences"
-                ),
-                ErrorClass::Auth => format!(
-                    "Authentication failure ({tool}): credentials invalid or expired — {count} occurrences"
-                ),
-                ErrorClass::Network => format!(
-                    "Network connectivity issue ({tool}): connection failures — {count} occurrences"
-                ),
-                ErrorClass::Timeout => format!(
-                    "Timeout ({tool}): operation exceeded time limit — {count} occurrences"
-                ),
-                ErrorClass::FileNotFound => format!(
-                    "Missing files/paths ({tool}): agent tried nonexistent paths — {count} occurrences"
-                ),
-                ErrorClass::ToolMisuse => format!(
-                    "Tool parameter errors ({tool}): wrong arguments passed — {count} occurrences"
-                ),
-                ErrorClass::DatabaseError => format!(
-                    "Database error ({tool}): SQL or connection failure — {count} occurrences"
-                ),
-                ErrorClass::Stall => format!(
-                    "Agent stall detected — {count} stall events, agent may be looping or stuck"
-                ),
-                ErrorClass::Unknown => format!(
-                    "Unclassified errors ({tool}): {count} occurrences"
-                ),
-            };
-
-            let fix_hint = match &class {
-                ErrorClass::ResourceLimit => "Check system limits: `ulimit -u` (max procs), `ulimit -n` (open files). Kill orphan processes: `ps aux | grep defunct`. May need to restart the system or increase limits.".to_string(),
-                ErrorClass::Auth => "Re-authenticate with `/login`. Check token expiry. Verify API credentials in environment variables.".to_string(),
-                ErrorClass::Network => "Check network connectivity and proxy settings. Verify `NO_PROXY=localhost,127.0.0.1` for local services. Check if target service is running.".to_string(),
-                ErrorClass::Timeout => format!("Tool `{tool}` is slow. Consider breaking the operation into smaller chunks or increasing the timeout."),
-                ErrorClass::FileNotFound => "Agent guessed wrong paths. Use `list_dir` before `read_file`/`grep`. Check that the workspace context is accurate.".to_string(),
-                ErrorClass::ToolMisuse => "Model is calling tools with wrong parameters. This may improve with a better model or clearer system prompt.".to_string(),
-                ErrorClass::DatabaseError => "Check MatrixOne connectivity and SQL syntax. Use CAST for DATETIME columns, MIN/MAX for non-grouped columns.".to_string(),
-                ErrorClass::Stall => "Agent is stuck in a loop. Try `/rewind` to go back, or switch to a different model with `/model`. Break complex tasks into smaller steps.".to_string(),
-                ErrorClass::Unknown => "Review the error samples above to identify the pattern.".to_string(),
-            };
-
             Diagnosis {
-                category: class,
-                severity,
-                summary,
+                category: kind,
+                severity: severity_for(kind, count).to_string(),
+                summary: summary_for(kind, &tool, count),
                 samples,
                 occurrences: count,
                 affected_tool: tool,
-                fix_hint,
+                fix_hint: kind.diagnosis_hint().to_string(),
             }
         })
         .collect();
 
-    // Sort: critical first, then by occurrence count
     diagnoses.sort_by(|a, b| {
         let sev_ord = |s: &str| match s {
             "critical" => 0,
@@ -546,6 +438,65 @@ pub fn build_diagnoses(raw_errors: &[RawError]) -> Vec<Diagnosis> {
     });
 
     diagnoses
+}
+
+fn severity_for(kind: astra_core::ErrorKind, count: i64) -> &'static str {
+    use astra_core::ErrorKind as K;
+    match (kind, count) {
+        // Always critical — system-level or data-integrity
+        (K::ResourceLimit | K::DatabaseError, _) => "critical",
+        // Stall ramps with repetition
+        (K::Stall, n) if n >= 3 => "warning",
+        (K::Stall, _) => "info",
+        // Generic count-based escalation
+        (_, n) if n >= 5 => "critical",
+        (_, n) if n >= 3 => "warning",
+        _ => "info",
+    }
+}
+
+fn summary_for(kind: astra_core::ErrorKind, tool: &str, count: i64) -> String {
+    use astra_core::ErrorKind as K;
+    match kind {
+        K::ResourceLimit => format!(
+            "System resource exhaustion ({tool}): OS cannot fork/allocate — {count} occurrences"
+        ),
+        K::Auth => format!(
+            "Authentication failure ({tool}): credentials invalid or expired — {count} occurrences"
+        ),
+        K::Network | K::RateLimit | K::ServerError | K::StreamIdle | K::StreamTransport => {
+            format!(
+                "Network/provider issue ({tool}): connection or upstream failure — {count} occurrences"
+            )
+        }
+        K::ToolTimeout => {
+            format!("Timeout ({tool}): operation exceeded time limit — {count} occurrences")
+        }
+        K::ToolNotFound => format!(
+            "Missing files/paths ({tool}): agent tried nonexistent paths — {count} occurrences"
+        ),
+        K::ToolInvalidArgs | K::InvalidRequest => {
+            format!("Tool parameter errors ({tool}): wrong arguments passed — {count} occurrences")
+        }
+        K::ToolUnavailable => {
+            format!("Tool not available in this environment ({tool}) — {count} occurrences")
+        }
+        K::ContextWindow => format!(
+            "Prompt exceeded context window ({tool}): compact history or switch model — {count} occurrences"
+        ),
+        K::BudgetExhausted => {
+            format!("Turn/session budget exhausted ({tool}): {count} occurrences")
+        }
+        K::ToolRoundsExhausted => format!("Tool-round cap hit ({tool}): {count} occurrences"),
+        K::DatabaseError => {
+            format!("Database error ({tool}): SQL or pool failure — {count} occurrences")
+        }
+        K::Stall => {
+            format!("Agent stall detected — {count} stall events, agent may be looping or stuck")
+        }
+        K::Cancelled => format!("Cancelled operations ({tool}): {count} occurrences"),
+        K::Unknown => format!("Unclassified errors ({tool}): {count} occurrences"),
+    }
 }
 
 // ── Statistical insights (secondary) ─────────────────────────────────────────
@@ -1460,7 +1411,7 @@ mod tests {
             focus: "auto".into(),
             overview: make_overview(10, 1, vec![("bash".into(), 8)], 2, Some(5.0)),
             diagnoses: vec![Diagnosis {
-                category: ErrorClass::ResourceLimit,
+                category: astra_core::ErrorKind::ResourceLimit,
                 severity: "critical".into(),
                 summary: "fork failed".into(),
                 samples: vec!["fork: Resource temporarily unavailable".into()],
@@ -1547,7 +1498,7 @@ mod tests {
     fn reflect_shape_helpers_build_local_compatible_fields() {
         let overview = make_overview(10, 2, vec![("bash".into(), 8)], 3, Some(5.0));
         let diagnoses = vec![Diagnosis {
-            category: ErrorClass::Timeout,
+            category: astra_core::ErrorKind::ToolTimeout,
             severity: "warning".into(),
             summary: "bash timed out".into(),
             samples: vec!["command timed out".into()],
@@ -1575,7 +1526,7 @@ mod tests {
 
         assert_eq!(context["session_id"], "test-sess");
         assert_eq!(context["tool_stats"][0]["tool_name"], "bash");
-        assert_eq!(context["signals"][0]["kind"], "timeout");
+        assert_eq!(context["signals"][0]["kind"], "tool_timeout");
         assert!(prompt.contains("Focus: performance"));
         assert!(prompt.contains("Question: why so slow?"));
     }
@@ -1682,101 +1633,75 @@ mod tests {
     }
 
     // ── Error classification tests ──────────────────────────────────────
+    //
+    // `classify_error` is the single entry point for `(content, event_type)`
+    // pairs. It returns `astra_core::ErrorKind`. Exhaustive per-variant
+    // coverage lives in astra-core's error_kind tests; here we only verify
+    // the service-level behaviour (stall short-circuit, DB detection, and
+    // delegation to core).
 
     #[test]
-    fn classify_resource_limit_fork() {
-        assert_eq!(
-            classify_error_content("fork: Resource temporarily unavailable"),
-            ErrorClass::ResourceLimit
-        );
-    }
-
-    #[test]
-    fn classify_resource_limit_oom() {
-        assert_eq!(
-            classify_error_content("Cannot allocate memory (ENOMEM)"),
-            ErrorClass::ResourceLimit
-        );
-    }
-
-    #[test]
-    fn classify_resource_limit_files() {
-        assert_eq!(
-            classify_error_content("too many open files"),
-            ErrorClass::ResourceLimit
-        );
-    }
-
-    #[test]
-    fn classify_auth() {
-        assert_eq!(
-            classify_error_content("HTTP 403: Unauthorized access"),
-            ErrorClass::Auth
-        );
-        assert_eq!(
-            classify_error_content("token expired, please re-authenticate"),
-            ErrorClass::Auth
-        );
-    }
-
-    #[test]
-    fn classify_network() {
-        assert_eq!(
-            classify_error_content("error sending request for url (http://127.0.0.1:8000)"),
-            ErrorClass::Network
-        );
-        assert_eq!(
-            classify_error_content("connection refused"),
-            ErrorClass::Network
-        );
-    }
-
-    #[test]
-    fn classify_file_not_found() {
-        assert_eq!(
-            classify_error_content("No such file or directory (os error 2)"),
-            ErrorClass::FileNotFound
-        );
-        assert_eq!(
-            classify_error_content("Path does not exist: /foo/bar"),
-            ErrorClass::FileNotFound
-        );
-    }
-
-    #[test]
-    fn classify_tool_misuse() {
-        assert_eq!(
-            classify_error_content("Missing 'path' parameter"),
-            ErrorClass::ToolMisuse
-        );
-        assert_eq!(
-            classify_error_content("old_str not found in the file"),
-            ErrorClass::ToolMisuse
-        );
-    }
-
-    #[test]
-    fn classify_database() {
-        assert_eq!(
-            classify_error_content("SQL syntax error: column must appear in GROUP BY"),
-            ErrorClass::DatabaseError
-        );
-    }
-
-    #[test]
-    fn classify_timeout() {
-        assert_eq!(
-            classify_error_content("operation deadline exceeded"),
-            ErrorClass::Timeout
-        );
-    }
-
-    #[test]
-    fn classify_unknown() {
-        assert_eq!(
-            classify_error_content("something completely unexpected happened"),
-            ErrorClass::Unknown
-        );
+    fn classify_error_cases() {
+        use astra_core::ErrorKind as K;
+        let cases: &[(&str, &str, K)] = &[
+            (
+                "fork: Resource temporarily unavailable",
+                "tool_error",
+                K::ResourceLimit,
+            ),
+            (
+                "Cannot allocate memory (ENOMEM)",
+                "tool_error",
+                K::ResourceLimit,
+            ),
+            ("HTTP 403: Unauthorized access", "tool_error", K::Auth),
+            (
+                "token expired, please re-authenticate",
+                "tool_error",
+                K::Auth,
+            ),
+            ("connection refused", "tool_error", K::Network),
+            (
+                "error sending request for url (x)",
+                "tool_error",
+                K::Network,
+            ),
+            (
+                "No such file or directory (os error 2)",
+                "tool_error",
+                K::ToolNotFound,
+            ),
+            (
+                "Path does not exist: /foo/bar",
+                "tool_error",
+                K::ToolNotFound,
+            ),
+            ("Missing 'path' parameter", "tool_error", K::ToolInvalidArgs),
+            (
+                "old_str not found in the file",
+                "tool_error",
+                K::ToolInvalidArgs,
+            ),
+            (
+                "SQL syntax error: column must appear in GROUP BY",
+                "tool_error",
+                K::DatabaseError,
+            ),
+            (
+                "sqlx: connection pool timed out",
+                "tool_error",
+                K::DatabaseError,
+            ),
+            ("operation deadline exceeded", "tool_error", K::ToolTimeout),
+            ("something completely unexpected", "tool_error", K::Unknown),
+        ];
+        for &(content, event_type, expected) in cases {
+            assert_eq!(
+                classify_error(content, event_type),
+                expected,
+                "classify_error({content:?}, {event_type:?})"
+            );
+        }
     }
 
     // ── Diagnosis builder tests ─────────────────────────────────────────
@@ -1803,12 +1728,20 @@ mod tests {
         let diags = build_diagnoses(&errors);
         // Two groups: ResourceLimit/bash, FileNotFound/grep
         assert_eq!(diags.len(), 2);
-        assert!(diags.iter().any(|d| d.category == ErrorClass::ResourceLimit
-            && d.affected_tool == "bash"
-            && d.occurrences == 2));
-        assert!(diags.iter().any(|d| d.category == ErrorClass::FileNotFound
-            && d.affected_tool == "grep"
-            && d.occurrences == 1));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.category == astra_core::ErrorKind::ResourceLimit
+                    && d.affected_tool == "bash"
+                    && d.occurrences == 2)
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.category == astra_core::ErrorKind::ToolNotFound
+                    && d.affected_tool == "grep"
+                    && d.occurrences == 1)
+        );
     }
 
     #[test]
@@ -1868,14 +1801,14 @@ mod tests {
             },
         ];
         let diags = build_diagnoses(&errors);
-        assert_eq!(diags[0].category, ErrorClass::ResourceLimit);
+        assert_eq!(diags[0].category, astra_core::ErrorKind::ResourceLimit);
     }
 
     #[test]
     fn recommendations_from_diagnoses() {
         let overview = make_overview(50, 3, vec![], 5, None);
         let diags = vec![Diagnosis {
-            category: ErrorClass::ResourceLimit,
+            category: astra_core::ErrorKind::ResourceLimit,
             severity: "critical".into(),
             summary: "fork failed".into(),
             samples: vec![],
@@ -1900,7 +1833,7 @@ mod tests {
         ];
         let diags = build_diagnoses(&errors);
         assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].category, ErrorClass::ResourceLimit);
+        assert_eq!(diags[0].category, astra_core::ErrorKind::ResourceLimit);
         // Fix hint explains it's a process fork issue, not a general system issue
         assert!(diags[0].fix_hint.contains("ulimit") || diags[0].fix_hint.contains("procs"));
     }
@@ -1909,12 +1842,12 @@ mod tests {
     fn classify_stall_by_event_type() {
         assert_eq!(
             classify_error("some content", "stall_detected"),
-            ErrorClass::Stall
+            astra_core::ErrorKind::Stall
         );
         // Even if content looks like network error, event_type takes priority
         assert_eq!(
             classify_error("connection refused", "stall_detected"),
-            ErrorClass::Stall
+            astra_core::ErrorKind::Stall
         );
     }
 
@@ -1939,7 +1872,7 @@ mod tests {
         ];
         let diags = build_diagnoses(&errors);
         assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].category, ErrorClass::Stall);
+        assert_eq!(diags[0].category, astra_core::ErrorKind::Stall);
         assert_eq!(diags[0].occurrences, 3);
         assert_eq!(diags[0].severity, "warning"); // 3 stalls = warning
         assert!(diags[0].fix_hint.contains("rewind") || diags[0].fix_hint.contains("/rewind"));
@@ -1962,7 +1895,57 @@ mod tests {
         let diags = build_diagnoses(&errors);
         assert_eq!(diags.len(), 2);
         // ResourceLimit is critical → sorted first
-        assert_eq!(diags[0].category, ErrorClass::ResourceLimit);
-        assert_eq!(diags[1].category, ErrorClass::Stall);
+        assert_eq!(diags[0].category, astra_core::ErrorKind::ResourceLimit);
+        assert_eq!(diags[1].category, astra_core::ErrorKind::Stall);
+    }
+
+    // ── P0.1 contract: taxonomy is a single ErrorKind source ─────────────
+
+    #[test]
+    fn diagnosis_fix_hint_comes_from_error_kind() {
+        // The fix_hint on every diagnosis must match the canonical
+        // `ErrorKind::diagnosis_hint()` output. This is the contract that
+        // makes the taxonomy the single source of truth for operator advice.
+        let errors = vec![
+            RawError {
+                skill_name: "bash".into(),
+                event_type: "tool_error".into(),
+                content: "fork: Resource temporarily unavailable".into(),
+            },
+            RawError {
+                skill_name: "matrixone".into(),
+                event_type: "tool_error".into(),
+                content: "SQL syntax error: column must appear in GROUP BY".into(),
+            },
+            RawError {
+                skill_name: "system".into(),
+                event_type: "stall_detected".into(),
+                content: "Agent looping".into(),
+            },
+        ];
+        let diags = build_diagnoses(&errors);
+        for d in &diags {
+            assert_eq!(
+                d.fix_hint,
+                d.category.diagnosis_hint(),
+                "fix_hint diverged from ErrorKind::diagnosis_hint for {:?}",
+                d.category
+            );
+        }
+    }
+
+    #[test]
+    fn database_errors_always_critical_regardless_of_count() {
+        // DatabaseError signals data-integrity risk; a single occurrence
+        // must still be critical (not info). Same rule as ResourceLimit.
+        let errors = vec![RawError {
+            skill_name: "matrixone".into(),
+            event_type: "tool_error".into(),
+            content: "SQL syntax error: column must appear in GROUP BY".into(),
+        }];
+        let diags = build_diagnoses(&errors);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].category, astra_core::ErrorKind::DatabaseError);
+        assert_eq!(diags[0].severity, "critical");
     }
 }
