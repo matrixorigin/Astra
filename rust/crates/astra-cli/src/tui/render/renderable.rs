@@ -45,7 +45,9 @@ impl<'a> Renderable for RenderableItem<'a> {
 
 impl Renderable for () {
     fn render(&self, _: Rect, _: &mut Buffer) {}
-    fn desired_height(&self, _: u16) -> u16 { 0 }
+    fn desired_height(&self, _: u16) -> u16 {
+        0
+    }
 }
 
 impl Renderable for Paragraph<'_> {
@@ -61,14 +63,18 @@ impl Renderable for Line<'_> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         ratatui::widgets::WidgetRef::render_ref(self, area, buf);
     }
-    fn desired_height(&self, _: u16) -> u16 { 1 }
+    fn desired_height(&self, _: u16) -> u16 {
+        1
+    }
 }
 
 impl Renderable for Span<'_> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         Line::from(self.clone()).render(area, buf);
     }
-    fn desired_height(&self, _: u16) -> u16 { 1 }
+    fn desired_height(&self, _: u16) -> u16 {
+        1
+    }
 }
 
 // ── FlexRenderable (from Codex) ─────────────────────────────────────────────
@@ -190,6 +196,9 @@ pub(crate) trait RenderableExt<'a> {
 
 impl<'a> RenderableExt<'a> for RenderableItem<'a> {
     fn inset(self, insets: Insets) -> RenderableItem<'a> {
-        RenderableItem::Owned(Box::new(InsetRenderable { child: self, insets }))
+        RenderableItem::Owned(Box::new(InsetRenderable {
+            child: self,
+            insets,
+        }))
     }
 }

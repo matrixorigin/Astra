@@ -1285,7 +1285,8 @@ fn format_project_instructions_wraps_in_tags() {
 fn build_effective_line_includes_project_instructions() {
     let mut state = ReplState::default();
     state.project_instructions = Some("Always use Rust.".to_string());
-    let result = repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+    let result =
+        repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
     assert!(
         result.contains("<project_instructions>"),
         "should wrap in tags"
@@ -1300,7 +1301,8 @@ fn build_effective_line_includes_project_instructions() {
 #[test]
 fn build_effective_line_no_instructions_when_none() {
     let state = ReplState::default();
-    let result = repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+    let result =
+        repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
     assert!(
         !result.contains("<project_instructions>"),
         "should not inject when None"

@@ -32,10 +32,7 @@ impl SkillPopup {
 
     pub fn set_filter(&mut self, text: &str) {
         let first_line = text.lines().next().unwrap_or("");
-        self.filter = first_line
-            .strip_prefix('$')
-            .unwrap_or("")
-            .to_lowercase();
+        self.filter = first_line.strip_prefix('$').unwrap_or("").to_lowercase();
         if self.selected >= self.filtered().len().max(1) {
             self.selected = 0;
         }
@@ -58,7 +55,11 @@ impl SkillPopup {
     pub fn move_up(&mut self) {
         let len = self.filtered().len();
         if len > 0 {
-            self.selected = if self.selected == 0 { len - 1 } else { self.selected - 1 };
+            self.selected = if self.selected == 0 {
+                len - 1
+            } else {
+                self.selected - 1
+            };
         }
     }
 
@@ -79,7 +80,9 @@ impl SkillPopup {
 
     pub fn height(&self) -> u16 {
         let n = self.filtered().len();
-        if n == 0 { return 0; }
+        if n == 0 {
+            return 0;
+        }
         let items_h = n.min(MAX_VISIBLE) as u16;
         items_h + 2 // items + blank + hint
     }
@@ -104,8 +107,15 @@ impl SkillPopup {
         let visible_end = (visible_start + MAX_VISIBLE).min(filtered.len());
 
         let mut y = area.y;
-        for (i, item) in filtered.iter().enumerate().skip(visible_start).take(visible_end - visible_start) {
-            if y >= area.bottom() { break; }
+        for (i, item) in filtered
+            .iter()
+            .enumerate()
+            .skip(visible_start)
+            .take(visible_end - visible_start)
+        {
+            if y >= area.bottom() {
+                break;
+            }
             let is_sel = i == self.selected;
 
             let tag = format!("[{}]", item.source);
@@ -116,7 +126,9 @@ impl SkillPopup {
             let desc: String = item.description.chars().take(desc_budget).collect();
 
             let line = if is_sel {
-                let sel = Style::default().fg(Color::Cyan).add_modifier(ratatui::style::Modifier::BOLD);
+                let sel = Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(ratatui::style::Modifier::BOLD);
                 Line::from(vec![
                     Span::styled("  ", sel),
                     Span::styled(padded_name, sel),
@@ -136,12 +148,11 @@ impl SkillPopup {
         }
 
         // Blank + hint
-        if y < area.bottom() { y += 1; }
         if y < area.bottom() {
-            let hint = Line::from(Span::styled(
-                "  Press enter to insert or esc to close",
-                dim,
-            ));
+            y += 1;
+        }
+        if y < area.bottom() {
+            let hint = Line::from(Span::styled("  Press enter to insert or esc to close", dim));
             Widget::render(hint, Rect::new(area.x, y, area.width, 1), buf);
         }
     }

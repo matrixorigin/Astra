@@ -82,7 +82,11 @@ impl ChatViewport {
     }
 
     pub fn scroll_page_down(&mut self, viewport_height: u16) {
-        self.scroll_down(viewport_height.saturating_sub(2), self.last_width, viewport_height);
+        self.scroll_down(
+            viewport_height.saturating_sub(2),
+            self.last_width,
+            viewport_height,
+        );
     }
 
     pub fn jump_to_top(&mut self) {

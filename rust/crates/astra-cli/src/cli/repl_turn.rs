@@ -360,7 +360,10 @@ pub(super) async fn handle_chat_input_with_ui(
                     ui.show_warning("  Token expired, attempting refresh…");
                     if repl_runtime::attempt_token_refresh(ctx.api, ctx.profile).await {
                         if let Some(new_token) = repl_runtime::current_access_token(ctx.profile) {
-                            ui.show_info(&format!("  {} Token refreshed, retrying…", crate::theme::icon_ok()));
+                            ui.show_info(&format!(
+                                "  {} Token refreshed, retrying…",
+                                crate::theme::icon_ok()
+                            ));
                             match run_chat_turn(
                                 state,
                                 &ctx,
@@ -433,7 +436,11 @@ fn apply_resume_context(
     effective_line
 }
 
-pub(super) fn build_effective_line(line: &str, state: &ReplState, ui: &mut dyn crate::ui_adapter::ReplUiAdapter) -> String {
+pub(super) fn build_effective_line(
+    line: &str,
+    state: &ReplState,
+    ui: &mut dyn crate::ui_adapter::ReplUiAdapter,
+) -> String {
     let mut effective_line = if let Some(ref dev) = state.skill_dev {
         let skill_md = dev.dir.join("SKILL.md");
         // Re-read SKILL.md from disk every turn so external edits are picked up.
@@ -2453,7 +2460,11 @@ fn report_turn_failure(
     if is_auth_error(&failure.error) {
         ui.show_error("  Session expired. Run /login to refresh.");
     } else {
-        ui.show_error(&format!("  {} {}", crate::theme::icon_err(), &failure.error));
+        ui.show_error(&format!(
+            "  {} {}",
+            crate::theme::icon_err(),
+            &failure.error
+        ));
     }
 
     // If the turn carried a session_id but the journal was never initialised
@@ -3681,7 +3692,8 @@ mod tests {
             ..ReplState::default()
         };
 
-        let effective = build_effective_line("修复?", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let effective =
+            build_effective_line("修复?", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(effective.contains("[Active task attachment]"));
         assert!(effective.contains("review commit aa1f419b"));
         assert!(effective.contains("fix / patch / test / continue"));
@@ -3695,7 +3707,11 @@ mod tests {
             ..ReplState::default()
         };
 
-        let effective = build_effective_line("修一下输入法问题", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let effective = build_effective_line(
+            "修一下输入法问题",
+            &state,
+            &mut crate::ui_adapter::LineUiAdapter,
+        );
         assert!(!effective.contains("[Active task attachment]"));
         assert_eq!(effective, "修一下输入法问题");
     }
@@ -3731,7 +3747,11 @@ mod tests {
             session_goal: None,
             ..ReplState::default()
         };
-        let effective_no_goal = build_effective_line("sure", &state_no_goal, &mut crate::ui_adapter::LineUiAdapter);
+        let effective_no_goal = build_effective_line(
+            "sure",
+            &state_no_goal,
+            &mut crate::ui_adapter::LineUiAdapter,
+        );
         assert!(effective_no_goal.contains("[Active task attachment]"));
         assert!(!effective_no_goal.contains("Session goal:"));
     }
@@ -3817,7 +3837,11 @@ mod tests {
             ..ReplState::default()
         };
 
-        let effective = build_effective_line("improve this skill", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let effective = build_effective_line(
+            "improve this skill",
+            &state,
+            &mut crate::ui_adapter::LineUiAdapter,
+        );
         assert!(effective.contains("[SKILL DEV: test-skill]"));
         assert!(effective.contains("Do stuff."));
         assert!(effective.contains("improve this skill"));
@@ -3848,7 +3872,8 @@ mod tests {
         )
         .unwrap();
 
-        let turn2 = build_effective_line("check again", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let turn2 =
+            build_effective_line("check again", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(!turn2.contains("V1"), "should not contain old content");
         assert!(turn2.contains("V2 rewritten"), "should contain new content");
     }
@@ -3863,7 +3888,8 @@ mod tests {
             ..ReplState::default()
         };
 
-        let effective = build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let effective =
+            build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert_eq!(effective, "hello");
     }
 
@@ -3882,7 +3908,8 @@ mod tests {
             ..ReplState::default()
         };
 
-        let effective = build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let effective =
+            build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
         // Empty SKILL.md should not inject a useless prefix
         assert_eq!(effective, "hello");
     }
@@ -3937,7 +3964,8 @@ mod tests {
         };
 
         // Short continuation prompt triggers all three layers
-        let effective = build_effective_line("continue", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let effective =
+            build_effective_line("continue", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(effective.contains("[SKILL DEV: combo]"), "skill dev prefix");
         assert!(effective.contains("Concise"), "system skill");
         assert!(effective.contains("[Active task attachment]"), "anchor");
@@ -4119,7 +4147,11 @@ mod tests {
         );
 
         // Phase 5: Normal prompt should NOT inject anchor
-        let normal = build_effective_line("explain Pin in detail", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let normal = build_effective_line(
+            "explain Pin in detail",
+            &state,
+            &mut crate::ui_adapter::LineUiAdapter,
+        );
         assert!(
             !normal.contains("[Active task attachment]"),
             "normal prompt must not inject anchor"
@@ -4763,7 +4795,8 @@ mod tests {
             "Latest user task: now explain borrowing\nLatest assistant summary:\nBorrowing lets you reference data"
                 .to_string(),
         );
-        let effective = build_effective_line("continue", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let effective =
+            build_effective_line("continue", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(effective.contains("[Active task attachment]"));
         assert!(effective.contains("explain borrowing"));
 

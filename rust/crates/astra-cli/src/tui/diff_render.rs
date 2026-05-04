@@ -87,7 +87,10 @@ pub fn render_diff_lines(diff_text: &str, max_lines: usize) -> Vec<Line<'static>
         }
 
         if raw.starts_with("--- ") || raw.starts_with("+++ ") {
-            lines.push(Line::from(Span::styled(format!("    {raw}"), header_style())));
+            lines.push(Line::from(Span::styled(
+                format!("    {raw}"),
+                header_style(),
+            )));
             continue;
         }
 

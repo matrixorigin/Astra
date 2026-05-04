@@ -60,7 +60,10 @@ pub enum ApprovalResponse {
 
 impl ApprovalResponse {
     pub fn is_approved(self) -> bool {
-        matches!(self, Self::AllowOnce | Self::AlwaysAllow | Self::AutoRunSession)
+        matches!(
+            self,
+            Self::AllowOnce | Self::AlwaysAllow | Self::AutoRunSession
+        )
     }
 }
 

@@ -8,8 +8,8 @@ use ratatui::{
 };
 use tokio::sync::oneshot;
 
-use crate::chat_stream::ApprovalResponse;
 use super::view::{BottomPaneView, CancellationEvent, ViewCompletion};
+use crate::chat_stream::ApprovalResponse;
 
 struct ApprovalOption {
     key: char,
@@ -18,11 +18,31 @@ struct ApprovalOption {
 }
 
 const OPTIONS: &[ApprovalOption] = &[
-    ApprovalOption { key: 'y', label: "Yes, allow once", response: ApprovalResponse::AllowOnce },
-    ApprovalOption { key: 'n', label: "No, deny", response: ApprovalResponse::Deny },
-    ApprovalOption { key: 'a', label: "Always allow this tool", response: ApprovalResponse::AlwaysAllow },
-    ApprovalOption { key: '!', label: "Auto-run session (allow all)", response: ApprovalResponse::AutoRunSession },
-    ApprovalOption { key: 's', label: "Skip tool", response: ApprovalResponse::Skip },
+    ApprovalOption {
+        key: 'y',
+        label: "Yes, allow once",
+        response: ApprovalResponse::AllowOnce,
+    },
+    ApprovalOption {
+        key: 'n',
+        label: "No, deny",
+        response: ApprovalResponse::Deny,
+    },
+    ApprovalOption {
+        key: 'a',
+        label: "Always allow this tool",
+        response: ApprovalResponse::AlwaysAllow,
+    },
+    ApprovalOption {
+        key: '!',
+        label: "Auto-run session (allow all)",
+        response: ApprovalResponse::AutoRunSession,
+    },
+    ApprovalOption {
+        key: 's',
+        label: "Skip tool",
+        response: ApprovalResponse::Skip,
+    },
 ];
 
 pub(crate) struct ApprovalOverlay {
@@ -71,7 +91,9 @@ impl BottomPaneView for ApprovalOverlay {
         let dim = Style::default().fg(Color::DarkGray);
         let yellow = Style::default().fg(Color::Yellow);
         let bold = Style::default().add_modifier(Modifier::BOLD);
-        let sel_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+        let sel_style = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
 
         let mut y = area.y;
 
@@ -83,7 +105,8 @@ impl BottomPaneView for ApprovalOverlay {
                     Span::styled("⚠ ", yellow),
                     Span::styled(&self.header, yellow),
                 ]),
-                Rect::new(area.x, y, area.width, 1), buf,
+                Rect::new(area.x, y, area.width, 1),
+                buf,
             );
             y += 1;
         }
@@ -91,10 +114,13 @@ impl BottomPaneView for ApprovalOverlay {
         // Detail
         if let Some(ref detail) = self.detail {
             for dl in detail.lines().take(3) {
-                if y >= area.bottom() { break; }
+                if y >= area.bottom() {
+                    break;
+                }
                 Widget::render(
                     Line::from(vec![Span::raw("    "), Span::styled(dl.to_string(), dim)]),
-                    Rect::new(area.x, y, area.width, 1), buf,
+                    Rect::new(area.x, y, area.width, 1),
+                    buf,
                 );
                 y += 1;
             }
@@ -103,18 +129,26 @@ impl BottomPaneView for ApprovalOverlay {
         // Reason
         if !self.reason.is_empty() && y < area.bottom() {
             Widget::render(
-                Line::from(vec![Span::raw("    "), Span::styled(format!("Reason: {}", &self.reason), dim)]),
-                Rect::new(area.x, y, area.width, 1), buf,
+                Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(format!("Reason: {}", &self.reason), dim),
+                ]),
+                Rect::new(area.x, y, area.width, 1),
+                buf,
             );
             y += 1;
         }
 
         // Blank
-        if y < area.bottom() { y += 1; }
+        if y < area.bottom() {
+            y += 1;
+        }
 
         // Options
         for (i, opt) in OPTIONS.iter().enumerate() {
-            if y >= area.bottom() { break; }
+            if y >= area.bottom() {
+                break;
+            }
             let is_sel = i == self.selected;
             let row_style = if is_sel { sel_style } else { Style::default() };
             let key_style = if is_sel { sel_style } else { bold };
@@ -125,19 +159,24 @@ impl BottomPaneView for ApprovalOverlay {
                     Span::styled(format!("[{}] ", opt.key), key_style),
                     Span::styled(opt.label, row_style),
                 ]),
-                Rect::new(area.x, y, area.width, 1), buf,
+                Rect::new(area.x, y, area.width, 1),
+                buf,
             );
             y += 1;
         }
 
         // Hint
-        if y < area.bottom() { y += 1; }
+        if y < area.bottom() {
+            y += 1;
+        }
         if y < area.bottom() {
             Widget::render(
                 Line::from(Span::styled(
-                    "  Press key or Enter to confirm, Esc to deny", dim,
+                    "  Press key or Enter to confirm, Esc to deny",
+                    dim,
                 )),
-                Rect::new(area.x, y, area.width, 1), buf,
+                Rect::new(area.x, y, area.width, 1),
+                buf,
             );
         }
     }
@@ -147,7 +186,9 @@ impl BottomPaneView for ApprovalOverlay {
         if let Some(ref detail) = self.detail {
             h += detail.lines().take(3).count() as u16;
         }
-        if !self.reason.is_empty() { h += 1; }
+        if !self.reason.is_empty() {
+            h += 1;
+        }
         h += 1; // blank
         h += OPTIONS.len() as u16;
         h += 2; // blank + hint
@@ -163,10 +204,12 @@ impl BottomPaneView for ApprovalOverlay {
             KeyCode::Char('!') => self.respond(ApprovalResponse::AutoRunSession),
             KeyCode::Char('s') | KeyCode::Char('S') => self.respond(ApprovalResponse::Skip),
             // Arrow navigation
-            KeyCode::Up | KeyCode::Char('k')
-                if self.selected > 0 => { self.selected -= 1; }
-            KeyCode::Down | KeyCode::Char('j')
-                if self.selected + 1 < OPTIONS.len() => { self.selected += 1; }
+            KeyCode::Up | KeyCode::Char('k') if self.selected > 0 => {
+                self.selected -= 1;
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.selected + 1 < OPTIONS.len() => {
+                self.selected += 1;
+            }
             KeyCode::Enter => {
                 self.respond(OPTIONS[self.selected].response);
             }
@@ -190,7 +233,10 @@ impl BottomPaneView for ApprovalOverlay {
 
     fn completion(&self) -> Option<ViewCompletion> {
         if self.completed {
-            Some(ViewCompletion { result: None, reopen: None })
+            Some(ViewCompletion {
+                result: None,
+                reopen: None,
+            })
         } else {
             None
         }

@@ -55,7 +55,9 @@ impl BottomPaneView for TranscriptView {
         // Content
         let visible_end = (self.scroll + MAX_VISIBLE_LINES).min(self.lines.len());
         for i in self.scroll..visible_end {
-            if y >= area.bottom() { break; }
+            if y >= area.bottom() {
+                break;
+            }
             Widget::render(
                 self.lines[i].clone(),
                 Rect::new(area.x, y, area.width, 1),
@@ -68,7 +70,12 @@ impl BottomPaneView for TranscriptView {
         if self.lines.len() > MAX_VISIBLE_LINES && y < area.bottom() {
             Widget::render(
                 Line::from(Span::styled(
-                    format!("  ({}-{} of {})", self.scroll + 1, visible_end, self.lines.len()),
+                    format!(
+                        "  ({}-{} of {})",
+                        self.scroll + 1,
+                        visible_end,
+                        self.lines.len()
+                    ),
                     dim,
                 )),
                 Rect::new(area.x, y, area.width, 1),
@@ -78,7 +85,9 @@ impl BottomPaneView for TranscriptView {
         }
 
         // Hint
-        if y < area.bottom() { y += 1; }
+        if y < area.bottom() {
+            y += 1;
+        }
         if y < area.bottom() {
             Widget::render(
                 Line::from(Span::styled(
@@ -94,7 +103,11 @@ impl BottomPaneView for TranscriptView {
     fn desired_height(&self, _width: u16) -> u16 {
         let title_h = 1;
         let content_h = self.lines.len().min(MAX_VISIBLE_LINES) as u16;
-        let scroll_h = if self.lines.len() > MAX_VISIBLE_LINES { 1 } else { 0 };
+        let scroll_h = if self.lines.len() > MAX_VISIBLE_LINES {
+            1
+        } else {
+            0
+        };
         let hint_h = 2;
         title_h + content_h + scroll_h + hint_h
     }
@@ -136,7 +149,10 @@ impl BottomPaneView for TranscriptView {
 
     fn completion(&self) -> Option<ViewCompletion> {
         if self.completed {
-            Some(ViewCompletion { result: None, reopen: None })
+            Some(ViewCompletion {
+                result: None,
+                reopen: None,
+            })
         } else {
             None
         }

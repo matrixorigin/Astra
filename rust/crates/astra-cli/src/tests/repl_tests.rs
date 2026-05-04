@@ -32,7 +32,8 @@ async fn execute_cli_health_command() {
 #[test]
 fn build_effective_line_plain() {
     let state = ReplState::default();
-    let result = repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+    let result =
+        repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
     assert_eq!(result, "hello");
 }
 
@@ -43,7 +44,8 @@ fn build_effective_line_with_system_skills() {
     if let Some(md) = skills.iter().find(|s| s.name == "markdown") {
         state.active_system_skills.push(md.clone());
     }
-    let result = repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+    let result =
+        repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
     assert!(result.contains("hello"));
     assert!(result.contains("Markdown"));
 }

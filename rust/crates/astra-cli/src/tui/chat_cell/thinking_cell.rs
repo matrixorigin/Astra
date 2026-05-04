@@ -51,8 +51,12 @@ impl ThinkingChatCell {
 }
 
 impl ChatCell for ThinkingChatCell {
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
-    fn as_any_ref(&self) -> &dyn std::any::Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn as_any_ref(&self) -> &dyn std::any::Any {
+        self
+    }
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let border_style = Style::default().fg(Color::DarkGray);
         let text_style = Style::default()
@@ -86,13 +90,16 @@ impl ChatCell for ThinkingChatCell {
                 ]));
             }
             if start > 0 {
-                lines.insert(1, Line::from(vec![
-                    Span::styled("  │ ", border_style),
-                    Span::styled(
-                        format!("… {start} earlier lines"),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]));
+                lines.insert(
+                    1,
+                    Line::from(vec![
+                        Span::styled("  │ ", border_style),
+                        Span::styled(
+                            format!("… {start} earlier lines"),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]),
+                );
             }
         }
         // collapsed: just the header line, no content preview

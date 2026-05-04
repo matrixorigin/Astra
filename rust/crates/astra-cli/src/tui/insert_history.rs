@@ -57,7 +57,11 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
             for wl in &line_wrapped {
                 wrapped_rows += wl.width().max(1).div_ceil(wrap_width) as u16;
             }
-            wrapped.extend(line_wrapped.into_iter().map(|l| crate::tui::render::line_utils::line_to_static(&l)));
+            wrapped.extend(
+                line_wrapped
+                    .into_iter()
+                    .map(|l| crate::tui::render::line_utils::line_to_static(&l)),
+            );
         }
     }
 
@@ -74,10 +78,7 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
         let scroll_up = wrapped_rows.saturating_sub(shift_down);
 
         if scroll_up > 0 {
-            queue!(
-                writer,
-                MoveTo(0, screen_size.height.saturating_sub(1))
-            )?;
+            queue!(writer, MoveTo(0, screen_size.height.saturating_sub(1)))?;
             for _ in 0..scroll_up {
                 queue!(writer, Print("\n"))?;
             }
@@ -144,10 +145,7 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
         };
 
         if new_area.top() > 0 {
-            queue!(
-                writer,
-                Print(format!("\x1b[1;{}r", new_area.top()))
-            )?;
+            queue!(writer, Print(format!("\x1b[1;{}r", new_area.top())))?;
 
             queue!(writer, MoveTo(0, cursor_top))?;
 
@@ -181,14 +179,8 @@ fn write_history_line(writer: &mut impl Write, line: &Line<'_>) -> io::Result<()
     queue!(
         writer,
         SetColors(Colors::new(
-            line.style
-                .fg
-                .map(Into::into)
-                .unwrap_or(CColor::Reset),
-            line.style
-                .bg
-                .map(Into::into)
-                .unwrap_or(CColor::Reset),
+            line.style.fg.map(Into::into).unwrap_or(CColor::Reset),
+            line.style.bg.map(Into::into).unwrap_or(CColor::Reset),
         ))
     )?;
 

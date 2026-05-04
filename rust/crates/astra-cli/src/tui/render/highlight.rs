@@ -89,7 +89,10 @@ pub(crate) fn set_syntax_theme(theme: Theme) {
 
 #[allow(dead_code)]
 pub(crate) fn current_syntax_theme() -> Theme {
-    current_theme().read().map(|t| t.clone()).unwrap_or_default()
+    current_theme()
+        .read()
+        .map(|t| t.clone())
+        .unwrap_or_default()
 }
 
 #[allow(dead_code)]

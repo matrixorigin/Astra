@@ -317,13 +317,37 @@ async fn run_interactive_chat(
     if use_tui {
         if !tui::can_run_tui() {
             eprintln!("TUI mode requires an interactive terminal. Falling back to line mode.");
-            return run_chat_repl(api, profile, initial_model, resume_session_id, no_instructions, max_budget).await;
+            return run_chat_repl(
+                api,
+                profile,
+                initial_model,
+                resume_session_id,
+                no_instructions,
+                max_budget,
+            )
+            .await;
         }
         // Box::pin to reduce the parent future's stack frame size (avoids stack
         // overflow in debug-mode tests that instantiate execute_cli_command).
-        Box::pin(tui::run_tui_repl(api, profile, initial_model, resume_session_id, no_instructions, max_budget)).await
+        Box::pin(tui::run_tui_repl(
+            api,
+            profile,
+            initial_model,
+            resume_session_id,
+            no_instructions,
+            max_budget,
+        ))
+        .await
     } else {
-        run_chat_repl(api, profile, initial_model, resume_session_id, no_instructions, max_budget).await
+        run_chat_repl(
+            api,
+            profile,
+            initial_model,
+            resume_session_id,
+            no_instructions,
+            max_budget,
+        )
+        .await
     }
 }
 
@@ -1771,7 +1795,8 @@ mod tests {
     #[test]
     fn build_effective_line_plain() {
         let state = ReplState::default();
-        let result = repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let result =
+            repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert_eq!(result, "hello");
     }
 
@@ -1782,7 +1807,8 @@ mod tests {
         if let Some(md) = skills.iter().find(|s| s.name == "markdown") {
             state.active_system_skills.push(md.clone());
         }
-        let result = repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let result =
+            repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(result.contains("hello"));
         assert!(result.contains("Markdown"));
     }
@@ -4775,7 +4801,8 @@ total_tokens_out: 500
     fn build_effective_line_includes_project_instructions() {
         let mut state = ReplState::default();
         state.project_instructions = Some("Always use Rust.".to_string());
-        let result = repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let result =
+            repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(
             result.contains("<project_instructions>"),
             "should wrap in tags"
@@ -4790,7 +4817,8 @@ total_tokens_out: 500
     #[test]
     fn build_effective_line_no_instructions_when_none() {
         let state = ReplState::default();
-        let result = repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
+        let result =
+            repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(
             !result.contains("<project_instructions>"),
             "should not inject when None"

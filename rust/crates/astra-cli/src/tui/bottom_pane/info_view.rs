@@ -83,13 +83,21 @@ impl BottomPaneView for InfoView {
         }
 
         // Blank
-        if y < area.bottom() { y += 1; }
+        if y < area.bottom() {
+            y += 1;
+        }
 
         // Content
         let visible_end = (self.scroll + self.visible_count()).min(self.lines.len());
         for i in self.scroll..visible_end {
-            if y >= area.bottom() { break; }
-            Widget::render(self.lines[i].clone(), Rect::new(area.x, y, area.width, 1), buf);
+            if y >= area.bottom() {
+                break;
+            }
+            Widget::render(
+                self.lines[i].clone(),
+                Rect::new(area.x, y, area.width, 1),
+                buf,
+            );
             y += 1;
         }
 
@@ -106,7 +114,9 @@ impl BottomPaneView for InfoView {
         }
 
         // Hint
-        if y < area.bottom() { y += 1; }
+        if y < area.bottom() {
+            y += 1;
+        }
         if y < area.bottom() {
             let hint = if self.lines.len() > MAX_VISIBLE {
                 "  ↑/↓ scroll  Esc close"
@@ -134,17 +144,15 @@ impl BottomPaneView for InfoView {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.scroll = self.scroll.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j')
-                if self.scroll + MAX_VISIBLE < self.lines.len() => {
-                    self.scroll += 1;
-                }
+            KeyCode::Down | KeyCode::Char('j') if self.scroll + MAX_VISIBLE < self.lines.len() => {
+                self.scroll += 1;
+            }
             KeyCode::PageUp => {
                 self.scroll = self.scroll.saturating_sub(MAX_VISIBLE);
             }
             KeyCode::PageDown => {
-                self.scroll = (self.scroll + MAX_VISIBLE).min(
-                    self.lines.len().saturating_sub(MAX_VISIBLE),
-                );
+                self.scroll =
+                    (self.scroll + MAX_VISIBLE).min(self.lines.len().saturating_sub(MAX_VISIBLE));
             }
             KeyCode::Esc | KeyCode::Enter => {
                 self.completed = true;
@@ -168,7 +176,10 @@ impl BottomPaneView for InfoView {
 
     fn completion(&self) -> Option<ViewCompletion> {
         if self.completed {
-            Some(ViewCompletion { result: None, reopen: self.reopen.clone() })
+            Some(ViewCompletion {
+                result: None,
+                reopen: self.reopen.clone(),
+            })
         } else {
             None
         }

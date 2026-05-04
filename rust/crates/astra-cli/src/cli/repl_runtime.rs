@@ -331,8 +331,7 @@ pub(super) async fn try_silent_auth(api: &astra_thin_client::ThinClient, profile
                 return;
             }
             // Another CLI may have won refresh first (server revokes old refresh on success).
-            if recover_credentials_after_refresh_race(api, profile, refresh_str).await {
-            }
+            if recover_credentials_after_refresh_race(api, profile, refresh_str).await {}
         }
     }
 

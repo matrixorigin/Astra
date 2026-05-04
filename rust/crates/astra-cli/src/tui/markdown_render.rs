@@ -123,7 +123,8 @@ impl Writer {
             }
             first = false;
             if !part.is_empty() {
-                self.current_spans.push(Span::styled(part.to_string(), style));
+                self.current_spans
+                    .push(Span::styled(part.to_string(), style));
             }
         }
     }
@@ -175,10 +176,8 @@ impl Writer {
                 }
                 Event::Rule => {
                     self.flush_line();
-                    self.lines.push(Line::styled(
-                        "─".repeat(40),
-                        Style::default().dark_gray(),
-                    ));
+                    self.lines
+                        .push(Line::styled("─".repeat(40), Style::default().dark_gray()));
                     self.flush_line();
                 }
                 _ => {}
@@ -201,14 +200,13 @@ impl Writer {
                 };
                 self.push_style(style);
             }
-            Tag::Paragraph
-                if !self.lines.is_empty() && self.list_stack.is_empty() => {
-                    if let Some(last) = self.lines.last() {
-                        if !last.spans.is_empty() {
-                            self.lines.push(Line::default());
-                        }
+            Tag::Paragraph if !self.lines.is_empty() && self.list_stack.is_empty() => {
+                if let Some(last) = self.lines.last() {
+                    if !last.spans.is_empty() {
+                        self.lines.push(Line::default());
                     }
                 }
+            }
             Tag::CodeBlock(kind) => {
                 let lang = match kind {
                     CodeBlockKind::Fenced(info) => {
@@ -281,10 +279,9 @@ impl Writer {
                     self.lines.push(Line::default());
                 }
             }
-            TagEnd::Item
-                if !self.current_spans.is_empty() => {
-                    self.flush_line();
-                }
+            TagEnd::Item if !self.current_spans.is_empty() => {
+                self.flush_line();
+            }
             TagEnd::Emphasis => {
                 self.pop_style();
             }

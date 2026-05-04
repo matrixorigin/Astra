@@ -100,8 +100,12 @@ impl BottomPane {
     }
 
     fn popup_height(&self) -> u16 {
-        if let Some(p) = &self.slash_popup { return p.height(); }
-        if let Some(p) = &self.skill_popup { return p.height(); }
+        if let Some(p) = &self.slash_popup {
+            return p.height();
+        }
+        if let Some(p) = &self.skill_popup {
+            return p.height();
+        }
         0
     }
 
@@ -114,9 +118,14 @@ impl BottomPane {
             if popup.is_empty() {
                 self.slash_popup = None;
             }
-        } else if self.view_stack.is_empty() && text.starts_with('$') && !self.skill_items.is_empty() {
+        } else if self.view_stack.is_empty()
+            && text.starts_with('$')
+            && !self.skill_items.is_empty()
+        {
             self.slash_popup = None;
-            let popup = self.skill_popup.get_or_insert_with(|| SkillPopup::new(self.skill_items.clone()));
+            let popup = self
+                .skill_popup
+                .get_or_insert_with(|| SkillPopup::new(self.skill_items.clone()));
             popup.set_filter(&text);
             if popup.is_empty() {
                 self.skill_popup = None;
@@ -128,7 +137,9 @@ impl BottomPane {
     }
 
     fn queue_preview_height(&self) -> u16 {
-        if self.queued_messages.is_empty() { 0 } else {
+        if self.queued_messages.is_empty() {
+            0
+        } else {
             (self.queued_messages.len().min(3) + 1) as u16 // header + up to 3 messages
         }
     }
@@ -187,9 +198,15 @@ impl BottomPane {
                 let completion = view.completion();
                 self.view_stack.pop();
                 if let Some(vc) = completion {
-                    return BottomPaneAction::ViewCompleted { result: vc.result, reopen: vc.reopen };
+                    return BottomPaneAction::ViewCompleted {
+                        result: vc.result,
+                        reopen: vc.reopen,
+                    };
                 }
-                return BottomPaneAction::ViewCompleted { result: None, reopen: None };
+                return BottomPaneAction::ViewCompleted {
+                    result: None,
+                    reopen: None,
+                };
             }
             return BottomPaneAction::Consumed;
         }
@@ -209,17 +226,25 @@ impl BottomPane {
         // Popup key handling: Up/Down/Tab/Enter when popup is visible
         if self.slash_popup.is_some() {
             match key.code {
-                KeyCode::Up => { self.slash_popup.as_mut().unwrap().move_up(); return BottomPaneAction::Consumed; }
-                KeyCode::Down => { self.slash_popup.as_mut().unwrap().move_down(); return BottomPaneAction::Consumed; }
+                KeyCode::Up => {
+                    self.slash_popup.as_mut().unwrap().move_up();
+                    return BottomPaneAction::Consumed;
+                }
+                KeyCode::Down => {
+                    self.slash_popup.as_mut().unwrap().move_down();
+                    return BottomPaneAction::Consumed;
+                }
                 KeyCode::Tab => {
-                    if let Some(cmd) = self.slash_popup.as_ref().and_then(|p| p.selected_command()) {
+                    if let Some(cmd) = self.slash_popup.as_ref().and_then(|p| p.selected_command())
+                    {
                         self.composer.set_text(&format!("{cmd} "));
                         self.slash_popup = None;
                     }
                     return BottomPaneAction::Consumed;
                 }
                 KeyCode::Enter => {
-                    if let Some(cmd) = self.slash_popup.as_ref().and_then(|p| p.selected_command()) {
+                    if let Some(cmd) = self.slash_popup.as_ref().and_then(|p| p.selected_command())
+                    {
                         let text = cmd.to_string();
                         self.composer.clear_draft();
                         self.slash_popup = None;
@@ -232,8 +257,14 @@ impl BottomPane {
 
         if self.skill_popup.is_some() {
             match key.code {
-                KeyCode::Up => { self.skill_popup.as_mut().unwrap().move_up(); return BottomPaneAction::Consumed; }
-                KeyCode::Down => { self.skill_popup.as_mut().unwrap().move_down(); return BottomPaneAction::Consumed; }
+                KeyCode::Up => {
+                    self.skill_popup.as_mut().unwrap().move_up();
+                    return BottomPaneAction::Consumed;
+                }
+                KeyCode::Down => {
+                    self.skill_popup.as_mut().unwrap().move_down();
+                    return BottomPaneAction::Consumed;
+                }
                 KeyCode::Tab | KeyCode::Enter => {
                     if let Some(name) = self.skill_popup.as_ref().and_then(|p| p.selected_name()) {
                         self.composer.set_text(&format!("${name} "));
@@ -287,17 +318,24 @@ impl BottomPane {
             };
             ratatui::widgets::Widget::render(
                 ratatui::text::Line::from(ratatui::text::Span::styled(hint, dim)),
-                Rect::new(area.x, y, area.width, 1), buf,
+                Rect::new(area.x, y, area.width, 1),
+                buf,
             );
             y += 1;
         }
 
         for msg in self.queued_messages.iter().take(3) {
-            if y >= area.bottom() { break; }
+            if y >= area.bottom() {
+                break;
+            }
             let preview: String = msg.chars().take(area.width as usize - 6).collect();
             ratatui::widgets::Widget::render(
-                ratatui::text::Line::from(ratatui::text::Span::styled(format!("    ↳ {preview}"), italic)),
-                Rect::new(area.x, y, area.width, 1), buf,
+                ratatui::text::Line::from(ratatui::text::Span::styled(
+                    format!("    ↳ {preview}"),
+                    italic,
+                )),
+                Rect::new(area.x, y, area.width, 1),
+                buf,
             );
             y += 1;
         }
@@ -350,11 +388,8 @@ impl BottomPane {
         }
 
         let content_h = self.composer.desired_height(area.width);
-        let chunks = Layout::vertical([
-            Constraint::Length(content_h),
-            Constraint::Min(0),
-        ])
-        .split(area);
+        let chunks =
+            Layout::vertical([Constraint::Length(content_h), Constraint::Min(0)]).split(area);
 
         self.composer.cursor_position(chunks[0])
     }
@@ -363,7 +398,10 @@ impl BottomPane {
 #[derive(Debug)]
 pub(crate) enum BottomPaneAction {
     SubmitInput(String),
-    ViewCompleted { result: Option<String>, reopen: Option<String> },
+    ViewCompleted {
+        result: Option<String>,
+        reopen: Option<String>,
+    },
     Interrupt,
     Quit,
     Consumed,

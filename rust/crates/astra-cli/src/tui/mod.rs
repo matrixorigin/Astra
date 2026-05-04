@@ -1,7 +1,7 @@
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod layout_test;
+#[cfg(test)]
+mod tests;
 
 mod app_event;
 mod bottom_pane;
@@ -34,8 +34,8 @@ mod wrapping;
 use app_event::TuiAppEvent;
 use bottom_pane::{BottomPane, BottomPaneAction};
 use chat_cell::{
-    assistant_cell::AssistantChatCell, system_cell::SystemChatCell,
-    tool_cell::ToolChatCell, user_cell::UserChatCell, ChatCell,
+    ChatCell, assistant_cell::AssistantChatCell, system_cell::SystemChatCell,
+    tool_cell::ToolChatCell, user_cell::UserChatCell,
 };
 
 use ratatui::widgets::Clear;
@@ -146,7 +146,15 @@ pub(crate) async fn run_tui_repl(
         state.max_budget_limit = max_budget;
     }
     tracer.phase("state_init");
-    let startup = complete_repl_startup(&mut state, &mut tracer, api, profile, resume_session_id, no_instructions).await?;
+    let startup = complete_repl_startup(
+        &mut state,
+        &mut tracer,
+        api,
+        profile,
+        resume_session_id,
+        no_instructions,
+    )
+    .await?;
     tracer.finish();
 
     // ── TUI mode overrides ──────────────────────────────────────────────
@@ -156,7 +164,8 @@ pub(crate) async fn run_tui_repl(
     state.tui_cancel_token = Some(tui_cancel_token.clone());
 
     // Approval channel: tool approval requests from SSE host → TUI overlay
-    let (approval_tx, mut approval_rx) = tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::ApprovalRequest>();
+    let (approval_tx, mut approval_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::chat_stream::ApprovalRequest>();
     state.tui_approval_request_tx = Some(approval_tx);
 
     // ── Enter TUI ───────────────────────────────────────────────────────
@@ -515,8 +524,8 @@ fn do_draw(
     active_cell: &Option<Box<dyn ChatCell>>,
     bottom_pane: &mut BottomPane,
 ) -> Result<(), String> {
-    use render::renderable::{FlexRenderable, RenderableItem, Renderable, RenderableExt};
     use render::Insets;
+    use render::renderable::{FlexRenderable, Renderable, RenderableExt, RenderableItem};
 
     bottom_pane.pre_draw_tick(std::time::Instant::now());
 
@@ -527,8 +536,7 @@ fn do_draw(
             let lines = cell.display_lines(width);
             let text = ratatui::text::Text::from(lines);
             let para = ratatui::widgets::Paragraph::new(text);
-            RenderableItem::Owned(Box::new(para))
-                .inset(Insets::tlbr(1, 0, 0, 0))
+            RenderableItem::Owned(Box::new(para)).inset(Insets::tlbr(1, 0, 0, 0))
         }
         None => RenderableItem::Owned(Box::new(())),
     };
@@ -550,15 +558,17 @@ fn do_draw(
 
     let total_h = flex.desired_height(width);
 
-    guard.draw(total_h, |frame| {
-        let area = frame.area();
-        Clear.render(area, frame.buffer_mut());
-        flex.render(area, frame.buffer_mut());
+    guard
+        .draw(total_h, |frame| {
+            let area = frame.area();
+            Clear.render(area, frame.buffer_mut());
+            flex.render(area, frame.buffer_mut());
 
-        if let Some((x, y)) = flex.cursor_pos(area) {
-            frame.set_cursor_position((x, y));
-        }
-    }).map_err(|e| format!("draw: {e}"))?;
+            if let Some((x, y)) = flex.cursor_pos(area) {
+                frame.set_cursor_position((x, y));
+            }
+        })
+        .map_err(|e| format!("draw: {e}"))?;
     Ok(())
 }
 
@@ -617,7 +627,9 @@ fn handle_app_event(
                     }
                 }
             }
-            bottom_pane.set_task_status(TaskStatus::TurnRunning { started_at: std::time::Instant::now() });
+            bottom_pane.set_task_status(TaskStatus::TurnRunning {
+                started_at: std::time::Instant::now(),
+            });
             fr.schedule_frame();
         }
         TuiAppEvent::ThinkingStarted => {
@@ -657,9 +669,10 @@ fn handle_app_event(
                     .add_modifier(ratatui::style::Modifier::ITALIC);
                 for line in text.lines() {
                     let preview: String = line.chars().take(width as usize - 6).collect();
-                    transcript.push(ratatui::text::Line::from(
-                        ratatui::text::Span::styled(format!("  │ {preview}"), dim_italic),
-                    ));
+                    transcript.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+                        format!("  │ {preview}"),
+                        dim_italic,
+                    )));
                 }
             }
             fr.schedule_frame();
@@ -678,7 +691,9 @@ fn handle_app_event(
             fr.schedule_frame();
         }
         TuiAppEvent::ModelResponding => {
-            bottom_pane.set_task_status(TaskStatus::TurnRunning { started_at: std::time::Instant::now() });
+            bottom_pane.set_task_status(TaskStatus::TurnRunning {
+                started_at: std::time::Instant::now(),
+            });
             fr.schedule_frame();
         }
         TuiAppEvent::ToolStarted { name, description } => {
@@ -689,11 +704,24 @@ fn handle_app_event(
                 flush_cell_to_scrollback(guard, cell, width, transcript);
             }
 
-            *active_cell = Some(Box::new(ToolChatCell::new_running(name.clone(), description)));
-            bottom_pane.set_task_status(TaskStatus::ToolExecuting { name, started_at: std::time::Instant::now() });
+            *active_cell = Some(Box::new(ToolChatCell::new_running(
+                name.clone(),
+                description,
+            )));
+            bottom_pane.set_task_status(TaskStatus::ToolExecuting {
+                name,
+                started_at: std::time::Instant::now(),
+            });
             fr.schedule_frame();
         }
-        TuiAppEvent::ToolCompleted { name: _, description, status, duration_ms, output_summary, output } => {
+        TuiAppEvent::ToolCompleted {
+            name: _,
+            description,
+            status,
+            duration_ms,
+            output_summary,
+            output,
+        } => {
             if let Some(cell) = active_cell {
                 if let Some(tc) = cell.as_any_mut().downcast_mut::<ToolChatCell>() {
                     tc.complete(&status, duration_ms, description, output_summary, output);
@@ -771,7 +799,9 @@ fn format_turn_summary(
         parts.push(format!("model:{model}"));
     }
 
-    parts.push(format!("tokens:{tokens_str} (↑{prompt_short} ↓{completion_short})"));
+    parts.push(format!(
+        "tokens:{tokens_str} (↑{prompt_short} ↓{completion_short})"
+    ));
 
     if turn_cost > 0.0 {
         parts.push(crate::slash_stats::format_cost(turn_cost));
@@ -801,7 +831,10 @@ fn format_turn_summary(
     let session_cost = state.total_session_cost;
     let mut line = format!("  ─ {} ─", parts.join(" │ "));
     if session_cost > 0.0 && state.turn > 0 {
-        line.push_str(&format!("  session: {}", crate::slash_stats::format_cost(session_cost)));
+        line.push_str(&format!(
+            "  session: {}",
+            crate::slash_stats::format_cost(session_cost)
+        ));
     }
     line
 }
@@ -819,5 +852,3 @@ impl<'a> render::renderable::Renderable for BottomPaneRenderable<'a> {
         self.0.cursor_position(area)
     }
 }
-
-

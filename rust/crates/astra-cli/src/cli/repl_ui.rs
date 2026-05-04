@@ -1380,7 +1380,9 @@ pub(super) fn format_help_lines() -> Vec<String> {
         let commands: Vec<_> = crate::command_registry::commands_by_group(*group)
             .filter(|m| !m.is_alias && !m.name.contains(' '))
             .collect();
-        if commands.is_empty() { continue; }
+        if commands.is_empty() {
+            continue;
+        }
         lines.push(String::new());
         lines.push(format!("  {} {}", group.icon(), group.title()));
         for meta in commands {

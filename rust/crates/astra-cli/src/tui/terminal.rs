@@ -1,8 +1,7 @@
 use std::io::{self, Stdout, stdout};
 
 use crossterm::{
-    SynchronizedUpdate,
-    cursor,
+    SynchronizedUpdate, cursor,
     event::{DisableBracketedPaste, EnableBracketedPaste},
     execute, queue,
     style::Print,
@@ -80,11 +79,8 @@ impl TerminalGuard {
             let mut needs_full_repaint =
                 Self::update_inline_viewport(terminal, height, self.is_zellij)?;
 
-            needs_full_repaint |= Self::flush_pending_history(
-                terminal,
-                &mut self.pending_history,
-                self.is_zellij,
-            )?;
+            needs_full_repaint |=
+                Self::flush_pending_history(terminal, &mut self.pending_history, self.is_zellij)?;
 
             if needs_full_repaint {
                 terminal.invalidate_viewport();
@@ -161,9 +157,7 @@ impl TerminalGuard {
         }
 
         let lines = std::mem::take(pending);
-        super::insert_history::insert_history_lines_with_terminal(
-            terminal, &lines, is_zellij,
-        )?;
+        super::insert_history::insert_history_lines_with_terminal(terminal, &lines, is_zellij)?;
 
         Ok(is_zellij)
     }
@@ -189,11 +183,7 @@ impl TerminalGuard {
         }
 
         // Position cursor at viewport top and show it
-        execute!(
-            stdout(),
-            cursor::MoveTo(0, area.top()),
-            cursor::Show
-        )?;
+        execute!(stdout(), cursor::MoveTo(0, area.top()), cursor::Show)?;
 
         // Leave TUI modes
         disable_raw_mode()?;
@@ -210,7 +200,9 @@ impl TerminalGuard {
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            unsafe { nix::libc::tcflush(std::io::stdin().as_raw_fd(), nix::libc::TCIFLUSH); }
+            unsafe {
+                nix::libc::tcflush(std::io::stdin().as_raw_fd(), nix::libc::TCIFLUSH);
+            }
         }
 
         // Clear the screen area where the slash command output was,
@@ -226,11 +218,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let area = self.terminal.viewport_area;
-        let _ = execute!(
-            stdout(),
-            cursor::MoveTo(0, area.bottom()),
-            cursor::Show
-        );
+        let _ = execute!(stdout(), cursor::MoveTo(0, area.bottom()), cursor::Show);
         let _ = disable_raw_mode();
         let _ = execute!(stdout(), DisableBracketedPaste);
         let _ = println!();

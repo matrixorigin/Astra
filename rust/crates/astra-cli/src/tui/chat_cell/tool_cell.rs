@@ -36,7 +36,14 @@ impl ToolChatCell {
         }
     }
 
-    pub fn complete(&mut self, status_str: &str, duration_ms: u64, description: String, output_summary: Option<String>, output: Option<String>) {
+    pub fn complete(
+        &mut self,
+        status_str: &str,
+        duration_ms: u64,
+        description: String,
+        output_summary: Option<String>,
+        output: Option<String>,
+    ) {
         self.status = if status_str == "success" {
             ToolStatus::Success
         } else {
@@ -60,10 +67,18 @@ impl ToolChatCell {
 
     fn elapsed_str(&self) -> String {
         if let Some(ms) = self.duration_ms {
-            if ms < 1000 { format!("{ms}ms") } else { format!("{:.1}s", ms as f64 / 1000.0) }
+            if ms < 1000 {
+                format!("{ms}ms")
+            } else {
+                format!("{:.1}s", ms as f64 / 1000.0)
+            }
         } else {
             let ms = self.started_at.elapsed().as_millis();
-            if ms < 1000 { format!("{ms}ms") } else { format!("{:.1}s", ms as f64 / 1000.0) }
+            if ms < 1000 {
+                format!("{ms}ms")
+            } else {
+                format!("{:.1}s", ms as f64 / 1000.0)
+            }
         }
     }
 
@@ -77,15 +92,24 @@ impl ToolChatCell {
 }
 
 impl ChatCell for ToolChatCell {
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
-    fn as_any_ref(&self) -> &dyn std::any::Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn as_any_ref(&self) -> &dyn std::any::Any {
+        self
+    }
 
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let dim = Style::default().dim();
         let w = width as usize;
 
         let header = if self.status == ToolStatus::Running {
-            let text = format!("{} {} ({})", self.title_text(), self.name, self.elapsed_str());
+            let text = format!(
+                "{} {} ({})",
+                self.title_text(),
+                self.name,
+                self.elapsed_str()
+            );
             let mut spans = vec![self.bullet()];
             spans.extend(crate::tui::shimmer::shimmer_spans(&text));
             Line::from(spans)
@@ -113,7 +137,9 @@ impl ChatCell for ToolChatCell {
 
         // Output summary with └ prefix, using diff renderer for +/- lines
         if let Some(ref summary) = self.output_summary {
-            let has_diff = summary.lines().any(|l| l.starts_with('+') || l.starts_with('-'));
+            let has_diff = summary
+                .lines()
+                .any(|l| l.starts_with('+') || l.starts_with('-'));
             if has_diff {
                 let diff_lines = crate::tui::diff_render::render_diff_lines(summary, 8);
                 for (i, dl) in diff_lines.into_iter().enumerate() {
@@ -134,7 +160,10 @@ impl ChatCell for ToolChatCell {
                     } else {
                         Span::raw("    ")
                     };
-                    lines.push(Line::from(vec![prefix, Span::raw(truncate_by_width(ol, max_w))]));
+                    lines.push(Line::from(vec![
+                        prefix,
+                        Span::raw(truncate_by_width(ol, max_w)),
+                    ]));
                 }
                 if summary.lines().count() > 5 {
                     let remaining = summary.lines().count() - 5;
@@ -171,7 +200,9 @@ fn truncate_by_width(s: &str, max_width: usize) -> String {
     let mut end = 0;
     for (i, c) in s.char_indices() {
         let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if width + cw + 1 > max_width { break; }
+        if width + cw + 1 > max_width {
+            break;
+        }
         width += cw;
         end = i + c.len_utf8();
     }

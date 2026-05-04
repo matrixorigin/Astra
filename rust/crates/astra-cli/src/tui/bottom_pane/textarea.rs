@@ -2,11 +2,7 @@ use std::cell::RefCell;
 use std::ops::Range;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::Style,
-};
+use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -303,7 +299,13 @@ impl TextArea {
             .char_indices()
             .rev()
             .find(|(_, c)| !c.is_whitespace())
-            .map(|(i, _)| i + self.text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(0))
+            .map(|(i, _)| {
+                i + self.text[i..]
+                    .chars()
+                    .next()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(0)
+            })
             .unwrap_or(0);
 
         if trimmed_end == 0 {
@@ -472,7 +474,10 @@ impl TextArea {
 
         let line_range = &lines[cursor_line];
         let line_start = line_range.start;
-        let pos_in_line = self.cursor_pos.min(self.text.len()).saturating_sub(line_start);
+        let pos_in_line = self
+            .cursor_pos
+            .min(self.text.len())
+            .saturating_sub(line_start);
         let slice_end = (line_start + pos_in_line).min(self.text.len());
         let display_col = UnicodeWidthStr::width(&self.text[line_start..slice_end]);
 

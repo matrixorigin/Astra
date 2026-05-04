@@ -1876,7 +1876,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             }
                             ApprovalResponse::AlwaysAllow => {
                                 pm.record_approval(&t, Some(args), true);
-                                let rule = crate::permission_manager::PermissionManager::make_allow_rule(&t, args);
+                                let rule =
+                                    crate::permission_manager::PermissionManager::make_allow_rule(
+                                        &t, args,
+                                    );
                                 pm.add_allow_rule(&rule);
                             }
                             ApprovalResponse::AutoRunSession => {
@@ -2069,7 +2072,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         pm.add_allow_rule(&rule);
                                     }
                                     if response == ApprovalResponse::AutoRunSession {
-                                        pm.set_mode(crate::permission_manager::PermissionMode::Auto);
+                                        pm.set_mode(
+                                            crate::permission_manager::PermissionMode::Auto,
+                                        );
                                     }
                                     if response.is_approved() {
                                         pm.record_approval(&sandbox_tool_key, Some(args), true);

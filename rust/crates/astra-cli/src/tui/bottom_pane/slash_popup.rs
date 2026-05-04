@@ -11,10 +11,23 @@ use crate::command_registry::{self, CommandMeta};
 const MAX_VISIBLE: usize = 10;
 
 fn is_tui_native(name: &str) -> bool {
-    matches!(name,
-        "/help" | "/commands" | "/model" | "/stats" | "/skill" | "/skills"
-        | "/copy" | "/version" | "/whoami" | "/history"
-        | "/instructions" | "/allow" | "/yolo" | "/exit" | "/quit"
+    matches!(
+        name,
+        "/help"
+            | "/commands"
+            | "/model"
+            | "/stats"
+            | "/skill"
+            | "/skills"
+            | "/copy"
+            | "/version"
+            | "/whoami"
+            | "/history"
+            | "/instructions"
+            | "/allow"
+            | "/yolo"
+            | "/exit"
+            | "/quit"
     )
 }
 
@@ -109,7 +122,9 @@ impl SlashPopup {
 
         for (vi, i) in (visible_start..visible_end).enumerate() {
             let row = area.y + vi as u16;
-            if row >= area.bottom() { break; }
+            if row >= area.bottom() {
+                break;
+            }
 
             let meta = self.matches[i];
             let is_sel = i == self.selected;
@@ -122,7 +137,9 @@ impl SlashPopup {
             let desc: String = meta.description.chars().take(desc_budget).collect();
 
             let line = if is_sel {
-                let sel = Style::default().fg(Color::Cyan).add_modifier(ratatui::style::Modifier::BOLD);
+                let sel = Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(ratatui::style::Modifier::BOLD);
                 Line::from(vec![
                     Span::styled(marker, sel),
                     Span::styled(padded_name, sel),

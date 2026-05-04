@@ -16,8 +16,12 @@ impl UserChatCell {
 }
 
 impl ChatCell for UserChatCell {
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
-    fn as_any_ref(&self) -> &dyn std::any::Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn as_any_ref(&self) -> &dyn std::any::Any {
+        self
+    }
 
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let bg = user_message_style();
@@ -47,7 +51,7 @@ impl ChatCell for UserChatCell {
         }
 
         lines.push(Line::styled("", bg)); // blank line 1 below
-        lines.push(Line::default());     // blank line 2 below (Codex has 2 blank lines after user)
+        lines.push(Line::default()); // blank line 2 below (Codex has 2 blank lines after user)
         lines
     }
 }

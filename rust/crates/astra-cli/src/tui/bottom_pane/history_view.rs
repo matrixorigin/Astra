@@ -52,8 +52,7 @@ impl HistoryView {
             self.entries
                 .iter()
                 .filter(|e| {
-                    e.user.to_lowercase().contains(&q)
-                        || e.assistant.to_lowercase().contains(&q)
+                    e.user.to_lowercase().contains(&q) || e.assistant.to_lowercase().contains(&q)
                 })
                 .collect()
         }
@@ -76,7 +75,11 @@ impl BottomPaneView for HistoryView {
         let title = if self.query.is_empty() {
             format!("Conversation History ({} turns)", self.entries.len())
         } else {
-            format!("History — {} match(es) for '{}'", filtered.len(), self.query)
+            format!(
+                "History — {} match(es) for '{}'",
+                filtered.len(),
+                self.query
+            )
         };
         if y < area.bottom() {
             Widget::render(
@@ -124,13 +127,23 @@ impl BottomPaneView for HistoryView {
             let visible_end = (visible_start + MAX_VISIBLE_ENTRIES).min(filtered.len());
 
             for &entry in &filtered[visible_start..visible_end] {
-                if y + 2 >= area.bottom() { break; }
+                if y + 2 >= area.bottom() {
+                    break;
+                }
 
                 let budget = (area.width as usize).saturating_sub(12);
                 let u_preview: String = entry.user.chars().take(budget).collect();
                 let a_preview: String = entry.assistant.chars().take(budget).collect();
-                let u_suffix = if entry.user.chars().count() > budget { "…" } else { "" };
-                let a_suffix = if entry.assistant.chars().count() > budget { "…" } else { "" };
+                let u_suffix = if entry.user.chars().count() > budget {
+                    "…"
+                } else {
+                    ""
+                };
+                let a_suffix = if entry.assistant.chars().count() > budget {
+                    "…"
+                } else {
+                    ""
+                };
 
                 Widget::render(
                     Line::from(vec![
@@ -154,13 +167,20 @@ impl BottomPaneView for HistoryView {
                 );
                 y += 1;
 
-                if y < area.bottom() { y += 1; }
+                if y < area.bottom() {
+                    y += 1;
+                }
             }
 
             if filtered.len() > MAX_VISIBLE_ENTRIES && y < area.bottom() {
                 Widget::render(
                     Line::from(Span::styled(
-                        format!("  ({}-{} of {})", visible_start + 1, visible_end, filtered.len()),
+                        format!(
+                            "  ({}-{} of {})",
+                            visible_start + 1,
+                            visible_end,
+                            filtered.len()
+                        ),
                         dim,
                     )),
                     Rect::new(area.x, y, area.width, 1),
@@ -171,11 +191,14 @@ impl BottomPaneView for HistoryView {
         }
 
         // Hint
-        if y < area.bottom() { y += 1; }
+        if y < area.bottom() {
+            y += 1;
+        }
         if y < area.bottom() {
             Widget::render(
                 Line::from(Span::styled(
-                    "  ↑/↓ scroll  PgUp/PgDn page  type to search  Esc close", dim,
+                    "  ↑/↓ scroll  PgUp/PgDn page  type to search  Esc close",
+                    dim,
                 )),
                 Rect::new(area.x, y, area.width, 1),
                 buf,
@@ -192,7 +215,11 @@ impl BottomPaneView for HistoryView {
             let visible = filtered.len().min(MAX_VISIBLE_ENTRIES);
             (visible * 3) as u16
         };
-        let scroll_h = if filtered.len() > MAX_VISIBLE_ENTRIES { 1 } else { 0 };
+        let scroll_h = if filtered.len() > MAX_VISIBLE_ENTRIES {
+            1
+        } else {
+            0
+        };
         let hint_h = 2; // blank + hint line
         header_h + entries_h + scroll_h as u16 + hint_h
     }
@@ -206,10 +233,9 @@ impl BottomPaneView for HistoryView {
             KeyCode::Up => {
                 self.scroll = self.scroll.saturating_sub(1);
             }
-            KeyCode::Down
-                if self.scroll + MAX_VISIBLE_ENTRIES < filtered_len => {
-                    self.scroll += 1;
-                }
+            KeyCode::Down if self.scroll + MAX_VISIBLE_ENTRIES < filtered_len => {
+                self.scroll += 1;
+            }
             KeyCode::PageUp => {
                 self.scroll = self.scroll.saturating_sub(MAX_VISIBLE_ENTRIES);
             }
@@ -244,7 +270,10 @@ impl BottomPaneView for HistoryView {
 
     fn completion(&self) -> Option<ViewCompletion> {
         if self.completed {
-            Some(ViewCompletion { result: None, reopen: None })
+            Some(ViewCompletion {
+                result: None,
+                reopen: None,
+            })
         } else {
             None
         }

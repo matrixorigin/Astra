@@ -234,7 +234,6 @@ mod key_routing_tests {
     }
 }
 
-
 #[cfg(test)]
 mod markdown_tests {
     use crate::tui::markdown_render::render_markdown_text;
@@ -260,8 +259,14 @@ mod markdown_tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect::<Vec<_>>()
             .join("");
-        assert!(all.contains("fn"), "code block should contain 'fn', got: {all}");
-        assert!(all.contains("main"), "code block should contain 'main', got: {all}");
+        assert!(
+            all.contains("fn"),
+            "code block should contain 'fn', got: {all}"
+        );
+        assert!(
+            all.contains("main"),
+            "code block should contain 'main', got: {all}"
+        );
     }
 
     #[test]
@@ -274,8 +279,14 @@ mod markdown_tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect::<Vec<_>>()
             .join("");
-        assert!(all.contains("fn"), "code block should contain 'fn', got: {all}");
-        assert!(all.contains("main"), "code block should contain 'main', got: {all}");
+        assert!(
+            all.contains("fn"),
+            "code block should contain 'fn', got: {all}"
+        );
+        assert!(
+            all.contains("main"),
+            "code block should contain 'main', got: {all}"
+        );
     }
 
     #[test]
@@ -304,8 +315,12 @@ mod stream_bridge_tests {
         let stream_tx = stream_bridge::create_per_turn_bridge(tui_tx);
 
         // Send two tokens then drop the sender (simulates turn end)
-        stream_tx.send(StreamEvent::Token("hello ".to_string())).unwrap();
-        stream_tx.send(StreamEvent::Token("world".to_string())).unwrap();
+        stream_tx
+            .send(StreamEvent::Token("hello ".to_string()))
+            .unwrap();
+        stream_tx
+            .send(StreamEvent::Token("world".to_string()))
+            .unwrap();
         drop(stream_tx);
 
         // Receive: should get Token, Token, TurnComplete in order
@@ -318,10 +333,17 @@ mod stream_bridge_tests {
             }
         }
 
-        assert!(events.len() >= 3, "expected at least 3 events, got {}", events.len());
+        assert!(
+            events.len() >= 3,
+            "expected at least 3 events, got {}",
+            events.len()
+        );
         assert!(matches!(&events[0], TuiAppEvent::Token(t) if t == "hello "));
         assert!(matches!(&events[1], TuiAppEvent::Token(t) if t == "world"));
-        assert!(matches!(&events[events.len() - 1], TuiAppEvent::TurnComplete));
+        assert!(matches!(
+            &events[events.len() - 1],
+            TuiAppEvent::TurnComplete
+        ));
     }
 }
 
@@ -349,7 +371,10 @@ mod turn_input_tests {
 
         // Don't route to bottom_pane — this is what the TUI does during turn
         // Verify draft is preserved
-        assert!(!bp.composer.is_empty(), "draft should be preserved after blocked Enter");
+        assert!(
+            !bp.composer.is_empty(),
+            "draft should be preserved after blocked Enter"
+        );
         assert_eq!(bp.composer.text(), "hello");
     }
 }

@@ -37,10 +37,7 @@ impl StreamState {
 
     pub fn drain_n(&mut self, max: usize) -> Vec<Line<'static>> {
         let n = max.min(self.queued_lines.len());
-        self.queued_lines
-            .drain(..n)
-            .map(|ql| ql.line)
-            .collect()
+        self.queued_lines.drain(..n).map(|ql| ql.line).collect()
     }
 
     pub fn is_idle(&self) -> bool {

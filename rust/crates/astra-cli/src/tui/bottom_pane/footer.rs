@@ -57,7 +57,14 @@ impl Footer {
                 right_parts.push(sep.clone());
             }
             let display = if cwd.chars().count() > 25 {
-                let suffix: String = cwd.chars().rev().take(24).collect::<Vec<_>>().into_iter().rev().collect();
+                let suffix: String = cwd
+                    .chars()
+                    .rev()
+                    .take(24)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
                 format!("…{suffix}")
             } else {
                 cwd.clone()
@@ -78,7 +85,10 @@ impl Footer {
         if self.is_turn_active {
             left_parts.push(Span::styled("Ctrl+C interrupt", dim));
         } else {
-            left_parts.push(Span::styled("/ commands · $ skills · Ctrl+O transcript", dim));
+            left_parts.push(Span::styled(
+                "/ commands · $ skills · Ctrl+O transcript",
+                dim,
+            ));
         }
 
         // Show non-default permission mode as a warning indicator

@@ -224,7 +224,8 @@ pub(crate) struct ReplState {
 
     /// When Some, a plan-executor tool is waiting for user approval.
     /// In blocking mode this is handled inline; kept for edge-case fallback.
-    pub pending_approval: Option<tokio::sync::oneshot::Sender<crate::chat_stream::ApprovalResponse>>,
+    pub pending_approval:
+        Option<tokio::sync::oneshot::Sender<crate::chat_stream::ApprovalResponse>>,
     /// True while plan display is in the middle of printing streaming LLM tokens.
     /// Used to insert a newline before the next non-token event.
     pub plan_in_token_stream: bool,

@@ -930,7 +930,11 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut ReplState) {
             .await
             .unwrap_or(false);
             if let Some(tx) = state.pending_approval.take() {
-                let _ = tx.send(if approved { crate::chat_stream::ApprovalResponse::AllowOnce } else { crate::chat_stream::ApprovalResponse::Deny });
+                let _ = tx.send(if approved {
+                    crate::chat_stream::ApprovalResponse::AllowOnce
+                } else {
+                    crate::chat_stream::ApprovalResponse::Deny
+                });
             }
             continue;
         }

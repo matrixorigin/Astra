@@ -15,13 +15,20 @@ pub(crate) struct AgentMessageCell {
 
 impl AgentMessageCell {
     pub fn new(lines: Vec<Line<'static>>, is_first_line: bool) -> Self {
-        Self { lines, is_first_line }
+        Self {
+            lines,
+            is_first_line,
+        }
     }
 }
 
 impl ChatCell for AgentMessageCell {
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
-    fn as_any_ref(&self) -> &dyn std::any::Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn as_any_ref(&self) -> &dyn std::any::Any {
+        self
+    }
 
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         adaptive_wrap_lines(

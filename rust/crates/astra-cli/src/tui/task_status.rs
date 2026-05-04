@@ -16,9 +16,8 @@ impl TaskStatus {
 
     pub fn elapsed(&self) -> Option<Duration> {
         match self {
-            TaskStatus::TurnRunning { started_at } | TaskStatus::ToolExecuting { started_at, .. } => {
-                Some(started_at.elapsed())
-            }
+            TaskStatus::TurnRunning { started_at }
+            | TaskStatus::ToolExecuting { started_at, .. } => Some(started_at.elapsed()),
             _ => None,
         }
     }

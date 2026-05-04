@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use ratatui::text::Line;
 
 use super::StreamState;
-use crate::tui::chat_cell::agent_message_cell::AgentMessageCell;
 use crate::tui::chat_cell::ChatCell;
+use crate::tui::chat_cell::agent_message_cell::AgentMessageCell;
 use crate::tui::markdown::append_markdown;
 
 /// Streams markdown deltas while retaining source for resize reflow.

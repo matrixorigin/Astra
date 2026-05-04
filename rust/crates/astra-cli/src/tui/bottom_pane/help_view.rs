@@ -7,8 +7,8 @@ use ratatui::{
     widgets::Widget,
 };
 
-use crate::command_registry::{self, CommandGroup, CommandMeta};
 use super::view::{BottomPaneView, CancellationEvent, ViewCompletion};
+use crate::command_registry::{self, CommandGroup, CommandMeta};
 
 const MAX_CMD_ROWS: usize = 10;
 
@@ -33,7 +33,14 @@ impl HelpView {
                 let cmds: Vec<&'static CommandMeta> = command_registry::commands_by_group(g)
                     .filter(|m| !m.is_alias && !m.name.contains(' '))
                     .collect();
-                if cmds.is_empty() { None } else { Some(GroupData { group: g, commands: cmds }) }
+                if cmds.is_empty() {
+                    None
+                } else {
+                    Some(GroupData {
+                        group: g,
+                        commands: cmds,
+                    })
+                }
             })
             .collect();
         Self {
@@ -61,7 +68,9 @@ impl BottomPaneView for HelpView {
         }
 
         let dim = Style::default().fg(Color::DarkGray);
-        let sel = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+        let sel = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
         let mut y = area.y;
 
         // Tab bar: ⚡Core  📂Workspace  🔭Observability ...
@@ -81,7 +90,9 @@ impl BottomPaneView for HelpView {
         }
 
         // Blank line
-        if y >= area.bottom() { return; }
+        if y >= area.bottom() {
+            return;
+        }
         y += 1;
 
         // Commands in active group
@@ -93,8 +104,15 @@ impl BottomPaneView for HelpView {
         };
         let visible_end = (visible_start + MAX_CMD_ROWS).min(cmds.len());
 
-        for (i, &meta) in cmds.iter().enumerate().skip(visible_start).take(visible_end - visible_start) {
-            if y >= area.bottom() { return; }
+        for (i, &meta) in cmds
+            .iter()
+            .enumerate()
+            .skip(visible_start)
+            .take(visible_end - visible_start)
+        {
+            if y >= area.bottom() {
+                return;
+            }
             let is_sel = i == self.selected_cmd;
 
             let cmd_display = if let Some(hint) = meta.arg_hint {
@@ -127,7 +145,9 @@ impl BottomPaneView for HelpView {
         }
 
         // Blank + hint
-        if y < area.bottom() { y += 1; }
+        if y < area.bottom() {
+            y += 1;
+        }
         if y < area.bottom() {
             let hint = Line::from(Span::styled(
                 "  ←/→ switch group  ↑/↓ browse  Enter select  Esc close",
@@ -160,18 +180,16 @@ impl BottomPaneView for HelpView {
                 self.active_tab = (self.active_tab + 1) % self.groups.len();
                 self.selected_cmd = 0;
             }
-            KeyCode::Up
-                if cmd_count > 0 => {
-                    self.selected_cmd = if self.selected_cmd == 0 {
-                        cmd_count - 1
-                    } else {
-                        self.selected_cmd - 1
-                    };
-                }
-            KeyCode::Down
-                if cmd_count > 0 => {
-                    self.selected_cmd = (self.selected_cmd + 1) % cmd_count;
-                }
+            KeyCode::Up if cmd_count > 0 => {
+                self.selected_cmd = if self.selected_cmd == 0 {
+                    cmd_count - 1
+                } else {
+                    self.selected_cmd - 1
+                };
+            }
+            KeyCode::Down if cmd_count > 0 => {
+                self.selected_cmd = (self.selected_cmd + 1) % cmd_count;
+            }
             KeyCode::Enter => {
                 if let Some(meta) = self.active_commands().get(self.selected_cmd) {
                     self.accepted = Some(meta.name.to_string());
@@ -200,7 +218,10 @@ impl BottomPaneView for HelpView {
 
     fn completion(&self) -> Option<ViewCompletion> {
         if self.completed {
-            Some(ViewCompletion { result: self.accepted.clone(), reopen: None })
+            Some(ViewCompletion {
+                result: self.accepted.clone(),
+                reopen: None,
+            })
         } else {
             None
         }

@@ -95,7 +95,9 @@ impl BottomPaneView for ListSelectionView {
         let visible_end = (visible_start + MAX_VISIBLE).min(filtered.len());
 
         for (vi, &(_, item)) in filtered[visible_start..visible_end].iter().enumerate() {
-            if y >= area.bottom() { break; }
+            if y >= area.bottom() {
+                break;
+            }
             let idx = visible_start + vi;
             let is_sel = idx == self.selected;
 
@@ -103,7 +105,9 @@ impl BottomPaneView for ListSelectionView {
             let num = format!("{}. ", idx + 1);
             let current_tag = if item.is_current { " (current)" } else { "" };
 
-            let sel_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+            let sel_style = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD);
 
             let mut spans = if is_sel {
                 vec![
@@ -122,7 +126,8 @@ impl BottomPaneView for ListSelectionView {
             };
 
             if let Some(ref desc) = item.description {
-                let budget = (area.width as usize).saturating_sub(8 + item.name.len() + current_tag.len());
+                let budget =
+                    (area.width as usize).saturating_sub(8 + item.name.len() + current_tag.len());
                 if budget > 5 {
                     let d: String = desc.chars().take(budget).collect();
                     spans.push(Span::raw("  "));
@@ -145,7 +150,9 @@ impl BottomPaneView for ListSelectionView {
         }
 
         // Blank line + footer hint
-        if y < area.bottom() { y += 1; }
+        if y < area.bottom() {
+            y += 1;
+        }
         if let Some(ref hint) = self.footer_hint {
             if y < area.bottom() {
                 let line = Line::from(Span::styled(format!("  {hint}"), dim));
@@ -165,18 +172,16 @@ impl BottomPaneView for ListSelectionView {
     fn handle_key(&mut self, key: KeyEvent) {
         let filtered_len = self.filtered_items().len();
         match key.code {
-            KeyCode::Up | KeyCode::Char('k')
-                if filtered_len > 0 => {
-                    self.selected = if self.selected == 0 {
-                        filtered_len - 1
-                    } else {
-                        self.selected - 1
-                    };
-                }
-            KeyCode::Down | KeyCode::Char('j')
-                if filtered_len > 0 => {
-                    self.selected = (self.selected + 1) % filtered_len;
-                }
+            KeyCode::Up | KeyCode::Char('k') if filtered_len > 0 => {
+                self.selected = if self.selected == 0 {
+                    filtered_len - 1
+                } else {
+                    self.selected - 1
+                };
+            }
+            KeyCode::Down | KeyCode::Char('j') if filtered_len > 0 => {
+                self.selected = (self.selected + 1) % filtered_len;
+            }
             KeyCode::Enter => self.accept(),
             KeyCode::Esc => {
                 self.completed = true;

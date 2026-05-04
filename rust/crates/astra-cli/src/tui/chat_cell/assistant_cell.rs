@@ -97,8 +97,12 @@ impl AssistantChatCell {
 }
 
 impl ChatCell for AssistantChatCell {
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
-    fn as_any_ref(&self) -> &dyn std::any::Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn as_any_ref(&self) -> &dyn std::any::Any {
+        self
+    }
 
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
@@ -117,7 +121,10 @@ impl ChatCell for AssistantChatCell {
             }
         } else if self.is_thinking() {
             // Thinking in progress, no content yet → shimmer "Working" like Codex
-            let working_text = format!("Working ({} • esc to interrupt)", self.thinking_elapsed_str());
+            let working_text = format!(
+                "Working ({} • esc to interrupt)",
+                self.thinking_elapsed_str()
+            );
             let mut spans = vec![Span::styled("• ", Style::default().dim())];
             spans.extend(crate::tui::shimmer::shimmer_spans(&working_text));
             lines.push(Line::from(spans));
@@ -133,21 +140,26 @@ impl ChatCell for AssistantChatCell {
 
         // Include thinking content (hidden in display_lines)
         if !self.thinking_chunks.is_empty() {
-            let dim_italic = Style::default().dim().add_modifier(ratatui::style::Modifier::ITALIC);
+            let dim_italic = Style::default()
+                .dim()
+                .add_modifier(ratatui::style::Modifier::ITALIC);
             let elapsed = self.thinking_elapsed_str();
             lines.push(Line::from(Span::styled(
-                format!("  │ Thinking ({elapsed})"), dim_italic,
+                format!("  │ Thinking ({elapsed})"),
+                dim_italic,
             )));
             let full = self.thinking_chunks.join("");
             for text_line in full.lines().take(20) {
                 let preview: String = text_line.chars().take(width as usize - 6).collect();
                 lines.push(Line::from(Span::styled(
-                    format!("  │ {preview}"), dim_italic,
+                    format!("  │ {preview}"),
+                    dim_italic,
                 )));
             }
             if full.lines().count() > 20 {
                 lines.push(Line::from(Span::styled(
-                    format!("  │ … +{} more lines", full.lines().count() - 20), dim_italic,
+                    format!("  │ … +{} more lines", full.lines().count() - 20),
+                    dim_italic,
                 )));
             }
             lines.push(Line::default());
