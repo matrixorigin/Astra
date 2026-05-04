@@ -280,7 +280,7 @@ impl GatewayRunner {
         };
 
         // Apply per-user model override scoped to this CLI
-        let model_key = format!("model_override:{}", profile.name());
+        let model_key = storage::model_preference_key(profile.name());
         if let Some(ref pool) = self.pool
             && let Ok(Some(model_name)) =
                 storage::get_user_preference(pool, platform, user_id, &model_key).await

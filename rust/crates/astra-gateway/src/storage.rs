@@ -258,6 +258,12 @@ pub async fn get_user_preference(
     Ok(row.and_then(|r| r.0).filter(|v| v != "null"))
 }
 
+/// Build a JSON-path-safe preference key for per-CLI model overrides.
+/// Uses underscore separator — colon is invalid in MatrixOne JSON paths.
+pub fn model_preference_key(cli_name: &str) -> String {
+    format!("model_override_{cli_name}")
+}
+
 // ─── Session operations ─────────────────────────────────────────────────────
 
 pub async fn get_current_session(
@@ -872,5 +878,51 @@ mod tests {
         };
         assert!(pc.expires_at.is_none());
         assert_eq!(pc.credentials["secret"], "s3cr3t");
+    }
+
+    #[test]
+    fn model_override_key_uses_underscore_separator() {
+        for cli_name in &["astra", "claude", "codex"] {
+            let key = super::model_preference_key(cli_name);
+            assert!(
+                !key.contains(':'),
+                "key must not contain colon (invalid in JSON path): {key}"
+            );
+            assert!(
+                key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "key must be alphanumeric + underscore only: {key}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn preference_roundtrip_model_override() {
+        let db_url = std::env::var("GATEWAY_DATABASE_URL")
+            .unwrap_or_else(|_| "mysql://root:111@127.0.0.1:6001/astra_gateway".into());
+        let pool = super::try_connect_db(&db_url).await.expect("DB connect");
+
+        let platform = "test";
+        let user_id = &format!("pref_test_{}", uuid::Uuid::new_v4());
+        super::upsert_user(&pool, platform, user_id, "tester")
+            .await
+            .unwrap();
+
+        let key = "model_override_astra";
+        super::set_user_preference(&pool, platform, user_id, key, "opus")
+            .await
+            .expect("set_user_preference with underscore key should succeed");
+
+        let val = super::get_user_preference(&pool, platform, user_id, key)
+            .await
+            .expect("get_user_preference should succeed");
+        assert_eq!(val.as_deref(), Some("opus"));
+
+        sqlx::query("DELETE FROM gw_users WHERE platform = ? AND platform_user_id = ?")
+            .bind(platform)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

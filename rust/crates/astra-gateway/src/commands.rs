@@ -325,7 +325,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             }
             let target = resolve_model_shortcut(arg);
             if let Some(pool) = ctx.pool {
-                let model_key = format!("model_override:{}", ctx.resolved_cli.name());
+                let model_key = storage::model_preference_key(ctx.resolved_cli.name());
                 if let Err(e) = storage::set_user_preference(
                     pool,
                     ctx.platform,

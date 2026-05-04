@@ -210,7 +210,7 @@ impl CronScheduler {
         } else {
             self.config.cli.clone()
         };
-        let model_key = format!("model_override:{}", profile.name());
+        let model_key = storage::model_preference_key(profile.name());
         if let Ok(Some(model_name)) =
             storage::get_user_preference(&self.pool, platform, user_id, &model_key).await
         {
