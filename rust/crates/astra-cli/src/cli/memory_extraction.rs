@@ -122,16 +122,55 @@ pub struct CacheUsage {
     pub prompt_tokens: Option<u64>,
 }
 
+/// Cache hit ratio, typed by which formula produced it. Making the
+/// formula visible at the type level prevents dashboards from silently
+/// comparing apples-to-oranges when a provider stops reporting
+/// `cache_creation_input_tokens` and we fall back to `read / prompt`.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum CacheHitRatio {
+    /// Formula: read / (read + created). "What share of cache operations
+    /// hit." Most accurate when both fields are reported by the provider.
+    CacheVsCreated { ratio: f32, read: u64, created: u64 },
+    /// Formula: read / prompt_tokens. "What share of input tokens came
+    /// from cache." Used as a fallback when `cache_creation` is missing;
+    /// semantically different from CacheVsCreated — don't average them.
+    CacheVsPrompt { ratio: f32, read: u64, prompt: u64 },
+    /// Usage fields missing or all-zero. No meaningful ratio available.
+    Unknown,
+}
+
+impl CacheHitRatio {
+    /// Extract the raw f32 ratio (for tracing / metrics fields). Returns
+    /// None for Unknown. Use the enum variant when you need to know
+    /// WHICH formula produced the number.
+    pub fn as_f32(&self) -> Option<f32> {
+        match self {
+            CacheHitRatio::CacheVsCreated { ratio, .. }
+            | CacheHitRatio::CacheVsPrompt { ratio, .. } => Some(*ratio),
+            CacheHitRatio::Unknown => None,
+        }
+    }
+}
+
 impl CacheUsage {
-    /// Cache hit ratio among input tokens (0.0 if unknown or denominator 0).
-    /// Ratio is `read / (read + creation)` when both fields present,
-    /// else `read / prompt` as a fallback.
-    pub fn hit_ratio(&self) -> Option<f32> {
+    /// Compute the cache hit ratio. The variant names tell callers (and
+    /// dashboards) which formula was used — previously a silent fallback
+    /// could move a metric between two semantically different scales.
+    pub fn hit_ratio(&self) -> CacheHitRatio {
         match (self.cache_read_tokens, self.cache_creation_tokens) {
-            (Some(r), Some(c)) if r + c > 0 => Some(r as f32 / (r + c) as f32),
+            (Some(read), Some(created)) if read + created > 0 => CacheHitRatio::CacheVsCreated {
+                ratio: read as f32 / (read + created) as f32,
+                read,
+                created,
+            },
             _ => match (self.cache_read_tokens, self.prompt_tokens) {
-                (Some(r), Some(p)) if p > 0 => Some(r as f32 / p as f32),
-                _ => None,
+                (Some(read), Some(prompt)) if prompt > 0 => CacheHitRatio::CacheVsPrompt {
+                    ratio: read as f32 / prompt as f32,
+                    read,
+                    prompt,
+                },
+                _ => CacheHitRatio::Unknown,
             },
         }
     }
@@ -440,20 +479,29 @@ async fn run_extraction(
         serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
     let usage = parse_cache_usage(&body_json);
     if prefix_reused {
-        match usage.hit_ratio() {
-            Some(ratio) if ratio >= 0.5 => {
+        let ratio = usage.hit_ratio();
+        // Tag the formula in the log so dashboards don't mix denominators.
+        let formula = match ratio {
+            CacheHitRatio::CacheVsCreated { .. } => "read/(read+created)",
+            CacheHitRatio::CacheVsPrompt { .. } => "read/prompt",
+            CacheHitRatio::Unknown => "unknown",
+        };
+        match ratio.as_f32() {
+            Some(r) if r >= 0.5 => {
                 tracing::info!(
                     target: "astra_cli::memory_extraction",
-                    hit_ratio = ratio,
+                    hit_ratio = r,
+                    formula,
                     cache_read = usage.cache_read_tokens,
                     cache_creation = usage.cache_creation_tokens,
                     "fork-prefix cache HIT confirmed by provider usage"
                 );
             }
-            Some(ratio) => {
+            Some(r) => {
                 tracing::warn!(
                     target: "astra_cli::memory_extraction",
-                    hit_ratio = ratio,
+                    hit_ratio = r,
+                    formula,
                     cache_read = usage.cache_read_tokens,
                     cache_creation = usage.cache_creation_tokens,
                     "prefix_reused=true but provider hit_ratio is LOW — \
@@ -834,7 +882,14 @@ mod tests {
             cache_creation_tokens: Some(100),
             prompt_tokens: None,
         };
-        assert_eq!(u.hit_ratio(), Some(0.9));
+        match u.hit_ratio() {
+            CacheHitRatio::CacheVsCreated { ratio, read, created } => {
+                assert!((ratio - 0.9).abs() < 1e-6);
+                assert_eq!(read, 900);
+                assert_eq!(created, 100);
+            }
+            other => panic!("expected CacheVsCreated, got {other:?}"),
+        }
     }
 
     #[test]
@@ -844,12 +899,24 @@ mod tests {
             cache_creation_tokens: None,
             prompt_tokens: Some(100),
         };
-        assert_eq!(u.hit_ratio(), Some(0.8));
+        match u.hit_ratio() {
+            CacheHitRatio::CacheVsPrompt { ratio, read, prompt } => {
+                assert!((ratio - 0.8).abs() < 1e-6);
+                assert_eq!(read, 80);
+                assert_eq!(prompt, 100);
+            }
+            other => panic!(
+                "expected CacheVsPrompt fallback when creation missing, got {other:?}"
+            ),
+        }
     }
 
     #[test]
-    fn hit_ratio_none_when_nothing_known() {
-        assert_eq!(CacheUsage::default().hit_ratio(), None);
+    fn hit_ratio_unknown_when_nothing_known() {
+        assert!(matches!(
+            CacheUsage::default().hit_ratio(),
+            CacheHitRatio::Unknown
+        ));
     }
 
     #[test]
@@ -859,7 +926,24 @@ mod tests {
             cache_creation_tokens: Some(0),
             prompt_tokens: Some(0),
         };
-        assert_eq!(u.hit_ratio(), None);
+        assert!(
+            matches!(u.hit_ratio(), CacheHitRatio::Unknown),
+            "zero denominators must collapse to Unknown, not a bogus 0.0"
+        );
+    }
+
+    #[test]
+    fn hit_ratio_as_f32_convenience() {
+        // Some call sites want a plain f32 for log fields. Provide a
+        // convenience accessor that extracts it without forcing callers
+        // to match on the enum.
+        let u = CacheUsage {
+            cache_read_tokens: Some(7),
+            cache_creation_tokens: Some(3),
+            prompt_tokens: None,
+        };
+        assert_eq!(u.hit_ratio().as_f32(), Some(0.7));
+        assert_eq!(CacheUsage::default().hit_ratio().as_f32(), None);
     }
 
     #[test]

@@ -70,7 +70,7 @@ tree-sitter-ruby = "0.23"
 rmcp = { version = "1.3", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-async-rw"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 nix.workspace = true
-libc = "0.2"
+libc.workspace = true
 clap_complete = "4.6.0"
 inquire = "0.7"
 urlencoding = "2.1.3"

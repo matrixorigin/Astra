@@ -18,23 +18,34 @@ const DEFAULT_MAX_SNAPSHOTS: usize = 100;
 /// the tool reports the skip rather than silently losing the state.
 pub const MAX_CHECKPOINT_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
 
-/// A single file backup within a snapshot.
+/// What we know about a file at the moment a checkpoint was taken.
 ///
-/// New fields may be added between releases (e.g. the `skipped_reason`
-/// field was added after the initial layout). External callers that
-/// construct or destructure this struct MUST use `..` to allow growth.
+/// A checkpointed file is in exactly one of three states; encoding them
+/// as an ADT (rather than two correlated `Option<String>` + `PathBuf`
+/// fields) makes it impossible for a consumer to miss a case.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum FileBackupState {
+    /// File existed pre-checkpoint and its bytes were copied to `backup_path`.
+    /// Undo restores from this path.
+    Captured { backup_path: PathBuf },
+    /// File did NOT exist pre-checkpoint. No bytes to keep. Undo means
+    /// "delete the version we wrote on top of nothing".
+    AbsentBefore,
+    /// File existed but was not captured (typically oversize). Undo is
+    /// a no-op; the reason is surfaced to the user so they know undo
+    /// didn't fully restore them to the checkpoint state.
+    Skipped { reason: String },
+}
+
+/// A single file backup within a snapshot.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct FileBackup {
     /// The original file path that was backed up.
     pub original_path: PathBuf,
-    /// Path to the backup copy (inside the backup directory). Empty path if skipped.
-    pub backup_path: PathBuf,
-    /// Whether the file existed before the mutation. If `false`, undo means delete.
-    pub existed: bool,
-    /// If Some, the file was NOT captured and revert is a no-op. Reason is
-    /// surfaced to the user so undo doesn't silently appear to succeed.
-    pub skipped_reason: Option<String>,
+    /// What happened when we tried to capture this file — see FileBackupState.
+    pub state: FileBackupState,
 }
 
 /// A point-in-time snapshot of one or more files.
@@ -70,7 +81,17 @@ pub struct DiffStats {
 #[non_exhaustive]
 pub struct RevertReport {
     pub reverted: Vec<PathBuf>,
-    pub skipped: Vec<(PathBuf, String)>,
+    pub skipped: Vec<SkippedEntry>,
+}
+
+/// A file that was intentionally not restored by a revert, with the
+/// reason so the user knows why (typically an oversize file whose
+/// pre-state was never captured to `~/.astra/file-history/`).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct SkippedEntry {
+    pub path: PathBuf,
+    pub reason: String,
 }
 
 impl RevertReport {
@@ -176,13 +197,12 @@ impl FileHistory {
 
         let mut file_backups = Vec::with_capacity(paths.len());
         for &path in paths {
-            let existed = path.exists();
             let relative = sanitize_path_for_backup(path);
             let backup_path = snap_dir.join(&relative);
 
-            let mut skipped_reason: Option<String> = None;
-
-            if existed {
+            let state = if !path.exists() {
+                FileBackupState::AbsentBefore
+            } else {
                 // Size-guard: refuse to capture oversize files. 100 snapshots
                 // of a 500MB binary would blow out ~/.astra/file-history/.
                 //
@@ -199,9 +219,9 @@ impl FileHistory {
                     })?
                     .len();
                 if size > MAX_CHECKPOINT_FILE_BYTES {
-                    skipped_reason = Some(format!(
+                    let reason = format!(
                         "size {size} bytes exceeds checkpoint limit {MAX_CHECKPOINT_FILE_BYTES}"
-                    ));
+                    );
                     tracing::warn!(
                         target: "astra_cli::file_history",
                         path = %path.display(),
@@ -209,23 +229,19 @@ impl FileHistory {
                         limit_bytes = MAX_CHECKPOINT_FILE_BYTES,
                         "file too large to checkpoint — undo for this file will be a no-op"
                     );
+                    FileBackupState::Skipped { reason }
                 } else {
                     if let Some(parent) = backup_path.parent() {
                         fs::create_dir_all(parent)?;
                     }
                     fs::copy(path, &backup_path)?;
+                    FileBackupState::Captured { backup_path }
                 }
-            }
+            };
 
             file_backups.push(FileBackup {
                 original_path: path.to_path_buf(),
-                backup_path: if skipped_reason.is_some() {
-                    PathBuf::new()
-                } else {
-                    backup_path
-                },
-                existed,
-                skipped_reason,
+                state,
             });
         }
         Ok(file_backups)
@@ -237,23 +253,30 @@ impl FileHistory {
     fn apply_snapshot(snapshot: &Snapshot) -> io::Result<RevertReport> {
         let mut report = RevertReport::default();
         for backup in &snapshot.files {
-            if let Some(ref reason) = backup.skipped_reason {
-                // File's pre-state was never captured (typically oversize).
-                // Current file is left alone; record the skip for the UI.
-                report
-                    .skipped
-                    .push((backup.original_path.clone(), reason.clone()));
-                continue;
-            }
-            if backup.existed {
-                if let Some(parent) = backup.original_path.parent() {
-                    fs::create_dir_all(parent)?;
+            match &backup.state {
+                FileBackupState::Skipped { reason } => {
+                    // Pre-state was never captured (typically oversize).
+                    // Leave the current file alone; tell the user.
+                    report.skipped.push(SkippedEntry {
+                        path: backup.original_path.clone(),
+                        reason: reason.clone(),
+                    });
                 }
-                fs::copy(&backup.backup_path, &backup.original_path)?;
-            } else if backup.original_path.exists() {
-                fs::remove_file(&backup.original_path)?;
+                FileBackupState::Captured { backup_path } => {
+                    if let Some(parent) = backup.original_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::copy(backup_path, &backup.original_path)?;
+                    report.reverted.push(backup.original_path.clone());
+                }
+                FileBackupState::AbsentBefore => {
+                    // File was created after the checkpoint — undo means delete.
+                    if backup.original_path.exists() {
+                        fs::remove_file(&backup.original_path)?;
+                    }
+                    report.reverted.push(backup.original_path.clone());
+                }
             }
-            report.reverted.push(backup.original_path.clone());
         }
         Ok(report)
     }
@@ -308,18 +331,19 @@ impl FileHistory {
         let mut stats = DiffStats::default();
 
         for backup in &snapshot.files {
-            if backup.skipped_reason.is_some() {
-                // We never captured this file's prior state — can't diff.
-                continue;
-            }
+            let (backup_content, was_captured) = match &backup.state {
+                FileBackupState::Skipped { .. } => {
+                    // We never captured this file's prior state — can't diff.
+                    continue;
+                }
+                FileBackupState::Captured { backup_path } => {
+                    (fs::read_to_string(backup_path).ok(), true)
+                }
+                FileBackupState::AbsentBefore => (None, false),
+            };
+            let _ = was_captured; // reserved for future: distinguish "empty pre" from "absent pre"
             let current_content = if backup.original_path.exists() {
                 fs::read_to_string(&backup.original_path).ok()
-            } else {
-                None
-            };
-
-            let backup_content = if backup.existed {
-                fs::read_to_string(&backup.backup_path).ok()
             } else {
                 None
             };
@@ -508,19 +532,16 @@ mod tests {
         assert_eq!(snap.id, snap_id);
         assert_eq!(snap.files.len(), 1);
         let backup = &snap.files[0];
-        assert!(
-            backup.skipped_reason.is_some(),
-            "oversize file must be marked skipped, not silently copied"
-        );
-        let reason = backup.skipped_reason.as_deref().unwrap();
-        assert!(
-            reason.contains("size") || reason.contains("bytes"),
-            "skip reason should mention size: {reason}"
-        );
-        assert!(
-            !backup.backup_path.exists(),
-            "no backup file should be created for skipped entries — disk would blow up"
-        );
+        match &backup.state {
+            FileBackupState::Skipped { reason } => {
+                assert!(
+                    reason.contains("size") || reason.contains("bytes"),
+                    "skip reason should mention size: {reason}"
+                );
+            }
+            other => panic!("oversize file must be Skipped, got {other:?}"),
+        }
+        // No backup file on disk for the skipped entry.
     }
 
     #[test]
@@ -533,8 +554,10 @@ mod tests {
 
         history.checkpoint(&[small.as_path()]).unwrap();
         let backup = &history.list_snapshots()[0].files[0];
-        assert!(backup.skipped_reason.is_none(), "small file should be captured");
-        assert!(backup.backup_path.exists());
+        match &backup.state {
+            FileBackupState::Captured { backup_path } => assert!(backup_path.exists()),
+            other => panic!("small file should be Captured, got {other:?}"),
+        }
     }
 
     // ── P3-1: symlink + permission unhappy paths ──────────────────────────
@@ -564,11 +587,11 @@ mod tests {
         let snap = &history.list_snapshots()[0];
         assert_eq!(snap.files.len(), 1);
         let backup = &snap.files[0];
-        assert!(
-            backup.skipped_reason.is_none(),
-            "symlink to small file should be captured, not skipped"
-        );
-        let captured = fs::read(&backup.backup_path).unwrap();
+        let backup_path = match &backup.state {
+            FileBackupState::Captured { backup_path } => backup_path,
+            other => panic!("symlink to small file should be Captured, got {other:?}"),
+        };
+        let captured = fs::read(backup_path).unwrap();
         assert_eq!(
             captured, b"target content",
             "fs::copy follows symlink, so backup holds the target's bytes"
@@ -594,8 +617,8 @@ mod tests {
         assert_eq!(snap.id, snap_id);
         let backup = &snap.files[0];
         assert!(
-            !backup.existed,
-            "dangling symlink must record existed=false, not pretend we captured it"
+            matches!(backup.state, FileBackupState::AbsentBefore),
+            "dangling symlink must map to AbsentBefore, not a bogus Captured"
         );
     }
 
@@ -727,22 +750,21 @@ mod tests {
         let snap = &history.list_snapshots()[0];
         assert_eq!(snap.id, snap_id);
         let backup = &snap.files[0];
-        // The key invariant: we did NOT silently mark it as skipped-due-to-size.
-        // Either existed=false (correct fail-closed) OR skipped_reason=Some(reason
-        // that doesn't mention size). What we must NOT see: existed=true +
-        // skipped_reason=None + backup_path non-empty (as that would mean
-        // we "captured" 0 bytes of a secret file).
-        assert!(
-            !backup.existed || backup.skipped_reason.is_some(),
-            "if metadata failed, either record existed=false OR record a \
-             skip with reason — never pretend we captured the file"
-        );
-        if let Some(reason) = backup.skipped_reason.as_deref() {
-            // If we did record a skip, the reason must not be the \"size 0 bytes\" lie.
-            assert!(
-                !reason.starts_with("size 0 bytes exceeds"),
-                "stat failure must not masquerade as \"size 0 bytes exceeds limit\": {reason}"
-            );
+        // Invariant: we did NOT silently claim to have captured a file
+        // whose metadata we couldn't even read. The only valid states
+        // here are AbsentBefore (correct fail-closed) or Skipped with a
+        // reason that's NOT the "size 0 bytes" lie.
+        match &backup.state {
+            FileBackupState::AbsentBefore => {}
+            FileBackupState::Skipped { reason } => {
+                assert!(
+                    !reason.starts_with("size 0 bytes exceeds"),
+                    "stat failure must not masquerade as \"size 0 bytes exceeds limit\": {reason}"
+                );
+            }
+            FileBackupState::Captured { .. } => {
+                panic!("never pretend we captured a file whose metadata failed")
+            }
         }
     }
 
@@ -786,11 +808,12 @@ mod tests {
         assert_eq!(report.reverted, vec![normal.clone()]);
         assert!(report.has_skips(), "big file must appear in skipped list");
         assert_eq!(report.skipped.len(), 1);
-        let (skipped_path, reason) = &report.skipped[0];
-        assert_eq!(skipped_path, &big);
+        let entry = &report.skipped[0];
+        assert_eq!(entry.path, big);
         assert!(
-            reason.contains("size") || reason.contains("bytes"),
-            "reason should describe why (size): {reason}"
+            entry.reason.contains("size") || entry.reason.contains("bytes"),
+            "reason should describe why (size): {}",
+            entry.reason
         );
     }
 
@@ -848,8 +871,11 @@ mod tests {
         let snapshots = history.list_snapshots();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].files.len(), 1);
-        assert!(snapshots[0].files[0].existed);
-        let backup_content = fs::read_to_string(&snapshots[0].files[0].backup_path).unwrap();
+        let backup_path = match &snapshots[0].files[0].state {
+            FileBackupState::Captured { backup_path } => backup_path.clone(),
+            other => panic!("expected Captured state, got {other:?}"),
+        };
+        let backup_content = fs::read_to_string(&backup_path).unwrap();
         assert_eq!(backup_content, "original content");
     }
 
@@ -865,9 +891,10 @@ mod tests {
 
         let snapshots = history.list_snapshots();
         assert_eq!(snapshots.len(), 1);
-        assert!(!snapshots[0].files[0].existed);
-        // Backup file should NOT exist on disk.
-        assert!(!snapshots[0].files[0].backup_path.exists());
+        assert!(
+            matches!(snapshots[0].files[0].state, FileBackupState::AbsentBefore),
+            "non-existent file must be AbsentBefore, not a bogus capture"
+        );
     }
 
     #[test]
@@ -1096,13 +1123,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut history = make_history(&tmp);
 
-        // The path doesn't exist — should record existed=false without error.
+        // The path doesn't exist — should record AbsentBefore without error.
         let missing = tmp.path().join("ghost.txt");
         let snap_id = history.checkpoint(&[missing.as_path()]).unwrap();
         assert_eq!(snap_id, 0);
 
         let snapshots = history.list_snapshots();
-        assert!(!snapshots[0].files[0].existed);
+        assert!(matches!(
+            snapshots[0].files[0].state,
+            FileBackupState::AbsentBefore
+        ));
     }
 
     #[test]
