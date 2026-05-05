@@ -120,13 +120,18 @@ import socket
 import os
 
 _SOCKET_PATH = os.environ["ASTRA_RPC_SOCKET"]
+_AUTH_TOKEN = os.environ["ASTRA_RPC_AUTH_TOKEN"]
 
 
 def _rpc_call(tool_name, args):
     """Send an RPC request to the agent and return the result."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(_SOCKET_PATH)
-    request = json.dumps({"tool": tool_name, "args": args})
+    request = json.dumps({
+        "tool": tool_name,
+        "args": args,
+        "auth_token": _AUTH_TOKEN,
+    })
     sock.sendall((request + "\n").encode())
     sock.shutdown(socket.SHUT_WR)
     response = b""
@@ -181,11 +186,44 @@ def web_fetch(url, format="markdown"):
 
 // ─── RPC request/response types ────────────────────────────────────────────
 
-/// A JSON RPC request from the Python script.
+/// A JSON RPC request from the Python script. The `auth_token` field
+/// must match the token generated for this invocation and placed in the
+/// script's env (`ASTRA_RPC_AUTH_TOKEN`). Without this check, any sibling
+/// process of the same user could connect to the UDS in /tmp and invoke
+/// tools. Option<String> rather than mandatory so legacy test inputs
+/// parse, but `check_rpc_auth` rejects None or mismatch.
 #[derive(Debug, serde::Deserialize)]
 pub struct RpcRequest {
     pub tool: String,
     pub args: Value,
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+/// Generate a random per-invocation RPC auth token. 128 bits of entropy,
+/// stringified so it round-trips cleanly through env + JSON.
+pub fn generate_rpc_auth_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// Constant-time-ish check that the request's `auth_token` matches the
+/// expected token. Length-mismatch fast path is acceptable (token length
+/// is public — random UUID). For same-length inputs, XOR-OR every byte
+/// to avoid short-circuit timing leaks.
+pub fn check_rpc_auth(req: &RpcRequest, expected: &str) -> bool {
+    let Some(got) = req.auth_token.as_deref() else {
+        return false;
+    };
+    let a = got.as_bytes();
+    let b = expected.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
 }
 
 /// A JSON RPC response to the Python script.
@@ -221,6 +259,7 @@ async fn handle_rpc_connection(
     tool_executor: &dyn ToolExecutor,
     call_count: &AtomicUsize,
     config: &CodeExecConfig,
+    auth_token: &str,
 ) -> Result<(), CodeExecError> {
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader);
@@ -246,6 +285,23 @@ async fn handle_rpc_connection(
             return Ok(());
         }
     };
+
+    // Auth check: reject connections without the per-invocation token.
+    // Without this, any sibling process of the current user could bind to
+    // the UDS in /tmp and invoke tools.
+    if !check_rpc_auth(&request, auth_token) {
+        let resp = serde_json::to_vec(&RpcResponse::error(
+            "RPC auth failed — missing or invalid auth_token".into(),
+        ))
+        .map_err(|e| CodeExecError::Internal(e.to_string()))?;
+        writer.write_all(&resp).await?;
+        tracing::warn!(
+            target: "astra_tools::code_exec",
+            tool = %request.tool,
+            "rejected RPC request with bad auth_token"
+        );
+        return Ok(());
+    }
 
     // Check tool allowlist
     if !config.allowed_tools.contains(&request.tool) {
@@ -296,14 +352,29 @@ pub async fn execute_code(
     config: &CodeExecConfig,
     tool_executor: &dyn ToolExecutor,
 ) -> Result<String, CodeExecError> {
-    // Create temp directory for socket + stub + script
+    // Create temp directory for socket + stub + script.
     let tmp_dir = tempfile::tempdir()?;
     let tmp_path = tmp_dir.path().to_path_buf();
+
+    // Harden perms: temp dir 0o700 means only this user can enter; the
+    // UDS under it inherits the protection (listing the socket requires
+    // reading the dir). tempfile already does this on Unix but be explicit.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&tmp_path)?.permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&tmp_path, perms)?;
+    }
+
     let socket_path = tmp_path.join("rpc.sock");
     let stub_path = tmp_path.join("astra_tools.py");
     let script_path = tmp_path.join("script.py");
 
-    // Write Python stub
+    // Generate per-invocation auth token. Passed to the child via env.
+    let auth_token = generate_rpc_auth_token();
+
+    // Write Python stub (uses ASTRA_RPC_AUTH_TOKEN env).
     std::fs::write(&stub_path, generate_python_stub())?;
 
     // Write the user's script
@@ -315,18 +386,17 @@ pub async fn execute_code(
     // Shared call counter
     let call_count = Arc::new(AtomicUsize::new(0));
 
-    // Spawn Python subprocess
+    // Spawn Python subprocess with hardened environment: minimum PATH,
+    // no inherited parent vars, auth token + socket path set explicitly.
+    // The LLM script must get PYTHONPATH to find astra_tools, and PATH to
+    // find python3's subprocess needs. Everything else is stripped.
     let mut child = Command::new("python3")
         .arg(&script_path)
+        .env_clear()
         .env("ASTRA_RPC_SOCKET", &socket_path)
-        .env(
-            "PYTHONPATH",
-            format!(
-                "{}:{}",
-                tmp_path.display(),
-                std::env::var("PYTHONPATH").unwrap_or_default()
-            ),
-        )
+        .env("ASTRA_RPC_AUTH_TOKEN", &auth_token)
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("PYTHONPATH", tmp_path.display().to_string())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
@@ -375,6 +445,7 @@ pub async fn execute_code(
                                 tool_executor,
                                 &call_count,
                                 config,
+                                &auth_token,
                             )
                             .await;
                             if let Err(CodeExecError::TooManyToolCalls(_)) = result {
@@ -572,6 +643,81 @@ mod tests {
         }
     }
 
+    // ── P1-1: RPC auth ────────────────────────────────────────────────────
+    //
+    // The Unix socket lives in /tmp; any process of the same user could
+    // connect and call tools. Require a per-invocation auth token that
+    // the script sends in every request.
+
+    #[test]
+    fn auth_token_is_generated_per_invocation() {
+        let a = generate_rpc_auth_token();
+        let b = generate_rpc_auth_token();
+        assert_ne!(a, b, "tokens must be random per call");
+        assert!(
+            a.len() >= 16,
+            "token length {} too short for meaningful security",
+            a.len()
+        );
+    }
+
+    #[test]
+    fn rpc_request_requires_auth_token() {
+        // Request without auth_token must fail to parse (or be rejected).
+        let json_no_auth = serde_json::json!({
+            "tool": "read_file",
+            "args": {"path": "foo"}
+        });
+        let parsed: Result<RpcRequest, _> = serde_json::from_value(json_no_auth);
+        // Either parse fails (missing field) OR parses with empty auth, both
+        // acceptable as long as check_auth rejects it.
+        if let Ok(req) = parsed {
+            assert!(
+                !check_rpc_auth(&req, "expected-token"),
+                "request without auth_token must fail check_rpc_auth"
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_request_rejects_wrong_token() {
+        let json_wrong = serde_json::json!({
+            "tool": "read_file",
+            "args": {"path": "foo"},
+            "auth_token": "WRONG"
+        });
+        let req: RpcRequest = serde_json::from_value(json_wrong).unwrap();
+        assert!(
+            !check_rpc_auth(&req, "correct-token"),
+            "mismatched token must be rejected"
+        );
+    }
+
+    #[test]
+    fn rpc_request_accepts_correct_token() {
+        let json_ok = serde_json::json!({
+            "tool": "read_file",
+            "args": {"path": "foo"},
+            "auth_token": "correct-token"
+        });
+        let req: RpcRequest = serde_json::from_value(json_ok).unwrap();
+        assert!(check_rpc_auth(&req, "correct-token"));
+    }
+
+    #[test]
+    fn check_rpc_auth_is_constant_time() {
+        // Two rejected tokens of equal length should cost equivalent time
+        // (no short-circuit on first differing byte). Smoke check.
+        let req = RpcRequest {
+            tool: "read_file".into(),
+            args: serde_json::json!({}),
+            auth_token: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+        };
+        // Constant-time impl must not panic or diverge on bytes comparison.
+        assert!(!check_rpc_auth(&req, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        assert!(!check_rpc_auth(&req, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"));
+    }
+
     // ── P0-1: allowlist discipline ────────────────────────────────────────
 
     #[test]
@@ -617,6 +763,15 @@ mod tests {
         assert!(stub.contains("socket.AF_UNIX"));
         assert!(stub.contains("json.dumps"));
         assert!(stub.contains("json.loads"));
+        // P1-1: stub must send auth_token on every request.
+        assert!(
+            stub.contains("ASTRA_RPC_AUTH_TOKEN"),
+            "stub must read ASTRA_RPC_AUTH_TOKEN so it can include auth on every RPC call"
+        );
+        assert!(
+            stub.contains("auth_token"),
+            "stub request payload must include 'auth_token' field"
+        );
     }
 
     #[test]
@@ -709,6 +864,7 @@ mod tests {
             ..Default::default()
         };
         let executor = MockToolExecutor::new();
+        let token = "test-token-abcd";
 
         // Create a UDS pair for testing
         let tmp = tempfile::tempdir().unwrap();
@@ -719,15 +875,17 @@ mod tests {
         let client1 = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
         let (stream1, _) = listener.accept().await.unwrap();
 
-        // Write a valid request to client1
-        let req = r#"{"tool": "read_file", "args": {"path": "test.txt"}}"#;
+        // Write a valid request with auth token
+        let req = format!(
+            r#"{{"tool": "read_file", "args": {{"path": "test.txt"}}, "auth_token": "{token}"}}"#
+        );
         use tokio::io::AsyncWriteExt;
         let (_, mut writer1) = client1.into_split();
         writer1.write_all(req.as_bytes()).await.unwrap();
         writer1.write_all(b"\n").await.unwrap();
         writer1.shutdown().await.unwrap();
 
-        let result = handle_rpc_connection(stream1, &executor, &call_count, &config).await;
+        let result = handle_rpc_connection(stream1, &executor, &call_count, &config, token).await;
         assert!(result.is_ok());
         assert_eq!(call_count.load(Ordering::SeqCst), 50);
 
@@ -740,7 +898,7 @@ mod tests {
         writer2.write_all(b"\n").await.unwrap();
         writer2.shutdown().await.unwrap();
 
-        let result = handle_rpc_connection(stream2, &executor, &call_count, &config).await;
+        let result = handle_rpc_connection(stream2, &executor, &call_count, &config, token).await;
         assert!(matches!(result, Err(CodeExecError::TooManyToolCalls(50))));
     }
 
@@ -751,6 +909,7 @@ mod tests {
         let call_count = AtomicUsize::new(0);
         let config = CodeExecConfig::default();
         let executor = MockToolExecutor::new();
+        let token = "tok";
 
         let tmp = tempfile::tempdir().unwrap();
         let sock_path = tmp.path().join("test.sock");
@@ -759,17 +918,59 @@ mod tests {
         let client = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
         let (stream, _) = listener.accept().await.unwrap();
 
-        // Try a disallowed tool
-        let req = r#"{"tool": "git_commit", "args": {"message": "evil"}}"#;
+        // Try a disallowed tool (with correct auth — allowlist check is what rejects)
+        let req = format!(
+            r#"{{"tool": "git_commit", "args": {{"message": "evil"}}, "auth_token": "{token}"}}"#
+        );
         let (_, mut writer) = client.into_split();
         writer.write_all(req.as_bytes()).await.unwrap();
         writer.write_all(b"\n").await.unwrap();
         writer.shutdown().await.unwrap();
 
-        let result = handle_rpc_connection(stream, &executor, &call_count, &config).await;
+        let result = handle_rpc_connection(stream, &executor, &call_count, &config, token).await;
         // Should succeed (the handler writes an error response, doesn't return Err)
         assert!(result.is_ok());
         // Call count should NOT have incremented
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+    }
+
+    // ── P1-1: RPC auth rejects bad token over actual socket ───────────────
+
+    #[tokio::test]
+    async fn rpc_request_without_token_rejected_via_socket() {
+        let call_count = AtomicUsize::new(0);
+        let config = CodeExecConfig::default();
+        let executor = MockToolExecutor::new();
+        let token = "real-token";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_path = tmp.path().join("auth.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let client = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+
+        // Request that a sibling (non-authorized) process might send:
+        // no auth_token field at all.
+        let req = r#"{"tool": "read_file", "args": {"path": "x"}}"#;
+        use tokio::io::AsyncWriteExt;
+        let (mut reader, mut writer) = client.into_split();
+        writer.write_all(req.as_bytes()).await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let _ = handle_rpc_connection(stream, &executor, &call_count, &config, token).await;
+
+        // Verify the response is an auth error (not tool output).
+        use tokio::io::AsyncReadExt;
+        let mut resp = Vec::new();
+        reader.read_to_end(&mut resp).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.contains("auth"),
+            "expected auth-related error response, got: {resp_str}"
+        );
+        // Tool must NOT have been invoked.
         assert_eq!(call_count.load(Ordering::SeqCst), 0);
     }
 
