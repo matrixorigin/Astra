@@ -1,132 +1,98 @@
-//! Serialization support for PipelineSession persistence.
+//! Helpers for restoring a `PipelineSession` from checkpoint state.
 //!
-//! Enables warm-start: save pipeline state at checkpoint, reload on resume.
-//! The envelope format (`PipelineStateEnvelope`) is versioned so schema
-//! evolution can be handled gracefully at deserialization time.
+//! The write side is `PipelineSession::snapshot_full_state()` +
+//! `serde_json::to_value(snapshot)` (called from
+//! `agentic_loop_finalization::persist_heavy_checkpoint`). The read side is
+//! a raw `serde_json::Value` loaded from `HeavyCheckpoint.pipeline_state`.
+//!
+//! This module provides the resume-time glue: it parses that Value back into
+//! a `PipelineSessionSnapshot`, distinguishes missing / corrupt / valid
+//! payloads, and logs so operators can diagnose warm-start failures.
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::pipeline_config::PipelineConfig;
+use crate::pipeline_session::{PipelineSession, PipelineSessionSnapshot};
 use crate::pipeline_stats::PipelineStats;
-use crate::recovery_state::RecoveryState;
-use crate::session_latches::SessionLatches;
 
-/// Versioned envelope for checkpoint persistence.
-/// All pipeline state that should survive session suspend/resume.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PipelineStateEnvelope {
-    version: u32,
-    stats: PipelineStats,
-    latches: SessionLatches,
-    recovery: RecoveryState,
+/// Outcome of attempting to parse `HeavyCheckpoint.pipeline_state`.
+#[derive(Debug)]
+pub enum RestoreOutcome {
+    /// Field was null or missing — legitimate for checkpoints written before
+    /// pipeline_state existed. Start with a fresh session.
+    Missing,
+    /// Payload parsed successfully. Caller should pass this into
+    /// `PipelineSession::from_snapshot`.
+    Restored(PipelineSessionSnapshot),
+    /// Payload is present but schema-incompatible. Caller SHOULD log so
+    /// operators can diagnose warm-start loss, then start fresh.
+    Corrupt(serde_json::Error),
 }
 
-const CURRENT_VERSION: u32 = 1;
-
-/// Serialize the pipeline session's cross-turn state into a JSON Value
-/// suitable for storage in `HeavyCheckpoint.pipeline_state`.
-pub fn serialize_session_state(
-    stats: &PipelineStats,
-    latches: &SessionLatches,
-    recovery: &RecoveryState,
-) -> Result<Value, serde_json::Error> {
-    let envelope = PipelineStateEnvelope {
-        version: CURRENT_VERSION,
-        stats: stats.clone(),
-        latches: latches.clone(),
-        recovery: *recovery,
+/// Parse a `pipeline_state` JSON value into a snapshot.
+///
+/// This is the inverse of `serde_json::to_value(session.snapshot_full_state())`
+/// that `agentic_loop_finalization` writes. The three-outcome enum forces
+/// callers to distinguish legitimate absence from corruption.
+pub fn parse_pipeline_state(value: Option<&Value>) -> RestoreOutcome {
+    let Some(value) = value else {
+        return RestoreOutcome::Missing;
     };
-    serde_json::to_value(&envelope)
-}
-
-/// Restored pipeline state from a checkpoint.
-#[derive(Debug, Clone)]
-pub struct RestoredPipelineState {
-    pub stats: PipelineStats,
-    pub latches: SessionLatches,
-    pub recovery: RecoveryState,
-}
-
-/// Deserialize pipeline state from a JSON Value (from `HeavyCheckpoint.pipeline_state`).
-///
-/// Fallible variant that distinguishes three cases:
-///   - `Ok(None)`  — value is null or an empty object (legitimate: old
-///     checkpoint written before pipeline_state was added).
-///   - `Ok(Some(state))` — parsed successfully.
-///   - `Err(e)`    — payload is present but corrupt / schema-incompatible.
-///     Callers that care about observability (runtime, cloud restore)
-///     must log the error — a silent drop hides warm-start failures.
-///
-/// On successful parse, transient recovery fields (`consecutive_ptl_errors`,
-/// `consecutive_same_errors`, `has_attempted_reactive_compact`) are cleared
-/// because PTL errors are in-flight state that doesn't carry across session
-/// boundaries. Escalation counters are preserved for reserve widening.
-pub fn deserialize_session_state_fallible(
-    value: &Value,
-) -> Result<Option<RestoredPipelineState>, serde_json::Error> {
     if value.is_null() {
-        return Ok(None);
+        return RestoreOutcome::Missing;
     }
-    // Empty object is treated as "field missing" — old checkpoints that never
-    // populated pipeline_state show up this way in the persisted JSON.
+    // An empty object is treated as "missing field" — older checkpoints that
+    // serialized a default struct can manifest as `{}` for truly-empty state.
     if value.as_object().is_some_and(|o| o.is_empty()) {
-        return Ok(None);
+        return RestoreOutcome::Missing;
     }
-    let envelope: PipelineStateEnvelope = serde_json::from_value(value.clone())?;
-    // Version gate: if future versions need migration, handle here.
-    // For now, version 1 is the only version.
-    if envelope.version > CURRENT_VERSION {
-        // Future version — serde ignored unknown fields during deserialization,
-        // so we may have lost fidelity. Log once rather than silently pretending
-        // the restore was clean.
-        tracing::warn!(
-            checkpoint_version = envelope.version,
-            supported_version = CURRENT_VERSION,
-            "pipeline_state checkpoint is from a newer version; unknown fields dropped"
-        );
+    match serde_json::from_value::<PipelineSessionSnapshot>(value.clone()) {
+        Ok(snapshot) => RestoreOutcome::Restored(snapshot),
+        Err(err) => RestoreOutcome::Corrupt(err),
     }
-
-    let mut recovery = envelope.recovery;
-    recovery.consecutive_ptl_errors = 0;
-    recovery.consecutive_same_errors = 0;
-    recovery.has_attempted_reactive_compact = false;
-
-    Ok(Some(RestoredPipelineState {
-        stats: envelope.stats,
-        latches: envelope.latches,
-        recovery,
-    }))
 }
 
-/// Back-compat wrapper around [`deserialize_session_state_fallible`] that
-/// collapses the corrupt-payload case into `None`.
+/// Convenience: build a `PipelineSession` from an optional checkpoint value.
 ///
-/// **Prefer the fallible variant in new code.** This wrapper is kept for
-/// the handful of callers that can't meaningfully act on a parse error
-/// (e.g., fire-and-forget telemetry); when they upgrade, delete this.
+/// - Missing / null → fresh `PipelineSession::new(config)`
+/// - Corrupt payload → fresh session + `tracing::warn!` (operators see why
+///   warm-start data was lost; they can investigate the on-disk blob)
+/// - Valid snapshot → `PipelineSession::from_snapshot(config, snapshot)`
+///   (retains stats / latches / emergent / recovery-escalation counters)
 ///
-/// On corrupt input this still logs via `tracing::warn!` so operators
-/// aren't left with zero signal — the old version was `.ok()?` with no log.
-pub fn deserialize_session_state(value: &Value) -> Option<RestoredPipelineState> {
-    match deserialize_session_state_fallible(value) {
-        Ok(opt) => opt,
-        Err(err) => {
+/// This is the canonical way to construct a `PipelineSession` on server
+/// resume. Use it at EVERY site that currently calls `PipelineSession::new`
+/// with a checkpoint value available — otherwise warm-start silently
+/// regresses to cold.
+#[must_use]
+pub fn restore_or_new(config: PipelineConfig, checkpoint_value: Option<&Value>) -> PipelineSession {
+    match parse_pipeline_state(checkpoint_value) {
+        RestoreOutcome::Missing => PipelineSession::new(config),
+        RestoreOutcome::Restored(snapshot) => {
+            tracing::debug!(
+                turns = snapshot.stats.turns_executed,
+                cache_breaks = snapshot.stats.cache_breaks.len(),
+                "pipeline session restored from checkpoint (warm-start)"
+            );
+            PipelineSession::from_snapshot(config, snapshot)
+        }
+        RestoreOutcome::Corrupt(err) => {
             tracing::warn!(
                 error = %err,
                 "pipeline_state checkpoint is corrupt; starting fresh. \
                  Warm-start data lost — cache/feedback history reset to defaults"
             );
-            None
+            PipelineSession::new(config)
         }
     }
 }
 
-/// Serialize PipelineStats to JSON bytes for persistence (legacy API).
+/// Serialize PipelineStats to JSON bytes for persistence (standalone).
 pub fn serialize_stats(stats: &PipelineStats) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(stats)
 }
 
-/// Deserialize PipelineStats from JSON bytes (legacy API).
+/// Deserialize PipelineStats from JSON bytes (standalone).
 pub fn deserialize_stats(bytes: &[u8]) -> Result<PipelineStats, serde_json::Error> {
     serde_json::from_slice(bytes)
 }
@@ -135,180 +101,138 @@ pub fn deserialize_stats(bytes: &[u8]) -> Result<PipelineStats, serde_json::Erro
 mod tests {
     use super::*;
     use crate::context_feedback::ContextFeedback;
+    use crate::recovery_state::RecoveryState;
     use crate::section_types::CacheScope;
+    use crate::session_latches::SessionLatches;
 
     #[test]
-    fn roundtrip_empty_stats() {
-        let stats = PipelineStats::default();
-        let bytes = serialize_stats(&stats).unwrap();
-        let restored = deserialize_stats(&bytes).unwrap();
-        assert_eq!(restored.turns_executed, 0);
-        assert_eq!(restored.avg_cache_hit_ratio, 0.0);
+    fn parse_none_is_missing() {
+        assert!(matches!(parse_pipeline_state(None), RestoreOutcome::Missing));
     }
 
     #[test]
-    fn roundtrip_populated_stats() {
-        let mut stats = PipelineStats::default();
-        let feedback = ContextFeedback::from_usage(1000, 800, 200, 500, false);
-        stats.record("claude-sonnet-4-6", "repl", &feedback);
-        stats.record_compaction(2000);
-
-        let bytes = serialize_stats(&stats).unwrap();
-        let restored = deserialize_stats(&bytes).unwrap();
-
-        assert_eq!(restored.turns_executed, 1);
-        assert!((restored.avg_cache_hit_ratio - stats.avg_cache_hit_ratio).abs() < 1e-9);
-        assert_eq!(restored.compact_events.len(), 1);
-        assert_eq!(restored.cache_breaks.len(), 0);
+    fn parse_null_is_missing() {
+        assert!(matches!(
+            parse_pipeline_state(Some(&Value::Null)),
+            RestoreOutcome::Missing
+        ));
     }
 
     #[test]
-    fn deserialize_gracefully_fails_on_garbage() {
-        let result = deserialize_stats(b"not json");
-        assert!(result.is_err());
+    fn parse_empty_object_is_missing() {
+        let v = serde_json::json!({});
+        assert!(matches!(parse_pipeline_state(Some(&v)), RestoreOutcome::Missing));
     }
 
     #[test]
-    fn roundtrip_preserves_response_token_estimates() {
-        let mut stats = PipelineStats::default();
-        for i in 1..=20 {
-            let feedback = ContextFeedback::from_usage(0, 0, 0, i * 100, false);
-            stats.record("model-a", "api", &feedback);
-        }
-
-        let bytes = serialize_stats(&stats).unwrap();
-        let restored = deserialize_stats(&bytes).unwrap();
-
-        let original_reserve =
-            stats
-                .response_token_estimates
-                .reserve_for("model-a", "api", &RecoveryState::default());
-        let restored_reserve = restored.response_token_estimates.reserve_for(
-            "model-a",
-            "api",
-            &RecoveryState::default(),
-        );
-        assert_eq!(
-            original_reserve.output_tokens,
-            restored_reserve.output_tokens
-        );
-    }
-
-    #[test]
-    fn session_state_roundtrip() {
+    fn parse_valid_snapshot_restores() {
+        // Write-side round-trip: snapshot_full_state → to_value → parse
         let mut stats = PipelineStats::default();
         let feedback = ContextFeedback::from_usage(0, 900, 100, 500, false);
         stats.record("claude-sonnet-4-6", "repl", &feedback);
 
         let mut latches = SessionLatches::default();
         latches.latch_cache_scope(CacheScope::Global, 1);
-        latches.latch_header("anthropic-beta", "prompt-caching-2024-07-31", 1);
 
         let mut recovery = RecoveryState::default();
-        recovery.record_ptl_error();
         recovery.record_output_escalation();
 
-        let value = serialize_session_state(&stats, &latches, &recovery).unwrap();
-        let restored = deserialize_session_state(&value).unwrap();
+        let session = PipelineSession::from_snapshot(
+            PipelineConfig::default(),
+            PipelineSessionSnapshot {
+                stats: stats.clone(),
+                latches: latches.clone(),
+                recovery,
+                emergent: Default::default(),
+            },
+        );
+        let value = serde_json::to_value(session.snapshot_full_state()).unwrap();
 
-        assert_eq!(restored.stats.turns_executed, 1);
-        assert!(restored.stats.avg_cache_hit_ratio > 0.8);
-        assert_eq!(restored.latches.cache_scope, Some(CacheScope::Global));
-        assert!(restored.latches.has_header("anthropic-beta"));
-        // PTL errors cleared on restore, escalation preserved
-        assert_eq!(restored.recovery.consecutive_ptl_errors, 0);
-        assert_eq!(restored.recovery.max_output_escalation_count, 1);
+        match parse_pipeline_state(Some(&value)) {
+            RestoreOutcome::Restored(snap) => {
+                assert_eq!(snap.stats.turns_executed, 1);
+                assert_eq!(snap.latches.cache_scope, Some(CacheScope::Global));
+                // output-escalation preserved across restore
+                assert_eq!(snap.recovery.max_output_escalation_count, 1);
+            }
+            other => panic!("expected Restored, got {other:?}"),
+        }
     }
 
     #[test]
-    fn deserialize_null_returns_none() {
-        assert!(deserialize_session_state(&Value::Null).is_none());
-    }
-
-    #[test]
-    fn deserialize_garbage_returns_none() {
-        let garbage = serde_json::json!({"not": "a pipeline state"});
-        assert!(deserialize_session_state(&garbage).is_none());
-    }
-
-    #[test]
-    fn backward_compat_missing_field_uses_default() {
-        // Simulate: old checkpoint saved with fewer fields in latches.
-        // serde(default) on missing fields should produce a valid SessionLatches.
-        let stats = PipelineStats::default();
-        let latches = SessionLatches::default();
-        let recovery = RecoveryState::default();
-        let value = serialize_session_state(&stats, &latches, &recovery).unwrap();
-
-        // Tamper: remove a field from latches to simulate schema evolution
-        let mut obj = value.as_object().unwrap().clone();
-        obj.insert("latches".into(), serde_json::json!({}));
-        let tampered = Value::Object(obj);
-
-        let restored = deserialize_session_state(&tampered).unwrap();
-        assert_eq!(restored.latches.cache_scope, None);
-        assert!(restored.latches.beta_headers.is_empty());
-    }
-
-    #[test]
-    fn backward_compat_missing_pipeline_state_returns_none() {
-        // Old checkpoints have no pipeline_state field — should gracefully return None
-        assert!(deserialize_session_state(&Value::Null).is_none());
-        assert!(deserialize_session_state(&serde_json::json!({})).is_none());
-    }
-
-    /// Review gap: the original `deserialize_session_state` collapsed
-    /// "missing pipeline_state" and "corrupt pipeline_state" into the same
-    /// `None`, leaving operators blind to restoration failures. The
-    /// fallible twin distinguishes:
-    ///   - `Ok(None)` → null / missing (old checkpoint, legitimate)
-    ///   - `Ok(Some(_))` → parsed successfully
-    ///   - `Err(_)` → present but corrupt / schema-broken; caller MUST log
-    #[test]
-    fn fallible_variant_distinguishes_missing_from_corrupt() {
-        // Missing → Ok(None)
-        let res = deserialize_session_state_fallible(&Value::Null);
-        assert!(matches!(res, Ok(None)));
-        let res = deserialize_session_state_fallible(&serde_json::json!({}));
-        assert!(matches!(res, Ok(None)));
-
-        // Corrupt (right shape, wrong types) → Err
+    fn parse_corrupt_returns_corrupt_variant() {
+        // Right general shape, wrong types — forces serde error
         let corrupt = serde_json::json!({
-            "version": "not_a_number",
-            "stats": {},
+            "stats": "not-a-struct",
             "latches": {},
-            "recovery": {}
+            "recovery": {},
+            "emergent": {}
         });
-        let res = deserialize_session_state_fallible(&corrupt);
+        let out = parse_pipeline_state(Some(&corrupt));
         assert!(
-            res.is_err(),
-            "corrupt payload must surface as Err, not Ok(None): {res:?}"
+            matches!(out, RestoreOutcome::Corrupt(_)),
+            "expected Corrupt, got {out:?}"
         );
-
-        // Valid → Ok(Some)
-        let valid = serialize_session_state(
-            &PipelineStats::default(),
-            &SessionLatches::default(),
-            &RecoveryState::default(),
-        )
-        .unwrap();
-        let res = deserialize_session_state_fallible(&valid);
-        assert!(matches!(res, Ok(Some(_))));
     }
 
-    /// Backward-compat shim: the non-fallible `deserialize_session_state`
-    /// retains the old `Option<_>` signature for callers that don't want
-    /// three-way handling, but behaviour is STILL to collapse corrupt →
-    /// None. Document that convention so nobody removes the shim without
-    /// updating every caller.
     #[test]
-    fn legacy_non_fallible_variant_still_collapses_corrupt_to_none() {
-        let corrupt =
-            serde_json::json!({"version": "bad", "stats": {}, "latches": {}, "recovery": {}});
-        assert!(
-            deserialize_session_state(&corrupt).is_none(),
-            "legacy API collapses corrupt to None for back-compat — callers wanting \
-             the distinction must use deserialize_session_state_fallible()"
+    fn restore_or_new_missing_yields_fresh_session() {
+        let sess = restore_or_new(PipelineConfig::default(), None);
+        assert_eq!(sess.stats.turns_executed, 0);
+    }
+
+    #[test]
+    fn restore_or_new_corrupt_falls_back_to_fresh() {
+        let corrupt = serde_json::json!({"stats": "bad"});
+        let sess = restore_or_new(PipelineConfig::default(), Some(&corrupt));
+        assert_eq!(
+            sess.stats.turns_executed, 0,
+            "corrupt payload must fall back to fresh, not panic"
         );
+    }
+
+    #[test]
+    fn restore_or_new_valid_preserves_warm_state() {
+        let mut stats = PipelineStats::default();
+        let feedback = ContextFeedback::from_usage(0, 900, 100, 500, false);
+        stats.record("m", "q", &feedback);
+        stats.record_compaction(2000);
+
+        let original = PipelineSession::from_snapshot(
+            PipelineConfig::default(),
+            PipelineSessionSnapshot {
+                stats: stats.clone(),
+                latches: SessionLatches::default(),
+                recovery: RecoveryState::default(),
+                emergent: Default::default(),
+            },
+        );
+        let value = serde_json::to_value(original.snapshot_full_state()).unwrap();
+
+        let restored = restore_or_new(PipelineConfig::default(), Some(&value));
+        assert_eq!(
+            restored.stats.turns_executed, 1,
+            "warm-start must preserve stats across restore"
+        );
+        assert_eq!(restored.stats.compact_events.len(), 1);
+    }
+
+    // ── Stats standalone serialization ──
+
+    #[test]
+    fn roundtrip_stats() {
+        let mut stats = PipelineStats::default();
+        let feedback = ContextFeedback::from_usage(1000, 800, 200, 500, false);
+        stats.record("m", "q", &feedback);
+        let bytes = serialize_stats(&stats).unwrap();
+        let restored = deserialize_stats(&bytes).unwrap();
+        assert_eq!(restored.turns_executed, 1);
+        assert!((restored.avg_cache_hit_ratio - stats.avg_cache_hit_ratio).abs() < 1e-9);
+    }
+
+    #[test]
+    fn deserialize_stats_rejects_garbage() {
+        let result = deserialize_stats(b"not json");
+        assert!(result.is_err());
     }
 }
