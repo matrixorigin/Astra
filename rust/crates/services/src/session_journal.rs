@@ -3213,7 +3213,15 @@ impl JournalEvent {
         categories: &[String],
         duration_ms: u64,
     ) -> Self {
-        Self::memory_extraction_ex(session_id, turn, outcome, memories_saved, categories, duration_ms, false)
+        Self::memory_extraction_ex(
+            session_id,
+            turn,
+            outcome,
+            memories_saved,
+            categories,
+            duration_ms,
+            false,
+        )
     }
 
     pub fn memory_extraction_ex(

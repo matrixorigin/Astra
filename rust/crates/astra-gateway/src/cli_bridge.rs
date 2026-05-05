@@ -34,7 +34,9 @@ impl Drop for ChildKillGuard {
             && let Ok(pid_i32) = i32::try_from(pid)
             && pid_i32 > 1
         {
-            unsafe { libc::kill(pid_i32, libc::SIGKILL); }
+            unsafe {
+                libc::kill(pid_i32, libc::SIGKILL);
+            }
         }
     }
 }
@@ -680,9 +682,19 @@ pub async fn run_cli_with_context_trace_and_timeout(
     access_token: Option<&str>,
 ) -> Result<CliResult, String> {
     run_cli_with_cancel(
-        profile, message, session_id, working_dir, progress_tx,
-        system_prompt, trace_id, request_id, timeout, access_token, None,
-    ).await
+        profile,
+        message,
+        session_id,
+        working_dir,
+        progress_tx,
+        system_prompt,
+        trace_id,
+        request_id,
+        timeout,
+        access_token,
+        None,
+    )
+    .await
 }
 
 /// Full CLI spawn with cancellation token support. When `cancel` fires,
@@ -1593,8 +1605,13 @@ model: claude-sonnet-4-6"#;
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
         let result = run_child_with_cancel(
-            cmd, None, Some(Duration::from_secs(30)), Some(token), "test",
-        ).await;
+            cmd,
+            None,
+            Some(Duration::from_secs(30)),
+            Some(token),
+            "test",
+        )
+        .await;
 
         assert!(result.is_err());
         assert!(
@@ -1615,8 +1632,13 @@ model: claude-sonnet-4-6"#;
         cmd.arg("30");
         let handle = tokio::spawn(async move {
             run_child_with_cancel(
-                cmd, None, Some(Duration::from_secs(60)), Some(token_clone), "test",
-            ).await
+                cmd,
+                None,
+                Some(Duration::from_secs(60)),
+                Some(token_clone),
+                "test",
+            )
+            .await
         });
 
         // Cancel fires. The select! picks it up and kills the child.
@@ -1639,9 +1661,8 @@ model: claude-sonnet-4-6"#;
     async fn no_cancel_completes_normally() {
         // `true` exits 0 immediately; no cancel token.
         let cmd = Command::new("true");
-        let result = run_child_with_cancel(
-            cmd, None, Some(Duration::from_secs(5)), None, "test",
-        ).await;
+        let result =
+            run_child_with_cancel(cmd, None, Some(Duration::from_secs(5)), None, "test").await;
         assert!(result.is_ok(), "true must exit 0: {:?}", result);
         let (stdout, _stderr, code) = result.unwrap();
         assert_eq!(code, 0);
@@ -1657,13 +1678,20 @@ model: claude-sonnet-4-6"#;
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
         let result = run_child_with_cancel(
-            cmd, None, Some(Duration::from_millis(100)), Some(token.clone()), "test",
-        ).await;
+            cmd,
+            None,
+            Some(Duration::from_millis(100)),
+            Some(token.clone()),
+            "test",
+        )
+        .await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("timed out"), "expected timeout, got: {err}");
-        assert!(!token.is_cancelled(), "token must NOT be cancelled by timeout");
+        assert!(
+            !token.is_cancelled(),
+            "token must NOT be cancelled by timeout"
+        );
     }
-
 }

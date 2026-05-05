@@ -643,7 +643,9 @@ mod tests {
         fs::write(&file_a, "aaa").unwrap();
         fs::write(&file_b, "bbb").unwrap();
 
-        let snap_id = history.checkpoint(&[file_a.as_path(), file_b.as_path()]).unwrap();
+        let snap_id = history
+            .checkpoint(&[file_a.as_path(), file_b.as_path()])
+            .unwrap();
 
         // Modify both.
         fs::write(&file_a, "AAA").unwrap();

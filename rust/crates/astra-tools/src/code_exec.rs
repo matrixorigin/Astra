@@ -10,8 +10,8 @@
 //! 6. Only the script's stdout is returned to the LLM.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -281,8 +281,8 @@ async fn handle_rpc_connection(
     } else {
         RpcResponse::success(result.output)
     };
-    let resp_bytes = serde_json::to_vec(&response)
-        .map_err(|e| CodeExecError::Internal(e.to_string()))?;
+    let resp_bytes =
+        serde_json::to_vec(&response).map_err(|e| CodeExecError::Internal(e.to_string()))?;
     writer.write_all(&resp_bytes).await?;
     writer.shutdown().await?;
 
@@ -336,9 +336,7 @@ pub async fn execute_code(
     // Collect stdout in background (capped)
     let stdout = child.stdout.take().expect("stdout piped");
     let max_stdout = config.max_stdout_bytes;
-    let stdout_handle = tokio::spawn(async move {
-        collect_stdout(stdout, max_stdout).await
-    });
+    let stdout_handle = tokio::spawn(async move { collect_stdout(stdout, max_stdout).await });
 
     // Collect stderr in background
     let stderr = child.stderr.take().expect("stderr piped");
@@ -435,10 +433,7 @@ pub async fn execute_code(
 }
 
 /// Collect stdout from a reader, capping at max_bytes.
-async fn collect_stdout(
-    stdout: tokio::process::ChildStdout,
-    max_bytes: usize,
-) -> String {
+async fn collect_stdout(stdout: tokio::process::ChildStdout, max_bytes: usize) -> String {
     let mut buf = Vec::with_capacity(max_bytes.min(8192));
     let mut reader = BufReader::new(stdout);
     let mut line_buf = String::new();
@@ -704,8 +699,7 @@ mod tests {
         writer1.write_all(b"\n").await.unwrap();
         writer1.shutdown().await.unwrap();
 
-        let result =
-            handle_rpc_connection(stream1, &executor, &call_count, &config).await;
+        let result = handle_rpc_connection(stream1, &executor, &call_count, &config).await;
         assert!(result.is_ok());
         assert_eq!(call_count.load(Ordering::SeqCst), 50);
 
@@ -718,8 +712,7 @@ mod tests {
         writer2.write_all(b"\n").await.unwrap();
         writer2.shutdown().await.unwrap();
 
-        let result =
-            handle_rpc_connection(stream2, &executor, &call_count, &config).await;
+        let result = handle_rpc_connection(stream2, &executor, &call_count, &config).await;
         assert!(matches!(result, Err(CodeExecError::TooManyToolCalls(50))));
     }
 
@@ -745,8 +738,7 @@ mod tests {
         writer.write_all(b"\n").await.unwrap();
         writer.shutdown().await.unwrap();
 
-        let result =
-            handle_rpc_connection(stream, &executor, &call_count, &config).await;
+        let result = handle_rpc_connection(stream, &executor, &call_count, &config).await;
         // Should succeed (the handler writes an error response, doesn't return Err)
         assert!(result.is_ok());
         // Call count should NOT have incremented
@@ -900,10 +892,7 @@ except RuntimeError as e:
         let result = execute_code(script, &config, &executor).await;
         assert!(result.is_ok(), "got: {:?}", result);
         let output = result.unwrap();
-        assert!(
-            output.contains("Correctly rejected"),
-            "got: {output}"
-        );
+        assert!(output.contains("Correctly rejected"), "got: {output}");
         assert!(output.contains("not allowed"));
     }
 

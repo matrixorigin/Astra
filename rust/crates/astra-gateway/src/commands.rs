@@ -241,7 +241,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     "其他 CLI 有活跃会话:".into(),
                 ];
                 lines.extend(found);
-                lines.push(format!("\n使用 `/cli <name>` 切换，或发送消息创建新 `{cli_name}` 会话。"));
+                lines.push(format!(
+                    "\n使用 `/cli <name>` 切换，或发送消息创建新 `{cli_name}` 会话。"
+                ));
                 return Some(lines.join("\n"));
             }
 

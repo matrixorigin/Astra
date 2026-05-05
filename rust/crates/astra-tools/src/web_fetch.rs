@@ -1739,18 +1739,30 @@ mod tests {
 
     #[test]
     fn upgrades_http_to_https() {
-        assert_eq!(upgrade_scheme("http://example.com/page"), "https://example.com/page");
-        assert_eq!(upgrade_scheme("http://example.com:80/p?q=1"), "https://example.com/p?q=1");
+        assert_eq!(
+            upgrade_scheme("http://example.com/page"),
+            "https://example.com/page"
+        );
+        assert_eq!(
+            upgrade_scheme("http://example.com:80/p?q=1"),
+            "https://example.com/p?q=1"
+        );
     }
 
     #[test]
     fn does_not_modify_https() {
-        assert_eq!(upgrade_scheme("https://example.com/page"), "https://example.com/page");
+        assert_eq!(
+            upgrade_scheme("https://example.com/page"),
+            "https://example.com/page"
+        );
     }
 
     #[test]
     fn preserves_explicit_non_standard_port() {
-        assert_eq!(upgrade_scheme("http://example.com:8080/p"), "https://example.com:8080/p");
+        assert_eq!(
+            upgrade_scheme("http://example.com:8080/p"),
+            "https://example.com:8080/p"
+        );
     }
 
     // ── Relative URL resolution ───────────────────────────────────────
@@ -1779,21 +1791,32 @@ mod tests {
 
     #[test]
     fn md_handles_empty_links_gracefully() {
-        let doc = scraper::Html::parse_document(r#"<html><body><a href="">empty</a><a href="/ok">ok</a></body></html>"#);
+        let doc = scraper::Html::parse_document(
+            r#"<html><body><a href="">empty</a><a href="/ok">ok</a></body></html>"#,
+        );
         let md = to_markdown(&doc, "https://x.com");
         assert!(md.contains("[ok](https://x.com/ok)"), "got: {md}");
     }
 
     #[test]
     fn md_nested_inline_formatting() {
-        let doc = scraper::Html::parse_document("<html><body><p><strong><em>bold italic</em></strong></p></body></html>");
+        let doc = scraper::Html::parse_document(
+            "<html><body><p><strong><em>bold italic</em></strong></p></body></html>",
+        );
         let md = to_markdown(&doc, "https://x.com");
-        assert!(md.contains("***bold italic***") || md.contains("**_bold italic_**") || md.contains("***bold italic***"), "got: {md}");
+        assert!(
+            md.contains("***bold italic***")
+                || md.contains("**_bold italic_**")
+                || md.contains("***bold italic***"),
+            "got: {md}"
+        );
     }
 
     #[test]
     fn md_preserves_code_block_content_verbatim() {
-        let doc = scraper::Html::parse_document(r#"<html><body><pre><code>fn &lt;T&gt;(x: &amp;T) { }</code></pre></body></html>"#);
+        let doc = scraper::Html::parse_document(
+            r#"<html><body><pre><code>fn &lt;T&gt;(x: &amp;T) { }</code></pre></body></html>"#,
+        );
         let md = to_markdown(&doc, "https://x.com");
         // HTML entities should be decoded by the parser
         assert!(md.contains("fn <T>(x: &T) { }"), "got: {md}");
@@ -1801,9 +1824,14 @@ mod tests {
 
     #[test]
     fn text_collapses_excessive_whitespace() {
-        let doc = scraper::Html::parse_document("<html><body><p>  lots   of   spaces  </p></body></html>");
+        let doc = scraper::Html::parse_document(
+            "<html><body><p>  lots   of   spaces  </p></body></html>",
+        );
         let text = to_text(&doc);
-        assert!(text.contains("lots of spaces") || text.contains("lots   of   spaces"), "got: {text}");
+        assert!(
+            text.contains("lots of spaces") || text.contains("lots   of   spaces"),
+            "got: {text}"
+        );
     }
 
     // ── Binary content types ──────────────────────────────────────────
@@ -1811,19 +1839,55 @@ mod tests {
     #[test]
     fn detects_all_binary_types() {
         let config = FetchConfig::default();
-        for ct in ["image/png", "audio/mpeg", "video/mp4", "application/pdf",
-                   "application/zip", "application/octet-stream", "application/gzip"] {
-            let r = transform("https://x.com/f", None, 200, ct, "", &config, Duration::ZERO);
-            assert!(r.content.contains("Binary content"), "failed for {ct}: {}", r.content);
+        for ct in [
+            "image/png",
+            "audio/mpeg",
+            "video/mp4",
+            "application/pdf",
+            "application/zip",
+            "application/octet-stream",
+            "application/gzip",
+        ] {
+            let r = transform(
+                "https://x.com/f",
+                None,
+                200,
+                ct,
+                "",
+                &config,
+                Duration::ZERO,
+            );
+            assert!(
+                r.content.contains("Binary content"),
+                "failed for {ct}: {}",
+                r.content
+            );
         }
     }
 
     #[test]
     fn non_binary_types_not_rejected() {
         let config = FetchConfig::default();
-        for ct in ["text/html", "text/plain", "application/json", "text/xml", "text/csv"] {
-            let r = transform("https://x.com/f", None, 200, ct, "data", &config, Duration::ZERO);
-            assert!(!r.content.contains("Binary content"), "incorrectly rejected {ct}");
+        for ct in [
+            "text/html",
+            "text/plain",
+            "application/json",
+            "text/xml",
+            "text/csv",
+        ] {
+            let r = transform(
+                "https://x.com/f",
+                None,
+                200,
+                ct,
+                "data",
+                &config,
+                Duration::ZERO,
+            );
+            assert!(
+                !r.content.contains("Binary content"),
+                "incorrectly rejected {ct}"
+            );
         }
     }
 }

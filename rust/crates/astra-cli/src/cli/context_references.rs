@@ -318,11 +318,7 @@ pub fn is_outside_project(path: &Path, project_root: &Path) -> bool {
 /// Rough token estimate: ~4 characters per token (common heuristic for English/code).
 pub fn estimate_tokens(content: &str) -> usize {
     let chars = content.len();
-    if chars == 0 {
-        0
-    } else {
-        (chars / 4).max(1)
-    }
+    if chars == 0 { 0 } else { (chars / 4).max(1) }
 }
 
 // ---------------------------------------------------------------------------
@@ -618,7 +614,10 @@ fn format_label(reference: &ContextReference, tokens: usize) -> String {
     match &reference.kind {
         RefKind::File => {
             if let Some((s, e)) = reference.line_range {
-                format!("@file:{}:{}-{} (~{} tokens)", reference.target, s, e, tokens)
+                format!(
+                    "@file:{}:{}-{} (~{} tokens)",
+                    reference.target, s, e, tokens
+                )
             } else {
                 format!("@file:{} (~{} tokens)", reference.target, tokens)
             }
@@ -768,7 +767,9 @@ mod tests {
 
     #[test]
     fn test_sensitive_path_gnupg() {
-        assert!(is_sensitive_path(Path::new("/home/user/.gnupg/private-keys")));
+        assert!(is_sensitive_path(Path::new(
+            "/home/user/.gnupg/private-keys"
+        )));
     }
 
     #[test]
@@ -791,7 +792,10 @@ mod tests {
     fn test_outside_project_root() {
         let root = Path::new("/home/user/project");
         assert!(is_outside_project(Path::new("/etc/passwd"), root));
-        assert!(is_outside_project(Path::new("/home/user/other/file.rs"), root));
+        assert!(is_outside_project(
+            Path::new("/home/user/other/file.rs"),
+            root
+        ));
     }
 
     // ===== Token estimation tests =====
@@ -967,7 +971,12 @@ mod tests {
         let result = expand_references(msg, dir.path(), 100_000).await;
 
         assert_eq!(result.attachments.len(), 0);
-        assert!(result.warnings.iter().any(|w| w.contains("not a directory")));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("not a directory"))
+        );
     }
 
     // ===== URL expansion tests =====

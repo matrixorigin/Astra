@@ -410,8 +410,10 @@ impl GatewayRunner {
         // so they execute immediately even when a task is running.
         if let Some(rest) = trimmed.strip_prefix("/manage ") {
             let rest = rest.trim();
-            if rest == "cancel" || rest.starts_with("cancel ")
-                || rest == "kill" || rest.starts_with("kill ")
+            if rest == "cancel"
+                || rest.starts_with("cancel ")
+                || rest == "kill"
+                || rest.starts_with("kill ")
             {
                 let rewritten_cmd = format!("/{rest}");
                 // Build command context and dispatch directly (avoids async recursion).
@@ -423,10 +425,9 @@ impl GatewayRunner {
                     chat_id: &effective_chat_id,
                     user_id: &msg.user_id,
                     resolved_cli: &cli_profile,
-                    durable_store: self
-                        .durable_store
-                        .as_ref()
-                        .map(|s| s.as_ref() as &dyn astra_core::durable_task_store::DurableTaskStore),
+                    durable_store: self.durable_store.as_ref().map(|s| {
+                        s.as_ref() as &dyn astra_core::durable_task_store::DurableTaskStore
+                    }),
                     trace_repo: self
                         .trace_repo
                         .as_ref()
@@ -852,14 +853,20 @@ impl GatewayRunner {
             if text.is_empty() {
                 return 0;
             }
+            let Some(tx) = tx else {
+                // No outbound channel — discard to prevent memory leak.
+                buf.clear();
+                return 0;
+            };
             let len = text.len();
             let tagged = format!("[{tag}:{chunk_num}] {text}");
-            if let Some(tx) = tx
-                && tx.try_send(OutboundMessage::plain(
+            if tx
+                .try_send(OutboundMessage::plain(
                     platform.to_string(),
                     chat.to_string(),
                     tagged,
-                )).is_err()
+                ))
+                .is_err()
             {
                 return 0;
             }
@@ -867,7 +874,6 @@ impl GatewayRunner {
             buf.clear();
             len
         };
-
 
         loop {
             tokio::select! {
@@ -4829,19 +4835,28 @@ async fn kill_command_removes_and_cancels_token() {
 #[test]
 fn manage_redirect_recognizes_cancel_and_kill() {
     // Verifies the routing predicate used in handle_fast.
-    for input in ["/manage cancel", "/manage cancel 1", "/manage kill", "/manage kill 2"] {
+    for input in [
+        "/manage cancel",
+        "/manage cancel 1",
+        "/manage kill",
+        "/manage kill 2",
+    ] {
         let rest = input.strip_prefix("/manage ").unwrap().trim();
         assert!(
-            rest == "cancel" || rest.starts_with("cancel ")
-                || rest == "kill" || rest.starts_with("kill "),
+            rest == "cancel"
+                || rest.starts_with("cancel ")
+                || rest == "kill"
+                || rest.starts_with("kill "),
             "'{input}' should redirect to fast path"
         );
     }
     // These should NOT redirect.
     for input in ["/manage status", "/manage", "/manage help"] {
         let rest = input.strip_prefix("/manage ").unwrap_or("").trim();
-        let should_redirect = rest == "cancel" || rest.starts_with("cancel ")
-            || rest == "kill" || rest.starts_with("kill ");
+        let should_redirect = rest == "cancel"
+            || rest.starts_with("cancel ")
+            || rest == "kill"
+            || rest.starts_with("kill ");
         assert!(!should_redirect, "'{input}' should NOT redirect");
     }
 }
@@ -4959,12 +4974,17 @@ async fn flush_buf_does_not_block_when_channel_full() {
 
     // Fill channel.
     tx.try_send(OutboundMessage::plain(
-        String::from("p"), String::from("c"), String::from("fill"),
-    )).unwrap();
+        String::from("p"),
+        String::from("c"),
+        String::from("fill"),
+    ))
+    .unwrap();
 
     // flush_buf equivalent: try_send on full channel completes instantly.
     let result = tx.try_send(OutboundMessage::plain(
-        String::from("p"), String::from("c"), String::from("chunk"),
+        String::from("p"),
+        String::from("c"),
+        String::from("chunk"),
     ));
     // Returns Err(Full), not deadlock.
     assert!(result.is_err());

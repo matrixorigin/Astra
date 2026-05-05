@@ -133,11 +133,7 @@ fn unix_terminal_focused() -> bool {
 /// Format a notification message for task completion.
 pub fn format_notification(title: &str, body: &str, elapsed: Duration) -> (String, String) {
     let elapsed_str = if elapsed.as_secs() >= 60 {
-        format!(
-            "{}m{}s",
-            elapsed.as_secs() / 60,
-            elapsed.as_secs() % 60
-        )
+        format!("{}m{}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
     } else {
         format!("{}s", elapsed.as_secs())
     };
@@ -405,33 +401,21 @@ mod tests {
 
     #[test]
     fn test_format_notification_seconds() {
-        let (title, body) = format_notification(
-            "Astra",
-            "Task completed",
-            Duration::from_secs(25),
-        );
+        let (title, body) = format_notification("Astra", "Task completed", Duration::from_secs(25));
         assert_eq!(title, "Astra");
         assert_eq!(body, "Task completed (25s)");
     }
 
     #[test]
     fn test_format_notification_minutes() {
-        let (title, body) = format_notification(
-            "Astra",
-            "Turn finished",
-            Duration::from_secs(135),
-        );
+        let (title, body) = format_notification("Astra", "Turn finished", Duration::from_secs(135));
         assert_eq!(title, "Astra");
         assert_eq!(body, "Turn finished (2m15s)");
     }
 
     #[test]
     fn test_format_notification_exact_minute() {
-        let (title, body) = format_notification(
-            "Astra Agent",
-            "Done",
-            Duration::from_secs(60),
-        );
+        let (title, body) = format_notification("Astra Agent", "Done", Duration::from_secs(60));
         assert_eq!(title, "Astra Agent");
         assert_eq!(body, "Done (1m0s)");
     }

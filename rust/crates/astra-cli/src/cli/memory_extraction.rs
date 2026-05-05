@@ -1121,10 +1121,7 @@ mod tests {
             content.contains(EXTRACTION_SYSTEM_PROMPT),
             "must contain extraction system instruction"
         );
-        assert!(
-            content.contains(query),
-            "must contain the extraction query"
-        );
+        assert!(content.contains(query), "must contain the extraction query");
     }
 
     #[test]
@@ -1372,7 +1369,10 @@ mod tests {
 
         match result {
             Some(ExtractionOutcome::Extracted { prefix_reused, .. }) => {
-                assert!(!prefix_reused, "oversized prefix must not be marked as reused");
+                assert!(
+                    !prefix_reused,
+                    "oversized prefix must not be marked as reused"
+                );
             }
             other => panic!("expected Extracted, got: {other:?}"),
         }
@@ -1499,7 +1499,10 @@ mod tests {
 
         match result {
             Some(ExtractionOutcome::Extracted { prefix_reused, .. }) => {
-                assert!(prefix_reused, "matching prefix must report prefix_reused=true");
+                assert!(
+                    prefix_reused,
+                    "matching prefix must report prefix_reused=true"
+                );
             }
             other => panic!("expected Extracted, got: {other:?}"),
         }

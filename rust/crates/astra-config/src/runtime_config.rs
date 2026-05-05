@@ -1951,7 +1951,10 @@ impl RuntimeConfig {
 /// Any other value (including `0/false/off/no`) means disabled.
 /// Absence of the variable is handled by the caller (no-op).
 pub fn parse_fork_prefix_flag(val: &str) -> bool {
-    matches!(val.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes")
+    matches!(
+        val.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "on" | "yes"
+    )
 }
 
 #[cfg(test)]
@@ -2888,10 +2891,7 @@ mod tests {
     #[test]
     fn fork_prefix_flag_truthy_values() {
         for val in ["1", "true", "TRUE", "True", "on", "ON", "yes", "Yes", "YES"] {
-            assert!(
-                parse_fork_prefix_flag(val),
-                "{val:?} must parse as enabled"
-            );
+            assert!(parse_fork_prefix_flag(val), "{val:?} must parse as enabled");
         }
     }
 
