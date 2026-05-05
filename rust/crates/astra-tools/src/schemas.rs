@@ -80,6 +80,7 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "memory_purge",
     "memory_correct",
     "memory_profile",
+    "execute_code",
     "enter_plan_mode",
     "exit_plan_mode",
     "get_agent_info",
@@ -1928,6 +1929,27 @@ pub fn all_tool_schemas() -> Vec<Value> {
                             "description": "Whether the plan is approved for execution. Default true."
                         }
                     }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "execute_code",
+                "description": "Execute a Python script that can call agent tools via RPC. Use for multi-step operations that would require many tool calls — the script handles the logic, calling tools as needed. Only stdout is returned. Available functions: read_file, write_file, bash, list_dir, grep, web_fetch.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "script": {
+                            "type": "string",
+                            "description": "Python script to execute. The module `astra_tools` is auto-imported with functions: read_file(path), write_file(path, content), bash(command), list_dir(path), grep(pattern, path), web_fetch(url)."
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Max execution time in seconds (default 300)"
+                        }
+                    },
+                    "required": ["script"]
                 }
             }
         }),

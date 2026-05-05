@@ -321,6 +321,9 @@ impl DefaultToolExecutor {
                 ))
             }
 
+            // ── Code execution (Python RPC bridge) ──────────────────
+            "execute_code" => crate::code_exec::handle_execute_code(args, self).await,
+
             // ── Delegation placeholder ───────────────────────────────
             "delegate" => ToolResult::text(
                 "Delegation request acknowledged. Sub-agent will be spawned.".into(),

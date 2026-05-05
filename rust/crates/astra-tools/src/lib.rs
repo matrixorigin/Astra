@@ -13,6 +13,7 @@ pub mod web_fetch;
 pub mod web_search;
 
 pub mod build_test;
+pub mod code_exec;
 pub mod code_intel;
 pub mod config_tool;
 pub mod env_tools;
