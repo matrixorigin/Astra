@@ -1705,4 +1705,188 @@ mod cache_stability_regression {
              (pinned prefix cache hits regardless of MCP churn)"
         );
     }
+
+    // ── Composite request-body byte-equality ─────────────────────────────
+    //
+    // Review gap: the component-level tests above verify tools, system
+    // blocks, and messages *separately*. A composition bug (e.g., system
+    // blocks silently reordered by `build_provider_request_body`, or the
+    // cachePoint shifted by Bedrock translation) wouldn't surface in any
+    // single one. These tests build the FULL outgoing request body and
+    // diff it byte-by-byte between two turns with identical stable inputs
+    // and different dynamic tails.
+
+    /// Helper: build two complete Bedrock request bodies that share the
+    /// same system prompt + pinned tools + user message, but differ only
+    /// in dynamic tool tail. Returns `(body_a, body_b, pinned_count)`.
+    fn build_two_bedrock_bodies_with_shared_prefix() -> (Value, Value, usize) {
+        let system_msg = json!({
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "You are an expert."},
+                {"type": "text", "text": "## Rules\nFollow them."},
+            ],
+        });
+        let user_msg = json!({
+            "role": "user",
+            "content": "Say ACK.",
+        });
+
+        let build = |dynamic_tail: Vec<Value>| {
+            let mut tools = pinned_prefix_fixture();
+            tools.extend(dynamic_tail);
+            annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
+            crate::turn::llm_client::build_provider_request_body(
+                &[system_msg.clone(), user_msg.clone()],
+                &tools,
+                "anthropic.claude-sonnet-4-20250514-v1:0",
+                "bedrock",
+                Some(256),
+                None,
+                false,
+                &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            )
+        };
+
+        let a = build(vec![schema("git_log"), schema("mo_branch")]);
+        let b = build(vec![schema("web_fetch")]);
+        (a, b, pinned_prefix_fixture().len())
+    }
+
+    #[test]
+    fn composite_bedrock_body_system_bytes_identical_across_turns() {
+        let (a, b, _) = build_two_bedrock_bodies_with_shared_prefix();
+        assert_eq!(
+            a["system"], b["system"],
+            "system blocks must be byte-identical across turns with shared static prefix"
+        );
+    }
+
+    #[test]
+    fn composite_bedrock_body_first_user_message_identical() {
+        let (a, b, _) = build_two_bedrock_bodies_with_shared_prefix();
+        let msg_a = &a["messages"][0];
+        let msg_b = &b["messages"][0];
+        assert_eq!(
+            msg_a, msg_b,
+            "first user message must be byte-identical when content is shared"
+        );
+    }
+
+    #[test]
+    fn composite_bedrock_body_pinned_tools_plus_cachepoint_identical() {
+        let (a, b, pinned_count) = build_two_bedrock_bodies_with_shared_prefix();
+        let a_tools = a["toolConfig"]["tools"].as_array().unwrap();
+        let b_tools = b["toolConfig"]["tools"].as_array().unwrap();
+
+        // [pinned_0..pinned_{n-1}, cachePoint, dynamic_tail...]
+        // Compare indices 0..=pinned_count (inclusive of the cachePoint).
+        for i in 0..=pinned_count {
+            let sa = serde_json::to_string(&a_tools[i]).unwrap();
+            let sb = serde_json::to_string(&b_tools[i]).unwrap();
+            assert_eq!(
+                sa, sb,
+                "composite body: tool[{i}] must match across turns through cachePoint"
+            );
+        }
+
+        // Dynamic tail is allowed to differ — that's the whole point.
+        // Sanity: the two bodies DO differ somewhere after the cachePoint,
+        // otherwise the test isn't exercising what it claims to.
+        let tail_a: Vec<_> = a_tools.iter().skip(pinned_count + 1).collect();
+        let tail_b: Vec<_> = b_tools.iter().skip(pinned_count + 1).collect();
+        assert_ne!(
+            tail_a, tail_b,
+            "sanity: dynamic tails should differ between the two fixtures — \
+             if they're equal the test is tautological"
+        );
+    }
+
+    /// Same composite check for the direct-Anthropic path. The body shape
+    /// differs from Bedrock (no `toolConfig` wrapping, no `cachePoint`
+    /// block; instead `cache_control` rides on the last pinned tool).
+    #[test]
+    fn composite_anthropic_direct_body_prefix_identical_across_turns() {
+        let system_msg = json!({
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "You are an expert."},
+            ],
+        });
+        let user_msg = json!({"role": "user", "content": "Hi"});
+
+        let build = |tail: Vec<Value>| {
+            let mut tools = pinned_prefix_fixture();
+            tools.extend(tail);
+            annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
+            crate::turn::llm_client::build_provider_request_body(
+                &[system_msg.clone(), user_msg.clone()],
+                &tools,
+                "claude-sonnet-4-5-20250929",
+                "anthropic",
+                Some(256),
+                None,
+                false,
+                &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            )
+        };
+        let a = build(vec![schema("git_log"), schema("mo_branch")]);
+        let b = build(vec![schema("web_fetch")]);
+
+        // Static system + user message identical
+        assert_eq!(a["system"], b["system"]);
+        assert_eq!(a["messages"], b["messages"]);
+
+        // Pinned tool bytes (through the marker-hosting last pinned tool) identical
+        let a_tools = a["tools"].as_array().unwrap();
+        let b_tools = b["tools"].as_array().unwrap();
+        let pinned_count = pinned_prefix_fixture().len();
+        for i in 0..pinned_count {
+            assert_eq!(
+                serde_json::to_string(&a_tools[i]).unwrap(),
+                serde_json::to_string(&b_tools[i]).unwrap(),
+                "anthropic composite: tool[{i}] must match across turns"
+            );
+        }
+    }
+
+    /// OpenAI-compatible path: no cache_control is consumed, but the whole
+    /// prefix (system + tools up to pinned_count + first user msg) must be
+    /// byte-identical for DeepSeek/OpenAI server-side prefix caching to hit.
+    #[test]
+    fn composite_openai_body_prefix_identical_across_turns() {
+        let system_msg = json!({"role": "system", "content": "You are an expert."});
+        let user_msg = json!({"role": "user", "content": "hi"});
+
+        let build = |tail: Vec<Value>| {
+            let mut tools = pinned_prefix_fixture();
+            tools.extend(tail);
+            annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
+            crate::turn::llm_client::build_provider_request_body(
+                &[system_msg.clone(), user_msg.clone()],
+                &tools,
+                "deepseek-chat",
+                "openai",
+                Some(256),
+                None,
+                false,
+                &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            )
+        };
+        let a = build(vec![schema("git_log"), schema("mo_branch")]);
+        let b = build(vec![schema("web_fetch")]);
+
+        assert_eq!(a["messages"], b["messages"]);
+
+        let a_tools = a["tools"].as_array().unwrap();
+        let b_tools = b["tools"].as_array().unwrap();
+        let pinned_count = pinned_prefix_fixture().len();
+        for i in 0..pinned_count {
+            assert_eq!(
+                serde_json::to_string(&a_tools[i]).unwrap(),
+                serde_json::to_string(&b_tools[i]).unwrap(),
+                "openai composite: tool[{i}] must match — prefix auto-caching needs byte equality"
+            );
+        }
+    }
 }
