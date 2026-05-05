@@ -357,10 +357,6 @@ pub struct ToolExecutor {
     /// more aggressively.
     /// Per-turn aggregate budget is 200K.
     aggregate_output_bytes: std::sync::atomic::AtomicUsize,
-    /// URL fetch cache: LRU-style cache mapping URL → (response, timestamp).
-    /// Returns cached response for repeated fetches within TTL (15 minutes).
-    /// Prevents wasting tokens re-fetching the same documentation pages.
-    url_cache: std::sync::Mutex<HashMap<String, (String, std::time::Instant)>>,
     /// After a `.rs` file is written under a Rust workspace, set so the next
     /// `/chat` turn with `tool_results` can run passive `cargo check` and inject diagnostics.
     passive_cargo_pending: AtomicBool,
@@ -472,7 +468,6 @@ impl ToolExecutor {
             memoria_notified_down: std::sync::atomic::AtomicBool::new(false),
             file_state: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             aggregate_output_bytes: std::sync::atomic::AtomicUsize::new(0),
-            url_cache: std::sync::Mutex::new(HashMap::new()),
             passive_cargo_pending: AtomicBool::new(false),
             passive_tsc_pending: AtomicBool::new(false),
             passive_lsp: passive_lsp::PassiveLspManager::new(),
@@ -1057,7 +1052,7 @@ impl ToolExecutor {
                 "github_get_issue" => self.github_get_issue(args).await,
                 "github_repo_stats" => self.github_repo_stats(args).await,
                 "github_create_issue" => self.github_create_issue(args).await,
-                "web_fetch" => self.web_fetch(args),
+                "web_fetch" => astra_tools::web_fetch::fetch(None, args).await,
                 "memory_retrieve" => self.memoria_call("retrieve", args).await,
                 "memory_store" => self.memoria_call("store", args).await,
                 "memory_search" => self.memoria_call("search", args).await,

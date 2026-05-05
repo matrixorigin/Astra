@@ -1145,13 +1145,15 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "web_fetch",
-                "description": "Fetch a URL and return its content (truncated to ~10KB by default). Use for reading web pages, APIs, documentation, or any HTTP resource. Safer and simpler than bash+curl. Set max_bytes to fetch more content.",
+                "description": "Fetch a URL and return structured JSON with metadata, extracted content (Markdown by default), and navigation links. Handles HTML-to-Markdown conversion, link discovery, and content truncation automatically.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "url": {"type": "string", "description": "URL to fetch (http:// or https://)"},
-                        "max_bytes": {"type": "integer", "description": "Max response size in bytes (default 10000)"},
-                        "timeout": {"type": "integer", "description": "Timeout in seconds (default 10)"}
+                        "format": {"type": "string", "enum": ["markdown", "text"], "description": "Output format for extracted content (default: markdown)"},
+                        "max_content": {"type": "integer", "description": "Max extracted content characters (default 80000)"},
+                        "timeout": {"type": "integer", "description": "Timeout in seconds (default 30)"},
+                        "max_links": {"type": "integer", "description": "Max navigation links to extract (default 25)"}
                     },
                     "required": ["url"]
                 }

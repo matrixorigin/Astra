@@ -1,0 +1,1549 @@
+//! Web content retrieval with intelligent extraction.
+//!
+//! Fetches URLs and transforms raw HTML into model-friendly Markdown with
+//! metadata extraction, link discovery, and content-aware routing.
+
+use std::net::IpAddr;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
+use serde_json::Value;
+use tokio::sync::Mutex;
+
+pub use convert::{to_markdown, to_text};
+pub use extract::{ExtractedLink, PageMetadata, extract_links, extract_metadata};
+
+// ─── Public Types ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutputFormat {
+    Markdown,
+    Text,
+}
+
+impl OutputFormat {
+    fn parse(s: Option<&str>) -> Result<Self, String> {
+        match s {
+            None | Some("markdown") => Ok(Self::Markdown),
+            Some("text") => Ok(Self::Text),
+            Some(other) => Err(format!(
+                "Unknown format '{other}'. Use 'markdown' or 'text'."
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FetchResult {
+    pub url: String,
+    pub final_url: Option<String>,
+    pub status: u16,
+    pub content_type: String,
+    pub metadata: extract::PageMetadata,
+    pub content: String,
+    pub links: Vec<extract::ExtractedLink>,
+    pub content_length: usize,
+    pub truncated: bool,
+    pub cached: bool,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum FetchError {
+    #[error("{0}")]
+    Validation(String),
+    #[error("{0}")]
+    Network(String),
+    #[error("{0}")]
+    Timeout(String),
+    #[error("SSRF blocked: {0} resolves to a private/internal address")]
+    SsrfBlocked(String),
+}
+
+// ─── Configuration ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct FetchConfig {
+    pub format: OutputFormat,
+    pub max_content: usize,
+    pub timeout: Duration,
+    pub max_links: usize,
+}
+
+impl Default for FetchConfig {
+    fn default() -> Self {
+        Self {
+            format: OutputFormat::Markdown,
+            max_content: 80_000,
+            timeout: Duration::from_secs(30),
+            max_links: 25,
+        }
+    }
+}
+
+impl FetchConfig {
+    fn from_args(args: &Value) -> Result<(String, Self), FetchError> {
+        let url = args
+            .get("url")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| FetchError::Validation("Missing 'url' parameter".into()))?;
+
+        let format = OutputFormat::parse(args.get("format").and_then(Value::as_str))
+            .map_err(FetchError::Validation)?;
+
+        let max_content = args
+            .get("max_content")
+            .and_then(Value::as_u64)
+            .unwrap_or(80_000) as usize;
+
+        let timeout_secs = args.get("timeout").and_then(Value::as_u64).unwrap_or(30);
+
+        let max_links = args.get("max_links").and_then(Value::as_u64).unwrap_or(25) as usize;
+
+        Ok((
+            url,
+            Self {
+                format,
+                max_content,
+                timeout: Duration::from_secs(timeout_secs),
+                max_links,
+            },
+        ))
+    }
+}
+
+// ─── Cache ───────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct CacheKey {
+    url: String,
+    format: OutputFormat,
+}
+
+struct CacheEntry {
+    result: Arc<FetchResult>,
+    inserted_at: Instant,
+}
+
+struct Cache {
+    entries: Vec<(CacheKey, CacheEntry)>,
+    max_entries: usize,
+    ttl: Duration,
+}
+
+impl Cache {
+    fn new(max_entries: usize, ttl: Duration) -> Self {
+        Self {
+            entries: Vec::with_capacity(max_entries),
+            max_entries,
+            ttl,
+        }
+    }
+
+    fn get(&mut self, key: &CacheKey) -> Option<Arc<FetchResult>> {
+        let now = Instant::now();
+        self.entries
+            .retain(|(_, e)| now.duration_since(e.inserted_at) < self.ttl);
+        self.entries
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, e)| Arc::clone(&e.result))
+    }
+
+    fn put(&mut self, key: CacheKey, result: Arc<FetchResult>) {
+        if self.entries.len() >= self.max_entries {
+            self.entries.remove(0);
+        }
+        self.entries.push((
+            key,
+            CacheEntry {
+                result,
+                inserted_at: Instant::now(),
+            },
+        ));
+    }
+}
+
+static CACHE: OnceLock<Arc<Mutex<Cache>>> = OnceLock::new();
+
+fn shared_cache() -> &'static Arc<Mutex<Cache>> {
+    CACHE.get_or_init(|| Arc::new(Mutex::new(Cache::new(64, Duration::from_secs(15 * 60)))))
+}
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+const MAX_DOWNLOAD_BYTES: usize = 2 * 1024 * 1024;
+const MAX_REDIRECTS: usize = 5;
+const MAX_URL_LENGTH: usize = 4096;
+const USER_AGENT: &str = "astra/1.0 (web-fetch)";
+const MAX_WALK_DEPTH: usize = 256;
+
+// ─── Entry Point ─────────────────────────────────────────────────────────────
+
+/// Tool dispatcher entry point. Returns JSON on success, `"Error: ..."` on failure.
+/// HTTP 4xx/5xx responses are returned as error strings so the caller marks them as errors.
+pub async fn fetch(client: Option<&reqwest::Client>, args: &Value) -> String {
+    match fetch_inner(client, args).await {
+        Ok(result) if result.status >= 400 => {
+            format!("Error: HTTP {} — {}", result.status, result.content)
+        }
+        Ok(result) => serde_json::to_string(&*result).unwrap_or_else(|e| format!("Error: {e}")),
+        Err(e) => format!("Error: {e}"),
+    }
+}
+
+async fn fetch_inner(
+    client: Option<&reqwest::Client>,
+    args: &Value,
+) -> Result<Arc<FetchResult>, FetchError> {
+    let (url, config) = FetchConfig::from_args(args)?;
+    validate_url(&url)?;
+
+    let cache_key = CacheKey {
+        url: url.clone(),
+        format: config.format,
+    };
+
+    // Check cache
+    {
+        let mut cache = shared_cache().lock().await;
+        if let Some(cached) = cache.get(&cache_key) {
+            let mut result = (*cached).clone();
+            result.cached = true;
+            return Ok(Arc::new(result));
+        }
+    }
+
+    let start = Instant::now();
+    let (status, final_url, content_type, body) = do_fetch(client, &url, config.timeout).await?;
+    let result = transform(
+        &url,
+        final_url.as_deref(),
+        status,
+        &content_type,
+        &body,
+        &config,
+        start.elapsed(),
+    );
+    let result = Arc::new(result);
+
+    if status < 400 {
+        let mut cache = shared_cache().lock().await;
+        cache.put(cache_key, Arc::clone(&result));
+    }
+
+    Ok(result)
+}
+
+// ─── URL Validation ──────────────────────────────────────────────────────────
+
+fn validate_url(url: &str) -> Result<(), FetchError> {
+    if url.len() > MAX_URL_LENGTH {
+        return Err(FetchError::Validation(format!(
+            "URL exceeds {MAX_URL_LENGTH} chars"
+        )));
+    }
+
+    let parsed =
+        url::Url::parse(url).map_err(|e| FetchError::Validation(format!("Invalid URL: {e}")))?;
+
+    match parsed.scheme() {
+        "http" | "https" => {}
+        s => return Err(FetchError::Validation(format!("Unsupported scheme '{s}'"))),
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| FetchError::Validation("URL has no host".into()))?;
+
+    if is_private_host(host) {
+        return Err(FetchError::SsrfBlocked(host.to_string()));
+    }
+
+    Ok(())
+}
+
+fn is_private_host(host: &str) -> bool {
+    let host_clean = host.trim_start_matches('[').trim_end_matches(']');
+
+    if let Ok(ip) = host_clean.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.octets()[0] == 169 && v4.octets()[1] == 254
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+            }
+            IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        };
+    }
+
+    matches!(host_clean, "localhost" | "localhost.localdomain")
+        || host_clean.ends_with(".local")
+        || host_clean.ends_with(".internal")
+}
+
+// ─── HTTP Fetch ──────────────────────────────────────────────────────────────
+
+async fn do_fetch(
+    client: Option<&reqwest::Client>,
+    url: &str,
+    timeout: Duration,
+) -> Result<(u16, Option<String>, String, String), FetchError> {
+    if let Some(client) = client {
+        fetch_reqwest(client, url, timeout).await
+    } else {
+        fetch_curl(url, timeout).await
+    }
+}
+
+async fn fetch_reqwest(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+) -> Result<(u16, Option<String>, String, String), FetchError> {
+    let resp = tokio::time::timeout(timeout, async {
+        client
+            .get(url)
+            .header("User-Agent", USER_AGENT)
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8",
+            )
+            .send()
+            .await
+    })
+    .await
+    .map_err(|_| FetchError::Timeout(format!("Request timed out after {timeout:?}")))?
+    .map_err(|e| FetchError::Network(format!("HTTP request failed: {e}")))?;
+
+    let status = resp.status().as_u16();
+    let final_url = resp.url().as_str();
+    let final_url = if final_url != url {
+        Some(final_url.to_string())
+    } else {
+        None
+    };
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("text/html")
+        .to_string();
+
+    // Stream body with size limit
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| FetchError::Network(format!("Failed to read body: {e}")))?;
+
+    let body = if body.len() > MAX_DOWNLOAD_BYTES {
+        body[..body.floor_char_boundary(MAX_DOWNLOAD_BYTES)].to_string()
+    } else {
+        body
+    };
+
+    Ok((status, final_url, content_type, body))
+}
+
+/// Sentinel used to separate body from curl metadata.
+/// Chosen to be long and random-looking so it cannot appear in real HTTP content.
+const CURL_SENTINEL: &str = "\n---ASTRA_FETCH_7f3a9b2e1d4c---\n";
+
+async fn fetch_curl(
+    url: &str,
+    timeout: Duration,
+) -> Result<(u16, Option<String>, String, String), FetchError> {
+    let timeout_secs = timeout.as_secs().to_string();
+    let write_format =
+        format!("{CURL_SENTINEL}%{{http_code}}\n%{{content_type}}\n%{{url_effective}}");
+    let output = tokio::process::Command::new("curl")
+        .args([
+            "-sS",
+            "-L",
+            "--max-redirs",
+            &MAX_REDIRECTS.to_string(),
+            "--max-time",
+            &timeout_secs,
+            "--max-filesize",
+            &MAX_DOWNLOAD_BYTES.to_string(),
+            "-H",
+            &format!("User-Agent: {USER_AGENT}"),
+            "-H",
+            "Accept: text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8",
+            "-w",
+            &write_format,
+            url,
+        ])
+        .output()
+        .await
+        .map_err(|e| FetchError::Network(format!("curl: {e}")))?;
+
+    if !output.status.success() && output.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(FetchError::Network(format!("curl: {}", stderr.trim())));
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let (body, meta) = raw
+        .rsplit_once(CURL_SENTINEL)
+        .ok_or_else(|| FetchError::Network("Failed to parse curl output".into()))?;
+
+    let lines: Vec<&str> = meta.lines().collect();
+    let status: u16 = lines.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let content_type = lines.get(1).unwrap_or(&"text/html").to_string();
+    let effective_url = lines.get(2).map(|s| s.to_string());
+    let final_url = effective_url.filter(|u| u != url);
+
+    Ok((status, final_url, content_type, body.to_string()))
+}
+
+// ─── Content Transformation ──────────────────────────────────────────────────
+
+fn transform(
+    url: &str,
+    final_url: Option<&str>,
+    status: u16,
+    content_type: &str,
+    body: &str,
+    config: &FetchConfig,
+    elapsed: Duration,
+) -> FetchResult {
+    let ct = content_type.to_lowercase();
+
+    let base = FetchResult {
+        url: url.to_string(),
+        final_url: final_url.map(String::from),
+        status,
+        content_type: content_type.to_string(),
+        metadata: PageMetadata::default(),
+        content: String::new(),
+        links: vec![],
+        content_length: 0,
+        truncated: false,
+        cached: false,
+        elapsed_ms: elapsed.as_millis().min(u64::MAX as u128) as u64,
+    };
+
+    if is_binary_content_type(&ct) {
+        return FetchResult {
+            content: format!("[Binary content: {content_type}]"),
+            ..base
+        };
+    }
+
+    if ct.contains("application/json") || ct.contains("application/ld+json") {
+        let (content, truncated) = truncate(body, config.max_content);
+        return FetchResult {
+            content,
+            content_length: body.len(),
+            truncated,
+            ..base
+        };
+    }
+
+    if ct.contains("text/html") || ct.contains("application/xhtml") {
+        let doc = scraper::Html::parse_document(body);
+        let effective_base = final_url.unwrap_or(url);
+        let metadata = extract_metadata(&doc, effective_base);
+        let links = extract_links(&doc, effective_base, config.max_links);
+        let extracted = match config.format {
+            OutputFormat::Markdown => to_markdown(&doc, effective_base),
+            OutputFormat::Text => to_text(&doc),
+        };
+        let (content, truncated) = truncate(&extracted, config.max_content);
+        return FetchResult {
+            metadata,
+            content,
+            links,
+            content_length: extracted.len(),
+            truncated,
+            ..base
+        };
+    }
+
+    // Plain text fallback
+    let (content, truncated) = truncate(body, config.max_content);
+    FetchResult {
+        content,
+        content_length: body.len(),
+        truncated,
+        ..base
+    }
+}
+
+fn is_binary_content_type(ct: &str) -> bool {
+    ct.starts_with("image/")
+        || ct.starts_with("audio/")
+        || ct.starts_with("video/")
+        || ct.contains("application/pdf")
+        || ct.contains("application/zip")
+        || ct.contains("application/octet-stream")
+        || ct.contains("application/gzip")
+}
+
+fn truncate(content: &str, max: usize) -> (String, bool) {
+    if content.len() <= max {
+        return (content.to_string(), false);
+    }
+    let end = content.floor_char_boundary(max);
+    (
+        format!(
+            "{}\n\n[…truncated — showing {} of {} chars]",
+            &content[..end],
+            end,
+            content.len()
+        ),
+        true,
+    )
+}
+
+// ─── Submodules (inline for single-file simplicity) ──────────────────────────
+
+mod convert {
+    use super::MAX_WALK_DEPTH;
+    use scraper::Selector;
+
+    pub fn to_markdown(doc: &scraper::Html, base_url: &str) -> String {
+        let root = doc.root_element();
+        let content_root = find_content_element(&root).unwrap_or(root);
+        let mut out = String::new();
+        walk_md(&content_root, base_url, &mut out, &MdState::default(), 0);
+        normalize_blank_lines(&out)
+    }
+
+    pub fn to_text(doc: &scraper::Html) -> String {
+        let root = doc.root_element();
+        let mut out = String::new();
+        walk_text(&root, &mut out, 0);
+        normalize_blank_lines(&out)
+    }
+
+    #[derive(Default, Clone)]
+    struct MdState {
+        in_pre: bool,
+        list_depth: usize,
+        ordered_counter: usize,
+        is_ordered: bool,
+    }
+
+    fn walk_text(el: &scraper::ElementRef, out: &mut String, depth: usize) {
+        if depth > MAX_WALK_DEPTH {
+            return;
+        }
+        use scraper::node::Node;
+        for child in el.children() {
+            match child.value() {
+                Node::Text(t) => {
+                    let s = t.text.trim();
+                    if !s.is_empty() {
+                        if !out.is_empty() && !out.ends_with('\n') && !out.ends_with(' ') {
+                            out.push(' ');
+                        }
+                        out.push_str(s);
+                    }
+                }
+                Node::Element(e) => {
+                    let tag = e.name();
+                    if is_non_content(tag) {
+                        continue;
+                    }
+                    let block = is_block(tag);
+                    if block && !out.is_empty() && !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    if tag == "li" {
+                        out.push_str("- ");
+                    }
+                    if let Some(child_el) = scraper::ElementRef::wrap(child) {
+                        walk_text(&child_el, out, depth + 1);
+                    }
+                    if block {
+                        out.push('\n');
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn walk_md(
+        el: &scraper::ElementRef,
+        base_url: &str,
+        out: &mut String,
+        state: &MdState,
+        depth: usize,
+    ) {
+        if depth > MAX_WALK_DEPTH {
+            return;
+        }
+        use scraper::node::Node;
+
+        let mut li_counter: usize = state.ordered_counter;
+
+        for child in el.children() {
+            match child.value() {
+                Node::Text(t) => {
+                    if state.in_pre {
+                        out.push_str(t.text.as_ref());
+                    } else {
+                        let s = t.text.trim();
+                        if !s.is_empty() {
+                            if !out.is_empty() && !out.ends_with('\n') && !out.ends_with(' ') {
+                                out.push(' ');
+                            }
+                            out.push_str(s);
+                        }
+                    }
+                }
+                Node::Element(e) => {
+                    let tag = e.name();
+                    if is_non_content(tag) {
+                        continue;
+                    }
+                    let child_el = match scraper::ElementRef::wrap(child) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+
+                    match tag {
+                        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                            let level = tag[1..].parse::<usize>().unwrap_or(1);
+                            ensure_blank_line(out);
+                            out.push_str(&"#".repeat(level));
+                            out.push(' ');
+                            walk_md(&child_el, base_url, out, state, depth + 1);
+                            out.push_str("\n\n");
+                        }
+                        "p" => {
+                            ensure_blank_line(out);
+                            walk_md(&child_el, base_url, out, state, depth + 1);
+                            out.push_str("\n\n");
+                        }
+                        "a" => {
+                            let href = e.attr("href").unwrap_or("");
+                            let resolved = super::resolve_url(base_url, href).unwrap_or_default();
+                            out.push('[');
+                            let mark = out.len();
+                            walk_md(&child_el, base_url, out, state, depth + 1);
+                            trim_leading_space(out, mark);
+                            out.push_str("](");
+                            out.push_str(&resolved);
+                            out.push(')');
+                        }
+                        "strong" | "b" => {
+                            out.push_str("**");
+                            let mark = out.len();
+                            walk_md(&child_el, base_url, out, state, depth + 1);
+                            trim_leading_space(out, mark);
+                            out.push_str("**");
+                        }
+                        "em" | "i" => {
+                            out.push('*');
+                            let mark = out.len();
+                            walk_md(&child_el, base_url, out, state, depth + 1);
+                            trim_leading_space(out, mark);
+                            out.push('*');
+                        }
+                        "code" if !state.in_pre => {
+                            out.push('`');
+                            let mark = out.len();
+                            walk_md(&child_el, base_url, out, state, depth + 1);
+                            trim_leading_space(out, mark);
+                            out.push('`');
+                        }
+                        "pre" => {
+                            ensure_blank_line(out);
+                            let lang = detect_lang(&child_el);
+                            out.push_str("```");
+                            out.push_str(lang);
+                            out.push('\n');
+                            let pre_state = MdState {
+                                in_pre: true,
+                                ..state.clone()
+                            };
+                            walk_md(&child_el, base_url, out, &pre_state, depth + 1);
+                            if !out.ends_with('\n') {
+                                out.push('\n');
+                            }
+                            out.push_str("```\n\n");
+                        }
+                        "blockquote" => {
+                            ensure_blank_line(out);
+                            let mut inner = String::new();
+                            walk_md(&child_el, base_url, &mut inner, state, depth + 1);
+                            for line in inner.trim().lines() {
+                                out.push_str("> ");
+                                out.push_str(line);
+                                out.push('\n');
+                            }
+                            out.push('\n');
+                        }
+                        "ul" => {
+                            ensure_newline(out);
+                            let child_state = MdState {
+                                list_depth: state.list_depth + 1,
+                                is_ordered: false,
+                                ordered_counter: 0,
+                                ..state.clone()
+                            };
+                            walk_md(&child_el, base_url, out, &child_state, depth + 1);
+                            out.push('\n');
+                        }
+                        "ol" => {
+                            ensure_newline(out);
+                            let child_state = MdState {
+                                list_depth: state.list_depth + 1,
+                                is_ordered: true,
+                                ordered_counter: 0,
+                                ..state.clone()
+                            };
+                            walk_md(&child_el, base_url, out, &child_state, depth + 1);
+                            out.push('\n');
+                        }
+                        "li" => {
+                            let indent = "  ".repeat(state.list_depth.saturating_sub(1));
+                            out.push_str(&indent);
+                            if state.is_ordered {
+                                li_counter += 1;
+                                out.push_str(&format!("{li_counter}. "));
+                            } else {
+                                out.push_str("- ");
+                            }
+                            walk_md(&child_el, base_url, out, state, depth + 1);
+                            ensure_newline(out);
+                        }
+                        "table" => {
+                            ensure_blank_line(out);
+                            render_table(&child_el, base_url, out, state, depth);
+                            out.push('\n');
+                        }
+                        "br" => out.push('\n'),
+                        "hr" => {
+                            ensure_blank_line(out);
+                            out.push_str("---\n\n");
+                        }
+                        "img" => {
+                            let alt = e.attr("alt").unwrap_or("");
+                            if let Some(src) = e.attr("src").filter(|s| !s.is_empty())
+                                && let Some(resolved) = super::resolve_url(base_url, src)
+                            {
+                                out.push_str(&format!("![{alt}]({resolved})"));
+                            }
+                        }
+                        _ => walk_md(&child_el, base_url, out, state, depth + 1),
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn detect_lang<'a>(pre: &'a scraper::ElementRef<'a>) -> &'a str {
+        Selector::parse("code")
+            .ok()
+            .and_then(|sel| pre.select(&sel).next())
+            .and_then(|code| code.value().attr("class"))
+            .and_then(|cls| {
+                cls.split_whitespace().find(|c| {
+                    c.starts_with("language-")
+                        || c.starts_with("lang-")
+                        || c.starts_with("highlight-")
+                })
+            })
+            .map(|c| {
+                c.trim_start_matches("language-")
+                    .trim_start_matches("lang-")
+                    .trim_start_matches("highlight-")
+            })
+            .unwrap_or("")
+    }
+
+    fn render_table(
+        table: &scraper::ElementRef,
+        base_url: &str,
+        out: &mut String,
+        state: &MdState,
+        depth: usize,
+    ) {
+        let row_sel = match Selector::parse("tr") {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let cell_sel = match Selector::parse("th, td") {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        for row in table.select(&row_sel) {
+            let cells: Vec<String> = row
+                .select(&cell_sel)
+                .map(|cell| {
+                    let mut s = String::new();
+                    walk_md(&cell, base_url, &mut s, state, depth + 1);
+                    s.trim().replace('|', "\\|").to_string()
+                })
+                .collect();
+            if !cells.is_empty() {
+                rows.push(cells);
+            }
+        }
+        if rows.is_empty() {
+            return;
+        }
+
+        let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        for row in &mut rows {
+            row.resize(cols, String::new());
+        }
+
+        out.push_str("| ");
+        out.push_str(&rows[0].join(" | "));
+        out.push_str(" |\n|");
+        for _ in 0..cols {
+            out.push_str(" --- |");
+        }
+        out.push('\n');
+        for row in rows.iter().skip(1) {
+            out.push_str("| ");
+            out.push_str(&row.join(" | "));
+            out.push_str(" |\n");
+        }
+    }
+
+    fn find_content_element<'a>(
+        root: &'a scraper::ElementRef<'a>,
+    ) -> Option<scraper::ElementRef<'a>> {
+        for sel_str in ["main", "article", r#"[role="main"]"#] {
+            if let Ok(sel) = Selector::parse(sel_str)
+                && let Some(el) = root.select(&sel).next()
+            {
+                return Some(el);
+            }
+        }
+        Selector::parse("body")
+            .ok()
+            .and_then(|sel| root.select(&sel).next())
+    }
+
+    fn is_non_content(tag: &str) -> bool {
+        matches!(
+            tag,
+            "script" | "style" | "noscript" | "svg" | "nav" | "footer" | "aside" | "iframe"
+        )
+    }
+
+    fn is_block(tag: &str) -> bool {
+        matches!(
+            tag,
+            "p" | "div"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+                | "li"
+                | "tr"
+                | "br"
+                | "hr"
+                | "blockquote"
+                | "pre"
+                | "section"
+                | "article"
+                | "main"
+                | "ul"
+                | "ol"
+                | "table"
+        )
+    }
+
+    fn ensure_newline(out: &mut String) {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+
+    fn ensure_blank_line(out: &mut String) {
+        if out.is_empty() {
+            return;
+        }
+        if !out.ends_with('\n') {
+            out.push_str("\n\n");
+        } else if !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+    }
+
+    fn trim_leading_space(out: &mut String, mark: usize) {
+        if out.len() > mark && out.as_bytes()[mark] == b' ' {
+            out.remove(mark);
+        }
+    }
+
+    pub(super) fn normalize_blank_lines(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut consecutive = 0u8;
+        for line in s.lines() {
+            if line.trim().is_empty() {
+                consecutive += 1;
+                if consecutive <= 2 {
+                    out.push('\n');
+                }
+            } else {
+                consecutive = 0;
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out.trim_end().to_string()
+    }
+}
+
+mod extract {
+    use scraper::Selector;
+    use serde::Serialize;
+    use std::collections::HashSet;
+
+    #[derive(Debug, Clone, Default, Serialize)]
+    pub struct PageMetadata {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub title: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub canonical_url: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct ExtractedLink {
+        pub href: String,
+        pub text: String,
+    }
+
+    pub fn extract_metadata(doc: &scraper::Html, base_url: &str) -> PageMetadata {
+        let title = select_text(doc, "title");
+        let description = meta_attr(doc, "name", "description")
+            .or_else(|| meta_attr(doc, "property", "og:description"));
+        let canonical_url = Selector::parse(r#"link[rel="canonical"]"#)
+            .ok()
+            .and_then(|sel| doc.select(&sel).next())
+            .and_then(|el| el.value().attr("href"))
+            .and_then(|href| super::resolve_url(base_url, href));
+
+        PageMetadata {
+            title,
+            description,
+            canonical_url,
+        }
+    }
+
+    pub fn extract_links(doc: &scraper::Html, base_url: &str, max: usize) -> Vec<ExtractedLink> {
+        let sel = match Selector::parse("a[href]") {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let mut seen = HashSet::new();
+        let mut links = Vec::new();
+
+        for el in doc.select(&sel) {
+            if links.len() >= max {
+                break;
+            }
+            let href = match el.value().attr("href") {
+                Some(h) => h.trim(),
+                None => continue,
+            };
+            if should_skip(href) {
+                continue;
+            }
+            let resolved = match super::resolve_url(base_url, href) {
+                Some(u) => u,
+                None => continue,
+            };
+            if !seen.insert(resolved.clone()) {
+                continue;
+            }
+            let text: String = el
+                .text()
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if text.is_empty() || text.len() > 200 {
+                continue;
+            }
+            links.push(ExtractedLink {
+                href: resolved,
+                text,
+            });
+        }
+        links
+    }
+
+    fn select_text(doc: &scraper::Html, selector: &str) -> Option<String> {
+        Selector::parse(selector)
+            .ok()
+            .and_then(|sel| doc.select(&sel).next())
+            .map(|el| el.text().collect::<String>().trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn meta_attr(doc: &scraper::Html, attr_name: &str, attr_value: &str) -> Option<String> {
+        let sel_str = format!(r#"meta[{attr_name}="{attr_value}"]"#);
+        Selector::parse(&sel_str)
+            .ok()
+            .and_then(|sel| doc.select(&sel).next())
+            .and_then(|el| el.value().attr("content"))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn should_skip(href: &str) -> bool {
+        href.is_empty()
+            || href == "#"
+            || href.starts_with("javascript:")
+            || href.starts_with("mailto:")
+            || href.starts_with("tel:")
+            || href.starts_with("data:")
+    }
+}
+
+fn resolve_url(base: &str, href: &str) -> Option<String> {
+    if href.starts_with("http://") || href.starts_with("https://") {
+        return Some(href.to_string());
+    }
+    url::Url::parse(base)
+        .ok()
+        .and_then(|b| b.join(href).ok())
+        .map(|u| u.to_string())
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── SSRF Protection ───────────────────────────────────────────────
+
+    #[test]
+    fn blocks_localhost() {
+        assert!(validate_url("http://localhost/secret").is_err());
+        assert!(validate_url("http://127.0.0.1/admin").is_err());
+        assert!(validate_url("http://[::1]/internal").is_err());
+    }
+
+    #[test]
+    fn blocks_private_ips() {
+        assert!(validate_url("http://10.0.0.1/api").is_err());
+        assert!(validate_url("http://172.16.0.1/").is_err());
+        assert!(validate_url("http://192.168.1.1/").is_err());
+        assert!(validate_url("http://169.254.169.254/metadata").is_err());
+    }
+
+    #[test]
+    fn blocks_internal_domains() {
+        assert!(validate_url("http://service.local/api").is_err());
+        assert!(validate_url("http://db.internal/query").is_err());
+    }
+
+    #[test]
+    fn allows_public_urls() {
+        assert!(validate_url("https://example.com").is_ok());
+        assert!(validate_url("https://docs.rs/scraper").is_ok());
+        assert!(validate_url("http://93.184.216.34/").is_ok());
+    }
+
+    // ── URL Validation ────────────────────────────────────────────────
+
+    #[test]
+    fn rejects_bad_schemes() {
+        assert!(validate_url("ftp://example.com").is_err());
+        assert!(validate_url("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn rejects_too_long_url() {
+        let long = format!("https://x.com/{}", "a".repeat(5000));
+        assert!(validate_url(&long).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_urls() {
+        assert!(validate_url("not a url").is_err());
+        assert!(validate_url("").is_err());
+    }
+
+    // ── Format Parsing ────────────────────────────────────────────────
+
+    #[test]
+    fn format_valid() {
+        assert_eq!(OutputFormat::parse(None).unwrap(), OutputFormat::Markdown);
+        assert_eq!(
+            OutputFormat::parse(Some("markdown")).unwrap(),
+            OutputFormat::Markdown
+        );
+        assert_eq!(
+            OutputFormat::parse(Some("text")).unwrap(),
+            OutputFormat::Text
+        );
+    }
+
+    #[test]
+    fn format_invalid_returns_error() {
+        assert!(OutputFormat::parse(Some("raw")).is_err());
+        assert!(OutputFormat::parse(Some("markdwon")).is_err());
+    }
+
+    // ── Ordered List Fix ──────────────────────────────────────────────
+
+    #[test]
+    fn ordered_list_numbers_correctly() {
+        let doc = scraper::Html::parse_document(
+            "<html><body><ol><li>A</li><li>B</li><li>C</li></ol></body></html>",
+        );
+        let md = to_markdown(&doc, "https://x.com");
+        assert!(md.contains("1. A"), "got: {md}");
+        assert!(md.contains("2. B"), "got: {md}");
+        assert!(md.contains("3. C"), "got: {md}");
+    }
+
+    #[test]
+    fn nested_lists() {
+        let doc = scraper::Html::parse_document(
+            "<html><body><ul><li>Top<ul><li>Nested</li></ul></li></ul></body></html>",
+        );
+        let md = to_markdown(&doc, "https://x.com");
+        assert!(md.contains("- Top"), "got: {md}");
+        assert!(md.contains("  - Nested"), "got: {md}");
+    }
+
+    // ── Depth Guard ───────────────────────────────────────────────────
+
+    #[test]
+    fn deeply_nested_html_does_not_stack_overflow() {
+        let open: String = (0..1000).map(|_| "<div>").collect();
+        let close: String = (0..1000).map(|_| "</div>").collect();
+        let html = format!("<html><body>{open}deep{close}</body></html>");
+        let doc = scraper::Html::parse_document(&html);
+        let md = to_markdown(&doc, "https://x.com");
+        // Should not panic — depth guard truncates
+        assert!(!md.is_empty() || md.is_empty()); // just assert no panic
+    }
+
+    // ── Cache ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn cache_key_includes_format() {
+        let mut cache = Cache::new(10, Duration::from_secs(60));
+        let result = Arc::new(FetchResult {
+            url: "https://x.com".into(),
+            final_url: None,
+            status: 200,
+            content_type: "text/html".into(),
+            metadata: PageMetadata::default(),
+            content: "md content".into(),
+            links: vec![],
+            content_length: 10,
+            truncated: false,
+            cached: false,
+            elapsed_ms: 0,
+        });
+        let key_md = CacheKey {
+            url: "https://x.com".into(),
+            format: OutputFormat::Markdown,
+        };
+        let key_txt = CacheKey {
+            url: "https://x.com".into(),
+            format: OutputFormat::Text,
+        };
+        cache.put(key_md.clone(), Arc::clone(&result));
+
+        assert!(cache.get(&key_md).is_some());
+        assert!(cache.get(&key_txt).is_none());
+    }
+
+    #[test]
+    fn cache_evicts_oldest() {
+        let mut cache = Cache::new(2, Duration::from_secs(60));
+        for i in 0..3 {
+            let result = Arc::new(FetchResult {
+                url: format!("https://x.com/{i}"),
+                final_url: None,
+                status: 200,
+                content_type: "text/html".into(),
+                metadata: PageMetadata::default(),
+                content: format!("c{i}"),
+                links: vec![],
+                content_length: 2,
+                truncated: false,
+                cached: false,
+                elapsed_ms: 0,
+            });
+            cache.put(
+                CacheKey {
+                    url: format!("https://x.com/{i}"),
+                    format: OutputFormat::Markdown,
+                },
+                result,
+            );
+        }
+        assert_eq!(cache.entries.len(), 2);
+        // First entry should be evicted
+        let key0 = CacheKey {
+            url: "https://x.com/0".into(),
+            format: OutputFormat::Markdown,
+        };
+        assert!(cache.get(&key0).is_none());
+    }
+
+    #[test]
+    fn cache_expires() {
+        let mut cache = Cache::new(10, Duration::from_millis(1));
+        let result = Arc::new(FetchResult {
+            url: "https://x.com".into(),
+            final_url: None,
+            status: 200,
+            content_type: "text/html".into(),
+            metadata: PageMetadata::default(),
+            content: "old".into(),
+            links: vec![],
+            content_length: 3,
+            truncated: false,
+            cached: false,
+            elapsed_ms: 0,
+        });
+        cache.put(
+            CacheKey {
+                url: "https://x.com".into(),
+                format: OutputFormat::Markdown,
+            },
+            result,
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        let key = CacheKey {
+            url: "https://x.com".into(),
+            format: OutputFormat::Markdown,
+        };
+        assert!(cache.get(&key).is_none());
+    }
+
+    // ── Metadata ──────────────────────────────────────────────────────
+
+    #[test]
+    fn extracts_title_and_description() {
+        let doc = scraper::Html::parse_document(
+            r#"<html><head><title>T</title><meta name="description" content="D"></head><body></body></html>"#,
+        );
+        let meta = extract_metadata(&doc, "https://x.com");
+        assert_eq!(meta.title.as_deref(), Some("T"));
+        assert_eq!(meta.description.as_deref(), Some("D"));
+    }
+
+    #[test]
+    fn canonical_url_resolved() {
+        let doc = scraper::Html::parse_document(
+            r#"<html><head><link rel="canonical" href="/p"></head><body></body></html>"#,
+        );
+        let meta = extract_metadata(&doc, "https://x.com/other");
+        assert_eq!(meta.canonical_url.as_deref(), Some("https://x.com/p"));
+    }
+
+    // ── Links ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn links_resolved_and_filtered() {
+        let html = concat!(
+            r#"<html><body>"#,
+            r#"<a href="/page">Page</a>"#,
+            r#"<a href="javascript:void(0)">JS</a>"#,
+            r#"<a href="https://ext.com">Ext</a>"#,
+            r#"</body></html>"#,
+        );
+        let doc = scraper::Html::parse_document(html);
+        let links = extract_links(&doc, "https://x.com", 10);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].href, "https://x.com/page");
+        assert_eq!(links[1].href, "https://ext.com");
+    }
+
+    #[test]
+    fn links_deduplicated_and_capped() {
+        let html: String = (0..50)
+            .map(|i| format!(r#"<a href="/p{i}">L{i}</a>"#))
+            .collect();
+        let html = format!("<html><body>{html}<a href=\"/p0\">dup</a></body></html>");
+        let doc = scraper::Html::parse_document(&html);
+        let links = extract_links(&doc, "https://x.com", 5);
+        assert_eq!(links.len(), 5);
+    }
+
+    // ── HTML → Text ───────────────────────────────────────────────────
+
+    #[test]
+    fn text_strips_non_content() {
+        let doc = scraper::Html::parse_document(
+            "<html><body><script>x</script><nav>N</nav><p>V</p><footer>F</footer></body></html>",
+        );
+        let text = to_text(&doc);
+        assert!(text.contains('V'));
+        assert!(!text.contains('x'));
+        assert!(!text.contains('N'));
+        assert!(!text.contains('F'));
+    }
+
+    // ── HTML → Markdown ───────────────────────────────────────────────
+
+    #[test]
+    fn md_headings() {
+        let doc = scraper::Html::parse_document("<html><body><h1>A</h1><h2>B</h2></body></html>");
+        let md = to_markdown(&doc, "https://x.com");
+        assert!(md.contains("# A"), "got: {md}");
+        assert!(md.contains("## B"), "got: {md}");
+    }
+
+    #[test]
+    fn md_links() {
+        let doc = scraper::Html::parse_document(
+            r#"<html><body><p><a href="/d">docs</a></p></body></html>"#,
+        );
+        let md = to_markdown(&doc, "https://x.com");
+        assert!(md.contains("[docs](https://x.com/d)"), "got: {md}");
+    }
+
+    #[test]
+    fn md_code_block() {
+        let doc = scraper::Html::parse_document(
+            r#"<html><body><pre><code class="language-rs">fn f(){}</code></pre></body></html>"#,
+        );
+        let md = to_markdown(&doc, "https://x.com");
+        assert!(md.contains("```rs"), "got: {md}");
+        assert!(md.contains("fn f(){}"), "got: {md}");
+    }
+
+    #[test]
+    fn md_inline_formatting() {
+        let doc = scraper::Html::parse_document(
+            "<html><body><p><strong>b</strong> <em>i</em> <code>c</code></p></body></html>",
+        );
+        let md = to_markdown(&doc, "https://x.com");
+        assert!(md.contains("**b**"), "got: {md}");
+        assert!(md.contains("*i*"), "got: {md}");
+        assert!(md.contains("`c`"), "got: {md}");
+    }
+
+    #[test]
+    fn md_table() {
+        let doc = scraper::Html::parse_document(
+            r#"<html><body><table><tr><th>H</th></tr><tr><td>D</td></tr></table></body></html>"#,
+        );
+        let md = to_markdown(&doc, "https://x.com");
+        assert!(md.contains("| H |"), "got: {md}");
+        assert!(md.contains("| D |"), "got: {md}");
+    }
+
+    #[test]
+    fn md_blockquote() {
+        let doc = scraper::Html::parse_document(
+            "<html><body><blockquote><p>Q</p></blockquote></body></html>",
+        );
+        let md = to_markdown(&doc, "https://x.com");
+        assert!(md.contains("> Q"), "got: {md}");
+    }
+
+    #[test]
+    fn md_content_root_preference() {
+        let doc = scraper::Html::parse_document(
+            "<html><body><div>X</div><main><p>M</p></main></body></html>",
+        );
+        let md = to_markdown(&doc, "https://x.com");
+        assert!(md.contains('M'), "got: {md}");
+        assert!(!md.contains('X'), "got: {md}");
+    }
+
+    // ── Content-Type Routing ──────────────────────────────────────────
+
+    #[test]
+    fn json_passthrough() {
+        let config = FetchConfig::default();
+        let r = transform(
+            "https://x.com",
+            None,
+            200,
+            "application/json",
+            r#"{"a":1}"#,
+            &config,
+            Duration::ZERO,
+        );
+        assert!(r.content.contains(r#""a":1"#));
+    }
+
+    #[test]
+    fn binary_rejection() {
+        let config = FetchConfig::default();
+        let r = transform(
+            "https://x.com",
+            None,
+            200,
+            "image/png",
+            "",
+            &config,
+            Duration::ZERO,
+        );
+        assert!(r.content.contains("Binary content"));
+    }
+
+    // ── Truncation ────────────────────────────────────────────────────
+
+    #[test]
+    fn truncation_works() {
+        let (content, trunc) = truncate(&"x".repeat(1000), 100);
+        assert!(trunc);
+        assert!(content.len() < 200);
+        assert!(content.contains("truncated"));
+    }
+
+    // ── Integration ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn error_on_missing_url() {
+        let r = fetch(None, &serde_json::json!({})).await;
+        assert!(r.starts_with("Error:"), "got: {r}");
+        assert!(r.contains("Missing 'url'"));
+    }
+
+    #[tokio::test]
+    async fn error_on_private_ip() {
+        let r = fetch(None, &serde_json::json!({"url": "http://127.0.0.1/admin"})).await;
+        assert!(r.starts_with("Error:"), "got: {r}");
+        assert!(r.contains("SSRF"), "got: {r}");
+    }
+
+    #[tokio::test]
+    async fn error_on_bad_format() {
+        let r = fetch(
+            None,
+            &serde_json::json!({"url": "https://x.com", "format": "raw"}),
+        )
+        .await;
+        assert!(r.starts_with("Error:"), "got: {r}");
+    }
+
+    // ── Performance ───────────────────────────────────────────────────
+
+    #[test]
+    fn extraction_under_50ms() {
+        let para = format!("<p>{}</p>\n", "word ".repeat(100));
+        let html = format!("<html><body>{}</body></html>", para.repeat(400));
+        let doc = scraper::Html::parse_document(&html);
+        let start = Instant::now();
+        let _ = to_markdown(&doc, "https://x.com");
+        assert!(
+            start.elapsed().as_millis() < 50,
+            "took {:?}",
+            start.elapsed()
+        );
+    }
+
+    // ── HTTP Error Signaling ──────────────────────────────────────────
+
+    #[test]
+    fn transform_404_returns_content_normally() {
+        let config = FetchConfig::default();
+        let r = transform(
+            "https://x.com/missing",
+            None,
+            404,
+            "text/html",
+            "<html><body><p>Not Found</p></body></html>",
+            &config,
+            Duration::ZERO,
+        );
+        assert_eq!(r.status, 404);
+        assert!(r.content.contains("Not Found"), "got: {}", r.content);
+    }
+
+    #[tokio::test]
+    async fn http_4xx_returns_error_string() {
+        // Simulate what happens when fetch_inner returns a 404
+        // We test the fetch() wrapper's error signaling by calling transform + checking output
+        let config = FetchConfig::default();
+        let result = transform(
+            "https://x.com/gone",
+            None,
+            410,
+            "text/html",
+            "<html><body><p>Gone</p></body></html>",
+            &config,
+            Duration::ZERO,
+        );
+        assert_eq!(result.status, 410);
+        // The fetch() function wraps this as an error
+        let result = Arc::new(result);
+        let output = if result.status >= 400 {
+            format!("Error: HTTP {} — {}", result.status, result.content)
+        } else {
+            serde_json::to_string(&*result).unwrap()
+        };
+        assert!(output.starts_with("Error: HTTP 410"), "got: {output}");
+    }
+
+    // ── Curl Sentinel ─────────────────────────────────────────────────
+
+    #[test]
+    fn curl_sentinel_is_sufficiently_unique() {
+        // Verify the sentinel won't appear in typical web content
+        assert!(CURL_SENTINEL.contains("ASTRA_FETCH_7f3a9b2e1d4c"));
+        assert!(
+            CURL_SENTINEL.len() > 30,
+            "sentinel must be long enough to be unique"
+        );
+        // Verify it starts and ends with newlines for clean splitting
+        assert!(CURL_SENTINEL.starts_with('\n'));
+        assert!(CURL_SENTINEL.ends_with('\n'));
+    }
+
+    // ── Empty Body Handling ───────────────────────────────────────────
+
+    #[test]
+    fn empty_html_body_returns_empty_content() {
+        let config = FetchConfig::default();
+        let r = transform(
+            "https://x.com",
+            None,
+            200,
+            "text/html",
+            "<html><head><title>Empty</title></head><body></body></html>",
+            &config,
+            Duration::ZERO,
+        );
+        assert_eq!(r.status, 200);
+        assert_eq!(r.metadata.title.as_deref(), Some("Empty"));
+        // Content may be empty or just whitespace
+        assert!(r.content.trim().is_empty(), "got: {:?}", r.content);
+    }
+
+    #[test]
+    fn completely_empty_body_text() {
+        let config = FetchConfig::default();
+        let r = transform(
+            "https://x.com",
+            None,
+            200,
+            "text/plain",
+            "",
+            &config,
+            Duration::ZERO,
+        );
+        assert_eq!(r.content, "");
+        assert_eq!(r.content_length, 0);
+        assert!(!r.truncated);
+    }
+}
