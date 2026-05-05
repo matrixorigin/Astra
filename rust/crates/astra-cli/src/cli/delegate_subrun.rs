@@ -416,6 +416,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 token: self.cancel_token.clone(),
             },
             error_recovery: Default::default(),
+            pipeline_session: None,
             message: config.task.clone(),
             recent_tools: Vec::new(),
             task_profile,

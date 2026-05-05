@@ -183,6 +183,7 @@ mod tests {
             cancellation: Default::default(),
             messaging: Default::default(),
             error_recovery: Default::default(),
+            pipeline_session: None,
             message: "test query".to_string(),
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),

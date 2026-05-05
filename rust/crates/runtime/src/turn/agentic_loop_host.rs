@@ -669,6 +669,12 @@ pub struct AgenticLoopState {
     pub cancellation: CancellationState,
     pub error_recovery: ErrorRecoveryState,
 
+    // ── Context Pipeline ──
+    /// Session-scoped pipeline orchestrator. When `Some`, the pipeline manages
+    /// context assembly, cache optimization, and pressure-adaptive compaction.
+    /// Initialized on first turn; carries stats/latches/emergent across turns.
+    pub pipeline_session: Option<astra_turn_core::pipeline_session::PipelineSession>,
+
     // ── Host-provided context (read-only by runtime) ──
     pub message: String,
     pub recent_tools: Vec<String>,
@@ -1363,6 +1369,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         messaging: Default::default(),
         cancellation: Default::default(),
         error_recovery: Default::default(),
+        pipeline_session: None,
         message: "test query".to_string(),
         recent_tools: Vec::new(),
         task_profile: TaskExecutionProfile::default(),
@@ -1729,6 +1736,7 @@ pub(crate) mod tests {
             messaging: Default::default(),
             cancellation: Default::default(),
             error_recovery: Default::default(),
+            pipeline_session: None,
             message: "test query".to_string(),
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),

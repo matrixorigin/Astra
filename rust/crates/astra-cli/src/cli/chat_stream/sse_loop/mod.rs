@@ -688,6 +688,7 @@ pub(crate) async fn stream_chat_sse(
             consecutive_same_error: 0,
             last_error_category: None,
         },
+        pipeline_session: None,
         message: p.message.to_string(),
         recent_tools: p.recent_tools.to_vec(),
         task_profile,
