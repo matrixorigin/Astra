@@ -1,0 +1,62 @@
+# LLM Summarization on Context Pressure — Next Step
+# Status: PLANNED
+# Depends on: compact-and-continue (done in commit 63673750)
+# Priority: P1 — directly impacts long-session usability
+
+## Problem
+Current `handle_token_budget` runs `CompressionPipeline::aggressive_pipeline()`
+which only clears tool_result content mechanically. For sessions with many
+assistant messages, code discussions, and reasoning — this clears very little
+because the BULK of tokens are in assistant text + user messages, not just
+tool_results.
+
+## Desired Behavior (matching industry pattern)
+When context pressure exceeds threshold:
+1. Fork a lightweight LLM call with a summarization prompt
+2. Summarize the conversation into a structured condensed form
+3. Replace old messages with the summary
+4. Re-inject recently-read files as attachments
+5. Continue the agent's current task with compressed context
+
+## Implementation Plan
+
+### Phase A: Wire LLM Summary into handle_token_budget
+- Add `summary_llm_config: Option<LlmConnParams>` to AgenticLoopState
+  (populated from the same model config used for the main loop)
+- In handle_token_budget, after mechanical compression fails to free enough:
+  1. Call `generate_compact_summary(&state.messages, &summary_client)`
+  2. If success: replace state.messages with [summary_as_system_msg, recent_N_messages]
+  3. Re-inject `restore_recent_files` after summary
+  4. Reset budget_wrapup_injected = false (allow agent to continue)
+  5. Record audit event for observability
+
+### Phase B: Structured Summary Prompt
+- Adapt the summary prompt to include:
+  - Primary intent & current task
+  - Files modified/read (paths only, content via restore_recent_files)
+  - Errors encountered & fixes applied
+  - Decisions made
+  - What was being done immediately before summary
+- Keep it structured so the post-summary agent can pick up seamlessly
+
+### Phase C: Integration with Pipeline SpillBackend
+- The Context Pipeline's SpillBackend (D1 in residual defects) was designed
+  for exactly this: "spill" large content to disk, replace with reference token.
+- LLM summary IS a form of intelligent spill: the full conversation is "spilled"
+  to a summary, and only the summary remains in context.
+- Wire: SpillBackend::store() → writes full messages to session dir
+- Wire: SpillBackend::load() → if agent needs old content, it can be restored
+- This completes the design's original intent for the Spill phase.
+
+## Key Files
+- runtime/src/turn/agentic_loop_execution_phase.rs (handle_token_budget)
+- astra-turn-core/src/cloud_summary.rs (existing generate_compact_summary)
+- runtime/src/turn/cloud/compaction.rs (existing wiring for compaction_replay)
+- runtime/src/turn/agentic_loop_host.rs (AgenticLoopState — add summary config)
+
+## Acceptance Criteria
+- Long sessions (50+ rounds) no longer get force-terminated at budget
+- Summary preserves user intent, file paths, and current work state
+- Agent successfully continues task after summarization
+- Token count drops by 60%+ after summary (similar to manual /compact)
+- No regression on short sessions (< 20 rounds) — summarization never fires
