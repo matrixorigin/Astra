@@ -8,7 +8,6 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::context_assembly_trace::PromptTraceSignals;
 
@@ -171,8 +170,6 @@ pub enum SectionSource {
     Memory,
     /// Conversation history (messages array).
     History,
-    /// Tool registry (schemas).
-    ToolSchema,
     /// Skill catalog.
     Skill,
     /// Edge profile / runtime environment.
@@ -202,17 +199,11 @@ pub enum SectionArtifact {
     RuntimeText(String),
     MemoryText(String),
     HistorySummary(String),
-    ToolSchema(Value),
     SpillReference { path: String, original_tokens: u32 },
     Empty,
 }
 
 impl SectionArtifact {
-    /// Construct a text-bearing artifact for a section kind.
-    ///
-    /// This intentionally has no path for `ToolSchema` or `SpillReference`;
-    /// callers producing those non-text artifacts must construct the enum
-    /// variants explicitly so schema/spill semantics are not erased into text.
     #[must_use]
     pub fn from_text(kind: SectionKind, text: String) -> Self {
         if text.is_empty() {
@@ -233,10 +224,7 @@ impl SectionArtifact {
     }
 
     /// Returns the text content of this artifact, or `None` for non-text
-    /// variants (`ToolSchema`, `SpillReference`, `Empty`).
-    ///
-    /// Callers MUST handle `None` — silently treating ToolSchema as empty text
-    /// is a semantic error.
+    /// variants (`SpillReference`, `Empty`).
     #[must_use]
     pub fn text(&self) -> Option<&str> {
         match self {
@@ -244,7 +232,7 @@ impl SectionArtifact {
             | Self::RuntimeText(text)
             | Self::MemoryText(text)
             | Self::HistorySummary(text) => Some(text),
-            Self::ToolSchema(_) | Self::SpillReference { .. } | Self::Empty => None,
+            Self::SpillReference { .. } | Self::Empty => None,
         }
     }
 
@@ -257,7 +245,7 @@ impl SectionArtifact {
             Self::Empty if !suffix.is_empty() => {
                 *self = Self::from_text(kind, suffix.to_string());
             }
-            Self::ToolSchema(_) | Self::SpillReference { .. } | Self::Empty => {}
+            Self::SpillReference { .. } | Self::Empty => {}
         }
     }
 }
