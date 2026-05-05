@@ -107,6 +107,38 @@ pub fn main_model_wrote_memory(tools_used: &[String]) -> bool {
     tools_used.iter().any(|t| t == "memory_store")
 }
 
+/// Actual cache usage reported by the provider, when available.
+/// `read` is how many input tokens came from cache (hit); `creation` is
+/// how many were newly cached (miss or first-write). Both None means the
+/// provider didn't report usage or we failed to parse it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CacheUsage {
+    pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub prompt_tokens: Option<u64>,
+}
+
+impl CacheUsage {
+    /// Cache hit ratio among input tokens (0.0 if unknown or denominator 0).
+    /// Ratio is `read / (read + creation)` when both fields present,
+    /// else `read / prompt` as a fallback.
+    pub fn hit_ratio(&self) -> Option<f32> {
+        match (self.cache_read_tokens, self.cache_creation_tokens) {
+            (Some(r), Some(c)) if r + c > 0 => Some(r as f32 / (r + c) as f32),
+            _ => match (self.cache_read_tokens, self.prompt_tokens) {
+                (Some(r), Some(p)) if p > 0 => Some(r as f32 / p as f32),
+                _ => None,
+            },
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cache_read_tokens.is_none()
+            && self.cache_creation_tokens.is_none()
+            && self.prompt_tokens.is_none()
+    }
+}
+
 /// Outcome of an extraction attempt, for journal/audit.
 #[derive(Debug, Clone)]
 pub enum ExtractionOutcome {
@@ -117,8 +149,13 @@ pub enum ExtractionOutcome {
         count: usize,
         categories: Vec<String>,
         duration_ms: u64,
-        /// Whether the extraction reused a fork prefix for cache sharing.
+        /// Whether the extraction attempted to reuse a fork prefix (claim).
         prefix_reused: bool,
+        /// Actual cache utilization from the provider (verification).
+        /// If prefix_reused=true but usage.hit_ratio() is low/None, the
+        /// provider did NOT honor the cache — ops should see this in
+        /// journals & tracing to debug the 70-95% savings claim.
+        usage: CacheUsage,
     },
     SkippedMainWrote,
     SkippedNoSelector,
@@ -391,16 +428,46 @@ async fn run_extraction(
     };
 
     let body = resp.text().await.unwrap_or_default();
-    let text = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| {
-            v.get("choices")?
-                .get(0)?
-                .get("message")?
-                .get("content")?
-                .as_str()
-                .map(String::from)
-        })
+    let body_json: serde_json::Value =
+        serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    let usage = parse_cache_usage(&body_json);
+    if prefix_reused {
+        match usage.hit_ratio() {
+            Some(ratio) if ratio >= 0.5 => {
+                tracing::info!(
+                    target: "astra_cli::memory_extraction",
+                    hit_ratio = ratio,
+                    cache_read = usage.cache_read_tokens,
+                    cache_creation = usage.cache_creation_tokens,
+                    "fork-prefix cache HIT confirmed by provider usage"
+                );
+            }
+            Some(ratio) => {
+                tracing::warn!(
+                    target: "astra_cli::memory_extraction",
+                    hit_ratio = ratio,
+                    cache_read = usage.cache_read_tokens,
+                    cache_creation = usage.cache_creation_tokens,
+                    "prefix_reused=true but provider hit_ratio is LOW — \
+                     provider may not be honoring our cached blocks"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    target: "astra_cli::memory_extraction",
+                    "prefix_reused=true but provider did not report cache usage — \
+                     cannot verify claimed savings"
+                );
+            }
+        }
+    }
+    let text = body_json
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .map(String::from)
         .unwrap_or_default();
 
     // Strip <think> tags that native thinkers may emit despite suppression.
@@ -425,6 +492,7 @@ async fn run_extraction(
             categories: vec![],
             duration_ms: start.elapsed().as_millis() as u64,
             prefix_reused,
+            usage: usage.clone(),
         };
     }
 
@@ -456,6 +524,7 @@ async fn run_extraction(
                 categories,
                 duration_ms: start.elapsed().as_millis() as u64,
                 prefix_reused,
+                usage: usage.clone(),
             };
         }
     };
@@ -493,6 +562,38 @@ async fn run_extraction(
         categories,
         duration_ms,
         prefix_reused,
+        usage,
+    }
+}
+
+/// Parse cache usage fields from a provider chat-completion response body.
+/// Supports both Anthropic (`cache_read_input_tokens` / `cache_creation_input_tokens`)
+/// and OpenAI (`prompt_tokens_details.cached_tokens`) shapes.
+pub fn parse_cache_usage(body: &serde_json::Value) -> CacheUsage {
+    let Some(usage) = body.get("usage").and_then(|u| u.as_object()) else {
+        return CacheUsage::default();
+    };
+
+    let cache_read_tokens = usage
+        .get("cache_read_input_tokens")
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|v| v.as_u64())
+        });
+
+    let cache_creation_tokens = usage
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_u64());
+
+    let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64());
+
+    CacheUsage {
+        cache_read_tokens,
+        cache_creation_tokens,
+        prompt_tokens,
     }
 }
 
@@ -662,6 +763,95 @@ mod tests {
         assert_eq!(outcome.tag(), "skipped_no_selector");
     }
 
+    // ── P1-2: CacheUsage parsing & metrics ────────────────────────────────
+    //
+    // Previously we reported prefix_reused=true whenever we sent a prefixed
+    // request, regardless of whether the provider actually used the cache.
+    // Now we parse the usage object and surface real cache_read_tokens.
+
+    #[test]
+    fn hit_ratio_from_read_and_creation() {
+        let u = CacheUsage {
+            cache_read_tokens: Some(900),
+            cache_creation_tokens: Some(100),
+            prompt_tokens: None,
+        };
+        assert_eq!(u.hit_ratio(), Some(0.9));
+    }
+
+    #[test]
+    fn hit_ratio_falls_back_to_prompt_when_creation_missing() {
+        let u = CacheUsage {
+            cache_read_tokens: Some(80),
+            cache_creation_tokens: None,
+            prompt_tokens: Some(100),
+        };
+        assert_eq!(u.hit_ratio(), Some(0.8));
+    }
+
+    #[test]
+    fn hit_ratio_none_when_nothing_known() {
+        assert_eq!(CacheUsage::default().hit_ratio(), None);
+    }
+
+    #[test]
+    fn hit_ratio_handles_zero_denominator() {
+        let u = CacheUsage {
+            cache_read_tokens: Some(0),
+            cache_creation_tokens: Some(0),
+            prompt_tokens: Some(0),
+        };
+        assert_eq!(u.hit_ratio(), None);
+    }
+
+    #[test]
+    fn parse_usage_anthropic_format() {
+        // Anthropic-style: usage.cache_read_input_tokens / cache_creation_input_tokens
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": "{}"}}],
+            "usage": {
+                "cache_read_input_tokens": 1500,
+                "cache_creation_input_tokens": 200,
+                "prompt_tokens": 1800
+            }
+        });
+        let usage = parse_cache_usage(&body);
+        assert_eq!(usage.cache_read_tokens, Some(1500));
+        assert_eq!(usage.cache_creation_tokens, Some(200));
+        assert_eq!(usage.prompt_tokens, Some(1800));
+    }
+
+    #[test]
+    fn parse_usage_openai_format() {
+        // OpenAI-style: usage.prompt_tokens_details.cached_tokens
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": "{}"}}],
+            "usage": {
+                "prompt_tokens": 1800,
+                "prompt_tokens_details": {"cached_tokens": 1500}
+            }
+        });
+        let usage = parse_cache_usage(&body);
+        assert_eq!(usage.cache_read_tokens, Some(1500));
+        assert_eq!(usage.prompt_tokens, Some(1800));
+    }
+
+    #[test]
+    fn parse_usage_missing_yields_empty() {
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": "{}"}}]
+        });
+        assert!(parse_cache_usage(&body).is_empty());
+    }
+
+    #[test]
+    fn parse_usage_malformed_yields_empty() {
+        let body = serde_json::json!({
+            "usage": "not an object"
+        });
+        assert!(parse_cache_usage(&body).is_empty());
+    }
+
     // ── P0-3: busy-skip observability ─────────────────────────────────────
     //
     // Previously, `is_busy() → SkippedDisabled` — indistinguishable from
@@ -772,6 +962,7 @@ mod tests {
                 categories: vec![],
                 duration_ms: 0,
                 prefix_reused: false,
+                usage: CacheUsage::default(),
             }
             .tag(),
             "extracted"

@@ -167,6 +167,7 @@ pub(super) async fn finalize_session(state: &mut ReplState) {
                     categories,
                     duration_ms,
                     prefix_reused,
+                    ..
                 } => (*count, categories.clone(), *duration_ms, *prefix_reused),
                 _ => (0, vec![], 0, false),
             };
