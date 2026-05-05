@@ -2037,6 +2037,11 @@ pub(super) async fn handle_session_command(
                                     },
                                 );
                             }
+                            session_journal::JournalEventType::PipelineFeedback
+                            | session_journal::JournalEventType::PipelineAlert
+                            | session_journal::JournalEventType::PipelineCompactionAudit => {
+                                // Rendered by /inspect; suppress in timeline for now
+                            }
                         }
                     }
                     // Summary stats

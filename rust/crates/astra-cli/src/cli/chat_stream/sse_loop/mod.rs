@@ -691,14 +691,13 @@ pub(crate) async fn stream_chat_sse(
         pipeline_session: Some({
             let config = astra_turn_core::pipeline_config::PipelineConfig::default();
             match p.pipeline_state.as_ref().and_then(|v| {
-                astra_turn_core::pipeline_session_serde::deserialize_session_state(v)
+                serde_json::from_value::<astra_turn_core::pipeline_session::PipelineSessionSnapshot>(
+                    v.clone(),
+                ).ok()
             }) {
-                Some(restored) => {
-                    astra_turn_core::pipeline_session::PipelineSession::with_restored_state(
-                        config,
-                        restored.stats,
-                        restored.latches,
-                        restored.recovery,
+                Some(snapshot) => {
+                    astra_turn_core::pipeline_session::PipelineSession::from_snapshot(
+                        config, snapshot,
                     )
                 }
                 None => astra_turn_core::pipeline_session::PipelineSession::new(config),

@@ -64,6 +64,7 @@ pub mod observer;
 pub mod optimize_limits;
 pub mod parallel_tool_exec;
 pub mod pipeline_config;
+pub mod pipeline_journal;
 pub mod pipeline_learning;
 pub mod pipeline_session;
 pub mod pipeline_session_serde;

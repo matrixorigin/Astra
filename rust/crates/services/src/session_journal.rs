@@ -846,6 +846,12 @@ pub enum JournalEventType {
     LlmResponseFull,
     /// Background memory extraction agent completed (extracted, skipped, or errored).
     MemoryExtraction,
+    /// Context pipeline per-turn feedback (cache ratio, tokens, tier).
+    PipelineFeedback,
+    /// Context pipeline trace alert fired (cache break, recovery loop, etc.).
+    PipelineAlert,
+    /// Context pipeline compaction audit (what was dropped/cleared, why).
+    PipelineCompactionAudit,
 }
 
 /// Writer that appends events to a session journal file.
@@ -3242,6 +3248,42 @@ impl JournalEvent {
             "categories": categories,
             "prefix_reused": prefix_reused,
         }));
+        evt
+    }
+
+    /// Context pipeline per-turn feedback event.
+    pub fn pipeline_feedback(
+        session_id: Option<&str>,
+        turn: u32,
+        event_payload: serde_json::Value,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::PipelineFeedback, session_id);
+        evt.turn = Some(turn);
+        evt.metadata = Some(event_payload);
+        evt
+    }
+
+    /// Context pipeline alert event.
+    pub fn pipeline_alert(
+        session_id: Option<&str>,
+        turn: u32,
+        event_payload: serde_json::Value,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::PipelineAlert, session_id);
+        evt.turn = Some(turn);
+        evt.metadata = Some(event_payload);
+        evt
+    }
+
+    /// Context pipeline compaction audit event.
+    pub fn pipeline_compaction_audit(
+        session_id: Option<&str>,
+        turn: u32,
+        event_payload: serde_json::Value,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::PipelineCompactionAudit, session_id);
+        evt.turn = Some(turn);
+        evt.metadata = Some(event_payload);
         evt
     }
 }

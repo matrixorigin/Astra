@@ -375,6 +375,48 @@ impl PipelineSession {
     pub fn latch_feature(&mut self, key: impl Into<String>, turn: u32) -> bool {
         self.latches.latch_feature(key, turn)
     }
+
+    // ── Snapshot & Restore ──────────────────────────────────────────────────
+
+    /// Capture a full snapshot of all session-scoped pipeline state.
+    /// Used for checkpoint persistence (includes emergent context).
+    #[must_use]
+    pub fn snapshot_full_state(&self) -> PipelineSessionSnapshot {
+        PipelineSessionSnapshot {
+            stats: self.stats.clone(),
+            latches: self.latches.clone(),
+            recovery: self.recovery,
+            emergent: self.emergent.clone(),
+        }
+    }
+
+    /// Restore a session from a full snapshot (checkpoint restore).
+    #[must_use]
+    pub fn from_snapshot(config: PipelineConfig, snapshot: PipelineSessionSnapshot) -> Self {
+        let mut recovery = snapshot.recovery;
+        // Clear transient per-session error state on restore
+        recovery.consecutive_ptl_errors = 0;
+        recovery.consecutive_same_errors = 0;
+        recovery.has_attempted_reactive_compact = false;
+
+        Self {
+            pipeline: ContextPipeline::new(config),
+            stats: snapshot.stats,
+            latches: snapshot.latches,
+            emergent: snapshot.emergent,
+            recovery,
+            turns_completed: 0,
+        }
+    }
+}
+
+/// Full snapshot of pipeline session state for checkpoint persistence.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PipelineSessionSnapshot {
+    pub stats: PipelineStats,
+    pub latches: SessionLatches,
+    pub recovery: RecoveryState,
+    pub emergent: EmergentContext,
 }
 
 /// Stable in-process dedup hash for emergent context items.
