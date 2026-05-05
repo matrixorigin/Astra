@@ -77,6 +77,7 @@ pub struct PipelineSession {
     pub emergent: EmergentContext,
     pub recovery: RecoveryState,
     turns_completed: u32,
+    pending_audits: Vec<crate::pipeline_journal::PipelineJournalEvent>,
 }
 
 impl PipelineSession {
@@ -90,6 +91,7 @@ impl PipelineSession {
             emergent: EmergentContext::default(),
             recovery: RecoveryState::default(),
             turns_completed: 0,
+            pending_audits: Vec::new(),
         }
     }
 
@@ -103,6 +105,7 @@ impl PipelineSession {
             emergent: EmergentContext::default(),
             recovery: RecoveryState::default(),
             turns_completed: 0,
+            pending_audits: Vec::new(),
         }
     }
 
@@ -125,6 +128,7 @@ impl PipelineSession {
             emergent: EmergentContext::default(),
             recovery,
             turns_completed: 0,
+            pending_audits: Vec::new(),
         }
     }
 
@@ -288,6 +292,40 @@ impl PipelineSession {
         self.pipeline.config()
     }
 
+    // ── Cascade Responder ────────────────────────────────────────────────────
+
+    /// Build optimize limits that respond to compaction cascade detection.
+    /// When a cascade is active, suppress tool_result_clearing to break the loop.
+    #[must_use]
+    pub fn cascade_aware_limits(&self, model_limit: u32) -> OptimizeLimits {
+        let mut limits = OptimizeLimits::for_tier(self.current_pressure_tier(), model_limit);
+        if self.stats.has_compaction_cascade() {
+            limits.allow_tool_result_clearing = false;
+        }
+        limits
+    }
+
+    // ── Compaction Audit Trail ───────────────────────────────────────────────
+
+    /// Record a compaction operation for audit trail emission.
+    /// The runtime calls this after each compaction step in the optimizer.
+    pub fn record_compaction_audit(&mut self, strategy: &str, items: u32, tokens_freed: u32) {
+        self.pending_audits.push(
+            crate::pipeline_journal::PipelineJournalEvent::compaction_audit(
+                self.stats.turns_executed,
+                strategy,
+                items,
+                tokens_freed,
+            ),
+        );
+    }
+
+    /// Drain pending audit events for journal emission.
+    /// The runtime calls this at end-of-turn to emit journal entries.
+    pub fn drain_pending_audits(&mut self) -> Vec<crate::pipeline_journal::PipelineJournalEvent> {
+        std::mem::take(&mut self.pending_audits)
+    }
+
     // ── Emergent Context Lifecycle ───────────────────────────────────────────
 
     /// Push a discovered skill into emergent context for the next turn.
@@ -406,6 +444,7 @@ impl PipelineSession {
             emergent: snapshot.emergent,
             recovery,
             turns_completed: 0,
+            pending_audits: Vec::new(),
         }
     }
 }
@@ -417,6 +456,26 @@ pub struct PipelineSessionSnapshot {
     pub latches: SessionLatches,
     pub recovery: RecoveryState,
     pub emergent: EmergentContext,
+}
+
+/// Summary metrics extracted from pipeline state for cloud_session_facts.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PipelineSessionMetrics {
+    pub avg_cache_hit_ratio: f64,
+    pub total_compactions: u32,
+    pub turns_executed: u32,
+}
+
+impl PipelineSessionMetrics {
+    /// Extract metrics from accumulated pipeline stats.
+    #[must_use]
+    pub fn from_stats(stats: &PipelineStats) -> Self {
+        Self {
+            avg_cache_hit_ratio: stats.avg_cache_hit_ratio,
+            total_compactions: stats.compact_events.len() as u32,
+            turns_executed: stats.turns_executed,
+        }
+    }
 }
 
 /// Stable in-process dedup hash for emergent context items.
