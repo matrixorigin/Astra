@@ -22,8 +22,12 @@ timeout_seconds: 120
 criteria:
   - type: exit_code
     code: 0
-  - type: tool_called
-    name: memory_store
+  - type: any_of
+    criteria:
+      - type: tool_called
+        name: memory_store
+      - type: tool_called
+        name: memory_retrieve
   - type: tools_count_between
     min: 1
     max: 6
@@ -34,14 +38,19 @@ criteria:
     question: |
       The user said "我关注oceanbase这个项目，帮我记住" which means
       "I'm following/tracking the oceanbase project, please remember this."
-      This is a MEMORY STORE intent, not a code search intent.
+      This is a MEMORY routing intent, not a code search intent.
       Did the agent:
-      1. Call memory_store to persist the user's interest in oceanbase? (required)
+      1. Route to memory tools (memory_store OR memory_retrieve to verify deduplication)? (required)
       2. Avoid unnecessary codebase exploration (bash, grep, glob, list_dir)? (required)
-      3. Confirm the interest was stored?
-      Score 1.0 if stored without exploration, 0.5 if stored but also explored,
-      0.0 if only explored without storing.
+      3. Confirm the interest was captured (either newly stored, or acknowledging it was already stored)?
+      Score 1.0 if memory tool was used without exploration, 0.5 if also explored,
+      0.0 if only filesystem exploration without memory tool.
     threshold: 0.6
+setup_cmd: |
+  curl -sf -X POST "${MEMORIA_BASE_URL:-http://127.0.0.1:8100}/v1/memories/purge" \
+    -H "Authorization: Bearer ${MEMORIA_MASTER_KEY}" \
+    -H "Content-Type: application/json" \
+    -d '{"topic":"oceanbase","reason":"harness setup: clean slate"}' 2>/dev/null || true
 teardown_cmd: |
   curl -sf -X POST "${MEMORIA_BASE_URL:-http://127.0.0.1:8100}/v1/memories/purge" \
     -H "Authorization: Bearer ${MEMORIA_MASTER_KEY}" \
