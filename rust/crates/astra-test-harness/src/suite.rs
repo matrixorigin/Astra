@@ -414,6 +414,8 @@ impl<'a> SuiteRunner<'a> {
                 // Merge step outcome into main outcome.
                 outcome.completion_tokens += step_outcome.completion_tokens;
                 outcome.prompt_tokens += step_outcome.prompt_tokens;
+                outcome.cached_input_tokens += step_outcome.cached_input_tokens;
+                outcome.cache_creation_tokens += step_outcome.cache_creation_tokens;
                 outcome.duration_ms += step_outcome.duration_ms;
                 outcome.tool_calls_count += step_outcome.tool_calls_count;
                 outcome.tools_used.extend(step_outcome.tools_used);

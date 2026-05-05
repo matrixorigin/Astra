@@ -1,0 +1,30 @@
+name: pipeline_cache_hit_multi_turn
+description: |
+  **What**: 4-turn session with identical-shape prompts to measure prompt-cache hits
+  accumulated across turns. Turn 1 creates cache; turns 2–4 must hit it.
+  **Tests**: Prompt-cache stability — the system prompt prefix and tool schemas must
+  be byte-identical across turns in the same session so Bedrock/Anthropic cache hits.
+  **Why**: Cache hit ratio is the primary value prop of the context pipeline. A 0%
+  hit ratio means stable content is being rebuilt every turn (HashMap drift, dynamic
+  tool ordering, incompatible cache_control markers, etc.) and we're paying full
+  input-token cost each turn instead of the 10% cached-read price.
+  **Pass means**: cumulative cached_input_tokens ≥ 8000 across the session
+  AND cache_creation_tokens ≤ 20000 (creation happens only in turn 1, not every turn).
+  **Fail means**: cache prefix breaks each turn (e.g., non-deterministic skill enum,
+  `ttl: 1h` marker Bedrock silently drops, Session-scoped tool-dependent sections).
+prompt: |
+  Reply with the single word ACK. Do not call any tools.
+capability: custom:cache
+difficulty: 2
+weight: 1.0
+timeout_seconds: 180
+steps:
+  - prompt: 'Reply with the single word ACK. Do not call any tools.'
+  - prompt: 'Reply with the single word ACK. Do not call any tools.'
+  - prompt: 'Reply with the single word ACK. Do not call any tools.'
+criteria:
+  - type: exit_code
+    code: 0
+  - type: prompt_cache_tokens
+    min_read: 8000
+    min_creation: 0
