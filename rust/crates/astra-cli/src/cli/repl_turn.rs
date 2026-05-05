@@ -1751,6 +1751,20 @@ async fn apply_turn_success_async(
     // Background memory extraction: analyze this turn for durable memories.
     let tools_used: Vec<String> = state.recent_tools.to_vec();
     let extraction_turn = state.turn;
+
+    // Resolve fork prefix for extraction cache sharing: look up the
+    // current run's captured prefix from the spawner's store.
+    let fork_prefix = state
+        .agent_spawner
+        .as_ref()
+        .and_then(|s| s.prefix_store())
+        .and_then(|store| {
+            state
+                .run_id
+                .as_deref()
+                .and_then(|rid| store.get_prefix(rid))
+        });
+
     let outcome =
         state
             .memory_extractor
@@ -1762,6 +1776,7 @@ async fn apply_turn_success_async(
                 tools_used: &tools_used,
                 session_id: state.session_id.as_deref(),
                 existing_manifest: "",
+                fork_prefix,
             });
     // Journal: record extraction skip reasons for audit trail.
     // Started outcomes are journaled when drain() completes (session end).
