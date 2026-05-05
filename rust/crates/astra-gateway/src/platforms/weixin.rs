@@ -805,6 +805,11 @@ fn classify_send_error(
     if errcode == -2 && errmsg.contains("freq") {
         return SendRetryAction::RateLimitBackoff;
     }
+    // -2 + anything else (e.g. "unknown") = likely context_token expired
+    // after long CLI execution. Drop token and retry once.
+    if errcode == -2 && !already_tried_tokenless {
+        return SendRetryAction::DropContextToken;
+    }
     // Everything else: normal retry with original context_token
     SendRetryAction::NormalRetry
 }
@@ -1320,17 +1325,18 @@ mod tests {
     // ── classify_send_error regression tests ───────────────────────
 
     #[test]
-    fn error_minus2_unknown_keeps_context_token() {
-        // CRITICAL: -2 "unknown" must NOT drop context_token.
-        // Dropping it causes permanent send failures.
+    fn error_minus2_unknown_drops_context_token_once() {
+        // -2 "unknown" after long CLI execution = context_token expired.
+        // Try once without token; if that also fails, NormalRetry kicks in.
         assert_eq!(
             classify_send_error(-2, "unknown", false),
-            SendRetryAction::NormalRetry,
+            SendRetryAction::DropContextToken,
         );
     }
 
     #[test]
-    fn error_minus2_unknown_still_normal_even_after_tokenless() {
+    fn error_minus2_unknown_falls_back_to_normal_after_tokenless() {
+        // Already tried tokenless — don't loop, just normal retry.
         assert_eq!(
             classify_send_error(-2, "unknown", true),
             SendRetryAction::NormalRetry,
