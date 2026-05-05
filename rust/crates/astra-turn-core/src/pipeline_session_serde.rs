@@ -179,13 +179,19 @@ mod tests {
         let bytes = serialize_stats(&stats).unwrap();
         let restored = deserialize_stats(&bytes).unwrap();
 
-        let original_reserve = stats
-            .response_token_estimates
-            .reserve_for("model-a", "api", &RecoveryState::default());
-        let restored_reserve = restored
-            .response_token_estimates
-            .reserve_for("model-a", "api", &RecoveryState::default());
-        assert_eq!(original_reserve.output_tokens, restored_reserve.output_tokens);
+        let original_reserve =
+            stats
+                .response_token_estimates
+                .reserve_for("model-a", "api", &RecoveryState::default());
+        let restored_reserve = restored.response_token_estimates.reserve_for(
+            "model-a",
+            "api",
+            &RecoveryState::default(),
+        );
+        assert_eq!(
+            original_reserve.output_tokens,
+            restored_reserve.output_tokens
+        );
     }
 
     #[test]
@@ -275,7 +281,7 @@ mod tests {
         });
         let res = deserialize_session_state_fallible(&corrupt);
         assert!(
-            matches!(res, Err(_)),
+            res.is_err(),
             "corrupt payload must surface as Err, not Ok(None): {res:?}"
         );
 
@@ -297,7 +303,8 @@ mod tests {
     /// updating every caller.
     #[test]
     fn legacy_non_fallible_variant_still_collapses_corrupt_to_none() {
-        let corrupt = serde_json::json!({"version": "bad", "stats": {}, "latches": {}, "recovery": {}});
+        let corrupt =
+            serde_json::json!({"version": "bad", "stats": {}, "latches": {}, "recovery": {}});
         assert!(
             deserialize_session_state(&corrupt).is_none(),
             "legacy API collapses corrupt to None for back-compat — callers wanting \

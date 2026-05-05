@@ -71,11 +71,7 @@ pub fn analyze_pipeline_health(capture: &SessionCapture) -> PipelineHealthReport
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown")
                         .to_string();
-                    let turn = event
-                        .raw
-                        .get("turn")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
+                    let turn = event.raw.get("turn").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
                     if rule == "compaction_cascade" {
                         report.cascade_detected = true;
@@ -122,7 +118,13 @@ pub fn render_pipeline_health(report: &PipelineHealthReport) -> String {
     if !report.cache_hit_ratios.is_empty() {
         let first = report.cache_hit_ratios.first().unwrap_or(&0.0);
         let last = report.cache_hit_ratios.last().unwrap_or(&0.0);
-        let trend = if last > first { "↑" } else if last < first { "↓" } else { "→" };
+        let trend = if last > first {
+            "↑"
+        } else if last < first {
+            "↓"
+        } else {
+            "→"
+        };
         out.push_str(&format!(
             "  Cache trend: {:.0}% → {:.0}% {}\n",
             first * 100.0,
@@ -252,11 +254,7 @@ mod tests {
 
     #[test]
     fn cascade_alert_detected() {
-        let capture = make_capture(vec![make_alert_event(
-            7,
-            "compaction_cascade",
-            "Warning",
-        )]);
+        let capture = make_capture(vec![make_alert_event(7, "compaction_cascade", "Warning")]);
         let report = analyze_pipeline_health(&capture);
         assert!(report.cascade_detected);
         assert_eq!(report.alerts.len(), 1);

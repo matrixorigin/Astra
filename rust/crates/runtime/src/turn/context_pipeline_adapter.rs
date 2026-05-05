@@ -10,9 +10,7 @@
 
 use serde_json::Value;
 
-use astra_turn_core::context_sources::{
-    EdgeProfile, ExternalSources, SessionContext, TurnState,
-};
+use astra_turn_core::context_sources::{EdgeProfile, ExternalSources, SessionContext, TurnState};
 use astra_turn_core::microcompact::ProviderCacheStrategy;
 use astra_turn_core::pipeline_config::ProviderCachePolicy;
 use astra_turn_core::recovery_state::RecoveryState;
@@ -68,7 +66,10 @@ pub(crate) fn build_external_sources(
     let profile_desc = if profile_parts.is_empty() {
         None
     } else {
-        Some(format!("\n\n# Project Profile\n{}", profile_parts.join("\n")))
+        Some(format!(
+            "\n\n# Project Profile\n{}",
+            profile_parts.join("\n")
+        ))
     };
 
     // 4. Effort/agent_type hint
@@ -102,9 +103,7 @@ pub(crate) fn build_external_sources(
         .map(|s| format!("\n\n{s}"));
 
     // 7. Plan context
-    let plan_context = plan_resume_hint
-        .filter(|s| !s.is_empty())
-        .map(String::from);
+    let plan_context = plan_resume_hint.filter(|s| !s.is_empty()).map(String::from);
 
     // 8. Tool round guidance
     let tool_cfg = astra_config::runtime_config::RuntimeConfig::load().tool_selection;
@@ -205,18 +204,24 @@ pub(crate) fn build_session_context(
     edge_profile: &serde_json::Map<String, Value>,
     provider: &str,
 ) -> SessionContext {
-    let provider_policy = provider_policy_for(provider);
+    let provider_policy = provider_policy_for(provider, model_name);
     SessionContext {
         session_id: session_id.to_string(),
         run_id: run_id.unwrap_or_default().to_string(),
         model_id: model_name.to_string(),
-        model_limit: max_input_tokens as u32,
+        model_limit: u32::try_from(max_input_tokens).unwrap_or(u32::MAX),
         provider_policy,
         provider_strategy: ProviderCacheStrategy::default(),
         project_context: String::new(),
         edge_profile: EdgeProfile {
-            cwd: edge_profile.get("cwd").and_then(Value::as_str).map(String::from),
-            git_branch: edge_profile.get("git_branch").and_then(Value::as_str).map(String::from),
+            cwd: edge_profile
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(String::from),
+            git_branch: edge_profile
+                .get("git_branch")
+                .and_then(Value::as_str)
+                .map(String::from),
             ..Default::default()
         },
         self_model: None,
@@ -225,16 +230,20 @@ pub(crate) fn build_session_context(
 
 /// Map a provider name to its cache policy.
 ///
-/// Anthropic-family providers (direct Anthropic, Bedrock Claude models) use
-/// `cache_control` markers; everyone else gets prefix-only caching. The
-/// model name isn't used — Bedrock identifies itself via `provider=bedrock`
-/// even when the model is Claude, and `build_provider_request_body` handles
-/// the cache_control → cachePoint translation downstream.
-fn provider_policy_for(provider: &str) -> ProviderCachePolicy {
+/// Anthropic-family providers use `cache_control` markers; everyone else gets
+/// prefix-only caching. Bedrock is provider-multiplexed, so it must opt in only
+/// for Claude model IDs rather than all `provider=bedrock` traffic.
+fn provider_policy_for(provider: &str, model_name: &str) -> ProviderCachePolicy {
     match provider {
-        "anthropic" | "bedrock" => ProviderCachePolicy::anthropic(),
+        "anthropic" => ProviderCachePolicy::anthropic(),
+        "bedrock" if is_bedrock_claude_model(model_name) => ProviderCachePolicy::anthropic(),
         _ => ProviderCachePolicy::openai_compatible(),
     }
+}
+
+fn is_bedrock_claude_model(model_name: &str) -> bool {
+    let model = model_name.to_ascii_lowercase();
+    model.contains("anthropic.claude")
 }
 
 #[cfg(test)]
@@ -307,6 +316,31 @@ mod tests {
             "bedrock must use anthropic policy — Bedrock Converse translates cache_control \
              to cachePoint transparently"
         );
+    }
+
+    #[test]
+    fn session_context_uses_prefix_policy_for_non_claude_bedrock_model() {
+        let ep = serde_json::Map::new();
+        let ctx = build_session_context(
+            "sid",
+            None,
+            "amazon.titan-text-express-v1",
+            200_000,
+            &ep,
+            "bedrock",
+        );
+        assert_eq!(
+            ctx.provider_policy.max_markers, 0,
+            "non-Claude Bedrock models must not receive Anthropic cache_control markers"
+        );
+        assert!(!ctx.provider_policy.supports_global_scope);
+    }
+
+    #[test]
+    fn session_context_saturates_oversized_model_limit() {
+        let ep = serde_json::Map::new();
+        let ctx = build_session_context("sid", None, "gpt-4o", u64::MAX, &ep, "openai");
+        assert_eq!(ctx.model_limit, u32::MAX);
     }
 
     #[test]

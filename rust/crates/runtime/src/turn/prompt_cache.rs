@@ -132,7 +132,10 @@ pub(crate) fn assemble_system_message_via_pipeline(
     let profile_desc = if profile_parts.is_empty() {
         None
     } else {
-        Some(format!("\n\n# Project Profile\n{}", profile_parts.join("\n")))
+        Some(format!(
+            "\n\n# Project Profile\n{}",
+            profile_parts.join("\n")
+        ))
     };
 
     // Forward ASTRA_OUTPUT_STYLE as a dynamic extra section so the active
@@ -232,11 +235,7 @@ pub(crate) fn assemble_system_message_via_pipeline(
     // text-equality overlay for trace_signals wouldn't round-trip. Consumers
     // (`build_system_prompt_trace`) care about the logical *input* sections,
     // not the serialized bytes — that's what the old helper returned too.
-    let mut sections: Vec<prompts::PromptSection> = statics
-        .as_vec()
-        .into_iter()
-        .cloned()
-        .collect();
+    let mut sections: Vec<prompts::PromptSection> = statics.as_vec().into_iter().cloned().collect();
     // Append caller-supplied extras (and any we injected, like output style)
     // in their original form — trace_signals intact. Downstream
     // `build_system_prompt_trace` aggregates context_signals across every
@@ -685,11 +684,11 @@ mod tests {
     #[test]
     fn annotate_tool_schemas_marks_end_of_pinned_prefix_not_last_tool() {
         let mut tools = vec![
-            json!({"type": "function", "function": {"name": "bash"}}),         // pinned
-            json!({"type": "function", "function": {"name": "read_file"}}),    // pinned
-            json!({"type": "function", "function": {"name": "git_status"}}),   // pinned (new)
-            json!({"type": "function", "function": {"name": "git_log"}}),      // dynamic
-            json!({"type": "function", "function": {"name": "mo_branch"}}),    // dynamic
+            json!({"type": "function", "function": {"name": "bash"}}), // pinned
+            json!({"type": "function", "function": {"name": "read_file"}}), // pinned
+            json!({"type": "function", "function": {"name": "git_status"}}), // pinned (new)
+            json!({"type": "function", "function": {"name": "git_log"}}), // dynamic
+            json!({"type": "function", "function": {"name": "mo_branch"}}), // dynamic
         ];
         annotate_tool_schemas_for_caching(
             &mut tools,
@@ -719,10 +718,10 @@ mod tests {
     #[test]
     fn annotate_tool_schemas_handles_interleaved_tools() {
         let mut tools = vec![
-            json!({"type": "function", "function": {"name": "bash"}}),       // pinned
-            json!({"type": "function", "function": {"name": "lsp"}}),        // dynamic
+            json!({"type": "function", "function": {"name": "bash"}}), // pinned
+            json!({"type": "function", "function": {"name": "lsp"}}),  // dynamic
             json!({"type": "function", "function": {"name": "memory_store"}}), // pinned
-            json!({"type": "function", "function": {"name": "git_log"}}),   // dynamic
+            json!({"type": "function", "function": {"name": "git_log"}}), // dynamic
         ];
         annotate_tool_schemas_for_caching(
             &mut tools,
@@ -772,7 +771,10 @@ mod tests {
         );
 
         // Anthropic path puts everything in one message with content-array blocks.
-        assert!(dynamic.is_none(), "anthropic path emits single system message");
+        assert!(
+            dynamic.is_none(),
+            "anthropic path emits single system message"
+        );
         let content = primary
             .get("content")
             .and_then(Value::as_array)
@@ -1355,7 +1357,11 @@ mod cache_stability_regression {
     fn pinned_prefix_bytes_survive_dynamic_churn() {
         // Turn A: 3 dynamic tools in one order.
         let mut a = pinned_prefix_fixture();
-        a.extend([schema("git_log"), schema("mo_branch"), schema("github_list_prs")]);
+        a.extend([
+            schema("git_log"),
+            schema("mo_branch"),
+            schema("github_list_prs"),
+        ]);
         annotate_tool_schemas_for_caching(&mut a, &cfg_anthropic());
 
         // Turn B: different dynamic tools in different order, different count.
@@ -1424,12 +1430,12 @@ mod cache_stability_regression {
     #[test]
     fn marker_position_equals_last_pinned_index() {
         let mut tools = vec![
-            schema("bash"),        // pinned
-            schema("git_log"),     // dynamic (interleaved — shouldn't happen in production)
-            schema("read_file"),   // pinned
-            schema("mo_branch"),   // dynamic
+            schema("bash"),         // pinned
+            schema("git_log"),      // dynamic (interleaved — shouldn't happen in production)
+            schema("read_file"),    // pinned
+            schema("mo_branch"),    // dynamic
             schema("memory_store"), // pinned
-            schema("web_fetch"),   // dynamic
+            schema("web_fetch"),    // dynamic
         ];
         annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
 
@@ -1624,7 +1630,11 @@ mod cache_stability_regression {
         let a = build_once();
         let b_tools_churned = {
             let mut tools = pinned_prefix_fixture();
-            tools.extend([schema("web_fetch"), schema("github_list_prs"), schema("mo_query")]);
+            tools.extend([
+                schema("web_fetch"),
+                schema("github_list_prs"),
+                schema("mo_query"),
+            ]);
             annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
             build_provider_request_body(
                 &[json!({"role": "user", "content": "hi"})],
@@ -1786,7 +1796,8 @@ mod cache_stability_regression {
         }
         // Marker stays on the same pinned tool, bytes match.
         assert_eq!(
-            without[pinned_count - 1], with_new_mcp[pinned_count - 1],
+            without[pinned_count - 1],
+            with_new_mcp[pinned_count - 1],
             "pinned tool hosting the marker must be byte-identical \
              (pinned prefix cache hits regardless of MCP churn)"
         );

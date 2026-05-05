@@ -119,10 +119,7 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
     // Only add --session-id if the caller hasn't already provided one in extra_cli_args.
     // Multi-turn step cases inject --session-id via extra_cli_args to thread the parent's
     // session id across steps; we must not emit a second --session-id there.
-    let has_session_id_in_extras = case
-        .extra_cli_args
-        .iter()
-        .any(|a| a == "--session-id");
+    let has_session_id_in_extras = case.extra_cli_args.iter().any(|a| a == "--session-id");
     if !has_session_id_in_extras {
         cmd.arg("--session-id")
             .arg(uuid::Uuid::new_v4().to_string());

@@ -23,18 +23,15 @@ pub use system::{
     AgentRuntimeContext, CacheScope, LOW_CONFIDENCE_THRESHOLD, PARALLEL_BATCHING_NUDGE_THRESHOLD,
     PromptOverrides, PromptSection, PromptTokenBucket, ROUND_BUDGET_HARD_LIMIT,
     ROUND_BUDGET_THRESHOLD, STALL_NUDGE, SYSTEM_PROMPT_BASE, apply_overrides,
-    build_main_system_prompt, build_main_system_prompt_with_style,
-    build_pipeline_static_sections, build_system_prompt_sections,
-    build_system_prompt_sections_with_style, build_system_prompt_trace, default_overrides_dir,
-    detect_task_type, load_overrides, parallel_batching_nudge_directive,
-    parallel_execution_feedback, round_budget_directive, round_budget_directive_with,
-    sections_to_string, self_awareness_prompt_section, synthesize_or_batch_directive,
-    tool_round_guidance, tool_round_guidance_trace_with,
+    build_main_system_prompt, build_main_system_prompt_with_style, build_pipeline_static_sections,
+    build_system_prompt_sections, build_system_prompt_sections_with_style,
+    build_system_prompt_trace, default_overrides_dir, detect_task_type, load_overrides,
+    parallel_batching_nudge_directive, parallel_execution_feedback, round_budget_directive,
+    round_budget_directive_with, sections_to_string, self_awareness_prompt_section,
+    synthesize_or_batch_directive, tool_round_guidance, tool_round_guidance_trace_with,
     tool_round_guidance_with, trailing_single_tool_round_streak,
 };
-pub(crate) use system::{
-    self_model_section, tool_conditional_section,
-};
+pub(crate) use system::{self_model_section, tool_conditional_section};
 
 pub use astra_prompts::memory_lifecycle;
 pub use astra_prompts::memory_proto;

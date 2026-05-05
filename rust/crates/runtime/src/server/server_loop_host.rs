@@ -1591,7 +1591,6 @@ impl ServerAgenticLoopHost {
         results
     }
 
-
     fn emit_context_meta(
         &mut self,
         breakdown: &astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
@@ -1681,8 +1680,8 @@ impl ServerAgenticLoopHost {
     ///
     /// Returns `(structured_system_messages, plain_text_for_estimates, breakdown)`.
     fn build_pipeline_system_messages(
-        &self,
-        state: &AgenticLoopState,
+        &mut self,
+        state: &mut AgenticLoopState,
         visible_tools: &[Value],
         provider: &str,
         model_name: &str,
@@ -1754,19 +1753,54 @@ impl ServerAgenticLoopHost {
             query_source: "agentic_loop",
         };
 
-        // run_turn_adaptive can only fail with pipeline abort (context-window
-        // exhaustion). In that rare case we fall back to an empty system
-        // message rather than propagating — the caller has no good recovery
-        // path from here and the subsequent LLM call will surface the issue.
+        // Fail safe on pipeline abort: never continue with an empty system
+        // prompt, because that silently drops identity, constraints, and tool
+        // guidance. Emit a structured alert and use a minimal emergency prompt
+        // so the next provider call remains bounded and diagnosable.
         let pipeline_output = match pipeline_sess.run_turn_adaptive(input) {
             Ok(out) => out,
             Err(abort) => {
+                let turn = state.llm_rounds_completed;
+                let alert = astra_turn_core::trace_alert::TraceAlert {
+                    severity: astra_turn_core::trace_alert::AlertSeverity::Error,
+                    rule: "system_prompt_abort".into(),
+                    message: format!("pipeline aborted during system-message build: {abort:?}"),
+                    turn,
+                };
+                if let Some(ref mut buf) = state.turn_event_buffer {
+                    let alert_evt =
+                        astra_turn_core::pipeline_journal::PipelineJournalEvent::from_alert(&alert);
+                    if let Ok(payload) = serde_json::to_value(&alert_evt) {
+                        buf.record(
+                            astra_services::session_journal::JournalEvent::pipeline_alert(
+                                state.current_session_id.as_deref(),
+                                turn,
+                                payload,
+                            ),
+                        );
+                    }
+                }
                 astra_core::agent_warn!(
                     "pipeline",
                     "pipeline aborted during system-message build: {abort:?} — \
-                     falling back to empty system content"
+                     falling back to emergency system content"
                 );
-                return (vec![], String::new(), Default::default());
+                let emergency = "You are Astra, a coding assistant. The normal context pipeline \
+                    could not build the full system prompt for this turn, so proceed cautiously: \
+                    preserve user intent, avoid destructive actions unless explicitly requested, \
+                    and surface any uncertainty instead of guessing.";
+                let breakdown = astra_turn_core::context_assembly_trace::SystemPromptBreakdown {
+                    total_tokens: (emergency.len() / 4) as u32,
+                    ..Default::default()
+                };
+                return (
+                    vec![json!({
+                        "role": "system",
+                        "content": [{"type": "text", "text": emergency}],
+                    })],
+                    emergency.to_string(),
+                    breakdown,
+                );
             }
         };
 
@@ -1778,7 +1812,11 @@ impl ServerAgenticLoopHost {
             total_tokens: pipeline_output.metrics.sections,
             ..Default::default()
         };
-        (vec![json!({"role": "system", "content": content})], plain, breakdown)
+        (
+            vec![json!({"role": "system", "content": content})],
+            plain,
+            breakdown,
+        )
     }
 
     /// Test-only: returns the plain-text system prompt (no cache annotations).
@@ -3527,6 +3565,55 @@ mod tests {
         assert!(
             !prompt.contains("[plan-resume]"),
             "system prompt must NOT mention plan-resume when no plan is active"
+        );
+    }
+
+    #[test]
+    fn pipeline_abort_falls_back_to_emergency_prompt_and_records_alert() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .build();
+        let mut state = crate::turn::agentic_loop_host::tests::make_state();
+        state.current_session_id = Some("sid-abort".into());
+        state.max_turn_input_tokens = 100_000;
+        state.turn_event_buffer = Some(
+            astra_services::session_journal::TurnEventBuffer::begin_turn(Some("sid-abort"), 1),
+        );
+        let mut pipeline_session = astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        );
+        pipeline_session.recovery.consecutive_ptl_errors = 3;
+        state.pipeline_session = Some(pipeline_session);
+        let tools = host.edge_tools.clone();
+
+        let (messages, plain, breakdown) = host.build_pipeline_system_messages(
+            &mut state,
+            &tools,
+            "anthropic",
+            "claude-sonnet",
+            "continue",
+        );
+
+        assert!(
+            !messages.is_empty(),
+            "pipeline abort must not continue with an empty system prompt"
+        );
+        assert!(
+            plain.contains("normal context pipeline could not build"),
+            "fallback should clearly identify the degraded emergency path"
+        );
+        assert!(breakdown.total_tokens > 0);
+        assert!(
+            state
+                .turn_event_buffer
+                .as_ref()
+                .is_some_and(|buffer| !buffer.is_empty()),
+            "pipeline abort should record an alert event for harness/journal analysis"
         );
     }
 

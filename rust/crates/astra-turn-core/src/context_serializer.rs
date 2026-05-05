@@ -132,9 +132,7 @@ pub fn system_blocks_to_anthropic_content(request: &SerializedProviderRequest) -
 /// Convert system blocks into the Anthropic system message (single message with content array).
 /// Returns `(system_message_value, plain_text)`.
 #[must_use]
-pub fn system_blocks_to_anthropic_message(
-    request: &SerializedProviderRequest,
-) -> (Value, String) {
+pub fn system_blocks_to_anthropic_message(request: &SerializedProviderRequest) -> (Value, String) {
     let content = system_blocks_to_anthropic_content(request);
     let plain = flatten_serialized_system_blocks(request);
     let msg = serde_json::json!({

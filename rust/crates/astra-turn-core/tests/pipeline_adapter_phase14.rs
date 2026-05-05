@@ -12,7 +12,6 @@ use astra_turn_core::optimize_limits::OptimizeLimits;
 use astra_turn_core::pipeline_config::{PipelineConfig, ProviderCachePolicy};
 use astra_turn_core::pipeline_session::{AdaptiveTurnInput, PipelineSession, TurnInput};
 use astra_turn_core::recovery_state::RecoveryState;
-use astra_turn_core::section_types::CacheScope;
 use astra_turn_core::token_accounting::TokenAccounting;
 
 /// Simulates the data available on AgenticLoopState at the point where
@@ -146,7 +145,9 @@ fn adapter_feeds_pipeline_session_run_turn() {
         query_source: "agentic_loop",
     };
 
-    let output = sess.run_turn(input).expect("pipeline should produce output");
+    let output = sess
+        .run_turn(input)
+        .expect("pipeline should produce output");
     assert!(output.metrics.turn_index == 3);
     assert!(!output.serialized.system_blocks.is_empty());
     assert!(output.explain.phase_timings.len() == 4);
@@ -290,9 +291,8 @@ fn pipeline_output_flattened_matches_concatenation_of_blocks() {
     };
 
     let output = sess.run_turn(input).unwrap();
-    let flattened = astra_turn_core::context_serializer::flatten_serialized_system_blocks(
-        &output.serialized,
-    );
+    let flattened =
+        astra_turn_core::context_serializer::flatten_serialized_system_blocks(&output.serialized);
 
     // Flattened should be non-empty and contain all block texts
     assert!(!flattened.is_empty());

@@ -973,7 +973,11 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 // Record compression audit for pipeline journal
                 if let Some(ref mut sess) = state.pipeline_session {
                     sess.record_compaction_audit(
-                        if post_mc_pressure >= 0.90 { "aggressive_compression" } else { "default_compression" },
+                        if post_mc_pressure >= 0.90 {
+                            "aggressive_compression"
+                        } else {
+                            "default_compression"
+                        },
                         outcome.layer_results.len() as u32,
                         outcome.total_tokens_freed as u32,
                     );

@@ -148,6 +148,75 @@ fn context_pipeline_serializes_provider_request_and_metrics() {
 }
 
 #[test]
+fn context_pipeline_rejects_zero_model_limit_before_compaction() {
+    let (statics, agent, latches, mut session, turn, ext, emer, stats) = build_sources();
+    session.model_limit = 0;
+    let sources = ContextSources {
+        statics: &statics,
+        agent: &agent,
+        latches: &latches,
+        session: &session,
+        turn: &turn,
+        external: &ext,
+        emergent: &emer,
+        stats: &stats,
+    };
+    let pipeline = ContextPipeline::new(PipelineConfig::default());
+
+    let err = pipeline
+        .run(PipelineRunInput {
+            sources: &sources,
+            tokens: &turn.tokens,
+            model_limit: session.model_limit,
+            recovery: &turn.recovery,
+            latches: &latches,
+            optimize_limits: &OptimizeLimits::for_tier(
+                astra_turn_core::compaction_types::CompactionTier::AggressivePrune,
+                0,
+            ),
+            model_id: &session.model_id,
+            query_source: "harness",
+        })
+        .expect_err("zero model limit must abort instead of pruning context");
+
+    assert_eq!(err, PipelineAbort::InvalidModelLimit { model_limit: 0 });
+}
+
+#[test]
+fn context_pipeline_uses_session_provider_policy_not_default_config() {
+    let (statics, agent, latches, session, turn, ext, emer, stats) = build_sources();
+    let sources = ContextSources {
+        statics: &statics,
+        agent: &agent,
+        latches: &latches,
+        session: &session,
+        turn: &turn,
+        external: &ext,
+        emergent: &emer,
+        stats: &stats,
+    };
+    let pipeline = ContextPipeline::new(PipelineConfig::default());
+
+    let run = pipeline
+        .run(PipelineRunInput {
+            sources: &sources,
+            tokens: &turn.tokens,
+            model_limit: session.model_limit,
+            recovery: &turn.recovery,
+            latches: &latches,
+            optimize_limits: &OptimizeLimits::default(),
+            model_id: &session.model_id,
+            query_source: "harness",
+        })
+        .expect("pipeline should use session policy and complete");
+
+    assert!(
+        !run.serialized.cache_markers.is_empty(),
+        "Anthropic session policy must place cache markers even when PipelineConfig is default"
+    );
+}
+
+#[test]
 fn prompt_sections_serialize_through_pipeline_without_text_loss() {
     let sections = vec![
         PromptSection::stable("global", CacheScope::Global),

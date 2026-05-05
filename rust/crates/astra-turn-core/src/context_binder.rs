@@ -293,7 +293,7 @@ mod tests {
             external: ExternalSources {
                 memory_snippets: vec!["Remember: prefer pipeline-first design.".into()],
                 spill_dir: None,
-            ..Default::default()
+                ..Default::default()
             },
             emergent: EmergentContext::default(),
             stats: PipelineStats::default(),
@@ -390,7 +390,10 @@ mod tests {
         let content = bind_runtime_identity(&sources);
         // Core identity still intact; no spurious trailing content.
         assert!(content.contains("test-model"));
-        assert!(!content.ends_with("\n\n"), "no orphan blank lines from empty extras");
+        assert!(
+            !content.ends_with("\n\n"),
+            "no orphan blank lines from empty extras"
+        );
     }
 
     #[test]

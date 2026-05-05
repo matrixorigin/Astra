@@ -69,9 +69,8 @@ pub fn build_pipeline_static_sections() -> astra_turn_core::context_sources::Sta
     // assembly time; the pipeline applies them here so both paths surface
     // the same Global text.
     let overrides = load_overrides(&default_overrides_dir());
-    let resolve = |key: &str, default: String| -> String {
-        overrides.get(key).cloned().unwrap_or(default)
-    };
+    let resolve =
+        |key: &str, default: String| -> String { overrides.get(key).cloned().unwrap_or(default) };
 
     StaticSections {
         core_rules: PromptSection {
@@ -759,7 +758,10 @@ pub fn build_system_prompt_sections_with_style(
 
     let tool_cond = tool_conditional_section(tool_names, profile_desc, selection_confidence);
     if !tool_cond.is_empty() {
-        sections.push(PromptSection::dynamic(tool_cond, PromptTokenBucket::BasePersona));
+        sections.push(PromptSection::dynamic(
+            tool_cond,
+            PromptTokenBucket::BasePersona,
+        ));
     }
 
     let tt = task_type_section(task_type);

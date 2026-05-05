@@ -216,8 +216,7 @@ mod section_ema_serde {
     where
         D: Deserializer<'de>,
     {
-        let vec: Vec<(crate::section_types::SectionKind, f64)> =
-            Vec::deserialize(deserializer)?;
+        let vec: Vec<(crate::section_types::SectionKind, f64)> = Vec::deserialize(deserializer)?;
         Ok(vec.into_iter().collect())
     }
 }

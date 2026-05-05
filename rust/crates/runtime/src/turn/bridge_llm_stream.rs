@@ -281,10 +281,9 @@ async fn bedrock_stream_with_retry(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
-            let dump_path = std::env::temp_dir()
-                .join(format!("astra-bedrock-body-{ts}.json"));
-            let dump_content = serde_json::to_string_pretty(&body)
-                .unwrap_or_else(|_| "serialize error".into());
+            let dump_path = std::env::temp_dir().join(format!("astra-bedrock-body-{ts}.json"));
+            let dump_content =
+                serde_json::to_string_pretty(&body).unwrap_or_else(|_| "serialize error".into());
             let _ = std::fs::write(&dump_path, &dump_content);
         }
 

@@ -403,7 +403,11 @@ impl PipelineSession {
 
     /// Latch the cache scope. Call on the first turn to freeze scope for the session.
     /// Returns true if newly latched.
-    pub fn latch_cache_scope(&mut self, scope: crate::section_types::CacheScope, turn: u32) -> bool {
+    pub fn latch_cache_scope(
+        &mut self,
+        scope: crate::section_types::CacheScope,
+        turn: u32,
+    ) -> bool {
         self.latches.latch_cache_scope(scope, turn)
     }
 
@@ -586,9 +590,11 @@ mod tests {
 
     #[test]
     fn warm_start_preserves_stats() {
-        let mut stats = PipelineStats::default();
-        stats.turns_executed = 5;
-        stats.avg_cache_hit_ratio = 0.85;
+        let stats = PipelineStats {
+            turns_executed: 5,
+            avg_cache_hit_ratio: 0.85,
+            ..Default::default()
+        };
 
         let sess = PipelineSession::with_warm_stats(PipelineConfig::default(), stats);
         assert_eq!(sess.stats.turns_executed, 5);
@@ -607,7 +613,10 @@ mod tests {
 
         sess.record_ptl_error();
         assert!(!sess.should_abort());
-        assert_eq!(sess.current_pressure_tier(), CompactionTier::AggressivePrune);
+        assert_eq!(
+            sess.current_pressure_tier(),
+            CompactionTier::AggressivePrune
+        );
 
         sess.record_ptl_error();
         assert!(sess.should_abort());
@@ -703,9 +712,7 @@ mod tests {
             query_source: "repl",
         };
 
-        let shadow = sess
-            .run_turn_shadow(input2, &output.optimized)
-            .unwrap();
+        let shadow = sess.run_turn_shadow(input2, &output.optimized).unwrap();
         assert!(shadow.diff.is_clean());
     }
 
@@ -786,7 +793,9 @@ mod tests {
             query_source: "repl",
         };
 
-        let output = sess.run_turn_adaptive(input).expect("2 PTL should not abort");
+        let output = sess
+            .run_turn_adaptive(input)
+            .expect("2 PTL should not abort");
         assert_eq!(output.metrics.turn_index, 3);
     }
 

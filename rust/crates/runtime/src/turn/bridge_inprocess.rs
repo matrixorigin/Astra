@@ -3924,18 +3924,19 @@ mod tests {
                 },
             ),
         ];
-        let (_, _, prompt_sections) = crate::turn::prompt_cache::assemble_system_message_via_pipeline(
-            &["bash", "read_file"],
-            &dynamic_sections,
-            0.8,
-            Some("implementation"),
-            &PromptCacheConfig::latch("openai", "gpt-4"),
-            "test-session",
-            "gpt-4",
-            "openai",
-            None,
-            None,
-        );
+        let (_, _, prompt_sections) =
+            crate::turn::prompt_cache::assemble_system_message_via_pipeline(
+                &["bash", "read_file"],
+                &dynamic_sections,
+                0.8,
+                Some("implementation"),
+                &PromptCacheConfig::latch("openai", "gpt-4"),
+                "test-session",
+                "gpt-4",
+                "openai",
+                None,
+                None,
+            );
         let breakdown = prompts::build_system_prompt_trace(&prompt_sections, vec![], vec![]);
 
         assert!(breakdown.context_signals.active_output_skills);

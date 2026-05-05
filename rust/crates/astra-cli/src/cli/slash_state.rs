@@ -493,8 +493,8 @@ pub(super) async fn handle_state_command(
                             runtime_continuity: None,
                             turn_index: 0,
                             evolution_service: state.evolution_service.clone(),
-                pipeline_state: None,
-            pre_loaded_messages: None,
+                            pipeline_state: None,
+                            pre_loaded_messages: None,
                             append_system_prompt: None,
                             #[cfg(feature = "harness")]
                             harness_sink: Some(state.harness_sink.clone()),
@@ -592,8 +592,8 @@ pub(super) async fn handle_state_command(
                                     runtime_continuity: None,
                                     turn_index: 0,
                                     evolution_service: state.evolution_service.clone(),
-                pipeline_state: None,
-            pre_loaded_messages: None,
+                                    pipeline_state: None,
+                                    pre_loaded_messages: None,
                                     append_system_prompt: None,
                                     #[cfg(feature = "harness")]
                                     harness_sink: Some(state.harness_sink.clone()),

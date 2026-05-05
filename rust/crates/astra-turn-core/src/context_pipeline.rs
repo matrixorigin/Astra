@@ -26,6 +26,8 @@ use crate::token_accounting::TokenAccounting;
 pub enum PipelineAbort {
     /// Consecutive PTL errors exceeded abort threshold (3).
     ConsecutivePtlExhausted { consecutive_errors: u32 },
+    /// The model context limit is invalid, so planning would be unsafe.
+    InvalidModelLimit { model_limit: u32 },
 }
 
 impl fmt::Display for PipelineAbort {
@@ -36,6 +38,12 @@ impl fmt::Display for PipelineAbort {
                     f,
                     "pipeline aborted: {} consecutive prompt-too-long errors",
                     consecutive_errors
+                )
+            }
+            Self::InvalidModelLimit { model_limit } => {
+                write!(
+                    f,
+                    "pipeline aborted: invalid model context limit {model_limit}"
                 )
             }
         }
@@ -61,6 +69,14 @@ impl ContextPipeline {
     /// Run the full pipeline. Returns `Err(PipelineAbort)` if recovery state
     /// indicates an unrecoverable error streak (e.g., 3+ consecutive PTL errors).
     pub fn run(&self, input: PipelineRunInput<'_>) -> Result<PipelineRunOutput, PipelineAbort> {
+        if input.model_limit == 0 {
+            return Err(PipelineAbort::InvalidModelLimit {
+                model_limit: input.model_limit,
+            });
+        }
+
+        let provider_policy = &input.sources.session.provider_policy;
+
         // Gate: check abort condition before spending compute
         if input.recovery.should_abort() {
             return Err(PipelineAbort::ConsecutivePtlExhausted {
@@ -77,7 +93,7 @@ impl ContextPipeline {
             recovery: input.recovery,
             latches: input.latches,
             stats: input.sources.stats,
-            provider_policy: &self.config.provider_policy,
+            provider_policy,
             has_memory: !input.sources.external.memory_snippets.is_empty(),
             model_id: input.model_id,
             query_source: input.query_source,
@@ -94,14 +110,14 @@ impl ContextPipeline {
             &plan,
             bound,
             input.latches,
-            &self.config.provider_policy,
+            provider_policy,
             input.optimize_limits,
             input.sources.turn.turn_index,
         );
         timings.push(PipelinePhaseTiming::elapsed("optimize", started));
 
         let started = Instant::now();
-        let serialized = serialize_provider_request(&optimized, &self.config.provider_policy);
+        let serialized = serialize_provider_request(&optimized, provider_policy);
         timings.push(PipelinePhaseTiming::elapsed("serialize", started));
 
         let metrics = PipelineRunMetrics::from_output(&input, &plan, &optimized);
@@ -222,6 +238,14 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_abort_display_contains_invalid_model_limit() {
+        let abort = PipelineAbort::InvalidModelLimit { model_limit: 0 };
+        let msg = abort.to_string();
+        assert!(msg.contains("invalid model context limit"));
+        assert!(msg.contains("0"));
+    }
+
+    #[test]
     fn pipeline_abort_eq_derives_correctly() {
         let a = PipelineAbort::ConsecutivePtlExhausted {
             consecutive_errors: 3,
@@ -232,8 +256,10 @@ mod tests {
         let c = PipelineAbort::ConsecutivePtlExhausted {
             consecutive_errors: 4,
         };
+        let invalid = PipelineAbort::InvalidModelLimit { model_limit: 0 };
         assert_eq!(a, b);
         assert_ne!(a, c);
+        assert_ne!(a, invalid);
     }
 
     #[test]
@@ -251,6 +277,14 @@ mod tests {
         let abort = PipelineAbort::ConsecutivePtlExhausted {
             consecutive_errors: 5,
         };
+        let json = serde_json::to_string(&abort).unwrap();
+        let restored: PipelineAbort = serde_json::from_str(&json).unwrap();
+        assert_eq!(abort, restored);
+    }
+
+    #[test]
+    fn invalid_model_limit_abort_serializes_roundtrip() {
+        let abort = PipelineAbort::InvalidModelLimit { model_limit: 0 };
         let json = serde_json::to_string(&abort).unwrap();
         let restored: PipelineAbort = serde_json::from_str(&json).unwrap();
         assert_eq!(abort, restored);

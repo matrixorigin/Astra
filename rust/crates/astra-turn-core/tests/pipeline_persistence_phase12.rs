@@ -3,15 +3,9 @@
 //! Tests written first (red), then implementation makes them green.
 
 use astra_turn_core::context_feedback::ContextFeedback;
-use astra_turn_core::emergent_context::{DiscoveredSkill, EmergentItem};
 use astra_turn_core::pipeline_config::PipelineConfig;
 use astra_turn_core::pipeline_session::PipelineSession;
-use astra_turn_core::pipeline_session_serde::{
-    deserialize_session_state, serialize_session_state,
-};
-use astra_turn_core::recovery_state::RecoveryState;
 use astra_turn_core::section_types::CacheScope;
-use astra_turn_core::session_latches::SessionLatches;
 
 // ── 12.2: EmergentContext in checkpoints ────────────────────────────────────
 
@@ -46,14 +40,17 @@ fn emergent_context_restored_into_session() {
 
     let sess2 = PipelineSession::from_snapshot(PipelineConfig::default(), restored);
     assert!(!sess2.emergent.is_empty());
-    assert_eq!(sess2.emergent.discovered_skills[0].value.skill_name, "review");
+    assert_eq!(
+        sess2.emergent.discovered_skills[0].value.skill_name,
+        "review"
+    );
 }
 
 // ── 12.4: Journal events ────────────────────────────────────────────────────
 
 #[test]
 fn pipeline_feedback_event_captures_cache_metrics() {
-    use astra_turn_core::pipeline_journal::{PipelineJournalEvent, PipelineEventKind};
+    use astra_turn_core::pipeline_journal::{PipelineEventKind, PipelineJournalEvent};
 
     let feedback = ContextFeedback::from_usage(1000, 800, 200, 500, false);
     let event = PipelineJournalEvent::from_feedback(3, "claude-sonnet-4-6", &feedback);
@@ -66,7 +63,7 @@ fn pipeline_feedback_event_captures_cache_metrics() {
 
 #[test]
 fn pipeline_alert_event_captures_rule_and_severity() {
-    use astra_turn_core::pipeline_journal::{PipelineJournalEvent, PipelineEventKind};
+    use astra_turn_core::pipeline_journal::{PipelineEventKind, PipelineJournalEvent};
     use astra_turn_core::trace_alert::{AlertSeverity, TraceAlert};
 
     let alert = TraceAlert {
@@ -85,25 +82,23 @@ fn pipeline_alert_event_captures_rule_and_severity() {
 
 #[test]
 fn compaction_audit_event_captures_what_was_dropped() {
-    use astra_turn_core::pipeline_journal::{PipelineJournalEvent, PipelineEventKind};
+    use astra_turn_core::pipeline_journal::{PipelineEventKind, PipelineJournalEvent};
 
-    let event = PipelineJournalEvent::compaction_audit(
-        5,
-        "tool_result_clearing",
-        12,
-        3400,
-    );
+    let event = PipelineJournalEvent::compaction_audit(5, "tool_result_clearing", 12, 3400);
 
     assert_eq!(event.kind, PipelineEventKind::CompactionAudit);
     assert_eq!(event.turn, 5);
-    assert_eq!(event.compaction_strategy.as_deref(), Some("tool_result_clearing"));
+    assert_eq!(
+        event.compaction_strategy.as_deref(),
+        Some("tool_result_clearing")
+    );
     assert_eq!(event.items_affected, Some(12));
     assert_eq!(event.tokens_freed, Some(3400));
 }
 
 #[test]
 fn pipeline_events_serialize_to_journal_compatible_json() {
-    use astra_turn_core::pipeline_journal::{PipelineJournalEvent, PipelineEventKind};
+    use astra_turn_core::pipeline_journal::PipelineJournalEvent;
 
     let feedback = ContextFeedback::from_usage(0, 900, 100, 300, false);
     let event = PipelineJournalEvent::from_feedback(1, "model", &feedback);
@@ -118,7 +113,7 @@ fn pipeline_events_serialize_to_journal_compatible_json() {
 
 #[test]
 fn pipeline_events_round_trip_through_json() {
-    use astra_turn_core::pipeline_journal::{PipelineJournalEvent, PipelineEventKind};
+    use astra_turn_core::pipeline_journal::{PipelineEventKind, PipelineJournalEvent};
 
     let event = PipelineJournalEvent::compaction_audit(10, "round_dropping", 6, 8000);
     let json = serde_json::to_string(&event).unwrap();

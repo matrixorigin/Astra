@@ -84,7 +84,7 @@ fn ten_turn_session_lifecycle() {
     let external = ExternalSources {
         memory_snippets: vec!["User prefers concise answers.".into()],
         spill_dir: None,
-            ..Default::default()
+        ..Default::default()
     };
     let limits = OptimizeLimits::default();
 
@@ -164,7 +164,7 @@ fn ptl_error_recovery_and_abort() {
     let external = ExternalSources {
         memory_snippets: vec![],
         spill_dir: None,
-            ..Default::default()
+        ..Default::default()
     };
     let limits = OptimizeLimits::default();
 
@@ -196,7 +196,7 @@ fn shadow_mode_produces_deterministic_output() {
     let external = ExternalSources {
         memory_snippets: vec!["test memory".into()],
         spill_dir: None,
-            ..Default::default()
+        ..Default::default()
     };
     let limits = OptimizeLimits::default();
 
@@ -235,10 +235,10 @@ fn response_token_estimator_improves_over_turns() {
     let config = PipelineConfig::default();
     let mut sess = PipelineSession::new(config);
 
-    let initial_reserve = sess
-        .stats
-        .response_token_estimates
-        .reserve_for("model", "repl", &RecoveryState::default());
+    let initial_reserve =
+        sess.stats
+            .response_token_estimates
+            .reserve_for("model", "repl", &RecoveryState::default());
     assert_eq!(initial_reserve.output_tokens, 500);
 
     for i in 1..=20 {
@@ -246,10 +246,10 @@ fn response_token_estimator_improves_over_turns() {
         sess.record_feedback("model", "repl", feedback, None);
     }
 
-    let learned_reserve = sess
-        .stats
-        .response_token_estimates
-        .reserve_for("model", "repl", &RecoveryState::default());
+    let learned_reserve =
+        sess.stats
+            .response_token_estimates
+            .reserve_for("model", "repl", &RecoveryState::default());
     assert!(
         learned_reserve.output_tokens > 500,
         "after 20 samples with completion > 1000, reserve should exceed default floor 500, got {}",
@@ -282,7 +282,7 @@ fn full_lifecycle_with_emergent_and_latches() {
     let external = ExternalSources {
         memory_snippets: vec!["User works on astra-engine.".into()],
         spill_dir: None,
-            ..Default::default()
+        ..Default::default()
     };
 
     // Turn 1: initial turn — latch cache scope, run pipeline
@@ -299,7 +299,9 @@ fn full_lifecycle_with_emergent_and_latches() {
         model_id: "claude-sonnet-4-6",
         query_source: "repl",
     };
-    let output1 = sess.run_turn_adaptive(input1).expect("turn 1 should succeed");
+    let output1 = sess
+        .run_turn_adaptive(input1)
+        .expect("turn 1 should succeed");
     assert_eq!(output1.metrics.turn_index, 1);
 
     // Simulate: during turn 1 execution, we discover a skill and prefetch memory
@@ -310,7 +312,10 @@ fn full_lifecycle_with_emergent_and_latches() {
     sess.record_feedback("claude-sonnet-4-6", "repl", feedback1, Some(&output1));
 
     // Turn 2: emergent context should be available (not empty)
-    assert!(!sess.emergent.is_empty(), "emergent should have items from turn 1");
+    assert!(
+        !sess.emergent.is_empty(),
+        "emergent should have items from turn 1"
+    );
 
     let turn2 = make_turn_state(2, 4);
     let input2 = AdaptiveTurnInput {
@@ -322,7 +327,9 @@ fn full_lifecycle_with_emergent_and_latches() {
         model_id: "claude-sonnet-4-6",
         query_source: "repl",
     };
-    let output2 = sess.run_turn_adaptive(input2).expect("turn 2 should succeed");
+    let output2 = sess
+        .run_turn_adaptive(input2)
+        .expect("turn 2 should succeed");
     assert_eq!(output2.metrics.turn_index, 2);
 
     let feedback2 = ContextFeedback::from_usage(0, 950, 50, 350, false);
@@ -342,7 +349,9 @@ fn full_lifecycle_with_emergent_and_latches() {
         model_id: "claude-sonnet-4-6",
         query_source: "repl",
     };
-    let output3 = sess.run_turn_adaptive(input3).expect("turn 3 should succeed");
+    let output3 = sess
+        .run_turn_adaptive(input3)
+        .expect("turn 3 should succeed");
 
     let feedback3 = ContextFeedback::from_usage(0, 980, 20, 300, false);
     sess.record_feedback("claude-sonnet-4-6", "repl", feedback3, Some(&output3));
@@ -353,8 +362,14 @@ fn full_lifecycle_with_emergent_and_latches() {
     assert!(!sess.stats.section_token_history().is_empty());
 
     // Verify latches are frozen
-    assert!(!sess.latch_cache_scope(CacheScope::Session, 4), "scope should not re-latch");
-    assert!(!sess.latch_header("anthropic-beta", "different-value", 4), "header should not re-latch");
+    assert!(
+        !sess.latch_cache_scope(CacheScope::Session, 4),
+        "scope should not re-latch"
+    );
+    assert!(
+        !sess.latch_header("anthropic-beta", "different-value", 4),
+        "header should not re-latch"
+    );
 
     // Verify warm start preservation
     let bytes = serialize_stats(&sess.stats).unwrap();

@@ -5,7 +5,6 @@ use astra_turn_core::context_feedback::ContextFeedback;
 use astra_turn_core::context_pipeline::PipelineExplain;
 use astra_turn_core::context_pressure::ContextPressure;
 use astra_turn_core::pipeline_config::PipelineConfig;
-use astra_turn_core::pipeline_journal::PipelineJournalEvent;
 use astra_turn_core::pipeline_session::PipelineSession;
 use astra_turn_core::pipeline_stats::PipelineStats;
 
@@ -24,7 +23,10 @@ fn pipeline_explain_serializes_to_trace_compatible_json() {
                 elapsed_micros: 80,
             },
         ],
-        pressure: ContextPressure { value: 0.65, raw: 0.55 },
+        pressure: ContextPressure {
+            value: 0.65,
+            raw: 0.55,
+        },
         compact_tier: CompactionTier::TrimSchemas,
         skipped_optimizations: 2,
     };
@@ -76,11 +78,13 @@ fn no_cascade_allows_normal_clearing() {
 
 #[test]
 fn cascade_responder_emits_alert() {
-    use astra_turn_core::trace_alert::{evaluate_alerts, AlertSeverity};
     use astra_turn_core::recovery_state::RecoveryState;
+    use astra_turn_core::trace_alert::evaluate_alerts;
 
-    let mut stats = PipelineStats::default();
-    stats.turns_executed = 5;
+    let mut stats = PipelineStats {
+        turns_executed: 5,
+        ..Default::default()
+    };
     stats.record_compaction(3000);
     stats.turns_executed = 6;
     stats.record_compaction(2000);
@@ -107,9 +111,15 @@ fn pipeline_session_collects_compaction_audits() {
 
     let audits = sess.drain_pending_audits();
     assert_eq!(audits.len(), 2);
-    assert_eq!(audits[0].compaction_strategy.as_deref(), Some("tool_result_clearing"));
+    assert_eq!(
+        audits[0].compaction_strategy.as_deref(),
+        Some("tool_result_clearing")
+    );
     assert_eq!(audits[0].tokens_freed, Some(2400));
-    assert_eq!(audits[1].compaction_strategy.as_deref(), Some("schema_prune"));
+    assert_eq!(
+        audits[1].compaction_strategy.as_deref(),
+        Some("schema_prune")
+    );
 }
 
 #[test]
