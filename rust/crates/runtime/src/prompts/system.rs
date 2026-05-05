@@ -66,7 +66,6 @@ pub fn build_pipeline_static_sections() -> astra_turn_core::context_sources::Sta
     use astra_turn_core::section_types::PromptTokenBucket;
 
     // Apply prompt overrides from $ASTRA_PROMPT_OVERRIDES_DIR (or ~/.astra/prompts).
-    // Legacy `build_system_message_with_dynamic_sections` applied these at
     // assembly time; the pipeline applies them here so both paths surface
     // the same Global text.
     let overrides = load_overrides(&default_overrides_dir());

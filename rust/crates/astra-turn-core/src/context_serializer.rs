@@ -110,7 +110,6 @@ pub fn flatten_serialized_system_blocks(request: &SerializedProviderRequest) -> 
 /// Convert system blocks into the Anthropic multi-block format:
 /// `[{"type": "text", "text": "...", "cache_control": {...}}, ...]`
 ///
-/// This produces the same shape as `build_system_message_with_dynamic_sections()`
 /// in the legacy path, enabling drop-in replacement.
 #[must_use]
 pub fn system_blocks_to_anthropic_content(request: &SerializedProviderRequest) -> Vec<Value> {

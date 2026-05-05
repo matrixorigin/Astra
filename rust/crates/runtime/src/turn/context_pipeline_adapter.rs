@@ -22,9 +22,7 @@ use super::agentic_loop_host::AgenticLoopState;
 
 /// Build ExternalSources from the Host's edge_profile + state.
 ///
-/// This replaces the scattered inline logic in `build_system_messages_cached()`
-/// with a single extraction point. Each field maps to one of the 15 dynamic
-/// prompt fragments that the legacy path computed.
+/// Single extraction point for all dynamic prompt fragments.
 pub(crate) fn build_external_sources(
     edge_profile: &serde_json::Map<String, Value>,
     state: &AgenticLoopState,

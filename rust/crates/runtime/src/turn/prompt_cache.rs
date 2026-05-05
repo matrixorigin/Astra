@@ -137,7 +137,6 @@ pub(crate) fn assemble_system_message_via_pipeline(
 
     // Forward ASTRA_OUTPUT_STYLE as a dynamic extra section so the active
     // user style (concise/verbose/…) lands in the post-cache segment.
-    // Legacy `build_system_message_with_dynamic_sections` did this inline;
     // the pipeline takes it through the escape hatch.
     let mut all_extras: Vec<prompts::PromptSection> = extra_dynamic_sections.to_vec();
     if let Some(style) = astra_text_utils::output_style::current_output_style()
@@ -915,7 +914,6 @@ mod tests {
 
     /// `PromptCacheConfig.cache_enabled = false` must strip all cache_control
     /// markers from the anthropic system message. Ports the intent of the
-    /// legacy `build_system_message_cache_disabled_env` test.
     #[test]
     fn pipeline_assembly_cache_disabled_strips_all_markers() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();

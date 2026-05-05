@@ -1071,7 +1071,6 @@ impl ServerAgenticLoopHost {
         let edge_tools_snapshot = self.edge_tools.clone();
         // Use the same pipeline path as `execute_turn` so mock-replay exercises
         // exactly what a real turn would send. The previous implementation had
-        // its own `build_system_messages_cached` re-implementation that drifted.
         let (provider_name, model_name_for_pipeline) = match &self.mock_provider {
             Some((p, m)) => (p.clone(), m.clone()),
             None => ("openai".to_string(), "server-loop-mock".to_string()),
@@ -1677,7 +1676,6 @@ impl ServerAgenticLoopHost {
     ///
     /// Single source of truth for both the real `execute_turn` path and the
     /// `bridge-e2e-hooks`-gated `execute_mock_turn` path. Previously the mock
-    /// path had its own 400-line `build_system_messages_cached` re-implementation
     /// that duplicated section assembly AND drifted from production behaviour —
     /// deleted in the same change that introduced this helper.
     ///
@@ -1803,7 +1801,6 @@ impl ServerAgenticLoopHost {
             })
             .collect();
 
-        // Replicate the dynamic section assembly from build_system_messages_cached.
         let mut profile_parts = Vec::new();
         if let Some(cwd) = self.edge_profile.get("cwd").and_then(Value::as_str) {
             profile_parts.push(format!("cwd: {cwd}"));
@@ -2865,7 +2862,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // Populate tool_schemas from the turn's advertised list so
         // per-tool drift attribution works. `system_blocks` stays
         // empty for now: the server assembles system messages via
-        // `build_system_messages_cached` per-turn and does not retain
         // the canonical byte form. A follow-up can thread the
         // system_msgs Vec<Value> through the same stash path if the
         // telemetry attribution need arises.
