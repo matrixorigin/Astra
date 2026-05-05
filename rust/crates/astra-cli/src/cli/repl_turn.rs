@@ -1784,6 +1784,21 @@ async fn apply_turn_success_async(
         }
         _ => {}
     }
+
+    // ── Desktop notification (fire-and-forget) ──────────────────────────
+    let elapsed = turn_start.elapsed();
+    let notif_config = super::notifications::NotificationConfig::from_env();
+    if notif_config.enabled && notif_config.exceeds_threshold(elapsed) {
+        tokio::spawn(async move {
+            super::notifications::notify_completion(
+                &notif_config,
+                "Astra",
+                "Turn completed",
+                elapsed,
+            )
+            .await;
+        });
+    }
 }
 
 fn apply_turn_success_sync(
