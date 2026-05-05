@@ -41,9 +41,9 @@ tree-sitter-ruby = "0.23"
 # SIGKILL an entire process group without fork-execing `/usr/bin/kill`.
 nix.workspace = true
 dirs = "6.0.0"
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 serde_json.workspace = true
 serial_test = "3"
 
@@ -51,3 +51,5 @@ serial_test = "3"
 default = []
 # Enable CLI-specific tool features (MCP dispatch, passive LSP, colored output)
 cli = []
+# Enable integration tests that require python3 on the system
+python_tests = []
