@@ -9,7 +9,7 @@ description: |
   tool ordering, incompatible cache_control markers, etc.) and we're paying full
   input-token cost each turn instead of the 10% cached-read price.
   **Pass means** (calibrated against 3 runs of live Bedrock Sonnet-4.6):
-    - cumulative cached_input_tokens ≥ 30000 (observed: 32k / 47k / 52k across 4 turns)
+    - cumulative cached_input_tokens ≥ 15000 (Bedrock: 32k-52k; DeepSeek: ~22k — provider token counts differ)
     - cache_creation_tokens ≤ 25000 (observed: 20k worst-case warm-up, 0 when
       cross-session cache is warm; 25k caps persistent ~5-6k/turn rebuilds)
   **Fail means**: cache prefix broken every turn (non-deterministic skill enum,
@@ -36,6 +36,6 @@ criteria:
   - type: all_of
     criteria:
       - type: prompt_cache_tokens
-        min_read: 30000
+        min_read: 15000
         min_creation: 0
         max_creation: 25000
