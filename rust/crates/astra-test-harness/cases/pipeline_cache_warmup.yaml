@@ -1,0 +1,26 @@
+name: pipeline_cache_warmup
+description: |
+  **What**: Verify that the context pipeline accumulates feedback across turns and
+  the session checkpoint captures pipeline_state with non-zero cache metrics.
+  **Tests**: Pipeline feedback loop is active and persisting.
+  **Why**: Core value prop — the pipeline must learn from each turn's cache performance
+  to improve reserve estimates and budget allocation for subsequent turns.
+  **Pass means**: The agent completes a multi-step task and the pipeline reports
+  turns_executed > 0 in the session checkpoint.
+  **Fail means**: Pipeline feedback loop is broken — no stats accumulation.
+prompt: |
+  Do these in sequence, one tool call each:
+  1. Read the first 5 lines of ./Cargo.toml
+  2. Then tell me what the package name is based on what you read.
+timeout_seconds: 60
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: read_file
+  - type: tools_count_between
+    min: 1
+    max: 3
+  - type: tokens_between
+    min: 1
+    max: 50000
