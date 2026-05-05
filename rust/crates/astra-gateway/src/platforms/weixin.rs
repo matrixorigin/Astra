@@ -462,7 +462,22 @@ impl PlatformAdapter for WeixinAdapter {
                 }
                 Ok(())
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                if e.starts_with(FATAL_SEND_ERROR_PREFIX) {
+                    // Fatal send (stale session even after tokenless retry) —
+                    // evict the dead token so the NEXT inbound message's
+                    // context_token takes over. Without this the cache
+                    // keeps serving the dead value forever.
+                    let mut tokens = self.context_tokens.lock().await;
+                    if tokens.remove(chat_id).is_some() {
+                        tracing::warn!(
+                            chat_id = %crate::runner::truncate_chars(chat_id, 12),
+                            "evicted dead context_token after fatal send"
+                        );
+                    }
+                }
+                Err(e)
+            }
         }
     }
 
@@ -778,6 +793,15 @@ const SEND_MAX_RETRIES: usize = 3;
 const SEND_RETRY_DELAY_MS: u64 = 1500;
 
 /// What to do when iLink returns a non-zero error code.
+///
+/// The semantics here are derived from empirical observation + the
+/// Hermes-Agent reference impl (`gateway/platforms/weixin.py`):
+/// - iLink returns bare `{"ret":-2}` with NO `errmsg` field for stale
+///   sessions (same condition as `errcode=-14`, despite the different code).
+/// - iLink returns `-2` with an explicit `freq` errmsg for rate limiting.
+/// - Any other `-2` with a specific errmsg is genuinely "something else
+///   went wrong, give up for this call" — retrying won't change the
+///   outcome and clogs the outbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SendRetryAction {
     /// Retry the same request without context_token (session expired).
@@ -786,30 +810,62 @@ enum SendRetryAction {
     RateLimitBackoff,
     /// Normal retry with delay (keep context_token).
     NormalRetry,
+    /// Do NOT retry — the error is terminal for this message. Caller
+    /// should give up and surface the failure immediately instead of
+    /// blocking the outbox on repeated attempts that will all fail.
+    /// Triggered when we've already tried tokenless and still hit
+    /// stale-session-shape errors — the problem is outside our control
+    /// (e.g. peer logged out, token revoked).
+    Fatal,
+}
+
+/// Return true when the errmsg "looks like" iLink's stale-session signal:
+/// missing, empty, or the default "unknown" / "unknown error" we see when
+/// the response body is just `{"ret":-2}`. Same semantic as errcode=-14.
+fn is_stale_session_errmsg(errmsg: &str) -> bool {
+    let trimmed = errmsg.trim().to_lowercase();
+    trimmed.is_empty() || trimmed == "unknown" || trimmed == "unknown error"
 }
 
 /// Decide how to handle an iLink send error. Pure function — no I/O.
-///
-/// Key invariant: `-2` ("unknown") must NOT drop context_token.
-/// iLink requires context_token for session routing; dropping it makes
-/// the error permanent. Only `-14` (explicit session expiry) should drop.
 fn classify_send_error(
     errcode: i64,
     errmsg: &str,
     already_tried_tokenless: bool,
 ) -> SendRetryAction {
-    // -14 = explicit session expiry — retry once without context_token
-    if errcode == -14 && !already_tried_tokenless {
-        return SendRetryAction::DropContextToken;
+    // -14 = explicit session expiry.
+    if errcode == -14 {
+        return if already_tried_tokenless {
+            // Tokenless retry still session-expired → nothing left to try.
+            // The peer's session is gone; our outbound is blocked until
+            // they send us something new.
+            SendRetryAction::Fatal
+        } else {
+            SendRetryAction::DropContextToken
+        };
     }
-    // -2 + "freq" = rate limit — backoff
+    // -2 + explicit rate-limit errmsg (`freq`) → backoff.
     if errcode == -2 && errmsg.contains("freq") {
         return SendRetryAction::RateLimitBackoff;
     }
-    // -2 + anything else (e.g. "unknown") = likely context_token expired
-    // after long CLI execution. Drop token and retry once.
-    if errcode == -2 && !already_tried_tokenless {
-        return SendRetryAction::DropContextToken;
+    // -2 with no/empty/"unknown" errmsg = stale session (Hermes compat).
+    // iLink returns bare `{"ret":-2}` in this case; we parse errmsg as
+    // the default placeholder "unknown". Treat as session-expired.
+    if errcode == -2 && is_stale_session_errmsg(errmsg) {
+        return if already_tried_tokenless {
+            // We already tried without context_token and still got -2 stale.
+            // The peer's session is dead. Do NOT NormalRetry — that would
+            // waste retry budget on the same hopeless attempt.
+            SendRetryAction::Fatal
+        } else {
+            SendRetryAction::DropContextToken
+        };
+    }
+    // -2 with some other specific errmsg: genuinely an iLink error we
+    // don't understand. Retry once in case it's transient — but only
+    // while we still have a token. Tokenless + unknown -2 = give up.
+    if errcode == -2 && already_tried_tokenless {
+        return SendRetryAction::Fatal;
     }
     // Everything else: normal retry with original context_token
     SendRetryAction::NormalRetry
@@ -910,6 +966,17 @@ async fn send_text_with_retry(
                 tokio::time::sleep(std::time::Duration::from_millis(SEND_RETRY_DELAY_MS * 3)).await;
                 continue;
             }
+            SendRetryAction::Fatal => {
+                // Tokenless retry still stale (or some other unrecoverable
+                // -14/-2). Do NOT keep hammering the same failing request.
+                tracing::warn!(
+                    errcode,
+                    tried_tokenless,
+                    "iLink send unrecoverable — giving up this attempt \
+                     so the outbox isn't blocked on a dead session"
+                );
+                return Err(FATAL_SEND_ERROR_PREFIX.to_string() + &format!("{errcode}: {errmsg}"));
+            }
             SendRetryAction::NormalRetry => {}
         }
 
@@ -921,6 +988,13 @@ async fn send_text_with_retry(
 
     Err(format!("weixin send failed after retries: {last_error}"))
 }
+
+/// Prefix on Err(...) from send_text_with_retry that tells the caller this
+/// is a fatal/unrecoverable send failure (stale session that even tokenless
+/// retry couldn't resolve). The PlatformAdapter impl recognizes this prefix
+/// and evicts the cached context_token so the next inbound message
+/// refreshes it rather than reusing the dead one.
+const FATAL_SEND_ERROR_PREFIX: &str = "weixin fatal send: ";
 
 async fn fetch_typing_ticket(
     token: &str,
@@ -1327,10 +1401,14 @@ mod tests {
 
     // ── classify_send_error regression tests ───────────────────────
 
+    // R6: Reference Hermes-Agent `_is_stale_session_ret`:
+    //   ret=-2 + errmsg missing/empty/"unknown error" = stale session
+    // Our iLink responses are literally `{"ret":-2}` with no errmsg field,
+    // which we parse as default "unknown". That's the same bucket.
+
     #[test]
     fn error_minus2_unknown_drops_context_token_once() {
-        // -2 "unknown" after long CLI execution = context_token expired.
-        // Try once without token; if that also fails, NormalRetry kicks in.
+        // First attempt with "unknown" → drop token, retry once.
         assert_eq!(
             classify_send_error(-2, "unknown", false),
             SendRetryAction::DropContextToken,
@@ -1338,18 +1416,56 @@ mod tests {
     }
 
     #[test]
-    fn error_minus2_unknown_falls_back_to_normal_after_tokenless() {
-        // Already tried tokenless — don't loop, just normal retry.
+    fn error_minus2_empty_errmsg_treated_as_stale_session() {
+        // iLink returns `{"ret":-2}` with no errmsg field → parser default
+        // can be empty too. Same behavior as "unknown".
+        assert_eq!(
+            classify_send_error(-2, "", false),
+            SendRetryAction::DropContextToken,
+        );
+    }
+
+    #[test]
+    fn error_minus2_unknown_error_with_space_treated_as_stale_session() {
+        // Hermes reference explicitly checks the string "unknown error"
+        // (with space). Normalize both forms.
+        assert_eq!(
+            classify_send_error(-2, "unknown error", false),
+            SendRetryAction::DropContextToken,
+        );
+    }
+
+    #[test]
+    fn error_minus2_unknown_after_tokenless_is_fatal() {
+        // BUG FIX: we used to loop on NormalRetry here, burning the entire
+        // retry budget on doomed requests and blocking the outbox for
+        // seconds. Tokenless retry still getting -2 means the session is
+        // really dead — give up this call, let the next inbound refresh it.
         assert_eq!(
             classify_send_error(-2, "unknown", true),
-            SendRetryAction::NormalRetry,
+            SendRetryAction::Fatal,
         );
+    }
+
+    #[test]
+    fn error_minus2_empty_after_tokenless_is_fatal() {
+        assert_eq!(classify_send_error(-2, "", true), SendRetryAction::Fatal,);
     }
 
     #[test]
     fn error_minus2_freq_triggers_rate_limit_backoff() {
         assert_eq!(
             classify_send_error(-2, "freq limit exceeded", false),
+            SendRetryAction::RateLimitBackoff,
+        );
+    }
+
+    #[test]
+    fn error_minus2_freq_still_backoff_after_tokenless() {
+        // Rate-limit is a server-load signal, not a session signal.
+        // Whether or not we tried tokenless, backoff is the right response.
+        assert_eq!(
+            classify_send_error(-2, "freq exceeded", true),
             SendRetryAction::RateLimitBackoff,
         );
     }
@@ -1363,17 +1479,20 @@ mod tests {
     }
 
     #[test]
-    fn error_minus14_does_not_drop_twice() {
+    fn error_minus14_is_fatal_after_tokenless() {
+        // BUG FIX: was NormalRetry, which is hopeless for -14.
         assert_eq!(
             classify_send_error(-14, "session expired", true),
-            SendRetryAction::NormalRetry,
+            SendRetryAction::Fatal,
         );
     }
 
     #[test]
     fn error_other_codes_normal_retry() {
+        // Unknown negative codes without context_token-affinity: maybe
+        // transient server blip, worth one more try.
         assert_eq!(
-            classify_send_error(-1, "unknown", false),
+            classify_send_error(-1, "", false),
             SendRetryAction::NormalRetry,
         );
         assert_eq!(
@@ -1390,6 +1509,24 @@ mod tests {
             classify_send_error(0, "", false),
             SendRetryAction::NormalRetry,
         );
+    }
+
+    #[test]
+    fn is_stale_session_errmsg_matches_known_shapes() {
+        assert!(is_stale_session_errmsg(""));
+        assert!(is_stale_session_errmsg("   "));
+        assert!(is_stale_session_errmsg("unknown"));
+        assert!(is_stale_session_errmsg("Unknown"));
+        assert!(is_stale_session_errmsg("unknown error"));
+        assert!(is_stale_session_errmsg("UNKNOWN ERROR"));
+    }
+
+    #[test]
+    fn is_stale_session_errmsg_rejects_specific_errors() {
+        assert!(!is_stale_session_errmsg("freq"));
+        assert!(!is_stale_session_errmsg("freq limit"));
+        assert!(!is_stale_session_errmsg("invalid token"));
+        assert!(!is_stale_session_errmsg("peer offline"));
     }
 
     #[test]
