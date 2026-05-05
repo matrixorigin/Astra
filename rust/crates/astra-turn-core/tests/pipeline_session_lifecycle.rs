@@ -84,6 +84,7 @@ fn ten_turn_session_lifecycle() {
     let external = ExternalSources {
         memory_snippets: vec!["User prefers concise answers.".into()],
         spill_dir: None,
+        dynamic_prompt_sections: vec![],
     };
     let limits = OptimizeLimits::default();
 
@@ -163,6 +164,7 @@ fn ptl_error_recovery_and_abort() {
     let external = ExternalSources {
         memory_snippets: vec![],
         spill_dir: None,
+        dynamic_prompt_sections: vec![],
     };
     let limits = OptimizeLimits::default();
 
@@ -194,6 +196,7 @@ fn shadow_mode_produces_deterministic_output() {
     let external = ExternalSources {
         memory_snippets: vec!["test memory".into()],
         spill_dir: None,
+        dynamic_prompt_sections: vec![],
     };
     let limits = OptimizeLimits::default();
 
@@ -279,6 +282,7 @@ fn full_lifecycle_with_emergent_and_latches() {
     let external = ExternalSources {
         memory_snippets: vec!["User works on astra-engine.".into()],
         spill_dir: None,
+        dynamic_prompt_sections: vec![],
     };
 
     // Turn 1: initial turn — latch cache scope, run pipeline

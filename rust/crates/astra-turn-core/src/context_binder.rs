@@ -135,6 +135,12 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
     if !sources.session.session_id.is_empty() {
         parts.push(format!("Session: {}", sources.session.session_id));
     }
+    // Append pre-computed dynamic sections from the runtime
+    for section in &sources.external.dynamic_prompt_sections {
+        if !section.is_empty() {
+            parts.push(section.clone());
+        }
+    }
     parts.join("\n")
 }
 
@@ -249,6 +255,7 @@ mod tests {
             external: ExternalSources {
                 memory_snippets: vec!["Remember: prefer pipeline-first design.".into()],
                 spill_dir: None,
+                dynamic_prompt_sections: vec![],
             },
             emergent: EmergentContext::default(),
             stats: PipelineStats::default(),
