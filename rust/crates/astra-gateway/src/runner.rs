@@ -489,7 +489,14 @@ impl GatewayRunner {
     pub async fn replay_pending_messages(&self, adapter: &dyn PlatformAdapter) {
         if let Some(ref store) = self.store {
             let platform = adapter.name();
-            match store.list_pending_messages(Some(platform)).await {
+            let loaded = retry_once_on_transient("list_pending_messages", || async {
+                store
+                    .list_pending_messages(Some(platform))
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await;
+            match loaded {
                 Ok(msgs) if msgs.is_empty() => {}
                 Ok(msgs) => {
                     tracing::info!(platform, count = msgs.len(), "replaying pending messages");
@@ -523,7 +530,11 @@ impl GatewayRunner {
 
     pub async fn sweep_stale_tasks(&self) {
         if let Some(ref store) = self.durable_store {
-            match store.suspend_stale_running_tasks("gateway restarted").await {
+            let result = retry_once_on_transient("sweep_stale_tasks", || async {
+                store.suspend_stale_running_tasks("gateway restarted").await
+            })
+            .await;
+            match result {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(count = n, "swept stale running tasks → suspended"),
                 Err(e) => tracing::warn!(error = %e, "failed to sweep stale tasks"),
@@ -533,7 +544,11 @@ impl GatewayRunner {
 
     pub async fn sweep_stale_traces(&self) {
         if let Some(ref repo) = self.trace_repo {
-            match repo.sweep_stale_requests("gateway restarted").await {
+            let result = retry_once_on_transient("sweep_stale_traces", || async {
+                repo.sweep_stale_requests("gateway restarted").await
+            })
+            .await;
+            match result {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(count = n, "swept stale trace requests → failed"),
                 Err(e) => tracing::warn!(error = %e, "failed to sweep stale traces"),
@@ -2266,7 +2281,11 @@ impl GatewayRunner {
         let Some(repo) = self.trace_repo.as_ref() else {
             return;
         };
-        match repo.list_retryable_outbox(None, 100).await {
+        let result = retry_once_on_transient("list_retryable_outbox", || async {
+            repo.list_retryable_outbox(None, 100).await
+        })
+        .await;
+        match result {
             Ok(rows) if rows.is_empty() => {}
             Ok(rows) => {
                 tracing::info!(count = rows.len(), "replaying retryable outbox");
@@ -5571,5 +5590,129 @@ mod truncate_tests {
     #[test]
     fn zero_limit() {
         assert_eq!(truncate_chars("hello", 0), "");
+    }
+}
+
+// ── Startup DB EOF retry ────────────────────────────────────────────────
+//
+// MatrixOne / sqlx-mysql can return a "read 0 bytes at EOF" error on the
+// very first acquire from a freshly-built pool when the server has silently
+// closed the idle connection mid-handshake. `test_before_acquire(true)`
+// catches most of these, but the first-use race still slips through once.
+// Startup sweeps (sweep_stale_traces / sweep_stale_tasks /
+// replay_retryable_outbox) then permanently silently fail, leaving zombie
+// state in the DB. The retry helper wraps those paths so a single
+// transient error doesn't poison startup.
+
+/// Return true if the error message looks like a transient sqlx/MySQL
+/// connection fault that a second attempt should recover from. We
+/// explicitly do NOT retry on logic errors (syntax, schema, permission);
+/// those are stable and retrying would just waste time.
+pub(crate) fn is_transient_db_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("expected to read")
+        || lower.contains("got 0 bytes at eof")
+        || lower.contains("broken pipe")
+        || lower.contains("connection reset")
+        || lower.contains("connection closed")
+        || lower.contains("connection refused")
+}
+
+/// Run `op`, and if it fails with a transient DB error, wait briefly and
+/// retry once. Two attempts are enough — by the second call, sqlx has
+/// replaced the dead connection in the pool.
+async fn retry_once_on_transient<T, F, Fut>(label: &'static str, op: F) -> Result<T, String>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    match op().await {
+        Ok(v) => Ok(v),
+        Err(e) if is_transient_db_error(&e) => {
+            tracing::info!(
+                target: "gateway::runner",
+                op = label,
+                error = %e,
+                "transient DB error — retrying once after 100ms"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            op().await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod db_retry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn transient_detects_eof_shape() {
+        assert!(is_transient_db_error(
+            "error communicating with database: expected to read 4 bytes, got 0 bytes at EOF"
+        ));
+        assert!(is_transient_db_error("broken pipe"));
+        assert!(is_transient_db_error("Connection reset by peer"));
+        assert!(is_transient_db_error("connection refused"));
+    }
+
+    #[test]
+    fn transient_ignores_logic_errors() {
+        // Syntax / schema / permission errors are stable — retry wastes time.
+        assert!(!is_transient_db_error("duplicate key"));
+        assert!(!is_transient_db_error("access denied for user 'foo'"));
+        assert!(!is_transient_db_error("syntax error near FROM"));
+        assert!(!is_transient_db_error("table 'x' doesn't exist"));
+    }
+
+    #[tokio::test]
+    async fn retry_once_recovers_from_transient_first_attempt() {
+        let calls = AtomicUsize::new(0);
+        let result = retry_once_on_transient("test", || async {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Err::<i32, _>(
+                    "error communicating with database: expected to read 4 bytes, got 0 bytes at EOF".to_string(),
+                )
+            } else {
+                Ok(42)
+            }
+        })
+        .await;
+        assert_eq!(result, Ok(42));
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "must retry exactly once");
+    }
+
+    #[tokio::test]
+    async fn retry_once_gives_up_on_persistent_transient() {
+        let calls = AtomicUsize::new(0);
+        let result: Result<i32, String> = retry_once_on_transient("test", || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err("broken pipe".to_string())
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "at most 2 attempts — don't retry forever on persistent EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_once_does_not_retry_logic_errors() {
+        let calls = AtomicUsize::new(0);
+        let result: Result<i32, String> = retry_once_on_transient("test", || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err("syntax error".to_string())
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "logic errors must NOT trigger retry"
+        );
     }
 }
