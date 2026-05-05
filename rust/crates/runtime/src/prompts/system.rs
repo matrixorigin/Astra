@@ -2275,7 +2275,12 @@ mod tests {
             "should have multiple Global sections, got {}",
             globals.len()
         );
-        assert!(!sessions.is_empty(), "should have Session sections");
+        // NOTE: tool-dependent sections (self-model, tool-conditional, task-type,
+        // search-strategy) are intentionally `CacheScope::None` so they sit
+        // AFTER the cache marker and can change per turn without invalidating
+        // the cached prefix. The Session scope remains available for future
+        // use but is not populated by the current build_system_prompt_sections.
+        let _ = sessions; // kept to document the intent; no assertion on count
 
         // First section should be Global
         assert_eq!(
@@ -2284,15 +2289,15 @@ mod tests {
             "first section should be Global"
         );
 
-        // Profile section should be CacheScope::None
-        let profile = sections.iter().find(|s| s.scope == CacheScope::None);
+        // Profile lives in the None-scoped post-cache segment alongside
+        // other tool-dependent sections. Search by content rather than
+        // by scope+first-match.
+        let profile = sections
+            .iter()
+            .find(|s| s.scope == CacheScope::None && s.text.contains("cwd: /tmp"));
         assert!(
             profile.is_some(),
-            "should have a None-scoped profile section"
-        );
-        assert!(
-            profile.unwrap().text.contains("cwd: /tmp"),
-            "profile section should contain the cwd"
+            "should have a None-scoped profile section containing cwd"
         );
     }
 
@@ -2330,27 +2335,34 @@ mod tests {
     }
 
     #[test]
-    fn sections_session_contains_tool_guidance() {
+    fn sections_tool_dependent_guidance_is_none_scoped() {
+        // Tool-dependent guidance (code-nav, task-type strategies) sits in
+        // the None-scoped post-cache segment so it can vary per turn without
+        // invalidating the cached Global prefix.
         let tools = vec!["bash", "find_definition", "find_references", "git_commit"];
         let sections = build_system_prompt_sections(&tools, "", 0.8, Some("debugging"));
 
-        let session_text: String = sections
+        let post_cache_text: String = sections
             .iter()
-            .filter(|s| s.scope == CacheScope::Session)
+            .filter(|s| s.scope == CacheScope::None)
             .map(|s| s.text.as_str())
             .collect();
         assert!(
-            session_text.contains("Code Navigation"),
-            "session should include code nav guidance"
+            post_cache_text.contains("Code Navigation"),
+            "code nav guidance should land in None-scoped (post-cache) segment"
         );
         assert!(
-            session_text.contains("Debugging Strategy"),
-            "session should include task-type strategy"
+            post_cache_text.contains("Debugging Strategy"),
+            "task-type strategy should land in None-scoped (post-cache) segment"
         );
     }
 
     #[test]
-    fn sections_no_profile_when_empty() {
+    fn sections_profile_and_toolset_populate_none_scope() {
+        // Even with empty profile, the None segment still holds tool-dependent
+        // sections (self-model, tool-conditional guidance, etc.). Prior to
+        // the cache-stability refactor this was empty; now it's the
+        // per-turn dynamic bucket.
         let tools = vec!["bash"];
         let sections = build_system_prompt_sections(&tools, "", 0.8, None);
 
@@ -2359,8 +2371,8 @@ mod tests {
             .filter(|s| s.scope == CacheScope::None)
             .collect();
         assert!(
-            none_scoped.is_empty(),
-            "no None-scoped section when profile is empty"
+            !none_scoped.is_empty(),
+            "None-scoped segment should carry tool-dependent sections (self-model, etc.)"
         );
     }
 
@@ -2412,18 +2424,21 @@ mod tests {
     }
 
     #[test]
-    fn sections_low_confidence_in_session_scope() {
+    fn sections_low_confidence_in_post_cache_segment() {
+        // Low-confidence advisory is tool-selector-driven (depends on which
+        // tools were chosen), so it lives in the None-scoped post-cache
+        // segment alongside other per-turn content.
         let tools = vec!["bash"];
         let sections = build_system_prompt_sections(&tools, "", 0.1, None);
 
-        let session_text: String = sections
+        let post_cache_text: String = sections
             .iter()
-            .filter(|s| s.scope == CacheScope::Session)
+            .filter(|s| s.scope == CacheScope::None)
             .map(|s| s.text.as_str())
             .collect();
         assert!(
-            session_text.contains("Low-Confidence Tool Selection"),
-            "low confidence advisory should be in session section"
+            post_cache_text.contains("Low-Confidence Tool Selection"),
+            "low confidence advisory should land in None-scoped post-cache segment"
         );
     }
 
@@ -2573,10 +2588,13 @@ mod tests {
         );
     }
 
-    // ── All code-nav tools in session scope ──────────────────────
+    // ── Code-nav guidance lives in the post-cache segment ────────────
 
     #[test]
-    fn sections_all_code_nav_tools_in_session_scope() {
+    fn sections_all_code_nav_tools_appear_in_post_cache_segment() {
+        // Code-nav guidance references the active tool names, so it lives
+        // in the None-scoped post-cache segment (varies per turn with tool
+        // selection) rather than Session.
         let tools = vec![
             "find_definition",
             "find_references",
@@ -2588,33 +2606,33 @@ mod tests {
             "lsp",
         ];
         let sections = build_system_prompt_sections(&tools, "", 0.8, None);
-        let session_text: String = sections
+        let post_cache_text: String = sections
             .iter()
-            .filter(|s| s.scope == CacheScope::Session)
+            .filter(|s| s.scope == CacheScope::None)
             .map(|s| s.text.as_str())
             .collect();
-        assert!(session_text.contains("Code Navigation"));
-        assert!(session_text.contains("call_graph"));
-        assert!(session_text.contains("rename_symbol"));
-        assert!(session_text.contains("dead_code"));
-        assert!(session_text.contains("extract_members"));
-        assert!(session_text.contains("type_hierarchy"));
-        assert!(session_text.contains("lsp"));
+        assert!(post_cache_text.contains("Code Navigation"));
+        assert!(post_cache_text.contains("call_graph"));
+        assert!(post_cache_text.contains("rename_symbol"));
+        assert!(post_cache_text.contains("dead_code"));
+        assert!(post_cache_text.contains("extract_members"));
+        assert!(post_cache_text.contains("type_hierarchy"));
+        assert!(post_cache_text.contains("lsp"));
     }
 
     #[test]
     fn sections_lsp_alone_adds_code_navigation_guidance() {
         let sections = build_system_prompt_sections(&["lsp"], "", 0.8, None);
-        let session_text: String = sections
+        let post_cache_text: String = sections
             .iter()
-            .filter(|s| s.scope == CacheScope::Session)
+            .filter(|s| s.scope == CacheScope::None)
             .map(|s| s.text.as_str())
             .collect();
-        assert!(session_text.contains("Code Navigation"));
-        assert!(session_text.contains("item_index"));
-        assert!(session_text.contains("action_index"));
-        assert!(session_text.contains("quick fixes"));
-        assert!(session_text.contains("autocomplete"));
+        assert!(post_cache_text.contains("Code Navigation"));
+        assert!(post_cache_text.contains("item_index"));
+        assert!(post_cache_text.contains("action_index"));
+        assert!(post_cache_text.contains("quick fixes"));
+        assert!(post_cache_text.contains("autocomplete"));
     }
 
     // ── Empty-tools + empty-profile section behavior ─────────────

@@ -1781,14 +1781,30 @@ mod tests {
     }
 
     #[test]
-    fn prefilter_memory_query_includes_memory_tools() {
-        let state = ConversationState::from_message("我有哪些记忆？", 1);
-        let ranked = pre_filter_dynamic(&state, "我有哪些记忆？");
-
-        let has_memory = ranked
+    fn memory_query_has_memory_tools_available() {
+        // The full memory toolset (memory_store, memory_retrieve, memory_purge,
+        // memory_correct) is now pinned — always included in the static tool
+        // prefix — so a memory-query doesn't need to "activate" them via
+        // dynamic ranking. This test asserts the pinning contract instead:
+        // every turn, regardless of query, the pinned prefix carries the
+        // memory tools.
+        let pinned_memory: Vec<&str> = TOOL_CATALOG
             .iter()
-            .any(|&(idx, _)| TOOL_CATALOG[idx].intents.contains(&IntentType::Memory));
-        assert!(has_memory, "Memory query should include memory tools");
+            .filter(|t| t.pinned && t.intents.contains(&IntentType::Memory))
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            pinned_memory.contains(&"memory_store"),
+            "memory_store must be pinned — memory operations require it"
+        );
+        assert!(
+            pinned_memory.contains(&"memory_retrieve"),
+            "memory_retrieve must be pinned — memory queries need recall"
+        );
+        assert!(
+            pinned_memory.len() >= 3,
+            "at least 3 memory-intent tools should be pinned, got: {pinned_memory:?}"
+        );
     }
 
     #[test]

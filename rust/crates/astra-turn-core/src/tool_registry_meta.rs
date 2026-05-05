@@ -143,7 +143,8 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "输出到文件",
             "导出文件",
         ],
-        pinned: false,
+        // Pinned: paired with str_replace/read_file as the basic edit triad.
+        pinned: true,
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         schema_tokens: 25,
@@ -221,7 +222,9 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "代码搜索",
             "全文搜索",
         ],
-        pinned: false,
+        // Pinned: near-universal for code navigation — including in the static
+        // tool prefix keeps prompt cache stable across turns.
+        pinned: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         schema_tokens: 40,
@@ -249,7 +252,8 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "文件模式",
             "扩展名",
         ],
-        pinned: false,
+        // Pinned: partner to grep for locating files before reading them.
+        pinned: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         schema_tokens: 25,
@@ -333,7 +337,8 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "有改动吗",
             "什么修改",
         ],
-        pinned: false,
+        // Pinned: nearly every coding turn inspects git state at least once.
+        pinned: true,
         intents: &[IntentType::Git],
         scope: Scope::LocalGit,
         schema_tokens: 15,
@@ -359,7 +364,8 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "改动了什么",
             "修改了什么",
         ],
-        pinned: false,
+        // Pinned: co-emitted with git_status in most review/edit turns.
+        pinned: true,
         intents: &[IntentType::Git],
         scope: Scope::LocalGit,
         schema_tokens: 30,
@@ -870,7 +876,9 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "删掉记忆",
             "不要记住",
         ],
-        pinned: false,
+        // Pinned: paired with memory_store/retrieve — keeping the full memory
+        // triad static avoids cache churn when the agent does memory hygiene.
+        pinned: true,
         intents: &[IntentType::Memory],
         scope: Scope::CrossSession,
         schema_tokens: 25,
@@ -897,7 +905,8 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "记错了",
             "不对要改",
         ],
-        pinned: false,
+        // Pinned: completes the memory tool group — see memory_purge comment.
+        pinned: true,
         intents: &[IntentType::Memory],
         scope: Scope::CrossSession,
         schema_tokens: 30,

@@ -324,22 +324,82 @@ fn provider_policy_for_prompt_cache(cache_cfg: &PromptCacheConfig) -> ProviderCa
     }
 }
 
-/// Add `cache_control` to the last tool schema for Anthropic caching.
+/// Add `cache_control` to a tool schema for Anthropic caching.
 ///
-/// Anthropic allows only 4 cache_control breakpoints per request. Our allocation:
-/// - System prompt: 2 breakpoints (global scope + session scope)
-/// - Tools: 1 breakpoint (last tool only)
-/// - Messages: 1 breakpoint (last message)
+/// Anthropic allows up to 4 cache_control breakpoints per request. Our allocation:
+/// - System prompt: up to 2 breakpoints (global scope + session scope)
+/// - Tools: 1 breakpoint at the end of the STATIC (pinned) prefix — keeps the
+///   static lib cached even when dynamic tools churn per turn
+/// - Messages: 1 breakpoint on the last message
+///
+/// `pinned_names` identifies tools that are guaranteed present every turn
+/// (static lib). The marker goes on the last pinned tool, so subsequent
+/// dynamic tools sitting after it don't invalidate the cached prefix. If no
+/// pinned tools are present (e.g. caller opted into full-dynamic), falls
+/// back to the last tool.
 pub(crate) fn annotate_tool_schemas_for_caching(
     tools: &mut [Value],
     cache_cfg: &PromptCacheConfig,
 ) {
+    annotate_tool_schemas_for_caching_with_pinned(tools, cache_cfg, &default_pinned_tool_names());
+}
+
+/// Variant of [`annotate_tool_schemas_for_caching`] that takes an explicit
+/// pinned set — used by tests and callers that need to override the default.
+pub(crate) fn annotate_tool_schemas_for_caching_with_pinned(
+    tools: &mut [Value],
+    cache_cfg: &PromptCacheConfig,
+    pinned_names: &std::collections::HashSet<String>,
+) {
     if !cache_cfg.should_annotate() || tools.is_empty() {
         return;
     }
-    // Mark only the last tool — this creates a single cache covering all tools.
-    let last_idx = tools.len() - 1;
-    tools[last_idx]["cache_control"] = json!({"type": "ephemeral"});
+    let marker_idx = last_pinned_tool_index(tools, pinned_names).unwrap_or(tools.len() - 1);
+    tools[marker_idx]["cache_control"] = json!({"type": "ephemeral"});
+}
+
+fn last_pinned_tool_index(
+    tools: &[Value],
+    pinned_names: &std::collections::HashSet<String>,
+) -> Option<usize> {
+    if pinned_names.is_empty() {
+        return None;
+    }
+    tools.iter().enumerate().rev().find_map(|(idx, t)| {
+        let name = t
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)?;
+        if pinned_names.contains(name) {
+            Some(idx)
+        } else {
+            None
+        }
+    })
+}
+
+/// Default pinned tool names — the static-lib set that should appear in every
+/// turn of every session. Derived from `TOOL_CATALOG` + schemas that are
+/// auto-pinned via `ToolRegistry::upsert_schema` (skill, spawn_agent,
+/// get_agent_result, send_message, etc.).
+///
+/// Returning a fresh `HashSet` per call keeps the API safe across threads
+/// without a static — the set is small (~15 entries) so this is cheap.
+pub(crate) fn default_pinned_tool_names() -> std::collections::HashSet<String> {
+    use astra_turn_core::tool_registry_meta::TOOL_CATALOG;
+    let mut out: std::collections::HashSet<String> = TOOL_CATALOG
+        .iter()
+        .filter(|t| t.pinned)
+        .map(|t| t.name.to_string())
+        .collect();
+    // Auto-injected via ToolRegistry::upsert_schema (see sse_loop mod.rs +
+    // agentic_loop_lifecycle.rs). These aren't in TOOL_CATALOG but are
+    // structurally part of the static lib — include them so the cache
+    // marker sits at the real static-prefix boundary.
+    for name in ["skill", "spawn_agent", "get_agent_result", "send_message"] {
+        out.insert(name.to_string());
+    }
+    out
 }
 
 /// Add a cache breakpoint on the last conversation message for Anthropic.
@@ -823,6 +883,9 @@ mod tests {
 
     #[test]
     fn annotate_tool_schemas_for_caching_adds_cache_control() {
+        // With unknown (non-pinned) names, fall back to the last tool — the
+        // historical behavior. Covers custom-tool pipelines that don't go
+        // through TOOL_CATALOG.
         let mut tools = vec![
             json!({"type": "function", "function": {"name": "a"}}),
             json!({"type": "function", "function": {"name": "b"}}),
@@ -840,8 +903,64 @@ mod tests {
         );
         assert!(
             tools[1].get("cache_control").is_some(),
-            "last tool should have cache_control"
+            "last tool should have cache_control (fallback — no pinned tools present)"
         );
+    }
+
+    /// Cache marker must sit at the end of the STATIC (pinned) prefix, not
+    /// after dynamic tools. Otherwise churn in the dynamic segment invalidates
+    /// the cached prefix every turn.
+    #[test]
+    fn annotate_tool_schemas_marks_end_of_pinned_prefix_not_last_tool() {
+        let mut tools = vec![
+            json!({"type": "function", "function": {"name": "bash"}}),         // pinned
+            json!({"type": "function", "function": {"name": "read_file"}}),    // pinned
+            json!({"type": "function", "function": {"name": "git_status"}}),   // pinned (new)
+            json!({"type": "function", "function": {"name": "git_log"}}),      // dynamic
+            json!({"type": "function", "function": {"name": "mo_branch"}}),    // dynamic
+        ];
+        annotate_tool_schemas_for_caching(
+            &mut tools,
+            &PromptCacheConfig {
+                cache_enabled: true,
+                is_anthropic: true,
+            },
+        );
+
+        // Marker on last pinned (git_status at idx 2).
+        assert!(tools[0].get("cache_control").is_none());
+        assert!(tools[1].get("cache_control").is_none());
+        assert!(
+            tools[2].get("cache_control").is_some(),
+            "marker belongs on the last pinned tool (static-lib boundary)"
+        );
+        assert!(
+            tools[3].get("cache_control").is_none(),
+            "dynamic tool must NOT receive the marker — its churn would invalidate cache"
+        );
+        assert!(tools[4].get("cache_control").is_none());
+    }
+
+    /// When dynamic tools are interleaved (shouldn't happen in production but
+    /// could via custom pipelines), the marker goes on the LAST pinned tool —
+    /// guaranteeing the pinned prefix is fully cached.
+    #[test]
+    fn annotate_tool_schemas_handles_interleaved_tools() {
+        let mut tools = vec![
+            json!({"type": "function", "function": {"name": "bash"}}),       // pinned
+            json!({"type": "function", "function": {"name": "lsp"}}),        // dynamic
+            json!({"type": "function", "function": {"name": "memory_store"}}), // pinned
+            json!({"type": "function", "function": {"name": "git_log"}}),   // dynamic
+        ];
+        annotate_tool_schemas_for_caching(
+            &mut tools,
+            &PromptCacheConfig {
+                cache_enabled: true,
+                is_anthropic: true,
+            },
+        );
+        assert!(tools[2].get("cache_control").is_some());
+        assert!(tools[3].get("cache_control").is_none());
     }
 
     #[test]

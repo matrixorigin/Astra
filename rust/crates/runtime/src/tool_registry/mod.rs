@@ -73,13 +73,17 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_6_pinned() {
-        assert_eq!(ToolRegistry::pinned_count(), 6);
+    fn catalog_has_13_pinned() {
+        // Expanded from 6 to 13 for prompt-cache stability: the static tool
+        // prefix is the cacheable prefix, so the more tools we can include
+        // in it without breaking cache, the higher the hit rate. See
+        // `pinned_tools_are_core_set` for the full list.
+        assert_eq!(ToolRegistry::pinned_count(), 13);
     }
 
     #[test]
-    fn catalog_has_37_dynamic() {
-        assert_eq!(ToolRegistry::dynamic_count(), 37);
+    fn catalog_has_30_dynamic() {
+        assert_eq!(ToolRegistry::dynamic_count(), 30);
     }
 
     #[test]
@@ -89,6 +93,7 @@ mod tests {
             .filter(|t| t.pinned)
             .map(|t| t.name)
             .collect();
+        // Original core 6 — file + edit + memory basics.
         assert!(pinned.contains(&"bash"));
         assert!(pinned.contains(&"read_file"));
         assert!(pinned.contains(&"str_replace"));
@@ -101,9 +106,24 @@ mod tests {
             pinned.contains(&"memory_retrieve"),
             "memory_retrieve must be pinned — intrinsic recall capability"
         );
-        assert!(!pinned.contains(&"write_file"));
-        assert!(!pinned.contains(&"grep"));
-        assert!(!pinned.contains(&"glob"));
+        // Expanded set: near-universal tools promoted from dynamic to static
+        // to keep them inside the cacheable tool prefix.
+        assert!(
+            pinned.contains(&"write_file"),
+            "write_file completes the read/edit/write triad"
+        );
+        assert!(
+            pinned.contains(&"grep") && pinned.contains(&"glob"),
+            "grep/glob are near-universal for code navigation"
+        );
+        assert!(
+            pinned.contains(&"git_status") && pinned.contains(&"git_diff"),
+            "git_status/git_diff appear in most coding turns"
+        );
+        assert!(
+            pinned.contains(&"memory_purge") && pinned.contains(&"memory_correct"),
+            "keep the full memory triad static so hygiene turns don't break cache"
+        );
     }
 
     #[test]
@@ -321,6 +341,11 @@ mod tests {
 
     #[test]
     fn prefilter_ranks_git_tools_for_diff() {
+        // git_diff itself is now pinned (part of the static tool prefix), so
+        // it's guaranteed to be present every turn without participating in
+        // dynamic ranking. The dynamic rank for a diff query should still
+        // surface git_show / git_log — the tools the agent typically reaches
+        // for AFTER an initial git_diff.
         let state = ConversationState::from_message("show me the git diff", 1);
         let ranked = pre_filter_dynamic(&state, "show me the git diff");
 
@@ -330,8 +355,8 @@ mod tests {
             .map(|&(idx, _)| TOOL_CATALOG[idx].name)
             .collect();
         assert!(
-            top_names.contains(&"git_diff"),
-            "git_diff should be top-3, got: {:?}",
+            top_names.iter().any(|n| n.starts_with("git_")),
+            "at least one git_* tool should be top-3 dynamic, got: {:?}",
             top_names
         );
     }

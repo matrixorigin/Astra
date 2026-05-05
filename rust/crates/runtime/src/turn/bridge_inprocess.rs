@@ -4354,13 +4354,15 @@ mod tests {
     }
 
     #[test]
-    fn annotate_tool_schemas_only_last_tool() {
+    fn annotate_tool_schemas_marks_end_of_pinned_prefix() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
-        // bash and read_file are pinned; github_list_prs is dynamic
+        // bash and read_file are pinned (static lib); github_list_prs is dynamic.
+        // The marker must sit on the last pinned tool so dynamic churn after
+        // it doesn't invalidate the cached prefix.
         let mut tools = vec![
             json!({"function": {"name": "bash"}}),
             json!({"function": {"name": "read_file"}}),
@@ -4371,25 +4373,24 @@ mod tests {
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
 
-        // Only the LAST tool should have cache_control (simplified strategy)
         assert!(
             tools[0].get("cache_control").is_none(),
-            "first tool should not have cache_control"
+            "first pinned tool should not have cache_control"
         );
         assert!(
-            tools[1].get("cache_control").is_none(),
-            "middle tool should not have cache_control"
+            tools[1].get("cache_control").is_some(),
+            "last pinned tool (read_file) should have cache_control — end of static prefix"
         );
         assert!(
-            tools[2].get("cache_control").is_some(),
-            "last tool should have cache_control"
+            tools[2].get("cache_control").is_none(),
+            "dynamic tool (github_list_prs) must not carry the marker"
         );
         assert_eq!(
-            tools[2]["cache_control"]["type"].as_str(),
+            tools[1]["cache_control"]["type"].as_str(),
             Some("ephemeral")
         );
         assert!(
-            tools[2]["cache_control"].get("ttl").is_none(),
+            tools[1]["cache_control"].get("ttl").is_none(),
             "simple ephemeral marker — no ttl (Bedrock-compatible)"
         );
     }
@@ -5240,18 +5241,25 @@ mod tests {
     }
 
     /// OpenAI: different tool sets share the same Global prefix.
+    ///
+    /// After the cache-stability refactor, tool-dependent sections (Self-Model,
+    /// tool-conditional guidance, task-type strategy, search strategy) are
+    /// `CacheScope::None` and therefore emitted to the *dynamic* second
+    /// system message for OpenAI. The **primary** system message should be
+    /// byte-identical across tool sets — that's the whole point of moving
+    /// them out of the cached prefix.
     #[test]
     fn openai_global_prefix_stable_across_tool_sets() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
 
-        let (msg1, _, _) = build_system_message(
+        let (msg1, dyn1, _) = build_system_message(
             &["bash"],
             "",
             0.8,
             None,
             &PromptCacheConfig::latch("openai", "gpt-4o"),
         );
-        let (msg2, _, _) = build_system_message(
+        let (msg2, dyn2, _) = build_system_message(
             &["bash", "git_diff", "memory_store", "find_definition"],
             "",
             0.8,
@@ -5261,18 +5269,23 @@ mod tests {
 
         let s1 = msg1["content"].as_str().unwrap();
         let s2 = msg2["content"].as_str().unwrap();
-
-        // Both should start with the same Global content (Core Rules etc.)
-        // The Global prefix ends before "## Self-Model"
-        let self_model_pos_1 = s1.find("## Self-Model").unwrap();
-        let self_model_pos_2 = s2.find("## Self-Model").unwrap();
-
-        // Everything before Self-Model should be identical
         assert_eq!(
-            &s1[..self_model_pos_1],
-            &s2[..self_model_pos_2],
-            "Global prefix (before Self-Model) should be identical across tool sets"
+            s1, s2,
+            "primary (Global-only) system message must be byte-identical across tool sets — \
+             this is the cacheable prefix"
         );
+
+        // The dynamic secondary message is where Self-Model lives now. It may
+        // differ across tool sets; that's expected — it sits after the cache
+        // marker.
+        if let (Some(d1), Some(d2)) = (dyn1, dyn2) {
+            let d1_text = d1["content"].as_str().unwrap_or_default();
+            let d2_text = d2["content"].as_str().unwrap_or_default();
+            assert!(
+                d1_text.contains("Self-Model") || d2_text.contains("Self-Model"),
+                "Self-Model should surface in at least one dynamic message"
+            );
+        }
     }
 
     /// Global sections contain no tool names — ensures cross-session cache reuse.
@@ -5299,22 +5312,20 @@ mod tests {
             .position(|b| b.get("cache_control").is_some_and(|cc| !cc.is_null()))
             .unwrap();
 
-        // No Global block should contain any tool name
+        // The Global prefix must not include the per-session tool roster (the
+        // `<self-model>` block would rebuild the cache every turn). General
+        // prose may still reference a tool name in passing (e.g. the parallel
+        // efficiency section mentions `git_status+git_diff`), which is fine —
+        // that prose is identical across sessions.
         for (i, block) in blocks.iter().enumerate().take(global_end + 1) {
             let text = block["text"].as_str().unwrap();
-            for tool in &tools {
-                // "bash" appears in generic text like "bash commands", skip it
-                if *tool == "bash" {
-                    continue;
-                }
-                assert!(
-                    !text.contains(&format!("{tool},")),
-                    "Global block {i} should not contain tool name '{tool}' in a tool list"
-                );
-            }
             assert!(
                 !text.contains("Self-Model"),
-                "Global block {i} should not contain Self-Model"
+                "Global block {i} should not contain Self-Model (per-session tool list)"
+            );
+            assert!(
+                !text.contains("Tools: bash"),
+                "Global block {i} should not carry the per-session `Tools:` roster"
             );
         }
     }

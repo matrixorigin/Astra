@@ -1193,17 +1193,18 @@ mod pinned_budget_tests {
 
     #[test]
     fn pinned_tools_included_even_with_tiny_budget() {
+        // Use bash (pinned) + git_log / mo_branch (still dynamic after the
+        // pinned-list expansion) to prove budget gating only affects dynamic.
         let schemas = vec![
             json!({"function": {"name": "bash", "description": "Execute shell commands", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}),
             json!({"function": {"name": "read_file", "description": "Read file contents", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}),
             json!({"function": {"name": "str_replace", "description": "Replace text in files", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"}}, "required": ["path", "old_str", "new_str"]}}}),
-            json!({"function": {"name": "git_diff", "description": "Show git diff", "parameters": {"type": "object", "properties": {}}}}),
-            json!({"function": {"name": "git_status", "description": "Show git status", "parameters": {"type": "object", "properties": {}}}}),
+            json!({"function": {"name": "git_log", "description": "Show git log", "parameters": {"type": "object", "properties": {}}}}),
+            json!({"function": {"name": "mo_branch", "description": "Matrixone branch ops", "parameters": {"type": "object", "properties": {}}}}),
         ];
 
         let registry = ToolRegistry::new(schemas);
 
-        // Verify pinned schemas are resolved
         let pinned = registry.pinned_schemas();
         let pinned_names: Vec<&str> = pinned.iter().map(|(n, _)| n.as_str()).collect();
         assert!(
@@ -1223,16 +1224,16 @@ mod pinned_budget_tests {
         );
 
         // budget_select_measured with budget=0: pinned survive, dynamic excluded.
-        let git_diff_idx = TOOL_CATALOG
+        let git_log_idx = TOOL_CATALOG
             .iter()
-            .position(|t| t.name == "git_diff")
-            .expect("git_diff must exist in TOOL_CATALOG");
-        let git_status_idx = TOOL_CATALOG
+            .position(|t| t.name == "git_log")
+            .expect("git_log must exist in TOOL_CATALOG");
+        let mo_branch_idx = TOOL_CATALOG
             .iter()
-            .position(|t| t.name == "git_status")
-            .expect("git_status must exist in TOOL_CATALOG");
+            .position(|t| t.name == "mo_branch")
+            .expect("mo_branch must exist in TOOL_CATALOG");
 
-        let ranked = vec![(git_diff_idx, 0.8), (git_status_idx, 0.5)];
+        let ranked = vec![(git_log_idx, 0.8), (mo_branch_idx, 0.5)];
         let result = registry.budget_select_measured(&ranked, 0);
 
         let result_names: Vec<&str> = result
@@ -1244,7 +1245,7 @@ mod pinned_budget_tests {
             })
             .collect();
 
-        // Pinned tools present (budget-exempt)
+        // Pinned tools present (budget-exempt).
         assert!(
             result_names.contains(&"bash"),
             "bash must survive zero budget, got: {:?}",
@@ -1260,14 +1261,14 @@ mod pinned_budget_tests {
             "str_replace must survive zero budget, got: {:?}",
             result_names
         );
-        // Dynamic tools excluded — proves budget is actually enforced
+        // Dynamic tools excluded — proves budget is actually enforced.
         assert!(
-            !result_names.contains(&"git_diff"),
-            "git_diff should be excluded at zero budget"
+            !result_names.contains(&"git_log"),
+            "git_log should be excluded at zero budget"
         );
         assert!(
-            !result_names.contains(&"git_status"),
-            "git_status should be excluded at zero budget"
+            !result_names.contains(&"mo_branch"),
+            "mo_branch should be excluded at zero budget"
         );
         assert_eq!(
             result_names.len(),
