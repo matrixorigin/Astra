@@ -32,29 +32,138 @@ const PROGRESSIVE_MIN_CHARS: usize = 200;
 // ─── Send Circuit Breaker ───────────────────────────────────────────────────
 
 const SEND_FAILURE_THRESHOLD: u32 = 3;
+/// After this long without a new failure, the breaker auto half-opens even
+/// without a success call. This matters for long-running tasks that recover
+/// the platform but don't emit sends (so `record_success` is never called).
+/// Without the cooldown, such tasks would stay silent forever.
+const SEND_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Injectable clock so cooldown tests don't need real sleeps.
+trait Clock: Send + Sync + std::fmt::Debug {
+    fn now(&self) -> Instant;
+}
+
+#[derive(Debug, Default)]
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct TestClockHandle {
+    offset: Arc<std::sync::Mutex<Duration>>,
+    base: Instant,
+}
+
+#[cfg(test)]
+impl Clock for TestClockHandle {
+    fn now(&self) -> Instant {
+        self.base + *self.offset.lock().unwrap()
+    }
+}
+
+#[cfg(test)]
+struct TestClock {
+    offset: Arc<std::sync::Mutex<Duration>>,
+    base: Instant,
+}
+
+#[cfg(test)]
+impl TestClock {
+    fn new() -> Self {
+        Self {
+            offset: Arc::new(std::sync::Mutex::new(Duration::ZERO)),
+            base: Instant::now(),
+        }
+    }
+    fn advance(&self, d: Duration) {
+        *self.offset.lock().unwrap() += d;
+    }
+    fn handle(&self) -> TestClockHandle {
+        TestClockHandle {
+            offset: Arc::clone(&self.offset),
+            base: self.base,
+        }
+    }
+}
 
 /// Per-conversation send health tracker. Suppresses heartbeats after
 /// consecutive send failures to avoid flooding an unreachable platform.
-#[derive(Clone, Default)]
+///
+/// Recovery paths:
+/// - `record_success` closes the breaker immediately (clears state).
+/// - Without any send (task processing locally), the breaker auto half-opens
+///   after `SEND_FAILURE_COOLDOWN` elapsed since `last_failure_at`, so the
+///   next heartbeat probes platform recovery.
+#[derive(Clone)]
 struct SendCircuitBreaker {
-    state: Arc<dashmap::DashMap<String, u32>>,
+    state: Arc<dashmap::DashMap<String, (u32, Instant)>>,
+    clock: Arc<dyn Clock>,
+}
+
+impl Default for SendCircuitBreaker {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(dashmap::DashMap::new()),
+            clock: Arc::new(SystemClock),
+        }
+    }
 }
 
 impl SendCircuitBreaker {
+    #[cfg(test)]
+    fn with_clock(clock: TestClockHandle) -> Self {
+        Self {
+            state: Arc::new(dashmap::DashMap::new()),
+            clock: Arc::new(clock),
+        }
+    }
+
     fn record_success(&self, key: &str) {
-        self.state.remove(key);
+        if let Some((_, (count, _))) = self.state.remove(key)
+            && count >= SEND_FAILURE_THRESHOLD
+        {
+            tracing::info!(
+                target: "gateway::circuit_breaker",
+                key = %key,
+                prior_failures = count,
+                "send circuit breaker CLOSED after successful send"
+            );
+        }
     }
 
     fn record_failure(&self, key: &str) {
-        let mut entry = self.state.entry(key.to_string()).or_insert(0);
-        *entry += 1;
+        let now = self.clock.now();
+        let mut entry = self.state.entry(key.to_string()).or_insert((0, now));
+        entry.0 += 1;
+        entry.1 = now;
+        if entry.0 == SEND_FAILURE_THRESHOLD {
+            tracing::warn!(
+                target: "gateway::circuit_breaker",
+                key = %key,
+                threshold = SEND_FAILURE_THRESHOLD,
+                "send circuit breaker OPENED — heartbeats suppressed until recovery or cooldown"
+            );
+        }
     }
 
     fn is_open(&self, key: &str) -> bool {
-        self.state
-            .get(key)
-            .map(|v| *v >= SEND_FAILURE_THRESHOLD)
-            .unwrap_or(false)
+        let Some(entry) = self.state.get(key) else {
+            return false;
+        };
+        let (count, last_failure_at) = *entry;
+        if count < SEND_FAILURE_THRESHOLD {
+            return false;
+        }
+        // Half-open after cooldown: lets the caller probe platform recovery.
+        // State (failure count) is kept — a probe failure re-trips immediately
+        // via record_failure, without needing THRESHOLD more failures.
+        let now = self.clock.now();
+        now.saturating_duration_since(last_failure_at) < SEND_FAILURE_COOLDOWN
     }
 
     fn reset(&self, key: &str) {
@@ -5134,8 +5243,112 @@ mod circuit_breaker_tests {
             cb.record_failure("wx:chat1");
         }
         h.join().unwrap();
-        // After 200 failures, must be open.
+        // After 200 failures from 2 threads, count must be exactly 200
+        // (DashMap's entry() lock guarantees atomic increment). A lossy
+        // implementation (e.g., get+insert) would miss counts.
+        let count = cb.state.get("wx:chat1").map(|v| v.0).unwrap_or(0);
+        assert_eq!(count, 200, "atomic increment lost counts — got {count}");
         assert!(cb.is_open("wx:chat1"));
+    }
+
+    // ── Cooldown recovery (issue #1 from review) ─────────────────────────
+    //
+    // Scenario: breaker opens (3 failures), then task runs for a long time
+    // without sending anything. Platform recovers, but without a success
+    // call, the breaker never closes. Cooldown lets is_open() return false
+    // after SEND_FAILURE_COOLDOWN since last_failure, letting the next send
+    // probe the platform.
+
+    #[test]
+    fn stays_open_within_cooldown() {
+        let clock = TestClock::new();
+        let cb = SendCircuitBreaker::with_clock(clock.handle());
+        let key = "wx:chat1";
+        for _ in 0..SEND_FAILURE_THRESHOLD {
+            cb.record_failure(key);
+        }
+        assert!(cb.is_open(key), "open immediately after threshold");
+        clock.advance(SEND_FAILURE_COOLDOWN - Duration::from_millis(1));
+        assert!(cb.is_open(key), "still open just before cooldown expires");
+    }
+
+    #[test]
+    fn closes_after_cooldown_without_success_call() {
+        let clock = TestClock::new();
+        let cb = SendCircuitBreaker::with_clock(clock.handle());
+        let key = "wx:chat1";
+        for _ in 0..SEND_FAILURE_THRESHOLD {
+            cb.record_failure(key);
+        }
+        assert!(cb.is_open(key));
+        clock.advance(SEND_FAILURE_COOLDOWN);
+        assert!(
+            !cb.is_open(key),
+            "breaker must half-open after cooldown elapsed so worker can probe recovery"
+        );
+    }
+
+    #[test]
+    fn failure_after_cooldown_re_opens() {
+        let clock = TestClock::new();
+        let cb = SendCircuitBreaker::with_clock(clock.handle());
+        let key = "wx:chat1";
+        for _ in 0..SEND_FAILURE_THRESHOLD {
+            cb.record_failure(key);
+        }
+        clock.advance(SEND_FAILURE_COOLDOWN + Duration::from_secs(1));
+        assert!(!cb.is_open(key), "closed after cooldown");
+        // Probe send fails again — breaker must re-open on the next failure,
+        // not require 3 more failures (failure count carries forward).
+        cb.record_failure(key);
+        assert!(
+            cb.is_open(key),
+            "a single failure after half-open must re-trip the breaker"
+        );
+    }
+
+    #[test]
+    fn success_after_cooldown_fully_closes() {
+        let clock = TestClock::new();
+        let cb = SendCircuitBreaker::with_clock(clock.handle());
+        let key = "wx:chat1";
+        for _ in 0..SEND_FAILURE_THRESHOLD {
+            cb.record_failure(key);
+        }
+        clock.advance(SEND_FAILURE_COOLDOWN + Duration::from_secs(1));
+        cb.record_success(key);
+        // New failures after a success restart the count — need THRESHOLD
+        // more to trip again, not just 1.
+        for _ in 0..(SEND_FAILURE_THRESHOLD - 1) {
+            cb.record_failure(key);
+        }
+        assert!(
+            !cb.is_open(key),
+            "after success, count is reset — {} failures should not open",
+            SEND_FAILURE_THRESHOLD - 1
+        );
+    }
+
+    #[test]
+    fn cooldown_per_key_independent() {
+        let clock = TestClock::new();
+        let cb = SendCircuitBreaker::with_clock(clock.handle());
+        for _ in 0..SEND_FAILURE_THRESHOLD {
+            cb.record_failure("wx:chat1");
+        }
+        clock.advance(SEND_FAILURE_COOLDOWN / 2);
+        for _ in 0..SEND_FAILURE_THRESHOLD {
+            cb.record_failure("wx:chat2");
+        }
+        clock.advance(SEND_FAILURE_COOLDOWN / 2 + Duration::from_secs(1));
+        // chat1: last_failure was T0, now T0 + cooldown + tail → past cooldown
+        assert!(!cb.is_open("wx:chat1"), "chat1 past cooldown");
+        // chat2: last_failure was T0 + cooldown/2, now T0 + cooldown + tail
+        // elapsed since chat2 failure: cooldown/2 + tail — still within cooldown
+        assert!(
+            cb.is_open("wx:chat2"),
+            "chat2 still within cooldown (elapsed < cooldown)"
+        );
     }
 }
 
