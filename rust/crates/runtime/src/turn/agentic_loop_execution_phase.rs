@@ -507,6 +507,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     state.llm_rounds_completed += 1;
     let turn_result = turn_result?;
     state.rate_limit_cooldown.record_success();
+    // Clear pipeline recovery escalation after a successful LLM call —
+    // the PTL pressure is relieved.
+    if let Some(ref mut sess) = state.pipeline_session {
+        sess.recovery.reset_on_success();
+    }
     if let Some(ref emitter) = state.messaging.progress_emitter {
         emitter.llm_call_completed(
             turn_index as u32,
@@ -714,6 +719,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 && state.consecutive_context_window_errors
                     <= super::compaction_replay::MAX_COMPACT_RETRIES
             {
+                // Inform the pipeline session about the PTL error so its
+                // RecoveryState can escalate tier on subsequent turns and
+                // widen reserve estimates. This bridges the legacy compaction
+                // retry path with the pipeline's observability/feedback loop.
+                if let Some(ref mut sess) = state.pipeline_session {
+                    sess.recovery.record_ptl_error();
+                }
+
                 if let Some(result) = super::compaction_replay::try_compact_for_retry_tiered(
                     &mut state.messages,
                     state.last_measured_prompt_tokens,
@@ -724,6 +737,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     state
                         .compaction_effectiveness
                         .record_compaction(result.tokens_freed);
+                    // Feed compaction stats into pipeline for reserve estimation.
+                    if let Some(ref mut sess) = state.pipeline_session {
+                        sess.recovery.record_reactive_compact();
+                        sess.stats.record_compaction(result.tokens_freed);
+                    }
                     let summary = super::compaction_replay::compaction_summary(&result);
                     if !prep.quiet {
                         host.emit_headless_line(
