@@ -3040,6 +3040,7 @@ mod tests {
             approval_overrides: None,
             consecutive_context_window_errors: 0,
             compaction_state: None,
+            pipeline_state: None,
             continuity_state: None,
         }));
         let err = cp.validate().unwrap_err();
@@ -3075,6 +3076,7 @@ mod tests {
             approval_overrides: None,
             consecutive_context_window_errors: 0,
             compaction_state: None,
+            pipeline_state: None,
             continuity_state: None,
         }));
         assert!(cp.validate().is_ok());
@@ -3396,6 +3398,7 @@ mod tests {
             approval_overrides: None,
             consecutive_context_window_errors: 0,
             compaction_state: None,
+            pipeline_state: None,
             continuity_state: cs,
         }
     }

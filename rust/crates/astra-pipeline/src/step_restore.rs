@@ -61,6 +61,8 @@ pub struct RestoredSession {
     pub consecutive_context_window_errors: u32,
     /// Serialized CompactionEffectivenessTracker state for enriched resume guidance.
     pub compaction_state: Option<serde_json::Value>,
+    /// Serialized context pipeline state for warm-start on resume.
+    pub pipeline_state: Option<serde_json::Value>,
     /// Validated runtime-owned continuity state restored from checkpoint.
     pub continuity_state: Option<astra_turn_types::continuity::ContinuityState>,
 }
@@ -180,6 +182,7 @@ fn build_restored_session(
         approval_overrides: heavy.approval_overrides,
         consecutive_context_window_errors: heavy.consecutive_context_window_errors,
         compaction_state: heavy.compaction_state,
+        pipeline_state: heavy.pipeline_state,
         continuity_state,
     }))
 }
@@ -478,6 +481,7 @@ mod tests {
             approval_overrides: None,
             consecutive_context_window_errors: 0,
             compaction_state: None,
+            pipeline_state: None,
             continuity_state: None,
         }
     }
@@ -668,6 +672,7 @@ mod tests {
             approval_overrides: None,
             consecutive_context_window_errors: 0,
             compaction_state: None,
+            pipeline_state: None,
             continuity_state: None,
         };
 
