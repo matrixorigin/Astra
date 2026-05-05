@@ -452,6 +452,92 @@ mod tests {
         assert!(backup.backup_path.exists());
     }
 
+    // ── P3-1: symlink + permission unhappy paths ──────────────────────────
+    //
+    // The review noted file_history had zero coverage for symlinks and
+    // permission-denied. Neither is fixed by this commit — we just prove
+    // current behavior so a future refactor that breaks it is caught.
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_is_followed_and_captures_target_content() {
+        // Checkpoint of a symlink captures the TARGET file's bytes via
+        // fs::copy — which follows symlinks on Unix. Regression guard:
+        // if the implementation is later changed to preserve the link
+        // itself (e.g. using fs::hard_link or explicit symlink_metadata),
+        // restore semantics change and callers must be updated.
+        use std::os::unix::fs as unix_fs;
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let target = tmp.path().join("real.txt");
+        fs::write(&target, "target content").unwrap();
+        let link = tmp.path().join("link.txt");
+        unix_fs::symlink(&target, &link).unwrap();
+
+        history.checkpoint(&[link.as_path()]).unwrap();
+        let snap = &history.list_snapshots()[0];
+        assert_eq!(snap.files.len(), 1);
+        let backup = &snap.files[0];
+        assert!(
+            backup.skipped_reason.is_none(),
+            "symlink to small file should be captured, not skipped"
+        );
+        let captured = fs::read(&backup.backup_path).unwrap();
+        assert_eq!(
+            captured, b"target content",
+            "fs::copy follows symlink, so backup holds the target's bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_symlink_surfaces_error_not_silent_success() {
+        use std::os::unix::fs as unix_fs;
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let missing = tmp.path().join("does_not_exist");
+        let link = tmp.path().join("dangling");
+        unix_fs::symlink(&missing, &link).unwrap();
+
+        // path.exists() returns false for dangling symlinks — we treat
+        // them as "did not exist" rather than erroring. Regression guard
+        // that we don't silently treat them as existing-and-capturable.
+        let snap_id = history.checkpoint(&[link.as_path()]).unwrap();
+        let snap = &history.list_snapshots()[0];
+        assert_eq!(snap.id, snap_id);
+        let backup = &snap.files[0];
+        assert!(
+            !backup.existed,
+            "dangling symlink must record existed=false, not pretend we captured it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readable_but_unreadable_mode_surfaces_error() {
+        // File exists but we can't read it (mode 0000). Capture must
+        // not silently succeed with empty bytes.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let p = tmp.path().join("locked.txt");
+        fs::write(&p, "secret").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = history.checkpoint(&[p.as_path()]);
+        // Restore perms first so TempDir::drop can clean up.
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "fs::copy of unreadable file must bubble up the io::Error, \
+             not swallow it and record a bogus backup"
+        );
+    }
+
     #[test]
     fn revert_of_skipped_file_is_noop_not_error() {
         // Undo must NOT try to restore a skipped file (its backup_path

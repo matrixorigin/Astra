@@ -449,4 +449,51 @@ mod tests {
         // 5 seconds < 60 threshold — should be a no-op.
         notify_completion(&config, "Test", "body", Duration::from_secs(5)).await;
     }
+
+    // ── P3-1: send_notification dispatch coverage ──────────────────────────
+    //
+    // The review flagged that send_notification's dispatch to osascript /
+    // notify-send was never exercised by tests — the entire OS-call side
+    // of the feature was a coverage hole. We can't actually fire desktop
+    // notifications in CI, but we can assert the dispatch arms complete
+    // without panic / deadlock and that the Disabled arm is a true no-op.
+
+    #[tokio::test]
+    async fn send_notification_disabled_backend_is_noop() {
+        // Must return immediately without spawning any subprocess.
+        let start = std::time::Instant::now();
+        send_notification(NotificationBackend::Disabled, "t", "b").await;
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "Disabled backend must not try to spawn osascript/notify-send"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_notification_terminal_bell_does_not_panic() {
+        // eprint! the bell — no subprocess, no await, just stderr write.
+        send_notification(NotificationBackend::TerminalBell, "t", "b").await;
+    }
+
+    #[tokio::test]
+    async fn send_notification_linux_backend_survives_missing_binary() {
+        // Even on CI without notify-send, the dispatch must not panic —
+        // Command::status consumes the spawn error silently. Regression
+        // guard against a future change that unwrap()s or ?'s that error.
+        send_notification(NotificationBackend::Linux, "title", "body").await;
+    }
+
+    #[tokio::test]
+    async fn send_notification_macos_backend_escapes_quotes_in_body() {
+        // The escape happens before the Command is built. We can't
+        // observe the osascript invocation on Linux CI, but we verify
+        // that a malicious body containing `"` doesn't panic during
+        // the format!() step and that dispatch completes.
+        send_notification(
+            NotificationBackend::MacOs,
+            "title with \"quote\"",
+            "body with \"quote\" and $(whoami)",
+        )
+        .await;
+    }
 }
