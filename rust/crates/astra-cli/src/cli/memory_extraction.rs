@@ -566,6 +566,56 @@ async fn run_extraction(
     }
 }
 
+/// Build a JournalEvent capturing the given extraction outcome, including
+/// structured metadata specific to the outcome variant (e.g. `prior_turn`
+/// for `SkippedBusy`). Centralizing this keeps repl_turn/session_cleanup
+/// from dropping fields during manual construction.
+pub fn journal_event_for_outcome(
+    session_id: Option<&str>,
+    turn: u32,
+    outcome: &ExtractionOutcome,
+) -> astra_services::session_journal::JournalEvent {
+    use astra_services::session_journal::JournalEvent;
+    let (memories_saved, categories, duration_ms, prefix_reused) = match outcome {
+        ExtractionOutcome::Extracted {
+            count,
+            categories,
+            duration_ms,
+            prefix_reused,
+            ..
+        } => (*count, categories.clone(), *duration_ms, *prefix_reused),
+        _ => (0usize, Vec::<String>::new(), 0u64, false),
+    };
+    let mut evt = JournalEvent::memory_extraction_ex(
+        session_id,
+        turn,
+        outcome.tag(),
+        memories_saved,
+        &categories,
+        duration_ms,
+        prefix_reused,
+    );
+    // Merge outcome-specific structured fields into the metadata JSON.
+    if let Some(meta) = evt.metadata.as_mut().and_then(|m| m.as_object_mut()) {
+        match outcome {
+            ExtractionOutcome::SkippedBusy { prior_turn } => {
+                meta.insert(
+                    "prior_turn".into(),
+                    serde_json::Value::from(*prior_turn),
+                );
+            }
+            ExtractionOutcome::Error(err) => {
+                meta.insert(
+                    "error".into(),
+                    serde_json::Value::from(err.clone()),
+                );
+            }
+            _ => {}
+        }
+    }
+    evt
+}
+
 /// Parse cache usage fields from a provider chat-completion response body.
 /// Supports both Anthropic (`cache_read_input_tokens` / `cache_creation_input_tokens`)
 /// and OpenAI (`prompt_tokens_details.cached_tokens`) shapes.
@@ -915,6 +965,53 @@ mod tests {
             ext.last_processed_turn, 4,
             "busy-skip must not mark turn as processed; cursor stays at prior value"
         );
+    }
+
+    // ── review-critical #2: prior_turn must land in the journal event ─────
+    //
+    // P0-3's commit message claimed prior_turn was "plumbed into journal
+    // for ops correlation" — but the repl_turn path only used
+    // JournalEvent::memory_extraction, dropping the field. Ops saw
+    // `tag="skipped_busy"` with no way to know WHICH turn was blocking.
+
+    #[test]
+    fn journal_event_for_skipped_busy_carries_prior_turn() {
+        let outcome = ExtractionOutcome::SkippedBusy { prior_turn: 7 };
+        let evt = journal_event_for_outcome(None, 8, &outcome);
+        let meta = evt
+            .metadata
+            .as_ref()
+            .expect("memory_extraction event must have metadata");
+        assert_eq!(
+            meta.get("outcome").and_then(|v| v.as_str()),
+            Some("skipped_busy")
+        );
+        assert_eq!(
+            meta.get("prior_turn").and_then(|v| v.as_u64()),
+            Some(7),
+            "SkippedBusy must propagate prior_turn into journal metadata \
+             so operators can correlate skips with the blocker turn. meta={meta:?}"
+        );
+    }
+
+    #[test]
+    fn journal_event_for_non_busy_outcomes_has_no_prior_turn() {
+        // prior_turn is only meaningful for SkippedBusy. Other outcomes
+        // should not have a stray prior_turn field in metadata.
+        for outcome in [
+            ExtractionOutcome::SkippedMainWrote,
+            ExtractionOutcome::SkippedNoSelector,
+            ExtractionOutcome::SkippedDisabled,
+            ExtractionOutcome::Error("x".into()),
+        ] {
+            let evt = journal_event_for_outcome(None, 3, &outcome);
+            let meta = evt.metadata.as_ref().unwrap();
+            assert!(
+                meta.get("prior_turn").is_none(),
+                "{} outcome should not carry prior_turn: {meta:?}",
+                outcome.tag()
+            );
+        }
     }
 
     #[test]

@@ -1785,13 +1785,13 @@ async fn apply_turn_success_async(
         | super::memory_extraction::ExtractionOutcome::SkippedNoSelector
         | super::memory_extraction::ExtractionOutcome::SkippedBusy { .. }
         | super::memory_extraction::ExtractionOutcome::Error(_) => {
-            let evt = astra_services::session_journal::JournalEvent::memory_extraction(
+            // Use the centralized builder so variant-specific fields
+            // (prior_turn, error) reach the journal metadata instead of
+            // being silently dropped during manual construction.
+            let evt = super::memory_extraction::journal_event_for_outcome(
                 state.session_id.as_deref(),
                 extraction_turn,
-                outcome.tag(),
-                0,
-                &[],
-                0,
+                &outcome,
             );
             enqueue_ingestion(state, &evt);
             if let Some(ref j) = state.journal {
