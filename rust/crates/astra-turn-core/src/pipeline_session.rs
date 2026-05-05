@@ -39,6 +39,17 @@ pub struct TurnInput<'a> {
     pub query_source: &'a str,
 }
 
+/// Simplified input for `run_turn_adaptive()` — limits derived from plan tier.
+pub struct AdaptiveTurnInput<'a> {
+    pub statics: &'a StaticSections,
+    pub agent: &'a AgentContext,
+    pub session: &'a SessionContext,
+    pub turn: &'a TurnState,
+    pub external: &'a ExternalSources,
+    pub model_id: &'a str,
+    pub query_source: &'a str,
+}
+
 /// Output from a successful pipeline turn.
 pub struct TurnOutput {
     pub plan: ContextPlan,
@@ -142,6 +153,30 @@ impl PipelineSession {
             explain,
             metrics,
         })
+    }
+
+    /// Run the pipeline with tier-adaptive limits. The Plan phase determines
+    /// the compaction tier, then limits are derived automatically from that tier.
+    /// This is the preferred entry point for runtime integration.
+    pub fn run_turn_adaptive(
+        &self,
+        input: AdaptiveTurnInput<'_>,
+    ) -> Result<TurnOutput, PipelineAbort> {
+        let limits = OptimizeLimits::for_tier(
+            self.current_pressure_tier(),
+            input.session.model_limit,
+        );
+        let full_input = TurnInput {
+            statics: input.statics,
+            agent: input.agent,
+            session: input.session,
+            turn: input.turn,
+            external: input.external,
+            optimize_limits: &limits,
+            model_id: input.model_id,
+            query_source: input.query_source,
+        };
+        self.run_turn(full_input)
     }
 
     /// Run the pipeline in shadow mode: produce pipeline output AND compare
@@ -467,5 +502,55 @@ mod tests {
         assert_eq!(sess.turns_completed(), 5);
         assert_eq!(sess.stats.turns_executed, 5);
         assert!(sess.stats.avg_cache_hit_ratio > 0.0);
+    }
+
+    #[test]
+    fn run_turn_adaptive_uses_tier_based_limits() {
+        let sess = PipelineSession::new(PipelineConfig::default());
+        let statics = test_statics();
+        let agent = AgentContext::default();
+        let session = test_session_context();
+        let turn = test_turn_state(1);
+        let external = test_external();
+
+        let input = AdaptiveTurnInput {
+            statics: &statics,
+            agent: &agent,
+            session: &session,
+            turn: &turn,
+            external: &external,
+            model_id: "claude-sonnet-4-6",
+            query_source: "repl",
+        };
+
+        let output = sess.run_turn_adaptive(input).expect("should succeed");
+        assert_eq!(output.metrics.turn_index, 1);
+        assert!(output.explain.phase_timings.len() == 4);
+    }
+
+    #[test]
+    fn adaptive_escalates_after_ptl_errors() {
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        sess.record_ptl_error();
+        sess.record_ptl_error();
+
+        let statics = test_statics();
+        let agent = AgentContext::default();
+        let session = test_session_context();
+        let turn = test_turn_state(3);
+        let external = test_external();
+
+        let input = AdaptiveTurnInput {
+            statics: &statics,
+            agent: &agent,
+            session: &session,
+            turn: &turn,
+            external: &external,
+            model_id: "claude-sonnet-4-6",
+            query_source: "repl",
+        };
+
+        let output = sess.run_turn_adaptive(input).expect("2 PTL should not abort");
+        assert_eq!(output.metrics.turn_index, 3);
     }
 }
