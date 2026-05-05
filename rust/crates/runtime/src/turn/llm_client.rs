@@ -802,7 +802,7 @@ fn build_bedrock_message_content(msg: &Value, include_reasoning_content: bool) -
         "assistant" => {
             let mut blocks = Vec::new();
             // Bedrock requires reasoningContent FIRST when thinking is enabled.
-            if include_reasoning_content
+            let has_reasoning = if include_reasoning_content
                 && let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str)
             {
                 if !rc.is_empty() {
@@ -813,12 +813,23 @@ fn build_bedrock_message_content(msg: &Value, include_reasoning_content: bool) -
                         }
                     }
                     blocks.push(json!({"reasoningContent": {"reasoningText": reasoning_text}}));
+                    true
+                } else {
+                    false
                 }
-            }
+            } else {
+                false
+            };
             blocks.extend(build_bedrock_text_content_blocks(msg.get("content")));
             blocks.extend(build_bedrock_tool_blocks(
                 msg.get("tool_calls").and_then(Value::as_array),
             ));
+            // Bedrock rejects assistant messages where the final block is thinking/reasoning.
+            // If reasoning was emitted but no text or tool_use followed, append a minimal
+            // text block to satisfy the constraint.
+            if has_reasoning && blocks.len() == 1 {
+                blocks.push(json!({ "text": "" }));
+            }
             blocks
         }
         _ => build_bedrock_text_content_blocks(msg.get("content")),
@@ -1539,17 +1550,23 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
         }
         "assistant" => {
             let mut blocks = Vec::new();
-            if let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str) {
-                if !rc.is_empty() {
-                    let mut thinking = json!({"type": "thinking", "thinking": rc});
-                    if let Some(sig) = msg.get("reasoning_signature").and_then(Value::as_str) {
-                        if !sig.is_empty() {
-                            thinking["signature"] = Value::String(sig.to_string());
+            let has_thinking =
+                if let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str) {
+                    if !rc.is_empty() {
+                        let mut thinking = json!({"type": "thinking", "thinking": rc});
+                        if let Some(sig) = msg.get("reasoning_signature").and_then(Value::as_str) {
+                            if !sig.is_empty() {
+                                thinking["signature"] = Value::String(sig.to_string());
+                            }
                         }
+                        blocks.push(thinking);
+                        true
+                    } else {
+                        false
                     }
-                    blocks.push(thinking);
-                }
-            }
+                } else {
+                    false
+                };
             blocks.extend(anthropic_text_blocks_from_content(msg.get("content")));
             if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
                 blocks.extend(
@@ -1557,6 +1574,12 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
                         .iter()
                         .filter_map(openai_tool_call_to_anthropic_block),
                 );
+            }
+            // Anthropic/Bedrock reject assistant messages where the final block is `thinking`.
+            // If thinking was emitted but no text or tool_use followed, append a minimal
+            // text block to satisfy the constraint.
+            if has_thinking && blocks.len() == 1 {
+                blocks.push(json!({"type": "text", "text": ""}));
             }
             let mut out = json!({"role": "assistant", "content": blocks});
             carry_cache_annotations(msg, &mut out);
@@ -6910,6 +6933,78 @@ mod tests {
         assert!(
             !content.iter().any(|b| b.get("reasoningContent").is_some()),
             "empty reasoning_content must NOT produce a reasoningContent block"
+        );
+    }
+
+    /// Regression: assistant message with reasoning_content but no text/tool_calls
+    /// must NOT produce a message ending with a thinking block (Bedrock 400 error).
+    #[test]
+    fn bedrock_reasoning_only_assistant_gets_trailing_text_block() {
+        let messages = vec![
+            json!({"role": "user", "content": "hello"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "I need to think about this...",
+                "reasoning_signature": "sig_test"
+            }),
+            json!({"role": "user", "content": "continue"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "us.anthropic.claude-opus-4-6-v1:0",
+            "bedrock",
+            Some(4096),
+            None,
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+        );
+        let bedrock_msgs = body["messages"].as_array().unwrap();
+        let assistant = &bedrock_msgs[1];
+        assert_eq!(assistant["role"], "assistant");
+        let content = assistant["content"].as_array().unwrap();
+        assert!(
+            content.len() >= 2,
+            "reasoning-only assistant must have at least 2 blocks, got {}",
+            content.len()
+        );
+        assert!(
+            content[0].get("reasoningContent").is_some(),
+            "first block should be reasoningContent"
+        );
+        // Final block must NOT be reasoningContent (Bedrock rejects this)
+        let last = content.last().unwrap();
+        assert!(
+            last.get("reasoningContent").is_none(),
+            "final block must not be reasoningContent, got: {last}"
+        );
+    }
+
+    /// Same regression for the Anthropic Messages path.
+    #[test]
+    fn anthropic_reasoning_only_assistant_gets_trailing_text_block() {
+        let msg = json!({
+            "role": "assistant",
+            "content": null,
+            "reasoning_content": "Let me think...",
+            "reasoning_signature": "sig_xyz"
+        });
+        let result = anthropic_message_from_openai(&msg).unwrap();
+        let blocks = result["content"].as_array().unwrap();
+        assert!(
+            blocks.len() >= 2,
+            "reasoning-only assistant must have at least 2 blocks, got {}",
+            blocks.len()
+        );
+        assert_eq!(blocks[0]["type"], "thinking");
+        // Final block must NOT be thinking
+        let last = blocks.last().unwrap();
+        assert_ne!(
+            last["type"], "thinking",
+            "final block must not be thinking, got: {last}"
         );
     }
 
