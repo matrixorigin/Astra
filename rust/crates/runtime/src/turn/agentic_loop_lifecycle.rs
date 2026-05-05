@@ -861,15 +861,10 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             }
         }
 
-        // Compute context pressure from a fresh estimate that includes
-        // per-message overhead, calibrated system-prompt overhead, and
-        // (when available) measured tool-schema tokens — not the stale
-        // `last_measured_prompt_tokens` from the previous round.
-        //
-        // Using `estimate_tokens_precise` with the calibrated 14 000-token
-        // system-prompt default (vs. the legacy 3 000-token `FIXED_OVERHEAD`)
-        // keeps the 0.75 / 0.90 microcompact gates from firing too late and
-        // matches the pre-request accounting used by `/chat` budget pressure.
+        // Context pressure estimation + adaptive compaction.
+        // When pipeline_session is active, use its pressure model (predictive
+        // with reserves) and cascade-aware limits. Otherwise fall back to
+        // legacy inline estimation.
         let pressure = if state.max_turn_input_tokens > 0 {
             let fresh_estimate = crate::prompts::estimate_tokens_precise(
                 &state.messages,
@@ -882,15 +877,24 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         };
 
         // Adaptive microcompact: scale aggressiveness with context pressure.
-        // Use state-aware variant when SessionFacts has active files (pin list).
-        // Persist cleared content to disk when a session directory is available.
+        // When pipeline_session is active, cascade detection suppresses clearing
+        // to break infinite compaction loops.
+        let pipeline_allows_clearing = state
+            .pipeline_session
+            .as_ref()
+            .map(|sess| !sess.stats.has_compaction_cascade())
+            .unwrap_or(true);
+
         let strategy = state.compact_strategy;
         let session_dir = state.current_session_id.as_deref().and_then(|sid| {
             astra_services::local_session_artifact_store()
                 .session_dir(sid)
                 .ok()
         });
-        let mc = if !state.session_facts.active_files.is_empty() {
+        let mc = if !pipeline_allows_clearing {
+            // Cascade detected: skip clearing this turn to break the loop.
+            astra_turn_core::microcompact::CompactStats::default()
+        } else if !state.session_facts.active_files.is_empty() {
             astra_turn_core::microcompact::compact_tool_results_state_aware_with_persistence(
                 &mut state.messages,
                 pressure,
@@ -917,6 +921,15 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     pressure * 100.0,
                 ),
             );
+            // Record compaction audit for pipeline journal
+            if let Some(ref mut sess) = state.pipeline_session {
+                sess.record_compaction_audit(
+                    "tool_result_clearing",
+                    mc.results_compacted as u32,
+                    mc.tokens_saved as u32,
+                );
+                sess.stats.record_compaction(mc.tokens_saved as u64);
+            }
         }
 
         // Re-estimate pressure after microcompact (messages may have shrunk).
@@ -957,6 +970,15 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                         post_mc_pressure * 100.0,
                     ),
                 );
+                // Record compression audit for pipeline journal
+                if let Some(ref mut sess) = state.pipeline_session {
+                    sess.record_compaction_audit(
+                        if post_mc_pressure >= 0.90 { "aggressive_compression" } else { "default_compression" },
+                        outcome.layer_results.len() as u32,
+                        outcome.total_tokens_freed as u32,
+                    );
+                    sess.stats.record_compaction(outcome.total_tokens_freed);
+                }
             }
         }
     }
