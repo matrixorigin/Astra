@@ -92,6 +92,8 @@ mod dynamic_completions;
 mod edge_lifecycle;
 #[path = "cli/effects/mod.rs"]
 mod effects;
+#[path = "cli/file_history.rs"]
+mod file_history;
 #[path = "cli/followup_suggestion.rs"]
 mod followup_suggestion;
 #[path = "cli/idle_agent_messages.rs"]
