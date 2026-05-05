@@ -299,6 +299,7 @@ dependencies = [
  "ecb",
  "futures-util",
  "hex",
+ "libc",
  "rand 0.9.4",
  "regex",
  "reqwest 0.12.28",

@@ -840,10 +840,11 @@ impl GatewayRunner {
         let next_timer = tokio::time::sleep(INITIAL_ACK_DELAY);
         tokio::pin!(next_timer);
 
-        // Health key for heartbeat circuit-breaker: stop emitting
-        // heartbeats when the platform is unreachable (consecutive
-        // send failures tracked by deliver_outbound).
-        let health_key = format!("{}:{}", msg.platform, chat_id);
+        // Health key for heartbeat circuit-breaker. MUST use msg.chat_id
+        // (not effective_chat_id) because deliver_outbound receives
+        // OutboundMessage with msg.chat_id and tracks failures under
+        // that key. Using effective_chat_id here would create a mismatch.
+        let health_key = format!("{}:{}", msg.platform, msg.chat_id);
         const HEARTBEAT_FAILURE_THRESHOLD: u32 = 3;
         // Reset health at task start — previous failures are stale.
         self.send_health.remove(&health_key);
@@ -984,6 +985,27 @@ impl GatewayRunner {
         // Deregister from active tasks registry.
         if let Some(ref tid) = trace_id_for_kill {
             self.active_tasks.remove(tid);
+        }
+
+        // If the task was cancelled, the CLI bridge returns Err("killed by user").
+        // Short-circuit: mark trace as failed and return a kill confirmation
+        // without processing the result as a normal completion.
+        if cancel_token.is_cancelled() {
+            if let Some(writer) = trace_writer.as_ref() {
+                let _ = writer.fail_request("killed by user").await;
+            }
+            let _ = cli_handle.await; // drain the handle
+            tracing::info!(tag = %request_tag, "task killed, skipping result processing");
+            return Some(
+                self.outbound_response(
+                    trace.as_ref(),
+                    msg.platform,
+                    &msg.chat_id,
+                    msg.reply_token.clone(),
+                    format!("[{request_tag}] 💀 任务已终止"),
+                )
+                .await,
+            );
         }
 
         // Helper: suspend running durable tasks for this chat on failure

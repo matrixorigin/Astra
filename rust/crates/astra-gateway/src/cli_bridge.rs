@@ -10,6 +10,34 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
+/// Kill guard: sends SIGKILL to a child process on drop. Defuse with
+/// `.defuse()` when the process exits normally. Without this, an async
+/// cancellation (outer task abort) would orphan the child process since
+/// tokio's `Child::drop` does NOT kill the process.
+struct ChildKillGuard {
+    pid: Option<u32>,
+}
+
+impl ChildKillGuard {
+    fn new(child: &tokio::process::Child) -> Self {
+        Self { pid: child.id() }
+    }
+
+    fn defuse(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for ChildKillGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum CliProgress {
     Status(String),
@@ -689,6 +717,12 @@ pub async fn run_cli_with_cancel(
         .spawn()
         .map_err(|e| format!("failed to spawn {}: {e}", profile.name()))?;
 
+    // Safety guard: if this function is cancelled (outer task abort),
+    // ensure the child process is killed. Without this, the child
+    // becomes an orphan zombie. Tokio's Child::drop does NOT kill.
+    let mut kill_guard = ChildKillGuard::new(&child);
+
+
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let stderr = child.stderr.take().ok_or("no stderr")?;
 
@@ -770,6 +804,9 @@ pub async fn run_cli_with_cancel(
             }
         }
     };
+    // Child exited normally — defuse the kill guard.
+    kill_guard.defuse();
+
     let stderr_text = stderr_task.await.unwrap_or_default();
     let stdout_text = stdout_task.await.unwrap_or_default();
     let exit_code = status.code().unwrap_or(-1);
