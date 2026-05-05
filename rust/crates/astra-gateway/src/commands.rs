@@ -26,6 +26,10 @@ pub struct CommandContext<'a> {
     pub auth_status: Option<String>,
     /// Active task registry — allows /kill to actually terminate CLI processes.
     pub active_tasks: Option<&'a dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    /// Gateway process start time. Used by /running to flag zombie
+    /// requests whose created_at predates this process (i.e. leftovers
+    /// from the previous gateway lifecycle whose cancel tokens died).
+    pub gateway_start: chrono::DateTime<chrono::Utc>,
 }
 
 /// Helper: get store or return error message for storage-dependent commands.
@@ -710,30 +714,44 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             } else {
                 let mut lines = vec![format!("🔄 **正在执行** ({} 个)", rows.len())];
                 let mut stuck_outbox_count = 0usize;
+                let mut zombie_count = 0usize;
                 for (i, row) in rows.iter().enumerate() {
                     let icon = status_icon(row.display_status());
                     let tag = crate::runner::short_request_tag(row.trace_id.as_str());
                     let short_text = truncate_text(&row.text_preview, 40);
                     let ts = short_timestamp(&row.created_at);
+                    let zombie_mark =
+                        if is_zombie_request(&row.created_at, ctx.gateway_start) {
+                            zombie_count += 1;
+                            " 🧟"
+                        } else {
+                            ""
+                        };
                     lines.push(format!(
-                        "[{}] {} {} | {} | {} | {}",
+                        "[{}] {} {} | {} | {} | {}{}",
                         i + 1,
                         icon,
                         row.display_status(),
                         tag,
                         short_text,
                         ts,
+                        zombie_mark,
                     ));
                     if row.status.is_terminal() && row.outbox_status == Some(OutboxStatus::Failed) {
                         stuck_outbox_count += 1;
                     }
+                }
+                if zombie_count > 0 {
+                    lines.push(format!(
+                        "\n🧟 发现 {zombie_count} 个僵尸请求 (创建时间早于本次 gateway 启动)。用 `/kill all` 一键清空。"
+                    ));
                 }
                 if stuck_outbox_count > 0 {
                     lines.push(format!(
                         "\n📬 有 {stuck_outbox_count} 个消息发送失败。用 `/retry` 查看，`/retry dismiss` 清除。"
                     ));
                 }
-                lines.push("\n💡 `/kill 1` 终止 | `/cancel 2` 取消 | `/manage` AI 辅助管理".into());
+                lines.push("\n💡 `/kill 1` 终止 | `/kill all` 清空 | `/cancel 2` 取消 | `/manage` AI 辅助管理".into());
                 Some(lines.join("\n"))
             }
         }
@@ -786,6 +804,9 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             let repo = require_trace_repo!(ctx);
             let conversation =
                 ConversationKey::new(ctx.platform, ctx.chat_id, ctx.resolved_cli.name());
+            if arg == "all" {
+                return Some(kill_or_cancel_all(repo, &conversation, ctx.active_tasks, "cancelled by user via /cancel all").await);
+            }
             if arg.is_empty() {
                 // Auto-pick first cancellable
                 let row = repo
@@ -850,6 +871,10 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             let repo = require_trace_repo!(ctx);
             let conversation =
                 ConversationKey::new(ctx.platform, ctx.chat_id, ctx.resolved_cli.name());
+
+            if arg == "all" {
+                return Some(kill_or_cancel_all(repo, &conversation, ctx.active_tasks, "killed by user via /kill all").await);
+            }
 
             let row = if arg.is_empty() {
                 // Auto-pick the most recent running request
@@ -1268,6 +1293,144 @@ async fn resolve_trace_selector(
 }
 
 /// Resolve a selector to an active request. Supports:
+/// What the user meant by `/manage <hint>`. Fast-path handlers (runner.rs)
+/// inspect this before enqueueing the slow-path CLI analysis — a "kill
+/// all" intent goes straight to the sweep, otherwise the slow path would
+/// queue behind the very tasks the user is trying to clear.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ManageIntent {
+    /// User wants to wipe every active request in the conversation.
+    KillAll,
+    /// User wants AI-assisted analysis — hand off to the slow CLI path.
+    Unknown,
+}
+
+/// Heuristic parser for `/manage <hint>` text. Recognizes common
+/// cleanup phrasings in English and Chinese. Conservative: anything
+/// ambiguous returns `Unknown` so slow-path LLM gets a chance.
+pub fn parse_manage_intent(hint: &str) -> ManageIntent {
+    let lower = hint.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return ManageIntent::Unknown;
+    }
+
+    // Single-target kills ("kill 1", "cancel 2") must NOT trigger KillAll.
+    // If the hint contains a digit right after kill/cancel, it's not "all".
+    let has_index = lower
+        .split_whitespace()
+        .any(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()));
+    if has_index {
+        return ManageIntent::Unknown;
+    }
+
+    // English "all" style: matches "kill all", "cancel all", "clear all",
+    // "cleanup all", "stop everything", etc.
+    let en_all = (lower.contains("all")
+        || lower.contains("everything")
+        || lower.contains("every"))
+        && (lower.contains("kill")
+            || lower.contains("cancel")
+            || lower.contains("clear")
+            || lower.contains("clean")
+            || lower.contains("stop")
+            || lower.contains("wipe"));
+
+    // Chinese 清理/清空/清除/杀掉/终止 + 所有/全部/(no qualifier → aggregate)
+    let zh_cleanup =
+        (hint.contains("清理") || hint.contains("清空") || hint.contains("清除"))
+            || (hint.contains("杀掉") && (hint.contains("所有") || hint.contains("全部")))
+            || (hint.contains("kill") && (hint.contains("全部") || hint.contains("所有")));
+
+    if en_all || zh_cleanup {
+        ManageIntent::KillAll
+    } else {
+        ManageIntent::Unknown
+    }
+}
+
+/// Return true if `created_at` (as reported by the DB — various formats)
+/// is before `gateway_start`. Such requests can't progress on this
+/// process — their cancellation tokens and subprocess state died with
+/// the previous gateway lifecycle.
+///
+/// Unparseable timestamps return false (conservative — better to
+/// under-flag zombies than to scare operators about timestamp format
+/// drift).
+pub fn is_zombie_request(created_at: &str, gateway_start: chrono::DateTime<chrono::Utc>) -> bool {
+    let parsed = chrono::NaiveDateTime::parse_from_str(
+        created_at,
+        "%Y-%m-%d %H:%M:%S%.f",
+    )
+    .map(|dt| dt.and_utc())
+    .or_else(|_| {
+        chrono::DateTime::parse_from_rfc3339(created_at).map(|dt| dt.with_timezone(&chrono::Utc))
+    });
+    match parsed {
+        Ok(ts) => ts < gateway_start,
+        Err(_) => false,
+    }
+}
+
+/// Sweep every active request in `conversation`: force-fail in the DB,
+/// cancel the in-memory cancellation token (so the live CLI child exits),
+/// and remove it from `active_tasks`. Returns a user-facing summary with
+/// the count killed + the count of stale DB rows whose process was
+/// already gone (no token in the map — typical zombie case).
+///
+/// Shared by `/kill all` and `/cancel all` since both do the same
+/// thing for already-running requests.
+async fn kill_or_cancel_all(
+    repo: &dyn TraceRepository,
+    conversation: &ConversationKey,
+    active_tasks: Option<
+        &dashmap::DashMap<String, tokio_util::sync::CancellationToken>,
+    >,
+    reason: &str,
+) -> String {
+    let rows = match repo.list_active_requests(conversation, 200).await {
+        Ok(r) => r,
+        Err(e) => return format!("⚠️ 清理失败: {e}"),
+    };
+    if rows.is_empty() {
+        return "✅ 当前会话没有活跃请求 (0 个清理)。".into();
+    }
+    let mut db_cleared = 0usize;
+    let mut process_killed = 0usize;
+    let mut zombie_cleared = 0usize;
+    for row in &rows {
+        match repo.force_fail_request(&row.trace_id, reason).await {
+            Ok(true) => db_cleared += 1,
+            Ok(false) => {
+                // Already terminal — likely an outbox-failed retry; count
+                // it as zombie so the user sees we didn't ignore it.
+                zombie_cleared += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "gateway::commands",
+                    trace_id = %row.trace_id.as_str(),
+                    error = %e,
+                    "force_fail_request failed during /kill all"
+                );
+            }
+        }
+        if let Some(tasks) = active_tasks
+            && let Some((_, token)) = tasks.remove(row.trace_id.as_str())
+        {
+            token.cancel();
+            process_killed += 1;
+        }
+    }
+    let mut out = format!("💀 已终止 {db_cleared} 个请求");
+    if process_killed > 0 {
+        out.push_str(&format!(" (进程杀死 {process_killed})"));
+    }
+    if zombie_cleared > 0 {
+        out.push_str(&format!("，清理 🧟 僵尸 {zombie_cleared} 个"));
+    }
+    out
+}
+
 /// - Numeric index "1", "2" (from `/running` output order)
 /// - Trace ID or prefix match
 /// - Text substring match against message content
@@ -1942,6 +2105,7 @@ mod tests {
                     cli_availability: &[],
                     auth_status: None,
                     active_tasks: None,
+                    gateway_start: chrono::Utc::now(),
                 };
                 let result = handle_command(&ctx, $input).await;
                 let check: fn(Option<String>) = $check;
@@ -2053,6 +2217,7 @@ mod tests {
             cli_availability: &[],
             auth_status: Some("⚠️ 暂停 (剩余 3m 42s)".to_string()),
             active_tasks: None,
+            gateway_start: chrono::Utc::now(),
         };
 
         let result = handle_command(&ctx, "/status").await.unwrap();
@@ -2435,5 +2600,266 @@ mod tests {
     fn parse_cron_add_rejects_invalid_cron_expression() {
         assert!(parse_cron_add("99 99 99 99 99 impossible").is_none());
         assert!(parse_cron_add("\"bad expr\" impossible").is_none());
+    }
+
+    // ── R5-#3: /manage cleanup keywords take fast path ────────────────────
+    //
+    // When the queue is already stuck, `/manage <something>` slow-path
+    // enqueues ANOTHER task that waits behind the 8 stuck ones — the
+    // user's cleanup request never executes. Detect cleanup intent
+    // early and redirect to /kill all.
+
+    #[test]
+    fn manage_intent_detects_cleanup_keywords() {
+        // Chinese + English keywords a user would reasonably type.
+        for hint in [
+            "清理所有",
+            "清理卡住的任务",
+            "清空",
+            "清除全部",
+            "cleanup all",
+            "clear all",
+            "kill all",
+            "kill 全部",
+            "杀掉所有",
+            "stop everything",
+        ] {
+            assert!(
+                matches!(parse_manage_intent(hint), ManageIntent::KillAll),
+                "should classify {hint:?} as KillAll"
+            );
+        }
+    }
+
+    #[test]
+    fn manage_intent_ignores_single_kill_hint() {
+        // "kill 1" / "cancel 3" must NOT match KillAll — they target one.
+        for hint in ["kill 1", "cancel 2", "/kill 3", "终止第一个"] {
+            assert!(
+                !matches!(parse_manage_intent(hint), ManageIntent::KillAll),
+                "single-kill hint {hint:?} must not trigger KillAll"
+            );
+        }
+    }
+
+    #[test]
+    fn manage_intent_unknown_for_regular_text() {
+        assert!(matches!(
+            parse_manage_intent("help me write a poem"),
+            ManageIntent::Unknown
+        ));
+        assert!(matches!(parse_manage_intent(""), ManageIntent::Unknown));
+    }
+
+    // ── R5-#2: zombie detection on /running output ────────────────────────
+    //
+    // A request whose `created_at` predates the current gateway process
+    // start cannot make progress (its cancel_token is gone, its CLI
+    // subprocess is gone, its outbox scheduler is gone). Tag these with
+    // 🧟 in /running so the operator knows they need /kill all.
+
+    #[test]
+    fn is_zombie_flags_request_created_before_gateway_start() {
+        use chrono::{Duration as ChronoDuration, Utc};
+        let gateway_start = Utc::now() - ChronoDuration::hours(1);
+        let created_at = (gateway_start - ChronoDuration::minutes(30))
+            .format("%Y-%m-%d %H:%M:%S.%6f")
+            .to_string();
+        assert!(
+            is_zombie_request(&created_at, gateway_start),
+            "request created 30 min before gateway start must be flagged zombie"
+        );
+    }
+
+    #[test]
+    fn is_zombie_skips_request_created_after_gateway_start() {
+        use chrono::{Duration as ChronoDuration, Utc};
+        let gateway_start = Utc::now() - ChronoDuration::hours(1);
+        let created_at = (gateway_start + ChronoDuration::minutes(5))
+            .format("%Y-%m-%d %H:%M:%S.%6f")
+            .to_string();
+        assert!(
+            !is_zombie_request(&created_at, gateway_start),
+            "request created after gateway start is NOT a zombie"
+        );
+    }
+
+    #[test]
+    fn is_zombie_tolerates_unparseable_timestamp() {
+        // DB timestamp formats drift. An unparseable string must NOT be
+        // flagged as zombie — conservatively treat it as recent.
+        let gateway_start = chrono::Utc::now();
+        assert!(!is_zombie_request("not a date", gateway_start));
+        assert!(!is_zombie_request("", gateway_start));
+    }
+
+    #[test]
+    fn is_zombie_handles_iso8601_with_tz() {
+        // Some drivers return "2026-05-04T09:55:12Z" — also parseable.
+        use chrono::{Duration as ChronoDuration, Utc};
+        let gateway_start = Utc::now();
+        let iso = (gateway_start - ChronoDuration::minutes(10)).to_rfc3339();
+        assert!(
+            is_zombie_request(&iso, gateway_start),
+            "RFC3339 timestamps before gateway start must be recognized"
+        );
+    }
+
+    // ── R5-#1: /kill all — sweep every active request in the conversation ──
+    //
+    // Scenario: 8 running + queued requests pile up (user repeatedly
+    // retries because gateway is stuck). Operator needs a single command
+    // to clear them all without guessing trace_ids. Previous /kill only
+    // accepted ONE selector — "all" returned "not found".
+
+    async fn build_ctx_with_repo<'a>(
+        config: &'a GatewayConfig,
+        cli: &'a crate::cli_bridge::CliProfile,
+        astra: &'a astra_thin_client::ThinClient,
+        repo: &'a dyn crate::trace_model::TraceRepository,
+        active_tasks: Option<&'a dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    ) -> CommandContext<'a> {
+        CommandContext {
+            astra,
+            config,
+            store: None,
+            platform: "test",
+            chat_id: "chat_kill_all",
+            user_id: "user_1",
+            resolved_cli: cli,
+            durable_store: None,
+            trace_repo: Some(repo),
+            project_dirs: &config.project_dirs,
+            cli_availability: &[],
+            auth_status: None,
+            active_tasks,
+            gateway_start: chrono::Utc::now(),
+        }
+    }
+
+    async fn seed_running_request(
+        repo: &crate::trace_model::InMemoryTraceRepository,
+        cli_name: &str,
+        chat_id: &str,
+        text: &str,
+    ) -> crate::trace_model::TraceId {
+        let conv = ConversationKey::new("test", chat_id, cli_name);
+        let req = crate::trace_model::GatewayRequest::new(conv, "msg", "user", text);
+        let trace_id = req.trace_id.clone();
+        let writer = crate::trace_model::TraceWriter::begin(repo, req).await.unwrap();
+        writer.mark_queued(0).await.unwrap();
+        writer.mark_running().await.unwrap();
+        trace_id
+    }
+
+    #[tokio::test]
+    async fn kill_all_fails_every_active_request_in_conversation() {
+        use crate::trace_model::InMemoryTraceRepository;
+        let repo = InMemoryTraceRepository::default();
+        let config = test_config();
+        let cli = crate::cli_bridge::CliProfile::default();
+        let astra = astra_thin_client::ThinClient::new("http://localhost:8080", None).unwrap();
+
+        // Seed 3 running requests in the same conversation.
+        let t1 = seed_running_request(&repo, cli.name(), "chat_kill_all", "msg1").await;
+        let t2 = seed_running_request(&repo, cli.name(), "chat_kill_all", "msg2").await;
+        let t3 = seed_running_request(&repo, cli.name(), "chat_kill_all", "msg3").await;
+        // And a request in a DIFFERENT conversation — must NOT be touched.
+        let other = seed_running_request(&repo, cli.name(), "other_chat", "msg4").await;
+
+        let ctx = build_ctx_with_repo(&config, &cli, &astra, &repo, None).await;
+        let result = handle_command(&ctx, "/kill all").await.unwrap();
+
+        assert!(
+            result.contains("3") && (result.contains("终止") || result.contains("killed")),
+            "response should report 3 killed: {result}"
+        );
+
+        // Confirm the target conversation is empty afterward.
+        let conv = ConversationKey::new("test", "chat_kill_all", cli.name());
+        let remaining = repo.list_active_requests(&conv, 20).await.unwrap();
+        assert!(
+            remaining.is_empty(),
+            "target conversation should have no active requests left, got {}",
+            remaining.len()
+        );
+        // And trace_ids match what we seeded.
+        let _ = (t1, t2, t3);
+
+        // The other conversation's request stays running — /kill all is
+        // scoped to the invoker's conversation, not global.
+        let other_conv = ConversationKey::new("test", "other_chat", cli.name());
+        let still_there = repo.list_active_requests(&other_conv, 20).await.unwrap();
+        assert_eq!(
+            still_there.len(),
+            1,
+            "requests in other conversations must NOT be swept by /kill all"
+        );
+        assert_eq!(still_there[0].trace_id, other);
+    }
+
+    #[tokio::test]
+    async fn kill_all_on_empty_conversation_reports_zero() {
+        use crate::trace_model::InMemoryTraceRepository;
+        let repo = InMemoryTraceRepository::default();
+        let config = test_config();
+        let cli = crate::cli_bridge::CliProfile::default();
+        let astra = astra_thin_client::ThinClient::new("http://localhost:8080", None).unwrap();
+
+        let ctx = build_ctx_with_repo(&config, &cli, &astra, &repo, None).await;
+        let result = handle_command(&ctx, "/kill all").await.unwrap();
+        assert!(
+            result.contains("0") || result.contains("没有"),
+            "empty-conversation /kill all should report zero: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_all_also_cancels_in_memory_tokens() {
+        use crate::trace_model::InMemoryTraceRepository;
+        let repo = InMemoryTraceRepository::default();
+        let config = test_config();
+        let cli = crate::cli_bridge::CliProfile::default();
+        let astra = astra_thin_client::ThinClient::new("http://localhost:8080", None).unwrap();
+        let active_tasks: dashmap::DashMap<String, tokio_util::sync::CancellationToken> =
+            dashmap::DashMap::new();
+
+        let t1 = seed_running_request(&repo, cli.name(), "chat_kill_all", "live").await;
+        let token = tokio_util::sync::CancellationToken::new();
+        active_tasks.insert(t1.as_str().to_string(), token.clone());
+
+        let ctx = build_ctx_with_repo(&config, &cli, &astra, &repo, Some(&active_tasks)).await;
+        handle_command(&ctx, "/kill all").await.unwrap();
+
+        assert!(
+            token.is_cancelled(),
+            "/kill all must cancel the in-memory cancellation token too, so the \
+             live CLI child exits — not just mark DB as failed"
+        );
+        assert!(
+            active_tasks.get(t1.as_str()).is_none(),
+            "cancelled token entry should be removed from active_tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_all_sweeps_like_kill_all() {
+        // Symmetry: /cancel all behaves identically to /kill all for
+        // already-running requests (cancel is just a gentler noun).
+        use crate::trace_model::InMemoryTraceRepository;
+        let repo = InMemoryTraceRepository::default();
+        let config = test_config();
+        let cli = crate::cli_bridge::CliProfile::default();
+        let astra = astra_thin_client::ThinClient::new("http://localhost:8080", None).unwrap();
+
+        seed_running_request(&repo, cli.name(), "chat_kill_all", "a").await;
+        seed_running_request(&repo, cli.name(), "chat_kill_all", "b").await;
+
+        let ctx = build_ctx_with_repo(&config, &cli, &astra, &repo, None).await;
+        let result = handle_command(&ctx, "/cancel all").await.unwrap();
+        assert!(
+            result.contains("2"),
+            "/cancel all should report 2 cleared: {result}"
+        );
     }
 }

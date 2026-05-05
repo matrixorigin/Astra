@@ -314,6 +314,10 @@ pub struct GatewayRunner {
     /// emitting heartbeats — stops sending after consecutive failures to
     /// avoid message flood when platform is unreachable.
     send_health: SendCircuitBreaker,
+    /// When this gateway process started. Requests with `created_at`
+    /// before this are zombies — their cancel tokens and CLI children
+    /// died with the previous gateway lifecycle.
+    gateway_start: chrono::DateTime<chrono::Utc>,
 }
 
 /// No-op adapter used in spawned CLI tasks (typing/heartbeats not available in background).
@@ -458,6 +462,7 @@ impl GatewayRunner {
             request_counter: AtomicU32::new(0),
             active_tasks: Arc::new(dashmap::DashMap::new()),
             send_health: SendCircuitBreaker::default(),
+            gateway_start: chrono::Utc::now(),
         })
     }
 
@@ -610,14 +615,31 @@ impl GatewayRunner {
 
         // /manage cancel, /manage kill → redirect to fast-path /cancel, /kill
         // so they execute immediately even when a task is running.
+        // Also: /manage <cleanup-keyword> → fast-path /kill all, otherwise
+        // the slow-path CLI analysis would queue behind the very tasks
+        // the user is trying to clear.
         if let Some(rest) = trimmed.strip_prefix("/manage ") {
             let rest = rest.trim();
-            if rest == "cancel"
+            let rewritten_cmd = if rest == "cancel"
                 || rest.starts_with("cancel ")
                 || rest == "kill"
                 || rest.starts_with("kill ")
             {
-                let rewritten_cmd = format!("/{rest}");
+                Some(format!("/{rest}"))
+            } else if matches!(
+                commands::parse_manage_intent(rest),
+                commands::ManageIntent::KillAll
+            ) {
+                tracing::info!(
+                    target: "gateway::commands",
+                    hint = %rest,
+                    "classified /manage hint as KillAll — redirecting to /kill all"
+                );
+                Some("/kill all".into())
+            } else {
+                None
+            };
+            if let Some(rewritten_cmd) = rewritten_cmd {
                 // Build command context and dispatch directly (avoids async recursion).
                 let cmd_ctx = CommandContext {
                     astra: &self.thin,
@@ -638,6 +660,7 @@ impl GatewayRunner {
                     cli_availability: &self.cli_availability,
                     auth_status: self.auth_status_line(cli_profile.name()),
                     active_tasks: Some(&self.active_tasks),
+                    gateway_start: self.gateway_start,
                 };
                 if let Some(response) = commands::handle_command(&cmd_ctx, &rewritten_cmd).await {
                     return Ok(Some(response));
@@ -677,6 +700,7 @@ impl GatewayRunner {
             cli_availability: &self.cli_availability,
             auth_status: self.auth_status_line(cli_profile.name()),
             active_tasks: Some(&self.active_tasks),
+            gateway_start: self.gateway_start,
         };
         if let Some(response) = commands::handle_command(&cmd_ctx, &msg.text).await {
             return Ok(Some(response));
