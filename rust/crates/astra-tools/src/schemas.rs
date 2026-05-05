@@ -1542,7 +1542,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "spawn_agent",
-                "description": "Launch a sub-agent for independent work. Types: explore, code-review, task, general-purpose.",
+                "description": "Launch a sub-agent for independent work. Types: explore, code-review, task, general-purpose. Returns the agent's result synchronously by default. Set background=true only when you have genuinely independent work to do in parallel — and you MUST then call get_agent_result(agent_id) to retrieve the result, or it will be lost.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1566,8 +1566,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         },
                         "background": {
                             "type": "boolean",
-                            "description": "Run in background (async). If true, returns immediately with agent_id. Default: true.",
-                            "default": true
+                            "description": "Run in background (async). If true, returns immediately with agent_id and you MUST call get_agent_result(agent_id) to collect the output. Default: false (sync — result returned directly).",
+                            "default": false
                         },
                         "name": {
                             "type": "string",
@@ -1591,6 +1591,24 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         }
                     },
                     "required": ["description", "prompt"]
+                }
+            }
+        }),
+        // ── get_agent_result: Retrieve result of background-spawned agent ──────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "get_agent_result",
+                "description": "Retrieve the result of a background-spawned agent. Call this after spawn_agent with background=true to collect the child's output once it finishes. Waits up to 120s for completion; returns status=timeout if the agent is still running.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent_id": {
+                            "type": "string",
+                            "description": "The agent_id returned by spawn_agent."
+                        }
+                    },
+                    "required": ["agent_id"]
                 }
             }
         }),

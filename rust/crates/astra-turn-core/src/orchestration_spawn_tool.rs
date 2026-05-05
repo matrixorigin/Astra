@@ -255,7 +255,7 @@ pub fn spawn_agent_schema() -> serde_json::Value {
                     },
                     "background": {
                         "type": "boolean",
-                        "description": "If true, return immediately with agent_id. Default false waits for the result.",
+                        "description": "If true, return immediately with agent_id and you MUST call get_agent_result(agent_id) to collect the output. Default false waits for the result synchronously.",
                         "default": false
                     },
                     "name": {
