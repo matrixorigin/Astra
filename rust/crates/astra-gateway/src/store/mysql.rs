@@ -22,6 +22,10 @@ impl MysqlGatewayStore {
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
         let pool = sqlx::mysql::MySqlPoolOptions::new()
             .max_connections(5)
+            .idle_timeout(std::time::Duration::from_secs(60))
+            .max_lifetime(std::time::Duration::from_secs(300))
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .test_before_acquire(true)
             .connect(url)
             .await?;
         Ok(Self { pool })
