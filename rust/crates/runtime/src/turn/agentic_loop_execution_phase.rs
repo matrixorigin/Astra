@@ -3890,18 +3890,83 @@ mod tests {
 /// specifics, the full transcript is one read_file away.
 ///
 /// Returns estimated tokens freed.
+// Spill policy tunables — keep ~40% of the tail, shed ~60%. Chosen to
+// meaningfully relieve pressure in a single pass while preserving enough
+// recent turns that the agent doesn't lose working context.
+const SPILL_KEEP_NUMERATOR: usize = 2;
+const SPILL_KEEP_DENOMINATOR: usize = 5;
+const SPILL_MIN_KEEP: usize = 6;
+const SPILL_MIN_TOTAL: usize = 10;
+const SPILL_MIN_SPILL: usize = 4;
+
+/// Adjust `spill_count` so the drain boundary lands on a clean role boundary.
+///
+/// Provider APIs require assistant messages with `tool_calls` / `tool_use`
+/// blocks to be followed by matching tool-result messages with the same ids.
+/// If we spill through the middle of such a pair we'll get 400s on the next
+/// provider call. This walks the boundary *backward* (spilling fewer messages)
+/// until we land in a safe spot:
+///   - the retained prefix does not start with a `tool` / `tool_result` role, and
+///   - the last spilled message is not an assistant with unanswered tool calls.
+fn adjust_spill_boundary_for_tool_pairs(
+    messages: &[serde_json::Value],
+    mut spill_count: usize,
+) -> usize {
+    let is_tool_role = |m: &serde_json::Value| -> bool {
+        matches!(
+            m.get("role").and_then(|r| r.as_str()),
+            Some("tool") | Some("tool_result")
+        )
+    };
+    let has_tool_calls = |m: &serde_json::Value| -> bool {
+        if m.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            return false;
+        }
+        // OpenAI-shape: top-level `tool_calls` array.
+        if m.get("tool_calls")
+            .and_then(|t| t.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        // Anthropic-shape: `content` is an array with `tool_use` blocks.
+        if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
+            return arr
+                .iter()
+                .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
+        }
+        false
+    };
+
+    // Walk backward while the boundary is unsafe. Bail if we'd spill nothing.
+    while spill_count > 0 {
+        let last_spilled = &messages[spill_count - 1];
+        let first_retained = messages.get(spill_count);
+        let retained_starts_with_tool = first_retained.map(is_tool_role).unwrap_or(false);
+        let last_is_pending_assistant = has_tool_calls(last_spilled);
+        if !retained_starts_with_tool && !last_is_pending_assistant {
+            break;
+        }
+        spill_count -= 1;
+    }
+    spill_count
+}
+
 fn spill_old_messages_to_disk(
     messages: &mut Vec<serde_json::Value>,
     session_id: &str,
     round: u32,
 ) -> u64 {
     let total = messages.len();
-    if total < 10 {
+    if total < SPILL_MIN_TOTAL {
         return 0;
     }
-    let keep_count = (total * 2 / 5).max(6);
-    let spill_count = total - keep_count;
-    if spill_count < 4 {
+    let keep_count = (total * SPILL_KEEP_NUMERATOR / SPILL_KEEP_DENOMINATOR).max(SPILL_MIN_KEEP);
+    let mut spill_count = total.saturating_sub(keep_count);
+    // Snap to a safe role boundary so we never split an assistant/tool pair.
+    spill_count = adjust_spill_boundary_for_tool_pairs(messages, spill_count);
+    if spill_count < SPILL_MIN_SPILL {
         return 0;
     }
 
@@ -3913,7 +3978,7 @@ fn spill_old_messages_to_disk(
     let spill_json = match serde_json::to_string_pretty(&to_spill) {
         Ok(json) => json,
         Err(_) => {
-            // Put messages back on failure.
+            // Put messages back in their original position (prefix).
             let mut restored = to_spill;
             restored.append(messages);
             *messages = restored;
@@ -3959,19 +4024,75 @@ fn build_spill_summary(messages: &[serde_json::Value]) -> String {
     let mut files_modified = Vec::new();
     let mut errors = Vec::new();
 
+    // Synthetic/system-injected user messages that shouldn't count as "requests".
+    const SYNTHETIC_USER_PREFIXES: &[&str] = &[
+        "[attention:",
+        "[session-anchor]",
+        "[working-set:",
+        "[session-memory:",
+        "(cached",
+    ];
+    let is_synthetic_user = |s: &str| {
+        SYNTHETIC_USER_PREFIXES
+            .iter()
+            .any(|p| s.trim_start().starts_with(p))
+    };
+
+    // Extract plain text from a `content` field that may be a string or an
+    // array of content blocks (Anthropic shape).
+    let content_text = |v: &serde_json::Value| -> Option<String> {
+        if let Some(s) = v.as_str() {
+            return Some(s.to_string());
+        }
+        if let Some(arr) = v.as_array() {
+            let mut out = String::new();
+            for b in arr {
+                let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if ty == "text" {
+                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                        if !out.is_empty() {
+                            out.push('\n');
+                        }
+                        out.push_str(t);
+                    }
+                }
+            }
+            if !out.is_empty() {
+                return Some(out);
+            }
+        }
+        None
+    };
+
+    // Record a tool invocation, extracting a `path` arg when present.
+    let mut record_tool = |name: &str, args: &serde_json::Value| {
+        let path = args.get("path").and_then(|p| p.as_str());
+        if let Some(p) = path {
+            if matches!(name, "str_replace" | "write_file" | "multi_edit") {
+                let ps = p.to_string();
+                if !files_modified.contains(&ps) {
+                    files_modified.push(ps);
+                }
+            }
+            tools_used.push(format!("{name}({p})"));
+        } else {
+            tools_used.push(name.to_string());
+        }
+    };
+
     for msg in messages {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         match role {
             "user" => {
-                if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                    // Skip system-injected user messages (attention manifests, etc.)
-                    if !content.starts_with("[attention:") && !content.starts_with("(cached") {
+                if let Some(content) = msg.get("content").and_then(content_text) {
+                    if !is_synthetic_user(&content) {
                         let preview: String = content.chars().take(150).collect();
                         user_messages.push(preview);
                     }
                 }
             }
             "assistant" => {
+                // OpenAI-shape: top-level `tool_calls`.
                 if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
                     for tc in tool_calls {
                         let name = tc
@@ -3979,35 +4100,40 @@ fn build_spill_summary(messages: &[serde_json::Value]) -> String {
                             .and_then(|f| f.get("name"))
                             .and_then(|n| n.as_str())
                             .unwrap_or("?");
-                        let args = tc
+                        let args_str = tc
                             .get("function")
                             .and_then(|f| f.get("arguments"))
                             .and_then(|a| a.as_str())
                             .unwrap_or("");
-                        // Extract file path from args if present
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
-                            if let Some(path) = parsed.get("path").and_then(|p| p.as_str()) {
-                                if name == "str_replace" || name == "write_file" {
-                                    if !files_modified.contains(&path.to_string()) {
-                                        files_modified.push(path.to_string());
-                                    }
-                                }
-                                tools_used.push(format!("{name}({path})"));
-                            } else {
-                                tools_used.push(name.to_string());
-                            }
-                        } else {
-                            tools_used.push(name.to_string());
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(args_str).unwrap_or(serde_json::Value::Null);
+                        record_tool(name, &parsed);
+                    }
+                }
+                // Anthropic-shape: content array with `tool_use` blocks.
+                if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+                    for block in arr {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                            let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                            let input = block
+                                .get("input")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            record_tool(name, &input);
                         }
                     }
                 }
-                // Check for error mentions in assistant text
-                if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
-                    if text.contains("error") || text.contains("Error") || text.contains("failed") {
+                // Error mentions in assistant text — require word boundaries
+                // to avoid false positives like "no errors" or "won't fail".
+                if let Some(text) = msg.get("content").and_then(content_text) {
+                    let looks_like_error = text.contains(": error")
+                        || text.contains("Error:")
+                        || text.contains("panicked")
+                        || text.contains("traceback")
+                        || text.contains("Traceback");
+                    if looks_like_error && errors.len() < 5 {
                         let preview: String = text.chars().take(100).collect();
-                        if errors.len() < 5 {
-                            errors.push(preview);
-                        }
+                        errors.push(preview);
                     }
                 }
             }
