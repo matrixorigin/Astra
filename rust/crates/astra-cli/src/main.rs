@@ -77,6 +77,8 @@ mod command_registry;
 mod command_router;
 #[path = "cli/command_usage.rs"]
 mod command_usage;
+#[path = "cli/context_references.rs"]
+mod context_references;
 
 #[path = "cli/delegate_subrun.rs"]
 mod delegate_subrun;
