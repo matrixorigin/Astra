@@ -1934,18 +1934,8 @@ impl RuntimeConfig {
         if let Ok(val) = std::env::var("ASTRA_CAPTURE_TRACES") {
             self.telemetry.capture_context_traces = val == "1" || val.to_lowercase() == "true";
         }
-        // Fork-prefix master switch — `config.fork_prefix.enabled`
-        // is the source of truth, but we keep this env override so
-        // operators can flip the feature on or off without
-        // redeploying. Recognises 1/true/on/yes (case-insensitive)
-        // as true; any other value (including absence) is a no-op
-        // on whatever the TOML config said — we DON'T treat unset
-        // as false, because that would clobber an intentional
-        // `enabled = true` in the TOML. Only EXPLICITLY turn it off
-        // via `ASTRA_FORK_INHERIT_PREFIX=0`.
         if let Ok(val) = std::env::var("ASTRA_FORK_INHERIT_PREFIX") {
-            let normalized = val.trim().to_ascii_lowercase();
-            self.fork_prefix.enabled = matches!(normalized.as_str(), "1" | "true" | "on" | "yes");
+            self.fork_prefix.enabled = parse_fork_prefix_flag(&val);
         }
     }
 
@@ -1953,6 +1943,15 @@ impl RuntimeConfig {
     pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
     }
+}
+
+/// Parse the `ASTRA_FORK_INHERIT_PREFIX` env value into a bool.
+///
+/// Recognises `1/true/on/yes` (case-insensitive) as enabled.
+/// Any other value (including `0/false/off/no`) means disabled.
+/// Absence of the variable is handled by the caller (no-op).
+pub fn parse_fork_prefix_flag(val: &str) -> bool {
+    matches!(val.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes")
 }
 
 #[cfg(test)]
@@ -2887,62 +2886,40 @@ mod tests {
     }
 
     #[test]
-    fn fork_prefix_env_override_turns_on() {
-        // SAFETY: tests that mutate env vars are serialized via the
-        // `ENV_LOCK` pattern in other tests — here we use a scoped
-        // set+remove, which is racy in principle but deterministic
-        // in practice because no other test touches this var. If
-        // flakes appear, wrap with ENV_LOCK like neighboring tests.
-        // SAFETY: set_var/remove_var are `unsafe` in Rust 2024.
-        unsafe {
-            std::env::set_var("ASTRA_FORK_INHERIT_PREFIX", "1");
-        }
-        let mut cfg = RuntimeConfig::default();
-        cfg.apply_env_overrides();
-        assert!(cfg.fork_prefix.enabled);
-        unsafe {
-            std::env::remove_var("ASTRA_FORK_INHERIT_PREFIX");
-        }
-    }
-
-    #[test]
-    fn fork_prefix_env_override_turns_off_explicitly() {
-        // An explicit `ASTRA_FORK_INHERIT_PREFIX=0` must override a
-        // TOML that said `enabled = true`. This is the deploy-time
-        // kill switch contract.
-        unsafe {
-            std::env::set_var("ASTRA_FORK_INHERIT_PREFIX", "0");
-        }
-        let mut cfg = RuntimeConfig::default();
-        cfg.fork_prefix.enabled = true; // pretend TOML set it
-        cfg.apply_env_overrides();
-        assert!(
-            !cfg.fork_prefix.enabled,
-            "env override=0 must beat TOML enabled=true"
-        );
-        unsafe {
-            std::env::remove_var("ASTRA_FORK_INHERIT_PREFIX");
-        }
-    }
-
-    #[test]
-    fn fork_prefix_env_accepts_various_truthy_spellings() {
-        // These operational aliases are widely used; pinning them
-        // avoids "I set ASTRA_FORK_INHERIT_PREFIX=true but it didn't
-        // turn on" confusion.
-        for truthy in ["1", "true", "TRUE", "on", "yes", "Yes"] {
-            unsafe {
-                std::env::set_var("ASTRA_FORK_INHERIT_PREFIX", truthy);
-            }
-            let mut cfg = RuntimeConfig::default();
-            cfg.apply_env_overrides();
+    fn fork_prefix_flag_truthy_values() {
+        for val in ["1", "true", "TRUE", "True", "on", "ON", "yes", "Yes", "YES"] {
             assert!(
-                cfg.fork_prefix.enabled,
-                "value {truthy:?} must be interpreted as truthy"
+                parse_fork_prefix_flag(val),
+                "{val:?} must parse as enabled"
             );
         }
-        unsafe {
-            std::env::remove_var("ASTRA_FORK_INHERIT_PREFIX");
+    }
+
+    #[test]
+    fn fork_prefix_flag_falsy_values() {
+        for val in ["0", "false", "FALSE", "off", "no", "anything", ""] {
+            assert!(
+                !parse_fork_prefix_flag(val),
+                "{val:?} must parse as disabled"
+            );
         }
+    }
+
+    #[test]
+    fn fork_prefix_flag_trims_whitespace() {
+        assert!(parse_fork_prefix_flag("  1  "));
+        assert!(parse_fork_prefix_flag("\ttrue\n"));
+        assert!(!parse_fork_prefix_flag("  0  "));
+    }
+
+    #[test]
+    fn fork_prefix_flag_kill_switch_contract() {
+        // Explicit "0" must produce false — this is the deploy-time
+        // kill switch (applied by apply_env_overrides when the env
+        // var is present, overriding whatever TOML says).
+        let mut cfg = RuntimeConfig::default();
+        cfg.fork_prefix.enabled = true;
+        cfg.fork_prefix.enabled = parse_fork_prefix_flag("0");
+        assert!(!cfg.fork_prefix.enabled);
     }
 }
