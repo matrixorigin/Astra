@@ -110,7 +110,7 @@ fn ten_turn_session_lifecycle() {
         let completion = 300 + (turn_idx as u64 * 50);
         let feedback =
             ContextFeedback::from_usage(0, cache_read, cache_creation, completion, false);
-        sess.record_feedback("claude-sonnet-4-6", "repl", feedback);
+        sess.record_feedback("claude-sonnet-4-6", "repl", feedback, None);
     }
 
     assert_eq!(sess.turns_completed(), 10);
@@ -131,7 +131,7 @@ fn warm_start_from_serialized_stats() {
     let mut first_session = PipelineSession::new(config.clone());
     for _ in 1..=5 {
         let feedback = ContextFeedback::from_usage(0, 900, 100, 400, false);
-        first_session.record_feedback("claude-sonnet-4-6", "repl", feedback);
+        first_session.record_feedback("claude-sonnet-4-6", "repl", feedback, None);
     }
 
     let bytes = serialize_stats(&first_session.stats).expect("serialization should succeed");
@@ -240,7 +240,7 @@ fn response_token_estimator_improves_over_turns() {
 
     for i in 1..=20 {
         let feedback = ContextFeedback::from_usage(0, 0, 0, 1000 + i * 100, false);
-        sess.record_feedback("model", "repl", feedback);
+        sess.record_feedback("model", "repl", feedback, None);
     }
 
     let learned_reserve = sess

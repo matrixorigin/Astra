@@ -197,7 +197,16 @@ impl PipelineSession {
 
     /// Record feedback from the API response. Updates stats, recovery state,
     /// and detects cache breaks. Call this after every successful API response.
-    pub fn record_feedback(&mut self, model_id: &str, query_source: &str, feedback: ContextFeedback) {
+    ///
+    /// Pass `turn_output` to also record per-section token usage (enables
+    /// adaptive budget allocation). If unavailable, pass `None`.
+    pub fn record_feedback(
+        &mut self,
+        model_id: &str,
+        query_source: &str,
+        feedback: ContextFeedback,
+        turn_output: Option<&TurnOutput>,
+    ) {
         self.stats.record(model_id, query_source, &feedback);
         self.recovery.process_feedback(feedback.was_truncated);
 
@@ -209,6 +218,14 @@ impl PipelineSession {
             if tokens_freed > 0 {
                 self.stats.record_compaction(tokens_freed);
             }
+        }
+
+        if let Some(output) = turn_output {
+            let mut usage = std::collections::HashMap::new();
+            for section in &output.optimized.sections {
+                *usage.entry(section.plan.kind).or_insert(0u32) += section.actual_tokens;
+            }
+            self.stats.record_section_usage(&usage);
         }
 
         self.turns_completed += 1;
@@ -335,7 +352,7 @@ mod tests {
     fn record_feedback_increments_turns() {
         let mut sess = PipelineSession::new(PipelineConfig::default());
         let feedback = ContextFeedback::from_usage(1000, 800, 200, 500, false);
-        sess.record_feedback("model", "repl", feedback);
+        sess.record_feedback("model", "repl", feedback, None);
         assert_eq!(sess.turns_completed(), 1);
         assert_eq!(sess.stats.turns_executed, 1);
     }
@@ -344,7 +361,7 @@ mod tests {
     fn feedback_updates_cache_hit_ratio() {
         let mut sess = PipelineSession::new(PipelineConfig::default());
         let feedback = ContextFeedback::from_usage(0, 900, 100, 200, false);
-        sess.record_feedback("model", "repl", feedback);
+        sess.record_feedback("model", "repl", feedback, None);
         assert!((sess.stats.avg_cache_hit_ratio - 0.9).abs() < 1e-9);
     }
 
@@ -411,7 +428,7 @@ mod tests {
         let mut sess = PipelineSession::new(PipelineConfig::default());
         // Simulate: no PTL errors, just a normal successful turn
         let feedback = ContextFeedback::from_usage(1000, 800, 200, 500, false);
-        sess.record_feedback("model", "repl", feedback);
+        sess.record_feedback("model", "repl", feedback, None);
         assert_eq!(sess.recovery.consecutive_ptl_errors, 0);
         assert!(!sess.recovery.is_in_recovery());
     }
@@ -425,7 +442,7 @@ mod tests {
 
         // process_feedback won't clear PTL errors (they're "in flight")
         let feedback = ContextFeedback::from_usage(1000, 800, 200, 500, false);
-        sess.record_feedback("model", "repl", feedback);
+        sess.record_feedback("model", "repl", feedback, None);
         assert_eq!(sess.recovery.consecutive_ptl_errors, 2);
 
         // Explicit reset (runtime calls this after successful retry)
@@ -496,7 +513,7 @@ mod tests {
             };
             let _output = sess.run_turn(input).expect("should not abort");
             let feedback = ContextFeedback::from_usage(0, 800, 200, 300 + i as u64 * 50, false);
-            sess.record_feedback("claude-sonnet-4-6", "repl", feedback);
+            sess.record_feedback("claude-sonnet-4-6", "repl", feedback, None);
         }
 
         assert_eq!(sess.turns_completed(), 5);
@@ -552,5 +569,37 @@ mod tests {
 
         let output = sess.run_turn_adaptive(input).expect("2 PTL should not abort");
         assert_eq!(output.metrics.turn_index, 3);
+    }
+
+    #[test]
+    fn record_feedback_with_output_tracks_section_usage() {
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        let statics = test_statics();
+        let agent = AgentContext::default();
+        let session = test_session_context();
+        let turn = test_turn_state(1);
+        let external = test_external();
+        let limits = OptimizeLimits::default();
+
+        let input = TurnInput {
+            statics: &statics,
+            agent: &agent,
+            session: &session,
+            turn: &turn,
+            external: &external,
+            optimize_limits: &limits,
+            model_id: "model",
+            query_source: "repl",
+        };
+        let output = sess.run_turn(input).unwrap();
+
+        let feedback = ContextFeedback::from_usage(0, 800, 200, 500, false);
+        sess.record_feedback("model", "repl", feedback, Some(&output));
+
+        let history = sess.stats.section_token_history();
+        assert!(
+            !history.is_empty(),
+            "section usage should be recorded from turn output"
+        );
     }
 }
