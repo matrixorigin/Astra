@@ -564,12 +564,16 @@ impl super::traits::SkillResolver for UnifiedSkillResolver {
     }
 
     fn available_skills(&self) -> Vec<SkillToolInfo> {
-        self.registry
+        // Sort by name for deterministic ordering — the skill registry's cache is a
+        // HashMap whose iteration order changes per call. Any byte drift in the
+        // rendered tool schema (skill enum, <available_skills> listing) breaks
+        // Bedrock/Anthropic prompt cache hits.
+        let mut out: Vec<SkillToolInfo> = self
+            .registry
             .all_manifests()
             .into_iter()
             .filter(|m| m.user_invocable)
             .filter(|m| {
-                // Exclude conditional skills that haven't been activated
                 if m.is_conditional() {
                     self.registry.is_skill_activated(&m.name)
                 } else {
@@ -586,7 +590,9 @@ impl super::traits::SkillResolver for UnifiedSkillResolver {
                 tags: m.tags,
                 triggers: m.triggers,
             })
-            .collect()
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 }
 

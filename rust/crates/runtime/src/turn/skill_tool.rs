@@ -555,6 +555,9 @@ pub fn execute_discover_skills(
 }
 
 fn skill_enum_names(skills: &[SkillToolInfo]) -> Vec<String> {
+    // Sort for deterministic ordering — the skill cache is a HashMap, so the
+    // incoming `skills` slice has non-deterministic iteration order. Any byte
+    // drift in the JSON schema breaks Bedrock/Anthropic prompt cache hits.
     let mut seen: HashSet<&str> = skills.iter().map(|s| s.name.as_str()).collect();
     let mut names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
     for skill in skills {
@@ -564,6 +567,7 @@ fn skill_enum_names(skills: &[SkillToolInfo]) -> Vec<String> {
             }
         }
     }
+    names.sort();
     names
 }
 

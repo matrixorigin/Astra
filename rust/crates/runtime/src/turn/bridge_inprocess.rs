@@ -1490,6 +1490,27 @@ impl InProcessChatTurnBridge {
                 task_type,
                 &cache_cfg,
             );
+            // Debug: dump system prompt for cache analysis (env-gated).
+            // Enable with ASTRA_PIPELINE_DUMP_SYSTEM_PROMPT=1. Writes to
+            // $TMPDIR/astra-bridge-prompt-<sid>-<ts>.json so `diff` between
+            // consecutive turns reveals which sections break cache prefix.
+            if std::env::var("ASTRA_PIPELINE_DUMP_SYSTEM_PROMPT").is_ok() {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let sid = if session_id.is_empty() {
+                    "nosid".to_string()
+                } else {
+                    session_id.clone()
+                };
+                let dump_path = std::env::temp_dir().join(format!(
+                    "astra-bridge-prompt-{sid}-{ts}.json"
+                ));
+                let dump_content = serde_json::to_string_pretty(&system_msg)
+                    .unwrap_or_else(|_| "serialize error".into());
+                let _ = std::fs::write(&dump_path, &dump_content);
+            }
             llm_messages.push(system_msg);
             if let Some(dyn_msg) = dynamic_msg {
                 llm_messages.push(dyn_msg);
@@ -3796,20 +3817,23 @@ mod tests {
             "Non-last Global block should not have cache_control"
         );
 
-        // Some block should have cache_control with scope=global (the last Global)
-        let global_cc_block = blocks.iter().find(|b| {
+        // At least one block should have a simple ephemeral cache_control marker.
+        // Note: scope:"global" + ttl:"1h" variants require the extended-cache-ttl-2025-04-11
+        // beta header which Bedrock does not propagate — silently disables cache.
+        let cc_block = blocks.iter().find(|b| {
             b.get("cache_control")
-                .and_then(|cc| cc.get("scope"))
+                .and_then(|cc| cc.get("type"))
                 .and_then(|s| s.as_str())
-                == Some("global")
+                == Some("ephemeral")
         });
         assert!(
-            global_cc_block.is_some(),
-            "should have a block with scope=global cache_control"
+            cc_block.is_some(),
+            "should have a block with ephemeral cache_control"
         );
-        let gcc = &global_cc_block.unwrap()["cache_control"];
+        let gcc = &cc_block.unwrap()["cache_control"];
         assert_eq!(gcc["type"].as_str(), Some("ephemeral"));
-        assert_eq!(gcc["ttl"].as_str(), Some("1h"));
+        assert!(gcc.get("scope").is_none() || gcc["scope"].is_null());
+        assert!(gcc.get("ttl").is_none() || gcc["ttl"].is_null());
 
         // Last block (profile/dynamic) should NOT have cache_control
         let last = blocks.last().unwrap();
@@ -3844,15 +3868,13 @@ mod tests {
                 .and_then(|t| t.as_str())
                 .is_some_and(|t| t.contains("Self-Model"))
         });
-        if let Some(block) = session_block {
-            if let Some(cc) = block.get("cache_control") {
-                assert_eq!(cc["ttl"].as_str(), Some("1h"), "Session should have ttl=1h");
-                // Session should NOT have scope=global (it's per-session)
-                assert!(
-                    cc.get("scope").is_none() || cc["scope"].is_null(),
-                    "Session block should not have scope=global"
-                );
-            }
+        if let Some(block) = session_block
+            && let Some(cc) = block.get("cache_control")
+        {
+            // Simple ephemeral marker — no ttl or scope (Bedrock-compatible).
+            assert_eq!(cc["type"].as_str(), Some("ephemeral"));
+            assert!(cc.get("scope").is_none() || cc["scope"].is_null());
+            assert!(cc.get("ttl").is_none() || cc["ttl"].is_null());
         }
     }
 
@@ -4063,10 +4085,21 @@ mod tests {
             content.is_string(),
             "explicit openai provider should keep string system content even for Claude-named models"
         );
-        assert!(
-            dynamic.is_none(),
-            "empty profile should not create dynamic message"
-        );
+        // Dynamic message may be populated with tool-dependent sections (self_model,
+        // tool_conditional, etc.) — these are CacheScope::None and intentionally live
+        // after the cache marker so they can change per turn without cache invalidation.
+        // If present, dynamic content must NOT include the stable Global sections
+        // (planning, coding discipline, etc.).
+        if let Some(dyn_msg) = dynamic {
+            let dyn_text = dyn_msg
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                !dyn_text.contains("## Planning") && !dyn_text.contains("## Coding Discipline"),
+                "dynamic message must not contain stable Global sections: {dyn_text}"
+            );
+        }
     }
 
     #[test]
@@ -4079,15 +4112,18 @@ mod tests {
             &PromptCacheConfig::latch("openai", "gpt-4"),
         );
         assert!(!sections.is_empty(), "should return prompt sections");
-        // Should have Global + Session scoped sections
+        // Should have Global scope sections. Tool-dependent sections (self-model,
+        // tool-conditional, task-type, search-strategy) are CacheScope::None after
+        // the cache-stability fix — they sit after the Global cache marker so they
+        // can change per turn without invalidating the cached prefix.
         let has_global = sections
             .iter()
             .any(|s| s.scope == crate::prompts::CacheScope::Global);
-        let has_session = sections
+        let has_none = sections
             .iter()
-            .any(|s| s.scope == crate::prompts::CacheScope::Session);
+            .any(|s| s.scope == crate::prompts::CacheScope::None);
         assert!(has_global, "should have Global sections");
-        assert!(has_session, "should have Session sections");
+        assert!(has_none, "should have None-scoped (per-turn) sections");
     }
 
     #[test]
@@ -4301,10 +4337,9 @@ mod tests {
             Some("ephemeral"),
             "last tool should have ephemeral cache_control"
         );
-        assert_eq!(
-            tools[1]["cache_control"]["ttl"].as_str(),
-            Some("1h"),
-            "last tool should have ttl=1h"
+        assert!(
+            tools[1]["cache_control"].get("ttl").is_none(),
+            "simple ephemeral marker — no ttl (Bedrock-compatible)"
         );
     }
 
@@ -4353,7 +4388,10 @@ mod tests {
             tools[2]["cache_control"]["type"].as_str(),
             Some("ephemeral")
         );
-        assert_eq!(tools[2]["cache_control"]["ttl"].as_str(), Some("1h"));
+        assert!(
+            tools[2]["cache_control"].get("ttl").is_none(),
+            "simple ephemeral marker — no ttl (Bedrock-compatible)"
+        );
     }
 
     #[test]
@@ -5005,7 +5043,9 @@ mod tests {
         );
     }
 
-    /// Anthropic: Global breakpoint has scope:"global", Session breakpoint does not.
+    /// Anthropic: simple ephemeral breakpoint on the last Global block.
+    /// Session-scoped sections were demoted to None (tool-dependent, change per turn)
+    /// as part of the cache-stability fix, so only the Global breakpoint remains.
     #[test]
     fn anthropic_scope_annotations_correct() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
@@ -5027,20 +5067,21 @@ mod tests {
             .filter(|b| b.get("cache_control").is_some_and(|cc| !cc.is_null()))
             .collect();
 
-        assert_eq!(cc_blocks.len(), 2, "should have exactly 2 breakpoints");
-
-        // First breakpoint: Global (has scope:"global")
-        let first_cc = &cc_blocks[0]["cache_control"];
-        assert_eq!(first_cc["scope"].as_str(), Some("global"));
-        assert_eq!(first_cc["ttl"].as_str(), Some("1h"));
-
-        // Second breakpoint: Session (no scope field)
-        let second_cc = &cc_blocks[1]["cache_control"];
         assert!(
-            second_cc.get("scope").is_none() || second_cc["scope"].is_null(),
-            "Session breakpoint should not have scope"
+            (1..=2).contains(&cc_blocks.len()),
+            "should have 1–2 breakpoints (Global always; Session optional), got {}",
+            cc_blocks.len()
         );
-        assert_eq!(second_cc["ttl"].as_str(), Some("1h"));
+
+        // All breakpoints are simple ephemeral (Bedrock-compatible, no beta header).
+        // The scope:"global" + ttl:"1h" variants require extended-cache-ttl-2025-04-11
+        // which Bedrock does not propagate — silently disables cache.
+        for cc_block in &cc_blocks {
+            let cc = &cc_block["cache_control"];
+            assert_eq!(cc["type"].as_str(), Some("ephemeral"));
+            assert!(cc.get("scope").is_none() || cc["scope"].is_null());
+            assert!(cc.get("ttl").is_none() || cc["ttl"].is_null());
+        }
     }
 
     /// Anthropic multi-turn: Global prefix is identical across turns with
@@ -5070,25 +5111,15 @@ mod tests {
         let blocks1 = msg1["content"].as_array().unwrap();
         let blocks2 = msg2["content"].as_array().unwrap();
 
-        // Find the Global breakpoint index in each
-        let global_end_1 = blocks1
-            .iter()
-            .position(|b| {
-                b.get("cache_control")
-                    .and_then(|cc| cc.get("scope"))
-                    .and_then(|s| s.as_str())
-                    == Some("global")
-            })
-            .expect("should have global breakpoint");
-        let global_end_2 = blocks2
-            .iter()
-            .position(|b| {
-                b.get("cache_control")
-                    .and_then(|cc| cc.get("scope"))
-                    .and_then(|s| s.as_str())
-                    == Some("global")
-            })
-            .expect("should have global breakpoint");
+        // Global breakpoint is the FIRST block with cache_control (Global → Session order).
+        let first_cc_idx = |blocks: &[Value]| -> usize {
+            blocks
+                .iter()
+                .position(|b| b.get("cache_control").is_some_and(|cc| !cc.is_null()))
+                .expect("should have a cache breakpoint")
+        };
+        let global_end_1 = first_cc_idx(blocks1);
+        let global_end_2 = first_cc_idx(blocks2);
 
         // Same number of Global blocks
         assert_eq!(
@@ -5262,15 +5293,10 @@ mod tests {
         );
 
         let blocks = msg["content"].as_array().unwrap();
-        // Find the Global breakpoint
+        // Global breakpoint is the FIRST block with cache_control (Global → Session order).
         let global_end = blocks
             .iter()
-            .position(|b| {
-                b.get("cache_control")
-                    .and_then(|cc| cc.get("scope"))
-                    .and_then(|s| s.as_str())
-                    == Some("global")
-            })
+            .position(|b| b.get("cache_control").is_some_and(|cc| !cc.is_null()))
             .unwrap();
 
         // No Global block should contain any tool name
@@ -5326,14 +5352,10 @@ mod tests {
 
         let get_global_blocks = |msg: &Value| -> Vec<String> {
             let blocks = msg["content"].as_array().unwrap();
+            // Global breakpoint is the FIRST block with cache_control (Global → Session order).
             let global_end = blocks
                 .iter()
-                .position(|b| {
-                    b.get("cache_control")
-                        .and_then(|cc| cc.get("scope"))
-                        .and_then(|s| s.as_str())
-                        == Some("global")
-                })
+                .position(|b| b.get("cache_control").is_some_and(|cc| !cc.is_null()))
                 .unwrap();
             (0..=global_end)
                 .map(|i| blocks[i]["text"].as_str().unwrap().to_string())

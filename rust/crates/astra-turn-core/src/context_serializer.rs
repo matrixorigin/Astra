@@ -245,12 +245,11 @@ fn apply_cache_policy_to_blocks(
     markers
 }
 
-fn cache_control_for_scope(scope: CacheScope, policy: &ProviderCachePolicy) -> Value {
-    if scope == CacheScope::Global && policy.supports_global_scope {
-        json!({ "type": "ephemeral", "scope": "global", "ttl": "1h" })
-    } else {
-        json!({ "type": "ephemeral", "ttl": "1h" })
-    }
+fn cache_control_for_scope(_scope: CacheScope, _policy: &ProviderCachePolicy) -> Value {
+    // Simple ephemeral marker — compatible with Bedrock Claude and vanilla Anthropic.
+    // The "scope: global" and "ttl: 1h" variants require the extended-cache-ttl-2025-04-11
+    // beta header which Bedrock doesn't propagate; using them silently disables cache.
+    json!({ "type": "ephemeral" })
 }
 
 #[cfg(test)]
@@ -284,7 +283,7 @@ mod tests {
         );
         assert_eq!(
             cached_blocks[0].cache_control.as_ref().unwrap(),
-            &json!({ "type": "ephemeral", "scope": "global", "ttl": "1h" })
+            &json!({ "type": "ephemeral" })
         );
         // None-scoped block should NOT have cache_control
         let none_block = result

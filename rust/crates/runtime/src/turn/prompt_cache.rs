@@ -339,7 +339,7 @@ pub(crate) fn annotate_tool_schemas_for_caching(
     }
     // Mark only the last tool — this creates a single cache covering all tools.
     let last_idx = tools.len() - 1;
-    tools[last_idx]["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
+    tools[last_idx]["cache_control"] = json!({"type": "ephemeral"});
 }
 
 /// Add a cache breakpoint on the last conversation message for Anthropic.
@@ -758,14 +758,8 @@ mod tests {
         assert!(
             cache_controls
                 .iter()
-                .any(|cc| **cc == json!({"type": "ephemeral", "scope": "global", "ttl": "1h"})),
-            "global cache marker should keep production scope+ttl shape: {cache_controls:?}"
-        );
-        assert!(
-            cache_controls
-                .iter()
-                .any(|cc| **cc == json!({"type": "ephemeral", "ttl": "1h"})),
-            "session cache marker should keep ttl shape: {cache_controls:?}"
+                .all(|cc| **cc == json!({"type": "ephemeral"})),
+            "cache markers should be simple ephemeral (Bedrock-compatible, no beta header): {cache_controls:?}"
         );
     }
 

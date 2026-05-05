@@ -2482,6 +2482,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let system_prompt_plain = astra_turn_core::context_serializer::flatten_serialized_system_blocks(
             &pipeline_output.serialized,
         );
+
+        // Debug: dump system prompt for cache analysis (env-gated, zero cost when off).
+        if std::env::var("ASTRA_PIPELINE_DUMP_SYSTEM_PROMPT").is_ok() {
+            let dump_path = std::env::temp_dir().join(format!(
+                "astra-pipeline-prompt-{}-turn{}.txt",
+                self.session_id, state.llm_rounds_completed
+            ));
+            let _ = std::fs::write(&dump_path, &system_prompt_plain);
+        }
         let system_prompt_breakdown = astra_turn_core::context_assembly_trace::SystemPromptBreakdown {
             total_tokens: pipeline_output.metrics.sections,
             ..Default::default()

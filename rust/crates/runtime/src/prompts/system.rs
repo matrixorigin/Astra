@@ -735,25 +735,33 @@ pub fn build_system_prompt_sections_with_style(
         ),
     ];
 
-    // ── Session sections (stable within a session) ──
-    sections.push(PromptSection::stable(
+    // ── Tool-dependent sections (CacheScope::None — change when tool selector
+    //    picks different tools per turn, so they MUST go after the cache marker
+    //    to keep the Global prefix stable) ──
+    sections.push(PromptSection::dynamic(
         self_model_section(tool_names),
-        CacheScope::Session,
+        PromptTokenBucket::BasePersona,
     ));
 
     let tool_cond = tool_conditional_section(tool_names, profile_desc, selection_confidence);
     if !tool_cond.is_empty() {
-        sections.push(PromptSection::stable(tool_cond, CacheScope::Session));
+        sections.push(PromptSection::dynamic(tool_cond, PromptTokenBucket::BasePersona));
     }
 
     let tt = task_type_section(task_type);
     if !tt.is_empty() {
-        sections.push(PromptSection::stable(tt.to_string(), CacheScope::Session));
+        sections.push(PromptSection::dynamic(
+            tt.to_string(),
+            PromptTokenBucket::BasePersona,
+        ));
     }
 
     let ss = search_strategy_section(tool_names);
     if !ss.is_empty() {
-        sections.push(PromptSection::stable(ss.to_string(), CacheScope::Session));
+        sections.push(PromptSection::dynamic(
+            ss.to_string(),
+            PromptTokenBucket::BasePersona,
+        ));
     }
 
     // ── Dynamic sections (change every turn) ──
