@@ -28,6 +28,49 @@ const INITIAL_ACK_DELAY: Duration = Duration::from_secs(3);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 const PROGRESSIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(8);
 const PROGRESSIVE_MIN_CHARS: usize = 200;
+
+// ─── Send Circuit Breaker ───────────────────────────────────────────────────
+
+const SEND_FAILURE_THRESHOLD: u32 = 3;
+
+/// Per-conversation send health tracker. Suppresses heartbeats after
+/// consecutive send failures to avoid flooding an unreachable platform.
+#[derive(Clone, Default)]
+struct SendCircuitBreaker {
+    state: Arc<dashmap::DashMap<String, u32>>,
+}
+
+impl SendCircuitBreaker {
+    fn record_success(&self, key: &str) {
+        self.state.remove(key);
+    }
+
+    fn record_failure(&self, key: &str) {
+        let mut entry = self.state.entry(key.to_string()).or_insert(0);
+        *entry += 1;
+    }
+
+    fn is_open(&self, key: &str) -> bool {
+        self.state
+            .get(key)
+            .map(|v| *v >= SEND_FAILURE_THRESHOLD)
+            .unwrap_or(false)
+    }
+
+    fn reset(&self, key: &str) {
+        self.state.remove(key);
+    }
+}
+
+// ─── Safe String Truncation ─────────────────────────────────────────────────
+
+/// Truncate a string to at most `n` characters, safe for multi-byte UTF-8.
+pub(crate) fn truncate_chars(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
 const CONVERSATION_QUEUE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Number of consecutive auth failures before the circuit breaker trips.
@@ -108,10 +151,10 @@ pub struct GatewayRunner {
     /// Active CLI processes indexed by trace_id. Used by `/kill` to abort
     /// running tasks immediately (SIGKILL) instead of only marking DB state.
     active_tasks: Arc<dashmap::DashMap<String, CancellationToken>>,
-    /// Per-conversation consecutive send failure counter. Workers check this
-    /// before emitting heartbeats — stops sending after 3 failures to avoid
-    /// message flood when platform is unreachable. Reset on successful send.
-    send_health: Arc<dashmap::DashMap<String, u32>>,
+    /// Per-conversation send circuit breaker. Workers check this before
+    /// emitting heartbeats — stops sending after consecutive failures to
+    /// avoid message flood when platform is unreachable.
+    send_health: SendCircuitBreaker,
 }
 
 /// No-op adapter used in spawned CLI tasks (typing/heartbeats not available in background).
@@ -255,7 +298,7 @@ impl GatewayRunner {
             shared_auth,
             request_counter: AtomicU32::new(0),
             active_tasks: Arc::new(dashmap::DashMap::new()),
-            send_health: Arc::new(dashmap::DashMap::new()),
+            send_health: SendCircuitBreaker::default(),
         })
     }
 
@@ -838,9 +881,8 @@ impl GatewayRunner {
         // OutboundMessage with msg.chat_id and tracks failures under
         // that key. Using effective_chat_id here would create a mismatch.
         let health_key = format!("{}:{}", msg.platform, msg.chat_id);
-        const HEARTBEAT_FAILURE_THRESHOLD: u32 = 3;
         // Reset health at task start — previous failures are stale.
-        self.send_health.remove(&health_key);
+        self.send_health.reset(&health_key);
 
         let flush_buf = |buf: &mut String,
                          tx: &Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
@@ -926,10 +968,7 @@ impl GatewayRunner {
                 }
                 _ = &mut next_timer => {
                     // Circuit-breaker: skip heartbeats/flushes when platform is unreachable.
-                    let send_unhealthy = self.send_health.get(&health_key)
-                        .map(|v| *v >= HEARTBEAT_FAILURE_THRESHOLD)
-                        .unwrap_or(false);
-                    if send_unhealthy {
+                    if self.send_health.is_open(&health_key) {
                         next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
                         continue;
                     }
@@ -2061,11 +2100,10 @@ impl GatewayRunner {
         // Track send health for heartbeat circuit-breaker.
         match &result {
             Ok(_) => {
-                self.send_health.remove(&health_key);
+                self.send_health.record_success(&health_key);
             }
             Err((_, error)) => {
-                let mut entry = self.send_health.entry(health_key).or_insert(0);
-                *entry += 1;
+                self.send_health.record_failure(&health_key);
                 if outbound.outbox.is_none() {
                     tracing::debug!(
                         platform = %outbound.platform,
@@ -5021,8 +5059,131 @@ async fn child_kill_guard_kills_on_drop() {
 #[test]
 fn child_kill_guard_defuse_prevents_kill() {
     // Defused guard must NOT kill.
-    let mut guard = crate::cli_bridge::ChildKillGuard { pid: Some(1) };
+    let mut guard = crate::cli_bridge::ChildKillGuard::with_pid(1);
     guard.defuse();
-    assert!(guard.pid.is_none());
+    assert!(guard.is_defused());
     // Drop now — no kill sent (pid is None).
+}
+
+// ── SendCircuitBreaker tests ─────────────────────────────────────────────
+
+#[cfg(test)]
+mod circuit_breaker_tests {
+    use super::*;
+
+    #[test]
+    fn starts_closed() {
+        let cb = SendCircuitBreaker::default();
+        assert!(!cb.is_open("wx:chat1"));
+    }
+
+    #[test]
+    fn opens_after_threshold_failures() {
+        let cb = SendCircuitBreaker::default();
+        let key = "wx:chat1";
+        cb.record_failure(key);
+        cb.record_failure(key);
+        assert!(!cb.is_open(key), "2 failures should not open");
+        cb.record_failure(key);
+        assert!(cb.is_open(key), "3 failures must open");
+    }
+
+    #[test]
+    fn success_resets_to_closed() {
+        let cb = SendCircuitBreaker::default();
+        let key = "wx:chat1";
+        for _ in 0..5 {
+            cb.record_failure(key);
+        }
+        assert!(cb.is_open(key));
+        cb.record_success(key);
+        assert!(!cb.is_open(key));
+    }
+
+    #[test]
+    fn reset_clears_state() {
+        let cb = SendCircuitBreaker::default();
+        let key = "wx:chat1";
+        for _ in 0..5 {
+            cb.record_failure(key);
+        }
+        cb.reset(key);
+        assert!(!cb.is_open(key));
+    }
+
+    #[test]
+    fn independent_keys() {
+        let cb = SendCircuitBreaker::default();
+        for _ in 0..5 {
+            cb.record_failure("wx:chat1");
+        }
+        assert!(cb.is_open("wx:chat1"));
+        assert!(!cb.is_open("wx:chat2"));
+    }
+
+    #[test]
+    fn concurrent_access() {
+        let cb = SendCircuitBreaker::default();
+        let cb2 = cb.clone();
+        let h = std::thread::spawn(move || {
+            for _ in 0..100 {
+                cb2.record_failure("wx:chat1");
+            }
+        });
+        for _ in 0..100 {
+            cb.record_failure("wx:chat1");
+        }
+        h.join().unwrap();
+        // After 200 failures, must be open.
+        assert!(cb.is_open("wx:chat1"));
+    }
+}
+
+// ── truncate_chars tests ─────────────────────────────────────────────────
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::*;
+
+    #[test]
+    fn ascii_within_limit() {
+        assert_eq!(truncate_chars("abcdefgh", 8), "abcdefgh");
+    }
+
+    #[test]
+    fn ascii_over_limit() {
+        assert_eq!(truncate_chars("abcdefghij", 8), "abcdefgh");
+    }
+
+    #[test]
+    fn empty_string() {
+        assert_eq!(truncate_chars("", 8), "");
+    }
+
+    #[test]
+    fn multibyte_chinese() {
+        let s = "你好世界测试数据额外";
+        let truncated = truncate_chars(s, 8);
+        assert_eq!(truncated.chars().count(), 8);
+        assert_eq!(truncated, "你好世界测试数据");
+    }
+
+    #[test]
+    fn multibyte_shorter_than_limit() {
+        let s = "你好";
+        assert_eq!(truncate_chars(s, 8), "你好");
+    }
+
+    #[test]
+    fn emoji_boundary() {
+        let s = "👋🌍🎉✨💫🔥⭐🎯extra";
+        let truncated = truncate_chars(s, 8);
+        assert_eq!(truncated.chars().count(), 8);
+        assert_eq!(truncated, "👋🌍🎉✨💫🔥⭐🎯");
+    }
+
+    #[test]
+    fn zero_limit() {
+        assert_eq!(truncate_chars("hello", 0), "");
+    }
 }

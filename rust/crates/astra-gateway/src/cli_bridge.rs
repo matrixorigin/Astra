@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 /// cancellation (outer task abort) would orphan the child process since
 /// tokio's `Child::drop` does NOT kill the process.
 pub(crate) struct ChildKillGuard {
-    pub(crate) pid: Option<u32>,
+    pid: Option<u32>,
 }
 
 impl ChildKillGuard {
@@ -25,6 +25,16 @@ impl ChildKillGuard {
 
     pub(crate) fn defuse(&mut self) {
         self.pid = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_pid(pid: u32) -> Self {
+        Self { pid: Some(pid) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_defused(&self) -> bool {
+        self.pid.is_none()
     }
 }
 
@@ -737,6 +747,21 @@ pub async fn run_cli_with_cancel(
 /// Core subprocess lifecycle: spawn, stream output, handle timeout/cancel.
 /// Separated from `run_cli_with_cancel` for testability — tests can pass
 /// any `Command` directly without going through `build_command_with_context`.
+/// Kill a child process and abort its I/O tasks. Used by cancel paths.
+async fn abort_child(
+    kill_guard: ChildKillGuard,
+    mut child: tokio::process::Child,
+    stderr_task: tokio::task::JoinHandle<String>,
+    stdout_task: tokio::task::JoinHandle<String>,
+) {
+    // Defuse so drop doesn't redundantly SIGKILL after we explicitly kill.
+    let mut guard = kill_guard;
+    guard.defuse();
+    let _ = child.kill().await;
+    stderr_task.abort();
+    stdout_task.abort();
+}
+
 pub(crate) async fn run_child_with_cancel(
     mut cmd: Command,
     progress_tx: Option<mpsc::Sender<CliProgress>>,
@@ -789,10 +814,18 @@ pub(crate) async fn run_child_with_cancel(
         output
     });
 
+    let cancel_future = async {
+        match cancel.as_ref() {
+            Some(t) => t.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+
     let status = if let Some(timeout) = timeout {
         tokio::select! {
             status = child.wait() => status.map_err(|e| format!("wait failed: {e}"))?,
             _ = tokio::time::sleep(timeout) => {
+                // Timeout — kill and collect stderr for diagnostics.
                 kill_guard.defuse();
                 let _ = child.kill().await;
                 let stderr_text = stderr_task.await.unwrap_or_default();
@@ -804,36 +837,21 @@ pub(crate) async fn run_child_with_cancel(
                     stderr_text.lines().take(10).collect::<Vec<_>>().join("\n")
                 ).trim().to_string());
             }
-            _ = async {
-                match cancel.as_ref() {
-                    Some(t) => t.cancelled().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                kill_guard.defuse();
-                let _ = child.kill().await;
-                stderr_task.abort();
-                stdout_task.abort();
+            _ = cancel_future => {
+                abort_child(kill_guard, child, stderr_task, stdout_task).await;
                 return Err(format!("{name} killed by user"));
             }
         }
     } else {
         tokio::select! {
             status = child.wait() => status.map_err(|e| format!("wait failed: {e}"))?,
-            _ = async {
-                match cancel.as_ref() {
-                    Some(t) => t.cancelled().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                kill_guard.defuse();
-                let _ = child.kill().await;
-                stderr_task.abort();
-                stdout_task.abort();
+            _ = cancel_future => {
+                abort_child(kill_guard, child, stderr_task, stdout_task).await;
                 return Err(format!("{name} killed by user"));
             }
         }
     };
+    // Normal exit — defuse so Drop doesn't send SIGKILL.
     kill_guard.defuse();
 
     let stderr_text = stderr_task.await.unwrap_or_default();

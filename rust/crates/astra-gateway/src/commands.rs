@@ -214,7 +214,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                         .get_current_session(ctx.platform, ctx.chat_id, default_cli_name)
                         .await
                 {
-                    let short = &other_sid[..8.min(other_sid.len())];
+                    let short = crate::runner::truncate_chars(&other_sid, 8);
                     found.push(format!("  `{default_cli_name}`: `{short}…`"));
                 }
                 for (name, _) in ctx.config.cli_profiles.iter() {
@@ -225,7 +225,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                         .get_current_session(ctx.platform, ctx.chat_id, name)
                         .await
                     {
-                        let short = &other_sid[..8.min(other_sid.len())];
+                        let short = crate::runner::truncate_chars(&other_sid, 8);
                         found.push(format!("  `{name}`: `{short}…`"));
                     }
                 }
