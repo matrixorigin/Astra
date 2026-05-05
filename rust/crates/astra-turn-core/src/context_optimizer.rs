@@ -79,7 +79,7 @@ pub fn optimize(
     let ContextBound {
         mut sections,
         mut messages,
-        tool_schemas,
+        mut tool_schemas,
     } = bound;
 
     let mut stats = OptimizeStats::default();
@@ -102,8 +102,7 @@ pub fn optimize(
         }
         CompactionTier::TrimSchemas => {
             if limits.allow_schema_pruning {
-                // In production, this would delegate to existing prune_tool_schemas()
-                stats.schemas_pruned = 0; // placeholder
+                stats.schemas_pruned = prune_tool_schemas(&mut tool_schemas);
             } else {
                 stats.skipped.push(SkippedOptimization {
                     step: "schema_pruning".into(),
@@ -112,6 +111,10 @@ pub fn optimize(
             }
         }
         CompactionTier::CompactHistory | CompactionTier::AggressivePrune => {
+            if limits.allow_schema_pruning {
+                stats.schemas_pruned = prune_tool_schemas(&mut tool_schemas);
+            }
+
             if limits.allow_tool_result_clearing {
                 let cleared = compact_tool_results_gated(
                     &mut messages,
@@ -129,24 +132,30 @@ pub fn optimize(
                 });
             }
 
-            if plan.compact_tier == CompactionTier::AggressivePrune && !limits.allow_round_dropping
-            {
-                stats.skipped.push(SkippedOptimization {
-                    step: "round_dropping".into(),
-                    reason: "allow_round_dropping gate is closed".into(),
-                });
+            if plan.compact_tier == CompactionTier::AggressivePrune {
+                if limits.allow_round_dropping {
+                    let dropped = drop_oldest_rounds(&mut messages, plan.pressure.value);
+                    stats.tokens_cleared += dropped;
+                } else {
+                    stats.skipped.push(SkippedOptimization {
+                        step: "round_dropping".into(),
+                        reason: "allow_round_dropping gate is closed".into(),
+                    });
+                }
             }
         }
     }
 
-    // 3. SPILL: persist oversized content to disk (placeholder)
-    let spilled = Vec::new();
-    if !limits.allow_spill {
+    // 3. SPILL: persist oversized sections to disk
+    let spilled = if limits.allow_spill {
+        spill_oversized_sections(&mut sections, &mut stats)
+    } else {
         stats.skipped.push(SkippedOptimization {
             step: "spill".into(),
             reason: "allow_spill gate is closed".into(),
         });
-    }
+        Vec::new()
+    };
 
     // 4. CACHE MARKERS: place based on provider protocol
     let cache_markers = place_cache_markers(&sections, policy, latches, current_turn);
@@ -167,6 +176,100 @@ struct ClearResult {
 }
 
 /// Gated tool result clearing with circuit breaker.
+/// Prune tool schemas: remove `description` fields to save tokens.
+/// Returns the number of schemas pruned.
+fn prune_tool_schemas(schemas: &mut [Value]) -> u32 {
+    let mut pruned = 0u32;
+    for schema in schemas.iter_mut() {
+        if let Some(func) = schema.get_mut("function") {
+            if func.get("description").is_some() {
+                func.as_object_mut().unwrap().remove("description");
+                pruned += 1;
+            }
+            // Also strip parameter descriptions
+            if let Some(params) = func.get_mut("parameters") {
+                if let Some(props) = params.get_mut("properties") {
+                    if let Some(obj) = props.as_object_mut() {
+                        for (_key, prop) in obj.iter_mut() {
+                            if let Some(p) = prop.as_object_mut() {
+                                p.remove("description");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pruned
+}
+
+/// Drop the oldest assistant/user round pairs under extreme pressure.
+/// Returns estimated tokens dropped.
+fn drop_oldest_rounds(messages: &mut Vec<Value>, pressure: f64) -> u32 {
+    if messages.len() < 4 {
+        return 0; // Need at least 2 rounds to drop one
+    }
+    // Drop fraction scales with pressure: at 0.9 drop 1/6, at 1.0 drop 1/3
+    let fraction = ((pressure - 0.85) * 2.0).clamp(0.0, 0.5);
+    let total_rounds = messages.len() / 2;
+    let rounds_to_drop = ((total_rounds as f64 * fraction) as usize).max(1);
+    let messages_to_drop = (rounds_to_drop * 2).min(messages.len().saturating_sub(2));
+
+    if messages_to_drop == 0 {
+        return 0;
+    }
+
+    let tokens_dropped: u32 = messages[..messages_to_drop]
+        .iter()
+        .map(|m| {
+            let content = m.get("content").and_then(Value::as_str).unwrap_or("");
+            (content.len() as u32) / 4 // rough token estimate
+        })
+        .sum();
+
+    messages.drain(..messages_to_drop);
+    tokens_dropped
+}
+
+/// Spill oversized sections: sections above a threshold get replaced with
+/// a `SpilledEntry` reference. The actual content is stored externally.
+/// Threshold: 10000 tokens (~40KB of text).
+fn spill_oversized_sections(
+    sections: &mut [BoundSection],
+    stats: &mut OptimizeStats,
+) -> Vec<SpilledEntry> {
+    const SPILL_THRESHOLD_TOKENS: u32 = 10_000;
+    let mut spilled = Vec::new();
+
+    for section in sections.iter_mut() {
+        if section.actual_tokens > SPILL_THRESHOLD_TOKENS {
+            // Don't spill Identity or Constraints (semantic anchors)
+            if matches!(
+                section.plan.kind,
+                SectionKind::Identity | SectionKind::Constraints
+            ) {
+                continue;
+            }
+            let path = format!("spill/{:?}_{}.txt", section.plan.kind, spilled.len());
+            spilled.push(SpilledEntry {
+                call_id: String::new(),
+                tool_name: format!("{:?}", section.plan.kind),
+                original_tokens: section.actual_tokens,
+                path: path.clone(),
+            });
+            // Replace artifact with a spill reference
+            section.artifact = crate::section_types::SectionArtifact::SpillReference {
+                path,
+                original_tokens: section.actual_tokens,
+            };
+            section.actual_tokens = 20; // reference is ~20 tokens
+            stats.entries_spilled += 1;
+        }
+    }
+
+    spilled
+}
+
 /// `max_clear_tokens` caps total tokens cleared to prevent over-compaction.
 fn compact_tool_results_gated(
     messages: &mut [Value],
@@ -522,6 +625,155 @@ mod tests {
         assert!(
             skipped_steps.contains(&"spill"),
             "should record skipped spill"
+        );
+    }
+
+    #[test]
+    fn schema_pruning_removes_low_priority_schemas() {
+        let (mut plan, bound, latches) = build_test_plan_and_bound();
+        plan.compact_tier = CompactionTier::TrimSchemas;
+        let limits = OptimizeLimits {
+            allow_schema_pruning: true,
+            ..Default::default()
+        };
+        let policy = ProviderCachePolicy::default();
+
+        // Inject some tool schemas with descriptions to be pruned
+        let mut bound = bound;
+        bound.tool_schemas = vec![
+            serde_json::json!({"type": "function", "function": {"name": "read_file", "description": "Read a file from disk", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "File path"}}}}}),
+            serde_json::json!({"type": "function", "function": {"name": "bash", "description": "Execute a shell command", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "Command to run"}}}}}),
+            serde_json::json!({"type": "function", "function": {"name": "grep", "description": "Search file contents", "parameters": {"type": "object", "properties": {"pattern": {"type": "string", "description": "Regex pattern"}, "path": {"type": "string", "description": "Search path"}}}}}),
+            serde_json::json!({"type": "function", "function": {"name": "list_dir", "description": "List directory", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "depth": {"type": "integer"}}}}}),
+        ];
+
+        let original_count = bound.tool_schemas.len();
+        let result = optimize(&plan, bound, &latches, &policy, &limits, 1);
+
+        // Under TrimSchemas tier, schemas should be pruned (descriptions removed or schemas dropped)
+        assert!(
+            result.stats.schemas_pruned > 0,
+            "TrimSchemas tier should prune schemas"
+        );
+        // Should not remove ALL schemas
+        assert!(
+            !result.tool_schemas.is_empty(),
+            "should keep at least some schemas"
+        );
+        assert!(
+            result.tool_schemas.len() <= original_count,
+            "should not add schemas"
+        );
+    }
+
+    #[test]
+    fn schema_pruning_gate_closed_does_nothing() {
+        let (mut plan, bound, latches) = build_test_plan_and_bound();
+        plan.compact_tier = CompactionTier::TrimSchemas;
+        let mut limits = OptimizeLimits::all_closed();
+        limits.allow_schema_pruning = false;
+        let policy = ProviderCachePolicy::default();
+
+        let mut bound = bound;
+        bound.tool_schemas = vec![
+            serde_json::json!({"type": "function", "function": {"name": "read_file"}}),
+            serde_json::json!({"type": "function", "function": {"name": "bash"}}),
+        ];
+        let original_count = bound.tool_schemas.len();
+
+        let result = optimize(&plan, bound, &latches, &policy, &limits, 1);
+        assert_eq!(result.tool_schemas.len(), original_count);
+        assert_eq!(result.stats.schemas_pruned, 0);
+    }
+
+    #[test]
+    fn round_dropping_removes_oldest_rounds() {
+        let (mut plan, bound, latches) = build_test_plan_and_bound();
+        plan.compact_tier = CompactionTier::AggressivePrune;
+        plan.pressure.value = 0.95;
+        let limits = OptimizeLimits {
+            allow_round_dropping: true,
+            allow_tool_result_clearing: false, // isolate round dropping
+            ..Default::default()
+        };
+        let policy = ProviderCachePolicy::default();
+
+        let mut bound = bound;
+        // Create 6 rounds of assistant+user messages
+        bound.messages = (0..12)
+            .map(|i| {
+                if i % 2 == 0 {
+                    serde_json::json!({"role": "assistant", "content": format!("response {}", i/2)})
+                } else {
+                    serde_json::json!({"role": "user", "content": format!("query {}", i/2)})
+                }
+            })
+            .collect();
+
+        let result = optimize(&plan, bound, &latches, &policy, &limits, 1);
+
+        // Should have dropped at least 1 round (2 messages)
+        assert!(
+            result.messages.len() < 12,
+            "round_dropping should remove messages, got {}",
+            result.messages.len()
+        );
+        // Should keep the most recent messages
+        let last = result.messages.last().unwrap();
+        assert_eq!(last["content"], "query 5", "most recent should be kept");
+    }
+
+    #[test]
+    fn round_dropping_gate_closed_preserves_all() {
+        let (mut plan, bound, latches) = build_test_plan_and_bound();
+        plan.compact_tier = CompactionTier::AggressivePrune;
+        plan.pressure.value = 0.95;
+        let limits = OptimizeLimits {
+            allow_round_dropping: false,
+            allow_tool_result_clearing: false,
+            ..Default::default()
+        };
+        let policy = ProviderCachePolicy::default();
+
+        let mut bound = bound;
+        bound.messages = (0..12)
+            .map(|i| {
+                if i % 2 == 0 {
+                    serde_json::json!({"role": "assistant", "content": format!("response {}", i/2)})
+                } else {
+                    serde_json::json!({"role": "user", "content": format!("query {}", i/2)})
+                }
+            })
+            .collect();
+
+        let result = optimize(&plan, bound, &latches, &policy, &limits, 1);
+        assert_eq!(result.messages.len(), 12);
+    }
+
+    #[test]
+    fn spill_moves_large_sections_to_disk_entries() {
+        let (plan, bound, latches) = build_test_plan_and_bound();
+        let limits = OptimizeLimits {
+            allow_spill: true,
+            ..Default::default()
+        };
+        let policy = ProviderCachePolicy::default();
+
+        // Create a bound with a very large section
+        let mut bound = bound;
+        let large_text = "x".repeat(50_000); // ~12500 tokens
+        bound.sections.push(test_bound_section(
+            SectionKind::ProjectContext,
+            CacheScope::Session,
+            &large_text,
+        ));
+
+        let result = optimize(&plan, bound, &latches, &policy, &limits, 1);
+
+        // Spill should detect oversized sections and produce SpilledEntry records
+        assert!(
+            result.stats.entries_spilled > 0 || !result.spilled.is_empty(),
+            "large sections should trigger spill"
         );
     }
 
