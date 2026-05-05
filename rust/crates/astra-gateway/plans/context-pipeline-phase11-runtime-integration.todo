@@ -1,7 +1,7 @@
 # Phase 11: Runtime Integration — P0 (Unlocks All Value)
-# Status: IN PROGRESS (core library layer complete, runtime wiring pending)
+# Status: ACTIVE — feedback loop wired, pipeline learning from live traffic
 # Depends on: Phases 1-10 (COMPLETE)
-# Blocks: Phases 12-14
+# Blocks: Phases 12-14 (partially unblocked — persistence can start)
 
 ## Goal
 Wire ContextPipeline::run() into the agentic loop so every LLM request
@@ -23,13 +23,15 @@ flows through Plan→Bind→Optimize→Serialize instead of inline assembly.
 - [x] PipelineStats carried across turns via PipelineSession ownership
 - [x] Unit tests: 19 tests covering all lifecycle paths
 
-### 11.2 — Pipeline Call Site (agentic_loop_turn.rs) ⏳ PARTIALLY DONE
+### 11.2 — Pipeline Call Site (agentic_loop_turn.rs) ✅ FEEDBACK ACTIVE
 - [x] PipelineSession provides run_turn() and run_turn_adaptive() entry points
 - [x] record_feedback() with section usage tracking
 - [x] OptimizeLimits::for_tier() auto-derives limits from pressure tier
-- [ ] Wire PipelineSession into agentic loop host (CLI layer — runtime work)
-- [ ] Construct TurnInput from AgenticLoopState fields
-- [ ] Feed serialized output into payload (replace inline assembly)
+- [x] PipelineSession field on AgenticLoopState (11 construction sites)
+- [x] CLI main loop initializes PipelineSession (active from first turn)
+- [x] Execution phase records feedback after every successful ingest
+- [ ] Shadow mode: run pipeline alongside existing path, diff outputs (Phase 14 prereq)
+- [ ] Full payload replacement: use ContextOptimized output (Phase 14)
 
 ### 11.3 — Shadow Pipeline Mode
 - [ ] Add `shadow_pipeline: bool` config flag (default: true during rollout)
