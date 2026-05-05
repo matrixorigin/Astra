@@ -3130,7 +3130,30 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             captured_at_secs,
             microcompact_fired_in_turn: false,
         };
-        let _ = astra_turn_core::fork_capture::capture_parent_prefix(req, store.as_ref());
+        // Route the capture outcome to telemetry rather than discarding it —
+        // silent drops hide "child sub-run started without inheriting parent
+        // cache prefix" and "prefix store ran out of room" conditions, both
+        // of which directly degrade cache hit rate on delegated runs.
+        match astra_turn_core::fork_capture::capture_parent_prefix(req, store.as_ref()) {
+            astra_turn_core::fork_capture::ForkCaptureOutcome::Captured { prefix_id, evicted } => {
+                if !evicted.is_empty() {
+                    astra_core::agent_warn!(
+                        "fork_prefix",
+                        "parent prefix captured ({prefix_id}); evicted {} old entries to make room: {:?}",
+                        evicted.len(),
+                        evicted
+                    );
+                }
+            }
+            astra_turn_core::fork_capture::ForkCaptureOutcome::FeatureDisabled => {}
+            astra_turn_core::fork_capture::ForkCaptureOutcome::Skipped { reason } => {
+                astra_core::agent_warn!(
+                    "fork_prefix",
+                    "parent prefix capture skipped ({reason:?}) — child sub-runs in this \
+                     session will start with cold cache"
+                );
+            }
+        }
     }
 
     fn inject_tool_schema(&mut self, schema: Value) {

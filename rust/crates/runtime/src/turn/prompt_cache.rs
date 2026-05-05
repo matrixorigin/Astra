@@ -84,6 +84,23 @@ fn section_cache() -> &'static Mutex<HashMap<u64, CachedSections>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Log a poisoned `section_cache` mutex exactly once per process. Without
+/// this, a panic in one turn would silently disable the HashMap cache for
+/// the rest of the process and cache-hit ratio would collapse with zero
+/// operator signal. The HashMap itself is pure data — recovering the
+/// `into_inner()` value is safe.
+fn warn_section_cache_poisoned() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        astra_core::agent_warn!(
+            "prompt_cache",
+            "section_cache mutex poisoned (prior panic mid-build). Recovering inner \
+             HashMap — cache will continue to function but investigate the panic source."
+        );
+    }
+}
+
 fn pinned_cache_edits() -> &'static Mutex<HashMap<String, Vec<String>>> {
     static PINS: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
     PINS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -195,17 +212,29 @@ pub(crate) fn build_system_message_with_dynamic_sections(
         output_style_fingerprint(output_style),
     );
 
-    // Try cache for the stable (Global + Session) + dynamic (None-scoped) sections
-    let cached = if let Ok(cache) = section_cache().lock() {
-        cache.get(&key).map(|c| {
+    // Try cache for the stable (Global + Session) + dynamic (None-scoped) sections.
+    // `section_cache()` is a process-global Mutex — if a prior panic poisoned it,
+    // recover the inner state (the cache is a pure HashMap so there's nothing
+    // to corrupt) and log so operators see WHY cache hit rate fell off a cliff.
+    let cached = match section_cache().lock() {
+        Ok(cache) => cache.get(&key).map(|c| {
             (
                 c.text.clone(),
                 c.sections.clone(),
                 c.dynamic_sections.clone(),
             )
-        })
-    } else {
-        None
+        }),
+        Err(poisoned) => {
+            warn_section_cache_poisoned();
+            let cache = poisoned.into_inner();
+            cache.get(&key).map(|c| {
+                (
+                    c.text.clone(),
+                    c.sections.clone(),
+                    c.dynamic_sections.clone(),
+                )
+            })
+        }
     };
 
     let (stable_text, sections, runtime_dynamic_sections) = cached.unwrap_or_else(|| {
@@ -233,7 +262,14 @@ pub(crate) fn build_system_message_with_dynamic_sections(
             .collect::<Vec<_>>()
             .join("");
 
-        if let Ok(mut cache) = section_cache().lock() {
+        let cache_guard = match section_cache().lock() {
+            Ok(g) => Some(g),
+            Err(poisoned) => {
+                warn_section_cache_poisoned();
+                Some(poisoned.into_inner())
+            }
+        };
+        if let Some(mut cache) = cache_guard {
             if cache.len() > 32 {
                 cache.clear();
             }
@@ -354,7 +390,21 @@ pub(crate) fn annotate_tool_schemas_for_caching_with_pinned(
     if !cache_cfg.should_annotate() || tools.is_empty() {
         return;
     }
-    let marker_idx = last_pinned_tool_index(tools, pinned_names).unwrap_or(tools.len() - 1);
+    let marker_idx = match last_pinned_tool_index(tools, pinned_names) {
+        Some(idx) => idx,
+        None => {
+            // Fallback path: no pinned tool present in this tool list. Legit
+            // for delegated sub-runs that pass a fully custom toolset, but a
+            // cache-hit regression triage needs to see it — otherwise "why
+            // does this sub-run cache worse than its parent?" is opaque.
+            tracing::debug!(
+                tool_count = tools.len(),
+                "cache marker fallback: no pinned tools present; placing on last tool. \
+                 Static-prefix caching unavailable for this request."
+            );
+            tools.len() - 1
+        }
+    };
     tools[marker_idx]["cache_control"] = json!({"type": "ephemeral"});
 }
 

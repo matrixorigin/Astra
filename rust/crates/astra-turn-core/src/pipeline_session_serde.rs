@@ -49,34 +49,76 @@ pub struct RestoredPipelineState {
 
 /// Deserialize pipeline state from a JSON Value (from `HeavyCheckpoint.pipeline_state`).
 ///
-/// Returns `None` if the value is null/missing or cannot be parsed.
-/// On version mismatch or partial corruption, returns what can be recovered
-/// with defaults for unreadable fields.
-pub fn deserialize_session_state(value: &Value) -> Option<RestoredPipelineState> {
+/// Fallible variant that distinguishes three cases:
+///   - `Ok(None)`  — value is null or an empty object (legitimate: old
+///     checkpoint written before pipeline_state was added).
+///   - `Ok(Some(state))` — parsed successfully.
+///   - `Err(e)`    — payload is present but corrupt / schema-incompatible.
+///     Callers that care about observability (runtime, cloud restore)
+///     must log the error — a silent drop hides warm-start failures.
+///
+/// On successful parse, transient recovery fields (`consecutive_ptl_errors`,
+/// `consecutive_same_errors`, `has_attempted_reactive_compact`) are cleared
+/// because PTL errors are in-flight state that doesn't carry across session
+/// boundaries. Escalation counters are preserved for reserve widening.
+pub fn deserialize_session_state_fallible(
+    value: &Value,
+) -> Result<Option<RestoredPipelineState>, serde_json::Error> {
     if value.is_null() {
-        return None;
+        return Ok(None);
     }
-    let envelope: PipelineStateEnvelope = serde_json::from_value(value.clone()).ok()?;
+    // Empty object is treated as "field missing" — old checkpoints that never
+    // populated pipeline_state show up this way in the persisted JSON.
+    if value.as_object().is_some_and(|o| o.is_empty()) {
+        return Ok(None);
+    }
+    let envelope: PipelineStateEnvelope = serde_json::from_value(value.clone())?;
     // Version gate: if future versions need migration, handle here.
     // For now, version 1 is the only version.
     if envelope.version > CURRENT_VERSION {
-        // Future version — take what we can (serde ignores unknown fields)
-        // but log that we may have lost fidelity.
+        // Future version — serde ignored unknown fields during deserialization,
+        // so we may have lost fidelity. Log once rather than silently pretending
+        // the restore was clean.
+        tracing::warn!(
+            checkpoint_version = envelope.version,
+            supported_version = CURRENT_VERSION,
+            "pipeline_state checkpoint is from a newer version; unknown fields dropped"
+        );
     }
 
     let mut recovery = envelope.recovery;
-    // On session resume, clear transient error state but preserve escalation history.
-    // PTL errors are "in flight" — they don't carry across session boundaries.
-    // Output escalation count is preserved for reserve widening.
     recovery.consecutive_ptl_errors = 0;
     recovery.consecutive_same_errors = 0;
     recovery.has_attempted_reactive_compact = false;
 
-    Some(RestoredPipelineState {
+    Ok(Some(RestoredPipelineState {
         stats: envelope.stats,
         latches: envelope.latches,
         recovery,
-    })
+    }))
+}
+
+/// Back-compat wrapper around [`deserialize_session_state_fallible`] that
+/// collapses the corrupt-payload case into `None`.
+///
+/// **Prefer the fallible variant in new code.** This wrapper is kept for
+/// the handful of callers that can't meaningfully act on a parse error
+/// (e.g., fire-and-forget telemetry); when they upgrade, delete this.
+///
+/// On corrupt input this still logs via `tracing::warn!` so operators
+/// aren't left with zero signal — the old version was `.ok()?` with no log.
+pub fn deserialize_session_state(value: &Value) -> Option<RestoredPipelineState> {
+    match deserialize_session_state_fallible(value) {
+        Ok(opt) => opt,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "pipeline_state checkpoint is corrupt; starting fresh. \
+                 Warm-start data lost — cache/feedback history reset to defaults"
+            );
+            None
+        }
+    }
 }
 
 /// Serialize PipelineStats to JSON bytes for persistence (legacy API).
@@ -207,5 +249,59 @@ mod tests {
         // Old checkpoints have no pipeline_state field — should gracefully return None
         assert!(deserialize_session_state(&Value::Null).is_none());
         assert!(deserialize_session_state(&serde_json::json!({})).is_none());
+    }
+
+    /// Review gap: the original `deserialize_session_state` collapsed
+    /// "missing pipeline_state" and "corrupt pipeline_state" into the same
+    /// `None`, leaving operators blind to restoration failures. The
+    /// fallible twin distinguishes:
+    ///   - `Ok(None)` → null / missing (old checkpoint, legitimate)
+    ///   - `Ok(Some(_))` → parsed successfully
+    ///   - `Err(_)` → present but corrupt / schema-broken; caller MUST log
+    #[test]
+    fn fallible_variant_distinguishes_missing_from_corrupt() {
+        // Missing → Ok(None)
+        let res = deserialize_session_state_fallible(&Value::Null);
+        assert!(matches!(res, Ok(None)));
+        let res = deserialize_session_state_fallible(&serde_json::json!({}));
+        assert!(matches!(res, Ok(None)));
+
+        // Corrupt (right shape, wrong types) → Err
+        let corrupt = serde_json::json!({
+            "version": "not_a_number",
+            "stats": {},
+            "latches": {},
+            "recovery": {}
+        });
+        let res = deserialize_session_state_fallible(&corrupt);
+        assert!(
+            matches!(res, Err(_)),
+            "corrupt payload must surface as Err, not Ok(None): {res:?}"
+        );
+
+        // Valid → Ok(Some)
+        let valid = serialize_session_state(
+            &PipelineStats::default(),
+            &SessionLatches::default(),
+            &RecoveryState::default(),
+        )
+        .unwrap();
+        let res = deserialize_session_state_fallible(&valid);
+        assert!(matches!(res, Ok(Some(_))));
+    }
+
+    /// Backward-compat shim: the non-fallible `deserialize_session_state`
+    /// retains the old `Option<_>` signature for callers that don't want
+    /// three-way handling, but behaviour is STILL to collapse corrupt →
+    /// None. Document that convention so nobody removes the shim without
+    /// updating every caller.
+    #[test]
+    fn legacy_non_fallible_variant_still_collapses_corrupt_to_none() {
+        let corrupt = serde_json::json!({"version": "bad", "stats": {}, "latches": {}, "recovery": {}});
+        assert!(
+            deserialize_session_state(&corrupt).is_none(),
+            "legacy API collapses corrupt to None for back-compat — callers wanting \
+             the distinction must use deserialize_session_state_fallible()"
+        );
     }
 }
