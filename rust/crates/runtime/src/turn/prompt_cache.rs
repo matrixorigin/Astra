@@ -10,6 +10,8 @@ use std::sync::{Mutex, OnceLock};
 use serde_json::{Value, json};
 
 use crate::prompts;
+use astra_turn_core::context_serializer::serialize_prompt_sections;
+use astra_turn_core::pipeline_config::ProviderCachePolicy;
 
 const DEFAULT_CACHE_EDIT_PIN_KEY: &str = "__default__";
 const MAX_PINNED_CACHE_EDIT_SESSIONS: usize = 1024;
@@ -261,43 +263,16 @@ pub(crate) fn build_system_message_with_dynamic_sections(
     };
 
     if is_anthropic {
-        // Anthropic: multi-block content with cache_control on stable sections.
-        //
-        // Cache strategy:
-        //   Place cache_control on the LAST block of each scope group.
-        //   Anthropic allows up to 4 breakpoints per request — we use at most 2
-        //   (last Global, last Session). The provider caches the prefix up to
-        //   each breakpoint.
-        //
-        //   Global  → scope:"global" + ttl:"1h"  (shared across all sessions/orgs)
-        //   Session → ttl:"1h"                    (stable within a session)
-        //   None    → no cache_control             (changes every turn)
-        let cache_disabled = !cache_cfg.cache_enabled;
-
-        // Find the last index of each scope group for breakpoint placement
-        let last_global = sections
-            .iter()
-            .rposition(|s| s.scope == prompts::CacheScope::Global);
-        let last_session = sections
-            .iter()
-            .rposition(|s| s.scope == prompts::CacheScope::Session);
-
-        let mut blocks: Vec<Value> = Vec::with_capacity(sections.len() + 1);
-        for (i, section) in sections.iter().enumerate() {
-            let cc = if cache_disabled {
-                None
-            } else if Some(i) == last_global {
-                Some(json!({"type": "ephemeral", "scope": "global", "ttl": "1h"}))
-            } else if Some(i) == last_session {
-                Some(json!({"type": "ephemeral", "ttl": "1h"}))
-            } else {
-                None
-            };
+        let policy = provider_policy_for_prompt_cache(cache_cfg);
+        let serialized = serialize_prompt_sections(&sections, &policy);
+        let mut blocks: Vec<Value> =
+            Vec::with_capacity(serialized.system_blocks.len() + all_dynamic_sections.len());
+        for section in serialized.system_blocks {
             let mut block = json!({
                 "type": "text",
                 "text": section.text,
             });
-            if let Some(cc) = cc {
+            if let Some(cc) = section.cache_control {
                 block["cache_control"] = cc;
             }
             blocks.push(block);
@@ -335,6 +310,17 @@ pub(crate) fn build_system_message_with_dynamic_sections(
             }))
         };
         (primary, dynamic, append_dynamic(sections))
+    }
+}
+
+fn provider_policy_for_prompt_cache(cache_cfg: &PromptCacheConfig) -> ProviderCachePolicy {
+    if cache_cfg.cache_enabled {
+        ProviderCachePolicy::anthropic()
+    } else {
+        ProviderCachePolicy {
+            max_markers: 0,
+            ..ProviderCachePolicy::anthropic()
+        }
     }
 }
 
@@ -764,6 +750,22 @@ mod tests {
         assert!(
             content.iter().any(|b| b.get("cache_control").is_some()),
             "Anthropic should have cache_control blocks"
+        );
+        let cache_controls: Vec<_> = content
+            .iter()
+            .filter_map(|block| block.get("cache_control"))
+            .collect();
+        assert!(
+            cache_controls
+                .iter()
+                .any(|cc| **cc == json!({"type": "ephemeral", "scope": "global", "ttl": "1h"})),
+            "global cache marker should keep production scope+ttl shape: {cache_controls:?}"
+        );
+        assert!(
+            cache_controls
+                .iter()
+                .any(|cc| **cc == json!({"type": "ephemeral", "ttl": "1h"})),
+            "session cache marker should keep ttl shape: {cache_controls:?}"
         );
     }
 

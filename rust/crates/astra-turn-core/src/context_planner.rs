@@ -316,6 +316,26 @@ mod tests {
     }
 
     #[test]
+    fn section_feedback_changes_next_turn_plan_budget_with_floor() {
+        let (tokens, recovery, latches, mut stats, policy) = default_input();
+        let mut usage = std::collections::HashMap::new();
+        usage.insert(SectionKind::Memory, 1);
+        stats.record_section_usage(&usage);
+
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+
+        assert_eq!(plan.budget.budget_for(SectionKind::History), 0);
+        assert_eq!(plan.budget.budget_for(SectionKind::Memory), 256);
+        let planned_memory = plan
+            .sections
+            .iter()
+            .find(|section| section.kind == SectionKind::Memory)
+            .expect("memory section should be planned when memory is available");
+        assert_eq!(planned_memory.estimated_tokens, 256);
+    }
+
+    #[test]
     fn plan_section_manifest_does_not_emit_hollow_history_section() {
         let (tokens, recovery, latches, stats, policy) = default_input();
         let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);

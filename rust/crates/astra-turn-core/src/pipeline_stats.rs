@@ -258,14 +258,25 @@ impl PipelineStats {
     pub fn section_token_history(&self) -> HashMap<crate::section_types::SectionKind, u32> {
         self.section_usage_ema
             .iter()
-            .map(|(&k, &v)| (k, v.round() as u32))
+            .map(|(&k, &v)| (k, f64_to_u32_saturating(v.round())))
             .collect()
     }
+}
+
+fn f64_to_u32_saturating(value: f64) -> u32 {
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+    if value >= u32::MAX as f64 {
+        return u32::MAX;
+    }
+    value as u32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::section_types::SectionKind;
 
     fn make_feedback(completion: u64, cache_read: u64, cache_creation: u64) -> ContextFeedback {
         ContextFeedback::from_usage(0, cache_read, cache_creation, completion, false)
@@ -320,6 +331,22 @@ mod tests {
         // Second turn: ratio = 0.0, EMA = 0.9 * 1.0 + 0.1 * 0.0 = 0.9
         stats.record("m", "s", &make_feedback(100, 0, 1000));
         assert!((stats.avg_cache_hit_ratio - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn section_token_history_clamps_non_finite_and_huge_values() {
+        let mut stats = PipelineStats::default();
+        stats
+            .section_usage_ema
+            .insert(SectionKind::Memory, f64::NAN);
+        stats
+            .section_usage_ema
+            .insert(SectionKind::ProjectContext, (u32::MAX as f64) * 2.0);
+
+        let history = stats.section_token_history();
+
+        assert_eq!(history[&SectionKind::Memory], 0);
+        assert_eq!(history[&SectionKind::ProjectContext], u32::MAX);
     }
 
     #[test]

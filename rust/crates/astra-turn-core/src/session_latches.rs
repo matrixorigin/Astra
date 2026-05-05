@@ -32,6 +32,8 @@ pub struct SessionLatches {
     /// Cache scope eligibility (e.g., 1h TTL, global scope).
     /// Evaluated once, then frozen to prevent mid-session scope flips.
     pub cache_scope: Option<CacheScope>,
+    /// Turn where cache scope first latched.
+    pub cache_scope_latched_at_turn: Option<u32>,
     /// Provider-specific feature gates that affect serialization.
     pub provider_features: Vec<LatchedFeature>,
 }
@@ -60,11 +62,12 @@ impl SessionLatches {
 
     /// Attempt to latch the cache scope. If already latched, this is a no-op.
     /// Returns `true` if the scope was newly latched.
-    pub fn latch_cache_scope(&mut self, scope: CacheScope) -> bool {
+    pub fn latch_cache_scope(&mut self, scope: CacheScope, turn: u32) -> bool {
         if self.cache_scope.is_some() {
             return false;
         }
         self.cache_scope = Some(scope);
+        self.cache_scope_latched_at_turn = Some(turn);
         true
     }
 
@@ -96,6 +99,7 @@ impl SessionLatches {
         self.beta_headers
             .iter()
             .any(|h| h.latched_at_turn == current_turn)
+            || self.cache_scope_latched_at_turn == Some(current_turn)
             || self
                 .provider_features
                 .iter()
@@ -112,6 +116,7 @@ mod tests {
         let l = SessionLatches::default();
         assert!(l.beta_headers.is_empty());
         assert!(l.cache_scope.is_none());
+        assert!(l.cache_scope_latched_at_turn.is_none());
         assert!(l.provider_features.is_empty());
     }
 
@@ -128,9 +133,12 @@ mod tests {
     #[test]
     fn cache_scope_frozen_after_first() {
         let mut l = SessionLatches::default();
-        assert!(l.latch_cache_scope(CacheScope::Global));
-        assert!(!l.latch_cache_scope(CacheScope::Session));
+        assert!(l.latch_cache_scope(CacheScope::Global, 4));
+        assert!(!l.latch_cache_scope(CacheScope::Session, 5));
         assert_eq!(l.cache_scope, Some(CacheScope::Global));
+        assert_eq!(l.cache_scope_latched_at_turn, Some(4));
+        assert!(l.any_flipped_this_turn(4));
+        assert!(!l.any_flipped_this_turn(5));
     }
 
     #[test]

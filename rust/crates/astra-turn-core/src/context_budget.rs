@@ -68,12 +68,6 @@ impl TokenBudget {
         let limit = effective_limit as f64;
 
         let fixed_budget = (limit * 0.10).min(2000.0) as u32;
-        let history_ratio = match tier {
-            CompactionTier::Normal => 0.50,
-            CompactionTier::TrimSchemas => 0.40,
-            CompactionTier::CompactHistory => 0.30,
-            CompactionTier::AggressivePrune => 0.15,
-        };
         let memory_ratio = match tier {
             CompactionTier::Normal => 0.15,
             CompactionTier::TrimSchemas => 0.12,
@@ -85,22 +79,11 @@ impl TokenBudget {
         allocations.insert(SectionKind::Identity, fixed_budget);
         allocations.insert(SectionKind::Constraints, fixed_budget);
 
-        // History: shrink toward observed + 50% headroom if we have data
-        let history_max = (limit * history_ratio) as u32;
-        let history_budget = if let Some(&observed) = section_history.get(&SectionKind::History) {
-            // observed + 50% headroom, but never exceed tier max
-            let with_headroom = observed.saturating_add(observed / 2);
-            with_headroom.min(history_max)
-        } else {
-            history_max
-        };
-        allocations.insert(SectionKind::History, history_budget);
-
-        // Memory: same shrink logic
+        // Conversation history is carried as provider messages, not a planned
+        // text section, so it must not reserve section budget here.
         let memory_max = (limit * memory_ratio) as u32;
         let memory_budget = if let Some(&observed) = section_history.get(&SectionKind::Memory) {
-            let with_headroom = observed.saturating_add(observed / 2);
-            with_headroom.min(memory_max)
+            observed_budget_with_floor(observed, memory_max)
         } else {
             memory_max
         };
@@ -130,6 +113,17 @@ impl TokenBudget {
     pub fn total_allocated(&self) -> u32 {
         self.allocations.values().sum()
     }
+}
+
+fn observed_budget_with_floor(observed: u32, max_budget: u32) -> u32 {
+    const MIN_ADAPTIVE_SECTION_BUDGET: u32 = 256;
+    if max_budget == 0 {
+        return 0;
+    }
+    observed
+        .saturating_add(observed / 2)
+        .max(MIN_ADAPTIVE_SECTION_BUDGET)
+        .min(max_budget)
 }
 
 #[cfg(test)]
@@ -248,43 +242,48 @@ mod tests {
     }
 
     #[test]
-    fn budget_uses_section_history_to_shrink_overallocated() {
-        // If History historically uses only 2000 tokens but would get 50000 (50% of 100k),
-        // the allocator should reduce History budget toward the observed usage + headroom.
-        let mut history = HashMap::new();
-        history.insert(SectionKind::History, 2000u32);
-
-        let budget = TokenBudget::allocate(100_000, CompactionTier::Normal, &history);
-        // With history feedback, History budget should be < the default 50% (50000)
-        let history_budget = budget.budget_for(SectionKind::History);
-        assert!(
-            history_budget < 50_000,
-            "History budget should shrink from history feedback, got {history_budget}"
+    fn budget_does_not_reserve_ghost_history_section() {
+        let budget = TokenBudget::allocate(100_000, CompactionTier::Normal, &HashMap::new());
+        assert_eq!(
+            budget.budget_for(SectionKind::History),
+            0,
+            "history travels in provider messages and must not reserve section budget"
         );
-        // But should still give headroom above the observed usage
-        assert!(
-            history_budget >= 2000,
-            "History budget should be >= observed usage, got {history_budget}"
-        );
-        // Total must still not exceed limit
         assert!(budget.total_allocated() <= budget.effective_limit);
     }
 
     #[test]
-    fn budget_without_history_uses_default_ratios() {
-        let budget = TokenBudget::allocate(100_000, CompactionTier::Normal, &HashMap::new());
-        // Default Normal tier: 50% for history = 50000
-        assert_eq!(budget.budget_for(SectionKind::History), 50_000);
+    fn budget_uses_memory_history_to_shrink_overallocated_with_floor() {
+        let mut history = HashMap::new();
+        history.insert(SectionKind::Memory, 2u32);
+
+        let budget = TokenBudget::allocate(100_000, CompactionTier::Normal, &history);
+        let memory_budget = budget.budget_for(SectionKind::Memory);
+        assert!(
+            memory_budget < 15_000,
+            "Memory budget should shrink from feedback, got {memory_budget}"
+        );
+        assert!(
+            memory_budget >= 256,
+            "Memory budget should retain a usable floor, got {memory_budget}"
+        );
+        assert!(budget.total_allocated() <= budget.effective_limit);
     }
 
     #[test]
-    fn higher_tier_gets_tighter_history_budget() {
+    fn budget_without_history_does_not_allocate_history() {
+        let budget = TokenBudget::allocate(100_000, CompactionTier::Normal, &HashMap::new());
+        assert_eq!(budget.budget_for(SectionKind::History), 0);
+    }
+
+    #[test]
+    fn higher_tier_gets_tighter_memory_budget() {
         let history = HashMap::new();
         let normal = TokenBudget::allocate(100_000, CompactionTier::Normal, &history);
         let aggressive = TokenBudget::allocate(100_000, CompactionTier::AggressivePrune, &history);
         assert!(
-            normal.budget_for(SectionKind::History) > aggressive.budget_for(SectionKind::History),
-            "Normal should have more history budget than AggressivePrune"
+            normal.budget_for(SectionKind::Memory) > aggressive.budget_for(SectionKind::Memory),
+            "Normal should have more memory budget than AggressivePrune"
         );
     }
 }

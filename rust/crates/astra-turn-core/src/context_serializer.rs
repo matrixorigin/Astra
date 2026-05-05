@@ -140,7 +140,7 @@ fn remap_cache_markers_to_blocks(
             continue;
         };
         if let Some(block) = system_blocks.get_mut(block_idx) {
-            block.cache_control = Some(json!({ "type": "ephemeral" }));
+            block.cache_control = Some(cache_control_for_scope(block.scope, policy));
             let mut marker = marker.clone();
             marker.after_section_index = block_idx;
             remapped.push(marker);
@@ -165,8 +165,8 @@ fn block_index_for_marker(
 
 /// Apply cache policy to legacy-path system blocks.
 ///
-/// Places `cache_control` markers on up to `max_markers` global-scoped blocks
-/// (last global block first), matching the Anthropic cache breakpoint convention.
+/// Places `cache_control` markers on the last Global and last Session block,
+/// matching the production Anthropic cache breakpoint convention.
 fn apply_cache_policy_to_blocks(
     system_blocks: &mut [SerializedSystemBlock],
     policy: &ProviderCachePolicy,
@@ -175,21 +175,26 @@ fn apply_cache_policy_to_blocks(
         return Vec::new();
     }
 
-    // Collect indices of global-scoped blocks (stable content = best cache breakpoints).
-    let global_indices: Vec<usize> = system_blocks
+    let mut chosen = Vec::new();
+    if let Some(idx) = system_blocks
         .iter()
-        .enumerate()
-        .filter(|(_, b)| b.scope == CacheScope::Global)
-        .map(|(i, _)| i)
-        .collect();
-
-    // Place markers on the last N global blocks (most stable suffix = highest reuse).
-    let take = (policy.max_markers as usize).min(global_indices.len());
-    let chosen: Vec<usize> = global_indices.into_iter().rev().take(take).collect();
+        .rposition(|block| block.scope == CacheScope::Global)
+    {
+        chosen.push(idx);
+    }
+    if chosen.len() < policy.max_markers as usize
+        && let Some(idx) = system_blocks
+            .iter()
+            .rposition(|block| block.scope == CacheScope::Session)
+        && !chosen.contains(&idx)
+    {
+        chosen.push(idx);
+    }
 
     let mut markers = Vec::new();
     for &idx in &chosen {
-        system_blocks[idx].cache_control = Some(json!({ "type": "ephemeral" }));
+        system_blocks[idx].cache_control =
+            Some(cache_control_for_scope(system_blocks[idx].scope, policy));
         markers.push(CacheMarker {
             after_section_index: idx,
             scope: system_blocks[idx].scope,
@@ -199,6 +204,14 @@ fn apply_cache_policy_to_blocks(
     // Return markers in ascending block order for consistency.
     markers.sort_by_key(|m| m.after_section_index);
     markers
+}
+
+fn cache_control_for_scope(scope: CacheScope, policy: &ProviderCachePolicy) -> Value {
+    if scope == CacheScope::Global && policy.supports_global_scope {
+        json!({ "type": "ephemeral", "scope": "global", "ttl": "1h" })
+    } else {
+        json!({ "type": "ephemeral", "ttl": "1h" })
+    }
 }
 
 #[cfg(test)]
@@ -230,6 +243,10 @@ mod tests {
             !cached_blocks.is_empty(),
             "anthropic policy should place cache markers"
         );
+        assert_eq!(
+            cached_blocks[0].cache_control.as_ref().unwrap(),
+            &json!({ "type": "ephemeral", "scope": "global", "ttl": "1h" })
+        );
         // None-scoped block should NOT have cache_control
         let none_block = result
             .system_blocks
@@ -256,10 +273,12 @@ mod tests {
 
     #[test]
     fn legacy_path_respects_max_markers_limit() {
-        // 5 global sections but max_markers=4
-        let sections: Vec<_> = (0..5)
-            .map(|i| make_section(&format!("section {i}"), CacheScope::Global))
-            .collect();
+        let sections = vec![
+            make_section("global 1", CacheScope::Global),
+            make_section("global 2", CacheScope::Global),
+            make_section("session 1", CacheScope::Session),
+            make_section("session 2", CacheScope::Session),
+        ];
         let policy = ProviderCachePolicy::anthropic(); // max_markers = 4
         let result = serialize_prompt_sections(&sections, &policy);
 
@@ -268,8 +287,10 @@ mod tests {
             .iter()
             .filter(|b| b.cache_control.is_some())
             .count();
-        assert_eq!(cached_count, 4, "should not exceed max_markers");
-        assert_eq!(result.cache_markers.len(), 4);
+        assert_eq!(cached_count, 2, "should mark last global and last session");
+        assert_eq!(result.cache_markers.len(), 2);
+        assert!(result.system_blocks[1].cache_control.is_some());
+        assert!(result.system_blocks[3].cache_control.is_some());
     }
 
     #[test]
@@ -300,10 +321,8 @@ mod tests {
 
         // Only 2 blocks emitted (empty filtered)
         assert_eq!(result.system_blocks.len(), 2);
-        // Both should have cache_control
-        for block in &result.system_blocks {
-            assert!(block.cache_control.is_some());
-        }
+        assert!(result.system_blocks[0].cache_control.is_none());
+        assert!(result.system_blocks[1].cache_control.is_some());
     }
 
     #[test]

@@ -125,6 +125,15 @@ pub fn optimize(
                 );
                 stats.tool_results_cleared = cleared.count;
                 stats.tokens_cleared = cleared.tokens;
+                if cleared.skipped_over_budget {
+                    stats.skipped.push(SkippedOptimization {
+                        step: "tool_result_clearing".into(),
+                        reason: format!(
+                            "clearing would exceed max_clear_tokens={}",
+                            limits.max_clear_tokens
+                        ),
+                    });
+                }
             } else {
                 stats.skipped.push(SkippedOptimization {
                     step: "tool_result_clearing".into(),
@@ -173,6 +182,7 @@ pub fn optimize(
 struct ClearResult {
     count: u32,
     tokens: u32,
+    skipped_over_budget: bool,
 }
 
 /// Gated tool result clearing with circuit breaker.
@@ -182,18 +192,20 @@ fn prune_tool_schemas(schemas: &mut [Value]) -> u32 {
     let mut pruned = 0u32;
     for schema in schemas.iter_mut() {
         if let Some(func) = schema.get_mut("function") {
-            if func.get("description").is_some() {
-                func.as_object_mut().unwrap().remove("description");
-                pruned += 1;
-            }
-            // Also strip parameter descriptions
-            if let Some(params) = func.get_mut("parameters") {
-                if let Some(props) = params.get_mut("properties") {
-                    if let Some(obj) = props.as_object_mut() {
-                        for (_key, prop) in obj.iter_mut() {
-                            if let Some(p) = prop.as_object_mut() {
-                                p.remove("description");
-                            }
+            if let Some(func_obj) = func.as_object_mut() {
+                if func_obj.remove("description").is_some() {
+                    pruned += 1;
+                }
+                // Also strip parameter descriptions.
+                if let Some(params) = func_obj.get_mut("parameters")
+                    && let Some(props) = params.get_mut("properties")
+                    && let Some(obj) = props.as_object_mut()
+                {
+                    for (_key, prop) in obj.iter_mut() {
+                        if let Some(p) = prop.as_object_mut()
+                            && p.remove("description").is_some()
+                        {
+                            pruned += 1;
                         }
                     }
                 }
@@ -206,40 +218,51 @@ fn prune_tool_schemas(schemas: &mut [Value]) -> u32 {
 /// Drop the oldest assistant/user round pairs under extreme pressure.
 /// Returns estimated tokens dropped.
 fn drop_oldest_rounds(messages: &mut Vec<Value>, pressure: f64) -> u32 {
-    if messages.len() < 4 {
+    let droppable_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.get("role").and_then(Value::as_str) != Some("system"))
+        .map(|(idx, _)| idx)
+        .collect();
+
+    if droppable_indices.len() < 4 {
         return 0; // Need at least 2 rounds to drop one
     }
     // Drop fraction scales with pressure: at 0.9 drop 1/6, at 1.0 drop 1/3
     let fraction = ((pressure - 0.85) * 2.0).clamp(0.0, 0.5);
-    let total_rounds = messages.len() / 2;
+    let total_rounds = droppable_indices.len() / 2;
     let rounds_to_drop = ((total_rounds as f64 * fraction) as usize).max(1);
-    let messages_to_drop = (rounds_to_drop * 2).min(messages.len().saturating_sub(2));
+    let messages_to_drop = (rounds_to_drop * 2).min(droppable_indices.len().saturating_sub(2));
 
     if messages_to_drop == 0 {
         return 0;
     }
 
-    let tokens_dropped: u32 = messages[..messages_to_drop]
+    let tokens_dropped: u32 = droppable_indices
         .iter()
+        .take(messages_to_drop)
+        .map(|&idx| &messages[idx])
         .map(|m| {
             let content = m.get("content").and_then(Value::as_str).unwrap_or("");
             (content.len() as u32) / 4 // rough token estimate
         })
         .sum();
 
-    messages.drain(..messages_to_drop);
+    for &idx in droppable_indices.iter().take(messages_to_drop).rev() {
+        messages.remove(idx);
+    }
     tokens_dropped
 }
 
 /// Spill oversized sections: sections above a threshold get replaced with
-/// a `SpilledEntry` reference. The actual content is stored externally.
+/// a `SpilledEntry` reference. The actual content must be stored externally.
 /// Threshold: 10000 tokens (~40KB of text).
 fn spill_oversized_sections(
     sections: &mut [BoundSection],
     stats: &mut OptimizeStats,
 ) -> Vec<SpilledEntry> {
     const SPILL_THRESHOLD_TOKENS: u32 = 10_000;
-    let mut spilled = Vec::new();
+    let mut saw_spill_candidate = false;
 
     for section in sections.iter_mut() {
         if section.actual_tokens > SPILL_THRESHOLD_TOKENS {
@@ -250,24 +273,19 @@ fn spill_oversized_sections(
             ) {
                 continue;
             }
-            let path = format!("spill/{:?}_{}.txt", section.plan.kind, spilled.len());
-            spilled.push(SpilledEntry {
-                call_id: String::new(),
-                tool_name: format!("{:?}", section.plan.kind),
-                original_tokens: section.actual_tokens,
-                path: path.clone(),
-            });
-            // Replace artifact with a spill reference
-            section.artifact = crate::section_types::SectionArtifact::SpillReference {
-                path,
-                original_tokens: section.actual_tokens,
-            };
-            section.actual_tokens = 20; // reference is ~20 tokens
-            stats.entries_spilled += 1;
+            saw_spill_candidate = true;
         }
     }
 
-    spilled
+    if saw_spill_candidate {
+        stats.skipped.push(SkippedOptimization {
+            step: "spill".into(),
+            reason: "oversized sections require persistence before replacement; content preserved"
+                .into(),
+        });
+    }
+
+    Vec::new()
 }
 
 /// `max_clear_tokens` caps total tokens cleared to prevent over-compaction.
@@ -278,17 +296,39 @@ fn compact_tool_results_gated(
     strategy: CompactStrategy,
     max_clear_tokens: u32,
 ) -> ClearResult {
+    if max_clear_tokens == 0 {
+        return ClearResult {
+            count: 0,
+            tokens: 0,
+            skipped_over_budget: true,
+        };
+    }
+
     // AggressivePrune escalates effective pressure to clear more aggressively
     let effective_pressure = match tier {
         CompactionTier::AggressivePrune => (pressure * 1.2).min(1.0),
         _ => pressure,
     };
-    let stats =
-        crate::microcompact::compact_tool_results_adaptive(messages, effective_pressure, strategy);
-    let tokens = (stats.tokens_saved as u32).min(max_clear_tokens);
+
+    let mut candidate = messages.to_vec();
+    let stats = crate::microcompact::compact_tool_results_adaptive(
+        &mut candidate,
+        effective_pressure,
+        strategy,
+    );
+    let tokens = u32::try_from(stats.tokens_saved).unwrap_or(u32::MAX);
+    if tokens > max_clear_tokens {
+        return ClearResult {
+            count: 0,
+            tokens: 0,
+            skipped_over_budget: true,
+        };
+    }
+    messages.clone_from_slice(&candidate);
     ClearResult {
-        count: stats.results_compacted as u32,
+        count: u32::try_from(stats.results_compacted).unwrap_or(u32::MAX),
         tokens,
+        skipped_over_budget: false,
     }
 }
 
@@ -327,30 +367,13 @@ fn cache_align_sections(sections: &mut [BoundSection], max_moves: u32) -> u32 {
         }
     }
 
-    // Apply sort in-place using swap instead of clone
     if moves <= max_moves && moves > 0 {
-        // Build a permutation map and apply it via cycle-sort (zero allocations beyond the index vec)
-        let mut perm: Vec<usize> = (0..reorderable.len()).collect();
-        perm.sort_by_key(|&i| sections[reorderable[i]].plan.scope.order());
-
-        let mut visited = vec![false; perm.len()];
-        for start in 0..perm.len() {
-            if visited[start] || perm[start] == start {
-                visited[start] = true;
-                continue;
-            }
-            let mut current = start;
-            loop {
-                visited[current] = true;
-                let next = perm[current];
-                if next == start {
-                    break;
-                }
-                sections.swap(reorderable[current], reorderable[next]);
-                current = next;
-            }
-            // Final swap to place `start` element
-            sections.swap(reorderable[start], reorderable[perm[start]]);
+        let sorted_sections: Vec<BoundSection> = sorted_indices
+            .iter()
+            .map(|&idx| sections[idx].clone())
+            .collect();
+        for (target_idx, sorted_section) in reorderable.iter().zip(sorted_sections) {
+            sections[*target_idx] = sorted_section;
         }
     }
 
@@ -410,7 +433,7 @@ mod tests {
     use crate::context_planner::{PlanInput, plan_turn};
     use crate::context_sources::*;
     use crate::emergent_context::EmergentContext;
-    use crate::microcompact::ProviderCacheStrategy;
+    use crate::microcompact::{CompactStrategy, ProviderCacheStrategy};
     use crate::pipeline_config::ProviderCachePolicy;
     use crate::pipeline_stats::PipelineStats;
     use crate::recovery_state::RecoveryState;
@@ -548,6 +571,27 @@ mod tests {
     }
 
     #[test]
+    fn reorder_applies_length_three_cycle_correctly() {
+        let mut sections = vec![
+            test_bound_section(SectionKind::Skills, CacheScope::Session, "session"),
+            test_bound_section(SectionKind::RuntimeIdentity, CacheScope::None, "none"),
+            test_bound_section(SectionKind::ProjectContext, CacheScope::Global, "global"),
+        ];
+
+        let moves = cache_align_sections(&mut sections, 3);
+
+        assert_eq!(moves, 3);
+        assert_eq!(
+            sections.iter().map(|s| s.plan.scope).collect::<Vec<_>>(),
+            vec![CacheScope::Global, CacheScope::Session, CacheScope::None],
+            "length-3 reorder cycles must produce fully sorted cache scopes"
+        );
+        assert_eq!(sections[0].text(), Some("global"));
+        assert_eq!(sections[1].text(), Some("session"));
+        assert_eq!(sections[2].text(), Some("none"));
+    }
+
+    #[test]
     fn tool_result_clearing_gate_controls_microcompact() {
         let (plan, bound, latches) = build_test_plan_and_bound();
         let limits = OptimizeLimits::all_closed();
@@ -564,6 +608,48 @@ mod tests {
                 .any(|s| s.step == "tool_result_clearing"
                     || s.step == "reorder"
                     || s.step == "spill")
+        );
+    }
+
+    #[test]
+    fn tool_result_clearing_skips_when_over_max_clear_tokens() {
+        let mut messages = vec![serde_json::json!({
+            "role": "assistant",
+            "tool_calls": (0..8)
+                .map(|i| serde_json::json!({
+                    "id": format!("call_{i}"),
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }))
+                .collect::<Vec<_>>()
+        })];
+        for i in 0..8 {
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": format!("call_{i}"),
+                "content": "x".repeat(12_000),
+            }));
+        }
+
+        let result = compact_tool_results_gated(
+            &mut messages,
+            CompactionTier::AggressivePrune,
+            1.0,
+            CompactStrategy::Normalized,
+            1,
+        );
+
+        assert!(result.skipped_over_budget);
+        assert_eq!(result.count, 0);
+        assert_eq!(result.tokens, 0);
+        assert!(
+            messages.iter().all(|message| {
+                message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(|content| !crate::microcompact::is_cleared_content(content))
+                    .unwrap_or(true)
+            }),
+            "messages must remain unmodified when clearing exceeds the circuit breaker"
         );
     }
 
@@ -687,6 +773,19 @@ mod tests {
     }
 
     #[test]
+    fn schema_pruning_preserves_malformed_function_schema() {
+        let mut schemas = vec![serde_json::json!({
+            "type": "function",
+            "function": "not-an-object"
+        })];
+
+        let pruned = prune_tool_schemas(&mut schemas);
+
+        assert_eq!(pruned, 0);
+        assert_eq!(schemas[0]["function"], "not-an-object");
+    }
+
+    #[test]
     fn round_dropping_removes_oldest_rounds() {
         let (mut plan, bound, latches) = build_test_plan_and_bound();
         plan.compact_tier = CompactionTier::AggressivePrune;
@@ -751,7 +850,28 @@ mod tests {
     }
 
     #[test]
-    fn spill_moves_large_sections_to_disk_entries() {
+    fn round_dropping_never_removes_system_messages() {
+        let mut messages = vec![serde_json::json!({
+            "role": "system",
+            "content": "stable system"
+        })];
+        messages.extend((0..12).map(|i| {
+            if i % 2 == 0 {
+                serde_json::json!({"role": "assistant", "content": format!("response {}", i/2)})
+            } else {
+                serde_json::json!({"role": "user", "content": format!("query {}", i/2)})
+            }
+        }));
+
+        let dropped = drop_oldest_rounds(&mut messages, 1.0);
+
+        assert!(dropped > 0);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "stable system");
+    }
+
+    #[test]
+    fn spill_preserves_large_sections_without_persistence() {
         let (plan, bound, latches) = build_test_plan_and_bound();
         let limits = OptimizeLimits {
             allow_spill: true,
@@ -770,10 +890,21 @@ mod tests {
 
         let result = optimize(&plan, bound, &latches, &policy, &limits, 1);
 
-        // Spill should detect oversized sections and produce SpilledEntry records
+        assert_eq!(result.stats.entries_spilled, 0);
+        assert!(result.spilled.is_empty());
+        let preserved = result
+            .sections
+            .iter()
+            .find(|section| section.text() == Some(large_text.as_str()))
+            .expect("oversized text must survive when no persistence boundary exists");
+        assert_eq!(preserved.actual_tokens, large_text.len() as u32);
         assert!(
-            result.stats.entries_spilled > 0 || !result.spilled.is_empty(),
-            "large sections should trigger spill"
+            result
+                .stats
+                .skipped
+                .iter()
+                .any(|skipped| skipped.step == "spill"),
+            "preserving an oversized section should be explicit in optimizer trace"
         );
     }
 
