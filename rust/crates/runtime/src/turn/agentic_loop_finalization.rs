@@ -306,6 +306,16 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     // Persist compaction effectiveness state for enriched resume guidance.
     heavy.compaction_state = Some(state.compaction_effectiveness.to_json());
     heavy.continuity_state = serde_json::to_value(&state.continuity).ok();
+    // Persist context pipeline state for warm-start on resume.
+    if let Some(ref sess) = state.pipeline_session {
+        heavy.pipeline_state =
+            astra_turn_core::pipeline_session_serde::serialize_session_state(
+                &sess.stats,
+                &sess.latches,
+                &sess.recovery,
+            )
+            .ok();
+    }
     let cp = StepCheckpoint::Heavy(Box::new(heavy));
     if let Err(e) = step_checkpoint::write_step_checkpoint(sid, ckpt_num, &cp) {
         astra_core::agent_warn!(

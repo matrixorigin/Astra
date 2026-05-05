@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 /// Per-turn recovery state. Feeds into `plan_turn()` to escalate
 /// compaction tiers and widen reserve estimates after failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RecoveryState {
     /// Consecutive prompt-too-long errors without a successful turn in between.
     pub consecutive_ptl_errors: u32,

@@ -840,6 +840,11 @@ pub struct HeavyCheckpoint {
     /// Persisted so aggressive-tier compaction survives session resume.
     #[serde(default)]
     pub consecutive_context_window_errors: u32,
+    /// Serialized context pipeline state (PipelineStats + SessionLatches + RecoveryState).
+    /// Enables warm-start on session resume: EMA cache ratios, percentile reserves,
+    /// latched headers/scope, and output escalation history survive across sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_state: Option<serde_json::Value>,
     /// Serialized CompactionEffectivenessTracker state for cross-turn persistence.
     /// Contains cumulative_tokens_freed, attempt_count, last_tokens_freed,
     /// last_was_insufficient — enabling enriched resume guidance and tier selection.
@@ -967,6 +972,7 @@ impl StepCheckpoint {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            pipeline_state: None,
             compaction_state: None,
             continuity_state: None,
         }))

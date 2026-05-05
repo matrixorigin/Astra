@@ -1049,6 +1049,7 @@ async fn run_chat_turn(
             runtime_continuity: state.runtime_continuity.as_ref(),
             turn_index: state.turn,
             evolution_service: state.evolution_service.clone(),
+            pipeline_state: None,
             pre_loaded_messages: None,
                     append_system_prompt: None,
             #[cfg(feature = "harness")]
@@ -3076,6 +3077,7 @@ fn build_manual_heavy_step_checkpoint(
         approval_overrides: None,
         consecutive_context_window_errors: 0,
         compaction_state: None,
+        pipeline_state: None,
         continuity_state: None,
     };
     StepCheckpoint::Heavy(Box::new(heavy))

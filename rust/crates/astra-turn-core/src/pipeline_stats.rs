@@ -181,6 +181,7 @@ pub struct CompactEvent {
 
 /// Cross-turn accumulated statistics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PipelineStats {
     pub turns_executed: u32,
     pub avg_cache_hit_ratio: f64,

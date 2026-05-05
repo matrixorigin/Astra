@@ -397,6 +397,7 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
         interruption: Some(interruption),
         approval_overrides: None,
         consecutive_context_window_errors: 0,
+        pipeline_state: None,
         compaction_state: None,
         continuity_state: None,
     };

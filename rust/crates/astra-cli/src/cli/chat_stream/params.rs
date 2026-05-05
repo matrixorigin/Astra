@@ -197,6 +197,8 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Shared evolution service for multi-axis self-evolution.
     pub(crate) evolution_service: Option<Arc<astra_runtime::evolution::service::EvolutionService>>,
     /// Pre-loaded CSL messages (from CslManager.load() in repl_turn).
+    /// Restored pipeline state from a checkpoint (enables warm-start on resume).
+    pub(crate) pipeline_state: Option<serde_json::Value>,
     /// When present, these are used instead of converting history pairs.
     pub(crate) pre_loaded_messages: Option<Vec<serde_json::Value>>,
     /// Extra context appended to the system prompt (gateway injects cron/session context here).
@@ -312,6 +314,7 @@ impl<'a> ChatTurnParams<'a> {
             runtime_continuity: None,
             turn_index: 0,
             evolution_service: None,
+            pipeline_state: None,
             pre_loaded_messages: None,
             append_system_prompt: None,
             #[cfg(feature = "harness")]

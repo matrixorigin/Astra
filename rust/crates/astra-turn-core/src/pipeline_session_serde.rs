@@ -1,17 +1,90 @@
-//! Serialization support for PipelineStats persistence.
+//! Serialization support for PipelineSession persistence.
 //!
-//! Enables warm-start: save stats at session end, reload on resume.
-//! This is the Phase 12 foundation — persistence layer uses these
-//! functions to store/load the cross-turn accumulated state.
+//! Enables warm-start: save pipeline state at checkpoint, reload on resume.
+//! The envelope format (`PipelineStateEnvelope`) is versioned so schema
+//! evolution can be handled gracefully at deserialization time.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::pipeline_stats::PipelineStats;
+use crate::recovery_state::RecoveryState;
+use crate::session_latches::SessionLatches;
 
-/// Serialize PipelineStats to JSON bytes for persistence.
+/// Versioned envelope for checkpoint persistence.
+/// All pipeline state that should survive session suspend/resume.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PipelineStateEnvelope {
+    version: u32,
+    stats: PipelineStats,
+    latches: SessionLatches,
+    recovery: RecoveryState,
+}
+
+const CURRENT_VERSION: u32 = 1;
+
+/// Serialize the pipeline session's cross-turn state into a JSON Value
+/// suitable for storage in `HeavyCheckpoint.pipeline_state`.
+pub fn serialize_session_state(
+    stats: &PipelineStats,
+    latches: &SessionLatches,
+    recovery: &RecoveryState,
+) -> Result<Value, serde_json::Error> {
+    let envelope = PipelineStateEnvelope {
+        version: CURRENT_VERSION,
+        stats: stats.clone(),
+        latches: latches.clone(),
+        recovery: *recovery,
+    };
+    serde_json::to_value(&envelope)
+}
+
+/// Restored pipeline state from a checkpoint.
+#[derive(Debug, Clone)]
+pub struct RestoredPipelineState {
+    pub stats: PipelineStats,
+    pub latches: SessionLatches,
+    pub recovery: RecoveryState,
+}
+
+/// Deserialize pipeline state from a JSON Value (from `HeavyCheckpoint.pipeline_state`).
+///
+/// Returns `None` if the value is null/missing or cannot be parsed.
+/// On version mismatch or partial corruption, returns what can be recovered
+/// with defaults for unreadable fields.
+pub fn deserialize_session_state(value: &Value) -> Option<RestoredPipelineState> {
+    if value.is_null() {
+        return None;
+    }
+    let envelope: PipelineStateEnvelope = serde_json::from_value(value.clone()).ok()?;
+    // Version gate: if future versions need migration, handle here.
+    // For now, version 1 is the only version.
+    if envelope.version > CURRENT_VERSION {
+        // Future version — take what we can (serde ignores unknown fields)
+        // but log that we may have lost fidelity.
+    }
+
+    let mut recovery = envelope.recovery;
+    // On session resume, clear transient error state but preserve escalation history.
+    // PTL errors are "in flight" — they don't carry across session boundaries.
+    // Output escalation count is preserved for reserve widening.
+    recovery.consecutive_ptl_errors = 0;
+    recovery.consecutive_same_errors = 0;
+    recovery.has_attempted_reactive_compact = false;
+
+    Some(RestoredPipelineState {
+        stats: envelope.stats,
+        latches: envelope.latches,
+        recovery,
+    })
+}
+
+/// Serialize PipelineStats to JSON bytes for persistence (legacy API).
 pub fn serialize_stats(stats: &PipelineStats) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(stats)
 }
 
-/// Deserialize PipelineStats from JSON bytes (loaded from persistence).
+/// Deserialize PipelineStats from JSON bytes (legacy API).
 pub fn deserialize_stats(bytes: &[u8]) -> Result<PipelineStats, serde_json::Error> {
     serde_json::from_slice(bytes)
 }
@@ -20,6 +93,7 @@ pub fn deserialize_stats(bytes: &[u8]) -> Result<PipelineStats, serde_json::Erro
 mod tests {
     use super::*;
     use crate::context_feedback::ContextFeedback;
+    use crate::section_types::CacheScope;
 
     #[test]
     fn roundtrip_empty_stats() {
@@ -65,10 +139,73 @@ mod tests {
 
         let original_reserve = stats
             .response_token_estimates
-            .reserve_for("model-a", "api", &crate::recovery_state::RecoveryState::default());
+            .reserve_for("model-a", "api", &RecoveryState::default());
         let restored_reserve = restored
             .response_token_estimates
-            .reserve_for("model-a", "api", &crate::recovery_state::RecoveryState::default());
+            .reserve_for("model-a", "api", &RecoveryState::default());
         assert_eq!(original_reserve.output_tokens, restored_reserve.output_tokens);
+    }
+
+    #[test]
+    fn session_state_roundtrip() {
+        let mut stats = PipelineStats::default();
+        let feedback = ContextFeedback::from_usage(0, 900, 100, 500, false);
+        stats.record("claude-sonnet-4-6", "repl", &feedback);
+
+        let mut latches = SessionLatches::default();
+        latches.latch_cache_scope(CacheScope::Global, 1);
+        latches.latch_header("anthropic-beta", "prompt-caching-2024-07-31", 1);
+
+        let mut recovery = RecoveryState::default();
+        recovery.record_ptl_error();
+        recovery.record_output_escalation();
+
+        let value = serialize_session_state(&stats, &latches, &recovery).unwrap();
+        let restored = deserialize_session_state(&value).unwrap();
+
+        assert_eq!(restored.stats.turns_executed, 1);
+        assert!(restored.stats.avg_cache_hit_ratio > 0.8);
+        assert_eq!(restored.latches.cache_scope, Some(CacheScope::Global));
+        assert!(restored.latches.has_header("anthropic-beta"));
+        // PTL errors cleared on restore, escalation preserved
+        assert_eq!(restored.recovery.consecutive_ptl_errors, 0);
+        assert_eq!(restored.recovery.max_output_escalation_count, 1);
+    }
+
+    #[test]
+    fn deserialize_null_returns_none() {
+        assert!(deserialize_session_state(&Value::Null).is_none());
+    }
+
+    #[test]
+    fn deserialize_garbage_returns_none() {
+        let garbage = serde_json::json!({"not": "a pipeline state"});
+        assert!(deserialize_session_state(&garbage).is_none());
+    }
+
+    #[test]
+    fn backward_compat_missing_field_uses_default() {
+        // Simulate: old checkpoint saved with fewer fields in latches.
+        // serde(default) on missing fields should produce a valid SessionLatches.
+        let stats = PipelineStats::default();
+        let latches = SessionLatches::default();
+        let recovery = RecoveryState::default();
+        let value = serialize_session_state(&stats, &latches, &recovery).unwrap();
+
+        // Tamper: remove a field from latches to simulate schema evolution
+        let mut obj = value.as_object().unwrap().clone();
+        obj.insert("latches".into(), serde_json::json!({}));
+        let tampered = Value::Object(obj);
+
+        let restored = deserialize_session_state(&tampered).unwrap();
+        assert_eq!(restored.latches.cache_scope, None);
+        assert!(restored.latches.beta_headers.is_empty());
+    }
+
+    #[test]
+    fn backward_compat_missing_pipeline_state_returns_none() {
+        // Old checkpoints have no pipeline_state field — should gracefully return None
+        assert!(deserialize_session_state(&Value::Null).is_none());
+        assert!(deserialize_session_state(&serde_json::json!({})).is_none());
     }
 }

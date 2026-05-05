@@ -74,6 +74,9 @@ pub struct RestoredSession {
     /// Serialized compaction-state payload restored from a heavy checkpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_state: Option<serde_json::Value>,
+    /// Serialized context pipeline state (stats + latches + recovery).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_state: Option<serde_json::Value>,
     /// Validated runtime-owned continuity state restored from a heavy checkpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuity_state: Option<astra_turn_types::continuity::ContinuityState>,
@@ -118,6 +121,7 @@ pub struct CloudHeavyCheckpointState {
     pub approval_overrides: Option<serde_json::Value>,
     pub interruption: Option<serde_json::Value>,
     pub compaction_state: Option<serde_json::Value>,
+    pub pipeline_state: Option<serde_json::Value>,
     /// Already-validated and deserialized continuity state. Avoids double-parse
     /// (validate_restored_continuity_state → downstream restore).
     pub continuity_state: Option<ContinuityState>,
@@ -429,6 +433,9 @@ impl HybridRestoreService {
                     compaction_state: heavy_state
                         .as_ref()
                         .and_then(|heavy| heavy.compaction_state.clone()),
+                    pipeline_state: heavy_state
+                        .as_ref()
+                        .and_then(|heavy| heavy.pipeline_state.clone()),
                     continuity_state: heavy_state
                         .as_ref()
                         .and_then(|heavy| heavy.continuity_state.clone()),
@@ -1018,6 +1025,10 @@ pub fn parse_cloud_heavy_checkpoint_state(
         interruption: heavy.get("interruption").cloned().filter(|v| !v.is_null()),
         compaction_state: heavy
             .get("compaction_state")
+            .cloned()
+            .filter(|v| !v.is_null()),
+        pipeline_state: heavy
+            .get("pipeline_state")
             .cloned()
             .filter(|v| !v.is_null()),
         continuity_state,
@@ -2827,6 +2838,7 @@ mod tests {
             approval_overrides: Some(approval_overrides.clone()),
             interruption: Some(interruption.clone()),
             compaction_state: Some(compaction_state.clone()),
+            pipeline_state: None,
             continuity_state: astra_turn_types::continuity::try_from_checkpoint_value(
                 &continuity_state,
             )

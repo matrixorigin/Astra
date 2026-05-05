@@ -26,6 +26,7 @@ pub struct LatchedFeature {
 /// Session-stable latches. Each field starts as None, becomes Some(value)
 /// on first trigger, and NEVER changes again for the session lifetime.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SessionLatches {
     /// Beta headers that, once sent, must be sent on every subsequent turn.
     pub beta_headers: Vec<LatchedHeader>,

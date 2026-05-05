@@ -688,9 +688,22 @@ pub(crate) async fn stream_chat_sse(
             consecutive_same_error: 0,
             last_error_category: None,
         },
-        pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
-            astra_turn_core::pipeline_config::PipelineConfig::default(),
-        )),
+        pipeline_session: Some({
+            let config = astra_turn_core::pipeline_config::PipelineConfig::default();
+            match p.pipeline_state.as_ref().and_then(|v| {
+                astra_turn_core::pipeline_session_serde::deserialize_session_state(v)
+            }) {
+                Some(restored) => {
+                    astra_turn_core::pipeline_session::PipelineSession::with_restored_state(
+                        config,
+                        restored.stats,
+                        restored.latches,
+                        restored.recovery,
+                    )
+                }
+                None => astra_turn_core::pipeline_session::PipelineSession::new(config),
+            }
+        }),
         message: p.message.to_string(),
         recent_tools: p.recent_tools.to_vec(),
         task_profile,

@@ -4377,6 +4377,7 @@ mod file_event_store_proofs {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            pipeline_state: None,
             compaction_state: None,
             continuity_state: None,
         };
@@ -5534,6 +5535,7 @@ mod crash_recovery_proofs {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            pipeline_state: None,
             compaction_state: None,
         };
 
@@ -5583,6 +5585,7 @@ mod crash_recovery_proofs {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            pipeline_state: None,
             compaction_state: None,
             continuity_state: None,
         };
@@ -5702,6 +5705,7 @@ mod crash_recovery_proofs {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            pipeline_state: None,
             compaction_state: None,
             continuity_state: None,
         };
@@ -5743,6 +5747,7 @@ mod crash_recovery_proofs {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            pipeline_state: None,
             compaction_state: None,
             continuity_state: None,
         };
@@ -6449,6 +6454,7 @@ mod checkpoint_cloud_persistence_proofs {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            pipeline_state: None,
             compaction_state: None,
             continuity_state: None,
         }
@@ -6575,6 +6581,7 @@ mod checkpoint_cloud_persistence_proofs {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            pipeline_state: None,
             compaction_state: None,
             continuity_state: None,
         }));

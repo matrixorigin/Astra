@@ -325,7 +325,8 @@ pub(super) async fn handle_task_command(
                     runtime_continuity: None,
                     turn_index: 0,
                     evolution_service: bg_evolution_service.clone(),
-                    pre_loaded_messages: None,
+                pipeline_state: None,
+            pre_loaded_messages: None,
                     append_system_prompt: None,
                     #[cfg(feature = "harness")]
                     harness_sink: Some(bg_harness_sink.clone()),

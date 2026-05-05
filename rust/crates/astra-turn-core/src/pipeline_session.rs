@@ -106,6 +106,28 @@ impl PipelineSession {
         }
     }
 
+    /// Create a session restored from a checkpoint (full warm start).
+    ///
+    /// Restores stats (EMA, percentile estimator), latches (frozen headers/scope),
+    /// and recovery state (escalation history). Transient error counters are
+    /// cleared by `deserialize_session_state()` before reaching this constructor.
+    #[must_use]
+    pub fn with_restored_state(
+        config: PipelineConfig,
+        stats: PipelineStats,
+        latches: SessionLatches,
+        recovery: RecoveryState,
+    ) -> Self {
+        Self {
+            pipeline: ContextPipeline::new(config),
+            stats,
+            latches,
+            emergent: EmergentContext::default(),
+            recovery,
+            turns_completed: 0,
+        }
+    }
+
     /// Number of turns successfully completed in this session.
     #[must_use]
     pub fn turns_completed(&self) -> u32 {
