@@ -688,7 +688,9 @@ pub(crate) async fn stream_chat_sse(
             consecutive_same_error: 0,
             last_error_category: None,
         },
-        pipeline_session: None,
+        pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        )),
         message: p.message.to_string(),
         recent_tools: p.recent_tools.to_vec(),
         task_profile,
