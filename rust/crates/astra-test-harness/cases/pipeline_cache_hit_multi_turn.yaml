@@ -8,10 +8,15 @@ description: |
   hit ratio means stable content is being rebuilt every turn (HashMap drift, dynamic
   tool ordering, incompatible cache_control markers, etc.) and we're paying full
   input-token cost each turn instead of the 10% cached-read price.
-  **Pass means**: cumulative cached_input_tokens ≥ 8000 across the session
-  AND cache_creation_tokens ≤ 20000 (creation happens only in turn 1, not every turn).
-  **Fail means**: cache prefix breaks each turn (e.g., non-deterministic skill enum,
-  `ttl: 1h` marker Bedrock silently drops, Session-scoped tool-dependent sections).
+  **Pass means** (calibrated against 3 runs of live Bedrock Sonnet-4.6):
+    - cumulative cached_input_tokens ≥ 30000 (observed: 32k / 47k / 52k across 4 turns)
+    - cache_creation_tokens ≤ 25000 (observed: 20k worst-case warm-up, 0 when
+      cross-session cache is warm; 25k caps persistent ~5-6k/turn rebuilds)
+  **Fail means**: cache prefix broken every turn (non-deterministic skill enum,
+  `ttl: 1h` marker Bedrock silently drops, Session-scoped tool-dependent sections,
+  or any byte drift in the pinned prefix).
+  **Catches**: 100% → 60% hit-rate regressions. Tighter than the original
+  (min_read=8000, no max) threshold which would pass even at 0%.
 prompt: |
   Reply with the single word ACK. Do not call any tools.
 capability: custom:cache
@@ -25,6 +30,12 @@ steps:
 criteria:
   - type: exit_code
     code: 0
-  - type: prompt_cache_tokens
-    min_read: 8000
-    min_creation: 0
+  # Wrap in all_of to promote `prompt_cache_tokens` from soft (default for
+  # metric criteria) to a hard pass/fail — this case's whole purpose is to
+  # catch cache-stability regressions in CI.
+  - type: all_of
+    criteria:
+      - type: prompt_cache_tokens
+        min_read: 30000
+        min_creation: 0
+        max_creation: 25000

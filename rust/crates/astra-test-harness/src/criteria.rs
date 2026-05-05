@@ -159,11 +159,25 @@ pub enum Criterion {
         min_calls: u32,
     },
 
-    /// Passes when provider prompt-cache accounting reports both the
-    /// cache-read and cache-creation buckets at or above the expected
-    /// minimums. This is distinct from `cache_rate_above`, which checks
-    /// the local idempotent tool-result cache.
-    PromptCacheTokens { min_read: u64, min_creation: u64 },
+    /// Passes when provider prompt-cache accounting reports the cache-read
+    /// and cache-creation buckets within the expected bounds.
+    ///
+    /// - `min_read` — floor on cumulative `cached_input_tokens`. Fails when
+    ///   the prefix doesn't hit enough (cache prefix broken).
+    /// - `min_creation` — floor on `cache_creation_tokens`. Rarely used; set
+    ///   to 0 for backward compatibility.
+    /// - `max_creation` — ceiling on `cache_creation_tokens`. When set, fails
+    ///   if cache is being rebuilt excessively (partial-hit regressions where
+    ///   reads look healthy but creations explode).
+    ///
+    /// Distinct from `cache_rate_above`, which checks the local idempotent
+    /// tool-result cache.
+    PromptCacheTokens {
+        min_read: u64,
+        min_creation: u64,
+        #[serde(default)]
+        max_creation: Option<u64>,
+    },
 
     /// Passes when any nested deterministic criterion passes.
     ///
@@ -697,19 +711,30 @@ fn evaluate_one(
         Criterion::PromptCacheTokens {
             min_read,
             min_creation,
+            max_creation,
         } => {
-            let passed = outcome.cached_input_tokens >= *min_read
-                && outcome.cache_creation_tokens >= *min_creation;
+            let read_ok = outcome.cached_input_tokens >= *min_read;
+            let creation_floor_ok = outcome.cache_creation_tokens >= *min_creation;
+            let creation_ceiling_ok = match max_creation {
+                Some(max) => outcome.cache_creation_tokens <= *max,
+                None => true,
+            };
+            let passed = read_ok && creation_floor_ok && creation_ceiling_ok;
+            let ceiling_desc = match max_creation {
+                Some(max) => format!(", creation<={max}"),
+                None => String::new(),
+            };
             CriterionResult {
                 criterion: c.clone(),
                 severity: criterion_severity(c),
                 passed,
                 detail: format!(
-                    "prompt_cache read={} creation={}, expected read>={} creation>={}",
+                    "prompt_cache read={} creation={}, expected read>={} creation>={}{}",
                     outcome.cached_input_tokens,
                     outcome.cache_creation_tokens,
                     min_read,
-                    min_creation
+                    min_creation,
+                    ceiling_desc
                 ),
                 full_detail: None,
                 score: None,
@@ -867,12 +892,20 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
         Criterion::PromptCacheTokens {
             min_read,
             min_creation,
+            max_creation,
         } => {
-            if *min_read == 0 && *min_creation == 0 {
+            if *min_read == 0 && *min_creation == 0 && max_creation.is_none() {
                 return Err(
-                    "PromptCacheTokens requires min_read or min_creation to be greater than 0"
+                    "PromptCacheTokens requires min_read, min_creation, or max_creation to be set"
                         .into(),
                 );
+            }
+            if let Some(max) = max_creation
+                && *max < *min_creation
+            {
+                return Err(format!(
+                    "PromptCacheTokens.max_creation ({max}) must be >= min_creation ({min_creation})"
+                ));
             }
             Ok(())
         }
@@ -1668,6 +1701,7 @@ mod tests {
         let c = Criterion::PromptCacheTokens {
             min_read: 10,
             min_creation: 5,
+            max_creation: None,
         };
         let mut out = RunOutcome::new("m");
         out.cached_input_tokens = 12;
@@ -1678,5 +1712,73 @@ mod tests {
         out.cached_input_tokens = 9;
         let r = evaluate_one(&c, &out, None);
         assert!(!r.passed, "{r:?}");
+    }
+
+    /// `max_creation` flags excessive cache-rebuild. Catches the failure mode
+    /// where cache_read is healthy but cache_creation is also huge — i.e. the
+    /// prefix is hitting partially but something after the marker is forcing
+    /// re-creation every turn (silent 40-60% hit-rate regressions).
+    #[test]
+    fn prompt_cache_tokens_max_creation_catches_churn() {
+        let c = Criterion::PromptCacheTokens {
+            min_read: 10000,
+            min_creation: 0,
+            max_creation: Some(15_000),
+        };
+        let mut out = RunOutcome::new("m");
+
+        // Healthy: read well past min, creation within ceiling.
+        out.cached_input_tokens = 30_000;
+        out.cache_creation_tokens = 4_000;
+        let r = evaluate_one(&c, &out, None);
+        assert!(r.passed, "healthy cache should pass: {r:?}");
+
+        // Regression: plenty of reads, but creation explodes — partial cache hit.
+        out.cached_input_tokens = 30_000;
+        out.cache_creation_tokens = 25_000;
+        let r = evaluate_one(&c, &out, None);
+        assert!(
+            !r.passed,
+            "max_creation must fire when cache creation exceeds the ceiling: {r:?}"
+        );
+        assert!(
+            r.detail.contains("25000") && r.detail.contains("15000"),
+            "detail must surface both observed and ceiling: {}",
+            r.detail
+        );
+    }
+
+    #[test]
+    fn prompt_cache_tokens_max_creation_defaults_to_unbounded() {
+        // YAML case omitting `max_creation` must remain backward-compatible.
+        let c = Criterion::PromptCacheTokens {
+            min_read: 10,
+            min_creation: 0,
+            max_creation: None,
+        };
+        let mut out = RunOutcome::new("m");
+        out.cached_input_tokens = 100;
+        out.cache_creation_tokens = 999_999;
+        let r = evaluate_one(&c, &out, None);
+        assert!(
+            r.passed,
+            "unlimited creation must pass when max_creation is None: {r:?}"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_tokens_validation_catches_inverted_bounds() {
+        // min_creation > max_creation is unreachable — validation must reject
+        // it so YAML authors notice typos at parse time, not run time.
+        let c = Criterion::PromptCacheTokens {
+            min_read: 100,
+            min_creation: 5_000,
+            max_creation: Some(1_000),
+        };
+        let err = validate_criterion(&c).unwrap_err();
+        assert!(
+            err.contains("max_creation"),
+            "validate must mention the offending field: {err}"
+        );
     }
 }
