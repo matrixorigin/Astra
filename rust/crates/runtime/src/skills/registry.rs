@@ -1393,6 +1393,64 @@ Shared MCP.
         assert!(result.is_err());
     }
 
+    /// Regression test: prompt cache hits require `available_skills()` output
+    /// to be byte-stable across calls. The underlying cache is a HashMap, so
+    /// without an explicit sort the iteration order varies between calls,
+    /// which invalidates the `skill` tool schema's `enum` and the
+    /// `<available_skills>` system block, breaking Bedrock/Anthropic cache hits.
+    #[tokio::test]
+    async fn available_skills_is_deterministic_across_calls() {
+        let mut registry = UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(StubProvider {
+            skills: vec![
+                (
+                    SkillManifest {
+                        name: "zeta".into(),
+                        description: "z".into(),
+                        ..Default::default()
+                    },
+                    "".into(),
+                ),
+                (
+                    SkillManifest {
+                        name: "alpha".into(),
+                        description: "a".into(),
+                        ..Default::default()
+                    },
+                    "".into(),
+                ),
+                (
+                    SkillManifest {
+                        name: "middle".into(),
+                        description: "m".into(),
+                        ..Default::default()
+                    },
+                    "".into(),
+                ),
+            ],
+        }));
+        registry.discover_all().await.unwrap();
+
+        let resolver = UnifiedSkillResolver::new(Arc::new(registry));
+        let first: Vec<String> = resolver
+            .available_skills()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(first, vec!["alpha", "middle", "zeta"]);
+
+        // Every subsequent call must produce the identical order, regardless of
+        // HashMap iteration variance.
+        for _ in 0..50 {
+            let names: Vec<String> = resolver
+                .available_skills()
+                .into_iter()
+                .map(|s| s.name)
+                .collect();
+            assert_eq!(names, first);
+        }
+    }
+
     #[tokio::test]
     async fn available_skills_includes_aliases() {
         let mut registry = UnifiedSkillRegistry::new();

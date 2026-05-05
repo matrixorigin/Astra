@@ -2237,10 +2237,39 @@ mod tests {
             },
         ];
 
+        // Sorted alphabetically for byte-stable tool schema across turns —
+        // prompt cache hits require deterministic ordering.
         assert_eq!(
             skill_enum_names(&skills),
-            vec!["review", "audit", "inspect", "check"]
+            vec!["audit", "check", "inspect", "review"]
         );
+    }
+
+    /// Regression test: `skill_enum_names` output must be identical across
+    /// calls even when the input slice order changes (upstream cache is a
+    /// HashMap). A drifting enum breaks Bedrock/Anthropic prompt cache hits.
+    #[test]
+    fn skill_enum_names_are_stable_under_input_reorder() {
+        let a = SkillToolInfo {
+            name: "alpha".into(),
+            aliases: vec!["a1".into()],
+            ..Default::default()
+        };
+        let b = SkillToolInfo {
+            name: "beta".into(),
+            aliases: vec!["b1".into()],
+            ..Default::default()
+        };
+        let c = SkillToolInfo {
+            name: "charlie".into(),
+            ..Default::default()
+        };
+
+        let order1 = skill_enum_names(&[a.clone(), b.clone(), c.clone()]);
+        let order2 = skill_enum_names(&[c.clone(), a.clone(), b.clone()]);
+        let order3 = skill_enum_names(&[b.clone(), c.clone(), a.clone()]);
+        assert_eq!(order1, order2);
+        assert_eq!(order1, order3);
     }
 
     #[test]
