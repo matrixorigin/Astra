@@ -2183,7 +2183,9 @@ impl AgenticRunLifecycleService {
             cancellation: Default::default(),
             messaging: Default::default(),
             error_recovery: Default::default(),
-            pipeline_session: None,
+            pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
+                astra_turn_core::pipeline_config::PipelineConfig::default(),
+            )),
             message: request.message.clone(),
             recent_tools: Vec::new(),
             task_profile,
@@ -3909,7 +3911,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 ..Default::default()
             },
             error_recovery: Default::default(),
-            pipeline_session: None,
+            pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
+                astra_turn_core::pipeline_config::PipelineConfig::default(),
+            )),
             message: full_task,
             recent_tools: Vec::new(),
             task_profile,

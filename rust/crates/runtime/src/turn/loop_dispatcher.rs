@@ -304,7 +304,9 @@ mod tests {
             messaging: Default::default(),
             cancellation: Default::default(),
             error_recovery: Default::default(),
-            pipeline_session: None,
+            pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
+                astra_turn_core::pipeline_config::PipelineConfig::default(),
+            )),
             message: message.to_string(),
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),

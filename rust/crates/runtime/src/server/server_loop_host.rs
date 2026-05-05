@@ -2416,8 +2416,73 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let cache_cfg = PromptCacheConfig::latch(&llm_cfg.provider, &llm_cfg.model_name);
         self.resolved_model_name = Some(llm_cfg.model_name.clone());
 
+        // Build system messages: pipeline path (when active) or legacy fallback.
         let (system_messages, system_prompt_plain, system_prompt_breakdown) =
-            self.build_system_messages_cached(&user_content, &visible_tools, state, &cache_cfg);
+            if state.pipeline_session.is_some() {
+                // Pipeline path: adapter extracts dynamic data → pipeline assembles
+                use crate::turn::context_pipeline_adapter::*;
+                use astra_turn_core::context_serializer::system_blocks_to_anthropic_content;
+                use astra_turn_core::context_sources::{AgentContext, StaticSections};
+                use astra_turn_core::pipeline_session::AdaptiveTurnInput;
+
+                let tool_names: Vec<&str> = visible_tools
+                    .iter()
+                    .filter_map(|t| t.get("function").and_then(|f| f.get("name")).and_then(Value::as_str))
+                    .collect();
+                let plan_hint = self.plan_resume_hint.read().ok().and_then(|g| g.clone());
+                let external = build_external_sources(
+                    &self.edge_profile,
+                    state,
+                    &user_content,
+                    &tool_names,
+                    self.selection_confidence,
+                    plan_hint.as_deref(),
+                    self.resolved_model_name.as_deref(),
+                );
+                let turn_state = build_turn_state(state, &user_content);
+                let session_ctx = build_session_context(
+                    &self.session_id,
+                    state.current_run_id.as_deref(),
+                    &llm_cfg.model_name,
+                    state.max_turn_input_tokens,
+                    &self.edge_profile,
+                );
+                let statics = crate::prompts::build_pipeline_static_sections();
+                let agent = AgentContext {
+                    tool_schemas: visible_tools.to_vec(),
+                    ..Default::default()
+                };
+
+                let input = AdaptiveTurnInput {
+                    statics: &statics,
+                    agent: &agent,
+                    session: &session_ctx,
+                    turn: &turn_state,
+                    external: &external,
+                    model_id: &llm_cfg.model_name,
+                    query_source: "agentic_loop",
+                };
+
+                let pipeline_sess = state.pipeline_session.as_ref().unwrap();
+                match pipeline_sess.run_turn_adaptive(input) {
+                    Ok(output) => {
+                        let content = system_blocks_to_anthropic_content(&output.serialized);
+                        let plain = astra_turn_core::context_serializer::flatten_serialized_system_blocks(&output.serialized);
+                        let breakdown = astra_turn_core::context_assembly_trace::SystemPromptBreakdown {
+                            total_tokens: output.metrics.sections,
+                            ..Default::default()
+                        };
+                        (vec![json!({"role": "system", "content": content})], plain, breakdown)
+                    }
+                    Err(_abort) => {
+                        // Pipeline aborted (3+ PTL errors) — fall back to legacy
+                        self.build_system_messages_cached(&user_content, &visible_tools, state, &cache_cfg)
+                    }
+                }
+            } else {
+                // No pipeline session — legacy path (test fixtures, server without pipeline)
+                self.build_system_messages_cached(&user_content, &visible_tools, state, &cache_cfg)
+            };
         self.emit_context_meta(&system_prompt_breakdown);
 
         let llm_messages = self
