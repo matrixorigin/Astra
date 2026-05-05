@@ -96,6 +96,7 @@ pub fn serialize_prompt_sections(
     }
 }
 
+/// Flatten all system blocks into a single concatenated string (for OpenAI-style providers).
 #[must_use]
 pub fn flatten_serialized_system_blocks(request: &SerializedProviderRequest) -> String {
     request
@@ -104,6 +105,44 @@ pub fn flatten_serialized_system_blocks(request: &SerializedProviderRequest) -> 
         .map(|block| block.text.as_str())
         .collect::<Vec<_>>()
         .join("")
+}
+
+/// Convert system blocks into the Anthropic multi-block format:
+/// `[{"type": "text", "text": "...", "cache_control": {...}}, ...]`
+///
+/// This produces the same shape as `build_system_message_with_dynamic_sections()`
+/// in the legacy path, enabling drop-in replacement.
+#[must_use]
+pub fn system_blocks_to_anthropic_content(request: &SerializedProviderRequest) -> Vec<Value> {
+    request
+        .system_blocks
+        .iter()
+        .map(|block| {
+            let mut v = serde_json::json!({
+                "type": "text",
+                "text": block.text,
+            });
+            if let Some(ref cc) = block.cache_control {
+                v["cache_control"] = cc.clone();
+            }
+            v
+        })
+        .collect()
+}
+
+/// Convert system blocks into the Anthropic system message (single message with content array).
+/// Returns `(system_message_value, plain_text)`.
+#[must_use]
+pub fn system_blocks_to_anthropic_message(
+    request: &SerializedProviderRequest,
+) -> (Value, String) {
+    let content = system_blocks_to_anthropic_content(request);
+    let plain = flatten_serialized_system_blocks(request);
+    let msg = serde_json::json!({
+        "role": "system",
+        "content": content,
+    });
+    (msg, plain)
 }
 
 fn prompt_section_kind(section: &PromptSection, idx: usize) -> SectionKind {

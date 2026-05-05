@@ -302,3 +302,55 @@ fn pipeline_output_flattened_matches_concatenation_of_blocks() {
         );
     }
 }
+
+#[test]
+fn pipeline_to_anthropic_message_format() {
+    use astra_turn_core::context_serializer::system_blocks_to_anthropic_message;
+
+    let mock = MockLoopState::default_test();
+    let statics = StaticSections::test_default();
+    let agent = AgentContext::default();
+    let session = mock.build_session_context();
+    let turn = mock.build_turn_state();
+    let external = mock.build_external();
+    let limits = OptimizeLimits::default();
+
+    let sess = PipelineSession::new(PipelineConfig {
+        provider_policy: ProviderCachePolicy::anthropic(),
+    });
+
+    let input = TurnInput {
+        statics: &statics,
+        agent: &agent,
+        session: &session,
+        turn: &turn,
+        external: &external,
+        optimize_limits: &limits,
+        model_id: "model",
+        query_source: "repl",
+    };
+
+    let output = sess.run_turn(input).unwrap();
+    let (msg, plain) = system_blocks_to_anthropic_message(&output.serialized);
+
+    // Message shape: {"role": "system", "content": [...]}
+    assert_eq!(msg["role"], "system");
+    let content = msg["content"].as_array().unwrap();
+    assert!(!content.is_empty());
+
+    // Each block is {"type": "text", "text": "..."}
+    for block in content {
+        assert_eq!(block["type"], "text");
+        assert!(block["text"].as_str().is_some());
+    }
+
+    // Plain text is non-empty
+    assert!(!plain.is_empty());
+    assert!(plain.contains("expert")); // from identity section
+
+    // At least one block has cache_control (Anthropic policy)
+    assert!(
+        content.iter().any(|b| b.get("cache_control").is_some()),
+        "Anthropic format should have cache_control on at least one block"
+    );
+}
