@@ -265,6 +265,103 @@ impl PipelineSession {
     pub fn config(&self) -> &PipelineConfig {
         self.pipeline.config()
     }
+
+    // ── Emergent Context Lifecycle ───────────────────────────────────────────
+
+    /// Push a discovered skill into emergent context for the next turn.
+    /// The runtime calls this during tool execution when a skill trigger is detected.
+    pub fn push_emergent_skill(
+        &mut self,
+        skill_name: impl Into<String>,
+        trigger: impl Into<String>,
+        current_turn: u32,
+    ) {
+        use crate::emergent_context::{DiscoveredSkill, EmergentItem};
+        use std::hash::{Hash, Hasher};
+        let skill_name = skill_name.into();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        skill_name.hash(&mut hasher);
+        let hash = hasher.finish();
+        self.emergent.push_skill(EmergentItem {
+            value: DiscoveredSkill {
+                skill_name,
+                trigger: trigger.into(),
+            },
+            created_at_turn: current_turn,
+            content_hash: hash,
+        });
+    }
+
+    /// Push prefetched memory into emergent context for the next turn.
+    /// The runtime calls this when memory is fetched concurrently during streaming.
+    pub fn push_emergent_memory(
+        &mut self,
+        content: impl Into<String>,
+        relevance_score: f64,
+        current_turn: u32,
+    ) {
+        use crate::emergent_context::{EmergentItem, PrefetchedMemory};
+        use std::hash::{Hash, Hasher};
+        let content = content.into();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        content.hash(&mut hasher);
+        let hash = hasher.finish();
+        self.emergent.push_memory(EmergentItem {
+            value: PrefetchedMemory {
+                content,
+                relevance_score,
+            },
+            created_at_turn: current_turn,
+            content_hash: hash,
+        });
+    }
+
+    /// Push a tool use summary into emergent context for the next turn.
+    pub fn push_emergent_summary(
+        &mut self,
+        summary: impl Into<String>,
+        tool_calls_covered: u32,
+        current_turn: u32,
+    ) {
+        use crate::emergent_context::{EmergentItem, ToolUseSummary};
+        use std::hash::{Hash, Hasher};
+        let summary = summary.into();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        summary.hash(&mut hasher);
+        let hash = hasher.finish();
+        self.emergent.push_summary(EmergentItem {
+            value: ToolUseSummary {
+                summary,
+                tool_calls_covered,
+            },
+            created_at_turn: current_turn,
+            content_hash: hash,
+        });
+    }
+
+    // ── Session Latches Lifecycle ────────────────────────────────────────────
+
+    /// Latch a beta header. Call when the runtime first evaluates a beta feature.
+    /// Returns true if newly latched (first time), false if already latched.
+    pub fn latch_header(
+        &mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+        turn: u32,
+    ) -> bool {
+        self.latches.latch_header(name, value, turn)
+    }
+
+    /// Latch the cache scope. Call on the first turn to freeze scope for the session.
+    /// Returns true if newly latched.
+    pub fn latch_cache_scope(&mut self, scope: crate::section_types::CacheScope, turn: u32) -> bool {
+        self.latches.latch_cache_scope(scope, turn)
+    }
+
+    /// Latch a provider feature gate.
+    pub fn latch_feature(&mut self, key: impl Into<String>, turn: u32) -> bool {
+        self.latches.latch_feature(key, turn)
+    }
 }
 
 #[cfg(test)]
@@ -601,5 +698,71 @@ mod tests {
             !history.is_empty(),
             "section usage should be recorded from turn output"
         );
+    }
+
+    #[test]
+    fn push_emergent_skill_populates_context() {
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        assert!(sess.emergent.is_empty());
+
+        sess.push_emergent_skill("code-review", "detected REVIEW keyword", 1);
+        assert!(!sess.emergent.is_empty());
+        assert_eq!(sess.emergent.discovered_skills.len(), 1);
+        assert_eq!(
+            sess.emergent.discovered_skills[0].value.skill_name,
+            "code-review"
+        );
+    }
+
+    #[test]
+    fn push_emergent_memory_deduplicates() {
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+
+        sess.push_emergent_memory("User prefers Rust.", 0.9, 1);
+        sess.push_emergent_memory("User prefers Rust.", 0.95, 1);
+        assert_eq!(sess.emergent.prefetched_memory.len(), 1);
+    }
+
+    #[test]
+    fn latch_header_freezes_on_first_call() {
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        assert!(sess.latch_header("anthropic-beta", "prompt-caching-2024-07-31", 1));
+        assert!(!sess.latch_header("anthropic-beta", "something-else", 2));
+        assert!(sess.latches.has_header("anthropic-beta"));
+    }
+
+    #[test]
+    fn latch_cache_scope_freezes_on_first_call() {
+        use crate::section_types::CacheScope;
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        assert!(sess.latch_cache_scope(CacheScope::Global, 1));
+        assert!(!sess.latch_cache_scope(CacheScope::Session, 2));
+        assert_eq!(sess.latches.cache_scope, Some(CacheScope::Global));
+    }
+
+    #[test]
+    fn emergent_context_available_to_next_turn() {
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        sess.push_emergent_skill("debug", "error in output", 1);
+
+        let statics = test_statics();
+        let agent = AgentContext::default();
+        let session = test_session_context();
+        let turn = test_turn_state(2);
+        let external = test_external();
+        let limits = OptimizeLimits::default();
+
+        let input = TurnInput {
+            statics: &statics,
+            agent: &agent,
+            session: &session,
+            turn: &turn,
+            external: &external,
+            optimize_limits: &limits,
+            model_id: "model",
+            query_source: "repl",
+        };
+
+        let _output = sess.run_turn(input).expect("should succeed with emergent");
     }
 }
