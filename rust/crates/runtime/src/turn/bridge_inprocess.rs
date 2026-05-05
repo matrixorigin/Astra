@@ -3796,7 +3796,7 @@ mod tests {
     static CACHE_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn build_system_message_records_bridge_context_signals() {
+    fn pipeline_assembly_records_bridge_context_signals() {
         let active_skill_names = vec!["concise"];
         let learned_context_text = "matrixorigin => github";
         // memory_signal_hint removed — LLM-driven via system prompt rules
