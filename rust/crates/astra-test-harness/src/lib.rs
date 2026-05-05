@@ -50,6 +50,7 @@ pub mod judger;
 pub mod preflight;
 pub mod report;
 pub mod runner;
+pub mod pipeline_analysis;
 pub mod session_capture;
 pub mod suite;
 pub mod summarizer;
