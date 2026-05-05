@@ -2131,17 +2131,20 @@ async fn handle_token_budget<H: AgenticLoopHost>(
     //   1. Aggressive compression pipeline (clear tool results)
     //   2. If still over: spill old messages to disk, keep reference in context
     // Only if both fail do we inject the stop directive.
-    // Skip if pre-turn LLM compact already ran this turn (avoid double work).
-    if !state.budget_wrapup_injected && !state.pre_turn_compact_applied {
+    // Skip tier-1 mechanical compression if pre-turn LLM compact already ran,
+    // but still allow tier-2 spill-to-disk as an independent recovery path.
+    if !state.budget_wrapup_injected {
         let budget = super::context_compression::TokenBudget {
             max_prompt_tokens: state.max_turn_input_tokens,
             last_measured_tokens: measured,
             current_round_index: Some(state.current_round_index),
         };
-        let pipeline = super::context_compression::CompressionPipeline::aggressive_pipeline();
-        let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
-
-        let mut total_freed = outcome.total_tokens_freed;
+        let mut total_freed = 0;
+        if !state.pre_turn_compact_applied {
+            let pipeline = super::context_compression::CompressionPipeline::aggressive_pipeline();
+            let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
+            total_freed = outcome.total_tokens_freed;
+        }
 
         // Tier 2: Spill old messages to disk if compression wasn't enough.
         // Serialize the oldest 60% of messages to a session-local file.
@@ -2149,7 +2152,7 @@ async fn handle_token_budget<H: AgenticLoopHost>(
         // can read_file it if needed. This is the SpillBackend pattern
         // applied to conversation history — content isn't lost, just
         // moved out of the live context window.
-        if total_freed == 0 || (measured.saturating_sub(total_freed) > state.max_turn_input_tokens)
+        if measured.saturating_sub(total_freed) > state.max_turn_input_tokens
         {
             if let Some(sid) = state.current_session_id.as_deref() {
                 let spill_freed = spill_old_messages_to_disk(
@@ -3910,15 +3913,28 @@ const SPILL_MIN_SPILL: usize = 4;
 /// until we land in a safe spot:
 ///   - the retained prefix does not start with a `tool` / `tool_result` role, and
 ///   - the last spilled message is not an assistant with unanswered tool calls.
-fn adjust_spill_boundary_for_tool_pairs(
+pub(crate) fn adjust_spill_boundary_for_tool_pairs(
     messages: &[serde_json::Value],
     mut spill_count: usize,
 ) -> usize {
     let is_tool_role = |m: &serde_json::Value| -> bool {
-        matches!(
-            m.get("role").and_then(|r| r.as_str()),
-            Some("tool") | Some("tool_result")
-        )
+        let role = m.get("role").and_then(|r| r.as_str());
+        // OpenAI-shape: role is "tool"; Anthropic-shape: role is "tool_result".
+        if matches!(role, Some("tool") | Some("tool_result")) {
+            return true;
+        }
+        // Anthropic tool-result messages arrive as role="user" with a content
+        // array containing {type:"tool_result"} blocks.  The current-role check
+        // above misses these, which would leave an orphaned tool_use assistant
+        // message in the retained window.
+        if role == Some("user") {
+            if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
+                return arr
+                    .iter()
+                    .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"));
+            }
+        }
+        false
     };
     let has_tool_calls = |m: &serde_json::Value| -> bool {
         if m.get("role").and_then(|r| r.as_str()) != Some("assistant") {

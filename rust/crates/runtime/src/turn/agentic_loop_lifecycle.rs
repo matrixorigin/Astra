@@ -876,67 +876,14 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             0.0
         };
 
-        // Pre-turn LLM compact: if pressure exceeds 80% AND the host provides
-        // a summary client, compress old messages via LLM summarization BEFORE
-        // microcompact and the main LLM call. This is the forked-agent pattern:
-        // same model, shared cache prefix, one-shot summary.
+        // Pre-turn LLM compact: if pressure exceeds 80%, let the host run an
+        // optional cache-friendly inline-summary pass before the next LLM call.
+        // Server hosts can build the exact system prompt + history prefix;
+        // generic hosts keep the default no-op behavior.
         if pressure >= 0.80 && !state.pre_turn_compact_applied && state.messages.len() > 10 {
-            if let Some(client) = host.summary_client() {
-                if let Some(summary_text) =
-                    astra_turn_core::cloud_summary::generate_compact_summary(
-                        &state.messages,
-                        client.as_ref(),
-                    )
-                    .await
-                {
-                    let old_count = state.messages.len();
-                    let keep_recent = (old_count / 4).max(4);
-                    let spilled: Vec<_> =
-                        state.messages.drain(..old_count - keep_recent).collect();
-                    let tokens_freed = spilled
-                        .iter()
-                        .map(|m| {
-                            serde_json::to_string(m).map(|s| s.len()).unwrap_or(0)
-                        })
-                        .sum::<usize>() as u64
-                        / 4;
-
-                    state.messages.insert(
-                        0,
-                        serde_json::json!({
-                            "role": "system",
-                            "content": format!(
-                                "[Conversation compacted — {} messages summarized]\n\n{}",
-                                spilled.len(),
-                                summary_text,
-                            )
-                        }),
-                    );
-                    state.pre_turn_compact_applied = true;
-
-                    if let Some(ref mut sess) = state.pipeline_session {
-                        sess.recovery.record_reactive_compact();
-                        sess.stats.record_compaction(tokens_freed);
-                    }
-                    if !quiet {
-                        host.emit_headless_line(
-                            HeadlessStderrStyle::Yellow,
-                            format!(
-                                "♻ Pre-turn LLM compact: freed ~{} tokens ({} → summary)",
-                                tokens_freed, spilled.len(),
-                            ),
-                        );
-                    }
-                } else if !quiet {
-                    host.emit_headless_line(
-                        HeadlessStderrStyle::Dim,
-                        format!(
-                            "  ⚠ Pre-turn LLM compact failed; continuing at {:.0}% pressure",
-                            pressure * 100.0,
-                        ),
-                    );
-                }
-            }
+            host.maybe_pre_turn_compact(state, pressure, quiet)
+                .await
+                .map_err(|e| e.to_string())?;
         }
 
         // Adaptive microcompact: scale aggressiveness with context pressure.

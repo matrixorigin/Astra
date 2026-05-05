@@ -13,11 +13,11 @@
 //!   tests can inject mock responses without a real API.
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{
     cloud_compact_prompt::{
-        build_compact_user_prompt, render_messages_for_summary, COMPACT_SYSTEM_PROMPT,
+        COMPACT_SYSTEM_PROMPT, build_compact_user_prompt, render_messages_for_summary,
     },
     cloud_grouping::{drop_oldest_rounds, flatten_rounds, group_by_api_round},
 };
@@ -446,8 +446,8 @@ fn is_ptl_error(body: &str) -> bool {
 /// Test helpers exposed for cross-crate testing (e.g. runtime's compaction tests).
 pub mod test_support {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Mock LLM client for testing.
     pub struct MockSummaryClient {
@@ -585,10 +585,12 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["role"].as_str().unwrap(), "system");
         assert_eq!(msgs[1]["role"].as_str().unwrap(), "user");
-        assert!(msgs[1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("some conversation"));
+        assert!(
+            msgs[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("some conversation")
+        );
     }
 
     #[test]
@@ -597,10 +599,12 @@ mod tests {
         let body = build_bedrock_summary_body(&messages, 321);
         assert_eq!(body["system"][0]["text"], COMPACT_SYSTEM_PROMPT);
         assert_eq!(body["messages"][0]["role"], "user");
-        assert!(body["messages"][0]["content"][0]["text"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("some conversation"));
+        assert!(
+            body["messages"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("some conversation")
+        );
         assert_eq!(body["inferenceConfig"]["maxTokens"], 321);
 
         let response = json!({

@@ -2882,14 +2882,122 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         true
     }
 
+    async fn maybe_pre_turn_compact(
+        &mut self,
+        state: &mut crate::turn::agentic_loop_host::AgenticLoopState,
+        pressure: f64,
+        quiet: bool,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        if pressure < 0.80 || state.pre_turn_compact_applied || state.messages.len() <= 10 {
+            return Ok(());
+        }
+        let Some(params) = self.resolved_llm_params.clone() else {
+            return Ok(());
+        };
+
+        let user_content = state
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .and_then(|m| m.get("content").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_string();
+
+        let mut effective_restricted = state.restricted_tools.clone();
+        if !state.widen_selection_pending {
+            merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut effective_restricted);
+        }
+        effective_restricted.extend(self.effective_allowlist_restrictions(state));
+        let interaction_mode = self.turn_interaction_mode();
+        effective_restricted.extend(interaction_scoped_tool_restrictions(interaction_mode));
+        for boosted in &state.boosted_tools {
+            effective_restricted.remove(boosted);
+        }
+        let visible_tools = self.filtered_turn_tools(&effective_restricted);
+        let (system_messages, _, _) = self.build_pipeline_system_messages(
+            state,
+            &visible_tools,
+            &params.provider,
+            &params.model_name,
+            &user_content,
+        );
+        // Use the trait's summary_client() so gateway overrides and forwarded
+        // auth headers are respected, rather than constructing a plain client inline.
+        let Some(client) = self.summary_client() else {
+            return Ok(());
+        };
+        if let Some(summary_text) = astra_turn_core::cloud_summary::generate_inline_summary(
+            &system_messages,
+            &state.messages,
+            client.as_ref(),
+        )
+        .await
+        {
+            let old_count = state.messages.len();
+            let keep_recent = (old_count / 4).max(4);
+            let mut spill_count = old_count - keep_recent;
+            // Snap to a safe role boundary so we never split an assistant/tool pair.
+            spill_count =
+                crate::turn::agentic_loop_execution_phase::adjust_spill_boundary_for_tool_pairs(
+                    &state.messages,
+                    spill_count,
+                );
+            let spilled: Vec<_> = state.messages.drain(..spill_count).collect();
+            let tokens_freed = spilled
+                .iter()
+                .map(|m| serde_json::to_string(m).map(|s| s.len()).unwrap_or(0))
+                .sum::<usize>() as u64
+                / 4;
+
+            state.messages.insert(
+                0,
+                serde_json::json!({
+                    "role": "system",
+                    "content": format!(
+                        "[Conversation compacted — {} messages summarized]\n\n{}",
+                        spilled.len(),
+                        summary_text,
+                    )
+                }),
+            );
+            state.pre_turn_compact_applied = true;
+
+            if let Some(ref mut sess) = state.pipeline_session {
+                sess.recovery.record_reactive_compact();
+                sess.stats.record_compaction(tokens_freed);
+            }
+            if !quiet {
+                self.emit_headless_line(
+                    HeadlessStderrStyle::Yellow,
+                    format!(
+                        "♻ Pre-turn LLM compact: freed ~{} tokens ({} → summary)",
+                        tokens_freed,
+                        spilled.len(),
+                    ),
+                );
+            }
+        } else if !quiet {
+            self.emit_headless_line(
+                HeadlessStderrStyle::Dim,
+                format!(
+                    "  ⚠ Pre-turn LLM compact failed; continuing at {:.0}% pressure",
+                    pressure * 100.0,
+                ),
+            );
+        }
+
+        Ok(())
+    }
+
     fn summary_client(&self) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
         // LLM config is resolved per-turn inside execute_turn. We cache it in
         // `resolved_llm_params` after first successful resolution so the trait
         // method can construct the client without re-resolving.
         let params = self.resolved_llm_params.as_ref()?;
-        Some(Box::new(astra_turn_core::cloud_summary::HttpSummaryClient::new(
-            params.clone(),
-        )))
+        Some(Box::new(
+            astra_turn_core::cloud_summary::HttpSummaryClient::new(params.clone()),
+        ))
     }
 
     fn valid_tool_names(&self) -> &HashSet<String> {
@@ -5131,6 +5239,136 @@ mod tests {
         assert_eq!(
             capture.path.lock().await.as_deref(),
             Some("/gateway/chat/completions")
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn maybe_pre_turn_compact_uses_inline_summary_prefix() {
+        use axum::{Router, extract::State, routing::post};
+        use tokio::net::TcpListener;
+
+        #[derive(Default)]
+        struct RequestCapture {
+            body: tokio::sync::Mutex<Option<Value>>,
+        }
+
+        async fn handler(
+            State(capture): State<Arc<RequestCapture>>,
+            request: axum::extract::Request,
+        ) -> axum::Json<Value> {
+            let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("read request body");
+            *capture.body.lock().await = Some(serde_json::from_slice(&bytes).expect("json body"));
+            axum::Json(json!({
+                "choices": [
+                    {
+                        "message": { "content": "inline summary" },
+                        "finish_reason": "stop"
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            }))
+        }
+
+        let capture = Arc::new(RequestCapture::default());
+        let app = Router::new()
+            .route("/gateway/chat/completions", post(handler))
+            .with_state(capture.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-inline".to_string(),
+            "session-inline".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .build();
+        host.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
+            model_name: "gpt-4o-mini".to_string(),
+            api_key: String::new(),
+            base_url: format!("http://{addr}/gateway"),
+            provider: "openai".to_string(),
+            max_output_tokens: 128,
+        });
+
+        let mut state = create_test_state();
+        state.max_turn_input_tokens = 100;
+        state.message = "Fix the regression".to_string();
+        for i in 0..6 {
+            state
+                .messages
+                .push(json!({"role": "user", "content": format!("question {i}")}));
+            state
+                .messages
+                .push(json!({"role": "assistant", "content": format!("answer {i}")}));
+        }
+
+        <ServerAgenticLoopHost as crate::turn::agentic_loop_host::AgenticLoopHost>::maybe_pre_turn_compact(
+            &mut host,
+            &mut state,
+            0.95,
+            true,
+        )
+        .await
+        .expect("pre-turn compact should succeed");
+
+        let body = capture
+            .body
+            .lock()
+            .await
+            .clone()
+            .expect("summary request should be captured");
+        let messages = body["messages"]
+            .as_array()
+            .expect("openai request should contain messages");
+
+        assert!(
+            messages.len() > state.messages.len() / 2,
+            "inline summary request should include system prompt plus much of the original history"
+        );
+        assert_eq!(
+            messages
+                .first()
+                .and_then(|m| m.get("role"))
+                .and_then(Value::as_str),
+            Some("system"),
+            "inline summary request should begin with main-turn system messages"
+        );
+        assert!(
+            messages.iter().any(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("question 0"))
+            }),
+            "expected original conversation history in inline summary request"
+        );
+        assert_eq!(
+            messages
+                .last()
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_str),
+            Some(astra_turn_core::cloud_summary::INLINE_COMPACT_INSTRUCTION),
+            "expected trailing inline compact instruction"
+        );
+        assert!(
+            !messages.iter().any(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("You are a conversation summarizer"))
+            }),
+            "inline path must not fall back to COMPACT_SYSTEM_PROMPT"
         );
 
         server.abort();

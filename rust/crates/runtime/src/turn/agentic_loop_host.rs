@@ -172,18 +172,31 @@ pub trait AgenticLoopHost: Send {
     /// Whether output is suppressed (quiet mode).
     fn is_quiet(&self) -> bool;
 
-    /// Optional LLM summary client for pre-turn compaction.
+    /// Optional LLM summary client for summary-based compaction helpers.
     ///
-    /// When provided, the agentic loop can call `generate_compact_summary`
-    /// to compress old messages before the main LLM request — matching the
-    /// forked-agent summarization pattern. The client uses the same
-    /// model/credentials as the main call, so its input shares the prompt
-    /// cache prefix.
+    /// Hosts can provide a client that uses the same model/credentials as the
+    /// main LLM path for summary-related work. Cache-friendly pre-turn inline
+    /// compaction is handled by [`AgenticLoopHost::maybe_pre_turn_compact`],
+    /// which can build the exact main-turn prefix when the host supports it.
     ///
     /// Default: `None` (no pre-turn compaction available — falls back to
     /// mechanical compression only).
     fn summary_client(&self) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
         None
+    }
+
+    /// Optional host-specific pre-turn compaction hook.
+    ///
+    /// Hosts that can build the exact next-turn system prompt may override
+    /// this to run cache-friendly inline summarization before the next LLM
+    /// round. Default is a no-op so non-server hosts preserve legacy behavior.
+    async fn maybe_pre_turn_compact(
+        &mut self,
+        _state: &mut AgenticLoopState,
+        _pressure: f64,
+        _quiet: bool,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        Ok(())
     }
 
     /// Valid tool names from the host's tool schemas.
@@ -4584,6 +4597,68 @@ pub(crate) mod tests {
         // Should complete (hard stop), not error.
         assert!(outcome.is_ok());
         assert!(state.budget_wrapup_injected);
+    }
+
+    #[tokio::test]
+    async fn budget_after_pre_turn_compact_still_spills_old_messages() {
+        let session_id = format!(
+            "precompact-spill-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        );
+        let spill_dir = astra_services::session_journal::local_sessions_dir().join(&session_id);
+
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool("bash", "large output")],
+                90_000,
+                2_000,
+                Some(100),
+            ),
+            text_result("Done after spill.", 40_000, 500, None),
+        ]);
+        let mut state = make_state();
+        state.max_turn_input_tokens = 80_000;
+        state.current_session_id = Some(session_id.clone());
+        state.pre_turn_compact_applied = true;
+        state
+            .messages
+            .push(json!({"role": "user", "content": "keep debugging"}));
+        for i in 0..12 {
+            state
+                .messages
+                .push(json!({"role": "assistant", "content": format!("analysis step {i}")}));
+            state
+                .messages
+                .push(json!({"role": "user", "content": format!("follow-up {i}")}));
+        }
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(outcome.is_ok());
+        assert_eq!(state.final_text, "Done after spill.");
+        let has_spill_msg = state.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| s.contains("[Context compressed"))
+        });
+        assert!(
+            has_spill_msg,
+            "expected spill-to-disk system message after budget recovery"
+        );
+        let has_budget_wrapup_msg = state.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| s.contains("token budget limit"))
+        });
+        assert!(
+            !has_budget_wrapup_msg,
+            "spill recovery should avoid injecting the hard wrap-up message"
+        );
+
+        let _ = std::fs::remove_dir_all(spill_dir);
     }
 
     // ── Rate-limit graceful degradation tests ───────────────────────────────
