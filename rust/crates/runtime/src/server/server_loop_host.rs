@@ -528,6 +528,8 @@ pub struct ServerAgenticLoopHost {
     edge_profile: Map<String, Value>,
     valid_tools: HashSet<String>,
     selection_confidence: f64,
+    /// Cached pipeline static sections (compiled once, reused every turn).
+    pipeline_statics: astra_turn_core::context_sources::StaticSections,
     /// `true` when tools were auto-populated from astra-tools (no CLI connected).
     server_side_tools: bool,
     /// `true` when the connected client can answer ask_user prompts.
@@ -868,6 +870,7 @@ impl ServerAgenticLoopHostBuilder {
             emitted_tool_call_ids: self.shared_dedup_state.unwrap_or_else(|| {
                 std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()))
             }),
+            pipeline_statics: crate::prompts::build_pipeline_static_sections(),
             prefix_store: self.prefix_store,
             last_turn_tool_schemas: Vec::new(),
         }
