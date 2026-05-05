@@ -848,8 +848,7 @@ impl GatewayRunner {
                          tag: &str,
                          chunk_num: u32|
          -> usize {
-            let text = std::mem::take(buf);
-            let text = text.trim().to_string();
+            let text = buf.trim().to_string();
             if text.is_empty() {
                 return 0;
             }
@@ -864,6 +863,8 @@ impl GatewayRunner {
             {
                 return 0;
             }
+            // Only clear buffer after successful send.
+            buf.clear();
             len
         };
 

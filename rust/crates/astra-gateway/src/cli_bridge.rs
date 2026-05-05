@@ -781,6 +781,7 @@ pub(crate) async fn run_child_with_cancel(
         tokio::select! {
             status = child.wait() => status.map_err(|e| format!("wait failed: {e}"))?,
             _ = tokio::time::sleep(timeout) => {
+                kill_guard.defuse();
                 let _ = child.kill().await;
                 let stderr_text = stderr_task.await.unwrap_or_default();
                 let _stdout_text = stdout_task.await.unwrap_or_default();
@@ -797,6 +798,7 @@ pub(crate) async fn run_child_with_cancel(
                     None => std::future::pending().await,
                 }
             } => {
+                kill_guard.defuse();
                 let _ = child.kill().await;
                 stderr_task.abort();
                 stdout_task.abort();
@@ -812,6 +814,7 @@ pub(crate) async fn run_child_with_cancel(
                     None => std::future::pending().await,
                 }
             } => {
+                kill_guard.defuse();
                 let _ = child.kill().await;
                 stderr_task.abort();
                 stdout_task.abort();
