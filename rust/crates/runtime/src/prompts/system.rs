@@ -94,10 +94,9 @@ fn planning_section() -> &'static str {
      ## Context Strategy\n\
      Before acting, identify WHAT context you need:\n\
      1. **Plan context needs**: What files/functions/tests must I understand first?\n\
-     2. **Batch the fetch**: Call all needed reads/greps in ONE turn (parallel).\n\
-     3. **Check inventory**: If context was already fetched, use it — don't re-fetch.\n\
-     4. **Then act**: Only after understanding, make your changes.\n\
-     Example: To fix a bug in auth.rs, plan: \"Need auth.rs:50-100, the test file, and git blame on line 75\" → fetch all 3 → then edit.\n"
+      2. **Batch the fetch**: Call all needed reads/greps in ONE turn (parallel).\n\
+      3. **Check inventory**: If context was already fetched, use it — don't re-fetch.\n\
+      4. **Then act**: Only after understanding, make your changes.\n"
 }
 
 /// Discovery + coding discipline. Pure static.
@@ -140,29 +139,27 @@ fn parallel_and_efficiency_section() -> &'static str {
      4. Only make sequential calls when one result determines the next call's arguments.\n\
      Aim to gather all necessary context in 1-2 turns, then synthesize your answer.\n\n\
      ## Parallel Tool Calls\n\
-     Call multiple tools in ONE turn when they are independent:\n\
-     - Reading 3 files? Call read_file 3× in parallel.\n\
-     - Need git_status AND git_diff? Call both.\n\
-     - Need glob AND grep with different patterns? Call both.\n\
-     - Reviewing a commit? Call git_log AND git_show (or git_diff) in the SAME turn.\n\
-     - Analyzing a project? Call list_dir + read_file for multiple key files in ONE turn.\n\
-     Do NOT parallelize when one result determines the next call's arguments.\n\
-      **Limit**: Keep parallel tool calls to ≤5 per turn. If you need more, batch into multiple turns — wait for results, then continue.\n\
-      **Anti-pattern**: Don't launch 10+ speculative searches hoping one hits — start precise, expand only if needed.\n\
-      **Anti-pattern**: Don't call one tool, wait for results, then call the next independent tool — batch them.\n\n\
-      ## Batching read-only tool calls\n\
-      When you need to gather information from multiple sources, return ALL the read-only tool_calls (e.g. read_file / grep / glob / list_dir / git_show / git_log / git_diff / git_status / web_fetch / memory_retrieve / find_definition / find_references) in a single assistant message — they execute in parallel. Only serialize a call when the next one genuinely depends on the previous result. This roughly halves round-trip latency for information-gathering turns.\n\
-      Do NOT batch write/mutating tools (write_file / multi_edit / bash / adjust_config / git_commit) — those execute sequentially.\n\n\
+      Call multiple independent tools in ONE turn (e.g., several reads, git_status+git_diff, glob+grep, git_log+git_show).\n\
+      Do NOT parallelize when one result determines the next call's arguments.\n\
+       **Limit**: Keep parallel tool calls to ≤5 per turn. If you need more, batch into multiple turns — wait for results, then continue.\n\
+       **Anti-pattern**: Don't launch 10+ speculative searches hoping one hits — start precise, expand only if needed.\n\
+       **Anti-pattern**: Don't call one tool, wait for results, then call the next independent tool — batch them.\n\n\
+       ## Batching read-only tool calls\n\
+       Return all independent read-only tool calls in one assistant message. Only serialize when the next call depends on the previous result.\n\
+       Do NOT batch write/mutating tools (write_file / multi_edit / bash / adjust_config / git_commit) — those execute sequentially.\n\n\
       ## Token Efficiency\n\
      - Prefer targeted reads (line ranges) over full-file reads.\n\
      - Use glob to narrow candidates before grep.\n\
      - Request only the data you need — avoid fetching entire files when a section suffices.\n\
      - Summarize findings concisely. Show relevant code, not the whole file.\n\
-     - If you've already fetched something, reference it from history — don't re-fetch.\n\
-     - **Avoid redundant calls**: don't call the same tool multiple times when ONE call suffices (e.g., git_diff once covers all files).\n\n\
-     ## ⚠ When to Run Build / Test Commands\n\
-     Build, compile, and test commands (cargo build, npm test, make, pytest, etc.) are EXPENSIVE.\n\
-     - **Run them ONLY to verify YOUR changes** — after you edited or created files.\n\
+      - If you've already fetched something, reference it from history — don't re-fetch.\n\
+      - **Avoid redundant calls**: don't call the same tool multiple times when ONE call suffices (e.g., git_diff once covers all files).\n\n\
+      ## Runaway Exploration Guard\n\
+      - For open-ended loops (\"keep going\", \"as many as you can\", repeated list/read), do one useful pass, then stop and say more would be busywork/a busy-loop.\n\n\
+      - Hard cap open-ended file exploration at 2 directory listings and 2 file reads unless the user names a concrete target.\n\n\
+      ## ⚠ When to Run Build / Test Commands\n\
+      Build, compile, and test commands (cargo build, npm test, make, pytest, etc.) are EXPENSIVE.\n\
+      - **Run them ONLY to verify YOUR changes** — after you edited or created files.\n\
      - **Do NOT run them for information gathering** — reviewing code, answering questions, summarizing changes, or exploring the codebase does NOT require compilation or test runs.\n\
      - **Wait for tool results before deciding next steps** — don't speculatively launch bash commands in the same turn as reads. Read first, then decide if bash is needed.\n"
 }
@@ -284,6 +281,13 @@ fn tool_conditional_section(
     let has_turn_rollback = tool_names.contains(&"rollback_turn_actions");
 
     let mut s = String::new();
+
+    if tool_names.contains(&"bash") {
+        s.push_str(
+            "\n## Explicit Tool Requests\n\
+             - If the user explicitly asks to use `bash`, call the `bash` tool rather than substituting file/navigation tools. Batch safe shell steps with `&&`.\n",
+        );
+    }
 
     if has_git || has_github {
         s.push_str(
@@ -751,11 +755,11 @@ pub fn self_awareness_prompt_section(
 
 /// Flatten sections into a single string (backward-compatible convenience).
 pub fn sections_to_string(sections: &[PromptSection]) -> String {
-    sections
-        .iter()
-        .map(|s| s.text.as_str())
-        .collect::<Vec<_>>()
-        .join("")
+    let serialized = astra_turn_core::context_serializer::serialize_prompt_sections(
+        sections,
+        &astra_turn_core::pipeline_config::ProviderCachePolicy::default(),
+    );
+    astra_turn_core::context_serializer::flatten_serialized_system_blocks(&serialized)
 }
 
 // ─── Prompt Section Overrides ─────────────────────────────────────────────
@@ -1801,6 +1805,22 @@ mod tests {
         assert!(p.contains("DB connection error"));
         assert!(p.contains("Empty results"));
         assert!(p.contains("Unknown tool"));
+    }
+
+    #[test]
+    fn prompt_honors_explicit_bash_requests() {
+        let p = build_main_system_prompt(&["bash", "read_file", "list_dir"], "", 0.5, None);
+        assert!(p.contains("If the user explicitly asks to use `bash`"));
+        assert!(p.contains("rather than substituting file/navigation tools"));
+    }
+
+    #[test]
+    fn prompt_bounds_runaway_file_exploration() {
+        let p = build_main_system_prompt(&["bash", "read_file", "list_dir"], "", 0.5, None);
+        assert!(p.contains("Runaway Exploration Guard"));
+        assert!(p.contains("\"as many as you can\""));
+        assert!(p.contains("2 directory listings and 2 file reads"));
+        assert!(p.contains("busy-loop"));
     }
 
     #[test]

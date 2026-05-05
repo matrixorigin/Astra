@@ -6,8 +6,6 @@
 //!
 //! Every item carries TTL (turn-based), a dedup hash, and each list has a cap.
 
-use std::collections::HashSet;
-
 use serde::{Deserialize, Serialize};
 
 /// Default TTL: items are consumed on the immediately next turn only.
@@ -64,6 +62,9 @@ impl EmergentContext {
 
     /// Drain items within TTL, clearing consumed items from this context.
     /// Returns a new EmergentContext containing only live items.
+    ///
+    /// **Consumption semantics**: this is a one-shot drain. After the call,
+    /// `self` is empty — a second call in the same turn returns an empty context.
     pub fn drain_live(&mut self, current_turn: u32, max_age: u32) -> EmergentContext {
         EmergentContext {
             discovered_skills: drain_live_items(&mut self.discovered_skills, current_turn, max_age),
@@ -85,10 +86,14 @@ impl EmergentContext {
 
 fn push_with_dedup_and_cap<T>(list: &mut Vec<EmergentItem<T>>, item: EmergentItem<T>, cap: usize) {
     // Dedup: reject if same hash already exists
-    if list.iter().any(|existing| existing.content_hash == item.content_hash) {
+    if list
+        .iter()
+        .any(|existing| existing.content_hash == item.content_hash)
+    {
         return;
     }
-    // Cap: drop oldest if at capacity
+    // Cap: drop oldest if at capacity. Caps are deliberately tiny (<=16), so
+    // Vec::remove(0) keeps the API simple without material runtime cost.
     while list.len() >= cap {
         list.remove(0);
     }
@@ -101,17 +106,16 @@ fn drain_live_items<T: Clone>(
     max_age: u32,
 ) -> Vec<EmergentItem<T>> {
     let mut live = Vec::new();
-    let mut consumed_hashes = HashSet::new();
 
     for item in source.iter() {
         if current_turn.saturating_sub(item.created_at_turn) <= max_age {
             live.push(item.clone());
-            consumed_hashes.insert(item.content_hash);
         }
     }
 
-    // Remove consumed items from source
-    source.retain(|item| !consumed_hashes.contains(&item.content_hash));
+    // Drain is a consumption boundary: live items move into the returned
+    // context, and expired items are discarded so stale data cannot resurface.
+    source.clear();
 
     live
 }
@@ -178,6 +182,18 @@ mod tests {
     }
 
     #[test]
+    fn drain_live_treats_future_created_turn_as_live_once_then_clears_source() {
+        let mut ctx = EmergentContext::default();
+        ctx.push_skill(make_skill("future", 10, 10));
+
+        let live = ctx.drain_live(5, DEFAULT_MAX_AGE);
+
+        assert_eq!(live.discovered_skills.len(), 1);
+        assert_eq!(live.discovered_skills[0].value.skill_name, "future");
+        assert!(ctx.discovered_skills.is_empty());
+    }
+
+    #[test]
     fn push_dedup_by_hash() {
         let mut ctx = EmergentContext::default();
         ctx.push_skill(make_skill("first", 1, 42));
@@ -195,6 +211,10 @@ mod tests {
         let live = ctx.drain_live(5, DEFAULT_MAX_AGE);
         assert_eq!(live.discovered_skills.len(), 1);
         assert_eq!(live.discovered_skills[0].value.skill_name, "new");
+        assert!(
+            ctx.discovered_skills.is_empty(),
+            "expired and consumed items must both be removed from source"
+        );
     }
 
     #[test]
@@ -213,12 +233,18 @@ mod tests {
     fn summary_cap_is_one() {
         let mut ctx = EmergentContext::default();
         ctx.push_summary(make_item(
-            ToolUseSummary { summary: "first".into(), tool_calls_covered: 3 },
+            ToolUseSummary {
+                summary: "first".into(),
+                tool_calls_covered: 3,
+            },
             1,
             1,
         ));
         ctx.push_summary(make_item(
-            ToolUseSummary { summary: "second".into(), tool_calls_covered: 5 },
+            ToolUseSummary {
+                summary: "second".into(),
+                tool_calls_covered: 5,
+            },
             1,
             2,
         ));
@@ -229,6 +255,22 @@ mod tests {
     #[test]
     fn empty_context_is_empty() {
         let ctx = EmergentContext::default();
+        assert!(ctx.is_empty());
+    }
+
+    #[test]
+    fn drain_live_double_call_returns_empty_second_time() {
+        let mut ctx = EmergentContext::default();
+        ctx.push_skill(make_skill("alpha", 5, 100));
+        ctx.push_skill(make_skill("beta", 5, 200));
+
+        // First drain: returns both live items
+        let first = ctx.drain_live(5, DEFAULT_MAX_AGE);
+        assert_eq!(first.discovered_skills.len(), 2);
+
+        // Second drain in same turn: source is empty, returns nothing
+        let second = ctx.drain_live(5, DEFAULT_MAX_AGE);
+        assert!(second.is_empty());
         assert!(ctx.is_empty());
     }
 }

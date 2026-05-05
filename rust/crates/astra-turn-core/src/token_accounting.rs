@@ -37,6 +37,17 @@ impl TokenAccounting {
             .saturating_add(self.cache_creation)
     }
 
+    /// Total input tokens as `u32`, saturating instead of truncating.
+    ///
+    /// Planner pressure math and provider limits are currently `u32` sized, but
+    /// API token usage is stored as `u64`. Keep overflow explicit at the
+    /// boundary so pathological or corrupt accounting cannot wrap to low
+    /// pressure.
+    #[must_use]
+    pub fn total_input_u32_saturating(&self) -> u32 {
+        self.total_input().min(u32::MAX as u64) as u32
+    }
+
     /// Cache hit ratio: cache_read / (cache_read + cache_creation).
     /// Returns 0.0 if both are zero.
     #[must_use]
@@ -109,5 +120,11 @@ mod tests {
         assert_eq!(t.cache_read, 20);
         assert_eq!(t.cache_creation, 30);
         assert_eq!(t.completion, 40);
+    }
+
+    #[test]
+    fn total_input_u32_saturates_instead_of_truncating() {
+        let t = TokenAccounting::from_fields(u64::from(u32::MAX), 10, 20, 0);
+        assert_eq!(t.total_input_u32_saturating(), u32::MAX);
     }
 }

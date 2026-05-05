@@ -40,7 +40,12 @@ impl SessionLatches {
     /// Attempt to latch a beta header. If a header with the same name is
     /// already latched, this is a no-op (the original value is preserved).
     /// Returns `true` if the header was newly latched.
-    pub fn latch_header(&mut self, name: impl Into<String>, value: impl Into<String>, turn: u32) -> bool {
+    pub fn latch_header(
+        &mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+        turn: u32,
+    ) -> bool {
         let name = name.into();
         if self.beta_headers.iter().any(|h| h.name == name) {
             return false;

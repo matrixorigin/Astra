@@ -128,7 +128,8 @@ pub fn optimize(
                 });
             }
 
-            if plan.compact_tier == CompactionTier::AggressivePrune && !limits.allow_round_dropping {
+            if plan.compact_tier == CompactionTier::AggressivePrune && !limits.allow_round_dropping
+            {
                 stats.skipped.push(SkippedOptimization {
                     step: "round_dropping".into(),
                     reason: "allow_round_dropping gate is closed".into(),
@@ -173,11 +174,7 @@ fn compact_tool_results_gated(
     _max_clear_tokens: u32,
 ) -> ClearResult {
     // Delegate to existing microcompact functions
-    let stats = crate::microcompact::compact_tool_results_adaptive(
-        messages,
-        pressure,
-        strategy,
-    );
+    let stats = crate::microcompact::compact_tool_results_adaptive(messages, pressure, strategy);
     ClearResult {
         count: stats.results_compacted as u32,
         tokens: stats.tokens_saved as u32,
@@ -185,7 +182,9 @@ fn compact_tool_results_gated(
 }
 
 /// Cache-align sections: sort within reorderable groups by cache scope.
-/// Returns the number of moves made.
+/// Returns the total displaced positions required by the proposed reorder. If
+/// that count exceeds `max_moves`, no reorder is applied and the returned value
+/// still reports the skipped work for optimizer stats/explainability.
 fn cache_align_sections(sections: &mut [BoundSection], max_moves: u32) -> u32 {
     // Only reorder within groups that have the same scope
     // For now, a simple stable sort by scope.order() within non-fixed sections
@@ -213,15 +212,15 @@ fn cache_align_sections(sections: &mut [BoundSection], max_moves: u32) -> u32 {
     sorted_indices.sort_by_key(|&i| sections[i].plan.scope.order());
 
     for (pos, &target_idx) in sorted_indices.iter().enumerate() {
-        if reorderable[pos] != target_idx && moves < max_moves {
-            // Would need a swap — count it
+        if reorderable[pos] != target_idx {
             moves += 1;
         }
     }
 
     // Actually sort if moves are within budget
     if moves <= max_moves && moves > 0 {
-        let mut reorderable_sections: Vec<_> = reorderable.iter().map(|&i| sections[i].clone()).collect();
+        let mut reorderable_sections: Vec<_> =
+            reorderable.iter().map(|&i| sections[i].clone()).collect();
         reorderable_sections.sort_by_key(|s| s.plan.scope.order());
         for (pos, &idx) in reorderable.iter().enumerate() {
             sections[idx] = reorderable_sections[pos].clone();
@@ -269,7 +268,7 @@ fn place_cache_markers(
 mod tests {
     use super::*;
     use crate::context_binder::bind_all;
-    use crate::context_planner::{plan_turn, PlanInput};
+    use crate::context_planner::{PlanInput, plan_turn};
     use crate::context_sources::*;
     use crate::emergent_context::EmergentContext;
     use crate::microcompact::ProviderCacheStrategy;
@@ -307,9 +306,8 @@ mod tests {
             last_user_message: "test".into(),
         };
         let external = ExternalSources {
-            has_memoria: false,
+            memory_snippets: Vec::new(),
             spill_dir: None,
-            has_fork_prefix: false,
         };
         let emergent = EmergentContext::default();
         let stats = PipelineStats::default();
@@ -332,8 +330,7 @@ mod tests {
             latches: &latches,
             stats: &stats,
             provider_policy: &session.provider_policy,
-            has_memoria: false,
-            has_fork_prefix: false,
+            has_memory: false,
             model_id: "m1",
             query_source: "repl",
         };
@@ -355,7 +352,10 @@ mod tests {
 
         assert_eq!(result.sections.len(), original_section_count);
         assert_eq!(result.messages.len(), original_message_count);
-        assert!(!result.stats.skipped.is_empty(), "closed gates should produce skipped entries");
+        assert!(
+            !result.stats.skipped.is_empty(),
+            "closed gates should produce skipped entries"
+        );
     }
 
     #[test]
@@ -368,21 +368,64 @@ mod tests {
         let result = optimize(&plan, bound, &latches, &policy, &limits);
         let result_order: Vec<SectionKind> = result.sections.iter().map(|s| s.plan.kind).collect();
 
-        assert_eq!(original_order, result_order, "order should be preserved when reorder gate is closed");
+        assert_eq!(
+            original_order, result_order,
+            "order should be preserved when reorder gate is closed"
+        );
+    }
+
+    fn test_bound_section(kind: SectionKind, scope: CacheScope, text: &str) -> BoundSection {
+        BoundSection {
+            plan: crate::section_types::PlannedSection {
+                kind,
+                scope,
+                estimated_tokens: text.len() as u32,
+                priority: crate::section_types::CompressionPriority::Normal,
+                source: crate::section_types::SectionSource::Static,
+            },
+            artifact: crate::section_types::SectionArtifact::from_text(kind, text.to_string()),
+            actual_tokens: text.len() as u32,
+            bind_latency: std::time::Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn reorder_respects_max_moves_budget() {
+        let mut sections = vec![
+            test_bound_section(SectionKind::Skills, CacheScope::None, "none"),
+            test_bound_section(SectionKind::RuntimeIdentity, CacheScope::Session, "session"),
+            test_bound_section(SectionKind::ProjectContext, CacheScope::Global, "global"),
+        ];
+        let original_order: Vec<CacheScope> = sections.iter().map(|s| s.plan.scope).collect();
+
+        let moves = cache_align_sections(&mut sections, 1);
+
+        assert_eq!(moves, 2, "should report actual displaced positions");
+        assert_eq!(
+            sections.iter().map(|s| s.plan.scope).collect::<Vec<_>>(),
+            original_order,
+            "order must be preserved when required moves exceed max_moves"
+        );
     }
 
     #[test]
     fn tool_result_clearing_gate_controls_microcompact() {
         let (plan, bound, latches) = build_test_plan_and_bound();
-        let mut limits = OptimizeLimits::all_closed();
+        let limits = OptimizeLimits::all_closed();
         // Gate is closed — no clearing should happen
         let policy = ProviderCachePolicy::default();
 
         let result = optimize(&plan, bound, &latches, &policy, &limits);
         assert_eq!(result.stats.tool_results_cleared, 0);
-        assert!(result.stats.skipped.iter().any(|s| s.step == "tool_result_clearing"
-            || s.step == "reorder"
-            || s.step == "spill"));
+        assert!(
+            result
+                .stats
+                .skipped
+                .iter()
+                .any(|s| s.step == "tool_result_clearing"
+                    || s.step == "reorder"
+                    || s.step == "spill")
+        );
     }
 
     #[test]
@@ -417,7 +460,10 @@ mod tests {
         let policy = ProviderCachePolicy::openai_compatible();
 
         let result = optimize(&plan, bound, &latches, &policy, &limits);
-        assert!(result.cache_markers.is_empty(), "prefix caching should not produce explicit markers");
+        assert!(
+            result.cache_markers.is_empty(),
+            "prefix caching should not produce explicit markers"
+        );
     }
 
     #[test]
@@ -427,9 +473,20 @@ mod tests {
         let policy = ProviderCachePolicy::default();
 
         let result = optimize(&plan, bound, &latches, &policy, &limits);
-        let skipped_steps: Vec<&str> = result.stats.skipped.iter().map(|s| s.step.as_str()).collect();
-        assert!(skipped_steps.contains(&"reorder"), "should record skipped reorder");
-        assert!(skipped_steps.contains(&"spill"), "should record skipped spill");
+        let skipped_steps: Vec<&str> = result
+            .stats
+            .skipped
+            .iter()
+            .map(|s| s.step.as_str())
+            .collect();
+        assert!(
+            skipped_steps.contains(&"reorder"),
+            "should record skipped reorder"
+        );
+        assert!(
+            skipped_steps.contains(&"spill"),
+            "should record skipped spill"
+        );
     }
 
     #[test]

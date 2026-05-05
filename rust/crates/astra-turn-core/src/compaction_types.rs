@@ -3,7 +3,9 @@
 //! Extracted from `prompts::context` for cross-crate use.
 
 /// Token-budget compaction tier based on context window usage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionTier {
     /// < 60% of effective input limit — no action needed.

@@ -128,6 +128,16 @@ fn recent_turns_are_repetitive(state: &AgenticLoopState) -> bool {
 }
 
 fn recent_progress_is_real(state: &AgenticLoopState) -> bool {
+    if is_open_ended_file_exploration(&state.message) {
+        return state
+            .stall
+            .tool_call_records
+            .iter()
+            .rev()
+            .take(6)
+            .any(tool_record_is_workspace_mutation);
+    }
+
     // Note: `tool_record_is_workspace_mutation` no longer treats every `bash`
     // call as mutating — only commands that actually modify state qualify.
     // This is intentional: a loop that only runs `grep`/`cat`/`ls` should not
@@ -189,6 +199,51 @@ fn recent_progress_is_real(state: &AgenticLoopState) -> bool {
     false
 }
 
+const OPEN_ENDED_EXPLORATION_MAX_TURNS: usize = 4;
+const OPEN_ENDED_EXPLORATION_MAX_TOOLS_PER_TURN: u32 = 2;
+const OPEN_ENDED_EXPLORATION_BUDGET_MESSAGE: &str = "Open-ended file exploration budget is active: do at most one bounded useful pass with no more than two tool calls per turn, then summarize. Do not keep listing/reading files recursively.";
+
+fn is_open_ended_file_exploration(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let has_list_operation =
+        lower.contains("list") || lower.contains("ls ") || lower.contains("directory");
+    let has_read_operation = lower.contains("read") || lower.contains("cat ");
+    let asks_for_many_files = lower.contains("as many files") || lower.contains("many files as");
+    let repeated_file_loop = has_list_operation
+        && has_read_operation
+        && (lower.contains("keep going")
+            || lower.contains("as many")
+            || lower.contains("list again")
+            || lower.contains("read again"));
+    let explicit_file_loop = asks_for_many_files
+        || lower.contains("as many")
+            && lower.contains("files")
+            && (has_read_operation || has_list_operation);
+    repeated_file_loop || explicit_file_loop
+}
+
+fn apply_open_ended_exploration_budget(state: &mut AgenticLoopState) -> bool {
+    if !is_open_ended_file_exploration(&state.message) {
+        return false;
+    }
+
+    state.max_turns = state.max_turns.min(OPEN_ENDED_EXPLORATION_MAX_TURNS);
+    state.remaining_turns = state.remaining_turns.min(state.max_turns);
+    state.max_tools_per_turn = state
+        .max_tools_per_turn
+        .min(OPEN_ENDED_EXPLORATION_MAX_TOOLS_PER_TURN);
+    if !state.messages.iter().any(|message| {
+        message.get("content").and_then(|content| content.as_str())
+            == Some(OPEN_ENDED_EXPLORATION_BUDGET_MESSAGE)
+    }) {
+        state.messages.push(serde_json::json!({
+            "role": "system",
+            "content": OPEN_ENDED_EXPLORATION_BUDGET_MESSAGE,
+        }));
+    }
+    true
+}
+
 fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<String> {
     let budget = state.agentic_turn_budget;
     if budget.extension_turns == 0
@@ -247,6 +302,8 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) {
+    apply_open_ended_exploration_budget(state);
+
     if state
         .skills
         .session_event_hooks
@@ -958,6 +1015,60 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn open_ended_file_exploration_detection_requires_file_and_loop_signal() {
+        assert!(is_open_ended_file_exploration(
+            "List files, read one, list again, then read again. Keep going."
+        ));
+        assert!(!is_open_ended_file_exploration(
+            "Read README.md and summarize it."
+        ));
+        assert!(!is_open_ended_file_exploration(
+            "Keep going on the implementation plan."
+        ));
+        assert!(!is_open_ended_file_exploration(
+            "Read the failing tests, keep going with the refactor until they pass."
+        ));
+        assert!(!is_open_ended_file_exploration(
+            "Read the design doc again, then write the implementation."
+        ));
+    }
+
+    #[test]
+    fn open_ended_file_exploration_budget_caps_turns_and_tools() {
+        let mut state = make_state();
+        state.message =
+            "List files using bash, read one, list again, then read again. Keep going.".into();
+        state.max_turns = 10;
+        state.remaining_turns = 10;
+        state.max_tools_per_turn = 15;
+
+        assert!(apply_open_ended_exploration_budget(&mut state));
+
+        assert_eq!(state.max_turns, OPEN_ENDED_EXPLORATION_MAX_TURNS);
+        assert_eq!(state.remaining_turns, OPEN_ENDED_EXPLORATION_MAX_TURNS);
+        assert_eq!(
+            state.max_tools_per_turn,
+            OPEN_ENDED_EXPLORATION_MAX_TOOLS_PER_TURN
+        );
+        assert!(state.messages.iter().any(|msg| {
+            msg.get("content")
+                .and_then(|content| content.as_str())
+                .is_some_and(|content| content.contains("Open-ended file exploration budget"))
+        }));
+
+        assert!(apply_open_ended_exploration_budget(&mut state));
+        let budget_messages = state
+            .messages
+            .iter()
+            .filter(|msg| {
+                msg.get("content").and_then(|content| content.as_str())
+                    == Some(OPEN_ENDED_EXPLORATION_BUDGET_MESSAGE)
+            })
+            .count();
+        assert_eq!(budget_messages, 1, "budget message must be idempotent");
+    }
 
     #[tokio::test]
     async fn auto_inject_delegate_schema_when_engine_present() {

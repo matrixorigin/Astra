@@ -10,7 +10,7 @@ use astra_turn_core::compaction_types::CompactionTier;
 use astra_turn_core::context_binder::bind_all;
 use astra_turn_core::context_feedback::ContextFeedback;
 use astra_turn_core::context_optimizer::optimize;
-use astra_turn_core::context_planner::{plan_turn, PlanInput};
+use astra_turn_core::context_planner::{PlanInput, plan_turn};
 use astra_turn_core::context_sources::*;
 use astra_turn_core::emergent_context::*;
 use astra_turn_core::microcompact::ProviderCacheStrategy;
@@ -68,9 +68,8 @@ fn build_sources() -> (
             last_user_message: "Fix the bug in main.rs".into(),
         },
         ExternalSources {
-            has_memoria: true,
+            memory_snippets: vec!["Relevant memory: main.rs has flaky parsing.".into()],
             spill_dir: None,
-            has_fork_prefix: false,
         },
         EmergentContext::default(),
         PipelineStats::default(),
@@ -99,8 +98,7 @@ fn pipeline_single_turn_produces_valid_output() {
         latches: &latches,
         stats: &stats,
         provider_policy: &session.provider_policy,
-        has_memoria: ext.has_memoria,
-        has_fork_prefix: ext.has_fork_prefix,
+        has_memory: !ext.memory_snippets.is_empty(),
         model_id: &session.model_id,
         query_source: "repl",
     };
@@ -108,7 +106,11 @@ fn pipeline_single_turn_produces_valid_output() {
     // Plan
     let plan = plan_turn(&plan_input);
     assert!(!plan.sections.is_empty());
-    assert!(plan.sections.iter().any(|s| s.kind == SectionKind::Identity));
+    assert!(
+        plan.sections
+            .iter()
+            .any(|s| s.kind == SectionKind::Identity)
+    );
     assert!(plan.sections.iter().any(|s| s.kind == SectionKind::Memory));
 
     // Bind
@@ -133,10 +135,10 @@ fn pipeline_multi_turn_feedback_accumulates() {
     // Simulate 3 turns
     for i in 1..=3 {
         let feedback = ContextFeedback::from_usage(
-            1000 * i,     // prompt
-            800 * i,      // cache_read
-            100 * i,      // cache_creation
-            200 * i,      // completion
+            1000 * i, // prompt
+            800 * i,  // cache_read
+            100 * i,  // cache_creation
+            200 * i,  // completion
             false,
         );
         stats.record("test-model", "repl", &feedback);
@@ -153,7 +155,7 @@ fn pipeline_compaction_under_pressure() {
     // Set high token usage: 85% of 100K
     turn.tokens = TokenAccounting::from_fields(85_000, 0, 0, 0);
 
-    let sources = ContextSources {
+    let _sources = ContextSources {
         statics: &statics,
         agent: &agent,
         latches: &latches,
@@ -171,8 +173,7 @@ fn pipeline_compaction_under_pressure() {
         latches: &latches,
         stats: &stats,
         provider_policy: &session.provider_policy,
-        has_memoria: ext.has_memoria,
-        has_fork_prefix: ext.has_fork_prefix,
+        has_memory: !ext.memory_snippets.is_empty(),
         model_id: &session.model_id,
         query_source: "repl",
     };
@@ -193,7 +194,7 @@ fn pipeline_ptl_recovery_escalates() {
     turn.recovery.record_ptl_error();
     turn.recovery.record_ptl_error();
 
-    let sources = ContextSources {
+    let _sources = ContextSources {
         statics: &statics,
         agent: &agent,
         latches: &latches,
@@ -211,8 +212,7 @@ fn pipeline_ptl_recovery_escalates() {
         latches: &latches,
         stats: &stats,
         provider_policy: &session.provider_policy,
-        has_memoria: ext.has_memoria,
-        has_fork_prefix: ext.has_fork_prefix,
+        has_memory: !ext.memory_snippets.is_empty(),
         model_id: &session.model_id,
         query_source: "repl",
     };
@@ -259,8 +259,7 @@ fn pipeline_emergent_context_flows() {
         latches: &latches,
         stats: &stats,
         provider_policy: &session.provider_policy,
-        has_memoria: ext.has_memoria,
-        has_fork_prefix: ext.has_fork_prefix,
+        has_memory: !ext.memory_snippets.is_empty(),
         model_id: &session.model_id,
         query_source: "repl",
     };
@@ -275,7 +274,7 @@ fn pipeline_emergent_context_flows() {
         .find(|s| s.plan.kind == SectionKind::EmergentSkills);
     assert!(emergent_section.is_some());
     assert!(
-        emergent_section.unwrap().content.contains("security_review"),
+        emergent_section.unwrap().text().contains("security_review"),
         "Emergent skill should be bound"
     );
 }
@@ -302,8 +301,7 @@ fn pipeline_shadow_diff_identical() {
         latches: &latches,
         stats: &stats,
         provider_policy: &session.provider_policy,
-        has_memoria: ext.has_memoria,
-        has_fork_prefix: ext.has_fork_prefix,
+        has_memory: !ext.memory_snippets.is_empty(),
         model_id: &session.model_id,
         query_source: "repl",
     };
@@ -316,7 +314,11 @@ fn pipeline_shadow_diff_identical() {
     let opt2 = optimize(&plan, bound2, &latches, &session.provider_policy, &limits);
 
     let diff = diff_pipeline_outputs(&opt1, &opt2, 1);
-    assert!(diff.is_clean(), "identical runs should produce clean diff: {:?}", diff.alerts);
+    assert!(
+        diff.is_clean(),
+        "identical runs should produce clean diff: {:?}",
+        diff.alerts
+    );
 }
 
 /// Trace alerts fire on recovery loop.

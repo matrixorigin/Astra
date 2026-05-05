@@ -64,6 +64,8 @@ impl CaseExecutor for AstraCliExecutor {
             "chat".into(),
             "-m".into(),
             shell_escape(case.prompt.clone()),
+            "--session-id".into(),
+            shell_escape(uuid::Uuid::new_v4().to_string()),
             "--model".into(),
             shell_escape(model.to_string()),
             "--json".into(),
@@ -111,6 +113,8 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
     cmd.arg("chat")
         .arg("-m")
         .arg(&case.prompt)
+        .arg("--session-id")
+        .arg(uuid::Uuid::new_v4().to_string())
         .arg("--model")
         .arg(model)
         .arg("--json")
@@ -457,6 +461,7 @@ mod tests {
         };
         let repro = exec.reproducer(&case, "qwen-flash");
         assert!(repro.contains("/usr/local/bin/astra"));
+        assert!(repro.contains("--session-id"));
         assert!(repro.contains("--model"));
         assert!(repro.contains("qwen-flash"));
         assert!(repro.contains("--verbose"));

@@ -40,8 +40,14 @@ impl PercentileDigest {
         if self.samples.is_empty() {
             return default;
         }
-        let idx = ((self.samples.len() as f64 * p).ceil() as usize).min(self.samples.len()) - 1;
-        self.samples[idx.min(self.samples.len() - 1)]
+        let p = if p.is_nan() { 1.0 } else { p.clamp(0.0, 1.0) };
+        if p == 0.0 {
+            return self.samples[0];
+        }
+        let idx = ((self.samples.len() as f64 * p).ceil() as usize)
+            .saturating_sub(1)
+            .min(self.samples.len() - 1);
+        self.samples[idx]
     }
 
     /// Number of samples recorded.
@@ -94,7 +100,11 @@ impl ResponseTokenEstimator {
             model_id: model.to_string(),
             query_source: source.to_string(),
         };
-        let p = if recovery.is_in_recovery() { 0.95 } else { 0.75 };
+        let p = if recovery.is_in_recovery() {
+            0.95
+        } else {
+            0.75
+        };
         let output_tokens = self
             .buckets
             .get(&key)
@@ -132,6 +142,8 @@ pub struct PipelineStats {
     pub compact_events: Vec<CompactEvent>,
     pub cache_breaks: Vec<CacheBreakEvent>,
     pub response_token_estimates: ResponseTokenEstimator,
+    /// EMA of per-section token usage across turns (alpha=0.3).
+    pub section_usage_ema: HashMap<crate::section_types::SectionKind, f64>,
 }
 
 impl Default for PipelineStats {
@@ -142,6 +154,7 @@ impl Default for PipelineStats {
             compact_events: Vec::new(),
             cache_breaks: Vec::new(),
             response_token_estimates: ResponseTokenEstimator::with_floor(500),
+            section_usage_ema: HashMap::new(),
         }
     }
 }
@@ -157,7 +170,8 @@ impl PipelineStats {
             (1.0 - alpha) * self.avg_cache_hit_ratio + alpha * feedback.cache_hit_ratio;
 
         // Feed response token estimator
-        self.response_token_estimates.record(model, source, feedback);
+        self.response_token_estimates
+            .record(model, source, feedback);
 
         // Record cache breaks
         if let Some(reason) = &feedback.cache_break_detected {
@@ -187,6 +201,34 @@ impl PipelineStats {
             .filter(|e| e.turn > window_start)
             .count();
         recent >= 2
+    }
+
+    /// Record per-section token usage observed in a completed turn.
+    /// Updates an EMA (alpha=0.3) per section kind.
+    pub fn record_section_usage(
+        &mut self,
+        usage: &HashMap<crate::section_types::SectionKind, u32>,
+    ) {
+        const ALPHA: f64 = 0.3;
+        for (&kind, &tokens) in usage {
+            let entry = self.section_usage_ema.entry(kind).or_insert(0.0);
+            if *entry == 0.0 {
+                // First sample: seed directly
+                *entry = tokens as f64;
+            } else {
+                *entry = (1.0 - ALPHA) * *entry + ALPHA * tokens as f64;
+            }
+        }
+    }
+
+    /// Return the historical EMA of section token usage, rounded to u32.
+    /// Used by the planner to feed `TokenBudget::allocate`.
+    #[must_use]
+    pub fn section_token_history(&self) -> HashMap<crate::section_types::SectionKind, u32> {
+        self.section_usage_ema
+            .iter()
+            .map(|(&k, &v)| (k, v.round() as u32))
+            .collect()
     }
 }
 
@@ -260,8 +302,10 @@ mod tests {
 
     #[test]
     fn compaction_cascade_detection() {
-        let mut stats = PipelineStats::default();
-        stats.turns_executed = 5;
+        let mut stats = PipelineStats {
+            turns_executed: 5,
+            ..Default::default()
+        };
         stats.record_compaction(1000);
         assert!(!stats.has_compaction_cascade());
 
@@ -280,5 +324,60 @@ mod tests {
         assert_eq!(d.percentile(0.5, 0), 200);
         assert_eq!(d.percentile(0.75, 0), 300);
         assert_eq!(d.percentile(1.0, 0), 400);
+    }
+
+    #[test]
+    fn percentile_digest_handles_lower_bound_without_underflow() {
+        let mut d = PercentileDigest::default();
+        d.push(100);
+        d.push(200);
+
+        assert_eq!(d.percentile(0.0, 0), 100);
+        assert_eq!(d.percentile(f64::MIN_POSITIVE, 0), 100);
+    }
+
+    #[test]
+    fn section_history_empty_when_no_records() {
+        let stats = PipelineStats::default();
+        let history = stats.section_token_history();
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn section_history_returns_ema_of_recorded_usage() {
+        use crate::section_types::SectionKind;
+        let mut stats = PipelineStats::default();
+
+        let mut usage = HashMap::new();
+        usage.insert(SectionKind::History, 5000u32);
+        usage.insert(SectionKind::Memory, 1000u32);
+        stats.record_section_usage(&usage);
+
+        let history = stats.section_token_history();
+        // After one sample, EMA = exact value
+        assert_eq!(history[&SectionKind::History], 5000);
+        assert_eq!(history[&SectionKind::Memory], 1000);
+
+        // Second sample — EMA with alpha=0.3: 0.7*5000 + 0.3*8000 = 5900
+        let mut usage2 = HashMap::new();
+        usage2.insert(SectionKind::History, 8000u32);
+        usage2.insert(SectionKind::Memory, 2000u32);
+        stats.record_section_usage(&usage2);
+
+        let history2 = stats.section_token_history();
+        assert_eq!(history2[&SectionKind::History], 5900);
+        assert_eq!(history2[&SectionKind::Memory], 1300); // 0.7*1000 + 0.3*2000
+    }
+
+    #[test]
+    fn percentile_digest_clamps_invalid_percentiles() {
+        let mut d = PercentileDigest::default();
+        d.push(100);
+        d.push(200);
+        d.push(300);
+
+        assert_eq!(d.percentile(-1.0, 0), 100);
+        assert_eq!(d.percentile(2.0, 0), 300);
+        assert_eq!(d.percentile(f64::NAN, 0), 300);
     }
 }

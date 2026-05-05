@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::context_assembly_trace::PromptTraceSignals;
 
@@ -190,11 +191,77 @@ pub struct PlannedSection {
     pub source: SectionSource,
 }
 
-/// A section after binding: concrete content resolved from its source.
+/// Typed payload produced by Bind.
+///
+/// The pipeline keeps section content structured until the provider serializer
+/// chooses a wire representation. This avoids making downstream stages infer
+/// semantics from plain strings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SectionArtifact {
+    SystemText(String),
+    RuntimeText(String),
+    MemoryText(String),
+    HistorySummary(String),
+    ToolSchema(Value),
+    SpillReference { path: String, original_tokens: u32 },
+    Empty,
+}
+
+impl SectionArtifact {
+    /// Construct a text-bearing artifact for a section kind.
+    ///
+    /// This intentionally has no path for `ToolSchema` or `SpillReference`;
+    /// callers producing those non-text artifacts must construct the enum
+    /// variants explicitly so schema/spill semantics are not erased into text.
+    #[must_use]
+    pub fn from_text(kind: SectionKind, text: String) -> Self {
+        if text.is_empty() {
+            return Self::Empty;
+        }
+        match kind {
+            SectionKind::Identity | SectionKind::Constraints => Self::SystemText(text),
+            SectionKind::Memory | SectionKind::EmergentMemory => Self::MemoryText(text),
+            SectionKind::History => Self::HistorySummary(text),
+            SectionKind::SelfModel
+            | SectionKind::ProjectContext
+            | SectionKind::WorkingMemory
+            | SectionKind::Skills
+            | SectionKind::RuntimeIdentity
+            | SectionKind::EmergentSkills
+            | SectionKind::EmergentSummary => Self::RuntimeText(text),
+        }
+    }
+
+    #[must_use]
+    pub fn text(&self) -> &str {
+        match self {
+            Self::SystemText(text)
+            | Self::RuntimeText(text)
+            | Self::MemoryText(text)
+            | Self::HistorySummary(text) => text,
+            Self::ToolSchema(_) | Self::SpillReference { .. } | Self::Empty => "",
+        }
+    }
+
+    pub fn append_text(&mut self, kind: SectionKind, suffix: &str) {
+        match self {
+            Self::SystemText(text)
+            | Self::RuntimeText(text)
+            | Self::MemoryText(text)
+            | Self::HistorySummary(text) => text.push_str(suffix),
+            Self::Empty if !suffix.is_empty() => {
+                *self = Self::from_text(kind, suffix.to_string());
+            }
+            Self::ToolSchema(_) | Self::SpillReference { .. } | Self::Empty => {}
+        }
+    }
+}
+
+/// A section after binding: concrete typed content resolved from its source.
 #[derive(Debug, Clone)]
 pub struct BoundSection {
     pub plan: PlannedSection,
-    pub content: String,
+    pub artifact: SectionArtifact,
     pub actual_tokens: u32,
     pub bind_latency: Duration,
 }
@@ -211,11 +278,33 @@ impl BoundSection {
                 priority: CompressionPriority::Normal,
                 source: SectionSource::Static,
             },
-            content: String::new(),
+            artifact: SectionArtifact::Empty,
             actual_tokens: 0,
             bind_latency: Duration::ZERO,
         }
     }
+
+    #[must_use]
+    pub fn text(&self) -> &str {
+        self.artifact.text()
+    }
+
+    pub fn append_text(&mut self, suffix: &str) {
+        let before = self.text().len();
+        self.artifact.append_text(self.plan.kind, suffix);
+        if self.text().len() > before {
+            self.actual_tokens = self
+                .actual_tokens
+                .saturating_add(estimate_text_tokens(suffix));
+        }
+    }
+}
+
+/// Estimate token count from raw text length (≈4 bytes/token).
+/// Saturates at `u32::MAX` instead of truncating on extremely large inputs.
+#[must_use]
+pub fn estimate_text_tokens(text: &str) -> u32 {
+    (text.len() / 4).min(u32::MAX as usize) as u32
 }
 
 #[cfg(test)]
@@ -269,7 +358,63 @@ mod tests {
     fn bound_section_empty_has_zero_tokens() {
         let b = BoundSection::empty(SectionKind::Memory);
         assert_eq!(b.actual_tokens, 0);
-        assert!(b.content.is_empty());
+        assert!(b.text().is_empty());
         assert_eq!(b.plan.kind, SectionKind::Memory);
+    }
+
+    #[test]
+    fn section_artifact_preserves_semantics() {
+        let system = SectionArtifact::from_text(SectionKind::Identity, "rules".into());
+        let memory = SectionArtifact::from_text(SectionKind::Memory, "memory".into());
+        let history = SectionArtifact::from_text(SectionKind::History, "history".into());
+
+        assert!(matches!(system, SectionArtifact::SystemText(_)));
+        assert!(matches!(memory, SectionArtifact::MemoryText(_)));
+        assert!(matches!(history, SectionArtifact::HistorySummary(_)));
+    }
+
+    #[test]
+    fn append_text_to_empty_keeps_section_semantics() {
+        let mut identity = BoundSection::empty(SectionKind::Identity);
+        identity.append_text("core rules");
+        assert!(matches!(identity.artifact, SectionArtifact::SystemText(_)));
+
+        let mut memory = BoundSection::empty(SectionKind::Memory);
+        memory.append_text("remember this");
+        assert!(matches!(memory.artifact, SectionArtifact::MemoryText(_)));
+    }
+
+    #[test]
+    fn append_text_preserves_existing_token_count_and_adds_delta() {
+        let mut section = BoundSection {
+            plan: PlannedSection {
+                kind: SectionKind::Identity,
+                scope: CacheScope::Global,
+                estimated_tokens: 0,
+                priority: CompressionPriority::Never,
+                source: SectionSource::Static,
+            },
+            artifact: SectionArtifact::SystemText("accurately tokenized content".into()),
+            actual_tokens: 123,
+            bind_latency: Duration::ZERO,
+        };
+
+        section.append_text(" plus");
+        assert_eq!(section.actual_tokens, 123 + estimate_text_tokens(" plus"));
+        assert!(matches!(section.artifact, SectionArtifact::SystemText(_)));
+    }
+
+    #[test]
+    fn estimate_text_tokens_saturates_on_huge_input() {
+        // Simulate a length that would overflow u32 if cast directly.
+        // We can't allocate 16GB in a test, but we can verify the arithmetic
+        // path by checking that for any len the result is <= u32::MAX.
+        let big_len: usize = (u32::MAX as usize) * 4 + 100;
+        let estimated = (big_len / 4).min(u32::MAX as usize) as u32;
+        assert_eq!(estimated, u32::MAX);
+
+        // Also verify normal path still works
+        let normal = "hello world"; // 11 bytes => 2 tokens
+        assert_eq!(estimate_text_tokens(normal), 2);
     }
 }

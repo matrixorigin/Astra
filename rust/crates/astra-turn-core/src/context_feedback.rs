@@ -98,7 +98,10 @@ mod tests {
     fn detects_cache_break_from_cold_creation() {
         let mut f = ContextFeedback::from_usage(0, 0, 5000, 100, false);
         f.detect_cache_break(2, 1000);
-        assert_eq!(f.cache_break_detected, Some(CacheBreakReason::UnknownColdStart));
+        assert_eq!(
+            f.cache_break_detected,
+            Some(CacheBreakReason::UnknownColdStart)
+        );
     }
 
     #[test]
@@ -113,6 +116,9 @@ mod tests {
         let mut f = ContextFeedback::from_usage(0, 0, 5000, 100, false);
         f.detect_cache_break(2, 1000);
         f.attribute_cache_break(CacheBreakReason::ToolSchemaChanged);
-        assert_eq!(f.cache_break_detected, Some(CacheBreakReason::ToolSchemaChanged));
+        assert_eq!(
+            f.cache_break_detected,
+            Some(CacheBreakReason::ToolSchemaChanged)
+        );
     }
 }

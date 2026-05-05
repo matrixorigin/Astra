@@ -5,12 +5,10 @@
 //! turn needs: which sections to include, their budgets, the compaction
 //! tier, and the cache strategy.
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
 use crate::compaction_types::CompactionTier;
-use crate::context_budget::{select_tier_gated, TokenBudget};
+use crate::context_budget::{TokenBudget, select_tier_gated};
 use crate::context_pressure::{ContextPressure, ContextReserves};
 use crate::microcompact::PromptCacheProtocol;
 use crate::pipeline_config::ProviderCachePolicy;
@@ -50,10 +48,8 @@ pub struct PlanInput<'a> {
     pub latches: &'a SessionLatches,
     pub stats: &'a PipelineStats,
     pub provider_policy: &'a ProviderCachePolicy,
-    /// Whether external memory (Memoria) is available.
-    pub has_memoria: bool,
-    /// Whether there's a ForkPrefix from a parent agent.
-    pub has_fork_prefix: bool,
+    /// Whether memory text has already been retrieved by the runtime.
+    pub has_memory: bool,
     /// Model ID for reserve estimation bucketing.
     pub model_id: &'a str,
     /// Query source for reserve estimation bucketing.
@@ -67,31 +63,32 @@ pub struct PlanInput<'a> {
 #[must_use]
 pub fn plan_turn(input: &PlanInput<'_>) -> ContextPlan {
     // 1. Compute reserves from historical response data
-    let reserves = input
-        .stats
-        .response_token_estimates
-        .reserve_for(input.model_id, input.query_source, input.recovery);
+    let reserves = input.stats.response_token_estimates.reserve_for(
+        input.model_id,
+        input.query_source,
+        input.recovery,
+    );
 
     // 2. Compute raw and predictive pressure
     let pressure = ContextPressure::compute(
-        input.tokens.total_input() as u32,
+        input.tokens.total_input_u32_saturating(),
         input.model_limit,
         reserves,
     );
 
     // 3. Select compaction tier (gated: predictive can escalate, not de-escalate)
-    let tier = select_tier_gated(pressure.raw, pressure.value)
-        .escalate_for_recovery(input.recovery);
+    let tier =
+        select_tier_gated(pressure.raw, pressure.value).escalate_for_recovery(input.recovery);
 
     // 4. Allocate token budgets per section
-    let section_history = HashMap::new(); // TODO: feed from PipelineStats
+    let section_history = input.stats.section_token_history();
     let budget = TokenBudget::allocate(input.model_limit, tier, &section_history);
 
     // 5. Choose cache strategy based on provider policy + latches
     let cache_strategy = plan_cache_strategy(input.provider_policy, input.latches);
 
     // 6. Build section manifest
-    let sections = plan_section_manifest(&budget, input.has_memoria, input.has_fork_prefix);
+    let sections = plan_section_manifest(&budget, input.has_memory);
 
     ContextPlan {
         sections,
@@ -120,13 +117,11 @@ fn plan_cache_strategy(policy: &ProviderCachePolicy, latches: &SessionLatches) -
 /// Build the section manifest: which sections to include and with what properties.
 ///
 /// Identity and Constraints are always present. Memory is included only if
-/// Memoria is available. Emergent sections are always included (the Bind
-/// phase will produce empty BoundSections if there's nothing to inject).
-fn plan_section_manifest(
-    budget: &TokenBudget,
-    has_memoria: bool,
-    _has_fork_prefix: bool,
-) -> Vec<PlannedSection> {
+/// retrieval has already produced concrete snippets. Conversation history
+/// travels in the provider messages array, not as a hollow system section.
+/// Emergent sections are always included (the Bind phase will produce empty
+/// BoundSections if there's nothing to inject).
+fn plan_section_manifest(budget: &TokenBudget, has_memory: bool) -> Vec<PlannedSection> {
     let mut sections = vec![
         PlannedSection {
             kind: SectionKind::Identity,
@@ -164,13 +159,6 @@ fn plan_section_manifest(
             source: SectionSource::Skill,
         },
         PlannedSection {
-            kind: SectionKind::History,
-            scope: CacheScope::None,
-            estimated_tokens: budget.budget_for(SectionKind::History),
-            priority: CompressionPriority::Normal,
-            source: SectionSource::History,
-        },
-        PlannedSection {
             kind: SectionKind::RuntimeIdentity,
             scope: CacheScope::None,
             estimated_tokens: budget.budget_for(SectionKind::RuntimeIdentity),
@@ -179,7 +167,7 @@ fn plan_section_manifest(
         },
     ];
 
-    if has_memoria {
+    if has_memory {
         sections.push(PlannedSection {
             kind: SectionKind::Memory,
             scope: CacheScope::None,
@@ -242,8 +230,7 @@ mod tests {
             latches,
             stats,
             provider_policy: policy,
-            has_memoria: true,
-            has_fork_prefix: false,
+            has_memory: true,
             model_id: "test-model",
             query_source: "repl",
         }
@@ -268,6 +255,21 @@ mod tests {
     }
 
     #[test]
+    fn plan_huge_token_accounting_saturates_instead_of_truncating() {
+        let (mut tokens, recovery, latches, stats, policy) = default_input();
+        tokens.prompt = u64::from(u32::MAX) + 10;
+
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+
+        assert!(
+            plan.pressure.raw > 1.0,
+            "huge token accounting must not wrap to low pressure"
+        );
+        assert_eq!(plan.compact_tier, CompactionTier::AggressivePrune);
+    }
+
+    #[test]
     fn plan_recovery_escalates_tier() {
         let (tokens, mut recovery, latches, stats, policy) = default_input();
         recovery.record_ptl_error();
@@ -284,15 +286,23 @@ mod tests {
         let (tokens, recovery, latches, stats, policy) = default_input();
         let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
         let plan = plan_turn(&input);
-        assert!(plan.sections.iter().any(|s| s.kind == SectionKind::Identity));
-        assert!(plan.sections.iter().any(|s| s.kind == SectionKind::Constraints));
+        assert!(
+            plan.sections
+                .iter()
+                .any(|s| s.kind == SectionKind::Identity)
+        );
+        assert!(
+            plan.sections
+                .iter()
+                .any(|s| s.kind == SectionKind::Constraints)
+        );
     }
 
     #[test]
     fn plan_section_manifest_excludes_memory_when_unavailable() {
         let (tokens, recovery, latches, stats, policy) = default_input();
         let mut input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
-        input.has_memoria = false;
+        input.has_memory = false;
         let plan = plan_turn(&input);
         assert!(!plan.sections.iter().any(|s| s.kind == SectionKind::Memory));
     }
@@ -303,6 +313,14 @@ mod tests {
         let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
         let plan = plan_turn(&input);
         assert!(plan.sections.iter().any(|s| s.kind == SectionKind::Memory));
+    }
+
+    #[test]
+    fn plan_section_manifest_does_not_emit_hollow_history_section() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+        assert!(!plan.sections.iter().any(|s| s.kind == SectionKind::History));
     }
 
     #[test]
@@ -325,7 +343,10 @@ mod tests {
         let anthropic = ProviderCachePolicy::anthropic();
         let input = make_plan_input(&tokens, &recovery, &latches, &stats, &anthropic);
         let plan_a = plan_turn(&input);
-        assert_eq!(plan_a.cache_strategy.protocol, PromptCacheProtocol::AnthropicCacheControl);
+        assert_eq!(
+            plan_a.cache_strategy.protocol,
+            PromptCacheProtocol::AnthropicCacheControl
+        );
         assert!(plan_a.cache_strategy.use_global_scope);
 
         let openai = ProviderCachePolicy::openai_compatible();
@@ -343,7 +364,9 @@ mod tests {
         tokens.prompt = 80_000;
         // Feed the estimator so reserves are non-zero
         let feedback = crate::context_feedback::ContextFeedback::from_usage(0, 0, 0, 5000, false);
-        stats.response_token_estimates.record("test-model", "repl", &feedback);
+        stats
+            .response_token_estimates
+            .record("test-model", "repl", &feedback);
 
         let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
         let plan = plan_turn(&input);
@@ -358,8 +381,20 @@ mod tests {
         let (tokens, recovery, latches, stats, policy) = default_input();
         let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
         let plan = plan_turn(&input);
-        assert!(plan.sections.iter().any(|s| s.kind == SectionKind::EmergentSkills));
-        assert!(plan.sections.iter().any(|s| s.kind == SectionKind::EmergentMemory));
-        assert!(plan.sections.iter().any(|s| s.kind == SectionKind::EmergentSummary));
+        assert!(
+            plan.sections
+                .iter()
+                .any(|s| s.kind == SectionKind::EmergentSkills)
+        );
+        assert!(
+            plan.sections
+                .iter()
+                .any(|s| s.kind == SectionKind::EmergentMemory)
+        );
+        assert!(
+            plan.sections
+                .iter()
+                .any(|s| s.kind == SectionKind::EmergentSummary)
+        );
     }
 }

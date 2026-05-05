@@ -60,8 +60,7 @@ impl ContextPressure {
         }
         let limit_f = limit as f64;
         let raw = current_tokens as f64 / limit_f;
-        let predictive =
-            (current_tokens as f64 + reserves.total() as f64) / limit_f;
+        let predictive = (current_tokens as f64 + reserves.total() as f64) / limit_f;
         Self {
             value: predictive,
             raw,

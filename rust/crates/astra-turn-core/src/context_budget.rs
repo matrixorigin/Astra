@@ -49,11 +49,14 @@ impl TokenBudget {
     /// Allocate token budget across sections based on tier and history.
     ///
     /// Higher tiers get tighter history budgets to free headroom.
+    /// When `section_history` has EMA data for a section, the allocator
+    /// shrinks toward observed usage + 50% headroom (capped at the
+    /// tier-based maximum).
     #[must_use]
     pub fn allocate(
         effective_limit: u32,
         tier: CompactionTier,
-        _section_history: &HashMap<SectionKind, u32>,
+        section_history: &HashMap<SectionKind, u32>,
     ) -> Self {
         let limit = effective_limit as f64;
 
@@ -74,8 +77,27 @@ impl TokenBudget {
         let mut allocations = HashMap::new();
         allocations.insert(SectionKind::Identity, fixed_budget);
         allocations.insert(SectionKind::Constraints, fixed_budget);
-        allocations.insert(SectionKind::History, (limit * history_ratio) as u32);
-        allocations.insert(SectionKind::Memory, (limit * memory_ratio) as u32);
+
+        // History: shrink toward observed + 50% headroom if we have data
+        let history_max = (limit * history_ratio) as u32;
+        let history_budget = if let Some(&observed) = section_history.get(&SectionKind::History) {
+            // observed + 50% headroom, but never exceed tier max
+            let with_headroom = observed.saturating_add(observed / 2);
+            with_headroom.min(history_max)
+        } else {
+            history_max
+        };
+        allocations.insert(SectionKind::History, history_budget);
+
+        // Memory: same shrink logic
+        let memory_max = (limit * memory_ratio) as u32;
+        let memory_budget = if let Some(&observed) = section_history.get(&SectionKind::Memory) {
+            let with_headroom = observed.saturating_add(observed / 2);
+            with_headroom.min(memory_max)
+        } else {
+            memory_max
+        };
+        allocations.insert(SectionKind::Memory, memory_budget);
 
         let allocated: u32 = allocations.values().sum();
         let remaining = effective_limit.saturating_sub(allocated);
@@ -107,6 +129,7 @@ impl TokenBudget {
 mod tests {
     use super::*;
     use crate::recovery_state::RecoveryState;
+    use proptest::prelude::*;
 
     #[test]
     fn tier_from_pressure_boundaries() {
@@ -115,9 +138,18 @@ mod tests {
         assert_eq!(select_compaction_tier(0.65), CompactionTier::TrimSchemas);
         assert_eq!(select_compaction_tier(0.75), CompactionTier::CompactHistory);
         assert_eq!(select_compaction_tier(0.80), CompactionTier::CompactHistory);
-        assert_eq!(select_compaction_tier(0.90), CompactionTier::AggressivePrune);
-        assert_eq!(select_compaction_tier(0.92), CompactionTier::AggressivePrune);
-        assert_eq!(select_compaction_tier(1.05), CompactionTier::AggressivePrune);
+        assert_eq!(
+            select_compaction_tier(0.90),
+            CompactionTier::AggressivePrune
+        );
+        assert_eq!(
+            select_compaction_tier(0.92),
+            CompactionTier::AggressivePrune
+        );
+        assert_eq!(
+            select_compaction_tier(1.05),
+            CompactionTier::AggressivePrune
+        );
     }
 
     #[test]
@@ -130,7 +162,10 @@ mod tests {
 
         r.record_ptl_error();
         let escalated2 = CompactionTier::Normal.escalate_for_recovery(&r);
-        assert!(escalated2 >= CompactionTier::CompactHistory, "2 PTL should reach CompactHistory+");
+        assert!(
+            escalated2 >= CompactionTier::CompactHistory,
+            "2 PTL should reach CompactHistory+"
+        );
     }
 
     #[test]
@@ -170,6 +205,69 @@ mod tests {
                 budget.effective_limit,
             );
         }
+    }
+
+    proptest! {
+        #[test]
+        fn budget_total_never_exceeds_limit_for_any_tier(
+            limit in 0u32..=1_000_000,
+            tier_idx in 0usize..4,
+        ) {
+            let tiers = [
+                CompactionTier::Normal,
+                CompactionTier::TrimSchemas,
+                CompactionTier::CompactHistory,
+                CompactionTier::AggressivePrune,
+            ];
+            let budget = TokenBudget::allocate(limit, tiers[tier_idx], &HashMap::new());
+            prop_assert!(
+                budget.total_allocated() <= budget.effective_limit,
+                "allocated={} > limit={} tier={:?}",
+                budget.total_allocated(),
+                budget.effective_limit,
+                tiers[tier_idx],
+            );
+        }
+
+        #[test]
+        fn gated_tier_never_deescalates_for_any_pressure(
+            raw in 0.0f64..1.5,
+            predictive in 0.0f64..1.5,
+        ) {
+            let gated = select_tier_gated(raw, predictive);
+            prop_assert!(gated >= select_compaction_tier(raw));
+            prop_assert!(gated >= select_compaction_tier(predictive));
+        }
+    }
+
+    #[test]
+    fn budget_uses_section_history_to_shrink_overallocated() {
+        // If History historically uses only 2000 tokens but would get 50000 (50% of 100k),
+        // the allocator should reduce History budget toward the observed usage + headroom.
+        let mut history = HashMap::new();
+        history.insert(SectionKind::History, 2000u32);
+
+        let budget = TokenBudget::allocate(100_000, CompactionTier::Normal, &history);
+        // With history feedback, History budget should be < the default 50% (50000)
+        let history_budget = budget.budget_for(SectionKind::History);
+        assert!(
+            history_budget < 50_000,
+            "History budget should shrink from history feedback, got {history_budget}"
+        );
+        // But should still give headroom above the observed usage
+        assert!(
+            history_budget >= 2000,
+            "History budget should be >= observed usage, got {history_budget}"
+        );
+        // Total must still not exceed limit
+        assert!(budget.total_allocated() <= budget.effective_limit);
+    }
+
+    #[test]
+    fn budget_without_history_uses_default_ratios() {
+        let budget = TokenBudget::allocate(100_000, CompactionTier::Normal, &HashMap::new());
+        // Default Normal tier: 50% for history = 50000
+        assert_eq!(budget.budget_for(SectionKind::History), 50_000);
     }
 
     #[test]

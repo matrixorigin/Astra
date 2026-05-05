@@ -1123,6 +1123,8 @@ impl ContextPipeline {
 
 The Execute phase is mechanical — serialize and send. Separated from Optimize so that the optimized plan can be inspected (`EXPLAIN` without `ANALYZE`).
 
+**Implementation boundary**: `astra-turn-core` implements the pure phases plus provider serialization (`Plan → Bind → Optimize → Serialize`). Actual network I/O, tool execution, emergent-context discovery, and feedback mutation stay in runtime. This preserves the dependency DAG: core owns deterministic request construction; runtime owns side effects and then feeds `ContextFeedback`/`EmergentContext` into the next pipeline invocation.
+
 ```rust
 impl ContextPipeline {
     pub async fn execute(&self, optimized: ContextOptimized) -> (ApiResponse, ContextFeedback) {

@@ -150,11 +150,31 @@ mod tests {
     }
 
     #[test]
+    fn healthy_feedback_produces_no_alerts() {
+        let f = make_feedback(800, 200);
+        let stats = PipelineStats {
+            turns_executed: 5,
+            avg_cache_hit_ratio: 0.75,
+            ..Default::default()
+        };
+        let recovery = RecoveryState::default();
+
+        let alerts = evaluate_alerts(5, &f, &stats, &recovery);
+
+        assert!(
+            alerts.is_empty(),
+            "healthy feedback should not alert: {alerts:?}"
+        );
+    }
+
+    #[test]
     fn cache_regression_alert_on_3_turn_drop() {
         let f = make_feedback(100, 900); // ratio = 0.1
-        let mut stats = PipelineStats::default();
-        stats.turns_executed = 4;
-        stats.avg_cache_hit_ratio = 0.85; // session avg much higher
+        let stats = PipelineStats {
+            turns_executed: 4,
+            avg_cache_hit_ratio: 0.85, // session avg much higher
+            ..Default::default()
+        };
         let recovery = RecoveryState::default();
         let alerts = evaluate_alerts(5, &f, &stats, &recovery);
         assert!(alerts.iter().any(|a| a.rule == "cache_regression"));
@@ -163,8 +183,10 @@ mod tests {
     #[test]
     fn compaction_cascade_alert_on_2_in_3_turns() {
         let f = make_feedback(1000, 0);
-        let mut stats = PipelineStats::default();
-        stats.turns_executed = 5;
+        let mut stats = PipelineStats {
+            turns_executed: 5,
+            ..Default::default()
+        };
         stats.record_compaction(1000);
         stats.turns_executed = 6;
         stats.record_compaction(2000);
@@ -189,8 +211,10 @@ mod tests {
     fn predictive_miss_alert_on_high_creation_ratio() {
         let mut f = make_feedback(0, 5000); // 100% creation
         f.cache_break_detected = Some(CacheBreakReason::UnknownColdStart);
-        let mut stats = PipelineStats::default();
-        stats.turns_executed = 3;
+        let stats = PipelineStats {
+            turns_executed: 3,
+            ..Default::default()
+        };
         let recovery = RecoveryState::default();
         let alerts = evaluate_alerts(4, &f, &stats, &recovery);
         assert!(alerts.iter().any(|a| a.rule == "predictive_miss"));

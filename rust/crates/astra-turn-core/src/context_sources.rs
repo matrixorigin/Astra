@@ -103,9 +103,10 @@ pub struct TurnState {
 
 /// External data sources — fetched on demand, not owned by the pipeline.
 pub struct ExternalSources {
-    pub has_memoria: bool,
+    /// Memory text already retrieved by the runtime before entering the pure
+    /// core pipeline. Core does not perform Memoria I/O.
+    pub memory_snippets: Vec<String>,
     pub spill_dir: Option<PathBuf>,
-    pub has_fork_prefix: bool,
 }
 
 impl StaticSections {
@@ -130,7 +131,6 @@ impl StaticSections {
             .sum()
     }
 }
-
 
 impl StaticSections {
     /// Build a minimal StaticSections for testing.

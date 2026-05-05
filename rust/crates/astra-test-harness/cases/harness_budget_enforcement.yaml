@@ -15,9 +15,17 @@ criteria:
     code: 0
   - type: tool_called
     name: bash
-  - type: turn_rounds_between
-    min: 1
-    max: 30
-  - type: tokens_between
-    min: 1
-    max: 500000
+  - type: all_of
+    criteria:
+      - type: turn_rounds_between
+        min: 1
+        max: 6
+      - type: tools_count_between
+        min: 1
+        max: 8
+      - type: duration_between
+        min_ms: 1
+        max_ms: 60000
+      - type: tokens_between
+        min: 1
+        max: 100000

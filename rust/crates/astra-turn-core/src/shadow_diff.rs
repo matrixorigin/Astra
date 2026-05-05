@@ -113,7 +113,10 @@ pub fn diff_pipeline_outputs(
 fn hash_sections(sections: &[crate::section_types::BoundSection]) -> u64 {
     let mut hasher = DefaultHasher::new();
     for section in sections {
-        section.content.hash(&mut hasher);
+        // Artifact discriminant is part of the semantic contract: identical
+        // text moving from MemoryText to RuntimeText should alert.
+        std::mem::discriminant(&section.artifact).hash(&mut hasher);
+        section.text().hash(&mut hasher);
         (section.plan.kind as u8).hash(&mut hasher);
     }
     hasher.finish()
@@ -122,11 +125,15 @@ fn hash_sections(sections: &[crate::section_types::BoundSection]) -> u64 {
 /// Check if a shadow diff result is clean (no errors).
 impl ShadowDiffResult {
     pub fn is_clean(&self) -> bool {
-        self.alerts.iter().all(|a| a.severity < AlertSeverity::Error)
+        self.alerts
+            .iter()
+            .all(|a| a.severity < AlertSeverity::Error)
     }
 
     pub fn has_errors(&self) -> bool {
-        self.alerts.iter().any(|a| a.severity >= AlertSeverity::Error)
+        self.alerts
+            .iter()
+            .any(|a| a.severity >= AlertSeverity::Error)
     }
 }
 
@@ -135,7 +142,7 @@ mod tests {
     use super::*;
     use crate::context_binder::bind_all;
     use crate::context_optimizer::optimize;
-    use crate::context_planner::{plan_turn, PlanInput};
+    use crate::context_planner::{PlanInput, plan_turn};
     use crate::context_sources::*;
     use crate::emergent_context::EmergentContext;
     use crate::microcompact::ProviderCacheStrategy;
@@ -174,9 +181,8 @@ mod tests {
             last_user_message: "test".into(),
         };
         let external = ExternalSources {
-            has_memoria: false,
+            memory_snippets: Vec::new(),
             spill_dir: None,
-            has_fork_prefix: false,
         };
         let emergent = EmergentContext::default();
         let stats = PipelineStats::default();
@@ -199,8 +205,7 @@ mod tests {
             latches: &latches,
             stats: &stats,
             provider_policy: &session.provider_policy,
-            has_memoria: false,
-            has_fork_prefix: false,
+            has_memory: false,
             model_id: "m1",
             query_source: "repl",
         };
@@ -217,17 +222,27 @@ mod tests {
         let (opt1, _) = build_optimized();
         let (opt2, _) = build_optimized();
         let result = diff_pipeline_outputs(&opt1, &opt2, 1);
-        assert!(result.is_clean(), "identical outputs should produce no errors: {:?}", result.alerts);
+        assert!(
+            result.is_clean(),
+            "identical outputs should produce no errors: {:?}",
+            result.alerts
+        );
     }
 
     #[test]
     fn message_count_mismatch_emits_error() {
         let (mut opt1, _) = build_optimized();
         let (opt2, _) = build_optimized();
-        opt1.messages.push(serde_json::json!({"role": "user", "content": "extra"}));
+        opt1.messages
+            .push(serde_json::json!({"role": "user", "content": "extra"}));
         let result = diff_pipeline_outputs(&opt1, &opt2, 2);
         assert!(result.has_errors());
-        assert!(result.alerts.iter().any(|a| a.rule == "shadow_message_count"));
+        assert!(
+            result
+                .alerts
+                .iter()
+                .any(|a| a.rule == "shadow_message_count")
+        );
     }
 
     #[test]
@@ -235,11 +250,16 @@ mod tests {
         let (mut opt1, _) = build_optimized();
         let (opt2, _) = build_optimized();
         if let Some(section) = opt1.sections.first_mut() {
-            section.content.push_str(" extra content");
+            section.append_text(" extra content");
         }
         let result = diff_pipeline_outputs(&opt1, &opt2, 3);
         assert!(result.has_errors());
-        assert!(result.alerts.iter().any(|a| a.rule == "shadow_system_block_hash"));
+        assert!(
+            result
+                .alerts
+                .iter()
+                .any(|a| a.rule == "shadow_system_block_hash")
+        );
     }
 
     #[test]
@@ -248,6 +268,11 @@ mod tests {
         let (opt2, _) = build_optimized();
         // Identical sections → identical tokens → no delta alert
         let result = diff_pipeline_outputs(&opt1, &opt2, 4);
-        assert!(!result.alerts.iter().any(|a| a.rule == "shadow_token_estimate_delta"));
+        assert!(
+            !result
+                .alerts
+                .iter()
+                .any(|a| a.rule == "shadow_token_estimate_delta")
+        );
     }
 }

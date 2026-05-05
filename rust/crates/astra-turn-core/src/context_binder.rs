@@ -10,7 +10,9 @@ use serde_json::Value;
 
 use crate::context_planner::ContextPlan;
 use crate::context_sources::ContextSources;
-use crate::section_types::{BoundSection, PlannedSection, SectionKind};
+use crate::section_types::{
+    BoundSection, PlannedSection, SectionArtifact, SectionKind, estimate_text_tokens,
+};
 
 /// Result of the Bind phase.
 #[derive(Debug)]
@@ -53,7 +55,9 @@ fn bind_section(planned: &PlannedSection, sources: &ContextSources<'_>) -> Bound
         SectionKind::Skills => bind_skills(sources),
         SectionKind::Memory => bind_memory(sources),
         SectionKind::WorkingMemory => String::new(),
-        SectionKind::History => bind_history(sources),
+        // Conversation history is serialized as provider messages, not as a
+        // separate text section.
+        SectionKind::History => String::new(),
         SectionKind::RuntimeIdentity => bind_runtime_identity(sources),
         SectionKind::EmergentSkills => bind_emergent_skills(sources),
         SectionKind::EmergentMemory => bind_emergent_memory(sources),
@@ -64,7 +68,7 @@ fn bind_section(planned: &PlannedSection, sources: &ContextSources<'_>) -> Bound
 
     BoundSection {
         plan: planned.clone(),
-        content,
+        artifact: SectionArtifact::from_text(planned.kind, content),
         actual_tokens,
         bind_latency: latency,
     }
@@ -112,19 +116,9 @@ fn bind_skills(sources: &ContextSources<'_>) -> String {
     format!("Active skills: {}", sources.turn.active_skills.join(", "))
 }
 
-/// Bind memory — placeholder for Memoria retrieval.
-/// In production, this would be async and call MemoriaClient::retrieve().
-fn bind_memory(_sources: &ContextSources<'_>) -> String {
-    // TODO: Wire to actual Memoria retrieval in Phase 6
-    String::new()
-}
-
-/// Bind conversation history as a text summary (token estimate).
-fn bind_history(sources: &ContextSources<'_>) -> String {
-    if sources.turn.messages.is_empty() {
-        return String::new();
-    }
-    format!("[{} messages in history]", sources.turn.messages.len())
+/// Bind memory snippets that the runtime retrieved before entering core.
+fn bind_memory(sources: &ContextSources<'_>) -> String {
+    sources.external.memory_snippets.join("\n\n")
 }
 
 /// Bind runtime identity from edge profile.
@@ -178,7 +172,7 @@ fn bind_emergent_summary(sources: &ContextSources<'_>) -> String {
 
 /// Rough token estimate: ~4 bytes per token.
 fn estimate_tokens(s: &str) -> u32 {
-    (s.len() / 4) as u32
+    estimate_text_tokens(s)
 }
 
 #[cfg(test)]
@@ -195,21 +189,38 @@ mod tests {
     use crate::token_accounting::TokenAccounting;
     use std::collections::HashMap;
 
-    fn test_sources() -> (
-        StaticSections,
-        AgentContext,
-        SessionLatches,
-        SessionContext,
-        TurnState,
-        ExternalSources,
-        EmergentContext,
-        PipelineStats,
-    ) {
-        (
-            StaticSections::test_default(),
-            AgentContext::default(),
-            SessionLatches::default(),
-            SessionContext {
+    struct TestSources {
+        statics: StaticSections,
+        agent: AgentContext,
+        latches: SessionLatches,
+        session: SessionContext,
+        turn: TurnState,
+        external: ExternalSources,
+        emergent: EmergentContext,
+        stats: PipelineStats,
+    }
+
+    impl TestSources {
+        fn context(&self) -> ContextSources<'_> {
+            ContextSources {
+                statics: &self.statics,
+                agent: &self.agent,
+                latches: &self.latches,
+                session: &self.session,
+                turn: &self.turn,
+                external: &self.external,
+                emergent: &self.emergent,
+                stats: &self.stats,
+            }
+        }
+    }
+
+    fn test_sources() -> TestSources {
+        TestSources {
+            statics: StaticSections::test_default(),
+            agent: AgentContext::default(),
+            latches: SessionLatches::default(),
+            session: SessionContext {
                 session_id: "test-session".into(),
                 run_id: "test-run".into(),
                 model_id: "test-model".into(),
@@ -224,7 +235,7 @@ mod tests {
                 },
                 self_model: Some("Expert coder.".into()),
             },
-            TurnState {
+            turn: TurnState {
                 messages: vec![serde_json::json!({"role": "user", "content": "hello"})],
                 tool_results: vec![],
                 tokens: TokenAccounting::default(),
@@ -235,93 +246,82 @@ mod tests {
                 recovery: RecoveryState::default(),
                 last_user_message: "hello".into(),
             },
-            ExternalSources {
-                has_memoria: true,
+            external: ExternalSources {
+                memory_snippets: vec!["Remember: prefer pipeline-first design.".into()],
                 spill_dir: None,
-                has_fork_prefix: false,
             },
-            EmergentContext::default(),
-            PipelineStats::default(),
-        )
-    }
-
-    fn make_context_sources<'a>(
-        statics: &'a StaticSections,
-        agent: &'a AgentContext,
-        latches: &'a SessionLatches,
-        session: &'a SessionContext,
-        turn: &'a TurnState,
-        external: &'a ExternalSources,
-        emergent: &'a EmergentContext,
-        stats: &'a PipelineStats,
-    ) -> ContextSources<'a> {
-        ContextSources {
-            statics,
-            agent,
-            latches,
-            session,
-            turn,
-            external,
-            emergent,
-            stats,
+            emergent: EmergentContext::default(),
+            stats: PipelineStats::default(),
         }
     }
 
     #[test]
     fn bind_identity_produces_global_scope_content() {
-        let (statics, agent, latches, session, turn, ext, emer, stats) = test_sources();
-        let sources = make_context_sources(&statics, &agent, &latches, &session, &turn, &ext, &emer, &stats);
+        let fixture = test_sources();
+        let sources = fixture.context();
         let content = bind_identity(&sources);
-        assert!(content.contains("expert"), "identity should contain core rules");
-        assert!(content.contains("Plan carefully"), "identity should contain planning");
+        assert!(
+            content.contains("expert"),
+            "identity should contain core rules"
+        );
+        assert!(
+            content.contains("Plan carefully"),
+            "identity should contain planning"
+        );
     }
 
     #[test]
     fn bind_constraints_produces_global_scope_content() {
-        let (statics, agent, latches, session, turn, ext, emer, stats) = test_sources();
-        let sources = make_context_sources(&statics, &agent, &latches, &session, &turn, &ext, &emer, &stats);
+        let fixture = test_sources();
+        let sources = fixture.context();
         let content = bind_constraints(&sources);
-        assert!(content.contains("concise"), "constraints should contain output format");
-        assert!(content.contains("Retry"), "constraints should contain error recovery");
+        assert!(
+            content.contains("concise"),
+            "constraints should contain output format"
+        );
+        assert!(
+            content.contains("Retry"),
+            "constraints should contain error recovery"
+        );
     }
 
     #[test]
     fn bind_runtime_identity_produces_none_scope() {
-        let (statics, agent, latches, session, turn, ext, emer, stats) = test_sources();
-        let sources = make_context_sources(&statics, &agent, &latches, &session, &turn, &ext, &emer, &stats);
+        let fixture = test_sources();
+        let sources = fixture.context();
         let content = bind_runtime_identity(&sources);
         assert!(content.contains("test-model"));
         assert!(content.contains("main")); // git branch
     }
 
     #[test]
-    fn bind_history_shows_message_count() {
-        let (statics, agent, latches, session, turn, ext, emer, stats) = test_sources();
-        let sources = make_context_sources(&statics, &agent, &latches, &session, &turn, &ext, &emer, &stats);
-        let content = bind_history(&sources);
-        assert!(content.contains("1 messages"));
+    fn bind_memory_uses_retrieved_snippets() {
+        let fixture = test_sources();
+        let sources = fixture.context();
+        let content = bind_memory(&sources);
+        assert!(content.contains("pipeline-first"));
     }
 
     #[test]
     fn bind_skills_lists_active_skills() {
-        let (statics, agent, latches, session, turn, ext, emer, stats) = test_sources();
-        let sources = make_context_sources(&statics, &agent, &latches, &session, &turn, &ext, &emer, &stats);
+        let fixture = test_sources();
+        let sources = fixture.context();
         let content = bind_skills(&sources);
         assert!(content.contains("code_review"));
     }
 
     #[test]
     fn bind_emergent_skills_empty_when_no_discoveries() {
-        let (statics, agent, latches, session, turn, ext, emer, stats) = test_sources();
-        let sources = make_context_sources(&statics, &agent, &latches, &session, &turn, &ext, &emer, &stats);
+        let fixture = test_sources();
+        let sources = fixture.context();
         let content = bind_emergent_skills(&sources);
         assert!(content.is_empty());
     }
 
     #[test]
     fn bind_emergent_skills_lists_discovered() {
-        let (statics, agent, latches, session, turn, ext, mut emer, stats) = test_sources();
-        emer.push_skill(EmergentItem {
+        let mut fixture = test_sources();
+        fixture.emergent.push_skill(EmergentItem {
             value: DiscoveredSkill {
                 skill_name: "review".into(),
                 trigger: "file write".into(),
@@ -329,15 +329,15 @@ mod tests {
             created_at_turn: 1,
             content_hash: 42,
         });
-        let sources = make_context_sources(&statics, &agent, &latches, &session, &turn, &ext, &emer, &stats);
+        let sources = fixture.context();
         let content = bind_emergent_skills(&sources);
         assert!(content.contains("review"));
     }
 
     #[test]
     fn bind_all_produces_sections_matching_plan() {
-        let (statics, agent, latches, session, turn, ext, emer, stats) = test_sources();
-        let sources = make_context_sources(&statics, &agent, &latches, &session, &turn, &ext, &emer, &stats);
+        let fixture = test_sources();
+        let sources = fixture.context();
 
         let plan_input = crate::context_planner::PlanInput {
             tokens: &sources.turn.tokens,
@@ -346,8 +346,7 @@ mod tests {
             latches: sources.latches,
             stats: sources.stats,
             provider_policy: &sources.session.provider_policy,
-            has_memoria: sources.external.has_memoria,
-            has_fork_prefix: sources.external.has_fork_prefix,
+            has_memory: !sources.external.memory_snippets.is_empty(),
             model_id: &sources.session.model_id,
             query_source: "repl",
         };
