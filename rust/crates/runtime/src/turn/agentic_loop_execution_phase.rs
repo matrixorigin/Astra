@@ -566,6 +566,21 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // can still move by-value into the control-flow mapper below.
     let ingest_is_fatal = matches!(ingest_outcome, AgenticTurnIngestOutcome::Fatal(_));
     if !ingest_is_fatal {
+        if let Some(ref mut pipeline_sess) = state.pipeline_session {
+            let feedback = astra_turn_core::context_feedback::ContextFeedback::from_usage(
+                turn_result.accum.prompt_tokens,
+                turn_result.accum.cache_read_tokens,
+                turn_result.accum.cache_creation_tokens,
+                turn_result.accum.completion_tokens,
+                false,
+            );
+            pipeline_sess.record_feedback(
+                "model",
+                "agentic_loop",
+                feedback,
+                None,
+            );
+        }
         host.on_turn_completed(state);
     }
 
@@ -3639,5 +3654,42 @@ mod tests {
             !state.restricted_tools.contains("bash"),
             "search-family corrective must not globally block bash"
         );
+    }
+
+    #[tokio::test]
+    async fn pipeline_session_receives_feedback_on_successful_turn() {
+        use astra_turn_core::pipeline_config::PipelineConfig;
+        use astra_turn_core::pipeline_session::PipelineSession;
+
+        let mut state = make_state();
+        state.pipeline_session = Some(PipelineSession::new(PipelineConfig::default()));
+
+        let mut host = MockHost::new(vec![text_result("Hello", 1000, 200, Some(50))]);
+        let prep = TurnIterationPrep {
+            quiet: true,
+            turn_start_time: Instant::now(),
+        };
+
+        let result = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep).await;
+        assert!(result.is_ok());
+
+        let sess = state.pipeline_session.as_ref().unwrap();
+        assert_eq!(sess.turns_completed(), 1);
+        assert_eq!(sess.stats.turns_executed, 1);
+    }
+
+    #[tokio::test]
+    async fn pipeline_session_none_does_not_panic() {
+        let mut state = make_state();
+        assert!(state.pipeline_session.is_none());
+
+        let mut host = MockHost::new(vec![text_result("Hello", 500, 100, None)]);
+        let prep = TurnIterationPrep {
+            quiet: true,
+            turn_start_time: Instant::now(),
+        };
+
+        let result = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep).await;
+        assert!(result.is_ok());
     }
 }
