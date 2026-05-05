@@ -4,9 +4,9 @@
 //! All queries run against MatrixOne `agent_events` + `agent_sessions` tables.
 
 use async_trait::async_trait;
-use axum::{http::StatusCode, Json};
+use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
-use sqlx::{query, Row};
+use sqlx::{Row, query};
 
 use crate::evaluation::{DatabaseEvaluationService, EvaluationService};
 use crate::{
@@ -15,7 +15,7 @@ use crate::{
     StagedMutationState,
 };
 use astra_core::{
-    connect_matrixone, error_response, internal_error, ErrorResponse, MatrixOneSettings, SharedPool,
+    ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
 
 fn normalize_tool_name(name: String) -> String {

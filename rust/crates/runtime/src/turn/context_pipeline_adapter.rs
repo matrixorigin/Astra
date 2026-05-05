@@ -85,11 +85,7 @@ pub(crate) fn build_external_sources(
                 "\n\n## Agent Type\nYou are acting as a **{agent_type}** agent for this skill.",
             ));
         }
-        if hint.is_empty() {
-            None
-        } else {
-            Some(hint)
-        }
+        if hint.is_empty() { None } else { Some(hint) }
     };
 
     // 5. Learned context

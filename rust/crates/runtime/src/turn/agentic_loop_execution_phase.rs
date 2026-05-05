@@ -16,6 +16,48 @@ use astra_turn_core::agentic_turn_ingest::{
 };
 use astra_turn_core::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
 
+/// Lazily-initialized process-wide alert dispatcher.
+///
+/// Reads `ASTRA_ALERT_WEBHOOK_URL` (and optional `ASTRA_ALERT_WEBHOOK_MIN_SEVERITY`)
+/// once, builds a single `AlertDispatcher` with a reusable reqwest client so that
+/// webhook calls share a TCP connection pool and TLS session cache across turns.
+///
+/// Returns `None` when no webhook URL is configured — the whole alert-dispatch
+/// branch is then a single cheap `OnceLock` load.
+fn global_alert_dispatcher()
+-> Option<&'static std::sync::Arc<astra_turn_core::alert_dispatcher::AlertDispatcher>> {
+    use std::sync::OnceLock;
+    static DISPATCHER: OnceLock<
+        Option<std::sync::Arc<astra_turn_core::alert_dispatcher::AlertDispatcher>>,
+    > = OnceLock::new();
+    DISPATCHER
+        .get_or_init(|| {
+            let url = std::env::var("ASTRA_ALERT_WEBHOOK_URL").ok()?;
+            let url = url.trim().to_string();
+            if url.is_empty() {
+                return None;
+            }
+            let min_severity = std::env::var("ASTRA_ALERT_WEBHOOK_MIN_SEVERITY")
+                .ok()
+                .and_then(|s| match s.to_ascii_lowercase().as_str() {
+                    "info" => Some(astra_turn_core::trace_alert::AlertSeverity::Info),
+                    "warning" | "warn" => {
+                        Some(astra_turn_core::trace_alert::AlertSeverity::Warning)
+                    }
+                    "error" => Some(astra_turn_core::trace_alert::AlertSeverity::Error),
+                    _ => None,
+                })
+                .unwrap_or(astra_turn_core::trace_alert::AlertSeverity::Error);
+            let client =
+                std::sync::Arc::new(astra_turn_core::alert_dispatcher::ReqwestWebhookClient::new());
+            let cfg = astra_turn_core::alert_dispatcher::AlertWebhookConfig { url, min_severity };
+            Some(std::sync::Arc::new(
+                astra_turn_core::alert_dispatcher::AlertDispatcher::new(cfg, client),
+            ))
+        })
+        .as_ref()
+}
+
 /// Record an `llm_round` event for an early-exit path (no tool calls).
 fn record_early_exit_llm_round(
     state: &mut AgenticLoopState,
@@ -618,6 +660,21 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     &pipeline_sess.stats,
                     &pipeline_sess.recovery,
                 );
+                // Best-effort webhook dispatch: dispatcher is initialized once
+                // per process via a global OnceLock, reusing reqwest::Client's
+                // connection pool + TLS session cache across turns. Dispatch
+                // runs async so it never blocks turn execution.
+                if !alerts.is_empty() {
+                    if let Some(dispatcher) = global_alert_dispatcher() {
+                        let session_id_str = session_id.unwrap_or("unknown-session").to_string();
+                        let alerts_to_send = alerts.clone();
+                        let dispatcher = dispatcher.clone();
+                        tokio::spawn(async move {
+                            dispatcher.dispatch(&session_id_str, &alerts_to_send).await;
+                        });
+                    }
+                }
+
                 for alert in &alerts {
                     if alert.severity >= astra_turn_core::trace_alert::AlertSeverity::Error {
                         let alert_evt =
@@ -2070,8 +2127,10 @@ async fn handle_token_budget<H: AgenticLoopHost>(
     }
 
     // First attempt: compact-and-continue instead of hard-stopping.
-    // Run the compression pipeline to free tokens and let the agent keep working.
-    // Only if compaction doesn't free enough do we inject the stop directive.
+    // Two-tier strategy:
+    //   1. Aggressive compression pipeline (clear tool results)
+    //   2. If still over: spill old messages to disk, keep reference in context
+    // Only if both fail do we inject the stop directive.
     if !state.budget_wrapup_injected {
         let budget = super::context_compression::TokenBudget {
             max_prompt_tokens: state.max_turn_input_tokens,
@@ -2081,27 +2140,44 @@ async fn handle_token_budget<H: AgenticLoopHost>(
         let pipeline = super::context_compression::CompressionPipeline::aggressive_pipeline();
         let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
 
-        if outcome.total_tokens_freed > 0 {
+        let mut total_freed = outcome.total_tokens_freed;
+
+        // Tier 2: Spill old messages to disk if compression wasn't enough.
+        // Serialize the oldest 60% of messages to a session-local file.
+        // Leave a system message referencing the file path so the agent
+        // can read_file it if needed. This is the SpillBackend pattern
+        // applied to conversation history — content isn't lost, just
+        // moved out of the live context window.
+        if total_freed == 0 || (measured.saturating_sub(total_freed) > state.max_turn_input_tokens)
+        {
+            if let Some(sid) = state.current_session_id.as_deref() {
+                let spill_freed = spill_old_messages_to_disk(
+                    &mut state.messages,
+                    sid,
+                    state.llm_rounds_completed,
+                );
+                total_freed += spill_freed;
+            }
+        }
+
+        if total_freed > 0 {
             if !prep.quiet {
                 host.emit_headless_line(
                     HeadlessStderrStyle::Yellow,
                     format!(
-                        "♻ Context pressure {measured}/{} tokens — compacted ~{} tokens, continuing.",
-                        state.max_turn_input_tokens, outcome.total_tokens_freed,
+                        "♻ Context pressure {measured}/{} tokens — freed ~{} tokens (compact+spill), continuing.",
+                        state.max_turn_input_tokens, total_freed,
                     ),
                 );
             }
             if let Some(ref mut sess) = state.pipeline_session {
                 sess.recovery.record_reactive_compact();
-                sess.stats.record_compaction(outcome.total_tokens_freed);
+                sess.stats.record_compaction(total_freed);
             }
             state
                 .compaction_effectiveness
-                .record_compaction(outcome.total_tokens_freed);
-            // Don't set budget_wrapup_injected — allow agent to continue.
-            // If next round still exceeds budget, we'll reach here again
-            // and try once more (up to 2 compaction attempts before stop).
-            state.budget_wrapup_injected = true; // Mark: one compact done
+                .record_compaction(total_freed);
+            state.budget_wrapup_injected = true;
             try_write_heavy_checkpoint(state);
             return Some(TurnExecutionControl::ContinueLoop);
         }
@@ -3797,4 +3873,196 @@ mod tests {
         let result = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep).await;
         assert!(result.is_ok());
     }
+}
+
+/// Spill old messages to disk with a structural summary retained in context.
+///
+/// Strategy (SpillBackend pattern for conversation history):
+/// 1. Extract a compact structural summary from the messages being spilled
+///    (user intents, tool calls made, files touched, errors hit)
+/// 2. Serialize the full messages to a session-local file (backup)
+/// 3. Replace the spilled messages with ONE system message containing:
+///    - The structural summary (so the agent retains awareness)
+///    - The spill file path (so it can read_file for full details)
+///
+/// This is NOT just raw dump — the summary gives the agent enough context
+/// to continue working without re-reading the full history. But if it needs
+/// specifics, the full transcript is one read_file away.
+///
+/// Returns estimated tokens freed.
+fn spill_old_messages_to_disk(
+    messages: &mut Vec<serde_json::Value>,
+    session_id: &str,
+    round: u32,
+) -> u64 {
+    let total = messages.len();
+    if total < 10 {
+        return 0;
+    }
+    let keep_count = (total * 2 / 5).max(6);
+    let spill_count = total - keep_count;
+    if spill_count < 4 {
+        return 0;
+    }
+
+    let to_spill: Vec<_> = messages.drain(..spill_count).collect();
+
+    // Build structural summary from the spilled messages.
+    let summary = build_spill_summary(&to_spill);
+
+    let spill_json = match serde_json::to_string_pretty(&to_spill) {
+        Ok(json) => json,
+        Err(_) => {
+            // Put messages back on failure.
+            let mut restored = to_spill;
+            restored.append(messages);
+            *messages = restored;
+            return 0;
+        }
+    };
+    let tokens_freed = (spill_json.len() / 4) as u64;
+
+    // Write full transcript to session dir.
+    let spill_dir = astra_services::session_journal::local_sessions_dir().join(session_id);
+    let _ = std::fs::create_dir_all(&spill_dir);
+    let spill_path = spill_dir.join(format!("spill-round{round}.json"));
+    if std::fs::write(&spill_path, &spill_json).is_err() {
+        let mut restored = to_spill;
+        restored.append(messages);
+        *messages = restored;
+        return 0;
+    }
+
+    // Insert summary + reference as first message.
+    let reference_msg = serde_json::json!({
+        "role": "system",
+        "content": format!(
+            "[Context compressed — {spill_count} earlier messages spilled to disk]\n\n\
+             ## Summary of spilled context\n{summary}\n\n\
+             ## Full transcript\n\
+             Path: {path}\n\
+             Use `read_file` on this path if you need exact details from \
+             the earlier conversation.",
+            path = spill_path.display(),
+        )
+    });
+    messages.insert(0, reference_msg);
+
+    tokens_freed
+}
+
+/// Extract a structural summary from messages without LLM — pure string extraction.
+/// Captures: user requests, tools called, files modified, errors encountered.
+fn build_spill_summary(messages: &[serde_json::Value]) -> String {
+    let mut user_messages = Vec::new();
+    let mut tools_used = Vec::new();
+    let mut files_modified = Vec::new();
+    let mut errors = Vec::new();
+
+    for msg in messages {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        match role {
+            "user" => {
+                if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                    // Skip system-injected user messages (attention manifests, etc.)
+                    if !content.starts_with("[attention:") && !content.starts_with("(cached") {
+                        let preview: String = content.chars().take(150).collect();
+                        user_messages.push(preview);
+                    }
+                }
+            }
+            "assistant" => {
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                    for tc in tool_calls {
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("?");
+                        let args = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("");
+                        // Extract file path from args if present
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
+                            if let Some(path) = parsed.get("path").and_then(|p| p.as_str()) {
+                                if name == "str_replace" || name == "write_file" {
+                                    if !files_modified.contains(&path.to_string()) {
+                                        files_modified.push(path.to_string());
+                                    }
+                                }
+                                tools_used.push(format!("{name}({path})"));
+                            } else {
+                                tools_used.push(name.to_string());
+                            }
+                        } else {
+                            tools_used.push(name.to_string());
+                        }
+                    }
+                }
+                // Check for error mentions in assistant text
+                if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
+                    if text.contains("error") || text.contains("Error") || text.contains("failed") {
+                        let preview: String = text.chars().take(100).collect();
+                        if errors.len() < 5 {
+                            errors.push(preview);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut summary = String::new();
+
+    if !user_messages.is_empty() {
+        summary.push_str("**User requests:**\n");
+        for (i, msg) in user_messages.iter().take(10).enumerate() {
+            summary.push_str(&format!("{}. {}\n", i + 1, msg));
+        }
+        summary.push('\n');
+    }
+
+    if !files_modified.is_empty() {
+        summary.push_str("**Files modified:**\n");
+        for f in files_modified.iter().take(20) {
+            summary.push_str(&format!("- {f}\n"));
+        }
+        summary.push('\n');
+    }
+
+    if !tools_used.is_empty() {
+        // Deduplicate and count
+        let mut tool_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for t in &tools_used {
+            *tool_counts.entry(t.as_str()).or_default() += 1;
+        }
+        let mut sorted: Vec<_> = tool_counts.into_iter().collect();
+        sorted.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        summary.push_str(&format!("**Tools used ({} calls):**\n", tools_used.len()));
+        for (tool, count) in sorted.iter().take(15) {
+            if *count > 1 {
+                summary.push_str(&format!("- {tool} ×{count}\n"));
+            } else {
+                summary.push_str(&format!("- {tool}\n"));
+            }
+        }
+        summary.push('\n');
+    }
+
+    if !errors.is_empty() {
+        summary.push_str("**Errors encountered:**\n");
+        for e in &errors {
+            summary.push_str(&format!("- {e}\n"));
+        }
+    }
+
+    if summary.is_empty() {
+        summary.push_str("(no structured content extracted from spilled messages)");
+    }
+
+    summary
 }

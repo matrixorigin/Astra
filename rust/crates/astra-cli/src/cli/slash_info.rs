@@ -2047,10 +2047,7 @@ fn parse_continuation_anchor(anchor: &str) -> ContinuationAnchorParts {
 fn print_context_explain(trace: &astra_turn_core::context_assembly_trace::ContextAssemblyTrace) {
     use astra_turn_core::context_assembly_trace::DecisionType;
 
-    let header = format!(
-        "─── Context Explain — {} ──────────────────",
-        trace.turn_id
-    );
+    let header = format!("─── Context Explain — {} ──────────────────", trace.turn_id);
     eprintln!("\n{}", header.bold().cyan());
 
     let total_tokens = trace.token_budget.total_used;

@@ -10,10 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::compaction_types::CompactionTier;
 use crate::context_binder::bind_all;
-use crate::context_optimizer::{optimize_with_spill, ContextOptimized};
-use crate::context_planner::{plan_turn, ContextPlan, PlanInput};
+use crate::context_optimizer::{ContextOptimized, optimize_with_spill};
+use crate::context_planner::{ContextPlan, PlanInput, plan_turn};
 use crate::context_pressure::ContextPressure;
-use crate::context_serializer::{serialize_provider_request, SerializedProviderRequest};
+use crate::context_serializer::{SerializedProviderRequest, serialize_provider_request};
 use crate::context_sources::ContextSources;
 use crate::optimize_limits::OptimizeLimits;
 use crate::pipeline_config::PipelineConfig;
