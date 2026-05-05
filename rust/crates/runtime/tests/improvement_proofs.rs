@@ -9012,3 +9012,53 @@ mod trigger_match_regressions {
         );
     }
 }
+
+/// Shadow validation: pipeline StaticSections produce the same core text
+/// as the legacy build_system_prompt_sections Global-scope sections.
+#[test]
+fn pipeline_static_sections_match_legacy_global_sections() {
+    use astra_runtime::prompts::{
+        build_pipeline_static_sections, build_system_prompt_sections_with_style,
+    };
+    use astra_turn_core::section_types::CacheScope;
+
+    let statics = build_pipeline_static_sections();
+    let legacy_sections =
+        build_system_prompt_sections_with_style(&["bash", "read_file"], "", 1.0, None, None);
+
+    // Extract only Global-scope sections from legacy
+    let legacy_global_text: String = legacy_sections
+        .iter()
+        .filter(|s| s.scope == CacheScope::Global)
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+
+    // Pipeline statics flattened
+    let pipeline_text: String = statics
+        .as_vec()
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+
+    // The pipeline text should contain the same core rules
+    assert!(
+        pipeline_text.contains("NEVER fabricate data"),
+        "pipeline must contain core rules"
+    );
+    assert!(
+        pipeline_text.contains("Planning Protocol"),
+        "pipeline must contain planning"
+    );
+    assert!(
+        pipeline_text.contains("Coding Discipline"),
+        "pipeline must contain coding discipline"
+    );
+
+    // Both should start with the same base prompt
+    assert!(
+        pipeline_text.starts_with(&legacy_global_text[..50.min(legacy_global_text.len())]),
+        "pipeline prefix should match legacy Global prefix"
+    );
+}

@@ -57,6 +57,52 @@ pub const LOW_CONFIDENCE_THRESHOLD: f64 = 0.3;
 // (prompt builders) without a circular dependency.
 pub use astra_turn_core::section_types::{CacheScope, PromptSection, PromptTokenBucket};
 
+/// Build the static sections for the context pipeline.
+/// These are the Global-scope sections that never change between turns.
+/// Compile once at session start and pass to PipelineSession's TurnInput.
+pub fn build_pipeline_static_sections() -> astra_turn_core::context_sources::StaticSections {
+    use astra_turn_core::context_assembly_trace::PromptTraceSignals;
+    use astra_turn_core::context_sources::StaticSections;
+    use astra_turn_core::section_types::PromptTokenBucket;
+
+    StaticSections {
+        core_rules: PromptSection {
+            text: core_rules_section(),
+            scope: CacheScope::Global,
+            token_bucket: PromptTokenBucket::BasePersona,
+            trace_signals: PromptTraceSignals::default(),
+        },
+        planning_protocol: PromptSection::stable(
+            planning_section().to_string(),
+            CacheScope::Global,
+        ),
+        coding_discipline: PromptSection::stable(
+            coding_discipline_section().to_string(),
+            CacheScope::Global,
+        ),
+        turn_discipline: PromptSection::stable(
+            turn_discipline_section().to_string(),
+            CacheScope::Global,
+        ),
+        parallel_efficiency: PromptSection::stable(
+            format!(
+                "{}\n{}",
+                parallel_and_efficiency_section(),
+                plan_execution_section()
+            ),
+            CacheScope::Global,
+        ),
+        output_format: PromptSection::stable(
+            output_format_section().to_string(),
+            CacheScope::Global,
+        ),
+        tool_error_recovery: PromptSection::stable(
+            tool_error_recovery_section().to_string(),
+            CacheScope::Global,
+        ),
+    }
+}
+
 // ── Section builder functions ─────────────────────────────────────────────
 // Each returns a prompt fragment. These are the shared building blocks for
 // both `build_main_system_prompt` (flat string) and
