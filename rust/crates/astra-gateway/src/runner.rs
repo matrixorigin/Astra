@@ -811,21 +811,20 @@ impl GatewayRunner {
             let token = access_token.clone();
             let kill_token = cancel_token.clone();
             async move {
-                tokio::select! {
-                    result = cli_bridge::run_cli_with_context_and_timeout(
-                        &profile,
-                        &message_text,
-                        sid.as_deref(),
-                        ws.as_deref(),
-                        Some(progress_tx),
-                        Some(&system_prompt),
-                        Some(cli_timeout),
-                        token.as_deref(),
-                    ) => result,
-                    _ = kill_token.cancelled() => {
-                        Err(format!("{} killed by user", profile.name()))
-                    }
-                }
+                cli_bridge::run_cli_with_cancel(
+                    &profile,
+                    &message_text,
+                    sid.as_deref(),
+                    ws.as_deref(),
+                    Some(progress_tx),
+                    Some(&system_prompt),
+                    None, // trace_id
+                    None, // request_id
+                    Some(cli_timeout),
+                    token.as_deref(),
+                    Some(kill_token),
+                )
+                .await
             }
         });
 
@@ -846,6 +845,8 @@ impl GatewayRunner {
         // send failures tracked by deliver_outbound).
         let health_key = format!("{}:{}", msg.platform, chat_id);
         const HEARTBEAT_FAILURE_THRESHOLD: u32 = 3;
+        // Reset health at task start — previous failures are stale.
+        self.send_health.remove(&health_key);
 
         #[allow(clippy::type_complexity)]
         let flush_buf = |buf: &mut String,
@@ -884,8 +885,7 @@ impl GatewayRunner {
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => {
-                    tracing::info!(tag = %request_tag, "task cancelled by user, aborting progress loop");
-                    cli_handle.abort();
+                    tracing::info!(tag = %request_tag, "task cancelled by user — CLI process will be killed by bridge");
                     break;
                 }
                 progress = progress_rx.recv() => {

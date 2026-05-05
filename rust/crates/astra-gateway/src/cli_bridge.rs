@@ -650,6 +650,28 @@ pub async fn run_cli_with_context_trace_and_timeout(
     timeout: Option<Duration>,
     access_token: Option<&str>,
 ) -> Result<CliResult, String> {
+    run_cli_with_cancel(
+        profile, message, session_id, working_dir, progress_tx,
+        system_prompt, trace_id, request_id, timeout, access_token, None,
+    ).await
+}
+
+/// Full CLI spawn with cancellation token support. When `cancel` fires,
+/// the child process is killed (SIGKILL) immediately — no zombie.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_cli_with_cancel(
+    profile: &CliProfile,
+    message: &str,
+    session_id: Option<&str>,
+    working_dir: Option<&std::path::Path>,
+    progress_tx: Option<mpsc::Sender<CliProgress>>,
+    system_prompt: Option<&str>,
+    trace_id: Option<&str>,
+    request_id: Option<&str>,
+    timeout: Option<Duration>,
+    access_token: Option<&str>,
+    cancel: Option<tokio_util::sync::CancellationToken>,
+) -> Result<CliResult, String> {
     let mut cmd =
         profile.build_command_with_context(message, session_id, working_dir, system_prompt);
     if let Some(trace_id) = trace_id {
@@ -720,12 +742,33 @@ pub async fn run_cli_with_context_trace_and_timeout(
                     stderr_text.lines().take(10).collect::<Vec<_>>().join("\n")
                 ).trim().to_string());
             }
+            _ = async {
+                match cancel.as_ref() {
+                    Some(t) => t.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let _ = child.kill().await;
+                stderr_task.abort();
+                stdout_task.abort();
+                return Err(format!("{} killed by user", profile.name()));
+            }
         }
     } else {
-        child
-            .wait()
-            .await
-            .map_err(|e| format!("wait failed: {e}"))?
+        tokio::select! {
+            status = child.wait() => status.map_err(|e| format!("wait failed: {e}"))?,
+            _ = async {
+                match cancel.as_ref() {
+                    Some(t) => t.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let _ = child.kill().await;
+                stderr_task.abort();
+                stdout_task.abort();
+                return Err(format!("{} killed by user", profile.name()));
+            }
+        }
     };
     let stderr_text = stderr_task.await.unwrap_or_default();
     let stdout_text = stdout_task.await.unwrap_or_default();
@@ -1478,5 +1521,136 @@ model: claude-sonnet-4-6"#;
     fn parse_status_event() {
         let line = r#"{"type":"status","text":"compiling..."}"#;
         assert!(matches!(parse_stderr_line(line), CliProgress::Status(t) if t == "compiling..."));
+    }
+
+    // ── Cancellation tests ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cancel_kills_child_process_immediately() {
+        use tokio_util::sync::CancellationToken;
+
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+
+        // Spawn a long-running process (sleep 60s).
+        let handle = tokio::spawn(async move {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("60");
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            let mut child = cmd.spawn().expect("spawn sleep");
+            let pid = child.id().expect("pid");
+
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let stderr_task = tokio::spawn(async move {
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                let mut s = String::new();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    s.push_str(&line);
+                }
+                s
+            });
+            let stdout_task = tokio::spawn(async move {
+                let reader = BufReader::new(stdout);
+                let mut lines = reader.lines();
+                let mut s = String::new();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    s.push_str(&line);
+                }
+                s
+            });
+
+            tokio::select! {
+                status = child.wait() => {
+                    let _ = status;
+                    Ok(pid)
+                }
+                _ = token_clone.cancelled() => {
+                    let _ = child.kill().await;
+                    stderr_task.abort();
+                    stdout_task.abort();
+                    Err(pid)
+                }
+            }
+        });
+
+        // Give process time to start.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Cancel.
+        token.cancel();
+
+        let result = handle.await.unwrap();
+        assert!(result.is_err(), "task must return Err when cancelled");
+        let pid = result.unwrap_err();
+
+        // Verify process is dead (not zombie).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let status = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status();
+        if let Ok(s) = status {
+            assert!(!s.success(), "process {pid} should be dead after kill");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_with_none_token_does_not_interfere() {
+        // A short-lived command with cancel=None must complete normally.
+        let profile = CliProfile::Astra {
+            bin: "true".into(),
+            model: None,
+            permission_mode: "auto".into(),
+        };
+        let result = run_cli_with_cancel(
+            &profile, "ignored", None, None, None, None, None, None,
+            Some(std::time::Duration::from_secs(5)),
+            None, None,
+        ).await;
+        // `true` exits immediately with code 0. build_command_with_context
+        // adds flags that `true` ignores, but it still exits 0.
+        assert!(result.is_ok(), "true should exit 0: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn cancel_token_fires_returns_killed_error() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio_util::sync::CancellationToken;
+
+        // Create a wrapper script that ignores args and just sleeps.
+        let script = "/tmp/astra_test_slow_cli.sh";
+        std::fs::write(script, "#!/bin/sh\nsleep 60\n").unwrap();
+        std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+
+        let profile = CliProfile::Astra {
+            bin: script.into(),
+            model: None,
+            permission_mode: "auto".into(),
+        };
+
+        let handle = tokio::spawn(async move {
+            run_cli_with_cancel(
+                &profile, "ignored", None, None, None, None, None, None,
+                Some(std::time::Duration::from_secs(120)),
+                None,
+                Some(token_clone),
+            ).await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        token.cancel();
+
+        let result = handle.await.unwrap();
+        assert!(result.is_err(), "cancelled task must return Err");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("killed by user"),
+            "error must mention kill reason, got: {err}"
+        );
     }
 }

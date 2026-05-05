@@ -87,11 +87,16 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
         "/status" => {
             let cli_name = ctx.resolved_cli.name();
             let session = if let Some(store) = ctx.store {
-                store
+                match store
                     .get_current_session(ctx.platform, ctx.chat_id, cli_name)
                     .await
-                    .ok()
-                    .flatten()
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "session lookup failed in /status");
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -201,9 +206,21 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                         sid.as_deref().unwrap_or("(无)")
                     ));
                 }
-                // Current CLI has no session — check all CLIs and show which ones do.
+                // Current CLI has no session — check all CLIs (including default) and show which ones do.
                 let mut found = Vec::new();
+                let default_cli_name = ctx.config.cli.name();
+                if default_cli_name != cli_name
+                    && let Ok(Some(other_sid)) = store
+                        .get_current_session(ctx.platform, ctx.chat_id, default_cli_name)
+                        .await
+                {
+                    let short = &other_sid[..8.min(other_sid.len())];
+                    found.push(format!("  `{default_cli_name}`: `{short}…`"));
+                }
                 for (name, _) in ctx.config.cli_profiles.iter() {
+                    if name == cli_name {
+                        continue;
+                    }
                     if let Ok(Some(other_sid)) = store
                         .get_current_session(ctx.platform, ctx.chat_id, name)
                         .await
