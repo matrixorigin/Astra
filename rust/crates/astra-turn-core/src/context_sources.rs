@@ -103,12 +103,33 @@ pub struct TurnState {
 }
 
 /// External data sources — fetched on demand, not owned by the pipeline.
-#[derive(Debug)]
+///
+/// Each field is a pre-computed prompt fragment from the runtime. The pipeline
+/// includes non-empty fields in the RuntimeIdentity section (per-turn dynamic).
+/// This keeps all runtime-specific logic in the runtime crate while the pipeline
+/// owns structure, ordering, and cache optimization.
+#[derive(Debug, Default)]
 pub struct ExternalSources {
     /// Memory text already retrieved by the runtime before entering the pure
     /// core pipeline. Core does not perform Memoria I/O.
     pub memory_snippets: Vec<String>,
     pub spill_dir: Option<PathBuf>,
+    /// Learned context from skill quality tracker / session history.
+    pub learned_context: Option<String>,
+    /// Delegation system override (injected by orchestrator).
+    pub system_override: Option<String>,
+    /// Plan-in-progress reminder ("You are executing step 3 of 5...").
+    pub plan_context: Option<String>,
+    /// Tool round guidance (budget warning, batching nudge, etc.).
+    pub tool_guidance: Option<String>,
+    /// Skill effort/agent_type hint ("effort: high", "agent: reviewer").
+    pub effort_hint: Option<String>,
+    /// Self-model section (tool-dependent capabilities description).
+    pub self_model_text: Option<String>,
+    /// Tool-conditional guidance (search strategy, task-type-specific rules).
+    pub tool_conditional: Option<String>,
+    /// Project profile description (cwd, git_branch, project facts).
+    pub profile_desc: Option<String>,
 }
 
 impl StaticSections {

@@ -530,6 +530,7 @@ mod tests {
         ExternalSources {
             memory_snippets: vec![],
             spill_dir: None,
+            ..Default::default()
         }
     }
 

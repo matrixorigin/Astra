@@ -121,10 +121,17 @@ fn bind_memory(sources: &ContextSources<'_>) -> String {
     sources.external.memory_snippets.join("\n\n")
 }
 
-/// Bind runtime identity from edge profile.
+/// Bind runtime identity — the per-turn dynamic section.
+///
+/// Includes: model/env identity + all pre-computed dynamic fragments from
+/// ExternalSources (profile, self-model, tool guidance, plan context, etc.).
+/// The runtime computes these; the pipeline just includes them in order.
 fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
     let ep = &sources.session.edge_profile;
+    let ext = &sources.external;
     let mut parts = Vec::new();
+
+    // Core identity (always present)
     parts.push(format!("Model: {}", sources.session.model_id));
     if let Some(cwd) = &ep.cwd {
         parts.push(format!("CWD: {cwd}"));
@@ -135,6 +142,33 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
     if !sources.session.session_id.is_empty() {
         parts.push(format!("Session: {}", sources.session.session_id));
     }
+
+    // Dynamic fragments from runtime (order matches legacy for cache stability)
+    if let Some(ref text) = ext.self_model_text {
+        parts.push(text.clone());
+    }
+    if let Some(ref text) = ext.tool_conditional {
+        parts.push(text.clone());
+    }
+    if let Some(ref text) = ext.profile_desc {
+        parts.push(text.clone());
+    }
+    if let Some(ref text) = ext.effort_hint {
+        parts.push(text.clone());
+    }
+    if let Some(ref text) = ext.learned_context {
+        parts.push(text.clone());
+    }
+    if let Some(ref text) = ext.system_override {
+        parts.push(text.clone());
+    }
+    if let Some(ref text) = ext.plan_context {
+        parts.push(text.clone());
+    }
+    if let Some(ref text) = ext.tool_guidance {
+        parts.push(text.clone());
+    }
+
     parts.join("\n")
 }
 
@@ -249,6 +283,7 @@ mod tests {
             external: ExternalSources {
                 memory_snippets: vec!["Remember: prefer pipeline-first design.".into()],
                 spill_dir: None,
+            ..Default::default()
             },
             emergent: EmergentContext::default(),
             stats: PipelineStats::default(),

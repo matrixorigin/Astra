@@ -63,6 +63,7 @@ fn build_sources() -> (
         ExternalSources {
             memory_snippets: vec!["contract memory".into()],
             spill_dir: None,
+            ..Default::default()
         },
         EmergentContext::default(),
         PipelineStats::default(),

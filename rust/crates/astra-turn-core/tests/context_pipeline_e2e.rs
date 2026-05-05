@@ -70,6 +70,7 @@ fn build_sources() -> (
         ExternalSources {
             memory_snippets: vec!["Relevant memory: main.rs has flaky parsing.".into()],
             spill_dir: None,
+            ..Default::default()
         },
         EmergentContext::default(),
         PipelineStats::default(),
