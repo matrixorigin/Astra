@@ -65,39 +65,54 @@ pub fn build_pipeline_static_sections() -> astra_turn_core::context_sources::Sta
     use astra_turn_core::context_sources::StaticSections;
     use astra_turn_core::section_types::PromptTokenBucket;
 
+    // Apply prompt overrides from $ASTRA_PROMPT_OVERRIDES_DIR (or ~/.astra/prompts).
+    // Legacy `build_system_message_with_dynamic_sections` applied these at
+    // assembly time; the pipeline applies them here so both paths surface
+    // the same Global text.
+    let overrides = load_overrides(&default_overrides_dir());
+    let resolve = |key: &str, default: String| -> String {
+        overrides.get(key).cloned().unwrap_or(default)
+    };
+
     StaticSections {
         core_rules: PromptSection {
-            text: core_rules_section(),
+            text: resolve("core_rules", core_rules_section()),
             scope: CacheScope::Global,
             token_bucket: PromptTokenBucket::BasePersona,
             trace_signals: PromptTraceSignals::default(),
         },
         planning_protocol: PromptSection::stable(
-            planning_section().to_string(),
+            resolve("planning", planning_section().to_string()),
             CacheScope::Global,
         ),
         coding_discipline: PromptSection::stable(
-            coding_discipline_section().to_string(),
+            resolve("coding_discipline", coding_discipline_section().to_string()),
             CacheScope::Global,
         ),
         turn_discipline: PromptSection::stable(
-            turn_discipline_section().to_string(),
+            resolve("turn_discipline", turn_discipline_section().to_string()),
             CacheScope::Global,
         ),
         parallel_efficiency: PromptSection::stable(
-            format!(
-                "{}\n{}",
-                parallel_and_efficiency_section(),
-                plan_execution_section()
+            resolve(
+                "parallel_and_efficiency",
+                format!(
+                    "{}\n{}",
+                    parallel_and_efficiency_section(),
+                    plan_execution_section()
+                ),
             ),
             CacheScope::Global,
         ),
         output_format: PromptSection::stable(
-            output_format_section().to_string(),
+            resolve("output_format", output_format_section().to_string()),
             CacheScope::Global,
         ),
         tool_error_recovery: PromptSection::stable(
-            tool_error_recovery_section().to_string(),
+            resolve(
+                "tool_error_recovery",
+                tool_error_recovery_section().to_string(),
+            ),
             CacheScope::Global,
         ),
     }
