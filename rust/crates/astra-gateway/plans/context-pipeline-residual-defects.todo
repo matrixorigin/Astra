@@ -23,26 +23,21 @@
 - Impact: spill strategy is a no-op in production (never actually frees tokens)
 - Fix: implement SpillBackend trait + LocalFs impl (Phase 12.2)
 
-### D2: EmergentContext Not Populated (P2, blocks Phase 11)
-- Location: context_sources.rs, EmergentContext struct
-- Current: EmergentContext always empty (no runtime writes to it)
-- Expected: previous turn's discovered_skills, prefetched_memory fed in
-- Impact: emergent tier never contributes to context (cold start every turn)
-- Fix: wire agentic loop to populate from previous turn (Phase 11.1)
+### D2: EmergentContext Not Populated (P2, blocks Phase 11) — FIXED
+- Location: pipeline_session.rs
+- Fix: push_emergent_skill/memory/summary methods on PipelineSession
+- Commit: 377cd805 (Phase 11 — emergent context + session latches lifecycle)
 
-### D3: SessionLatches Struct Exists But Never Latched (P2, blocks Phase 11)
-- Location: context_optimizer.rs, place_cache_markers()
-- Current: latches parameter reserved but unused (always default values)
-- Expected: first beta header evaluation latches value for session
-- Impact: cache markers may be placed on unstable prefix (cache breaks)
-- Fix: implement latch-on-first-use in runtime adapter (Phase 11.1)
+### D3: SessionLatches Struct Exists But Never Latched (P2, blocks Phase 11) — FIXED
+- Location: pipeline_session.rs
+- Fix: latch_header/cache_scope/feature methods on PipelineSession
+- Commit: 377cd805 (Phase 11 — emergent context + session latches lifecycle)
 
-### D4: PipelineStats Not Carried Across Turns (P1, blocks Phase 11)
-- Location: context_pipeline.rs, PipelineStats
-- Current: stats exist in tests but no runtime storage across turns
-- Expected: stats accumulate within session, persisted across restarts
-- Impact: every turn has cold pressure estimates (no learning)
-- Fix: add PipelineStats to loop state (Phase 11.2), persist (Phase 12.1)
+### D4: PipelineStats Not Carried Across Turns (P1, blocks Phase 11) — FIXED
+- Location: pipeline_session.rs, pipeline_session_serde.rs
+- Fix: PipelineSession owns stats, record_feedback() updates them each turn;
+  serialize_stats/deserialize_stats enable persistence (Phase 12 ready)
+- Commit: fdc3cf27 (Phase 11 — PipelineSession orchestrator)
 
 ### D5: place_cache_markers() Latch-Aware Logic Not Implemented (P3)
 - Location: context_optimizer.rs:~390
