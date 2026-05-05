@@ -109,11 +109,6 @@ pub struct ExternalSources {
     /// core pipeline. Core does not perform Memoria I/O.
     pub memory_snippets: Vec<String>,
     pub spill_dir: Option<PathBuf>,
-    /// Pre-computed dynamic prompt sections from the runtime (skill hints,
-    /// profile, effort, plan resume, tool guidance, runtime identity).
-    /// These are appended AFTER the pipeline's optimized static sections.
-    /// The pipeline doesn't generate these — it just passes them through.
-    pub dynamic_prompt_sections: Vec<String>,
 }
 
 impl StaticSections {

@@ -103,7 +103,6 @@ impl MockLoopState {
         ExternalSources {
             memory_snippets: self.memory_snippets.clone(),
             spill_dir: None,
-            dynamic_prompt_sections: vec![],
         }
     }
 }

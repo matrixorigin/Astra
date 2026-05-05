@@ -210,7 +210,6 @@ mod tests {
         let external = ExternalSources {
             memory_snippets: Vec::new(),
             spill_dir: None,
-            dynamic_prompt_sections: vec![],
         };
         let emergent = EmergentContext::default();
         let stats = PipelineStats::default();

@@ -63,7 +63,6 @@ fn build_sources() -> (
         ExternalSources {
             memory_snippets: vec!["contract memory".into()],
             spill_dir: None,
-            dynamic_prompt_sections: vec![],
         },
         EmergentContext::default(),
         PipelineStats::default(),

@@ -400,9 +400,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             },
             messaging: Default::default(),
             error_recovery: Default::default(),
-            pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
-                astra_turn_core::pipeline_config::PipelineConfig::default(),
-            )),
+            pipeline_session: None,
             message: task_context.to_string(),
             recent_tools: Vec::new(),
             task_profile: infer_task_execution_profile(task_context),

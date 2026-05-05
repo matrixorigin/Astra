@@ -530,7 +530,6 @@ mod tests {
         ExternalSources {
             memory_snippets: vec![],
             spill_dir: None,
-            dynamic_prompt_sections: vec![],
         }
     }
 

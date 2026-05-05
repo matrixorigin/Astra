@@ -416,9 +416,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 token: self.cancel_token.clone(),
             },
             error_recovery: Default::default(),
-            pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
-                astra_turn_core::pipeline_config::PipelineConfig::default(),
-            )),
+            pipeline_session: None,
             message: config.task.clone(),
             recent_tools: Vec::new(),
             task_profile,
