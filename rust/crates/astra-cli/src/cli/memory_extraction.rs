@@ -994,6 +994,39 @@ mod tests {
         );
     }
 
+    // R2-#1: end-to-end assertion that the drain path also plumbs
+    // outcome-specific metadata. session_cleanup's journal event for
+    // SkippedBusy must carry `prior_turn`; for Extracted must carry the
+    // usage fields (via prefix_reused at minimum, since usage is not in
+    // the journal schema yet).
+    #[test]
+    fn drain_path_journal_event_carries_prior_turn_for_busy() {
+        // Fake the drain() return value: SkippedBusy.
+        let outcome = ExtractionOutcome::SkippedBusy { prior_turn: 42 };
+        let evt = journal_event_for_outcome(Some("sess-1"), 43, &outcome);
+        let meta = evt.metadata.as_ref().unwrap();
+        assert_eq!(
+            meta.get("prior_turn").and_then(|v| v.as_u64()),
+            Some(42),
+            "session_cleanup must journal prior_turn on SkippedBusy drain — \
+             session-end is when ops are most likely to investigate"
+        );
+    }
+
+    #[test]
+    fn drain_path_journal_event_error_variant_carries_error_field() {
+        // R2 test cleanup: positive test for Error variant that was missing
+        // from the previous negative-only coverage.
+        let outcome = ExtractionOutcome::Error("provider 503".into());
+        let evt = journal_event_for_outcome(None, 1, &outcome);
+        let meta = evt.metadata.as_ref().unwrap();
+        assert_eq!(
+            meta.get("error").and_then(|v| v.as_str()),
+            Some("provider 503"),
+            "Error outcome must serialize the error message into journal metadata"
+        );
+    }
+
     #[test]
     fn journal_event_for_non_busy_outcomes_has_no_prior_turn() {
         // prior_turn is only meaningful for SkippedBusy. Other outcomes

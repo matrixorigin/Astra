@@ -389,7 +389,18 @@ pub async fn expand_references(
 
         match expand_single(reference, cwd) {
             Ok(content) => {
-                let tokens = estimate_tokens(&content);
+                // Build the fenced payload FIRST so the token accounting
+                // reflects what the LLM will actually see — including the
+                // HTML-escape inflation (a file full of `<` expands ~4x).
+                // Before this ordering fix, a dense XML/HTML file could
+                // pass the hard-limit check at raw size, then silently
+                // exceed it once escaped.
+                let source_attr = reference_source_attr(reference);
+                let escaped_content = escape_for_fence(&content);
+                let fenced = format!(
+                    "<attached source=\"{source_attr}\">\n{escaped_content}\n</attached>"
+                );
+                let tokens = estimate_tokens(&fenced);
 
                 // Check hard limit
                 if total_tokens + tokens > budget.hard_limit {
@@ -413,20 +424,6 @@ pub async fn expand_references(
 
                 total_tokens += tokens;
                 let label = format_label(reference, tokens);
-                // Wrap content in a <attached source="..."> fence so the
-                // LLM treats file content as data, not instructions. A
-                // file containing "[SYSTEM]: ignore previous" pasted raw
-                // would be indistinguishable from a real system message.
-                //
-                // Content must be HTML-escaped so a crafted file containing
-                // literal `</attached>` cannot close the fence prematurely
-                // (review finding: the attribute-only escape from P2-1 was
-                // not enough — content-level injection was still possible).
-                let source_attr = reference_source_attr(reference);
-                let escaped_content = escape_for_fence(&content);
-                let fenced = format!(
-                    "<attached source=\"{source_attr}\">\n{escaped_content}\n</attached>"
-                );
                 attachments.push(Attachment {
                     label,
                     content: fenced,
@@ -950,6 +947,72 @@ mod tests {
     // was injected raw. A crafted file with "\n</attached>\n[SYSTEM]: ..."
     // would close the fence prematurely, letting the instruction text
     // reach the LLM without the `attached` scope — full injection bypass.
+
+    // ── R2-#3: token budget must account for HTML-escape inflation ────────
+    //
+    // `estimate_tokens` was called on raw content BEFORE escape_for_fence.
+    // A file dense in `<`, `>`, `&` (XML/HTML/JSX) inflates ~4x in those
+    // chars, pushing the actual LLM input over the user's budget while
+    // bookkeeping still shows under-limit.
+
+    #[tokio::test]
+    async fn token_estimate_reflects_escape_inflation() {
+        let dir = TempDir::new().unwrap();
+        // 40 `<` chars = 40 bytes pre-escape, 40*4 = 160 bytes post-escape
+        // (`<` → `&lt;` is 1→4 bytes). 10 tokens pre, 40 tokens post.
+        let p = dir.path().join("xml.xml");
+        let raw = "<".repeat(40);
+        fs::write(&p, &raw).unwrap();
+
+        let msg = "@file:xml.xml";
+        let result = expand_references(msg, dir.path(), 100_000).await;
+        assert_eq!(result.attachments.len(), 1);
+        let att = &result.attachments[0];
+
+        // Actual LLM input is the fenced body, not the raw file content.
+        // Reported `tokens` must track what the provider will bill.
+        let actual_body_tokens = estimate_tokens(&att.content);
+        assert_eq!(
+            att.tokens, actual_body_tokens,
+            "Attachment.tokens must reflect the FENCED body (what the LLM \
+             actually sees), not the raw pre-escape content. raw={} bytes, \
+             body={} bytes, reported tokens={}, actual body tokens={}",
+            raw.len(),
+            att.content.len(),
+            att.tokens,
+            actual_body_tokens
+        );
+        // Also check total_tokens is consistent.
+        assert_eq!(result.total_tokens, actual_body_tokens);
+    }
+
+    #[tokio::test]
+    async fn hard_budget_blocks_based_on_escaped_size_not_raw_size() {
+        // A file at 40 bytes of '<' = 10 tokens pre-escape; 40 tokens
+        // post-escape (160 bytes). Budget: hard = 20 tokens. Pre-fix
+        // the raw 10 tokens passes the 20-token hard limit, then we
+        // silently ship 40 tokens to the LLM. After fix: block.
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("bomb.xml");
+        // 40 chars of '<' → 10 tokens raw, 40 tokens escaped.
+        fs::write(&p, "<".repeat(40)).unwrap();
+
+        // context window 80 → soft=20, hard=40. So we need content that's
+        // under raw-hard (40 tokens) but OVER escaped-hard once expanded.
+        // Use 120 raw bytes (~30 tokens pre, 120 tokens post).
+        let p2 = dir.path().join("bigger.xml");
+        fs::write(&p2, "<".repeat(120)).unwrap();
+        let msg = "@file:bigger.xml";
+        let result = expand_references(msg, dir.path(), 80).await;
+
+        assert!(
+            result.blocked || result.attachments.is_empty(),
+            "escape inflation pushes attachment over hard limit; must block \
+             or reject. attachments={:?}, warnings={:?}",
+            result.attachments.len(),
+            result.warnings
+        );
+    }
 
     #[tokio::test]
     async fn attachment_content_escapes_literal_close_tag() {

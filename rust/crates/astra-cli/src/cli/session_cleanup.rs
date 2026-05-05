@@ -159,26 +159,18 @@ pub(super) async fn finalize_session(state: &mut ReplState) {
         }
     }
     // 3f. Drain any in-flight memory extraction (bounded 5s).
+    //
+    // Use the centralized journal_event_for_outcome builder so that
+    // variant-specific metadata (prior_turn for SkippedBusy, error string
+    // for Error) reaches the session-end journal — previously the manual
+    // constructor here dropped those fields and operators investigating
+    // a session end saw only `tag=skipped_busy` with no blocker context.
     if let Some(outcome) = state.memory_extractor.drain(Duration::from_secs(5)).await {
         if let Some(ref j) = state.journal {
-            let (saved, cats, dur, pfx) = match &outcome {
-                super::memory_extraction::ExtractionOutcome::Extracted {
-                    count,
-                    categories,
-                    duration_ms,
-                    prefix_reused,
-                    ..
-                } => (*count, categories.clone(), *duration_ms, *prefix_reused),
-                _ => (0, vec![], 0, false),
-            };
-            let evt = session_journal::JournalEvent::memory_extraction_ex(
+            let evt = super::memory_extraction::journal_event_for_outcome(
                 state.session_id.as_deref(),
                 state.turn,
-                outcome.tag(),
-                saved,
-                &cats,
-                dur,
-                pfx,
+                &outcome,
             );
             let _ = j.append(&evt);
             enqueue_ingestion_pub(state, &evt);
