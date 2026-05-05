@@ -29,8 +29,11 @@ pub use system::{
     detect_task_type, load_overrides, parallel_batching_nudge_directive,
     parallel_execution_feedback, round_budget_directive, round_budget_directive_with,
     sections_to_string, self_awareness_prompt_section, synthesize_or_batch_directive,
-    tool_round_guidance, tool_round_guidance_trace_with, tool_round_guidance_with,
-    trailing_single_tool_round_streak,
+    tool_round_guidance, tool_round_guidance_trace_with,
+    tool_round_guidance_with, trailing_single_tool_round_streak,
+};
+pub(crate) use system::{
+    self_model_section, tool_conditional_section,
 };
 
 pub use astra_prompts::memory_lifecycle;

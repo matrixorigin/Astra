@@ -269,7 +269,7 @@ fn tool_error_recovery_section() -> &'static str {
 }
 
 /// Self-model (tool list). Session-scoped — changes when tool set changes.
-fn self_model_section(tool_names: &[&str]) -> String {
+pub(crate) fn self_model_section(tool_names: &[&str]) -> String {
     format!(
         "\n## Self-Model\nTools: {}\n\
          Refer to 'Runtime Identity' below for model, session, and environment details.\n",
@@ -304,7 +304,7 @@ fn memory_prompt_mode(tool_names: &[&str], profile_desc: &str) -> MemoryPromptMo
 
 /// Tool-conditional guidance (git, code nav, editing, build/test, memory, etc.).
 /// Session-scoped — depends on which tools are selected.
-fn tool_conditional_section(
+pub(crate) fn tool_conditional_section(
     tool_names: &[&str],
     profile_desc: &str,
     selection_confidence: f64,
