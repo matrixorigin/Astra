@@ -66,6 +66,7 @@ impl ContextPipeline {
             input.latches,
             &self.config.provider_policy,
             input.optimize_limits,
+            input.sources.turn.turn_index,
         );
         timings.push(PipelinePhaseTiming::elapsed("optimize", started));
 

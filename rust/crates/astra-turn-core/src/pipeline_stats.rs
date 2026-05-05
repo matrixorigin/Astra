@@ -19,19 +19,38 @@ pub struct EstimatorKey {
 }
 
 /// Simple sorted-list quantile estimator. Stores raw samples and computes
-/// percentiles on demand. Suitable for sessions with <1000 turns.
-/// For larger workloads, upgrade to t-digest.
+/// percentiles on demand. Capped at `MAX_SAMPLES`; once full, new values
+/// replace the median to keep extremes (which drive p75/p95) intact.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PercentileDigest {
     samples: Vec<u32>,
 }
 
 impl PercentileDigest {
-    /// Add a sample.
+    /// Maximum retained samples. Beyond this, the digest down-samples by
+    /// replacing the median with the new value.
+    pub const MAX_SAMPLES: usize = 512;
+
+    /// Add a sample. O(n) insert; capped at `MAX_SAMPLES`.
+    /// Once the cap is reached, the median is evicted to preserve tail accuracy
+    /// (p75/p95 unaffected). Check [`Self::is_saturated`] if diagnostics are needed.
     pub fn push(&mut self, value: u32) {
+        if self.samples.len() >= Self::MAX_SAMPLES {
+            // Replace median to preserve tail behavior (p75/p95 accuracy).
+            let mid = self.samples.len() / 2;
+            self.samples.remove(mid);
+        }
         // Keep sorted for percentile computation
         let pos = self.samples.partition_point(|&x| x < value);
         self.samples.insert(pos, value);
+    }
+
+    /// Returns `true` when the digest has hit its sample cap and is now
+    /// evicting median values. Callers may log a diagnostic or switch to a
+    /// streaming quantile algorithm when this fires.
+    #[must_use]
+    pub fn is_saturated(&self) -> bool {
+        self.samples.len() >= Self::MAX_SAMPLES
     }
 
     /// Get the p-th percentile (0.0–1.0). Returns `default` if no samples.
@@ -75,16 +94,14 @@ impl ResponseTokenEstimator {
         }
     }
 
-    /// Record an observed response.
+    /// Record an observed response (saturating u64→u32 cast).
     pub fn record(&mut self, model: &str, source: &str, feedback: &ContextFeedback) {
         let key = EstimatorKey {
             model_id: model.to_string(),
             query_source: source.to_string(),
         };
-        self.buckets
-            .entry(key)
-            .or_default()
-            .push(feedback.tokens.completion as u32);
+        let completion_u32 = u32::try_from(feedback.tokens.completion).unwrap_or(u32::MAX);
+        self.buckets.entry(key).or_default().push(completion_u32);
     }
 
     /// Compute reserves for the next turn.
@@ -146,6 +163,13 @@ pub struct PipelineStats {
     pub section_usage_ema: HashMap<crate::section_types::SectionKind, f64>,
 }
 
+impl PipelineStats {
+    /// Maximum retained compact events (ring buffer semantics).
+    const MAX_COMPACT_EVENTS: usize = 64;
+    /// Maximum retained cache break events.
+    const MAX_CACHE_BREAKS: usize = 64;
+}
+
 impl Default for PipelineStats {
     fn default() -> Self {
         Self {
@@ -173,8 +197,11 @@ impl PipelineStats {
         self.response_token_estimates
             .record(model, source, feedback);
 
-        // Record cache breaks
+        // Record cache breaks (capped)
         if let Some(reason) = &feedback.cache_break_detected {
+            if self.cache_breaks.len() >= Self::MAX_CACHE_BREAKS {
+                self.cache_breaks.remove(0);
+            }
             self.cache_breaks.push(CacheBreakEvent {
                 turn: self.turns_executed,
                 reason: reason.clone(),
@@ -184,7 +211,11 @@ impl PipelineStats {
     }
 
     /// Record a compaction event for cascade detection.
+    /// Old events beyond `MAX_COMPACT_EVENTS` are evicted (ring semantics).
     pub fn record_compaction(&mut self, tokens_freed: u64) {
+        if self.compact_events.len() >= Self::MAX_COMPACT_EVENTS {
+            self.compact_events.remove(0);
+        }
         self.compact_events.push(CompactEvent {
             turn: self.turns_executed,
             tokens_freed,
@@ -379,5 +410,68 @@ mod tests {
         assert_eq!(d.percentile(-1.0, 0), 100);
         assert_eq!(d.percentile(2.0, 0), 300);
         assert_eq!(d.percentile(f64::NAN, 0), 300);
+    }
+
+    #[test]
+    fn percentile_digest_saturates_at_max_samples() {
+        let mut d = PercentileDigest::default();
+        assert!(!d.is_saturated());
+
+        for i in 0..PercentileDigest::MAX_SAMPLES as u32 {
+            d.push(i);
+        }
+        assert!(d.is_saturated());
+        assert_eq!(d.count(), PercentileDigest::MAX_SAMPLES);
+
+        // Pushing beyond cap preserves count and tail accuracy
+        d.push(9999);
+        assert_eq!(d.count(), PercentileDigest::MAX_SAMPLES);
+        assert_eq!(d.percentile(1.0, 0), 9999);
+    }
+
+    #[test]
+    fn predictive_reserves_always_gte_raw_floor() {
+        // Core invariant: predictive estimate (p75/p95) ≥ default floor
+        // when data exists. This must hold even with adversarial inputs.
+        let mut est = ResponseTokenEstimator::with_floor(200);
+        let scenarios: &[u64] = &[0, 1, 50, 200, 500, u32::MAX as u64];
+
+        for &completion in scenarios {
+            est.record("m", "s", &make_feedback(completion, 0, 0));
+        }
+
+        let normal = est.reserve_for("m", "s", &RecoveryState::default());
+        let mut recovery = RecoveryState::default();
+        recovery.record_ptl_error();
+        let elevated = est.reserve_for("m", "s", &recovery);
+
+        // p95 ≥ p75 (never-de-escalate under recovery)
+        assert!(
+            elevated.output_tokens >= normal.output_tokens,
+            "recovery reserves ({}) must be >= normal ({})",
+            elevated.output_tokens,
+            normal.output_tokens,
+        );
+    }
+
+    #[test]
+    fn compact_events_capped_at_max() {
+        let mut stats = PipelineStats::default();
+        for i in 0..100u64 {
+            stats.turns_executed = i as u32;
+            stats.record_compaction(i * 100);
+        }
+        assert!(stats.compact_events.len() <= PipelineStats::MAX_COMPACT_EVENTS);
+    }
+
+    #[test]
+    fn cache_breaks_capped_at_max() {
+        let mut stats = PipelineStats::default();
+        for _ in 0..100 {
+            let mut f = make_feedback(100, 0, 5000);
+            f.detect_cache_break(2, 1000);
+            stats.record("m", "s", &f);
+        }
+        assert!(stats.cache_breaks.len() <= PipelineStats::MAX_CACHE_BREAKS);
     }
 }

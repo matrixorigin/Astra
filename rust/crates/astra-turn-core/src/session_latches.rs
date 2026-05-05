@@ -87,6 +87,20 @@ impl SessionLatches {
     pub fn has_header(&self, name: &str) -> bool {
         self.beta_headers.iter().any(|h| h.name == name)
     }
+
+    /// Returns true if any latch was triggered on the given turn.
+    /// Used by the optimizer to suppress cache markers near volatile content
+    /// that was just introduced this turn (and may change next turn).
+    #[must_use]
+    pub fn any_flipped_this_turn(&self, current_turn: u32) -> bool {
+        self.beta_headers
+            .iter()
+            .any(|h| h.latched_at_turn == current_turn)
+            || self
+                .provider_features
+                .iter()
+                .any(|f| f.latched_at_turn == current_turn)
+    }
 }
 
 #[cfg(test)]

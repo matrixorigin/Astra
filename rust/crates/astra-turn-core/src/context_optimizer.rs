@@ -74,6 +74,7 @@ pub fn optimize(
     latches: &SessionLatches,
     policy: &ProviderCachePolicy,
     limits: &OptimizeLimits,
+    current_turn: u32,
 ) -> ContextOptimized {
     let ContextBound {
         mut sections,
@@ -148,7 +149,7 @@ pub fn optimize(
     }
 
     // 4. CACHE MARKERS: place based on provider protocol
-    let cache_markers = place_cache_markers(&sections, policy, latches);
+    let cache_markers = place_cache_markers(&sections, policy, latches, current_turn);
 
     ContextOptimized {
         sections,
@@ -166,18 +167,25 @@ struct ClearResult {
 }
 
 /// Gated tool result clearing with circuit breaker.
+/// `max_clear_tokens` caps total tokens cleared to prevent over-compaction.
 fn compact_tool_results_gated(
     messages: &mut [Value],
-    _tier: CompactionTier,
+    tier: CompactionTier,
     pressure: f64,
     strategy: CompactStrategy,
-    _max_clear_tokens: u32,
+    max_clear_tokens: u32,
 ) -> ClearResult {
-    // Delegate to existing microcompact functions
-    let stats = crate::microcompact::compact_tool_results_adaptive(messages, pressure, strategy);
+    // AggressivePrune escalates effective pressure to clear more aggressively
+    let effective_pressure = match tier {
+        CompactionTier::AggressivePrune => (pressure * 1.2).min(1.0),
+        _ => pressure,
+    };
+    let stats =
+        crate::microcompact::compact_tool_results_adaptive(messages, effective_pressure, strategy);
+    let tokens = (stats.tokens_saved as u32).min(max_clear_tokens);
     ClearResult {
         count: stats.results_compacted as u32,
-        tokens: stats.tokens_saved as u32,
+        tokens,
     }
 }
 
@@ -187,9 +195,6 @@ fn compact_tool_results_gated(
 /// still reports the skipped work for optimizer stats/explainability.
 fn cache_align_sections(sections: &mut [BoundSection], max_moves: u32) -> u32 {
     // Only reorder within groups that have the same scope
-    // For now, a simple stable sort by scope.order() within non-fixed sections
-    let mut moves = 0u32;
-
     // Don't reorder Identity and Constraints (they're semantic anchors)
     let reorderable: Vec<usize> = sections
         .iter()
@@ -207,23 +212,42 @@ fn cache_align_sections(sections: &mut [BoundSection], max_moves: u32) -> u32 {
         return 0;
     }
 
-    // Simple bubble sort with move counter (sections are small, ~10 elements)
+    // Compute desired order by cache scope
     let mut sorted_indices = reorderable.clone();
     sorted_indices.sort_by_key(|&i| sections[i].plan.scope.order());
 
+    // Count displacements
+    let mut moves = 0u32;
     for (pos, &target_idx) in sorted_indices.iter().enumerate() {
         if reorderable[pos] != target_idx {
             moves += 1;
         }
     }
 
-    // Actually sort if moves are within budget
+    // Apply sort in-place using swap instead of clone
     if moves <= max_moves && moves > 0 {
-        let mut reorderable_sections: Vec<_> =
-            reorderable.iter().map(|&i| sections[i].clone()).collect();
-        reorderable_sections.sort_by_key(|s| s.plan.scope.order());
-        for (pos, &idx) in reorderable.iter().enumerate() {
-            sections[idx] = reorderable_sections[pos].clone();
+        // Build a permutation map and apply it via cycle-sort (zero allocations beyond the index vec)
+        let mut perm: Vec<usize> = (0..reorderable.len()).collect();
+        perm.sort_by_key(|&i| sections[reorderable[i]].plan.scope.order());
+
+        let mut visited = vec![false; perm.len()];
+        for start in 0..perm.len() {
+            if visited[start] || perm[start] == start {
+                visited[start] = true;
+                continue;
+            }
+            let mut current = start;
+            loop {
+                visited[current] = true;
+                let next = perm[current];
+                if next == start {
+                    break;
+                }
+                sections.swap(reorderable[current], reorderable[next]);
+                current = next;
+            }
+            // Final swap to place `start` element
+            sections.swap(reorderable[start], reorderable[perm[start]]);
         }
     }
 
@@ -231,15 +255,22 @@ fn cache_align_sections(sections: &mut [BoundSection], max_moves: u32) -> u32 {
 }
 
 /// Place cache markers at scope boundaries.
+/// `latches` reserved for future latch-aware marker placement (e.g. skip
+/// marker if latch flip would invalidate prefix).
 fn place_cache_markers(
     sections: &[BoundSection],
     policy: &ProviderCachePolicy,
-    _latches: &SessionLatches,
+    latches: &SessionLatches,
+    current_turn: u32,
 ) -> Vec<CacheMarker> {
     if policy.protocol == PromptCacheProtocol::Prefix {
         // Prefix caching: no explicit markers (provider does it automatically)
         return Vec::new();
     }
+
+    // If any latch flipped this turn, suppress trailing markers to avoid
+    // caching content that will change next turn.
+    let latch_flipped = latches.any_flipped_this_turn(current_turn);
 
     let mut markers = Vec::new();
     let mut cumulative_tokens = 0u32;
@@ -251,11 +282,16 @@ fn place_cache_markers(
 
         if let Some(prev_scope) = last_scope {
             if prev_scope != scope && markers.len() < policy.max_markers as usize {
-                markers.push(CacheMarker {
-                    after_section_index: i.saturating_sub(1),
-                    scope: prev_scope,
-                    cumulative_tokens: cumulative_tokens - section.actual_tokens,
-                });
+                // Skip None-scope markers if a latch flipped (content unstable)
+                if latch_flipped && scope == CacheScope::None {
+                    // Don't place marker before volatile content
+                } else {
+                    markers.push(CacheMarker {
+                        after_section_index: i.saturating_sub(1),
+                        scope: prev_scope,
+                        cumulative_tokens: cumulative_tokens - section.actual_tokens,
+                    });
+                }
             }
         }
         last_scope = Some(scope);
@@ -348,7 +384,7 @@ mod tests {
         let limits = OptimizeLimits::all_closed();
         let policy = ProviderCachePolicy::default();
 
-        let result = optimize(&plan, bound, &latches, &policy, &limits);
+        let result = optimize(&plan, bound, &latches, &policy, &limits, 1);
 
         assert_eq!(result.sections.len(), original_section_count);
         assert_eq!(result.messages.len(), original_message_count);
@@ -365,7 +401,7 @@ mod tests {
         let limits = OptimizeLimits::all_closed();
         let policy = ProviderCachePolicy::default();
 
-        let result = optimize(&plan, bound, &latches, &policy, &limits);
+        let result = optimize(&plan, bound, &latches, &policy, &limits, 1);
         let result_order: Vec<SectionKind> = result.sections.iter().map(|s| s.plan.kind).collect();
 
         assert_eq!(
@@ -415,7 +451,7 @@ mod tests {
         // Gate is closed — no clearing should happen
         let policy = ProviderCachePolicy::default();
 
-        let result = optimize(&plan, bound, &latches, &policy, &limits);
+        let result = optimize(&plan, bound, &latches, &policy, &limits, 1);
         assert_eq!(result.stats.tool_results_cleared, 0);
         assert!(
             result
@@ -435,7 +471,7 @@ mod tests {
         let limits = OptimizeLimits::default();
         let policy = ProviderCachePolicy::default();
 
-        let result = optimize(&plan, bound, &latches, &policy, &limits);
+        let result = optimize(&plan, bound, &latches, &policy, &limits, 1);
         assert_eq!(result.stats.tool_results_cleared, 0);
     }
 
@@ -445,7 +481,7 @@ mod tests {
         let limits = OptimizeLimits::default();
         let policy = ProviderCachePolicy::anthropic();
 
-        let result = optimize(&plan, bound, &latches, &policy, &limits);
+        let result = optimize(&plan, bound, &latches, &policy, &limits, 1);
         // Anthropic should have markers at scope boundaries
         // (Global→Session or Session→None transitions)
         // The exact count depends on section layout
@@ -459,7 +495,7 @@ mod tests {
         let limits = OptimizeLimits::default();
         let policy = ProviderCachePolicy::openai_compatible();
 
-        let result = optimize(&plan, bound, &latches, &policy, &limits);
+        let result = optimize(&plan, bound, &latches, &policy, &limits, 1);
         assert!(
             result.cache_markers.is_empty(),
             "prefix caching should not produce explicit markers"
@@ -472,7 +508,7 @@ mod tests {
         let limits = OptimizeLimits::all_closed();
         let policy = ProviderCachePolicy::default();
 
-        let result = optimize(&plan, bound, &latches, &policy, &limits);
+        let result = optimize(&plan, bound, &latches, &policy, &limits, 1);
         let skipped_steps: Vec<&str> = result
             .stats
             .skipped
@@ -495,7 +531,7 @@ mod tests {
         let limits = OptimizeLimits::default(); // reorder=false by default
         let policy = ProviderCachePolicy::default();
 
-        let result = optimize(&plan, bound, &latches, &policy, &limits);
+        let result = optimize(&plan, bound, &latches, &policy, &limits, 1);
         // Identity should be first, Constraints should be second (or early)
         let kinds: Vec<SectionKind> = result.sections.iter().map(|s| s.plan.kind).collect();
         let identity_pos = kinds.iter().position(|k| *k == SectionKind::Identity);

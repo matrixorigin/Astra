@@ -88,6 +88,7 @@ pub struct EdgeProfile {
 ///
 /// This is a typed view over the relevant subset of `AgenticLoopState`.
 /// The ~125 execution-machinery fields stay in the loop orchestrator.
+#[derive(Debug)]
 pub struct TurnState {
     pub messages: Vec<Value>,
     pub tool_results: Vec<Value>,
@@ -102,6 +103,7 @@ pub struct TurnState {
 }
 
 /// External data sources — fetched on demand, not owned by the pipeline.
+#[derive(Debug)]
 pub struct ExternalSources {
     /// Memory text already retrieved by the runtime before entering the pure
     /// core pipeline. Core does not perform Memoria I/O.

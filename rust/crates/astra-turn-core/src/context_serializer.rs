@@ -37,10 +37,10 @@ pub fn serialize_provider_request(
     let mut section_to_block = vec![None; optimized.sections.len()];
     let mut system_blocks = Vec::new();
     for (idx, section) in optimized.sections.iter().enumerate() {
-        let text = section.text();
-        if text.is_empty() {
-            continue;
-        }
+        let text = match section.text() {
+            Some(t) if !t.is_empty() => t,
+            _ => continue,
+        };
         section_to_block[idx] = Some(system_blocks.len());
         system_blocks.push(SerializedSystemBlock {
             kind: section.plan.kind,

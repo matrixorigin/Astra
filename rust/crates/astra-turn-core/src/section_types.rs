@@ -232,14 +232,19 @@ impl SectionArtifact {
         }
     }
 
+    /// Returns the text content of this artifact, or `None` for non-text
+    /// variants (`ToolSchema`, `SpillReference`, `Empty`).
+    ///
+    /// Callers MUST handle `None` — silently treating ToolSchema as empty text
+    /// is a semantic error.
     #[must_use]
-    pub fn text(&self) -> &str {
+    pub fn text(&self) -> Option<&str> {
         match self {
             Self::SystemText(text)
             | Self::RuntimeText(text)
             | Self::MemoryText(text)
-            | Self::HistorySummary(text) => text,
-            Self::ToolSchema(_) | Self::SpillReference { .. } | Self::Empty => "",
+            | Self::HistorySummary(text) => Some(text),
+            Self::ToolSchema(_) | Self::SpillReference { .. } | Self::Empty => None,
         }
     }
 
@@ -284,15 +289,16 @@ impl BoundSection {
         }
     }
 
+    /// Returns the text content if this section has text, `None` for non-text artifacts.
     #[must_use]
-    pub fn text(&self) -> &str {
+    pub fn text(&self) -> Option<&str> {
         self.artifact.text()
     }
 
     pub fn append_text(&mut self, suffix: &str) {
-        let before = self.text().len();
+        let before = self.text().map_or(0, |t| t.len());
         self.artifact.append_text(self.plan.kind, suffix);
-        if self.text().len() > before {
+        if self.text().map_or(0, |t| t.len()) > before {
             self.actual_tokens = self
                 .actual_tokens
                 .saturating_add(estimate_text_tokens(suffix));
@@ -358,7 +364,7 @@ mod tests {
     fn bound_section_empty_has_zero_tokens() {
         let b = BoundSection::empty(SectionKind::Memory);
         assert_eq!(b.actual_tokens, 0);
-        assert!(b.text().is_empty());
+        assert!(b.text().is_none());
         assert_eq!(b.plan.kind, SectionKind::Memory);
     }
 

@@ -4,11 +4,38 @@
 //! Any divergence produces a TraceAlert. This is the mechanism that makes
 //! optimizer changes safe to iterate on.
 
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use crate::context_optimizer::ContextOptimized;
 use crate::trace_alert::{AlertSeverity, TraceAlert};
+
+/// FNV-1a hasher — deterministic across Rust versions and builds.
+/// DefaultHasher uses SipHash with per-process random keys, making hashes
+/// non-reproducible across binaries. FNV-1a provides a stable, fast hash
+/// for same-process shadow diff comparison and cross-binary diagnostics.
+struct StableHasher(u64);
+
+impl StableHasher {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    fn new() -> Self {
+        Self(Self::FNV_OFFSET_BASIS)
+    }
+}
+
+impl Hasher for StableHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= byte as u64;
+            self.0 = self.0.wrapping_mul(Self::FNV_PRIME);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
 
 /// Result of comparing two pipeline outputs.
 #[derive(Debug, Default)]
@@ -111,15 +138,15 @@ pub fn diff_pipeline_outputs(
 }
 
 fn hash_sections(sections: &[crate::section_types::BoundSection]) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = StableHasher::new();
     for section in sections {
         // Artifact discriminant is part of the semantic contract: identical
         // text moving from MemoryText to RuntimeText should alert.
         std::mem::discriminant(&section.artifact).hash(&mut hasher);
-        section.text().hash(&mut hasher);
+        section.text().unwrap_or("").hash(&mut hasher);
         (section.plan.kind as u8).hash(&mut hasher);
     }
-    hasher.finish()
+    Hasher::finish(&hasher)
 }
 
 /// Check if a shadow diff result is clean (no errors).
@@ -213,7 +240,7 @@ mod tests {
         let bound = bind_all(&plan, &sources);
         let limits = OptimizeLimits::default();
         let policy = ProviderCachePolicy::default();
-        let optimized = optimize(&plan, bound, &latches, &policy, &limits);
+        let optimized = optimize(&plan, bound, &latches, &policy, &limits, 1);
         (optimized, latches)
     }
 
