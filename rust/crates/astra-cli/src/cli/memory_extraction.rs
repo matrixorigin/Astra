@@ -117,6 +117,8 @@ pub enum ExtractionOutcome {
         count: usize,
         categories: Vec<String>,
         duration_ms: u64,
+        /// Whether the extraction reused a fork prefix for cache sharing.
+        prefix_reused: bool,
     },
     SkippedMainWrote,
     SkippedNoSelector,
@@ -212,12 +214,10 @@ impl MemoryExtractor {
         );
         let sid = ctx.session_id.map(String::from);
 
-        // Resolve fork prefix for cache sharing: only when the feature
-        // flag is on AND the prefix's model/provider match the selector.
         let resolved_prefix = resolve_prefix_for_extraction(ctx.fork_prefix.as_ref(), &params);
 
         let handle = tokio::spawn(async move {
-            run_extraction(&params, &query, sid.as_deref(), resolved_prefix.as_ref()).await
+            run_extraction(&params, &query, sid.as_deref(), resolved_prefix).await
         });
         self.in_flight = Some(handle);
         ExtractionOutcome::Started
@@ -239,29 +239,32 @@ impl MemoryExtractor {
     }
 }
 
-/// Build messages array using the fork prefix's canonical bytes as
-/// the leading segment, with the extraction query appended as a user
-/// message suffix. Returns `None` if the prefix bytes are not valid
-/// JSON or not an array (malformed capture).
+/// Extraction has a much smaller context budget than the main turn.
+/// Prefixes beyond this threshold are unlikely to yield cache hits
+/// (the provider may have evicted them) and risk hitting input limits.
+const EXTRACTION_PREFIX_MAX_BYTES: usize = 128 * 1024;
+
+/// Build messages array using the fork prefix's canonical bytes as the
+/// leading segment, with the extraction query appended as a user message
+/// suffix.
 ///
-/// The resulting messages array looks like:
-/// ```text
-/// [...parent_prefix_messages..., {"role": "user", "content": "<system_instruction>\n\n<query>"}]
-/// ```
+/// Returns `None` when:
+/// - Prefix bytes exceed `EXTRACTION_PREFIX_MAX_BYTES` (too large)
+/// - Prefix bytes are not valid JSON or not an array (malformed capture)
 ///
 /// The extraction system instruction is embedded in the user message
 /// (not as a separate system block) so the parent's system blocks
-/// remain the cache-leading segment. This maximizes cache hit
-/// probability.
+/// remain the cache-leading segment — maximizing cache hit probability.
 fn build_prefixed_messages(prefix: &ForkPrefix, query: &str) -> Option<serde_json::Value> {
+    if prefix.size_bytes() > EXTRACTION_PREFIX_MAX_BYTES {
+        return None;
+    }
+
     let canonical = prefix.canonical_prefix_bytes();
     let parsed: serde_json::Value = serde_json::from_slice(canonical).ok()?;
     let arr = parsed.as_array()?;
 
     let mut messages = arr.clone();
-    // Append extraction instruction + query as a user-role suffix.
-    // Combining system instruction into the user message avoids
-    // changing the system blocks (which are part of the cached prefix).
     messages.push(serde_json::json!({
         "role": "user",
         "content": format!("{EXTRACTION_SYSTEM_PROMPT}\n\n{query}")
@@ -276,12 +279,7 @@ fn build_prefixed_messages(prefix: &ForkPrefix, query: &str) -> Option<serde_jso
 /// 2. A prefix is available from the parent turn's capture
 /// 3. The selector model's provider matches the prefix's provider
 /// 4. The selector model's model_name matches the prefix's model_id
-///
-/// When the prefix is reused, extraction piggybacks on the parent's
-/// prompt-cache entry — the provider sees the same leading bytes and
-/// charges only for the extraction-specific suffix. The request uses
-/// `CacheMode::SkipWrite` semantics: extraction is fire-and-forget,
-/// so it does NOT write a new cache entry for its own tail.
+/// 5. The prefix is not oversized (checked later in `build_prefixed_messages`)
 fn resolve_prefix_for_extraction(
     prefix: Option<&Arc<ForkPrefix>>,
     params: &LlmConnParams,
@@ -294,13 +292,11 @@ fn resolve_prefix_for_extraction(
     }
     let prefix = prefix?;
 
-    // Provider must match: cross-provider reuse is meaningless.
     let selector_provider = ProviderKind::from_provider_hint(&params.provider);
     if prefix.provider != selector_provider {
         return None;
     }
 
-    // Model must match: different models have different cache keys.
     if prefix.model_id != params.model_name {
         return None;
     }
@@ -308,11 +304,18 @@ fn resolve_prefix_for_extraction(
     Some(Arc::clone(prefix))
 }
 
+fn standalone_messages(query: &str) -> serde_json::Value {
+    serde_json::json!([
+        {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+        {"role": "user", "content": query},
+    ])
+}
+
 async fn run_extraction(
     params: &LlmConnParams,
     query: &str,
     session_id: Option<&str>,
-    fork_prefix: Option<&Arc<ForkPrefix>>,
+    fork_prefix: Option<Arc<ForkPrefix>>,
 ) -> ExtractionOutcome {
     let start = std::time::Instant::now();
 
@@ -325,32 +328,26 @@ async fn run_extraction(
         Err(e) => return ExtractionOutcome::Error(format!("client build: {e}")),
     };
 
-    // When a fork prefix is available, build messages by appending the
-    // extraction query as a user message AFTER the parent's cached prefix
-    // messages. The provider recognizes the leading bytes as already-cached
-    // and only charges for the extraction-specific suffix.
-    let messages = if let Some(prefix) = fork_prefix {
+    let (messages, prefix_reused) = if let Some(prefix) = fork_prefix.as_ref() {
         match build_prefixed_messages(prefix, query) {
             Some(msgs) => {
                 eprintln!(
                     "  [memory-extraction] reusing fork prefix ({}B cached)",
                     prefix.size_bytes()
                 );
-                msgs
+                (msgs, true)
             }
             None => {
-                // Prefix bytes were malformed — fall back to standalone.
-                serde_json::json!([
-                    {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                    {"role": "user", "content": query},
-                ])
+                eprintln!(
+                    "  [memory-extraction] prefix unusable ({}B, valid={}), falling back",
+                    prefix.size_bytes(),
+                    prefix.size_bytes() <= EXTRACTION_PREFIX_MAX_BYTES
+                );
+                (standalone_messages(query), false)
             }
         }
     } else {
-        serde_json::json!([
-            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-            {"role": "user", "content": query},
-        ])
+        (standalone_messages(query), false)
     };
 
     let mut req_body = serde_json::json!({
@@ -412,6 +409,7 @@ async fn run_extraction(
             count: 0,
             categories: vec![],
             duration_ms: start.elapsed().as_millis() as u64,
+            prefix_reused,
         };
     }
 
@@ -442,6 +440,7 @@ async fn run_extraction(
                 count: quality_filtered.len(),
                 categories,
                 duration_ms: start.elapsed().as_millis() as u64,
+                prefix_reused,
             };
         }
     };
@@ -467,16 +466,18 @@ async fn run_extraction(
 
     let duration_ms = start.elapsed().as_millis() as u64;
     eprintln!(
-        "  [memory-extraction] turn: extracted {} memories ({}) in {:.1}s",
+        "  [memory-extraction] turn: extracted {} memories ({}) in {:.1}s{}",
         quality_filtered.len(),
         categories.join(", "),
         duration_ms as f64 / 1000.0,
+        if prefix_reused { " [cache-shared]" } else { "" },
     );
 
     ExtractionOutcome::Extracted {
         count: quality_filtered.len(),
         categories,
         duration_ms,
+        prefix_reused,
     }
 }
 
@@ -676,7 +677,8 @@ mod tests {
             ExtractionOutcome::Extracted {
                 count: 1,
                 categories: vec![],
-                duration_ms: 0
+                duration_ms: 0,
+                prefix_reused: false,
             }
             .tag(),
             "extracted"
@@ -1163,16 +1165,6 @@ mod tests {
 
     #[tokio::test]
     async fn extraction_uses_prefixed_messages_when_prefix_available() {
-        // Set feature flag before any async work. The flag is global
-        // state; we accept a small race window since these tests run
-        // serially within this module (tokio test default).
-        let prev = {
-            let _lock = astra_turn_core::fork_capture::FORK_FLAG_TEST_MUTEX
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            astra_turn_core::fork_capture::set_fork_flag_for_tests(true)
-        };
-
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_extraction_mock(
             captured.clone(),
@@ -1185,23 +1177,31 @@ mod tests {
             model_name: "gpt-4o".into(),
             provider: "openai".into(),
         };
-        // Create a prefix with matching model/provider.
         let prefix = make_test_prefix("gpt-4o", "openai");
-        let mut ext = MemoryExtractor::new();
-        let outcome = ext.maybe_extract(ExtractionContext {
-            turn: 1,
-            selector_params: Some(&params),
-            user_message: "set dark mode",
-            assistant_response: "done",
-            tools_used: &[],
-            session_id: None,
-            existing_manifest: "",
-            fork_prefix: Some(prefix),
-        });
-        assert_eq!(outcome.tag(), "started");
+
+        // Lock scope: flag set + maybe_extract (synchronous read).
+        let (prev, mut ext) = {
+            let _lock = astra_turn_core::fork_capture::FORK_FLAG_TEST_MUTEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev = astra_turn_core::fork_capture::set_fork_flag_for_tests(true);
+            let mut ext = MemoryExtractor::new();
+            let outcome = ext.maybe_extract(ExtractionContext {
+                turn: 1,
+                selector_params: Some(&params),
+                user_message: "set dark mode",
+                assistant_response: "done",
+                tools_used: &[],
+                session_id: None,
+                existing_manifest: "",
+                fork_prefix: Some(prefix),
+            });
+            assert_eq!(outcome.tag(), "started");
+            (prev, ext)
+        };
+
         let _ = ext.drain(std::time::Duration::from_secs(3)).await;
 
-        // Verify the request body has 4 messages (3 prefix + 1 extraction).
         let body = captured.lock().unwrap().take().expect("request captured");
         let messages = body["messages"].as_array().expect("messages array");
         assert_eq!(
@@ -1209,7 +1209,6 @@ mod tests {
             4,
             "should have 3 prefix messages + 1 extraction suffix"
         );
-        // The last message should contain the extraction system prompt.
         let last_content = messages[3]["content"].as_str().unwrap();
         assert!(
             last_content.contains("durable memories"),
@@ -1257,5 +1256,337 @@ mod tests {
         );
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[1]["role"], "user");
+    }
+
+    // ── Unhappy path: oversized prefix ─────────────────────────────────
+
+    #[test]
+    fn build_prefixed_messages_returns_none_on_oversized_prefix() {
+        use astra_turn_core::fork_prefix::{
+            CacheMode, ProviderKind, SystemBlock, hash_tool_schema,
+        };
+
+        let schema = serde_json::json!({"function": {"name": "bash"}});
+        let (bytes, hash) = hash_tool_schema(&schema);
+        // Create canonical bytes exceeding EXTRACTION_PREFIX_MAX_BYTES.
+        let oversized = vec![b'x'; EXTRACTION_PREFIX_MAX_BYTES + 1];
+        let prefix = Arc::new(ForkPrefix::build(
+            "pfx-huge",
+            "run-x",
+            1,
+            1_700_000_000,
+            ProviderKind::OpenAi,
+            "m",
+            None,
+            vec![SystemBlock {
+                bytes: b"sys".to_vec(),
+                has_cache_control: false,
+            }],
+            vec![astra_turn_core::fork_prefix::ToolSchemaEntry {
+                name: "bash".into(),
+                canonical_bytes: bytes,
+                hash,
+            }],
+            vec![],
+            oversized,
+            CacheMode::SkipWrite,
+        ));
+        assert!(
+            build_prefixed_messages(&prefix, "query").is_none(),
+            "oversized prefix must return None"
+        );
+    }
+
+    #[tokio::test]
+    async fn extraction_falls_back_on_oversized_prefix() {
+        use astra_turn_core::fork_prefix::{
+            CacheMode, ProviderKind, SystemBlock, hash_tool_schema,
+        };
+
+        let captured = Arc::new(Mutex::new(None));
+        let base = spawn_extraction_mock(
+            captured.clone(),
+            r#"[{"type":"user","content":"has preference"}]"#,
+        )
+        .await;
+        let params = LlmConnParams {
+            base_url: base,
+            api_key: "k".into(),
+            model_name: "m".into(),
+            provider: "openai".into(),
+        };
+
+        let schema = serde_json::json!({"function": {"name": "bash"}});
+        let (bytes, hash) = hash_tool_schema(&schema);
+        let oversized = vec![b'x'; EXTRACTION_PREFIX_MAX_BYTES + 1];
+        let prefix = Arc::new(ForkPrefix::build(
+            "pfx-huge",
+            "run-x",
+            1,
+            1_700_000_000,
+            ProviderKind::from_provider_hint("openai"),
+            "m",
+            None,
+            vec![SystemBlock {
+                bytes: b"sys".to_vec(),
+                has_cache_control: false,
+            }],
+            vec![astra_turn_core::fork_prefix::ToolSchemaEntry {
+                name: "bash".into(),
+                canonical_bytes: bytes,
+                hash,
+            }],
+            vec![],
+            oversized,
+            CacheMode::SkipWrite,
+        ));
+
+        let (prev, mut ext) = {
+            let _lock = astra_turn_core::fork_capture::FORK_FLAG_TEST_MUTEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev = astra_turn_core::fork_capture::set_fork_flag_for_tests(true);
+            let mut ext = MemoryExtractor::new();
+            let _ = ext.maybe_extract(ExtractionContext {
+                turn: 1,
+                selector_params: Some(&params),
+                user_message: "test",
+                assistant_response: "ok",
+                tools_used: &[],
+                session_id: None,
+                existing_manifest: "",
+                fork_prefix: Some(prefix),
+            });
+            (prev, ext)
+        };
+
+        let result = ext.drain(std::time::Duration::from_secs(3)).await;
+
+        let body = captured.lock().unwrap().take().expect("request captured");
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(
+            messages.len(),
+            2,
+            "oversized prefix must fall back to standalone 2-message format"
+        );
+
+        match result {
+            Some(ExtractionOutcome::Extracted { prefix_reused, .. }) => {
+                assert!(!prefix_reused, "oversized prefix must not be marked as reused");
+            }
+            other => panic!("expected Extracted, got: {other:?}"),
+        }
+
+        astra_turn_core::fork_capture::restore_fork_flag_raw_for_tests(prev);
+    }
+
+    // ── Unhappy path: prefix with valid JSON but not an array ──────────
+
+    #[test]
+    fn build_prefixed_messages_returns_none_on_non_array_json() {
+        use astra_turn_core::fork_prefix::{
+            CacheMode, ProviderKind, SystemBlock, hash_tool_schema,
+        };
+
+        let schema = serde_json::json!({"function": {"name": "bash"}});
+        let (bytes, hash) = hash_tool_schema(&schema);
+        // Valid JSON but an object, not an array.
+        let not_array = serde_json::to_vec(&serde_json::json!({"key": "value"})).unwrap();
+        let prefix = Arc::new(ForkPrefix::build(
+            "pfx-obj",
+            "run-x",
+            1,
+            1_700_000_000,
+            ProviderKind::OpenAi,
+            "m",
+            None,
+            vec![SystemBlock {
+                bytes: b"sys".to_vec(),
+                has_cache_control: false,
+            }],
+            vec![astra_turn_core::fork_prefix::ToolSchemaEntry {
+                name: "bash".into(),
+                canonical_bytes: bytes,
+                hash,
+            }],
+            vec![],
+            not_array,
+            CacheMode::SkipWrite,
+        ));
+        assert!(
+            build_prefixed_messages(&prefix, "q").is_none(),
+            "non-array JSON must return None"
+        );
+    }
+
+    // ── Unhappy path: prefix with empty messages array ─────────────────
+
+    #[test]
+    fn build_prefixed_messages_works_with_empty_array() {
+        use astra_turn_core::fork_prefix::{
+            CacheMode, ProviderKind, SystemBlock, hash_tool_schema,
+        };
+
+        let schema = serde_json::json!({"function": {"name": "bash"}});
+        let (bytes, hash) = hash_tool_schema(&schema);
+        let empty_array = serde_json::to_vec(&serde_json::json!([])).unwrap();
+        let prefix = Arc::new(ForkPrefix::build(
+            "pfx-empty",
+            "run-x",
+            1,
+            1_700_000_000,
+            ProviderKind::OpenAi,
+            "m",
+            None,
+            vec![SystemBlock {
+                bytes: b"sys".to_vec(),
+                has_cache_control: false,
+            }],
+            vec![astra_turn_core::fork_prefix::ToolSchemaEntry {
+                name: "bash".into(),
+                canonical_bytes: bytes,
+                hash,
+            }],
+            vec![],
+            empty_array,
+            CacheMode::SkipWrite,
+        ));
+        // Empty array is technically valid — results in just the extraction suffix.
+        let result = build_prefixed_messages(&prefix, "query");
+        assert!(result.is_some());
+        let arr = result.unwrap();
+        assert_eq!(arr.as_array().unwrap().len(), 1, "empty prefix + 1 suffix");
+    }
+
+    // ── Verify prefix_reused=true is tracked ───────────────────────────
+
+    #[tokio::test]
+    async fn extraction_reports_prefix_reused_true() {
+        let captured = Arc::new(Mutex::new(None));
+        let base = spawn_extraction_mock(
+            captured.clone(),
+            r#"[{"type":"feedback","content":"likes concise answers"}]"#,
+        )
+        .await;
+        let params = LlmConnParams {
+            base_url: base,
+            api_key: "k".into(),
+            model_name: "gpt-4o".into(),
+            provider: "openai".into(),
+        };
+        let prefix = make_test_prefix("gpt-4o", "openai");
+
+        let (prev, mut ext) = {
+            let _lock = astra_turn_core::fork_capture::FORK_FLAG_TEST_MUTEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev = astra_turn_core::fork_capture::set_fork_flag_for_tests(true);
+            let mut ext = MemoryExtractor::new();
+            let _ = ext.maybe_extract(ExtractionContext {
+                turn: 1,
+                selector_params: Some(&params),
+                user_message: "be concise",
+                assistant_response: "ok",
+                tools_used: &[],
+                session_id: None,
+                existing_manifest: "",
+                fork_prefix: Some(prefix),
+            });
+            (prev, ext)
+        };
+
+        let result = ext.drain(std::time::Duration::from_secs(3)).await;
+
+        match result {
+            Some(ExtractionOutcome::Extracted { prefix_reused, .. }) => {
+                assert!(prefix_reused, "matching prefix must report prefix_reused=true");
+            }
+            other => panic!("expected Extracted, got: {other:?}"),
+        }
+
+        astra_turn_core::fork_capture::restore_fork_flag_raw_for_tests(prev);
+    }
+
+    // ── Unhappy path: extraction HTTP error with prefix still reports correctly ──
+
+    #[tokio::test]
+    async fn extraction_http_error_with_prefix_returns_error_outcome() {
+        let params = LlmConnParams {
+            base_url: "http://127.0.0.1:1".into(),
+            api_key: "k".into(),
+            model_name: "gpt-4o".into(),
+            provider: "openai".into(),
+        };
+        let prefix = make_test_prefix("gpt-4o", "openai");
+
+        let (prev, mut ext) = {
+            let _lock = astra_turn_core::fork_capture::FORK_FLAG_TEST_MUTEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev = astra_turn_core::fork_capture::set_fork_flag_for_tests(true);
+            let mut ext = MemoryExtractor::new();
+            let _ = ext.maybe_extract(ExtractionContext {
+                turn: 1,
+                selector_params: Some(&params),
+                user_message: "test",
+                assistant_response: "ok",
+                tools_used: &[],
+                session_id: None,
+                existing_manifest: "",
+                fork_prefix: Some(prefix),
+            });
+            (prev, ext)
+        };
+
+        let result = ext.drain(std::time::Duration::from_secs(5)).await;
+
+        match result {
+            Some(ExtractionOutcome::Error(msg)) => {
+                assert!(
+                    msg.contains("request:"),
+                    "error must come from request phase, got: {msg}"
+                );
+            }
+            other => panic!("expected Error, got: {other:?}"),
+        }
+
+        astra_turn_core::fork_capture::restore_fork_flag_raw_for_tests(prev);
+    }
+
+    // ── Verify prefix_reused=false in non-prefix path ──────────────────
+
+    #[tokio::test]
+    async fn extraction_reports_prefix_reused_false_without_prefix() {
+        let captured = Arc::new(Mutex::new(None));
+        let base = spawn_extraction_mock(
+            captured.clone(),
+            r#"[{"type":"project","content":"deadline friday"}]"#,
+        )
+        .await;
+        let params = LlmConnParams {
+            base_url: base,
+            api_key: "k".into(),
+            model_name: "m".into(),
+            provider: "openai".into(),
+        };
+        let mut ext = MemoryExtractor::new();
+        let _ = ext.maybe_extract(ExtractionContext {
+            turn: 1,
+            selector_params: Some(&params),
+            user_message: "deadline is friday",
+            assistant_response: "noted",
+            tools_used: &[],
+            session_id: None,
+            existing_manifest: "",
+            fork_prefix: None,
+        });
+        let result = ext.drain(std::time::Duration::from_secs(3)).await;
+
+        match result {
+            Some(ExtractionOutcome::Extracted { prefix_reused, .. }) => {
+                assert!(!prefix_reused, "no prefix must report prefix_reused=false");
+            }
+            other => panic!("expected Extracted, got: {other:?}"),
+        }
     }
 }
