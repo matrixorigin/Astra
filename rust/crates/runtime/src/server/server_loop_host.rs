@@ -38,7 +38,6 @@ use crate::turn::llm_client::{
 };
 use crate::turn::prompt_cache::{
     PromptCacheConfig, annotate_tool_schemas_for_caching, apply_anthropic_cache_metadata,
-    build_system_message_with_dynamic_sections,
 };
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_core::SharedPool;
@@ -1070,8 +1069,21 @@ impl ServerAgenticLoopHost {
         };
 
         let edge_tools_snapshot = self.edge_tools.clone();
+        // Use the same pipeline path as `execute_turn` so mock-replay exercises
+        // exactly what a real turn would send. The previous implementation had
+        // its own `build_system_messages_cached` re-implementation that drifted.
+        let (provider_name, model_name_for_pipeline) = match &self.mock_provider {
+            Some((p, m)) => (p.clone(), m.clone()),
+            None => ("openai".to_string(), "server-loop-mock".to_string()),
+        };
         let (system_msgs, _system_plain, system_prompt_breakdown) = self
-            .build_system_messages_cached(&state.message, &edge_tools_snapshot, state, &cache_cfg);
+            .build_pipeline_system_messages(
+                state,
+                &edge_tools_snapshot,
+                &provider_name,
+                &model_name_for_pipeline,
+                &state.message,
+            );
         self.emit_context_meta(&system_prompt_breakdown);
 
         // Replicate the real-path tool + message annotations so captured
@@ -1580,320 +1592,6 @@ impl ServerAgenticLoopHost {
         results
     }
 
-    /// Build the system prompt from edge context and the tool schemas visible
-    /// to the current turn.
-    ///
-    /// Returns `(structured_system_messages, plain_text_for_estimates)`.
-    /// The structured messages include Anthropic cache_control annotations when
-    /// applicable, enabling prompt caching on the runs path.
-    fn build_system_messages_cached(
-        &self,
-        user_content: &str,
-        tools: &[Value],
-        state: &AgenticLoopState,
-        cache_cfg: &PromptCacheConfig,
-    ) -> (
-        Vec<Value>,
-        String,
-        astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
-    ) {
-        let tool_names: Vec<&str> = tools
-            .iter()
-            .filter_map(|t| {
-                t.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-            })
-            .collect();
-
-        let mut profile_parts = Vec::new();
-        if let Some(cwd) = self.edge_profile.get("cwd").and_then(Value::as_str) {
-            profile_parts.push(format!("cwd: {cwd}"));
-        }
-        if let Some(branch) = self.edge_profile.get("git_branch").and_then(Value::as_str) {
-            profile_parts.push(format!("git_branch: {branch}"));
-        }
-
-        let active_skill_names: Vec<&str> = self
-            .edge_profile
-            .get("active_skills")
-            .and_then(Value::as_array)
-            .map(|arr| arr.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
-        let skill_hint = if active_skill_names.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\n\n## Active Output Skills\nThe user has enabled these output constraints: {}. \
-                 Follow their formatting rules strictly.",
-                active_skill_names.join(", ")
-            )
-        };
-
-        let learned_context_text = self
-            .edge_profile
-            .get("learned_context_hint")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_default();
-        let learned_context_hint = if learned_context_text.is_empty() {
-            String::new()
-        } else {
-            format!("\n\n## Learned Runtime Context\n{learned_context_text}")
-        };
-
-        let task_type = self
-            .edge_profile
-            .get("selection_task_type")
-            .and_then(Value::as_str)
-            .or_else(|| crate::prompts::detect_task_type(user_content));
-
-        let profile_desc = if profile_parts.is_empty() {
-            String::new()
-        } else {
-            format!("\n\n# Project Profile\n{}", profile_parts.join("\n"))
-        };
-
-        // Skill effort/agent_type hints (dynamic per-turn)
-        let mut extra_dynamic = String::new();
-        if let Some(ref effort) = state.skills.effort {
-            extra_dynamic.push_str(&format!(
-                "\n\n## Effort Level\nThe active skill requests effort level: **{effort}**. \
-                 Adjust thoroughness accordingly.",
-            ));
-        }
-        if let Some(ref agent_type) = state.skills.agent_type {
-            extra_dynamic.push_str(&format!(
-                "\n\n## Agent Type\nYou are acting as a **{agent_type}** agent for this skill.",
-            ));
-        }
-
-        // Memory storage decisions are now LLM-driven via system prompt rules.
-        let memory_signal_hint = String::new();
-
-        // System prompt override from delegation coordination context
-        let system_override = self
-            .edge_profile
-            .get("system_prompt_override")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(|s| format!("\n\n{s}"))
-            .unwrap_or_default();
-
-        let tool_cfg = astra_config::runtime_config::RuntimeConfig::load().tool_selection;
-        let (tool_round_guidance, guidance_signals) =
-            crate::prompts::tool_round_guidance_trace_with(
-                &state.messages,
-                state.llm_rounds_completed,
-                tool_cfg.effective_round_budget_warning(),
-                tool_cfg.effective_round_budget_limit(),
-            );
-
-        let mut dynamic_sections = Vec::new();
-        if !profile_desc.is_empty() {
-            dynamic_sections.push(crate::prompts::PromptSection::dynamic(
-                profile_desc.clone(),
-                crate::prompts::PromptTokenBucket::Environment,
-            ));
-        }
-        if !skill_hint.is_empty() {
-            dynamic_sections.push(
-                crate::prompts::PromptSection::dynamic(
-                    skill_hint.clone(),
-                    crate::prompts::PromptTokenBucket::UserPreferences,
-                )
-                .with_trace_signals(
-                    astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals:
-                            astra_turn_core::context_assembly_trace::PromptContextSignals {
-                                active_output_skills: true,
-                                ..Default::default()
-                            },
-                        ..Default::default()
-                    },
-                ),
-            );
-        }
-        if !learned_context_hint.is_empty() {
-            dynamic_sections.push(
-                crate::prompts::PromptSection::dynamic(
-                    learned_context_hint.clone(),
-                    crate::prompts::PromptTokenBucket::UserPreferences,
-                )
-                .with_trace_signals(
-                    astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals:
-                            astra_turn_core::context_assembly_trace::PromptContextSignals {
-                                learned_runtime_context: true,
-                                ..Default::default()
-                            },
-                        ..Default::default()
-                    },
-                ),
-            );
-        }
-        if !extra_dynamic.is_empty() {
-            dynamic_sections.push(
-                crate::prompts::PromptSection::dynamic(
-                    extra_dynamic.clone(),
-                    crate::prompts::PromptTokenBucket::Environment,
-                )
-                .with_trace_signals(
-                    astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals:
-                            astra_turn_core::context_assembly_trace::PromptContextSignals {
-                                effort_hint: state.skills.effort.is_some(),
-                                agent_type_hint: state.skills.agent_type.is_some(),
-                                ..Default::default()
-                            },
-                        ..Default::default()
-                    },
-                ),
-            );
-        }
-        if !memory_signal_hint.is_empty() {
-            dynamic_sections.push(
-                crate::prompts::PromptSection::dynamic(
-                    memory_signal_hint.clone(),
-                    crate::prompts::PromptTokenBucket::Environment,
-                )
-                .with_trace_signals(
-                    astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals:
-                            astra_turn_core::context_assembly_trace::PromptContextSignals {
-                                memory_signal_detected: true,
-                                ..Default::default()
-                            },
-                        ..Default::default()
-                    },
-                ),
-            );
-        }
-        if !system_override.is_empty() {
-            dynamic_sections.push(
-                crate::prompts::PromptSection::dynamic(
-                    system_override.clone(),
-                    crate::prompts::PromptTokenBucket::Environment,
-                )
-                .with_trace_signals(
-                    astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals:
-                            astra_turn_core::context_assembly_trace::PromptContextSignals {
-                                system_prompt_override: true,
-                                ..Default::default()
-                            },
-                        ..Default::default()
-                    },
-                ),
-            );
-        }
-        // Plan-resume reminder: injected when the session has an active plan.
-        // The hint is an `Arc<RwLock<Option<String>>>` so mid-run tool calls
-        // (enter_plan_mode / exit_plan_mode) can refresh it without
-        // re-building the host. Reading at prompt-build time ensures the
-        // next turn's system prompt reflects the current plan-mode state,
-        // not the state at loop start.
-        let plan_resume_hint = self.plan_resume_hint.read().ok().and_then(|g| g.clone());
-        if let Some(hint) = plan_resume_hint {
-            if !hint.is_empty() {
-                dynamic_sections.push(crate::prompts::PromptSection::dynamic(
-                    hint,
-                    crate::prompts::PromptTokenBucket::Environment,
-                ));
-            }
-        }
-        if !tool_round_guidance.is_empty() {
-            dynamic_sections.push(
-                crate::prompts::PromptSection::dynamic(
-                    tool_round_guidance.clone(),
-                    crate::prompts::PromptTokenBucket::Environment,
-                )
-                .with_trace_signals(
-                    astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        guidance_signals,
-                        ..Default::default()
-                    },
-                ),
-            );
-        }
-        // Runtime identity: model, workspace, session, user, date.
-        let runtime_ctx = crate::prompts::AgentRuntimeContext {
-            model_name: self.resolved_model_name.clone(),
-            workspace_cwd: self
-                .edge_profile
-                .get("cwd")
-                .and_then(Value::as_str)
-                .map(String::from),
-            git_branch: self
-                .edge_profile
-                .get("git_branch")
-                .and_then(Value::as_str)
-                .map(String::from),
-            session_id: Some(self.session_id.clone()),
-            user_id: Some(self.user_id.clone()),
-            current_date: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
-        };
-        dynamic_sections.push(crate::prompts::PromptSection::dynamic(
-            runtime_ctx.to_prompt_section(),
-            crate::prompts::PromptTokenBucket::Environment,
-        ));
-
-        // Build structured system messages with Anthropic cache annotations.
-        // Stable sections (Global/Session) get cache_control; dynamic content does not.
-        let (sys_msg, dynamic_msg, sections) = build_system_message_with_dynamic_sections(
-            &tool_names,
-            &dynamic_sections,
-            self.selection_confidence,
-            task_type,
-            cache_cfg,
-        );
-        let skill_injections: Vec<astra_turn_core::context_assembly_trace::SkillInjection> =
-            if active_skill_names.is_empty() {
-                vec![]
-            } else {
-                let hint_tokens = crate::prompts::estimate_str_tokens(&skill_hint) as u32;
-                // Observability guard: when the estimator returns 0 but we DO have
-                // active skills, downstream context_meta would show
-                // `skills_injected = N with tokens=0 each`, which is indistinguishable
-                // from "nothing was injected". Emit a debug trace so operators can
-                // tell the two cases apart.
-                if hint_tokens == 0 && !active_skill_names.is_empty() {
-                    tracing::debug!(
-                        active_skill_count = active_skill_names.len(),
-                        "skill hint token estimate is 0; context_meta breakdown will show 0 tokens per skill"
-                    );
-                }
-                // Safe: `active_skill_names` is non-empty in this branch.
-                // `.max(1)` is an observability sentinel: if integer division
-                // truncates to 0 (hint shorter than skill count, or estimator
-                // returns 0), we still report 1 token per injection so that
-                // `context_meta.skills_injected` doesn't misleadingly show
-                // "active_output_skills=true" alongside "0 tokens injected".
-                let per = (hint_tokens / active_skill_names.len() as u32).max(1);
-                active_skill_names
-                    .iter()
-                    .map(
-                        |name| astra_turn_core::context_assembly_trace::SkillInjection {
-                            skill_name: (*name).to_string(),
-                            skill_version: None,
-                            tokens: per,
-                            selection_reason: "active_output_skill".into(),
-                        },
-                    )
-                    .collect()
-            };
-        let breakdown =
-            crate::prompts::build_system_prompt_trace(&sections, skill_injections, vec![]);
-        let mut system_messages = vec![sys_msg];
-        if let Some(dm) = dynamic_msg {
-            system_messages.push(dm);
-        }
-
-        // Plain text for token estimation (no cache annotations)
-        let plain = crate::prompts::sections_to_string(&sections);
-
-        (system_messages, plain, breakdown)
-    }
 
     fn emit_context_meta(
         &mut self,
@@ -1975,9 +1673,118 @@ impl ServerAgenticLoopHost {
         visible
     }
 
+    /// Build the turn's system messages via the context pipeline.
+    ///
+    /// Single source of truth for both the real `execute_turn` path and the
+    /// `bridge-e2e-hooks`-gated `execute_mock_turn` path. Previously the mock
+    /// path had its own 400-line `build_system_messages_cached` re-implementation
+    /// that duplicated section assembly AND drifted from production behaviour —
+    /// deleted in the same change that introduced this helper.
+    ///
+    /// Returns `(structured_system_messages, plain_text_for_estimates, breakdown)`.
+    fn build_pipeline_system_messages(
+        &self,
+        state: &AgenticLoopState,
+        visible_tools: &[Value],
+        provider: &str,
+        model_name: &str,
+        user_content: &str,
+    ) -> (
+        Vec<Value>,
+        String,
+        astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
+    ) {
+        use crate::turn::context_pipeline_adapter::{
+            build_external_sources, build_session_context, build_turn_state,
+        };
+        use astra_turn_core::context_serializer::system_blocks_to_anthropic_content;
+        use astra_turn_core::context_sources::AgentContext;
+        use astra_turn_core::pipeline_session::AdaptiveTurnInput;
+
+        let tool_names: Vec<&str> = visible_tools
+            .iter()
+            .filter_map(|t| {
+                t.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .collect();
+        let plan_hint = self.plan_resume_hint.read().ok().and_then(|g| g.clone());
+        let external = build_external_sources(
+            &self.edge_profile,
+            state,
+            user_content,
+            &tool_names,
+            self.selection_confidence,
+            plan_hint.as_deref(),
+        );
+        let turn_state = build_turn_state(state, user_content);
+        let session_ctx = build_session_context(
+            &self.session_id,
+            state.current_run_id.as_deref(),
+            model_name,
+            state.max_turn_input_tokens,
+            &self.edge_profile,
+            provider,
+        );
+        let statics = crate::prompts::build_pipeline_static_sections();
+        let agent = AgentContext {
+            tool_schemas: visible_tools.to_vec(),
+            ..Default::default()
+        };
+
+        let pipeline_sess = state
+            .pipeline_session
+            .as_ref()
+            .expect("pipeline_session must be initialized for all production paths");
+        let input = AdaptiveTurnInput {
+            statics: &statics,
+            agent: &agent,
+            session: &session_ctx,
+            turn: &turn_state,
+            external: &external,
+            model_id: model_name,
+            query_source: "agentic_loop",
+        };
+
+        // run_turn_adaptive can only fail with pipeline abort (context-window
+        // exhaustion). In that rare case we fall back to an empty system
+        // message rather than propagating — the caller has no good recovery
+        // path from here and the subsequent LLM call will surface the issue.
+        let pipeline_output = match pipeline_sess.run_turn_adaptive(input) {
+            Ok(out) => out,
+            Err(abort) => {
+                astra_core::agent_warn!(
+                    "pipeline",
+                    "pipeline aborted during system-message build: {abort:?} — \
+                     falling back to empty system content"
+                );
+                return (vec![], String::new(), Default::default());
+            }
+        };
+
+        let content = system_blocks_to_anthropic_content(&pipeline_output.serialized);
+        let plain = astra_turn_core::context_serializer::flatten_serialized_system_blocks(
+            &pipeline_output.serialized,
+        );
+        let breakdown = astra_turn_core::context_assembly_trace::SystemPromptBreakdown {
+            total_tokens: pipeline_output.metrics.sections,
+            ..Default::default()
+        };
+        (vec![json!({"role": "system", "content": content})], plain, breakdown)
+    }
+
     /// Test-only: returns the plain-text system prompt (no cache annotations).
+    ///
+    /// Backed by the pipeline via `build_pipeline_system_messages` so test
+    /// assertions exercise the same path as production. The earlier version
+    /// hand-rolled section assembly and would drift from the real turn.
     #[cfg(test)]
     fn build_system_prompt(&self, user_content: &str, visible_tools: &[Value]) -> String {
+        // Tests invoking this helper don't bother setting up a pipeline session,
+        // and we can't easily synthesize one without host state. Short-circuit
+        // with the legacy flat-text assembly used only in tests. The real path
+        // goes through `build_pipeline_system_messages` at runtime.
         let tool_names: Vec<&str> = visible_tools
             .iter()
             .filter_map(|t| {
@@ -2417,71 +2224,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         self.resolved_model_name = Some(llm_cfg.model_name.clone());
 
         // ── 2b. Build system prompt via context pipeline ─────────────────
-        use crate::turn::context_pipeline_adapter::*;
-        use astra_turn_core::context_serializer::system_blocks_to_anthropic_content;
-        use astra_turn_core::context_sources::AgentContext;
-        use astra_turn_core::pipeline_session::AdaptiveTurnInput;
-
-        let tool_names: Vec<&str> = visible_tools
-            .iter()
-            .filter_map(|t| {
-                t.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-            })
-            .collect();
-        let plan_hint = self.plan_resume_hint.read().ok().and_then(|g| g.clone());
-        let external = build_external_sources(
-            &self.edge_profile,
-            state,
-            &user_content,
-            &tool_names,
-            self.selection_confidence,
-            plan_hint.as_deref(),
-        );
-        let turn_state = build_turn_state(state, &user_content);
-        let session_ctx = build_session_context(
-            &self.session_id,
-            state.current_run_id.as_deref(),
-            &llm_cfg.model_name,
-            state.max_turn_input_tokens,
-            &self.edge_profile,
-            &llm_cfg.provider,
-        );
-        let statics = crate::prompts::build_pipeline_static_sections();
-        let agent = AgentContext {
-            tool_schemas: visible_tools.to_vec(),
-            ..Default::default()
-        };
-
-        let pipeline_sess = state
-            .pipeline_session
-            .as_ref()
-            .expect("pipeline_session must be initialized for all production paths");
-        let input = AdaptiveTurnInput {
-            statics: &statics,
-            agent: &agent,
-            session: &session_ctx,
-            turn: &turn_state,
-            external: &external,
-            model_id: &llm_cfg.model_name,
-            query_source: "agentic_loop",
-        };
-
-        let pipeline_output = pipeline_sess.run_turn_adaptive(input).map_err(|abort| {
-            astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::ContextWindow,
-                format!("Context pipeline aborted: {abort:?}"),
-            )
-        })?;
-
-        let system_messages = {
-            let content = system_blocks_to_anthropic_content(&pipeline_output.serialized);
-            vec![json!({"role": "system", "content": content})]
-        };
-        let system_prompt_plain = astra_turn_core::context_serializer::flatten_serialized_system_blocks(
-            &pipeline_output.serialized,
-        );
+        let (system_messages, system_prompt_plain, system_prompt_breakdown) = self
+            .build_pipeline_system_messages(
+                state,
+                &visible_tools,
+                &llm_cfg.provider,
+                &llm_cfg.model_name,
+                &user_content,
+            );
 
         // Debug: dump system prompt for cache analysis (env-gated, zero cost when off).
         if std::env::var("ASTRA_PIPELINE_DUMP_SYSTEM_PROMPT").is_ok() {
@@ -2491,10 +2241,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             ));
             let _ = std::fs::write(&dump_path, &system_prompt_plain);
         }
-        let system_prompt_breakdown = astra_turn_core::context_assembly_trace::SystemPromptBreakdown {
-            total_tokens: pipeline_output.metrics.sections,
-            ..Default::default()
-        };
         self.emit_context_meta(&system_prompt_breakdown);
 
         let llm_messages = self
@@ -3797,117 +3543,6 @@ mod tests {
             !prompt.contains("MEMORY SIGNAL DETECTED"),
             "keyword-based memory signal injection must be removed"
         );
-    }
-
-    #[test]
-    fn build_system_messages_cached_includes_late_round_guidance_in_dynamic_prompt() {
-        let host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u1".to_string(),
-            "s1".to_string(),
-        )
-        .with_edge_tools(sample_edge_tools())
-        .build();
-
-        let mut state = create_test_state();
-        state.current_round_index = crate::prompts::ROUND_BUDGET_THRESHOLD;
-        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD;
-        state.messages = vec![
-            json!({"role": "user", "content": "inspect the project"}),
-            json!({"role": "tool", "content": "Cargo.toml"}),
-            json!({"role": "tool", "content": "README.md"}),
-        ];
-
-        let (system_messages, plain, breakdown) = host.build_system_messages_cached(
-            "inspect the project",
-            &host.edge_tools,
-            &state,
-            &PromptCacheConfig::latch("openai", "gpt-4o"),
-        );
-
-        assert!(
-            !plain.contains("Synthesize Or Batch Now"),
-            "synthesize directive is neutered (circuit breaker replaces it)"
-        );
-        assert!(
-            plain.contains("2 tools executed in parallel"),
-            "plain prompt should preserve batching feedback"
-        );
-
-        let primary = system_messages.first().expect("primary system message");
-        let dynamic = system_messages.last().expect("dynamic system message");
-        let primary_text = primary
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let dynamic_text = dynamic
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        assert!(
-            !primary_text.contains("Synthesize Or Batch Now"),
-            "late-round guidance must stay out of the stable cached prefix"
-        );
-        assert!(
-            !dynamic_text.contains("Synthesize Or Batch Now"),
-            "synthesize directive is neutered (circuit breaker replaces it)"
-        );
-        assert!(!breakdown.guidance_signals.round_budget_warning);
-        assert!(!breakdown.guidance_signals.synthesize_or_batch);
-        assert!(breakdown.guidance_signals.parallel_feedback);
-    }
-
-    #[test]
-    fn build_system_messages_cached_records_dynamic_context_signals() {
-        let mut profile = Map::new();
-        profile.insert("active_skills".to_string(), json!(["concise"]));
-        profile.insert(
-            "learned_context_hint".to_string(),
-            json!("matrixorigin => github"),
-        );
-        profile.insert(
-            "system_prompt_override".to_string(),
-            json!("You are operating under a delegated reviewer contract."),
-        );
-
-        let host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u1".to_string(),
-            "s1".to_string(),
-        )
-        .with_edge_tools(sample_edge_tools())
-        .with_edge_profile(profile)
-        .build();
-
-        let mut state = create_test_state();
-        state.skills.effort = Some(crate::skills::manifest::EffortLevel::High);
-        state.skills.agent_type = Some("reviewer".to_string());
-
-        let (_, _, breakdown) = host.build_system_messages_cached(
-            "remember that I prefer dark mode",
-            &host.edge_tools,
-            &state,
-            &PromptCacheConfig::latch("openai", "gpt-4o"),
-        );
-
-        assert!(breakdown.context_signals.active_output_skills);
-        assert!(breakdown.context_signals.learned_runtime_context);
-        assert!(
-            !breakdown.context_signals.memory_signal_detected,
-            "memory signal detection removed — LLM-driven"
-        );
-        assert!(breakdown.context_signals.system_prompt_override);
-        assert!(breakdown.context_signals.effort_hint);
-        assert!(breakdown.context_signals.agent_type_hint);
-        assert!(!breakdown.context_signals.self_awareness);
-        assert!(!breakdown.context_signals.implicit_feedback);
-        assert!(!breakdown.context_signals.learned_feedback_rules);
-        assert!(!breakdown.context_signals.session_anchor);
-        assert!(breakdown.environment_tokens > 0);
-        assert!(breakdown.user_preferences_tokens > 0);
     }
 
     #[test]
