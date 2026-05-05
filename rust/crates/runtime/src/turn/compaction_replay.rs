@@ -1,13 +1,22 @@
-//! Compaction Replay Lane
+//! Message-Level Compaction (Overflow Recovery)
 //!
 //! When a context window overflow (413 / prompt-too-long) is detected during
-//! the agentic loop, this module runs the compression pipeline and allows the
-//! turn to retry with a compacted message list instead of hard-failing.
+//! the agentic loop, this module runs the message compression pipeline and
+//! allows the turn to retry with a compacted message list.
 //!
-//! Design: the lane runs at most once per turn (gated by
-//! `consecutive_context_window_errors`). If the first compaction attempt frees
-//! enough tokens, the turn retries immediately. If the second attempt still
-//! fails, the error propagates as a structured `InterruptionRecord` with
+//! This is complementary to, not replaced by, the Context Pipeline's
+//! `CompactionTier` system which handles *prompt-level* compaction (schema
+//! pruning, section reduction). This module handles *message-level* compaction
+//! (removing old turns, summarizing tool results, truncating large outputs).
+//!
+//! The pipeline's `RecoveryState` is informed of PTL errors and compaction
+//! outcomes via `record_ptl_error()` / `record_reactive_compact()` in
+//! `agentic_loop_execution_phase.rs`, ensuring the planner can escalate its
+//! own tier on the next turn.
+//!
+//! Design: tiered escalation (default → aggressive → emergency) gated by
+//! `consecutive_context_window_errors`. After MAX_COMPACT_RETRIES the error
+//! propagates as a structured `InterruptionRecord` with
 //! `ResumeAction::CompactAndRetry` (for cross-session resume).
 
 use super::context_compression::{CompressionPipeline, PipelineOutcome, TokenBudget};
