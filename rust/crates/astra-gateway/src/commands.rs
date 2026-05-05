@@ -100,13 +100,17 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 | crate::cli_bridge::CliProfile::Claude { model, .. } => model.as_deref(),
                 _ => None,
             };
-            let model = cli_model
-                .or(ctx.config.astra.default_model.as_deref())
-                .unwrap_or("default");
+            let (model_display, model_source) = if let Some(m) = cli_model {
+                (m.to_string(), "user override")
+            } else if let Some(m) = ctx.config.astra.default_model.as_deref() {
+                (m.to_string(), "config default")
+            } else {
+                ("(CLI default)".to_string(), "profile default")
+            };
             let mut lines = vec![
                 "📊 **状态**".to_string(),
-                format!("- CLI: `{}`", ctx.resolved_cli.name()),
-                format!("- 模型: `{model}`"),
+                format!("- CLI: `{cli_name}`"),
+                format!("- 模型: `{model_display}` ({model_source})"),
                 format!("- 用户: `{}`", ctx.user_id),
                 format!("- 会话: `{}`", session.as_deref().unwrap_or("(无)")),
                 format!(
@@ -185,15 +189,43 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
         "/session" => {
             let cli_name = ctx.resolved_cli.name();
             if arg.is_empty() || arg == "current" {
-                let sid = require_store!(ctx)
+                let store = require_store!(ctx);
+                let sid = store
                     .get_current_session(ctx.platform, ctx.chat_id, cli_name)
                     .await
                     .ok()
                     .flatten();
-                return Some(format!(
-                    "📋 **当前会话** (CLI: `{cli_name}`)\n- ID: `{}`",
-                    sid.as_deref().unwrap_or("(无)")
-                ));
+                if sid.is_some() {
+                    return Some(format!(
+                        "📋 **当前会话** (CLI: `{cli_name}`)\n- ID: `{}`",
+                        sid.as_deref().unwrap_or("(无)")
+                    ));
+                }
+                // Current CLI has no session — check all CLIs and show which ones do.
+                let mut found = Vec::new();
+                for (name, _) in ctx.config.cli_profiles.iter() {
+                    if let Ok(Some(other_sid)) = store
+                        .get_current_session(ctx.platform, ctx.chat_id, name)
+                        .await
+                    {
+                        let short = &other_sid[..8.min(other_sid.len())];
+                        found.push(format!("  `{name}`: `{short}…`"));
+                    }
+                }
+                if found.is_empty() {
+                    return Some(format!(
+                        "📋 **当前会话** (CLI: `{cli_name}`)\n- ID: (无)\n\n所有 CLI 均无活跃会话。发送消息开始新对话。"
+                    ));
+                }
+                let mut lines = vec![
+                    format!("📋 **当前会话** (CLI: `{cli_name}`)"),
+                    "- ID: (无)".into(),
+                    String::new(),
+                    "其他 CLI 有活跃会话:".into(),
+                ];
+                lines.extend(found);
+                lines.push(format!("\n使用 `/cli <name>` 切换，或发送消息创建新 `{cli_name}` 会话。"));
+                return Some(lines.join("\n"));
             }
 
             if arg == "list" {

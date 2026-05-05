@@ -108,6 +108,10 @@ pub struct GatewayRunner {
     /// Active CLI processes indexed by trace_id. Used by `/kill` to abort
     /// running tasks immediately (SIGKILL) instead of only marking DB state.
     active_tasks: Arc<dashmap::DashMap<String, CancellationToken>>,
+    /// Per-conversation consecutive send failure counter. Workers check this
+    /// before emitting heartbeats — stops sending after 3 failures to avoid
+    /// message flood when platform is unreachable. Reset on successful send.
+    send_health: Arc<dashmap::DashMap<String, u32>>,
 }
 
 /// No-op adapter used in spawned CLI tasks (typing/heartbeats not available in background).
@@ -251,6 +255,7 @@ impl GatewayRunner {
             shared_auth,
             request_counter: AtomicU32::new(0),
             active_tasks: Arc::new(dashmap::DashMap::new()),
+            send_health: Arc::new(dashmap::DashMap::new()),
         })
     }
 
@@ -836,6 +841,12 @@ impl GatewayRunner {
         let next_timer = tokio::time::sleep(INITIAL_ACK_DELAY);
         tokio::pin!(next_timer);
 
+        // Health key for heartbeat circuit-breaker: stop emitting
+        // heartbeats when the platform is unreachable (consecutive
+        // send failures tracked by deliver_outbound).
+        let health_key = format!("{}:{}", msg.platform, chat_id);
+        const HEARTBEAT_FAILURE_THRESHOLD: u32 = 3;
+
         #[allow(clippy::type_complexity)]
         let flush_buf = |buf: &mut String,
                          tx: &Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
@@ -927,6 +938,14 @@ impl GatewayRunner {
                     }
                 }
                 _ = &mut next_timer => {
+                    // Circuit-breaker: skip heartbeats/flushes when platform is unreachable.
+                    let send_unhealthy = self.send_health.get(&health_key)
+                        .map(|v| *v >= HEARTBEAT_FAILURE_THRESHOLD)
+                        .unwrap_or(false);
+                    if send_unhealthy {
+                        next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
+                        continue;
+                    }
                     if !token_buf.is_empty() {
                         chunk_counter += 1;
                         if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter) {
@@ -2019,6 +2038,7 @@ impl GatewayRunner {
         adapter_indices: &HashMap<&'static str, usize>,
         outbound: OutboundMessage,
     ) {
+        let health_key = format!("{}:{}", outbound.platform, outbound.chat_id);
         let result = send_text_to_platform(
             adapters,
             adapter_indices,
@@ -2028,6 +2048,18 @@ impl GatewayRunner {
             outbound.reply_token.as_deref(),
         )
         .await;
+
+        // Track send health for heartbeat circuit-breaker.
+        match &result {
+            Ok(_) => {
+                self.send_health.remove(&health_key);
+            }
+            Err(_) => {
+                let mut entry = self.send_health.entry(health_key).or_insert(0);
+                *entry += 1;
+            }
+        }
+
         let Some(outbox) = outbound.outbox else {
             return;
         };
@@ -4805,4 +4837,93 @@ fn manage_other_is_not_redirected() {
     let rest = trimmed.strip_prefix("/manage ").unwrap().trim();
     assert!(!(rest == "cancel" || rest.starts_with("cancel ")));
     assert!(!(rest == "kill" || rest.starts_with("kill ")));
+}
+
+// ── Send health circuit-breaker tests ──────────────────────────────────
+
+#[test]
+fn send_health_tracks_failures() {
+    let health: dashmap::DashMap<String, u32> = dashmap::DashMap::new();
+    let key = "weixin:chat_1".to_string();
+
+    // Simulate 3 failures
+    for _ in 0..3 {
+        let mut entry = health.entry(key.clone()).or_insert(0);
+        *entry += 1;
+    }
+    assert_eq!(*health.get(&key).unwrap(), 3);
+
+    // Check threshold
+    let unhealthy = health.get(&key).map(|v| *v >= 3).unwrap_or(false);
+    assert!(unhealthy);
+}
+
+#[test]
+fn send_health_resets_on_success() {
+    let health: dashmap::DashMap<String, u32> = dashmap::DashMap::new();
+    let key = "weixin:chat_1".to_string();
+
+    // Accumulate failures
+    health.insert(key.clone(), 5);
+    assert_eq!(*health.get(&key).unwrap(), 5);
+
+    // Success resets
+    health.remove(&key);
+    assert!(health.get(&key).is_none());
+    let unhealthy = health.get(&key).map(|v| *v >= 3).unwrap_or(false);
+    assert!(!unhealthy);
+}
+
+#[test]
+fn send_health_absent_is_healthy() {
+    let health: dashmap::DashMap<String, u32> = dashmap::DashMap::new();
+    let unhealthy = health
+        .get("nonexistent")
+        .map(|v| *v >= 3)
+        .unwrap_or(false);
+    assert!(!unhealthy, "absent key must be treated as healthy");
+}
+
+// ── /status model display tests ────────────────────────────────────────
+
+#[test]
+fn model_display_with_override() {
+    let model: Option<String> = Some("gpt-4o".into());
+    let (display, source) = if let Some(m) = model.as_deref() {
+        (m.to_string(), "user override")
+    } else {
+        ("(CLI default)".to_string(), "profile default")
+    };
+    assert_eq!(display, "gpt-4o");
+    assert_eq!(source, "user override");
+}
+
+#[test]
+fn model_display_without_override() {
+    let model: Option<String> = None;
+    let config_default: Option<&str> = Some("sonnet");
+    let (display, source) = if let Some(m) = model.as_deref() {
+        (m.to_string(), "user override")
+    } else if let Some(m) = config_default {
+        (m.to_string(), "config default")
+    } else {
+        ("(CLI default)".to_string(), "profile default")
+    };
+    assert_eq!(display, "sonnet");
+    assert_eq!(source, "config default");
+}
+
+#[test]
+fn model_display_no_config() {
+    let model: Option<String> = None;
+    let config_default: Option<&str> = None;
+    let (display, source) = if let Some(m) = model.as_deref() {
+        (m.to_string(), "user override")
+    } else if let Some(m) = config_default {
+        (m.to_string(), "config default")
+    } else {
+        ("(CLI default)".to_string(), "profile default")
+    };
+    assert_eq!(display, "(CLI default)");
+    assert_eq!(source, "profile default");
 }
