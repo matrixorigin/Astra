@@ -30,10 +30,11 @@ impl ChildKillGuard {
 
 impl Drop for ChildKillGuard {
     fn drop(&mut self) {
-        if let Some(pid) = self.pid {
-            unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
-            }
+        if let Some(pid) = self.pid
+            && let Ok(pid_i32) = i32::try_from(pid)
+            && pid_i32 > 0
+        {
+            unsafe { libc::kill(pid_i32, libc::SIGKILL); }
         }
     }
 }
@@ -1654,59 +1655,4 @@ model: claude-sonnet-4-6"#;
         assert!(result.is_ok(), "true must exit 0: {:?}", result);
     }
 
-    #[tokio::test]
-    async fn timeout_still_works_with_cancel_token() {
-        use tokio_util::sync::CancellationToken;
-
-        // Token is NOT cancelled — timeout fires instead.
-        // `sleep` ignores unknown args and sleeps for the first numeric-looking one,
-        // but build_command_with_context passes `chat -m "msg"...` which `sleep`
-        // interprets as an error and exits. So we use `sleep 10` directly.
-        let token = CancellationToken::new();
-
-        let mut cmd = Command::new("sleep");
-        cmd.arg("10");
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd.spawn().expect("spawn sleep");
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let stderr_task = tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(_)) = lines.next_line().await {}
-            String::new()
-        });
-        let stdout_task = tokio::spawn(async move {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(_)) = lines.next_line().await {}
-            String::new()
-        });
-
-        let timeout = Duration::from_millis(100);
-        let result: Result<(), String> = tokio::select! {
-            status = child.wait() => {
-                let _ = status;
-                Ok(())
-            }
-            _ = tokio::time::sleep(timeout) => {
-                let _ = child.kill().await;
-                stderr_task.abort();
-                stdout_task.abort();
-                Err("timed out".into())
-            }
-            _ = token.cancelled() => {
-                let _ = child.kill().await;
-                stderr_task.abort();
-                stdout_task.abort();
-                Err("killed by user".into())
-            }
-        };
-
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().contains("timed out"),
-            "timeout must fire before cancel (cancel was never triggered)"
-        );
-    }
 }

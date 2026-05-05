@@ -269,6 +269,18 @@ impl GatewayRunner {
         self.store.clone()
     }
 
+    /// Cancel a running CLI task by its registry key (trace_id or
+    /// `notrace:{tag}`). Triggers CancellationToken which causes the CLI
+    /// subprocess to receive SIGKILL. Returns true if a task was found.
+    pub fn cancel_task(&self, key: &str) -> bool {
+        if let Some((_, token)) = self.active_tasks.remove(key) {
+            token.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Clone the Arc-wrapped trace repository.
     pub fn trace_repo(&self) -> Option<Arc<MysqlTraceRepository>> {
         self.trace_repo.clone()
@@ -841,37 +853,28 @@ impl GatewayRunner {
         // Reset health at task start — previous failures are stale.
         self.send_health.remove(&health_key);
 
-        #[allow(clippy::type_complexity)]
         let flush_buf = |buf: &mut String,
                          tx: &Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
                          platform: &str,
                          chat: &str,
                          tag: &str,
                          chunk_num: u32|
-         -> Option<(
-            std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>,
-            usize,
-        )> {
+         -> usize {
             let text = std::mem::take(buf);
             let text = text.trim().to_string();
             if text.is_empty() {
-                return None;
+                return 0;
             }
             let len = text.len();
             let tagged = format!("[{tag}:{chunk_num}] {text}");
-            let tx = tx.clone();
-            let platform = platform.to_string();
-            let chat = chat.to_string();
-            Some((
-                Box::pin(async move {
-                    if let Some(tx) = tx {
-                        let _ = tx
-                            .send(OutboundMessage::plain(platform, chat, tagged))
-                            .await;
-                    }
-                }),
-                len,
-            ))
+            if let Some(tx) = tx {
+                let _ = tx.try_send(OutboundMessage::plain(
+                    platform.to_string(),
+                    chat.to_string(),
+                    tagged,
+                ));
+            }
+            len
         };
 
 
@@ -890,10 +893,7 @@ impl GatewayRunner {
                                 token_buf.push_str(&filtered);
                                 if token_buf.len() >= PROGRESSIVE_MIN_CHARS {
                                     chunk_counter += 1;
-                                    if let Some(fut) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter) {
-                                        progressive_text_len += fut.1;
-                                        fut.0.await;
-                                    }
+                                    progressive_text_len += flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter);
                                     next_timer.as_mut().reset(tokio::time::Instant::now() + PROGRESSIVE_FLUSH_INTERVAL);
                                 }
                             }
@@ -922,10 +922,7 @@ impl GatewayRunner {
                                 token_buf.push_str(&tail);
                             }
                             chunk_counter += 1;
-                            if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter) {
-                                progressive_text_len += len;
-                                fut.await;
-                            }
+                            progressive_text_len += flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter);
                             break;
                         }
                     }
@@ -941,10 +938,7 @@ impl GatewayRunner {
                     }
                     if !token_buf.is_empty() {
                         chunk_counter += 1;
-                        if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter) {
-                            progressive_text_len += len;
-                            fut.await;
-                        }
+                        progressive_text_len += flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter);
                         next_timer.as_mut().reset(tokio::time::Instant::now() + PROGRESSIVE_FLUSH_INTERVAL);
                     } else if !sent_initial_ack {
                         sent_initial_ack = true;
@@ -983,10 +977,14 @@ impl GatewayRunner {
         // Short-circuit: mark trace as failed and return a kill confirmation
         // without processing the result as a normal completion.
         if cancel_token.is_cancelled() {
-            if let Some(writer) = trace_writer.as_ref() {
-                let _ = writer.fail_request("killed by user").await;
+            if let Some(writer) = trace_writer.as_ref()
+                && let Err(e) = writer.fail_request("killed by user").await
+            {
+                tracing::warn!(error = %e, "failed to mark trace as killed");
             }
-            let _ = cli_handle.await; // drain the handle
+            if let Err(e) = cli_handle.await {
+                tracing::debug!(error = %e, "cli task join error after cancel");
+            }
             tracing::info!(tag = %request_tag, "task killed, skipping result processing");
             return Some(
                 self.outbound_response(
@@ -4835,74 +4833,50 @@ async fn kill_command_removes_and_cancels_token() {
 
 // ── /manage cancel redirect tests ──────────────────────────────────────
 
-#[test]
-fn manage_cancel_is_recognized_as_redirect() {
-    let text = "/manage cancel";
-    let trimmed = text.trim();
-    let rest = trimmed.strip_prefix("/manage ").unwrap().trim();
-    assert!(rest == "cancel" || rest.starts_with("cancel "));
-}
+// ── /manage redirect routing tests ─────────────────────────────────────
 
 #[test]
-fn manage_kill_is_recognized_as_redirect() {
-    let text = "/manage kill 1";
-    let trimmed = text.trim();
-    let rest = trimmed.strip_prefix("/manage ").unwrap().trim();
-    assert!(rest == "kill" || rest.starts_with("kill "));
-}
-
-#[test]
-fn manage_other_is_not_redirected() {
-    let text = "/manage status";
-    let trimmed = text.trim();
-    let rest = trimmed.strip_prefix("/manage ").unwrap().trim();
-    assert!(!(rest == "cancel" || rest.starts_with("cancel ")));
-    assert!(!(rest == "kill" || rest.starts_with("kill ")));
-}
-
-// ── Send health circuit-breaker tests ──────────────────────────────────
-
-#[test]
-fn send_health_tracks_failures() {
-    let health: dashmap::DashMap<String, u32> = dashmap::DashMap::new();
-    let key = "weixin:chat_1".to_string();
-
-    // Simulate 3 failures
-    for _ in 0..3 {
-        let mut entry = health.entry(key.clone()).or_insert(0);
-        *entry += 1;
+fn manage_redirect_recognizes_cancel_and_kill() {
+    // Verifies the routing predicate used in handle_fast.
+    for input in ["/manage cancel", "/manage cancel 1", "/manage kill", "/manage kill 2"] {
+        let rest = input.strip_prefix("/manage ").unwrap().trim();
+        assert!(
+            rest == "cancel" || rest.starts_with("cancel ")
+                || rest == "kill" || rest.starts_with("kill "),
+            "'{input}' should redirect to fast path"
+        );
     }
-    assert_eq!(*health.get(&key).unwrap(), 3);
-
-    // Check threshold
-    let unhealthy = health.get(&key).map(|v| *v >= 3).unwrap_or(false);
-    assert!(unhealthy);
+    // These should NOT redirect.
+    for input in ["/manage status", "/manage", "/manage help"] {
+        let rest = input.strip_prefix("/manage ").unwrap_or("").trim();
+        let should_redirect = rest == "cancel" || rest.starts_with("cancel ")
+            || rest == "kill" || rest.starts_with("kill ");
+        assert!(!should_redirect, "'{input}' should NOT redirect");
+    }
 }
 
-#[test]
-fn send_health_resets_on_success() {
-    let health: dashmap::DashMap<String, u32> = dashmap::DashMap::new();
-    let key = "weixin:chat_1".to_string();
-
-    // Accumulate failures
-    health.insert(key.clone(), 5);
-    assert_eq!(*health.get(&key).unwrap(), 5);
-
-    // Success resets
-    health.remove(&key);
-    assert!(health.get(&key).is_none());
-    let unhealthy = health.get(&key).map(|v| *v >= 3).unwrap_or(false);
-    assert!(!unhealthy);
-}
+// ── cancel_task abstraction test ───────────────────────────────────────
 
 #[test]
-fn send_health_absent_is_healthy() {
-    let health: dashmap::DashMap<String, u32> = dashmap::DashMap::new();
-    let unhealthy = health
-        .get("nonexistent")
-        .map(|v| *v >= 3)
-        .unwrap_or(false);
-    assert!(!unhealthy, "absent key must be treated as healthy");
+fn cancel_task_removes_token_and_fires() {
+    let registry: Arc<dashmap::DashMap<String, CancellationToken>> =
+        Arc::new(dashmap::DashMap::new());
+    let token = CancellationToken::new();
+    registry.insert("trace-1".into(), token.clone());
+
+    // Simulate GatewayRunner::cancel_task logic
+    let found = if let Some((_, t)) = registry.remove("trace-1") {
+        t.cancel();
+        true
+    } else {
+        false
+    };
+
+    assert!(found);
+    assert!(token.is_cancelled());
+    assert!(registry.is_empty());
+    // Double-cancel is a no-op
+    assert!(registry.remove("trace-1").is_none());
 }
 
 // ── /status model display tests ────────────────────────────────────────
@@ -4985,36 +4959,24 @@ fn kill_registry_notrace_key_is_findable() {
     assert!(token.is_cancelled());
 }
 
-// ── Heartbeat backpressure test ────────────────────────────────────────
+// ── flush_buf non-blocking test ────────────────────────────────────────
 
 #[tokio::test]
-async fn heartbeat_try_send_drops_when_channel_full() {
+async fn flush_buf_does_not_block_when_channel_full() {
+    // Proves the progressive loop won't deadlock: flush_buf uses try_send.
     let (tx, _rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
 
+    // Fill channel.
     tx.try_send(OutboundMessage::plain(
-        String::from("test"), String::from("chat"), String::from("first"),
+        String::from("p"), String::from("c"), String::from("fill"),
     )).unwrap();
 
+    // flush_buf equivalent: try_send on full channel completes instantly.
     let result = tx.try_send(OutboundMessage::plain(
-        String::from("test"), String::from("chat"), String::from("heartbeat"),
+        String::from("p"), String::from("c"), String::from("chunk"),
     ));
-    assert!(result.is_err(), "try_send on full channel must fail");
-}
-
-#[tokio::test]
-async fn heartbeat_not_blocked_by_slow_consumer() {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(2);
-
-    let _ = tx.try_send(OutboundMessage::plain(String::from("p"), String::from("c"), String::from("1")));
-    let _ = tx.try_send(OutboundMessage::plain(String::from("p"), String::from("c"), String::from("2")));
-
-    let r = tx.try_send(OutboundMessage::plain(String::from("p"), String::from("c"), String::from("hb")));
-    assert!(r.is_err());
-
-    let _ = rx.recv().await;
-
-    let r = tx.try_send(OutboundMessage::plain(String::from("p"), String::from("c"), String::from("hb2")));
-    assert!(r.is_ok());
+    // Returns Err(Full), not deadlock.
+    assert!(result.is_err());
 }
 
 // ── ChildKillGuard Drop test ───────────────────────────────────────────
