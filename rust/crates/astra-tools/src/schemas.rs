@@ -116,9 +116,14 @@ pub fn all_tool_schemas() -> Vec<Value> {
 /// expose the `execute_code` tool, which runs Python scripts unsandboxed.
 pub fn all_tool_schemas_with_env<F: Fn(&str) -> Option<String>>(env: F) -> Vec<Value> {
     let mut schemas = all_tool_schemas_core();
+    // execute_code is Unix-only (UDS RPC transport). On Windows the
+    // schema is hidden from the LLM — even if the env var is set.
+    #[cfg(unix)]
     if env("ASTRA_CODE_EXEC_UNSAFE").as_deref() == Some("1") {
         schemas.push(execute_code_schema());
     }
+    #[cfg(not(unix))]
+    let _ = env; // suppress unused-param warning on non-unix builds
     schemas
 }
 
@@ -2032,6 +2037,20 @@ mod tests {
         );
     }
 
+    #[cfg(not(unix))]
+    #[test]
+    fn execute_code_hidden_on_non_unix_even_with_env_set() {
+        // The RPC transport is a Unix domain socket; on Windows the
+        // tool is unavailable regardless of ASTRA_CODE_EXEC_UNSAFE.
+        let schemas = all_tool_schemas_with_env(|_| Some("1".into()));
+        let names = schema_names(&schemas);
+        assert!(
+            !names.contains(&"execute_code"),
+            "execute_code must stay hidden on non-unix even if env says enable"
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn execute_code_visible_when_unsafe_env_set() {
         let schemas = all_tool_schemas_with_env(|k| {
@@ -2048,6 +2067,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn execute_code_description_warns_unsandboxed() {
         let schemas = all_tool_schemas_with_env(|_| Some("1".into()));
@@ -2067,6 +2087,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn execute_code_description_omits_bash_from_allowlist() {
         // Script-callable `bash` is a bypass for the allowlist concept.

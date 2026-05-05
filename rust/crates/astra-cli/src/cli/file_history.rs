@@ -56,6 +56,29 @@ pub struct DiffStats {
     pub deletions: usize,
 }
 
+/// Outcome of a revert/undo operation, for surfacing to the user.
+///
+/// `reverted` is the list of paths that were successfully restored (or
+/// deleted, if they didn't exist pre-checkpoint). `skipped` is the list
+/// of paths that were in the snapshot but whose pre-state was never
+/// captured (typically because the file exceeded `MAX_CHECKPOINT_FILE_BYTES`);
+/// the CURRENT file state was left alone. The user needs to see this so
+/// they don't assume undo fully restored everything.
+///
+/// `#[non_exhaustive]` so we can add fields (e.g. `errors_per_path`) later.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct RevertReport {
+    pub reverted: Vec<PathBuf>,
+    pub skipped: Vec<(PathBuf, String)>,
+}
+
+impl RevertReport {
+    pub fn has_skips(&self) -> bool {
+        !self.skipped.is_empty()
+    }
+}
+
 /// Manages per-session file history with bounded snapshot storage.
 #[derive(Debug)]
 pub struct FileHistory {
@@ -208,54 +231,18 @@ impl FileHistory {
         Ok(file_backups)
     }
 
-    /// Revert all files in a specific snapshot to their backed-up state.
-    pub fn revert_to(&self, snapshot_id: usize) -> io::Result<()> {
-        let snapshot = self
-            .snapshots
-            .iter()
-            .find(|s| s.id == snapshot_id)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("snapshot {snapshot_id} not found"),
-                )
-            })?;
-
+    /// Apply a snapshot's backups to the filesystem, building a report of
+    /// what was restored vs what was intentionally skipped (oversize files
+    /// that were never captured).
+    fn apply_snapshot(snapshot: &Snapshot) -> io::Result<RevertReport> {
+        let mut report = RevertReport::default();
         for backup in &snapshot.files {
-            if backup.skipped_reason.is_some() {
-                // File was too large to checkpoint — leave it alone.
-                continue;
-            }
-            if backup.existed {
-                // Restore from backup.
-                if let Some(parent) = backup.original_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::copy(&backup.backup_path, &backup.original_path)?;
-            } else {
-                // File didn't exist before — delete it if it exists now.
-                if backup.original_path.exists() {
-                    fs::remove_file(&backup.original_path)?;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Revert the most recent snapshot and remove it from history.
-    ///
-    /// Returns the snapshot ID that was reverted, or `None` if no snapshots exist.
-    pub fn undo_last(&mut self) -> io::Result<Option<usize>> {
-        let snapshot = match self.snapshots.pop_back() {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-
-        let snap_id = snapshot.id;
-
-        for backup in &snapshot.files {
-            if backup.skipped_reason.is_some() {
+            if let Some(ref reason) = backup.skipped_reason {
+                // File's pre-state was never captured (typically oversize).
+                // Current file is left alone; record the skip for the UI.
+                report
+                    .skipped
+                    .push((backup.original_path.clone(), reason.clone()));
                 continue;
             }
             if backup.existed {
@@ -266,13 +253,43 @@ impl FileHistory {
             } else if backup.original_path.exists() {
                 fs::remove_file(&backup.original_path)?;
             }
+            report.reverted.push(backup.original_path.clone());
         }
+        Ok(report)
+    }
+
+    /// Revert all files in a specific snapshot to their backed-up state.
+    pub fn revert_to(&self, snapshot_id: usize) -> io::Result<RevertReport> {
+        let snapshot = self
+            .snapshots
+            .iter()
+            .find(|s| s.id == snapshot_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("snapshot {snapshot_id} not found"),
+                )
+            })?;
+        Self::apply_snapshot(snapshot)
+    }
+
+    /// Revert the most recent snapshot and remove it from history.
+    ///
+    /// Returns `None` if no snapshots exist, else `Some(report)`.
+    pub fn undo_last(&mut self) -> io::Result<Option<RevertReport>> {
+        let snapshot = match self.snapshots.pop_back() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let snap_id = snapshot.id;
+        let report = Self::apply_snapshot(&snapshot)?;
 
         // Clean up the snapshot directory.
         let snap_dir = self.backup_dir.join(format!("snap_{snap_id}"));
         let _ = fs::remove_dir_all(&snap_dir);
 
-        Ok(Some(snap_id))
+        Ok(Some(report))
     }
 
     /// Compute diff statistics between a snapshot and the current file state.
@@ -422,16 +439,40 @@ fn line_diff_counts(old: &str, new: &str) -> (usize, usize) {
 }
 
 /// Convert an absolute path to a sanitized relative path for the backup tree.
+///
+/// Cross-platform:
+/// - Unix roots (`/`) are stripped.
+/// - Windows drive prefixes (`C:`, `\\?\UNC`) are encoded as a leading
+///   pseudo-component (`_drive_c`, `_unc_<server>_<share>`) so files on
+///   different drives don't collide under the same backup tree.
+/// - `..` and `.` components are dropped; `Normal` components are kept.
+/// - Components are joined using the platform-native separator via
+///   `PathBuf::push`, not a hardcoded `/`.
 fn sanitize_path_for_backup(path: &Path) -> PathBuf {
-    // Strip the root prefix and join with underscores or preserve structure.
-    let components: Vec<&str> = path
-        .components()
-        .filter_map(|c| match c {
-            std::path::Component::Normal(s) => s.to_str(),
-            _ => None,
-        })
-        .collect();
-    PathBuf::from(components.join("/"))
+    use std::path::{Component, Prefix};
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(p) => match p.kind() {
+                Prefix::Disk(b) | Prefix::VerbatimDisk(b) => {
+                    out.push(format!("_drive_{}", (b as char).to_ascii_lowercase()));
+                }
+                Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                    out.push(format!(
+                        "_unc_{}_{}",
+                        server.to_string_lossy(),
+                        share.to_string_lossy()
+                    ));
+                }
+                Prefix::DeviceNS(name) | Prefix::Verbatim(name) => {
+                    out.push(format!("_dev_{}", name.to_string_lossy()));
+                }
+            },
+            Component::RootDir | Component::CurDir | Component::ParentDir => {}
+            Component::Normal(s) => out.push(s),
+        }
+    }
+    out
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -705,6 +746,68 @@ mod tests {
         }
     }
 
+    // ── R3-P1-#3: undo surfaces skipped files to the caller ───────────────
+    //
+    // Previously revert_to/undo_last returned io::Result<()> — no way for
+    // a caller (CLI or UI layer) to tell the user "we couldn't restore
+    // big.bin because it was too large to checkpoint". Now both return
+    // a RevertReport listing reverted + skipped paths with reasons.
+
+    #[test]
+    fn undo_report_lists_reverted_paths() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+        let p1 = tmp.path().join("a.txt");
+        let p2 = tmp.path().join("b.txt");
+        fs::write(&p1, "one").unwrap();
+        fs::write(&p2, "two").unwrap();
+        history.checkpoint(&[p1.as_path(), p2.as_path()]).unwrap();
+        fs::write(&p1, "ONE").unwrap();
+        fs::write(&p2, "TWO").unwrap();
+
+        let report = history.undo_last().unwrap().unwrap();
+        assert!(!report.has_skips());
+        assert_eq!(report.reverted.len(), 2);
+        assert!(report.reverted.contains(&p1));
+        assert!(report.reverted.contains(&p2));
+    }
+
+    #[test]
+    fn undo_report_lists_skipped_with_reason() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = FileHistory::with_backup_dir(tmp.path().join("backups"), 10);
+        let normal = tmp.path().join("small.txt");
+        let big = tmp.path().join("big.bin");
+        fs::write(&normal, "ok").unwrap();
+        fs::write(&big, vec![0u8; (MAX_CHECKPOINT_FILE_BYTES + 1) as usize]).unwrap();
+        history.checkpoint(&[normal.as_path(), big.as_path()]).unwrap();
+
+        let report = history.undo_last().unwrap().unwrap();
+        assert_eq!(report.reverted, vec![normal.clone()]);
+        assert!(report.has_skips(), "big file must appear in skipped list");
+        assert_eq!(report.skipped.len(), 1);
+        let (skipped_path, reason) = &report.skipped[0];
+        assert_eq!(skipped_path, &big);
+        assert!(
+            reason.contains("size") || reason.contains("bytes"),
+            "reason should describe why (size): {reason}"
+        );
+    }
+
+    #[test]
+    fn revert_to_returns_same_report_shape() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+        let p = tmp.path().join("x.txt");
+        fs::write(&p, "v1").unwrap();
+        let snap_id = history.checkpoint(&[p.as_path()]).unwrap();
+        fs::write(&p, "v2").unwrap();
+
+        let report = history.revert_to(snap_id).unwrap();
+        assert_eq!(report.reverted, vec![p]);
+        assert!(report.skipped.is_empty());
+    }
+
     #[test]
     fn revert_of_skipped_file_is_noop_not_error() {
         // Undo must NOT try to restore a skipped file (its backup_path
@@ -879,20 +982,21 @@ mod tests {
         fs::write(&file_path, "latest").unwrap();
 
         // Undo last should revert to "modified" state.
-        let undone = history.undo_last().unwrap();
-        assert_eq!(undone, Some(1));
+        let report = history.undo_last().unwrap().expect("snap present");
+        assert!(report.reverted.contains(&file_path));
+        assert!(report.skipped.is_empty());
         assert_eq!(fs::read_to_string(&file_path).unwrap(), "modified");
         assert_eq!(history.snapshot_count(), 1);
 
         // Undo again should revert to "original".
-        let undone = history.undo_last().unwrap();
-        assert_eq!(undone, Some(0));
+        let report = history.undo_last().unwrap().expect("snap present");
+        assert!(report.reverted.contains(&file_path));
         assert_eq!(fs::read_to_string(&file_path).unwrap(), "original");
         assert_eq!(history.snapshot_count(), 0);
 
         // Undo with nothing left should return None.
         let undone = history.undo_last().unwrap();
-        assert_eq!(undone, None);
+        assert!(undone.is_none());
     }
 
     #[test]
@@ -1063,6 +1167,62 @@ mod tests {
     fn test_sanitize_path_for_backup() {
         let path = Path::new("/home/user/project/src/main.rs");
         let sanitized = sanitize_path_for_backup(path);
-        assert_eq!(sanitized, PathBuf::from("home/user/project/src/main.rs"));
+        assert_eq!(
+            sanitized,
+            PathBuf::from("home").join("user").join("project").join("src").join("main.rs")
+        );
+    }
+
+    // ── R3-P1-#2: cross-platform path sanitization ────────────────────────
+    //
+    // `components.join("/")` was hardcoded. On Windows, `C:\Users\Alice\x.txt`
+    // has a Prefix(C:) + RootDir + Normal(Users)...; the Prefix is dropped
+    // by our Normal-only filter, so files on C:\ and D:\ would collide in
+    // the backup tree. Use MAIN_SEPARATOR (platform-native) and encode the
+    // Prefix explicitly so drive letters don't get silently stripped.
+
+    #[test]
+    fn sanitize_uses_platform_native_separator() {
+        // The sanitized path should be a valid native PathBuf (accepts
+        // both `/` and `\` on Windows; `/` on Unix). What matters is that
+        // iterating its components yields each piece separately.
+        let path = Path::new("/a/b/c.txt");
+        let sanitized = sanitize_path_for_backup(path);
+        let pieces: Vec<&std::ffi::OsStr> = sanitized
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pieces, vec![
+            std::ffi::OsStr::new("a"),
+            std::ffi::OsStr::new("b"),
+            std::ffi::OsStr::new("c.txt"),
+        ]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sanitize_preserves_windows_drive_letter() {
+        // C:\x.txt and D:\x.txt must not collide in the backup tree.
+        let p_c = Path::new(r"C:\Users\Alice\file.txt");
+        let p_d = Path::new(r"D:\Users\Alice\file.txt");
+        let s_c = sanitize_path_for_backup(p_c);
+        let s_d = sanitize_path_for_backup(p_d);
+        assert_ne!(
+            s_c, s_d,
+            "C-drive and D-drive files with the same relative path MUST \
+             produce distinct backup paths: both collapsed to {:?}",
+            s_c
+        );
+    }
+
+    #[test]
+    fn sanitize_is_idempotent_for_relative_input() {
+        // A relative input shouldn't grow extra components.
+        let p = Path::new("src/main.rs");
+        let s = sanitize_path_for_backup(p);
+        assert_eq!(s, PathBuf::from("src").join("main.rs"));
     }
 }

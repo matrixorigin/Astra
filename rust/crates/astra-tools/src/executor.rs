@@ -322,7 +322,15 @@ impl DefaultToolExecutor {
             }
 
             // ── Code execution (Python RPC bridge) ──────────────────
+            // Unix-only: the RPC transport is a Unix domain socket.
+            #[cfg(unix)]
             "execute_code" => crate::code_exec::handle_execute_code(args, self).await,
+            #[cfg(not(unix))]
+            "execute_code" => ToolResult::error(
+                "execute_code is not available on this platform \
+                 (requires Unix domain sockets; Windows named-pipe \
+                 support is a future work)".into(),
+            ),
 
             // ── Delegation placeholder ───────────────────────────────
             "delegate" => ToolResult::text(
