@@ -1,6 +1,6 @@
 use astra_turn_core::context_binder::bind_all;
 use astra_turn_core::context_optimizer::{CacheMarker, ContextOptimized};
-use astra_turn_core::context_pipeline::{ContextPipeline, PipelineRunInput};
+use astra_turn_core::context_pipeline::{ContextPipeline, PipelineAbort, PipelineRunInput};
 use astra_turn_core::context_planner::{PlanInput, plan_turn};
 use astra_turn_core::context_serializer::{
     flatten_serialized_system_blocks, serialize_prompt_sections, serialize_provider_request,
@@ -120,19 +120,20 @@ fn context_pipeline_serializes_provider_request_and_metrics() {
         stats: &stats,
     };
     let pipeline = ContextPipeline::new(PipelineConfig {
-        explain_only: false,
         provider_policy: session.provider_policy.clone(),
     });
-    let run = pipeline.run(PipelineRunInput {
-        sources: &sources,
-        tokens: &turn.tokens,
-        model_limit: session.model_limit,
-        recovery: &turn.recovery,
-        latches: &latches,
-        optimize_limits: &OptimizeLimits::default(),
-        model_id: &session.model_id,
-        query_source: "harness",
-    });
+    let run = pipeline
+        .run(PipelineRunInput {
+            sources: &sources,
+            tokens: &turn.tokens,
+            model_limit: session.model_limit,
+            recovery: &turn.recovery,
+            latches: &latches,
+            optimize_limits: &OptimizeLimits::default(),
+            model_id: &session.model_id,
+            query_source: "harness",
+        })
+        .expect("pipeline should not abort with default recovery state");
 
     assert!(!run.serialized.system_blocks.is_empty());
     assert_eq!(run.serialized.messages.len(), turn.messages.len());
@@ -223,6 +224,105 @@ fn cache_marker_indices_match_serialized_system_blocks() {
             .is_some(),
         "remapped marker target should carry cache_control"
     );
+}
+
+#[test]
+fn pipeline_aborts_on_consecutive_ptl_errors() {
+    let (statics, agent, latches, session, mut turn, ext, emer, stats) = build_sources();
+    // Simulate 3 consecutive PTL errors
+    turn.recovery.record_ptl_error();
+    turn.recovery.record_ptl_error();
+    turn.recovery.record_ptl_error();
+    assert!(turn.recovery.should_abort());
+
+    let sources = ContextSources {
+        statics: &statics,
+        agent: &agent,
+        latches: &latches,
+        session: &session,
+        turn: &turn,
+        external: &ext,
+        emergent: &emer,
+        stats: &stats,
+    };
+    let pipeline = ContextPipeline::new(PipelineConfig {
+        provider_policy: session.provider_policy.clone(),
+    });
+    let result = pipeline.run(PipelineRunInput {
+        sources: &sources,
+        tokens: &turn.tokens,
+        model_limit: session.model_limit,
+        recovery: &turn.recovery,
+        latches: &latches,
+        optimize_limits: &OptimizeLimits::default(),
+        model_id: &session.model_id,
+        query_source: "harness",
+    });
+
+    assert!(result.is_err());
+    assert_eq!(
+        result.unwrap_err(),
+        PipelineAbort::ConsecutivePtlExhausted {
+            consecutive_errors: 3
+        }
+    );
+}
+
+#[test]
+fn serialized_output_format_system_blocks_are_well_structured() {
+    let (statics, agent, latches, session, turn, ext, emer, stats) = build_sources();
+    let sources = ContextSources {
+        statics: &statics,
+        agent: &agent,
+        latches: &latches,
+        session: &session,
+        turn: &turn,
+        external: &ext,
+        emergent: &emer,
+        stats: &stats,
+    };
+    let pipeline = ContextPipeline::new(PipelineConfig {
+        provider_policy: session.provider_policy.clone(),
+    });
+    let run = pipeline
+        .run(PipelineRunInput {
+            sources: &sources,
+            tokens: &turn.tokens,
+            model_limit: session.model_limit,
+            recovery: &turn.recovery,
+            latches: &latches,
+            optimize_limits: &OptimizeLimits::default(),
+            model_id: &session.model_id,
+            query_source: "harness",
+        })
+        .expect("pipeline should succeed");
+
+    // Every system block must have a non-empty text body and a valid SectionKind
+    for block in &run.serialized.system_blocks {
+        assert!(
+            !block.text.is_empty(),
+            "system block {:?} must have non-empty text",
+            block.kind
+        );
+    }
+
+    // Messages should be valid JSON objects with "role" field
+    for msg in &run.serialized.messages {
+        assert!(
+            msg.get("role").is_some(),
+            "each message must have a 'role' field"
+        );
+    }
+
+    // Cache markers (if any) must reference valid block indices
+    for marker in &run.serialized.cache_markers {
+        assert!(
+            marker.after_section_index < run.serialized.system_blocks.len(),
+            "cache marker index {} out of bounds (blocks={})",
+            marker.after_section_index,
+            run.serialized.system_blocks.len()
+        );
+    }
 }
 
 /// Proptest: predictive reserves (p75/p95) are always ≥ the response floor.

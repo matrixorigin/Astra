@@ -9,19 +9,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::compaction_types::CompactionTier;
 use crate::section_types::SectionKind;
+/// Pressure threshold above which schema trimming begins.
+/// Shared with `microcompact::AdaptiveCompactConfig::from_pressure()`.
+pub const PRESSURE_TRIM_SCHEMAS: f64 = 0.60;
+/// Pressure threshold above which message history compaction activates.
+pub const PRESSURE_COMPACT_HISTORY: f64 = 0.75;
+/// Pressure threshold above which aggressive pruning engages.
+pub const PRESSURE_AGGRESSIVE_PRUNE: f64 = 0.90;
 
 /// Select the compaction tier from a raw or predictive pressure value.
 ///
-/// Thresholds align with `AdaptiveCompactConfig::from_pressure()` in
-/// microcompact.rs, but this function returns the tier (policy) rather
-/// than the adaptive parameters (mechanism).
+/// Thresholds are defined as constants (`PRESSURE_TRIM_SCHEMAS`,
+/// `PRESSURE_COMPACT_HISTORY`, `PRESSURE_AGGRESSIVE_PRUNE`) shared with
+/// the microcompact layer to eliminate comment-only alignment.
 #[must_use]
 pub fn select_compaction_tier(pressure: f64) -> CompactionTier {
-    if pressure >= 0.90 {
+    if pressure >= PRESSURE_AGGRESSIVE_PRUNE {
         CompactionTier::AggressivePrune
-    } else if pressure >= 0.75 {
+    } else if pressure >= PRESSURE_COMPACT_HISTORY {
         CompactionTier::CompactHistory
-    } else if pressure >= 0.60 {
+    } else if pressure >= PRESSURE_TRIM_SCHEMAS {
         CompactionTier::TrimSchemas
     } else {
         CompactionTier::Normal

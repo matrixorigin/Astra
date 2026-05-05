@@ -69,8 +69,6 @@ impl ProviderCachePolicy {
 /// Top-level pipeline configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PipelineConfig {
-    /// Whether to run in EXPLAIN-only mode (plan + trace without API call).
-    pub explain_only: bool,
     /// Provider cache policy for the current session.
     pub provider_policy: ProviderCachePolicy,
 }
@@ -80,9 +78,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_not_explain_only() {
+    fn default_config_uses_default_policy() {
         let c = PipelineConfig::default();
-        assert!(!c.explain_only);
+        assert_eq!(c.provider_policy.max_markers, 0);
+        assert!(!c.provider_policy.supports_global_scope);
     }
 
     #[test]
