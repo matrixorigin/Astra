@@ -196,6 +196,16 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         .iter()
         .map(|r| r.outcome.completion_tokens)
         .sum();
+    let total_cache_read: u64 = report
+        .runs
+        .iter()
+        .map(|r| r.outcome.cached_input_tokens)
+        .sum();
+    let total_cache_create: u64 = report
+        .runs
+        .iter()
+        .map(|r| r.outcome.cache_creation_tokens)
+        .sum();
     let sum_dur: u64 = report.runs.iter().map(|r| r.outcome.duration_ms).sum();
     let wall_ms = if report.wall_time_ms > 0 {
         report.wall_time_ms
@@ -204,13 +214,22 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
     };
     let wall_secs = wall_ms / 1000;
 
+    let cache_ratio_pct = if total_cache_read + total_cache_create > 0 {
+        format!(
+            " cache={:.0}%",
+            total_cache_read as f64 / (total_cache_read + total_cache_create) as f64 * 100.0
+        )
+    } else {
+        String::new()
+    };
     s.push_str(&format!(
-        "total={} passed={} failed={} | tokens: {}in/{}out | wall: {}m{}s (sum: {}m{}s)\n\n",
+        "total={} passed={} failed={} | tokens: {}in/{}out{} | wall: {}m{}s (sum: {}m{}s)\n\n",
         report.total(),
         report.passed(),
         report.failed(),
         total_prompt,
         total_completion,
+        cache_ratio_pct,
         wall_secs / 60,
         wall_secs % 60,
         sum_dur / 1000 / 60,
