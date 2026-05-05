@@ -789,7 +789,7 @@ impl ToolSelectionConfig {
 
     /// Resolved circuit breaker stall threshold (0 → default 3, floor 2).
     pub fn effective_circuit_breaker_stall_threshold(&self) -> u32 {
-        resolve_threshold(self.circuit_breaker_stall_threshold, 3, 2)
+        resolve_threshold(self.circuit_breaker_stall_threshold, 6, 3)
     }
 
     /// Resolved circuit breaker repetition threshold (0 → default 3, floor 2).

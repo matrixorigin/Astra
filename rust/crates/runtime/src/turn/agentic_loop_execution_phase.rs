@@ -2069,7 +2069,45 @@ async fn handle_token_budget<H: AgenticLoopHost>(
         return Some(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
     }
 
-    state.budget_wrapup_injected = true;
+    // First attempt: compact-and-continue instead of hard-stopping.
+    // Run the compression pipeline to free tokens and let the agent keep working.
+    // Only if compaction doesn't free enough do we inject the stop directive.
+    if !state.budget_wrapup_injected {
+        let budget = super::context_compression::TokenBudget {
+            max_prompt_tokens: state.max_turn_input_tokens,
+            last_measured_tokens: measured,
+            current_round_index: Some(state.current_round_index),
+        };
+        let pipeline = super::context_compression::CompressionPipeline::aggressive_pipeline();
+        let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
+
+        if outcome.total_tokens_freed > 0 {
+            if !prep.quiet {
+                host.emit_headless_line(
+                    HeadlessStderrStyle::Yellow,
+                    format!(
+                        "♻ Context pressure {measured}/{} tokens — compacted ~{} tokens, continuing.",
+                        state.max_turn_input_tokens, outcome.total_tokens_freed,
+                    ),
+                );
+            }
+            if let Some(ref mut sess) = state.pipeline_session {
+                sess.recovery.record_reactive_compact();
+                sess.stats.record_compaction(outcome.total_tokens_freed);
+            }
+            state
+                .compaction_effectiveness
+                .record_compaction(outcome.total_tokens_freed);
+            // Don't set budget_wrapup_injected — allow agent to continue.
+            // If next round still exceeds budget, we'll reach here again
+            // and try once more (up to 2 compaction attempts before stop).
+            state.budget_wrapup_injected = true; // Mark: one compact done
+            try_write_heavy_checkpoint(state);
+            return Some(TurnExecutionControl::ContinueLoop);
+        }
+    }
+
+    // Compaction didn't help (or already tried once) — inject stop directive.
     if !prep.quiet {
         host.emit_headless_line(
             HeadlessStderrStyle::Yellow,

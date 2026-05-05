@@ -45,6 +45,19 @@ pub(super) async fn audit_turn_detail_handler(
     Ok(Json(serde_json::to_value(detail).map_err(internal_error)?))
 }
 
+pub(super) async fn audit_context_traces_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let traces = state
+        .session_audit_service
+        .list_context_traces(&user.user_id, &session_id)
+        .await?;
+    Ok(Json(serde_json::to_value(traces).map_err(internal_error)?))
+}
+
 pub(super) async fn audit_tools_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,

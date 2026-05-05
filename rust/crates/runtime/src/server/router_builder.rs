@@ -463,6 +463,10 @@ pub(super) fn build_router(state: AppState) -> Router {
             get(audit_handlers::audit_turn_detail_handler),
         )
         .route(
+            "/sessions/{session_id}/audit/context-traces",
+            get(audit_handlers::audit_context_traces_handler),
+        )
+        .route(
             "/sessions/{session_id}/audit/tools",
             get(audit_handlers::audit_tools_handler),
         )
