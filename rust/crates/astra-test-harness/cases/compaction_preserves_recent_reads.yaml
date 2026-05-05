@@ -6,10 +6,10 @@ description: |
   **Pass means**: The agent retains specific file content (target names, variables) after compaction pressure, proving state re-injection works.
   **Fail means**: Compaction dropped recent_file_reads — the agent either re-read the file (wasted a tool call) or fabricated generic content.
 prompt: |
-  First, use read_file to look at ./Makefile (top 30 lines is fine).
+  First, use read_file to look at ./Cargo.toml (top 30 lines is fine).
   Then in your final answer, do two things:
-    1. Describe what's in the Makefile based on what you just read.
-    2. Reference a SPECIFIC target or variable name from the file.
+    1. Describe what's in the Cargo.toml based on what you just read.
+    2. Reference a SPECIFIC workspace member or profile name from the file.
 
   Do not re-read the file. Use only one tool call.
 timeout_seconds: 120
@@ -23,10 +23,10 @@ criteria:
     max: 2
   - type: judger
     question: |
-      Does the final answer quote a specific Makefile target or
-      variable (like `test`, `build`, `dev-start`, `CC`, `RUSTFLAGS`,
-      etc.) that would only be known by having actually read the
-      file? Generic answers that could apply to any Makefile
-      ("has some rules", "defines targets") score 0.3. Concrete
-      citations score 1.0. Clear fabrication scores 0.0.
+      Does the final answer quote a specific Cargo.toml workspace
+      member (like `crates/core`, `crates/runtime`, `astra-cli`, etc.)
+      or profile/config field that would only be known by having
+      actually read the file? Generic answers that could apply to
+      any Cargo.toml ("has some members", "defines workspace") score
+      0.3. Concrete citations score 1.0. Clear fabrication scores 0.0.
     threshold: 0.7
