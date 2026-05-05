@@ -80,7 +80,7 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "memory_purge",
     "memory_correct",
     "memory_profile",
-    "execute_code",
+    // execute_code gated behind ASTRA_CODE_EXEC_UNSAFE=1 — opt-in only.
     "enter_plan_mode",
     "exit_plan_mode",
     "get_agent_info",
@@ -108,6 +108,21 @@ pub fn server_executor_tool_schemas() -> Vec<Value> {
 }
 
 pub fn all_tool_schemas() -> Vec<Value> {
+    all_tool_schemas_with_env(|k| std::env::var(k).ok())
+}
+
+/// Like `all_tool_schemas()` but reads env via a caller-supplied closure.
+/// Used for deterministic testing — set `ASTRA_CODE_EXEC_UNSAFE=1` to
+/// expose the `execute_code` tool, which runs Python scripts unsandboxed.
+pub fn all_tool_schemas_with_env<F: Fn(&str) -> Option<String>>(env: F) -> Vec<Value> {
+    let mut schemas = all_tool_schemas_core();
+    if env("ASTRA_CODE_EXEC_UNSAFE").as_deref() == Some("1") {
+        schemas.push(execute_code_schema());
+    }
+    schemas
+}
+
+fn all_tool_schemas_core() -> Vec<Value> {
     vec![
         json!({
             "type": "function",
@@ -1950,28 +1965,35 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "execute_code",
-                "description": "Execute a Python script that can call agent tools via RPC. Use for multi-step operations that would require many tool calls — the script handles the logic, calling tools as needed. Only stdout is returned. Available functions: read_file, write_file, bash, list_dir, grep, web_fetch.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "script": {
-                            "type": "string",
-                            "description": "Python script to execute. The module `astra_tools` is auto-imported with functions: read_file(path), write_file(path, content), bash(command), list_dir(path), grep(pattern, path), web_fetch(url)."
-                        },
-                        "timeout": {
-                            "type": "integer",
-                            "description": "Max execution time in seconds (default 300)"
-                        }
-                    },
-                    "required": ["script"]
-                }
-            }
-        }),
     ]
+}
+
+/// Schema for the `execute_code` tool. Returned by `all_tool_schemas_with_env`
+/// only when `ASTRA_CODE_EXEC_UNSAFE=1` — the tool runs Python scripts
+/// unsandboxed as the current user. Keep the description pointed at what
+/// the model needs to know for correct usage AND for understanding the risk.
+fn execute_code_schema() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "execute_code",
+            "description": "⚠️ UNSAFE: executes a Python script unsandboxed as the current user — no cgroup, no seccomp, no chroot. Use only when absolutely necessary for multi-step read/search operations that would otherwise require dozens of tool calls. Only stdout is returned. Script-callable functions: read_file, write_file, list_dir, grep, web_fetch.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "script": {
+                        "type": "string",
+                        "description": "Python script to execute. Module `astra_tools` is auto-imported with: read_file(path), write_file(path, content), list_dir(path), grep(pattern, path), web_fetch(url). Do NOT rely on shell access — write Python, not shell-outs."
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Max execution time in seconds (default 300, capped at 600)"
+                    }
+                },
+                "required": ["script"]
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1990,6 +2012,88 @@ mod tests {
                     .and_then(Value::as_str)
             })
             .collect()
+    }
+
+    // ── P0-1: execute_code gate tests ─────────────────────────────────────
+    //
+    // execute_code spawns `python3 script.py` directly without sandboxing.
+    // In practice this is RCE-as-current-user: LLM can read any file, spawn
+    // shell via allowlisted `bash`, open network. Gate the schema behind
+    // an explicit opt-in env var so the tool isn't silently available.
+    // See plans review 2026-05-05.
+
+    #[test]
+    fn execute_code_hidden_by_default() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let names = schema_names(&schemas);
+        assert!(
+            !names.contains(&"execute_code"),
+            "execute_code must NOT appear in the default schema list — it runs unsandboxed"
+        );
+    }
+
+    #[test]
+    fn execute_code_visible_when_unsafe_env_set() {
+        let schemas = all_tool_schemas_with_env(|k| {
+            if k == "ASTRA_CODE_EXEC_UNSAFE" {
+                Some("1".into())
+            } else {
+                None
+            }
+        });
+        let names = schema_names(&schemas);
+        assert!(
+            names.contains(&"execute_code"),
+            "execute_code must appear when ASTRA_CODE_EXEC_UNSAFE=1"
+        );
+    }
+
+    #[test]
+    fn execute_code_description_warns_unsandboxed() {
+        let schemas = all_tool_schemas_with_env(|_| Some("1".into()));
+        let desc = schemas
+            .iter()
+            .find(|s| {
+                s.get("function").and_then(|f| f.get("name")).and_then(Value::as_str)
+                    == Some("execute_code")
+            })
+            .and_then(|s| s.get("function"))
+            .and_then(|f| f.get("description"))
+            .and_then(Value::as_str)
+            .expect("execute_code schema present");
+        assert!(
+            desc.to_lowercase().contains("unsandboxed") || desc.contains("UNSAFE"),
+            "description must warn the model the tool is unsandboxed: got {desc:?}"
+        );
+    }
+
+    #[test]
+    fn execute_code_description_omits_bash_from_allowlist() {
+        // Script-callable `bash` is a bypass for the allowlist concept.
+        // The schema must not advertise bash as available to the script.
+        let schemas = all_tool_schemas_with_env(|_| Some("1".into()));
+        let func = schemas
+            .iter()
+            .find(|s| {
+                s.get("function").and_then(|f| f.get("name")).and_then(Value::as_str)
+                    == Some("execute_code")
+            })
+            .and_then(|s| s.get("function"))
+            .expect("execute_code schema present");
+        let outer_desc = func.get("description").and_then(Value::as_str).unwrap_or("");
+        let script_desc = func
+            .get("parameters")
+            .and_then(|p| p.get("properties"))
+            .and_then(|p| p.get("script"))
+            .and_then(|p| p.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let combined = format!("{outer_desc} {script_desc}");
+        // Token boundaries to avoid matching 'bashrc' etc.
+        assert!(
+            !combined.contains("bash("),
+            "schema still advertises bash() to the script — remove it"
+        );
     }
 
     #[test]
