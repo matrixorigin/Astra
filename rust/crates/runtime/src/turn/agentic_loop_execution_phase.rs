@@ -575,7 +575,60 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 false,
             );
             let model_id = state.skills.model_override.as_deref().unwrap_or("default");
-            pipeline_sess.record_feedback(model_id, "agentic_loop", feedback, None);
+            pipeline_sess.record_feedback(model_id, "agentic_loop", feedback.clone(), None);
+
+            // Emit pipeline journal events for observability and cloud sync
+            if let Some(ref mut buf) = state.turn_event_buffer {
+                let turn = state.llm_rounds_completed;
+                let session_id = state.current_session_id.as_deref();
+
+                // Per-turn feedback event
+                let feedback_evt =
+                    astra_turn_core::pipeline_journal::PipelineJournalEvent::from_feedback(
+                        turn, model_id, &feedback,
+                    );
+                if let Ok(payload) = serde_json::to_value(&feedback_evt) {
+                    buf.record(
+                        astra_services::session_journal::JournalEvent::pipeline_feedback(
+                            session_id, turn, payload,
+                        ),
+                    );
+                }
+
+                // Drain and emit compaction audit events
+                for audit in pipeline_sess.drain_pending_audits() {
+                    if let Ok(payload) = serde_json::to_value(&audit) {
+                        buf.record(
+                            astra_services::session_journal::JournalEvent::pipeline_compaction_audit(
+                                session_id, turn, payload,
+                            ),
+                        );
+                    }
+                }
+
+                // Evaluate trace alerts and emit Error-severity ones
+                let alerts = astra_turn_core::trace_alert::evaluate_alerts(
+                    turn,
+                    &feedback,
+                    &pipeline_sess.stats,
+                    &pipeline_sess.recovery,
+                );
+                for alert in &alerts {
+                    if alert.severity >= astra_turn_core::trace_alert::AlertSeverity::Error {
+                        let alert_evt =
+                            astra_turn_core::pipeline_journal::PipelineJournalEvent::from_alert(
+                                alert,
+                            );
+                        if let Ok(payload) = serde_json::to_value(&alert_evt) {
+                            buf.record(
+                                astra_services::session_journal::JournalEvent::pipeline_alert(
+                                    session_id, turn, payload,
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
         }
         host.on_turn_completed(state);
     }

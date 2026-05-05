@@ -183,15 +183,13 @@ impl PipelineSession {
 
     /// Run the pipeline with tier-adaptive limits. The Plan phase determines
     /// the compaction tier, then limits are derived automatically from that tier.
+    /// When a compaction cascade is active, clearing is suppressed to break the loop.
     /// This is the preferred entry point for runtime integration.
     pub fn run_turn_adaptive(
         &self,
         input: AdaptiveTurnInput<'_>,
     ) -> Result<TurnOutput, PipelineAbort> {
-        let limits = OptimizeLimits::for_tier(
-            self.current_pressure_tier(),
-            input.session.model_limit,
-        );
+        let limits = self.cascade_aware_limits(input.session.model_limit);
         let full_input = TurnInput {
             statics: input.statics,
             agent: input.agent,
