@@ -574,12 +574,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 turn_result.accum.completion_tokens,
                 false,
             );
-            pipeline_sess.record_feedback(
-                "model",
-                "agentic_loop",
-                feedback,
-                None,
-            );
+            let model_id = state.skills.model_override.as_deref().unwrap_or("default");
+            pipeline_sess.record_feedback(model_id, "agentic_loop", feedback, None);
         }
         host.on_turn_completed(state);
     }

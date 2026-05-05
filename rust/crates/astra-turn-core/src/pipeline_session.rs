@@ -277,11 +277,8 @@ impl PipelineSession {
         current_turn: u32,
     ) {
         use crate::emergent_context::{DiscoveredSkill, EmergentItem};
-        use std::hash::{Hash, Hasher};
         let skill_name = skill_name.into();
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        skill_name.hash(&mut hasher);
-        let hash = hasher.finish();
+        let hash = content_dedup_hash(&skill_name);
         self.emergent.push_skill(EmergentItem {
             value: DiscoveredSkill {
                 skill_name,
@@ -301,11 +298,8 @@ impl PipelineSession {
         current_turn: u32,
     ) {
         use crate::emergent_context::{EmergentItem, PrefetchedMemory};
-        use std::hash::{Hash, Hasher};
         let content = content.into();
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        content.hash(&mut hasher);
-        let hash = hasher.finish();
+        let hash = content_dedup_hash(&content);
         self.emergent.push_memory(EmergentItem {
             value: PrefetchedMemory {
                 content,
@@ -324,11 +318,8 @@ impl PipelineSession {
         current_turn: u32,
     ) {
         use crate::emergent_context::{EmergentItem, ToolUseSummary};
-        use std::hash::{Hash, Hasher};
         let summary = summary.into();
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        summary.hash(&mut hasher);
-        let hash = hasher.finish();
+        let hash = content_dedup_hash(&summary);
         self.emergent.push_summary(EmergentItem {
             value: ToolUseSummary {
                 summary,
@@ -362,6 +353,15 @@ impl PipelineSession {
     pub fn latch_feature(&mut self, key: impl Into<String>, turn: u32) -> bool {
         self.latches.latch_feature(key, turn)
     }
+}
+
+/// Stable in-process dedup hash for emergent context items.
+/// Uses DefaultHasher which is fast and sufficient for same-process deduplication.
+fn content_dedup_hash(content: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]
