@@ -48,15 +48,11 @@ fn load_session_messages_for_continuation(session_id: &str) -> Option<Vec<serde_
 fn sanitize_continuation_messages(mut msgs: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
     msgs.retain(|m| {
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-        let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        let content_text = extract_text_content(m);
+        let content = content_text.as_deref().unwrap_or("");
         match role {
             "user" => !is_runtime_injected_user_msg(content),
-            "system" => {
-                !content.starts_with("[working-set:")
-                    && !content.starts_with("## Already Fetched")
-                    && !content.starts_with("## Cross-Session Project Context")
-                    && !content.starts_with("✓ ")
-            }
+            "system" => !is_runtime_injected_system_msg(content),
             _ => true,
         }
     });
@@ -64,12 +60,42 @@ fn sanitize_continuation_messages(mut msgs: Vec<serde_json::Value>) -> Vec<serde
     msgs
 }
 
+/// Extract text content from a message regardless of format.
+/// Handles both string content and array-format content blocks.
+fn extract_text_content(msg: &serde_json::Value) -> Option<String> {
+    if let Some(s) = msg.get("content").and_then(|c| c.as_str()) {
+        return Some(s.to_string());
+    }
+    if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+        let texts: Vec<&str> = arr
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect();
+        if !texts.is_empty() {
+            return Some(texts.join("\n"));
+        }
+    }
+    None
+}
+
 fn is_runtime_injected_user_msg(content: &str) -> bool {
     let trimmed = content.trim_start();
     trimmed.starts_with("## ⚠ Sequential Tool Calls Detected")
         || trimmed.starts_with("✓ Previous round:")
-        || trimmed.starts_with("\n\n## ⚠ Sequential Tool Calls Detected")
-        || trimmed.starts_with("\n\n✓ Previous round:")
+        || trimmed.starts_with("[attention:")
+        || trimmed.starts_with("[working-set:")
+        || trimmed.starts_with("[session-anchor]")
+}
+
+fn is_runtime_injected_system_msg(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with("[working-set:")
+        || trimmed.starts_with("[attention:")
+        || trimmed.starts_with("[session-anchor]")
+        || trimmed.starts_with("## Already Fetched")
+        || trimmed.starts_with("## Cross-Session Project Context")
+        || trimmed.starts_with("✓ ")
 }
 
 /// If the conversation ends with an incomplete tool round (assistant tool_use
@@ -3771,6 +3797,11 @@ mod session_continuation_tests {
             json!({"role": "system", "content": "## Already Fetched (do NOT re-read)\nContext already fetched:\nGit: status"}),
             json!({"role": "system", "content": "## Cross-Session Project Context\nBelow are summaries..."}),
             json!({"role": "user", "content": "\n\n✓ Previous round: 2 tools executed in parallel — excellent."}),
+            json!({"role": "user", "content": "[attention:v1]\ngoal: stale goal\ncurrent_todo: none"}),
+            json!({"role": "user", "content": "[working-set:v1]\ngoal: stale\npending_work: none"}),
+            json!({"role": "user", "content": "[session-anchor] Goal: stale. State: t1."}),
+            json!({"role": "system", "content": "[attention:v1]\ngoal: stale system-role manifest"}),
+            json!({"role": "system", "content": "[session-anchor] Goal: stale. State: t1."}),
             json!({"role": "user", "content": "你好"}),
         ];
         let result = super::sanitize_continuation_messages(msgs);

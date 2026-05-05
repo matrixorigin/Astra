@@ -426,7 +426,9 @@ pub async fn execute_code(
     #[cfg(unix)]
     unsafe {
         cmd.pre_exec(|| {
-            libc::setsid();
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }

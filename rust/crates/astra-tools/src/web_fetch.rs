@@ -230,7 +230,10 @@ async fn fetch_inner(
         upgrade_scheme(&raw_url)
     };
     validate_url(&url)?;
-    let _resolved = resolve_and_validate_host(&url).await?;
+    // Resolve once for validation; the actual fetch paths re-resolve per hop
+    // during redirect following (different host), so this is intentionally
+    // consumed only for early fail on private-IP targets.
+    let _early_validate = resolve_and_validate_host(&url).await?;
 
     let cache_key = CacheKey {
         scope: cache_scope.to_string(),
@@ -456,15 +459,14 @@ async fn do_fetch(
     url: &str,
     timeout: Duration,
 ) -> Result<(u16, Option<String>, String, String), FetchError> {
-    if let Some(client) = client {
-        fetch_reqwest(client, url, timeout).await
+    if let Some(_client) = client {
+        fetch_reqwest(url, timeout).await
     } else {
         fetch_curl(url, timeout).await
     }
 }
 
 async fn fetch_reqwest(
-    client: &reqwest::Client,
     url: &str,
     timeout: Duration,
 ) -> Result<(u16, Option<String>, String, String), FetchError> {
@@ -547,10 +549,6 @@ async fn fetch_reqwest(
 
         return Ok((status.as_u16(), final_url, content_type, body));
     }
-
-    // Suppress unused variable warning — the shared client is intentionally not
-    // used directly since we build per-hop pinned clients above.
-    let _ = client;
 
     Err(FetchError::Network(format!(
         "Too many redirects (>{MAX_REDIRECTS})"
@@ -635,7 +633,12 @@ async fn fetch_curl_once(
         .map(|a| a.ip().to_string())
         .collect::<Vec<_>>()
         .join(",");
-    let resolve_directive = format!("{host}:{port}:{resolve_addrs}");
+    // curl --resolve requires brackets around IPv6 hosts to avoid ambiguity.
+    let resolve_directive = if host.contains(':') {
+        format!("[{host}]:{port}:{resolve_addrs}")
+    } else {
+        format!("{host}:{port}:{resolve_addrs}")
+    };
 
     let output = tokio::process::Command::new("curl")
         .args([
