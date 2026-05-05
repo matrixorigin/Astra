@@ -34,9 +34,86 @@ impl From<ExitCode> for i32 {
 /// the checkpoint is unreadable.
 fn load_session_messages_for_continuation(session_id: &str) -> Option<Vec<serde_json::Value>> {
     match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(session_id) {
-        Ok(Some(cp)) if !cp.messages.is_empty() => Some(cp.messages),
+        Ok(Some(cp)) if !cp.messages.is_empty() => {
+            Some(sanitize_continuation_messages(cp.messages))
+        }
         _ => None,
     }
+}
+
+/// Strip runtime-injected scaffolding messages that must not persist across
+/// turn boundaries. Without this, harness nudges (injected as "user" role)
+/// bias the model toward tool usage on the next turn even when the user's
+/// new message is purely conversational.
+fn sanitize_continuation_messages(mut msgs: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    msgs.retain(|m| {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        match role {
+            "user" => !is_runtime_injected_user_msg(content),
+            "system" => {
+                !content.starts_with("[working-set:")
+                    && !content.starts_with("## Already Fetched")
+                    && !content.starts_with("## Cross-Session Project Context")
+                    && !content.starts_with("✓ ")
+            }
+            _ => true,
+        }
+    });
+    trim_trailing_incomplete_tool_round(&mut msgs);
+    msgs
+}
+
+fn is_runtime_injected_user_msg(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with("## ⚠ Sequential Tool Calls Detected")
+        || trimmed.starts_with("✓ Previous round:")
+        || trimmed.starts_with("\n\n## ⚠ Sequential Tool Calls Detected")
+        || trimmed.starts_with("\n\n✓ Previous round:")
+}
+
+/// If the conversation ends with an incomplete tool round (assistant tool_use
+/// → tool results, but no final assistant text), trim back to the last
+/// complete exchange. This prevents the model from continuing a stale tool
+/// loop from the previous turn.
+fn trim_trailing_incomplete_tool_round(msgs: &mut Vec<serde_json::Value>) {
+    // Walk backwards: if the tail is tool/assistant-tool_use pattern without
+    // a final assistant-text, find the cut point.
+    let mut cut_at = None;
+    for i in (0..msgs.len()).rev() {
+        let role = msgs[i].get("role").and_then(|r| r.as_str()).unwrap_or("");
+        match role {
+            "tool" => continue,
+            "assistant" => {
+                if has_tool_use_content(&msgs[i]) {
+                    cut_at = Some(i);
+                    continue;
+                }
+                // Assistant with text content — this is a valid end point.
+                break;
+            }
+            _ => break,
+        }
+    }
+    if let Some(cut) = cut_at {
+        msgs.truncate(cut);
+    }
+}
+
+fn has_tool_use_content(msg: &serde_json::Value) -> bool {
+    if msg
+        .get("tool_calls")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty())
+    {
+        return true;
+    }
+    if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
+        return content
+            .iter()
+            .any(|c| c.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
+    }
+    false
 }
 
 /// Prepend system prompt to user message when `--system-prompt` is set.
@@ -3682,5 +3759,53 @@ mod session_continuation_tests {
     fn load_session_messages_returns_none_for_missing_session() {
         let messages = super::load_session_messages_for_continuation("nonexistent-session-xyz-42");
         assert!(messages.is_none());
+    }
+
+    #[test]
+    fn sanitize_strips_runtime_injected_messages() {
+        let msgs = vec![
+            json!({"role": "user", "content": "review code"}),
+            json!({"role": "assistant", "content": "Here is the review..."}),
+            json!({"role": "system", "content": "[working-set:v1]\ngoal: review code\npending_work: none"}),
+            json!({"role": "user", "content": "\n\n## ⚠ Sequential Tool Calls Detected\nYour last 4 rounds..."}),
+            json!({"role": "system", "content": "## Already Fetched (do NOT re-read)\nContext already fetched:\nGit: status"}),
+            json!({"role": "system", "content": "## Cross-Session Project Context\nBelow are summaries..."}),
+            json!({"role": "user", "content": "\n\n✓ Previous round: 2 tools executed in parallel — excellent."}),
+            json!({"role": "user", "content": "你好"}),
+        ];
+        let result = super::sanitize_continuation_messages(msgs);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0]["content"], "review code");
+        assert_eq!(result[1]["content"], "Here is the review...");
+        assert_eq!(result[2]["content"], "你好");
+    }
+
+    #[test]
+    fn sanitize_trims_trailing_tool_round() {
+        let msgs = vec![
+            json!({"role": "user", "content": "check status"}),
+            json!({"role": "assistant", "content": "Here is the status."}),
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "git_status", "arguments": "{}"}}]}),
+            json!({"role": "tool", "content": "M file.rs", "tool_call_id": "1"}),
+            json!({"role": "assistant", "tool_calls": [{"id": "2", "type": "function", "function": {"name": "git_diff", "arguments": "{}"}}]}),
+            json!({"role": "tool", "content": "+line", "tool_call_id": "2"}),
+        ];
+        let result = super::sanitize_continuation_messages(msgs);
+        // Should trim back to the last complete exchange
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[2]["content"], "hi");
+    }
+
+    #[test]
+    fn sanitize_preserves_complete_conversation() {
+        let msgs = vec![
+            json!({"role": "user", "content": "hello"}),
+            json!({"role": "assistant", "content": "Hi! How can I help?"}),
+            json!({"role": "user", "content": "thanks"}),
+            json!({"role": "assistant", "content": "You're welcome!"}),
+        ];
+        let result = super::sanitize_continuation_messages(msgs.clone());
+        assert_eq!(result.len(), 4);
     }
 }
