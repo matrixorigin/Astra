@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 astra-thin-client.workspace = true
 tokio.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true

@@ -24,6 +24,8 @@ pub struct CommandContext<'a> {
     pub project_dirs: &'a [String],
     pub cli_availability: &'a [(String, crate::cli_bridge::CliAvailability)],
     pub auth_status: Option<String>,
+    /// Active task registry — allows /kill to actually terminate CLI processes.
+    pub active_tasks: Option<&'a dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
 }
 
 /// Helper: get store or return error message for storage-dependent commands.
@@ -822,10 +824,30 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 .force_fail_request(&row.trace_id, "killed by user via /kill")
                 .await
             {
-                Ok(true) => Some(format!(
-                    "💀 已终止: {}",
-                    truncate_text(&row.text_preview, 40)
-                )),
+                Ok(true) => {
+                    // Actually kill the CLI process via cancellation token.
+                    let process_killed = ctx
+                        .active_tasks
+                        .map(|tasks| {
+                            if let Some((_, token)) = tasks.remove(row.trace_id.as_str()) {
+                                token.cancel();
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(false);
+                    let suffix = if process_killed {
+                        " (进程已杀死)"
+                    } else {
+                        " (等待自然退出)"
+                    };
+                    Some(format!(
+                        "💀 已终止: {}{}",
+                        truncate_text(&row.text_preview, 40),
+                        suffix
+                    ))
+                }
                 Ok(false) => Some(format!(
                     "⚠️ 请求已是终态: {}",
                     truncate_text(&row.text_preview, 30)
@@ -1868,6 +1890,7 @@ mod tests {
                     project_dirs: &config.project_dirs,
                     cli_availability: &[],
                     auth_status: None,
+                    active_tasks: None,
                 };
                 let result = handle_command(&ctx, $input).await;
                 let check: fn(Option<String>) = $check;
@@ -1978,6 +2001,7 @@ mod tests {
             project_dirs: &config.project_dirs,
             cli_availability: &[],
             auth_status: Some("⚠️ 暂停 (剩余 3m 42s)".to_string()),
+            active_tasks: None,
         };
 
         let result = handle_command(&ctx, "/status").await.unwrap();

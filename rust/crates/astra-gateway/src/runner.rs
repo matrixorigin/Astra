@@ -21,6 +21,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 const MAX_CHUNK_LEN: usize = 3800;
 const INITIAL_ACK_DELAY: Duration = Duration::from_secs(3);
@@ -104,6 +105,9 @@ pub struct GatewayRunner {
     shared_auth: Option<SharedAuthToken>,
     /// Monotonic counter for generating short request tags when no trace exists.
     request_counter: AtomicU32,
+    /// Active CLI processes indexed by trace_id. Used by `/kill` to abort
+    /// running tasks immediately (SIGKILL) instead of only marking DB state.
+    active_tasks: Arc<dashmap::DashMap<String, CancellationToken>>,
 }
 
 /// No-op adapter used in spawned CLI tasks (typing/heartbeats not available in background).
@@ -246,6 +250,7 @@ impl GatewayRunner {
             auth_failures: Arc::new(dashmap::DashMap::new()),
             shared_auth,
             request_counter: AtomicU32::new(0),
+            active_tasks: Arc::new(dashmap::DashMap::new()),
         })
     }
 
@@ -262,6 +267,20 @@ impl GatewayRunner {
     /// Clone the Arc-wrapped trace repository.
     pub fn trace_repo(&self) -> Option<Arc<MysqlTraceRepository>> {
         self.trace_repo.clone()
+    }
+
+    /// Abort a running CLI task by trace_id. Triggers CancellationToken which
+    /// causes the CLI subprocess to be killed (SIGKILL) and the tokio task to
+    /// exit immediately. Returns true if a running task was found and cancelled.
+    pub fn kill_active_task(&self, trace_id: &str) -> bool {
+        if let Some((_, token)) = self.active_tasks.remove(trace_id) {
+            tracing::info!(trace_id, "killing active CLI task via cancellation token");
+            token.cancel();
+            true
+        } else {
+            tracing::debug!(trace_id, "no active task found for kill");
+            false
+        }
     }
 
     pub fn cli_profile(&self) -> &CliProfile {
@@ -396,6 +415,42 @@ impl GatewayRunner {
             return Ok(Some(self.handle_auth_command(&cli_profile).await));
         }
 
+        // /manage cancel, /manage kill → redirect to fast-path /cancel, /kill
+        // so they execute immediately even when a task is running.
+        if let Some(rest) = trimmed.strip_prefix("/manage ") {
+            let rest = rest.trim();
+            if rest == "cancel" || rest.starts_with("cancel ")
+                || rest == "kill" || rest.starts_with("kill ")
+            {
+                let rewritten_cmd = format!("/{rest}");
+                // Build command context and dispatch directly (avoids async recursion).
+                let cmd_ctx = CommandContext {
+                    astra: &self.thin,
+                    config: &self.config,
+                    store: self.store.as_deref(),
+                    platform: msg.platform,
+                    chat_id: &effective_chat_id,
+                    user_id: &msg.user_id,
+                    resolved_cli: &cli_profile,
+                    durable_store: self
+                        .durable_store
+                        .as_ref()
+                        .map(|s| s.as_ref() as &dyn astra_core::durable_task_store::DurableTaskStore),
+                    trace_repo: self
+                        .trace_repo
+                        .as_ref()
+                        .map(|repo| repo.as_ref() as &dyn TraceRepository),
+                    project_dirs: &self.config.project_dirs,
+                    cli_availability: &self.cli_availability,
+                    auth_status: self.auth_status_line(cli_profile.name()),
+                    active_tasks: Some(&self.active_tasks),
+                };
+                if let Some(response) = commands::handle_command(&cmd_ctx, &rewritten_cmd).await {
+                    return Ok(Some(response));
+                }
+            }
+        }
+
         // /manage — rewrite to rich context message and send to slow CLI path
         if trimmed == "/manage" || trimmed.starts_with("/manage ") {
             let extra = trimmed.strip_prefix("/manage").unwrap_or("").trim();
@@ -427,6 +482,7 @@ impl GatewayRunner {
             project_dirs: &self.config.project_dirs,
             cli_availability: &self.cli_availability,
             auth_status: self.auth_status_line(cli_profile.name()),
+            active_tasks: Some(&self.active_tasks),
         };
         if let Some(response) = commands::handle_command(&cmd_ctx, &msg.text).await {
             return Ok(Some(response));
@@ -735,24 +791,36 @@ impl GatewayRunner {
 
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<CliProgress>(64);
 
+        // Register cancellation token for this task so /kill can abort it.
+        let cancel_token = CancellationToken::new();
+        let trace_id_for_kill = trace.as_ref().map(|t| t.trace_id.to_string());
+        if let Some(ref tid) = trace_id_for_kill {
+            self.active_tasks.insert(tid.clone(), cancel_token.clone());
+        }
+
         let cli_handle = tokio::spawn({
             let profile = cli_profile.clone();
             let message_text = message_text.clone();
             let system_prompt = system_prompt.clone();
             let ws = workspace.clone();
             let token = access_token.clone();
+            let kill_token = cancel_token.clone();
             async move {
-                cli_bridge::run_cli_with_context_and_timeout(
-                    &profile,
-                    &message_text,
-                    sid.as_deref(),
-                    ws.as_deref(),
-                    Some(progress_tx),
-                    Some(&system_prompt),
-                    Some(cli_timeout),
-                    token.as_deref(),
-                )
-                .await
+                tokio::select! {
+                    result = cli_bridge::run_cli_with_context_and_timeout(
+                        &profile,
+                        &message_text,
+                        sid.as_deref(),
+                        ws.as_deref(),
+                        Some(progress_tx),
+                        Some(&system_prompt),
+                        Some(cli_timeout),
+                        token.as_deref(),
+                    ) => result,
+                    _ = kill_token.cancelled() => {
+                        Err(format!("{} killed by user", profile.name()))
+                    }
+                }
             }
         });
 
@@ -801,8 +869,14 @@ impl GatewayRunner {
             ))
         };
 
+
         loop {
             tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    tracing::info!(tag = %request_tag, "task cancelled by user, aborting progress loop");
+                    cli_handle.abort();
+                    break;
+                }
                 progress = progress_rx.recv() => {
                     match progress {
                         Some(CliProgress::Token(text)) => {
@@ -853,7 +927,6 @@ impl GatewayRunner {
                     }
                 }
                 _ = &mut next_timer => {
-                    // Timer-based flush: either initial ack or periodic token flush
                     if !token_buf.is_empty() {
                         chunk_counter += 1;
                         if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter) {
@@ -887,6 +960,11 @@ impl GatewayRunner {
                     }
                 }
             }
+        }
+
+        // Deregister from active tasks registry.
+        if let Some(ref tid) = trace_id_for_kill {
+            self.active_tasks.remove(tid);
         }
 
         // Helper: suspend running durable tasks for this chat on failure
@@ -4641,4 +4719,90 @@ async fn typing_sent_before_cli_spawn() {
     // NullAdapter.send_typing succeeds but does nothing — that's OK
     // because the real adapter sends typing in run() before spawning
     assert!(adapter.send_typing("chat").await.is_ok());
+}
+
+// ── Kill registry tests ────────────────────────────────────────────────
+
+#[test]
+fn active_tasks_registry_insert_and_cancel() {
+    let registry: dashmap::DashMap<String, CancellationToken> = dashmap::DashMap::new();
+    let token = CancellationToken::new();
+    registry.insert("trace-1".into(), token.clone());
+    assert!(!token.is_cancelled());
+
+    // Simulate /kill: remove + cancel
+    let (_, removed_token) = registry.remove("trace-1").unwrap();
+    removed_token.cancel();
+    assert!(token.is_cancelled());
+}
+
+#[test]
+fn active_tasks_registry_kill_nonexistent_returns_none() {
+    let registry: dashmap::DashMap<String, CancellationToken> = dashmap::DashMap::new();
+    assert!(registry.remove("ghost").is_none());
+}
+
+#[tokio::test]
+async fn cancellation_token_aborts_spawned_task() {
+    let token = CancellationToken::new();
+    let token_inner = token.clone();
+
+    let handle = tokio::spawn(async move {
+        tokio::select! {
+            _ = token_inner.cancelled() => "killed",
+            _ = tokio::time::sleep(Duration::from_secs(60)) => "completed",
+        }
+    });
+
+    // Cancel immediately
+    token.cancel();
+    let result = handle.await.unwrap();
+    assert_eq!(result, "killed");
+}
+
+#[tokio::test]
+async fn kill_active_task_method_cancels_registered_token() {
+    let registry: Arc<dashmap::DashMap<String, CancellationToken>> =
+        Arc::new(dashmap::DashMap::new());
+    let token = CancellationToken::new();
+    registry.insert("trace-abc".into(), token.clone());
+
+    // Simulate the kill_active_task logic
+    let killed = if let Some((_, t)) = registry.remove("trace-abc") {
+        t.cancel();
+        true
+    } else {
+        false
+    };
+
+    assert!(killed);
+    assert!(token.is_cancelled());
+    assert!(registry.is_empty());
+}
+
+// ── /manage cancel redirect tests ──────────────────────────────────────
+
+#[test]
+fn manage_cancel_is_recognized_as_redirect() {
+    let text = "/manage cancel";
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix("/manage ").unwrap().trim();
+    assert!(rest == "cancel" || rest.starts_with("cancel "));
+}
+
+#[test]
+fn manage_kill_is_recognized_as_redirect() {
+    let text = "/manage kill 1";
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix("/manage ").unwrap().trim();
+    assert!(rest == "kill" || rest.starts_with("kill "));
+}
+
+#[test]
+fn manage_other_is_not_redirected() {
+    let text = "/manage status";
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix("/manage ").unwrap().trim();
+    assert!(!(rest == "cancel" || rest.starts_with("cancel ")));
+    assert!(!(rest == "kill" || rest.starts_with("kill ")));
 }
