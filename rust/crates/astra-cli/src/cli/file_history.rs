@@ -149,8 +149,7 @@ impl FileHistory {
 
         // Wrap the fallible work in a closure so both error and success
         // paths share the id/dir bookkeeping cleanup.
-        let result: io::Result<Vec<FileBackup>> =
-            Self::build_file_backups(&snap_dir, paths);
+        let result: io::Result<Vec<FileBackup>> = Self::build_file_backups(&snap_dir, paths);
 
         let file_backups = match result {
             Ok(v) => v,
@@ -189,10 +188,7 @@ impl FileHistory {
     /// create the directory, iterate paths, stat/copy/skip each file.
     /// Returns on first error so the caller can clean snap_dir and roll
     /// back snap_id.
-    fn build_file_backups(
-        snap_dir: &Path,
-        paths: &[&Path],
-    ) -> io::Result<Vec<FileBackup>> {
+    fn build_file_backups(snap_dir: &Path, paths: &[&Path]) -> io::Result<Vec<FileBackup>> {
         fs::create_dir_all(snap_dir)?;
 
         let mut file_backups = Vec::with_capacity(paths.len());
@@ -212,10 +208,7 @@ impl FileHistory {
                 // error. (Review-critical #3: fail-closed over fail-open.)
                 let size = fs::metadata(path)
                     .map_err(|e| {
-                        io::Error::new(
-                            e.kind(),
-                            format!("stat {}: {}", path.display(), e),
-                        )
+                        io::Error::new(e.kind(), format!("stat {}: {}", path.display(), e))
                     })?
                     .len();
                 if size > MAX_CHECKPOINT_FILE_BYTES {
@@ -802,7 +795,9 @@ mod tests {
         let big = tmp.path().join("big.bin");
         fs::write(&normal, "ok").unwrap();
         fs::write(&big, vec![0u8; (MAX_CHECKPOINT_FILE_BYTES + 1) as usize]).unwrap();
-        history.checkpoint(&[normal.as_path(), big.as_path()]).unwrap();
+        history
+            .checkpoint(&[normal.as_path(), big.as_path()])
+            .unwrap();
 
         let report = history.undo_last().unwrap().unwrap();
         assert_eq!(report.reverted, vec![normal.clone()]);
@@ -1199,7 +1194,11 @@ mod tests {
         let sanitized = sanitize_path_for_backup(path);
         assert_eq!(
             sanitized,
-            PathBuf::from("home").join("user").join("project").join("src").join("main.rs")
+            PathBuf::from("home")
+                .join("user")
+                .join("project")
+                .join("src")
+                .join("main.rs")
         );
     }
 
@@ -1225,11 +1224,14 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(pieces, vec![
-            std::ffi::OsStr::new("a"),
-            std::ffi::OsStr::new("b"),
-            std::ffi::OsStr::new("c.txt"),
-        ]);
+        assert_eq!(
+            pieces,
+            vec![
+                std::ffi::OsStr::new("a"),
+                std::ffi::OsStr::new("b"),
+                std::ffi::OsStr::new("c.txt"),
+            ]
+        );
     }
 
     #[cfg(windows)]

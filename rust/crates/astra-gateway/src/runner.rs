@@ -502,6 +502,7 @@ impl GatewayRunner {
                             msg_id: format!("replay-{}", pm.id),
                             chat_type: crate::platforms::ChatType::DirectMessage,
                             reply_token: None,
+                            route_override: None,
                         };
                         if let Some(response) = self
                             .handle_message_inner(&msg, adapter, Some(pm.id), false, None)
@@ -614,32 +615,19 @@ impl GatewayRunner {
         }
 
         // /manage cancel, /manage kill → redirect to fast-path /cancel, /kill
-        // so they execute immediately even when a task is running.
-        // Also: /manage <cleanup-keyword> → fast-path /kill all, otherwise
-        // the slow-path CLI analysis would queue behind the very tasks
-        // the user is trying to clear.
+        // so they execute immediately even when a task is running. For
+        // bulk cleanup the user should type /kill all directly — we don't
+        // try to guess bulk intent from natural language (too brittle,
+        // CN/EN case-explosion), and the AI slow-path would queue behind
+        // the very tasks the user wants to clear.
         if let Some(rest) = trimmed.strip_prefix("/manage ") {
             let rest = rest.trim();
-            let rewritten_cmd = if rest == "cancel"
+            if rest == "cancel"
                 || rest.starts_with("cancel ")
                 || rest == "kill"
                 || rest.starts_with("kill ")
             {
-                Some(format!("/{rest}"))
-            } else if matches!(
-                commands::parse_manage_intent(rest),
-                commands::ManageIntent::KillAll
-            ) {
-                tracing::info!(
-                    target: "gateway::commands",
-                    hint = %rest,
-                    "classified /manage hint as KillAll — redirecting to /kill all"
-                );
-                Some("/kill all".into())
-            } else {
-                None
-            };
-            if let Some(rewritten_cmd) = rewritten_cmd {
+                let rewritten_cmd = format!("/{rest}");
                 // Build command context and dispatch directly (avoids async recursion).
                 let cmd_ctx = CommandContext {
                     astra: &self.thin,
@@ -668,7 +656,12 @@ impl GatewayRunner {
             }
         }
 
-        // /manage — rewrite to rich context message and send to slow CLI path
+        // /manage — rewrite to rich context message and send to slow CLI path.
+        // MUST be routed to a SEPARATE conversation worker (virtual profile
+        // MANAGE_CLI_PROFILE) so /manage doesn't queue behind the very tasks
+        // it's supposed to manage. Mark the message with the route override
+        // via chat_id-side metadata; the enqueue point checks this and
+        // applies the override on build_queued_request.
         if trimmed == "/manage" || trimmed.starts_with("/manage ") {
             let extra = trimmed.strip_prefix("/manage").unwrap_or("").trim();
             let context = self
@@ -676,6 +669,9 @@ impl GatewayRunner {
                 .await;
             let mut managed_msg = msg.clone();
             managed_msg.text = context;
+            // Mark the msg so handle_fast's caller routes through the
+            // _manage worker instead of the user's normal queue.
+            managed_msg.route_override = Some(commands::MANAGE_CLI_PROFILE.to_string());
             return Err(managed_msg);
         }
 
@@ -2047,11 +2043,19 @@ impl GatewayRunner {
         sections.join("\n")
     }
 
-    async fn build_queued_request(&self, msg: InboundMessage) -> QueuedRequest {
-        let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
+    /// Build a queued request, optionally overriding the conversation's
+    /// cli_profile. Used by `/manage` to route to an independent worker
+    /// (virtual profile `_manage`) so management commands don't queue
+    /// behind the very tasks they're supposed to fix.
+    async fn build_queued_request_with_profile_override(
+        &self,
+        msg: InboundMessage,
+        profile_override: Option<&str>,
+    ) -> QueuedRequest {
+        let resolved = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
+        let conv_profile = profile_override.unwrap_or(resolved.name());
         let effective_chat_id = self.effective_chat_id(&msg);
-        let conversation =
-            ConversationKey::new(msg.platform, effective_chat_id, cli_profile.name());
+        let conversation = ConversationKey::new(msg.platform, effective_chat_id, conv_profile);
         let trace = if let Some(repo) = self.trace_repo.as_ref() {
             let request = GatewayRequest::new(
                 conversation.clone(),
@@ -2093,7 +2097,30 @@ impl GatewayRunner {
         msg: InboundMessage,
         cli_resp_tx: tokio::sync::mpsc::Sender<CliResponse>,
     ) {
-        let queued = self.build_queued_request(msg).await;
+        // If handle_fast marked the message with a route_override (e.g.
+        // `/manage` → MANAGE_CLI_PROFILE), use that as the ConversationKey
+        // profile so it goes to its own independent worker.
+        let override_profile = msg.route_override.clone();
+        self.enqueue_cli_request_with_profile_override(
+            msg,
+            cli_resp_tx,
+            override_profile.as_deref(),
+        )
+        .await
+    }
+
+    /// See build_queued_request_with_profile_override — used by the
+    /// `/manage` slow-path so the request goes to a different worker
+    /// than the user's currently-running tasks.
+    async fn enqueue_cli_request_with_profile_override(
+        self: &Arc<Self>,
+        msg: InboundMessage,
+        cli_resp_tx: tokio::sync::mpsc::Sender<CliResponse>,
+        profile_override: Option<&str>,
+    ) {
+        let queued = self
+            .build_queued_request_with_profile_override(msg, profile_override)
+            .await;
         let key = queued.conversation.clone();
         let tx = {
             let mut queues = self.queue_senders.lock().await;

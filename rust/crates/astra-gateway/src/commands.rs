@@ -720,13 +720,12 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     let tag = crate::runner::short_request_tag(row.trace_id.as_str());
                     let short_text = truncate_text(&row.text_preview, 40);
                     let ts = short_timestamp(&row.created_at);
-                    let zombie_mark =
-                        if is_zombie_request(&row.created_at, ctx.gateway_start) {
-                            zombie_count += 1;
-                            " 🧟"
-                        } else {
-                            ""
-                        };
+                    let zombie_mark = if is_zombie_request(&row.created_at, ctx.gateway_start) {
+                        zombie_count += 1;
+                        " 🧟"
+                    } else {
+                        ""
+                    };
                     lines.push(format!(
                         "[{}] {} {} | {} | {} | {}{}",
                         i + 1,
@@ -805,7 +804,15 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             let conversation =
                 ConversationKey::new(ctx.platform, ctx.chat_id, ctx.resolved_cli.name());
             if arg == "all" {
-                return Some(kill_or_cancel_all(repo, &conversation, ctx.active_tasks, "cancelled by user via /cancel all").await);
+                return Some(
+                    kill_or_cancel_all(
+                        repo,
+                        &conversation,
+                        ctx.active_tasks,
+                        "cancelled by user via /cancel all",
+                    )
+                    .await,
+                );
             }
             if arg.is_empty() {
                 // Auto-pick first cancellable
@@ -873,7 +880,15 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 ConversationKey::new(ctx.platform, ctx.chat_id, ctx.resolved_cli.name());
 
             if arg == "all" {
-                return Some(kill_or_cancel_all(repo, &conversation, ctx.active_tasks, "killed by user via /kill all").await);
+                return Some(
+                    kill_or_cancel_all(
+                        repo,
+                        &conversation,
+                        ctx.active_tasks,
+                        "killed by user via /kill all",
+                    )
+                    .await,
+                );
             }
 
             let row = if arg.is_empty() {
@@ -1292,61 +1307,13 @@ async fn resolve_trace_selector(
         .or_else(|| Some(TraceId::from_string(selector.to_string())))
 }
 
-/// Resolve a selector to an active request. Supports:
-/// What the user meant by `/manage <hint>`. Fast-path handlers (runner.rs)
-/// inspect this before enqueueing the slow-path CLI analysis — a "kill
-/// all" intent goes straight to the sweep, otherwise the slow path would
-/// queue behind the very tasks the user is trying to clear.
-#[derive(Debug, PartialEq, Eq)]
-pub enum ManageIntent {
-    /// User wants to wipe every active request in the conversation.
-    KillAll,
-    /// User wants AI-assisted analysis — hand off to the slow CLI path.
-    Unknown,
-}
-
-/// Heuristic parser for `/manage <hint>` text. Recognizes common
-/// cleanup phrasings in English and Chinese. Conservative: anything
-/// ambiguous returns `Unknown` so slow-path LLM gets a chance.
-pub fn parse_manage_intent(hint: &str) -> ManageIntent {
-    let lower = hint.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return ManageIntent::Unknown;
-    }
-
-    // Single-target kills ("kill 1", "cancel 2") must NOT trigger KillAll.
-    // If the hint contains a digit right after kill/cancel, it's not "all".
-    let has_index = lower
-        .split_whitespace()
-        .any(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()));
-    if has_index {
-        return ManageIntent::Unknown;
-    }
-
-    // English "all" style: matches "kill all", "cancel all", "clear all",
-    // "cleanup all", "stop everything", etc.
-    let en_all = (lower.contains("all")
-        || lower.contains("everything")
-        || lower.contains("every"))
-        && (lower.contains("kill")
-            || lower.contains("cancel")
-            || lower.contains("clear")
-            || lower.contains("clean")
-            || lower.contains("stop")
-            || lower.contains("wipe"));
-
-    // Chinese 清理/清空/清除/杀掉/终止 + 所有/全部/(no qualifier → aggregate)
-    let zh_cleanup =
-        (hint.contains("清理") || hint.contains("清空") || hint.contains("清除"))
-            || (hint.contains("杀掉") && (hint.contains("所有") || hint.contains("全部")))
-            || (hint.contains("kill") && (hint.contains("全部") || hint.contains("所有")));
-
-    if en_all || zh_cleanup {
-        ManageIntent::KillAll
-    } else {
-        ManageIntent::Unknown
-    }
-}
+/// Virtual CLI profile name used to route `/manage` requests into their
+/// own conversation worker / queue. Physically the same real CLI profile
+/// runs (`resolve_cli_profile` still picks the user's actual CLI at
+/// execution time), but the `ConversationKey` differs so `/manage` does
+/// NOT queue behind the user's normal tasks — the whole point of
+/// `/manage` is to inspect/fix a stuck queue, so it must not join it.
+pub const MANAGE_CLI_PROFILE: &str = "_manage";
 
 /// Return true if `created_at` (as reported by the DB — various formats)
 /// is before `gateway_start`. Such requests can't progress on this
@@ -1357,14 +1324,12 @@ pub fn parse_manage_intent(hint: &str) -> ManageIntent {
 /// under-flag zombies than to scare operators about timestamp format
 /// drift).
 pub fn is_zombie_request(created_at: &str, gateway_start: chrono::DateTime<chrono::Utc>) -> bool {
-    let parsed = chrono::NaiveDateTime::parse_from_str(
-        created_at,
-        "%Y-%m-%d %H:%M:%S%.f",
-    )
-    .map(|dt| dt.and_utc())
-    .or_else(|_| {
-        chrono::DateTime::parse_from_rfc3339(created_at).map(|dt| dt.with_timezone(&chrono::Utc))
-    });
+    let parsed = chrono::NaiveDateTime::parse_from_str(created_at, "%Y-%m-%d %H:%M:%S%.f")
+        .map(|dt| dt.and_utc())
+        .or_else(|_| {
+            chrono::DateTime::parse_from_rfc3339(created_at)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        });
     match parsed {
         Ok(ts) => ts < gateway_start,
         Err(_) => false,
@@ -1382,9 +1347,7 @@ pub fn is_zombie_request(created_at: &str, gateway_start: chrono::DateTime<chron
 async fn kill_or_cancel_all(
     repo: &dyn TraceRepository,
     conversation: &ConversationKey,
-    active_tasks: Option<
-        &dashmap::DashMap<String, tokio_util::sync::CancellationToken>,
-    >,
+    active_tasks: Option<&dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
     reason: &str,
 ) -> String {
     let rows = match repo.list_active_requests(conversation, 200).await {
@@ -2602,53 +2565,39 @@ mod tests {
         assert!(parse_cron_add("\"bad expr\" impossible").is_none());
     }
 
-    // ── R5-#3: /manage cleanup keywords take fast path ────────────────────
+    // ── R5-#3: /manage routes to a SEPARATE conversation worker ───────────
     //
-    // When the queue is already stuck, `/manage <something>` slow-path
-    // enqueues ANOTHER task that waits behind the 8 stuck ones — the
-    // user's cleanup request never executes. Detect cleanup intent
-    // early and redirect to /kill all.
+    // The problem: if the user's main CLI is stuck (worker blocked on an
+    // in-flight subprocess), posting `/manage 清一下` would enqueue to
+    // the SAME worker and wait behind the stuck tasks — the user's
+    // request to fix the queue joins the queue.
+    //
+    // The solution: route `/manage` slow-path requests through a virtual
+    // cli_profile (MANAGE_CLI_PROFILE = "_manage") so enqueue_cli_request
+    // picks a DIFFERENT ConversationKey → DIFFERENT worker → independent
+    // queue. The worker still resolves the user's real CLI at execute
+    // time (see handle_message_inner), so the actual subprocess that
+    // runs is the same CLI the user expected.
 
     #[test]
-    fn manage_intent_detects_cleanup_keywords() {
-        // Chinese + English keywords a user would reasonably type.
-        for hint in [
-            "清理所有",
-            "清理卡住的任务",
-            "清空",
-            "清除全部",
-            "cleanup all",
-            "clear all",
-            "kill all",
-            "kill 全部",
-            "杀掉所有",
-            "stop everything",
-        ] {
-            assert!(
-                matches!(parse_manage_intent(hint), ManageIntent::KillAll),
-                "should classify {hint:?} as KillAll"
-            );
-        }
+    fn manage_cli_profile_constant_is_namespaced() {
+        // Must not collide with any real user-configurable CLI profile
+        // name. Convention: leading underscore = gateway-internal.
+        assert!(MANAGE_CLI_PROFILE.starts_with('_'));
+        assert_eq!(MANAGE_CLI_PROFILE, "_manage");
     }
 
     #[test]
-    fn manage_intent_ignores_single_kill_hint() {
-        // "kill 1" / "cancel 3" must NOT match KillAll — they target one.
-        for hint in ["kill 1", "cancel 2", "/kill 3", "终止第一个"] {
-            assert!(
-                !matches!(parse_manage_intent(hint), ManageIntent::KillAll),
-                "single-kill hint {hint:?} must not trigger KillAll"
-            );
-        }
-    }
-
-    #[test]
-    fn manage_intent_unknown_for_regular_text() {
-        assert!(matches!(
-            parse_manage_intent("help me write a poem"),
-            ManageIntent::Unknown
-        ));
-        assert!(matches!(parse_manage_intent(""), ManageIntent::Unknown));
+    fn manage_and_regular_messages_produce_distinct_conversation_keys() {
+        // The whole point of R5-#3: distinct keys ⇒ distinct workers ⇒
+        // /manage does NOT block behind the user's stuck tasks.
+        let user_key = ConversationKey::new("weixin", "chat-1", "astra");
+        let manage_key = ConversationKey::new("weixin", "chat-1", MANAGE_CLI_PROFILE);
+        assert_ne!(user_key, manage_key);
+        // Same (platform, chat_id) but different cli_profile field.
+        assert_eq!(user_key.platform(), manage_key.platform());
+        assert_eq!(user_key.chat_id(), manage_key.chat_id());
+        assert_ne!(user_key.cli_profile(), manage_key.cli_profile());
     }
 
     // ── R5-#2: zombie detection on /running output ────────────────────────
@@ -2746,7 +2695,9 @@ mod tests {
         let conv = ConversationKey::new("test", chat_id, cli_name);
         let req = crate::trace_model::GatewayRequest::new(conv, "msg", "user", text);
         let trace_id = req.trace_id.clone();
-        let writer = crate::trace_model::TraceWriter::begin(repo, req).await.unwrap();
+        let writer = crate::trace_model::TraceWriter::begin(repo, req)
+            .await
+            .unwrap();
         writer.mark_queued(0).await.unwrap();
         writer.mark_running().await.unwrap();
         trace_id

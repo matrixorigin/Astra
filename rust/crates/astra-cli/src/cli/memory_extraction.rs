@@ -211,7 +211,9 @@ pub enum ExtractionOutcome {
     /// extraction was NOT run. `prior_turn` identifies what is blocking us
     /// so the journal can correlate. last_processed_turn is intentionally
     /// NOT advanced — the caller may choose to retry later.
-    SkippedBusy { prior_turn: u32 },
+    SkippedBusy {
+        prior_turn: u32,
+    },
     Error(String),
 }
 
@@ -655,16 +657,10 @@ pub fn journal_event_for_outcome(
     if let Some(meta) = evt.metadata.as_mut().and_then(|m| m.as_object_mut()) {
         match outcome {
             ExtractionOutcome::SkippedBusy { prior_turn } => {
-                meta.insert(
-                    "prior_turn".into(),
-                    serde_json::Value::from(*prior_turn),
-                );
+                meta.insert("prior_turn".into(), serde_json::Value::from(*prior_turn));
             }
             ExtractionOutcome::Error(err) => {
-                meta.insert(
-                    "error".into(),
-                    serde_json::Value::from(err.clone()),
-                );
+                meta.insert("error".into(), serde_json::Value::from(err.clone()));
             }
             _ => {}
         }
@@ -883,7 +879,11 @@ mod tests {
             prompt_tokens: None,
         };
         match u.hit_ratio() {
-            CacheHitRatio::CacheVsCreated { ratio, read, created } => {
+            CacheHitRatio::CacheVsCreated {
+                ratio,
+                read,
+                created,
+            } => {
                 assert!((ratio - 0.9).abs() < 1e-6);
                 assert_eq!(read, 900);
                 assert_eq!(created, 100);
@@ -900,14 +900,16 @@ mod tests {
             prompt_tokens: Some(100),
         };
         match u.hit_ratio() {
-            CacheHitRatio::CacheVsPrompt { ratio, read, prompt } => {
+            CacheHitRatio::CacheVsPrompt {
+                ratio,
+                read,
+                prompt,
+            } => {
                 assert!((ratio - 0.8).abs() < 1e-6);
                 assert_eq!(read, 80);
                 assert_eq!(prompt, 100);
             }
-            other => panic!(
-                "expected CacheVsPrompt fallback when creation missing, got {other:?}"
-            ),
+            other => panic!("expected CacheVsPrompt fallback when creation missing, got {other:?}"),
         }
     }
 

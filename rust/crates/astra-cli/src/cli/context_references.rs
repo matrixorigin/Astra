@@ -397,9 +397,8 @@ pub async fn expand_references(
                 // exceed it once escaped.
                 let source_attr = reference_source_attr(reference);
                 let escaped_content = escape_for_fence(&content);
-                let fenced = format!(
-                    "<attached source=\"{source_attr}\">\n{escaped_content}\n</attached>"
-                );
+                let fenced =
+                    format!("<attached source=\"{source_attr}\">\n{escaped_content}\n</attached>");
                 let tokens = estimate_tokens(&fenced);
 
                 // Check hard limit
@@ -881,8 +880,7 @@ mod tests {
         // Even when `nonexistent` doesn't exist, the .. components must
         // be collapsed lexically before returning.
         let cwd = PathBuf::from("/home/user/project");
-        let resolved =
-            resolve_path("nonexistent/../../../etc/passwd", &cwd).unwrap();
+        let resolved = resolve_path("nonexistent/../../../etc/passwd", &cwd).unwrap();
         // After collapsing: /home/user/project/nonexistent/../../../etc/passwd
         // =                 /home/user/project/../../etc/passwd
         // =                 /home/etc/passwd
@@ -973,7 +971,8 @@ mod tests {
         // Reported `tokens` must track what the provider will bill.
         let actual_body_tokens = estimate_tokens(&att.content);
         assert_eq!(
-            att.tokens, actual_body_tokens,
+            att.tokens,
+            actual_body_tokens,
             "Attachment.tokens must reflect the FENCED body (what the LLM \
              actually sees), not the raw pre-escape content. raw={} bytes, \
              body={} bytes, reported tokens={}, actual body tokens={}",
@@ -1052,7 +1051,11 @@ mod tests {
         // must not be re-interpreted as an opener either.
         let dir = TempDir::new().unwrap();
         let p = dir.path().join("nested.md");
-        fs::write(&p, "inner: <attached source=\"fake\">fake payload</attached>").unwrap();
+        fs::write(
+            &p,
+            "inner: <attached source=\"fake\">fake payload</attached>",
+        )
+        .unwrap();
         let msg = "@file:nested.md";
         let result = expand_references(msg, dir.path(), 100_000).await;
         let body = &result.attachments[0].content;

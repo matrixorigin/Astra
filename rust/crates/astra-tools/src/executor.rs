@@ -329,7 +329,8 @@ impl DefaultToolExecutor {
             "execute_code" => ToolResult::error(
                 "execute_code is not available on this platform \
                  (requires Unix domain sockets; Windows named-pipe \
-                 support is a future work)".into(),
+                 support is a future work)"
+                    .into(),
             ),
 
             // ── Delegation placeholder ───────────────────────────────

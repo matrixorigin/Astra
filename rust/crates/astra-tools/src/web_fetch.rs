@@ -1253,7 +1253,10 @@ mod tests {
     #[test]
     fn blocks_aws_metadata_endpoint() {
         // Classic cloud-metadata SSRF target.
-        assert!(validate_url("http://169.254.169.254/latest/meta-data/iam/security-credentials/").is_err());
+        assert!(
+            validate_url("http://169.254.169.254/latest/meta-data/iam/security-credentials/")
+                .is_err()
+        );
     }
 
     #[test]
@@ -1264,7 +1267,10 @@ mod tests {
     #[test]
     fn blocks_azure_metadata_endpoint() {
         // Azure IMDS also lives on 169.254.169.254.
-        assert!(validate_url("http://169.254.169.254/metadata/instance?api-version=2021-02-01").is_err());
+        assert!(
+            validate_url("http://169.254.169.254/metadata/instance?api-version=2021-02-01")
+                .is_err()
+        );
     }
 
     #[test]
@@ -1273,8 +1279,10 @@ mod tests {
         // DNS rebinding (hostname → private IP) is caught asynchronously
         // in validate_resolved_host. Assert the literal-IP form here;
         // integration test covers the DNS case.
-        assert!(validate_url("http://127.0.0.1.nip.io/").is_ok(),
-                "nip.io resolves 127.0.0.1.nip.io → 127.0.0.1; validate_url only inspects literal host, so this passes synchronously. DNS rebinding blocked at validate_resolved_host.");
+        assert!(
+            validate_url("http://127.0.0.1.nip.io/").is_ok(),
+            "nip.io resolves 127.0.0.1.nip.io → 127.0.0.1; validate_url only inspects literal host, so this passes synchronously. DNS rebinding blocked at validate_resolved_host."
+        );
         // Meanwhile a literal private IP is blocked immediately:
         assert!(validate_url("http://127.0.0.1/").is_err());
     }

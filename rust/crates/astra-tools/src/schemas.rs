@@ -2074,7 +2074,9 @@ mod tests {
         let desc = schemas
             .iter()
             .find(|s| {
-                s.get("function").and_then(|f| f.get("name")).and_then(Value::as_str)
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
                     == Some("execute_code")
             })
             .and_then(|s| s.get("function"))
@@ -2096,12 +2098,17 @@ mod tests {
         let func = schemas
             .iter()
             .find(|s| {
-                s.get("function").and_then(|f| f.get("name")).and_then(Value::as_str)
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
                     == Some("execute_code")
             })
             .and_then(|s| s.get("function"))
             .expect("execute_code schema present");
-        let outer_desc = func.get("description").and_then(Value::as_str).unwrap_or("");
+        let outer_desc = func
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let script_desc = func
             .get("parameters")
             .and_then(|p| p.get("properties"))
