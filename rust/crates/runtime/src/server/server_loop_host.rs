@@ -2438,7 +2438,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &tool_names,
             self.selection_confidence,
             plan_hint.as_deref(),
-            self.resolved_model_name.as_deref(),
         );
         let turn_state = build_turn_state(state, &user_content);
         let session_ctx = build_session_context(
@@ -2447,6 +2446,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &llm_cfg.model_name,
             state.max_turn_input_tokens,
             &self.edge_profile,
+            &llm_cfg.provider,
         );
         let statics = crate::prompts::build_pipeline_static_sections();
         let agent = AgentContext {
