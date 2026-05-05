@@ -1783,6 +1783,7 @@ async fn apply_turn_success_async(
     match &outcome {
         super::memory_extraction::ExtractionOutcome::SkippedMainWrote
         | super::memory_extraction::ExtractionOutcome::SkippedNoSelector
+        | super::memory_extraction::ExtractionOutcome::SkippedBusy { .. }
         | super::memory_extraction::ExtractionOutcome::Error(_) => {
             let evt = astra_services::session_journal::JournalEvent::memory_extraction(
                 state.session_id.as_deref(),

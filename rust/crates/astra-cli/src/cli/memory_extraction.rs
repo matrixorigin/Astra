@@ -123,6 +123,11 @@ pub enum ExtractionOutcome {
     SkippedMainWrote,
     SkippedNoSelector,
     SkippedDisabled,
+    /// A prior turn's extraction is still in flight. The current turn's
+    /// extraction was NOT run. `prior_turn` identifies what is blocking us
+    /// so the journal can correlate. last_processed_turn is intentionally
+    /// NOT advanced — the caller may choose to retry later.
+    SkippedBusy { prior_turn: u32 },
     Error(String),
 }
 
@@ -134,6 +139,7 @@ impl ExtractionOutcome {
             Self::SkippedMainWrote => "skipped_main_wrote",
             Self::SkippedNoSelector => "skipped_no_selector",
             Self::SkippedDisabled => "skipped_disabled",
+            Self::SkippedBusy { .. } => "skipped_busy",
             Self::Error(_) => "error",
         }
     }
@@ -195,7 +201,16 @@ impl MemoryExtractor {
             return ExtractionOutcome::SkippedDisabled;
         }
         if self.is_busy() {
-            return ExtractionOutcome::SkippedDisabled;
+            let prior = self.last_processed_turn;
+            tracing::warn!(
+                target: "astra_cli::memory_extraction",
+                current_turn = ctx.turn,
+                prior_turn = prior,
+                "extraction skipped: prior extraction still in flight. \
+                 The single-slot queue means this turn's memory may not be captured. \
+                 See plans/tool-unification follow-up for bounded queue."
+            );
+            return ExtractionOutcome::SkippedBusy { prior_turn: prior };
         }
         if main_model_wrote_memory(ctx.tools_used) {
             self.last_processed_turn = ctx.turn;
@@ -645,6 +660,84 @@ mod tests {
         let mut ext = MemoryExtractor::new();
         let outcome = ext.maybe_extract(ctx(1, None, &[]));
         assert_eq!(outcome.tag(), "skipped_no_selector");
+    }
+
+    // ── P0-3: busy-skip observability ─────────────────────────────────────
+    //
+    // Previously, `is_busy() → SkippedDisabled` — indistinguishable from
+    // feature-disabled, no journal record, no metric. In practice a user
+    // sending turn N+1 before turn N's extraction completed would lose
+    // extraction silently. Production operators can't tell this from
+    // "feature was off". Split the outcomes.
+
+    #[tokio::test]
+    async fn busy_second_call_returns_distinct_outcome() {
+        let mut ext = MemoryExtractor::new();
+        ext.last_processed_turn = 0;
+        // Park a task so is_busy() returns true.
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            ExtractionOutcome::Error("never".into())
+        });
+        ext.in_flight = Some(handle);
+
+        let params = LlmConnParams {
+            base_url: "http://x".into(),
+            api_key: "k".into(),
+            model_name: "m".into(),
+            provider: "openai".into(),
+        };
+        let outcome = ext.maybe_extract(ctx(1, Some(&params), &[]));
+        assert_eq!(
+            outcome.tag(),
+            "skipped_busy",
+            "busy must be its own tag, not conflated with 'skipped_disabled'"
+        );
+        match outcome {
+            ExtractionOutcome::SkippedBusy { prior_turn } => {
+                assert_eq!(prior_turn, 0, "prior_turn field must carry context");
+            }
+            other => panic!("expected SkippedBusy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn busy_skip_does_not_advance_cursor() {
+        // If turn N+1 skipped due to busy, we must NOT record N+1 as
+        // processed — the user may want to retry it manually. `last_
+        // processed_turn` should only advance on terminal outcomes.
+        let mut ext = MemoryExtractor::new();
+        ext.last_processed_turn = 4;
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            ExtractionOutcome::Error("never".into())
+        });
+        ext.in_flight = Some(handle);
+
+        let params = LlmConnParams {
+            base_url: "http://x".into(),
+            api_key: "k".into(),
+            model_name: "m".into(),
+            provider: "openai".into(),
+        };
+        let _ = ext.maybe_extract(ctx(5, Some(&params), &[]));
+        assert_eq!(
+            ext.last_processed_turn, 4,
+            "busy-skip must not mark turn as processed; cursor stays at prior value"
+        );
+    }
+
+    #[test]
+    fn skipped_busy_tag_is_distinct() {
+        assert_eq!(
+            ExtractionOutcome::SkippedBusy { prior_turn: 3 }.tag(),
+            "skipped_busy"
+        );
+        // And it is NOT the same as the disabled tag (no conflation).
+        assert_ne!(
+            ExtractionOutcome::SkippedBusy { prior_turn: 3 }.tag(),
+            ExtractionOutcome::SkippedDisabled.tag()
+        );
     }
 
     #[test]
