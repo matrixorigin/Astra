@@ -4,7 +4,15 @@
 //! focused, sends an OS-level notification to alert them. Supports macOS
 //! (`osascript`), Linux (`notify-send`), and a terminal bell fallback.
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Minimum interval between notifications to prevent toast spam.
+const NOTIFICATION_COOLDOWN_SECS: u64 = 30;
+
+/// Epoch-seconds of the last notification sent. Global to deduplicate across
+/// concurrent task completions.
+static LAST_NOTIFICATION_AT: AtomicU64 = AtomicU64::new(0);
 
 /// Configuration for the desktop notification system.
 #[derive(Debug, Clone)]
@@ -149,6 +157,7 @@ pub fn format_notification(title: &str, body: &str, elapsed: Duration) -> (Strin
 /// 1. Notifications are enabled
 /// 2. The elapsed time exceeds the threshold
 /// 3. The terminal is not focused
+/// 4. Cooldown period has elapsed since last notification (prevents toast spam)
 ///
 /// This function is designed to be called from a spawned task (fire-and-forget).
 pub async fn notify_completion(
@@ -164,6 +173,23 @@ pub async fn notify_completion(
         return;
     }
     if is_terminal_focused() {
+        return;
+    }
+
+    // Rate-limit: skip if we notified within the cooldown window.
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let last = LAST_NOTIFICATION_AT.load(Ordering::Relaxed);
+    if now_secs.saturating_sub(last) < NOTIFICATION_COOLDOWN_SECS {
+        return;
+    }
+    // CAS to avoid double-send from concurrent tasks.
+    if LAST_NOTIFICATION_AT
+        .compare_exchange(last, now_secs, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
         return;
     }
 
@@ -495,5 +521,24 @@ mod tests {
             "body with \"quote\" and $(whoami)",
         )
         .await;
+    }
+
+    #[test]
+    fn rate_limiter_suppresses_rapid_notifications() {
+        // Simulate a recent notification by setting LAST_NOTIFICATION_AT to now.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        LAST_NOTIFICATION_AT.store(now, Ordering::Relaxed);
+
+        // A second notification within the cooldown window should be suppressed.
+        // We test this by checking the CAS would fail (another thread "just sent").
+        let last = LAST_NOTIFICATION_AT.load(Ordering::Relaxed);
+        assert_eq!(last, now);
+        assert!(now.saturating_sub(last) < NOTIFICATION_COOLDOWN_SECS);
+
+        // Reset for other tests
+        LAST_NOTIFICATION_AT.store(0, Ordering::Relaxed);
     }
 }

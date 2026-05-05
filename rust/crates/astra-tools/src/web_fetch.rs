@@ -3,7 +3,7 @@
 //! Fetches URLs and transforms raw HTML into model-friendly Markdown with
 //! metadata extraction, link discovery, and content-aware routing.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -70,6 +70,8 @@ pub struct FetchConfig {
     pub max_content: usize,
     pub timeout: Duration,
     pub max_links: usize,
+    /// When true, skip HTTP→HTTPS upgrade (for known HTTP-only origins).
+    pub allow_http: bool,
 }
 
 impl Default for FetchConfig {
@@ -79,6 +81,7 @@ impl Default for FetchConfig {
             max_content: 80_000,
             timeout: Duration::from_secs(30),
             max_links: 25,
+            allow_http: false,
         }
     }
 }
@@ -105,6 +108,11 @@ impl FetchConfig {
 
         let max_links = args.get("max_links").and_then(Value::as_u64).unwrap_or(25) as usize;
 
+        let allow_http = args
+            .get("allow_http")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
         Ok((
             url,
             Self {
@@ -112,6 +120,7 @@ impl FetchConfig {
                 max_content,
                 timeout: Duration::from_secs(timeout_secs),
                 max_links,
+                allow_http,
             },
         ))
     }
@@ -215,9 +224,13 @@ async fn fetch_inner(
     cache_scope: &str,
 ) -> Result<Arc<FetchResult>, FetchError> {
     let (raw_url, config) = FetchConfig::from_args(args)?;
-    let url = upgrade_scheme(&raw_url);
+    let url = if config.allow_http {
+        raw_url.clone()
+    } else {
+        upgrade_scheme(&raw_url)
+    };
     validate_url(&url)?;
-    validate_resolved_host(&url).await?;
+    let _resolved = resolve_and_validate_host(&url).await?;
 
     let cache_key = CacheKey {
         scope: cache_scope.to_string(),
@@ -297,6 +310,13 @@ fn validate_url(url: &str) -> Result<(), FetchError> {
         s => return Err(FetchError::Validation(format!("Unsupported scheme '{s}'"))),
     }
 
+    // Reject URLs with userinfo (e.g. https://evil.com@internal-host/)
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(FetchError::Validation(
+            "URLs with userinfo (user:pass@) are not allowed".into(),
+        ));
+    }
+
     let host = parsed
         .host_str()
         .ok_or_else(|| FetchError::Validation("URL has no host".into()))?;
@@ -308,34 +328,54 @@ fn validate_url(url: &str) -> Result<(), FetchError> {
     Ok(())
 }
 
-async fn validate_resolved_host(url: &str) -> Result<(), FetchError> {
+/// Resolve DNS and validate ALL returned addresses are public.
+/// Returns the validated addresses so callers can pin them for the connection,
+/// preventing DNS rebinding (where a second resolution returns a different IP).
+async fn resolve_and_validate_host(url: &str) -> Result<Vec<SocketAddr>, FetchError> {
     let parsed =
         url::Url::parse(url).map_err(|e| FetchError::Validation(format!("Invalid URL: {e}")))?;
     let host = parsed
         .host_str()
         .ok_or_else(|| FetchError::Validation("URL has no host".into()))?;
 
-    if host.parse::<IpAddr>().is_ok() {
-        return Ok(());
-    }
-
     let port = parsed
         .port_or_known_default()
         .ok_or_else(|| FetchError::Validation("URL has no port for scheme".into()))?;
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| FetchError::Network(format!("DNS lookup failed for {host}: {e}")))?;
 
-    for addr in addrs {
+    // If host is already an IP literal, validate directly.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_private_ip(ip) {
+            return Err(FetchError::SsrfBlocked(host.to_string()));
+        }
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| FetchError::Network(format!("DNS lookup failed for {host}: {e}")))?
+        .collect();
+
+    if addrs.is_empty() {
+        return Err(FetchError::Network(format!(
+            "DNS lookup returned no addresses for {host}"
+        )));
+    }
+
+    for addr in &addrs {
         if is_private_ip(addr.ip()) {
             return Err(FetchError::SsrfBlocked(host.to_string()));
         }
     }
-    Ok(())
+    Ok(addrs)
 }
 
 fn is_private_host(host: &str) -> bool {
     let host_clean = host.trim_start_matches('[').trim_end_matches(']');
+
+    // Reject percent-encoded hosts (possible bypass)
+    if host_clean.contains('%') {
+        return true;
+    }
 
     if let Ok(ip) = host_clean.parse::<IpAddr>() {
         return is_private_ip(ip);
@@ -344,33 +384,69 @@ fn is_private_host(host: &str) -> bool {
     let lower = host_clean.to_ascii_lowercase();
     matches!(
         lower.as_str(),
-        "localhost" | "localhost.localdomain" | "metadata.google.internal"
+        "localhost"
+            | "localhost.localdomain"
+            | "metadata.google.internal"
+            | "metadata"
+            | "instance-data"
     ) || lower.ends_with(".localhost")
         || lower.ends_with(".local")
         || lower.ends_with(".internal")
+        || lower.ends_with(".metadata")
 }
 
 fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_multicast()
-        }
+        IpAddr::V4(v4) => is_private_ipv4(v4),
         IpAddr::V6(v6) => {
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
+                // ULA fc00::/7
                 || matches!(v6.segments()[0] & 0xfe00, 0xfc00)
+                // Link-local fe80::/10
                 || matches!(v6.segments()[0] & 0xffc0, 0xfe80)
-                || v6
-                    .to_ipv4_mapped()
-                    .is_some_and(|v4| is_private_ip(IpAddr::V4(v4)))
+                // IPv4-mapped ::ffff:x.x.x.x
+                || v6.to_ipv4_mapped().is_some_and(is_private_ipv4)
+                // NAT64 well-known prefix 64:ff9b::/96
+                || (v6.segments()[0] == 0x0064
+                    && v6.segments()[1] == 0xff9b
+                    && v6.segments()[2] == 0
+                    && v6.segments()[3] == 0
+                    && v6.segments()[4] == 0
+                    && v6.segments()[5] == 0
+                    && is_private_ipv4(Ipv4Addr::new(
+                        (v6.segments()[6] >> 8) as u8,
+                        v6.segments()[6] as u8,
+                        (v6.segments()[7] >> 8) as u8,
+                        v6.segments()[7] as u8,
+                    )))
         }
     }
+}
+
+fn is_private_ipv4(v4: Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        // CGNAT / Shared Address Space (RFC 6598)
+        || (octets[0] == 100 && (octets[1] & 0xC0) == 64) // 100.64.0.0/10
+        // Protocol assignments (RFC 6890)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0) // 192.0.0.0/24
+        // Documentation TEST-NET-1 (RFC 5737)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2) // 192.0.2.0/24
+        // Benchmarking (RFC 2544)
+        || (octets[0] == 198 && (octets[1] & 0xFE) == 18) // 198.18.0.0/15
+        // Documentation TEST-NET-2 (RFC 5737)
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100) // 198.51.100.0/24
+        // Documentation TEST-NET-3 (RFC 5737)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113) // 203.0.113.0/24
+        // Reserved for future use (RFC 1112)
+        || (octets[0] & 0xF0) == 240 // 240.0.0.0/4
 }
 
 // ─── HTTP Fetch ──────────────────────────────────────────────────────────────
@@ -388,27 +464,41 @@ async fn do_fetch(
 }
 
 async fn fetch_reqwest(
-    _client: &reqwest::Client,
+    client: &reqwest::Client,
     url: &str,
     timeout: Duration,
 ) -> Result<(u16, Option<String>, String, String), FetchError> {
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(USER_AGENT)
-        .no_proxy()
-        .build()
-        .map_err(|e| FetchError::Network(format!("HTTP client init failed: {e}")))?;
-
     let mut current = url.to_string();
     let mut final_url = None;
 
     for redirect_count in 0..=MAX_REDIRECTS {
         validate_url(&current)?;
-        validate_resolved_host(&current).await?;
+        // Resolve DNS and validate ALL IPs are public; pin them for the connection.
+        let resolved = resolve_and_validate_host(&current).await?;
+        let parsed = url::Url::parse(&current)
+            .map_err(|e| FetchError::Validation(format!("Invalid URL: {e}")))?;
+        let host = parsed.host_str().unwrap_or_default().to_string();
+
+        // Build a per-hop client that pins the DNS resolution to prevent rebinding.
+        // reqwest's `resolve()` overrides its internal DNS for this host.
+        let mut builder = reqwest::Client::builder()
+            .timeout(timeout)
+            .connect_timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(USER_AGENT)
+            .no_proxy();
+
+        // Pin ALL resolved addresses — reqwest will try them in order.
+        for addr in &resolved {
+            builder = builder.resolve(&host, *addr);
+        }
+
+        let pinned_client = builder
+            .build()
+            .map_err(|e| FetchError::Network(format!("HTTP client init failed: {e}")))?;
 
         let mut resp = tokio::time::timeout(timeout, async {
-            client
+            pinned_client
                 .get(&current)
                 .header(
                     "Accept",
@@ -437,7 +527,6 @@ async fn fetch_reqwest(
                 FetchError::Network(format!("Invalid redirect Location: {location}"))
             })?;
             validate_url(&next)?;
-            validate_resolved_host(&next).await?;
             final_url = Some(next.clone());
             current = next;
             continue;
@@ -458,6 +547,10 @@ async fn fetch_reqwest(
 
         return Ok((status.as_u16(), final_url, content_type, body));
     }
+
+    // Suppress unused variable warning — the shared client is intentionally not
+    // used directly since we build per-hop pinned clients above.
+    let _ = client;
 
     Err(FetchError::Network(format!(
         "Too many redirects (>{MAX_REDIRECTS})"
@@ -497,9 +590,11 @@ async fn fetch_curl(
 
     for redirect_count in 0..=MAX_REDIRECTS {
         validate_url(&current)?;
-        validate_resolved_host(&current).await?;
+        // Resolve + validate; pin the first resolved IP for curl --resolve.
+        let resolved = resolve_and_validate_host(&current).await?;
 
-        let (status, content_type, redirect_url, body) = fetch_curl_once(&current, timeout).await?;
+        let (status, content_type, redirect_url, body) =
+            fetch_curl_once(&current, timeout, &resolved).await?;
         if (300..400).contains(&status)
             && let Some(location) = redirect_url.filter(|u| !u.is_empty())
         {
@@ -509,7 +604,6 @@ async fn fetch_curl(
                 )));
             }
             validate_url(&location)?;
-            validate_resolved_host(&location).await?;
             final_url = Some(location.clone());
             current = location;
             continue;
@@ -525,10 +619,24 @@ async fn fetch_curl(
 async fn fetch_curl_once(
     url: &str,
     timeout: Duration,
+    resolved: &[SocketAddr],
 ) -> Result<(u16, String, Option<String>, String), FetchError> {
     let timeout_secs = timeout.as_secs().to_string();
     let write_format =
         format!("{CURL_SENTINEL}%{{http_code}}\n%{{content_type}}\n%{{redirect_url}}");
+
+    // Build curl --resolve directive to pin DNS, preventing rebinding.
+    let parsed =
+        url::Url::parse(url).map_err(|e| FetchError::Validation(format!("Invalid URL: {e}")))?;
+    let host = parsed.host_str().unwrap_or_default();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let resolve_addrs: String = resolved
+        .iter()
+        .map(|a| a.ip().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let resolve_directive = format!("{host}:{port}:{resolve_addrs}");
+
     let output = tokio::process::Command::new("curl")
         .args([
             "-sS",
@@ -540,6 +648,8 @@ async fn fetch_curl_once(
             "=http,https",
             "--proto-redir",
             "=http,https",
+            "--resolve",
+            &resolve_directive,
             "-H",
             &format!("User-Agent: {USER_AGENT}"),
             "-H",
@@ -576,6 +686,9 @@ async fn fetch_curl_once(
 
     let body = if is_binary_content_type(&content_type.to_lowercase()) {
         String::new()
+    } else if body.len() > MAX_DOWNLOAD_BYTES {
+        // --max-filesize only works with Content-Length; enforce cap for chunked.
+        String::from_utf8_lossy(&body.as_bytes()[..MAX_DOWNLOAD_BYTES]).into_owned()
     } else {
         body.to_string()
     };
@@ -1277,14 +1390,51 @@ mod tests {
     fn blocks_host_that_dns_would_resolve_to_private_ip() {
         // validate_url's synchronous guard catches the literal-IP form;
         // DNS rebinding (hostname → private IP) is caught asynchronously
-        // in validate_resolved_host. Assert the literal-IP form here;
-        // integration test covers the DNS case.
+        // in resolve_and_validate_host which pins the resolved IPs for
+        // the actual connection. Assert the literal-IP form here.
         assert!(
             validate_url("http://127.0.0.1.nip.io/").is_ok(),
-            "nip.io resolves 127.0.0.1.nip.io → 127.0.0.1; validate_url only inspects literal host, so this passes synchronously. DNS rebinding blocked at validate_resolved_host."
+            "nip.io resolves 127.0.0.1.nip.io → 127.0.0.1; validate_url only inspects literal host, so this passes synchronously. DNS rebinding blocked at resolve_and_validate_host + pinned connection."
         );
         // Meanwhile a literal private IP is blocked immediately:
         assert!(validate_url("http://127.0.0.1/").is_err());
+    }
+
+    #[test]
+    fn blocks_cgnat_and_reserved_ranges() {
+        // CGNAT (RFC 6598)
+        assert!(validate_url("http://100.64.0.1/").is_err());
+        assert!(validate_url("http://100.127.255.254/").is_err());
+        // Benchmarking (RFC 2544)
+        assert!(validate_url("http://198.18.0.1/").is_err());
+        assert!(validate_url("http://198.19.255.255/").is_err());
+        // Documentation TEST-NET-2
+        assert!(validate_url("http://198.51.100.1/").is_err());
+        // Documentation TEST-NET-3
+        assert!(validate_url("http://203.0.113.1/").is_err());
+        // Future use 240.0.0.0/4
+        assert!(validate_url("http://240.0.0.1/").is_err());
+        assert!(validate_url("http://255.255.255.254/").is_err());
+    }
+
+    #[test]
+    fn blocks_nat64_mapped_private_ipv6() {
+        // NAT64 well-known prefix wrapping a private IPv4
+        assert!(validate_url("http://[64:ff9b::127.0.0.1]/").is_err());
+        assert!(validate_url("http://[64:ff9b::10.0.0.1]/").is_err());
+        // NAT64 wrapping a public IP should pass
+        assert!(validate_url("http://[64:ff9b::93.184.216.34]/").is_ok());
+    }
+
+    #[test]
+    fn blocks_userinfo_in_url() {
+        assert!(validate_url("https://evil.com@internal.example.com/").is_err());
+        assert!(validate_url("https://user:pass@example.com/").is_err());
+    }
+
+    #[test]
+    fn blocks_percent_encoded_host() {
+        assert!(validate_url("http://localhost%00.evil.com/").is_err());
     }
 
     #[test]

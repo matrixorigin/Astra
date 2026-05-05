@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 
@@ -39,6 +39,9 @@ pub const MAX_TOOL_CALLS: usize = 50;
 
 /// Maximum stdout size in bytes.
 pub const MAX_STDOUT_BYTES: usize = 50_000;
+
+/// Maximum size of a single RPC request line (prevents OOM from malicious scripts).
+const MAX_RPC_REQUEST_BYTES: u64 = 1_024 * 1_024; // 1 MB
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -278,10 +281,10 @@ async fn handle_rpc_connection(
     auth_token: &AuthToken,
 ) -> Result<(), CodeExecError> {
     let (reader, mut writer) = stream.into_split();
-    let mut buf_reader = BufReader::new(reader);
+    let mut buf_reader = BufReader::new(reader.take(MAX_RPC_REQUEST_BYTES));
     let mut line = String::new();
 
-    // Read one JSON line
+    // Read one JSON line (capped to prevent OOM from malicious input)
     buf_reader.read_line(&mut line).await?;
     let line = line.trim();
     if line.is_empty() {
@@ -406,16 +409,29 @@ pub async fn execute_code(
     // no inherited parent vars, auth token + socket path set explicitly.
     // The LLM script must get PYTHONPATH to find astra_tools, and PATH to
     // find python3's subprocess needs. Everything else is stripped.
-    let mut child = Command::new("python3")
-        .arg(&script_path)
+    let mut cmd = Command::new("python3");
+    cmd.arg(&script_path)
         .env_clear()
         .env("ASTRA_RPC_SOCKET", &socket_path)
         .env("ASTRA_RPC_AUTH_TOKEN", auth_token.as_str())
+        .env("HOME", "/tmp")
+        .env("LANG", "C.UTF-8")
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .env("PYTHONPATH", tmp_path.display().to_string())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+        .stderr(std::process::Stdio::piped());
+
+    // Put the child in its own session so we can kill the entire process group
+    // on timeout, preventing orphaned grandchildren.
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+
+    let mut child = cmd.spawn()?;
 
     // Collect stdout in background (capped)
     let stdout = child.stdout.take().expect("stdout piped");
@@ -466,6 +482,7 @@ pub async fn execute_code(
                             .await;
                             if let Err(CodeExecError::TooManyToolCalls(_)) = result {
                                 // Kill the child — it exceeded the call limit
+                                kill_process_group(&child);
                                 let _ = child.kill().await;
                                 return child.wait().await;
                             }
@@ -510,12 +527,29 @@ pub async fn execute_code(
         }
         Ok(Err(e)) => Err(CodeExecError::Io(e)),
         Err(_) => {
-            // Timeout — kill the child
+            // Timeout — kill the entire process group (setsid gives child its own).
+            kill_process_group(&child);
             let _ = child.kill().await;
             Err(CodeExecError::Timeout(config.timeout))
         }
     }
 }
+
+/// Kill the entire process group of the child. Because we called setsid in
+/// pre_exec, the child's PID is also its PGID. This ensures forked
+/// grandchildren are also terminated.
+#[cfg(unix)]
+fn kill_process_group(child: &tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        // SAFETY: pid > 1 (we spawned it), negative pid = send to process group.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_child: &tokio::process::Child) {}
 
 /// Collect stdout from a reader, capping at max_bytes.
 async fn collect_stdout(stdout: tokio::process::ChildStdout, max_bytes: usize) -> String {

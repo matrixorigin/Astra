@@ -275,15 +275,28 @@ fn extract_line_range(path: &str, end: usize) -> (String, Option<(usize, usize)>
 // Security
 // ---------------------------------------------------------------------------
 
-/// Sensitive path segments that are always blocked.
-const SENSITIVE_SEGMENTS: &[&str] = &[".ssh", ".aws", ".gnupg", ".env", "credentials", ".netrc"];
+/// Sensitive path components that are always blocked (exact match).
+const SENSITIVE_EXACT: &[&str] = &[".ssh", ".aws", ".gnupg", ".netrc"];
+
+/// Sensitive path component prefixes (matches `.env`, `.env.local`, `credentials.json`, etc.)
+const SENSITIVE_PREFIX: &[&str] = &[".env", "credentials"];
 
 /// Returns `true` if the given path should be blocked for security reasons.
+/// Uses component-wise matching to avoid false positives on filenames
+/// like `.envoy-config.toml` or `credentials_docs.md`.
 pub fn is_sensitive_path(path: &Path) -> bool {
-    let path_str = path.to_string_lossy();
-    for segment in SENSITIVE_SEGMENTS {
-        if path_str.contains(segment) {
-            return true;
+    for component in path.components() {
+        let s = component.as_os_str().to_string_lossy();
+        for exact in SENSITIVE_EXACT {
+            if s == *exact {
+                return true;
+            }
+        }
+        for prefix in SENSITIVE_PREFIX {
+            // Match `.env` exactly OR `.env.` prefix (e.g. `.env.local`)
+            if s == *prefix || s.starts_with(&format!("{prefix}.")) {
+                return true;
+            }
         }
     }
     false
@@ -455,6 +468,9 @@ fn expand_single(reference: &ContextReference, cwd: &Path) -> Result<String, Str
     }
 }
 
+/// Maximum file size for @file expansion (2 MB). Prevents OOM on large files.
+const MAX_FILE_READ_BYTES: u64 = 2 * 1024 * 1024;
+
 /// Expand a file reference, optionally with line range.
 fn expand_file(reference: &ContextReference, cwd: &Path) -> Result<String, String> {
     let path = resolve_path(&reference.target, cwd)?;
@@ -465,6 +481,16 @@ fn expand_file(reference: &ContextReference, cwd: &Path) -> Result<String, Strin
     }
     if is_outside_project(&path, cwd) {
         return Err("blocked: path is outside the project root".to_string());
+    }
+
+    // Size guard: reject files larger than the cap before reading.
+    let metadata = std::fs::metadata(&path).map_err(|e| format!("failed to read file: {}", e))?;
+    if metadata.len() > MAX_FILE_READ_BYTES {
+        return Err(format!(
+            "file too large ({} bytes, max {})",
+            metadata.len(),
+            MAX_FILE_READ_BYTES
+        ));
     }
 
     let content =
@@ -856,6 +882,14 @@ mod tests {
     fn test_normal_path_not_sensitive() {
         assert!(!is_sensitive_path(Path::new("src/main.rs")));
         assert!(!is_sensitive_path(Path::new("/project/src/lib.rs")));
+        // No false positives on filenames that contain sensitive substrings
+        assert!(!is_sensitive_path(Path::new("/project/.envoy-config.toml")));
+        assert!(!is_sensitive_path(Path::new(
+            "/project/credentials_docs.md"
+        )));
+        assert!(!is_sensitive_path(Path::new(
+            "/project/src/.environment.rs"
+        )));
     }
 
     #[test]

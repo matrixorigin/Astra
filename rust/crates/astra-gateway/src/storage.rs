@@ -12,6 +12,9 @@ use sqlx::mysql::MySqlPool;
 pub async fn try_connect_db(url: &str) -> Result<MySqlPool, sqlx::Error> {
     let pool = sqlx::mysql::MySqlPoolOptions::new()
         .max_connections(2)
+        .idle_timeout(std::time::Duration::from_secs(300))
+        .max_lifetime(std::time::Duration::from_secs(1800))
+        .test_before_acquire(true)
         .connect(url)
         .await?;
     ensure_schema(&pool).await?;

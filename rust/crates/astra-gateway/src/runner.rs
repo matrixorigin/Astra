@@ -1424,7 +1424,7 @@ impl GatewayRunner {
                 exit_code = result.exit_code,
                 stderr = %result.stderr.chars().take(200).collect::<String>(),
                 stdout_len = result.stdout.len(),
-                text = ?result.text.as_deref().map(|t| &t[..t.len().min(100)]),
+                text = ?result.text.as_deref().map(|t| truncate_chars(t, 100)),
                 "CLI non-zero exit"
             );
 

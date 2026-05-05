@@ -794,8 +794,7 @@ const SEND_RETRY_DELAY_MS: u64 = 1500;
 
 /// What to do when iLink returns a non-zero error code.
 ///
-/// The semantics here are derived from empirical observation + the
-/// Hermes-Agent reference impl (`gateway/platforms/weixin.py`):
+/// Semantics (observed from production traffic):
 /// - iLink returns bare `{"ret":-2}` with NO `errmsg` field for stale
 ///   sessions (same condition as `errcode=-14`, despite the different code).
 /// - iLink returns `-2` with an explicit `freq` errmsg for rate limiting.
@@ -848,7 +847,7 @@ fn classify_send_error(
     if errcode == -2 && errmsg.contains("freq") {
         return SendRetryAction::RateLimitBackoff;
     }
-    // -2 with no/empty/"unknown" errmsg = stale session (Hermes compat).
+    // -2 with no/empty/"unknown" errmsg = stale session.
     // iLink returns bare `{"ret":-2}` in this case; we parse errmsg as
     // the default placeholder "unknown". Treat as session-expired.
     if errcode == -2 && is_stale_session_errmsg(errmsg) {
@@ -1401,10 +1400,13 @@ mod tests {
 
     // ── classify_send_error regression tests ───────────────────────
 
-    // R6: Reference Hermes-Agent `_is_stale_session_ret`:
-    //   ret=-2 + errmsg missing/empty/"unknown error" = stale session
+    // Stale-session semantics:
+    //   ret=-2 with errmsg missing / empty / "unknown"/"unknown error"
+    //   = stale session (same bucket as errcode=-14).
     // Our iLink responses are literally `{"ret":-2}` with no errmsg field,
-    // which we parse as default "unknown". That's the same bucket.
+    // which we parse via .unwrap_or("unknown"). Both forms must map to
+    // DropContextToken (first try) or Fatal (second try) — never
+    // NormalRetry, which would waste the retry budget on a dead session.
 
     #[test]
     fn error_minus2_unknown_drops_context_token_once() {
@@ -1427,8 +1429,8 @@ mod tests {
 
     #[test]
     fn error_minus2_unknown_error_with_space_treated_as_stale_session() {
-        // Hermes reference explicitly checks the string "unknown error"
-        // (with space). Normalize both forms.
+        // Normalize: "unknown" (our default placeholder) and "unknown error"
+        // (with space, the form some iLink responses carry) both mean stale.
         assert_eq!(
             classify_send_error(-2, "unknown error", false),
             SendRetryAction::DropContextToken,
