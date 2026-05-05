@@ -274,20 +274,6 @@ impl GatewayRunner {
         self.trace_repo.clone()
     }
 
-    /// Abort a running CLI task by trace_id. Triggers CancellationToken which
-    /// causes the CLI subprocess to be killed (SIGKILL) and the tokio task to
-    /// exit immediately. Returns true if a running task was found and cancelled.
-    pub fn kill_active_task(&self, trace_id: &str) -> bool {
-        if let Some((_, token)) = self.active_tasks.remove(trace_id) {
-            tracing::info!(trace_id, "killing active CLI task via cancellation token");
-            token.cancel();
-            true
-        } else {
-            tracing::debug!(trace_id, "no active task found for kill");
-            false
-        }
-    }
-
     pub fn cli_profile(&self) -> &CliProfile {
         &self.cli_profile
     }
@@ -2082,9 +2068,17 @@ impl GatewayRunner {
             Ok(_) => {
                 self.send_health.remove(&health_key);
             }
-            Err(_) => {
+            Err((_, error)) => {
                 let mut entry = self.send_health.entry(health_key).or_insert(0);
                 *entry += 1;
+                if outbound.outbox.is_none() {
+                    tracing::debug!(
+                        platform = %outbound.platform,
+                        chat_id = %safe_id(&outbound.chat_id),
+                        error,
+                        "heartbeat/chunk send failed (no outbox, not retried)"
+                    );
+                }
             }
         }
 
@@ -4821,13 +4815,12 @@ async fn cancellation_token_aborts_spawned_task() {
 }
 
 #[tokio::test]
-async fn kill_active_task_method_cancels_registered_token() {
+async fn kill_command_removes_and_cancels_token() {
     let registry: Arc<dashmap::DashMap<String, CancellationToken>> =
         Arc::new(dashmap::DashMap::new());
     let token = CancellationToken::new();
     registry.insert("trace-abc".into(), token.clone());
 
-    // Simulate the kill_active_task logic
     let killed = if let Some((_, t)) = registry.remove("trace-abc") {
         t.cancel();
         true
@@ -5022,4 +5015,41 @@ async fn heartbeat_not_blocked_by_slow_consumer() {
 
     let r = tx.try_send(OutboundMessage::plain(String::from("p"), String::from("c"), String::from("hb2")));
     assert!(r.is_ok());
+}
+
+// ── ChildKillGuard Drop test ───────────────────────────────────────────
+
+#[tokio::test]
+async fn child_kill_guard_kills_on_drop() {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let mut child = Command::new("cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cat");
+    let pid = child.id().expect("pid");
+
+    {
+        let _guard = crate::cli_bridge::ChildKillGuard::new(&child);
+        // Guard dropped here — should send SIGKILL.
+    }
+
+    // child.wait() should return quickly (killed).
+    let status = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    assert!(
+        status.is_ok(),
+        "child must exit promptly after guard drop (pid={pid})"
+    );
+}
+
+#[test]
+fn child_kill_guard_defuse_prevents_kill() {
+    // Defused guard must NOT kill.
+    let mut guard = crate::cli_bridge::ChildKillGuard { pid: Some(1) };
+    guard.defuse();
+    assert!(guard.pid.is_none());
+    // Drop now — no kill sent (pid is None).
 }

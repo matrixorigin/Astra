@@ -14,16 +14,16 @@ use tokio::sync::mpsc;
 /// `.defuse()` when the process exits normally. Without this, an async
 /// cancellation (outer task abort) would orphan the child process since
 /// tokio's `Child::drop` does NOT kill the process.
-struct ChildKillGuard {
-    pid: Option<u32>,
+pub(crate) struct ChildKillGuard {
+    pub(crate) pid: Option<u32>,
 }
 
 impl ChildKillGuard {
-    fn new(child: &tokio::process::Child) -> Self {
+    pub(crate) fn new(child: &tokio::process::Child) -> Self {
         Self { pid: child.id() }
     }
 
-    fn defuse(&mut self) {
+    pub(crate) fn defuse(&mut self) {
         self.pid = None;
     }
 }
