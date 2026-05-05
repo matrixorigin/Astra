@@ -108,12 +108,16 @@ pub struct TurnState {
 /// includes non-empty fields in the RuntimeIdentity section (per-turn dynamic).
 /// This keeps all runtime-specific logic in the runtime crate while the pipeline
 /// owns structure, ordering, and cache optimization.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ExternalSources {
     /// Memory text already retrieved by the runtime before entering the pure
     /// core pipeline. Core does not perform Memoria I/O.
     pub memory_snippets: Vec<String>,
     pub spill_dir: Option<PathBuf>,
+    /// Optional spill backend for offloading oversized sections to disk.
+    /// When set, the optimizer will persist section content and replace it
+    /// with a lightweight `SpillReference` to free token budget.
+    pub spill_backend: Option<std::sync::Arc<dyn crate::spill_backend::SpillBackend>>,
     /// Learned context from skill quality tracker / session history.
     pub learned_context: Option<String>,
     /// Delegation system override (injected by orchestrator).

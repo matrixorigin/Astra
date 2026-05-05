@@ -321,9 +321,19 @@ impl SemanticDedup {
         if current_turn <= *prev_turn {
             return None;
         }
-        // Find the most recent output from the same tool in output_log
+        // Find the most recent output from the same tool in output_log.
+        // Skip outputs that have been microcompact-cleared or are stubs —
+        // returning "[Cleared]" or a short placeholder instead of real content
+        // would leave the caller with nothing useful, forcing them to re-fetch
+        // anyway. In that case, allow the tool to re-execute.
         for (prev_tool, _out_turn, prev_output) in self.output_log.iter().rev() {
             if prev_tool == tool_name {
+                if prev_output.starts_with("[Cleared")
+                    || prev_output.starts_with("(cached")
+                    || prev_output.len() < 20
+                {
+                    return None; // Force re-execution — cached content is gone
+                }
                 return Some((*prev_turn, prev_output.clone()));
             }
         }

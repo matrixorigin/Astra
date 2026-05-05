@@ -110,6 +110,9 @@ pub struct AppState {
     /// [`astra_plan::CloudPlanRepository`] backed by the MatrixOne pool.
     pub(crate) plan_repo: Arc<dyn astra_plan::PlanRepository>,
     pub(crate) cors_origins: Option<String>,
+    /// Prometheus-style metrics registry. Shared across handlers and the
+    /// pipeline so /metrics exposes a single source of truth.
+    pub(crate) metrics_registry: Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>,
     #[cfg(feature = "harness")]
     pub harness_registry: crate::server::harness_handlers::HarnessSinkRegistry,
 }
@@ -215,6 +218,7 @@ impl AppState {
                 .expect("failed to build shared HTTP client"),
             plan_repo: Arc::new(astra_plan::LocalCachePlanRepository::new()),
             cors_origins: None,
+            metrics_registry: Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new()),
             #[cfg(feature = "harness")]
             harness_registry: crate::server::harness_handlers::HarnessSinkRegistry::new(),
         }
@@ -616,6 +620,12 @@ impl AppState {
     }
 
     /// Access the agent profile registry.
+    /// Shared Prometheus-style metrics registry. Handlers and pipeline code
+    /// register/increment counters here; `/metrics` renders its contents.
+    pub fn metrics_registry(&self) -> Arc<astra_turn_core::pipeline_metrics::MetricsRegistry> {
+        self.metrics_registry.clone()
+    }
+
     pub fn agent_profile_registry(&self) -> &astra_services::AgentProfileRegistry {
         &self.agent_profile_registry
     }

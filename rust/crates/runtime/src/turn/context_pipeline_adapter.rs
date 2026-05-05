@@ -85,7 +85,11 @@ pub(crate) fn build_external_sources(
                 "\n\n## Agent Type\nYou are acting as a **{agent_type}** agent for this skill.",
             ));
         }
-        if hint.is_empty() { None } else { Some(hint) }
+        if hint.is_empty() {
+            None
+        } else {
+            Some(hint)
+        }
     };
 
     // 5. Learned context
@@ -147,9 +151,22 @@ pub(crate) fn build_external_sources(
         .map(|s| vec![s.to_string()])
         .unwrap_or_default();
 
+    let spill_backend: Option<std::sync::Arc<dyn astra_turn_core::spill_backend::SpillBackend>> =
+        edge_profile
+            .get("spill_dir")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                std::sync::Arc::new(astra_turn_core::spill_backend::FileSystemSpillBackend::new(
+                    s,
+                ))
+                    as std::sync::Arc<dyn astra_turn_core::spill_backend::SpillBackend>
+            });
+
     ExternalSources {
         memory_snippets,
         spill_dir: None,
+        spill_backend,
         self_model_text,
         tool_conditional,
         profile_desc,

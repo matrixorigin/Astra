@@ -234,6 +234,7 @@ pub use introspection::{
 
 // ── Re-exports: server ───────────────────────────────────────────────────────
 
+pub use server::build_test_router;
 pub use server::delegation_engine::{
     CheckpointGate, DefaultQualityGate, DelegationEngine, DelegationTracker, GateVerdict,
     QualityThresholds, VerificationGate,

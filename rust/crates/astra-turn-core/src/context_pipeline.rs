@@ -10,15 +10,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::compaction_types::CompactionTier;
 use crate::context_binder::bind_all;
-use crate::context_optimizer::{ContextOptimized, optimize};
-use crate::context_planner::{ContextPlan, PlanInput, plan_turn};
+use crate::context_optimizer::{optimize_with_spill, ContextOptimized};
+use crate::context_planner::{plan_turn, ContextPlan, PlanInput};
 use crate::context_pressure::ContextPressure;
-use crate::context_serializer::{SerializedProviderRequest, serialize_provider_request};
+use crate::context_serializer::{serialize_provider_request, SerializedProviderRequest};
 use crate::context_sources::ContextSources;
 use crate::optimize_limits::OptimizeLimits;
 use crate::pipeline_config::PipelineConfig;
 use crate::recovery_state::RecoveryState;
 use crate::session_latches::SessionLatches;
+use crate::spill_backend::SpillBackend;
 use crate::token_accounting::TokenAccounting;
 
 /// Pipeline refused to execute due to unrecoverable error state.
@@ -106,13 +107,16 @@ impl ContextPipeline {
         timings.push(PipelinePhaseTiming::elapsed("bind", started));
 
         let started = Instant::now();
-        let optimized = optimize(
+        let spill_backend: Option<&dyn SpillBackend> =
+            input.sources.external.spill_backend.as_deref();
+        let optimized = optimize_with_spill(
             &plan,
             bound,
             input.latches,
             provider_policy,
             input.optimize_limits,
             input.sources.turn.turn_index,
+            spill_backend,
         );
         timings.push(PipelinePhaseTiming::elapsed("optimize", started));
 

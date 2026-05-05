@@ -13,6 +13,7 @@
 
 pub mod agentic_recursion_guard;
 pub mod agentic_verdict_audit;
+pub mod alert_dispatcher;
 pub mod boost_domain_hints;
 pub mod cache;
 pub mod cache_diagnostics;
@@ -66,6 +67,7 @@ pub mod parallel_tool_exec;
 pub mod pipeline_config;
 pub mod pipeline_journal;
 pub mod pipeline_learning;
+pub mod pipeline_metrics;
 pub mod pipeline_session;
 pub mod pipeline_session_serde;
 pub mod pipeline_stats;
@@ -80,6 +82,7 @@ pub mod selector_observability;
 pub mod session_latches;
 pub mod shadow_diff;
 pub mod skill_selector_metrics;
+pub mod spill_backend;
 pub mod sse_blocks;
 pub mod sse_edge_stderr_lines;
 pub mod state;

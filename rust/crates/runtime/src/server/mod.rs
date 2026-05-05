@@ -63,6 +63,14 @@ mod completions;
 pub use request_trace::RequestTrace;
 pub use state_builder::build_server_state;
 
+/// Test-only helper: return the raw `Router` without the CORS/body-limit
+/// layers, so integration tests can `.oneshot` it without dealing with
+/// middleware semantics (e.g. preflight, trace IDs). Production code paths
+/// must always go through [`build_app`].
+pub fn build_test_router(state: AppState) -> Router {
+    router_builder::build_router(state)
+}
+
 pub fn build_app(state: AppState) -> Router {
     let allow_origin = match state.cors_origins.as_deref() {
         Some(origins) if !origins.is_empty() && origins != "*" => {

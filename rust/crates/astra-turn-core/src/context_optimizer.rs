@@ -14,8 +14,9 @@ use crate::context_planner::ContextPlan;
 use crate::microcompact::{CompactStrategy, PromptCacheProtocol};
 use crate::optimize_limits::OptimizeLimits;
 use crate::pipeline_config::ProviderCachePolicy;
-use crate::section_types::{BoundSection, CacheScope, SectionKind};
+use crate::section_types::{BoundSection, CacheScope, SectionArtifact, SectionKind};
 use crate::session_latches::SessionLatches;
+use crate::spill_backend::SpillBackend;
 
 /// A cache marker placed in the optimized output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +76,24 @@ pub fn optimize(
     policy: &ProviderCachePolicy,
     limits: &OptimizeLimits,
     current_turn: u32,
+) -> ContextOptimized {
+    optimize_with_spill(plan, bound, latches, policy, limits, current_turn, None)
+}
+
+/// Same as [`optimize`] but accepts an optional spill backend. When the gate
+/// `allow_spill` is open and a backend is supplied, oversized non-anchor
+/// sections are persisted via the backend and replaced with
+/// `SectionArtifact::SpillReference`. Without a backend the optimizer keeps
+/// the conservative behaviour (preserve content + emit skipped-optimization
+/// trace entry).
+pub fn optimize_with_spill(
+    plan: &ContextPlan,
+    bound: ContextBound,
+    latches: &SessionLatches,
+    policy: &ProviderCachePolicy,
+    limits: &OptimizeLimits,
+    current_turn: u32,
+    spill_backend: Option<&dyn SpillBackend>,
 ) -> ContextOptimized {
     let ContextBound {
         mut sections,
@@ -155,9 +174,9 @@ pub fn optimize(
         }
     }
 
-    // 3. SPILL: persist oversized sections to disk
+    // 3. SPILL: persist oversized sections to the spill backend
     let spilled = if limits.allow_spill {
-        spill_oversized_sections(&mut sections, &mut stats)
+        spill_oversized_sections(&mut sections, &mut stats, spill_backend, plan, current_turn)
     } else {
         stats.skipped.push(SkippedOptimization {
             step: "spill".into(),
@@ -254,38 +273,85 @@ fn drop_oldest_rounds(messages: &mut Vec<Value>, pressure: f64) -> u32 {
     tokens_dropped
 }
 
-/// Spill oversized sections: sections above a threshold get replaced with
-/// a `SpilledEntry` reference. The actual content must be stored externally.
-/// Threshold: 10000 tokens (~40KB of text).
+/// Spill oversized sections: sections above `SPILL_THRESHOLD_TOKENS` are
+/// persisted via `backend` (if provided) and their in-prompt artifact is
+/// replaced with a `SpillReference`. `Identity` and `Constraints` sections
+/// are anchors and always preserved. Without a backend the function
+/// preserves content and records a skipped-optimization trace so operators
+/// can see that spill was attempted but had no sink.
 fn spill_oversized_sections(
     sections: &mut [BoundSection],
     stats: &mut OptimizeStats,
+    backend: Option<&dyn SpillBackend>,
+    plan: &ContextPlan,
+    current_turn: u32,
 ) -> Vec<SpilledEntry> {
     const SPILL_THRESHOLD_TOKENS: u32 = 10_000;
-    let mut saw_spill_candidate = false;
+    let mut spilled = Vec::new();
+    let mut saw_candidate_without_backend = false;
 
-    for section in sections.iter_mut() {
-        if section.actual_tokens > SPILL_THRESHOLD_TOKENS {
-            // Don't spill Identity or Constraints (semantic anchors)
-            if matches!(
-                section.plan.kind,
-                SectionKind::Identity | SectionKind::Constraints
-            ) {
-                continue;
+    for (idx, section) in sections.iter_mut().enumerate() {
+        if section.actual_tokens <= SPILL_THRESHOLD_TOKENS {
+            continue;
+        }
+        // Semantic anchors must remain inline.
+        if matches!(
+            section.plan.kind,
+            SectionKind::Identity | SectionKind::Constraints
+        ) {
+            continue;
+        }
+
+        let Some(backend) = backend else {
+            saw_candidate_without_backend = true;
+            continue;
+        };
+
+        // Only text-bearing artifacts can be spilled.
+        let Some(text) = section.artifact.text() else {
+            continue;
+        };
+        let original_tokens = section.actual_tokens;
+        let key_hint = format!(
+            "sec{idx}-turn{current_turn}-tier{tier:?}-{kind:?}",
+            kind = section.plan.kind,
+            tier = plan.compact_tier,
+        );
+
+        match backend.store(&key_hint, text.as_bytes()) {
+            Ok(path) => {
+                spilled.push(SpilledEntry {
+                    call_id: format!("section-{idx}"),
+                    tool_name: format!("{:?}", section.plan.kind),
+                    original_tokens,
+                    path: path.clone(),
+                });
+                section.artifact = SectionArtifact::SpillReference {
+                    path,
+                    original_tokens,
+                };
+                section.actual_tokens = 0;
+                stats.entries_spilled = stats.entries_spilled.saturating_add(1);
+                stats.tokens_cleared = stats.tokens_cleared.saturating_add(original_tokens);
             }
-            saw_spill_candidate = true;
+            Err(err) => {
+                stats.skipped.push(SkippedOptimization {
+                    step: "spill".into(),
+                    reason: format!("spill backend error for {:?}: {err}", section.plan.kind),
+                });
+            }
         }
     }
 
-    if saw_spill_candidate {
+    if saw_candidate_without_backend {
         stats.skipped.push(SkippedOptimization {
             step: "spill".into(),
-            reason: "oversized sections require persistence before replacement; content preserved"
+            reason: "oversized sections present but no spill backend configured; content preserved"
                 .into(),
         });
     }
 
-    Vec::new()
+    spilled
 }
 
 /// `max_clear_tokens` caps total tokens cleared to prevent over-compaction.
@@ -907,6 +973,94 @@ mod tests {
                 .any(|skipped| skipped.step == "spill"),
             "preserving an oversized section should be explicit in optimizer trace"
         );
+    }
+
+    #[test]
+    fn spill_offloads_oversized_section_when_backend_configured() {
+        use crate::spill_backend::FileSystemSpillBackend;
+        use tempfile::TempDir;
+
+        let (plan, bound, latches) = build_test_plan_and_bound();
+        let limits = OptimizeLimits {
+            allow_spill: true,
+            ..Default::default()
+        };
+        let policy = ProviderCachePolicy::default();
+
+        let mut bound = bound;
+        let large_text = "Y".repeat(50_000);
+        bound.sections.push(test_bound_section(
+            SectionKind::ProjectContext,
+            CacheScope::Session,
+            &large_text,
+        ));
+
+        let dir = TempDir::new().unwrap();
+        let backend = FileSystemSpillBackend::new(dir.path());
+        let result =
+            optimize_with_spill(&plan, bound, &latches, &policy, &limits, 1, Some(&backend));
+
+        assert_eq!(result.stats.entries_spilled, 1);
+        assert_eq!(result.spilled.len(), 1);
+        let entry = &result.spilled[0];
+        assert_eq!(entry.original_tokens, large_text.len() as u32);
+
+        // The offloaded section must no longer carry the text inline.
+        let offloaded = result
+            .sections
+            .iter()
+            .find(|s| {
+                matches!(
+                    s.artifact,
+                    crate::section_types::SectionArtifact::SpillReference { .. }
+                )
+            })
+            .expect("oversized section should be replaced with a SpillReference");
+        assert_eq!(offloaded.actual_tokens, 0);
+        assert_eq!(offloaded.text(), None);
+
+        // Tokens cleared accounting reflects the offload.
+        assert!(result.stats.tokens_cleared >= large_text.len() as u32);
+
+        // Persisted file contents match original text.
+        let persisted = std::fs::read_to_string(&entry.path).unwrap();
+        assert_eq!(persisted.len(), large_text.len());
+        assert!(persisted.starts_with("YYYYYY"));
+    }
+
+    #[test]
+    fn spill_never_offloads_identity_or_constraints_even_with_backend() {
+        use crate::spill_backend::FileSystemSpillBackend;
+        use tempfile::TempDir;
+
+        let (plan, bound, latches) = build_test_plan_and_bound();
+        let limits = OptimizeLimits {
+            allow_spill: true,
+            ..Default::default()
+        };
+        let policy = ProviderCachePolicy::default();
+
+        let mut bound = bound;
+        let large_text = "Z".repeat(50_000);
+        bound.sections.push(test_bound_section(
+            SectionKind::Identity,
+            CacheScope::Global,
+            &large_text,
+        ));
+
+        let dir = TempDir::new().unwrap();
+        let backend = FileSystemSpillBackend::new(dir.path());
+        let result =
+            optimize_with_spill(&plan, bound, &latches, &policy, &limits, 1, Some(&backend));
+
+        assert_eq!(result.stats.entries_spilled, 0);
+        assert!(result.spilled.is_empty());
+        let preserved = result
+            .sections
+            .iter()
+            .find(|s| s.plan.kind == SectionKind::Identity && s.text() == Some(large_text.as_str()))
+            .expect("Identity anchor must never be offloaded");
+        assert_eq!(preserved.actual_tokens, large_text.len() as u32);
     }
 
     #[test]

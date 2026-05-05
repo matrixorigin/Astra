@@ -2645,12 +2645,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             )
         {
             if restored.pipeline_state.is_some() {
-                loop_state.pipeline_session = Some(
-                    astra_turn_core::pipeline_session_serde::restore_or_new(
+                loop_state.pipeline_session =
+                    Some(astra_turn_core::pipeline_session_serde::restore_or_new(
                         astra_turn_core::pipeline_config::PipelineConfig::default(),
                         restored.pipeline_state.as_ref(),
-                    ),
-                );
+                    ));
             }
         }
 
@@ -3075,12 +3074,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 )
             {
                 if restored.pipeline_state.is_some() {
-                    state.pipeline_session = Some(
-                        astra_turn_core::pipeline_session_serde::restore_or_new(
+                    state.pipeline_session =
+                        Some(astra_turn_core::pipeline_session_serde::restore_or_new(
                             astra_turn_core::pipeline_config::PipelineConfig::default(),
                             restored.pipeline_state.as_ref(),
-                        ),
-                    );
+                        ));
                 }
             }
         }

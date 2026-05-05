@@ -4,6 +4,7 @@ pub(super) fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(meta_handlers::root_handler))
         .route("/health", get(meta_handlers::health_handler))
+        .route("/metrics", get(meta_handlers::metrics_handler))
         .route("/auth/register", post(auth_handlers::auth_register_handler))
         .route("/auth/login", post(auth_handlers::auth_login_handler))
         .route("/auth/refresh", post(auth_handlers::auth_refresh_handler))

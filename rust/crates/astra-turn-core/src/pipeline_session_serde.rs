@@ -107,7 +107,10 @@ mod tests {
 
     #[test]
     fn parse_none_is_missing() {
-        assert!(matches!(parse_pipeline_state(None), RestoreOutcome::Missing));
+        assert!(matches!(
+            parse_pipeline_state(None),
+            RestoreOutcome::Missing
+        ));
     }
 
     #[test]
@@ -121,7 +124,10 @@ mod tests {
     #[test]
     fn parse_empty_object_is_missing() {
         let v = serde_json::json!({});
-        assert!(matches!(parse_pipeline_state(Some(&v)), RestoreOutcome::Missing));
+        assert!(matches!(
+            parse_pipeline_state(Some(&v)),
+            RestoreOutcome::Missing
+        ));
     }
 
     #[test]

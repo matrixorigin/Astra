@@ -154,6 +154,7 @@ pub(crate) fn assemble_system_message_via_pipeline(
     let external = ExternalSources {
         memory_snippets: Vec::new(),
         spill_dir: None,
+        spill_backend: None,
         self_model_text,
         tool_conditional,
         profile_desc,
