@@ -521,6 +521,10 @@ pub struct ServerAgenticLoopHost {
     model_override: Option<String>,
     llm_token_service: Option<LlmTokenServiceConfig>,
     resolved_model_name: Option<String>,
+    /// Cached LLM connection params from the last successful model resolution.
+    /// Used by `summary_client()` to construct the compact-summary client
+    /// without re-resolving (model resolution requires async DB call).
+    resolved_llm_params: Option<astra_turn_core::cloud_summary::LlmConnParams>,
 
     // ── Context ──
     edge_tools: Vec<Value>,
@@ -835,6 +839,7 @@ impl ServerAgenticLoopHostBuilder {
             model_override: self.model_override,
             llm_token_service: self.llm_token_service,
             resolved_model_name: None,
+            resolved_llm_params: None,
             edge_tools,
             edge_profile: self.edge_profile,
             valid_tools,
@@ -2266,6 +2271,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // provider doesn't change within a turn).
         let cache_cfg = PromptCacheConfig::latch(&llm_cfg.provider, &llm_cfg.model_name);
         self.resolved_model_name = Some(llm_cfg.model_name.clone());
+        self.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
+            model_name: llm_cfg.model_name.clone(),
+            api_key: llm_cfg.api_key.clone(),
+            base_url: llm_cfg.base_url.clone(),
+            provider: llm_cfg.provider.clone(),
+            max_output_tokens: 4096,
+        });
 
         // ── 2b. Build system prompt via context pipeline ─────────────────
         let (system_messages, system_prompt_plain, system_prompt_breakdown) = self
@@ -2868,6 +2880,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
     fn is_quiet(&self) -> bool {
         true
+    }
+
+    fn summary_client(&self) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
+        // LLM config is resolved per-turn inside execute_turn. We cache it in
+        // `resolved_llm_params` after first successful resolution so the trait
+        // method can construct the client without re-resolving.
+        let params = self.resolved_llm_params.as_ref()?;
+        Some(Box::new(astra_turn_core::cloud_summary::HttpSummaryClient::new(
+            params.clone(),
+        )))
     }
 
     fn valid_tool_names(&self) -> &HashSet<String> {
@@ -4140,6 +4162,7 @@ mod tests {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
+            pre_turn_compact_applied: false,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,

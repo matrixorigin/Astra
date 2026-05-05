@@ -204,6 +204,7 @@ mod tests {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
+            pre_turn_compact_applied: false,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,

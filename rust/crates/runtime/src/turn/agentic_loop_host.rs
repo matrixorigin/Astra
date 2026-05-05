@@ -172,6 +172,20 @@ pub trait AgenticLoopHost: Send {
     /// Whether output is suppressed (quiet mode).
     fn is_quiet(&self) -> bool;
 
+    /// Optional LLM summary client for pre-turn compaction.
+    ///
+    /// When provided, the agentic loop can call `generate_compact_summary`
+    /// to compress old messages before the main LLM request — matching the
+    /// forked-agent summarization pattern. The client uses the same
+    /// model/credentials as the main call, so its input shares the prompt
+    /// cache prefix.
+    ///
+    /// Default: `None` (no pre-turn compaction available — falls back to
+    /// mechanical compression only).
+    fn summary_client(&self) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
+        None
+    }
+
     /// Valid tool names from the host's tool schemas.
     fn valid_tool_names(&self) -> &HashSet<String>;
 
@@ -726,6 +740,12 @@ pub struct AgenticLoopState {
     /// Set to `true` once the budget-exceeded wrap-up message has been injected.
     /// The loop allows exactly one more LLM iteration after injection.
     pub budget_wrapup_injected: bool,
+
+    /// Set to `true` when a pre-turn LLM summarization compact was applied
+    /// this turn. Reset to `false` at the start of each turn. Prevents
+    /// double-compaction: `handle_token_budget` skips tier-1 LLM compact
+    /// when the pre-turn pass already ran.
+    pub pre_turn_compact_applied: bool,
 
     /// Set to `true` when a skill produced substantial output in the current
     /// turn. The CLI host reads this to suppress intermediate text rendering
@@ -1390,6 +1410,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         pinned_tool_schema_tokens: 0,
         max_turn_input_tokens: 0,
         budget_wrapup_injected: false,
+        pre_turn_compact_applied: false,
         skill_produced_output: false,
         max_cumulative_tokens: 0,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
@@ -1757,6 +1778,7 @@ pub(crate) mod tests {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
+            pre_turn_compact_applied: false,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,

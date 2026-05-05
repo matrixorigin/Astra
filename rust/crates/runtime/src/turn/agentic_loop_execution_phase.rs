@@ -2131,7 +2131,8 @@ async fn handle_token_budget<H: AgenticLoopHost>(
     //   1. Aggressive compression pipeline (clear tool results)
     //   2. If still over: spill old messages to disk, keep reference in context
     // Only if both fail do we inject the stop directive.
-    if !state.budget_wrapup_injected {
+    // Skip if pre-turn LLM compact already ran this turn (avoid double work).
+    if !state.budget_wrapup_injected && !state.pre_turn_compact_applied {
         let budget = super::context_compression::TokenBudget {
             max_prompt_tokens: state.max_turn_input_tokens,
             last_measured_tokens: measured,
@@ -2184,6 +2185,7 @@ async fn handle_token_budget<H: AgenticLoopHost>(
     }
 
     // Compaction didn't help (or already tried once) — inject stop directive.
+    state.budget_wrapup_injected = true;
     if !prep.quiet {
         host.emit_headless_line(
             HeadlessStderrStyle::Yellow,

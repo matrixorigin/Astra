@@ -617,6 +617,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
+            pre_turn_compact_applied: false,
             skill_produced_output: false,
             max_cumulative_tokens: SUBRUN_MAX_CUMULATIVE_TOKENS,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
