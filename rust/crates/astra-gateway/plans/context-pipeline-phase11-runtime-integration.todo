@@ -1,0 +1,78 @@
+# Phase 11: Runtime Integration — P0 (Unlocks All Value)
+# Status: NOT STARTED
+# Depends on: Phases 1-10 (COMPLETE)
+# Blocks: Phases 12-14
+
+## Goal
+Wire ContextPipeline::run() into the agentic loop so every LLM request
+flows through Plan→Bind→Optimize→Serialize instead of inline assembly.
+
+## Strategy: Shadow-first rollout
+1. Build ContextSources from AgenticLoopState (adapter layer)
+2. Shadow-run pipeline alongside existing path (compare outputs)
+3. Flip traffic when shadow diff is zero for N turns
+4. Remove legacy path (deferred to Phase 14)
+
+## Tasks
+
+### 11.1 — ContextSources Adapter (astra-turn-core)
+- [ ] Create `ContextSourcesBuilder` that maps runtime state → 8-tier ContextSources
+  - StaticSections: from compiled prompt sections (system.rs builders)
+  - AgentContext: from ToolRegistry + SkillCatalog
+  - SessionLatches: new struct (beta_headers, cache_scope, provider_features)
+  - SessionContext: from EdgeProfile + model config
+  - TurnState: from messages[] + TokenAccounting + RecoveryState
+  - ExternalSources: from Memoria client + spill_dir
+  - EmergentContext: from previous turn's discovered skills/memory/summaries
+  - PipelineStats: accumulated cross-turn (new field on loop state)
+- [ ] Unit tests for builder (mock each source tier independently)
+
+### 11.2 — Pipeline Call Site (agentic_loop_turn.rs)
+- [ ] Add `PipelineStats` field to agentic loop state (cross-turn accumulator)
+- [ ] Before `build_chat_turn_base_payload()`: construct ContextSources via builder
+- [ ] Call `ContextPipeline::run(sources, limits)` to get ContextOptimized
+- [ ] Feed `ContextOptimized` into payload serialization (replace inline assembly)
+- [ ] After API response: call `process_feedback()` to update PipelineStats
+
+### 11.3 — Shadow Pipeline Mode
+- [ ] Add `shadow_pipeline: bool` config flag (default: true during rollout)
+- [ ] When shadow=true: run both old path + new pipeline, diff outputs
+- [ ] Log diff to trace (ContextAssemblyTrace) — no user-visible change
+- [ ] Metric: shadow_diff_count (should trend to zero)
+- [ ] When shadow=false: pipeline is sole path (flip after validation)
+
+### 11.4 — Serialize Phase Wire-up
+- [ ] ContextOptimized.system_blocks → replace system_prompt string in payload
+- [ ] ContextOptimized.messages → replace messages[] in payload
+- [ ] ContextOptimized.tools → replace edge_tools[] in payload
+- [ ] ContextOptimized.cache_breakpoints → inject cache_control into Anthropic requests
+- [ ] Provider-specific serialization (Anthropic vs OpenAI-compatible vs Bedrock)
+
+### 11.5 — Feedback Loop Wire-up
+- [ ] Extract cache metrics from API response (cache_read, cache_creation tokens)
+- [ ] Feed into ContextFeedback::from_response()
+- [ ] PipelineStats update: EMA cache ratio, response token percentile, cache breaks
+- [ ] Carry PipelineStats across turns (same session lifetime)
+- [ ] On session start: initialize fresh PipelineStats (or load from persistence — Phase 12)
+
+### 11.6 — Integration Tests
+- [ ] E2E test: shadow mode produces equivalent output to legacy path
+- [ ] E2E test: pipeline-only mode produces valid API requests
+- [ ] E2E test: feedback loop updates stats correctly across 3+ turns
+- [ ] Regression test: cache hit ratio doesn't degrade vs baseline
+- [ ] Contract test: ContextSourcesBuilder covers all 8 tiers
+
+## Acceptance Criteria
+- All existing tests pass (no regression)
+- Shadow mode diff is zero for all existing E2E scenarios
+- Pipeline-only mode produces valid requests accepted by providers
+- Cache hit ratio >= baseline (measured over 10+ turn sessions)
+- No performance regression > 5ms per turn (pipeline overhead budget)
+
+## Key Files
+- astra-turn-core/src/context_sources.rs (extend ContextSources)
+- astra-turn-core/src/context_pipeline.rs (run() entry point)
+- astra-cli/src/cli/chat_stream/sse_loop/agentic_loop_turn.rs (call site)
+- astra-cli/src/cli/chat_stream/sse_loop/cli_loop_host.rs (state carrier)
+- runtime/src/prompts/system.rs (becomes input to Bind phase)
+- astra-gateway/src/gateway_context.rs (becomes StaticSections source)

@@ -79,9 +79,37 @@ impl PercentileDigest {
 /// Per-model/query-source response token estimator for predictive reserves.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResponseTokenEstimator {
+    #[serde(with = "estimator_buckets_serde")]
     buckets: HashMap<EstimatorKey, PercentileDigest>,
     /// Floor reserve used when no history is available.
     pub default_floor: u32,
+}
+
+mod estimator_buckets_serde {
+    use super::*;
+    use serde::de::Deserializer;
+    use serde::ser::Serializer;
+
+    pub fn serialize<S>(
+        map: &HashMap<EstimatorKey, PercentileDigest>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let vec: Vec<(&EstimatorKey, &PercentileDigest)> = map.iter().collect();
+        vec.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<HashMap<EstimatorKey, PercentileDigest>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let vec: Vec<(EstimatorKey, PercentileDigest)> = Vec::deserialize(deserializer)?;
+        Ok(vec.into_iter().collect())
+    }
 }
 
 impl ResponseTokenEstimator {
@@ -160,7 +188,37 @@ pub struct PipelineStats {
     pub cache_breaks: Vec<CacheBreakEvent>,
     pub response_token_estimates: ResponseTokenEstimator,
     /// EMA of per-section token usage across turns (alpha=0.3).
+    #[serde(with = "section_ema_serde")]
     pub section_usage_ema: HashMap<crate::section_types::SectionKind, f64>,
+}
+
+mod section_ema_serde {
+    use super::*;
+    use serde::de::Deserializer;
+    use serde::ser::Serializer;
+
+    pub fn serialize<S>(
+        map: &HashMap<crate::section_types::SectionKind, f64>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let vec: Vec<(crate::section_types::SectionKind, f64)> =
+            map.iter().map(|(&k, &v)| (k, v)).collect();
+        vec.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<HashMap<crate::section_types::SectionKind, f64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let vec: Vec<(crate::section_types::SectionKind, f64)> =
+            Vec::deserialize(deserializer)?;
+        Ok(vec.into_iter().collect())
+    }
 }
 
 impl PipelineStats {

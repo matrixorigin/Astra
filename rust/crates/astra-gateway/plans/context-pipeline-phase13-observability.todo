@@ -1,0 +1,75 @@
+# Phase 13: Observability — P1-P2 (Metrics, Audit, Visualization)
+# Status: NOT STARTED
+# Depends on: Phase 11 (runtime integration for live data)
+# Blocks: None
+
+## Goal
+Surface pipeline decisions as actionable metrics, audit trails, and
+visualizations so operators can monitor cache health, debug regressions,
+and optimize configurations without reading code.
+
+## Why
+- Pipeline makes ~20 decisions per turn (tier, budget, compaction, markers)
+- Without observability, degradation is invisible until users complain
+- Cache regressions cost money (miss = full recomputation = 10x latency)
+- Operators need dashboards, not EXPLAIN output in logs
+
+## Tasks
+
+### 13.1 — Structured Metrics Emission
+- [ ] Define metric names and labels:
+  - `context_pipeline_pressure{tier,model}` — gauge
+  - `context_pipeline_cache_hit_ratio{model,session_age}` — gauge
+  - `context_pipeline_compact_events{strategy,tier}` — counter
+  - `context_pipeline_phase_duration_us{phase}` — histogram
+  - `context_pipeline_spill_bytes` — gauge
+  - `context_pipeline_abort_count{reason}` — counter
+  - `context_pipeline_shadow_diff_count` — counter (Phase 11 rollout)
+- [ ] Emit via existing metrics infrastructure (Prometheus/OpenTelemetry)
+- [ ] Per-session aggregation (avoid per-turn cardinality explosion)
+- [ ] Unit test: metric emission for each decision path
+
+### 13.2 — Audit Trail
+- [ ] Store ContextAssemblyTrace per turn in session journal
+- [ ] Include: tier selected, sections included/excluded, bytes cleared, markers placed
+- [ ] Retention: keep last N turns per session (configurable, default: 20)
+- [ ] Query API: GET /sessions/:id/context-traces (paginated)
+- [ ] Schema: add context_traces table (session_id, turn_index, trace_json, created_at)
+
+### 13.3 — Alert Rules
+- [ ] Cache regression alert: hit ratio drops > 15% over 5 turns
+- [ ] Pressure spike alert: raw pressure jumps > 0.20 in one turn
+- [ ] Recovery loop alert: consecutive_ptl_errors >= 3
+- [ ] Compaction cascade alert: 3+ compact events in 5 turns
+- [ ] Cold cache alert: turn > 3 and ratio still == 0 (likely misconfiguration)
+- [ ] Wire alerts to existing notification channels (log + optional webhook)
+
+### 13.4 — EXPLAIN Mode for Users
+- [ ] `/context explain` CLI command: show last turn's pipeline decisions
+- [ ] Output: pressure, tier, sections (with token counts), cache markers, alerts
+- [ ] Format: table (CLI) or JSON (API)
+- [ ] Include recommendations when issues detected:
+  - High pressure → "Consider reducing tool count or using schema pruning"
+  - Cache cold → "Check if system prompt changed mid-session"
+  - Recovery loop → "Tool may be producing unbounded output"
+
+### 13.5 — Dashboard Visualization (admin UI)
+- [ ] Session timeline: pressure + cache ratio over turns (line chart)
+- [ ] Section budget breakdown per turn (stacked bar)
+- [ ] Compaction events overlay (annotations on timeline)
+- [ ] Model comparison: cache performance across models (table)
+- [ ] Wire to existing Next.js admin dashboard (web/ directory)
+
+## Acceptance Criteria
+- All pipeline decisions emit at least one metric
+- Audit trail queryable for any session within retention window
+- Alert rules fire correctly for simulated degradation scenarios
+- EXPLAIN output readable by operators without pipeline knowledge
+- Dashboard renders for sessions with 50+ turns without lag
+
+## Key Files
+- astra-turn-core/src/context_assembly_trace.rs (trace data source)
+- astra-turn-core/src/context_pipeline.rs (timing + decision points)
+- runtime/src/server/ (API endpoints for trace query)
+- web/ (Next.js admin dashboard)
+- services/src/journals/ (audit trail storage)

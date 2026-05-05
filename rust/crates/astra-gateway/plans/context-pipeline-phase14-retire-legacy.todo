@@ -1,0 +1,72 @@
+# Phase 14: Retire Legacy — P2-P3 (Delete Old Path + Complete Design)
+# Status: NOT STARTED
+# Depends on: Phase 11 (shadow mode proves equivalence), Phase 13 (observability confirms no regression)
+# Blocks: None (final cleanup)
+
+## Goal
+Remove the legacy inline context assembly path once the pipeline has
+proven stable in production. Complete remaining design aspirations.
+
+## Why
+- Dual paths (shadow mode) add complexity and maintenance burden
+- Legacy code becomes dead code once pipeline is sole path
+- Completing design aspirations (density tracking, adaptive placement)
+  requires the pipeline to be authoritative (no fallback)
+
+## Tasks
+
+### 14.1 — Remove Legacy Assembly Path
+- [ ] Delete inline system prompt builders that are now pipeline inputs
+  - runtime/src/prompts/system.rs: build_main_system_prompt() (replaced by Bind phase)
+  - runtime/src/prompts/context.rs: inline compaction logic (replaced by Optimize phase)
+- [ ] Remove shadow mode infrastructure (diff logic, dual execution)
+- [ ] Remove feature flag / config for shadow vs pipeline-only
+- [ ] Update all call sites to use pipeline-only path
+- [ ] Grep for dead code: anything importing removed functions
+- [ ] Run full test suite — expect some tests to need updating
+
+### 14.2 — Simplify Payload Construction
+- [ ] chat_turn_payload.rs: remove base_payload builder (pipeline provides all fields)
+- [ ] agentic_loop_turn.rs: simplify to Pipeline::run() → serialize → send
+- [ ] Remove intermediate structs that existed for legacy compatibility
+- [ ] Inline ContextOptimized → provider wire format (no intermediate JSON)
+
+### 14.3 — Gateway Context Simplification
+- [ ] gateway_context.rs: to_system_prompt() → becomes ContextSources.statics provider
+- [ ] Remove template rendering (pipeline handles section assembly)
+- [ ] Gateway passes raw context data, pipeline decides formatting
+- [ ] Test: gateway integration produces identical API requests
+
+### 14.4 — Complete Design Aspirations (Stretch)
+- [ ] Information density tracking (requires LLM-as-judge per section)
+  - Track which sections the model actually references in responses
+  - Weight section budgets by measured utility
+  - Deprioritize sections with low reference rate
+- [ ] Adaptive cache breakpoint placement
+  - Use N turns of cache hit data to optimize marker positions
+  - A/B test marker strategies within same session
+  - Converge on placement that maximizes hit ratio
+- [ ] Cost-based section selection
+  - User-defined section priorities (config file)
+  - Budget allocation weighted by priority × information density
+  - Allow user to pin/exclude specific sections
+
+### 14.5 — Documentation & Knowledge Transfer
+- [ ] Update docs/design/context-pipeline.md with final architecture
+- [ ] Add operator runbook: common issues + resolution steps
+- [ ] Add developer guide: how to add new section types to pipeline
+- [ ] Archive Phase 1-10 commit history context in design doc
+
+## Acceptance Criteria
+- Zero dead code from legacy path remains
+- Total LOC reduction >= 200 lines (removed > added)
+- All tests pass with pipeline-only path
+- No performance regression after legacy removal
+- Design doc reflects actual shipped architecture
+
+## Key Files (to delete or heavily modify)
+- runtime/src/prompts/system.rs (legacy builder — delete most)
+- runtime/src/prompts/context.rs (inline compaction — delete)
+- astra-turn-core/src/chat_turn_payload.rs (simplify significantly)
+- astra-cli/src/cli/chat_stream/sse_loop/agentic_loop_turn.rs (simplify)
+- astra-gateway/src/gateway_context.rs (simplify to data provider)

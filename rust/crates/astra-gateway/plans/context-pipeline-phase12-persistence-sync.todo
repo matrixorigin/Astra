@@ -1,0 +1,65 @@
+# Phase 12: Persistence & Sync — P1 (Session Continuity + Edge-Cloud)
+# Status: NOT STARTED
+# Depends on: Phase 11 (runtime integration)
+# Blocks: None (independent of 13/14)
+
+## Goal
+Persist PipelineStats and spilled content across sessions and sync
+between edge (CLI) and cloud (server) for seamless session continuity.
+
+## Why
+- PipelineStats (cache ratios, token estimates) take 3-5 turns to warm up
+- Without persistence, every session restart loses learned behavior
+- Spilled content (tool results moved to disk) must survive process restart
+- Edge-cloud sync enables session handoff (start on mobile, continue on desktop)
+
+## Tasks
+
+### 12.1 — PipelineStats Persistence
+- [ ] Define serialization format for PipelineStats (JSON or bincode)
+- [ ] Save PipelineStats to session record on session pause/end
+- [ ] Load PipelineStats from session record on session resume
+- [ ] Schema: add `pipeline_stats BLOB` column to sessions table
+- [ ] Migration: backward-compatible (NULL = fresh stats, no breakage)
+- [ ] Unit test: serialize/deserialize round-trip preserves all fields
+
+### 12.2 — Spill Storage Backend
+- [ ] Define SpillBackend trait: store(key, content) → SpillRef, load(ref) → content
+- [ ] Implement LocalFsSpillBackend (current: /tmp or configurable dir)
+- [ ] Implement CloudSpillBackend (S3/object storage for server-side)
+- [ ] SpillRef carries backend hint (local vs cloud) for transparent load
+- [ ] TTL-based cleanup: spills older than session TTL are garbage collected
+- [ ] Unit test: store/load round-trip, TTL expiry, missing key handling
+
+### 12.3 — Session Continuity Protocol
+- [ ] On session save: serialize PipelineStats + active spill refs
+- [ ] On session load: deserialize stats, verify spill refs still accessible
+- [ ] Handle stale spills gracefully (content gone → re-fetch or mark unavailable)
+- [ ] SessionLatches persistence: latched values survive session resume
+- [ ] EmergentContext carry-forward: persist discovered skills/memory across restarts
+
+### 12.4 — Edge-Cloud Sync (extends existing cloud sync)
+- [ ] Include PipelineStats in session sync payload
+- [ ] Include spill content in sync (small spills inline, large spills by ref)
+- [ ] Conflict resolution: latest-write-wins for stats, merge for spill catalog
+- [ ] Sync protocol: existing outbox pattern (no new transport needed)
+- [ ] Test: start session on edge, sync to cloud, resume on cloud with warm stats
+
+### 12.5 — Warm Start Optimization
+- [ ] On new session with same agent+model: seed stats from historical average
+- [ ] Cross-session percentile pooling: response token estimates shared per model
+- [ ] First-turn heuristic: if no stats, use model defaults (skip cold 3 turns)
+- [ ] Test: warm-started session achieves target cache ratio 2 turns faster
+
+## Acceptance Criteria
+- PipelineStats round-trip through persistence without data loss
+- Session resume within 50ms overhead (stats deserialization budget)
+- Spilled content survives process restart on same machine
+- Edge→Cloud sync delivers warm stats within 1 sync cycle
+- No regression in session startup time (< 100ms total)
+
+## Key Files
+- astra-turn-core/src/context_feedback.rs (PipelineStats struct)
+- services/src/sessions/ (session persistence layer)
+- services/src/cloud_sync/ (edge-cloud sync protocol)
+- runtime/src/server/session_lifecycle.rs (save/load hooks)

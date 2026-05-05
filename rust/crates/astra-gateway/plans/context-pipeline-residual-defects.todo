@@ -1,0 +1,106 @@
+# Residual Defects & Known Limitations
+# Status: TRACKING
+# Severity: Mixed (some P1, some P3 — annotated per item)
+
+## Fixed in Phase 10 (commit 6d408c45) — CLOSED
+
+- [x] History section phantom budget (~50% budget freed) — P1
+- [x] Cycle-sort correctness for 3+ element cycles — P2
+- [x] max_clear_tokens not enforced (circuit breaker) — P1
+- [x] Schema pruning unwrap crash on malformed tool schemas — P1
+- [x] Round dropping removes system messages — P1
+- [x] Spill without persistence boundary (preserve content) — P2
+- [x] EMA → 0 inflation (MIN_ADAPTIVE_SECTION_BUDGET = 256) — P2
+- [x] f64 → u32 NaN/Inf clamping — P2
+- [x] Cache scope not latched (mid-session breaks) — P1
+
+## Open Defects — ACTIVE
+
+### D1: Spill Backend Not Wired (P2, blocks Phase 12)
+- Location: context_optimizer.rs, spill strategy
+- Current: spill preserves content in-memory, records as "skipped" in trace
+- Expected: spill writes to SpillBackend, returns SpillRef (20 tokens)
+- Impact: spill strategy is a no-op in production (never actually frees tokens)
+- Fix: implement SpillBackend trait + LocalFs impl (Phase 12.2)
+
+### D2: EmergentContext Not Populated (P2, blocks Phase 11)
+- Location: context_sources.rs, EmergentContext struct
+- Current: EmergentContext always empty (no runtime writes to it)
+- Expected: previous turn's discovered_skills, prefetched_memory fed in
+- Impact: emergent tier never contributes to context (cold start every turn)
+- Fix: wire agentic loop to populate from previous turn (Phase 11.1)
+
+### D3: SessionLatches Struct Exists But Never Latched (P2, blocks Phase 11)
+- Location: context_optimizer.rs, place_cache_markers()
+- Current: latches parameter reserved but unused (always default values)
+- Expected: first beta header evaluation latches value for session
+- Impact: cache markers may be placed on unstable prefix (cache breaks)
+- Fix: implement latch-on-first-use in runtime adapter (Phase 11.1)
+
+### D4: PipelineStats Not Carried Across Turns (P1, blocks Phase 11)
+- Location: context_pipeline.rs, PipelineStats
+- Current: stats exist in tests but no runtime storage across turns
+- Expected: stats accumulate within session, persisted across restarts
+- Impact: every turn has cold pressure estimates (no learning)
+- Fix: add PipelineStats to loop state (Phase 11.2), persist (Phase 12.1)
+
+### D5: place_cache_markers() Latch-Aware Logic Not Implemented (P3)
+- Location: context_optimizer.rs:~390
+- Current: `latches` parameter passed but not used in marker placement
+- Expected: suppress trailing markers if latch flip would invalidate prefix
+- Impact: rare edge case — only triggers on mid-session config change
+- Fix: implement conditional marker suppression (can defer to Phase 14)
+
+### D6: allow_llm_summary Gate Has No Implementation (P3)
+- Location: OptimizeLimits struct
+- Current: `allow_llm_summary: true` field exists but no summarization logic
+- Expected: LLM-based section summarization as compaction strategy
+- Impact: one compaction strategy unavailable (others compensate)
+- Fix: implement LLM summary strategy (requires async LLM call in optimizer)
+- Note: may never implement — cost/latency tradeoff unclear
+
+### D7: Cross-Agent Cache Sharing Limited to ForkPrefix (P3)
+- Location: context_sources.rs, design doc §3.3
+- Current: parent→child cache sharing via ForkPrefix (working)
+- Expected: peer-to-peer sharing for same-skill agents
+- Impact: missed cache opportunities in multi-agent scenarios
+- Fix: design peer cache protocol (deferred — complex coordination problem)
+
+## Known Limitations (by design, not defects)
+
+### L1: No Information Density Tracking
+- Pipeline allocates budget by tier/section, not by measured utility
+- Would require LLM-as-judge to measure which sections influence responses
+- Deferred to Phase 14.4 (stretch goal)
+
+### L2: No Adaptive Breakpoint Placement
+- Cache markers at fixed scope boundaries (Global→Session, Session→None)
+- Optimal placement requires N turns of data + A/B testing
+- Deferred to Phase 14.4 (stretch goal)
+
+### L3: Predictive Pressure Uses Percentiles Not ML
+- Response token estimates use percentile-based heuristic (p75/p95)
+- Could train a model on (query_type, tool_count, history_length) → output_tokens
+- Current approach is good enough (±20% accuracy) and zero latency
+
+### L4: No Per-Provider Compaction Tuning
+- Same compaction thresholds (0.60/0.75/0.90) for all providers
+- Optimal thresholds differ (Anthropic cache is more sensitive than OpenAI)
+- Could add per-provider tier boundaries to ProviderCachePolicy
+
+### L5: Tool Result Clearing Is Coarse-Grained
+- Clears entire tool_result content, not selective preservation
+- Could keep first N lines or extract key facts before clearing
+- Would require per-tool-type clearing strategies
+
+## Priority Matrix
+
+| ID  | Severity | Blocks    | Effort | Recommendation          |
+|-----|----------|-----------|--------|-------------------------|
+| D1  | P2       | Phase 12  | M      | Implement in Phase 12.2 |
+| D2  | P2       | Phase 11  | S      | Fix in Phase 11.1       |
+| D3  | P2       | Phase 11  | S      | Fix in Phase 11.1       |
+| D4  | P1       | Phase 11  | M      | Fix in Phase 11.2       |
+| D5  | P3       | None      | S      | Defer to Phase 14       |
+| D6  | P3       | None      | L      | May not implement       |
+| D7  | P3       | None      | XL     | Design only, defer      |

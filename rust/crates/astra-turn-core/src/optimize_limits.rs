@@ -62,6 +62,61 @@ impl OptimizeLimits {
         }
     }
 
+    /// Build limits appropriate for a given compaction tier.
+    ///
+    /// Gates are progressively opened as pressure increases:
+    /// - Normal: tool_result_clearing only (defensive)
+    /// - TrimSchemas: + schema_pruning
+    /// - CompactHistory: + spill
+    /// - AggressivePrune: + round_dropping
+    #[must_use]
+    pub fn for_tier(tier: crate::compaction_types::CompactionTier, model_limit: u32) -> Self {
+        use crate::compaction_types::CompactionTier;
+
+        match tier {
+            CompactionTier::Normal => Self {
+                allow_reorder: false,
+                allow_tool_result_clearing: true,
+                allow_schema_pruning: false,
+                allow_spill: false,
+                allow_llm_summary: false,
+                allow_round_dropping: false,
+                max_reorder_moves: 0,
+                max_clear_tokens: model_limit / 2,
+            },
+            CompactionTier::TrimSchemas => Self {
+                allow_reorder: false,
+                allow_tool_result_clearing: true,
+                allow_schema_pruning: true,
+                allow_spill: false,
+                allow_llm_summary: false,
+                allow_round_dropping: false,
+                max_reorder_moves: 0,
+                max_clear_tokens: model_limit / 2,
+            },
+            CompactionTier::CompactHistory => Self {
+                allow_reorder: false,
+                allow_tool_result_clearing: true,
+                allow_schema_pruning: true,
+                allow_spill: true,
+                allow_llm_summary: false,
+                allow_round_dropping: false,
+                max_reorder_moves: 2,
+                max_clear_tokens: model_limit / 2,
+            },
+            CompactionTier::AggressivePrune => Self {
+                allow_reorder: true,
+                allow_tool_result_clearing: true,
+                allow_schema_pruning: true,
+                allow_spill: true,
+                allow_llm_summary: true,
+                allow_round_dropping: true,
+                max_reorder_moves: 4,
+                max_clear_tokens: model_limit / 2,
+            },
+        }
+    }
+
     /// Whether any transformation gate is open.
     #[must_use]
     pub fn any_open(&self) -> bool {
@@ -77,6 +132,7 @@ impl OptimizeLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compaction_types::CompactionTier;
 
     #[test]
     fn default_gates_match_spec() {
@@ -111,5 +167,74 @@ mod tests {
         assert!(!c.any_open());
         c.allow_spill = true;
         assert!(c.any_open());
+    }
+
+    #[test]
+    fn for_tier_normal_is_conservative() {
+        let l = OptimizeLimits::for_tier(CompactionTier::Normal, 200_000);
+        assert!(l.allow_tool_result_clearing);
+        assert!(!l.allow_schema_pruning);
+        assert!(!l.allow_spill);
+        assert!(!l.allow_round_dropping);
+        assert!(!l.allow_reorder);
+        assert_eq!(l.max_clear_tokens, 100_000);
+    }
+
+    #[test]
+    fn for_tier_trim_schemas_opens_pruning() {
+        let l = OptimizeLimits::for_tier(CompactionTier::TrimSchemas, 200_000);
+        assert!(l.allow_schema_pruning);
+        assert!(!l.allow_spill);
+        assert!(!l.allow_round_dropping);
+    }
+
+    #[test]
+    fn for_tier_compact_history_opens_spill() {
+        let l = OptimizeLimits::for_tier(CompactionTier::CompactHistory, 200_000);
+        assert!(l.allow_schema_pruning);
+        assert!(l.allow_spill);
+        assert!(!l.allow_round_dropping);
+        assert_eq!(l.max_reorder_moves, 2);
+    }
+
+    #[test]
+    fn for_tier_aggressive_opens_all() {
+        let l = OptimizeLimits::for_tier(CompactionTier::AggressivePrune, 200_000);
+        assert!(l.allow_reorder);
+        assert!(l.allow_schema_pruning);
+        assert!(l.allow_spill);
+        assert!(l.allow_round_dropping);
+        assert!(l.allow_llm_summary);
+        assert_eq!(l.max_reorder_moves, 4);
+    }
+
+    #[test]
+    fn for_tier_monotonically_opens_gates() {
+        let tiers = [
+            CompactionTier::Normal,
+            CompactionTier::TrimSchemas,
+            CompactionTier::CompactHistory,
+            CompactionTier::AggressivePrune,
+        ];
+        let mut prev_open_count = 0u32;
+        for tier in tiers {
+            let l = OptimizeLimits::for_tier(tier, 128_000);
+            let open_count = [
+                l.allow_reorder,
+                l.allow_tool_result_clearing,
+                l.allow_schema_pruning,
+                l.allow_spill,
+                l.allow_llm_summary,
+                l.allow_round_dropping,
+            ]
+            .iter()
+            .filter(|&&b| b)
+            .count() as u32;
+            assert!(
+                open_count >= prev_open_count,
+                "{tier:?}: open_count {open_count} < prev {prev_open_count}"
+            );
+            prev_open_count = open_count;
+        }
     }
 }

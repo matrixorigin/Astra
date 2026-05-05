@@ -65,6 +65,8 @@ pub mod optimize_limits;
 pub mod parallel_tool_exec;
 pub mod pipeline_config;
 pub mod pipeline_learning;
+pub mod pipeline_session;
+pub mod pipeline_session_serde;
 pub mod pipeline_stats;
 pub mod prepare_turn_explain_text;
 pub mod recent_arg_hints;
