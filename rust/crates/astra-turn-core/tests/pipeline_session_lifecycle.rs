@@ -253,3 +253,108 @@ fn response_token_estimator_improves_over_turns() {
         learned_reserve.output_tokens
     );
 }
+
+#[test]
+fn full_lifecycle_with_emergent_and_latches() {
+    use astra_turn_core::pipeline_session::AdaptiveTurnInput;
+    use astra_turn_core::section_types::CacheScope;
+
+    let config = PipelineConfig {
+        provider_policy: ProviderCachePolicy::anthropic(),
+    };
+    let mut sess = PipelineSession::new(config);
+
+    let statics = StaticSections::test_default();
+    let agent = AgentContext {
+        agent_id: "test-agent".into(),
+        persona: "Expert coder".into(),
+        tool_schemas: vec![
+            serde_json::json!({"name": "read_file"}),
+            serde_json::json!({"name": "write_file"}),
+        ],
+        skill_names: vec!["review".into()],
+        delegation_targets: vec![],
+    };
+    let session = make_session_context();
+    let external = ExternalSources {
+        memory_snippets: vec!["User works on astra-engine.".into()],
+        spill_dir: None,
+    };
+
+    // Turn 1: initial turn — latch cache scope, run pipeline
+    sess.latch_cache_scope(CacheScope::Global, 1);
+    assert_eq!(sess.latches.cache_scope, Some(CacheScope::Global));
+
+    let turn1 = make_turn_state(1, 2);
+    let input1 = AdaptiveTurnInput {
+        statics: &statics,
+        agent: &agent,
+        session: &session,
+        turn: &turn1,
+        external: &external,
+        model_id: "claude-sonnet-4-6",
+        query_source: "repl",
+    };
+    let output1 = sess.run_turn_adaptive(input1).expect("turn 1 should succeed");
+    assert_eq!(output1.metrics.turn_index, 1);
+
+    // Simulate: during turn 1 execution, we discover a skill and prefetch memory
+    sess.push_emergent_skill("debug", "error detected in tool output", 1);
+    sess.push_emergent_memory("Related: user debugged similar issue last week", 0.85, 1);
+
+    let feedback1 = ContextFeedback::from_usage(0, 900, 100, 400, false);
+    sess.record_feedback("claude-sonnet-4-6", "repl", feedback1, Some(&output1));
+
+    // Turn 2: emergent context should be available (not empty)
+    assert!(!sess.emergent.is_empty(), "emergent should have items from turn 1");
+
+    let turn2 = make_turn_state(2, 4);
+    let input2 = AdaptiveTurnInput {
+        statics: &statics,
+        agent: &agent,
+        session: &session,
+        turn: &turn2,
+        external: &external,
+        model_id: "claude-sonnet-4-6",
+        query_source: "repl",
+    };
+    let output2 = sess.run_turn_adaptive(input2).expect("turn 2 should succeed");
+    assert_eq!(output2.metrics.turn_index, 2);
+
+    let feedback2 = ContextFeedback::from_usage(0, 950, 50, 350, false);
+    sess.record_feedback("claude-sonnet-4-6", "repl", feedback2, Some(&output2));
+
+    // Turn 3: latch a beta header
+    sess.latch_header("anthropic-beta", "prompt-caching-2024-07-31", 3);
+    assert!(sess.latches.has_header("anthropic-beta"));
+
+    let turn3 = make_turn_state(3, 6);
+    let input3 = AdaptiveTurnInput {
+        statics: &statics,
+        agent: &agent,
+        session: &session,
+        turn: &turn3,
+        external: &external,
+        model_id: "claude-sonnet-4-6",
+        query_source: "repl",
+    };
+    let output3 = sess.run_turn_adaptive(input3).expect("turn 3 should succeed");
+
+    let feedback3 = ContextFeedback::from_usage(0, 980, 20, 300, false);
+    sess.record_feedback("claude-sonnet-4-6", "repl", feedback3, Some(&output3));
+
+    // Verify accumulated state
+    assert_eq!(sess.turns_completed(), 3);
+    assert!(sess.stats.avg_cache_hit_ratio > 0.8);
+    assert!(!sess.stats.section_token_history().is_empty());
+
+    // Verify latches are frozen
+    assert!(!sess.latch_cache_scope(CacheScope::Session, 4), "scope should not re-latch");
+    assert!(!sess.latch_header("anthropic-beta", "different-value", 4), "header should not re-latch");
+
+    // Verify warm start preservation
+    let bytes = serialize_stats(&sess.stats).unwrap();
+    let restored = deserialize_stats(&bytes).unwrap();
+    assert_eq!(restored.turns_executed, 3);
+    assert!((restored.avg_cache_hit_ratio - sess.stats.avg_cache_hit_ratio).abs() < 1e-9);
+}
