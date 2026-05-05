@@ -1241,9 +1241,10 @@ model: claude-sonnet-4-6"#;
 
     #[tokio::test]
     async fn run_kills_cli_on_timeout() {
+        // Use `sleep 30` directly (not via sh -c) so kill is immediate.
         let p = CliProfile::Custom {
-            bin: "sh".into(),
-            args_template: vec!["-c".into(), "sleep 5".into()],
+            bin: "sleep".into(),
+            args_template: vec!["30".into()],
             json_output: false,
             text_field: None,
             session_id_field: None,
