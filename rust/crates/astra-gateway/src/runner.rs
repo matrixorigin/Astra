@@ -797,11 +797,15 @@ impl GatewayRunner {
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<CliProgress>(64);
 
         // Register cancellation token for this task so /kill can abort it.
+        // Uses trace_id if available, otherwise a synthetic key based on
+        // the request tag — ensures all tasks are killable.
         let cancel_token = CancellationToken::new();
-        let trace_id_for_kill = trace.as_ref().map(|t| t.trace_id.to_string());
-        if let Some(ref tid) = trace_id_for_kill {
-            self.active_tasks.insert(tid.clone(), cancel_token.clone());
-        }
+        let kill_registry_key = trace
+            .as_ref()
+            .map(|t| t.trace_id.to_string())
+            .unwrap_or_else(|| format!("notrace:{}", request_tag));
+        self.active_tasks
+            .insert(kill_registry_key.clone(), cancel_token.clone());
 
         let cli_handle = tokio::spawn({
             let profile = cli_profile.clone();
@@ -810,6 +814,8 @@ impl GatewayRunner {
             let ws = workspace.clone();
             let token = access_token.clone();
             let kill_token = cancel_token.clone();
+            let trace_id_str = trace.as_ref().map(|t| t.trace_id.to_string());
+            let request_id_str = trace.as_ref().map(|t| t.request_id.to_string());
             async move {
                 cli_bridge::run_cli_with_cancel(
                     &profile,
@@ -818,8 +824,8 @@ impl GatewayRunner {
                     ws.as_deref(),
                     Some(progress_tx),
                     Some(&system_prompt),
-                    None, // trace_id
-                    None, // request_id
+                    trace_id_str.as_deref(),
+                    request_id_str.as_deref(),
                     Some(cli_timeout),
                     token.as_deref(),
                     Some(kill_token),
@@ -958,9 +964,11 @@ impl GatewayRunner {
                         sent_initial_ack = true;
                         let heartbeat = format!("[{request_tag}] 🤔 {cli_name} 思考中…");
                         if let Some(ref tx) = self.outbound_tx {
-                            let _ = tx
-                                .send(OutboundMessage::plain(msg.platform.to_string(), chat_id.clone(), heartbeat))
-                                .await;
+                            // try_send: drop heartbeat if channel backpressured —
+                            // stale heartbeats are worse than missing ones.
+                            let _ = tx.try_send(OutboundMessage::plain(
+                                msg.platform.to_string(), chat_id.clone(), heartbeat,
+                            ));
                         }
                         next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
                     } else {
@@ -972,9 +980,9 @@ impl GatewayRunner {
                             format!("[{request_tag}] ⏳ 处理中… {elapsed_str}")
                         };
                         if let Some(ref tx) = self.outbound_tx {
-                            let _ = tx
-                                .send(OutboundMessage::plain(msg.platform.to_string(), chat_id.clone(), heartbeat))
-                                .await;
+                            let _ = tx.try_send(OutboundMessage::plain(
+                                msg.platform.to_string(), chat_id.clone(), heartbeat,
+                            ));
                         }
                         next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
                     }
@@ -983,9 +991,7 @@ impl GatewayRunner {
         }
 
         // Deregister from active tasks registry.
-        if let Some(ref tid) = trace_id_for_kill {
-            self.active_tasks.remove(tid);
-        }
+        self.active_tasks.remove(&kill_registry_key);
 
         // If the task was cancelled, the CLI bridge returns Err("killed by user").
         // Short-circuit: mark trace as failed and return a kill confirmation
@@ -4948,4 +4954,72 @@ fn model_display_no_config() {
     };
     assert_eq!(display, "(CLI default)");
     assert_eq!(source, "profile default");
+}
+
+// ── Kill registry key tests ────────────────────────────────────────────
+
+#[test]
+fn kill_registry_key_with_trace() {
+    let trace_id: Option<&str> = Some("abc-123");
+    let request_tag = "#A7";
+    let key = trace_id
+        .map(String::from)
+        .unwrap_or_else(|| format!("notrace:{request_tag}"));
+    assert_eq!(key, "abc-123");
+}
+
+#[test]
+fn kill_registry_key_without_trace() {
+    let trace_id: Option<&str> = None;
+    let request_tag = "#A7";
+    let key = trace_id
+        .map(String::from)
+        .unwrap_or_else(|| format!("notrace:{request_tag}"));
+    assert_eq!(key, "notrace:#A7");
+}
+
+#[test]
+fn kill_registry_notrace_key_is_findable() {
+    let registry: dashmap::DashMap<String, CancellationToken> = dashmap::DashMap::new();
+    let token = CancellationToken::new();
+    let key = "notrace:#A7".to_string();
+    registry.insert(key.clone(), token.clone());
+
+    // /kill can find it by the synthetic key
+    let found = registry.remove(&key);
+    assert!(found.is_some());
+    found.unwrap().1.cancel();
+    assert!(token.is_cancelled());
+}
+
+// ── Heartbeat backpressure test ────────────────────────────────────────
+
+#[tokio::test]
+async fn heartbeat_try_send_drops_when_channel_full() {
+    let (tx, _rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+
+    tx.try_send(OutboundMessage::plain(
+        String::from("test"), String::from("chat"), String::from("first"),
+    )).unwrap();
+
+    let result = tx.try_send(OutboundMessage::plain(
+        String::from("test"), String::from("chat"), String::from("heartbeat"),
+    ));
+    assert!(result.is_err(), "try_send on full channel must fail");
+}
+
+#[tokio::test]
+async fn heartbeat_not_blocked_by_slow_consumer() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(2);
+
+    let _ = tx.try_send(OutboundMessage::plain(String::from("p"), String::from("c"), String::from("1")));
+    let _ = tx.try_send(OutboundMessage::plain(String::from("p"), String::from("c"), String::from("2")));
+
+    let r = tx.try_send(OutboundMessage::plain(String::from("p"), String::from("c"), String::from("hb")));
+    assert!(r.is_err());
+
+    let _ = rx.recv().await;
+
+    let r = tx.try_send(OutboundMessage::plain(String::from("p"), String::from("c"), String::from("hb2")));
+    assert!(r.is_ok());
 }
