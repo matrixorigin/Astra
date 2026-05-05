@@ -32,7 +32,7 @@ impl Drop for ChildKillGuard {
     fn drop(&mut self) {
         if let Some(pid) = self.pid
             && let Ok(pid_i32) = i32::try_from(pid)
-            && pid_i32 > 0
+            && pid_i32 > 1
         {
             unsafe { libc::kill(pid_i32, libc::SIGKILL); }
         }
@@ -712,22 +712,37 @@ pub async fn run_cli_with_cancel(
     if let Some(token) = access_token {
         cmd.env("ASTRA_ACCESS_TOKEN", token);
     }
+    let name = profile.name().to_string();
+    let (stdout_text, stderr_text, exit_code) =
+        run_child_with_cancel(cmd, progress_tx, timeout, cancel, &name).await?;
+
+    let mut result = profile.parse_output(&stdout_text, exit_code);
+    result.stdout = stdout_text;
+    result.stderr = stderr_text;
+    Ok(result)
+}
+
+/// Core subprocess lifecycle: spawn, stream output, handle timeout/cancel.
+/// Separated from `run_cli_with_cancel` for testability — tests can pass
+/// any `Command` directly without going through `build_command_with_context`.
+pub(crate) async fn run_child_with_cancel(
+    mut cmd: Command,
+    progress_tx: Option<mpsc::Sender<CliProgress>>,
+    timeout: Option<Duration>,
+    cancel: Option<tokio_util::sync::CancellationToken>,
+    name: &str,
+) -> Result<(String, String, i32), String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("failed to spawn {}: {e}", profile.name()))?;
+        .map_err(|e| format!("failed to spawn {name}: {e}"))?;
 
-    // Safety guard: if this function is cancelled (outer task abort),
-    // ensure the child process is killed. Without this, the child
-    // becomes an orphan zombie. Tokio's Child::drop does NOT kill.
     let mut kill_guard = ChildKillGuard::new(&child);
-
 
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let stderr = child.stderr.take().ok_or("no stderr")?;
 
-    let progress_tx_clone = progress_tx;
     let stderr_task = tokio::spawn(async move {
         let reader = BufReader::new(stderr);
         let mut lines = reader.lines();
@@ -742,7 +757,7 @@ pub async fn run_cli_with_cancel(
             }
             collected.push_str(&line);
             let event = parse_stderr_line(&line);
-            if let Some(ref tx) = progress_tx_clone {
+            if let Some(ref tx) = progress_tx {
                 let _ = tx.send(event).await;
             }
         }
@@ -770,8 +785,7 @@ pub async fn run_cli_with_cancel(
                 let stderr_text = stderr_task.await.unwrap_or_default();
                 let _stdout_text = stdout_task.await.unwrap_or_default();
                 return Err(format!(
-                    "{} timed out after {}s\n{}{}",
-                    profile.name(),
+                    "{name} timed out after {}s\n{}{}",
                     timeout.as_secs(),
                     if stderr_text.is_empty() { "" } else { "stderr: " },
                     stderr_text.lines().take(10).collect::<Vec<_>>().join("\n")
@@ -786,7 +800,7 @@ pub async fn run_cli_with_cancel(
                 let _ = child.kill().await;
                 stderr_task.abort();
                 stdout_task.abort();
-                return Err(format!("{} killed by user", profile.name()));
+                return Err(format!("{name} killed by user"));
             }
         }
     } else {
@@ -801,21 +815,16 @@ pub async fn run_cli_with_cancel(
                 let _ = child.kill().await;
                 stderr_task.abort();
                 stdout_task.abort();
-                return Err(format!("{} killed by user", profile.name()));
+                return Err(format!("{name} killed by user"));
             }
         }
     };
-    // Child exited normally — defuse the kill guard.
     kill_guard.defuse();
 
     let stderr_text = stderr_task.await.unwrap_or_default();
     let stdout_text = stdout_task.await.unwrap_or_default();
     let exit_code = status.code().unwrap_or(-1);
-
-    let mut result = profile.parse_output(&stdout_text, exit_code);
-    result.stdout = stdout_text;
-    result.stderr = stderr_text;
-    Ok(result)
+    Ok((stdout_text, stderr_text, exit_code))
 }
 
 // ─── CLI Availability ──────────────────────────────────────────────────────
@@ -1563,30 +1572,24 @@ model: claude-sonnet-4-6"#;
 
     // ── Cancellation tests ─────────────────────────────────────────────
     //
-    // These test the CancellationToken integration in run_cli_with_cancel.
-    // Design: no sleep-based timing, no temp files, no PID probing.
-    // The tests use `cat` (blocks on stdin forever) as a deterministic
-    // long-running process — it starts instantly and only exits when
-    // stdin closes (which happens when we kill it).
+    // Test `run_child_with_cancel` DIRECTLY — bypasses build_command_with_context
+    // so we can pass a real blocking command (plain `cat` with no args = blocks
+    // forever on stdin). This avoids the false-positive bug where `cat` received
+    // `-m msg --json` args and exited immediately.
 
     #[tokio::test]
-    async fn cancel_pre_fired_token_returns_killed_immediately() {
+    async fn cancel_pre_fired_kills_immediately() {
         use tokio_util::sync::CancellationToken;
 
-        // Token already cancelled BEFORE spawn — must return Err without hanging.
+        // Pre-cancelled token: function must return Err without blocking.
         let token = CancellationToken::new();
         token.cancel();
 
-        let profile = CliProfile::Astra {
-            bin: "cat".into(),
-            model: None,
-            permission_mode: "auto".into(),
-        };
-        let result = run_cli_with_cancel(
-            &profile, "msg", None, None, None, None, None, None,
-            Some(Duration::from_secs(30)),
-            None,
-            Some(token),
+        // `sleep 30` would block 30s, but pre-fired cancel kills immediately.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let result = run_child_with_cancel(
+            cmd, None, Some(Duration::from_secs(30)), Some(token), "test",
         ).await;
 
         assert!(result.is_err());
@@ -1597,34 +1600,24 @@ model: claude-sonnet-4-6"#;
     }
 
     #[tokio::test]
-    async fn cancel_mid_execution_returns_killed() {
+    async fn cancel_kills_blocking_process() {
         use tokio_util::sync::CancellationToken;
 
         let token = CancellationToken::new();
         let token_clone = token.clone();
 
-        let profile = CliProfile::Astra {
-            bin: "cat".into(),
-            model: None,
-            permission_mode: "auto".into(),
-        };
-
-        // Spawn the CLI task. `cat` with piped stdin blocks indefinitely
-        // because nobody writes to its stdin — it will only exit when killed.
+        // `sleep 30` blocks for 30s — guaranteed to still be running when cancel fires.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
         let handle = tokio::spawn(async move {
-            run_cli_with_cancel(
-                &profile, "msg", None, None, None, None, None, None,
-                Some(Duration::from_secs(30)),
-                None,
-                Some(token_clone),
+            run_child_with_cancel(
+                cmd, None, Some(Duration::from_secs(60)), Some(token_clone), "test",
             ).await
         });
 
-        // Cancel immediately — no sleep needed. The token fires, the
-        // select! in run_cli_with_cancel picks it up and kills the child.
+        // Cancel fires. The select! picks it up and kills the child.
         token.cancel();
 
-        // Must complete within the test timeout (not 30s).
         let result = tokio::time::timeout(Duration::from_secs(5), handle)
             .await
             .expect("task must complete promptly after cancel")
@@ -1639,20 +1632,34 @@ model: claude-sonnet-4-6"#;
     }
 
     #[tokio::test]
-    async fn no_cancel_token_runs_to_completion() {
-        // With cancel=None, a fast command completes normally.
-        // `true` ignores all args and exits 0.
-        let profile = CliProfile::Astra {
-            bin: "true".into(),
-            model: None,
-            permission_mode: "auto".into(),
-        };
-        let result = run_cli_with_cancel(
-            &profile, "msg", None, None, None, None, None, None,
-            Some(Duration::from_secs(5)),
-            None, None,
+    async fn no_cancel_completes_normally() {
+        // `true` exits 0 immediately; no cancel token.
+        let cmd = Command::new("true");
+        let result = run_child_with_cancel(
+            cmd, None, Some(Duration::from_secs(5)), None, "test",
         ).await;
         assert!(result.is_ok(), "true must exit 0: {:?}", result);
+        let (stdout, _stderr, code) = result.unwrap();
+        assert_eq!(code, 0);
+        assert!(stdout.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_blocking_process() {
+        use tokio_util::sync::CancellationToken;
+
+        // `sleep 30` blocks for 30s; token NOT cancelled; 100ms timeout fires.
+        let token = CancellationToken::new();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let result = run_child_with_cancel(
+            cmd, None, Some(Duration::from_millis(100)), Some(token.clone()), "test",
+        ).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("timed out"), "expected timeout, got: {err}");
+        assert!(!token.is_cancelled(), "token must NOT be cancelled by timeout");
     }
 
 }

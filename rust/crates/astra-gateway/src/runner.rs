@@ -269,18 +269,6 @@ impl GatewayRunner {
         self.store.clone()
     }
 
-    /// Cancel a running CLI task by its registry key (trace_id or
-    /// `notrace:{tag}`). Triggers CancellationToken which causes the CLI
-    /// subprocess to receive SIGKILL. Returns true if a task was found.
-    pub fn cancel_task(&self, key: &str) -> bool {
-        if let Some((_, token)) = self.active_tasks.remove(key) {
-            token.cancel();
-            true
-        } else {
-            false
-        }
-    }
-
     /// Clone the Arc-wrapped trace repository.
     pub fn trace_repo(&self) -> Option<Arc<MysqlTraceRepository>> {
         self.trace_repo.clone()
@@ -867,12 +855,14 @@ impl GatewayRunner {
             }
             let len = text.len();
             let tagged = format!("[{tag}:{chunk_num}] {text}");
-            if let Some(tx) = tx {
-                let _ = tx.try_send(OutboundMessage::plain(
+            if let Some(tx) = tx
+                && tx.try_send(OutboundMessage::plain(
                     platform.to_string(),
                     chat.to_string(),
                     tagged,
-                ));
+                )).is_err()
+            {
+                return 0;
             }
             len
         };
