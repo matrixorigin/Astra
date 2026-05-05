@@ -3213,6 +3213,18 @@ impl JournalEvent {
         categories: &[String],
         duration_ms: u64,
     ) -> Self {
+        Self::memory_extraction_ex(session_id, turn, outcome, memories_saved, categories, duration_ms, false)
+    }
+
+    pub fn memory_extraction_ex(
+        session_id: Option<&str>,
+        turn: u32,
+        outcome: &str,
+        memories_saved: usize,
+        categories: &[String],
+        duration_ms: u64,
+        prefix_reused: bool,
+    ) -> Self {
         let mut evt = Self::base(JournalEventType::MemoryExtraction, session_id);
         evt.turn = Some(turn);
         evt.duration_ms = Some(duration_ms);
@@ -3220,6 +3232,7 @@ impl JournalEvent {
             "outcome": outcome,
             "memories_saved": memories_saved,
             "categories": categories,
+            "prefix_reused": prefix_reused,
         }));
         evt
     }

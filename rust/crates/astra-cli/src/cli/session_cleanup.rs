@@ -161,21 +161,23 @@ pub(super) async fn finalize_session(state: &mut ReplState) {
     // 3f. Drain any in-flight memory extraction (bounded 5s).
     if let Some(outcome) = state.memory_extractor.drain(Duration::from_secs(5)).await {
         if let Some(ref j) = state.journal {
-            let (saved, cats, dur) = match &outcome {
+            let (saved, cats, dur, pfx) = match &outcome {
                 super::memory_extraction::ExtractionOutcome::Extracted {
                     count,
                     categories,
                     duration_ms,
-                } => (*count, categories.clone(), *duration_ms),
-                _ => (0, vec![], 0),
+                    prefix_reused,
+                } => (*count, categories.clone(), *duration_ms, *prefix_reused),
+                _ => (0, vec![], 0, false),
             };
-            let evt = session_journal::JournalEvent::memory_extraction(
+            let evt = session_journal::JournalEvent::memory_extraction_ex(
                 state.session_id.as_deref(),
                 state.turn,
                 outcome.tag(),
                 saved,
                 &cats,
                 dur,
+                pfx,
             );
             let _ = j.append(&evt);
             enqueue_ingestion_pub(state, &evt);
