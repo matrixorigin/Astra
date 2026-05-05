@@ -2423,6 +2423,76 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             self.build_system_messages_cached(&user_content, &visible_tools, state, &cache_cfg);
         self.emit_context_meta(&system_prompt_breakdown);
 
+        // Pipeline system prompt override: when pipeline_session is active,
+        // run the pipeline to produce optimized system blocks. The pipeline
+        // uses the same static sections + passes through dynamic text that
+        // the legacy path already computed (via system_prompt_plain).
+        let system_messages = if let Some(ref pipeline_sess) = state.pipeline_session {
+            use astra_turn_core::context_serializer::system_blocks_to_anthropic_content;
+            use astra_turn_core::context_sources::*;
+            use astra_turn_core::pipeline_session::AdaptiveTurnInput;
+            use astra_turn_core::token_accounting::TokenAccounting;
+
+            let turn_state = TurnState {
+                messages: state.messages.clone(),
+                tool_results: vec![],
+                tokens: TokenAccounting::from_fields(
+                    state.total_prompt,
+                    state.total_cache_read,
+                    state.total_cache_creation,
+                    state.total_completion,
+                ),
+                active_skills: vec![],
+                recent_file_reads: std::collections::HashMap::new(),
+                remaining_turns: 20,
+                turn_index: state.llm_rounds_completed,
+                recovery: astra_turn_core::recovery_state::RecoveryState::default(),
+                last_user_message: user_content.clone(),
+            };
+            let session_ctx = SessionContext {
+                session_id: self.session_id.clone(),
+                run_id: state.current_run_id.clone().unwrap_or_default(),
+                model_id: llm_cfg.model_name.clone(),
+                model_limit: state.max_turn_input_tokens as u32,
+                provider_policy: astra_turn_core::pipeline_config::ProviderCachePolicy::anthropic(),
+                provider_strategy: astra_turn_core::microcompact::ProviderCacheStrategy::default(),
+                project_context: String::new(),
+                edge_profile: EdgeProfile {
+                    cwd: self.edge_profile.get("cwd").and_then(Value::as_str).map(String::from),
+                    git_branch: self.edge_profile.get("git_branch").and_then(Value::as_str).map(String::from),
+                    ..Default::default()
+                },
+                self_model: None,
+            };
+            // Pass the legacy-computed dynamic text so the pipeline includes it
+            let external = ExternalSources {
+                memory_snippets: vec![],
+                spill_dir: None,
+                dynamic_prompt_sections: vec![system_prompt_plain.clone()],
+            };
+            let agent = AgentContext::default();
+
+            let input = AdaptiveTurnInput {
+                statics: &self.pipeline_statics,
+                agent: &agent,
+                session: &session_ctx,
+                turn: &turn_state,
+                external: &external,
+                model_id: &llm_cfg.model_name,
+                query_source: "agentic_loop",
+            };
+
+            match pipeline_sess.run_turn_adaptive(input) {
+                Ok(output) => {
+                    let content = system_blocks_to_anthropic_content(&output.serialized);
+                    vec![json!({"role": "system", "content": content})]
+                }
+                Err(_) => system_messages,
+            }
+        } else {
+            system_messages
+        };
+
         let llm_messages = self
             .build_llm_messages(
                 system_messages,
