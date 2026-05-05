@@ -106,6 +106,8 @@ mod journal_tree;
 mod memory_extraction;
 #[path = "cli/mock_llm.rs"]
 mod mock_llm;
+#[path = "cli/notifications.rs"]
+mod notifications;
 #[path = "cli/permission_manager.rs"]
 mod permission_manager;
 #[path = "cli/picker_echo.rs"]
