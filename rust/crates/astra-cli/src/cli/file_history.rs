@@ -12,15 +12,24 @@ use std::time::Instant;
 /// Maximum number of snapshots retained before evicting the oldest.
 const DEFAULT_MAX_SNAPSHOTS: usize = 100;
 
+/// Maximum per-file size captured in a checkpoint. Larger files are
+/// skipped: 100 snapshots × gigabyte-sized artifacts would blow out
+/// `~/.astra/file-history/` quickly. Undo for skipped files is a no-op —
+/// the tool reports the skip rather than silently losing the state.
+pub const MAX_CHECKPOINT_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
+
 /// A single file backup within a snapshot.
 #[derive(Debug, Clone)]
 pub struct FileBackup {
     /// The original file path that was backed up.
     pub original_path: PathBuf,
-    /// Path to the backup copy (inside the backup directory).
+    /// Path to the backup copy (inside the backup directory). Empty path if skipped.
     pub backup_path: PathBuf,
     /// Whether the file existed before the mutation. If `false`, undo means delete.
     pub existed: bool,
+    /// If Some, the file was NOT captured and revert is a no-op. Reason is
+    /// surfaced to the user so undo doesn't silently appear to succeed.
+    pub skipped_reason: Option<String>,
 }
 
 /// A point-in-time snapshot of one or more files.
@@ -95,21 +104,44 @@ impl FileHistory {
             let relative = sanitize_path_for_backup(path);
             let backup_path = snap_dir.join(&relative);
 
+            let mut skipped_reason: Option<String> = None;
+
             if existed {
-                // Ensure parent directories exist in the backup tree.
-                if let Some(parent) = backup_path.parent() {
-                    fs::create_dir_all(parent)?;
+                // Size-guard: refuse to capture oversize files. 100 snapshots
+                // of a 500MB binary would blow out ~/.astra/file-history/.
+                let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                if size > MAX_CHECKPOINT_FILE_BYTES {
+                    skipped_reason = Some(format!(
+                        "size {size} bytes exceeds checkpoint limit {MAX_CHECKPOINT_FILE_BYTES}"
+                    ));
+                    tracing::warn!(
+                        target: "astra_cli::file_history",
+                        path = %path.display(),
+                        size_bytes = size,
+                        limit_bytes = MAX_CHECKPOINT_FILE_BYTES,
+                        "file too large to checkpoint — undo for this file will be a no-op"
+                    );
+                } else {
+                    // Ensure parent directories exist in the backup tree.
+                    if let Some(parent) = backup_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    // Always copy — hard links share the inode so in-place writes
+                    // (e.g. fs::write which truncates + writes) would mutate the
+                    // backup. A copy guarantees snapshot isolation.
+                    fs::copy(path, &backup_path)?;
                 }
-                // Always copy — hard links share the inode so in-place writes
-                // (e.g. fs::write which truncates + writes) would mutate the
-                // backup. A copy guarantees snapshot isolation.
-                fs::copy(path, &backup_path)?;
             }
 
             file_backups.push(FileBackup {
                 original_path: path.to_path_buf(),
-                backup_path,
+                backup_path: if skipped_reason.is_some() {
+                    PathBuf::new()
+                } else {
+                    backup_path
+                },
                 existed,
+                skipped_reason,
             });
         }
 
@@ -146,6 +178,10 @@ impl FileHistory {
             })?;
 
         for backup in &snapshot.files {
+            if backup.skipped_reason.is_some() {
+                // File was too large to checkpoint — leave it alone.
+                continue;
+            }
             if backup.existed {
                 // Restore from backup.
                 if let Some(parent) = backup.original_path.parent() {
@@ -175,15 +211,16 @@ impl FileHistory {
         let snap_id = snapshot.id;
 
         for backup in &snapshot.files {
+            if backup.skipped_reason.is_some() {
+                continue;
+            }
             if backup.existed {
                 if let Some(parent) = backup.original_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
                 fs::copy(&backup.backup_path, &backup.original_path)?;
-            } else {
-                if backup.original_path.exists() {
-                    fs::remove_file(&backup.original_path)?;
-                }
+            } else if backup.original_path.exists() {
+                fs::remove_file(&backup.original_path)?;
             }
         }
 
@@ -210,6 +247,10 @@ impl FileHistory {
         let mut stats = DiffStats::default();
 
         for backup in &snapshot.files {
+            if backup.skipped_reason.is_some() {
+                // We never captured this file's prior state — can't diff.
+                continue;
+            }
             let current_content = if backup.original_path.exists() {
                 fs::read_to_string(&backup.original_path).ok()
             } else {
@@ -359,6 +400,80 @@ mod tests {
 
     fn make_history(tmp: &TempDir) -> FileHistory {
         FileHistory::with_backup_dir(tmp.path().join("backups"), DEFAULT_MAX_SNAPSHOTS)
+    }
+
+    // ── P0-2: size guard ──────────────────────────────────────────────────
+    //
+    // Without a size cap, checkpointing a large binary can blow out disk.
+    // 100 snapshots × 500MB = 50GB in ~/.astra. Skip oversize files
+    // deliberately and record why, so undo clearly says "not captured".
+
+    #[test]
+    fn oversize_file_is_skipped_and_reason_recorded() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = FileHistory::with_backup_dir(tmp.path().join("backups"), 10);
+
+        let big = tmp.path().join("big.bin");
+        // Write more than MAX_CHECKPOINT_FILE_BYTES so the guard fires.
+        let oversize = (MAX_CHECKPOINT_FILE_BYTES + 1) as usize;
+        fs::write(&big, vec![0u8; oversize]).unwrap();
+
+        let snap_id = history.checkpoint(&[big.as_path()]).unwrap();
+        let snap = &history.list_snapshots()[0];
+        assert_eq!(snap.id, snap_id);
+        assert_eq!(snap.files.len(), 1);
+        let backup = &snap.files[0];
+        assert!(
+            backup.skipped_reason.is_some(),
+            "oversize file must be marked skipped, not silently copied"
+        );
+        let reason = backup.skipped_reason.as_deref().unwrap();
+        assert!(
+            reason.contains("size") || reason.contains("bytes"),
+            "skip reason should mention size: {reason}"
+        );
+        assert!(
+            !backup.backup_path.exists(),
+            "no backup file should be created for skipped entries — disk would blow up"
+        );
+    }
+
+    #[test]
+    fn under_limit_file_is_captured_normally() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let small = tmp.path().join("small.txt");
+        fs::write(&small, b"hello").unwrap();
+
+        history.checkpoint(&[small.as_path()]).unwrap();
+        let backup = &history.list_snapshots()[0].files[0];
+        assert!(backup.skipped_reason.is_none(), "small file should be captured");
+        assert!(backup.backup_path.exists());
+    }
+
+    #[test]
+    fn revert_of_skipped_file_is_noop_not_error() {
+        // Undo must NOT try to restore a skipped file (its backup_path
+        // doesn't exist) — should leave the current file untouched.
+        let tmp = TempDir::new().unwrap();
+        let mut history = FileHistory::with_backup_dir(tmp.path().join("backups"), 10);
+
+        let big = tmp.path().join("big.bin");
+        let oversize = (MAX_CHECKPOINT_FILE_BYTES + 1) as usize;
+        fs::write(&big, vec![0u8; oversize]).unwrap();
+
+        history.checkpoint(&[big.as_path()]).unwrap();
+        // User modifies the big file post-checkpoint.
+        fs::write(&big, b"modified").unwrap();
+
+        // Revert must not error and must not touch the (skipped) file.
+        history.undo_last().unwrap();
+        let content = fs::read(&big).unwrap();
+        assert_eq!(
+            content, b"modified",
+            "skipped files must be left alone on undo (we never had their state)"
+        );
     }
 
     #[test]
