@@ -111,7 +111,11 @@ pub fn main_model_wrote_memory(tools_used: &[String]) -> bool {
 /// `read` is how many input tokens came from cache (hit); `creation` is
 /// how many were newly cached (miss or first-write). Both None means the
 /// provider didn't report usage or we failed to parse it.
+///
+/// Marked `#[non_exhaustive]` because we may add more provider-reported
+/// fields (total_tokens, completion_tokens, etc.) without a semver bump.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CacheUsage {
     pub cache_read_tokens: Option<u64>,
     pub cache_creation_tokens: Option<u64>,
@@ -140,7 +144,11 @@ impl CacheUsage {
 }
 
 /// Outcome of an extraction attempt, for journal/audit.
+///
+/// New variants may be added between releases. External callers
+/// pattern-matching on this enum MUST include a `_ =>` catch-all.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ExtractionOutcome {
     /// Background task fired — actual results available via `drain()`.
     Started,

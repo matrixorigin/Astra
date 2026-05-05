@@ -230,9 +230,10 @@ async fn fetch_inner(
     if !cache_scope.is_empty() {
         let mut cache = shared_cache().lock().await;
         if let Some(cached) = cache.get(&cache_key) {
-            let mut result = (*cached).clone();
-            result.cached = true;
-            return Ok(Arc::new(result));
+            // Zero-copy hit: return an Arc clone to the stored result.
+            // The stored FetchResult already has `cached: true` (we set
+            // it pre-store below), so no mutation is needed here.
+            return Ok(cached);
         }
     }
 
@@ -247,14 +248,21 @@ async fn fetch_inner(
         &config,
         start.elapsed(),
     );
-    let result = Arc::new(result);
 
     if status < 400 && !cache_scope.is_empty() {
+        // Store a SECOND Arc (pre-flagged `cached: true`) separately so
+        // the fresh-miss return value keeps `cached: false` for the
+        // current caller. The clone is paid once at store time, not on
+        // every subsequent hit. Net: one O(FetchResult) allocation per
+        // miss; O(1) Arc::clone per hit.
+        let mut for_cache = result.clone();
+        for_cache.cached = true;
+        let cache_arc = Arc::new(for_cache);
         let mut cache = shared_cache().lock().await;
-        cache.put(cache_key, Arc::clone(&result));
+        cache.put(cache_key, cache_arc);
     }
 
-    Ok(result)
+    Ok(Arc::new(result))
 }
 
 // ─── URL Validation ──────────────────────────────────────────────────────────
@@ -1404,6 +1412,73 @@ mod tests {
         key_a.max_content = key_b.max_content;
         key_b.max_links = 5;
         assert_ne!(key_a, key_b);
+    }
+
+    // ── R3-P0-#3: cache hit must be Arc::clone, not deep clone ────────────
+    //
+    // Previous impl did `(*cached).clone()` then mutated `cached = true`,
+    // copying the full FetchResult (potentially MBs of content+markdown).
+    // Cache hit should be zero-copy via Arc — the FetchResult sitting in
+    // the cache is immutable from our side.
+
+    #[test]
+    fn cache_hit_returns_arc_clone_not_deep_copy() {
+        let mut cache = Cache::new(10, Duration::from_secs(60));
+        let result = Arc::new(FetchResult {
+            url: "https://x.com".into(),
+            final_url: None,
+            status: 200,
+            content_type: "text/html".into(),
+            metadata: PageMetadata::default(),
+            content: "X".repeat(100_000), // 100KB payload
+            links: vec![],
+            content_length: 100_000,
+            truncated: false,
+            cached: true,
+            elapsed_ms: 0,
+        });
+        let key = cache_key("s1", "https://x.com", OutputFormat::Markdown);
+        cache.put(key.clone(), Arc::clone(&result));
+
+        // After put, the cache and `result` share the same Arc => strong_count == 2.
+        assert_eq!(Arc::strong_count(&result), 2);
+
+        let hit = cache.get(&key).unwrap();
+        // Hit must clone the Arc, NOT deep-clone the FetchResult.
+        // Proof: the returned Arc points at the same allocation.
+        assert!(
+            Arc::ptr_eq(&result, &hit),
+            "cache hit must return an Arc to the same allocation — got \
+             different pointers (full FetchResult was cloned)"
+        );
+        // And the content buffer is the very same String, not a copy.
+        assert_eq!(hit.content.as_ptr(), result.content.as_ptr());
+    }
+
+    #[test]
+    fn cache_stores_with_cached_flag_preset() {
+        // When a caller put()s a FetchResult, the cached flag stays as
+        // written. Readers must decide whether to set cached=true BEFORE
+        // put, or accept the stored flag as-is. Production callers set
+        // it via `stash_with_cached_flag` helper.
+        let mut cache = Cache::new(10, Duration::from_secs(60));
+        let result = Arc::new(FetchResult {
+            url: "https://x.com".into(),
+            final_url: None,
+            status: 200,
+            content_type: "text/html".into(),
+            metadata: PageMetadata::default(),
+            content: "c".into(),
+            links: vec![],
+            content_length: 1,
+            truncated: false,
+            cached: true, // pre-flagged
+            elapsed_ms: 0,
+        });
+        let key = cache_key("s1", "https://x.com", OutputFormat::Markdown);
+        cache.put(key.clone(), result);
+        let hit = cache.get(&key).unwrap();
+        assert!(hit.cached, "stored flag must survive round-trip");
     }
 
     #[test]

@@ -91,6 +91,15 @@ impl TestClock {
     }
 }
 
+/// Entries whose `last_failure_at` is older than this are reaped on the
+/// next record_failure call. Bounds state.len() under a steady stream of
+/// one-off failures from unique conversations (gateway at scale).
+const SEND_FAILURE_EVICTION_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// Floor on how often we walk `state` to evict. Prevents an O(n) sweep
+/// from running on every single `record_failure` during a failure spike.
+const SEND_FAILURE_EVICTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Per-conversation send health tracker. Suppresses heartbeats after
 /// consecutive send failures to avoid flooding an unreachable platform.
 ///
@@ -99,9 +108,13 @@ impl TestClock {
 /// - Without any send (task processing locally), the breaker auto half-opens
 ///   after `SEND_FAILURE_COOLDOWN` elapsed since `last_failure_at`, so the
 ///   next heartbeat probes platform recovery.
+/// - Abandoned entries (no new failure for `SEND_FAILURE_EVICTION_AGE`) are
+///   lazily reaped so `state.len()` stays bounded under high-conversation
+///   churn. Sweep runs at most once per `SEND_FAILURE_EVICTION_SWEEP_INTERVAL`.
 #[derive(Clone)]
 struct SendCircuitBreaker {
     state: Arc<dashmap::DashMap<String, (u32, Instant)>>,
+    last_sweep_at: Arc<std::sync::Mutex<Option<Instant>>>,
     clock: Arc<dyn Clock>,
 }
 
@@ -109,6 +122,7 @@ impl Default for SendCircuitBreaker {
     fn default() -> Self {
         Self {
             state: Arc::new(dashmap::DashMap::new()),
+            last_sweep_at: Arc::new(std::sync::Mutex::new(None)),
             clock: Arc::new(SystemClock),
         }
     }
@@ -119,7 +133,40 @@ impl SendCircuitBreaker {
     fn with_clock(clock: TestClockHandle) -> Self {
         Self {
             state: Arc::new(dashmap::DashMap::new()),
+            last_sweep_at: Arc::new(std::sync::Mutex::new(None)),
             clock: Arc::new(clock),
+        }
+    }
+
+    /// Opportunistically reap entries older than the eviction age. Called
+    /// from record_failure so the sweep cost is amortized with the write.
+    /// Rate-limited to once per SEND_FAILURE_EVICTION_SWEEP_INTERVAL to
+    /// avoid O(n) per call during a failure spike.
+    fn maybe_evict(&self, now: Instant) {
+        {
+            let mut last = match self.last_sweep_at.lock() {
+                Ok(g) => g,
+                Err(_) => return, // poisoned — skip eviction, not critical
+            };
+            if let Some(prev) = *last
+                && now.saturating_duration_since(prev) < SEND_FAILURE_EVICTION_SWEEP_INTERVAL
+            {
+                return;
+            }
+            *last = Some(now);
+        }
+        let before = self.state.len();
+        self.state.retain(|_, (_, last_failure_at)| {
+            now.saturating_duration_since(*last_failure_at) < SEND_FAILURE_EVICTION_AGE
+        });
+        let evicted = before.saturating_sub(self.state.len());
+        if evicted > 0 {
+            tracing::debug!(
+                target: "gateway::circuit_breaker",
+                evicted,
+                remaining = self.state.len(),
+                "send circuit breaker swept stale entries"
+            );
         }
     }
 
@@ -138,6 +185,9 @@ impl SendCircuitBreaker {
 
     fn record_failure(&self, key: &str) {
         let now = self.clock.now();
+        // Reap stale entries before inserting so state.len() stays bounded
+        // under a steady stream of one-off failures from unique keys.
+        self.maybe_evict(now);
         let mut entry = self.state.entry(key.to_string()).or_insert((0, now));
         entry.0 += 1;
         entry.1 = now;
@@ -5349,6 +5399,78 @@ mod circuit_breaker_tests {
             cb.is_open("wx:chat2"),
             "chat2 still within cooldown (elapsed < cooldown)"
         );
+    }
+
+    // ── R3-P0-#4: eviction of abandoned entries ──────────────────────────
+    //
+    // Long-running gateway with 100k+ unique conversations would otherwise
+    // accumulate state.len() forever — each distinct (platform, chat_id)
+    // that ever failed once keeps a (count, last_failure_at) pair. Lazy
+    // eviction on record_failure drops entries older than the eviction age.
+
+    #[test]
+    fn entries_older_than_eviction_age_are_reaped() {
+        let clock = TestClock::new();
+        let cb = SendCircuitBreaker::with_clock(clock.handle());
+
+        // Seed many distinct conversations with a single failure each.
+        for i in 0..200 {
+            cb.record_failure(&format!("wx:conv{i}"));
+        }
+        assert_eq!(cb.state.len(), 200);
+
+        // Fast-forward past eviction age + advance the sweep.
+        clock.advance(SEND_FAILURE_EVICTION_AGE + Duration::from_secs(1));
+
+        // A new failure triggers opportunistic eviction of all the old
+        // entries whose last_failure_at is too old.
+        cb.record_failure("wx:fresh");
+        assert_eq!(
+            cb.state.len(),
+            1,
+            "stale entries must be reaped on next record_failure; only \
+             the freshly-recorded key should remain. len={}",
+            cb.state.len()
+        );
+    }
+
+    #[test]
+    fn eviction_preserves_recently_active_entries() {
+        let clock = TestClock::new();
+        let cb = SendCircuitBreaker::with_clock(clock.handle());
+
+        cb.record_failure("old");
+        clock.advance(SEND_FAILURE_EVICTION_AGE / 2);
+        cb.record_failure("mid");
+        clock.advance(SEND_FAILURE_EVICTION_AGE / 2 + Duration::from_secs(1));
+        // `old` is now past eviction age; `mid` is NOT.
+        cb.record_failure("fresh");
+        assert!(
+            cb.state.get("old").is_none(),
+            "old entry past eviction age must be gone"
+        );
+        assert!(
+            cb.state.get("mid").is_some(),
+            "mid-age entry within eviction window must remain"
+        );
+        assert!(
+            cb.state.get("fresh").is_some(),
+            "freshly-recorded entry must remain"
+        );
+    }
+
+    #[test]
+    fn eviction_is_amortized_not_every_call() {
+        // Sweeping on EVERY record_failure would make failure-spike
+        // scenarios pay O(n) per call. Eviction runs at most once per
+        // EVICTION_SWEEP_INTERVAL wall-time window per breaker.
+        let clock = TestClock::new();
+        let cb = SendCircuitBreaker::with_clock(clock.handle());
+        for i in 0..50 {
+            cb.record_failure(&format!("k{i}"));
+        }
+        // All within eviction age — no reap yet.
+        assert_eq!(cb.state.len(), 50);
     }
 }
 

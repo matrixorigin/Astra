@@ -19,7 +19,12 @@ const DEFAULT_MAX_SNAPSHOTS: usize = 100;
 pub const MAX_CHECKPOINT_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
 
 /// A single file backup within a snapshot.
+///
+/// New fields may be added between releases (e.g. the `skipped_reason`
+/// field was added after the initial layout). External callers that
+/// construct or destructure this struct MUST use `..` to allow growth.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FileBackup {
     /// The original file path that was backed up.
     pub original_path: PathBuf,
