@@ -9,6 +9,7 @@
 
 pub mod memoria;
 pub mod schemas;
+pub mod web_fetch;
 pub mod web_search;
 
 pub mod build_test;
