@@ -5345,15 +5345,35 @@ fn summarize_web_fetch_output(output: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    let non_empty_lines = trimmed
+
+    let parsed = serde_json::from_str::<serde_json::Value>(trimmed).ok();
+    let json_title = parsed
+        .as_ref()
+        .and_then(|v| v.get("metadata"))
+        .and_then(|m| m.get("title"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    let summary_source = parsed
+        .as_ref()
+        .and_then(|v| v.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(trimmed);
+
+    let mut non_empty_lines = summary_source
         .lines()
         .filter(|line| !line.trim().is_empty())
         .count();
     if non_empty_lines == 0 {
-        return None;
+        non_empty_lines = trimmed
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        if non_empty_lines == 0 {
+            return None;
+        }
     }
 
-    let markdown_title = trimmed.lines().find_map(|line| {
+    let markdown_title = summary_source.lines().find_map(|line| {
         let line = line.trim();
         line.strip_prefix("# ")
             .map(str::trim)
@@ -5362,18 +5382,20 @@ fn summarize_web_fetch_output(output: &str) -> Option<String> {
     });
 
     let html_title = {
-        let lower = trimmed.to_ascii_lowercase();
+        let lower = summary_source.to_ascii_lowercase();
         let start = lower.find("<title>");
         let end = lower.find("</title>");
         match (start, end) {
-            (Some(start), Some(end)) if end > start + "<title>".len() => {
-                Some(trimmed[start + "<title>".len()..end].trim().to_string())
-            }
+            (Some(start), Some(end)) if end > start + "<title>".len() => Some(
+                summary_source[start + "<title>".len()..end]
+                    .trim()
+                    .to_string(),
+            ),
             _ => None,
         }
     };
 
-    let title = markdown_title.or(html_title);
+    let title = json_title.or(markdown_title).or(html_title);
     match title {
         Some(title) => Some(format!(
             "{} · {}",
@@ -7499,6 +7521,21 @@ diff --git a/src/a.rs b/src/a.rs\n\
             .expect("summary");
         assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
         assert_eq!(summary.text, "Release Notes · 1 line");
+    }
+
+    #[test]
+    fn web_fetch_output_summary_uses_structured_json_title() {
+        let r = StreamRenderState::new();
+        let output = serde_json::json!({
+            "metadata": {"title": "Structured Docs"},
+            "content": "# Ignored Heading\n\nBody"
+        })
+        .to_string();
+        let summary = r
+            .format_output_summary("web_fetch", &output, "ok")
+            .expect("summary");
+        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
+        assert_eq!(summary.text, "Structured Docs · 2 lines");
     }
 
     #[test]

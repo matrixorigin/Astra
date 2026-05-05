@@ -302,7 +302,13 @@ impl DefaultToolExecutor {
 
             // ── Web fetch (HTTP GET) ─────────────────────────────────
             "web_fetch" => {
-                let output = crate::web_fetch::fetch(self.ctx.http_client.as_ref(), args).await;
+                let cache_scope = format!("{}:{}", self.ctx.user_id, self.ctx.session_id);
+                let output = crate::web_fetch::fetch_with_cache_scope(
+                    self.ctx.http_client.as_ref(),
+                    args,
+                    &cache_scope,
+                )
+                .await;
                 string_to_result(output)
             }
 

@@ -1052,7 +1052,15 @@ impl ToolExecutor {
                 "github_get_issue" => self.github_get_issue(args).await,
                 "github_repo_stats" => self.github_repo_stats(args).await,
                 "github_create_issue" => self.github_create_issue(args).await,
-                "web_fetch" => astra_tools::web_fetch::fetch(None, args).await,
+                "web_fetch" => {
+                    let cache_scope = self
+                        .active_session_id
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.clone())
+                        .unwrap_or_else(|| self.project_root.to_string_lossy().to_string());
+                    astra_tools::web_fetch::fetch_with_cache_scope(None, args, &cache_scope).await
+                }
                 "memory_retrieve" => self.memoria_call("retrieve", args).await,
                 "memory_store" => self.memoria_call("store", args).await,
                 "memory_search" => self.memoria_call("search", args).await,

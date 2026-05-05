@@ -7,6 +7,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use reqwest::header;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -96,6 +97,7 @@ impl FetchConfig {
 
         let max_content = args
             .get("max_content")
+            .or_else(|| args.get("max_bytes"))
             .and_then(Value::as_u64)
             .unwrap_or(80_000) as usize;
 
@@ -117,10 +119,13 @@ impl FetchConfig {
 
 // ─── Cache ───────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct CacheKey {
+    scope: String,
     url: String,
     format: OutputFormat,
+    max_content: usize,
+    max_links: usize,
 }
 
 struct CacheEntry {
@@ -186,7 +191,16 @@ const MAX_WALK_DEPTH: usize = 256;
 /// Tool dispatcher entry point. Returns JSON on success, `"Error: ..."` on failure.
 /// HTTP 4xx/5xx responses are returned as error strings so the caller marks them as errors.
 pub async fn fetch(client: Option<&reqwest::Client>, args: &Value) -> String {
-    match fetch_inner(client, args).await {
+    fetch_with_cache_scope(client, args, "").await
+}
+
+/// Same as [`fetch`], but isolates the URL cache by caller-provided session/workspace scope.
+pub async fn fetch_with_cache_scope(
+    client: Option<&reqwest::Client>,
+    args: &Value,
+    cache_scope: &str,
+) -> String {
+    match fetch_inner(client, args, cache_scope).await {
         Ok(result) if result.status >= 400 => {
             format!("Error: HTTP {} — {}", result.status, result.content)
         }
@@ -198,17 +212,21 @@ pub async fn fetch(client: Option<&reqwest::Client>, args: &Value) -> String {
 async fn fetch_inner(
     client: Option<&reqwest::Client>,
     args: &Value,
+    cache_scope: &str,
 ) -> Result<Arc<FetchResult>, FetchError> {
     let (url, config) = FetchConfig::from_args(args)?;
     validate_url(&url)?;
+    validate_resolved_host(&url).await?;
 
     let cache_key = CacheKey {
+        scope: cache_scope.to_string(),
         url: url.clone(),
         format: config.format,
+        max_content: config.max_content,
+        max_links: config.max_links,
     };
 
-    // Check cache
-    {
+    if !cache_scope.is_empty() {
         let mut cache = shared_cache().lock().await;
         if let Some(cached) = cache.get(&cache_key) {
             let mut result = (*cached).clone();
@@ -230,7 +248,7 @@ async fn fetch_inner(
     );
     let result = Arc::new(result);
 
-    if status < 400 {
+    if status < 400 && !cache_scope.is_empty() {
         let mut cache = shared_cache().lock().await;
         cache.put(cache_key, Arc::clone(&result));
     }
@@ -266,26 +284,69 @@ fn validate_url(url: &str) -> Result<(), FetchError> {
     Ok(())
 }
 
+async fn validate_resolved_host(url: &str) -> Result<(), FetchError> {
+    let parsed =
+        url::Url::parse(url).map_err(|e| FetchError::Validation(format!("Invalid URL: {e}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| FetchError::Validation("URL has no host".into()))?;
+
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| FetchError::Validation("URL has no port for scheme".into()))?;
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| FetchError::Network(format!("DNS lookup failed for {host}: {e}")))?;
+
+    for addr in addrs {
+        if is_private_ip(addr.ip()) {
+            return Err(FetchError::SsrfBlocked(host.to_string()));
+        }
+    }
+    Ok(())
+}
+
 fn is_private_host(host: &str) -> bool {
     let host_clean = host.trim_start_matches('[').trim_end_matches(']');
 
     if let Ok(ip) = host_clean.parse::<IpAddr>() {
-        return match ip {
-            IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.octets()[0] == 169 && v4.octets()[1] == 254
-                    || v4.is_unspecified()
-                    || v4.is_broadcast()
-            }
-            IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
-        };
+        return is_private_ip(ip);
     }
 
-    matches!(host_clean, "localhost" | "localhost.localdomain")
-        || host_clean.ends_with(".local")
-        || host_clean.ends_with(".internal")
+    let lower = host_clean.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "localhost" | "localhost.localdomain" | "metadata.google.internal"
+    ) || lower.ends_with(".localhost")
+        || lower.ends_with(".local")
+        || lower.ends_with(".internal")
+}
+
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || matches!(v6.segments()[0] & 0xfe00, 0xfc00)
+                || matches!(v6.segments()[0] & 0xffc0, 0xfe80)
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| is_private_ip(IpAddr::V4(v4)))
+        }
+    }
 }
 
 // ─── HTTP Fetch ──────────────────────────────────────────────────────────────
@@ -303,52 +364,100 @@ async fn do_fetch(
 }
 
 async fn fetch_reqwest(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     url: &str,
     timeout: Duration,
 ) -> Result<(u16, Option<String>, String, String), FetchError> {
-    let resp = tokio::time::timeout(timeout, async {
-        client
-            .get(url)
-            .header("User-Agent", USER_AGENT)
-            .header(
-                "Accept",
-                "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8",
-            )
-            .send()
-            .await
-    })
-    .await
-    .map_err(|_| FetchError::Timeout(format!("Request timed out after {timeout:?}")))?
-    .map_err(|e| FetchError::Network(format!("HTTP request failed: {e}")))?;
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(USER_AGENT)
+        .no_proxy()
+        .build()
+        .map_err(|e| FetchError::Network(format!("HTTP client init failed: {e}")))?;
 
-    let status = resp.status().as_u16();
-    let final_url = resp.url().as_str();
-    let final_url = if final_url != url {
-        Some(final_url.to_string())
-    } else {
-        None
-    };
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("text/html")
-        .to_string();
+    let mut current = url.to_string();
+    let mut final_url = None;
 
-    // Stream body with size limit
-    let body = resp
-        .text()
+    for redirect_count in 0..=MAX_REDIRECTS {
+        validate_url(&current)?;
+        validate_resolved_host(&current).await?;
+
+        let mut resp = tokio::time::timeout(timeout, async {
+            client
+                .get(&current)
+                .header(
+                    "Accept",
+                    "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8",
+                )
+                .send()
+                .await
+        })
         .await
-        .map_err(|e| FetchError::Network(format!("Failed to read body: {e}")))?;
+        .map_err(|_| FetchError::Timeout(format!("Request timed out after {timeout:?}")))?
+        .map_err(|e| FetchError::Network(format!("HTTP request failed: {e}")))?;
 
-    let body = if body.len() > MAX_DOWNLOAD_BYTES {
-        body[..body.floor_char_boundary(MAX_DOWNLOAD_BYTES)].to_string()
-    } else {
-        body
-    };
+        let status = resp.status();
+        if status.is_redirection()
+            && let Some(location) = resp.headers().get(header::LOCATION)
+        {
+            if redirect_count >= MAX_REDIRECTS {
+                return Err(FetchError::Network(format!(
+                    "Too many redirects (>{MAX_REDIRECTS})"
+                )));
+            }
+            let location = location.to_str().map_err(|e| {
+                FetchError::Network(format!("Invalid redirect Location header: {e}"))
+            })?;
+            let next = resolve_url(&current, location).ok_or_else(|| {
+                FetchError::Network(format!("Invalid redirect Location: {location}"))
+            })?;
+            validate_url(&next)?;
+            validate_resolved_host(&next).await?;
+            final_url = Some(next.clone());
+            current = next;
+            continue;
+        }
 
-    Ok((status, final_url, content_type, body))
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("text/html")
+            .to_string();
+
+        let body = if is_binary_content_type(&content_type.to_lowercase()) {
+            String::new()
+        } else {
+            read_limited_body(&mut resp).await?
+        };
+
+        return Ok((status.as_u16(), final_url, content_type, body));
+    }
+
+    Err(FetchError::Network(format!(
+        "Too many redirects (>{MAX_REDIRECTS})"
+    )))
+}
+
+async fn read_limited_body(resp: &mut reqwest::Response) -> Result<String, FetchError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| FetchError::Network(format!("Failed to read body: {e}")))?
+    {
+        let remaining = MAX_DOWNLOAD_BYTES.saturating_sub(bytes.len());
+        if remaining == 0 {
+            break;
+        }
+        if chunk.len() > remaining {
+            bytes.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Sentinel used to separate body from curl metadata.
@@ -359,19 +468,54 @@ async fn fetch_curl(
     url: &str,
     timeout: Duration,
 ) -> Result<(u16, Option<String>, String, String), FetchError> {
+    let mut current = url.to_string();
+    let mut final_url = None;
+
+    for redirect_count in 0..=MAX_REDIRECTS {
+        validate_url(&current)?;
+        validate_resolved_host(&current).await?;
+
+        let (status, content_type, redirect_url, body) = fetch_curl_once(&current, timeout).await?;
+        if (300..400).contains(&status)
+            && let Some(location) = redirect_url.filter(|u| !u.is_empty())
+        {
+            if redirect_count >= MAX_REDIRECTS {
+                return Err(FetchError::Network(format!(
+                    "Too many redirects (>{MAX_REDIRECTS})"
+                )));
+            }
+            validate_url(&location)?;
+            validate_resolved_host(&location).await?;
+            final_url = Some(location.clone());
+            current = location;
+            continue;
+        }
+        return Ok((status, final_url, content_type, body));
+    }
+
+    Err(FetchError::Network(format!(
+        "Too many redirects (>{MAX_REDIRECTS})"
+    )))
+}
+
+async fn fetch_curl_once(
+    url: &str,
+    timeout: Duration,
+) -> Result<(u16, String, Option<String>, String), FetchError> {
     let timeout_secs = timeout.as_secs().to_string();
     let write_format =
-        format!("{CURL_SENTINEL}%{{http_code}}\n%{{content_type}}\n%{{url_effective}}");
+        format!("{CURL_SENTINEL}%{{http_code}}\n%{{content_type}}\n%{{redirect_url}}");
     let output = tokio::process::Command::new("curl")
         .args([
             "-sS",
-            "-L",
-            "--max-redirs",
-            &MAX_REDIRECTS.to_string(),
             "--max-time",
             &timeout_secs,
             "--max-filesize",
             &MAX_DOWNLOAD_BYTES.to_string(),
+            "--proto",
+            "=http,https",
+            "--proto-redir",
+            "=http,https",
             "-H",
             &format!("User-Agent: {USER_AGENT}"),
             "-H",
@@ -384,7 +528,7 @@ async fn fetch_curl(
         .await
         .map_err(|e| FetchError::Network(format!("curl: {e}")))?;
 
-    if !output.status.success() && output.stdout.is_empty() {
+    if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(FetchError::Network(format!("curl: {}", stderr.trim())));
     }
@@ -397,10 +541,22 @@ async fn fetch_curl(
     let lines: Vec<&str> = meta.lines().collect();
     let status: u16 = lines.first().and_then(|s| s.parse().ok()).unwrap_or(0);
     let content_type = lines.get(1).unwrap_or(&"text/html").to_string();
-    let effective_url = lines.get(2).map(|s| s.to_string());
-    let final_url = effective_url.filter(|u| u != url);
+    let redirect_url = lines
+        .get(2)
+        .map(|s| s.to_string())
+        .filter(|u| !u.is_empty());
 
-    Ok((status, final_url, content_type, body.to_string()))
+    if status == 0 {
+        return Err(FetchError::Network("curl returned HTTP status 0".into()));
+    }
+
+    let body = if is_binary_content_type(&content_type.to_lowercase()) {
+        String::new()
+    } else {
+        body.to_string()
+    };
+
+    Ok((status, content_type, redirect_url, body))
 }
 
 // ─── Content Transformation ──────────────────────────────────────────────────
@@ -1049,6 +1205,15 @@ mod tests {
     }
 
     #[test]
+    fn blocks_private_ipv6_ranges() {
+        assert!(validate_url("http://[fc00::1]/").is_err());
+        assert!(validate_url("http://[fd12:3456::1]/").is_err());
+        assert!(validate_url("http://[fe80::1]/").is_err());
+        assert!(validate_url("http://[::ffff:127.0.0.1]/").is_err());
+        assert!(validate_url("http://[::ffff:10.0.0.1]/").is_err());
+    }
+
+    #[test]
     fn blocks_internal_domains() {
         assert!(validate_url("http://service.local/api").is_err());
         assert!(validate_url("http://db.internal/query").is_err());
@@ -1140,6 +1305,16 @@ mod tests {
 
     // ── Cache ─────────────────────────────────────────────────────────
 
+    fn cache_key(scope: &str, url: &str, format: OutputFormat) -> CacheKey {
+        CacheKey {
+            scope: scope.into(),
+            url: url.into(),
+            format,
+            max_content: 80_000,
+            max_links: 25,
+        }
+    }
+
     #[test]
     fn cache_key_includes_format() {
         let mut cache = Cache::new(10, Duration::from_secs(60));
@@ -1156,18 +1331,27 @@ mod tests {
             cached: false,
             elapsed_ms: 0,
         });
-        let key_md = CacheKey {
-            url: "https://x.com".into(),
-            format: OutputFormat::Markdown,
-        };
-        let key_txt = CacheKey {
-            url: "https://x.com".into(),
-            format: OutputFormat::Text,
-        };
+        let key_md = cache_key("s1", "https://x.com", OutputFormat::Markdown);
+        let key_txt = cache_key("s1", "https://x.com", OutputFormat::Text);
         cache.put(key_md.clone(), Arc::clone(&result));
 
         assert!(cache.get(&key_md).is_some());
         assert!(cache.get(&key_txt).is_none());
+    }
+
+    #[test]
+    fn cache_key_isolates_scope_and_limits() {
+        let mut key_a = cache_key("session-a", "https://x.com", OutputFormat::Markdown);
+        let mut key_b = cache_key("session-b", "https://x.com", OutputFormat::Markdown);
+        assert_ne!(key_a, key_b);
+
+        key_b.scope = key_a.scope.clone();
+        key_b.max_content = 10_000;
+        assert_ne!(key_a, key_b);
+
+        key_a.max_content = key_b.max_content;
+        key_b.max_links = 5;
+        assert_ne!(key_a, key_b);
     }
 
     #[test]
@@ -1188,19 +1372,13 @@ mod tests {
                 elapsed_ms: 0,
             });
             cache.put(
-                CacheKey {
-                    url: format!("https://x.com/{i}"),
-                    format: OutputFormat::Markdown,
-                },
+                cache_key("s1", &format!("https://x.com/{i}"), OutputFormat::Markdown),
                 result,
             );
         }
         assert_eq!(cache.entries.len(), 2);
         // First entry should be evicted
-        let key0 = CacheKey {
-            url: "https://x.com/0".into(),
-            format: OutputFormat::Markdown,
-        };
+        let key0 = cache_key("s1", "https://x.com/0", OutputFormat::Markdown);
         assert!(cache.get(&key0).is_none());
     }
 
@@ -1221,17 +1399,11 @@ mod tests {
             elapsed_ms: 0,
         });
         cache.put(
-            CacheKey {
-                url: "https://x.com".into(),
-                format: OutputFormat::Markdown,
-            },
+            cache_key("s1", "https://x.com", OutputFormat::Markdown),
             result,
         );
         std::thread::sleep(Duration::from_millis(5));
-        let key = CacheKey {
-            url: "https://x.com".into(),
-            format: OutputFormat::Markdown,
-        };
+        let key = cache_key("s1", "https://x.com", OutputFormat::Markdown);
         assert!(cache.get(&key).is_none());
     }
 
