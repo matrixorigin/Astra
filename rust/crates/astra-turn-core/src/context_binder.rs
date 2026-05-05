@@ -169,6 +169,16 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
         parts.push(text.clone());
     }
 
+    // Bridge escape hatch: pre-built dynamic sections (session anchor,
+    // feedback rules, memoria insights, etc.). Appended verbatim in
+    // caller order so the bridge's legacy composition can be replicated
+    // without adding 10 more typed fields.
+    for section in &ext.extra_dynamic_sections {
+        if !section.text.is_empty() {
+            parts.push(section.text.clone());
+        }
+    }
+
     parts.join("\n")
 }
 
@@ -327,6 +337,60 @@ mod tests {
         let content = bind_runtime_identity(&sources);
         assert!(content.contains("test-model"));
         assert!(content.contains("main")); // git branch
+    }
+
+    /// HTTP bridge escape hatch: `extra_dynamic_sections` gives callers a
+    /// way to feed pre-built sections (session anchor, feedback rules,
+    /// memoria insights, etc.) through the pipeline without each one
+    /// needing a dedicated typed field. Binder appends them verbatim
+    /// after the standard runtime fragments.
+    #[test]
+    fn bind_runtime_identity_includes_extra_dynamic_sections() {
+        use crate::section_types::PromptSection;
+        use crate::section_types::PromptTokenBucket;
+
+        let mut fixture = test_sources();
+        fixture.external.extra_dynamic_sections = vec![
+            PromptSection::dynamic(
+                "\n\n## Session Anchor\nOriginal task: build a CLI.".to_string(),
+                PromptTokenBucket::Environment,
+            ),
+            PromptSection::dynamic(
+                "\n\n[Learned Feedback Rules]\n- No mocks in integration tests.".to_string(),
+                PromptTokenBucket::Environment,
+            ),
+        ];
+
+        let sources = fixture.context();
+        let content = bind_runtime_identity(&sources);
+
+        assert!(
+            content.contains("Session Anchor"),
+            "first extra section must appear in runtime identity: {content}"
+        );
+        assert!(
+            content.contains("Learned Feedback Rules"),
+            "second extra section must also appear: {content}"
+        );
+        // Order preserved — anchor before feedback rules
+        let anchor_pos = content.find("Session Anchor").unwrap();
+        let rules_pos = content.find("Learned Feedback Rules").unwrap();
+        assert!(
+            anchor_pos < rules_pos,
+            "extra_dynamic_sections must append in caller-specified order"
+        );
+    }
+
+    #[test]
+    fn bind_runtime_identity_empty_extras_behaves_like_before() {
+        // Backward-compat: empty `extra_dynamic_sections` (the default)
+        // must not change the output versus the pre-refactor behaviour.
+        let fixture = test_sources();
+        let sources = fixture.context();
+        let content = bind_runtime_identity(&sources);
+        // Core identity still intact; no spurious trailing content.
+        assert!(content.contains("test-model"));
+        assert!(!content.ends_with("\n\n"), "no orphan blank lines from empty extras");
     }
 
     #[test]

@@ -130,6 +130,22 @@ pub struct ExternalSources {
     pub tool_conditional: Option<String>,
     /// Project profile description (cwd, git_branch, project facts).
     pub profile_desc: Option<String>,
+    /// Pre-built dynamic sections that should append verbatim after the
+    /// standard runtime-identity fragments. Used by callers that compose
+    /// bespoke per-turn content (session anchor, feedback rules, memoria
+    /// insights, implicit-feedback hints, etc.) rather than shoehorning
+    /// each into a typed field.
+    ///
+    /// Binder appends them as extra lines in `bind_runtime_identity` —
+    /// they inherit the None scope of that section, so they sit *after*
+    /// the cache marker and can churn per turn without invalidating the
+    /// cached static prefix.
+    ///
+    /// Empty by default; typed fields above are preferred whenever the
+    /// content is reusable across callers. This field is an escape hatch
+    /// for the HTTP bridge (`InProcessChatTurnBridge`) which composes ~10
+    /// signals the server loop doesn't need.
+    pub extra_dynamic_sections: Vec<PromptSection>,
 }
 
 impl StaticSections {

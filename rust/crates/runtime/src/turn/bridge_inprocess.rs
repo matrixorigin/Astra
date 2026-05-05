@@ -643,7 +643,6 @@ pub(crate) use super::prompt_cache::add_message_cache_breakpoint;
 pub(crate) use super::prompt_cache::build_system_message;
 pub(crate) use super::prompt_cache::{
     annotate_tool_schemas_for_caching, apply_anthropic_cache_metadata,
-    build_system_message_with_dynamic_sections,
 };
 
 #[derive(Clone)]
@@ -1480,15 +1479,26 @@ impl InProcessChatTurnBridge {
                     }),
                 );
             }
-            // Build provider-aware system message with static/dynamic boundary.
-            // Anthropic gets multi-block content with cache_control on stable sections;
-            // OpenAI/others get two messages: stable prefix (cacheable) + dynamic per-turn.
-            let (system_msg, dynamic_msg, prompt_sections) = build_system_message_with_dynamic_sections(
+            // Build provider-aware system message via the context pipeline.
+            // Anthropic: multi-block content with `cache_control` on stable sections.
+            // OpenAI/others: two messages (stable prefix + dynamic per-turn).
+            //
+            // This is the bridge's on-ramp to the pipeline: dynamic_sections
+            // (session anchor, feedback rules, memoria insights, etc.) flow
+            // through ExternalSources.extra_dynamic_sections so the binder
+            // appends them after runtime identity — keeping them in the
+            // None-scoped post-cache segment where churn is expected.
+            let (system_msg, dynamic_msg, prompt_sections) = crate::turn::prompt_cache::assemble_system_message_via_pipeline(
                 &tool_names,
                 &dynamic_sections,
                 selection_confidence,
                 task_type,
                 &cache_cfg,
+                &session_id,
+                &model_name,
+                &provider,
+                edge_profile.get("cwd").and_then(Value::as_str),
+                edge_profile.get("git_branch").and_then(Value::as_str),
             );
             // Debug: dump system prompt for cache analysis (env-gated).
             // Enable with ASTRA_PIPELINE_DUMP_SYSTEM_PROMPT=1. Writes to
@@ -4255,12 +4265,17 @@ mod tests {
                 },
             ),
         ];
-        let (_, _, prompt_sections) = build_system_message_with_dynamic_sections(
+        let (_, _, prompt_sections) = crate::turn::prompt_cache::assemble_system_message_via_pipeline(
             &["bash", "read_file"],
             &dynamic_sections,
             0.8,
             Some("implementation"),
             &PromptCacheConfig::latch("openai", "gpt-4"),
+            "test-session",
+            "gpt-4",
+            "openai",
+            None,
+            None,
         );
         let breakdown = prompts::build_system_prompt_trace(&prompt_sections, vec![], vec![]);
 

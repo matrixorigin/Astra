@@ -10,7 +10,9 @@ use std::sync::{Mutex, OnceLock};
 use serde_json::{Value, json};
 
 use crate::prompts;
+#[cfg(test)]
 use astra_turn_core::context_serializer::serialize_prompt_sections;
+#[cfg(test)]
 use astra_turn_core::pipeline_config::ProviderCachePolicy;
 
 const DEFAULT_CACHE_EDIT_PIN_KEY: &str = "__default__";
@@ -70,6 +72,7 @@ impl Default for PromptCacheConfig {
 // - Per-turn profile_desc is NOT cached (changes every turn with skills/memory/environment)
 
 /// Cached prompt sections split by cache scope.
+#[cfg(test)]
 struct CachedSections {
     /// Concatenated text of Global+Session sections (for non-Anthropic providers).
     text: String,
@@ -79,9 +82,210 @@ struct CachedSections {
     dynamic_sections: Vec<prompts::PromptSection>,
 }
 
+#[cfg(test)]
 fn section_cache() -> &'static Mutex<HashMap<u64, CachedSections>> {
     static CACHE: OnceLock<Mutex<HashMap<u64, CachedSections>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Assemble a system message via the context pipeline directly, without
+/// requiring a [`PipelineSession`]. Used by the HTTP bridge
+/// ([`InProcessChatTurnBridge`]) which has its own per-request lifecycle
+/// and doesn't carry a pipeline session across turns.
+///
+/// This is the pipeline-backed replacement for
+/// [`build_system_message_with_dynamic_sections`]. It produces the same
+/// byte-identical output shape (Anthropic multi-block / OpenAI stable+dynamic
+/// split) but assembles via the pipeline's planner + binder + serializer
+/// rather than the legacy section-cache path.
+///
+/// The `extra_dynamic_sections` (passed via `ExternalSources`) are the
+/// bridge's pre-built per-turn fragments (session anchor, feedback rules,
+/// memoria insights, etc.) — they append after the runtime-identity block
+/// in the None-scoped post-cache segment, so dynamic churn doesn't
+/// invalidate the cached prefix.
+///
+/// Returns `(primary_system_message, optional_dynamic_message, all_sections)`
+/// matching the legacy signature for drop-in bridge compatibility.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn assemble_system_message_via_pipeline(
+    tool_names: &[&str],
+    extra_dynamic_sections: &[prompts::PromptSection],
+    confidence: f64,
+    task_type: Option<&str>,
+    cache_cfg: &PromptCacheConfig,
+    session_id: &str,
+    model_id: &str,
+    provider: &str,
+    edge_profile_cwd: Option<&str>,
+    edge_profile_git_branch: Option<&str>,
+) -> (Value, Option<Value>, Vec<prompts::PromptSection>) {
+    use astra_turn_core::context_sources::{
+        AgentContext, EdgeProfile, ExternalSources, SessionContext, TurnState,
+    };
+    use astra_turn_core::microcompact::ProviderCacheStrategy;
+    use astra_turn_core::pipeline_config::{PipelineConfig, ProviderCachePolicy};
+    use astra_turn_core::pipeline_session::{AdaptiveTurnInput, PipelineSession};
+
+    // Build ExternalSources from bridge-side signals. Typed fields are
+    // driven by tool_names + cwd/branch; everything else flows through
+    // the escape-hatch `extra_dynamic_sections`.
+    let self_model_text = if tool_names.is_empty() {
+        None
+    } else {
+        Some(prompts::self_model_section(tool_names))
+    };
+    let profile_for_tc = edge_profile_cwd
+        .map(|cwd| format!("cwd: {cwd}"))
+        .unwrap_or_default();
+    let tool_conditional = if tool_names.is_empty() {
+        None
+    } else {
+        let text = prompts::tool_conditional_section(tool_names, &profile_for_tc, confidence);
+        if text.is_empty() { None } else { Some(text) }
+    };
+    let mut profile_parts = Vec::new();
+    if let Some(cwd) = edge_profile_cwd {
+        profile_parts.push(format!("cwd: {cwd}"));
+    }
+    if let Some(branch) = edge_profile_git_branch {
+        profile_parts.push(format!("git_branch: {branch}"));
+    }
+    let profile_desc = if profile_parts.is_empty() {
+        None
+    } else {
+        Some(format!("\n\n# Project Profile\n{}", profile_parts.join("\n")))
+    };
+
+    let external = ExternalSources {
+        memory_snippets: Vec::new(),
+        spill_dir: None,
+        self_model_text,
+        tool_conditional,
+        profile_desc,
+        effort_hint: None,
+        learned_context: None,
+        system_override: None,
+        plan_context: None,
+        tool_guidance: None,
+        extra_dynamic_sections: extra_dynamic_sections.to_vec(),
+    };
+
+    let provider_policy = match provider {
+        "anthropic" | "bedrock" => ProviderCachePolicy::anthropic(),
+        _ => ProviderCachePolicy::openai_compatible(),
+    };
+    let session_ctx = SessionContext {
+        session_id: session_id.to_string(),
+        run_id: String::new(),
+        model_id: model_id.to_string(),
+        model_limit: 200_000, // generous — bridge doesn't track per-model limits here
+        provider_policy: provider_policy.clone(),
+        provider_strategy: ProviderCacheStrategy::default(),
+        project_context: String::new(),
+        edge_profile: EdgeProfile {
+            cwd: edge_profile_cwd.map(String::from),
+            git_branch: edge_profile_git_branch.map(String::from),
+            ..Default::default()
+        },
+        self_model: None,
+    };
+
+    let agent = AgentContext::default();
+    let turn_state = TurnState {
+        messages: Vec::new(),
+        tool_results: Vec::new(),
+        tokens: Default::default(),
+        active_skills: Vec::new(),
+        recent_file_reads: Default::default(),
+        remaining_turns: 20,
+        turn_index: 0,
+        recovery: Default::default(),
+        last_user_message: String::new(),
+    };
+    let statics = prompts::build_pipeline_static_sections();
+
+    let _ = task_type; // Reserved for future planner input; unused today.
+
+    // Ephemeral per-request session. Bridge doesn't persist a session across
+    // turns — its compaction lives elsewhere — so a fresh session per call
+    // is the right lifecycle. Stats/recovery/latches all start at default.
+    let session = PipelineSession::new(PipelineConfig {
+        provider_policy: provider_policy.clone(),
+    });
+    let input = AdaptiveTurnInput {
+        statics: &statics,
+        agent: &agent,
+        session: &session_ctx,
+        turn: &turn_state,
+        external: &external,
+        model_id,
+        query_source: "bridge",
+    };
+
+    let output = match session.run_turn_adaptive(input) {
+        Ok(out) => out,
+        Err(abort) => {
+            tracing::warn!(
+                error = ?abort,
+                "bridge pipeline abort during system assembly — returning empty system"
+            );
+            return (json!({"role": "system", "content": ""}), None, Vec::new());
+        }
+    };
+
+    let is_anthropic = cache_cfg.is_anthropic;
+    // Build the trace-facing `Vec<PromptSection>` from original inputs
+    // rather than reverse-engineering the pipeline's compacted output.
+    // The pipeline may join/truncate sections in `optimized.sections`, so a
+    // text-equality overlay for trace_signals wouldn't round-trip. Consumers
+    // (`build_system_prompt_trace`) care about the logical *input* sections,
+    // not the serialized bytes — that's what the old helper returned too.
+    let mut sections: Vec<prompts::PromptSection> = statics
+        .as_vec()
+        .into_iter()
+        .cloned()
+        .collect();
+    // Append caller-supplied extras in their original form (with trace_signals
+    // intact). Downstream `build_system_prompt_trace` aggregates context_signals
+    // across every section, so this preserves the bridge's telemetry contract.
+    sections.extend(extra_dynamic_sections.iter().cloned());
+
+    if is_anthropic {
+        // Anthropic multi-block with cache_control. serialize_provider_request
+        // already placed cache markers per the policy.
+        let mut blocks: Vec<Value> = Vec::with_capacity(output.serialized.system_blocks.len());
+        for block in &output.serialized.system_blocks {
+            let mut b = json!({"type": "text", "text": block.text});
+            if let Some(ref cc) = block.cache_control {
+                b["cache_control"] = cc.clone();
+            }
+            blocks.push(b);
+        }
+        (json!({"role": "system", "content": blocks}), None, sections)
+    } else {
+        // OpenAI stable+dynamic split: stable = non-None-scoped blocks joined,
+        // dynamic = None-scoped joined separately.
+        let mut stable_text = String::new();
+        let mut dynamic_text = String::new();
+        for block in &output.serialized.system_blocks {
+            if matches!(
+                block.scope,
+                astra_turn_core::section_types::CacheScope::None
+            ) {
+                dynamic_text.push_str(&block.text);
+            } else {
+                stable_text.push_str(&block.text);
+            }
+        }
+        let primary = json!({"role": "system", "content": stable_text});
+        let dynamic = if dynamic_text.is_empty() {
+            None
+        } else {
+            Some(json!({"role": "system", "content": dynamic_text}))
+        };
+        (primary, dynamic, sections)
+    }
 }
 
 /// Log a poisoned `section_cache` mutex exactly once per process. Without
@@ -89,6 +293,7 @@ fn section_cache() -> &'static Mutex<HashMap<u64, CachedSections>> {
 /// the rest of the process and cache-hit ratio would collapse with zero
 /// operator signal. The HashMap itself is pure data — recovering the
 /// `into_inner()` value is safe.
+#[cfg(test)]
 fn warn_section_cache_poisoned() {
     use std::sync::atomic::{AtomicBool, Ordering};
     static WARNED: AtomicBool = AtomicBool::new(false);
@@ -115,6 +320,7 @@ pub(crate) fn section_cache_key(
     section_cache_key_with_customization(tool_names, task_type, confidence, 0, 0)
 }
 
+#[cfg(test)]
 fn section_cache_key_with_customization(
     tool_names: &[&str],
     task_type: Option<&str>,
@@ -135,6 +341,7 @@ fn section_cache_key_with_customization(
     hasher.finish()
 }
 
+#[cfg(test)]
 fn output_style_fingerprint(
     output_style: Option<&astra_text_utils::output_style::OutputStyle>,
 ) -> u64 {
@@ -147,6 +354,7 @@ fn output_style_fingerprint(
     hasher.finish()
 }
 
+#[cfg(test)]
 fn prompt_overrides_fingerprint(overrides: &prompts::PromptOverrides) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -170,7 +378,11 @@ fn prompt_overrides_fingerprint(overrides: &prompts::PromptOverrides) -> u64 {
 ///   `dynamic` holds a second system message with the per-turn profile/hints, or `None`
 ///   if there is nothing dynamic. This split enables OpenAI's automatic prefix caching:
 ///   the stable message stays identical across turns so the provider can reuse the KV cache.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Test-only: legacy section-assembly helper retained for regression
+/// coverage of section-cache behavior, scope mapping, and cache_control
+/// placement. Production code uses [`assemble_system_message_via_pipeline`]
+/// which threads the same assembly through a real `PipelineSession`.
+#[cfg(test)]
 pub(crate) fn build_system_message(
     tool_names: &[&str],
     profile_desc: &str,
@@ -195,6 +407,14 @@ pub(crate) fn build_system_message(
     )
 }
 
+/// Test-only: thin wrapper around the legacy section-cache + serializer
+/// that predates the pipeline's `PipelineSession`. Kept to exercise
+/// scope→cache_control, OpenAI stable/dynamic split, and section-cache
+/// memoization — the same concerns now covered at the pipeline level by
+/// [`assemble_system_message_via_pipeline`] tests. Production calls the
+/// pipeline variant; this exists only to keep 40+ historical tests alive
+/// without rewrite churn.
+#[cfg(test)]
 pub(crate) fn build_system_message_with_dynamic_sections(
     tool_names: &[&str],
     dynamic_sections: &[prompts::PromptSection],
@@ -349,6 +569,7 @@ pub(crate) fn build_system_message_with_dynamic_sections(
     }
 }
 
+#[cfg(test)]
 fn provider_policy_for_prompt_cache(cache_cfg: &PromptCacheConfig) -> ProviderCachePolicy {
     if cache_cfg.cache_enabled {
         ProviderCachePolicy::anthropic()
@@ -1024,6 +1245,161 @@ mod tests {
             },
         );
         assert!(tools.is_empty());
+    }
+
+    // ── assemble_system_message_via_pipeline ─────────────────────────────
+
+    #[test]
+    fn pipeline_assembly_anthropic_emits_multi_block_with_cache_control() {
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+        let (primary, dynamic, sections) = assemble_system_message_via_pipeline(
+            &["bash", "read_file"],
+            &[],
+            0.8,
+            None,
+            &cache_cfg,
+            "test-session",
+            "claude-sonnet-4-6",
+            "bedrock",
+            Some("/tmp/proj"),
+            Some("main"),
+        );
+
+        // Anthropic path puts everything in one message with content-array blocks.
+        assert!(dynamic.is_none(), "anthropic path emits single system message");
+        let content = primary
+            .get("content")
+            .and_then(Value::as_array)
+            .expect("anthropic primary.content is an array");
+        assert!(!content.is_empty(), "must emit at least one content block");
+        assert!(
+            content.iter().any(|b| b.get("cache_control").is_some()),
+            "anthropic path must carry at least one cache_control marker"
+        );
+        assert!(
+            !sections.is_empty(),
+            "sections vec must be populated for trace consumers"
+        );
+    }
+
+    #[test]
+    fn pipeline_assembly_openai_splits_stable_and_dynamic() {
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let (primary, dynamic, _sections) = assemble_system_message_via_pipeline(
+            &["bash", "read_file"],
+            &[],
+            0.8,
+            None,
+            &cache_cfg,
+            "sid",
+            "gpt-4o",
+            "openai",
+            Some("/tmp/proj"),
+            None,
+        );
+        // Primary is plain text for prefix caching
+        let primary_text = primary
+            .get("content")
+            .and_then(Value::as_str)
+            .expect("openai primary.content is a string");
+        assert!(
+            !primary_text.is_empty(),
+            "primary system message must be non-empty"
+        );
+        // Dynamic may or may not be present depending on whether any None-scoped
+        // section was emitted — assert at least the split is structurally sound.
+        if let Some(d) = dynamic {
+            let dtext = d.get("content").and_then(Value::as_str).unwrap_or_default();
+            assert!(!dtext.is_empty(), "if dynamic present, must be non-empty");
+        }
+    }
+
+    /// The bridge's escape-hatch use case: pre-built session anchor + feedback
+    /// rules flow through `extra_dynamic_sections` into the final system prompt.
+    #[test]
+    fn pipeline_assembly_carries_extra_dynamic_sections_through() {
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+        let extra = vec![
+            prompts::PromptSection::dynamic(
+                "\n\n## Session Anchor\nOriginal: build CLI.".to_string(),
+                prompts::PromptTokenBucket::Environment,
+            ),
+            prompts::PromptSection::dynamic(
+                "\n\n[Learned Feedback Rules]\n- No emojis.".to_string(),
+                prompts::PromptTokenBucket::Environment,
+            ),
+        ];
+        let (primary, _dynamic, _) = assemble_system_message_via_pipeline(
+            &["bash"],
+            &extra,
+            0.8,
+            None,
+            &cache_cfg,
+            "sid",
+            "claude-sonnet-4-6",
+            "bedrock",
+            Some("/tmp"),
+            None,
+        );
+        let all_text: String = primary["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all_text.contains("Session Anchor"),
+            "extra section 1 must reach the final prompt"
+        );
+        assert!(
+            all_text.contains("Learned Feedback Rules"),
+            "extra section 2 must reach the final prompt"
+        );
+    }
+
+    #[test]
+    fn pipeline_assembly_byte_stable_across_calls_with_identical_inputs() {
+        // Cache-hit prerequisite: two calls with identical inputs must
+        // produce identical system message bytes (no HashMap drift, no
+        // time-based IDs, no non-determinism).
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+        let args = || {
+            assemble_system_message_via_pipeline(
+                &["bash", "read_file", "memory_store"],
+                &[prompts::PromptSection::dynamic(
+                    "extra content".to_string(),
+                    prompts::PromptTokenBucket::Environment,
+                )],
+                0.8,
+                None,
+                &cache_cfg,
+                "sid",
+                "claude-sonnet-4-6",
+                "bedrock",
+                Some("/tmp"),
+                Some("main"),
+            )
+        };
+        let (a_primary, _, _) = args();
+        let (b_primary, _, _) = args();
+        assert_eq!(
+            serde_json::to_string(&a_primary).unwrap(),
+            serde_json::to_string(&b_primary).unwrap(),
+            "pipeline assembly must be byte-deterministic across calls"
+        );
     }
 
     #[test]

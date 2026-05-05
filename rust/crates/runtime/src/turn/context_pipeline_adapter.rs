@@ -161,6 +161,9 @@ pub(crate) fn build_external_sources(
         system_override,
         plan_context,
         tool_guidance,
+        // Adapter path doesn't use the escape hatch — all its signals have
+        // typed fields. The bridge (task #30) feeds this via its own builder.
+        extra_dynamic_sections: Vec::new(),
     }
 }
 
