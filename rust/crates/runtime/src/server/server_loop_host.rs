@@ -1709,7 +1709,16 @@ impl ServerAgenticLoopHost {
                     .and_then(Value::as_str)
             })
             .collect();
-        let plan_hint = self.plan_resume_hint.read().ok().and_then(|g| g.clone());
+        let plan_hint = match self.plan_resume_hint.read() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => {
+                astra_core::agent_warn!(
+                    "pipeline",
+                    "plan_resume_hint RwLock poisoned — plan context lost for this turn"
+                );
+                poisoned.into_inner().clone()
+            }
+        };
         let external = build_external_sources(
             &self.edge_profile,
             state,
