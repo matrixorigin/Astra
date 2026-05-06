@@ -8,7 +8,8 @@ PID_FILE="api_server.pid"
 _is_astra_server() {
     local pid=$1
     local comm
-    # /proc/$pid/comm is Linux-only; falls back to ps(1) on macOS/BSD.
+    # /proc/$pid/comm is Linux-only (truncated to 15 chars; "astra-server" is
+    # 12 so safe); falls back to ps(1) on macOS/BSD.
     comm=$(cat "/proc/$pid/comm" 2>/dev/null || ps -p "$pid" -o comm= 2>/dev/null)
     [[ "$comm" == "astra-server" ]]
 }

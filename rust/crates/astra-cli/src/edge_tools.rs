@@ -959,8 +959,11 @@ impl ToolExecutor {
         let snapshot = self
             .introspect_snapshot
             .read()
-            .ok()
-            .and_then(|guard| guard.clone());
+            .unwrap_or_else(|poisoned| {
+                astra_core::agent_warn!("introspect", "recovering from poisoned RwLock");
+                poisoned.into_inner()
+            })
+            .clone();
 
         match snapshot {
             Some(snap) => astra_turn_core::introspect::render_introspect(&snap, detail),

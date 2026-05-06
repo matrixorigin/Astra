@@ -942,7 +942,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             if let Some(ref mut sess) = state.pipeline_session {
                 sess.record_compaction_audit(
                     "tool_result_clearing",
-                    mc.results_compacted as u32,
+                    mc.results_compacted.min(u32::MAX as usize) as u32,
                     mc.tokens_saved.min(u32::MAX as usize) as u32,
                 );
                 sess.stats.record_compaction(mc.tokens_saved as u64);

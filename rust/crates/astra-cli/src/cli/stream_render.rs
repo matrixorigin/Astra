@@ -3414,6 +3414,205 @@ impl StreamRenderState {
                 let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
                 format!("Glob: {}", truncate_line(pattern, path_budget(6)))
             }
+            "git" => {
+                let action = args
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("status");
+                match action {
+                    "status" => "Git status".to_string(),
+                    "log" => {
+                        let n = args.get("n").and_then(Value::as_u64);
+                        let branch = args.get("branch").and_then(Value::as_str);
+                        match (n, branch) {
+                            (Some(n), Some(b)) => format!("Git log -{n} {b}"),
+                            (Some(n), None) => format!("Git log -{n}"),
+                            (None, Some(b)) => format!("Git log {b}"),
+                            _ => "Git log".to_string(),
+                        }
+                    }
+                    "show" => {
+                        let commit = args
+                            .get("commit")
+                            .or_else(|| args.get("ref"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        format!("Git show {}", truncate_line(commit, path_budget(9)))
+                    }
+                    "diff" => {
+                        let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
+                        let path = args.get("path").and_then(Value::as_str);
+                        let stat_only = args
+                            .get("stat_only")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let suffix = if stat_only { " --stat" } else { "" };
+                        match (staged, path) {
+                            (true, Some(p)) => format!(
+                                "Git diff --staged{suffix} {}",
+                                shorten_path(p, path_budget(18))
+                            ),
+                            (true, None) => format!("Git diff --staged{suffix}"),
+                            (false, Some(p)) => {
+                                format!("Git diff{suffix} {}", shorten_path(p, path_budget(10)))
+                            }
+                            _ => format!("Git diff{suffix}"),
+                        }
+                    }
+                    "blame" => {
+                        let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                        format!("Git blame {}", shorten_path(path, path_budget(10)))
+                    }
+                    "file_history" => {
+                        let file = args.get("file").and_then(Value::as_str).unwrap_or("");
+                        format!("Git history {}", shorten_path(file, path_budget(12)))
+                    }
+                    "log_search" => {
+                        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+                        format!(
+                            "Git log search \"{}\"",
+                            truncate_line(query, path_budget(17))
+                        )
+                    }
+                    "contributors" => {
+                        let path = args.get("path").and_then(Value::as_str);
+                        match path {
+                            Some(p) => {
+                                format!("Git contributors {}", shorten_path(p, path_budget(17)))
+                            }
+                            None => "Git contributors".to_string(),
+                        }
+                    }
+                    "commit" => {
+                        let msg = args.get("message").and_then(Value::as_str).unwrap_or("");
+                        format!("Git commit \"{}\"", truncate_line(msg, path_budget(13)))
+                    }
+                    "stash" => {
+                        let sub = args
+                            .get("stash_action")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        format!("Git stash {sub}")
+                    }
+                    _ => format!("Git {action}"),
+                }
+            }
+            "github" => {
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                let owner = args.get("owner").and_then(Value::as_str);
+                let repo = args.get("repo").and_then(Value::as_str);
+                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
+                match action {
+                    "list_prs" => format!("GitHub: list PRs {repo_display}"),
+                    "get_pr" => {
+                        let pr = args.get("pr_number").and_then(Value::as_u64);
+                        match pr {
+                            Some(n) => format!("GitHub: PR #{n} {repo_display}"),
+                            None => format!("GitHub: get PR {repo_display}"),
+                        }
+                    }
+                    "ci_status" => format!("GitHub: CI status {repo_display}"),
+                    "list_issues" => format!("GitHub: list issues {repo_display}"),
+                    "get_issue" => {
+                        let n = args.get("issue_number").and_then(Value::as_u64);
+                        match n {
+                            Some(n) => format!("GitHub: issue #{n} {repo_display}"),
+                            None => format!("GitHub: get issue {repo_display}"),
+                        }
+                    }
+                    "repo_stats" => format!("GitHub: stats {repo_display}"),
+                    "create_issue" => {
+                        let title = args.get("title").and_then(Value::as_str).unwrap_or("");
+                        format!(
+                            "GitHub: create issue \"{}\"",
+                            truncate_line(title, path_budget(22))
+                        )
+                    }
+                    _ => format!("GitHub: {action}"),
+                }
+            }
+            "memory" => {
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                match action {
+                    "retrieve" => {
+                        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+                        format!("Recalling: \"{}\"", truncate_line(query, path_budget(13)))
+                    }
+                    "store" => {
+                        let content = args.get("content").and_then(Value::as_str).unwrap_or("");
+                        format!("Storing: \"{}\"", truncate_line(content, path_budget(11)))
+                    }
+                    "search" => {
+                        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+                        format!(
+                            "Searching memory: \"{}\"",
+                            truncate_line(query, path_budget(20))
+                        )
+                    }
+                    "purge" => "Purging memory".to_string(),
+                    "correct" => "Correcting memory".to_string(),
+                    "profile" => "Checking profile".to_string(),
+                    "feedback" => "Memory feedback".to_string(),
+                    _ => format!("Memory: {action}"),
+                }
+            }
+            "session" => {
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                match action {
+                    "config" => {
+                        let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                        format!("Adjust config: {}", truncate_line(path, path_budget(15)))
+                    }
+                    "prioritize" => {
+                        let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
+                        format!("Prioritize: {}", truncate_line(tool, path_budget(12)))
+                    }
+                    "deprioritize" => {
+                        let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
+                        format!("Deprioritize: {}", truncate_line(tool, path_budget(14)))
+                    }
+                    "set_goal" => {
+                        let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
+                        format!("Set goal: \"{}\"", truncate_line(goal, path_budget(12)))
+                    }
+                    "compact" => "Compress context".to_string(),
+                    _ => format!("Session: {action}"),
+                }
+            }
+            "mo" => {
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                match action {
+                    "query" => {
+                        let sql = args.get("sql").and_then(Value::as_str).unwrap_or("");
+                        format!("MO query: \"{}\"", truncate_line(sql, path_budget(11)))
+                    }
+                    "snapshot" => {
+                        let name = args.get("name").and_then(Value::as_str).unwrap_or("");
+                        format!("MO snapshot: {}", truncate_line(name, path_budget(13)))
+                    }
+                    "branch" => {
+                        let name = args.get("name").and_then(Value::as_str).unwrap_or("");
+                        format!("MO branch: {}", truncate_line(name, path_budget(11)))
+                    }
+                    _ => format!("MO: {action}"),
+                }
+            }
+            "agent" => {
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                match action {
+                    "delegate" => {
+                        let task = args.get("task").and_then(Value::as_str).unwrap_or("");
+                        format!("Delegating: \"{}\"", truncate_line(task, path_budget(14)))
+                    }
+                    "run_chain" => {
+                        let chain = args.get("chain_name").and_then(Value::as_str).unwrap_or("");
+                        format!("Running chain: {}", truncate_line(chain, path_budget(15)))
+                    }
+                    _ => format!("Agent: {action}"),
+                }
+            }
+            "introspect" => "Introspecting…".to_string(),
+            // Legacy individual tool names (kept for backward compat)
             "git_status" => "Git status".to_string(),
             "git_log" => {
                 let n = args.get("n").and_then(Value::as_u64);
