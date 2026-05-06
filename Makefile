@@ -391,9 +391,9 @@ dev-seed:
 	SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
 	run_mysql_ddl() { mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$SQL"; }; \
 	mysql_ssl_disable_arg() { \
-		if mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1; then printf '%s\n' "--ssl-mode=DISABLED"; \
-		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1; then printf '%s\n' "--ssl=0"; \
-		elif mysql --no-defaults --skip-ssl --version >/dev/null 2>&1; then printf '%s\n' "--skip-ssl"; \
+		if mysql --no-defaults --skip-ssl --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --skip-ssl --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--skip-ssl"; \
+		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl=0 --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl=0"; \
+		elif mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl-mode=DISABLED --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl-mode=DISABLED"; \
 		fi; \
 	}; \
 	MYSQL_SSL_ARG=$$(mysql_ssl_disable_arg); \
@@ -617,9 +617,9 @@ test-online:
 	SQL="DROP DATABASE IF EXISTS $$TEST_DB; CREATE DATABASE $$TEST_DB;"; \
 	run_mysql_ddl() { mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$SQL"; }; \
 	mysql_ssl_disable_arg() { \
-		if mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1; then printf '%s\n' "--ssl-mode=DISABLED"; \
-		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1; then printf '%s\n' "--ssl=0"; \
-		elif mysql --no-defaults --skip-ssl --version >/dev/null 2>&1; then printf '%s\n' "--skip-ssl"; \
+		if mysql --no-defaults --skip-ssl --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --skip-ssl --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--skip-ssl"; \
+		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl=0 --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl=0"; \
+		elif mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl-mode=DISABLED --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl-mode=DISABLED"; \
 		fi; \
 	}; \
 	MYSQL_SSL_ARG=$$(mysql_ssl_disable_arg); \
