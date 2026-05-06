@@ -55,24 +55,40 @@ run: build _ensure_config _ensure_astra_auth
 # ── Background (production) ──
 
 start: build _ensure_config _ensure_astra_auth
-	@if [ -f $(PID_FILE) ] && kill -0 $$(cat $(PID_FILE)) 2>/dev/null; then \
-		echo "✅ Gateway already running (PID $$(cat $(PID_FILE)))"; \
-		exit 0; \
-	fi
-	@echo "Starting gateway in background..."
-	@nohup $(RELEASE_BIN) --config $(CONFIG) > $(LOG_FILE) 2>&1 &
-	@sleep 1
-	@if [ -f $(PID_FILE) ] && kill -0 $$(cat $(PID_FILE)) 2>/dev/null; then \
-		echo "✅ Gateway started (PID $$(cat $(PID_FILE)))"; \
-		echo "   Logs: $(LOG_FILE)"; \
+	@if [ -f $(PID_FILE) ]; then \
+		PID=$$(cat $(PID_FILE)); \
+		if kill -0 $$PID 2>/dev/null && ps -p $$PID -o command= 2>/dev/null | grep -q 'astra-gateway'; then \
+			echo "✅ Gateway already running (PID $$PID)"; \
+		else \
+			rm -f $(PID_FILE); \
+			echo "Starting gateway in background..."; \
+			nohup $(RELEASE_BIN) --config $(CONFIG) </dev/null > $(LOG_FILE) 2>&1 & \
+			sleep 1; \
+			if [ -f $(PID_FILE) ] && kill -0 $$(cat $(PID_FILE)) 2>/dev/null && ps -p $$(cat $(PID_FILE)) -o command= 2>/dev/null | grep -q 'astra-gateway'; then \
+				echo "✅ Gateway started (PID $$(cat $(PID_FILE)))"; \
+				echo "   Logs: $(LOG_FILE)"; \
+			else \
+				echo "❌ Gateway failed to start. Check $(LOG_FILE)"; \
+				tail -10 $(LOG_FILE); \
+				exit 1; \
+			fi; \
+		fi; \
 	else \
-		echo "❌ Gateway failed to start. Check $(LOG_FILE)"; \
-		tail -10 $(LOG_FILE); \
-		exit 1; \
+		echo "Starting gateway in background..."; \
+		nohup $(RELEASE_BIN) --config $(CONFIG) </dev/null > $(LOG_FILE) 2>&1 & \
+		sleep 1; \
+		if [ -f $(PID_FILE) ] && kill -0 $$(cat $(PID_FILE)) 2>/dev/null && ps -p $$(cat $(PID_FILE)) -o command= 2>/dev/null | grep -q 'astra-gateway'; then \
+			echo "✅ Gateway started (PID $$(cat $(PID_FILE)))"; \
+			echo "   Logs: $(LOG_FILE)"; \
+		else \
+			echo "❌ Gateway failed to start. Check $(LOG_FILE)"; \
+			tail -10 $(LOG_FILE); \
+			exit 1; \
+		fi; \
 	fi
 
 stop:
-	@if [ -f $(PID_FILE) ] && kill -0 $$(cat $(PID_FILE)) 2>/dev/null; then \
+	@if [ -f $(PID_FILE) ] && kill -0 $$(cat $(PID_FILE)) 2>/dev/null && ps -p $$(cat $(PID_FILE)) -o command= 2>/dev/null | grep -q 'astra-gateway'; then \
 		echo "Stopping gateway (PID $$(cat $(PID_FILE)))..."; \
 		kill $$(cat $(PID_FILE)); \
 		sleep 1; \
@@ -90,7 +106,7 @@ stop:
 restart: stop start
 
 status:
-	@if [ -f $(PID_FILE) ] && kill -0 $$(cat $(PID_FILE)) 2>/dev/null; then \
+	@if [ -f $(PID_FILE) ] && kill -0 $$(cat $(PID_FILE)) 2>/dev/null && ps -p $$(cat $(PID_FILE)) -o command= 2>/dev/null | grep -q 'astra-gateway'; then \
 		PID=$$(cat $(PID_FILE)); \
 		UPTIME=$$(ps -o etime= -p $$PID 2>/dev/null | tr -d ' '); \
 		MEM=$$(ps -o rss= -p $$PID 2>/dev/null | tr -d ' '); \

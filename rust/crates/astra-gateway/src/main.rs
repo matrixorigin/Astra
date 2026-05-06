@@ -1,4 +1,6 @@
 use clap::{Parser, Subcommand};
+use fs2::FileExt;
+use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -20,6 +22,53 @@ enum Command {
     LoginWeixin,
 }
 
+struct GatewayInstanceGuard {
+    _lock_file: File,
+    pid_file: PathBuf,
+}
+
+impl Drop for GatewayInstanceGuard {
+    fn drop(&mut self) {
+        let current_pid = std::process::id().to_string();
+        if std::fs::read_to_string(&self.pid_file)
+            .map(|pid| pid.trim() == current_pid)
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&self.pid_file);
+        }
+    }
+}
+
+fn acquire_gateway_instance_guard() -> Result<GatewayInstanceGuard, String> {
+    let lock_path = PathBuf::from("/tmp/astra-gateway.lock");
+    let pid_file = PathBuf::from("/tmp/astra-gateway.pid");
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)
+        .map_err(|e| format!("failed to open {}: {e}", lock_path.display()))?;
+
+    if let Err(e) = lock_file.try_lock_exclusive() {
+        let pid = std::fs::read_to_string(&pid_file)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
+        return Err(format!(
+            "astra-gateway is already running (pid: {pid}); stop it with `make gateway-stop` before starting another instance: {e}"
+        ));
+    }
+
+    std::fs::write(&pid_file, std::process::id().to_string())
+        .map_err(|e| format!("failed to write {}: {e}", pid_file.display()))?;
+
+    Ok(GatewayInstanceGuard {
+        _lock_file: lock_file,
+        pid_file,
+    })
+}
+
 #[tokio::main]
 async fn main() {
     // Load .env file if present (before logging init so RUST_LOG works)
@@ -33,22 +82,6 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
-
-    let pid_file = std::path::PathBuf::from("/tmp/astra-gateway.pid");
-    if pid_file.exists()
-        && let Ok(old_pid) = std::fs::read_to_string(&pid_file)
-    {
-        let old_pid = old_pid.trim();
-        let cmdline_path = format!("/proc/{old_pid}/cmdline");
-        if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path)
-            && cmdline.contains("astra-gateway")
-        {
-            tracing::warn!(pid = old_pid, "killing stale gateway process");
-            let _ = std::process::Command::new("kill").arg(old_pid).status();
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
-    }
-    std::fs::write(&pid_file, std::process::id().to_string()).ok();
 
     if let Some(Command::LoginWeixin) = cli.command {
         match astra_gateway::platforms::weixin::qr_login().await {
@@ -126,6 +159,15 @@ async fn main() {
         }
         return;
     }
+
+    let _instance_guard = match acquire_gateway_instance_guard() {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::error!(error = %e, "gateway already running");
+            eprintln!("❌ {e}");
+            std::process::exit(1);
+        }
+    };
 
     let mut config = match astra_gateway::config::GatewayConfig::load(&cli.config) {
         Ok(c) => c,

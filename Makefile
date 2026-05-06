@@ -242,7 +242,7 @@ dev-deps-wait:
 .PHONY: dev-db-connect
 dev-db-connect:
 	@set -a; [ -f .env ] && . ./.env; set +a; \
-	mysql -h$${MATRIXONE_HOST:-127.0.0.1} -P$${MATRIXONE_PORT:-6001} -u$${MATRIXONE_USER:-root} -p$${MATRIXONE_PASSWORD:-111}
+	mysql --protocol=TCP -h$${MATRIXONE_HOST:-127.0.0.1} -P$${MATRIXONE_PORT:-6001} -u$${MATRIXONE_USER:-root} -p$${MATRIXONE_PASSWORD:-111}
 
 # ============================================================================
 # API Server (Source Code Mode)
@@ -383,12 +383,18 @@ dev-seed:
 	DB_USER=$${MATRIXONE_USER:-root}; \
 	DB_PASS=$${MATRIXONE_PASSWORD:-111}; \
 	DB_NAME=$${ASTRA_DATABASE:-astra_runtime}; \
-	mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS \
-		-e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;" 2>/dev/null || \
-	mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS --skip-ssl \
-		-e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;" 2>/dev/null || \
-	mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS --skip_ssl \
-		-e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"
+	SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
+	run_mysql_ddl() { mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$SQL"; }; \
+	mysql_ssl_disable_arg() { \
+		if mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1; then printf '%s\n' "--ssl-mode=DISABLED"; \
+		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1; then printf '%s\n' "--ssl=0"; \
+		elif mysql --no-defaults --skip-ssl --version >/dev/null 2>&1; then printf '%s\n' "--skip-ssl"; \
+		fi; \
+	}; \
+	MYSQL_SSL_ARG=$$(mysql_ssl_disable_arg); \
+	run_mysql_ddl 2>/dev/null || { \
+		if [ -n "$$MYSQL_SSL_ARG" ]; then run_mysql_ddl "$$MYSQL_SSL_ARG"; else run_mysql_ddl; fi; \
+	}
 	@$(MAKE) dev-api-restart build-cli-release
 	@sleep 2
 	@echo "Registering admin (admin@mo.com)..."
@@ -607,10 +613,18 @@ test-online:
 	DB_USER=$${MATRIXONE_USER:-root}; \
 	DB_PASS=$${MATRIXONE_PASSWORD:-111}; \
 	echo "Recreating test database $$TEST_DB ..."; \
-	mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS \
-		-e "DROP DATABASE IF EXISTS $$TEST_DB; CREATE DATABASE $$TEST_DB;" 2>/dev/null || \
-	mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS --skip-ssl \
-		-e "DROP DATABASE IF EXISTS $$TEST_DB; CREATE DATABASE $$TEST_DB;" 2>/dev/null || true; \
+	SQL="DROP DATABASE IF EXISTS $$TEST_DB; CREATE DATABASE $$TEST_DB;"; \
+	run_mysql_ddl() { mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$SQL"; }; \
+	mysql_ssl_disable_arg() { \
+		if mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1; then printf '%s\n' "--ssl-mode=DISABLED"; \
+		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1; then printf '%s\n' "--ssl=0"; \
+		elif mysql --no-defaults --skip-ssl --version >/dev/null 2>&1; then printf '%s\n' "--skip-ssl"; \
+		fi; \
+	}; \
+	MYSQL_SSL_ARG=$$(mysql_ssl_disable_arg); \
+	run_mysql_ddl 2>/dev/null || { \
+		if [ -n "$$MYSQL_SSL_ARG" ]; then run_mysql_ddl "$$MYSQL_SSL_ARG"; else run_mysql_ddl; fi; \
+	} 2>/dev/null || true; \
 	echo "Running astra-runtime ignored unit tests (live DB; nextest profile=$(NEXTEST_ONLINE_PROFILE); live-LLM suite gated by ASTRA_LIVE_LLM)..."; \
 	FAILED=""; \
 	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
@@ -836,9 +850,18 @@ db-reset:
 		DB_PORT=$${MATRIXONE_PORT:-6001}; \
 		DB_USER=$${MATRIXONE_USER:-root}; \
 		DB_PASS=$${MATRIXONE_PASSWORD:-111}; \
-		mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS -e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;" 2>/dev/null || \
-		mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS --skip-ssl -e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;" 2>/dev/null || \
-		mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS --skip_ssl -e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
+		SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
+		run_mysql_ddl() { mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$SQL"; }; \
+		mysql_ssl_disable_arg() { \
+			if mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1; then printf '%s\n' "--ssl-mode=DISABLED"; \
+			elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1; then printf '%s\n' "--ssl=0"; \
+			elif mysql --no-defaults --skip-ssl --version >/dev/null 2>&1; then printf '%s\n' "--skip-ssl"; \
+			fi; \
+		}; \
+		MYSQL_SSL_ARG=$$(mysql_ssl_disable_arg); \
+		run_mysql_ddl 2>/dev/null || { \
+			if [ -n "$$MYSQL_SSL_ARG" ]; then run_mysql_ddl "$$MYSQL_SSL_ARG"; else run_mysql_ddl; fi; \
+		}; \
 		echo "✅ Database reset complete"; \
 	else \
 		echo "Cancelled"; \

@@ -308,6 +308,7 @@ dependencies = [
  "dashmap",
  "dotenvy",
  "ecb",
+ "fs2",
  "futures-util",
  "hex",
  "libc",
