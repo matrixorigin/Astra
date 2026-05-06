@@ -65,7 +65,9 @@ pub enum CliProgress {
     /// Tool execution completed.
     ToolDone {
         name: String,
-        duration_ms: u64,
+        /// Duration in milliseconds. `None` when unknown (e.g. stream-json
+        /// where completion events don't carry timing).
+        duration_ms: Option<u64>,
     },
     /// Thinking state changed.
     Thinking(bool),
@@ -108,6 +110,14 @@ pub enum CliProfile {
         #[serde(default = "default_claude_bin")]
         bin: String,
         model: Option<String>,
+        /// Use `--output-format stream-json` for real-time token/tool events on stdout.
+        /// When false (default) uses `--output-format json` (single JSON blob at end).
+        #[serde(default)]
+        stream_json: bool,
+        /// Extra args appended to the claude invocation before the prompt flag.
+        /// Example: ["--settings", "/path/to/hooks.json"]
+        #[serde(default)]
+        extra_args: Vec<String>,
     },
     #[serde(rename = "codex")]
     Codex {
@@ -247,13 +257,28 @@ impl CliProfile {
                 }
                 cmd
             }
-            Self::Claude { bin, model } => {
+            Self::Claude {
+                bin,
+                model,
+                stream_json,
+                extra_args,
+            } => {
                 let mut cmd = Command::new(bin);
-                cmd.arg("-p")
-                    .arg(message)
-                    .arg("--output-format")
-                    .arg("json")
-                    .arg("--dangerously-skip-permissions");
+                // Extra args first (e.g. --settings for hook injection).
+                for arg in extra_args {
+                    cmd.arg(arg);
+                }
+                cmd.arg("-p").arg(message);
+                if *stream_json {
+                    cmd.arg("--output-format")
+                        .arg("stream-json")
+                        .arg("--verbose")
+                        .arg("--include-partial-messages")
+                        .arg("--include-hook-events");
+                } else {
+                    cmd.arg("--output-format").arg("json");
+                }
+                cmd.arg("--dangerously-skip-permissions");
                 if let Some(sid) = session_id {
                     cmd.arg("--resume").arg(sid);
                 }
@@ -300,7 +325,13 @@ impl CliProfile {
     pub fn parse_output(&self, stdout: &str, exit_code: i32) -> CliResult {
         match self {
             Self::Astra { .. } => parse_astra_json(stdout, exit_code),
-            Self::Claude { .. } => parse_claude_json(stdout, exit_code),
+            Self::Claude { stream_json, .. } => {
+                if *stream_json {
+                    parse_claude_stream_json_stdout(stdout, exit_code)
+                } else {
+                    parse_claude_json(stdout, exit_code)
+                }
+            }
             Self::Codex { .. } => parse_generic_json(stdout, exit_code, "result", "session_id"),
             Self::Custom {
                 json_output,
@@ -513,6 +544,133 @@ fn parse_claude_json(stdout: &str, exit_code: i32) -> CliResult {
     }
 }
 
+/// Parse the accumulated stdout of a `--output-format stream-json` run.
+/// Walks every JSONL line to accumulate tool usage (since the final `result`
+/// frame only carries `num_turns`, not tool metadata).
+fn parse_claude_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
+    let mut session_id: Option<String> = None;
+    let mut text: Option<String> = None;
+    let mut tokens_prompt: Option<u64> = None;
+    let mut tokens_completion: Option<u64> = None;
+    let mut tools_used: Vec<String> = Vec::new();
+    let mut tool_use_count: u32 = 0;
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v["type"].as_str() {
+            Some("assistant") => {
+                if let Some(content) = v["message"]["content"].as_array() {
+                    for block in content {
+                        if block["type"].as_str() == Some("tool_use") {
+                            tool_use_count += 1;
+                            if let Some(name) = block["name"].as_str()
+                                && !tools_used.iter().any(|n| n == name)
+                            {
+                                tools_used.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Some("result") => {
+                session_id = v["session_id"].as_str().map(String::from);
+                text = v["result"].as_str().map(String::from);
+                let usage = &v["usage"];
+                tokens_prompt = usage["input_tokens"].as_u64();
+                tokens_completion = usage["output_tokens"].as_u64();
+            }
+            _ => {}
+        }
+    }
+
+    if text.is_some() || session_id.is_some() {
+        let tool_calls_count = if tool_use_count == 0 {
+            None
+        } else {
+            Some(tool_use_count)
+        };
+        CliResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code,
+            success: exit_code == 0,
+            error_kind: default_error_kind(exit_code),
+            trace_id: None,
+            request_id: None,
+            run_id: None,
+            session_id,
+            text,
+            tool_calls_count,
+            tools_used,
+            tokens_prompt,
+            tokens_completion,
+        }
+    } else {
+        plain_result(stdout, exit_code)
+    }
+}
+/// The last line with `"type":"result"` carries session_id, result text, and usage.
+
+/// Parse a single stdout JSONL line from `--output-format stream-json` into a
+/// progress event. Returns `None` for lines that don't map to a user-visible event.
+///
+/// Claude stream-json emits these top-level types:
+///   - `system` (init): tools, model, session info
+///   - `assistant`: message with content blocks (text, tool_use, thinking)
+///   - `result`: final answer with usage stats
+fn parse_claude_stream_json_line(line: &str) -> Option<CliProgress> {
+    let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    match v["type"].as_str()? {
+        // Assistant message — may contain text tokens or tool_use blocks.
+        "assistant" => {
+            let content = v["message"]["content"].as_array()?;
+            for block in content {
+                match block["type"].as_str() {
+                    Some("text") => {
+                        if let Some(text) = block["text"].as_str()
+                            && !text.is_empty()
+                        {
+                            return Some(CliProgress::Token(text.to_string()));
+                        }
+                    }
+                    Some("tool_use") => {
+                        let name = block["name"].as_str().unwrap_or("tool").to_string();
+                        return Some(CliProgress::ToolStarted { name });
+                    }
+                    Some("tool_result") => {
+                        let name = block["tool_use"]["name"]
+                            .as_str()
+                            .unwrap_or("tool")
+                            .to_string();
+                        return Some(CliProgress::ToolDone {
+                            name,
+                            duration_ms: None,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        // Hook lifecycle events forwarded via --include-hook-events.
+        // Claude emits the event name as `hook_event_name`
+        // (e.g. PreToolUse, PostToolUse, UserPromptSubmit).
+        "hook" => {
+            let hook_name = v["hook_event_name"].as_str().unwrap_or("hook");
+            Some(CliProgress::Status(format!("[hook:{hook_name}]")))
+        }
+        // Final result — no progress event (handled by parse_claude_stream_json_stdout).
+        "result" | "system" => None,
+        _ => None,
+    }
+}
+
 fn parse_generic_json(
     stdout: &str,
     exit_code: i32,
@@ -590,7 +748,7 @@ fn parse_stderr_line(line: &str) -> CliProgress {
             }
             Some("tool_completed") => {
                 let name = v["name"].as_str().unwrap_or_default().to_string();
-                let duration_ms = v["duration_ms"].as_u64().unwrap_or(0);
+                let duration_ms = v["duration_ms"].as_u64();
                 return CliProgress::ToolDone { name, duration_ms };
             }
             Some("status") => {
@@ -735,8 +893,18 @@ pub async fn run_cli_with_cancel(
         cmd.env("ASTRA_ACCESS_TOKEN", token);
     }
     let name = profile.name().to_string();
-    let (stdout_text, stderr_text, exit_code) =
-        run_child_with_cancel(cmd, progress_tx, timeout, cancel, &name).await?;
+    let stream_stdout = matches!(
+        profile,
+        CliProfile::Claude {
+            stream_json: true,
+            ..
+        }
+    );
+    let (stdout_text, stderr_text, exit_code) = if stream_stdout {
+        run_child_with_cancel_streaming(cmd, progress_tx, timeout, cancel, &name).await?
+    } else {
+        run_child_with_cancel(cmd, progress_tx, timeout, cancel, &name).await?
+    };
 
     let mut result = profile.parse_output(&stdout_text, exit_code);
     result.stdout = stdout_text;
@@ -763,11 +931,36 @@ async fn abort_child(
 }
 
 pub(crate) async fn run_child_with_cancel(
+    cmd: Command,
+    progress_tx: Option<mpsc::Sender<CliProgress>>,
+    timeout: Option<Duration>,
+    cancel: Option<tokio_util::sync::CancellationToken>,
+    name: &str,
+) -> Result<(String, String, i32), String> {
+    run_child_with_cancel_inner(cmd, progress_tx, timeout, cancel, name, false).await
+}
+
+/// Like `run_child_with_cancel` but also parses stdout as a JSONL progress stream
+/// (used by Claude's `--output-format stream-json` mode). Each stdout line is
+/// dispatched as a `CliProgress` event; the full stdout text is still returned
+/// for `parse_output` to extract the final result line.
+pub(crate) async fn run_child_with_cancel_streaming(
+    cmd: Command,
+    progress_tx: Option<mpsc::Sender<CliProgress>>,
+    timeout: Option<Duration>,
+    cancel: Option<tokio_util::sync::CancellationToken>,
+    name: &str,
+) -> Result<(String, String, i32), String> {
+    run_child_with_cancel_inner(cmd, progress_tx, timeout, cancel, name, true).await
+}
+
+async fn run_child_with_cancel_inner(
     mut cmd: Command,
     progress_tx: Option<mpsc::Sender<CliProgress>>,
     timeout: Option<Duration>,
     cancel: Option<tokio_util::sync::CancellationToken>,
     name: &str,
+    stream_stdout: bool,
 ) -> Result<(String, String, i32), String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -779,6 +972,14 @@ pub(crate) async fn run_child_with_cancel(
 
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let stderr = child.stderr.take().ok_or("no stderr")?;
+
+    // In stream-json mode, stdout carries JSONL progress events.
+    // In normal mode, stderr carries --stream-events JSONL progress events.
+    let (stderr_progress_tx, stdout_progress_tx) = if stream_stdout {
+        (None, progress_tx)
+    } else {
+        (progress_tx, None)
+    };
 
     let stderr_task = tokio::spawn(async move {
         let reader = BufReader::new(stderr);
@@ -793,8 +994,8 @@ pub(crate) async fn run_child_with_cancel(
                 collected.push('\n');
             }
             collected.push_str(&line);
-            let event = parse_stderr_line(&line);
-            if let Some(ref tx) = progress_tx {
+            if let Some(ref tx) = stderr_progress_tx {
+                let event = parse_stderr_line(&line);
                 let _ = tx.send(event).await;
             }
         }
@@ -810,6 +1011,11 @@ pub(crate) async fn run_child_with_cancel(
                 output.push('\n');
             }
             output.push_str(&line);
+            if let Some(ref tx) = stdout_progress_tx
+                && let Some(ev) = parse_claude_stream_json_line(&line)
+            {
+                let _ = tx.send(ev).await;
+            }
         }
         output
     });
@@ -1168,6 +1374,8 @@ mod tests {
         let p = CliProfile::Claude {
             bin: "claude".into(),
             model: Some("claude-sonnet-4-6".into()),
+            stream_json: false,
+            extra_args: vec![],
         };
         let cmd = p.build_command("fix bug", None, None);
         let args: Vec<_> = cmd.as_std().get_args().collect();
@@ -1181,6 +1389,8 @@ mod tests {
         let p = CliProfile::Claude {
             bin: "claude".into(),
             model: None,
+            stream_json: false,
+            extra_args: vec![],
         };
         let cmd = p.build_command_with_context("hi", None, None, Some("gateway context"));
         let args: Vec<_> = cmd.as_std().get_args().collect();
@@ -1534,7 +1744,7 @@ model: claude-sonnet-4-6"#;
     fn parse_tool_completed_event() {
         let line = r#"{"type":"tool_completed","name":"read_file","description":"x","status":"ok","duration_ms":42,"output_summary":null}"#;
         assert!(
-            matches!(parse_stderr_line(line), CliProgress::ToolDone { name, duration_ms } if name == "read_file" && duration_ms == 42)
+            matches!(parse_stderr_line(line), CliProgress::ToolDone { name, duration_ms } if name == "read_file" && duration_ms == Some(42))
         );
     }
 

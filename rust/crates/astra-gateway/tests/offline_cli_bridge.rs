@@ -71,6 +71,8 @@ fn offline_claude_hello_parse() {
     let profile = CliProfile::Claude {
         bin: "claude".into(),
         model: None,
+        stream_json: false,
+        extra_args: vec![],
     };
     let result = profile.parse_output(&json, 0);
 
@@ -94,6 +96,8 @@ fn offline_claude_session_id_format() {
     let profile = CliProfile::Claude {
         bin: "claude".into(),
         model: None,
+        stream_json: false,
+        extra_args: vec![],
     };
     let result = profile.parse_output(&json, 0);
     let sid = result.session_id.unwrap();
@@ -114,6 +118,8 @@ fn offline_both_clis_return_session_id() {
         CliProfile::Claude {
             bin: "claude".into(),
             model: None,
+            stream_json: false,
+            extra_args: vec![],
         }
         .parse_output(&json, 0)
     };
@@ -135,6 +141,8 @@ fn offline_both_clis_return_text() {
         CliProfile::Claude {
             bin: "claude".into(),
             model: None,
+            stream_json: false,
+            extra_args: vec![],
         }
         .parse_output(&json, 0)
     };

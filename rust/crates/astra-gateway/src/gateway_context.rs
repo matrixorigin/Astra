@@ -299,6 +299,8 @@ mod tests {
         let cli = CliProfile::Claude {
             bin: "claude".into(),
             model: None,
+            stream_json: false,
+            extra_args: vec![],
         };
         let ctx = GatewayContext::new("u1", "Test", "weixin", &cli, true);
         let prompt = ctx.to_system_prompt();

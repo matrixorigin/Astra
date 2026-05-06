@@ -140,6 +140,8 @@ fn claude_profile() -> CliProfile {
     CliProfile::Claude {
         bin: "claude".into(),
         model: None, // use default model
+        stream_json: false,
+        extra_args: vec![],
     }
 }
 

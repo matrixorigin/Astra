@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -c '{event:\"tool_done\", tool:.tool_name, exit_code:.tool_response.exit_code, session_id:env.ASTRA_GATEWAY_TRACE_ID}' | curl -sf -X POST http://127.0.0.1:7701/hook/tool_done -H 'Content-Type: application/json' -d @- || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -c '{event:\"stop\", stop_hook_active:.stop_hook_active, session_id:env.ASTRA_GATEWAY_TRACE_ID}' | curl -sf -X POST http://127.0.0.1:7701/hook/stop -H 'Content-Type: application/json' -d @- || true"
+          }
+        ]
+      }
+    ]
+  }
+}

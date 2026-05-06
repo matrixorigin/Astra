@@ -407,6 +407,27 @@ impl FileEditJournal {
             std::fs::write(&tmp, &json)?;
             std::fs::rename(&tmp, &dest)?;
         }
+        // fsync the directory to ensure renames are durable on crash.
+        // Linux guarantees directory fsync semantics; macOS/Windows treat it
+        // as best-effort (kernel may no-op). Log at debug so failures are
+        // observable without being noisy in the common no-op case.
+        #[cfg(target_os = "linux")]
+        {
+            match std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+                Ok(()) => {}
+                Err(e) => tracing::debug!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "journal: directory fsync failed (durability best-effort)"
+                ),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Directory fsync is not reliably defined on non-Linux; rely on
+            // rename(2) atomicity at the inode level. This is best-effort.
+            let _ = dir;
+        }
         Ok(())
     }
 
@@ -1142,5 +1163,67 @@ mod tests {
         assert_eq!(result.reverted.len(), 1);
         assert!(result.failed.is_empty());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "first");
+    }
+
+    /// Merge with cap eviction followed by save_to_dir must leave exactly
+    /// cap files on disk, and the evicted older entries must NOT be present.
+    #[test]
+    fn merge_cap_eviction_then_save_to_dir_disk_consistent() {
+        let tmp = TempDir::new().unwrap();
+        let persist_dir = tmp.path().join("journal");
+
+        let mk = |j: &mut FileEditJournal, tag: &str| {
+            let f = tmp.path().join(tag);
+            std::fs::write(&f, b"x").unwrap();
+            j.record_before(&f, tag, 0);
+            j.record_after(&f, tag, b"y");
+        };
+
+        // Simulate a prior run with 4 entries on disk.
+        let mut prior = FileEditJournal::new(10);
+        mk(&mut prior, "prior-0");
+        mk(&mut prior, "prior-1");
+        mk(&mut prior, "prior-2");
+        mk(&mut prior, "prior-3");
+        prior.save_to_dir(&persist_dir).unwrap();
+        let disk_before: Vec<_> = std::fs::read_dir(&persist_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
+            .collect();
+        assert_eq!(disk_before.len(), 4);
+
+        // Current session: cap=3, 1 pre-session entry.
+        let mut current = FileEditJournal::new(3);
+        mk(&mut current, "new-0");
+
+        // Load disk into a temp journal and merge as "older".
+        let older = FileEditJournal::load_from_dir(&persist_dir, 500).unwrap();
+        assert_eq!(older.len(), 4);
+        current.merge_older_entries(older);
+
+        // 4 + 1 = 5 total, cap=3 → keep newest 3: prior-2, prior-3, new-0
+        assert_eq!(current.len(), 3);
+
+        // Save merged state back to disk.
+        current.save_to_dir(&persist_dir).unwrap();
+
+        // Disk must have exactly 3 files (evicted prior-0, prior-1 removed).
+        let disk_after: Vec<_> = std::fs::read_dir(&persist_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
+            .collect();
+        assert_eq!(disk_after.len(), 3, "disk must match cap after merge+save");
+
+        // Reload and verify content consistency.
+        let reloaded = FileEditJournal::load_from_dir(&persist_dir, 10).unwrap();
+        assert_eq!(reloaded.len(), 3);
+        let tags: Vec<String> = reloaded
+            .entries_for_test()
+            .iter()
+            .map(|e| e.tool_call_id.clone())
+            .collect();
+        assert_eq!(tags, vec!["prior-2", "prior-3", "new-0"]);
     }
 }
