@@ -415,6 +415,15 @@ impl PipelineStats {
         self.section_churns.get(&kind).copied().unwrap_or(0)
     }
 
+    /// Last-observed content fingerprint for a section kind. `None` means
+    /// this kind has not been recorded yet (first turn, or section was
+    /// never rendered). Useful for diagnostics that want to spot-check
+    /// whether two turns saw the same content for a given kind.
+    #[must_use]
+    pub fn section_fingerprint(&self, kind: crate::section_types::SectionKind) -> Option<u64> {
+        self.section_fingerprints.get(&kind).copied()
+    }
+
     /// Return the historical EMA of section token usage, rounded to u32.
     /// Used by the planner to feed `TokenBudget::allocate`.
     #[must_use]
@@ -656,6 +665,47 @@ mod tests {
             1,
             "changed volatile section must increment churn once"
         );
+    }
+
+    #[test]
+    fn section_fingerprint_accessor_matches_last_recorded_hash() {
+        // The fingerprint accessor is the read-side complement of
+        // `section_churn` — it tells callers which hash was last seen so
+        // they can diff against a subsequent turn without re-recording.
+        let mut stats = PipelineStats::default();
+        assert!(
+            stats
+                .section_fingerprint(SectionKind::ProjectContext)
+                .is_none(),
+            "unseen kinds must return None rather than a sentinel hash"
+        );
+
+        stats.record_section_fingerprints(&[section(
+            SectionKind::ProjectContext,
+            "stable project",
+        )]);
+        let first = stats
+            .section_fingerprint(SectionKind::ProjectContext)
+            .expect("fingerprint present after first record");
+
+        stats.record_section_fingerprints(&[section(
+            SectionKind::ProjectContext,
+            "stable project",
+        )]);
+        assert_eq!(
+            stats.section_fingerprint(SectionKind::ProjectContext),
+            Some(first),
+            "identical content must yield identical fingerprint"
+        );
+
+        stats.record_section_fingerprints(&[section(
+            SectionKind::ProjectContext,
+            "different project",
+        )]);
+        let second = stats
+            .section_fingerprint(SectionKind::ProjectContext)
+            .expect("fingerprint present after mutation");
+        assert_ne!(first, second, "different content must yield different hash");
     }
 
     #[test]
