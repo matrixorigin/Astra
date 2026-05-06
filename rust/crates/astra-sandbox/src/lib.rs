@@ -29,7 +29,9 @@ pub use git_safety::{
 };
 pub use path::{SandboxPathError, validate_path};
 pub use policy::{SandboxMode, SandboxPolicy};
-pub use process_isolation::{IsolatedOutput, IsolationConfig, execute_isolated};
+pub use process_isolation::{
+    CgroupGuard, IsolatedOutput, IsolationConfig, apply_cgroup, execute_isolated,
+};
 pub use shell_hardening::{
     DANGEROUS_FILE_PATHS, SENSITIVE_ENV_VARS, ShellHardeningConfig, build_hardened_command,
     is_dangerous_file_path, scrub_secrets_from_env,

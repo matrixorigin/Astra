@@ -23,6 +23,8 @@ pub const DEFAULT_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "git_revert_commit",
     "web_fetch",
     "web_search",
+    // run_script: programmatic tool calling (Unix-only, schema filtered below)
+    "run_script",
 ];
 
 pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
@@ -80,7 +82,8 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "memory_purge",
     "memory_correct",
     "memory_profile",
-    // execute_code gated behind ASTRA_CODE_EXEC_UNSAFE=1 — opt-in only.
+    // run_script: programmatic tool calling (Unix-only, UDS RPC).
+    "run_script",
     "enter_plan_mode",
     "exit_plan_mode",
     "get_agent_info",
@@ -112,19 +115,38 @@ pub fn all_tool_schemas() -> Vec<Value> {
 }
 
 /// Like `all_tool_schemas()` but reads env via a caller-supplied closure.
-/// Used for deterministic testing — set `ASTRA_CODE_EXEC_UNSAFE=1` to
-/// expose the `execute_code` tool, which runs Python scripts unsandboxed.
+/// The `env` parameter is currently unused (all gated tools have been
+/// removed) but kept for forward compatibility with future per-env
+/// opt-in surfaces.
 pub fn all_tool_schemas_with_env<F: Fn(&str) -> Option<String>>(env: F) -> Vec<Value> {
+    let _ = env; // reserved for future env-gated tools
     let mut schemas = all_tool_schemas_core();
-    // execute_code is Unix-only (UDS RPC transport). On Windows the
-    // schema is hidden from the LLM — even if the env var is set.
+    // run_script is Unix-only (UDS RPC transport). Always exposed on Unix —
+    // no env gate, this is the production tool.
     #[cfg(unix)]
-    if env("ASTRA_CODE_EXEC_UNSAFE").as_deref() == Some("1") {
-        schemas.push(execute_code_schema());
+    {
+        schemas.push(run_script_schema_default());
     }
-    #[cfg(not(unix))]
-    let _ = env; // suppress unused-param warning on non-unix builds
     schemas
+}
+
+/// Default `run_script` schema exposed when the caller has not yet wired
+/// session-specific priority/enabled-tool hints. Uses the full sandbox
+/// allowlist + Project mode + neutral priority. Sites that know the session
+/// context (manifest_loader, repl_turn) should call
+/// `run_script::build_run_script_schema` directly for a tighter schema.
+#[cfg(unix)]
+fn run_script_schema_default() -> Value {
+    use std::collections::HashSet;
+    let enabled: HashSet<String> = crate::run_script::RPC_ALLOWED_TOOLS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    crate::run_script::build_run_script_schema(
+        &enabled,
+        crate::run_script::ExecutionMode::Project,
+        crate::run_script::PriorityHint::Neutral,
+    )
 }
 
 fn all_tool_schemas_core() -> Vec<Value> {
@@ -1973,34 +1995,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
     ]
 }
 
-/// Schema for the `execute_code` tool. Returned by `all_tool_schemas_with_env`
-/// only when `ASTRA_CODE_EXEC_UNSAFE=1` — the tool runs Python scripts
-/// unsandboxed as the current user. Keep the description pointed at what
-/// the model needs to know for correct usage AND for understanding the risk.
-fn execute_code_schema() -> Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": "execute_code",
-            "description": "⚠️ UNSAFE: executes a Python script unsandboxed as the current user — no cgroup, no seccomp, no chroot. Use only when absolutely necessary for multi-step read/search operations that would otherwise require dozens of tool calls. Only stdout is returned. Script-callable functions: read_file, write_file, list_dir, grep, web_fetch.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "script": {
-                        "type": "string",
-                        "description": "Python script to execute. Module `astra_tools` is auto-imported with: read_file(path), write_file(path, content), list_dir(path), grep(pattern, path), web_fetch(url). Do NOT rely on shell access — write Python, not shell-outs."
-                    },
-                    "timeout": {
-                        "type": "integer",
-                        "description": "Max execution time in seconds (default 300, capped at 600)"
-                    }
-                },
-                "required": ["script"]
-            }
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -2019,108 +2013,64 @@ mod tests {
             .collect()
     }
 
-    // ── P0-1: execute_code gate tests ─────────────────────────────────────
-    //
-    // execute_code spawns `python3 script.py` directly without sandboxing.
-    // In practice this is RCE-as-current-user: LLM can read any file, spawn
-    // shell via allowlisted `bash`, open network. Gate the schema behind
-    // an explicit opt-in env var so the tool isn't silently available.
-    // See plans review 2026-05-05.
+    // execute_code has been deleted. The only hallucination-prevention
+    // concern now is ensuring run_script is advertised on Unix, and that
+    // `execute_code` is NOT in the schema list (so the model doesn't
+    // hallucinate it).
 
     #[test]
-    fn execute_code_hidden_by_default() {
+    fn execute_code_no_longer_present_in_schemas() {
         let schemas = all_tool_schemas_with_env(|_| None);
         let names = schema_names(&schemas);
         assert!(
             !names.contains(&"execute_code"),
-            "execute_code must NOT appear in the default schema list — it runs unsandboxed"
+            "execute_code was removed; legacy references must not leak into the schema list"
         );
+    }
+
+    // ── run_script schema visibility ──────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn run_script_visible_by_default_on_unix() {
+        // run_script is the production successor to execute_code and must
+        // be discoverable without any opt-in env var.
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let names = schema_names(&schemas);
+        assert!(
+            names.contains(&"run_script"),
+            "run_script must appear in the default schema list so the LLM can discover it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_script_default_schema_lists_all_sandbox_tools() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let rs = schemas
+            .iter()
+            .find(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    == Some("run_script")
+            })
+            .expect("run_script schema present");
+        let desc = rs["function"]["description"].as_str().unwrap();
+        // At least read_file and web_fetch should be mentioned — they're
+        // the staple tools for multi-step pipelines.
+        assert!(desc.contains("read_file"), "default schema should list read_file");
+        assert!(desc.contains("web_fetch"), "default schema should list web_fetch");
     }
 
     #[cfg(not(unix))]
     #[test]
-    fn execute_code_hidden_on_non_unix_even_with_env_set() {
-        // The RPC transport is a Unix domain socket; on Windows the
-        // tool is unavailable regardless of ASTRA_CODE_EXEC_UNSAFE.
-        let schemas = all_tool_schemas_with_env(|_| Some("1".into()));
+    fn run_script_hidden_on_non_unix() {
+        let schemas = all_tool_schemas_with_env(|_| None);
         let names = schema_names(&schemas);
         assert!(
-            !names.contains(&"execute_code"),
-            "execute_code must stay hidden on non-unix even if env says enable"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn execute_code_visible_when_unsafe_env_set() {
-        let schemas = all_tool_schemas_with_env(|k| {
-            if k == "ASTRA_CODE_EXEC_UNSAFE" {
-                Some("1".into())
-            } else {
-                None
-            }
-        });
-        let names = schema_names(&schemas);
-        assert!(
-            names.contains(&"execute_code"),
-            "execute_code must appear when ASTRA_CODE_EXEC_UNSAFE=1"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn execute_code_description_warns_unsandboxed() {
-        let schemas = all_tool_schemas_with_env(|_| Some("1".into()));
-        let desc = schemas
-            .iter()
-            .find(|s| {
-                s.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-                    == Some("execute_code")
-            })
-            .and_then(|s| s.get("function"))
-            .and_then(|f| f.get("description"))
-            .and_then(Value::as_str)
-            .expect("execute_code schema present");
-        assert!(
-            desc.to_lowercase().contains("unsandboxed") || desc.contains("UNSAFE"),
-            "description must warn the model the tool is unsandboxed: got {desc:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn execute_code_description_omits_bash_from_allowlist() {
-        // Script-callable `bash` is a bypass for the allowlist concept.
-        // The schema must not advertise bash as available to the script.
-        let schemas = all_tool_schemas_with_env(|_| Some("1".into()));
-        let func = schemas
-            .iter()
-            .find(|s| {
-                s.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-                    == Some("execute_code")
-            })
-            .and_then(|s| s.get("function"))
-            .expect("execute_code schema present");
-        let outer_desc = func
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let script_desc = func
-            .get("parameters")
-            .and_then(|p| p.get("properties"))
-            .and_then(|p| p.get("script"))
-            .and_then(|p| p.get("description"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let combined = format!("{outer_desc} {script_desc}");
-        // Token boundaries to avoid matching 'bashrc' etc.
-        assert!(
-            !combined.contains("bash("),
-            "schema still advertises bash() to the script — remove it"
+            !names.contains(&"run_script"),
+            "run_script requires Unix domain sockets — must not appear on other platforms"
         );
     }
 

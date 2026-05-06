@@ -55,3 +55,7 @@ default = []
 cli = []
 # Enable integration tests that require python3 on the system
 python_tests = []
+# Enable integration tests that require cgroup v2 + write access to
+# /sys/fs/cgroup (usually means running as root or a systemd-delegated
+# subtree). CI without this is fine — these tests are #[ignore]'d.
+cgroup_tests = []

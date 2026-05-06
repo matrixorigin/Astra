@@ -321,24 +321,18 @@ impl DefaultToolExecutor {
                 ))
             }
 
-            // ── Code execution (Python RPC bridge) ──────────────────
-            // Fail-closed: runtime env-var gate regardless of schema visibility.
-            "execute_code" => {
-                if std::env::var("ASTRA_CODE_EXEC_UNSAFE").as_deref() != Ok("1") {
-                    return ToolResult::error(
-                        "execute_code is disabled. Set ASTRA_CODE_EXEC_UNSAFE=1 to enable.".into(),
-                    );
-                }
+            // ── run_script (programmatic tool calling via Python + UDS RPC) ──
+            "run_script" => {
                 #[cfg(unix)]
                 {
-                    crate::code_exec::handle_execute_code(args, self).await
+                    let config = crate::run_script::RunScriptConfig::default();
+                    crate::run_script::handle_run_script(args, self, config).await
                 }
                 #[cfg(not(unix))]
                 {
                     ToolResult::error(
-                        "execute_code is not available on this platform \
-                         (requires Unix domain sockets; Windows named-pipe \
-                         support is a future work)"
+                        "run_script is not available on this platform \
+                         (requires Unix domain sockets)"
                             .into(),
                     )
                 }
@@ -902,6 +896,63 @@ mod tests {
         assert!(
             result.output.contains("cancelled"),
             "error must mention cancellation, got: {}",
+            result.output
+        );
+    }
+
+    // ── run_script dispatch ──────────────────────────────────────────────
+
+    #[tokio::test]
+    #[cfg_attr(not(feature = "python_tests"), ignore)]
+    async fn dispatch_run_script_executes_python() {
+        if !crate::run_script::python3_available() {
+            return;
+        }
+        let (tmp, exec) = test_executor();
+        std::fs::write(tmp.path().join("data.txt"), "hello from file").unwrap();
+
+        let result = exec
+            .execute(
+                "run_script",
+                &serde_json::json!({
+                    "script": "print('run_script works')",
+                    "timeout": 5
+                }),
+            )
+            .await;
+        assert!(!result.is_error, "got error: {}", result.output);
+        assert!(
+            result.output.contains("run_script works"),
+            "output: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_run_script_missing_script_returns_error() {
+        let (_tmp, exec) = test_executor();
+        let result = exec
+            .execute("run_script", &serde_json::json!({}))
+            .await;
+        assert!(result.is_error);
+        assert!(result.output.contains("Missing 'script'"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_execute_code_is_unknown_tool() {
+        // Legacy execute_code has been removed. Attempting to dispatch it
+        // must fall through to the unknown-tool error — no gated fallback.
+        let (_tmp, exec) = test_executor();
+        let result = exec
+            .execute(
+                "execute_code",
+                &serde_json::json!({"script": "print('hi')"}),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("not available") || result.output.contains("Error"),
+            "expected unknown-tool error, got: {}",
             result.output
         );
     }

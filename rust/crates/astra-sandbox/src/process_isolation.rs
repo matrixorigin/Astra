@@ -224,6 +224,107 @@ fn cleanup_cgroup(cg_path: &Path) {
     let _ = std::fs::remove_dir(cg_path);
 }
 
+// ─── Public API: attach cgroup limits to an existing tokio::process::Command ──
+
+/// RAII handle for a transient cgroup v2 scope.
+///
+/// On drop, removes the cgroup directory (must be empty — i.e. the child
+/// process has already exited). Callers who care about guaranteed cleanup
+/// should drop the guard only after the child has been waited on.
+///
+/// Created by [`apply_cgroup`]. If the host doesn't support cgroup v2 or
+/// the caller passed zero limits, the guard is inactive: no cgroup is
+/// created and no cleanup happens. Check with [`CgroupGuard::active`].
+#[derive(Debug)]
+pub struct CgroupGuard {
+    cg_path: Option<PathBuf>,
+}
+
+impl CgroupGuard {
+    /// Whether an actual cgroup was created and joined by the child.
+    /// `false` means the host lacks cgroup v2 support, or all limits
+    /// were zero so no cgroup was needed.
+    pub fn active(&self) -> bool {
+        self.cg_path.is_some()
+    }
+
+    /// Absolute path of the cgroup directory, if active. Exposed for
+    /// observability — callers typically don't need to interact with it.
+    pub fn path(&self) -> Option<&Path> {
+        self.cg_path.as_deref()
+    }
+}
+
+impl Drop for CgroupGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.cg_path.take() {
+            cleanup_cgroup(&p);
+        }
+    }
+}
+
+/// Attach cgroup v2 memory + CPU limits to an existing Command.
+///
+/// The child process joins the cgroup via a `pre_exec` hook so its
+/// allocations are bounded from the very first instruction. The returned
+/// [`CgroupGuard`] cleans up the cgroup directory on drop.
+///
+/// Semantics:
+/// - `memory_limit_bytes = 0` → no memory limit applied.
+/// - `cpu_quota = 0.0` → no CPU limit applied.
+/// - If both are zero, or cgroup v2 is unavailable, returns an inactive
+///   guard and does not modify `cmd`. This is the happy "permissive"
+///   fallback — callers who need to *know* whether isolation actually
+///   fired should check [`CgroupGuard::active`].
+///
+/// Unlike [`execute_isolated`], this function does NOT spawn, pump, or
+/// wait — it only configures the `Command` builder. Use this when you
+/// need custom stdout/stderr handling (streaming, RPC sockets, etc.).
+pub fn apply_cgroup(
+    cmd: &mut tokio::process::Command,
+    memory_limit_bytes: u64,
+    cpu_quota: f64,
+) -> CgroupGuard {
+    // Mirror the allocation heuristic of create_cgroup.
+    if memory_limit_bytes == 0 && cpu_quota <= 0.0 {
+        return CgroupGuard { cg_path: None };
+    }
+    let config = IsolationConfig {
+        pid_namespace: false,
+        mount_namespace: false,
+        net_namespace: false,
+        memory_limit_bytes,
+        cpu_quota,
+        timeout: Duration::from_secs(0),
+        working_dir: PathBuf::new(),
+    };
+    let cg_path = match create_cgroup(&config) {
+        Some(p) => p,
+        None => return CgroupGuard { cg_path: None },
+    };
+
+    // Join the cgroup in the child via pre_exec. Writing our PID to
+    // cgroup.procs moves us into the cgroup before exec — so the exec'd
+    // program runs under the limits from instruction 0.
+    #[cfg(unix)]
+    {
+        let procs_path = cg_path.join("cgroup.procs");
+        // pre_exec is from std::os::unix::process::CommandExt — already
+        // in scope via the existing create_cgroup call site.
+        unsafe {
+            cmd.pre_exec(move || {
+                let pid = std::process::id().to_string();
+                std::fs::write(&procs_path, &pid)
+                    .map_err(|e| std::io::Error::other(format!("cgroup join: {e}")))
+            });
+        }
+    }
+
+    CgroupGuard {
+        cg_path: Some(cg_path),
+    }
+}
+
 fn append_capped(buffer: &mut Vec<u8>, chunk: &[u8], max_bytes: usize, capped: &mut bool) {
     if buffer.len() >= max_bytes {
         *capped = true;
@@ -619,6 +720,83 @@ mod tests {
         let out = execute_isolated("echo hello", &env, &config).await;
         assert_eq!(out.stdout.trim(), "hello");
         assert!(!out.timed_out);
+    }
+
+    // ── apply_cgroup / CgroupGuard public API ────────────────────────────
+
+    /// Zero limits → inactive guard, no cgroup, no side effects.
+    #[test]
+    fn apply_cgroup_zero_limits_inactive_guard() {
+        let mut cmd = tokio::process::Command::new("true");
+        let guard = apply_cgroup(&mut cmd, 0, 0.0);
+        assert!(!guard.active(), "zero limits must not create a cgroup");
+        assert!(guard.path().is_none());
+    }
+
+    /// Negative cpu_quota is treated as "no limit".
+    #[test]
+    fn apply_cgroup_negative_cpu_is_no_limit() {
+        let mut cmd = tokio::process::Command::new("true");
+        let guard = apply_cgroup(&mut cmd, 0, -1.0);
+        assert!(!guard.active());
+    }
+
+    /// CgroupGuard::active reflects cgroup v2 availability on this host.
+    /// We assert the contract in both branches: if available, a guard with
+    /// non-zero limits IS active; if not available, even non-zero limits
+    /// yield an inactive guard (graceful fallback).
+    #[test]
+    fn apply_cgroup_activity_matches_host_support() {
+        let mut cmd = tokio::process::Command::new("true");
+        let guard = apply_cgroup(&mut cmd, 64 * 1024 * 1024, 1.0);
+        if cgroupv2_available() {
+            // On a cgroup v2 host we'd expect active, UNLESS writing to
+            // /sys/fs/cgroup is blocked (unprivileged container, etc.) —
+            // in which case create_cgroup returns None and we still get
+            // an inactive guard. Both outcomes are contract-compliant.
+            if guard.active() {
+                assert!(guard.path().is_some());
+                assert!(
+                    guard.path().unwrap().starts_with("/sys/fs/cgroup"),
+                    "active guard path must be under /sys/fs/cgroup"
+                );
+            }
+        } else {
+            assert!(
+                !guard.active(),
+                "without cgroup v2 the guard must be inactive"
+            );
+        }
+    }
+
+    /// Drop of an active guard removes the cgroup directory. We simulate
+    /// an active guard by manually crafting one pointing at a tempdir.
+    #[test]
+    fn cgroup_guard_drop_removes_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty subdir that mimics the shape of a real cgroup directory.
+        let fake_cg = tmp.path().join("astra-tool-fake");
+        std::fs::create_dir(&fake_cg).unwrap();
+        assert!(fake_cg.exists());
+
+        {
+            let _guard = CgroupGuard {
+                cg_path: Some(fake_cg.clone()),
+            };
+            // guard goes out of scope here → Drop fires
+        }
+
+        assert!(
+            !fake_cg.exists(),
+            "CgroupGuard::drop must remove the cgroup directory"
+        );
+    }
+
+    /// Inactive guard's Drop is a no-op (no panic, no work).
+    #[test]
+    fn cgroup_guard_inactive_drop_noop() {
+        let guard = CgroupGuard { cg_path: None };
+        drop(guard); // must not panic
     }
 
     #[tokio::test]

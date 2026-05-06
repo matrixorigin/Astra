@@ -13,11 +13,14 @@ pub mod web_fetch;
 pub mod web_search;
 
 pub mod build_test;
-// code_exec uses Unix domain sockets for the script↔host RPC bridge.
-// On Windows it would need named pipes; that integration is deferred.
-// Gate the module itself so the crate still builds cross-platform.
+// run_script is the programmatic tool-calling / code execution RPC bridge.
+// It uses Unix domain sockets for the script↔host RPC channel. Windows
+// would need named pipes — deferred. Gate the modules so the crate still
+// builds cross-platform.
 #[cfg(unix)]
-pub mod code_exec;
+pub mod rpc_bridge;
+#[cfg(unix)]
+pub mod run_script;
 pub mod code_intel;
 pub mod config_tool;
 pub mod env_tools;
