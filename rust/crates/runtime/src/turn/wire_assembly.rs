@@ -7,9 +7,10 @@
 //! path discarded `CompactResult.boundary` and so lost the P2 continuation
 //! nudge) and every cache-annotation tweak had to be mirrored twice.
 //!
-//! Split into three steps that callers orchestrate:
+//! Callers orchestrate three steps per turn:
 //!
-//!   1. [`MemoriaContext::compact`] — async HTTP I/O that returns the
+//!   1. [`MemoriaContext::compact`] (or [`MemoriaContext::compact_with_overrides`]
+//!      for the emergency retry path) — async HTTP I/O that returns the
 //!      full `CompactResult` (messages + boundary + tier).
 //!   2. [`maybe_append_continuation_prompt`] — pure, reads the boundary
 //!      signal and decides whether to append a "keep going" user nudge.
@@ -22,13 +23,14 @@ use serde_json::Value;
 use crate::prompts::{CompactConfig, CompactionTier};
 use crate::turn::cloud::compaction::CompactResult;
 use crate::turn::cloud::memoria_compact::{
-    MemoriaClient, MemoriaCompactConfig, MemoriaCompactParams, SessionMemoryFileCombine,
-    compact_with_memoria, resolve_session_memory_file_options,
+    MemoriaClient, MemoriaCompactConfig, MemoriaCompactParams, compact_with_memoria,
+    resolve_session_memory_file_options,
 };
 use crate::turn::prompt_cache::{PromptCacheConfig, apply_anthropic_cache_metadata};
 
-/// All inputs `compact_with_memoria` needs, bundled so callers don't thread
-/// 8 parameters through their call sites.
+/// Session-level context that Memoria compaction needs. Bundled into one
+/// struct so callers don't pass a long list of positional arguments — each
+/// field is named and independently testable.
 pub(crate) struct MemoriaContext<'a> {
     /// Session id used for Memoria storage scope + cache-edit pin key.
     pub session_id: &'a str,
@@ -118,9 +120,10 @@ impl<'a> MemoriaContext<'a> {
         overrides: BudgetOverrides,
     ) -> CompactResult {
         let budget = crate::prompts::budget_for_model(Some(self.model_name));
-        // `current_tokens` feeds Memoria's budget-pressure knob. `tier` is
-        // the authoritative compaction choice (pipeline planner), so this
-        // estimate only tunes retrieval aggressiveness.
+        // `current_tokens` is a pressure signal for Memoria retrieval; the
+        // authoritative compaction tier is `self.tier` (or the override). The
+        // cache-aware estimate just tunes retrieval aggressiveness, so we
+        // count tool schemas alongside messages for a single total.
         let tool_schema_tokens: usize = visible_tools
             .iter()
             .map(|t| {
@@ -133,19 +136,17 @@ impl<'a> MemoriaContext<'a> {
         all_msgs.extend(messages.iter().cloned());
         let cache_est = crate::prompts::estimate_tokens_cache_aware(&all_msgs, tool_schema_tokens);
 
-        let base = ResolvedBudget {
+        let resolved = overrides.apply(ResolvedBudget {
             budget_chars: budget.effective_input_limit() * 4,
             keep_chars: 2_000,
             keep_recent_turns: budget.keep_recent_turns,
             current_tokens: cache_est.total_tokens,
             tier: self.tier,
-        };
-        let resolved = overrides.apply(base);
+        });
 
         let memoria_config = MemoriaCompactConfig::default();
         let (session_memory_file, session_memory_combine) =
             resolve_session_memory_file_options(self.session_id, self.cwd);
-        let _ = SessionMemoryFileCombine::None; // keep import live
         let memoria_params = MemoriaCompactParams {
             budget_chars: resolved.budget_chars,
             keep_chars: resolved.keep_chars,

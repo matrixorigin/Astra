@@ -1947,37 +1947,30 @@ impl ServerAgenticLoopHost {
     /// (messages + boundary). The boundary is what the caller inspects to
     /// decide whether to append the P2 continuation prompt — the bridge path
     /// does this inline, so we expose the same signal here for parity.
-    #[allow(clippy::too_many_arguments)]
     async fn compact_messages_via_memoria(
         &self,
         state: &AgenticLoopState,
         system_messages: &[Value],
         visible_tools: &[Value],
         tier: CompactionTier,
-        model_name: &str,
-        api_key: &str,
-        base_url: &str,
-        provider: &str,
-        header_overrides: &HashMap<String, String>,
-        completions_url_override: Option<&str>,
-        request_timeout: Option<Duration>,
+        llm_cfg: &ResolvedTurnLlmConfig,
     ) -> crate::turn::cloud::compaction::CompactResult {
         let compact_config = crate::prompts::CompactConfig::from_env();
         let summary_client = RequestAwareSummaryClient {
-            model_name: model_name.to_string(),
-            api_key: api_key.to_string(),
-            base_url: base_url.to_string(),
-            provider: provider.to_string(),
+            model_name: llm_cfg.model_name.clone(),
+            api_key: llm_cfg.api_key.clone(),
+            base_url: llm_cfg.base_url.clone(),
+            provider: llm_cfg.provider.clone(),
             max_output_tokens: compact_config.summary_token_budget,
-            header_overrides: header_overrides.clone(),
-            completions_url_override: completions_url_override.map(String::from),
-            request_timeout,
+            header_overrides: llm_cfg.header_overrides.clone(),
+            completions_url_override: llm_cfg.completions_url_override.clone(),
+            request_timeout: llm_cfg.request_timeout,
         };
         let memoria_client = crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
 
         let ctx = crate::turn::wire_assembly::MemoriaContext {
             session_id: &self.session_id,
-            model_name,
+            model_name: &llm_cfg.model_name,
             memoria_client: memoria_client
                 .as_ref()
                 .map(|c| c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient),
@@ -2002,8 +1995,7 @@ impl ServerAgenticLoopHost {
         system_messages: Vec<Value>,
         compacted_messages: Vec<Value>,
         state: &AgenticLoopState,
-        provider: &str,
-        model_name: &str,
+        llm_cfg: &ResolvedTurnLlmConfig,
         cache_cfg: &PromptCacheConfig,
     ) -> Vec<Value> {
         // Sort skills most-recent-first (matches legacy ordering; shared
@@ -2017,11 +2009,10 @@ impl ServerAgenticLoopHost {
                 content: s.content.as_str(),
             })
             .collect();
-        let cwd = self.edge_profile.get("cwd").and_then(|v| v.as_str());
         let attachments = crate::turn::wire_assembly::PostCompactAttachments {
             invoked_skills,
             recent_file_reads: &state.recent_file_reads,
-            cwd,
+            cwd: self.edge_profile.get("cwd").and_then(|v| v.as_str()),
         };
 
         // Per-turn skill listing (ranked shortlist) now flows through the
@@ -2034,8 +2025,8 @@ impl ServerAgenticLoopHost {
             compacted_messages,
             &attachments,
             &self.session_id,
-            provider,
-            model_name,
+            &llm_cfg.provider,
+            &llm_cfg.model_name,
             cache_cfg,
         )
     }
@@ -2304,19 +2295,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // the wire-building flow is readable and each phase is individually
         // testable / replaceable.
         let compact_result = self
-            .compact_messages_via_memoria(
-                state,
-                &system_messages,
-                &visible_tools,
-                tier,
-                &llm_cfg.model_name,
-                &llm_cfg.api_key,
-                &llm_cfg.base_url,
-                &llm_cfg.provider,
-                &llm_cfg.header_overrides,
-                llm_cfg.completions_url_override.as_deref(),
-                llm_cfg.request_timeout,
-            )
+            .compact_messages_via_memoria(state, &system_messages, &visible_tools, tier, &llm_cfg)
             .await;
         // Parity with the bridge path: when Memoria returned a boundary, the
         // conversation was trimmed mid-task, so nudge the model to resume
@@ -2326,14 +2305,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &mut compacted_messages,
             compact_result.boundary.is_some(),
         );
-        let llm_messages = self.assemble_llm_messages(
-            system_messages,
-            compacted_messages,
-            state,
-            &llm_cfg.provider,
-            &llm_cfg.model_name,
-            &cache_cfg,
-        );
+        let llm_messages =
+            self.assemble_llm_messages(system_messages, compacted_messages, state, &llm_cfg, &cache_cfg);
 
         // ── 3. Call LLM ─────────────────────────────────────────────────
         let budget = crate::prompts::budget_for_model(Some(&llm_cfg.model_name));
@@ -3921,12 +3894,21 @@ mod tests {
         // no Memoria I/O. With Normal tier Memoria passes messages through
         // unchanged, so feeding `state.messages` directly as the compacted
         // list is equivalent to the real runtime path here.
+        let llm_cfg = ResolvedTurnLlmConfig {
+            model_name: "gpt-4".into(),
+            api_key: String::new(),
+            base_url: String::new(),
+            provider: "openai".into(),
+            fallback_chain: Vec::new(),
+            header_overrides: HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
+        };
         let msgs = host.assemble_llm_messages(
             vec![json!({"role": "system", "content": "system prompt text"})],
             state.messages.clone(),
             &state,
-            "openai",
-            "gpt-4",
+            &llm_cfg,
             &PromptCacheConfig::latch("openai", "gpt-4"),
         );
         assert!(msgs.len() >= 2, "should have system + user messages");

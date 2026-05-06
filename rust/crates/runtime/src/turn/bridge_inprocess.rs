@@ -1888,41 +1888,28 @@ impl InProcessChatTurnBridge {
                                 tier: None, // ctx.tier already carries AggressivePrune
                             };
 
-                            // Exclude leading system messages before feeding
-                            // to Memoria — the retry rebuilds llm_messages
-                            // below from the unchanged system prefix + fresh
-                            // compacted tail.
+                            // Split out the leading system prefix so Memoria
+                            // only sees user/assistant/tool history; the
+                            // system block stays untouched across retries.
                             let sys_count = llm_messages
                                 .iter()
                                 .take_while(|m| {
                                     m.get("role").and_then(Value::as_str) == Some("system")
                                 })
                                 .count();
-                            let original_msgs: Vec<Value> = llm_messages
-                                .iter()
-                                .skip(sys_count)
-                                .cloned()
-                                .collect();
+                            let (system_prefix, original_msgs) = llm_messages.split_at(sys_count);
                             let compact_result = aggressive_ctx
                                 .compact_with_overrides(
-                                    &original_msgs,
-                                    &llm_messages[..sys_count],
+                                    original_msgs,
+                                    system_prefix,
                                     &round_edge_tools,
                                     overrides,
                                 )
                                 .await;
 
-                            // Rebuild llm_messages with compacted content.
-                            // Preserve all leading system messages (stable + dynamic).
-                            let system_msgs: Vec<Value> = llm_messages
-                                .iter()
-                                .take_while(|m| {
-                                    m.get("role").and_then(Value::as_str) == Some("system")
-                                })
-                                .cloned()
-                                .collect();
-                            llm_messages.clear();
-                            llm_messages.extend(system_msgs);
+                            // Rebuild llm_messages: unchanged system prefix +
+                            // fresh compacted tail from Memoria.
+                            llm_messages.truncate(sys_count);
                             llm_messages.extend(compact_result.messages);
 
                             // Also prune tool schemas more aggressively
