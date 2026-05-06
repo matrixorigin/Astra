@@ -1887,8 +1887,10 @@ esac
         (executor, session)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_file_boundary_commits_successful_turn() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-file-boundary-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
@@ -1940,8 +1942,10 @@ esac
         cleanup_session_artifacts(&session_id);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_file_boundary_aborts_and_rolls_back_failed_turn() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-file-boundary-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
@@ -2012,8 +2016,10 @@ esac
         cleanup_session_artifacts(&session_id);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_file_boundary_aborts_and_rolls_back_when_multi_edit_fails() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-file-boundary-multi-edit-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
@@ -2082,8 +2088,10 @@ esac
         cleanup_session_artifacts(&session_id);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_git_boundary_aborts_and_reverts_failed_turn() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-git-boundary-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         std::process::Command::new("git")
@@ -2183,8 +2191,10 @@ esac
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_database_boundary_aborts_and_rolls_back_failed_turn() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let fake_bin = tempfile::TempDir::new().unwrap();
         write_fake_mysql(fake_bin.path());
         let path = std::env::var_os("PATH").unwrap_or_default();
@@ -2257,8 +2267,10 @@ esac
         cleanup_session_artifacts(&session_id);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_session_state_boundary_aborts_and_rolls_back_failed_turn() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-session-boundary-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         let (executor, session) = session_state_executor(&session_id, &dir, 9);
@@ -2389,8 +2401,10 @@ esac
     /// before the fix, a `grep` returning `!ok` would blow away the
     /// `write_file` it was scheduled next to and leave the model's action
     /// history diverged from disk state.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_file_boundary_commits_when_only_read_only_tool_fails() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-scope-readonly-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
@@ -2456,8 +2470,10 @@ esac
 
     /// Multiple read-only tools all fail in a mutator round. Still commits —
     /// no number of read-only errors should cascade into a rollback.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_file_boundary_commits_when_multiple_read_only_tools_fail() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-scope-multi-readonly-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
