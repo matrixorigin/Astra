@@ -1679,6 +1679,84 @@ mod tests {
                     );
                 }
             }
+
+            /// Invariant 5: `place_cache_markers` respects max_markers cap,
+            /// never references out-of-bounds indices, always returns empty
+            /// for Prefix protocol, and suppresses None-scope markers when
+            /// a latch flipped this turn.
+            #[test]
+            fn cache_markers_respect_policy_and_latch_constraints(
+                kinds in prop::collection::vec(kind_strategy(), 1..10),
+                scopes in prop::collection::vec(scope_strategy(), 1..10),
+                max_markers in 0u32..=6,
+                use_anthropic in proptest::bool::ANY,
+                latch_this_turn in proptest::bool::ANY,
+                current_turn in 0u32..=100,
+            ) {
+                let n = kinds.len().min(scopes.len());
+                let sections: Vec<BoundSection> = (0..n)
+                    .map(|i| arbitrary_bound_section(kinds[i], scopes[i], (i as u32 + 1) * 10))
+                    .collect();
+
+                let policy = if use_anthropic {
+                    ProviderCachePolicy {
+                        protocol: PromptCacheProtocol::AnthropicCacheControl,
+                        max_markers,
+                        ..ProviderCachePolicy::anthropic()
+                    }
+                } else {
+                    ProviderCachePolicy::openai_compatible()
+                };
+
+                let mut latches = SessionLatches::default();
+                if latch_this_turn {
+                    latches.latch_feature("test_feature", current_turn);
+                }
+
+                let markers = place_cache_markers(&sections, &policy, &latches, current_turn);
+
+                // P1: Prefix protocol → always empty
+                if policy.protocol == PromptCacheProtocol::Prefix {
+                    prop_assert!(
+                        markers.is_empty(),
+                        "Prefix protocol must never emit markers"
+                    );
+                    return Ok(());
+                }
+
+                // P2: Never exceeds max_markers
+                prop_assert!(
+                    markers.len() <= max_markers as usize,
+                    "markers.len()={} exceeds max_markers={}",
+                    markers.len(),
+                    max_markers
+                );
+
+                // P3: All indices are valid
+                for marker in &markers {
+                    prop_assert!(
+                        marker.after_section_index < sections.len(),
+                        "marker index {} >= sections.len() {}",
+                        marker.after_section_index,
+                        sections.len()
+                    );
+                }
+
+                // P4: When latch flipped, no marker sits just before a None-scope section
+                if latch_this_turn {
+                    for marker in &markers {
+                        let next_idx = marker.after_section_index + 1;
+                        if next_idx < sections.len() {
+                            prop_assert!(
+                                sections[next_idx].plan.scope != CacheScope::None,
+                                "latch flipped: marker at {} precedes None-scope section at {}",
+                                marker.after_section_index,
+                                next_idx
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 }

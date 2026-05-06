@@ -10,7 +10,7 @@ use astra_turn_core::context_sources::*;
 use astra_turn_core::microcompact::ProviderCacheStrategy;
 use astra_turn_core::optimize_limits::OptimizeLimits;
 use astra_turn_core::pipeline_config::{PipelineConfig, ProviderCachePolicy};
-use astra_turn_core::pipeline_session::{AdaptiveTurnInput, PipelineSession, TurnInput};
+use astra_turn_core::pipeline_session::{PipelineSession, TurnInput};
 use astra_turn_core::recovery_state::RecoveryState;
 use astra_turn_core::token_accounting::TokenAccounting;
 
@@ -120,150 +120,11 @@ fn adapter_produces_valid_turn_input() {
     assert_eq!(external.memory_entries.len(), 1);
 }
 
-#[test]
-fn adapter_feeds_pipeline_session_run_turn() {
-    let mock = MockLoopState::default_test();
-    let statics = StaticSections::test_default();
-    let agent = AgentContext::default();
-    let session = mock.build_session_context();
-    let turn = mock.build_turn_state();
-    let external = mock.build_external();
-    let limits = OptimizeLimits::default();
-
-    let sess = PipelineSession::new(PipelineConfig {
-        provider_policy: ProviderCachePolicy::anthropic(),
-    });
-
-    let input = TurnInput {
-        statics: &statics,
-        agent: &agent,
-        session: &session,
-        turn: &turn,
-        external: &external,
-        optimize_limits: &limits,
-        model_id: &mock.model_id,
-        query_source: "agentic_loop",
-    };
-
-    let output = sess
-        .run_turn(input)
-        .expect("pipeline should produce output");
-    assert!(output.metrics.turn_index == 3);
-    assert!(!output.serialized.system_blocks.is_empty());
-    assert!(output.explain.phase_timings.len() == 4);
-}
-
-#[test]
-fn adapter_feeds_pipeline_session_adaptive() {
-    let mock = MockLoopState::default_test();
-    let statics = StaticSections::test_default();
-    let agent = AgentContext::default();
-    let session = mock.build_session_context();
-    let turn = mock.build_turn_state();
-    let external = mock.build_external();
-
-    let sess = PipelineSession::new(PipelineConfig {
-        provider_policy: ProviderCachePolicy::anthropic(),
-    });
-
-    let input = AdaptiveTurnInput {
-        statics: &statics,
-        agent: &agent,
-        session: &session,
-        turn: &turn,
-        external: &external,
-        model_id: &mock.model_id,
-        query_source: "agentic_loop",
-    };
-
-    let output = sess
-        .run_turn_adaptive(input)
-        .expect("adaptive should succeed");
-    assert!(output.metrics.sections > 0);
-    assert!(output.metrics.raw_pressure < 0.5); // low pressure with 5K/200K
-}
-
-#[test]
-fn pipeline_output_system_blocks_contain_identity() {
-    let mock = MockLoopState::default_test();
-    let statics = StaticSections::test_default();
-    let agent = AgentContext::default();
-    let session = mock.build_session_context();
-    let turn = mock.build_turn_state();
-    let external = mock.build_external();
-    let limits = OptimizeLimits::default();
-
-    let sess = PipelineSession::new(PipelineConfig {
-        provider_policy: ProviderCachePolicy::anthropic(),
-    });
-
-    let input = TurnInput {
-        statics: &statics,
-        agent: &agent,
-        session: &session,
-        turn: &turn,
-        external: &external,
-        optimize_limits: &limits,
-        model_id: "model",
-        query_source: "repl",
-    };
-
-    let output = sess.run_turn(input).unwrap();
-
-    // System blocks should start with Identity section content
-    let first_block = &output.serialized.system_blocks[0];
-    assert_eq!(
-        first_block.kind,
-        astra_turn_core::section_types::SectionKind::Identity,
-    );
-    assert!(
-        first_block.text.contains("expert"),
-        "identity block should contain static core rules"
-    );
-}
-
-#[test]
-fn pipeline_output_has_anthropic_cache_markers() {
-    let mock = MockLoopState::default_test();
-    let statics = StaticSections::test_default();
-    let agent = AgentContext::default();
-    let session = mock.build_session_context(); // Anthropic policy
-    let turn = mock.build_turn_state();
-    let external = mock.build_external();
-    let limits = OptimizeLimits::default();
-
-    let sess = PipelineSession::new(PipelineConfig {
-        provider_policy: ProviderCachePolicy::anthropic(),
-    });
-
-    let input = TurnInput {
-        statics: &statics,
-        agent: &agent,
-        session: &session,
-        turn: &turn,
-        external: &external,
-        optimize_limits: &limits,
-        model_id: "model",
-        query_source: "repl",
-    };
-
-    let output = sess.run_turn(input).unwrap();
-
-    // Anthropic should have cache markers at scope boundaries
-    assert!(
-        !output.serialized.cache_markers.is_empty(),
-        "Anthropic policy should produce cache markers"
-    );
-    // At least one block should have cache_control set
-    assert!(
-        output
-            .serialized
-            .system_blocks
-            .iter()
-            .any(|b| b.cache_control.is_some()),
-        "cache_control should be set on some blocks"
-    );
-}
+// NOTE: `adapter_feeds_pipeline_session_run_turn`, `adapter_feeds_pipeline_session_adaptive`,
+// `pipeline_output_system_blocks_contain_identity`, and `pipeline_output_has_anthropic_cache_markers`
+// were removed — they are fully subsumed by the composite integration tests in
+// `runtime/src/turn/context_pipeline_adapter.rs` which exercise the real adapter path
+// with stronger assertions (section ordering, scope boundary checks, per-marker validation).
 
 #[test]
 fn pipeline_output_flattened_matches_concatenation_of_blocks() {

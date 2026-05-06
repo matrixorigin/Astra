@@ -321,3 +321,181 @@ pub(super) fn detect_correction(obj: &serde_json::Map<String, serde_json::Value>
     }
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn obj(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn causal_support_no_tools_returns_perfect_score() {
+        let payload = obj(json!({}));
+        let result = assess_causal_support(&payload, &[], 0.9);
+        assert_eq!(result.score, 1.0);
+        assert!(result.flags.is_empty());
+    }
+
+    #[test]
+    fn causal_support_missing_assessments_penalizes() {
+        let payload = obj(json!({"tool_results": [{"content": "ok"}]}));
+        let result = assess_causal_support(&payload, &["bash".into()], 0.5);
+        assert!(result.score < 1.0);
+        assert!(
+            result
+                .flags
+                .contains(&"missing_quality_evidence".to_string())
+        );
+    }
+
+    #[test]
+    fn causal_support_weak_evidence_when_no_positive() {
+        let payload = obj(json!({
+            "tool_quality_assessments": [{"quality_score": 0.5}],
+            "tool_results": [{"content": "ok"}]
+        }));
+        let result = assess_causal_support(&payload, &["bash".into()], 0.5);
+        assert!(result.flags.contains(&"weak_quality_evidence".to_string()));
+    }
+
+    #[test]
+    fn causal_support_negative_signals_penalizes() {
+        let payload = obj(json!({
+            "tool_quality_assessments": [{"quality_score": 0.2}],
+            "tool_results": [{"content": "ok"}]
+        }));
+        let result = assess_causal_support(&payload, &["bash".into()], 0.5);
+        assert!(
+            result
+                .flags
+                .contains(&"negative_quality_signals".to_string())
+        );
+    }
+
+    #[test]
+    fn causal_support_sparse_coverage_multi_tool() {
+        let payload = obj(json!({
+            "tool_quality_assessments": [{"quality_score": 0.9}],
+            "tool_results": [{"content": "ok"}, {"content": "ok"}]
+        }));
+        let tools = vec!["bash".into(), "read_file".into(), "write".into()];
+        let result = assess_causal_support(&payload, &tools, 0.5);
+        assert!(
+            result
+                .flags
+                .contains(&"sparse_quality_coverage".to_string())
+        );
+    }
+
+    #[test]
+    fn causal_support_contradictory_assessments() {
+        let payload = obj(json!({
+            "tool_quality_assessments": [
+                {"quality_score": 0.9},
+                {"quality_score": 0.2}
+            ],
+            "tool_results": [{"content": "ok"}, {"content": "ok"}]
+        }));
+        let tools = vec!["bash".into(), "read_file".into()];
+        let result = assess_causal_support(&payload, &tools, 0.5);
+        assert!(
+            result
+                .flags
+                .contains(&"contradictory_quality_assessments".to_string())
+        );
+    }
+
+    #[test]
+    fn causal_support_error_tool_results_penalizes_heavily() {
+        let payload = obj(json!({
+            "tool_quality_assessments": [{"quality_score": 0.9}],
+            "tool_results": [{"content": "Error: permission denied"}]
+        }));
+        let result = assess_causal_support(&payload, &["bash".into()], 0.9);
+        assert!(result.flags.contains(&"error_tool_results".to_string()));
+        assert!(result.score < 0.7);
+    }
+
+    #[test]
+    fn causal_support_empty_tool_results_penalizes() {
+        let payload = obj(json!({
+            "tool_quality_assessments": [{"quality_score": 0.9}],
+            "tool_results": [{"content": ""}]
+        }));
+        let result = assess_causal_support(&payload, &["bash".into()], 0.9);
+        assert!(result.flags.contains(&"empty_tool_results".to_string()));
+    }
+
+    #[test]
+    fn causal_support_high_quality_without_support_adds_penalty() {
+        // Stack enough penalties to bring score below MIN_CAUSAL_SUPPORT (0.6):
+        // missing_quality_evidence (-0.25) + missing_tool_results (-0.15) = 0.60
+        // That's not < 0.6, so also add error results to push below threshold.
+        let payload = obj(json!({
+            "tool_results": [{"content": "Error: crash"}]
+        }));
+        let result = assess_causal_support(&payload, &["bash".into()], 0.9);
+        // missing_quality_evidence (-0.25) + error_tool_results (-0.35) = 0.40 < 0.6
+        assert!(
+            result.score < super::MIN_CAUSAL_SUPPORT_FOR_TRUSTED_SUCCESS,
+            "score {} should be below threshold to trigger this penalty",
+            result.score
+        );
+        assert!(
+            result
+                .flags
+                .contains(&"high_quality_without_causal_support".to_string())
+        );
+    }
+
+    #[test]
+    fn causal_support_score_clamped_to_zero_one() {
+        // Stack all penalties to try to go negative
+        let payload = obj(json!({
+            "tool_quality_assessments": [{"quality_score": 0.1}],
+            "tool_results": [{"content": "Error: failed"}]
+        }));
+        let tools = vec!["a".into(), "b".into(), "c".into()];
+        let result = assess_causal_support(&payload, &tools, 0.9);
+        assert!(result.score >= 0.0);
+        assert!(result.score <= 1.0);
+    }
+
+    #[test]
+    fn causal_support_flags_are_sorted_and_deduped() {
+        let payload = obj(json!({
+            "tool_quality_assessments": [{"quality_score": 0.1}],
+            "tool_results": [{"content": "Error: x"}]
+        }));
+        let tools = vec!["a".into(), "b".into()];
+        let result = assess_causal_support(&payload, &tools, 0.9);
+        let sorted = {
+            let mut v = result.flags.clone();
+            v.sort();
+            v.dedup();
+            v
+        };
+        assert_eq!(result.flags, sorted, "flags must be sorted and deduped");
+    }
+
+    #[test]
+    fn causal_support_perfect_when_all_evidence_positive() {
+        let payload = obj(json!({
+            "tool_quality_assessments": [
+                {"quality_score": 0.9},
+                {"quality_score": 0.85}
+            ],
+            "tool_results": [
+                {"content": "{\"status\":\"ok\"}"},
+                {"content": "{\"status\":\"ok\"}"}
+            ]
+        }));
+        let tools = vec!["bash".into(), "read_file".into()];
+        let result = assess_causal_support(&payload, &tools, 0.85);
+        assert_eq!(result.score, 1.0);
+        assert!(result.flags.is_empty());
+    }
+}

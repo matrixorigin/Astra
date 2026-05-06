@@ -400,22 +400,16 @@ dev-seed:
 	run_mysql_ddl 2>/dev/null || { \
 		if [ -n "$$MYSQL_SSL_ARG" ]; then run_mysql_ddl "$$MYSQL_SSL_ARG"; else run_mysql_ddl; fi; \
 	}
-	@if [ ! -f rust/target/release/astra-server ] || [ ! -f rust/target/release/astra-admin ]; then \
-		echo "Binaries not found — building release..."; \
-		$(MAKE) dev-api-restart build-cli-release; \
-	else \
-		echo "Binaries exist — restarting server (skipping rebuild)..."; \
-		export SKIP_BUILD=1; $(MAKE) dev-api-restart; \
-	fi
+	@$(MAKE) dev-api-restart-debug build-cli-debug
 	@sleep 2
 	@echo "Registering admin (admin@mo.com)..."
-	@NO_PROXY=localhost ./rust/target/release/astra-admin register \
+	@NO_PROXY=localhost ./rust/target/debug/astra-admin register \
 		--username admin --password 11111111 --email admin@mo.com
 	@echo "Logging in as admin..."
-	@NO_PROXY=localhost ./rust/target/release/astra-admin login \
+	@NO_PROXY=localhost ./rust/target/debug/astra-admin login \
 		--username admin --password 11111111
 	@echo "Loading models from .models.yaml..."
-	@NO_PROXY=localhost ./rust/target/release/astra-admin model load .models.yaml
+	@NO_PROXY=localhost ./rust/target/debug/astra-admin model load .models.yaml
 	@echo ""
 	@echo "✅ Seed complete — admin@mo.com / 11111111"
 
