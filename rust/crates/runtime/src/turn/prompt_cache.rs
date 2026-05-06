@@ -67,6 +67,27 @@ impl Default for PromptCacheConfig {
 // - Global+Session sections are cached by (tool_names, task_type, confidence) — stable within a session
 // - Per-turn profile_desc is NOT cached (changes every turn with skills/memory/environment)
 
+/// Full pipeline output a bridge caller needs, in one place.
+///
+/// Complements [`super::server_loop_host::PipelineTurnOutcome`]: the bridge
+/// has its own per-request lifecycle (no persistent `PipelineSession`) so
+/// it can't reuse the server struct, but the contract is the same — the
+/// pipeline is the sole source of truth for compaction tier + pruned tool
+/// schemas + system prompt, and the bridge consumes them verbatim.
+pub(crate) struct BridgePipelineOutcome {
+    /// Primary system message (Anthropic multi-block or OpenAI stable text).
+    pub primary_system: Value,
+    /// Optional dynamic system message (OpenAI stable+dynamic split only).
+    pub dynamic_system: Option<Value>,
+    /// Trace-facing sections (original input form, for observability).
+    pub prompt_sections: Vec<prompts::PromptSection>,
+    /// Compaction tier the planner selected this turn. Bridge must honour
+    /// this rather than re-deriving a tier downstream.
+    pub tier: astra_turn_core::compaction_types::CompactionTier,
+    /// Tool schemas already pruned to `tier` by the pipeline's Optimize phase.
+    pub tool_schemas: Vec<Value>,
+}
+
 /// Assemble a system message via the context pipeline directly, without
 /// requiring a [`PipelineSession`]. Used by the HTTP bridge
 /// ([`InProcessChatTurnBridge`]) which has its own per-request lifecycle
@@ -84,7 +105,10 @@ impl Default for PromptCacheConfig {
 /// invalidate the cached prefix.
 ///
 /// Returns `(primary_system_message, optional_dynamic_message, all_sections)`
-/// matching the legacy signature for drop-in bridge compatibility.
+/// matching the legacy signature. Production call-sites have migrated to
+/// [`assemble_bridge_pipeline_outcome`]; this 3-tuple wrapper remains only
+/// as a convenience for tests that still assert on the legacy shape.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_system_message_via_pipeline(
     tool_names: &[&str],
@@ -98,6 +122,48 @@ pub(crate) fn assemble_system_message_via_pipeline(
     edge_profile_cwd: Option<&str>,
     edge_profile_git_branch: Option<&str>,
 ) -> (Value, Option<Value>, Vec<prompts::PromptSection>) {
+    let outcome = assemble_bridge_pipeline_outcome(
+        tool_names,
+        &[],
+        extra_dynamic_sections,
+        confidence,
+        task_type,
+        cache_cfg,
+        session_id,
+        model_id,
+        provider,
+        edge_profile_cwd,
+        edge_profile_git_branch,
+    );
+    (
+        outcome.primary_system,
+        outcome.dynamic_system,
+        outcome.prompt_sections,
+    )
+}
+
+/// Bridge-side equivalent of [`super::server_loop_host::run_turn_pipeline`]:
+/// drives the full context pipeline (Plan → Bind → Optimize → Serialize) for
+/// an ephemeral per-request session, and returns system message(s), trace
+/// sections, planner tier, and tier-pruned tool schemas.
+///
+/// `tool_schemas` is the raw tool set the bridge wanted to expose; the
+/// returned `tool_schemas` is the tier-pruned view from the pipeline's
+/// Optimize phase (mirrors `server_loop_host::PipelineTurnOutcome.tool_schemas`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn assemble_bridge_pipeline_outcome(
+    tool_names: &[&str],
+    tool_schemas: &[Value],
+    extra_dynamic_sections: &[prompts::PromptSection],
+    confidence: f64,
+    task_type: Option<&str>,
+    cache_cfg: &PromptCacheConfig,
+    session_id: &str,
+    model_id: &str,
+    provider: &str,
+    edge_profile_cwd: Option<&str>,
+    edge_profile_git_branch: Option<&str>,
+) -> BridgePipelineOutcome {
     use astra_turn_core::context_sources::{
         AgentContext, EdgeProfile, ExternalSources, SessionContext, TurnState,
     };
@@ -186,7 +252,10 @@ pub(crate) fn assemble_system_message_via_pipeline(
         self_model: None,
     };
 
-    let agent = AgentContext::default();
+    let agent = AgentContext {
+        tool_schemas: tool_schemas.to_vec(),
+        ..Default::default()
+    };
     let turn_state = TurnState {
         messages: Vec::new(),
         tool_results: Vec::new(),
@@ -225,7 +294,13 @@ pub(crate) fn assemble_system_message_via_pipeline(
                 error = ?abort,
                 "bridge pipeline abort during system assembly — returning empty system"
             );
-            return (json!({"role": "system", "content": ""}), None, Vec::new());
+            return BridgePipelineOutcome {
+                primary_system: json!({"role": "system", "content": ""}),
+                dynamic_system: None,
+                prompt_sections: Vec::new(),
+                tier: astra_turn_core::compaction_types::CompactionTier::Normal,
+                tool_schemas: tool_schemas.to_vec(),
+            };
         }
     };
 
@@ -243,7 +318,10 @@ pub(crate) fn assemble_system_message_via_pipeline(
     // section, so this preserves the bridge's telemetry contract.
     sections.extend(all_extras.iter().cloned());
 
-    if is_anthropic {
+    let tier = output.plan.compact_tier;
+    let pruned_tool_schemas = output.optimized.tool_schemas.clone();
+
+    let (primary_system, dynamic_system) = if is_anthropic {
         // Anthropic multi-block with cache_control. serialize_provider_request
         // already placed cache markers per the policy.
         let mut blocks: Vec<Value> = Vec::with_capacity(output.serialized.system_blocks.len());
@@ -254,7 +332,7 @@ pub(crate) fn assemble_system_message_via_pipeline(
             }
             blocks.push(b);
         }
-        (json!({"role": "system", "content": blocks}), None, sections)
+        (json!({"role": "system", "content": blocks}), None)
     } else {
         // OpenAI stable+dynamic split: stable = non-None-scoped blocks joined,
         // dynamic = None-scoped joined separately.
@@ -276,7 +354,15 @@ pub(crate) fn assemble_system_message_via_pipeline(
         } else {
             Some(json!({"role": "system", "content": dynamic_text}))
         };
-        (primary, dynamic, sections)
+        (primary, dynamic)
+    };
+
+    BridgePipelineOutcome {
+        primary_system,
+        dynamic_system,
+        prompt_sections: sections,
+        tier,
+        tool_schemas: pruned_tool_schemas,
     }
 }
 
@@ -746,6 +832,64 @@ mod tests {
             },
         );
         assert!(tools.is_empty());
+    }
+
+    // ── assemble_bridge_pipeline_outcome (Phase 1b contract) ─────────────
+
+    #[test]
+    fn bridge_pipeline_outcome_returns_tier_and_pruned_tool_schemas() {
+        // Phase 1b: the bridge consumes the pipeline's tier + pruned tool
+        // schemas from a single helper call instead of re-deriving them via
+        // `compaction_tier_calibrated` + `tool_schema_prune::prune_tool_schemas`
+        // at two downstream sites. Lock that contract in.
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        remove_test_env("ASTRA_OUTPUT_STYLE");
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let tool_schemas = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Execute a shell command. Runs inside a sandbox with a 2-minute default timeout and cleans temp dirs on exit.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+        let outcome = assemble_bridge_pipeline_outcome(
+            &["bash"],
+            &tool_schemas,
+            &[],
+            0.8,
+            None,
+            &cache_cfg,
+            "sid-bridge",
+            "gpt-4o",
+            "openai",
+            None,
+            None,
+        );
+
+        // Low-pressure turn: planner stays at Normal, tool count preserved.
+        assert_eq!(
+            outcome.tier,
+            astra_turn_core::compaction_types::CompactionTier::Normal,
+            "fresh bridge session with no PTL history must plan at Normal"
+        );
+        assert_eq!(
+            outcome.tool_schemas.len(),
+            tool_schemas.len(),
+            "Normal tier preserves tool-schema count"
+        );
+        // The pipeline runs sophisticated pruning — at Normal tier the
+        // schemas should come through untouched (including descriptions).
+        assert_eq!(
+            outcome.tool_schemas[0]["function"]["description"]
+                .as_str()
+                .unwrap_or(""),
+            tool_schemas[0]["function"]["description"].as_str().unwrap(),
+            "Normal tier must not strip description text"
+        );
     }
 
     // ── assemble_system_message_via_pipeline ─────────────────────────────

@@ -1486,8 +1486,9 @@ impl InProcessChatTurnBridge {
             // through ExternalSources.extra_dynamic_sections so the binder
             // appends them after runtime identity — keeping them in the
             // None-scoped post-cache segment where churn is expected.
-            let (system_msg, dynamic_msg, prompt_sections) = crate::turn::prompt_cache::assemble_system_message_via_pipeline(
+            let pipeline_outcome = crate::turn::prompt_cache::assemble_bridge_pipeline_outcome(
                 &tool_names,
+                &edge_tools,
                 &dynamic_sections,
                 selection_confidence,
                 task_type,
@@ -1498,6 +1499,14 @@ impl InProcessChatTurnBridge {
                 edge_profile.get("cwd").and_then(Value::as_str),
                 edge_profile.get("git_branch").and_then(Value::as_str),
             );
+            let system_msg = pipeline_outcome.primary_system;
+            let dynamic_msg = pipeline_outcome.dynamic_system;
+            let prompt_sections = pipeline_outcome.prompt_sections;
+            // Pipeline decision is the only source of truth for tier + pruning.
+            // Cache the outputs so the round-level block below uses them
+            // instead of re-deriving a tier.
+            let pipeline_tier = pipeline_outcome.tier;
+            let pipeline_tool_schemas = pipeline_outcome.tool_schemas;
             // Debug: dump system prompt for cache analysis (env-gated).
             // Enable with ASTRA_PIPELINE_DUMP_SYSTEM_PROMPT=1. Writes to
             // $TMPDIR/astra-bridge-prompt-<sid>-<ts>.json so `diff` between
@@ -1533,22 +1542,19 @@ impl InProcessChatTurnBridge {
                 // Tool result compaction is handled by compact_tool_results_adaptive
                 // in agentic_loop_lifecycle.rs. No separate analytics pass here.
 
-                // Compute model budget for tier-aware compaction using cache-aware estimation.
-                // Tool schemas are cache-eligible (stable prefix), so we estimate their cost.
+                // Pipeline tier is authoritative — do not re-derive a second tier
+                // from raw token estimates here (caused drift between planner and
+                // Memoria decisions). Memoria still needs a `current_tokens` signal
+                // as a pressure knob until Phase 3 moves it into the pipeline; use
+                // cache-aware estimation for that value only, not for tier choice.
                 let budget = crate::prompts::budget_for_model(Some(&model_name));
                 let tool_schema_tokens: usize = edge_tools.iter()
                     .map(|t| serde_json::to_string(t).map(|s| crate::prompts::estimate_str_tokens(&s)).unwrap_or(50))
                     .sum();
-                // Combine system prompt (llm_messages) + conversation (raw) for estimation
                 let mut all_msgs = llm_messages.clone();
                 all_msgs.extend(raw.iter().cloned());
                 let cache_est = crate::prompts::estimate_tokens_cache_aware(&all_msgs, tool_schema_tokens);
-                let tier = crate::prompts::compaction_tier_calibrated(
-                    &budget,
-                    cache_est.total_tokens,
-                    None,
-                    0,
-                );
+                let tier = pipeline_tier;
                 // Use effective input limit as char budget (×4 for char-to-token ratio)
                 let budget_chars = budget.effective_input_limit() * 4;
 
@@ -1686,30 +1692,22 @@ impl InProcessChatTurnBridge {
 
                 // Budget check removed: single LLM call per HTTP request.
 
+                // Round-level tools come from the pipeline's Optimize phase,
+                // which already ran tier-appropriate schema pruning. The
+                // per-round `filter_round_edge_tools` pass strips names in
+                // `restricted_tools` — here always empty, so the pipeline
+                // output is already the authoritative set.
                 let round_edge_tools =
                     filter_round_edge_tools(&edge_tools, &HashSet::new());
                 let round_tools_fingerprint_str =
                     serde_json::to_string(&round_edge_tools).unwrap_or_default();
-
-                let tool_schema_tokens_round: usize = round_edge_tools
-                    .iter()
-                    .map(|t| {
-                        serde_json::to_string(t)
-                            .map(|s| crate::prompts::estimate_str_tokens(&s))
-                            .unwrap_or(50)
-                    })
-                    .sum();
-                let cache_est_round = crate::prompts::estimate_tokens_cache_aware(
-                    &llm_messages,
-                    tool_schema_tokens_round,
-                );
-                let round_tier = crate::prompts::compaction_tier_calibrated(
-                    &budget,
-                    cache_est_round.total_tokens,
-                    last_measured_prompt,
-                    0, // single-call proxy: no consecutive context-window errors to track
-                );
-                let mut pruned_tools = prune_tool_schemas(&round_edge_tools, round_tier);
+                // `pipeline_tier` is the authoritative tier; the per-round
+                // tier refinement (based on `last_measured_prompt`) used to
+                // live here but produced tier drift between planner and
+                // tool-pruning paths. Phase 3 will feed last-measured back
+                // into the planner; until then rely on pipeline output.
+                let _ = last_measured_prompt; // referenced for future wiring
+                let mut pruned_tools = pipeline_tool_schemas.clone();
                 annotate_tool_schemas_for_caching(&mut pruned_tools, &cache_cfg);
 
                 let loop_started = Instant::now();
