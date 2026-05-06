@@ -592,4 +592,338 @@ mod tests {
         let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None);
         assert!(sources.memory_entries.is_empty());
     }
+
+    // ── Composite integration tests ─────────────────────────────────────
+    //
+    // These drive the full adapter path — build_external_sources +
+    // build_turn_state + build_session_context — into a real
+    // PipelineSession::run_turn_adaptive and assert on the provider-facing
+    // output. They guard the post-cutover boundary where the adapter is the
+    // sole translator between AgenticLoopState and ContextSources: a
+    // regression in adapter construction will otherwise show up only at
+    // runtime as a silent cache break or a missing section.
+
+    use astra_turn_core::pipeline_config::PipelineConfig;
+    use astra_turn_core::pipeline_session::{AdaptiveTurnInput, PipelineSession};
+    use astra_turn_core::section_types::{CacheScope, SectionKind};
+
+    struct CompositeInputs {
+        statics: astra_turn_core::context_sources::StaticSections,
+        agent: astra_turn_core::context_sources::AgentContext,
+        session: astra_turn_core::context_sources::SessionContext,
+        turn: astra_turn_core::context_sources::TurnState,
+        external: astra_turn_core::context_sources::ExternalSources,
+    }
+
+    /// Build all adapter inputs from a populated state + edge profile.
+    /// Mirrors the ServerAgenticLoopHost call sequence so regressions in any
+    /// one builder surface as a failure here.
+    fn build_composite_inputs(
+        state: &AgenticLoopState,
+        edge_profile: &serde_json::Map<String, Value>,
+        provider: &str,
+        model_name: &str,
+        user_content: &str,
+    ) -> CompositeInputs {
+        let statics = crate::prompts::build_pipeline_static_sections();
+        let agent = astra_turn_core::context_sources::AgentContext {
+            tool_schemas: vec![serde_json::json!({
+                "type": "function",
+                "function": {"name": "bash", "description": "Run a shell command"}
+            })],
+            ..Default::default()
+        };
+        let session = build_session_context(
+            "composite-sess",
+            None,
+            model_name,
+            200_000,
+            edge_profile,
+            provider,
+            None,
+        );
+        let turn = build_turn_state(state, user_content);
+        let external =
+            build_external_sources(edge_profile, state, user_content, &["bash"], 0.8, None);
+        CompositeInputs {
+            statics,
+            agent,
+            session,
+            turn,
+            external,
+        }
+    }
+
+    #[test]
+    fn composite_anthropic_full_path_produces_expected_section_order() {
+        // Guards the full cutover contract: adapter-built inputs fed through
+        // PipelineSession must emit the canonical section sequence. Drift
+        // silently invalidates the Anthropic prompt-cache prefix.
+        let mut ep = serde_json::Map::new();
+        ep.insert("cwd".into(), Value::String("/tmp/proj".into()));
+        ep.insert("git_branch".into(), Value::String("main".into()));
+        ep.insert(
+            "memory_section".into(),
+            Value::String("## User Memories\n- prefers terse answers".into()),
+        );
+        let state = make_state();
+        let ci = build_composite_inputs(&state, &ep, "anthropic", "claude-sonnet-4-6", "hello");
+
+        let sess = PipelineSession::new(PipelineConfig {
+            provider_policy: ci.session.provider_policy.clone(),
+        });
+        let output = sess
+            .run_turn_adaptive(AdaptiveTurnInput {
+                statics: &ci.statics,
+                agent: &ci.agent,
+                session: &ci.session,
+                turn: &ci.turn,
+                external: &ci.external,
+                model_id: "claude-sonnet-4-6",
+                query_source: "agentic_loop",
+            })
+            .expect("adapter-built inputs must not abort the pipeline");
+
+        let kinds: Vec<SectionKind> = output.plan.sections.iter().map(|s| s.kind).collect();
+        // The planner owns the canonical order; this assertion proves the
+        // adapter didn't accidentally drop or reorder a section via missing
+        // external fields.
+        assert!(kinds.first() == Some(&SectionKind::Identity));
+        assert!(kinds.contains(&SectionKind::Constraints));
+        assert!(kinds.contains(&SectionKind::RuntimeIdentity));
+        assert!(kinds.contains(&SectionKind::RuntimeVolatile));
+        assert!(kinds.contains(&SectionKind::Memory));
+        let identity_pos = kinds
+            .iter()
+            .position(|k| *k == SectionKind::Identity)
+            .unwrap();
+        let runtime_id_pos = kinds
+            .iter()
+            .position(|k| *k == SectionKind::RuntimeIdentity)
+            .unwrap();
+        let volatile_pos = kinds
+            .iter()
+            .position(|k| *k == SectionKind::RuntimeVolatile)
+            .unwrap();
+        assert!(identity_pos < runtime_id_pos);
+        assert!(runtime_id_pos < volatile_pos);
+    }
+
+    #[test]
+    fn composite_anthropic_full_path_places_cache_markers_at_scope_boundaries() {
+        // Cache markers must land at Global→Session and Session→None
+        // transitions. The planner assigns scopes; the optimizer places
+        // markers; the serializer remaps them to block indices. This test
+        // verifies the chain end-to-end with adapter-built inputs.
+        let mut ep = serde_json::Map::new();
+        ep.insert("cwd".into(), Value::String("/tmp/proj".into()));
+        let state = make_state();
+        let ci = build_composite_inputs(&state, &ep, "anthropic", "claude-sonnet-4-6", "hello");
+
+        let sess = PipelineSession::new(PipelineConfig {
+            provider_policy: ci.session.provider_policy.clone(),
+        });
+        let output = sess
+            .run_turn_adaptive(AdaptiveTurnInput {
+                statics: &ci.statics,
+                agent: &ci.agent,
+                session: &ci.session,
+                turn: &ci.turn,
+                external: &ci.external,
+                model_id: "claude-sonnet-4-6",
+                query_source: "agentic_loop",
+            })
+            .expect("adapter-built inputs must not abort the pipeline");
+
+        assert!(
+            !output.serialized.cache_markers.is_empty(),
+            "anthropic policy must emit cache markers for adapter-built inputs"
+        );
+        // Every marker must point at a block that exists and whose scope is
+        // strictly more stable than the next block (or is the last block).
+        for marker in &output.serialized.cache_markers {
+            let block = output
+                .serialized
+                .system_blocks
+                .get(marker.after_section_index)
+                .expect("marker must reference a real block index");
+            assert!(
+                block.cache_control.is_some(),
+                "block at marker position must carry cache_control"
+            );
+            assert!(
+                matches!(block.scope, CacheScope::Global | CacheScope::Session),
+                "markers must land on Global or Session-scope blocks, not {:?}",
+                block.scope
+            );
+        }
+    }
+
+    #[test]
+    fn composite_openai_full_path_emits_zero_cache_markers() {
+        // OpenAI uses prefix-only caching; emitting cache_control is a no-op
+        // at best and a 400 at worst. The adapter+pipeline must agree on
+        // "no markers" for non-Anthropic providers.
+        let ep = serde_json::Map::new();
+        let state = make_state();
+        let ci = build_composite_inputs(&state, &ep, "openai", "gpt-4o", "hello");
+
+        let sess = PipelineSession::new(PipelineConfig {
+            provider_policy: ci.session.provider_policy.clone(),
+        });
+        let output = sess
+            .run_turn_adaptive(AdaptiveTurnInput {
+                statics: &ci.statics,
+                agent: &ci.agent,
+                session: &ci.session,
+                turn: &ci.turn,
+                external: &ci.external,
+                model_id: "gpt-4o",
+                query_source: "agentic_loop",
+            })
+            .expect("adapter-built inputs must not abort the pipeline");
+
+        assert!(
+            output.serialized.cache_markers.is_empty(),
+            "openai policy must not emit any cache markers"
+        );
+        for block in &output.serialized.system_blocks {
+            assert!(
+                block.cache_control.is_none(),
+                "openai blocks must not carry cache_control"
+            );
+        }
+    }
+
+    #[test]
+    fn composite_adapter_runtime_identity_sits_in_session_scope() {
+        // The cache-locality contract: dynamic-but-session-stable content
+        // (cwd, git_branch, profile_desc, self_model_text, tool_conditional)
+        // must land in CacheScope::Session. The adapter packs these into
+        // ExternalSources; the binder stitches them into RuntimeIdentity.
+        // If adapter output drifts back to CacheScope::None, the 2nd cache
+        // marker misses these bytes.
+        let mut ep = serde_json::Map::new();
+        ep.insert("cwd".into(), Value::String("/tmp/proj".into()));
+        ep.insert("git_branch".into(), Value::String("main".into()));
+        let state = make_state();
+        let ci = build_composite_inputs(&state, &ep, "anthropic", "claude-sonnet-4-6", "hello");
+
+        let sess = PipelineSession::new(PipelineConfig {
+            provider_policy: ci.session.provider_policy.clone(),
+        });
+        let output = sess
+            .run_turn_adaptive(AdaptiveTurnInput {
+                statics: &ci.statics,
+                agent: &ci.agent,
+                session: &ci.session,
+                turn: &ci.turn,
+                external: &ci.external,
+                model_id: "claude-sonnet-4-6",
+                query_source: "agentic_loop",
+            })
+            .expect("adapter-built inputs must not abort the pipeline");
+
+        let runtime_id_block = output
+            .serialized
+            .system_blocks
+            .iter()
+            .find(|b| b.kind == SectionKind::RuntimeIdentity);
+        if let Some(block) = runtime_id_block {
+            assert_eq!(
+                block.scope,
+                CacheScope::Session,
+                "RuntimeIdentity must be Session-scoped so the 2nd marker catches it"
+            );
+            assert!(
+                block.text.contains("/tmp/proj") || block.text.contains("main"),
+                "RuntimeIdentity should carry adapter-supplied cwd/branch: got {:?}",
+                block.text
+            );
+        }
+
+        // The Session→None boundary must be observed: the last Session block
+        // must precede the first None block.
+        let last_session = output
+            .serialized
+            .system_blocks
+            .iter()
+            .rposition(|b| b.scope == CacheScope::Session);
+        let first_none = output
+            .serialized
+            .system_blocks
+            .iter()
+            .position(|b| b.scope == CacheScope::None);
+        if let (Some(last), Some(first)) = (last_session, first_none) {
+            assert!(
+                last < first,
+                "Session-scope must precede None-scope end-to-end — \
+                 adapter leaked turn-volatile content into cached prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn composite_memory_section_appears_iff_edge_profile_has_memory() {
+        // With memory present → Memory section is planned and bound.
+        // Without memory → Memory section is absent (planner skips it so
+        // the optimizer doesn't emit an empty block that displaces other
+        // sections inside the budget allocator).
+        let state = make_state();
+
+        let mut ep_with = serde_json::Map::new();
+        ep_with.insert(
+            "memory_section".into(),
+            Value::String("## User Memories\n- uses rustfmt".into()),
+        );
+        let ci = build_composite_inputs(&state, &ep_with, "anthropic", "claude-sonnet-4-6", "hi");
+        let sess = PipelineSession::new(PipelineConfig {
+            provider_policy: ci.session.provider_policy.clone(),
+        });
+        let out_with = sess
+            .run_turn_adaptive(AdaptiveTurnInput {
+                statics: &ci.statics,
+                agent: &ci.agent,
+                session: &ci.session,
+                turn: &ci.turn,
+                external: &ci.external,
+                model_id: "claude-sonnet-4-6",
+                query_source: "agentic_loop",
+            })
+            .expect("adapter must not abort");
+        assert!(
+            out_with
+                .plan
+                .sections
+                .iter()
+                .any(|s| s.kind == SectionKind::Memory),
+            "Memory section must be planned when edge_profile carries memory"
+        );
+
+        let ep_without = serde_json::Map::new();
+        let ci2 =
+            build_composite_inputs(&state, &ep_without, "anthropic", "claude-sonnet-4-6", "hi");
+        let sess2 = PipelineSession::new(PipelineConfig {
+            provider_policy: ci2.session.provider_policy.clone(),
+        });
+        let out_without = sess2
+            .run_turn_adaptive(AdaptiveTurnInput {
+                statics: &ci2.statics,
+                agent: &ci2.agent,
+                session: &ci2.session,
+                turn: &ci2.turn,
+                external: &ci2.external,
+                model_id: "claude-sonnet-4-6",
+                query_source: "agentic_loop",
+            })
+            .expect("adapter must not abort");
+        assert!(
+            !out_without
+                .plan
+                .sections
+                .iter()
+                .any(|s| s.kind == SectionKind::Memory),
+            "Memory section must be skipped when edge_profile has no memory"
+        );
+    }
 }

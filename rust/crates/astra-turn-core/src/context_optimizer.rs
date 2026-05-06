@@ -1362,4 +1362,323 @@ mod tests {
         assert_eq!(sections[0].text().unwrap(), "core rules");
         assert_eq!(sections[0].actual_tokens, 10);
     }
+
+    // ── Optimizer invariant proptests ───────────────────────────────────
+    //
+    // These lock invariants that the optimizer MUST uphold for any input:
+    //  1. `cache_align_sections` never repositions Identity / Constraints.
+    //  2. After a successful reorder, scope order is non-decreasing within
+    //     the reorderable group.
+    //  3. `compact_tool_results_gated` never exceeds `max_clear_tokens`.
+    //  4. `spill_oversized_sections` never touches Identity / Constraints /
+    //     WorkingMemory, regardless of size.
+    //
+    // Example tests around these invariants exist above, but the single-
+    // example form can only prove the invariant for the handful of cases the
+    // author thought of. proptest is the tripwire for regressions where a
+    // future refactor passes the example tests but breaks on some corner
+    // input distribution.
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+        use std::sync::Mutex;
+
+        /// In-memory spill backend for proptest — avoids touching the
+        /// filesystem inside a property-based test (the 256+ invocations
+        /// `proptest` will do against the `spill_never_touches_*` property
+        /// would otherwise hammer /tmp pointlessly). `store` always
+        /// succeeds; `load` is unused here because the property asserts
+        /// *which* sections were spilled, not round-trip correctness.
+        #[derive(Default)]
+        struct InMemorySpillBackend {
+            counter: Mutex<u64>,
+        }
+
+        impl InMemorySpillBackend {
+            fn new() -> Self {
+                Self::default()
+            }
+        }
+
+        impl crate::spill_backend::SpillBackend for InMemorySpillBackend {
+            fn store(&self, key_hint: &str, _bytes: &[u8]) -> std::io::Result<String> {
+                let mut n = self.counter.lock().unwrap();
+                *n += 1;
+                Ok(format!("memory://{key_hint}-{}", *n))
+            }
+        }
+
+        fn scope_strategy() -> impl Strategy<Value = CacheScope> {
+            prop_oneof![
+                Just(CacheScope::Global),
+                Just(CacheScope::Session),
+                Just(CacheScope::None),
+            ]
+        }
+
+        fn kind_strategy() -> impl Strategy<Value = SectionKind> {
+            // Mix anchors (Identity/Constraints/WorkingMemory) and regular
+            // kinds so invariants that exclude them get exercised.
+            prop_oneof![
+                Just(SectionKind::Identity),
+                Just(SectionKind::Constraints),
+                Just(SectionKind::WorkingMemory),
+                Just(SectionKind::SelfModel),
+                Just(SectionKind::ProjectContext),
+                Just(SectionKind::Memory),
+                Just(SectionKind::Skills),
+                Just(SectionKind::RuntimeIdentity),
+                Just(SectionKind::RuntimeVolatile),
+                Just(SectionKind::EmergentSkills),
+                Just(SectionKind::EmergentMemory),
+                Just(SectionKind::EmergentSummary),
+            ]
+        }
+
+        fn arbitrary_bound_section(
+            kind: SectionKind,
+            scope: CacheScope,
+            tokens: u32,
+        ) -> BoundSection {
+            // Pad text so `actual_tokens` is plausibly derived from it;
+            // spill thresholds are in tokens so content length matters.
+            let text = "x".repeat((tokens as usize).saturating_mul(4));
+            BoundSection {
+                plan: PlannedSection {
+                    kind,
+                    scope,
+                    estimated_tokens: tokens,
+                    priority: CompressionPriority::Normal,
+                    source: SectionSource::Static,
+                },
+                artifact: SectionArtifact::from_text(kind, text),
+                actual_tokens: tokens,
+                bind_latency: std::time::Duration::ZERO,
+            }
+        }
+
+        proptest! {
+            /// Invariant 1: anchor sections (Identity, Constraints) MUST NOT
+            /// move under `cache_align_sections`, regardless of scope or
+            /// `max_moves` budget. Moving them invalidates the Anthropic
+            /// prompt-cache prefix and breaks semantic ordering.
+            #[test]
+            fn reorder_never_moves_identity_or_constraints(
+                kinds in prop::collection::vec(kind_strategy(), 0..12),
+                scopes in prop::collection::vec(scope_strategy(), 0..12),
+                max_moves in 0u32..=20,
+            ) {
+                let n = kinds.len().min(scopes.len());
+                if n == 0 { return Ok(()); }
+                let mut sections: Vec<BoundSection> = (0..n)
+                    .map(|i| arbitrary_bound_section(kinds[i], scopes[i], (i as u32) + 1))
+                    .collect();
+
+                // Record original positions of every anchor and its text.
+                let anchor_signatures_before: Vec<(usize, SectionKind, Option<String>)> = sections
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| matches!(
+                        s.plan.kind,
+                        SectionKind::Identity | SectionKind::Constraints
+                    ))
+                    .map(|(i, s)| (i, s.plan.kind, s.text().map(String::from)))
+                    .collect();
+
+                let _moves = cache_align_sections(&mut sections, max_moves);
+
+                for (original_idx, original_kind, original_text) in anchor_signatures_before {
+                    let section = &sections[original_idx];
+                    prop_assert_eq!(
+                        section.plan.kind,
+                        original_kind,
+                        "anchor at index {} changed kind: reorder must not displace \
+                         Identity or Constraints",
+                        original_idx
+                    );
+                    prop_assert_eq!(
+                        section.text().map(String::from),
+                        original_text,
+                        "anchor content at index {} changed — reorder must not swap \
+                         anchor payloads even if slot kind matched",
+                        original_idx
+                    );
+                }
+            }
+
+            /// Invariant 2: when `cache_align_sections` applies its reorder,
+            /// the reorderable group (everything except anchors) must end up
+            /// with non-decreasing scope order (Global < Session < None). If
+            /// it doesn't apply (moves > max_moves), the original order is
+            /// preserved — but this test only checks the "applied" case.
+            #[test]
+            fn reorder_yields_non_decreasing_scope_when_applied(
+                kinds in prop::collection::vec(kind_strategy(), 1..10),
+                scopes in prop::collection::vec(scope_strategy(), 1..10),
+            ) {
+                let n = kinds.len().min(scopes.len());
+                let mut sections: Vec<BoundSection> = (0..n)
+                    .map(|i| arbitrary_bound_section(kinds[i], scopes[i], (i as u32) + 1))
+                    .collect();
+                // Generous max_moves so reorder always applies.
+                let _moves = cache_align_sections(&mut sections, 1_000);
+
+                let reorderable_scopes: Vec<u8> = sections
+                    .iter()
+                    .filter(|s| !matches!(
+                        s.plan.kind,
+                        SectionKind::Identity | SectionKind::Constraints
+                    ))
+                    .map(|s| s.plan.scope.order())
+                    .collect();
+
+                for pair in reorderable_scopes.windows(2) {
+                    prop_assert!(
+                        pair[0] <= pair[1],
+                        "reorderable scope order is not non-decreasing: \
+                         got {:?}, violates Global<Session<None",
+                        reorderable_scopes
+                    );
+                }
+            }
+
+            /// Invariant 3: `compact_tool_results_gated` returns
+            /// `tokens <= max_clear_tokens` (and `skipped_over_budget=true`
+            /// when any would-be clearing exceeds the budget). This guards
+            /// the over-compaction safety valve.
+            #[test]
+            fn tool_result_clearing_respects_max_clear_tokens(
+                n_calls in 0usize..6,
+                content_len in 0usize..200,
+                max_clear_tokens in 0u32..=5_000,
+                pressure_bits in 0u32..=100,
+            ) {
+                let pressure = f64::from(pressure_bits) / 100.0;
+                let messages = {
+                    if n_calls == 0 {
+                        Vec::new()
+                    } else {
+                        let mut msgs = vec![serde_json::json!({
+                            "role": "assistant",
+                            "tool_calls": (0..n_calls)
+                                .map(|i| serde_json::json!({
+                                    "id": format!("call_{i}"),
+                                    "function": {"name": "read_file", "arguments": "{}"}
+                                }))
+                                .collect::<Vec<_>>()
+                        })];
+                        for i in 0..n_calls {
+                            msgs.push(serde_json::json!({
+                                "role": "tool",
+                                "tool_call_id": format!("call_{i}"),
+                                "content": "y".repeat(content_len),
+                            }));
+                        }
+                        msgs
+                    }
+                };
+                let mut msgs = messages.clone();
+                let result = compact_tool_results_gated(
+                    &mut msgs,
+                    CompactionTier::CompactHistory,
+                    pressure,
+                    CompactStrategy::Minimal,
+                    max_clear_tokens,
+                );
+                prop_assert!(
+                    result.tokens <= max_clear_tokens,
+                    "compact_tool_results_gated cleared {} tokens > cap {}",
+                    result.tokens,
+                    max_clear_tokens,
+                );
+                if result.skipped_over_budget {
+                    prop_assert_eq!(
+                        result.tokens, 0,
+                        "skipped_over_budget must imply zero clearing"
+                    );
+                    prop_assert_eq!(
+                        result.count, 0,
+                        "skipped_over_budget must imply zero results counted"
+                    );
+                }
+            }
+
+            /// Invariant 4: `spill_oversized_sections` never replaces the
+            /// artifact of Identity / Constraints / WorkingMemory even when
+            /// they are oversized and a backend is available. Spilling these
+            /// would hide the state needed to resume correctly after
+            /// compaction and is explicitly prevented by the optimizer.
+            #[test]
+            fn spill_never_touches_anchor_or_working_memory(
+                oversized_tokens in 10_001u32..50_000,
+                include_identity in proptest::bool::ANY,
+                include_constraints in proptest::bool::ANY,
+                include_working in proptest::bool::ANY,
+                include_regular in proptest::bool::ANY,
+            ) {
+                let mut sections: Vec<BoundSection> = Vec::new();
+                if include_identity {
+                    sections.push(arbitrary_bound_section(
+                        SectionKind::Identity, CacheScope::Global, oversized_tokens));
+                }
+                if include_constraints {
+                    sections.push(arbitrary_bound_section(
+                        SectionKind::Constraints, CacheScope::Global, oversized_tokens));
+                }
+                if include_working {
+                    sections.push(arbitrary_bound_section(
+                        SectionKind::WorkingMemory, CacheScope::None, oversized_tokens));
+                }
+                if include_regular {
+                    sections.push(arbitrary_bound_section(
+                        SectionKind::Memory, CacheScope::None, oversized_tokens));
+                }
+                if sections.is_empty() { return Ok(()); }
+
+                // Snapshot anchor/working-memory artifacts before spill.
+                let protected_before: Vec<(usize, SectionKind, SectionArtifact)> = sections
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| matches!(
+                        s.plan.kind,
+                        SectionKind::Identity
+                            | SectionKind::Constraints
+                            | SectionKind::WorkingMemory
+                    ))
+                    .map(|(i, s)| (i, s.plan.kind, s.artifact.clone()))
+                    .collect();
+
+                let backend = InMemorySpillBackend::new();
+                let mut stats = OptimizeStats::default();
+                let plan = {
+                    let (plan, _, _) = build_test_plan_and_bound();
+                    plan
+                };
+                let _spilled = spill_oversized_sections(
+                    &mut sections,
+                    &mut stats,
+                    Some(&backend),
+                    &plan,
+                    1,
+                );
+
+                for (idx, kind, original_artifact) in protected_before {
+                    prop_assert!(
+                        !matches!(sections[idx].artifact, SectionArtifact::SpillReference { .. }),
+                        "{:?} at index {} was spilled despite being a protected section",
+                        kind,
+                        idx
+                    );
+                    // Protected sections must keep their original artifact bytes.
+                    prop_assert_eq!(
+                        sections[idx].artifact.text().map(String::from),
+                        original_artifact.text().map(String::from),
+                        "{:?} at index {} had its artifact text mutated by spill",
+                        kind,
+                        idx
+                    );
+                }
+            }
+        }
+    }
 }

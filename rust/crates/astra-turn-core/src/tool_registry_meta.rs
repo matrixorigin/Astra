@@ -619,10 +619,12 @@ mod tests {
 
     #[test]
     fn catalog_has_expected_count() {
-        // Sanity check — if tools are added/removed, update this
+        // Sanity check — if tools are added/removed, update this.
+        // Post-consolidation: 8 git→1, 7 github→1, 5 memory→1, 5 session→1,
+        // 3 mo→1, 2 agent→1 — catalog now has ~17 entries.
         assert!(
-            TOOL_CATALOG.len() >= 30,
-            "expected at least 30 tools, got {}",
+            TOOL_CATALOG.len() >= 15,
+            "expected at least 15 tools, got {}",
             TOOL_CATALOG.len()
         );
     }
@@ -643,26 +645,14 @@ mod tests {
     }
 
     #[test]
-    fn catalog_memory_store_is_pinned() {
+    fn catalog_consolidated_memory_is_pinned() {
         let tool = TOOL_CATALOG
             .iter()
-            .find(|t| t.name == "memory_store")
-            .unwrap();
+            .find(|t| t.name == "memory")
+            .expect("consolidated `memory` tool must exist in catalog");
         assert!(
             tool.pinned,
-            "memory_store must be pinned — intrinsic store capability"
-        );
-    }
-
-    #[test]
-    fn catalog_memory_retrieve_is_pinned() {
-        let tool = TOOL_CATALOG
-            .iter()
-            .find(|t| t.name == "memory_retrieve")
-            .unwrap();
-        assert!(
-            tool.pinned,
-            "memory_retrieve must be pinned — intrinsic recall capability"
+            "memory must be pinned — intrinsic store/retrieve capability"
         );
     }
 
@@ -671,8 +661,8 @@ mod tests {
         assert!(is_pinned_tool("bash"));
         assert!(is_pinned_tool("read_file"));
         assert!(is_pinned_tool("str_replace"));
-        assert!(is_pinned_tool("memory_store"));
-        assert!(is_pinned_tool("memory_retrieve"));
+        assert!(is_pinned_tool("memory"));
+        assert!(is_pinned_tool("session"));
         assert!(!is_pinned_tool("nonexistent_tool"));
     }
 }
