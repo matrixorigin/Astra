@@ -14,10 +14,10 @@ arguments:
     description: "Action: 'list' (show PRs), 'comments' (show comments for a PR), 'address' (help address feedback). Default: 'comments'."
     required: false
 allowed_tools:
-  - github_list_prs
-  - github_get_pr
+  - github
+  - github
   - github_get_issue
-  - git_diff
+  - git
   - read_file
   - str_replace
   - grep
@@ -48,7 +48,7 @@ $ARGUMENTS
 If `PR_NUMBER` was already extracted from a GitHub URL in Phase 1, skip this phase.
 
 If `PR_NUMBER` is not provided:
-1. Use `github_list_prs` with `state: "open"` and `detail: "normal"`
+1. Use `github {action: "list_prs"}` with `state: "open"` and `detail: "normal"`
 2. If only one open PR exists, use it automatically
 3. Otherwise, show the list and ask the user
 
@@ -59,7 +59,7 @@ gh pr list --repo owner/repo --state open --json number,title,author,headRefName
 
 ## Phase 3: Fetch PR Details and Comments
 
-Use `github_get_pr` with `detail: "full"` to get:
+Use `github {action: "get_pr"}` with `detail: "full"` to get:
 - PR title, description, labels, changed files
 - Review comments and discussions
 
@@ -67,7 +67,7 @@ Use `github_get_pr` with `detail: "full"` to get:
 {"repo": "owner/repo", "pr_number": N, "detail": "full"}
 ```
 
-**If `github_get_pr` doesn't return review comments**, supplement with `github_get_issue`:
+**If `github {action: "get_pr"}` doesn't return review comments**, supplement with `github_get_issue`:
 ```json
 {"repo": "owner/repo", "issue_number": N, "detail": "full"}
 ```

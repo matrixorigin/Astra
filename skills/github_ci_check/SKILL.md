@@ -12,7 +12,7 @@ arguments:
     required: false
 allowed_tools:
   - github_ci_status
-  - github_get_pr
+  - github
   - read_file
   - grep
   - glob

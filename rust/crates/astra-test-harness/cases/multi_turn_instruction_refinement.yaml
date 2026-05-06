@@ -6,7 +6,7 @@ description: |
   output AND can persist learned conventions to durable memory when instructed.
   **Why**: Iterative code refinement is a core agent workflow. Additionally, conventions that emerge
   during refinement (e.g., "always add doc comments") should be persistable for future sessions.
-  **Pass means**: Turn 2 refines correctly, turn 3 calls memory_store to persist the convention.
+  **Pass means**: Turn 2 refines correctly, turn 3 calls memory to persist the convention.
   **Fail means**: Context lost (turn 1→2), refinement ignored, or memory_store not called (turn 3).
 prompt: |
   Write me a short Rust function signature (just the signature, no body)
@@ -23,10 +23,10 @@ steps:
         needle: "///"
       - type: text_contains
         needle: "String"
-  - prompt: "I always want /// doc comments on every public function in this project. Please remember this convention for our future conversations using memory_store."
+  - prompt: "I always want /// doc comments on every public function in this project. Please remember this convention for our future conversations using memory {action: "store"}."
     criteria:
       - type: tool_called
-        name: memory_store
+        name: memory
 teardown_cmd: |
   curl -sf -X POST "${MEMORIA_BASE_URL:-http://127.0.0.1:8100}/v1/memories/purge" \
     -H "Authorization: Bearer ${MEMORIA_MASTER_KEY}" \

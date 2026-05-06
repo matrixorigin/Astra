@@ -21,11 +21,11 @@ steps:
       - type: text_contains
         needle: "ALPHA-7742"
   - prompt: |
-      Store the secret code ALPHA-7742 in your persistent memory using memory_store,
+      Store the secret code ALPHA-7742 in your persistent memory using memory {action: "store"},
       so you'll remember it in future conversations. Use memory_type "semantic".
     criteria:
       - type: tool_called
-        name: memory_store
+        name: memory
   - prompt: |
       I always prefer small focused PRs, one logical concern per PR.
       What are my PR preferences?

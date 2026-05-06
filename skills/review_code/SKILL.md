@@ -11,7 +11,7 @@ arguments:
     description: "Review focus: 'tests', 'unhappy', 'e2e', 'db', or 'all' (default: all)"
     required: false
 allowed_tools:
-  - git_diff
+  - git
   - git_show
   - git_log
   - bash

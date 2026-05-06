@@ -9,8 +9,8 @@ arguments:
     required: false
 allowed_tools:
   - bash
-  - git_diff
-  - git_status
+  - git
+  - git
   - read_file
   - grep
   - glob
@@ -45,7 +45,7 @@ Check what build tools the project uses, in order:
 
 ## Phase 2: Assess Scope
 
-Use `git_diff` with `stat_only: true` to understand what changed. This helps determine which checks are most relevant.
+Use `git {action: "diff"}` with `stat_only: true` to understand what changed. This helps determine which checks are most relevant.
 
 ## Phase 3: Run Checks
 

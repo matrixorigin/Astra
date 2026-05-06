@@ -19,7 +19,7 @@ arguments:
 allowed_tools:
   - github_create_issue
   - github_list_issues
-  - git_diff
+  - git
   - read_file
   - grep
   - bash

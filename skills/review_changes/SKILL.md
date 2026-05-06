@@ -11,11 +11,11 @@ arguments:
     description: "Review focus: 'bugs', 'security', 'logic', 'api', 'tests', or 'all' (default: all)"
     required: false
 allowed_tools:
-  - git_diff
-  - git_status
+  - git
+  - git
   - git_show
   - git_log
-  - github_get_pr
+  - github
   - read_file
   - grep
   - glob
@@ -53,7 +53,7 @@ Call `git_diff(stat_only: true)` (or `git_show(sha, stat_only: true)` for a comm
 | `commit:<sha>` / `latest commit` | `git_log()` once → `git_show(sha)` |
 | `pr:<number>` / GitHub PR URL | `bash("gh pr diff N --repo owner/repo 2>&1")` |
 
-No changes? `git_status`, try `staged: true`. Still nothing? Ask user.
+No changes? `git {action: "status"}`, try `staged: true`. Still nothing? Ask user.
 
 ---
 
@@ -78,7 +78,7 @@ Fetch the full diff. Scan for signals and decide which checks to run in Step 3.
 
 **Context budget:** at most 3 `read_file` calls total. Before each one, name the exact question it answers. If you can't, skip it.
 
-Do not call `git_show` or `git_diff` more than once on the same target. Do not invoke `skill(review-changes)` again in the same session.
+Do not call `git_show` or `git {action: "diff"}` more than once on the same target. Do not invoke `skill(review-changes)` again in the same session.
 
 ---
 

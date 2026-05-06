@@ -9,7 +9,7 @@ description: |
   not code search operations. The tool selector must route these to memory tools, not exploration tools.
   After removing "关注" from github_list_prs triggers and deleting detect_store_signal, the system prompt
   memory rules must carry the full burden of routing these intents correctly.
-  **Pass means**: The agent calls memory_store to persist the tracking interest, and does NOT waste turns
+  **Pass means**: The agent calls memory to persist the tracking interest, and does NOT waste turns
   exploring the filesystem for "oceanbase" (which is just the name of what the user wants to track).
   **Fail means**: The agent explored codebase files (bash/grep/glob/list_dir) trying to find information
   about "oceanbase" instead of recognizing this as a memory-store intent.
@@ -25,9 +25,9 @@ criteria:
   - type: any_of
     criteria:
       - type: tool_called
-        name: memory_store
+        name: memory
       - type: tool_called
-        name: memory_retrieve
+        name: memory
   - type: tools_count_between
     min: 1
     max: 6
@@ -40,7 +40,7 @@ criteria:
       "I'm following/tracking the oceanbase project, please remember this."
       This is a MEMORY routing intent, not a code search intent.
       Did the agent:
-      1. Route to memory tools (memory_store OR memory_retrieve to verify deduplication)? (required)
+      1. Route to memory tools (memory {action: "store"} OR memory {action: "retrieve"} to verify deduplication)? (required)
       2. Avoid unnecessary codebase exploration (bash, grep, glob, list_dir)? (required)
       3. Confirm the interest was captured (either newly stored, or acknowledging it was already stored)?
       Score 1.0 if memory tool was used without exploration, 0.5 if also explored,

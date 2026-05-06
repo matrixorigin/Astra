@@ -32,7 +32,7 @@ steps:
   - prompt: "Please remember that /tmp/astra_harness_mt_test.txt is our scratch file for integration testing. Store this in your memory."
     criteria:
       - type: tool_called
-        name: memory_store
+        name: memory
 criteria:
   - type: exit_code
     code: 0
@@ -46,6 +46,6 @@ criteria:
       Do NOT try to read files yourself.
       Turn 1: did the agent read the file and show "hello world 42"?
       Turn 2: did the agent append "second line" using any tool?
-      Turn 3: did the agent store a fact about the file using memory_store?
+      Turn 3: did the agent store a fact about the file using memory {action: "store"}?
       Score 1.0 if all three turns worked, 0.5 if partial, 0.0 if fabricated.
     threshold: 0.6
