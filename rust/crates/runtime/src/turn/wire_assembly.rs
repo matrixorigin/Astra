@@ -17,9 +17,6 @@
 //!      compacted messages, optional post-compaction attachments, and
 //!      Anthropic cache annotations into the final wire payload.
 
-use std::collections::HashMap;
-use std::time::Duration;
-
 use serde_json::Value;
 
 use crate::prompts::{CompactConfig, CompactionTier};
@@ -54,6 +51,43 @@ pub(crate) struct MemoriaContext<'a> {
     pub session_facts: Option<astra_turn_types::session_facts::SessionFacts>,
 }
 
+/// Caller-side overrides for Memoria budget knobs that the context-window
+/// recovery path needs. The main turn path leaves every field `None` — the
+/// `MemoriaContext` then derives sensible defaults from the model budget and
+/// the `tier` on `MemoriaContext` itself. The emergency retry path (triggered
+/// by a prompt-too-long response) fills these in with tighter values.
+#[derive(Default)]
+pub(crate) struct BudgetOverrides {
+    pub budget_chars: Option<usize>,
+    pub keep_chars: Option<usize>,
+    pub keep_recent_turns: Option<usize>,
+    pub current_tokens: Option<usize>,
+    pub tier: Option<CompactionTier>,
+}
+
+/// Fully resolved budget values that Memoria needs. Produced either by
+/// deriving from the model or by applying caller overrides on top of the
+/// derived defaults.
+struct ResolvedBudget {
+    budget_chars: usize,
+    keep_chars: usize,
+    keep_recent_turns: usize,
+    current_tokens: usize,
+    tier: CompactionTier,
+}
+
+impl BudgetOverrides {
+    fn apply(self, base: ResolvedBudget) -> ResolvedBudget {
+        ResolvedBudget {
+            budget_chars: self.budget_chars.unwrap_or(base.budget_chars),
+            keep_chars: self.keep_chars.unwrap_or(base.keep_chars),
+            keep_recent_turns: self.keep_recent_turns.unwrap_or(base.keep_recent_turns),
+            current_tokens: self.current_tokens.unwrap_or(base.current_tokens),
+            tier: self.tier.unwrap_or(base.tier),
+        }
+    }
+}
+
 impl<'a> MemoriaContext<'a> {
     /// Run Memoria-based history compaction. Returns the full `CompactResult`
     /// so callers can react to `boundary.is_some()` (e.g. for the P2
@@ -63,13 +97,27 @@ impl<'a> MemoriaContext<'a> {
         messages: &[Value],
         system_messages: &[Value],
         visible_tools: &[Value],
-        header_overrides: &HashMap<String, String>,
-        completions_url_override: Option<&str>,
-        request_timeout: Option<Duration>,
+    ) -> CompactResult {
+        self.compact_with_overrides(
+            messages,
+            system_messages,
+            visible_tools,
+            BudgetOverrides::default(),
+        )
+        .await
+    }
+
+    /// Same as [`Self::compact`] but accepts budget overrides for emergency
+    /// retry after a context-window error. Main-turn callers should prefer
+    /// [`Self::compact`] which uses model-derived defaults.
+    pub async fn compact_with_overrides(
+        &self,
+        messages: &[Value],
+        system_messages: &[Value],
+        visible_tools: &[Value],
+        overrides: BudgetOverrides,
     ) -> CompactResult {
         let budget = crate::prompts::budget_for_model(Some(self.model_name));
-        let budget_chars = budget.effective_input_limit() * 4;
-
         // `current_tokens` feeds Memoria's budget-pressure knob. `tier` is
         // the authoritative compaction choice (pipeline planner), so this
         // estimate only tunes retrieval aggressiveness.
@@ -85,29 +133,31 @@ impl<'a> MemoriaContext<'a> {
         all_msgs.extend(messages.iter().cloned());
         let cache_est = crate::prompts::estimate_tokens_cache_aware(&all_msgs, tool_schema_tokens);
 
+        let base = ResolvedBudget {
+            budget_chars: budget.effective_input_limit() * 4,
+            keep_chars: 2_000,
+            keep_recent_turns: budget.keep_recent_turns,
+            current_tokens: cache_est.total_tokens,
+            tier: self.tier,
+        };
+        let resolved = overrides.apply(base);
+
         let memoria_config = MemoriaCompactConfig::default();
         let (session_memory_file, session_memory_combine) =
             resolve_session_memory_file_options(self.session_id, self.cwd);
         let _ = SessionMemoryFileCombine::None; // keep import live
         let memoria_params = MemoriaCompactParams {
-            budget_chars,
-            keep_chars: 2_000,
-            tier: self.tier,
-            keep_recent_turns: budget.keep_recent_turns,
-            current_tokens: cache_est.total_tokens,
+            budget_chars: resolved.budget_chars,
+            keep_chars: resolved.keep_chars,
+            tier: resolved.tier,
+            keep_recent_turns: resolved.keep_recent_turns,
+            current_tokens: resolved.current_tokens,
             session_memory_file,
             session_memory_combine,
             session_facts: self.session_facts.clone(),
         };
 
         let compact_config = CompactConfig::from_env();
-        // Summary client is injected from outside — keeping HTTP construction
-        // site-local (each caller knows its forwarded auth headers + override
-        // URLs) avoids coupling this module to the bridge's
-        // `RequestAwareSummaryClient` or the turn-core `HttpSummaryClient`.
-        let _ = header_overrides;
-        let _ = completions_url_override;
-        let _ = request_timeout;
 
         compact_with_memoria(
             messages,
@@ -294,6 +344,46 @@ mod tests {
 
     fn cache_cfg() -> PromptCacheConfig {
         PromptCacheConfig::latch("openai", "gpt-4")
+    }
+
+    #[test]
+    fn budget_overrides_default_is_all_none() {
+        // Default means "use the context's model-derived budget knobs" — the
+        // main path relies on this; a non-None default would silently change
+        // main-path behaviour.
+        let o = BudgetOverrides::default();
+        assert!(o.budget_chars.is_none());
+        assert!(o.keep_chars.is_none());
+        assert!(o.keep_recent_turns.is_none());
+        assert!(o.current_tokens.is_none());
+        assert!(o.tier.is_none());
+    }
+
+    #[test]
+    fn budget_overrides_merge_respects_caller_values() {
+        // The merge helper is the contract between context defaults and
+        // emergency-retry overrides. Each `Some(_)` must win; each `None`
+        // must fall through.
+        let base = ResolvedBudget {
+            budget_chars: 4000,
+            keep_chars: 2_000,
+            keep_recent_turns: 8,
+            current_tokens: 1_234,
+            tier: CompactionTier::CompactHistory,
+        };
+        let overrides = BudgetOverrides {
+            budget_chars: Some(3000),
+            keep_chars: None,
+            keep_recent_turns: Some(4),
+            current_tokens: Some(8_888),
+            tier: Some(CompactionTier::AggressivePrune),
+        };
+        let merged = overrides.apply(base);
+        assert_eq!(merged.budget_chars, 3000);
+        assert_eq!(merged.keep_chars, 2_000, "unset fields fall through");
+        assert_eq!(merged.keep_recent_turns, 4);
+        assert_eq!(merged.current_tokens, 8_888);
+        assert_eq!(merged.tier, CompactionTier::AggressivePrune);
     }
 
     #[test]

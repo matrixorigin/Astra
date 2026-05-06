@@ -1621,16 +1621,7 @@ impl InProcessChatTurnBridge {
                     session_facts: session_facts_shared.lock().ok().map(|f| f.clone()),
                 };
 
-                let compact_result = ctx
-                    .compact(
-                        &raw,
-                        &llm_messages,
-                        &edge_tools,
-                        &HashMap::new(),
-                        None,
-                        None,
-                    )
-                    .await;
+                let compact_result = ctx.compact(&raw, &llm_messages, &edge_tools).await;
 
                 let mut msgs = compact_result.messages;
                 crate::turn::wire_assembly::maybe_append_continuation_prompt(
@@ -1855,24 +1846,11 @@ impl InProcessChatTurnBridge {
                                 "bridge",
                                 "context window exceeded — forcing aggressive compaction and retrying"
                             );
-                            // Re-compact with AggressivePrune tier
+                            // Emergency retry: re-route through the shared
+                            // `MemoriaContext` with tighter budget overrides so
+                            // the aggressive path and the main path share one
+                            // compaction + summary-client construction flow.
                             let budget = crate::prompts::budget_for_model(Some(&model_name));
-                            let cwd_ag = edge_profile.get("cwd").and_then(Value::as_str);
-                            let (session_memory_file, session_memory_combine) =
-                                crate::turn::cloud::memoria_compact::resolve_session_memory_file_options(
-                                    &session_id,
-                                    cwd_ag,
-                                );
-                            let aggressive_params = crate::turn::cloud::memoria_compact::MemoriaCompactParams {
-                                budget_chars: budget.effective_input_limit() * 3, // tighter budget
-                                keep_chars: 1_000, // more aggressive truncation
-                                tier: crate::prompts::CompactionTier::AggressivePrune,
-                                keep_recent_turns: 4, // keep fewer turns
-                                current_tokens: budget.effective_input_limit(), // assume we're at limit
-                                session_memory_file,
-                                session_memory_combine,
-                    session_facts: session_facts_shared.lock().ok().map(|f| f.clone()),
-                            };
                             let compact_config = crate::prompts::CompactConfig::from_env();
                             let summary_client = astra_turn_core::cloud_summary::HttpSummaryClient::new(
                                 astra_turn_core::cloud_summary::LlmConnParams {
@@ -1884,23 +1862,55 @@ impl InProcessChatTurnBridge {
                                 },
                             );
                             let memoria_client = memoria_client_owned.clone();
-                            let memoria_config = crate::turn::cloud::memoria_compact::MemoriaCompactConfig::default();
 
-                            // Get original messages (exclude leading system messages)
-                            let sys_count = llm_messages.iter()
-                                .take_while(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+                            let aggressive_ctx = crate::turn::wire_assembly::MemoriaContext {
+                                session_id: &session_id,
+                                model_name: &model_name,
+                                memoria_client: memoria_client.as_ref().map(|c| {
+                                    c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient
+                                }),
+                                summary_client: Some(
+                                    &summary_client
+                                        as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
+                                ),
+                                tier: crate::prompts::CompactionTier::AggressivePrune,
+                                cwd: edge_profile.get("cwd").and_then(Value::as_str),
+                                session_facts: session_facts_shared
+                                    .lock()
+                                    .ok()
+                                    .map(|f| f.clone()),
+                            };
+                            let overrides = crate::turn::wire_assembly::BudgetOverrides {
+                                budget_chars: Some(budget.effective_input_limit() * 3),
+                                keep_chars: Some(1_000),
+                                keep_recent_turns: Some(4),
+                                current_tokens: Some(budget.effective_input_limit()),
+                                tier: None, // ctx.tier already carries AggressivePrune
+                            };
+
+                            // Exclude leading system messages before feeding
+                            // to Memoria — the retry rebuilds llm_messages
+                            // below from the unchanged system prefix + fresh
+                            // compacted tail.
+                            let sys_count = llm_messages
+                                .iter()
+                                .take_while(|m| {
+                                    m.get("role").and_then(Value::as_str) == Some("system")
+                                })
                                 .count();
-                            let original_msgs: Vec<Value> = llm_messages.iter().skip(sys_count).cloned().collect();
-                            let compact_result = crate::turn::cloud::memoria_compact::compact_with_memoria(
-                                &original_msgs,
-                                Some(&session_id),
-                                &memoria_config,
-                                &aggressive_params,
-                                memoria_client.as_ref().map(|c| c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient),
-                                Some(&compact_config),
-                                Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
-                            )
-                            .await;
+                            let original_msgs: Vec<Value> = llm_messages
+                                .iter()
+                                .skip(sys_count)
+                                .cloned()
+                                .collect();
+                            let compact_result = aggressive_ctx
+                                .compact_with_overrides(
+                                    &original_msgs,
+                                    &llm_messages[..sys_count],
+                                    &round_edge_tools,
+                                    overrides,
+                                )
+                                .await;
 
                             // Rebuild llm_messages with compacted content.
                             // Preserve all leading system messages (stable + dynamic).

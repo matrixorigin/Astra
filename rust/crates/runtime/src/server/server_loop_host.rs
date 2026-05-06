@@ -1988,15 +1988,8 @@ impl ServerAgenticLoopHost {
             cwd: self.edge_profile.get("cwd").and_then(|v| v.as_str()),
             session_facts: None,
         };
-        ctx.compact(
-            &state.messages,
-            system_messages,
-            visible_tools,
-            header_overrides,
-            completions_url_override,
-            request_timeout,
-        )
-        .await
+        ctx.compact(&state.messages, system_messages, visible_tools)
+            .await
     }
 
     /// Thin wrapper around [`wire_assembly::assemble_llm_messages`] that
