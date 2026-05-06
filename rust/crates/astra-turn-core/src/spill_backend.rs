@@ -25,6 +25,25 @@ pub trait SpillBackend: Send + Sync {
     /// `key_hint` is advisory: backends may use it to build human-readable
     /// filenames, but are free to ignore it.
     fn store(&self, key_hint: &str, bytes: &[u8]) -> io::Result<String>;
+
+    /// Resolve a `locator` previously returned by [`SpillBackend::store`]
+    /// back to the original bytes.
+    ///
+    /// This is the dual of `store` and is the foundation for Phase 12
+    /// session-resume / on-demand rehydration of spilled `SectionArtifact::
+    /// SpillReference` payloads.
+    ///
+    /// Default implementation returns `io::ErrorKind::Unsupported` so
+    /// existing backends that only implement `store` keep compiling — but
+    /// they will fail closed if a consumer tries to rehydrate. Real
+    /// backends SHOULD override this.
+    fn load(&self, locator: &str) -> io::Result<Vec<u8>> {
+        let _ = locator;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "SpillBackend::load not implemented for this backend",
+        ))
+    }
 }
 
 /// Filesystem-backed spill store. Writes each payload to
@@ -66,6 +85,27 @@ impl SpillBackend for FileSystemSpillBackend {
         let path = self.root.join(&filename);
         fs::write(&path, bytes)?;
         Ok(path.to_string_lossy().into_owned())
+    }
+
+    /// Resolve a locator (filesystem path returned by `store`) back to its
+    /// bytes. Fails closed if the path is outside this backend's `root` —
+    /// prevents a compromised pipeline from reading arbitrary files via
+    /// crafted `SpillReference` locators.
+    fn load(&self, locator: &str) -> io::Result<Vec<u8>> {
+        let path = PathBuf::from(locator);
+
+        // Resolve both to canonical form so `..` traversal / symlink
+        // escape is rejected before we ever read.
+        let canon_path = fs::canonicalize(&path)?;
+        let canon_root = fs::canonicalize(&self.root)?;
+        if !canon_path.starts_with(&canon_root) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "spill locator escapes backend root",
+            ));
+        }
+
+        fs::read(&canon_path)
     }
 }
 
@@ -137,5 +177,61 @@ mod tests {
         assert!(!nested.exists());
         backend.store("k", b"v").unwrap();
         assert!(nested.is_dir(), "dir should be created on first store");
+    }
+
+    #[test]
+    fn filesystem_backend_load_roundtrips_stored_bytes() {
+        let dir = TempDir::new().unwrap();
+        let backend = FileSystemSpillBackend::new(dir.path());
+        let locator = backend
+            .store("s1-turn3-ProjectContext", b"round trip payload")
+            .expect("store succeeds");
+
+        let loaded = backend.load(&locator).expect("load succeeds");
+        assert_eq!(loaded, b"round trip payload");
+    }
+
+    #[test]
+    fn filesystem_backend_load_rejects_paths_outside_root() {
+        // Create a backend rooted inside `inside_root`, then write a file
+        // OUTSIDE that root and try to load it by its absolute path.
+        // The backend MUST refuse even though the path exists.
+        let parent = TempDir::new().unwrap();
+        let inside_root = parent.path().join("inside");
+        fs::create_dir_all(&inside_root).unwrap();
+        let backend = FileSystemSpillBackend::new(&inside_root);
+
+        let outside = parent.path().join("outside.txt");
+        fs::write(&outside, b"secret").unwrap();
+
+        let err = backend
+            .load(outside.to_str().unwrap())
+            .expect_err("must refuse paths outside backend root");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn filesystem_backend_load_missing_file_returns_not_found() {
+        let dir = TempDir::new().unwrap();
+        let backend = FileSystemSpillBackend::new(dir.path());
+        // Canonicalize fails for non-existent paths → NotFound.
+        let err = backend
+            .load(&dir.path().join("nope.txt").to_string_lossy())
+            .expect_err("load of missing file must error");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn default_load_impl_returns_unsupported() {
+        // A backend that only implements `store` must fail closed on load.
+        struct StoreOnly;
+        impl SpillBackend for StoreOnly {
+            fn store(&self, _k: &str, _b: &[u8]) -> io::Result<String> {
+                Ok(String::new())
+            }
+            // intentionally does NOT override load
+        }
+        let err = StoreOnly.load("anything").expect_err("default must error");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 }

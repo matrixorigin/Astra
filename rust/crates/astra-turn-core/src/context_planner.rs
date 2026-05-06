@@ -417,4 +417,90 @@ mod tests {
                 .any(|s| s.kind == SectionKind::EmergentSummary)
         );
     }
+
+    /// Golden test: locks the canonical system-prompt section order.
+    ///
+    /// The **order** of sections emitted by `plan_section_manifest` is load-bearing:
+    /// Anthropic prompt-cache breakpoints key off the literal prefix, so any
+    /// reshuffle silently invalidates cache even if the *set* of sections is
+    /// unchanged. This test is the tripwire for future edits to `plan_section_manifest`.
+    ///
+    /// The order below matches `system_prompt_semantic_order_stable` in the
+    /// optimizer and the binder's `bind_all` emission order.
+    #[test]
+    fn canonical_section_order_is_stable_without_memory() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let mut input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        input.has_memory = false;
+        let plan = plan_turn(&input);
+
+        let kinds: Vec<SectionKind> = plan.sections.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SectionKind::Identity,
+                SectionKind::Constraints,
+                SectionKind::SelfModel,
+                SectionKind::ProjectContext,
+                SectionKind::Skills,
+                SectionKind::RuntimeIdentity,
+                SectionKind::EmergentSkills,
+                SectionKind::EmergentMemory,
+                SectionKind::EmergentSummary,
+            ],
+            "canonical section order drifted — this breaks Anthropic prompt-cache prefix"
+        );
+    }
+
+    #[test]
+    fn canonical_section_order_is_stable_with_memory() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+
+        let kinds: Vec<SectionKind> = plan.sections.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SectionKind::Identity,
+                SectionKind::Constraints,
+                SectionKind::SelfModel,
+                SectionKind::ProjectContext,
+                SectionKind::Skills,
+                SectionKind::RuntimeIdentity,
+                SectionKind::Memory,
+                SectionKind::EmergentSkills,
+                SectionKind::EmergentMemory,
+                SectionKind::EmergentSummary,
+            ],
+            "canonical section order (with memory) drifted — Memory must sit between RuntimeIdentity and Emergent*"
+        );
+    }
+
+    /// Global-scope anchors (Identity, Constraints) MUST appear before any
+    /// Session-scope section. This is what lets Global-scope content survive
+    /// across sessions in provider-level caches.
+    #[test]
+    fn global_scope_sections_precede_session_scope_sections() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+
+        let first_session_pos = plan
+            .sections
+            .iter()
+            .position(|s| s.scope == CacheScope::Session);
+        let last_global_pos = plan
+            .sections
+            .iter()
+            .rposition(|s| s.scope == CacheScope::Global);
+
+        if let (Some(first_session), Some(last_global)) = (first_session_pos, last_global_pos) {
+            assert!(
+                last_global < first_session,
+                "Global-scope anchors (Identity/Constraints) must precede all Session-scope sections \
+                 to preserve cache prefix"
+            );
+        }
+    }
 }

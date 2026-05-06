@@ -208,21 +208,16 @@ struct ClearResult {
 ///
 /// Delegates to [`crate::tool_schema_prune::prune_tool_schemas`] so the
 /// pipeline and runtime share exactly one pruning implementation.
-/// Returns the number of schemas whose JSON representation changed —
+/// Returns the number of schemas whose `Value` representation changed —
 /// observational only (for stats traces); the canonical proof is the
-/// mutated `schemas` slice itself.
+/// mutated `schemas` vec itself. Uses `Value` equality (no re-serialization)
+/// to keep the hot path allocation-light.
 fn prune_tool_schemas(schemas: &mut Vec<Value>, tier: CompactionTier) -> u32 {
-    let originals: Vec<String> = schemas
-        .iter()
-        .map(|s| serde_json::to_string(s).unwrap_or_default())
-        .collect();
     let pruned = crate::tool_schema_prune::prune_tool_schemas(schemas, tier);
     let touched = pruned
         .iter()
-        .zip(originals.iter())
-        .filter(|(after, before)| {
-            serde_json::to_string(*after).map(|s| s != **before).unwrap_or(false)
-        })
+        .zip(schemas.iter())
+        .filter(|(after, before)| after != before)
         .count();
     *schemas = pruned;
     u32::try_from(touched).unwrap_or(u32::MAX)
