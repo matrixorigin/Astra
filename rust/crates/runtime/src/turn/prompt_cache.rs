@@ -492,7 +492,7 @@ pub(crate) fn default_pinned_tool_names() -> std::collections::HashSet<String> {
     // agentic_loop_lifecycle.rs). These aren't in TOOL_CATALOG but are
     // structurally part of the static lib — include them so the cache
     // marker sits at the real static-prefix boundary.
-    for name in ["skill", "spawn_agent", "get_agent_result", "send_message"] {
+    for name in ["skill", "spawn_agent", "get_agent_result", "send_message", "introspect"] {
         out.insert(name.to_string());
     }
     out

@@ -58,6 +58,7 @@ pub mod headless_tool_stderr_lines;
 pub mod history;
 pub mod hook_plans;
 pub mod interaction_types;
+pub mod introspect;
 pub mod interruption;
 pub mod learning_quality_gate;
 pub mod microcompact;

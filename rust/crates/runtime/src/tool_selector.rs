@@ -1444,9 +1444,10 @@ mod tests {
     #[test]
     fn catalog_summary_is_compact() {
         let summary = build_catalog_summary();
-        // Should stay compact (about 750 tokens at 4 chars/token).
+        // Should stay compact (~780 tokens at 4 chars/token). Bumped to 3200
+        // after introspect tool added (44 tools total).
         assert!(
-            summary.len() < 3000,
+            summary.len() < 3200,
             "catalog summary too long: {} chars",
             summary.len()
         );

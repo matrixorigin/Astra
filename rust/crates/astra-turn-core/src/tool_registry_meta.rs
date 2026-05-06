@@ -258,6 +258,18 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         scope: Scope::Local,
         schema_tokens: 25,
     },
+    ToolMeta {
+        name: "introspect",
+        description: "Query own runtime state: pressure, cache, tool health, alerts",
+        triggers: &[
+            "introspect", "self-check", "status", "health", "diagnostics",
+            "自省", "自检", "状态", "健康度",
+        ],
+        pinned: true,
+        intents: &[IntentType::CodeRead],
+        scope: Scope::Local,
+        schema_tokens: 20,
+    },
     // ── Dynamic tools (selected per-request) ────────────────────────
     ToolMeta {
         name: "lsp",

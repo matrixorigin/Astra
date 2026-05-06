@@ -1015,6 +1015,11 @@ pub struct ServerToolExecutor {
     self_mod_deprioritized_tools: Mutex<Vec<String>>,
     /// Per-turn mutation accounting for adjust_config governor.
     self_mod_mutation_counter: Mutex<(u32, u32)>,
+    /// Budget-adaptive introspection snapshot, updated each turn by the
+    /// execution phase. The `introspect` tool reads this to return runtime
+    /// state without coupling to AgenticLoopState.
+    introspect_snapshot:
+        Arc<std::sync::RwLock<Option<astra_turn_core::introspect::IntrospectSnapshot>>>,
     /// Shared default executor for delegating common tool logic.
     default_executor: DefaultToolExecutor,
     /// Optional remote workspace artifact store for publishing workspace metadata.
@@ -1102,6 +1107,7 @@ impl ServerToolExecutor {
             resource_governor: None,
             edge_connection_pool: None,
             observability_session: None,
+            introspect_snapshot: Arc::new(std::sync::RwLock::new(None)),
             self_mod_pinned_tools: Mutex::new(pinned_tools),
             self_mod_deprioritized_tools: Mutex::new(deprioritized_tools),
             self_mod_mutation_counter: Mutex::new((0, 0)),
@@ -1332,6 +1338,7 @@ impl ServerToolExecutor {
             "adjust_config" => tool_result_from_output(self.adjust_config(args)),
             "prioritize_tool" => tool_result_from_output(self.prioritize_tool(args)),
             "deprioritize_tool" => tool_result_from_output(self.deprioritize_tool(args)),
+            "introspect" => tool_result_from_output(self.handle_introspect(args)),
             "set_goal" => tool_result_from_output(self.set_goal(args)),
             "compress_context" => tool_result_from_output(self.compress_context(args)),
             "rollback_session_state" => tool_result_from_output(self.rollback_session_state(args)),
@@ -2661,6 +2668,35 @@ impl ServerToolExecutor {
             "deprioritized_tools": deprioritized.clone(),
         })
         .to_string()
+    }
+
+    /// Update the introspect snapshot from the agentic loop state each turn.
+    pub fn update_introspect_snapshot(
+        &self,
+        snapshot: astra_turn_core::introspect::IntrospectSnapshot,
+    ) {
+        if let Ok(mut guard) = self.introspect_snapshot.write() {
+            *guard = Some(snapshot);
+        }
+    }
+
+    fn handle_introspect(&self, args: &Value) -> String {
+        let detail_arg = args
+            .get("detail")
+            .and_then(Value::as_str)
+            .unwrap_or("summary");
+        let detail = astra_turn_core::introspect::IntrospectDetail::from_arg(detail_arg);
+
+        let snapshot = self
+            .introspect_snapshot
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone());
+
+        match snapshot {
+            Some(snap) => astra_turn_core::introspect::render_introspect(&snap, detail),
+            None => "No introspection data available yet (first turn).".to_string(),
+        }
     }
 
     fn set_goal(&self, args: &Value) -> String {

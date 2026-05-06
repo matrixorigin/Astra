@@ -68,17 +68,14 @@ mod tests {
     // ── Catalog invariants ──
 
     #[test]
-    fn catalog_has_43_tools() {
-        assert_eq!(TOOL_CATALOG.len(), 43);
+    fn catalog_has_44_tools() {
+        assert_eq!(TOOL_CATALOG.len(), 44);
     }
 
     #[test]
-    fn catalog_has_13_pinned() {
-        // Expanded from 6 to 13 for prompt-cache stability: the static tool
-        // prefix is the cacheable prefix, so the more tools we can include
-        // in it without breaking cache, the higher the hit rate. See
-        // `pinned_tools_are_core_set` for the full list.
-        assert_eq!(ToolRegistry::pinned_count(), 13);
+    fn catalog_has_14_pinned() {
+        // +1 for introspect (budget-adaptive runtime self-check).
+        assert_eq!(ToolRegistry::pinned_count(), 14);
     }
 
     #[test]
