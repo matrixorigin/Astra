@@ -2229,11 +2229,7 @@ mod tests {
     #[test]
     fn session_state_rollback_guidance_mentions_turn_rollback_when_available() {
         let p = build_main_system_prompt(
-            &[
-                "rollback_session_state",
-                "rollback_turn_actions",
-                "session",
-            ],
+            &["rollback_session_state", "rollback_turn_actions", "session"],
             "",
             0.5,
             Some("implementation"),

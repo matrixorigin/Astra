@@ -680,18 +680,14 @@ mod tests {
             "unseen kinds must return None rather than a sentinel hash"
         );
 
-        stats.record_section_fingerprints(&[section(
-            SectionKind::ProjectContext,
-            "stable project",
-        )]);
+        stats
+            .record_section_fingerprints(&[section(SectionKind::ProjectContext, "stable project")]);
         let first = stats
             .section_fingerprint(SectionKind::ProjectContext)
             .expect("fingerprint present after first record");
 
-        stats.record_section_fingerprints(&[section(
-            SectionKind::ProjectContext,
-            "stable project",
-        )]);
+        stats
+            .record_section_fingerprints(&[section(SectionKind::ProjectContext, "stable project")]);
         assert_eq!(
             stats.section_fingerprint(SectionKind::ProjectContext),
             Some(first),

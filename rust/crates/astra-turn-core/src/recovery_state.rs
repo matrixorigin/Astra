@@ -5,6 +5,7 @@
 //! aggressive compaction tier or widen token reserves.
 
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 /// Per-turn recovery state. Feeds into `plan_turn()` to escalate
 /// compaction tiers and widen reserve estimates after failures.
@@ -69,8 +70,18 @@ impl RecoveryState {
     pub fn process_feedback(&mut self, was_truncated: bool) {
         if was_truncated {
             self.record_output_escalation();
-        } else if self.consecutive_ptl_errors == 0 {
-            // Only reset on full success (no PTL in flight)
+        } else {
+            // A successful (non-truncated) API response means the prompt fit.
+            // Clear all recovery state — the session has recovered from any
+            // prior PTL errors (the runtime only calls process_feedback after
+            // a successful API response; PTL errors are recorded separately).
+            if self.consecutive_ptl_errors > 0 {
+                debug!(
+                    ptl_errors = self.consecutive_ptl_errors,
+                    "recovery_state: clearing {} consecutive PTL errors after successful response",
+                    self.consecutive_ptl_errors
+                );
+            }
             self.reset_on_success();
         }
     }
@@ -131,11 +142,13 @@ mod tests {
     fn process_feedback_success_resets() {
         let mut r = RecoveryState::default();
         r.record_ptl_error();
-        // Don't reset if PTL is in flight
-        r.process_feedback(false);
         assert_eq!(r.consecutive_ptl_errors, 1);
-        // After clearing PTL manually, next success resets
-        r.reset_on_success();
+        // Successful feedback after a PTL error means recovery worked — reset.
+        r.process_feedback(false);
+        assert_eq!(r.consecutive_ptl_errors, 0);
+        assert!(!r.is_in_recovery());
+
+        // Also resets reactive compact state
         r.record_reactive_compact();
         assert!(r.is_in_recovery());
         r.process_feedback(false);

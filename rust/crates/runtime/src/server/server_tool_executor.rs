@@ -1296,7 +1296,10 @@ impl ServerToolExecutor {
                 let mut isolated_args = args.clone();
                 if let Some(obj) = isolated_args.as_object_mut() {
                     obj.remove("action"); // Memoria API doesn't expect this field
-                    obj.insert("session_id".to_string(), Value::String(self.user_id.clone()));
+                    obj.insert(
+                        "session_id".to_string(),
+                        Value::String(self.user_id.clone()),
+                    );
                     obj.insert("user_id".to_string(), Value::String(self.user_id.clone()));
                 }
                 let output = self.memoria_client.call(op, &isolated_args).await;
@@ -1383,11 +1386,20 @@ impl ServerToolExecutor {
             )),
             // ── Consolidated mo tool ───────────────────────────────────
             "mo" => {
-                let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("query");
+                let action = args
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("query");
                 match action {
                     "query" => self.server_mo_query(args),
-                    "snapshot" | "branch" => self.default_executor.execute(&format!("mo_{action}"), args).await,
-                    other => tool_result_from_output(format!("Unknown mo action: '{other}'. Use: query, snapshot, branch")),
+                    "snapshot" | "branch" => {
+                        self.default_executor
+                            .execute(&format!("mo_{action}"), args)
+                            .await
+                    }
+                    other => tool_result_from_output(format!(
+                        "Unknown mo action: '{other}'. Use: query, snapshot, branch"
+                    )),
                 }
             }
             // Legacy alias
@@ -1461,14 +1473,20 @@ impl ServerToolExecutor {
             "get_agent_info" => tool_result_from_output(self.server_get_agent_info(args)),
             // ── Consolidated agent tool ────────────────────────────────
             "agent" => {
-                let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("delegate");
+                let action = args
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("delegate");
                 match action {
                     "delegate" => astra_tools::ToolResult::text(
                         "Delegation request acknowledged. The delegation engine will execute \
-                         this request and provide results in the next round.".to_string(),
+                         this request and provide results in the next round."
+                            .to_string(),
                     ),
                     "run_chain" => self.default_executor.execute("run_chain", args).await,
-                    other => tool_result_from_output(format!("Unknown agent action: '{other}'. Use: delegate, run_chain")),
+                    other => tool_result_from_output(format!(
+                        "Unknown agent action: '{other}'. Use: delegate, run_chain"
+                    )),
                 }
             }
             // Legacy alias

@@ -3737,7 +3737,9 @@ mod tests {
         let root = repo_root();
         let result = super::git_dispatch(&root, &json!({"action": "status"}));
         assert!(
-            result.contains("##") || result.contains("nothing to commit") || result.contains("On branch"),
+            result.contains("##")
+                || result.contains("nothing to commit")
+                || result.contains("On branch"),
             "git status action should return valid status: {result}"
         );
     }

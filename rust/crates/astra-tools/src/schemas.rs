@@ -111,7 +111,8 @@ fn run_script_schema_default() -> Value {
 }
 
 fn all_tool_schemas_core() -> Vec<Value> {
-    vec![json!({
+    vec![
+        json!({
             "type": "function",
             "function": {
                 "name": "bash",
@@ -736,7 +737,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     }
                 }
             }
-        })
+        }),
     ]
 }
 

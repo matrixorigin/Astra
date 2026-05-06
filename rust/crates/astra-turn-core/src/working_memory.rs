@@ -97,7 +97,11 @@ impl WorkingMemoryState {
 
     /// Add a stable decision. Duplicate entries are ignored.
     pub fn push_decision(&mut self, decision: impl Into<String>) {
-        push_unique_capped(&mut self.decisions, decision.into(), self.config.decision_cap);
+        push_unique_capped(
+            &mut self.decisions,
+            decision.into(),
+            self.config.decision_cap,
+        );
     }
 
     /// Add a current blocker. Duplicate entries are ignored.
@@ -236,7 +240,10 @@ mod tests {
         wm.push_decision("second");
         wm.push_decision("third"); // evicts "first"
         let rendered = wm.render_prompt_section();
-        assert!(!rendered.contains("first"), "oldest decision must be evicted");
+        assert!(
+            !rendered.contains("first"),
+            "oldest decision must be evicted"
+        );
         assert!(rendered.contains("second"));
         assert!(rendered.contains("third"));
     }

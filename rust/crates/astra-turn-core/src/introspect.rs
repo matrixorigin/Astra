@@ -166,9 +166,24 @@ mod tests {
                 "tool_health: bash error rate >30%".into(),
             ],
             tool_health: vec![
-                ToolHealthEntry { name: "bash".into(), calls: 15, errors: 5, avg_ms: 2300 },
-                ToolHealthEntry { name: "read_file".into(), calls: 22, errors: 0, avg_ms: 12 },
-                ToolHealthEntry { name: "grep".into(), calls: 8, errors: 1, avg_ms: 45 },
+                ToolHealthEntry {
+                    name: "bash".into(),
+                    calls: 15,
+                    errors: 5,
+                    avg_ms: 2300,
+                },
+                ToolHealthEntry {
+                    name: "read_file".into(),
+                    calls: 22,
+                    errors: 0,
+                    avg_ms: 12,
+                },
+                ToolHealthEntry {
+                    name: "grep".into(),
+                    calls: 8,
+                    errors: 1,
+                    avg_ms: 45,
+                },
             ],
             working_memory_summary: "Goal: implement streaming resume".into(),
             total_input_tokens: 145_000,
@@ -181,7 +196,10 @@ mod tests {
     #[test]
     fn minimal_is_single_line() {
         let output = render_introspect(&sample_snapshot(), IntrospectDetail::Minimal);
-        assert!(!output.contains('\n'), "minimal must be a single line: {output}");
+        assert!(
+            !output.contains('\n'),
+            "minimal must be a single line: {output}"
+        );
         assert!(output.contains("pressure=72%"));
         assert!(output.contains("cache=65%"));
         assert!(output.contains("turns=8/20"));
@@ -209,16 +227,28 @@ mod tests {
     #[test]
     fn detail_from_budget_selects_correctly() {
         assert_eq!(IntrospectDetail::from_budget(10000), IntrospectDetail::Full);
-        assert_eq!(IntrospectDetail::from_budget(3000), IntrospectDetail::Summary);
-        assert_eq!(IntrospectDetail::from_budget(1000), IntrospectDetail::Minimal);
+        assert_eq!(
+            IntrospectDetail::from_budget(3000),
+            IntrospectDetail::Summary
+        );
+        assert_eq!(
+            IntrospectDetail::from_budget(1000),
+            IntrospectDetail::Minimal
+        );
     }
 
     #[test]
     fn detail_from_arg_parses_variants() {
         assert_eq!(IntrospectDetail::from_arg("full"), IntrospectDetail::Full);
-        assert_eq!(IntrospectDetail::from_arg("brief"), IntrospectDetail::Summary);
+        assert_eq!(
+            IntrospectDetail::from_arg("brief"),
+            IntrospectDetail::Summary
+        );
         assert_eq!(IntrospectDetail::from_arg("min"), IntrospectDetail::Minimal);
-        assert_eq!(IntrospectDetail::from_arg("unknown"), IntrospectDetail::Summary);
+        assert_eq!(
+            IntrospectDetail::from_arg("unknown"),
+            IntrospectDetail::Summary
+        );
     }
 
     #[test]

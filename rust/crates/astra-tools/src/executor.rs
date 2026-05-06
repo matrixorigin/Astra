@@ -265,15 +265,20 @@ impl DefaultToolExecutor {
                     "get_issue" => "github_get_issue",
                     "repo_stats" => "github_repo_stats",
                     "create_issue" => "github_create_issue",
-                    "" => return ToolResult::error(
-                        "Missing required parameter: action. Use one of: \
+                    "" => {
+                        return ToolResult::error(
+                            "Missing required parameter: action. Use one of: \
                          list_prs, get_pr, ci_status, list_issues, get_issue, \
-                         repo_stats, create_issue".to_string()
-                    ),
-                    other => return ToolResult::error(format!(
-                        "Unknown github action: '{other}'. Valid: list_prs, get_pr, \
+                         repo_stats, create_issue"
+                                .to_string(),
+                        );
+                    }
+                    other => {
+                        return ToolResult::error(format!(
+                            "Unknown github action: '{other}'. Valid: list_prs, get_pr, \
                          ci_status, list_issues, get_issue, repo_stats, create_issue"
-                    )),
+                        ));
+                    }
                 };
                 self.dispatch_github(resolved_name, args).await
             }

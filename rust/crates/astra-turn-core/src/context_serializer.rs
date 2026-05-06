@@ -727,7 +727,9 @@ mod tests {
         // user1 untouched
         assert_eq!(msgs[1]["content"], "turn 1 question");
         // assistant1 gets the marker (it's the message just before the last user)
-        let arr = msgs[2]["content"].as_array().expect("assistant content upgraded");
+        let arr = msgs[2]["content"]
+            .as_array()
+            .expect("assistant content upgraded");
         assert_eq!(arr[0]["cache_control"], json!({"type": "ephemeral"}));
         // user2 (current turn) has NO marker
         assert_eq!(msgs[3]["content"], "turn 2 question");

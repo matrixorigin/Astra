@@ -186,10 +186,7 @@ mod tests {
         // memory is now pinned — it no longer needs to rank in
         // pre_filter_dynamic. Verify it IS pinned so memory lifecycle
         // cases always have it available.
-        let tool = TOOL_CATALOG
-            .iter()
-            .find(|t| t.name == "memory")
-            .unwrap();
+        let tool = TOOL_CATALOG.iter().find(|t| t.name == "memory").unwrap();
         assert!(
             tool.pinned,
             "memory must be pinned for reliable memory lifecycle"
@@ -214,8 +211,8 @@ mod tests {
         let registry = ToolRegistry::new(mock_schemas());
         let selected = registry.select("我有哪些记忆？", 1);
         let names = ToolRegistry::selected_names(&selected);
-        let has_memory = names.contains(&"memory".to_string())
-            || names.contains(&"memory".to_string());
+        let has_memory =
+            names.contains(&"memory".to_string()) || names.contains(&"memory".to_string());
         assert!(
             has_memory,
             "memory query must select memory (or legacy memory), got: {:?}",
@@ -343,8 +340,7 @@ mod tests {
         let names = ToolRegistry::selected_names(&selected);
         // Should include both GitHub tools and git tools
         assert!(
-            names.contains(&"github".to_string())
-                || names.contains(&"github".to_string()),
+            names.contains(&"github".to_string()) || names.contains(&"github".to_string()),
             "CI/PR query should include GitHub tools, got: {:?}",
             names
         );
@@ -470,10 +466,7 @@ mod tests {
             .iter()
             .position(|t| t.name == "github")
             .unwrap();
-        let git_idx = TOOL_CATALOG
-            .iter()
-            .position(|t| t.name == "git")
-            .unwrap();
+        let git_idx = TOOL_CATALOG.iter().position(|t| t.name == "git").unwrap();
         assert!(
             tfidf_score(&terms, prs_idx) > tfidf_score(&terms, git_idx),
             "github_list_prs should score higher than git_status for 'list pull requests'"
@@ -487,10 +480,7 @@ mod tests {
             .iter()
             .position(|t| t.name == "memory")
             .unwrap();
-        let git_idx = TOOL_CATALOG
-            .iter()
-            .position(|t| t.name == "git")
-            .unwrap();
+        let git_idx = TOOL_CATALOG.iter().position(|t| t.name == "git").unwrap();
         assert!(
             tfidf_score(&terms, mem_idx) > tfidf_score(&terms, git_idx),
             "memory should score higher than git_diff for memory query"
@@ -500,10 +490,7 @@ mod tests {
     #[test]
     fn tfidf_git_tools_rank_high_for_diff() {
         let terms = tokenize("git diff");
-        let diff_idx = TOOL_CATALOG
-            .iter()
-            .position(|t| t.name == "git")
-            .unwrap();
+        let diff_idx = TOOL_CATALOG.iter().position(|t| t.name == "git").unwrap();
         let issue_idx = TOOL_CATALOG
             .iter()
             .position(|t| t.name == "github")

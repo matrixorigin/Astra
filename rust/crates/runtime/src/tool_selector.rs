@@ -1491,8 +1491,12 @@ mod tests {
             &LearnedContext {
                 task_archetype: Some(TaskType::Fetch),
                 entity_hints: vec!["Entity 'matrixorigin' is associated with domain GitHub".into()],
-                pattern_hints: vec!["Successful tool chain for Fetch/Some(GitHub): github_search -> github".into()],
-                calibration_hints: vec!["Calibration risk: domain GitHub needed correction 60% of the time".into()],
+                pattern_hints: vec![
+                    "Successful tool chain for Fetch/Some(GitHub): github_search -> github".into(),
+                ],
+                calibration_hints: vec![
+                    "Calibration risk: domain GitHub needed correction 60% of the time".into(),
+                ],
                 tool_hints: vec!["Tool history: prefer 'github'".into()],
             },
             "catalog",
@@ -2476,12 +2480,7 @@ mod tests {
                 &["github".into(), "github_search_repos".into()],
                 None,
             );
-            g.learn(
-                "matrixorigin",
-                DomainHint::GitHub,
-                &["github".into()],
-                None,
-            );
+            g.learn("matrixorigin", DomainHint::GitHub, &["github".into()], None);
         }
 
         let selector = TfIdfSelector::new(mock_registry()).with_entity_graph(graph.clone());
@@ -3078,7 +3077,10 @@ mod tests {
         // Should still select some tools (domain hint helps ranking despite pressure)
         assert!(!result.failed, "Combined pressure+hints should not fail");
         // The tools selected should be the most relevant (GitHub) ones
-        let has_github = result.tool_names.iter().any(|t| t == "github" || t.starts_with("github_"));
+        let has_github = result
+            .tool_names
+            .iter()
+            .any(|t| t == "github" || t.starts_with("github_"));
         assert!(
             has_github,
             "Even under pressure, domain hint should keep github tool: {:?}",
@@ -3110,7 +3112,10 @@ mod tests {
         };
         let result = selector.select(&ctx).await;
 
-        let has_git = result.tool_names.iter().any(|n| n == "git" || n.starts_with("git_"));
+        let has_git = result
+            .tool_names
+            .iter()
+            .any(|n| n == "git" || n.starts_with("git_"));
         assert!(
             has_git,
             "'review latest commit' should select the git tool, got: {:?}",

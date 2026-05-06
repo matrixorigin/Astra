@@ -1709,7 +1709,10 @@ mod tests {
             tool_events.len(),
             2,
             "must have exactly Started + Completed: {:?}",
-            tool_events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+            tool_events
+                .iter()
+                .map(|e| &e.event_type)
+                .collect::<Vec<_>>()
         );
         assert_eq!(tool_events[0].event_type, StepEventType::ToolCallStarted);
         assert_eq!(tool_events[1].event_type, StepEventType::ToolCallCompleted);
@@ -1734,7 +1737,15 @@ mod tests {
         rec.begin_turn(0);
         rec.begin_act(1);
         rec.begin_tool_with_key_and_args_preview("bash", "call-1", None, Some("ls"));
-        rec.complete_tool_with_result_and_metadata("bash", "call-1", Some("ls"), false, 10, false, "output");
+        rec.complete_tool_with_result_and_metadata(
+            "bash",
+            "call-1",
+            Some("ls"),
+            false,
+            10,
+            false,
+            "output",
+        );
 
         let started_count = rec
             .events()

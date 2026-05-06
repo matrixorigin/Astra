@@ -282,13 +282,9 @@ impl PipelineSession {
     /// Useful for the runtime to decide whether to attempt reactive compaction.
     #[must_use]
     pub fn current_pressure_tier(&self) -> CompactionTier {
-        if self.recovery.consecutive_ptl_errors >= 2 {
-            CompactionTier::AggressivePrune
-        } else if self.recovery.consecutive_ptl_errors >= 1 {
-            CompactionTier::CompactHistory
-        } else {
-            CompactionTier::Normal
-        }
+        // Delegate to the single source of truth for recovery escalation
+        // (CompactionTier::escalate_for_recovery) to avoid threshold desync.
+        CompactionTier::Normal.escalate_for_recovery(&self.recovery)
     }
 
     /// Whether the session should abort (unrecoverable error streak).
@@ -660,14 +656,13 @@ mod tests {
 
         sess.record_ptl_error();
         assert!(!sess.should_abort());
-        assert_eq!(sess.current_pressure_tier(), CompactionTier::CompactHistory);
+        // 1 PTL → TrimSchemas (matches escalate_for_recovery canonical mapping)
+        assert_eq!(sess.current_pressure_tier(), CompactionTier::TrimSchemas);
 
         sess.record_ptl_error();
         assert!(!sess.should_abort());
-        assert_eq!(
-            sess.current_pressure_tier(),
-            CompactionTier::AggressivePrune
-        );
+        // 2 PTL → CompactHistory
+        assert_eq!(sess.current_pressure_tier(), CompactionTier::CompactHistory);
 
         sess.record_ptl_error();
         assert!(sess.should_abort());
@@ -713,20 +708,17 @@ mod tests {
     }
 
     #[test]
-    fn reset_after_ptl_requires_explicit_reset() {
+    fn successful_feedback_clears_ptl_recovery() {
         let mut sess = PipelineSession::new(PipelineConfig::default());
         sess.record_ptl_error();
         sess.record_ptl_error();
         assert_eq!(sess.recovery.consecutive_ptl_errors, 2);
 
-        // process_feedback won't clear PTL errors (they're "in flight")
+        // A successful response (not truncated) means recovery worked — clear PTL state
         let feedback = ContextFeedback::from_usage(1000, 800, 200, 500, false);
         sess.record_feedback("model", "repl", feedback, None);
-        assert_eq!(sess.recovery.consecutive_ptl_errors, 2);
-
-        // Explicit reset (runtime calls this after successful retry)
-        sess.recovery.reset_on_success();
         assert_eq!(sess.recovery.consecutive_ptl_errors, 0);
+        assert!(!sess.recovery.is_in_recovery());
     }
 
     #[test]

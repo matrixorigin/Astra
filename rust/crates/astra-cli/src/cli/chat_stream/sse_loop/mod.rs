@@ -339,10 +339,7 @@ pub(crate) async fn stream_chat_sse(
     let pinned_schema_tokens = registry.total_pinned_token_cost() as u64;
     // Build valid_tool_names from the registry (includes dynamically injected
     // spawn_agent/get_agent_result), not from the pre-injection all_schemas vec.
-    let valid_tool_names: HashSet<String> = registry
-        .all_schema_names()
-        .into_iter()
-        .collect();
+    let valid_tool_names: HashSet<String> = registry.all_schema_names().into_iter().collect();
 
     // --allowed-tools: if set, restrict to only the specified tools
     let mut initial_restricted: HashSet<String> =

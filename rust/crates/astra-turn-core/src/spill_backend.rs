@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,7 +86,16 @@ impl SpillBackend for FileSystemSpillBackend {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         let filename = format!("{sanitized}-{n}.txt");
         let path = self.root.join(&filename);
-        fs::write(&path, bytes)?;
+
+        // Use explicit File handle so we can fsync without reopening.
+        let mut file = fs::File::create(&path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+
+        // Fsync the parent directory so the directory entry is visible
+        // after an unclean shutdown (required on Linux ext4/btrfs).
+        fs::File::open(&self.root)?.sync_all()?;
+
         Ok(path.to_string_lossy().into_owned())
     }
 

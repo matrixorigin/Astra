@@ -1211,7 +1211,9 @@ impl ToolExecutor {
                         None => return "Error: missing required parameter 'action'. Use one of: store, retrieve, purge, correct, profile, search, feedback".to_string(),
                     };
                     let mut clean_args = args.clone();
-                    if let Some(obj) = clean_args.as_object_mut() { obj.remove("action"); }
+                    if let Some(obj) = clean_args.as_object_mut() {
+                        obj.remove("action");
+                    }
                     self.memoria_call(op, &clean_args).await
                 }
                 "memory_retrieve" => self.memoria_call("retrieve", args).await,

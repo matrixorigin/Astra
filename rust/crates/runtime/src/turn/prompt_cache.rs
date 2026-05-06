@@ -492,7 +492,13 @@ pub(crate) fn default_pinned_tool_names() -> std::collections::HashSet<String> {
     // agentic_loop_lifecycle.rs). These aren't in TOOL_CATALOG but are
     // structurally part of the static lib — include them so the cache
     // marker sits at the real static-prefix boundary.
-    for name in ["skill", "spawn_agent", "get_agent_result", "send_message", "introspect"] {
+    for name in [
+        "skill",
+        "spawn_agent",
+        "get_agent_result",
+        "send_message",
+        "introspect",
+    ] {
         out.insert(name.to_string());
     }
     out
@@ -1494,11 +1500,7 @@ mod cache_stability_regression {
         let a = build_once();
         let b_tools_churned = {
             let mut tools = pinned_prefix_fixture();
-            tools.extend([
-                schema("web_fetch"),
-                schema("github_list_prs"),
-                schema("mo"),
-            ]);
+            tools.extend([schema("web_fetch"), schema("github_list_prs"), schema("mo")]);
             annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
             build_provider_request_body(
                 &[json!({"role": "user", "content": "hi"})],

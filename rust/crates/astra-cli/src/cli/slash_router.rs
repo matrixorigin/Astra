@@ -537,11 +537,7 @@ pub(super) async fn handle_slash_command(
         "/ask" => {
             if arg.trim().is_empty() {
                 eprintln!("{}", "  Usage: /ask <question about this session>".yellow());
-                eprintln!(
-                    "{}",
-                    "  Example: /ask why is my cache hit rate low?"
-                        .dim()
-                );
+                eprintln!("{}", "  Example: /ask why is my cache hit rate low?".dim());
             } else {
                 // Build diagnostics context and inject WITH the question.
                 let mut diag_parts = Vec::new();
