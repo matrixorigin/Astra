@@ -1294,13 +1294,13 @@ mod tests {
         let terms = vec!["记忆".to_string(), "搜索".to_string()];
         let mem_idx = TOOL_CATALOG
             .iter()
-            .position(|t| t.name == "memory_retrieve")
+            .position(|t| t.name == "memory")
             .unwrap();
         let score = tfidf_score(&terms, mem_idx);
         // CJK terms should match Chinese triggers in memory_retrieve
         assert!(
             score > 0.0,
-            "CJK query should match memory_retrieve triggers"
+            "CJK query should match memory triggers"
         );
     }
 

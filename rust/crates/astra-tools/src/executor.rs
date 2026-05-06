@@ -255,6 +255,29 @@ impl DefaultToolExecutor {
             "git_stash" => outcome_to_result(crate::git_gix::git_stash_with_metadata(pr, args)),
 
             // ── GitHub API ───────────────────────────────────────────
+            "github" => {
+                let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                let resolved_name = match action {
+                    "list_prs" => "github_list_prs",
+                    "get_pr" => "github_get_pr",
+                    "ci_status" => "github_ci_status",
+                    "list_issues" => "github_list_issues",
+                    "get_issue" => "github_get_issue",
+                    "repo_stats" => "github_repo_stats",
+                    "create_issue" => "github_create_issue",
+                    "" => return ToolResult::error(
+                        "Missing required parameter: action. Use one of: \
+                         list_prs, get_pr, ci_status, list_issues, get_issue, \
+                         repo_stats, create_issue".to_string()
+                    ),
+                    other => return ToolResult::error(format!(
+                        "Unknown github action: '{other}'. Valid: list_prs, get_pr, \
+                         ci_status, list_issues, get_issue, repo_stats, create_issue"
+                    )),
+                };
+                self.dispatch_github(resolved_name, args).await
+            }
+            // Legacy aliases
             "github_list_prs"
             | "github_get_pr"
             | "github_ci_status"
@@ -316,6 +339,14 @@ impl DefaultToolExecutor {
             }
 
             // ── Memory tools (require configured endpoint) ───────────
+            "memory" => {
+                let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                ToolResult::error(format!(
+                    "Error: Memory tool (action='{action}') requires a configured memoria endpoint. \
+                     Use ServerToolExecutor or CliToolExecutor instead of DefaultToolExecutor."
+                ))
+            }
+            // Legacy aliases
             "memory_retrieve" | "memory_store" | "memory_search" | "memory_purge"
             | "memory_correct" | "memory_profile" | "memory_feedback" => {
                 ToolResult::error(format!(

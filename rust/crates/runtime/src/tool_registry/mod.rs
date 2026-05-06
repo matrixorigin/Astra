@@ -68,19 +68,18 @@ mod tests {
     // ── Catalog invariants ──
 
     #[test]
-    fn catalog_has_37_tools() {
-        assert_eq!(TOOL_CATALOG.len(), 37);
+    fn catalog_has_27_tools() {
+        assert_eq!(TOOL_CATALOG.len(), 27);
     }
 
     #[test]
-    fn catalog_has_13_pinned() {
-        // 14 - 2 old pinned git_* + 1 consolidated git = 13
-        assert_eq!(ToolRegistry::pinned_count(), 13);
+    fn catalog_has_10_pinned() {
+        assert_eq!(ToolRegistry::pinned_count(), 10);
     }
 
     #[test]
-    fn catalog_has_24_dynamic() {
-        assert_eq!(ToolRegistry::dynamic_count(), 24);
+    fn catalog_has_17_dynamic() {
+        assert_eq!(ToolRegistry::dynamic_count(), 17);
     }
 
     #[test]
@@ -96,15 +95,9 @@ mod tests {
         assert!(pinned.contains(&"str_replace"));
         assert!(pinned.contains(&"list_dir"));
         assert!(
-            pinned.contains(&"memory_store"),
-            "memory_store must be pinned — intrinsic store capability"
+            pinned.contains(&"memory"),
+            "consolidated memory tool must be pinned — intrinsic capability"
         );
-        assert!(
-            pinned.contains(&"memory_retrieve"),
-            "memory_retrieve must be pinned — intrinsic recall capability"
-        );
-        // Expanded set: near-universal tools promoted from dynamic to static
-        // to keep them inside the cacheable tool prefix.
         assert!(
             pinned.contains(&"write_file"),
             "write_file completes the read/edit/write triad"
@@ -116,10 +109,6 @@ mod tests {
         assert!(
             pinned.contains(&"git"),
             "consolidated git tool must be pinned — git ops appear in most coding turns"
-        );
-        assert!(
-            pinned.contains(&"memory_purge") && pinned.contains(&"memory_correct"),
-            "keep the full memory triad static so hygiene turns don't break cache"
         );
     }
 
@@ -200,24 +189,24 @@ mod tests {
         // github_list_prs should be ranked first among dynamic tools
         let first_name = TOOL_CATALOG[ranked[0].0].name;
         assert_eq!(
-            first_name, "github_list_prs",
+            first_name, "github",
             "github_list_prs should be top-ranked for PR query, got: {}",
             first_name
         );
     }
 
     #[test]
-    fn pinned_memory_retrieve_always_available_for_recall() {
-        // memory_retrieve is now pinned — it no longer needs to rank in
+    fn pinned_memory_always_available_for_recall() {
+        // memory is now pinned — it no longer needs to rank in
         // pre_filter_dynamic. Verify it IS pinned so memory lifecycle
         // cases always have it available.
         let tool = TOOL_CATALOG
             .iter()
-            .find(|t| t.name == "memory_retrieve")
+            .find(|t| t.name == "memory")
             .unwrap();
         assert!(
             tool.pinned,
-            "memory_retrieve must be pinned for reliable memory lifecycle"
+            "memory must be pinned for reliable memory lifecycle"
         );
     }
 
@@ -271,41 +260,41 @@ mod tests {
 
     /// Regression: recall queries should surface recall-oriented memory tools.
     #[test]
-    fn select_memory_query_has_memory_retrieve() {
+    fn select_memory_query_has_memory() {
         let registry = ToolRegistry::new(mock_schemas());
         let selected = registry.select("我有哪些记忆？", 1);
         let names = ToolRegistry::selected_names(&selected);
-        let has_memory = names.contains(&"memory_retrieve".to_string())
-            || names.contains(&"memory_retrieve".to_string());
+        let has_memory = names.contains(&"memory".to_string())
+            || names.contains(&"memory".to_string());
         assert!(
             has_memory,
-            "memory query must select memory_retrieve (or legacy memory_retrieve), got: {:?}",
+            "memory query must select memory (or legacy memory), got: {:?}",
             names
         );
     }
 
-    /// Regression: implicit Chinese preferences should still surface memory_store
+    /// Regression: implicit Chinese preferences should still surface memory
     /// even after it leaves the pinned baseline.
     #[test]
-    fn select_preference_statement_has_memory_store() {
+    fn select_preference_statement_has_memory() {
         let registry = ToolRegistry::new(mock_schemas());
         let selected = registry.select("苹果比较好吃", 1);
         let names = ToolRegistry::selected_names(&selected);
         assert!(
-            names.contains(&"memory_store".to_string()),
-            "memory_store must be selected for implicit preference intent, got: {:?}",
+            names.contains(&"memory".to_string()),
+            "memory must be selected for implicit preference intent, got: {:?}",
             names
         );
     }
 
     #[test]
-    fn select_tracking_intent_has_memory_store() {
+    fn select_tracking_intent_has_memory() {
         let registry = ToolRegistry::new(mock_schemas());
         let selected = registry.select("我关注 matrixorigin", 1);
         let names = ToolRegistry::selected_names(&selected);
         assert!(
-            names.contains(&"memory_store".to_string()),
-            "memory_store must be selected for tracking intent, got: {:?}",
+            names.contains(&"memory".to_string()),
+            "memory must be selected for tracking intent, got: {:?}",
             names
         );
     }
@@ -416,7 +405,7 @@ mod tests {
         let result = registry.select_with_budget("最新的pr?", 1, 10000);
         let names = ToolRegistry::selected_names(&result);
         assert!(
-            names.contains(&"github_list_prs".to_string()),
+            names.contains(&"github".to_string()),
             "github_list_prs should be included for PR query"
         );
         // At minimum pinned + at least 1 dynamic tool
@@ -434,7 +423,7 @@ mod tests {
         let selected = registry.select("matrixorigin memoria 最新的pr?", 1);
         let names = ToolRegistry::selected_names(&selected);
         assert!(
-            names.contains(&"github_list_prs".to_string()),
+            names.contains(&"github".to_string()),
             "PR query must include github_list_prs, got: {:?}",
             names
         );
@@ -463,8 +452,8 @@ mod tests {
         let names = ToolRegistry::selected_names(&selected);
         // Should include both GitHub tools and git tools
         assert!(
-            names.contains(&"github_ci_status".to_string())
-                || names.contains(&"github_list_prs".to_string()),
+            names.contains(&"github".to_string())
+                || names.contains(&"github".to_string()),
             "CI/PR query should include GitHub tools, got: {:?}",
             names
         );
@@ -476,7 +465,7 @@ mod tests {
         let selected = registry.select("matrixorigin memoria 多少star了？", 1);
         let names = ToolRegistry::selected_names(&selected);
         assert!(
-            names.contains(&"github_repo_stats".to_string()),
+            names.contains(&"github".to_string()),
             "repo stats query should include github_repo_stats, got: {:?}",
             names
         );
@@ -488,8 +477,8 @@ mod tests {
         let selected = registry.select("我之前记住的偏好是什么?", 1);
         let names = ToolRegistry::selected_names(&selected);
         assert!(
-            names.contains(&"memory_retrieve".to_string()),
-            "memory query should include memory_retrieve, got: {:?}",
+            names.contains(&"memory".to_string()),
+            "memory query should include memory, got: {:?}",
             names
         );
     }
@@ -500,7 +489,7 @@ mod tests {
         let selected = registry.select("create a new issue for this bug", 1);
         let names = ToolRegistry::selected_names(&selected);
         assert!(
-            names.contains(&"github_create_issue".to_string()),
+            names.contains(&"github".to_string()),
             "create issue query should include github_create_issue, got: {:?}",
             names
         );
@@ -588,7 +577,7 @@ mod tests {
         let terms = tokenize("list pull requests");
         let prs_idx = TOOL_CATALOG
             .iter()
-            .position(|t| t.name == "github_list_prs")
+            .position(|t| t.name == "github")
             .unwrap();
         let git_idx = TOOL_CATALOG
             .iter()
@@ -605,7 +594,7 @@ mod tests {
         let terms = tokenize("search memory recall preferences");
         let mem_idx = TOOL_CATALOG
             .iter()
-            .position(|t| t.name == "memory_retrieve")
+            .position(|t| t.name == "memory")
             .unwrap();
         let git_idx = TOOL_CATALOG
             .iter()
@@ -613,7 +602,7 @@ mod tests {
             .unwrap();
         assert!(
             tfidf_score(&terms, mem_idx) > tfidf_score(&terms, git_idx),
-            "memory_retrieve should score higher than git_diff for memory query"
+            "memory should score higher than git_diff for memory query"
         );
     }
 
@@ -626,7 +615,7 @@ mod tests {
             .unwrap();
         let issue_idx = TOOL_CATALOG
             .iter()
-            .position(|t| t.name == "github_list_issues")
+            .position(|t| t.name == "github")
             .unwrap();
         assert!(
             tfidf_score(&terms, diff_idx) > tfidf_score(&terms, issue_idx),
@@ -720,12 +709,12 @@ mod tests {
     #[test]
     fn feedback_perfect_precision() {
         let report = SelectionReport {
-            tools_selected: vec!["bash".into(), "github_list_prs".into()],
+            tools_selected: vec!["bash".into(), "github".into()],
             selected_count: 2,
             budget_used: 50,
             budget_total: 3000,
         };
-        let fb = report.feedback(&["github_list_prs".into()]);
+        let fb = report.feedback(&["github".into()]);
         // precision = hits(1) / selected(2) = 0.5
         assert!(
             (fb.precision - 0.5).abs() < 0.01,
@@ -739,7 +728,7 @@ mod tests {
     #[test]
     fn feedback_no_tools_used() {
         let report = SelectionReport {
-            tools_selected: vec!["bash".into(), "github_list_prs".into()],
+            tools_selected: vec!["bash".into(), "github".into()],
             selected_count: 2,
             budget_used: 50,
             budget_total: 3000,
@@ -763,7 +752,7 @@ mod tests {
             budget_used: 30,
             budget_total: 3000,
         };
-        let fb = report.feedback(&["github_list_prs".into()]);
+        let fb = report.feedback(&["github".into()]);
         // precision = 0/1 = 0.0 (selected bash, never used)
         assert_eq!(fb.precision, 0.0, "selected tool wasn't used → precision 0");
         // recall = 0/1 = 0.0 (used tool wasn't in selection)
@@ -790,14 +779,14 @@ mod tests {
         // With tracker: record many successful uses for a specific tool
         let mut tracker = ToolQualityTracker::new();
         for _ in 0..10 {
-            tracker.record_selection(&["github_get_issue".into()]);
+            tracker.record_selection(&["github".into()]);
             tracker.record_feedback(&SelectionFeedback {
-                tools_used: vec!["github_get_issue".into()],
+                tools_used: vec!["github".into()],
                 unused_count: 0,
                 precision: 1.0,
                 recall: 1.0,
             });
-            tracker.record_quality("github_get_issue", 0.95);
+            tracker.record_quality("github", 0.95);
         }
 
         let boosted = pre_filter_dynamic_with_quality(
@@ -816,8 +805,8 @@ mod tests {
             })
         };
 
-        let baseline_score = find_score(&baseline, "github_get_issue").unwrap_or(0.0);
-        let boosted_score = find_score(&boosted, "github_get_issue").unwrap_or(0.0);
+        let baseline_score = find_score(&baseline, "github").unwrap_or(0.0);
+        let boosted_score = find_score(&boosted, "github").unwrap_or(0.0);
         assert!(
             boosted_score >= baseline_score,
             "quality tracker should boost tool score: baseline={:.4} boosted={:.4}",
@@ -871,7 +860,7 @@ mod tests {
         // Record extensive failure for one dynamic tool
         let mut tracker = ToolQualityTracker::new();
         for _ in 0..20 {
-            tracker.record_selection(&["github_list_prs".into()]);
+            tracker.record_selection(&["github".into()]);
             // Never used → penalized
         }
 

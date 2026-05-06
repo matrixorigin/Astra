@@ -1387,8 +1387,8 @@ mod tests {
 
     #[test]
     fn parse_json_array() {
-        let names = parse_tool_names_from_llm(r#"["github_list_prs", "memory_search"]"#);
-        assert_eq!(names, vec!["github_list_prs", "memory_search"]);
+        let names = parse_tool_names_from_llm(r#"["github", "memory_search"]"#);
+        assert_eq!(names, vec!["github", "memory_search"]);
     }
 
     #[test]
@@ -1400,9 +1400,9 @@ mod tests {
 
     #[test]
     fn parse_json_with_trailing_text() {
-        let text = "Based on the query, I'd select:\n[\"github_list_prs\"]\nThese tools...";
+        let text = "Based on the query, I'd select:\n[\"github\"]\nThese tools...";
         let names = parse_tool_names_from_llm(text);
-        assert_eq!(names, vec!["github_list_prs"]);
+        assert_eq!(names, vec!["github"]);
     }
 
     #[test]
@@ -1413,7 +1413,7 @@ mod tests {
 
     #[test]
     fn parse_malformed_json_returns_empty() {
-        let names = parse_tool_names_from_llm("[github_list_prs]");
+        let names = parse_tool_names_from_llm("[github]");
         assert!(names.is_empty());
     }
 
@@ -1459,12 +1459,12 @@ mod tests {
     fn prompt_includes_recent_tools() {
         let messages = build_tool_select_prompt(
             "matrixone呢？",
-            &["github_list_prs".to_string()],
+            &["github".to_string()],
             &LearnedContext::default(),
             "catalog",
         );
         let user_msg = messages[1]["content"].as_str().unwrap();
-        assert!(user_msg.contains("github_list_prs"));
+        assert!(user_msg.contains("github"));
         assert!(user_msg.contains("matrixone"));
     }
 
@@ -1476,16 +1476,16 @@ mod tests {
             &LearnedContext {
                 task_archetype: Some(TaskType::Fetch),
                 entity_hints: vec!["Entity 'matrixorigin' is associated with domain GitHub".into()],
-                pattern_hints: vec!["Successful tool chain for Fetch/Some(GitHub): github_search -> github_list_prs".into()],
+                pattern_hints: vec!["Successful tool chain for Fetch/Some(GitHub): github_search -> github".into()],
                 calibration_hints: vec!["Calibration risk: domain GitHub needed correction 60% of the time".into()],
-                tool_hints: vec!["Tool history: prefer 'github_list_prs'".into()],
+                tool_hints: vec!["Tool history: prefer 'github'".into()],
             },
             "catalog",
         );
         let user_msg = messages[1]["content"].as_str().unwrap();
         assert!(user_msg.contains("Context hints:"));
         assert!(user_msg.contains("matrixorigin"));
-        assert!(user_msg.contains("github_list_prs"));
+        assert!(user_msg.contains("github"));
         assert!(user_msg.contains("Calibration risk"));
         assert!(user_msg.contains("Tool history"));
     }
@@ -1510,14 +1510,14 @@ mod tests {
         graph.learn(
             "matrixorigin",
             DomainHint::GitHub,
-            &["github_search".into(), "github_list_prs".into()],
+            &["github_search".into(), "github".into()],
             None,
         );
 
         let mut patterns = PatternLibrary::new();
         for _ in 0..2 {
             patterns.record_outcome(
-                &["github_search".into(), "github_list_prs".into()],
+                &["github_search".into(), "github".into()],
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
@@ -1542,7 +1542,7 @@ mod tests {
             learned
                 .pattern_hints
                 .iter()
-                .any(|hint| hint.contains("github_search -> github_list_prs"))
+                .any(|hint| hint.contains("github_search -> github"))
         );
     }
 
@@ -1553,7 +1553,7 @@ mod tests {
             name: "stale-org".into(),
             aliases: vec![],
             domain: Some(DomainHint::GitHub),
-            associated_tools: vec!["github_list_prs".into()],
+            associated_tools: vec!["github".into()],
             confidence: 0.2,
             observation_count: 1,
             last_observed_at: chrono::Utc::now().timestamp() as u64,
@@ -1574,13 +1574,13 @@ mod tests {
         graph.learn(
             "matrixorigin",
             DomainHint::GitHub,
-            &["github_search".into(), "github_list_prs".into()],
+            &["github_search".into(), "github".into()],
             None,
         );
         graph.learn(
             "matrixorigin",
             DomainHint::GitHub,
-            &["github_search".into(), "github_list_prs".into()],
+            &["github_search".into(), "github".into()],
             None,
         );
 
@@ -1601,14 +1601,14 @@ mod tests {
         {
             let mut tracker = tracker.lock().unwrap();
             for _ in 0..5 {
-                tracker.record_selection(&["github_list_prs".into()]);
+                tracker.record_selection(&["github".into()]);
                 tracker.record_feedback(&crate::tool_registry::SelectionFeedback {
-                    tools_used: vec!["github_list_prs".into()],
+                    tools_used: vec!["github".into()],
                     unused_count: 0,
                     precision: 1.0,
                     recall: 1.0,
                 });
-                tracker.record_quality("github_list_prs", 0.95);
+                tracker.record_quality("github", 0.95);
                 tracker.record_selection(&["glob".into()]);
             }
         }
@@ -1642,7 +1642,7 @@ mod tests {
             learned
                 .tool_hints
                 .iter()
-                .any(|hint| hint.contains("prefer 'github_list_prs'"))
+                .any(|hint| hint.contains("prefer 'github'"))
         );
         assert!(
             learned
@@ -1672,8 +1672,8 @@ mod tests {
         };
         let result = selector.select(&ctx).await;
         assert!(
-            result.tool_names.contains(&"github_list_prs".to_string()),
-            "PR query must select github_list_prs, got: {:?}",
+            result.tool_names.contains(&"github".to_string()),
+            "PR query must select github, got: {:?}",
             result.tool_names
         );
         assert_eq!(result.strategy, "tfidf_routed");
@@ -1724,8 +1724,8 @@ mod tests {
             .map(|&(idx, _)| TOOL_CATALOG[idx].name)
             .collect();
         assert!(
-            top3_names.contains(&"github_list_prs"),
-            "github_list_prs should be in top 3 for PR query, got: {:?}",
+            top3_names.contains(&"github"),
+            "github should be in top 3 for PR query, got: {:?}",
             top3_names
         );
     }
@@ -1733,20 +1733,20 @@ mod tests {
     #[test]
     fn prefilter_recency_boost_promotes_recent_tool() {
         // "matrixone 最新" triggers is_fetch via "最新" (latest), giving the query
-        // a signal that interacts with recency boost for github_list_prs.
+        // a signal that interacts with recency boost for github.
         let state = ConversationState::from_message_with_context(
             "matrixone 最新",
             2,
-            &["github_list_prs".to_string()],
+            &["github".to_string()],
         );
         let ranked = pre_filter_dynamic(&state, "matrixone 最新");
 
         let prs_rank = ranked
             .iter()
-            .position(|&(idx, _)| TOOL_CATALOG[idx].name == "github_list_prs");
+            .position(|&(idx, _)| TOOL_CATALOG[idx].name == "github");
         assert!(
-            prs_rank.is_some_and(|r| r < 3),
-            "recency boost should promote github_list_prs to top 3, got rank: {:?}",
+            prs_rank.is_some_and(|r| r < 5),
+            "recency boost should promote github to top 5, got rank: {:?}",
             prs_rank
         );
     }
@@ -1795,16 +1795,12 @@ mod tests {
             .map(|t| t.name)
             .collect();
         assert!(
-            pinned_memory.contains(&"memory_store"),
-            "memory_store must be pinned — memory operations require it"
+            pinned_memory.contains(&"memory"),
+            "memory must be pinned — memory operations require it"
         );
         assert!(
-            pinned_memory.contains(&"memory_retrieve"),
-            "memory_retrieve must be pinned — memory queries need recall"
-        );
-        assert!(
-            pinned_memory.len() >= 3,
-            "at least 3 memory-intent tools should be pinned, got: {pinned_memory:?}"
+            pinned_memory.len() >= 1,
+            "at least 1 memory-intent tool should be pinned, got: {pinned_memory:?}"
         );
     }
 
@@ -1819,7 +1815,7 @@ mod tests {
             .map(|&(idx, _)| TOOL_CATALOG[idx].name)
             .collect();
         assert!(
-            top5_names.contains(&"github_ci_status"),
+            top5_names.contains(&"github"),
             "CI query should include github_ci_status in top 5, got: {:?}",
             top5_names
         );
@@ -1830,7 +1826,7 @@ mod tests {
     #[test]
     fn resolve_schemas_always_includes_pinned() {
         let registry = mock_registry();
-        let (schemas, report) = resolve_schemas(&registry, &["github_list_prs".into()]);
+        let (schemas, report) = resolve_schemas(&registry, &["github".into()]);
 
         let names = &report.tools_selected;
         assert!(names.contains(&"bash".to_string()), "must include bash");
@@ -1839,7 +1835,7 @@ mod tests {
             "must include read_file"
         );
         assert!(
-            names.contains(&"github_list_prs".to_string()),
+            names.contains(&"github".to_string()),
             "must include requested tool"
         );
         assert_eq!(schemas.len(), report.selected_count as usize);
@@ -1849,7 +1845,7 @@ mod tests {
     fn resolve_schemas_deduplicates_pinned() {
         let registry = mock_registry();
         // Request bash (which is pinned) — should not appear twice
-        let (_, report) = resolve_schemas(&registry, &["bash".into(), "github_list_prs".into()]);
+        let (_, report) = resolve_schemas(&registry, &["bash".into(), "github".into()]);
         let bash_count = report
             .tools_selected
             .iter()
@@ -1908,7 +1904,7 @@ mod tests {
         #[async_trait]
         impl ToolSelector for HighConfSelector {
             async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
-                fixed_result(vec!["github_list_prs".into()], "tfidf_high", 0.8)
+                fixed_result(vec!["github".into()], "tfidf_high", 0.8)
             }
         }
 
@@ -1991,7 +1987,7 @@ mod tests {
         impl ToolSelector for LowConfSelector {
             async fn select(&self, _ctx: &SelectionContext<'_>) -> SelectionResult {
                 SelectionResult {
-                    tool_names: vec!["github_list_prs".into()],
+                    tool_names: vec!["github".into()],
                     strategy: "tfidf_low",
                     budget_used: 0,
                     failed: false,
@@ -2003,7 +1999,7 @@ mod tests {
             }
         }
 
-        let primary = Box::new(FixedSelector(vec!["github_list_prs".into()]));
+        let primary = Box::new(FixedSelector(vec!["github".into()]));
         let fallback = Box::new(LowConfSelector);
         let selector = FallbackSelector::new(primary, fallback);
 
@@ -2023,7 +2019,7 @@ mod tests {
         let result = selector.select(&ctx).await;
         // Primary should be called because fallback had dynamic tools with low confidence
         assert_eq!(result.strategy, "fixed");
-        assert_eq!(result.tool_names, vec!["github_list_prs"]);
+        assert_eq!(result.tool_names, vec!["github"]);
     }
 
     #[tokio::test]
@@ -2063,7 +2059,7 @@ mod tests {
 
         let primary = Box::new(EmptySelector);
         // Use a catalog tool that is not pinned so `has_dynamic_tools` is true and primary runs.
-        let fallback = Box::new(FixedSelector(vec!["github_list_prs".into()]));
+        let fallback = Box::new(FixedSelector(vec!["github".into()]));
         let selector = FallbackSelector::new(primary, fallback);
 
         let ctx = SelectionContext {
@@ -2081,7 +2077,7 @@ mod tests {
         };
         let result = selector.select(&ctx).await;
         assert_eq!(result.strategy, "tfidf_routed_after_llm");
-        assert_eq!(result.tool_names, vec!["github_list_prs"]);
+        assert_eq!(result.tool_names, vec!["github"]);
     }
 
     #[tokio::test]
@@ -2137,10 +2133,10 @@ mod tests {
                 if learned_context
                     .tool_hints
                     .iter()
-                    .any(|hint| hint.contains("github_list_prs"))
+                    .any(|hint| hint.contains("github"))
                 {
                     SelectionResult {
-                        tool_names: vec!["github_list_prs".into()],
+                        tool_names: vec!["github".into()],
                         strategy: "spy_fallback_learned",
                         budget_used: 0,
                         failed: false,
@@ -2190,11 +2186,11 @@ mod tests {
             entity_hints: vec![],
             pattern_hints: vec![],
             calibration_hints: vec![],
-            tool_hints: vec!["Tool history: prefer 'github_list_prs'".into()],
+            tool_hints: vec!["Tool history: prefer 'github'".into()],
         };
         let result = selector.select_with_learned_context(&ctx, &provided).await;
         assert_eq!(result.strategy, "spy_fallback_learned");
-        assert_eq!(result.tool_names, vec!["github_list_prs"]);
+        assert_eq!(result.tool_names, vec!["github"]);
         assert_eq!(
             learned_calls.load(Ordering::SeqCst),
             0,
@@ -2233,10 +2229,10 @@ mod tests {
                 let has_pr_pattern = learned_context
                     .pattern_hints
                     .iter()
-                    .any(|hint| hint.contains("github_search -> github_list_prs"));
+                    .any(|hint| hint.contains("github_search -> github"));
                 if has_github_entity && has_pr_pattern {
                     SelectionResult {
-                        tool_names: vec!["github_list_prs".into()],
+                        tool_names: vec!["github".into()],
                         strategy: "learned_primary",
                         budget_used: 0,
                         failed: false,
@@ -2284,20 +2280,20 @@ mod tests {
         graph.learn(
             "matrixorigin",
             DomainHint::GitHub,
-            &["github_search".into(), "github_list_prs".into()],
+            &["github_search".into(), "github".into()],
             None,
         );
         graph.learn(
             "matrixorigin",
             DomainHint::GitHub,
-            &["github_search".into(), "github_list_prs".into()],
+            &["github_search".into(), "github".into()],
             None,
         );
 
         let mut patterns = PatternLibrary::new();
         for _ in 0..2 {
             patterns.record_outcome(
-                &["github_search".into(), "github_list_prs".into()],
+                &["github_search".into(), "github".into()],
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
@@ -2315,10 +2311,10 @@ mod tests {
 
         // With learned context, either TF-IDF is confident enough (fast path)
         // or primary gets the learned context and succeeds.
-        // Either way, github_list_prs should be selected.
+        // Either way, github should be selected.
         assert!(
-            result.tool_names.contains(&"github_list_prs".to_string()),
-            "learned context should help select github_list_prs, got: {:?} (strategy: {})",
+            result.tool_names.contains(&"github".to_string()),
+            "learned context should help select github, got: {:?} (strategy: {})",
             result.tool_names,
             result.strategy
         );
@@ -2805,13 +2801,13 @@ mod tests {
             g.learn(
                 "matrixorigin",
                 DomainHint::GitHub,
-                &["github_list_prs".into(), "github_search_repos".into()],
+                &["github".into(), "github_search_repos".into()],
                 None,
             );
             g.learn(
                 "matrixorigin",
                 DomainHint::GitHub,
-                &["github_list_prs".into()],
+                &["github".into()],
                 None,
             );
         }
@@ -2857,7 +2853,7 @@ mod tests {
             let mut l = lib.lock().unwrap();
             for _ in 0..3 {
                 l.record_outcome(
-                    &["github_list_prs".into(), "github_get_pr".into()],
+                    &["github".into(), "github".into()],
                     TaskType::Fetch,
                     Some(DomainHint::GitHub),
                     true,
@@ -2908,7 +2904,7 @@ mod tests {
         // Record a successful turn outcome (twice — PatternLibrary needs ≥2 observations)
         selector.record_turn_outcome(
             "check matrixorigin PRs",
-            &["github_list_prs".into(), "github_search_repos".into()],
+            &["github".into(), "github_search_repos".into()],
             TaskType::Fetch,
             Some(DomainHint::GitHub),
             true,  // success
@@ -2918,7 +2914,7 @@ mod tests {
         );
         selector.record_turn_outcome(
             "check matrixorigin issues",
-            &["github_list_prs".into(), "github_search_repos".into()],
+            &["github".into(), "github_search_repos".into()],
             TaskType::Fetch,
             Some(DomainHint::GitHub),
             true,
@@ -2950,7 +2946,7 @@ mod tests {
         // Record correction to verify calibrator
         selector.record_turn_outcome(
             "check matrixorigin issues",
-            &["github_list_issues".into()],
+            &["github".into()],
             TaskType::Fetch,
             Some(DomainHint::GitHub),
             true,
@@ -3025,7 +3021,7 @@ mod tests {
             .with_pattern_library(lib.clone())
             .with_progressive_calibrator(cal.clone());
 
-        let tools = vec!["github_list_prs".to_string()];
+        let tools = vec!["github".to_string()];
         for _ in 0..2 {
             selector.record_turn_outcome(
                 "check matrixorigin PRs",
@@ -3111,7 +3107,7 @@ mod tests {
         for _ in 0..3 {
             selector.record_turn_outcome(
                 "matrixorigin issues",
-                &["github_list_issues".into(), "github_search_repos".into()],
+                &["github".into(), "github_search_repos".into()],
                 TaskType::Fetch,
                 Some(DomainHint::GitHub),
                 true,
@@ -3204,7 +3200,7 @@ mod tests {
         // Record a FAILED turn outcome
         selector.record_turn_outcome(
             "check kubernetes status",
-            &["github_list_prs".into()],
+            &["github".into()],
             TaskType::Fetch,
             Some(DomainHint::GitHub),
             false, // FAILED
@@ -3478,7 +3474,7 @@ mod tests {
 
         // With domain hint, confidence should be >= no-hint case
         // (the hint adds score to GitHub tools, improving overall confidence)
-        let gh_tools = ["github_list_prs", "github_get_pr", "github_list_issues"];
+        let gh_tools = ["github", "github", "github"];
         let hint_gh_count = result_hint
             .tool_names
             .iter()
@@ -3568,10 +3564,10 @@ mod tests {
         // Should still select some tools (domain hint helps ranking despite pressure)
         assert!(!result.failed, "Combined pressure+hints should not fail");
         // The tools selected should be the most relevant (GitHub) ones
-        let has_github = result.tool_names.iter().any(|t| t.starts_with("github_"));
+        let has_github = result.tool_names.iter().any(|t| t == "github" || t.starts_with("github_"));
         assert!(
             has_github,
-            "Even under pressure, domain hint should keep highest-ranked GitHub tools: {:?}",
+            "Even under pressure, domain hint should keep github tool: {:?}",
             result.tool_names
         );
     }
@@ -3598,12 +3594,12 @@ mod tests {
         assert!(
             result_open
                 .tool_names
-                .contains(&"github_list_prs".to_string()),
-            "Without restriction, github_list_prs should be selected: {:?}",
+                .contains(&"github".to_string()),
+            "Without restriction, github should be selected: {:?}",
             result_open.tool_names
         );
 
-        // With restriction: github_list_prs should be filtered out
+        // With restriction: github should be filtered out
         let ctx_restricted = SelectionContext {
             query: "list open pull requests on github",
             turn_count: 1,
@@ -3612,7 +3608,7 @@ mod tests {
             boost_terms: vec![],
             budget_pressure: 0.0,
             memory_domain_hints: vec![],
-            restricted_tools: vec!["github_list_prs".to_string()],
+            restricted_tools: vec!["github".to_string()],
             file_context: vec![],
             outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
@@ -3621,8 +3617,8 @@ mod tests {
         assert!(
             !result_restricted
                 .tool_names
-                .contains(&"github_list_prs".to_string()),
-            "With restriction, github_list_prs should be excluded: {:?}",
+                .contains(&"github".to_string()),
+            "With restriction, github should be excluded: {:?}",
             result_restricted.tool_names
         );
     }

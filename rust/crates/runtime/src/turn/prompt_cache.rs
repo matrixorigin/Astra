@@ -740,7 +740,7 @@ mod tests {
         let mut tools = vec![
             json!({"type": "function", "function": {"name": "bash"}}), // pinned
             json!({"type": "function", "function": {"name": "lsp"}}),  // dynamic
-            json!({"type": "function", "function": {"name": "memory_store"}}), // pinned
+            json!({"type": "function", "function": {"name": "memory"}}), // pinned
             json!({"type": "function", "function": {"name": "git_log"}}), // dynamic
         ];
         annotate_tool_schemas_for_caching(
@@ -970,7 +970,7 @@ mod tests {
         };
         let args = || {
             assemble_system_message_via_pipeline(
-                &["bash", "read_file", "memory_store"],
+                &["bash", "read_file", "memory"],
                 &[prompts::PromptSection::dynamic(
                     "extra content".to_string(),
                     prompts::PromptTokenBucket::Environment,
@@ -1422,10 +1422,10 @@ mod cache_stability_regression {
             schema("glob"),
             schema("git"),
             schema("git"),
-            schema("memory_store"),
-            schema("memory_retrieve"),
-            schema("memory_purge"),
-            schema("memory_correct"),
+            schema("memory"),
+            schema("memory"),
+            schema("memory"),
+            schema("memory"),
             schema("skill"),
         ]
     }
@@ -1521,7 +1521,7 @@ mod cache_stability_regression {
             schema("git_log"),      // dynamic (interleaved — shouldn't happen in production)
             schema("read_file"),    // pinned
             schema("mo_branch"),    // dynamic
-            schema("memory_store"), // pinned
+            schema("memory"), // pinned
             schema("web_fetch"),    // dynamic
         ];
         annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
@@ -1553,10 +1553,10 @@ mod cache_stability_regression {
             "glob",
             "git",
             "git",
-            "memory_store",
-            "memory_retrieve",
-            "memory_purge",
-            "memory_correct",
+            "memory",
+            "memory",
+            "memory",
+            "memory",
         ] {
             assert!(
                 pinned.contains(name),
