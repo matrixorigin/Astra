@@ -291,11 +291,25 @@ impl FileEditJournal {
     /// existing entry's sequence.
     ///
     /// Ring-buffer semantics apply: if `older.len() + self.len() > max_entries`,
-    /// the oldest entries (starting from `older`) are evicted.
+    /// the oldest entries (starting from `older`) are evicted. Self's
+    /// `max_entries` wins — the older journal's cap is ignored.
     ///
     /// **No on-disk side effects**. This is purely an in-memory merge —
     /// callers that want to sync the merged state to disk should call
     /// [`Self::save_to_dir`] afterward.
+    ///
+    /// **Invariant loss**: any [`Self::checkpoint`] token captured
+    /// before this call is invalidated. The re-sequencing means the
+    /// token no longer corresponds to a real boundary in the journal,
+    /// and passing it to [`Self::undo_turn_since`] will filter against
+    /// the new sequence space incorrectly. Capture fresh checkpoints
+    /// AFTER a merge.
+    ///
+    /// **Turn-index preservation**: older entries retain their original
+    /// `turn_index` values. Callers that filter by turn (`undo_turn`,
+    /// `files_in_turn`) will see merged-in entries appear under their
+    /// original turn numbers — which may bucket them with unrelated
+    /// self-originated entries if turn counters happen to overlap.
     ///
     /// Use case: a `ToolExecutor` is wiring a shared journal that
     /// already holds pre-session entries. The session's on-disk dir may
@@ -710,6 +724,42 @@ mod tests {
             .map(|e| e.tool_call_id.clone())
             .collect();
         assert_eq!(tags, vec!["old-2", "self-0", "self-1"]);
+    }
+
+    /// T69: when self's cap is tighter than the older journal's size,
+    /// and self is empty, merge keeps the newest N of older (not all of
+    /// them). Pins "self's max_entries wins" — important because
+    /// `load_from_dir` reads up to its own cap (typically 500), which
+    /// may not match the bound journal's cap.
+    #[test]
+    fn merge_older_entries_self_cap_wins_when_tighter_than_older() {
+        let tmp = TempDir::new().unwrap();
+        let mk = |j: &mut FileEditJournal, tag: &str| {
+            let f = tmp.path().join(tag);
+            std::fs::write(&f, b"x").unwrap();
+            j.record_before(&f, tag, 0);
+            j.record_after(&f, tag, b"y");
+        };
+
+        // Self has cap=3, empty. Older has 5 entries (its own cap=10).
+        let mut j = FileEditJournal::new(3);
+        let mut older = FileEditJournal::new(10);
+        mk(&mut older, "old-0");
+        mk(&mut older, "old-1");
+        mk(&mut older, "old-2");
+        mk(&mut older, "old-3");
+        mk(&mut older, "old-4");
+
+        j.merge_older_entries(older);
+
+        // Self.max_entries=3 wins: keep newest 3 of older.
+        assert_eq!(j.len(), 3);
+        let tags: Vec<String> = j
+            .entries_for_test()
+            .iter()
+            .map(|e| e.tool_call_id.clone())
+            .collect();
+        assert_eq!(tags, vec!["old-2", "old-3", "old-4"]);
     }
 
     /// Merging an empty older journal is a no-op.

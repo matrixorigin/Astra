@@ -635,18 +635,41 @@ impl ToolExecutor {
         if let Some(dir) = file_checkpoint_dir_for(&session_id)
             && let Ok(mut journal) = self.file_journal.lock()
         {
-            // Idempotence: if the journal is already bound to the same
-            // dir, skip the merge (it would re-read our own flushed
-            // entries and prepend them as older duplicates).
-            if journal.persist_dir() == Some(dir.as_path()) {
-                // Nothing to do — already configured for this session.
-            } else {
-                if let Ok(disk_journal) =
-                    astra_turn_core::file_edit_journal::FileEditJournal::load_from_dir(&dir, 500)
-                {
-                    journal.merge_older_entries(disk_journal);
+            // Three cases:
+            //   (a) Already bound to the same dir → idempotent short-circuit.
+            //       Skipping the merge prevents re-reading our own flushed
+            //       entries and prepending them as older duplicates.
+            //   (b) Bound to a DIFFERENT dir → rebinding sessions.
+            //       Sessions are isolation boundaries: sid1's entries must
+            //       NOT leak into sid2's dir. Reset in-memory state
+            //       before loading sid2's own disk history.
+            //   (c) Unbound → first binding. Merge disk entries under any
+            //       pre-session in-memory entries (R9.1).
+            match journal.persist_dir() {
+                Some(existing) if existing == dir.as_path() => {
+                    // Case (a): nothing to do.
                 }
-                journal.enable_persistence(dir);
+                Some(_) => {
+                    // Case (b): different session. Clear memory first so
+                    // sid1 entries don't flow into sid2's dir via the
+                    // initial flush. Then load sid2's own disk state.
+                    *journal = astra_turn_core::file_edit_journal::FileEditJournal::new(500);
+                    if let Ok(disk_journal) =
+                        astra_turn_core::file_edit_journal::FileEditJournal::load_from_dir(&dir, 500)
+                    {
+                        journal.merge_older_entries(disk_journal);
+                    }
+                    journal.enable_persistence(dir);
+                }
+                None => {
+                    // Case (c): first binding — R9.1 merge policy.
+                    if let Ok(disk_journal) =
+                        astra_turn_core::file_edit_journal::FileEditJournal::load_from_dir(&dir, 500)
+                    {
+                        journal.merge_older_entries(disk_journal);
+                    }
+                    journal.enable_persistence(dir);
+                }
             }
         }
         if let Ok(mut guard) = self.active_session_id.lock() {
@@ -2205,6 +2228,64 @@ mod tests {
         assert_eq!(
             h1_count_before, h1_count_after,
             "rebinding must not touch the old session's dir"
+        );
+    }
+
+    /// R10.1: rebinding to a different session starts that new session
+    /// with a **clean slate** — the old session's in-memory entries
+    /// do NOT carry forward into the new session's disk dir.
+    ///
+    /// Rationale: sessions are isolation boundaries. An entry recorded
+    /// under sid1 is logically part of sid1's history. If a user
+    /// rebinds to sid2 (e.g. switching working contexts mid-process),
+    /// sid2 should not inherit ghost entries that were never part of
+    /// its own edit history.
+    ///
+    /// Before this policy, rebind carried memory forward and
+    /// `enable_persistence`'s initial flush wrote those carryover
+    /// entries into sid2's dir.
+    #[serial_test::serial]
+    #[test]
+    fn rebind_different_sid_does_not_leak_entries_into_new_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CheckpointRootGuard::set(tmp.path());
+        let work = tempfile::tempdir().unwrap();
+        let file = work.path().join("f.txt");
+        std::fs::write(&file, b"v0").unwrap();
+
+        let executor = test_executor().with_active_session_id("session-i1");
+        {
+            let mut j = executor.file_journal.lock().unwrap();
+            j.record_before(&file, "call-i1", 0);
+            j.record_after(&file, "call-i1", b"v1");
+        }
+        // Confirm sid1 has an entry in memory.
+        assert_eq!(executor.file_journal.lock().unwrap().len(), 1);
+
+        // Rebind to a fresh session.
+        executor.set_active_session_id("session-i2");
+        let i2_dir = tmp.path().join("session-i2").join("file_checkpoints");
+
+        // In-memory journal starts clean under the new session.
+        assert_eq!(
+            executor.file_journal.lock().unwrap().len(),
+            0,
+            "memory must be cleared on rebind-to-different-sid"
+        );
+        // sid2's dir must NOT contain sid1's entry.
+        let i2_count = std::fs::read_dir(&i2_dir)
+            .map(|r| {
+                r.flatten()
+                    .filter(|e| {
+                        e.path().extension().and_then(|x| x.to_str()) == Some("json")
+                            && !e.file_name().to_string_lossy().starts_with('.')
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            i2_count, 0,
+            "sid2 dir must be empty — sid1 entries must not leak"
         );
     }
 
