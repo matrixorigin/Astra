@@ -101,6 +101,13 @@ pub(crate) struct ReplState {
     /// Session-level goal derived from the first substantive user message.
     /// Survives compaction and is injected alongside the continuation anchor.
     pub session_goal: Option<String>,
+    /// One-shot diagnostics context injected by `/ask`. Prepended to the next
+    /// user message so the LLM sees runtime state alongside the question.
+    /// Consumed (cleared) after one turn.
+    pub diagnostics_context: Option<String>,
+    /// Message queued by a slash command (e.g. `/ask`) for immediate send
+    /// on the next REPL iteration. Consumed once after dispatch.
+    pub queued_message: Option<String>,
     /// Suggested next prompt shown after a completed turn when the next action is obvious.
     pub pending_followup_suggestion: Option<crate::followup_suggestion::FollowupSuggestion>,
     pub explain: ExplainMode,
@@ -408,6 +415,8 @@ impl Default for ReplState {
             task_manager: std::sync::Arc::new(crate::edge_tools::TaskManager::new()),
             continuation_anchor: None,
             session_goal: None,
+            diagnostics_context: None,
+            queued_message: None,
             pending_followup_suggestion: None,
             explain: ExplainMode::Off,
             verbose_mode: true,

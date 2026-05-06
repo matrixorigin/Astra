@@ -534,6 +534,47 @@ pub(super) async fn handle_slash_command(
             slash_session::handle_resume_command(arg, profile, api, state).await;
         }
 
+        "/ask" => {
+            if arg.trim().is_empty() {
+                eprintln!("{}", "  Usage: /ask <question about this session>".yellow());
+                eprintln!(
+                    "{}",
+                    "  Example: /ask why is my cache hit rate low?"
+                        .dim()
+                );
+            } else {
+                // Build diagnostics context and inject WITH the question.
+                let mut diag_parts = Vec::new();
+                diag_parts.push("[Runtime Diagnostics]".to_string());
+                diag_parts.push(format!("Turn: {}", state.turn));
+                diag_parts.push(format!(
+                    "Tokens: {}in + {}out (cache_read={}, cache_create={})",
+                    state.total_prompt_tokens,
+                    state.total_completion_tokens,
+                    state.total_cache_read_tokens,
+                    state.total_cache_creation_tokens,
+                ));
+                let total_in = state.total_prompt_tokens
+                    + state.total_cache_read_tokens
+                    + state.total_cache_creation_tokens;
+                let cache_pct = if total_in > 0 {
+                    state.total_cache_read_tokens as f64 / total_in as f64 * 100.0
+                } else {
+                    0.0
+                };
+                diag_parts.push(format!("Cache hit rate: {cache_pct:.1}%"));
+                diag_parts.push(format!(
+                    "\nAnswer this question using the diagnostics above: {}",
+                    arg
+                ));
+                state.diagnostics_context = Some(diag_parts.join("\n"));
+                // Queue the user's question for immediate dispatch. The REPL
+                // loop picks up queued_message and sends it as if the user typed
+                // it, with diagnostics_context prepended by build_effective_line.
+                state.queued_message = Some(arg.to_string());
+            }
+        }
+
         "/stats" => {
             slash_stats::handle_stats_command(arg, state).await;
         }

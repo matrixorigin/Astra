@@ -571,6 +571,22 @@ async fn run_chat_repl(
                             );
                         }
 
+                        // /ask (and future slash commands) can queue a message for
+                        // immediate dispatch — send it as if the user typed it.
+                        if let Some(queued) = state.queued_message.take() {
+                            handle_chat_input(
+                                queued,
+                                current_token.as_deref(),
+                                &mut state,
+                                ReplTurnContext {
+                                    api,
+                                    profile,
+                                    selector: &*selector,
+                                },
+                            )
+                            .await?;
+                        }
+
                         // If /plan auto triggered execution, start the background executor
                         if state.executing_plan.is_some() && state.plan_mode.is_none() {
                             start_and_monitor_plan(
