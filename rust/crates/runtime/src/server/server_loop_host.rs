@@ -1945,17 +1945,21 @@ impl ServerAgenticLoopHost {
         )
     }
 
-    /// Build the LLM message array from loop state.
+    /// Run Memoria-based history compaction on the current conversation.
     ///
-    /// `tier` is the compaction tier selected by the context pipeline's planner.
-    /// This function must NOT re-derive a tier — using a different tier than the
-    /// pipeline caused silent drift between planner decisions and Memoria
-    /// compaction decisions (two independent tier calculations that disagreed).
+    /// Returns the compacted message list ready to feed into the LLM request
+    /// (between system_messages and the skill/file attachments). Pure async
+    /// side-effect wrapper around `cloud::memoria_compact::compact_with_memoria`;
+    /// no mutation of runtime state.
+    ///
+    /// `tier` must come from the pipeline planner — using a runtime-derived
+    /// tier here used to produce drift between pipeline and Memoria compaction
+    /// decisions. See the Phase 1 refactor commit for history.
     #[allow(clippy::too_many_arguments)]
-    async fn build_llm_messages(
+    async fn compact_messages_via_memoria(
         &self,
-        system_messages: Vec<Value>,
         state: &AgenticLoopState,
+        system_messages: &[Value],
         visible_tools: &[Value],
         tier: CompactionTier,
         model_name: &str,
@@ -1965,16 +1969,13 @@ impl ServerAgenticLoopHost {
         header_overrides: &HashMap<String, String>,
         completions_url_override: Option<&str>,
         request_timeout: Option<Duration>,
-        cache_cfg: &PromptCacheConfig,
     ) -> Vec<Value> {
-        let mut llm_messages = system_messages;
-
         let budget = crate::prompts::budget_for_model(Some(model_name));
         let budget_chars = budget.effective_input_limit() * 4;
 
-        // For Memoria's `current_tokens` signal — memoria uses this as the
-        // "budget pressure" knob for retrieval. We still need an estimate here;
-        // Phase 3 will move this into the pipeline and this can disappear.
+        // Memoria's `current_tokens` signal — used as a budget-pressure knob
+        // for retrieval. `tier` is the authoritative compaction choice; this
+        // scalar only controls Memoria's internal retrieval aggressiveness.
         let tool_schema_tokens: usize = visible_tools
             .iter()
             .map(|t| {
@@ -1983,15 +1984,10 @@ impl ServerAgenticLoopHost {
                     .unwrap_or(50)
             })
             .sum();
-        let mut all_msgs = llm_messages.clone();
+        let mut all_msgs = system_messages.to_vec();
         all_msgs.extend(state.messages.iter().cloned());
         let cache_est = crate::prompts::estimate_tokens_cache_aware(&all_msgs, tool_schema_tokens);
 
-        // Tool result compaction is handled by compact_tool_results_adaptive
-        // in agentic_loop_lifecycle.rs. No separate analytics pass needed.
-        let micro_compacted_messages = state.messages.clone();
-
-        // Use Memoria-based compaction (async with HTTP client)
         let memoria_config = crate::turn::cloud::memoria_compact::MemoriaCompactConfig::default();
         let cwd = self.edge_profile.get("cwd").and_then(|v| v.as_str());
         let (session_memory_file, session_memory_combine) =
@@ -2010,10 +2006,7 @@ impl ServerAgenticLoopHost {
             session_facts: None,
         };
 
-        // Try to create Memoria client from environment
         let memoria_client = crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
-
-        // Build summary client for LLM-based compaction (uses same model as main LLM)
         let compact_config = crate::prompts::CompactConfig::from_env();
         let summary_client = RequestAwareSummaryClient {
             model_name: model_name.to_string(),
@@ -2026,8 +2019,8 @@ impl ServerAgenticLoopHost {
             request_timeout,
         };
 
-        let compact_result = crate::turn::cloud::memoria_compact::compact_with_memoria(
-            &micro_compacted_messages,
+        crate::turn::cloud::memoria_compact::compact_with_memoria(
+            &state.messages,
             Some(&self.session_id),
             &memoria_config,
             &memoria_params,
@@ -2037,18 +2030,40 @@ impl ServerAgenticLoopHost {
             Some(&compact_config),
             Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
         )
-        .await;
+        .await
+        .messages
+    }
 
-        llm_messages.extend(compact_result.messages);
-        // Strip old reasoning to reduce input tokens (see edge_ledger::strip_stale_reasoning).
+    /// Pure assembly step: take the pipeline-produced system messages, the
+    /// Memoria-compacted conversation messages, and the per-turn runtime
+    /// injections (skill attachments, recent-file attachments, skill listing),
+    /// and stitch them into the final wire-ready `llm_messages` array —
+    /// including protocol-level Anthropic cache annotations.
+    ///
+    /// Contains no Memoria or LLM calls; it's the last pure assembly step
+    /// before `call_llm_and_collect_with_request_overrides`. Extracted from
+    /// `build_llm_messages` in Phase 3 so the async Memoria step is visible
+    /// in `execute_turn` rather than buried inside a monolithic helper.
+    fn assemble_llm_messages(
+        &self,
+        system_messages: Vec<Value>,
+        compacted_messages: Vec<Value>,
+        state: &AgenticLoopState,
+        provider: &str,
+        model_name: &str,
+        cache_cfg: &PromptCacheConfig,
+    ) -> Vec<Value> {
+        let mut llm_messages = system_messages;
+        llm_messages.extend(compacted_messages);
         astra_turn_core::edge_ledger::strip_stale_reasoning(
             &mut llm_messages,
             provider,
             model_name,
         );
 
-        // Post-compaction: re-inject invoked skill instructions (truncated)
-        // so the LLM retains skill context after history summarization.
+        // Post-compaction skill re-injection: if any skill has been invoked
+        // earlier in the session, re-inject its (truncated) instructions so
+        // the LLM retains skill context even after history compaction.
         if !state.skills.invoked.is_empty() {
             let mut builder = astra_turn_core::cloud_attachments::AttachmentBuilder::new();
             let mut skills: Vec<_> = state.skills.invoked.values().collect();
@@ -2060,8 +2075,7 @@ impl ServerAgenticLoopHost {
             llm_messages.extend(attachments.to_messages());
         }
 
-        // Post-compaction: re-inject recently-read file contents so the LLM
-        // retains awareness of code it was working with before compaction.
+        // Post-compaction recently-read file re-injection.
         if !state.recent_file_reads.is_empty() {
             let cwd = self.edge_profile.get("cwd").and_then(|v| v.as_str());
             let file_messages = astra_turn_core::cloud_attachments::restore_recent_files(
@@ -2071,12 +2085,13 @@ impl ServerAgenticLoopHost {
             llm_messages.extend(file_messages);
         }
 
-        // Ephemeral skill listing: injected per-turn, not stored in state.messages.
+        // Ephemeral per-turn skill listing (not stored in state.messages).
         if let Some(ref listing) = state.skills.listing_message {
             llm_messages.push(listing.clone());
         }
 
-        // Add Anthropic protocol-level prompt-cache metadata on the request clone.
+        // Protocol-level Anthropic cache metadata (last-message breakpoint,
+        // cache_edits block, tool-result cache_references).
         apply_anthropic_cache_metadata(&mut llm_messages, cache_cfg, &self.session_id);
 
         llm_messages
@@ -2341,10 +2356,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
         self.emit_context_meta(&system_prompt_breakdown);
 
-        let llm_messages = self
-            .build_llm_messages(
-                system_messages,
+        // Phase 3: Memoria compaction is now a named async step, separate
+        // from the pure assembly step. `execute_turn` orchestrates both so
+        // the wire-building flow is readable and each phase is individually
+        // testable / replaceable.
+        let compacted_messages = self
+            .compact_messages_via_memoria(
                 state,
+                &system_messages,
                 &visible_tools,
                 tier,
                 &llm_cfg.model_name,
@@ -2354,9 +2373,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &llm_cfg.header_overrides,
                 llm_cfg.completions_url_override.as_deref(),
                 llm_cfg.request_timeout,
-                &cache_cfg,
             )
             .await;
+        let llm_messages = self.assemble_llm_messages(
+            system_messages,
+            compacted_messages,
+            state,
+            &llm_cfg.provider,
+            &llm_cfg.model_name,
+            &cache_cfg,
+        );
 
         // ── 3. Call LLM ─────────────────────────────────────────────────
         let budget = crate::prompts::budget_for_model(Some(&llm_cfg.model_name));
@@ -3914,7 +3940,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_llm_messages_includes_system_and_user() {
+    async fn assemble_llm_messages_includes_system_and_user() {
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -3929,22 +3955,18 @@ mod tests {
             .messages
             .push(json!({"role": "user", "content": "hello"}));
 
-        let msgs = host
-            .build_llm_messages(
-                vec![json!({"role": "system", "content": "system prompt text"})],
-                &state,
-                &host.edge_tools,
-                CompactionTier::Normal,
-                "gpt-4",
-                "sk-test",
-                "https://api.test.com",
-                "openai",
-                &HashMap::new(),
-                None,
-                None,
-                &PromptCacheConfig::latch("openai", "gpt-4"),
-            )
-            .await;
+        // `assemble_llm_messages` is the pure stitching step after Phase 3 —
+        // no Memoria I/O. With Normal tier Memoria passes messages through
+        // unchanged, so feeding `state.messages` directly as the compacted
+        // list is equivalent to the real runtime path here.
+        let msgs = host.assemble_llm_messages(
+            vec![json!({"role": "system", "content": "system prompt text"})],
+            state.messages.clone(),
+            &state,
+            "openai",
+            "gpt-4",
+            &PromptCacheConfig::latch("openai", "gpt-4"),
+        );
         assert!(msgs.len() >= 2, "should have system + user messages");
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[0]["content"], "system prompt text");
