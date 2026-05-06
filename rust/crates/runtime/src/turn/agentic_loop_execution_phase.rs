@@ -9,13 +9,12 @@ use super::agentic_loop_lifecycle::{
     TurnIterationPrep, current_agentic_step, interruption_state_summary, session_turn_number,
     tool_record_is_workspace_mutation,
 };
-use astra_turn_core::compaction_types::CompactionTier;
-
 use astra_turn_core::agentic_turn_ingest::{
     AgenticIngestIterationControl, AgenticTurnIngestMut, AgenticTurnIngestOutcome,
     agentic_turn_stream_snapshot_with_kind, ingest_agentic_turn_stream,
     map_ingest_outcome_to_iteration_control,
 };
+use astra_turn_core::compaction_types::CompactionTier;
 use astra_turn_core::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
 
 /// Lazily-initialized process-wide alert dispatcher.

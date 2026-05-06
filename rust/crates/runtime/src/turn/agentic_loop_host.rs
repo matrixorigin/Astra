@@ -1465,6 +1465,18 @@ pub(crate) mod tests {
     use astra_services::session_journal::SURGICAL_REMOVAL_TOOL_NAME;
     use serde_json::json;
 
+    /// Unwind-safe cleanup guard for tests that write under
+    /// `session_journal::local_sessions_dir()`. Removes the provided directory
+    /// on drop — including during panic unwinds from failed assertions — so
+    /// repeated runs don't leak `tier-gate-*` / `precompact-spill-*` siblings.
+    struct SpillDirGuard(std::path::PathBuf);
+
+    impl Drop for SpillDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     // ── Flexible mock host for multi-turn scenarios ─────────────────────────
 
     pub(crate) struct MockHost {
@@ -4615,7 +4627,8 @@ pub(crate) mod tests {
                 .expect("system time")
                 .as_nanos()
         );
-        let spill_dir = astra_services::session_journal::local_sessions_dir().join(&session_id);
+        let _guard =
+            SpillDirGuard(astra_services::session_journal::local_sessions_dir().join(&session_id));
 
         let mut host = MockHost::new(vec![
             edge_tool_result(
@@ -4664,8 +4677,6 @@ pub(crate) mod tests {
             !has_budget_wrapup_msg,
             "spill recovery should avoid injecting the hard wrap-up message"
         );
-
-        let _ = std::fs::remove_dir_all(spill_dir);
     }
 
     #[tokio::test]
@@ -4684,7 +4695,8 @@ pub(crate) mod tests {
                 .expect("system time")
                 .as_nanos()
         );
-        let spill_dir = astra_services::session_journal::local_sessions_dir().join(&session_id);
+        let _guard =
+            SpillDirGuard(astra_services::session_journal::local_sessions_dir().join(&session_id));
 
         let mut host = MockHost::new(vec![
             edge_tool_result(
@@ -4733,8 +4745,6 @@ pub(crate) mod tests {
             !has_cleared_tombstone,
             "tier-1 mechanical compression must be skipped when compact_tier_applied >= CompactHistory",
         );
-
-        let _ = std::fs::remove_dir_all(spill_dir);
     }
 
     // ── Rate-limit graceful degradation tests ───────────────────────────────
