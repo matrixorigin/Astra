@@ -152,7 +152,7 @@ pub(crate) fn assemble_system_message_via_pipeline(
 /// `tool_schemas` is the raw tool set the bridge wanted to expose; the
 /// returned `tool_schemas` is the tier-pruned view from the pipeline's
 /// Optimize phase (mirrors `server_loop_host::PipelineTurnOutcome.tool_schemas`).
-#[allow(clippy::too_many_arguments)]
+///
 /// Extra-sections are split into two lanes per cache strategy:
 ///
 /// * `extra_stable_sections` — session-stable bridge-composed content

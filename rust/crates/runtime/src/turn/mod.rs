@@ -48,6 +48,7 @@ pub mod skill_tool;
 pub mod token_usage;
 pub(crate) mod tool_side_effects;
 pub mod turn_trace_collector;
+pub(crate) mod wire_assembly;
 
 #[cfg(feature = "bridge-e2e-hooks")]
 pub mod stream_idle_test_hooks {

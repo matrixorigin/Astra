@@ -1586,51 +1586,14 @@ impl InProcessChatTurnBridge {
             // Merge tool results into messages (handle continuation turns)
             // Client sends complete message history including tool role messages,
             // so we just use messages directly.
+            //
+            // Phase 3/Convergence: both the bridge and `ServerAgenticLoopHost`
+            // now route through the shared `wire_assembly::MemoriaContext`.
+            // The summary client still constructs here (it captures the
+            // current request's auth headers + overrides) and is injected.
             let (merged_messages, _initial_tier) = {
                 let raw = messages.clone();
 
-                // Tool result compaction is handled by compact_tool_results_adaptive
-                // in agentic_loop_lifecycle.rs. No separate analytics pass here.
-
-                // Pipeline tier is authoritative — do not re-derive a second tier
-                // from raw token estimates here (caused drift between planner and
-                // Memoria decisions). Memoria still needs a `current_tokens` signal
-                // as a pressure knob until Phase 3 moves it into the pipeline; use
-                // cache-aware estimation for that value only, not for tier choice.
-                let budget = crate::prompts::budget_for_model(Some(&model_name));
-                let tool_schema_tokens: usize = edge_tools.iter()
-                    .map(|t| serde_json::to_string(t).map(|s| crate::prompts::estimate_str_tokens(&s)).unwrap_or(50))
-                    .sum();
-                let mut all_msgs = llm_messages.clone();
-                all_msgs.extend(raw.iter().cloned());
-                let cache_est = crate::prompts::estimate_tokens_cache_aware(&all_msgs, tool_schema_tokens);
-                let tier = pipeline_tier;
-                // Use effective input limit as char budget (×4 for char-to-token ratio)
-                let budget_chars = budget.effective_input_limit() * 4;
-
-                // Use Memoria-based compaction (async with HTTP client)
-                let memoria_config = crate::turn::cloud::memoria_compact::MemoriaCompactConfig::default();
-                let cwd = edge_profile.get("cwd").and_then(Value::as_str);
-                let (session_memory_file, session_memory_combine) =
-                    crate::turn::cloud::memoria_compact::resolve_session_memory_file_options(
-                        &session_id,
-                        cwd,
-                    );
-                let memoria_params = crate::turn::cloud::memoria_compact::MemoriaCompactParams {
-                    budget_chars,
-                    keep_chars: 2_000,
-                    tier,
-                    keep_recent_turns: budget.keep_recent_turns,
-                    current_tokens: cache_est.total_tokens,
-                    session_memory_file,
-                    session_memory_combine,
-                    session_facts: session_facts_shared.lock().ok().map(|f| f.clone()),
-                };
-
-                // Reuse shared Memoria client for compaction
-                let memoria_client = memoria_client_shared.clone();
-
-                // Build summary client for LLM-based compaction
                 let compact_config = crate::prompts::CompactConfig::from_env();
                 let summary_client = astra_turn_core::cloud_summary::HttpSummaryClient::new(
                     astra_turn_core::cloud_summary::LlmConnParams {
@@ -1641,68 +1604,41 @@ impl InProcessChatTurnBridge {
                         max_output_tokens: compact_config.summary_token_budget,
                     },
                 );
+                let memoria_client = memoria_client_shared.clone();
 
-                let compact_result = crate::turn::cloud::memoria_compact::compact_with_memoria(
-                    &raw,
-                    Some(&session_id),
-                    &memoria_config,
-                    &memoria_params,
-                    memoria_client.as_ref().map(|c| c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient),
-                    Some(&compact_config),
-                    Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
-                )
-                .await;
+                let ctx = crate::turn::wire_assembly::MemoriaContext {
+                    session_id: &session_id,
+                    model_name: &model_name,
+                    memoria_client: memoria_client.as_ref().map(|c| {
+                        c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient
+                    }),
+                    summary_client: Some(
+                        &summary_client
+                            as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
+                    ),
+                    tier: pipeline_tier,
+                    cwd: edge_profile.get("cwd").and_then(Value::as_str),
+                    session_facts: session_facts_shared.lock().ok().map(|f| f.clone()),
+                };
 
-                // ── P2: Continuation prompt after compaction ──
-                // When compaction removed messages, append a user-role nudge so the
-                // LLM resumes the task instead of asking "how can I help?"
-                // Skip if the last assistant message signals task completion.
+                let compact_result = ctx
+                    .compact(
+                        &raw,
+                        &llm_messages,
+                        &edge_tools,
+                        &HashMap::new(),
+                        None,
+                        None,
+                    )
+                    .await;
+
                 let mut msgs = compact_result.messages;
-                if compact_result.boundary.is_some() && msgs.len() >= 2 {
-                    let last_is_user = msgs.last()
-                        .and_then(|m| m.get("role").and_then(Value::as_str))
-                        == Some("user");
-                    let last_signals_done = msgs.last()
-                        .and_then(|m| m.get("content").and_then(Value::as_str))
-                        .map(|c| {
-                            // Check only the last ~200 chars (the conclusion) to avoid
-                            // false positives from negations in earlier context.
-                            let tail = if c.len() > 200 { &c[c.floor_char_boundary(c.len() - 200)..] } else { c };
-                            let lower = tail.to_ascii_lowercase();
-                            let has_completion = lower.contains("task complete") || lower.contains("all done")
-                                || lower.contains("finished") || lower.contains("completed successfully")
-                                || lower.contains("任务完成") || lower.contains("已完成");
-                            if !has_completion { return false; }
-                            // Only check negation near the completion phrase (same tail)
-                            let has_negation = lower.contains("not yet") || lower.contains("not complete")
-                                || lower.contains("not finished") || lower.contains("haven't finished")
-                                || lower.contains("hasn't finished") || lower.contains("won't be finished")
-                                || lower.contains("don't think") || lower.contains("not sure")
-                                || lower.contains("没有完成") || lower.contains("尚未完成")
-                                || lower.contains("except") || lower.contains("but ");
-                            has_completion && !has_negation
-                        })
-                        .unwrap_or(false);
-                    if !last_is_user && !last_signals_done {
-                        // Detect if conversation is primarily CJK (Chinese/Japanese/Korean)
-                        let is_cjk = msgs.iter().rev().take(4)
-                            .filter_map(|m| m.get("content").and_then(Value::as_str))
-                            .any(|c| c.chars().take(200).filter(|ch| ('\u{4e00}'..='\u{9fff}').contains(ch)).count() > 10);
-                        let prompt = if is_cjk {
-                            "从上次中断的地方继续。不要向用户提问，直接继续当前任务。"
-                        } else {
-                            "Continue the conversation from where it left off. \
-                             Do not ask the user any further questions — \
-                             pick up the current task and keep going."
-                        };
-                        msgs.push(serde_json::json!({
-                            "role": "user",
-                            "content": prompt
-                        }));
-                    }
-                }
+                crate::turn::wire_assembly::maybe_append_continuation_prompt(
+                    &mut msgs,
+                    compact_result.boundary.is_some(),
+                );
 
-                (msgs, tier) // tier only feeds memoria_compact params
+                (msgs, pipeline_tier)
             };
 
             llm_messages.extend(merged_messages);

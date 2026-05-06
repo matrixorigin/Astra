@@ -36,9 +36,7 @@ use crate::turn::llm_client::{
     call_llm_nonstream_fallback_with_request_overrides, llm_connect_timeout, llm_fallback_timeout,
     sleep_ms_or_llm_cancel,
 };
-use crate::turn::prompt_cache::{
-    PromptCacheConfig, annotate_tool_schemas_for_caching, apply_anthropic_cache_metadata,
-};
+use crate::turn::prompt_cache::{PromptCacheConfig, annotate_tool_schemas_for_caching};
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_core::SharedPool;
 use astra_services::LlmTokenServiceConfig;
@@ -1945,16 +1943,10 @@ impl ServerAgenticLoopHost {
         )
     }
 
-    /// Run Memoria-based history compaction on the current conversation.
-    ///
-    /// Returns the compacted message list ready to feed into the LLM request
-    /// (between system_messages and the skill/file attachments). Pure async
-    /// side-effect wrapper around `cloud::memoria_compact::compact_with_memoria`;
-    /// no mutation of runtime state.
-    ///
-    /// `tier` must come from the pipeline planner — using a runtime-derived
-    /// tier here used to produce drift between pipeline and Memoria compaction
-    /// decisions. See the Phase 1 refactor commit for history.
+    /// Run the Memoria compaction step and return the full `CompactResult`
+    /// (messages + boundary). The boundary is what the caller inspects to
+    /// decide whether to append the P2 continuation prompt — the bridge path
+    /// does this inline, so we expose the same signal here for parity.
     #[allow(clippy::too_many_arguments)]
     async fn compact_messages_via_memoria(
         &self,
@@ -1969,44 +1961,7 @@ impl ServerAgenticLoopHost {
         header_overrides: &HashMap<String, String>,
         completions_url_override: Option<&str>,
         request_timeout: Option<Duration>,
-    ) -> Vec<Value> {
-        let budget = crate::prompts::budget_for_model(Some(model_name));
-        let budget_chars = budget.effective_input_limit() * 4;
-
-        // Memoria's `current_tokens` signal — used as a budget-pressure knob
-        // for retrieval. `tier` is the authoritative compaction choice; this
-        // scalar only controls Memoria's internal retrieval aggressiveness.
-        let tool_schema_tokens: usize = visible_tools
-            .iter()
-            .map(|t| {
-                serde_json::to_string(t)
-                    .map(|s| crate::prompts::estimate_str_tokens(&s))
-                    .unwrap_or(50)
-            })
-            .sum();
-        let mut all_msgs = system_messages.to_vec();
-        all_msgs.extend(state.messages.iter().cloned());
-        let cache_est = crate::prompts::estimate_tokens_cache_aware(&all_msgs, tool_schema_tokens);
-
-        let memoria_config = crate::turn::cloud::memoria_compact::MemoriaCompactConfig::default();
-        let cwd = self.edge_profile.get("cwd").and_then(|v| v.as_str());
-        let (session_memory_file, session_memory_combine) =
-            crate::turn::cloud::memoria_compact::resolve_session_memory_file_options(
-                &self.session_id,
-                cwd,
-            );
-        let memoria_params = crate::turn::cloud::memoria_compact::MemoriaCompactParams {
-            budget_chars,
-            keep_chars: 2_000,
-            tier,
-            keep_recent_turns: budget.keep_recent_turns,
-            current_tokens: cache_est.total_tokens,
-            session_memory_file,
-            session_memory_combine,
-            session_facts: None,
-        };
-
-        let memoria_client = crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
+    ) -> crate::turn::cloud::compaction::CompactResult {
         let compact_config = crate::prompts::CompactConfig::from_env();
         let summary_client = RequestAwareSummaryClient {
             model_name: model_name.to_string(),
@@ -2018,32 +1973,37 @@ impl ServerAgenticLoopHost {
             completions_url_override: completions_url_override.map(String::from),
             request_timeout,
         };
+        let memoria_client = crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
 
-        crate::turn::cloud::memoria_compact::compact_with_memoria(
-            &state.messages,
-            Some(&self.session_id),
-            &memoria_config,
-            &memoria_params,
-            memoria_client
+        let ctx = crate::turn::wire_assembly::MemoriaContext {
+            session_id: &self.session_id,
+            model_name,
+            memoria_client: memoria_client
                 .as_ref()
                 .map(|c| c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient),
-            Some(&compact_config),
-            Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
+            summary_client: Some(
+                &summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
+            ),
+            tier,
+            cwd: self.edge_profile.get("cwd").and_then(|v| v.as_str()),
+            session_facts: None,
+        };
+        ctx.compact(
+            &state.messages,
+            system_messages,
+            visible_tools,
+            header_overrides,
+            completions_url_override,
+            request_timeout,
         )
         .await
-        .messages
     }
 
-    /// Pure assembly step: take the pipeline-produced system messages, the
-    /// Memoria-compacted conversation messages, and the per-turn runtime
-    /// injections (skill attachments, recent-file attachments, skill listing),
-    /// and stitch them into the final wire-ready `llm_messages` array —
-    /// including protocol-level Anthropic cache annotations.
-    ///
-    /// Contains no Memoria or LLM calls; it's the last pure assembly step
-    /// before `call_llm_and_collect_with_request_overrides`. Extracted from
-    /// `build_llm_messages` in Phase 3 so the async Memoria step is visible
-    /// in `execute_turn` rather than buried inside a monolithic helper.
+    /// Thin wrapper around [`wire_assembly::assemble_llm_messages`] that
+    /// extracts the server-path-specific attachments from `AgenticLoopState`
+    /// (invoked skills + recently-read files) and delegates the rest. The
+    /// shared module handles `strip_stale_reasoning`, continuation-prompt
+    /// insertion, attachment ordering, and cache annotations.
     fn assemble_llm_messages(
         &self,
         system_messages: Vec<Value>,
@@ -2053,48 +2013,38 @@ impl ServerAgenticLoopHost {
         model_name: &str,
         cache_cfg: &PromptCacheConfig,
     ) -> Vec<Value> {
-        let mut llm_messages = system_messages;
-        llm_messages.extend(compacted_messages);
-        astra_turn_core::edge_ledger::strip_stale_reasoning(
-            &mut llm_messages,
-            provider,
-            model_name,
-        );
-
-        // Post-compaction skill re-injection: if any skill has been invoked
-        // earlier in the session, re-inject its (truncated) instructions so
-        // the LLM retains skill context even after history compaction.
-        if !state.skills.invoked.is_empty() {
-            let mut builder = astra_turn_core::cloud_attachments::AttachmentBuilder::new();
-            let mut skills: Vec<_> = state.skills.invoked.values().collect();
-            skills.sort_by_key(|b| std::cmp::Reverse(b.invoked_at_turn));
-            for skill in skills {
-                builder.add_skill(&skill.name, &skill.content);
-            }
-            let attachments = builder.build();
-            llm_messages.extend(attachments.to_messages());
-        }
-
-        // Post-compaction recently-read file re-injection.
-        if !state.recent_file_reads.is_empty() {
-            let cwd = self.edge_profile.get("cwd").and_then(|v| v.as_str());
-            let file_messages = astra_turn_core::cloud_attachments::restore_recent_files(
-                &state.recent_file_reads,
-                cwd,
-            );
-            llm_messages.extend(file_messages);
-        }
+        // Sort skills most-recent-first (matches legacy ordering; shared
+        // assembler emits them in the order we supply).
+        let mut skills: Vec<_> = state.skills.invoked.values().collect();
+        skills.sort_by_key(|b| std::cmp::Reverse(b.invoked_at_turn));
+        let invoked_skills: Vec<crate::turn::wire_assembly::InvokedSkillRef<'_>> = skills
+            .iter()
+            .map(|s| crate::turn::wire_assembly::InvokedSkillRef {
+                name: s.name.as_str(),
+                content: s.content.as_str(),
+            })
+            .collect();
+        let cwd = self.edge_profile.get("cwd").and_then(|v| v.as_str());
+        let attachments = crate::turn::wire_assembly::PostCompactAttachments {
+            invoked_skills,
+            recent_file_reads: &state.recent_file_reads,
+            cwd,
+        };
 
         // Per-turn skill listing (ranked shortlist) now flows through the
-        // pipeline as an `extra_dynamic_sections` entry (RuntimeVolatile
-        // section, None scope). See `context_pipeline_adapter` —
-        // runtime-side post-injection here would double up the content.
+        // pipeline as an `extra_dynamic_sections` entry (RuntimeVolatile,
+        // None scope). See `context_pipeline_adapter` — post-hoc injection
+        // here would double up the content on the wire.
 
-        // Protocol-level Anthropic cache metadata (last-message breakpoint,
-        // cache_edits block, tool-result cache_references).
-        apply_anthropic_cache_metadata(&mut llm_messages, cache_cfg, &self.session_id);
-
-        llm_messages
+        crate::turn::wire_assembly::assemble_llm_messages(
+            system_messages,
+            compacted_messages,
+            &attachments,
+            &self.session_id,
+            provider,
+            model_name,
+            cache_cfg,
+        )
     }
 
     /// Convert an [`LlmCallResult`] into a [`ChatTurnSseAccum`].
@@ -2360,7 +2310,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // from the pure assembly step. `execute_turn` orchestrates both so
         // the wire-building flow is readable and each phase is individually
         // testable / replaceable.
-        let compacted_messages = self
+        let compact_result = self
             .compact_messages_via_memoria(
                 state,
                 &system_messages,
@@ -2375,6 +2325,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 llm_cfg.request_timeout,
             )
             .await;
+        // Parity with the bridge path: when Memoria returned a boundary, the
+        // conversation was trimmed mid-task, so nudge the model to resume
+        // instead of asking the user a follow-up question.
+        let mut compacted_messages = compact_result.messages;
+        crate::turn::wire_assembly::maybe_append_continuation_prompt(
+            &mut compacted_messages,
+            compact_result.boundary.is_some(),
+        );
         let llm_messages = self.assemble_llm_messages(
             system_messages,
             compacted_messages,
@@ -3408,26 +3366,37 @@ mod tests {
     /// persistence with no runtime error. This test pins both anchors.
     #[test]
     fn post_compaction_reinjects_invoked_skills() {
-        let source = include_str!("server_loop_host.rs");
-        let tests_start = source
+        // Cross-file anchor: production code lives here (extraction + ordering)
+        // while the actual attachment build has moved to the shared
+        // `wire_assembly` module. Both pieces must be present for the
+        // re-injection pipeline to work; a silent refactor that drops either
+        // is a cross-turn skill-loss bug waiting to happen.
+        let host_src = include_str!("server_loop_host.rs");
+        let host_tests_start = host_src
             .find("\n#[cfg(test)]\nmod tests {")
             .expect("cfg(test) + mod tests marker");
-        let production = &source[..tests_start];
+        let host_production = &host_src[..host_tests_start];
         assert!(
-            production.contains("state.skills.invoked"),
+            host_production.contains("state.skills.invoked"),
             "production code must consult state.skills.invoked to decide re-injection"
-        );
-        assert!(
-            production.contains("builder.add_skill(&skill.name, &skill.content)"),
-            "production code must feed invoked skills into AttachmentBuilder::add_skill \
-             so full instructions survive compaction"
         );
         // Ordering guard: most-recently invoked skill first (so the oldest
         // content sits closest to the model's current turn after to_messages
         // reverses). If this sort key flips, cross-turn ordering will break.
         assert!(
-            production.contains("std::cmp::Reverse(b.invoked_at_turn)"),
+            host_production.contains("std::cmp::Reverse(b.invoked_at_turn)"),
             "invoked skills must be sorted most-recent-first before re-injection"
+        );
+
+        let shared_src = include_str!("../turn/wire_assembly.rs");
+        let shared_tests_start = shared_src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("wire_assembly cfg(test) + mod tests marker");
+        let shared_production = &shared_src[..shared_tests_start];
+        assert!(
+            shared_production.contains("builder.add_skill(skill.name, skill.content)"),
+            "shared assembly must feed invoked skills into AttachmentBuilder::add_skill \
+             so full instructions survive compaction"
         );
     }
 
