@@ -39,7 +39,7 @@ criteria:
     needle: "greet"
   - type: tokens_between
     min: 1
-    max: 90000
+    max: 130000
   - type: turn_rounds_between
     min: 1
     max: 15
