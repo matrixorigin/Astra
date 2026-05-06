@@ -742,6 +742,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
 }
 
 #[cfg(test)]
+#[allow(dead_code, unused_imports, clippy::empty_line_after_doc_comments)]
 mod tests {
     use std::collections::HashSet;
 

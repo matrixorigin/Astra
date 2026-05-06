@@ -3780,6 +3780,7 @@ impl ToolExecutor for ServerToolExecutor {
 }
 
 #[cfg(test)]
+#[allow(dead_code, unused_imports, clippy::empty_line_after_doc_comments)]
 mod tests {
     use std::ffi::OsString;
     use std::path::Path;

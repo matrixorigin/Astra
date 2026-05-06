@@ -1065,10 +1065,7 @@ fn str_replace_not_found_hint(path_str: &str, content: &str, old_str: &str) -> S
             for (idx, line) in lines.iter().enumerate() {
                 if normalize_ws(line) == normalized_first {
                     msg.push_str(&format!("  Possible match at line {}\n", idx + 1));
-                    let end = (idx + old_lines.len()).min(lines.len());
-                    for (line_offset, line_content) in lines[idx..end].iter().enumerate() {
-                        msg.push_str(&format!("  {}: {}\n", idx + line_offset + 1, line_content));
-                    }
+                    append_nearby_file_context(&mut msg, path_str, &lines, idx, old_lines.len());
                     break;
                 }
             }
@@ -1096,16 +1093,7 @@ fn str_replace_not_found_hint(path_str: &str, content: &str, old_str: &str) -> S
                     matches
                 ));
                 let line_idx = matches[0] - 1;
-                let start = line_idx;
-                let end = (line_idx + old_lines.len()).min(lines.len());
-                msg.push_str("Actual file content:\n");
-                for (line_offset, line_content) in lines[start..end].iter().enumerate() {
-                    msg.push_str(&format!(
-                        "  {}: {}\n",
-                        start + line_offset + 1,
-                        line_content
-                    ));
-                }
+                append_nearby_file_context(&mut msg, path_str, &lines, line_idx, old_lines.len());
             }
         }
     }
@@ -1135,6 +1123,37 @@ fn str_replace_not_found_hint(path_str: &str, content: &str, old_str: &str) -> S
         );
     }
     msg
+}
+
+fn append_nearby_file_context(
+    msg: &mut String,
+    path_str: &str,
+    lines: &[&str],
+    anchor_idx: usize,
+    old_line_count: usize,
+) {
+    if lines.is_empty() {
+        return;
+    }
+    let span_len = old_line_count.max(1);
+    let start = anchor_idx.saturating_sub(5);
+    let end = anchor_idx
+        .saturating_add(span_len)
+        .saturating_add(5)
+        .min(lines.len());
+    msg.push_str(&format!(
+        "Exact nearby file context (read_file path={path_str} start_line={} end_line={}):\n",
+        start + 1,
+        end
+    ));
+    msg.push_str("Actual file content:\n");
+    for (line_offset, line_content) in lines[start..end].iter().enumerate() {
+        msg.push_str(&format!(
+            "  {}: {}\n",
+            start + line_offset + 1,
+            line_content
+        ));
+    }
 }
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {
@@ -2128,19 +2147,20 @@ mod tests {
         }
     }
 
-    // ─── Issue #3: first-line hint context should not show extra line ───
+    // ─── First-line hint gives a repair-ready context window ─────────────
     #[test]
-    fn str_replace_not_found_hint_first_line_shows_exact_span() {
+    fn str_replace_not_found_hint_first_line_shows_surrounding_context_window() {
         // File has 6 lines; old_str has 3 lines starting at line 2.
-        // Hint should show exactly old_lines.len() lines of context, not +1.
         let content = "header\nfn foo() {\n    bar();\n    baz();\n}\nfooter\n";
         let old_str = "fn foo() {\n    bar();\n    qux();\n}";
         let msg = str_replace_not_found_hint("f.txt", content, old_str);
-        // Should show lines 2..5 (4 lines = old_lines.len()), not line 6
+
         assert!(msg.contains("Actual file content"), "got: {msg}");
+        assert!(msg.contains("read_file path=f.txt"), "got: {msg}");
+        assert!(msg.contains("1: header"), "got: {msg}");
         assert!(
-            !msg.contains("footer"),
-            "should not show extra line beyond old_str span, got: {msg}"
+            msg.contains("6: footer"),
+            "should include surrounding context after the target span, got: {msg}"
         );
     }
 

@@ -885,6 +885,7 @@ fn merge_verification_summaries(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod inprocess_hook_contract_tests {
     use std::sync::Arc;
 

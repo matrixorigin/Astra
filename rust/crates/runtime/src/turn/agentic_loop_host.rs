@@ -503,6 +503,10 @@ pub struct StallTrackingState {
     /// mutation (for cap enforcement), while this counter monotonically
     /// accumulates across the whole turn (for diagnostics).
     pub introspection_count: u32,
+    /// Whether a completion-aware soft-stop prompt was injected after a
+    /// successful task-completion signal (for example a successful git commit).
+    /// One-shot per turn; advisory only, tools remain available.
+    pub forced_completion_soft_stop: bool,
     /// Whether the redundant-reads mid-loop corrective injected a guidance
     /// message this loop. Fires when the model has re-read overlapping line
     /// ranges of the same file enough times to cross

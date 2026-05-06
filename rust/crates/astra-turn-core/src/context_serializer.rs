@@ -769,7 +769,7 @@ mod tests {
         annotate_last_message_cache_breakpoint(&mut turn1);
         let marker1_idx = turn1
             .iter()
-            .position(|m| message_has_cache_control(m))
+            .position(message_has_cache_control)
             .expect("turn 1 must have marker");
 
         let mut turn2 = vec![
@@ -781,7 +781,7 @@ mod tests {
         annotate_last_message_cache_breakpoint(&mut turn2);
         let marker2_idx = turn2
             .iter()
-            .position(|m| message_has_cache_control(m))
+            .position(message_has_cache_control)
             .expect("turn 2 must have marker");
 
         let mut turn3 = vec![
@@ -795,7 +795,7 @@ mod tests {
         annotate_last_message_cache_breakpoint(&mut turn3);
         let marker3_idx = turn3
             .iter()
-            .position(|m| message_has_cache_control(m))
+            .position(message_has_cache_control)
             .expect("turn 3 must have marker");
 
         // Prefix grows: marker position advances each turn
@@ -828,7 +828,7 @@ mod tests {
         // Turn 2's cacheable prefix: everything up to and including the marker.
         let marker2_idx = turn2_msgs
             .iter()
-            .position(|m| message_has_cache_control(m))
+            .position(message_has_cache_control)
             .unwrap();
         // The prefix [0..=marker2_idx] must contain the exact same system + user1
         // that turn 1 had. The marker in turn 2 is on asst1 (index 2).

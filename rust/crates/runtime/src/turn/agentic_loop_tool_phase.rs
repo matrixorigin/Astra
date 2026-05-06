@@ -227,6 +227,29 @@ fn update_runtime_todo_from_tool_records(
     state.session_facts = state.continuity.facts.clone();
 }
 
+fn record_recent_read_file_path(
+    recent_file_reads: &mut Vec<(String, u32)>,
+    tool_name: &str,
+    args: &Value,
+    turn_num: u32,
+) {
+    if tool_name != "read_file" {
+        return;
+    }
+    let Some(path) = extract_file_path_from_tool(tool_name, args) else {
+        return;
+    };
+    if let Some(existing) = recent_file_reads.iter_mut().find(|(p, _)| p == &path) {
+        existing.1 = turn_num;
+    } else {
+        recent_file_reads.push((path, turn_num));
+    }
+    if recent_file_reads.len() > MAX_TRACKED_FILE_READS {
+        recent_file_reads.sort_by_key(|(_, t)| *t);
+        recent_file_reads.remove(0);
+    }
+}
+
 const EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK: &str = "turn_rollback";
 
 struct ServerRollbackBoundary {
@@ -1177,18 +1200,12 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     {
         let turn_num = (state.max_turns - state.remaining_turns) as u32;
         for edge_result in &turn_result.edge_tool_round {
-            if let Some(path) = extract_file_path_from_tool(&edge_result.tool, &edge_result.args) {
-                if let Some(existing) = state.recent_file_reads.iter_mut().find(|(p, _)| p == &path)
-                {
-                    existing.1 = turn_num;
-                } else {
-                    state.recent_file_reads.push((path, turn_num));
-                }
-                if state.recent_file_reads.len() > MAX_TRACKED_FILE_READS {
-                    state.recent_file_reads.sort_by_key(|(_, t)| *t);
-                    state.recent_file_reads.remove(0);
-                }
-            }
+            record_recent_read_file_path(
+                &mut state.recent_file_reads,
+                &edge_result.tool,
+                &edge_result.args,
+                turn_num,
+            );
         }
     }
 
@@ -1492,6 +1509,7 @@ fn build_introspect_snapshot(
 }
 
 #[cfg(test)]
+#[allow(dead_code, unused_imports, clippy::empty_line_after_doc_comments)]
 mod tests {
     use super::*;
 
@@ -1524,6 +1542,20 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn recent_file_cache_tracks_only_read_file_results() {
+        let mut reads = Vec::new();
+        record_recent_read_file_path(&mut reads, "str_replace", &json!({"path": "src/lib.rs"}), 1);
+        record_recent_read_file_path(
+            &mut reads,
+            "read_file",
+            &json!({"path": "src/lib.rs", "start_line": 10, "end_line": 20}),
+            2,
+        );
+
+        assert_eq!(reads, vec![("src/lib.rs".to_string(), 2)]);
     }
 
     #[test]

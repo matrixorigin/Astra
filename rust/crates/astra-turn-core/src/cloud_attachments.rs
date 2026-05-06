@@ -15,7 +15,11 @@ use serde_json::Value;
 // ---------------------------------------------------------------------------
 
 /// Maximum number of files to restore post-compaction.
-pub const MAX_FILES_TO_RESTORE: usize = 5;
+///
+/// Keep this as a small working set: these attachments preserve exact local
+/// code context after compaction, but every extra file competes directly with
+/// current tool results and task state.
+pub const MAX_FILES_TO_RESTORE: usize = 3;
 /// Total char budget for all file attachments.
 pub const FILE_ATTACHMENT_CHAR_BUDGET: usize = 200_000; // ~50K tokens
 /// Max chars per individual file.
@@ -520,6 +524,14 @@ mod tests {
         assert!(msgs.len() <= MAX_FILES_TO_RESTORE);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_recent_files_budget_matches_working_set_contract() {
+        assert_eq!(
+            MAX_FILES_TO_RESTORE, 3,
+            "recent file context cache should stay to a small working set"
+        );
     }
 
     #[test]

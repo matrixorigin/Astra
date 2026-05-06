@@ -1009,6 +1009,7 @@ const MIN_SCORE_THRESHOLD: f64 = 0.05;
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(dead_code, unused_imports, clippy::empty_line_after_doc_comments)]
 mod tests {
     use super::*;
     use crate::tool_registry::state::ConversationState;

@@ -371,6 +371,28 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     );
                 }
             }
+            astra_turn_core::loop_circuit_breaker::BreakerAction::SoftStop => {
+                state.stall.forced_completion_soft_stop = true;
+                state.messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": completion_soft_stop_message(state.llm_rounds_completed, &state.message),
+                }));
+                tracing::info!(
+                    target: "astra::loop_guard",
+                    tier = "completion_soft_stop",
+                    round = state.llm_rounds_completed,
+                    "completion soft-stop injected"
+                );
+                if !prep.quiet {
+                    host.emit_headless_line(
+                        HeadlessStderrStyle::Yellow,
+                        format!(
+                            "↻ Task appears complete at round {}; nudging model to stop unless work remains.",
+                            state.llm_rounds_completed
+                        ),
+                    );
+                }
+            }
             astra_turn_core::loop_circuit_breaker::BreakerAction::Continue => {}
             // BreakerAction is #[non_exhaustive] — future soft-intervention
             // variants should default to a no-op so the loop continues.
@@ -379,6 +401,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     }
 
     if !state.stall.forced_round_budget_phase1
+        && !state.stall.forced_completion_soft_stop
         && let Some((family, blocked_tools)) = exploration_family_phase2_candidate(state)
     {
         state.stall.forced_exploration_family_phase2 = true;
@@ -412,6 +435,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // phase-1 is the harder finalization push — if both would fire on the
     // same round we prefer phase-1's narrower "stop calling tools" message.
     if !state.stall.forced_round_budget_phase1
+        && !state.stall.forced_completion_soft_stop
         && !state.stall.forced_exploration_family_phase2
         && should_inject_redundant_reads_corrective(state, redundant_reads_threshold)
     {
@@ -441,6 +465,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
     if !state.stall.forced_round_budget_phase1
+        && !state.stall.forced_completion_soft_stop
         && !state.stall.forced_exploration_family_phase2
         && !state.stall.forced_redundant_reads_corrective
         && should_inject_cache_waste_corrective(state, cache_waste_threshold)
@@ -472,6 +497,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
     if !state.stall.forced_round_budget_phase1
+        && !state.stall.forced_completion_soft_stop
         && !state.stall.forced_exploration_family_phase2
         && !state.stall.forced_redundant_reads_corrective
         && !state.stall.forced_cache_waste_corrective
@@ -1485,6 +1511,7 @@ pub(crate) fn is_execution_corrective_message(m: &serde_json::Value) -> bool {
         || is_execution_escalation(m)
         || is_parallel_batching_force(m)
         || is_round_budget_phase1(m)
+        || is_completion_soft_stop(m)
         || is_redundant_reads_corrective(m)
         || is_cache_waste_corrective(m)
         || is_exploration_family_corrective(m)
@@ -1598,6 +1625,7 @@ pub(crate) fn parallel_batching_force_message(streak: usize, original_query: &st
 // overkill of an immediate hard cap on weaker models.
 
 pub(crate) const ROUND_BUDGET_PHASE1_MARKER: &str = "## ⤴ Round Budget Reached";
+pub(crate) const COMPLETION_SOFT_STOP_MARKER: &str = "## ✓ Task Appears Complete";
 
 pub(crate) fn is_round_budget_phase1(m: &serde_json::Value) -> bool {
     if m.get("role").and_then(|r| r.as_str()) != Some("user") {
@@ -1606,6 +1634,15 @@ pub(crate) fn is_round_budget_phase1(m: &serde_json::Value) -> bool {
     m.get("content")
         .and_then(|c| c.as_str())
         .is_some_and(|s| s.starts_with(ROUND_BUDGET_PHASE1_MARKER))
+}
+
+pub(crate) fn is_completion_soft_stop(m: &serde_json::Value) -> bool {
+    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return false;
+    }
+    m.get("content")
+        .and_then(|c| c.as_str())
+        .is_some_and(|s| s.starts_with(COMPLETION_SOFT_STOP_MARKER))
 }
 
 /// Build a `RoundSignal` from the current loop state for the circuit breaker.
@@ -1621,6 +1658,7 @@ fn build_circuit_breaker_signal(
         return RoundSignal {
             tool_signatures,
             produced_mutation: false,
+            task_completed: false,
             tool_count,
         };
     }
@@ -1651,12 +1689,26 @@ fn build_circuit_breaker_signal(
             .take(state.max_tools_per_turn as usize)
             .any(tool_record_is_workspace_mutation)
     };
+    let task_completed = latest_round_records
+        .iter()
+        .any(|record| record.ok && record.name == "git_commit");
 
     RoundSignal {
         tool_signatures,
         produced_mutation,
+        task_completed,
         tool_count,
     }
+}
+
+pub(crate) fn completion_soft_stop_message(round_index: u32, original_query: &str) -> String {
+    format!(
+        "{COMPLETION_SOFT_STOP_MARKER}\n\
+         Runtime signal: a successful git commit indicates the requested work is likely complete after {round_index} tool round(s).\n\n\
+         Stop now and provide the final answer unless you can name concrete remaining work that is necessary for the user's request. \
+         Do not run more verification or status checks just to be extra sure; only use tools if there is specific unresolved work.\n\n\
+         Original user query: {original_query}"
+    )
 }
 
 pub(crate) fn round_budget_phase1_message(round_index: u32, original_query: &str) -> String {
@@ -3043,6 +3095,78 @@ mod tests {
         assert!(
             !signal.produced_mutation,
             "an old str_replace must not mask a later read-only round"
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_signal_marks_successful_git_commit_as_task_completed() {
+        let mut state = make_state();
+        state.llm_rounds_completed = 4;
+        state.stall.turn_sigs.push(
+            ["git_commit:{\"message\":\"finish\"}".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "git_commit".into(),
+            ok: true,
+            round: Some(3),
+            ..Default::default()
+        });
+
+        let signal = build_circuit_breaker_signal(&state);
+
+        assert!(signal.task_completed);
+        assert!(
+            signal.produced_mutation,
+            "git_commit still counts as mutation evidence"
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_signal_does_not_reuse_stale_git_commit_completion() {
+        let mut state = make_state();
+        state.llm_rounds_completed = 5;
+        state.stall.turn_sigs.push(
+            ["read_file:{\"path\":\"a.rs\"}".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "git_commit".into(),
+            ok: true,
+            round: Some(3),
+            ..Default::default()
+        });
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "read_file".into(),
+            ok: true,
+            round: Some(4),
+            ..Default::default()
+        });
+
+        let signal = build_circuit_breaker_signal(&state);
+
+        assert!(
+            !signal.task_completed,
+            "only the latest completed round may emit completion"
+        );
+    }
+
+    #[test]
+    fn completion_soft_stop_message_is_ephemeral_corrective() {
+        let msg = serde_json::json!({
+            "role": "user",
+            "content": completion_soft_stop_message(7, "finish and commit the fix"),
+        });
+
+        assert!(is_completion_soft_stop(&msg));
+        assert!(is_execution_corrective_message(&msg));
+        assert!(
+            msg["content"]
+                .as_str()
+                .unwrap()
+                .contains("Stop now and provide the final answer")
         );
     }
 
