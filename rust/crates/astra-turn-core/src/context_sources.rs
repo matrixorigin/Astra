@@ -194,10 +194,7 @@ pub struct ExternalSources {
     pub tool_guidance: Option<String>,
     /// Skill effort/agent_type hint ("effort: high", "agent: reviewer").
     pub effort_hint: Option<String>,
-    /// Self-model section (tool-dependent capabilities description).
-    pub self_model_text: Option<String>,
-    /// Tool-conditional guidance (search strategy, task-type-specific rules).
-    pub tool_conditional: Option<String>,
+
     /// Project profile description (cwd, git_branch, project facts).
     pub profile_desc: Option<String>,
     /// **Session-stable** pre-built sections — bridge-composed content

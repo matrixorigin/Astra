@@ -31,7 +31,9 @@ pub use system::{
     synthesize_or_batch_directive, tool_round_guidance, tool_round_guidance_trace_with,
     tool_round_guidance_with, trailing_single_tool_round_streak,
 };
-pub(crate) use system::{self_model_section, tool_conditional_section};
+pub(crate) use system::{
+    low_confidence_tool_selection_section, self_model_section, tool_conditional_section,
+};
 
 pub use astra_prompts::memory_lifecycle;
 pub use astra_prompts::memory_proto;

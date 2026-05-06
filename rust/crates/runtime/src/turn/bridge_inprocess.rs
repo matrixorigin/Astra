@@ -68,6 +68,22 @@ use astra_turn_core::tool_schema_prune::prune_tool_schemas;
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
 const ROOT_TURN_JOURNAL_HEADER: &str = "x-mo-root-turn-journal";
 
+fn self_awareness_volatile_section(text: &str) -> Option<prompts::PromptSection> {
+    (!text.is_empty()).then(|| {
+        prompts::PromptSection::dynamic(text.to_string(), prompts::PromptTokenBucket::Environment)
+            .with_trace_signals(
+                astra_turn_core::context_assembly_trace::PromptTraceSignals {
+                    context_signals:
+                        astra_turn_core::context_assembly_trace::PromptContextSignals {
+                            self_awareness: true,
+                            ..Default::default()
+                        },
+                    ..Default::default()
+                },
+            )
+    })
+}
+
 #[derive(Clone)]
 struct BridgeTraceCorrelation {
     session_turn_source: String,
@@ -1366,10 +1382,11 @@ impl InProcessChatTurnBridge {
             //
             // STABLE (change only when session state changes, if at all):
             //   profile_desc (cwd/branch/env — Memoria split out),
-            //   skill_hint, learned_context_hint, feedback_rules_hint,
-            //   self_awareness_hint
+            //   learned_context_hint, feedback_rules_hint
             //
             // VOLATILE (change each turn by design):
+            //   skill_hint (active skill/tool selection),
+            //   self_awareness_hint (turn/token/outcome signals),
             //   typed memory_entries (per-turn retrieval — was baked into
             //     profile_desc, now routed through the Memory section),
             //   implicit_feedback_hint (per-turn correction signal based on
@@ -1395,7 +1412,7 @@ impl InProcessChatTurnBridge {
                 ));
             }
             if !skill_hint.is_empty() {
-                stable_sections.push(
+                dynamic_sections.push(
                     prompts::PromptSection::dynamic(
                         skill_hint.clone(),
                         prompts::PromptTokenBucket::UserPreferences,
@@ -1457,18 +1474,9 @@ impl InProcessChatTurnBridge {
                 );
             }
             if !self_awareness_hint.is_empty() {
-                stable_sections.push(
-                    prompts::PromptSection::dynamic(
-                        self_awareness_hint.clone(),
-                        prompts::PromptTokenBucket::Environment,
-                    )
-                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            self_awareness: true,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
+                dynamic_sections.push(
+                    self_awareness_volatile_section(&self_awareness_hint)
+                        .expect("non-empty self-awareness hint"),
                 );
             }
             if !memoria_insights_hint.is_empty() {
@@ -3787,6 +3795,21 @@ mod tests {
     // ── Static/dynamic prompt boundary tests ──
     // These tests manipulate env vars, so they must not run in parallel.
     static CACHE_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn self_awareness_section_is_post_cache_volatile() {
+        let section = self_awareness_volatile_section(
+            "\n\n## Self-Awareness\nTurn: 37 | Tokens: 26899/80000",
+        )
+        .expect("section");
+
+        assert_eq!(
+            section.scope,
+            prompts::CacheScope::None,
+            "self-awareness contains per-turn counters and must not enter the cached prefix"
+        );
+        assert!(section.trace_signals.context_signals.self_awareness);
+    }
 
     #[test]
     fn pipeline_assembly_records_bridge_context_signals() {

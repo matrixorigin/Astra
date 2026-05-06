@@ -50,11 +50,12 @@ pub(crate) fn build_external_sources(
     let tool_conditional = if tool_names.is_empty() {
         None
     } else {
-        Some(crate::prompts::tool_conditional_section(
+        let text = crate::prompts::tool_conditional_section(
             tool_names,
             &profile_for_tc,
             selection_confidence,
-        ))
+        );
+        if text.is_empty() { None } else { Some(text) }
     };
 
     // 3. Profile description
@@ -115,8 +116,12 @@ pub(crate) fn build_external_sources(
         tool_cfg.effective_round_budget_warning(),
         tool_cfg.effective_round_budget_limit(),
     );
+    let low_confidence_guidance =
+        crate::prompts::low_confidence_tool_selection_section(selection_confidence);
     let tool_guidance = if tool_guidance_text.is_empty() {
-        None
+        low_confidence_guidance
+    } else if let Some(low_confidence) = low_confidence_guidance {
+        Some(format!("{tool_guidance_text}{low_confidence}"))
     } else {
         Some(tool_guidance_text)
     };
@@ -127,6 +132,20 @@ pub(crate) fn build_external_sources(
         .and_then(Value::as_array)
         .map(|arr| arr.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
+
+    let mut extra_dynamic_sections = Vec::new();
+    if let Some(ref text) = self_model_text {
+        extra_dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+            text.clone(),
+            crate::prompts::PromptTokenBucket::BasePersona,
+        ));
+    }
+    if let Some(ref text) = tool_conditional {
+        extra_dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+            text.clone(),
+            crate::prompts::PromptTokenBucket::BasePersona,
+        ));
+    }
 
     let memory_entries = build_memory_entries_from_edge_profile(edge_profile);
 
@@ -167,8 +186,7 @@ pub(crate) fn build_external_sources(
         memory_entries,
         spill_dir: None,
         spill_backend,
-        self_model_text,
-        tool_conditional,
+
         profile_desc,
         effort_hint,
         learned_context,
@@ -183,7 +201,10 @@ pub(crate) fn build_external_sources(
         // by design (content depends on current user message). Kept in
         // None scope via RuntimeVolatile so it doesn't invalidate the
         // cached prefix.
-        extra_dynamic_sections: skill_listing_extra.into_iter().collect(),
+        extra_dynamic_sections: {
+            extra_dynamic_sections.extend(skill_listing_extra);
+            extra_dynamic_sections
+        },
     }
 }
 
@@ -583,6 +604,39 @@ mod tests {
                 .content
                 .contains("ranked fallback string")
         );
+    }
+
+    #[test]
+    fn low_confidence_warning_is_volatile_tool_guidance() {
+        let ep = serde_json::Map::new();
+        let state = make_state();
+        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.1, None);
+
+        // tool_conditional field removed — volatile content routes to extra_dynamic_sections only
+        assert!(
+            sources
+                .tool_guidance
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Low-Confidence Tool Selection"),
+            "low-confidence warning should route to RuntimeVolatile/tool_guidance"
+        );
+    }
+
+    #[test]
+    fn selected_tool_guidance_is_volatile() {
+        let ep = serde_json::Map::new();
+        let state = make_state();
+        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None);
+
+        let dynamic_text: String = sources
+            .extra_dynamic_sections
+            .iter()
+            .map(|section| section.text.as_str())
+            .collect();
+        // self_model_text and tool_conditional fields removed — volatile content routes to extra_dynamic_sections only
+        assert!(dynamic_text.contains("## Self-Model"));
+        assert!(dynamic_text.contains("Explicit Tool Requests"));
     }
 
     #[test]

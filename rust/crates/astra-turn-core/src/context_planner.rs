@@ -159,8 +159,10 @@ fn plan_section_manifest(budget: &TokenBudget, has_memory: bool) -> Vec<PlannedS
             source: SectionSource::Skill,
         },
         // Session-stable runtime identity: model / cwd / branch / session +
-        // fragments that only change at session boundaries (self_model_text,
-        // tool_conditional, profile_desc, learned_context, system_override).
+        // fragments that only change at session boundaries (profile_desc,
+        // learned_context, system_override). Tool-dependent and self-awareness
+        // fragments are per-turn in dynamic-tool-selection flows and must sit
+        // after the Session→None cache marker.
         // Placing these in `Session` scope is the cache optimization that
         // gives a 2nd marker its target — everything up through here sits in
         // the cached prefix, only truly per-turn content is re-sent.

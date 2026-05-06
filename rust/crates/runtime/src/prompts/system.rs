@@ -320,7 +320,7 @@ fn memory_prompt_mode(tool_names: &[&str], profile_desc: &str) -> MemoryPromptMo
 pub(crate) fn tool_conditional_section(
     tool_names: &[&str],
     profile_desc: &str,
-    selection_confidence: f64,
+    _selection_confidence: f64,
 ) -> String {
     let memory_mode = memory_prompt_mode(tool_names, profile_desc);
     let has_github = tool_names.iter().any(|n| n.starts_with("github"));
@@ -479,14 +479,20 @@ pub(crate) fn tool_conditional_section(
             s.push_str(&memory_section);
         }
     }
-    if selection_confidence < LOW_CONFIDENCE_THRESHOLD {
-        s.push_str(
-            "\n## ⚠ Low-Confidence Tool Selection\n\
-             Tool selection confidence is LOW. If available tools seem insufficient, ASK the user to clarify.\n\
-             Do NOT guess with bash/find/read_file when a more specific tool would be needed.\n",
-        );
-    }
     s
+}
+
+/// Per-turn advisory for tool-selector uncertainty.
+///
+/// This must stay out of Session-scoped prompt blocks: confidence is computed
+/// per turn from the current request and selected tools.
+pub(crate) fn low_confidence_tool_selection_section(selection_confidence: f64) -> Option<String> {
+    (selection_confidence < LOW_CONFIDENCE_THRESHOLD).then(|| {
+        "\n## ⚠ Low-Confidence Tool Selection\n\
+         Tool selection confidence is LOW. If available tools seem insufficient, ASK the user to clarify.\n\
+         Do NOT guess with bash/find/read_file when a more specific tool would be needed.\n"
+            .to_string()
+    })
 }
 
 /// Task-type specific strategy. Session-scoped — depends on detected task type.
@@ -761,6 +767,13 @@ pub fn build_system_prompt_sections_with_style(
         sections.push(PromptSection::dynamic(
             tool_cond,
             PromptTokenBucket::BasePersona,
+        ));
+    }
+
+    if let Some(low_confidence) = low_confidence_tool_selection_section(selection_confidence) {
+        sections.push(PromptSection::dynamic(
+            low_confidence,
+            PromptTokenBucket::Environment,
         ));
     }
 

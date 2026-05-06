@@ -215,10 +215,11 @@ fn bind_working_memory(sources: &ContextSources<'_>) -> String {
 /// Bind the **session-stable** runtime identity fragments.
 ///
 /// Includes model/cwd/branch header + fragments that only change at
-/// session boundaries: `self_model_text` (tools-dependent), `tool_conditional`
-/// guidance, `profile_desc`, `learned_context`, `system_override`. These
-/// sit in `CacheScope::Session` so Anthropic's per-session cache captures
-/// them behind the 2nd cache marker.
+/// session boundaries: `profile_desc`, `learned_context`, `system_override`.
+/// Tool-dependent/self-awareness fragments should be routed through
+/// `RuntimeVolatile`, because modern tool selection can vary every turn.
+/// These stable pieces sit in `CacheScope::Session` so Anthropic's
+/// per-session cache captures them behind the 2nd cache marker.
 ///
 /// NOTE: `session_id` is deliberately emitted in the **volatile** section
 /// (`bind_runtime_volatile`) rather than here. Placing a per-session UUID
@@ -242,12 +243,7 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
     // Session-stable dynamic fragments. Order matches the legacy
     // `bind_runtime_identity` emission order for byte stability across
     // refactors.
-    if let Some(ref text) = ext.self_model_text {
-        parts.push(text.clone());
-    }
-    if let Some(ref text) = ext.tool_conditional {
-        parts.push(text.clone());
-    }
+
     if let Some(ref text) = ext.profile_desc {
         parts.push(text.clone());
     }

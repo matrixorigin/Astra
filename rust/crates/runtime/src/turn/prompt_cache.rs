@@ -190,9 +190,8 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     use astra_turn_core::pipeline_config::{PipelineConfig, ProviderCachePolicy};
     use astra_turn_core::pipeline_session::{AdaptiveTurnInput, PipelineSession};
 
-    // Build ExternalSources from bridge-side signals. Typed fields are
-    // driven by tool_names + cwd/branch; everything else flows through
-    // the escape-hatch `extra_dynamic_sections`.
+    // Build ExternalSources from bridge-side signals. Tool-dependent prompt
+    // fragments are volatile because bridge tool selection can vary per turn.
     let self_model_text = if tool_names.is_empty() {
         None
     } else {
@@ -207,6 +206,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         let text = prompts::tool_conditional_section(tool_names, &profile_for_tc, confidence);
         if text.is_empty() { None } else { Some(text) }
     };
+    let tool_guidance = prompts::low_confidence_tool_selection_section(confidence);
     let mut profile_parts = Vec::new();
     if let Some(cwd) = edge_profile_cwd {
         profile_parts.push(format!("cwd: {cwd}"));
@@ -234,7 +234,19 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
             prompts::PromptTokenBucket::UserPreferences,
         ));
     }
-    let volatile = extra_volatile_sections.to_vec();
+    let mut volatile = extra_volatile_sections.to_vec();
+    if let Some(ref text) = self_model_text {
+        volatile.push(prompts::PromptSection::dynamic(
+            text.clone(),
+            prompts::PromptTokenBucket::BasePersona,
+        ));
+    }
+    if let Some(ref text) = tool_conditional {
+        volatile.push(prompts::PromptSection::dynamic(
+            text.clone(),
+            prompts::PromptTokenBucket::BasePersona,
+        ));
+    }
     let all_sections_for_trace = {
         let mut v = stable.clone();
         v.extend(volatile.iter().cloned());
@@ -245,14 +257,13 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         memory_entries: memory_entries.to_vec(),
         spill_dir: None,
         spill_backend: None,
-        self_model_text,
-        tool_conditional,
+
         profile_desc,
         effort_hint: None,
         learned_context: None,
         system_override: None,
         plan_context: None,
-        tool_guidance: None,
+        tool_guidance,
         extra_stable_sections: stable,
         extra_dynamic_sections: volatile,
     };
@@ -852,6 +863,61 @@ mod tests {
         assert!(
             dynamic_text.find("higher value memory") < dynamic_text.find("lower value memory"),
             "binder ranking should be visible in production bridge output: {dynamic_text}"
+        );
+    }
+
+    #[test]
+    fn bridge_pipeline_routes_low_confidence_warning_to_dynamic_message() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        remove_test_env("ASTRA_OUTPUT_STYLE");
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+
+        let outcome = assemble_bridge_pipeline_outcome(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            &[],
+            0.1,
+            None,
+            &cache_cfg,
+            "sid-low-confidence",
+            "gpt-4o",
+            "openai",
+            Some("/tmp/proj"),
+            None,
+            None,
+        );
+
+        let primary_text = outcome
+            .primary_system
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let dynamic_text = outcome
+            .dynamic_system
+            .as_ref()
+            .and_then(|msg| msg.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            !primary_text.contains("Low-Confidence Tool Selection"),
+            "per-turn selector confidence must not enter cached prefix: {primary_text}"
+        );
+        assert!(
+            !primary_text.contains("## Self-Model"),
+            "selected-tool self model must not enter cached prefix: {primary_text}"
+        );
+        assert!(
+            dynamic_text.contains("Low-Confidence Tool Selection"),
+            "low confidence warning should be post-cache RuntimeVolatile: {dynamic_text}"
+        );
+        assert!(
+            dynamic_text.contains("## Self-Model"),
+            "selected-tool self model should be post-cache RuntimeVolatile: {dynamic_text}"
         );
     }
 
