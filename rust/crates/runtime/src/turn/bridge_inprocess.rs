@@ -1382,9 +1382,10 @@ impl InProcessChatTurnBridge {
             //
             // STABLE (change only when session state changes, if at all):
             //   profile_desc (cwd/branch/env — Memoria split out),
-            //   learned_context_hint, feedback_rules_hint
+            //   learned_context_hint
             //
             // VOLATILE (change each turn by design):
+            //   feedback_rules_hint (accumulates on each user correction),
             //   skill_hint (active skill/tool selection),
             //   self_awareness_hint (turn/token/outcome signals),
             //   typed memory_entries (per-turn retrieval — was baked into
@@ -1459,7 +1460,7 @@ impl InProcessChatTurnBridge {
                 );
             }
             if !feedback_rules_hint.is_empty() {
-                stable_sections.push(
+                dynamic_sections.push(
                     prompts::PromptSection::dynamic(
                         feedback_rules_hint.clone(),
                         prompts::PromptTokenBucket::Environment,
