@@ -102,6 +102,7 @@ mod tests {
             status: "ok".into(),
             duration_ms: 42,
             output_summary: Some("150 lines".into()),
+            output: None,
         });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "tool_completed");
@@ -125,6 +126,7 @@ mod tests {
                 status: "ok".into(),
                 duration_ms: 0,
                 output_summary: None,
+                output: None,
             },
             StreamEvent::WaitingForModel,
             StreamEvent::ModelResponding,
@@ -180,6 +182,7 @@ mod tests {
             status: "ok".into(),
             duration_ms: 5,
             output_summary: None,
+            output: None,
         });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(v["output_summary"].is_null());
