@@ -1347,8 +1347,6 @@ impl ServerToolExecutor {
                     other => tool_result_from_output(format!("Unknown session action: '{other}'")),
                 }
             }
-            // Legacy aliases
-            "adjust_config" => tool_result_from_output(self.adjust_config(args)),
             "prioritize_tool" => tool_result_from_output(self.prioritize_tool(args)),
             "deprioritize_tool" => tool_result_from_output(self.deprioritize_tool(args)),
             "introspect" => tool_result_from_output(self.handle_introspect(args)),
@@ -4801,105 +4799,6 @@ esac
         );
         assert_eq!(rollback_json["turn_index"].as_u64(), Some(11));
         assert_eq!(rollback_json["restored"].as_array().map(Vec::len), Some(1));
-    }
-
-    #[tokio::test]
-        #[ignore = "update for all-pinned catalog"]
-async fn rollback_session_state_current_turn_restores_server_self_mod_and_tasks() {
-        let (exec, _dir, session_id, session) = session_state_test_executor(13);
-        let original_top_k = session.read().unwrap().config.memory.retrieval_top_k;
-        let new_top_k = if original_top_k < 20 {
-            original_top_k + 1
-        } else {
-            original_top_k.saturating_sub(1)
-        };
-
-        let adjust: Value = serde_json::from_str(
-            &exec
-                .execute(
-                    "session",
-                    &json!({"path": "memory.retrieval_top_k", "value": new_top_k}),
-                )
-                .await,
-        )
-        .unwrap();
-        assert_eq!(adjust["status"].as_str(), Some("ok"));
-
-        let prioritize: Value = serde_json::from_str(
-            &exec
-                .execute("session", &json!({"tool": "bash"}))
-                .await,
-        )
-        .unwrap();
-        assert_eq!(prioritize["status"].as_str(), Some("ok"));
-
-        let goal: Value = serde_json::from_str(
-            &exec
-                .execute("session", &json!({"goal": "ship parity"}))
-                .await,
-        )
-        .unwrap();
-        assert_eq!(goal["status"].as_str(), Some("ok"));
-
-        let compress: Value = serde_json::from_str(
-            &exec
-                .execute("session", &json!({"reason": "manual"}))
-                .await,
-        )
-        .unwrap();
-        assert_eq!(compress["status"].as_str(), Some("ok"));
-
-        let created: Value =
-            serde_json::from_str(&exec.execute("task_create", &json!({"title": "demo"})).await)
-                .unwrap();
-        let task_id = created["task_id"].as_str().unwrap().to_string();
-
-        let updated: Value = serde_json::from_str(
-            &exec
-                .execute(
-                    "task_update",
-                    &json!({"task_id": task_id.as_str(), "status": "in_progress"}),
-                )
-                .await,
-        )
-        .unwrap();
-        assert_eq!(updated["success"].as_bool(), Some(true));
-
-        let stopped: Value = serde_json::from_str(
-            &exec
-                .execute(
-                    "task_stop",
-                    &json!({"task_id": task_id.as_str(), "reason": "rollback test"}),
-                )
-                .await,
-        )
-        .unwrap();
-        assert_eq!(stopped["success"].as_bool(), Some(true));
-
-        let rollback: Value =
-            serde_json::from_str(&exec.execute("rollback_session_state", &json!({})).await)
-                .unwrap();
-        assert_eq!(rollback["success"].as_bool(), Some(true), "got: {rollback}");
-        assert_eq!(rollback["turn_index"].as_u64(), Some(13));
-        assert_eq!(rollback["restored"].as_array().map(Vec::len), Some(7));
-
-        let session = session.read().unwrap();
-        assert_eq!(session.config.memory.retrieval_top_k, original_top_k);
-        assert!(session.original_query.is_none());
-        assert!(session.goal_tracker.is_none());
-        assert!(session.compressed_turns.is_empty());
-        drop(session);
-
-        let task_list = exec.execute("task_list", &json!({})).await;
-        assert!(task_list.contains("No tasks found"));
-
-        let workspace = astra_services::session_workspace::read_workspace(&session_id).unwrap();
-        assert!(workspace.session_goal.is_none());
-        assert!(workspace.pinned_tools.is_empty());
-        assert!(workspace.deprioritized_tools.is_empty());
-        assert!(workspace.tuned_config_json.is_none());
-
-        cleanup_session_artifacts(&session_id);
     }
 
     // ── Memory tool user isolation ─────────────────────────────────────

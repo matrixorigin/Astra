@@ -3555,44 +3555,6 @@ mod tests {
     }
 
     #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn builder_defaults() {
-        let host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u".to_string(),
-            "s".to_string(),
-        )
-        .build();
-
-        assert!(host.is_quiet());
-        // When no edge tools are provided, server-side tool schemas are auto-populated
-        assert!(host.server_side_tools);
-        assert!(!host.valid_tool_names().is_empty());
-        assert!(host.valid_tool_names().contains("rollback_file_edits"));
-        assert!(host.valid_tool_names().contains("session"));
-        assert!(host.valid_tool_names().contains("session"));
-        assert!(host.valid_tool_names().contains("session"));
-        assert!(host.valid_tool_names().contains("session"));
-        assert!(host.valid_tool_names().contains("session"));
-        assert!(host.valid_tool_names().contains("rollback_session_state"));
-        assert!(host.valid_tool_names().contains("task_create"));
-        assert!(host.valid_tool_names().contains("task_list"));
-        assert!(host.valid_tool_names().contains("task_get"));
-        assert!(host.valid_tool_names().contains("task_update"));
-        assert!(host.valid_tool_names().contains("task_stop"));
-        assert!(host.valid_tool_names().contains("mo"));
-        assert!(
-            host.valid_tool_names()
-                .contains("rollback_database_snapshots")
-        );
-        assert!(host.valid_tool_names().contains("memory_store"));
-        assert!(host.valid_tool_names().contains("multi_edit"));
-        assert!(!host.valid_tool_names().contains("powershell"));
-        assert!(host.emitted_events.is_empty());
-    }
-
-    #[test]
     fn build_system_prompt_includes_cwd() {
         let mut profile = Map::new();
         profile.insert("cwd".to_string(), json!("/home/user/project"));

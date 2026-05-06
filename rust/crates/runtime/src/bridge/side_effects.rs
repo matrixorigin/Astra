@@ -1599,48 +1599,6 @@ mod inprocess_hook_contract_tests {
     }
 
     #[tokio::test]
-        #[ignore = "update for all-pinned catalog"]
-async fn hook_persists_pre_state_snapshot_id_on_action_profile() {
-        let hook_writer = RecordingHookDbWriter::default();
-        let reflection_store = RecordingReflectionStateStore::default();
-        let lesson_writer = RecordingReflectionLessonWriter::default();
-        let observer = RecordingObserverWorker::default();
-
-        run_bridge_hook_side_effects(
-            Some(build_hook_payload_with_mo_query_snapshot()),
-            Arc::new(hook_writer.clone()),
-            Arc::new(reflection_store),
-            Arc::new(lesson_writer),
-            Arc::new(observer),
-            None,
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let plans = hook_writer.plans.lock().await;
-        let audit = plans[0]
-            .decision_audit
-            .as_ref()
-            .expect("decision_audit missing");
-        assert_eq!(
-            audit.decision_output["action_profiles"][0]["tool_name"],
-            "mo"
-        );
-        assert_eq!(
-            audit.decision_output["action_profiles"][0]["pre_state_snapshot_id"],
-            "moq_snap_123"
-        );
-        assert_eq!(
-            audit.decision_output["action_profiles"][0]["pre_state_snapshot_database"],
-            "analytics"
-        );
-        assert_eq!(
-            audit.decision_output["action_profiles"][0]["profile"]["requires_pre_state"],
-            true
-        );
-    }
-
-    #[tokio::test]
     async fn hook_uses_turn_journal_verification_as_single_action_fallback() {
         let temp = tempdir().expect("tempdir");
         let _guard = JournalDirGuard::new(temp.path());

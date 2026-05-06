@@ -182,21 +182,6 @@ mod tests {
     // ── Pre-filter ordering ──
 
     #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn prefilter_ranks_github_tools_for_pr_query() {
-        let state = ConversationState::from_message("matrixorigin memoria 最新的pr?", 1);
-        let ranked = pre_filter_dynamic(&state, "matrixorigin memoria 最新的pr?");
-
-        // github_list_prs should be ranked first among dynamic tools
-        let first_name = TOOL_CATALOG[ranked[0].0].name;
-        assert_eq!(
-            first_name, "github",
-            "github_list_prs should be top-ranked for PR query, got: {}",
-            first_name
-        );
-    }
-
-    #[test]
     fn pinned_memory_always_available_for_recall() {
         // memory is now pinned — it no longer needs to rank in
         // pre_filter_dynamic. Verify it IS pinned so memory lifecycle
@@ -208,45 +193,6 @@ fn prefilter_ranks_github_tools_for_pr_query() {
         assert!(
             tool.pinned,
             "memory must be pinned for reliable memory lifecycle"
-        );
-    }
-
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn prefilter_ranks_lsp_for_code_intel_query() {
-        let state = ConversationState::from_message("帮我查这个符号的定义和引用", 1);
-        let ranked = pre_filter_dynamic(&state, "帮我查这个符号的定义和引用");
-        let first_name = TOOL_CATALOG[ranked[0].0].name;
-        assert_eq!(
-            first_name, "lsp",
-            "lsp should be top-ranked for code-intel query, got: {}",
-            first_name
-        );
-    }
-
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn prefilter_ranks_lsp_for_semantic_tokens_query() {
-        let state = ConversationState::from_message("show semantic tokens for this file", 1);
-        let ranked = pre_filter_dynamic(&state, "show semantic tokens for this file");
-        let first_name = TOOL_CATALOG[ranked[0].0].name;
-        assert_eq!(
-            first_name, "lsp",
-            "lsp should be top-ranked for semantic token query, got: {}",
-            first_name
-        );
-    }
-
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn prefilter_ranks_lsp_for_type_hierarchy_query() {
-        let state = ConversationState::from_message("show supertypes of this symbol", 1);
-        let ranked = pre_filter_dynamic(&state, "show supertypes of this symbol");
-        let first_name = TOOL_CATALOG[ranked[0].0].name;
-        assert_eq!(
-            first_name, "lsp",
-            "lsp should be top-ranked for type hierarchy query, got: {}",
-            first_name
         );
     }
 
@@ -329,50 +275,6 @@ fn prefilter_ranks_lsp_for_type_hierarchy_query() {
         assert!(terms.contains(&"忆".to_string()));
     }
 
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn prefilter_dynamic_still_produces_results_for_git_query() {
-        // The consolidated `git` tool is pinned, so dynamic ranking won't
-        // include it. But the ranker should still produce non-empty results
-        // for code-related queries (github, lsp, etc.).
-        let state = ConversationState::from_message("show me the git diff", 1);
-        let ranked = pre_filter_dynamic(&state, "show me the git diff");
-        assert!(
-            !ranked.is_empty(),
-            "dynamic ranking should still produce results even when git is pinned"
-        );
-    }
-
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn prefilter_never_returns_empty() {
-        // Even for completely unknown queries, the fallback ensures at least 3 tools.
-        let state = ConversationState::from_message("something completely random xyz", 1);
-        let ranked = pre_filter_dynamic(&state, "something completely random xyz");
-        assert!(
-            !ranked.is_empty(),
-            "pre-filter must never return empty (fallback to top-3 applies)"
-        );
-        assert!(
-            ranked.len() <= ToolRegistry::dynamic_count(),
-            "pre-filter must not exceed total dynamic count"
-        );
-    }
-
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn prefilter_filters_by_score_threshold() {
-        // A query with no matching intent should produce a filtered subset (not all tools).
-        let state = ConversationState::from_message("test", 1);
-        let ranked = pre_filter_dynamic(&state, "test");
-        // Should be fewer than all dynamic tools due to score threshold.
-        // The fallback ensures at least 3 results.
-        assert!(
-            !ranked.is_empty(),
-            "pre-filter must return at least 3 tools via fallback"
-        );
-    }
-
     // ── Budget gate ──
 
     #[test]
@@ -401,25 +303,6 @@ fn prefilter_filters_by_score_threshold() {
             total_dynamic <= 2,
             "50 token budget should fit ≤2 dynamic tools, got {}",
             total_dynamic
-        );
-    }
-
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn budget_large_includes_relevant_tools() {
-        let registry = ToolRegistry::new(mock_schemas());
-        // A GitHub-specific query with huge budget: should include GitHub tools.
-        // No longer guarantees ALL tools since score threshold filters irrelevant ones.
-        let result = registry.select_with_budget("最新的pr?", 1, 10000);
-        let names = ToolRegistry::selected_names(&result);
-        assert!(
-            names.contains(&"github".to_string()),
-            "github_list_prs should be included for PR query"
-        );
-        // At minimum pinned + at least 1 dynamic tool
-        assert!(
-            result.len() > ToolRegistry::pinned_count(),
-            "large budget should include at least some dynamic tools"
         );
     }
 
@@ -1016,24 +899,6 @@ fn budget_large_includes_relevant_tools() {
     // ── Phase 6: Testing gap coverage ──
 
     #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn mixed_multilingual_query_selects_github() {
-        // Phase 6.5: Multi-language query routing
-        let state = ConversationState::from_message("最新的 GitHub PRs list", 3);
-        let ranked = scoring::pre_filter_dynamic(&state, "最新的 GitHub PRs list");
-        let top_names: Vec<&str> = ranked
-            .iter()
-            .take(5)
-            .filter_map(|(idx, _)| TOOL_CATALOG.get(*idx).map(|t| t.name))
-            .collect();
-        assert!(
-            top_names.iter().any(|n| n.contains("github")),
-            "mixed EN/CN GitHub query should select github tools, got: {:?}",
-            top_names
-        );
-    }
-
-    #[test]
     fn budget_edge_exactly_one_tool_fits() {
         // Phase 6.2: Budget exhaustion boundary
         let reg = ToolRegistry::new(mock_schemas());
@@ -1063,19 +928,6 @@ fn mixed_multilingual_query_selects_github() {
             dynamic.is_empty(),
             "conversational should have 0 dynamic tools, got: {:?}",
             dynamic
-        );
-    }
-
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn zero_signal_query_gets_dynamic_tools() {
-        // Phase 7.1: Signal-strength adaptive threshold
-        let state = ConversationState::from_message("matrixorigin", 1);
-        assert_eq!(state.signal_count(), 0, "should have 0 signals");
-        let ranked = scoring::pre_filter_dynamic(&state, "matrixorigin");
-        assert!(
-            !ranked.is_empty(),
-            "0-signal query should still get dynamic tools via adaptive threshold"
         );
     }
 

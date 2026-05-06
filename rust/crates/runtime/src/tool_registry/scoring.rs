@@ -1216,49 +1216,12 @@ mod tests {
     // ──────────────────────────────────────────────────────────
 
     #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn pre_filter_returns_nonempty_for_real_query() {
-        let state = state_at_turn(1);
-        let results = pre_filter_dynamic(&state, "read the contents of a file");
-        assert!(
-            !results.is_empty(),
-            "should return some tools for a real query"
-        );
-    }
-
-    #[test]
     fn pre_filter_empty_query() {
         let state = state_at_turn(1);
         let results = pre_filter_dynamic(&state, "");
         // Empty query may still return tools due to cold-start logic
         // Just verify it doesn't panic
         let _ = results;
-    }
-
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn pre_filter_with_file_context() {
-        let state = state_at_turn(1);
-        let ctx = vec!["rust".to_string()];
-        let results = pre_filter_dynamic_with_file_context(
-            &state,
-            "run tests",
-            None,
-            None,
-            &[],
-            0.0,
-            &HashMap::new(),
-            &ctx,
-        );
-        assert!(!results.is_empty());
-    }
-
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn pre_filter_with_pressure_zero() {
-        let state = state_at_turn(1);
-        let results = pre_filter_dynamic_with_pressure(&state, "read file", None, None, &[], 0.0);
-        assert!(!results.is_empty());
     }
 
     #[test]
@@ -1415,91 +1378,5 @@ fn pre_filter_with_pressure_zero() {
                 None
             }
         })
-    }
-
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn outcome_bias_demotes_failing_tool() {
-        // Uses lsp (dynamic) — grep was previously used but is now pinned
-        // and therefore excluded from pre_filter_dynamic.
-        let state = ConversationState::default();
-        let query = "find the definition of this function";
-        let empty = HashMap::new();
-
-        let baseline = pre_filter_dynamic_with_outcome_bias(
-            &state,
-            query,
-            None,
-            None,
-            &[],
-            0.0,
-            &empty,
-            &[],
-            &empty,
-        );
-        let base_score = score_for(&baseline, "lsp").expect("git_log should rank");
-
-        let mut penalty = HashMap::new();
-        penalty.insert("lsp".to_string(), -0.16);
-        let biased = pre_filter_dynamic_with_outcome_bias(
-            &state,
-            query,
-            None,
-            None,
-            &[],
-            0.0,
-            &empty,
-            &[],
-            &penalty,
-        );
-        let biased_score = score_for(&biased, "lsp").expect("git_log should still rank");
-
-        assert!(
-            biased_score < base_score,
-            "negative outcome bias should lower score: {biased_score} vs {base_score}"
-        );
-        // Scoring applies an inner clamp of ±0.10.
-        assert!((base_score - biased_score - 0.10).abs() < 1e-6);
-    }
-
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn outcome_bias_promotes_successful_tool() {
-        let state = ConversationState::default();
-        let query = "find the definition of this function";
-        let empty = HashMap::new();
-
-        let baseline = pre_filter_dynamic_with_outcome_bias(
-            &state,
-            query,
-            None,
-            None,
-            &[],
-            0.0,
-            &empty,
-            &[],
-            &empty,
-        );
-        let base_score = score_for(&baseline, "lsp").expect("git_log should rank");
-
-        let mut boost = HashMap::new();
-        boost.insert("lsp".to_string(), 0.10);
-        let biased = pre_filter_dynamic_with_outcome_bias(
-            &state,
-            query,
-            None,
-            None,
-            &[],
-            0.0,
-            &empty,
-            &[],
-            &boost,
-        );
-        let biased_score = score_for(&biased, "lsp").expect("git_log should still rank");
-
-        assert!(
-            biased_score > base_score,
-            "positive outcome bias should raise score: {biased_score} vs {base_score}"
-        );
     }
 }

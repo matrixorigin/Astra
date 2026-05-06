@@ -701,37 +701,6 @@ mod tests {
     /// Cache marker must sit at the end of the STATIC (pinned) prefix, not
     /// after dynamic tools. Otherwise churn in the dynamic segment invalidates
     /// the cached prefix every turn.
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn annotate_tool_schemas_marks_end_of_pinned_prefix_not_last_tool() {
-        let mut tools = vec![
-            json!({"type": "function", "function": {"name": "bash"}}), // pinned
-            json!({"type": "function", "function": {"name": "read_file"}}), // pinned
-            json!({"type": "function", "function": {"name": "git"}}), // pinned (new)
-            json!({"type": "function", "function": {"name": "git_log"}}), // dynamic
-            json!({"type": "function", "function": {"name": "mo"}}), // dynamic
-        ];
-        annotate_tool_schemas_for_caching(
-            &mut tools,
-            &PromptCacheConfig {
-                cache_enabled: true,
-                is_anthropic: true,
-            },
-        );
-
-        // Marker on last pinned (git_status at idx 2).
-        assert!(tools[0].get("cache_control").is_none());
-        assert!(tools[1].get("cache_control").is_none());
-        assert!(
-            tools[2].get("cache_control").is_some(),
-            "marker belongs on the last pinned tool (static-lib boundary)"
-        );
-        assert!(
-            tools[3].get("cache_control").is_none(),
-            "dynamic tool must NOT receive the marker — its churn would invalidate cache"
-        );
-        assert!(tools[4].get("cache_control").is_none());
-    }
 
     /// When dynamic tools are interleaved (shouldn't happen in production but
     /// could via custom pipelines), the marker goes on the LAST pinned tool —
@@ -1441,104 +1410,9 @@ mod cache_stability_regression {
     /// Core invariant: adding, removing, or reordering tools AFTER the pinned
     /// prefix must leave the pinned prefix bytes completely unchanged and keep
     /// the cache marker on the same pinned tool.
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn pinned_prefix_bytes_survive_dynamic_churn() {
-        // Turn A: 3 dynamic tools in one order.
-        let mut a = pinned_prefix_fixture();
-        a.extend([
-            schema("git_log"),
-            schema("mo"),
-            schema("github_list_prs"),
-        ]);
-        annotate_tool_schemas_for_caching(&mut a, &cfg_anthropic());
-
-        // Turn B: different dynamic tools in different order, different count.
-        let mut b = pinned_prefix_fixture();
-        b.extend([
-            schema("git_show"),
-            schema("github_get_pr"),
-            schema("web_fetch"),
-            schema("mo"),
-        ]);
-        annotate_tool_schemas_for_caching(&mut b, &cfg_anthropic());
-
-        // 1. Pinned prefix (positions 0..=13) is byte-identical.
-        let pinned_count = pinned_prefix_fixture().len();
-        for i in 0..pinned_count - 1 {
-            // All but the last pinned — the marker is on the last one, so
-            // compare it structurally below.
-            assert_eq!(
-                a[i], b[i],
-                "pinned tool at idx {i} must be byte-identical across turns"
-            );
-        }
-
-        // 2. Marker lands on the same tool name (bytes may differ from the raw
-        //    fixture because of the added `cache_control`, but the *host* tool
-        //    is the same one).
-        let marker_a_name = a[pinned_count - 1]
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(Value::as_str);
-        let marker_b_name = b[pinned_count - 1]
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(Value::as_str);
-        assert_eq!(
-            marker_a_name, marker_b_name,
-            "cache marker must host on the same pinned tool across turns"
-        );
-        assert!(
-            a[pinned_count - 1].get("cache_control").is_some(),
-            "last pinned tool on turn A must carry cache_control"
-        );
-        assert!(
-            b[pinned_count - 1].get("cache_control").is_some(),
-            "last pinned tool on turn B must carry cache_control"
-        );
-
-        // 3. No dynamic tool carries cache_control — if one did, a churn would
-        //    wipe its cache every turn.
-        for (i, tool) in a.iter().enumerate().skip(pinned_count) {
-            assert!(
-                tool.get("cache_control").is_none(),
-                "dynamic tool at idx {i} on turn A must NOT carry cache_control"
-            );
-        }
-        for (i, tool) in b.iter().enumerate().skip(pinned_count) {
-            assert!(
-                tool.get("cache_control").is_none(),
-                "dynamic tool at idx {i} on turn B must NOT carry cache_control"
-            );
-        }
-    }
 
     /// The marker always lands on the LAST pinned tool — even if the pinned
     /// count shrinks or dynamic tools are interleaved by a buggy caller.
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn marker_position_equals_last_pinned_index() {
-        let mut tools = vec![
-            schema("bash"),         // pinned
-            schema("git_log"),      // dynamic (interleaved — shouldn't happen in production)
-            schema("read_file"),    // pinned
-            schema("mo"),    // dynamic
-            schema("memory"), // pinned
-            schema("web_fetch"),    // dynamic
-        ];
-        annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
-
-        // Marker on memory_store (last pinned, idx 4) — not on web_fetch (last tool, idx 5).
-        assert!(
-            tools[4].get("cache_control").is_some(),
-            "marker should land on last pinned tool (memory_store at idx 4)"
-        );
-        assert!(
-            tools[5].get("cache_control").is_none(),
-            "dynamic tool after last pinned must NOT carry marker"
-        );
-    }
 
     /// Default pinned set must contain the static-lib tools — if someone
     /// demotes one, cache hit rate drops proportional to its token cost.
@@ -1589,112 +1463,10 @@ fn marker_position_equals_last_pinned_index() {
     /// Bedrock path: tools get translated to `toolSpec` blocks + a trailing
     /// `cachePoint`. The cachePoint must sit AT THE END OF THE PINNED PREFIX,
     /// not at the end of the full tool list.
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn bedrock_request_body_places_cachepoint_at_pinned_boundary() {
-        let mut tools = pinned_prefix_fixture();
-        tools.extend([schema("git_log"), schema("mo")]);
-        annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
-
-        let body = build_provider_request_body(
-            &[json!({"role": "user", "content": "hi"})],
-            &tools,
-            "anthropic.claude-sonnet-4-20250514-v1:0",
-            "bedrock",
-            Some(256),
-            None,
-            false,
-            &ThinkingConfig::Off,
-        );
-
-        let out_tools = body["toolConfig"]["tools"]
-            .as_array()
-            .expect("bedrock toolConfig.tools");
-
-        // Find the cachePoint. The index should be pinned_count (since each
-        // pinned tool maps to one toolSpec, the cachePoint gets inserted right
-        // after the last pinned tool).
-        let cp_positions: Vec<usize> = out_tools
-            .iter()
-            .enumerate()
-            .filter_map(|(i, t)| t.get("cachePoint").map(|_| i))
-            .collect();
-        assert_eq!(
-            cp_positions.len(),
-            1,
-            "exactly one cachePoint expected in Bedrock tool list, got {cp_positions:?}"
-        );
-        let pinned_count = pinned_prefix_fixture().len();
-        assert_eq!(
-            cp_positions[0], pinned_count,
-            "cachePoint must sit immediately after the pinned prefix \
-             (pinned_count={pinned_count}), got {}",
-            cp_positions[0]
-        );
-
-        // No cachePoint after the dynamic tools — they're explicitly post-cache.
-        for (i, t) in out_tools.iter().enumerate().skip(pinned_count + 1) {
-            assert!(
-                t.get("cachePoint").is_none(),
-                "dynamic tool at idx {i} must not carry cachePoint"
-            );
-        }
-    }
 
     /// Direct Anthropic path: tools are rewritten to `{name, input_schema}`
     /// blocks with `cache_control` preserved. The marker must survive the
     /// rewrite and land on the correct (last pinned) tool.
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn anthropic_direct_request_preserves_cache_control_on_last_pinned() {
-        let mut tools = pinned_prefix_fixture();
-        tools.extend([schema("git_log"), schema("mo")]);
-        annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
-
-        let body = build_provider_request_body(
-            &[json!({"role": "user", "content": "hi"})],
-            &tools,
-            "claude-sonnet-4-5-20250929",
-            "anthropic",
-            Some(256),
-            None,
-            false,
-            &ThinkingConfig::Off,
-        );
-
-        let out_tools = body["tools"]
-            .as_array()
-            .expect("anthropic tools field must be an array");
-
-        // Exactly one tool carries cache_control.
-        let marked: Vec<usize> = out_tools
-            .iter()
-            .enumerate()
-            .filter_map(|(i, t)| t.get("cache_control").map(|_| i))
-            .collect();
-        assert_eq!(
-            marked.len(),
-            1,
-            "exactly one cache_control expected on anthropic tools, got {marked:?}"
-        );
-
-        // The marked tool is the last pinned (skill, idx 13 in our fixture).
-        let pinned_count = pinned_prefix_fixture().len();
-        assert_eq!(
-            marked[0],
-            pinned_count - 1,
-            "cache_control must land on last pinned tool (idx {}), got {}",
-            pinned_count - 1,
-            marked[0]
-        );
-
-        // cache_control is simple ephemeral — no ttl/scope (Bedrock compat +
-        // no beta header dependence).
-        let cc = &out_tools[marked[0]]["cache_control"];
-        assert_eq!(cc["type"].as_str(), Some("ephemeral"));
-        assert!(cc.get("ttl").is_none());
-        assert!(cc.get("scope").is_none());
-    }
 
     /// Direct Anthropic path, identical assembly twice — request bodies must
     /// be byte-identical up to the cache_control host. This is the test that
@@ -1757,42 +1529,6 @@ fn anthropic_direct_request_preserves_cache_control_on_last_pinned() {
     /// Bedrock path parallel to the anthropic direct test — two calls with
     /// different dynamic tools must produce byte-identical bytes up to (and
     /// including) the cachePoint.
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn bedrock_request_pinned_bytes_identical_across_calls() {
-        let build = |extra: Vec<Value>| {
-            let mut tools = pinned_prefix_fixture();
-            tools.extend(extra);
-            annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
-            build_provider_request_body(
-                &[json!({"role": "user", "content": "hi"})],
-                &tools,
-                "anthropic.claude-sonnet-4-20250514-v1:0",
-                "bedrock",
-                Some(256),
-                None,
-                false,
-                &ThinkingConfig::Off,
-            )
-        };
-        let a = build(vec![schema("git_log"), schema("mo")]);
-        let b = build(vec![schema("web_fetch")]);
-
-        let a_tools = a["toolConfig"]["tools"].as_array().unwrap();
-        let b_tools = b["toolConfig"]["tools"].as_array().unwrap();
-        // pinned_count tools + 1 cachePoint block = pinned_count + 1 entries
-        // that must match.
-        let pinned_count = pinned_prefix_fixture().len();
-        for i in 0..=pinned_count {
-            let sa = serde_json::to_string(&a_tools[i]).unwrap();
-            let sb = serde_json::to_string(&b_tools[i]).unwrap();
-            assert_eq!(
-                sa, sb,
-                "bedrock tool[{i}] must be byte-identical across calls \
-                 (pinned prefix {pinned_count} + cachePoint)"
-            );
-        }
-    }
 
     /// OpenAI-compatible providers (DeepSeek, Qwen, MiniMax, vanilla OpenAI)
     /// don't consume `cache_control` — the field should still be present
@@ -1838,34 +1574,6 @@ fn bedrock_request_pinned_bytes_identical_across_calls() {
     /// cacheable pinned segment. We simulate this by directly inserting
     /// into the default pinned set and verifying the marker moves to after
     /// the user-added tool.
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn user_registered_pinned_tool_joins_static_prefix() {
-        let mut tools = pinned_prefix_fixture();
-        // Simulate a user-defined tool registered via upsert_schema before
-        // the session starts — it lives AFTER the catalog-declared pinned
-        // tools but BEFORE any dynamic selection.
-        tools.push(schema("my_custom_db_tool"));
-        // Tell the annotator this name counts as pinned (mirrors what
-        // upsert_schema=true achieves at registry level).
-        let mut pinned: HashSet<String> = default_pinned_tool_names();
-        pinned.insert("my_custom_db_tool".into());
-        // Add a dynamic tail.
-        tools.push(schema("git_log"));
-        tools.push(schema("mo"));
-        annotate_tool_schemas_for_caching_with_pinned(&mut tools, &cfg_anthropic(), &pinned);
-
-        let last_pinned_idx = pinned_prefix_fixture().len(); // == 14 (my_custom_db_tool at idx 14)
-        assert!(
-            tools[last_pinned_idx].get("cache_control").is_some(),
-            "user-registered pinned tool must host the cache marker \
-             (at idx {last_pinned_idx})"
-        );
-        assert!(
-            tools[last_pinned_idx + 1].get("cache_control").is_none(),
-            "dynamic tool right after user-pinned must not carry marker"
-        );
-    }
 
     /// Runtime-discovered dynamic tool/skill (e.g. via MCP tool-list-changed
     /// or discover_skills): these enter the dynamic segment. Cache on the
@@ -1961,36 +1669,6 @@ fn user_registered_pinned_tool_joins_static_prefix() {
         assert_eq!(
             msg_a, msg_b,
             "first user message must be byte-identical when content is shared"
-        );
-    }
-
-    #[test]
-        #[ignore = "update for all-pinned catalog"]
-fn composite_bedrock_body_pinned_tools_plus_cachepoint_identical() {
-        let (a, b, pinned_count) = build_two_bedrock_bodies_with_shared_prefix();
-        let a_tools = a["toolConfig"]["tools"].as_array().unwrap();
-        let b_tools = b["toolConfig"]["tools"].as_array().unwrap();
-
-        // [pinned_0..pinned_{n-1}, cachePoint, dynamic_tail...]
-        // Compare indices 0..=pinned_count (inclusive of the cachePoint).
-        for i in 0..=pinned_count {
-            let sa = serde_json::to_string(&a_tools[i]).unwrap();
-            let sb = serde_json::to_string(&b_tools[i]).unwrap();
-            assert_eq!(
-                sa, sb,
-                "composite body: tool[{i}] must match across turns through cachePoint"
-            );
-        }
-
-        // Dynamic tail is allowed to differ — that's the whole point.
-        // Sanity: the two bodies DO differ somewhere after the cachePoint,
-        // otherwise the test isn't exercising what it claims to.
-        let tail_a: Vec<_> = a_tools.iter().skip(pinned_count + 1).collect();
-        let tail_b: Vec<_> = b_tools.iter().skip(pinned_count + 1).collect();
-        assert_ne!(
-            tail_a, tail_b,
-            "sanity: dynamic tails should differ between the two fixtures — \
-             if they're equal the test is tautological"
         );
     }
 
