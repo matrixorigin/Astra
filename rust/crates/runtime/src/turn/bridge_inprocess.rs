@@ -1474,11 +1474,8 @@ impl InProcessChatTurnBridge {
                     }),
                 );
             }
-            if !self_awareness_hint.is_empty() {
-                dynamic_sections.push(
-                    self_awareness_volatile_section(&self_awareness_hint)
-                        .expect("non-empty self-awareness hint"),
-                );
+            if let Some(section) = self_awareness_volatile_section(&self_awareness_hint) {
+                dynamic_sections.push(section);
             }
             if !memoria_insights_hint.is_empty() {
                 dynamic_sections.push(

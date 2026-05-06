@@ -625,11 +625,11 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "git",
-                "description": "Git operations. Actions: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash.",
+                "description": "Git operations. Actions: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["status","diff","log","show","blame","file_history","log_search","contributors","commit","revert_commit","stash"], "description": "Git operation to perform"},
+                        "action": {"type": "string", "enum": ["status","diff","log","show","blame","file_history","log_search","contributors","commit","revert_commit","stash","checkout_file","worktree"], "description": "Git operation to perform"},
                         "file": {"type": "string", "description": "File path (for blame, file_history)"},
                         "ref": {"type": "string", "description": "Git ref (for show, diff)"},
                         "n": {"type": "integer", "description": "Number of entries (for log)"},
