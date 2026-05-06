@@ -3467,12 +3467,17 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
+    // The journal-flow helpers below are only compiled when the
+    // `bridge-e2e-hooks` feature is on, because all their callers
+    // (`forward_persists_full_journal_*`, etc.) are gated on the same
+    // feature. Gating here means no `#[allow(dead_code)]` dance is
+    // needed when the feature is off.
+    #[cfg(feature = "bridge-e2e-hooks")]
     fn bridge_test_matrixone() -> MatrixOneSettings {
         MatrixOneSettings::mock()
     }
 
-    #[allow(dead_code)]
+    #[cfg(feature = "bridge-e2e-hooks")]
     fn bridge_test_encryptor() -> Arc<FernetTokenEncryptor> {
         Arc::new(
             FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=")
@@ -3480,7 +3485,7 @@ mod tests {
         )
     }
 
-    #[allow(dead_code)]
+    #[cfg(feature = "bridge-e2e-hooks")]
     fn bridge_test_headers(session_id: &str, full_llm_capture: bool) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("x-mo-user-id", "user-bridge-journal".parse().unwrap());
@@ -3499,7 +3504,7 @@ mod tests {
         headers
     }
 
-    #[allow(dead_code)]
+    #[cfg(feature = "bridge-e2e-hooks")]
     fn read_journal_events(session_id: &str) -> Vec<Value> {
         let path = JournalWriter::new(session_id)
             .expect("journal writer")
@@ -3516,7 +3521,7 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(feature = "bridge-e2e-hooks")]
     async fn wait_for_journal_events(session_id: &str) -> Vec<Value> {
         for _ in 0..100 {
             let events = read_journal_events(session_id);
@@ -3528,7 +3533,7 @@ mod tests {
         read_journal_events(session_id)
     }
 
-    #[allow(dead_code)]
+    #[cfg(feature = "bridge-e2e-hooks")]
     async fn collect_response_body(response: Response) -> String {
         let body = response
             .into_body()

@@ -37,6 +37,8 @@ use crate::turn::llm_client::{
     sleep_ms_or_llm_cancel,
 };
 use crate::turn::prompt_cache::{PromptCacheConfig, annotate_tool_schemas_for_caching};
+#[cfg(feature = "bridge-e2e-hooks")]
+use crate::turn::prompt_cache::apply_anthropic_cache_metadata;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_core::SharedPool;
 use astra_services::LlmTokenServiceConfig;

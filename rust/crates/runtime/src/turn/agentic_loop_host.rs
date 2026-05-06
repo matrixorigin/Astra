@@ -950,7 +950,7 @@ pub(crate) use super::agentic_delegate_interception::{
     tool_call_arguments_value, tool_call_name,
 };
 
-#[allow(unused_imports)]
+#[allow(unused_imports)] // threshold const is test-only; re-exported here so tests can reach it
 pub(crate) use super::agentic_auto_reflection::{
     AUTO_REFLECTION_SIGNAL_THRESHOLD, maybe_trigger_auto_reflection,
 };
