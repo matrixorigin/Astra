@@ -44,11 +44,11 @@ pub fn analyze_pipeline_health(capture: &SessionCapture) -> PipelineHealthReport
 
         match event.event_type.as_str() {
             "PipelineFeedback" => {
-                if let Some(meta) = metadata {
-                    if let Some(ratio) = meta.get("cache_hit_ratio").and_then(|v| v.as_f64()) {
-                        ratios.push(ratio);
-                        report.turns_with_feedback += 1;
-                    }
+                if let Some(meta) = metadata
+                    && let Some(ratio) = meta.get("cache_hit_ratio").and_then(|v| v.as_f64())
+                {
+                    ratios.push(ratio);
+                    report.turns_with_feedback += 1;
                 }
             }
             "PipelineCompactionAudit" => {

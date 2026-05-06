@@ -23,7 +23,7 @@ pub enum RestoreOutcome {
     Missing,
     /// Payload parsed successfully. Caller should pass this into
     /// `PipelineSession::from_snapshot`.
-    Restored(PipelineSessionSnapshot),
+    Restored(Box<PipelineSessionSnapshot>),
     /// Payload is present but schema-incompatible. Caller SHOULD log so
     /// operators can diagnose warm-start loss, then start fresh.
     Corrupt(serde_json::Error),
@@ -47,7 +47,7 @@ pub fn parse_pipeline_state(value: Option<&Value>) -> RestoreOutcome {
         return RestoreOutcome::Missing;
     }
     match serde_json::from_value::<PipelineSessionSnapshot>(value.clone()) {
-        Ok(snapshot) => RestoreOutcome::Restored(snapshot),
+        Ok(snapshot) => RestoreOutcome::Restored(Box::new(snapshot)),
         Err(err) => RestoreOutcome::Corrupt(err),
     }
 }
@@ -74,7 +74,7 @@ pub fn restore_or_new(config: PipelineConfig, checkpoint_value: Option<&Value>) 
                 cache_breaks = snapshot.stats.cache_breaks.len(),
                 "pipeline session restored from checkpoint (warm-start)"
             );
-            PipelineSession::from_snapshot(config, snapshot)
+            PipelineSession::from_snapshot(config, *snapshot)
         }
         RestoreOutcome::Corrupt(err) => {
             tracing::warn!(

@@ -401,11 +401,16 @@ fn evaluate_one(
             }
         }
         Criterion::AnyOf { criteria } => {
-            let nested = criteria
-                .iter()
-                .map(|criterion| evaluate_one(criterion, outcome, session))
-                .collect::<Vec<_>>();
-            let passed = nested.iter().any(|result| result.passed);
+            let mut nested = Vec::new();
+            let mut passed = false;
+            for criterion in criteria {
+                let result = evaluate_one(criterion, outcome, session);
+                passed = result.passed;
+                nested.push(result);
+                if passed {
+                    break;
+                }
+            }
             let detail = nested
                 .iter()
                 .enumerate()
@@ -432,11 +437,16 @@ fn evaluate_one(
             }
         }
         Criterion::AllOf { criteria } => {
-            let nested = criteria
-                .iter()
-                .map(|criterion| evaluate_one(criterion, outcome, session))
-                .collect::<Vec<_>>();
-            let passed = nested.iter().all(|result| result.passed);
+            let mut nested = Vec::new();
+            let mut passed = true;
+            for criterion in criteria {
+                let result = evaluate_one(criterion, outcome, session);
+                passed = result.passed;
+                nested.push(result);
+                if !passed {
+                    break;
+                }
+            }
             let detail = nested
                 .iter()
                 .enumerate()
@@ -1019,6 +1029,30 @@ mod tests {
     }
 
     #[test]
+    fn any_of_short_circuits_after_first_passing_criterion() {
+        let out = outcome_with_tools(&["bash"]);
+        let r = evaluate_deterministic(
+            &[Criterion::AnyOf {
+                criteria: vec![
+                    Criterion::ToolCalled {
+                        name: "bash".into(),
+                    },
+                    Criterion::TextContains {
+                        needle: "sentinel-not-evaluated".into(),
+                    },
+                ],
+            }],
+            &out,
+        );
+
+        assert!(r[0].passed);
+        assert!(
+            !r[0].detail.contains("sentinel-not-evaluated"),
+            "AnyOf should not evaluate criteria after the first pass"
+        );
+    }
+
+    #[test]
     fn any_of_fails_when_all_nested_criteria_fail() {
         let out = outcome_with_tools(&["read_file"]);
         let r = evaluate_deterministic(
@@ -1075,6 +1109,30 @@ mod tests {
         );
         assert!(!r[0].passed);
         assert_eq!(r[0].severity, CriterionSeverity::Hard);
+    }
+
+    #[test]
+    fn all_of_short_circuits_after_first_failing_criterion() {
+        let out = outcome_with_tools(&["read_file"]);
+        let r = evaluate_deterministic(
+            &[Criterion::AllOf {
+                criteria: vec![
+                    Criterion::ToolCalled {
+                        name: "bash".into(),
+                    },
+                    Criterion::TextContains {
+                        needle: "sentinel-not-evaluated".into(),
+                    },
+                ],
+            }],
+            &out,
+        );
+
+        assert!(!r[0].passed);
+        assert!(
+            !r[0].detail.contains("sentinel-not-evaluated"),
+            "AllOf should not evaluate criteria after the first failure"
+        );
     }
 
     #[test]

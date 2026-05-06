@@ -280,16 +280,31 @@ impl PipelineStats {
         });
     }
 
-    /// Check if there's a compaction cascade (2+ events in last 3 turns).
+    /// Check if there's a compaction cascade.
+    ///
+    /// Detect both tight loops (2+ events in 3 turns) and sustained pressure
+    /// (3+ events in 10 turns). The wider window avoids missing every-other-turn
+    /// compaction patterns that still indicate the context is growing faster
+    /// than optimization can stabilize it.
     #[must_use]
     pub fn has_compaction_cascade(&self) -> bool {
-        let window_start = self.turns_executed.saturating_sub(3);
-        let recent = self
+        let tight_window_start = self.turns_executed.saturating_sub(3);
+        let tight_recent = self
             .compact_events
             .iter()
-            .filter(|e| e.turn > window_start)
+            .filter(|e| e.turn > tight_window_start)
             .count();
-        recent >= 2
+        if tight_recent >= 2 {
+            return true;
+        }
+
+        let sustained_window_start = self.turns_executed.saturating_sub(10);
+        let sustained_recent = self
+            .compact_events
+            .iter()
+            .filter(|e| e.turn > sustained_window_start)
+            .count();
+        sustained_recent >= 3
     }
 
     /// Record per-section token usage observed in a completed turn.
@@ -428,6 +443,21 @@ mod tests {
         stats.turns_executed = 6;
         stats.record_compaction(2000);
         assert!(stats.has_compaction_cascade());
+    }
+
+    #[test]
+    fn sustained_compaction_cascade_detection() {
+        let mut stats = PipelineStats::default();
+        for turn in [1, 3, 5] {
+            stats.turns_executed = turn;
+            stats.record_compaction(1000);
+        }
+        stats.turns_executed = 7;
+
+        assert!(
+            stats.has_compaction_cascade(),
+            "every-other-turn compaction should still trip cascade protection"
+        );
     }
 
     #[test]

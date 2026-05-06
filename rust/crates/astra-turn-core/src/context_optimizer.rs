@@ -14,9 +14,7 @@ use crate::context_planner::ContextPlan;
 use crate::microcompact::{CompactStrategy, PromptCacheProtocol};
 use crate::optimize_limits::OptimizeLimits;
 use crate::pipeline_config::ProviderCachePolicy;
-use crate::section_types::{
-    BoundSection, CacheScope, CompressionPriority, SectionArtifact, SectionKind, SectionSource,
-};
+use crate::section_types::{BoundSection, CacheScope, SectionArtifact, SectionKind};
 use crate::session_latches::SessionLatches;
 use crate::spill_backend::SpillBackend;
 
@@ -540,7 +538,7 @@ mod tests {
     use crate::pipeline_config::ProviderCachePolicy;
     use crate::pipeline_stats::PipelineStats;
     use crate::recovery_state::RecoveryState;
-    use crate::section_types::PlannedSection;
+    use crate::section_types::{CompressionPriority, PlannedSection, SectionSource};
     use crate::session_latches::SessionLatches;
     use crate::token_accounting::TokenAccounting;
     use std::collections::HashMap;
@@ -697,6 +695,48 @@ mod tests {
     }
 
     #[test]
+    fn reorder_never_moves_identity_or_constraints_anchors() {
+        let mut sections = vec![
+            test_bound_section(SectionKind::Skills, CacheScope::None, "none-a"),
+            test_bound_section(SectionKind::Identity, CacheScope::Global, "identity"),
+            test_bound_section(SectionKind::RuntimeIdentity, CacheScope::Session, "session"),
+            test_bound_section(SectionKind::Constraints, CacheScope::Global, "constraints"),
+            test_bound_section(SectionKind::ProjectContext, CacheScope::Global, "global"),
+        ];
+
+        let moves = cache_align_sections(&mut sections, 5);
+
+        assert!(moves > 0);
+        assert_eq!(sections[1].plan.kind, SectionKind::Identity);
+        assert_eq!(sections[1].text(), Some("identity"));
+        assert_eq!(sections[3].plan.kind, SectionKind::Constraints);
+        assert_eq!(sections[3].text(), Some("constraints"));
+        assert_eq!(sections[0].text(), Some("global"));
+        assert_eq!(sections[2].text(), Some("session"));
+        assert_eq!(sections[4].text(), Some("none-a"));
+    }
+
+    fn tool_result_messages(count: usize, content_len: usize) -> Vec<Value> {
+        let mut messages = vec![serde_json::json!({
+            "role": "assistant",
+            "tool_calls": (0..count)
+                .map(|i| serde_json::json!({
+                    "id": format!("call_{i}"),
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }))
+                .collect::<Vec<_>>()
+        })];
+        for i in 0..count {
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": format!("call_{i}"),
+                "content": "x".repeat(content_len),
+            }));
+        }
+        messages
+    }
+
+    #[test]
     fn tool_result_clearing_gate_controls_microcompact() {
         let (plan, bound, latches) = build_test_plan_and_bound();
         let limits = OptimizeLimits::all_closed();
@@ -718,22 +758,7 @@ mod tests {
 
     #[test]
     fn tool_result_clearing_skips_when_over_max_clear_tokens() {
-        let mut messages = vec![serde_json::json!({
-            "role": "assistant",
-            "tool_calls": (0..8)
-                .map(|i| serde_json::json!({
-                    "id": format!("call_{i}"),
-                    "function": {"name": "read_file", "arguments": "{}"}
-                }))
-                .collect::<Vec<_>>()
-        })];
-        for i in 0..8 {
-            messages.push(serde_json::json!({
-                "role": "tool",
-                "tool_call_id": format!("call_{i}"),
-                "content": "x".repeat(12_000),
-            }));
-        }
+        let mut messages = tool_result_messages(8, 12_000);
 
         let result = compact_tool_results_gated(
             &mut messages,
@@ -755,6 +780,55 @@ mod tests {
                     .unwrap_or(true)
             }),
             "messages must remain unmodified when clearing exceeds the circuit breaker"
+        );
+    }
+
+    #[test]
+    fn tool_result_clearing_allows_exact_max_clear_tokens_boundary() {
+        let mut probe = tool_result_messages(8, 12_000);
+        let expected = compact_tool_results_gated(
+            &mut probe,
+            CompactionTier::AggressivePrune,
+            1.0,
+            CompactStrategy::Normalized,
+            u32::MAX,
+        )
+        .tokens;
+        assert!(
+            expected > 0,
+            "probe should identify compactable tool results"
+        );
+
+        let mut exact = tool_result_messages(8, 12_000);
+        let exact_result = compact_tool_results_gated(
+            &mut exact,
+            CompactionTier::AggressivePrune,
+            1.0,
+            CompactStrategy::Normalized,
+            expected,
+        );
+        assert!(!exact_result.skipped_over_budget);
+        assert_eq!(exact_result.tokens, expected);
+
+        let mut below = tool_result_messages(8, 12_000);
+        let below_result = compact_tool_results_gated(
+            &mut below,
+            CompactionTier::AggressivePrune,
+            1.0,
+            CompactStrategy::Normalized,
+            expected.saturating_sub(1),
+        );
+        assert!(below_result.skipped_over_budget);
+        assert_eq!(below_result.tokens, 0);
+        assert!(
+            below.iter().all(|message| {
+                message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(|content| !crate::microcompact::is_cleared_content(content))
+                    .unwrap_or(true)
+            }),
+            "below-boundary rejection must leave messages unmodified"
         );
     }
 
@@ -889,6 +963,21 @@ mod tests {
 
         assert_eq!(pruned, 0);
         assert_eq!(schemas[0]["function"], "not-an-object");
+    }
+
+    #[test]
+    fn schema_pruning_preserves_malformed_nested_properties() {
+        let original = vec![
+            serde_json::json!({"type": "function", "function": {"name": "null_props", "parameters": {"type": "object", "properties": null}}}),
+            serde_json::json!({"type": "function", "function": {"name": "array_props", "parameters": {"type": "object", "properties": []}}}),
+            serde_json::json!({"type": "function", "function": {"name": "number_props", "parameters": {"type": "object", "properties": 42}}}),
+        ];
+        let mut schemas = original.clone();
+
+        let pruned = prune_tool_schemas(&mut schemas, CompactionTier::TrimSchemas);
+
+        assert_eq!(pruned, 0);
+        assert_eq!(schemas, original);
     }
 
     #[test]
