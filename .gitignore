@@ -69,6 +69,7 @@ Thumbs.db
 .env.*.local
 *.pem
 .secrets*
+*.yaml.bak
 
 # Logs and temp
 *.log

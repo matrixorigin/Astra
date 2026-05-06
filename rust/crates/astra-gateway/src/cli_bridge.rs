@@ -615,15 +615,13 @@ fn parse_claude_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
         plain_result(stdout, exit_code)
     }
 }
-/// The last line with `"type":"result"` carries session_id, result text, and usage.
-
 /// Parse a single stdout JSONL line from `--output-format stream-json` into a
 /// progress event. Returns `None` for lines that don't map to a user-visible event.
 ///
 /// Claude stream-json emits these top-level types:
 ///   - `system` (init): tools, model, session info
 ///   - `assistant`: message with content blocks (text, tool_use, thinking)
-///   - `result`: final answer with usage stats
+///   - `result`: final answer with usage stats — carries session_id, result text, and token usage
 fn parse_claude_stream_json_line(line: &str) -> Option<CliProgress> {
     let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
     match v["type"].as_str()? {
