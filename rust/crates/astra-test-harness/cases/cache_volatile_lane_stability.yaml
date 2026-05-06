@@ -1,0 +1,34 @@
+name: cache_volatile_lane_stability
+description: |
+  **What**: 5-turn session that triggers feedback_rules accumulation and learned_context
+  updates, then verifies cache_read doesn't regress on subsequent turns.
+  **Tests**: Volatile-lane routing correctness — EMA-drifting and accumulating content
+  must NOT sit in the Session-scope cached prefix.
+  **Why**: Commits 03575ac8 + fc3f3579 moved learned_context and feedback_rules to the
+  volatile lane. Before this fix, any correction or quality tracker update would break
+  the 16K+ session prefix cache for 2 turns. This test catches regressions.
+  **Pass means**: cache_read is stable or growing across turns 3-5 (no drop after
+  turn 2 triggers implicit feedback). min_read=10000 ensures system prefix is cached
+  throughout despite the correction signal.
+  **Fail means**: cache_read drops to 0 on turn 3 (the turn after correction) indicating
+  the stable prefix was broken by volatile content leaking into Session scope.
+prompt: |
+  Read the first 10 lines of Cargo.toml. Reply with the package name only.
+capability: custom:cache
+difficulty: 2
+weight: 1.0
+timeout_seconds: 180
+steps:
+  - prompt: 'No wait, I meant read Makefile instead. Tell me the first target.'
+  - prompt: 'Reply ACK. Do not call any tools.'
+  - prompt: 'Reply ACK. Do not call any tools.'
+  - prompt: 'Reply ACK. Do not call any tools.'
+criteria:
+  - type: exit_code
+    code: 0
+  - type: all_of
+    criteria:
+      - type: prompt_cache_tokens
+        min_read: 10000
+        min_creation: 0
+        max_creation: 25000

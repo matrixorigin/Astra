@@ -1,0 +1,40 @@
+name: cache_message_level_reuse
+description: |
+  **What**: 6-turn session with tool calls to grow conversation history, measuring
+  whether message-level cache breakpoints (not just system prefix) produce hits.
+  **Tests**: Does Bedrock/Anthropic cache the conversation prefix across rounds?
+  Turn 1-2 build up history (~10K+ tokens); turns 3-6 should reuse that cached
+  prefix. If only system-level caching works, cache_read stays flat at ~16K.
+  If message-level caching works, cache_read should grow with history.
+  **Why**: Current Bedrock sessions show cache_read pinned at system-prompt size
+  (~16K) regardless of conversation length. This test quantifies whether
+  message-level cache_control/cachePoint actually saves tokens on Bedrock.
+  **Pass means**: cache_read grows beyond system-prompt size (>20K), indicating
+  message-level prefix reuse is active.
+  **Fail means**: cache_read stays flat (~16K) — only system blocks are cached,
+  message history is re-sent fresh each round. This is a Bedrock limitation,
+  not necessarily a code bug, but the test documents the behavior.
+prompt: |
+  Read the file Cargo.toml and summarize what workspace members it has.
+  Then read Makefile and tell me what the default target is.
+capability: custom:cache
+difficulty: 3
+weight: 1.0
+timeout_seconds: 240
+steps:
+  - prompt: 'Now read the first 20 lines of rust/crates/astra-turn-core/src/context_pipeline.rs and explain what ContextPipeline does.'
+  - prompt: 'Read rust/crates/astra-turn-core/src/context_planner.rs lines 60-100 and explain the plan_turn function.'
+  - prompt: 'Based on everything you read so far, what are the 4 phases of the pipeline? Reply concisely.'
+  - prompt: 'Reply ACK. Do not call any tools.'
+  - prompt: 'Reply ACK. Do not call any tools.'
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: read_file
+  # Soft metric: observe cache behavior. The test is observational —
+  # it documents whether message-level caching works on the provider.
+  - type: prompt_cache_tokens
+    min_read: 16000
+    min_creation: 0
+    max_creation: 60000

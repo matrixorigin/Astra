@@ -694,7 +694,11 @@ pub fn git_show(
         Err(e) => return e,
     };
 
-    let commit_ref = match args.get("commit").and_then(Value::as_str) {
+    let commit_ref = match args
+        .get("commit")
+        .or_else(|| args.get("ref"))
+        .and_then(Value::as_str)
+    {
         Some(c) => c,
         None => return "Error: missing 'commit' (SHA, branch, or tag)".to_string(),
     };
