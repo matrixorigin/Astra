@@ -7,10 +7,13 @@
 //! conservative behaviour (preserve content, emit a skipped-optimization
 //! trace entry).
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 /// Storage sink for spilled section content.
 ///
@@ -106,6 +109,125 @@ impl SpillBackend for FileSystemSpillBackend {
         }
 
         fs::read(&canon_path)
+    }
+}
+
+impl FileSystemSpillBackend {
+    /// Delete files in this backend's root whose modification time is
+    /// older than `max_age`. Returns the number of files removed.
+    ///
+    /// Errors on individual files are logged via `tracing` (when enabled)
+    /// but do not abort the sweep — a single corrupt/locked file must not
+    /// block GC progress for the rest of the directory.
+    pub fn prune_older_than(&self, max_age: Duration) -> io::Result<u64> {
+        let cutoff = SystemTime::now()
+            .checked_sub(max_age)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let mut removed: u64 = 0;
+        let entries = match fs::read_dir(&self.root) {
+            Ok(it) => it,
+            // If the directory does not exist yet (no spill ever happened)
+            // treat as a clean sweep: nothing to do.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            if modified < cutoff {
+                if fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
+    }
+}
+
+/// Default scheme used by [`SpillRegistry`] when a locator is a bare path
+/// (no `scheme://` prefix). Legacy `SpillReference` values written before
+/// the registry was introduced fall back to this scheme.
+pub const DEFAULT_SCHEME: &str = "file";
+
+/// Parse a locator of the form `scheme://path` into its pieces. Returns
+/// `(DEFAULT_SCHEME, locator)` if no scheme is present, preserving
+/// backwards compatibility with legacy payloads.
+#[must_use]
+pub fn parse_locator(locator: &str) -> (&str, &str) {
+    match locator.split_once("://") {
+        Some((scheme, rest)) if !scheme.is_empty() => (scheme, rest),
+        _ => (DEFAULT_SCHEME, locator),
+    }
+}
+
+/// Build a locator string of the form `scheme://path`.
+#[must_use]
+pub fn build_locator(scheme: &str, path: &str) -> String {
+    format!("{scheme}://{path}")
+}
+
+/// Scheme-based registry of [`SpillBackend`]s.
+///
+/// The registry is the Phase-12 answer to "given a `SpillReference` locator
+/// produced by an earlier turn (possibly in another process), which backend
+/// resolves it?". Each backend is registered under a short scheme string
+/// (e.g. `"file"`, `"s3"`); locators use `scheme://path` form.
+///
+/// Legacy locators (bare paths written before the registry existed) route
+/// to the [`DEFAULT_SCHEME`] backend, which is typically a
+/// [`FileSystemSpillBackend`]. This keeps on-disk payloads from earlier
+/// sessions readable after an upgrade.
+#[derive(Clone, Default)]
+pub struct SpillRegistry {
+    backends: HashMap<String, Arc<dyn SpillBackend>>,
+}
+
+impl std::fmt::Debug for SpillRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpillRegistry")
+            .field("schemes", &self.backends.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl SpillRegistry {
+    /// Create an empty registry — `load` will fail closed until a backend
+    /// is registered.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register `backend` for `scheme`. Replaces any backend previously
+    /// bound to the same scheme.
+    pub fn register(&mut self, scheme: impl Into<String>, backend: Arc<dyn SpillBackend>) {
+        self.backends.insert(scheme.into(), backend);
+    }
+
+    /// Look up the backend bound to `scheme`.
+    #[must_use]
+    pub fn resolve(&self, scheme: &str) -> Option<Arc<dyn SpillBackend>> {
+        self.backends.get(scheme).cloned()
+    }
+
+    /// Resolve `locator` (a `scheme://path` or legacy bare path) through
+    /// the registered backends. Returns `NotFound` if the scheme is not
+    /// registered.
+    pub fn load(&self, locator: &str) -> io::Result<Vec<u8>> {
+        let (scheme, path) = parse_locator(locator);
+        let backend = self.resolve(scheme).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no spill backend registered for scheme '{scheme}'"),
+            )
+        })?;
+        backend.load(path)
     }
 }
 
@@ -233,5 +355,134 @@ mod tests {
         }
         let err = StoreOnly.load("anything").expect_err("default must error");
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    // ── SpillRegistry (Phase 12: scheme-based routing) ─────────────────
+
+    #[test]
+    fn parse_locator_splits_scheme_and_path() {
+        let (s, p) = parse_locator("file:///tmp/x.txt");
+        assert_eq!(s, "file");
+        assert_eq!(p, "/tmp/x.txt");
+    }
+
+    #[test]
+    fn parse_locator_bare_path_falls_back_to_default_scheme() {
+        let (s, p) = parse_locator("/tmp/legacy.txt");
+        assert_eq!(s, DEFAULT_SCHEME);
+        assert_eq!(p, "/tmp/legacy.txt");
+    }
+
+    #[test]
+    fn registry_resolves_registered_scheme() {
+        let dir = TempDir::new().unwrap();
+        let backend: Arc<dyn SpillBackend> = Arc::new(FileSystemSpillBackend::new(dir.path()));
+        let mut reg = SpillRegistry::new();
+        reg.register("file", backend);
+        assert!(reg.resolve("file").is_some());
+        assert!(reg.resolve("s3").is_none());
+    }
+
+    #[test]
+    fn registry_load_routes_to_scheme_backend() {
+        let dir = TempDir::new().unwrap();
+        let fs_backend = Arc::new(FileSystemSpillBackend::new(dir.path()));
+        let locator = fs_backend.store("k", b"hello from fs").unwrap();
+
+        let mut reg = SpillRegistry::new();
+        reg.register("file", fs_backend.clone());
+
+        // Explicit scheme routes correctly.
+        let scheme_locator = build_locator("file", &locator);
+        let bytes = reg.load(&scheme_locator).expect("load via registry");
+        assert_eq!(bytes, b"hello from fs");
+    }
+
+    #[test]
+    fn registry_legacy_path_falls_back_to_file_scheme() {
+        let dir = TempDir::new().unwrap();
+        let fs_backend = Arc::new(FileSystemSpillBackend::new(dir.path()));
+        let locator = fs_backend.store("k", b"legacy bytes").unwrap();
+
+        let mut reg = SpillRegistry::new();
+        reg.register(DEFAULT_SCHEME, fs_backend);
+
+        // A bare path (no scheme) must still resolve via DEFAULT_SCHEME.
+        let bytes = reg.load(&locator).expect("legacy path resolves");
+        assert_eq!(bytes, b"legacy bytes");
+    }
+
+    #[test]
+    fn registry_load_unknown_scheme_returns_not_found() {
+        let reg = SpillRegistry::new();
+        let err = reg
+            .load("s3://bucket/key")
+            .expect_err("unknown scheme must fail");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn registry_after_process_restart_with_new_backend_instance_resolves() {
+        // Simulate process restart: original backend writes bytes, then is
+        // dropped; a brand-new backend instance rooted at the same dir
+        // resolves the locator via a fresh registry.
+        let dir = TempDir::new().unwrap();
+        let locator = {
+            let first = FileSystemSpillBackend::new(dir.path());
+            first.store("k", b"survive restart").unwrap()
+        };
+        // First backend is dropped here (process "died").
+
+        let reborn: Arc<dyn SpillBackend> = Arc::new(FileSystemSpillBackend::new(dir.path()));
+        let mut reg = SpillRegistry::new();
+        reg.register(DEFAULT_SCHEME, reborn);
+
+        let bytes = reg.load(&locator).expect("reborn backend resolves");
+        assert_eq!(bytes, b"survive restart");
+    }
+
+    // ── prune_older_than (Phase 12: GC) ────────────────────────────────
+
+    #[test]
+    fn prune_older_than_removes_stale_files() {
+        let dir = TempDir::new().unwrap();
+        let backend = FileSystemSpillBackend::new(dir.path());
+        let path = backend.store("old", b"stale").unwrap();
+
+        // Backdate the file's mtime by 2 hours.
+        let two_hours_ago = SystemTime::now() - Duration::from_secs(2 * 3600);
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(two_hours_ago))
+            .unwrap();
+
+        let removed = backend
+            .prune_older_than(Duration::from_secs(3600))
+            .expect("prune");
+        assert_eq!(removed, 1);
+        assert!(!Path::new(&path).exists(), "stale file should be gone");
+    }
+
+    #[test]
+    fn prune_older_than_keeps_fresh_files() {
+        let dir = TempDir::new().unwrap();
+        let backend = FileSystemSpillBackend::new(dir.path());
+        let path = backend.store("fresh", b"new").unwrap();
+
+        let removed = backend
+            .prune_older_than(Duration::from_secs(3600))
+            .expect("prune");
+        assert_eq!(removed, 0);
+        assert!(Path::new(&path).exists(), "fresh file should remain");
+    }
+
+    #[test]
+    fn prune_older_than_missing_root_is_noop() {
+        let parent = TempDir::new().unwrap();
+        let never_created = parent.path().join("never");
+        let backend = FileSystemSpillBackend::new(&never_created);
+        // root was never created — GC must not error.
+        let removed = backend
+            .prune_older_than(Duration::from_secs(1))
+            .expect("prune on missing root is ok");
+        assert_eq!(removed, 0);
     }
 }

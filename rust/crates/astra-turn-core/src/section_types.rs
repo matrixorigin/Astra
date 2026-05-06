@@ -5,11 +5,13 @@
 //! (prompt builders). Moving them here keeps the dependency DAG clean:
 //! `astra-turn-core` does NOT depend on `astra-runtime`.
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::context_assembly_trace::PromptTraceSignals;
+use crate::spill_backend::SpillRegistry;
 
 // ── Types moved from runtime::prompts::system ──────────────────────────────
 
@@ -236,6 +238,21 @@ impl SectionArtifact {
         }
     }
 
+    /// Returns `(path, original_tokens)` for `SpillReference`, else `None`.
+    ///
+    /// Callers use this to decide whether a section needs rehydration
+    /// without pattern-matching the enum at every call site.
+    #[must_use]
+    pub fn spill_locator(&self) -> Option<(&str, u32)> {
+        match self {
+            Self::SpillReference {
+                path,
+                original_tokens,
+            } => Some((path.as_str(), *original_tokens)),
+            _ => None,
+        }
+    }
+
     pub fn append_text(&mut self, kind: SectionKind, suffix: &str) {
         match self {
             Self::SystemText(text)
@@ -246,6 +263,35 @@ impl SectionArtifact {
                 *self = Self::from_text(kind, suffix.to_string());
             }
             Self::SpillReference { .. } | Self::Empty => {}
+        }
+    }
+
+    /// Resolve this artifact to concrete text.
+    ///
+    /// - Inline variants return a borrowed view (zero-copy).
+    /// - `SpillReference` resolves its locator through `registry`; on
+    ///   success the bytes are decoded as UTF-8. On failure (scheme
+    ///   unregistered, file missing, non-UTF-8) a human-readable
+    ///   placeholder is returned — fail-open keeps downstream
+    ///   serialization alive rather than poisoning the whole turn.
+    /// - `Empty` returns an empty string.
+    #[must_use]
+    pub fn rehydrate<'a>(&'a self, registry: &SpillRegistry) -> Cow<'a, str> {
+        match self {
+            Self::SystemText(t)
+            | Self::RuntimeText(t)
+            | Self::MemoryText(t)
+            | Self::HistorySummary(t) => Cow::Borrowed(t.as_str()),
+            Self::SpillReference { path, .. } => match registry.load(path) {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(s) => Cow::Owned(s),
+                    Err(_) => {
+                        Cow::Owned(format!("[spilled content unavailable: non-UTF8 at {path}]"))
+                    }
+                },
+                Err(_) => Cow::Owned(format!("[spilled content unavailable: {path}]")),
+            },
+            Self::Empty => Cow::Borrowed(""),
         }
     }
 }
@@ -410,5 +456,79 @@ mod tests {
         // Also verify normal path still works
         let normal = "hello world"; // 11 bytes => 2 tokens
         assert_eq!(estimate_text_tokens(normal), 2);
+    }
+
+    // ── rehydrate (Phase 12: on-demand spill resolution) ───────────────
+
+    use crate::spill_backend::{FileSystemSpillBackend, SpillBackend, DEFAULT_SCHEME};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    #[test]
+    fn rehydrate_inline_returns_borrowed() {
+        let art = SectionArtifact::RuntimeText("inline content".into());
+        let reg = SpillRegistry::new();
+        let got = art.rehydrate(&reg);
+        assert!(matches!(got, Cow::Borrowed(_)));
+        assert_eq!(got.as_ref(), "inline content");
+    }
+
+    #[test]
+    fn rehydrate_empty_returns_empty_borrowed() {
+        let art = SectionArtifact::Empty;
+        let reg = SpillRegistry::new();
+        assert_eq!(art.rehydrate(&reg).as_ref(), "");
+    }
+
+    #[test]
+    fn rehydrate_spill_reference_loads_from_backend() {
+        let dir = TempDir::new().unwrap();
+        let backend: Arc<dyn SpillBackend> = Arc::new(FileSystemSpillBackend::new(dir.path()));
+        let locator = backend.store("k", b"rehydrated text").unwrap();
+
+        let mut reg = SpillRegistry::new();
+        reg.register(DEFAULT_SCHEME, backend);
+
+        let art = SectionArtifact::SpillReference {
+            path: locator,
+            original_tokens: 10,
+        };
+        let got = art.rehydrate(&reg);
+        assert!(matches!(got, Cow::Owned(_)));
+        assert_eq!(got.as_ref(), "rehydrated text");
+    }
+
+    #[test]
+    fn rehydrate_missing_locator_degrades_gracefully() {
+        let reg = SpillRegistry::new(); // no backends registered
+        let art = SectionArtifact::SpillReference {
+            path: "file:///nonexistent".into(),
+            original_tokens: 5,
+        };
+        let got = art.rehydrate(&reg);
+        // Fail-open: placeholder, not panic, not empty string.
+        assert!(got.as_ref().contains("[spilled content unavailable"));
+        assert!(got.as_ref().contains("/nonexistent"));
+    }
+
+    #[test]
+    fn rehydrate_after_process_restart_with_new_backend_instance() {
+        // Phase 12 core promise: spill written in one "process" must be
+        // loadable through a fresh backend + registry instance.
+        let dir = TempDir::new().unwrap();
+        let locator = {
+            let first: Arc<dyn SpillBackend> = Arc::new(FileSystemSpillBackend::new(dir.path()));
+            first.store("k", b"survives restart").unwrap()
+        };
+
+        let reborn: Arc<dyn SpillBackend> = Arc::new(FileSystemSpillBackend::new(dir.path()));
+        let mut reg = SpillRegistry::new();
+        reg.register(DEFAULT_SCHEME, reborn);
+
+        let art = SectionArtifact::SpillReference {
+            path: locator,
+            original_tokens: 42,
+        };
+        assert_eq!(art.rehydrate(&reg).as_ref(), "survives restart");
     }
 }

@@ -14,7 +14,9 @@ use crate::context_planner::ContextPlan;
 use crate::microcompact::{CompactStrategy, PromptCacheProtocol};
 use crate::optimize_limits::OptimizeLimits;
 use crate::pipeline_config::ProviderCachePolicy;
-use crate::section_types::{BoundSection, CacheScope, SectionArtifact, SectionKind};
+use crate::section_types::{
+    BoundSection, CacheScope, CompressionPriority, SectionArtifact, SectionKind, SectionSource,
+};
 use crate::session_latches::SessionLatches;
 use crate::spill_backend::SpillBackend;
 
@@ -202,6 +204,52 @@ struct ClearResult {
     count: u32,
     tokens: u32,
     skipped_over_budget: bool,
+}
+
+/// Rehydrate previously-spilled sections in `sections` by replacing any
+/// `SectionArtifact::SpillReference` with the loaded original text
+/// (as `SystemText` / `RuntimeText` / `MemoryText` / `HistorySummary`
+/// depending on the section's kind).
+///
+/// This is the Phase-12 consumer side of spill: the optimizer *creates*
+/// `SpillReference` during `spill_oversized_sections`; this function
+/// *resolves* them back for downstream serialization or session-resume.
+///
+/// Behaviour:
+/// - Missing scheme / load error → fail-open with a placeholder string
+///   (`SectionArtifact::rehydrate` handles that) AND record a
+///   `SkippedOptimization` trace entry so explain UI can surface it.
+/// - `actual_tokens` is recomputed from the resolved text length so
+///   downstream budget accounting stays honest.
+/// - Inline artifacts are untouched (fast path).
+pub fn rehydrate_sections(
+    sections: &mut [BoundSection],
+    registry: &crate::spill_backend::SpillRegistry,
+) -> OptimizeStats {
+    let mut stats = OptimizeStats::default();
+    for section in sections.iter_mut() {
+        let Some((path, _)) = section.artifact.spill_locator() else {
+            continue;
+        };
+        let path = path.to_string();
+        // Route through registry + SectionArtifact::rehydrate so fail-open
+        // logic is in one place.
+        let resolved = section.artifact.rehydrate(registry).into_owned();
+        let is_placeholder = resolved.starts_with("[spilled content unavailable");
+        if is_placeholder {
+            stats.skipped.push(SkippedOptimization {
+                step: "rehydrate".into(),
+                reason: format!("failed to load spilled section from {path}"),
+            });
+            // Keep the spill reference intact — downstream consumers may
+            // choose to retry, and overwriting with a placeholder would
+            // permanently poison the section.
+            continue;
+        }
+        section.actual_tokens = crate::section_types::estimate_text_tokens(&resolved);
+        section.artifact = SectionArtifact::from_text(section.plan.kind, resolved);
+    }
+    stats
 }
 
 /// Prune tool schemas in-place using the shared 4-tier pruning strategy.
@@ -485,13 +533,14 @@ fn place_cache_markers(
 mod tests {
     use super::*;
     use crate::context_binder::bind_all;
-    use crate::context_planner::{PlanInput, plan_turn};
+    use crate::context_planner::{plan_turn, PlanInput};
     use crate::context_sources::*;
     use crate::emergent_context::EmergentContext;
     use crate::microcompact::{CompactStrategy, ProviderCacheStrategy};
     use crate::pipeline_config::ProviderCachePolicy;
     use crate::pipeline_stats::PipelineStats;
     use crate::recovery_state::RecoveryState;
+    use crate::section_types::PlannedSection;
     use crate::session_latches::SessionLatches;
     use crate::token_accounting::TokenAccounting;
     use std::collections::HashMap;
@@ -656,15 +705,11 @@ mod tests {
 
         let result = optimize(&plan, bound, &latches, &policy, &limits, 1);
         assert_eq!(result.stats.tool_results_cleared, 0);
-        assert!(
-            result
-                .stats
-                .skipped
-                .iter()
-                .any(|s| s.step == "tool_result_clearing"
-                    || s.step == "reorder"
-                    || s.step == "spill")
-        );
+        assert!(result
+            .stats
+            .skipped
+            .iter()
+            .any(|s| s.step == "tool_result_clearing" || s.step == "reorder" || s.step == "spill"));
     }
 
     #[test]
@@ -1070,5 +1115,109 @@ mod tests {
             identity_pos.unwrap() < constraints_pos.unwrap(),
             "Identity should come before Constraints"
         );
+    }
+
+    // ── rehydrate_sections (Phase 12: consumer side) ───────────────────
+
+    #[test]
+    fn rehydrate_sections_restores_spilled_section_content() {
+        use crate::spill_backend::{
+            FileSystemSpillBackend, SpillBackend, SpillRegistry, DEFAULT_SCHEME,
+        };
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let backend: Arc<dyn SpillBackend> = Arc::new(FileSystemSpillBackend::new(dir.path()));
+        let payload = b"ORIGINAL ProjectContext body".to_vec();
+        let locator = backend.store("ProjectContext", &payload).unwrap();
+
+        let mut sections = vec![BoundSection {
+            plan: PlannedSection {
+                kind: SectionKind::ProjectContext,
+                scope: CacheScope::None,
+                estimated_tokens: 100,
+                priority: CompressionPriority::Normal,
+                source: SectionSource::Static,
+            },
+            artifact: SectionArtifact::SpillReference {
+                path: locator,
+                original_tokens: 100,
+            },
+            actual_tokens: 0,
+            bind_latency: std::time::Duration::ZERO,
+        }];
+
+        let mut reg = SpillRegistry::new();
+        reg.register(DEFAULT_SCHEME, backend);
+
+        let stats = rehydrate_sections(&mut sections, &reg);
+        assert!(
+            stats.skipped.is_empty(),
+            "happy-path rehydrate must not record skipped entries"
+        );
+        assert!(matches!(
+            sections[0].artifact,
+            SectionArtifact::RuntimeText(_)
+        ));
+        assert_eq!(sections[0].text().unwrap(), "ORIGINAL ProjectContext body");
+        assert!(sections[0].actual_tokens > 0);
+    }
+
+    #[test]
+    fn rehydrate_sections_records_trace_on_load_error() {
+        use crate::spill_backend::SpillRegistry;
+
+        // Registry with NO backends registered → load will fail.
+        let reg = SpillRegistry::new();
+        let mut sections = vec![BoundSection {
+            plan: PlannedSection {
+                kind: SectionKind::Memory,
+                scope: CacheScope::Session,
+                estimated_tokens: 50,
+                priority: CompressionPriority::Normal,
+                source: SectionSource::Memory,
+            },
+            artifact: SectionArtifact::SpillReference {
+                path: "file:///missing".into(),
+                original_tokens: 50,
+            },
+            actual_tokens: 0,
+            bind_latency: std::time::Duration::ZERO,
+        }];
+
+        let stats = rehydrate_sections(&mut sections, &reg);
+        assert_eq!(stats.skipped.len(), 1);
+        assert_eq!(stats.skipped[0].step, "rehydrate");
+        // The section must REMAIN a SpillReference so callers can retry
+        // later instead of having a placeholder burned in.
+        assert!(matches!(
+            sections[0].artifact,
+            SectionArtifact::SpillReference { .. }
+        ));
+    }
+
+    #[test]
+    fn rehydrate_sections_is_noop_for_inline_artifacts() {
+        use crate::spill_backend::SpillRegistry;
+
+        let reg = SpillRegistry::new();
+        let mut sections = vec![BoundSection {
+            plan: PlannedSection {
+                kind: SectionKind::Identity,
+                scope: CacheScope::Global,
+                estimated_tokens: 10,
+                priority: CompressionPriority::Never,
+                source: SectionSource::Static,
+            },
+            artifact: SectionArtifact::SystemText("core rules".into()),
+            actual_tokens: 10,
+            bind_latency: std::time::Duration::ZERO,
+        }];
+
+        let stats = rehydrate_sections(&mut sections, &reg);
+        assert!(stats.skipped.is_empty());
+        assert_eq!(sections[0].text().unwrap(), "core rules");
+        assert_eq!(sections[0].actual_tokens, 10);
     }
 }
