@@ -46,6 +46,7 @@ fn acquire_gateway_instance_guard() -> Result<GatewayInstanceGuard, String> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&lock_path)
         .map_err(|e| format!("failed to open {}: {e}", lock_path.display()))?;
 
