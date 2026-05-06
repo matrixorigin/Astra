@@ -123,8 +123,23 @@ pub enum CliProfile {
     Codex {
         #[serde(default = "default_codex_bin")]
         bin: String,
-        #[serde(default = "default_codex_approval")]
-        approval_mode: String,
+        model: Option<String>,
+        /// Sandbox policy: "read-only" | "workspace-write" | "danger-full-access".
+        #[serde(default = "default_codex_sandbox")]
+        sandbox: String,
+        /// Use `--json` for JSONL streaming output in exec mode.
+        /// Codex `--json` is inherently streaming (each event prints as it occurs).
+        #[serde(default)]
+        stream_json: bool,
+        /// Extra args appended to the codex invocation before the prompt.
+        #[serde(default)]
+        extra_args: Vec<String>,
+        /// Skip git repo check (useful for non-git directories).
+        #[serde(default)]
+        skip_git_repo_check: bool,
+        /// Ephemeral mode: don't persist session files to disk.
+        #[serde(default)]
+        ephemeral: bool,
     },
     #[serde(rename = "custom")]
     Custom {
@@ -150,8 +165,8 @@ fn default_codex_bin() -> String {
 fn default_permission_mode() -> String {
     "auto".into()
 }
-fn default_codex_approval() -> String {
-    "full-auto".into()
+fn default_codex_sandbox() -> String {
+    "workspace-write".into()
 }
 
 impl Default for CliProfile {
@@ -192,8 +207,8 @@ impl CliProfile {
                 supports_tools: true,
             },
             Self::Codex { .. } => CliCapabilities {
-                supports_session: false,
-                supports_model_switch: false,
+                supports_session: true,
+                supports_model_switch: true,
                 supports_json_output: true,
                 supports_harness: false,
                 supports_tools: true,
@@ -293,11 +308,40 @@ impl CliProfile {
                 }
                 cmd
             }
-            Self::Codex { bin, approval_mode } => {
+            Self::Codex {
+                bin,
+                model,
+                sandbox,
+                stream_json,
+                extra_args,
+                skip_git_repo_check,
+                ephemeral,
+            } => {
                 let mut cmd = Command::new(bin);
-                cmd.arg(message)
-                    .arg(format!("--{approval_mode}"))
-                    .arg("--json");
+                if let Some(sid) = session_id {
+                    cmd.arg("exec").arg("resume").arg(sid);
+                    if !message.is_empty() {
+                        cmd.arg(message);
+                    }
+                } else {
+                    cmd.arg("exec").arg(message);
+                }
+                cmd.arg("--sandbox").arg(sandbox);
+                if *stream_json {
+                    cmd.arg("--json");
+                }
+                if *skip_git_repo_check {
+                    cmd.arg("--skip-git-repo-check");
+                }
+                if *ephemeral {
+                    cmd.arg("--ephemeral");
+                }
+                if let Some(m) = model {
+                    cmd.arg("--model").arg(m);
+                }
+                for arg in extra_args {
+                    cmd.arg(arg);
+                }
                 if let Some(dir) = working_dir {
                     cmd.current_dir(dir);
                 }
@@ -332,7 +376,13 @@ impl CliProfile {
                     parse_claude_json(stdout, exit_code)
                 }
             }
-            Self::Codex { .. } => parse_generic_json(stdout, exit_code, "result", "session_id"),
+            Self::Codex { stream_json, .. } => {
+                if *stream_json {
+                    parse_codex_stream_json_stdout(stdout, exit_code)
+                } else {
+                    parse_generic_json(stdout, exit_code, "result", "session_id")
+                }
+            }
             Self::Custom {
                 json_output,
                 text_field,
@@ -669,6 +719,187 @@ fn parse_claude_stream_json_line(line: &str) -> Option<CliProgress> {
     }
 }
 
+/// Parse accumulated stdout of a Codex `--json` (JSONL streaming) run.
+///
+/// Codex exec --json emits these event types:
+///   - `thread.started`: session init with thread_id
+///   - `turn.started` / `turn.completed`: turn lifecycle with usage
+///   - `item.started` / `item.updated` / `item.completed`: content items
+///   - `error`: error events
+///
+/// Item types: agent_message, reasoning, command_execution, file_change, mcp_tool_call
+fn parse_codex_stream_json_stdout(stdout: &str, exit_code: i32) -> CliResult {
+    let mut session_id: Option<String> = None;
+    let mut text = String::new();
+    let mut tokens_prompt: Option<u64> = None;
+    let mut tokens_completion: Option<u64> = None;
+    let mut tools_used: Vec<String> = Vec::new();
+    let mut tool_use_count: u32 = 0;
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v["type"].as_str() {
+            Some("thread.started") => {
+                session_id = v["thread_id"].as_str().map(String::from);
+            }
+            Some("turn.completed") => {
+                let usage = &v["usage"];
+                tokens_prompt = usage["input_tokens"]
+                    .as_u64()
+                    .or_else(|| usage["cached_input_tokens"].as_u64());
+                tokens_completion = usage["output_tokens"]
+                    .as_u64()
+                    .or_else(|| usage["reasoning_output_tokens"].as_u64());
+            }
+            Some("item.completed") => {
+                let item = &v["item"];
+                match item["type"].as_str() {
+                    Some("agent_message") => {
+                        if let Some(t) = item["text"].as_str() {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(t);
+                        }
+                    }
+                    Some("command_execution") => {
+                        tool_use_count += 1;
+                        if !tools_used.iter().any(|n| n == "command_execution") {
+                            tools_used.push("command_execution".to_string());
+                        }
+                    }
+                    Some("file_change") => {
+                        tool_use_count += 1;
+                        if !tools_used.iter().any(|n| n == "file_change") {
+                            tools_used.push("file_change".to_string());
+                        }
+                    }
+                    Some("mcp_tool_call") => {
+                        tool_use_count += 1;
+                        let tool_name = item["tool"]
+                            .as_str()
+                            .unwrap_or("mcp_tool")
+                            .to_string();
+                        if !tools_used.iter().any(|n| n == &tool_name) {
+                            tools_used.push(tool_name);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !text.is_empty() || session_id.is_some() {
+        let tool_calls_count = if tool_use_count == 0 {
+            None
+        } else {
+            Some(tool_use_count)
+        };
+        CliResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code,
+            success: exit_code == 0,
+            error_kind: default_error_kind(exit_code),
+            trace_id: None,
+            request_id: None,
+            run_id: None,
+            session_id,
+            text: if text.is_empty() { None } else { Some(text) },
+            tool_calls_count,
+            tools_used,
+            tokens_prompt,
+            tokens_completion,
+        }
+    } else {
+        plain_result(stdout, exit_code)
+    }
+}
+
+/// Parse a single stdout JSONL line from Codex `--json` into a progress event.
+///
+/// Codex events: thread.started, turn.started, turn.completed, item.started,
+/// item.updated, item.completed, error.
+fn parse_codex_stream_json_line(line: &str) -> Option<CliProgress> {
+    let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    match v["type"].as_str()? {
+        "item.started" | "item.updated" => {
+            let item = &v["item"];
+            match item["type"].as_str() {
+                Some("agent_message") => {
+                    if let Some(t) = item["text"].as_str()
+                        && !t.is_empty()
+                    {
+                        return Some(CliProgress::Token(t.to_string()));
+                    }
+                }
+                Some("reasoning") => {
+                    return Some(CliProgress::Thinking(true));
+                }
+                Some("command_execution") => {
+                    let cmd = item["command"].as_str().unwrap_or("shell").to_string();
+                    return Some(CliProgress::ToolStarted { name: cmd });
+                }
+                Some("file_change") => {
+                    return Some(CliProgress::ToolStarted {
+                        name: "file_change".to_string(),
+                    });
+                }
+                Some("mcp_tool_call") => {
+                    let tool = item["tool"].as_str().unwrap_or("mcp_tool").to_string();
+                    return Some(CliProgress::ToolStarted { name: tool });
+                }
+                _ => {}
+            }
+            None
+        }
+        "item.completed" => {
+            let item = &v["item"];
+            match item["type"].as_str() {
+                Some("command_execution") => {
+                    let cmd = item["command"].as_str().unwrap_or("shell").to_string();
+                    return Some(CliProgress::ToolDone {
+                        name: cmd,
+                        duration_ms: None,
+                    });
+                }
+                Some("file_change") => {
+                    return Some(CliProgress::ToolDone {
+                        name: "file_change".to_string(),
+                        duration_ms: None,
+                    });
+                }
+                Some("mcp_tool_call") => {
+                    let tool = item["tool"].as_str().unwrap_or("mcp_tool").to_string();
+                    return Some(CliProgress::ToolDone {
+                        name: tool,
+                        duration_ms: None,
+                    });
+                }
+                Some("reasoning") => {
+                    return Some(CliProgress::Thinking(false));
+                }
+                _ => {}
+            }
+            None
+        }
+        "turn.started" => Some(CliProgress::Status("codex turn started".to_string())),
+        "error" => {
+            let msg = v["message"].as_str().unwrap_or("unknown error").to_string();
+            Some(CliProgress::Status(format!("[error] {msg}")))
+        }
+        _ => None,
+    }
+}
+
 fn parse_generic_json(
     stdout: &str,
     exit_code: i32,
@@ -896,6 +1127,9 @@ pub async fn run_cli_with_cancel(
         CliProfile::Claude {
             stream_json: true,
             ..
+        } | CliProfile::Codex {
+            stream_json: true,
+            ..
         }
     );
     let (stdout_text, stderr_text, exit_code) = if stream_stdout {
@@ -1000,6 +1234,7 @@ async fn run_child_with_cancel_inner(
         collected
     });
 
+    let cli_name = name.to_string();
     let stdout_task = tokio::spawn(async move {
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
@@ -1009,10 +1244,14 @@ async fn run_child_with_cancel_inner(
                 output.push('\n');
             }
             output.push_str(&line);
-            if let Some(ref tx) = stdout_progress_tx
-                && let Some(ev) = parse_claude_stream_json_line(&line)
-            {
-                let _ = tx.send(ev).await;
+            if let Some(ref tx) = stdout_progress_tx {
+                let ev = match cli_name.as_str() {
+                    "codex" => parse_codex_stream_json_line(&line),
+                    _ => parse_claude_stream_json_line(&line),
+                };
+                if let Some(ev) = ev {
+                    let _ = tx.send(ev).await;
+                }
             }
         }
         output

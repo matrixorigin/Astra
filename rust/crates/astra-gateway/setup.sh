@@ -144,7 +144,8 @@ cli:
 $([ "$CLI_TYPE" = "astra" ] && echo "  permission_mode: auto")
 $([ "$CLI_TYPE" = "astra" ] && echo "  model: $MODEL")
 $([ "$CLI_TYPE" = "claude" ] && echo "  model: null")
-$([ "$CLI_TYPE" = "codex" ] && echo "  approval_mode: full-auto")
+$([ "$CLI_TYPE" = "codex" ] && echo "  sandbox: workspace-write")
+$([ "$CLI_TYPE" = "codex" ] && echo "  stream_json: true")
 
 platforms:
   wecom:

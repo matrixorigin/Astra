@@ -97,7 +97,12 @@ cli:
 #   codex:
 #     type: codex
 #     bin: codex
-#     approval_mode: full-auto  # full-auto | suggest | ask
+#     model: o4-mini
+#     sandbox: workspace-write   # read-only | workspace-write | danger-full-access
+#     stream_json: true          # JSONL streaming output (events printed as they occur)
+#     skip_git_repo_check: false
+#     ephemeral: false
+#     extra_args: []
 
 # ─── Astra Server (only needed if using astra CLI type) ─────────────────────
 

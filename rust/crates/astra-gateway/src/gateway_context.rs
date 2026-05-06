@@ -335,11 +335,14 @@ mod tests {
 
     #[test]
     fn template_session_only_when_supported() {
-        let codex = CliProfile::Codex {
-            bin: "codex".into(),
-            approval_mode: "full-auto".into(),
+        let custom = CliProfile::Custom {
+            bin: "my-agent".into(),
+            args_template: Vec::new(),
+            json_output: false,
+            session_id_field: None,
+            text_field: None,
         };
-        let ctx = GatewayContext::new("u1", "Test", "weixin", &codex, true);
+        let ctx = GatewayContext::new("u1", "Test", "weixin", &custom, true);
         let prompt = ctx.to_system_prompt();
         assert!(!prompt.contains("/session list"));
     }

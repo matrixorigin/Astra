@@ -1,0 +1,42 @@
+# Gateway — minimal Codex-only deployment
+#
+# Features:
+#   - No DB required (storage: none)
+#   - OpenAI Codex CLI as the only backend
+#   - JSONL streaming output for real-time progress events
+#   - Supports model selection, session resume, sandbox control
+#
+# Start:
+#   cargo run -p astra-gateway --release -- --config rust/crates/astra-gateway/gateway-codex-minimal.yaml
+#
+# Required env:
+#   OPENAI_API_KEY — OpenAI API key (read by codex CLI)
+#
+# Install codex:
+#   npm install -g @openai/codex
+
+storage:
+  backend: none
+
+cli:
+  type: codex
+  bin: codex                    # assumes `codex` is on PATH; or set full path
+  model: o4-mini               # override per-session with /model
+  sandbox: workspace-write     # read-only | workspace-write | danger-full-access
+  stream_json: true            # enables --json JSONL streaming in exec mode
+  skip_git_repo_check: false   # set true for non-git directories
+  ephemeral: false             # set true to skip session persistence
+  extra_args: []
+
+max_concurrent_runs: 2
+
+action_policy:
+  allow_slash_mutations: true
+  allow_model_generated_mutations: false
+  workspace_roots: []
+
+platforms:
+  weixin:
+    enabled: true
+    token: ""       # set here or via WEIXIN_TOKEN env var
+    account_id: ""  # set here or via WEIXIN_ACCOUNT_ID env var

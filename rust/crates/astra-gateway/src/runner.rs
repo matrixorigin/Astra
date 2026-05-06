@@ -581,7 +581,9 @@ impl GatewayRunner {
                 .await
         {
             match &mut profile {
-                CliProfile::Astra { model, .. } | CliProfile::Claude { model, .. } => {
+                CliProfile::Astra { model, .. }
+                | CliProfile::Claude { model, .. }
+                | CliProfile::Codex { model, .. } => {
                     *model = Some(model_name);
                 }
                 _ => {}
@@ -1631,9 +1633,9 @@ impl GatewayRunner {
                     user_id: msg.user_id.clone(),
                     cli_profile: cli_name.clone(),
                     model: match &cli_profile {
-                        CliProfile::Astra { model, .. } | CliProfile::Claude { model, .. } => {
-                            model.clone()
-                        }
+                        CliProfile::Astra { model, .. }
+                        | CliProfile::Claude { model, .. }
+                        | CliProfile::Codex { model, .. } => model.clone(),
                         _ => None,
                     },
                     tokens_prompt: result.tokens_prompt.unwrap_or(0),
