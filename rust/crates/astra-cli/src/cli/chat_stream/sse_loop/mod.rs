@@ -338,7 +338,12 @@ pub(crate) async fn stream_chat_sse(
     // side because the spawner is a CLI-level dependency.
     maybe_pin_spawn_agent_schema(&mut registry, p.agent_spawner.is_some());
     let pinned_schema_tokens = registry.total_pinned_token_cost() as u64;
-    let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
+    // Build valid_tool_names from the registry (includes dynamically injected
+    // spawn_agent/get_agent_result), not from the pre-injection all_schemas vec.
+    let valid_tool_names: HashSet<String> = registry
+        .all_schema_names()
+        .into_iter()
+        .collect();
 
     // --allowed-tools: if set, restrict to only the specified tools
     let mut initial_restricted: HashSet<String> =
