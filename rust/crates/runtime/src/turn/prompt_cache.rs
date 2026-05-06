@@ -706,7 +706,7 @@ mod tests {
         let mut tools = vec![
             json!({"type": "function", "function": {"name": "bash"}}), // pinned
             json!({"type": "function", "function": {"name": "read_file"}}), // pinned
-            json!({"type": "function", "function": {"name": "git_status"}}), // pinned (new)
+            json!({"type": "function", "function": {"name": "git"}}), // pinned (new)
             json!({"type": "function", "function": {"name": "git_log"}}), // dynamic
             json!({"type": "function", "function": {"name": "mo_branch"}}), // dynamic
         ];
@@ -1420,8 +1420,8 @@ mod cache_stability_regression {
             schema("list_dir"),
             schema("grep"),
             schema("glob"),
-            schema("git_status"),
-            schema("git_diff"),
+            schema("git"),
+            schema("git"),
             schema("memory_store"),
             schema("memory_retrieve"),
             schema("memory_purge"),
@@ -1551,8 +1551,8 @@ mod cache_stability_regression {
             "list_dir",
             "grep",
             "glob",
-            "git_status",
-            "git_diff",
+            "git",
+            "git",
             "memory_store",
             "memory_retrieve",
             "memory_purge",

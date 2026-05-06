@@ -1224,16 +1224,16 @@ mod pinned_budget_tests {
         );
 
         // budget_select_measured with budget=0: pinned survive, dynamic excluded.
-        let git_log_idx = TOOL_CATALOG
+        let lsp_idx = TOOL_CATALOG
             .iter()
-            .position(|t| t.name == "git_log")
-            .expect("git_log must exist in TOOL_CATALOG");
+            .position(|t| t.name == "lsp")
+            .expect("lsp must exist in TOOL_CATALOG");
         let mo_branch_idx = TOOL_CATALOG
             .iter()
             .position(|t| t.name == "mo_branch")
             .expect("mo_branch must exist in TOOL_CATALOG");
 
-        let ranked = vec![(git_log_idx, 0.8), (mo_branch_idx, 0.5)];
+        let ranked = vec![(lsp_idx, 0.8), (mo_branch_idx, 0.5)];
         let result = registry.budget_select_measured(&ranked, 0);
 
         let result_names: Vec<&str> = result

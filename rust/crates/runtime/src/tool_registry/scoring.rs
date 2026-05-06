@@ -1416,10 +1416,10 @@ mod tests {
 
     #[test]
     fn outcome_bias_demotes_failing_tool() {
-        // Uses git_log (dynamic) — grep was previously used but is now pinned
+        // Uses lsp (dynamic) — grep was previously used but is now pinned
         // and therefore excluded from pre_filter_dynamic.
         let state = ConversationState::default();
-        let query = "show the recent git log history";
+        let query = "find the definition of this function";
         let empty = HashMap::new();
 
         let baseline = pre_filter_dynamic_with_outcome_bias(
@@ -1433,10 +1433,10 @@ mod tests {
             &[],
             &empty,
         );
-        let base_score = score_for(&baseline, "git_log").expect("git_log should rank");
+        let base_score = score_for(&baseline, "lsp").expect("git_log should rank");
 
         let mut penalty = HashMap::new();
-        penalty.insert("git_log".to_string(), -0.16);
+        penalty.insert("lsp".to_string(), -0.16);
         let biased = pre_filter_dynamic_with_outcome_bias(
             &state,
             query,
@@ -1448,7 +1448,7 @@ mod tests {
             &[],
             &penalty,
         );
-        let biased_score = score_for(&biased, "git_log").expect("git_log should still rank");
+        let biased_score = score_for(&biased, "lsp").expect("git_log should still rank");
 
         assert!(
             biased_score < base_score,
@@ -1461,7 +1461,7 @@ mod tests {
     #[test]
     fn outcome_bias_promotes_successful_tool() {
         let state = ConversationState::default();
-        let query = "show the recent git log history";
+        let query = "find the definition of this function";
         let empty = HashMap::new();
 
         let baseline = pre_filter_dynamic_with_outcome_bias(
@@ -1475,10 +1475,10 @@ mod tests {
             &[],
             &empty,
         );
-        let base_score = score_for(&baseline, "git_log").expect("git_log should rank");
+        let base_score = score_for(&baseline, "lsp").expect("git_log should rank");
 
         let mut boost = HashMap::new();
-        boost.insert("git_log".to_string(), 0.10);
+        boost.insert("lsp".to_string(), 0.10);
         let biased = pre_filter_dynamic_with_outcome_bias(
             &state,
             query,
@@ -1490,7 +1490,7 @@ mod tests {
             &[],
             &boost,
         );
-        let biased_score = score_for(&biased, "git_log").expect("git_log should still rank");
+        let biased_score = score_for(&biased, "lsp").expect("git_log should still rank");
 
         assert!(
             biased_score > base_score,

@@ -114,8 +114,8 @@ mod tests {
             "grep/glob are near-universal for code navigation"
         );
         assert!(
-            pinned.contains(&"git_status") && pinned.contains(&"git_diff"),
-            "git_status/git_diff appear in most coding turns"
+            pinned.contains(&"git"),
+            "consolidated git tool must be pinned — git ops appear in most coding turns"
         );
         assert!(
             pinned.contains(&"memory_purge") && pinned.contains(&"memory_correct"),
@@ -337,24 +337,15 @@ mod tests {
     }
 
     #[test]
-    fn prefilter_ranks_git_tools_for_diff() {
-        // git_diff itself is now pinned (part of the static tool prefix), so
-        // it's guaranteed to be present every turn without participating in
-        // dynamic ranking. The dynamic rank for a diff query should still
-        // surface git_show / git_log — the tools the agent typically reaches
-        // for AFTER an initial git_diff.
+    fn prefilter_dynamic_still_produces_results_for_git_query() {
+        // The consolidated `git` tool is pinned, so dynamic ranking won't
+        // include it. But the ranker should still produce non-empty results
+        // for code-related queries (github, lsp, etc.).
         let state = ConversationState::from_message("show me the git diff", 1);
         let ranked = pre_filter_dynamic(&state, "show me the git diff");
-
-        let top_names: Vec<&str> = ranked
-            .iter()
-            .take(3)
-            .map(|&(idx, _)| TOOL_CATALOG[idx].name)
-            .collect();
         assert!(
-            top_names.iter().any(|n| n.starts_with("git_")),
-            "at least one git_* tool should be top-3 dynamic, got: {:?}",
-            top_names
+            !ranked.is_empty(),
+            "dynamic ranking should still produce results even when git is pinned"
         );
     }
 
@@ -521,7 +512,7 @@ mod tests {
         let selected = registry.select("git status 看看改了什么", 1);
         let names = ToolRegistry::selected_names(&selected);
         assert!(
-            names.contains(&"git_status".to_string()),
+            names.contains(&"git".to_string()),
             "git status query should include git_status, got: {:?}",
             names
         );
@@ -601,7 +592,7 @@ mod tests {
             .unwrap();
         let git_idx = TOOL_CATALOG
             .iter()
-            .position(|t| t.name == "git_status")
+            .position(|t| t.name == "git")
             .unwrap();
         assert!(
             tfidf_score(&terms, prs_idx) > tfidf_score(&terms, git_idx),
@@ -618,7 +609,7 @@ mod tests {
             .unwrap();
         let git_idx = TOOL_CATALOG
             .iter()
-            .position(|t| t.name == "git_diff")
+            .position(|t| t.name == "git")
             .unwrap();
         assert!(
             tfidf_score(&terms, mem_idx) > tfidf_score(&terms, git_idx),
@@ -631,7 +622,7 @@ mod tests {
         let terms = tokenize("git diff");
         let diff_idx = TOOL_CATALOG
             .iter()
-            .position(|t| t.name == "git_diff")
+            .position(|t| t.name == "git")
             .unwrap();
         let issue_idx = TOOL_CATALOG
             .iter()
@@ -844,7 +835,7 @@ mod tests {
         // Record many selections but zero uses for a dynamic tool
         let mut tracker = ToolQualityTracker::new();
         for _ in 0..10 {
-            tracker.record_selection(&["git_diff".into()]);
+            tracker.record_selection(&["git".into()]);
             // No record_feedback → tool never used → use_rate = 0
         }
 
@@ -862,8 +853,8 @@ mod tests {
             })
         };
 
-        let baseline_score = find_score(&baseline, "git_diff").unwrap_or(0.0);
-        let penalized_score = find_score(&penalized, "git_diff").unwrap_or(0.0);
+        let baseline_score = find_score(&baseline, "git").unwrap_or(0.0);
+        let penalized_score = find_score(&penalized, "git").unwrap_or(0.0);
         assert!(
             penalized_score <= baseline_score,
             "quality tracker should penalize ineffective tool: baseline={:.4} penalized={:.4}",

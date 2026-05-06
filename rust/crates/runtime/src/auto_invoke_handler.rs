@@ -495,9 +495,9 @@ mod tests {
                     )),
                 )
                 .with(
-                    "evaluate_session",
+                    "analyze_session",
                     Some(well_formed_reply(
-                        "evaluate_session",
+                        "analyze_session",
                         "repeated_corrections",
                         "scope drift",
                     )),
@@ -510,7 +510,7 @@ mod tests {
         let skills: Vec<&str> = out.iter().map(|d| d.skill.as_str()).collect();
         assert_eq!(
             skills,
-            vec!["analyze_session", "optimize_prompt", "evaluate_session"],
+            vec!["analyze_session", "optimize_prompt", "analyze_session"],
         );
         assert_eq!(exec.calls().len(), 3);
     }
@@ -659,7 +659,7 @@ mod tests {
                 "budget_pressure",
             ),
             (
-                "evaluate_session",
+                "analyze_session",
                 AutoInvokeCause::RepeatedCorrections { count: 5 },
                 "repeated_corrections",
             ),
@@ -732,7 +732,7 @@ mod tests {
         let skills: std::collections::HashSet<&str> =
             out.iter().map(|d| d.skill.as_str()).collect();
         assert!(skills.contains("analyze_session"));
-        assert!(skills.contains("evaluate_session"));
+        assert!(skills.contains("analyze_session"));
         for diag in &out {
             assert_eq!(diag.schema_version, SKILL_DIAGNOSIS_SCHEMA_VERSION);
             assert_eq!(diag.source, DiagnosisSource::SyntheticFallback);
@@ -824,9 +824,9 @@ mod tests {
                     )),
                 )
                 .with(
-                    "evaluate_session",
+                    "analyze_session",
                     Some(well_formed_reply(
-                        "evaluate_session",
+                        "analyze_session",
                         "repeated_corrections",
                         "corrections",
                     )),
@@ -838,7 +838,7 @@ mod tests {
         let skills: std::collections::HashSet<&str> =
             out.iter().map(|d| d.skill.as_str()).collect();
         assert!(skills.contains("analyze_session"));
-        assert!(skills.contains("evaluate_session"));
+        assert!(skills.contains("analyze_session"));
     }
 
     // ── R5: unwired metric fail-safe ────────────────────────────────────────

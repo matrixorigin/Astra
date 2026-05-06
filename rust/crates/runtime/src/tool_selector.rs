@@ -1393,9 +1393,9 @@ mod tests {
 
     #[test]
     fn parse_json_in_markdown_block() {
-        let text = "```json\n[\"git_log\", \"git_diff\"]\n```";
+        let text = "```json\n[\"git_log\", \"git\"]\n```";
         let names = parse_tool_names_from_llm(text);
-        assert_eq!(names, vec!["git_log", "git_diff"]);
+        assert_eq!(names, vec!["git_log", "git"]);
     }
 
     #[test]
@@ -3651,24 +3651,20 @@ mod tests {
         };
         let result = selector.select(&ctx).await;
 
-        let git_tools: Vec<&String> = result
-            .tool_names
-            .iter()
-            .filter(|n| n.starts_with("git_"))
-            .collect();
+        let has_git = result.tool_names.iter().any(|n| n == "git" || n.starts_with("git_"));
         assert!(
-            !git_tools.is_empty(),
-            "'review latest commit' should select at least 1 git tool, got: {:?}",
+            has_git,
+            "'review latest commit' should select the git tool, got: {:?}",
             result.tool_names
         );
-        // git_log or git_diff should be selected for commit review
+        // git tool should be selected for commit review
         let has_key_git_tool = result
             .tool_names
             .iter()
-            .any(|n| n == "git_log" || n == "git_diff" || n == "git_show");
+            .any(|n| n == "git_log" || n == "git" || n == "git_show");
         assert!(
             has_key_git_tool,
-            "'review latest commit' should select git_log, git_diff, or git_show, got: {:?}",
+            "'review latest commit' should select git, got: {:?}",
             result.tool_names
         );
     }
@@ -3692,7 +3688,7 @@ mod tests {
         };
         let result = selector.select(&ctx).await;
         assert!(
-            result.tool_names.contains(&"git_status".to_string()),
+            result.tool_names.contains(&"git".to_string()),
             "'show git status' should select git_status, got: {:?}",
             result.tool_names
         );
@@ -3809,7 +3805,7 @@ mod tests {
         };
         let result = selector.select(&ctx).await;
         assert!(
-            result.tool_names.contains(&"git_diff".to_string()),
+            result.tool_names.contains(&"git".to_string()),
             "'git diff HEAD~1' must select git_diff, got: {:?}",
             result.tool_names
         );
