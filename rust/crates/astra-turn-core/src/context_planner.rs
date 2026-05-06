@@ -183,6 +183,17 @@ fn plan_section_manifest(budget: &TokenBudget, has_memory: bool) -> Vec<PlannedS
             priority: CompressionPriority::Normal,
             source: SectionSource::Environment,
         },
+        // Goal/task continuity is turn-facing by nature: current decisions,
+        // blockers, and next action may change every turn. Keep it after the
+        // Session→None cache marker while giving it LastResort priority so
+        // pressure pruning preserves intent longer than ordinary guidance.
+        PlannedSection {
+            kind: SectionKind::WorkingMemory,
+            scope: CacheScope::None,
+            estimated_tokens: budget.budget_for(SectionKind::WorkingMemory),
+            priority: CompressionPriority::LastResort,
+            source: SectionSource::Environment,
+        },
     ];
 
     if has_memory {
@@ -463,6 +474,7 @@ mod tests {
                 SectionKind::Skills,
                 SectionKind::RuntimeIdentity,
                 SectionKind::RuntimeVolatile,
+                SectionKind::WorkingMemory,
                 SectionKind::EmergentSkills,
                 SectionKind::EmergentMemory,
                 SectionKind::EmergentSummary,
@@ -490,12 +502,13 @@ mod tests {
                 SectionKind::Skills,
                 SectionKind::RuntimeIdentity,
                 SectionKind::RuntimeVolatile,
+                SectionKind::WorkingMemory,
                 SectionKind::Memory,
                 SectionKind::EmergentSkills,
                 SectionKind::EmergentMemory,
                 SectionKind::EmergentSummary,
             ],
-            "canonical section order (with memory) drifted — Memory must sit between RuntimeVolatile and Emergent*"
+            "canonical section order (with memory) drifted — WorkingMemory and Memory must sit between RuntimeVolatile and Emergent*"
         );
     }
 

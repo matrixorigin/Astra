@@ -20,6 +20,7 @@ use crate::recovery_state::RecoveryState;
 use crate::section_types::PromptSection;
 use crate::session_latches::SessionLatches;
 use crate::token_accounting::TokenAccounting;
+use crate::working_memory::WorkingMemoryState;
 
 /// The catalog that the pipeline queries during Plan and Bind.
 ///
@@ -34,6 +35,7 @@ pub struct ContextSources<'a> {
     pub turn: &'a TurnState,
     pub external: &'a ExternalSources,
     pub emergent: &'a EmergentContext,
+    pub working_memory: Option<&'a WorkingMemoryState>,
     pub stats: &'a PipelineStats,
 }
 

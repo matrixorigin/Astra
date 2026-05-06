@@ -184,10 +184,7 @@ pub(crate) fn try_compact_for_retry_tiered(
 
     // Tiered escalation: default → aggressive → emergency.
     let (pipeline, tier) = if retry_count <= 1 {
-        (
-            CompressionPipeline::default_pipeline(),
-            RetryTier::Default,
-        )
+        (CompressionPipeline::default_pipeline(), RetryTier::Default)
     } else if retry_count == 2 {
         (
             CompressionPipeline::aggressive_pipeline(),

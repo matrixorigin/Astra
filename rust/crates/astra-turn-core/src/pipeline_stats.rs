@@ -4,6 +4,8 @@
 //! pressure estimation and cache hit rate tracking.
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
@@ -191,6 +193,12 @@ pub struct PipelineStats {
     /// EMA of per-section token usage across turns (alpha=0.3).
     #[serde(with = "section_ema_serde")]
     pub section_usage_ema: HashMap<crate::section_types::SectionKind, f64>,
+    /// Last observed content fingerprint per section kind.
+    #[serde(with = "section_hash_serde")]
+    pub section_fingerprints: HashMap<crate::section_types::SectionKind, u64>,
+    /// Count of observed content changes per section kind.
+    #[serde(with = "section_churn_serde")]
+    pub section_churns: HashMap<crate::section_types::SectionKind, u32>,
 }
 
 mod section_ema_serde {
@@ -221,6 +229,62 @@ mod section_ema_serde {
     }
 }
 
+mod section_hash_serde {
+    use super::*;
+    use serde::de::Deserializer;
+    use serde::ser::Serializer;
+
+    pub fn serialize<S>(
+        map: &HashMap<crate::section_types::SectionKind, u64>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let vec: Vec<(crate::section_types::SectionKind, u64)> =
+            map.iter().map(|(&k, &v)| (k, v)).collect();
+        vec.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<HashMap<crate::section_types::SectionKind, u64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let vec: Vec<(crate::section_types::SectionKind, u64)> = Vec::deserialize(deserializer)?;
+        Ok(vec.into_iter().collect())
+    }
+}
+
+mod section_churn_serde {
+    use super::*;
+    use serde::de::Deserializer;
+    use serde::ser::Serializer;
+
+    pub fn serialize<S>(
+        map: &HashMap<crate::section_types::SectionKind, u32>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let vec: Vec<(crate::section_types::SectionKind, u32)> =
+            map.iter().map(|(&k, &v)| (k, v)).collect();
+        vec.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<HashMap<crate::section_types::SectionKind, u32>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let vec: Vec<(crate::section_types::SectionKind, u32)> = Vec::deserialize(deserializer)?;
+        Ok(vec.into_iter().collect())
+    }
+}
+
 impl PipelineStats {
     /// Maximum retained compact events (ring buffer semantics).
     const MAX_COMPACT_EVENTS: usize = 64;
@@ -237,6 +301,8 @@ impl Default for PipelineStats {
             cache_breaks: Vec::new(),
             response_token_estimates: ResponseTokenEstimator::with_floor(500),
             section_usage_ema: HashMap::new(),
+            section_fingerprints: HashMap::new(),
+            section_churns: HashMap::new(),
         }
     }
 }
@@ -325,6 +391,30 @@ impl PipelineStats {
         }
     }
 
+    /// Record per-section content fingerprints and increment churn when a
+    /// section's rendered content changes from the previous observation.
+    pub fn record_section_fingerprints(&mut self, sections: &[crate::section_types::BoundSection]) {
+        for section in sections {
+            let Some(text) = section.text() else {
+                continue;
+            };
+            let hash = section_content_hash(section.plan.kind, text);
+            match self.section_fingerprints.insert(section.plan.kind, hash) {
+                Some(prev) if prev != hash => {
+                    let entry = self.section_churns.entry(section.plan.kind).or_insert(0);
+                    *entry = entry.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Observed content churn count for a section kind.
+    #[must_use]
+    pub fn section_churn(&self, kind: crate::section_types::SectionKind) -> u32 {
+        self.section_churns.get(&kind).copied().unwrap_or(0)
+    }
+
     /// Return the historical EMA of section token usage, rounded to u32.
     /// Used by the planner to feed `TokenBudget::allocate`.
     #[must_use]
@@ -346,13 +436,39 @@ fn f64_to_u32_saturating(value: f64) -> u32 {
     value as u32
 }
 
+fn section_content_hash(kind: crate::section_types::SectionKind, text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    kind.hash(&mut hasher);
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::section_types::SectionKind;
+    use crate::section_types::{
+        BoundSection, CacheScope, CompressionPriority, PlannedSection, SectionArtifact,
+        SectionKind, SectionSource,
+    };
+    use std::time::Duration;
 
     fn make_feedback(completion: u64, cache_read: u64, cache_creation: u64) -> ContextFeedback {
         ContextFeedback::from_usage(0, cache_read, cache_creation, completion, false)
+    }
+
+    fn section(kind: SectionKind, text: &str) -> BoundSection {
+        BoundSection {
+            plan: PlannedSection {
+                kind,
+                scope: CacheScope::None,
+                estimated_tokens: text.len() as u32,
+                priority: CompressionPriority::Normal,
+                source: SectionSource::Environment,
+            },
+            artifact: SectionArtifact::from_text(kind, text.to_string()),
+            actual_tokens: text.len() as u32,
+            bind_latency: Duration::ZERO,
+        }
     }
 
     #[test]
@@ -513,6 +629,33 @@ mod tests {
         let history2 = stats.section_token_history();
         assert_eq!(history2[&SectionKind::History], 5900);
         assert_eq!(history2[&SectionKind::Memory], 1300); // 0.7*1000 + 0.3*2000
+    }
+
+    #[test]
+    fn section_fingerprints_track_churn_per_kind() {
+        let mut stats = PipelineStats::default();
+        stats.record_section_fingerprints(&[
+            section(SectionKind::ProjectContext, "stable project"),
+            section(SectionKind::RuntimeVolatile, "turn one"),
+        ]);
+        assert_eq!(stats.section_churn(SectionKind::ProjectContext), 0);
+        assert_eq!(stats.section_churn(SectionKind::RuntimeVolatile), 0);
+
+        stats.record_section_fingerprints(&[
+            section(SectionKind::ProjectContext, "stable project"),
+            section(SectionKind::RuntimeVolatile, "turn two"),
+        ]);
+
+        assert_eq!(
+            stats.section_churn(SectionKind::ProjectContext),
+            0,
+            "stable sections must not accrue churn"
+        );
+        assert_eq!(
+            stats.section_churn(SectionKind::RuntimeVolatile),
+            1,
+            "changed volatile section must increment churn once"
+        );
     }
 
     #[test]

@@ -150,6 +150,7 @@ mod tests {
                 latches: latches.clone(),
                 recovery,
                 emergent: Default::default(),
+                working_memory: Default::default(),
             },
         );
         let value = serde_json::to_value(session.snapshot_full_state()).unwrap();
@@ -182,6 +183,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_legacy_snapshot_without_working_memory_uses_default() {
+        let legacy = serde_json::json!({
+            "stats": PipelineStats::default(),
+            "latches": SessionLatches::default(),
+            "recovery": RecoveryState::default(),
+            "emergent": crate::emergent_context::EmergentContext::default()
+        });
+
+        match parse_pipeline_state(Some(&legacy)) {
+            RestoreOutcome::Restored(snapshot) => {
+                assert!(
+                    snapshot.working_memory.is_empty(),
+                    "old checkpoints must restore with empty working memory instead of failing"
+                );
+            }
+            other => panic!("expected legacy snapshot to restore, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn restore_or_new_missing_yields_fresh_session() {
         let sess = restore_or_new(PipelineConfig::default(), None);
         assert_eq!(sess.stats.turns_executed, 0);
@@ -204,15 +225,23 @@ mod tests {
         stats.record("m", "q", &feedback);
         stats.record_compaction(2000);
 
-        let original = PipelineSession::from_snapshot(
+        let mut original = PipelineSession::from_snapshot(
             PipelineConfig::default(),
             PipelineSessionSnapshot {
                 stats: stats.clone(),
                 latches: SessionLatches::default(),
                 recovery: RecoveryState::default(),
                 emergent: Default::default(),
+                working_memory: Default::default(),
             },
         );
+        original.start_goal("finish context pipeline goal retention");
+        original.record_goal_signal(crate::goal_tracker::MilestoneSignal::FileChanged(
+            "rust/crates/astra-turn-core/src/context_binder.rs".into(),
+        ));
+        original
+            .working_memory_mut()
+            .set_next_action("run focused core tests");
         let value = serde_json::to_value(original.snapshot_full_state()).unwrap();
 
         let restored = restore_or_new(PipelineConfig::default(), Some(&value));
@@ -221,6 +250,15 @@ mod tests {
             "warm-start must preserve stats across restore"
         );
         assert_eq!(restored.stats.compact_events.len(), 1);
+        let rendered = restored.working_memory().render_prompt_section();
+        assert!(
+            rendered.contains("finish context pipeline goal retention"),
+            "goal must survive pipeline snapshot restore"
+        );
+        assert!(
+            rendered.contains("run focused core tests"),
+            "next action must survive pipeline snapshot restore"
+        );
     }
 
     // ── Stats standalone serialization ──

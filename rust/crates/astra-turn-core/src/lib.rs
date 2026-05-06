@@ -106,6 +106,7 @@ pub mod tool_schema_prune;
 pub mod tool_selection;
 pub mod trace_alert;
 pub mod view;
+pub mod working_memory;
 pub mod xml_tool_call_fallback;
 
 // Phase 15: turn leaf modules + cloud session modules

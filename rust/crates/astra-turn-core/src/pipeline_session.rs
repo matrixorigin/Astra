@@ -20,12 +20,14 @@ use crate::context_sources::{
     AgentContext, ContextSources, ExternalSources, SessionContext, StaticSections, TurnState,
 };
 use crate::emergent_context::EmergentContext;
+use crate::goal_tracker::{GoalTracker, MilestoneSignal};
 use crate::optimize_limits::OptimizeLimits;
 use crate::pipeline_config::PipelineConfig;
 use crate::pipeline_stats::PipelineStats;
 use crate::recovery_state::RecoveryState;
 use crate::session_latches::SessionLatches;
 use crate::shadow_diff::{ShadowDiffResult, diff_pipeline_outputs};
+use crate::working_memory::WorkingMemoryState;
 
 /// Per-turn input provided by the agentic loop to `PipelineSession::run_turn()`.
 pub struct TurnInput<'a> {
@@ -76,6 +78,8 @@ pub struct PipelineSession {
     pub latches: SessionLatches,
     pub emergent: EmergentContext,
     pub recovery: RecoveryState,
+    working_memory: WorkingMemoryState,
+    goal_tracker: Option<GoalTracker>,
     turns_completed: u32,
     pending_audits: Vec<crate::pipeline_journal::PipelineJournalEvent>,
 }
@@ -90,6 +94,8 @@ impl PipelineSession {
             latches: SessionLatches::default(),
             emergent: EmergentContext::default(),
             recovery: RecoveryState::default(),
+            working_memory: WorkingMemoryState::default(),
+            goal_tracker: None,
             turns_completed: 0,
             pending_audits: Vec::new(),
         }
@@ -104,6 +110,8 @@ impl PipelineSession {
             latches: SessionLatches::default(),
             emergent: EmergentContext::default(),
             recovery: RecoveryState::default(),
+            working_memory: WorkingMemoryState::default(),
+            goal_tracker: None,
             turns_completed: 0,
             pending_audits: Vec::new(),
         }
@@ -127,6 +135,8 @@ impl PipelineSession {
             latches,
             emergent: EmergentContext::default(),
             recovery,
+            working_memory: WorkingMemoryState::default(),
+            goal_tracker: None,
             turns_completed: 0,
             pending_audits: Vec::new(),
         }
@@ -150,6 +160,7 @@ impl PipelineSession {
             turn: input.turn,
             external: input.external,
             emergent: &self.emergent,
+            working_memory: Some(&self.working_memory),
             stats: &self.stats,
         };
 
@@ -250,6 +261,8 @@ impl PipelineSession {
                 *usage.entry(section.plan.kind).or_insert(0u32) += section.actual_tokens;
             }
             self.stats.record_section_usage(&usage);
+            self.stats
+                .record_section_fingerprints(&output.optimized.sections);
         }
 
         self.turns_completed += 1;
@@ -282,6 +295,36 @@ impl PipelineSession {
     #[must_use]
     pub fn should_abort(&self) -> bool {
         self.recovery.should_abort()
+    }
+
+    /// Prompt-facing working memory for goal/task continuity.
+    #[must_use]
+    pub fn working_memory(&self) -> &WorkingMemoryState {
+        &self.working_memory
+    }
+
+    /// Mutable working memory for runtime-owned decisions/blockers/next action.
+    pub fn working_memory_mut(&mut self) -> &mut WorkingMemoryState {
+        &mut self.working_memory
+    }
+
+    /// Start goal tracking if a non-empty user goal is available.
+    pub fn start_goal(&mut self, goal: impl AsRef<str>) {
+        let goal = goal.as_ref();
+        if goal.trim().is_empty() {
+            return;
+        }
+        let tracker = GoalTracker::new(goal);
+        self.working_memory.set_goal_progress(tracker.snapshot());
+        self.goal_tracker = Some(tracker);
+    }
+
+    /// Record a goal-relevant milestone and refresh the rendered progress.
+    pub fn record_goal_signal(&mut self, signal: MilestoneSignal) {
+        if let Some(tracker) = self.goal_tracker.as_mut() {
+            tracker.record(self.turns_completed, signal);
+            self.working_memory.set_goal_progress(tracker.snapshot());
+        }
     }
 
     /// Access the underlying pipeline config.
@@ -427,6 +470,7 @@ impl PipelineSession {
             latches: self.latches.clone(),
             recovery: self.recovery,
             emergent: self.emergent.clone(),
+            working_memory: self.working_memory.clone(),
         }
     }
 
@@ -445,6 +489,11 @@ impl PipelineSession {
             latches: snapshot.latches,
             emergent: snapshot.emergent,
             recovery,
+            goal_tracker: snapshot
+                .working_memory
+                .goal_progress()
+                .map(GoalTracker::from_snapshot),
+            working_memory: snapshot.working_memory,
             turns_completed: 0,
             pending_audits: Vec::new(),
         }
@@ -458,6 +507,8 @@ pub struct PipelineSessionSnapshot {
     pub latches: SessionLatches,
     pub recovery: RecoveryState,
     pub emergent: EmergentContext,
+    #[serde(default)]
+    pub working_memory: WorkingMemoryState,
 }
 
 /// Summary metrics extracted from pipeline state for cloud_session_facts.

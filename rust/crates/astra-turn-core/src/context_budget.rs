@@ -95,6 +95,7 @@ impl TokenBudget {
             SectionKind::SelfModel,
             SectionKind::Skills,
             SectionKind::ProjectContext,
+            SectionKind::WorkingMemory,
             SectionKind::RuntimeIdentity,
             SectionKind::RuntimeVolatile,
         ];

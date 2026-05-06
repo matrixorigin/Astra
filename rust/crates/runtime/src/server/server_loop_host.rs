@@ -1765,8 +1765,11 @@ impl ServerAgenticLoopHost {
 
         let pipeline_sess = state
             .pipeline_session
-            .as_ref()
+            .as_mut()
             .expect("pipeline_session must be initialized for all production paths");
+        if pipeline_sess.working_memory().is_empty() {
+            pipeline_sess.start_goal(user_content);
+        }
         let input = AdaptiveTurnInput {
             statics: &statics,
             agent: &agent,
@@ -2305,8 +2308,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &mut compacted_messages,
             compact_result.boundary.is_some(),
         );
-        let llm_messages =
-            self.assemble_llm_messages(system_messages, compacted_messages, state, &llm_cfg, &cache_cfg);
+        let llm_messages = self.assemble_llm_messages(
+            system_messages,
+            compacted_messages,
+            state,
+            &llm_cfg,
+            &cache_cfg,
+        );
 
         // ── 3. Call LLM ─────────────────────────────────────────────────
         let budget = crate::prompts::budget_for_model(Some(&llm_cfg.model_name));

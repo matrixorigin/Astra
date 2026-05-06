@@ -18,6 +18,7 @@ use astra_turn_core::section_types::{
 };
 use astra_turn_core::session_latches::SessionLatches;
 use astra_turn_core::token_accounting::TokenAccounting;
+use astra_turn_core::working_memory::WorkingMemoryState;
 use std::collections::HashMap;
 
 fn build_sources() -> (
@@ -71,6 +72,98 @@ fn build_sources() -> (
 }
 
 #[test]
+fn working_memory_goal_state_binds_and_serializes() {
+    let (statics, agent, latches, session, turn, ext, emer, stats) = build_sources();
+    let mut working_memory = WorkingMemoryState::default();
+    working_memory.set_goal("implement streaming resume without losing user intent");
+    working_memory.push_decision("Use the context pipeline as the only system prompt path.");
+    working_memory.push_blocker("Need to preserve post-compaction continuation state.");
+    working_memory.set_next_action("Write the resume regression test.");
+    let sources = ContextSources {
+        statics: &statics,
+        agent: &agent,
+        latches: &latches,
+        session: &session,
+        turn: &turn,
+        external: &ext,
+        emergent: &emer,
+        working_memory: Some(&working_memory),
+        stats: &stats,
+    };
+    let pipeline = ContextPipeline::new(PipelineConfig::default());
+
+    let run = pipeline
+        .run(PipelineRunInput {
+            sources: &sources,
+            tokens: &turn.tokens,
+            model_limit: session.model_limit,
+            recovery: &turn.recovery,
+            latches: &latches,
+            optimize_limits: &OptimizeLimits::default(),
+            model_id: &session.model_id,
+            query_source: "harness",
+        })
+        .expect("working memory should not abort pipeline");
+    let flattened = flatten_serialized_system_blocks(&run.serialized);
+
+    assert!(
+        flattened.contains("## Working Memory"),
+        "goal state must be a first-class prompt section, not a runtime side channel"
+    );
+    assert!(flattened.contains("implement streaming resume without losing user intent"));
+    assert!(flattened.contains("Write the resume regression test."));
+    assert!(
+        run.optimized
+            .sections
+            .iter()
+            .any(|s| s.plan.kind == SectionKind::WorkingMemory && s.actual_tokens > 0),
+        "planner/binder must produce a non-empty WorkingMemory section"
+    );
+}
+
+#[test]
+fn working_memory_survives_aggressive_pressure_prompt_assembly() {
+    let (statics, agent, latches, session, mut turn, ext, emer, stats) = build_sources();
+    turn.tokens = TokenAccounting::from_fields(95_000, 0, 0, 0);
+    let mut working_memory = WorkingMemoryState::default();
+    working_memory.set_goal("preserve the original user objective during compaction");
+    working_memory.set_next_action("continue implementing the context pipeline");
+    let sources = ContextSources {
+        statics: &statics,
+        agent: &agent,
+        latches: &latches,
+        session: &session,
+        turn: &turn,
+        external: &ext,
+        emergent: &emer,
+        working_memory: Some(&working_memory),
+        stats: &stats,
+    };
+    let pipeline = ContextPipeline::new(PipelineConfig::default());
+
+    let run = pipeline
+        .run(PipelineRunInput {
+            sources: &sources,
+            tokens: &turn.tokens,
+            model_limit: session.model_limit,
+            recovery: &turn.recovery,
+            latches: &latches,
+            optimize_limits: &OptimizeLimits::for_tier(
+                astra_turn_core::compaction_types::CompactionTier::AggressivePrune,
+                session.model_limit,
+            ),
+            model_id: &session.model_id,
+            query_source: "harness",
+        })
+        .expect("high pressure should optimize, not drop goal state");
+    let flattened = flatten_serialized_system_blocks(&run.serialized);
+
+    assert!(flattened.contains("## Working Memory"));
+    assert!(flattened.contains("preserve the original user objective during compaction"));
+    assert!(flattened.contains("continue implementing the context pipeline"));
+}
+
+#[test]
 fn bind_outputs_typed_artifacts_not_raw_string_only() {
     let (statics, agent, latches, session, turn, ext, emer, stats) = build_sources();
     let sources = ContextSources {
@@ -81,6 +174,7 @@ fn bind_outputs_typed_artifacts_not_raw_string_only() {
         turn: &turn,
         external: &ext,
         emergent: &emer,
+        working_memory: None,
         stats: &stats,
     };
     let plan_input = PlanInput {
@@ -118,6 +212,7 @@ fn context_pipeline_serializes_provider_request_and_metrics() {
         turn: &turn,
         external: &ext,
         emergent: &emer,
+        working_memory: None,
         stats: &stats,
     };
     let pipeline = ContextPipeline::new(PipelineConfig {
@@ -159,6 +254,7 @@ fn context_pipeline_rejects_zero_model_limit_before_compaction() {
         turn: &turn,
         external: &ext,
         emergent: &emer,
+        working_memory: None,
         stats: &stats,
     };
     let pipeline = ContextPipeline::new(PipelineConfig::default());
@@ -193,6 +289,7 @@ fn context_pipeline_uses_session_provider_policy_not_default_config() {
         turn: &turn,
         external: &ext,
         emergent: &emer,
+        working_memory: None,
         stats: &stats,
     };
     let pipeline = ContextPipeline::new(PipelineConfig::default());
@@ -313,6 +410,7 @@ fn pipeline_aborts_on_consecutive_ptl_errors() {
         turn: &turn,
         external: &ext,
         emergent: &emer,
+        working_memory: None,
         stats: &stats,
     };
     let pipeline = ContextPipeline::new(PipelineConfig {
@@ -349,6 +447,7 @@ fn serialized_output_format_system_blocks_are_well_structured() {
         turn: &turn,
         external: &ext,
         emergent: &emer,
+        working_memory: None,
         stats: &stats,
     };
     let pipeline = ContextPipeline::new(PipelineConfig {

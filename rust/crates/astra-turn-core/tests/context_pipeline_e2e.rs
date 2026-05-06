@@ -89,6 +89,7 @@ fn pipeline_single_turn_produces_valid_output() {
         turn: &turn,
         external: &ext,
         emergent: &emer,
+        working_memory: None,
         stats: &stats,
     };
 
@@ -164,6 +165,7 @@ fn pipeline_compaction_under_pressure() {
         turn: &turn,
         external: &ext,
         emergent: &emer,
+        working_memory: None,
         stats: &stats,
     };
 
@@ -203,6 +205,7 @@ fn pipeline_ptl_recovery_escalates() {
         turn: &turn,
         external: &ext,
         emergent: &emer,
+        working_memory: None,
         stats: &stats,
     };
 
@@ -250,6 +253,7 @@ fn pipeline_emergent_context_flows() {
         turn: &turn,
         external: &ext,
         emergent: &emer,
+        working_memory: None,
         stats: &stats,
     };
 
@@ -296,6 +300,7 @@ fn pipeline_shadow_diff_identical() {
         turn: &turn,
         external: &ext,
         emergent: &emer,
+        working_memory: None,
         stats: &stats,
     };
 
@@ -372,6 +377,7 @@ fn pipeline_shadow_diff_detects_recovery_divergence() {
         turn: &turn,
         external: &ext,
         emergent: &emer,
+        working_memory: None,
         stats: &stats,
     };
     let plan_input_normal = PlanInput {
@@ -408,6 +414,7 @@ fn pipeline_shadow_diff_detects_recovery_divergence() {
         turn: &turn,
         external: &ext,
         emergent: &emer,
+        working_memory: None,
         stats: &stats,
     };
     let plan_input_recovery = PlanInput {

@@ -329,11 +329,19 @@ fn spill_oversized_sections(
         if section.actual_tokens <= SPILL_THRESHOLD_TOKENS {
             continue;
         }
-        // Semantic anchors must remain inline.
+        // Semantic anchors and goal continuity must remain inline. A spill
+        // reference saves tokens but hides the very state needed to resume
+        // correctly after compaction.
         if matches!(
             section.plan.kind,
-            SectionKind::Identity | SectionKind::Constraints
+            SectionKind::Identity | SectionKind::Constraints | SectionKind::WorkingMemory
         ) {
+            if section.plan.kind == SectionKind::WorkingMemory {
+                stats.skipped.push(SkippedOptimization {
+                    step: "spill".into(),
+                    reason: "working memory carries goal continuity and must remain inline".into(),
+                });
+            }
             continue;
         }
 
@@ -585,6 +593,7 @@ mod tests {
             turn: &turn,
             external: &external,
             emergent: &emergent,
+            working_memory: None,
             stats: &stats,
         };
 
@@ -1189,6 +1198,46 @@ mod tests {
             .find(|s| s.plan.kind == SectionKind::Identity && s.text() == Some(large_text.as_str()))
             .expect("Identity anchor must never be offloaded");
         assert_eq!(preserved.actual_tokens, large_text.len() as u32);
+    }
+
+    #[test]
+    fn spill_never_offloads_working_memory_goal_state() {
+        use crate::spill_backend::FileSystemSpillBackend;
+        use tempfile::TempDir;
+
+        let (plan, bound, latches) = build_test_plan_and_bound();
+        let limits = OptimizeLimits {
+            allow_spill: true,
+            ..Default::default()
+        };
+        let policy = ProviderCachePolicy::default();
+
+        let mut bound = bound;
+        let large_goal_state = format!(
+            "## Working Memory\nGoal: keep the user objective visible\n{}",
+            "decision: preserve intent\n".repeat(20_000)
+        );
+        bound.sections.push(test_bound_section(
+            SectionKind::WorkingMemory,
+            CacheScope::None,
+            &large_goal_state,
+        ));
+
+        let dir = TempDir::new().unwrap();
+        let backend = FileSystemSpillBackend::new(dir.path());
+        let result =
+            optimize_with_spill(&plan, bound, &latches, &policy, &limits, 1, Some(&backend));
+
+        assert_eq!(result.stats.entries_spilled, 0);
+        assert!(result.spilled.is_empty());
+        assert!(
+            result
+                .sections
+                .iter()
+                .any(|s| s.plan.kind == SectionKind::WorkingMemory
+                    && s.text() == Some(large_goal_state.as_str())),
+            "working memory carries goal continuity and must remain inline even under spill pressure"
+        );
     }
 
     #[test]

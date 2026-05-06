@@ -1,8 +1,8 @@
 //! Context pipeline Bind phase — resolve planned sections into concrete content.
 //!
 //! Each `bind_*` function takes a `PlannedSection` + relevant source data
-//! and returns a `BoundSection`. In-memory bindings are sync; external
-//! bindings (Memoria, disk) are async.
+//! and returns a `BoundSection`. The runtime pre-fetches external data before
+//! entering core, so binding is a pure in-memory transform.
 
 use std::time::Instant;
 
@@ -13,6 +13,7 @@ use crate::context_sources::ContextSources;
 use crate::section_types::{
     BoundSection, PlannedSection, SectionArtifact, SectionKind, estimate_text_tokens,
 };
+use crate::working_memory::WorkingMemoryState;
 
 /// Result of the Bind phase.
 #[derive(Debug)]
@@ -54,7 +55,7 @@ fn bind_section(planned: &PlannedSection, sources: &ContextSources<'_>) -> Bound
         SectionKind::ProjectContext => bind_project_context(sources),
         SectionKind::Skills => bind_skills(sources),
         SectionKind::Memory => bind_memory(sources),
-        SectionKind::WorkingMemory => String::new(),
+        SectionKind::WorkingMemory => bind_working_memory(sources),
         // Conversation history is serialized as provider messages, not as a
         // separate text section.
         SectionKind::History => String::new(),
@@ -131,6 +132,14 @@ fn bind_skills(sources: &ContextSources<'_>) -> String {
 /// Bind memory snippets that the runtime retrieved before entering core.
 fn bind_memory(sources: &ContextSources<'_>) -> String {
     sources.external.memory_snippets.join("\n\n")
+}
+
+/// Bind first-class working memory: goal, decisions, blockers, next action.
+fn bind_working_memory(sources: &ContextSources<'_>) -> String {
+    sources
+        .working_memory
+        .map(WorkingMemoryState::render_prompt_section)
+        .unwrap_or_default()
 }
 
 /// Bind the **session-stable** runtime identity fragments.
@@ -273,6 +282,7 @@ mod tests {
     use crate::recovery_state::RecoveryState;
     use crate::session_latches::SessionLatches;
     use crate::token_accounting::TokenAccounting;
+    use crate::working_memory::WorkingMemoryState;
     use std::collections::HashMap;
 
     struct TestSources {
@@ -283,6 +293,7 @@ mod tests {
         turn: TurnState,
         external: ExternalSources,
         emergent: EmergentContext,
+        working_memory: WorkingMemoryState,
         stats: PipelineStats,
     }
 
@@ -296,6 +307,7 @@ mod tests {
                 turn: &self.turn,
                 external: &self.external,
                 emergent: &self.emergent,
+                working_memory: Some(&self.working_memory),
                 stats: &self.stats,
             }
         }
@@ -338,6 +350,7 @@ mod tests {
                 ..Default::default()
             },
             emergent: EmergentContext::default(),
+            working_memory: WorkingMemoryState::default(),
             stats: PipelineStats::default(),
         }
     }

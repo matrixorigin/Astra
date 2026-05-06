@@ -223,6 +223,7 @@ mod tests {
             turn: &turn,
             external: &external,
             emergent: &emergent,
+            working_memory: None,
             stats: &stats,
         };
 

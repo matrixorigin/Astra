@@ -74,6 +74,7 @@ pub struct GoalProgress {
 /// - Negative signals (fail, disapproval) decrease momentum
 /// - Relevance is computed via TF-IDF similarity between the
 ///   milestone description and the original goal keywords
+#[derive(Debug, Clone)]
 pub struct GoalTracker {
     /// The original user goal (first message).
     original_goal: String,
