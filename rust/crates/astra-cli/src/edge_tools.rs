@@ -1134,6 +1134,39 @@ impl ToolExecutor {
             outcome.output = output;
             return outcome;
         }
+        if name == "git" {
+            let action = args
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("status");
+            match action {
+                "commit" => {
+                    let mut outcome = self.git_commit_with_metadata(args);
+                    outcome.output = self.finalize_tool_output(outcome.output, name);
+                    self.record_output_size(outcome.output.len());
+                    return outcome;
+                }
+                "revert_commit" => {
+                    let mut outcome = self.git_revert_commit_with_metadata(args);
+                    outcome.output = self.finalize_tool_output(outcome.output, name);
+                    self.record_output_size(outcome.output.len());
+                    return outcome;
+                }
+                "stash" => {
+                    let mut outcome = self.git_stash_with_metadata(args);
+                    outcome.output = self.finalize_tool_output(outcome.output, name);
+                    self.record_output_size(outcome.output.len());
+                    return outcome;
+                }
+                "worktree" => {
+                    let mut outcome = self.git_worktree_with_metadata(args);
+                    outcome.output = self.finalize_tool_output(outcome.output, name);
+                    self.record_output_size(outcome.output.len());
+                    return outcome;
+                }
+                _ => {} // Other git actions handled in execute() below
+            }
+        }
         if name == "git_stash" {
             let mut outcome = self.git_stash_with_metadata(args);
             let output = self.finalize_tool_output(outcome.output, name);
@@ -1187,6 +1220,42 @@ impl ToolExecutor {
                 "list_dir" => self.list_dir(args),
                 "grep" => self.grep(args),
                 "glob" => self.glob(args),
+                "git" => {
+                    let action = args
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .unwrap_or("status");
+                    match action {
+                        "status" => git_gix::git_status(&self.project_root),
+                        "diff" => git_gix::git_diff(
+                            &self.project_root,
+                            args,
+                            self.get_budget_pressure(),
+                            self.aggregate_output_bytes
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        "log" => git_gix::git_log(&self.project_root, args),
+                        "show" => git_gix::git_show(
+                            &self.project_root,
+                            args,
+                            self.get_budget_pressure(),
+                            self.aggregate_output_bytes
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        "blame" => git_gix::git_blame(&self.project_root, args),
+                        "file_history" => git_gix::git_file_history(&self.project_root, args),
+                        "log_search" => git_gix::git_log_search(&self.project_root, args),
+                        "contributors" => git_gix::git_contributors(&self.project_root, args),
+                        "commit" => self.git_commit(args),
+                        "revert_commit" => self.git_revert_commit(args),
+                        "stash" => self.git_stash(args),
+                        "checkout_file" => self.git_checkout_file(args),
+                        "worktree" => self.git_worktree(args),
+                        _ => format!(
+                            "Error: unknown git action '{action}'. Use one of: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree"
+                        ),
+                    }
+                }
                 "git_status" => git_gix::git_status(&self.project_root),
                 "git_diff" => git_gix::git_diff(
                     &self.project_root,
