@@ -414,27 +414,36 @@ pub fn insert_cache_edits_block(messages: &mut [Value], delete_refs: &[String]) 
 }
 
 fn ensure_content_array(msg: &mut Value) {
-    if msg.get("content").is_some_and(Value::is_string) {
-        let text = msg["content"].as_str().unwrap_or_default().to_string();
-        msg["content"] = json!([{
-            "type": "text",
-            "text": text,
-        }]);
-    } else if msg.get("content").is_none() {
-        msg["content"] = json!([]);
+    if msg.get("content").is_some_and(Value::is_array) {
+        return;
     }
+    let text = msg
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    msg["content"] = json!([{ "type": "text", "text": text }]);
 }
 
 fn message_has_cache_control(msg: &Value) -> bool {
-    let Some(content) = msg.get("content") else {
-        return false;
-    };
-    if let Some(array) = content.as_array() {
-        return array
-            .iter()
-            .any(|block| block.get("cache_control").is_some());
+    // Top-level cache_control is preserved for forward compatibility: the
+    // legacy runtime helper checked it before block-level, and any future
+    // caller that places markers at the message level must still be
+    // recognized here so `annotate_tool_result_cache_references` stops at
+    // the right position.
+    if msg.get("cache_control").is_some() {
+        return true;
     }
-    false
+    msg.get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block
+                    .get("cache_control")
+                    .map(|cc| !cc.is_null())
+                    .unwrap_or(false)
+            })
+        })
 }
 
 #[cfg(test)]
