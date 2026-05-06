@@ -459,6 +459,11 @@ pub struct ToolExecutor {
             std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
         >,
     >,
+    /// Budget-adaptive introspection snapshot, updated each turn by the
+    /// execution phase. The `introspect` tool reads this to return runtime
+    /// state to the model.
+    introspect_snapshot:
+        std::sync::Arc<std::sync::RwLock<Option<astra_turn_core::introspect::IntrospectSnapshot>>>,
     /// Session id for persisting self-modification state and serving `astra self`
     /// compatible diagnostics from inside the live agent loop.
     active_session_id: std::sync::Mutex<Option<String>>,
@@ -543,6 +548,7 @@ impl ToolExecutor {
             agent_id: None,
             send_message_context: std::sync::Mutex::new(None),
             observability_session: None,
+            introspect_snapshot: std::sync::Arc::new(std::sync::RwLock::new(None)),
             active_session_id: std::sync::Mutex::new(None),
             self_mod_pinned_tools: std::sync::Mutex::new(Vec::new()),
             self_mod_deprioritized_tools: std::sync::Mutex::new(Vec::new()),
@@ -943,6 +949,34 @@ impl ToolExecutor {
         env_tools::env_tool(args)
     }
 
+    fn handle_introspect(&self, args: &Value) -> String {
+        let detail_arg = args
+            .get("detail")
+            .and_then(Value::as_str)
+            .unwrap_or("summary");
+        let detail = astra_turn_core::introspect::IntrospectDetail::from_arg(detail_arg);
+
+        let snapshot = self
+            .introspect_snapshot
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone());
+
+        match snapshot {
+            Some(snap) => astra_turn_core::introspect::render_introspect(&snap, detail),
+            None => "No introspection data available yet (first turn).".to_string(),
+        }
+    }
+
+    pub fn update_introspect_snapshot(
+        &self,
+        snapshot: astra_turn_core::introspect::IntrospectSnapshot,
+    ) {
+        if let Ok(mut guard) = self.introspect_snapshot.write() {
+            *guard = Some(snapshot);
+        }
+    }
+
     /// Check if a variable name suggests it contains sensitive data.
     fn is_sensitive_var(name: &str) -> bool {
         env_tools::is_sensitive_var(name)
@@ -1316,6 +1350,7 @@ impl ToolExecutor {
                 this request and provide results in the next round."
                         .to_string()
                 }
+                "introspect" => self.handle_introspect(args),
                 "diagnose" => self.diagnose(args).await,
                 "lsp" => self.lsp(args),
                 "env" => self.env_tool(args),

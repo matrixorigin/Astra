@@ -943,7 +943,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 sess.record_compaction_audit(
                     "tool_result_clearing",
                     mc.results_compacted as u32,
-                    mc.tokens_saved as u32,
+                    mc.tokens_saved.min(u32::MAX as usize) as u32,
                 );
                 sess.stats.record_compaction(mc.tokens_saved as u64);
             }
@@ -996,7 +996,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                             "default_compression"
                         },
                         outcome.layer_results.len() as u32,
-                        outcome.total_tokens_freed as u32,
+                        outcome.total_tokens_freed.min(u32::MAX as u64) as u32,
                     );
                     sess.stats.record_compaction(outcome.total_tokens_freed);
                 }
