@@ -48,14 +48,18 @@ for i in {1..15}; do
     fi
 done
 
-if [ "$BUILD_MODE" = "debug" ]; then
+# Skip build entirely with SKIP_BUILD=1 for fast iteration.
+if [ "${SKIP_BUILD:-}" = "1" ] && [ -f "$BIN_PATH" ]; then
+    echo "⏩ Skipping build (SKIP_BUILD=1)"
+elif [ "$BUILD_MODE" = "debug" ]; then
     echo "Building debug API binary..."
     cargo build -q --manifest-path rust/Cargo.toml -p astra-runtime --bin astra-server
+    echo "✅ Using $BIN_PATH"
 else
     echo "Building release API binary..."
     cargo build -q --manifest-path rust/Cargo.toml -p astra-runtime --release --bin astra-server
+    echo "✅ Using $BIN_PATH"
 fi
-echo "✅ Using $BIN_PATH"
 
 start_detached() {
     if command -v setsid >/dev/null 2>&1; then

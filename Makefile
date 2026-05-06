@@ -400,7 +400,13 @@ dev-seed:
 	run_mysql_ddl 2>/dev/null || { \
 		if [ -n "$$MYSQL_SSL_ARG" ]; then run_mysql_ddl "$$MYSQL_SSL_ARG"; else run_mysql_ddl; fi; \
 	}
-	@$(MAKE) dev-api-restart build-cli-release
+	@if [ ! -f rust/target/release/astra-server ] || [ ! -f rust/target/release/astra-admin ]; then \
+		echo "Binaries not found — building release..."; \
+		$(MAKE) dev-api-restart build-cli-release; \
+	else \
+		echo "Binaries exist — restarting server (skipping rebuild)..."; \
+		$(MAKE) dev-api-restart; \
+	fi
 	@sleep 2
 	@echo "Registering admin (admin@mo.com)..."
 	@NO_PROXY=localhost ./rust/target/release/astra-admin register \
