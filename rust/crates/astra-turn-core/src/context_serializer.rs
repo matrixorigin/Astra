@@ -249,6 +249,194 @@ fn cache_control_for_scope(_scope: CacheScope, _policy: &ProviderCachePolicy) ->
     json!({ "type": "ephemeral" })
 }
 
+// ═════════════════════════════════════════════════════════════════════════
+// Anthropic wire-level cache annotations (tool + message + tool_result)
+// ═════════════════════════════════════════════════════════════════════════
+//
+// These four helpers place Anthropic `cache_control` / `cache_edits` /
+// `cache_reference` metadata on the tool_schemas[] and messages[] arrays —
+// the wire-level equivalent of `cache_markers` on `system_blocks`. They
+// complement `apply_cache_policy_to_blocks` and live here (rather than
+// `astra-runtime`) because they are pure data transforms and the pipeline's
+// Optimize+Serialize phase should be the single owner of provider-specific
+// wire annotations.
+//
+// Session-scoped state (the "deleted cache_references" list that survives
+// across turns) is the runtime's responsibility — it feeds a `delete_refs`
+// slice into [`insert_cache_edits_block`].
+
+/// Anthropic ephemeral cache-control marker — the wire value all four
+/// annotation helpers place on schemas / messages / tool results.
+#[must_use]
+pub fn anthropic_ephemeral_cache_control() -> Value {
+    json!({ "type": "ephemeral" })
+}
+
+/// Place a single `cache_control` marker on the last pinned tool schema in
+/// `tool_schemas`, ending the static-lib prefix. Later dynamic tools still
+/// appear in the array but do not invalidate the cached prefix.
+///
+/// `pinned_names` is the set of tool names guaranteed present every turn
+/// (the "static lib"). If no pinned tool is present (e.g. a delegated
+/// sub-run with a fully custom toolset), the marker falls back to the last
+/// tool in the array — cache hits on dynamic tail are still a best-effort
+/// win, and the caller is expected to log a warning at the call-site.
+///
+/// No-op when `tool_schemas` is empty.
+pub fn annotate_pinned_tool_schema(
+    tool_schemas: &mut [Value],
+    pinned_names: &std::collections::HashSet<String>,
+) {
+    if tool_schemas.is_empty() {
+        return;
+    }
+    let marker_idx =
+        last_pinned_tool_index(tool_schemas, pinned_names).unwrap_or(tool_schemas.len() - 1);
+    tool_schemas[marker_idx]["cache_control"] = anthropic_ephemeral_cache_control();
+}
+
+fn last_pinned_tool_index(
+    tools: &[Value],
+    pinned_names: &std::collections::HashSet<String>,
+) -> Option<usize> {
+    if pinned_names.is_empty() {
+        return None;
+    }
+    tools.iter().enumerate().rev().find_map(|(idx, t)| {
+        let name = t
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)?;
+        if pinned_names.contains(name) {
+            Some(idx)
+        } else {
+            None
+        }
+    })
+}
+
+/// Place a single `cache_control` marker on the last non-system message,
+/// so the conversation prefix up to that point is cached across turns.
+///
+/// If the last message's `content` is a string, it is upgraded to a
+/// content-block array with one `{type: "text", cache_control: …}` entry.
+/// If already an array, the marker is attached to the last block.
+///
+/// No-op when `messages` is empty or contains only system messages.
+pub fn annotate_last_message_cache_breakpoint(messages: &mut [Value]) {
+    if messages.is_empty() {
+        return;
+    }
+    let Some(last) = messages.iter_mut().rev().find(|m| {
+        m.get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|r| r != "system")
+    }) else {
+        return;
+    };
+
+    if last.get("content").is_some_and(Value::is_string) {
+        let text = last["content"].as_str().unwrap_or_default().to_string();
+        last["content"] = json!([{
+            "type": "text",
+            "text": text,
+            "cache_control": anthropic_ephemeral_cache_control(),
+        }]);
+    } else if let Some(arr) = last.get_mut("content").and_then(Value::as_array_mut) {
+        if let Some(last_block) = arr.last_mut() {
+            last_block["cache_control"] = anthropic_ephemeral_cache_control();
+        }
+    }
+}
+
+/// Attach `cache_reference: <tool_call_id>` to every `role: "tool"` message
+/// that sits **before** the last message carrying a `cache_control` marker.
+/// The Anthropic API uses this to short-circuit replaying tool results whose
+/// content hasn't changed since the cached snapshot.
+///
+/// No-op if no message carries `cache_control` (nothing to reference against).
+pub fn annotate_tool_result_cache_references(messages: &mut [Value]) {
+    let Some(last_cc_idx) = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, msg)| message_has_cache_control(msg))
+        .map(|(idx, _)| idx)
+    else {
+        return;
+    };
+
+    for msg in messages.iter_mut().take(last_cc_idx) {
+        if msg.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        if let Some(tool_call_id) = msg.get("tool_call_id").and_then(Value::as_str) {
+            msg["cache_reference"] = Value::String(tool_call_id.to_string());
+        }
+    }
+}
+
+/// Insert a `cache_edits` block on the last user message listing the
+/// provided `delete_refs` (tool_call_ids whose results were cleared/compacted
+/// in a prior turn). Anthropic uses this to drop cached tool results that
+/// are no longer valid.
+///
+/// The `delete_refs` slice is the caller's responsibility — runtime keeps
+/// a session-keyed pin map so the delete list survives across turns.
+///
+/// No-op when `delete_refs` is empty or `messages` has no user message.
+pub fn insert_cache_edits_block(messages: &mut [Value], delete_refs: &[String]) {
+    if delete_refs.is_empty() {
+        return;
+    }
+    let Some(last_user) = messages
+        .iter_mut()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+    else {
+        return;
+    };
+    ensure_content_array(last_user);
+    let Some(content) = last_user.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    content.retain(|block| block.get("type").and_then(Value::as_str) != Some("cache_edits"));
+    content.push(json!({
+        "type": "cache_edits",
+        "edits": delete_refs
+            .iter()
+            .map(|cache_reference| json!({
+                "type": "delete",
+                "cache_reference": cache_reference,
+            }))
+            .collect::<Vec<_>>(),
+    }));
+}
+
+fn ensure_content_array(msg: &mut Value) {
+    if msg.get("content").is_some_and(Value::is_string) {
+        let text = msg["content"].as_str().unwrap_or_default().to_string();
+        msg["content"] = json!([{
+            "type": "text",
+            "text": text,
+        }]);
+    } else if msg.get("content").is_none() {
+        msg["content"] = json!([]);
+    }
+}
+
+fn message_has_cache_control(msg: &Value) -> bool {
+    let Some(content) = msg.get("content") else {
+        return false;
+    };
+    if let Some(array) = content.as_array() {
+        return array
+            .iter()
+            .any(|block| block.get("cache_control").is_some());
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +561,187 @@ mod tests {
     #[test]
     fn block_index_for_marker_empty_mapping() {
         assert_eq!(block_index_for_marker(5, &[]), None);
+    }
+
+    // ── Phase 2: tool / message / cache_edits annotations ────────────────
+    // Ported from runtime `prompt_cache`. Contract: these are pure
+    // data transforms over the wire payload; session state stays in
+    // runtime and is plumbed in via `delete_refs`.
+
+    fn tool_schema(name: &str) -> Value {
+        json!({
+            "type": "function",
+            "function": { "name": name, "description": "test tool" }
+        })
+    }
+
+    #[test]
+    fn annotate_pinned_tool_schema_marks_last_pinned() {
+        let mut tools = vec![
+            tool_schema("bash"),      // pinned
+            tool_schema("read_file"), // pinned
+            tool_schema("custom_a"),  // dynamic
+            tool_schema("custom_b"),  // dynamic
+        ];
+        let pinned: std::collections::HashSet<String> =
+            ["bash".into(), "read_file".into()].into_iter().collect();
+        annotate_pinned_tool_schema(&mut tools, &pinned);
+        // Marker goes on last pinned (read_file, idx 1), NOT the last
+        // overall tool — dynamic churn after this marker is expected
+        // and cache-safe.
+        assert!(tools[0]["cache_control"].is_null());
+        assert_eq!(tools[1]["cache_control"], json!({"type": "ephemeral"}));
+        assert!(tools[2]["cache_control"].is_null());
+        assert!(tools[3]["cache_control"].is_null());
+    }
+
+    #[test]
+    fn annotate_pinned_tool_schema_fallback_on_last_when_no_pinned() {
+        let mut tools = vec![tool_schema("custom_a"), tool_schema("custom_b")];
+        let pinned = std::collections::HashSet::new();
+        annotate_pinned_tool_schema(&mut tools, &pinned);
+        assert!(tools[0]["cache_control"].is_null());
+        assert_eq!(tools[1]["cache_control"], json!({"type": "ephemeral"}));
+    }
+
+    #[test]
+    fn annotate_pinned_tool_schema_noop_on_empty() {
+        let mut tools: Vec<Value> = Vec::new();
+        annotate_pinned_tool_schema(&mut tools, &std::collections::HashSet::new());
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn annotate_last_message_cache_breakpoint_upgrades_string_content() {
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "hi"}),
+        ];
+        annotate_last_message_cache_breakpoint(&mut msgs);
+        // system untouched
+        assert_eq!(msgs[0]["content"], "sys");
+        // user content upgraded to block array with cache_control
+        let arr = msgs[1]["content"].as_array().expect("content is array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], "hi");
+        assert_eq!(arr[0]["cache_control"], json!({"type": "ephemeral"}));
+    }
+
+    #[test]
+    fn annotate_last_message_cache_breakpoint_marks_last_block_of_array() {
+        let mut msgs = vec![json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "second"},
+            ]
+        })];
+        annotate_last_message_cache_breakpoint(&mut msgs);
+        let arr = msgs[0]["content"].as_array().unwrap();
+        assert!(arr[0]["cache_control"].is_null());
+        assert_eq!(arr[1]["cache_control"], json!({"type": "ephemeral"}));
+    }
+
+    #[test]
+    fn annotate_last_message_cache_breakpoint_noop_on_system_only() {
+        let mut msgs = vec![json!({"role": "system", "content": "sys"})];
+        annotate_last_message_cache_breakpoint(&mut msgs);
+        assert_eq!(msgs[0]["content"], "sys"); // unchanged
+    }
+
+    #[test]
+    fn annotate_tool_result_cache_references_stamps_tool_msgs_before_marker() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "question"}),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{"id": "c1", "function": {"name": "bash"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "result-1"}),
+            json!({
+                "role": "user",
+                "content": [{"type": "text", "text": "next", "cache_control": {"type": "ephemeral"}}]
+            }),
+        ];
+        annotate_tool_result_cache_references(&mut msgs);
+        // The tool message at idx 2 sits BEFORE the marker at idx 3 → gets cache_reference
+        assert_eq!(msgs[2]["cache_reference"], json!("c1"));
+        // The user message AT the marker is unchanged
+        assert!(msgs[3]["cache_reference"].is_null());
+    }
+
+    #[test]
+    fn annotate_tool_result_cache_references_noop_when_no_marker() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "r"}),
+        ];
+        annotate_tool_result_cache_references(&mut msgs);
+        assert!(msgs[1]["cache_reference"].is_null());
+    }
+
+    #[test]
+    fn insert_cache_edits_block_appends_to_last_user_message() {
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "continue"}),
+        ];
+        insert_cache_edits_block(&mut msgs, &["c1".to_string(), "c2".to_string()]);
+
+        // user.content upgraded to array, cache_edits block appended
+        let arr = msgs[1]["content"].as_array().unwrap();
+        let edits_block = arr
+            .iter()
+            .find(|b| b.get("type").and_then(Value::as_str) == Some("cache_edits"))
+            .expect("cache_edits block present");
+        let edits = edits_block["edits"].as_array().unwrap();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0]["type"], "delete");
+        assert_eq!(edits[0]["cache_reference"], "c1");
+        assert_eq!(edits[1]["cache_reference"], "c2");
+    }
+
+    #[test]
+    fn insert_cache_edits_block_replaces_existing_block() {
+        let mut msgs = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "task"},
+                {"type": "cache_edits", "edits": [{"type": "delete", "cache_reference": "stale"}]}
+            ]
+        })];
+        insert_cache_edits_block(&mut msgs, &["fresh".to_string()]);
+
+        let arr = msgs[0]["content"].as_array().unwrap();
+        let cache_edits_blocks: Vec<_> = arr
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("cache_edits"))
+            .collect();
+        assert_eq!(
+            cache_edits_blocks.len(),
+            1,
+            "old cache_edits block must be replaced, not duplicated"
+        );
+        assert_eq!(
+            cache_edits_blocks[0]["edits"][0]["cache_reference"],
+            "fresh"
+        );
+    }
+
+    #[test]
+    fn insert_cache_edits_block_noop_on_empty_refs() {
+        let mut msgs = vec![json!({"role": "user", "content": "x"})];
+        insert_cache_edits_block(&mut msgs, &[]);
+        // content untouched (still string, no cache_edits block)
+        assert!(msgs[0]["content"].is_string());
+    }
+
+    #[test]
+    fn insert_cache_edits_block_noop_when_no_user_message() {
+        let mut msgs = vec![json!({"role": "system", "content": "sys"})];
+        insert_cache_edits_block(&mut msgs, &["c1".into()]);
+        // No user message — function silently no-ops, doesn't panic.
+        assert_eq!(msgs[0]["content"], "sys");
     }
 }

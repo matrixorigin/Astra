@@ -419,6 +419,12 @@ pub(crate) fn annotate_tool_schemas_for_caching(
 
 /// Variant of [`annotate_tool_schemas_for_caching`] that takes an explicit
 /// pinned set — used by tests and callers that need to override the default.
+///
+/// Runtime-side adapter: decides whether to annotate (`cache_cfg.should_annotate`),
+/// logs the fallback path for triage, then delegates to the pure
+/// [`astra_turn_core::context_serializer::annotate_pinned_tool_schema`] for
+/// the actual wire mutation. The pure primitive lives in the pipeline so all
+/// provider-specific cache logic has exactly one implementation.
 pub(crate) fn annotate_tool_schemas_for_caching_with_pinned(
     tools: &mut [Value],
     cache_cfg: &PromptCacheConfig,
@@ -427,42 +433,25 @@ pub(crate) fn annotate_tool_schemas_for_caching_with_pinned(
     if !cache_cfg.should_annotate() || tools.is_empty() {
         return;
     }
-    let marker_idx = match last_pinned_tool_index(tools, pinned_names) {
-        Some(idx) => idx,
-        None => {
-            // Fallback path: no pinned tool present in this tool list. Legit
-            // for delegated sub-runs that pass a fully custom toolset, but a
-            // cache-hit regression triage needs to see it — otherwise "why
-            // does this sub-run cache worse than its parent?" is opaque.
-            tracing::debug!(
-                tool_count = tools.len(),
-                "cache marker fallback: no pinned tools present; placing on last tool. \
-                 Static-prefix caching unavailable for this request."
-            );
-            tools.len() - 1
-        }
-    };
-    tools[marker_idx]["cache_control"] = json!({"type": "ephemeral"});
-}
-
-fn last_pinned_tool_index(
-    tools: &[Value],
-    pinned_names: &std::collections::HashSet<String>,
-) -> Option<usize> {
-    if pinned_names.is_empty() {
-        return None;
+    if !pinned_names.is_empty()
+        && !tools.iter().any(|t| {
+            t.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .is_some_and(|n| pinned_names.contains(n))
+        })
+    {
+        // Fallback path: no pinned tool present in this tool list. Legit
+        // for delegated sub-runs that pass a fully custom toolset, but a
+        // cache-hit regression triage needs to see it — otherwise "why
+        // does this sub-run cache worse than its parent?" is opaque.
+        tracing::debug!(
+            tool_count = tools.len(),
+            "cache marker fallback: no pinned tools present; placing on last tool. \
+             Static-prefix caching unavailable for this request."
+        );
     }
-    tools.iter().enumerate().rev().find_map(|(idx, t)| {
-        let name = t
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(Value::as_str)?;
-        if pinned_names.contains(name) {
-            Some(idx)
-        } else {
-            None
-        }
-    })
+    astra_turn_core::context_serializer::annotate_pinned_tool_schema(tools, pinned_names);
 }
 
 /// Default pinned tool names — the static-lib set that should appear in every
@@ -491,31 +480,16 @@ pub(crate) fn default_pinned_tool_names() -> std::collections::HashSet<String> {
 
 /// Add a cache breakpoint on the last conversation message for Anthropic.
 /// This enables turn-to-turn KV cache reuse for the conversation prefix.
+///
+/// Runtime adapter: gates on `cache_cfg.should_annotate` then delegates to
+/// the pure pipeline primitive. Only used by tests now that
+/// `apply_anthropic_cache_metadata` calls the pipeline primitive directly.
+#[cfg(test)]
 pub(crate) fn add_message_cache_breakpoint(messages: &mut [Value], cache_cfg: &PromptCacheConfig) {
-    if !cache_cfg.should_annotate() || messages.is_empty() {
+    if !cache_cfg.should_annotate() {
         return;
     }
-    // Find the last non-system message and add cache_control to it
-    if let Some(last) = messages.iter_mut().rev().find(|m| {
-        m.get("role")
-            .and_then(Value::as_str)
-            .is_some_and(|r| r != "system")
-    }) {
-        // If content is a string, convert to array format for cache_control
-        if last.get("content").is_some_and(Value::is_string) {
-            let text = last["content"].as_str().unwrap_or_default().to_string();
-            last["content"] = json!([{
-                "type": "text",
-                "text": text,
-                "cache_control": {"type": "ephemeral"},
-            }]);
-        } else if let Some(arr) = last.get_mut("content").and_then(Value::as_array_mut) {
-            // Content is already an array — add cache_control to last element
-            if let Some(last_block) = arr.last_mut() {
-                last_block["cache_control"] = json!({"type": "ephemeral"});
-            }
-        }
-    }
+    astra_turn_core::context_serializer::annotate_last_message_cache_breakpoint(messages);
 }
 
 /// Add Anthropic protocol-level cache metadata for cached micro-compaction.
@@ -533,12 +507,21 @@ pub(crate) fn apply_anthropic_cache_metadata(
         return;
     }
 
-    add_message_cache_breakpoint(messages, cache_cfg);
+    // Phase 2 decomposition:
+    //  - the *pure* wire mutations (marker placement, cache_edits block
+    //    insertion, cache_reference stamping) live in
+    //    `astra_turn_core::context_serializer` alongside the pipeline's
+    //    Serialize phase.
+    //  - the *stateful* bits (which tool_call_ids have been cleared and
+    //    must stay in the cache_edits list across turns) stay here
+    //    because the pin map is keyed by session_id and outlives any
+    //    single request.
+    astra_turn_core::context_serializer::annotate_last_message_cache_breakpoint(messages);
 
     let new_deletes = collect_cleared_tool_result_refs(messages);
     let pinned_deletes = pin_and_merge_cache_edits(session_id, &new_deletes);
-    insert_cache_edits_block(messages, &pinned_deletes);
-    add_tool_result_cache_references(messages);
+    astra_turn_core::context_serializer::insert_cache_edits_block(messages, &pinned_deletes);
+    astra_turn_core::context_serializer::annotate_tool_result_cache_references(messages);
 }
 
 fn collect_cleared_tool_result_refs(messages: &[Value]) -> Vec<String> {
@@ -595,82 +578,12 @@ fn pin_and_merge_cache_edits(session_id: &str, new_deletes: &[String]) -> Vec<St
     entry.clone()
 }
 
-fn insert_cache_edits_block(messages: &mut [Value], delete_refs: &[String]) {
-    if delete_refs.is_empty() {
-        return;
-    }
-    let Some(last_user) = messages
-        .iter_mut()
-        .rev()
-        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-    else {
-        return;
-    };
-    ensure_content_array(last_user);
-    let Some(content) = last_user.get_mut("content").and_then(Value::as_array_mut) else {
-        return;
-    };
-    content.retain(|block| block.get("type").and_then(Value::as_str) != Some("cache_edits"));
-    content.push(json!({
-        "type": "cache_edits",
-        "edits": delete_refs
-            .iter()
-            .map(|cache_reference| json!({
-                "type": "delete",
-                "cache_reference": cache_reference,
-            }))
-            .collect::<Vec<_>>(),
-    }));
-}
-
-fn add_tool_result_cache_references(messages: &mut [Value]) {
-    let Some(last_cc_idx) = messages
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, msg)| message_has_cache_control(msg))
-        .map(|(idx, _)| idx)
-    else {
-        return;
-    };
-
-    for msg in messages.iter_mut().take(last_cc_idx) {
-        if msg.get("role").and_then(Value::as_str) != Some("tool") {
-            continue;
-        }
-        if let Some(tool_call_id) = msg.get("tool_call_id").and_then(Value::as_str) {
-            msg["cache_reference"] = Value::String(tool_call_id.to_string());
-        }
-    }
-}
-
-fn ensure_content_array(msg: &mut Value) {
-    if msg.get("content").is_some_and(Value::is_array) {
-        return;
-    }
-    let text = msg
-        .get("content")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    msg["content"] = json!([{ "type": "text", "text": text }]);
-}
-
-fn message_has_cache_control(msg: &Value) -> bool {
-    if msg.get("cache_control").is_some() {
-        return true;
-    }
-    msg.get("content")
-        .and_then(Value::as_array)
-        .is_some_and(|blocks| {
-            blocks.iter().any(|block| {
-                block
-                    .get("cache_control")
-                    .map(|cc| !cc.is_null())
-                    .unwrap_or(false)
-            })
-        })
-}
+// NOTE: `insert_cache_edits_block`, `add_tool_result_cache_references`,
+// `ensure_content_array`, and `message_has_cache_control` were moved to
+// `astra_turn_core::context_serializer` as Phase 2 of the pipeline-owned
+// wire payload refactor. Runtime keeps the session-keyed pin map in
+// `pin_and_merge_cache_edits` / `collect_cleared_tool_result_refs` and
+// calls the pure primitives from `apply_anthropic_cache_metadata` above.
 
 #[cfg(test)]
 fn clear_anthropic_cache_edit_pins_for_tests(session_id: &str) {

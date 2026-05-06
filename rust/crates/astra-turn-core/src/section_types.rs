@@ -460,7 +460,7 @@ mod tests {
 
     // ── rehydrate (Phase 12: on-demand spill resolution) ───────────────
 
-    use crate::spill_backend::{FileSystemSpillBackend, SpillBackend, DEFAULT_SCHEME};
+    use crate::spill_backend::{DEFAULT_SCHEME, FileSystemSpillBackend, SpillBackend};
     use std::sync::Arc;
     use tempfile::TempDir;
 
