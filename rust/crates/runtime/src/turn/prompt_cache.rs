@@ -125,6 +125,7 @@ pub(crate) fn assemble_system_message_via_pipeline(
     let outcome = assemble_bridge_pipeline_outcome(
         tool_names,
         &[],
+        &[], // legacy wrapper: no stable sections — tests pre-date the split
         extra_dynamic_sections,
         confidence,
         task_type,
@@ -134,6 +135,7 @@ pub(crate) fn assemble_system_message_via_pipeline(
         provider,
         edge_profile_cwd,
         edge_profile_git_branch,
+        None,
     );
     (
         outcome.primary_system,
@@ -151,10 +153,21 @@ pub(crate) fn assemble_system_message_via_pipeline(
 /// returned `tool_schemas` is the tier-pruned view from the pipeline's
 /// Optimize phase (mirrors `server_loop_host::PipelineTurnOutcome.tool_schemas`).
 #[allow(clippy::too_many_arguments)]
+/// Extra-sections are split into two lanes per cache strategy:
+///
+/// * `extra_stable_sections` — session-stable bridge-composed content
+///   (skill_hint, feedback rules, self-awareness). Bound into RuntimeIdentity
+///   (Session scope) so they sit BEFORE the Session→None cache marker.
+/// * `extra_volatile_sections` — per-turn bridge-composed content
+///   (session anchor, memoria insights, tool round guidance). Bound into
+///   RuntimeVolatile (None scope) so churn does not invalidate the
+///   cached session prefix.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_bridge_pipeline_outcome(
     tool_names: &[&str],
     tool_schemas: &[Value],
-    extra_dynamic_sections: &[prompts::PromptSection],
+    extra_stable_sections: &[prompts::PromptSection],
+    extra_volatile_sections: &[prompts::PromptSection],
     confidence: f64,
     task_type: Option<&str>,
     cache_cfg: &PromptCacheConfig,
@@ -163,6 +176,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     provider: &str,
     edge_profile_cwd: Option<&str>,
     edge_profile_git_branch: Option<&str>,
+    project_context: Option<&str>,
 ) -> BridgePipelineOutcome {
     use astra_turn_core::context_sources::{
         AgentContext, EdgeProfile, ExternalSources, SessionContext, TurnState,
@@ -204,18 +218,23 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         ))
     };
 
-    // Forward ASTRA_OUTPUT_STYLE as a dynamic extra section so the active
-    // user style (concise/verbose/…) lands in the post-cache segment.
-    // the pipeline takes it through the escape hatch.
-    let mut all_extras: Vec<prompts::PromptSection> = extra_dynamic_sections.to_vec();
+    // ASTRA_OUTPUT_STYLE is a user preference — stable within a session
+    // (user doesn't toggle styles mid-session). Route to stable lane.
+    let mut stable = extra_stable_sections.to_vec();
     if let Some(style) = astra_text_utils::output_style::current_output_style()
         && !style.prompt.is_empty()
     {
-        all_extras.push(prompts::PromptSection::dynamic(
+        stable.push(prompts::PromptSection::dynamic(
             format!("\n{}\n", style.prompt),
             prompts::PromptTokenBucket::UserPreferences,
         ));
     }
+    let volatile = extra_volatile_sections.to_vec();
+    let all_sections_for_trace = {
+        let mut v = stable.clone();
+        v.extend(volatile.iter().cloned());
+        v
+    };
 
     let external = ExternalSources {
         memory_snippets: Vec::new(),
@@ -229,7 +248,8 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         system_override: None,
         plan_context: None,
         tool_guidance: None,
-        extra_dynamic_sections: all_extras.clone(),
+        extra_stable_sections: stable,
+        extra_dynamic_sections: volatile,
     };
 
     let provider_policy = match provider {
@@ -243,7 +263,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         model_limit: 200_000, // generous — bridge doesn't track per-model limits here
         provider_policy: provider_policy.clone(),
         provider_strategy: ProviderCacheStrategy::default(),
-        project_context: String::new(),
+        project_context: project_context.unwrap_or("").to_string(),
         edge_profile: EdgeProfile {
             cwd: edge_profile_cwd.map(String::from),
             git_branch: edge_profile_git_branch.map(String::from),
@@ -316,7 +336,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     // in their original form — trace_signals intact. Downstream
     // `build_system_prompt_trace` aggregates context_signals across every
     // section, so this preserves the bridge's telemetry contract.
-    sections.extend(all_extras.iter().cloned());
+    sections.extend(all_sections_for_trace.iter().cloned());
 
     let tier = output.plan.compact_tier;
     let pruned_tool_schemas = output.optimized.tool_schemas.clone();
@@ -772,13 +792,15 @@ mod tests {
         let outcome = assemble_bridge_pipeline_outcome(
             &["bash"],
             &tool_schemas,
-            &[],
+            &[], // stable
+            &[], // volatile
             0.8,
             None,
             &cache_cfg,
             "sid-bridge",
             "gpt-4o",
             "openai",
+            None,
             None,
             None,
         );
@@ -1122,7 +1144,9 @@ mod tests {
 
     /// Ports `structured_prompt_cache_key_tracks_output_style_changes`:
     /// flipping `$ASTRA_OUTPUT_STYLE` between calls produces different
-    /// dynamic content.
+    /// primary system content. Output style is a user preference that's
+    /// session-stable (users don't toggle mid-session), so after the
+    /// stable/volatile split it lives in the Session-scoped primary block.
     #[test]
     fn pipeline_assembly_picks_up_output_style_changes() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
@@ -1130,7 +1154,7 @@ mod tests {
         set_test_env("HOME", home.path().to_str().unwrap());
 
         set_test_env("ASTRA_OUTPUT_STYLE", "concise");
-        let (_, dyn1, _) = assemble_system_message_via_pipeline(
+        let (primary1, _, _) = assemble_system_message_via_pipeline(
             &["bash"],
             &[],
             0.8,
@@ -1142,14 +1166,16 @@ mod tests {
             None,
             None,
         );
-        let t1 = dyn1
-            .as_ref()
-            .and_then(|m| m["content"].as_str())
-            .expect("dynamic present for style");
-        assert!(t1.contains("# Output Style: Concise"));
+        let t1 = primary1["content"]
+            .as_str()
+            .expect("primary content is plain text for openai");
+        assert!(
+            t1.contains("# Output Style: Concise"),
+            "output style must appear in primary (session-scoped) content: {t1}"
+        );
 
         set_test_env("ASTRA_OUTPUT_STYLE", "verbose");
-        let (_, dyn2, _) = assemble_system_message_via_pipeline(
+        let (primary2, _, _) = assemble_system_message_via_pipeline(
             &["bash"],
             &[],
             0.8,
@@ -1161,13 +1187,12 @@ mod tests {
             None,
             None,
         );
-        let t2 = dyn2
-            .as_ref()
-            .and_then(|m| m["content"].as_str())
-            .expect("dynamic present for second style");
+        let t2 = primary2["content"]
+            .as_str()
+            .expect("primary content is plain text for openai");
         assert!(
             t2.contains("# Output Style: Verbose") && !t2.contains("# Output Style: Concise"),
-            "pipeline dynamic segment must reflect new $ASTRA_OUTPUT_STYLE: {t2}"
+            "primary segment must reflect new $ASTRA_OUTPUT_STYLE: {t2}"
         );
         remove_test_env("ASTRA_OUTPUT_STYLE");
     }

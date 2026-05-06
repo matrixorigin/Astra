@@ -1345,6 +1345,30 @@ impl InProcessChatTurnBridge {
                 tool_cfg.effective_round_budget_limit(),
             );
 
+            // Split bridge-composed signals into session-stable (RuntimeIdentity
+            // scope → cached behind the Session→None marker) and turn-volatile
+            // (RuntimeVolatile scope → re-sent per turn).
+            //
+            // STABLE (change only when session state changes, if at all):
+            //   skill_hint, learned_context_hint, feedback_rules_hint,
+            //   self_awareness_hint
+            //
+            // VOLATILE (change each turn by design):
+            //   profile_desc (per-turn! includes Memoria prefetch snippets
+            //     under "## User Memories" header),
+            //   implicit_feedback_hint (per-turn correction signal based on
+            //     user message content),
+            //   memoria_insights_hint (per-turn retrieval),
+            //   recent_arg_hints_hint (per-turn tool args),
+            //   session_anchor (per-turn state),
+            //   tool_round_guidance (per-turn messages count)
+            //
+            // NOTE: the bridge's `profile_desc` is NOT the same as the
+            // pipeline's typed `ExternalSources.profile_desc` (which is
+            // pure cwd/branch). The bridge version is a superset that
+            // includes prefetched Memoria context, so it belongs in the
+            // volatile lane even though the name suggests stability.
+            let mut stable_sections = Vec::new();
             let mut dynamic_sections = Vec::new();
             if !profile_desc.is_empty() {
                 dynamic_sections.push(prompts::PromptSection::dynamic(
@@ -1353,7 +1377,7 @@ impl InProcessChatTurnBridge {
                 ));
             }
             if !skill_hint.is_empty() {
-                dynamic_sections.push(
+                stable_sections.push(
                     prompts::PromptSection::dynamic(
                         skill_hint.clone(),
                         prompts::PromptTokenBucket::UserPreferences,
@@ -1368,7 +1392,7 @@ impl InProcessChatTurnBridge {
                 );
             }
             if !learned_context_hint.is_empty() {
-                dynamic_sections.push(
+                stable_sections.push(
                     prompts::PromptSection::dynamic(
                         learned_context_hint.clone(),
                         prompts::PromptTokenBucket::UserPreferences,
@@ -1383,6 +1407,8 @@ impl InProcessChatTurnBridge {
                 );
             }
             if !implicit_feedback_hint.is_empty() {
+                // Per-turn correction signal — depends on current user
+                // message content, so it's volatile.
                 dynamic_sections.push(
                     prompts::PromptSection::dynamic(
                         implicit_feedback_hint.clone(),
@@ -1398,7 +1424,7 @@ impl InProcessChatTurnBridge {
                 );
             }
             if !feedback_rules_hint.is_empty() {
-                dynamic_sections.push(
+                stable_sections.push(
                     prompts::PromptSection::dynamic(
                         feedback_rules_hint.clone(),
                         prompts::PromptTokenBucket::Environment,
@@ -1413,7 +1439,7 @@ impl InProcessChatTurnBridge {
                 );
             }
             if !self_awareness_hint.is_empty() {
-                dynamic_sections.push(
+                stable_sections.push(
                     prompts::PromptSection::dynamic(
                         self_awareness_hint.clone(),
                         prompts::PromptTokenBucket::Environment,
@@ -1486,9 +1512,18 @@ impl InProcessChatTurnBridge {
             // through ExternalSources.extra_dynamic_sections so the binder
             // appends them after runtime identity — keeping them in the
             // None-scoped post-cache segment where churn is expected.
+            // project_context comes from cross-session history summaries;
+            // byte-stable within a session, so routing it into the pipeline's
+            // ProjectContext section (Session scope) puts it behind the
+            // Session→None cache marker.
+            let project_context = edge_profile
+                .get("project_context")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
             let pipeline_outcome = crate::turn::prompt_cache::assemble_bridge_pipeline_outcome(
                 &tool_names,
                 &edge_tools,
+                &stable_sections,
                 &dynamic_sections,
                 selection_confidence,
                 task_type,
@@ -1498,6 +1533,7 @@ impl InProcessChatTurnBridge {
                 &provider,
                 edge_profile.get("cwd").and_then(Value::as_str),
                 edge_profile.get("git_branch").and_then(Value::as_str),
+                project_context,
             );
             let system_msg = pipeline_outcome.primary_system;
             let dynamic_msg = pipeline_outcome.dynamic_system;

@@ -134,21 +134,27 @@ pub struct ExternalSources {
     pub tool_conditional: Option<String>,
     /// Project profile description (cwd, git_branch, project facts).
     pub profile_desc: Option<String>,
-    /// Pre-built dynamic sections that should append verbatim after the
-    /// standard runtime-identity fragments. Used by callers that compose
-    /// bespoke per-turn content (session anchor, feedback rules, memoria
-    /// insights, implicit-feedback hints, etc.) rather than shoehorning
-    /// each into a typed field.
+    /// **Session-stable** pre-built sections — bridge-composed content
+    /// that persists across turns (skill hint, accumulated feedback rules,
+    /// self-awareness hint, any caller-composed static snippet).
     ///
-    /// Binder appends them as extra lines in `bind_runtime_identity` —
-    /// they inherit the None scope of that section, so they sit *after*
-    /// the cache marker and can churn per turn without invalidating the
-    /// cached static prefix.
+    /// Bound into the `RuntimeIdentity` section (Session scope), so they
+    /// sit BEFORE the Session→None cache marker and participate in
+    /// Anthropic's per-session prompt cache. Empty by default; callers
+    /// opt-in per fragment.
     ///
-    /// Empty by default; typed fields above are preferred whenever the
-    /// content is reusable across callers. This field is an escape hatch
-    /// for the HTTP bridge (`InProcessChatTurnBridge`) which composes ~10
-    /// signals the server loop doesn't need.
+    /// Split from the legacy single `extra_dynamic_sections` field after
+    /// observing that the bridge was shoving session-stable content into
+    /// the volatile lane, losing ~6kB of cacheable tokens per turn.
+    pub extra_stable_sections: Vec<PromptSection>,
+
+    /// **Turn-volatile** pre-built sections — bridge-composed content
+    /// that can change every turn (session anchor, memoria insights that
+    /// rotate, recent-arg hints, per-turn tool round guidance).
+    ///
+    /// Bound into the `RuntimeVolatile` section (None scope), so they sit
+    /// AFTER the Session→None cache marker and can churn freely without
+    /// invalidating the cached session prefix.
     pub extra_dynamic_sections: Vec<PromptSection>,
 }
 

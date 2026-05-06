@@ -364,16 +364,13 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
         }
     }
 
-    if let Some(ref ctx) = state.project_context {
-        state.messages.push(serde_json::json!({
-            "role": "system",
-            "content": format!(
-                "## Cross-Session Project Context\n\
-                 Below are summaries of recent sessions in this project. \
-                 Use them for continuity — avoid re-asking questions already answered.\n\n{ctx}"
-            )
-        }));
-    }
+    // NOTE: Cross-Session Project Context used to be injected into
+    // `state.messages` here as a system message. It has moved into the
+    // context pipeline's `ProjectContext` section (bound from
+    // `SessionContext.project_context`) so it sits in `CacheScope::Session`
+    // BEFORE the Session→None marker — now it participates in the cached
+    // session prefix instead of being re-sent after the marker every turn.
+    // See `context_pipeline_adapter::build_session_context` + `bind_project_context`.
 
     if let Some(ref evo) = state.evolution_service {
         let turn_id = state.current_run_id.as_deref().unwrap_or("unknown");

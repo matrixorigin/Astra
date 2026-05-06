@@ -171,8 +171,9 @@ pub(crate) fn build_external_sources(
         system_override,
         plan_context,
         tool_guidance,
-        // Adapter path doesn't use the escape hatch — all its signals have
-        // typed fields. The bridge (task #30) feeds this via its own builder.
+        // Adapter path (ServerAgenticLoopHost) doesn't use the bridge
+        // escape hatches — all its signals have typed fields above.
+        extra_stable_sections: Vec::new(),
         extra_dynamic_sections: Vec::new(),
     }
 }
@@ -209,6 +210,7 @@ pub(crate) fn build_turn_state(state: &AgenticLoopState, user_content: &str) -> 
 /// falls back to prefix-only caching. Pulling this from the actual provider
 /// (vs. a hardcoded `anthropic()`) is what prevents the pipeline from emitting
 /// unsupported markers to OpenAI-compatible endpoints.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_session_context(
     session_id: &str,
     run_id: Option<&str>,
@@ -216,6 +218,7 @@ pub(crate) fn build_session_context(
     max_input_tokens: u64,
     edge_profile: &serde_json::Map<String, Value>,
     provider: &str,
+    project_context: Option<&str>,
 ) -> SessionContext {
     let provider_policy = provider_policy_for(provider, model_name);
     SessionContext {
@@ -225,7 +228,12 @@ pub(crate) fn build_session_context(
         model_limit: u32::try_from(max_input_tokens).unwrap_or(u32::MAX),
         provider_policy,
         provider_strategy: ProviderCacheStrategy::default(),
-        project_context: String::new(),
+        // Cross-session project context (summaries of prior sessions on
+        // this repo) is session-stable — feeding it through the pipeline's
+        // `ProjectContext` section puts it in CacheScope::Session behind the
+        // 2nd marker instead of runtime-injecting it into `state.messages`
+        // AFTER the marker.
+        project_context: project_context.unwrap_or("").to_string(),
         edge_profile: EdgeProfile {
             cwd: edge_profile
                 .get("cwd")
@@ -302,7 +310,15 @@ mod tests {
     #[test]
     fn session_context_picks_anthropic_policy_for_anthropic_provider() {
         let ep = serde_json::Map::new();
-        let ctx = build_session_context("sid", None, "claude-sonnet", 200_000, &ep, "anthropic");
+        let ctx = build_session_context(
+            "sid",
+            None,
+            "claude-sonnet",
+            200_000,
+            &ep,
+            "anthropic",
+            None,
+        );
         // anthropic policy supports cache_control markers (max_markers > 0).
         assert!(
             ctx.provider_policy.max_markers > 0,
@@ -321,6 +337,7 @@ mod tests {
             200_000,
             &ep,
             "bedrock",
+            None,
         );
         // Bedrock Claude translates cache_control → cachePoint downstream,
         // so the pipeline still emits Anthropic-style markers.
@@ -341,6 +358,7 @@ mod tests {
             200_000,
             &ep,
             "bedrock",
+            None,
         );
         assert_eq!(
             ctx.provider_policy.max_markers, 0,
@@ -352,14 +370,14 @@ mod tests {
     #[test]
     fn session_context_saturates_oversized_model_limit() {
         let ep = serde_json::Map::new();
-        let ctx = build_session_context("sid", None, "gpt-4o", u64::MAX, &ep, "openai");
+        let ctx = build_session_context("sid", None, "gpt-4o", u64::MAX, &ep, "openai", None);
         assert_eq!(ctx.model_limit, u32::MAX);
     }
 
     #[test]
     fn session_context_picks_openai_policy_for_openai_provider() {
         let ep = serde_json::Map::new();
-        let ctx = build_session_context("sid", None, "gpt-4o", 128_000, &ep, "openai");
+        let ctx = build_session_context("sid", None, "gpt-4o", 128_000, &ep, "openai", None);
         // OpenAI uses prefix-only caching — emitting cache_control is a no-op
         // at best and (for some proxies) a 400 Bad Request at worst.
         assert_eq!(
@@ -376,8 +394,50 @@ mod tests {
         // of "no markers" — emitting cache_control to an unknown backend
         // risks protocol errors, whereas omitting it just loses caching.
         let ep = serde_json::Map::new();
-        let ctx = build_session_context("sid", None, "unknown-model-v9", 100_000, &ep, "unknown");
+        let ctx = build_session_context(
+            "sid",
+            None,
+            "unknown-model-v9",
+            100_000,
+            &ep,
+            "unknown",
+            None,
+        );
         assert_eq!(ctx.provider_policy.max_markers, 0);
+    }
+
+    #[test]
+    fn session_context_passes_project_context_through() {
+        // The Cross-Session Project Context (summaries of prior sessions on
+        // this repo) must land in `SessionContext.project_context` so the
+        // pipeline's `ProjectContext` section picks it up. Previously this
+        // content was runtime-injected into `state.messages` AFTER the cache
+        // marker — every turn re-sent it as cache_creation. Now it sits in
+        // `CacheScope::Session` behind the 2nd marker and becomes cacheable.
+        let ep = serde_json::Map::new();
+        let ctx = build_session_context(
+            "sid",
+            None,
+            "claude-sonnet",
+            200_000,
+            &ep,
+            "anthropic",
+            Some(
+                "1. [active] (2026-05-06, 22 turns, branch: main)\n2. [active] (2026-05-05, 4 turns)",
+            ),
+        );
+        assert!(
+            ctx.project_context.contains("22 turns"),
+            "project_context must flow through to SessionContext: {}",
+            ctx.project_context
+        );
+    }
+
+    #[test]
+    fn session_context_defaults_project_context_to_empty_when_absent() {
+        let ep = serde_json::Map::new();
+        let ctx = build_session_context("sid", None, "gpt-4o", 128_000, &ep, "openai", None);
+        assert!(ctx.project_context.is_empty());
     }
 
     #[test]

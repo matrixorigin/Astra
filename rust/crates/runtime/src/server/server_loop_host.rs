@@ -1757,6 +1757,7 @@ impl ServerAgenticLoopHost {
             state.max_turn_input_tokens,
             &self.edge_profile,
             provider,
+            state.project_context.as_deref(),
         );
         let statics = crate::prompts::build_pipeline_static_sections();
         let agent = AgentContext {

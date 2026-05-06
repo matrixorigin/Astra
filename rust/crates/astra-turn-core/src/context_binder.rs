@@ -104,9 +104,20 @@ fn bind_self_model(sources: &ContextSources<'_>) -> String {
     sources.session.self_model.clone().unwrap_or_default()
 }
 
-/// Bind project context from session.
+/// Bind project context from session — cross-session project context summaries
+/// (prior sessions on the same repo). Wrapped in a stable header so the
+/// wire byte-matches the legacy runtime-injected version that used to go
+/// through `agentic_loop_lifecycle.rs`.
 fn bind_project_context(sources: &ContextSources<'_>) -> String {
-    sources.session.project_context.clone()
+    let ctx = &sources.session.project_context;
+    if ctx.is_empty() {
+        return String::new();
+    }
+    format!(
+        "## Cross-Session Project Context\n\
+         Below are summaries of recent sessions in this project. \
+         Use them for continuity — avoid re-asking questions already answered.\n\n{ctx}"
+    )
 }
 
 /// Bind active skills.
@@ -163,6 +174,16 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
     }
     if let Some(ref text) = ext.system_override {
         parts.push(text.clone());
+    }
+
+    // Bridge stable escape hatch: session-stable pre-composed fragments
+    // (skill_hint, feedback_rules, self_awareness, etc.). Binder appends
+    // them here so they inherit RuntimeIdentity's Session scope → cached
+    // behind the 2nd marker like the typed fragments above.
+    for section in &ext.extra_stable_sections {
+        if !section.text.is_empty() {
+            parts.push(section.text.clone());
+        }
     }
 
     parts.join("\n")
@@ -333,6 +354,46 @@ mod tests {
         assert!(
             content.contains("Plan carefully"),
             "identity should contain planning"
+        );
+    }
+
+    /// Project context from prior sessions must be rendered with the
+    /// "Cross-Session Project Context" header wrapper so the wire payload
+    /// matches the legacy runtime-injected version (pre-Phase-4 this was
+    /// pushed as a raw `role: system` message with the same header from
+    /// `agentic_loop_lifecycle.rs`).
+    #[test]
+    fn bind_project_context_wraps_in_cross_session_header() {
+        let mut fixture = test_sources();
+        fixture.session.project_context = "1. [active] (2026-05-06, 22 turns)".to_string();
+        let sources = fixture.context();
+        let content = bind_project_context(&sources);
+
+        assert!(
+            content.starts_with("## Cross-Session Project Context"),
+            "bound content must lead with the stable header: {content}"
+        );
+        assert!(
+            content.contains("Use them for continuity"),
+            "bound content must include the guidance blurb so the LLM knows what the block is"
+        );
+        assert!(
+            content.contains("22 turns"),
+            "bound content must include the caller-provided summaries"
+        );
+    }
+
+    #[test]
+    fn bind_project_context_empty_when_no_summaries() {
+        // No prior sessions → no section emitted → serializer drops the
+        // empty block so no wasted bytes on the wire.
+        let mut fixture = test_sources();
+        fixture.session.project_context = String::new();
+        let sources = fixture.context();
+        let content = bind_project_context(&sources);
+        assert!(
+            content.is_empty(),
+            "empty project_context must NOT render a bare header: {content}"
         );
     }
 
