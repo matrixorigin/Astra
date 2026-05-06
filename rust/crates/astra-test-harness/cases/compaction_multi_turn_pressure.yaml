@@ -23,6 +23,8 @@ capability: tool_use
 difficulty: 3
 weight: 2.0
 timeout_seconds: 300
+env:
+  ASTRA_MAX_TURN_INPUT_TOKENS: "35000"
 steps:
   - prompt: |
       Now read these 4 more files:

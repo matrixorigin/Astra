@@ -131,6 +131,9 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
     for extra in &case.extra_cli_args {
         cmd.arg(extra);
     }
+    for (k, v) in &case.env {
+        cmd.env(k, v);
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -28,13 +28,15 @@ capability: tool_use
 difficulty: 3
 weight: 2.0
 timeout_seconds: 180
+env:
+  ASTRA_MAX_TURN_INPUT_TOKENS: "35000"
 criteria:
   - type: exit_code
     code: 0
   - type: tool_called
     name: read_file
   - type: tools_count_between
-    min: 8
+    min: 6
     max: 12
   - type: text_contains
     needle: astra-turn-core

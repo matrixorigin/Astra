@@ -386,6 +386,7 @@ impl<'a> SuiteRunner<'a> {
                     difficulty: None,
                     weight: 1.0,
                     steps: vec![],
+                    env: case.env.clone(),
                     setup_cmd: None,
                     teardown_cmd: None,
                 };
