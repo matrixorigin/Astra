@@ -405,7 +405,7 @@ dev-seed:
 		$(MAKE) dev-api-restart build-cli-release; \
 	else \
 		echo "Binaries exist — restarting server (skipping rebuild)..."; \
-		$(MAKE) dev-api-restart; \
+		export SKIP_BUILD=1; $(MAKE) dev-api-restart; \
 	fi
 	@sleep 2
 	@echo "Registering admin (admin@mo.com)..."
