@@ -900,6 +900,12 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             .as_ref()
             .map(|b| b.current_round())
             .unwrap_or(0);
+        // Update introspect snapshot so the tool can return fresh state.
+        if let Some(executor) = state.server_tool_executor.as_deref() {
+            let snapshot = build_introspect_snapshot(state);
+            executor.update_introspect_snapshot(snapshot);
+        }
+
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index,
             quiet: headless_quiet,
@@ -1451,6 +1457,37 @@ fn observe_gate_cancelled(
         };
         let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
         crate::observability_integration::on_turn_end(hub, &mut session_guard, timing);
+    }
+}
+
+fn build_introspect_snapshot(
+    state: &super::agentic_loop_host::AgenticLoopState,
+) -> astra_turn_core::introspect::IntrospectSnapshot {
+    let total_in = state.total_prompt + state.total_cache_read + state.total_cache_creation;
+    let cache_ratio = if total_in > 0 {
+        state.total_cache_read as f64 / total_in as f64
+    } else {
+        0.0
+    };
+    let working_mem = state
+        .pipeline_session
+        .as_ref()
+        .map(|s| s.working_memory().render_prompt_section())
+        .unwrap_or_default();
+
+    astra_turn_core::introspect::IntrospectSnapshot {
+        token_pressure: 0.0, // TODO: wire from pipeline_session.stats when available
+        cache_hit_ratio: cache_ratio,
+        turns_completed: state.llm_rounds_completed,
+        turns_remaining: state.remaining_turns as u32,
+        compaction_tier: format!("{:?}", state.compact_tier_applied),
+        alerts: Vec::new(),
+        tool_health: Vec::new(), // TODO: wire from step_recorder.tool_timings
+        working_memory_summary: working_mem,
+        total_input_tokens: state.total_prompt + state.total_cache_read,
+        total_output_tokens: state.total_completion,
+        cache_read_tokens: state.total_cache_read,
+        cache_creation_tokens: state.total_cache_creation,
     }
 }
 
