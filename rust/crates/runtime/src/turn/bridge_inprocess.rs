@@ -1381,10 +1381,10 @@ impl InProcessChatTurnBridge {
             // (RuntimeVolatile scope → re-sent per turn).
             //
             // STABLE (change only when session state changes, if at all):
-            //   profile_desc (cwd/branch/env — Memoria split out),
-            //   learned_context_hint
+            //   profile_desc (cwd/branch/env — Memoria split out)
             //
             // VOLATILE (change each turn by design):
+            //   learned_context_hint (EMA tracker — byte-level changes break prefix cache),
             //   feedback_rules_hint (accumulates on each user correction),
             //   skill_hint (active skill/tool selection),
             //   self_awareness_hint (turn/token/outcome signals),
@@ -1428,7 +1428,7 @@ impl InProcessChatTurnBridge {
                 );
             }
             if !learned_context_hint.is_empty() {
-                stable_sections.push(
+                dynamic_sections.push(
                     prompts::PromptSection::dynamic(
                         learned_context_hint.clone(),
                         prompts::PromptTokenBucket::UserPreferences,
