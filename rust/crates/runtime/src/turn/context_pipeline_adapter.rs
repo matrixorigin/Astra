@@ -10,7 +10,9 @@
 
 use serde_json::Value;
 
-use astra_turn_core::context_sources::{EdgeProfile, ExternalSources, SessionContext, TurnState};
+use astra_turn_core::context_sources::{
+    EdgeProfile, ExternalSources, MemoryEntry, SessionContext, TurnState,
+};
 use astra_turn_core::microcompact::ProviderCacheStrategy;
 use astra_turn_core::pipeline_config::ProviderCachePolicy;
 use astra_turn_core::recovery_state::RecoveryState;
@@ -126,26 +128,7 @@ pub(crate) fn build_external_sources(
         .map(|arr| arr.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
 
-    // Memory snippets come from `edge_profile.memory_section`, which the
-    // CLI / legacy bridge populate via `prefetch_memories`. When this is
-    // empty, the pipeline simply omits the `## Memoria Recall` block
-    // from the runtime-identity section (binder.bind_memory joins with
-    // `\n\n`, so an empty Vec is a no-op).
-    //
-    // Architectural note: the server loop host (`ServerAgenticLoopHost`)
-    // does NOT currently prefetch memories directly — it relies on the CLI
-    // to forward the pre-retrieved section through `edge_profile`.
-    // Running the pipeline without a CLI in front (e.g., direct HTTP
-    // `/chat/turn`) still goes through `InProcessChatTurnBridge`'s prefetch,
-    // which flows back into `edge_profile`. A future refactor should pull
-    // the prefetch into the pipeline host itself so memory is a first-class
-    // pipeline input rather than plumbed through edge_profile.
-    let memory_snippets = edge_profile
-        .get("memory_section")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(|s| vec![s.to_string()])
-        .unwrap_or_default();
+    let memory_entries = build_memory_entries_from_edge_profile(edge_profile);
 
     let spill_backend: Option<std::sync::Arc<dyn astra_turn_core::spill_backend::SpillBackend>> =
         edge_profile
@@ -181,7 +164,7 @@ pub(crate) fn build_external_sources(
     });
 
     ExternalSources {
-        memory_snippets,
+        memory_entries,
         spill_dir: None,
         spill_backend,
         self_model_text,
@@ -202,6 +185,86 @@ pub(crate) fn build_external_sources(
         // cached prefix.
         extra_dynamic_sections: skill_listing_extra.into_iter().collect(),
     }
+}
+
+fn build_memory_entries_from_edge_profile(
+    edge_profile: &serde_json::Map<String, Value>,
+) -> Vec<MemoryEntry> {
+    if let Some(entries) = edge_profile.get("memory_entries").and_then(Value::as_array) {
+        let total = entries.len();
+        return entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, value)| memory_entry_from_value(value, total, idx))
+            .collect();
+    }
+
+    edge_profile
+        .get("memory_section")
+        .and_then(Value::as_str)
+        .map(memory_entries_from_section)
+        .unwrap_or_default()
+}
+
+fn memory_entry_from_value(value: &Value, total: usize, idx: usize) -> Option<MemoryEntry> {
+    match value {
+        Value::String(content) => {
+            let content = content.trim();
+            if content.is_empty() {
+                return None;
+            }
+            Some(
+                MemoryEntry::scored(content, default_memory_relevance_from_total(total, idx))
+                    .with_source("edge_profile.memory_entries"),
+            )
+        }
+        Value::Object(obj) => {
+            let content = obj.get("content").and_then(Value::as_str)?.trim();
+            if content.is_empty() {
+                return None;
+            }
+            let mut entry = MemoryEntry::scored(
+                content,
+                obj.get("relevance_score")
+                    .and_then(Value::as_f64)
+                    .unwrap_or_else(|| default_memory_relevance_from_total(total, idx)),
+            )
+            .with_source(
+                obj.get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or("edge_profile.memory_entries"),
+            );
+            if let Some(tokens) = obj.get("token_estimate").and_then(Value::as_u64) {
+                entry = entry.with_token_estimate(tokens.min(u64::from(u32::MAX)) as u32);
+            }
+            if let Some(turn) = obj.get("freshness_turn").and_then(Value::as_u64) {
+                entry = entry.with_freshness_turn(turn.min(u64::from(u32::MAX)) as u32);
+            }
+            Some(entry)
+        }
+        _ => None,
+    }
+}
+
+fn memory_entries_from_section(section: &str) -> Vec<MemoryEntry> {
+    let lines: Vec<&str> = section
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "## User Memories")
+        .collect();
+    let total = lines.len();
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            MemoryEntry::scored(line, default_memory_relevance_from_total(total, idx))
+                .with_source("edge_profile.memory_section")
+        })
+        .collect()
+}
+
+fn default_memory_relevance_from_total(total: usize, idx: usize) -> f64 {
+    total.saturating_sub(idx) as f64
 }
 
 /// Build TurnState from AgenticLoopState.
@@ -468,12 +531,6 @@ mod tests {
 
     #[test]
     fn external_sources_carries_prefetched_memory_from_edge_profile() {
-        // Memory prefetch happens in the legacy bridge (InProcessChatTurnBridge)
-        // before the request reaches the server loop host. When the CLI
-        // injects the prefetch result into `edge_profile.memory_section`, the
-        // adapter must forward it into `ExternalSources.memory_snippets` so
-        // the pipeline's binder can render `## Memoria Recall` into the
-        // runtime-identity block.
         let mut ep = serde_json::Map::new();
         ep.insert(
             "memory_section".into(),
@@ -482,10 +539,50 @@ mod tests {
         let state = make_state();
         let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None);
         assert!(
-            !sources.memory_snippets.is_empty(),
-            "edge_profile.memory_section must flow into ExternalSources.memory_snippets"
+            !sources.memory_entries.is_empty(),
+            "edge_profile.memory_section must flow into ExternalSources.memory_entries"
         );
-        assert!(sources.memory_snippets[0].contains("prefers Rust"));
+        assert_eq!(sources.memory_entries.len(), 2);
+        assert!(sources.memory_entries[0].content.contains("prefers Rust"));
+        assert!(
+            sources.memory_entries[0].relevance_score > sources.memory_entries[1].relevance_score,
+            "memory_section line order should become production relevance"
+        );
+    }
+
+    #[test]
+    fn external_sources_prefers_structured_memory_entries() {
+        let mut ep = serde_json::Map::new();
+        ep.insert(
+            "memory_section".into(),
+            Value::String("## User Memories\nfallback should be ignored".into()),
+        );
+        ep.insert(
+            "memory_entries".into(),
+            Value::Array(vec![
+                serde_json::json!({
+                    "content": "fresh structured memory",
+                    "relevance_score": 0.9,
+                    "source": "test",
+                    "token_estimate": 7,
+                    "freshness_turn": 3
+                }),
+                Value::String("ranked fallback string".into()),
+            ]),
+        );
+        let state = make_state();
+        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None);
+
+        assert_eq!(sources.memory_entries.len(), 2);
+        assert_eq!(sources.memory_entries[0].content, "fresh structured memory");
+        assert_eq!(sources.memory_entries[0].source.as_deref(), Some("test"));
+        assert_eq!(sources.memory_entries[0].token_estimate, 7);
+        assert_eq!(sources.memory_entries[0].freshness_turn, Some(3));
+        assert!(
+            sources.memory_entries[1]
+                .content
+                .contains("ranked fallback string")
+        );
     }
 
     #[test]
@@ -493,6 +590,6 @@ mod tests {
         let ep = serde_json::Map::new();
         let state = make_state();
         let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None);
-        assert!(sources.memory_snippets.is_empty());
+        assert!(sources.memory_entries.is_empty());
     }
 }

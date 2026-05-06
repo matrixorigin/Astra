@@ -95,7 +95,7 @@ impl ContextPipeline {
             latches: input.latches,
             stats: input.sources.stats,
             provider_policy,
-            has_memory: !input.sources.external.memory_snippets.is_empty(),
+            has_memory: !input.sources.external.memory_entries.is_empty(),
             model_id: input.model_id,
             query_source: input.query_source,
         };

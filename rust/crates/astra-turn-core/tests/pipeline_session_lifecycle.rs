@@ -11,7 +11,8 @@ use std::collections::HashMap;
 
 use astra_turn_core::context_feedback::ContextFeedback;
 use astra_turn_core::context_sources::{
-    AgentContext, EdgeProfile, ExternalSources, SessionContext, StaticSections, TurnState,
+    AgentContext, EdgeProfile, ExternalSources, MemoryEntry, SessionContext, StaticSections,
+    TurnState,
 };
 use astra_turn_core::microcompact::ProviderCacheStrategy;
 use astra_turn_core::optimize_limits::OptimizeLimits;
@@ -82,7 +83,7 @@ fn ten_turn_session_lifecycle() {
     };
     let session = make_session_context();
     let external = ExternalSources {
-        memory_snippets: vec!["User prefers concise answers.".into()],
+        memory_entries: vec![MemoryEntry::new("User prefers concise answers.")],
         spill_dir: None,
         ..Default::default()
     };
@@ -162,7 +163,7 @@ fn ptl_error_recovery_and_abort() {
     let session = make_session_context();
     let turn = make_turn_state(1, 2);
     let external = ExternalSources {
-        memory_snippets: vec![],
+        memory_entries: vec![],
         spill_dir: None,
         ..Default::default()
     };
@@ -194,7 +195,7 @@ fn shadow_mode_produces_deterministic_output() {
     let session = make_session_context();
     let turn = make_turn_state(1, 4);
     let external = ExternalSources {
-        memory_snippets: vec!["test memory".into()],
+        memory_entries: vec![MemoryEntry::new("test memory")],
         spill_dir: None,
         ..Default::default()
     };
@@ -280,7 +281,7 @@ fn full_lifecycle_with_emergent_and_latches() {
     };
     let session = make_session_context();
     let external = ExternalSources {
-        memory_snippets: vec!["User works on astra-engine.".into()],
+        memory_entries: vec![MemoryEntry::new("User works on astra-engine.")],
         spill_dir: None,
         ..Default::default()
     };

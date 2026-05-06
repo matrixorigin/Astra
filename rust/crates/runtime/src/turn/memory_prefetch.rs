@@ -6,10 +6,13 @@
 
 use std::time::Instant;
 
+use astra_turn_core::context_sources::MemoryEntry as ContextMemoryEntry;
+
 /// Result of a memory prefetch operation.
 #[derive(Debug, Default)]
 pub struct MemoryPrefetchResult {
     pub section: Option<String>,
+    pub entries: Vec<ContextMemoryEntry>,
     pub items: usize,
     pub preview: Vec<String>,
     pub fetch_ms: i64,
@@ -48,8 +51,10 @@ pub async fn prefetch_memories(
     let preview = merged.iter().take(3).map(|l| l.to_string()).collect();
     let items = merged.len();
     let section = build_memory_section(&merged);
+    let entries = build_memory_entries(&merged);
     MemoryPrefetchResult {
         section,
+        entries,
         items,
         preview,
         fetch_ms,
@@ -84,6 +89,31 @@ pub(crate) fn build_memory_section(merged_lines: &[String]) -> Option<String> {
     } else {
         Some(format!("## User Memories\n{}", merged_lines.join("\n")))
     }
+}
+
+/// Build typed memory catalog entries from ranked Memoria retrieval lines.
+pub(crate) fn build_memory_entries(merged_lines: &[String]) -> Vec<ContextMemoryEntry> {
+    let total = merged_lines.len();
+    merged_lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let formatted = astra_prompts::memory_proto::format_for_llm(&[trimmed]);
+            let content = if formatted.is_empty() {
+                trimmed.to_string()
+            } else {
+                formatted
+            };
+            Some(
+                ContextMemoryEntry::scored(content, (total.saturating_sub(idx)) as f64)
+                    .with_source("memoria.prefetch"),
+            )
+        })
+        .collect()
 }
 
 /// Extract non-CJK, non-punctuation tokens from a message for keyword-based retrieval.
@@ -286,6 +316,23 @@ mod tests {
     }
 
     #[test]
+    fn build_memory_entries_preserves_rank_as_relevance() {
+        let lines = vec![
+            "[@pref/active] prefer Rust".to_string(),
+            "[@fact/semantic] project is astra".to_string(),
+        ];
+        let entries = build_memory_entries(&lines);
+
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries[0].relevance_score > entries[1].relevance_score,
+            "retrieval order should become relevance for binder ranking: {entries:?}"
+        );
+        assert!(entries[0].content.contains("Preferences"));
+        assert_eq!(entries[0].source.as_deref(), Some("memoria.prefetch"));
+    }
+
+    #[test]
     fn entity_query_differs_from_mixed_language_input() {
         let msg = "memoria 最新的ci?";
         let entity = extract_entity_tokens(msg);
@@ -325,6 +372,7 @@ mod tests {
     fn memory_prefetch_result_default() {
         let r = MemoryPrefetchResult::default();
         assert!(r.section.is_none());
+        assert!(r.entries.is_empty());
         assert_eq!(r.items, 0);
         assert!(r.preview.is_empty());
         assert_eq!(r.fetch_ms, 0);

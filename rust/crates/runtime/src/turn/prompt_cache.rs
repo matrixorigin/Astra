@@ -127,6 +127,7 @@ pub(crate) fn assemble_system_message_via_pipeline(
         &[],
         &[], // legacy wrapper: no stable sections — tests pre-date the split
         extra_dynamic_sections,
+        &[],
         confidence,
         task_type,
         cache_cfg,
@@ -162,12 +163,16 @@ pub(crate) fn assemble_system_message_via_pipeline(
 ///   (session anchor, memoria insights, tool round guidance). Bound into
 ///   RuntimeVolatile (None scope) so churn does not invalidate the
 ///   cached session prefix.
+/// * `memory_entries` — per-turn Memoria retrieval results. Bound through
+///   the Memory section (None scope), where the core binder applies rank,
+///   deduplication, and token-budget trimming.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_bridge_pipeline_outcome(
     tool_names: &[&str],
     tool_schemas: &[Value],
     extra_stable_sections: &[prompts::PromptSection],
     extra_volatile_sections: &[prompts::PromptSection],
+    memory_entries: &[astra_turn_core::context_sources::MemoryEntry],
     confidence: f64,
     task_type: Option<&str>,
     cache_cfg: &PromptCacheConfig,
@@ -237,7 +242,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     };
 
     let external = ExternalSources {
-        memory_snippets: Vec::new(),
+        memory_entries: memory_entries.to_vec(),
         spill_dir: None,
         spill_backend: None,
         self_model_text,
@@ -770,6 +775,7 @@ mod tests {
             &tool_schemas,
             &[], // stable
             &[], // volatile
+            &[],
             0.8,
             None,
             &cache_cfg,
@@ -800,6 +806,52 @@ mod tests {
                 .unwrap_or(""),
             tool_schemas[0]["function"]["description"].as_str().unwrap(),
             "Normal tier must not strip description text"
+        );
+    }
+
+    #[test]
+    fn bridge_pipeline_outcome_routes_memory_entries_through_pipeline() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        remove_test_env("ASTRA_OUTPUT_STYLE");
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let memory_entries = vec![
+            astra_turn_core::context_sources::MemoryEntry::scored("higher value memory", 2.0),
+            astra_turn_core::context_sources::MemoryEntry::scored("lower value memory", 1.0),
+        ];
+
+        let outcome = assemble_bridge_pipeline_outcome(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            &memory_entries,
+            0.8,
+            None,
+            &cache_cfg,
+            "sid-memory",
+            "gpt-4o",
+            "openai",
+            None,
+            None,
+            None,
+        );
+
+        let dynamic_text = outcome
+            .dynamic_system
+            .as_ref()
+            .and_then(|msg| msg.get("content"))
+            .and_then(Value::as_str)
+            .expect("memory section is None-scoped and should be in dynamic system");
+        assert!(
+            dynamic_text.contains("higher value memory"),
+            "memory entry must reach final prompt: {dynamic_text}"
+        );
+        assert!(
+            dynamic_text.find("higher value memory") < dynamic_text.find("lower value memory"),
+            "binder ranking should be visible in production bridge output: {dynamic_text}"
         );
     }
 

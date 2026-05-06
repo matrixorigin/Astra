@@ -1098,11 +1098,11 @@ impl InProcessChatTurnBridge {
             //   Routes to RuntimeIdentity (Session scope) via the pipeline's
             //   typed `profile_desc` field → cached behind the 2nd marker.
             //
-            // * `memoria_prefetch_section` (VOLATILE) — the "## User Memories"
-            //   block produced by `prefetch_memories`. The retrieval query
-            //   uses the latest user message, so results drift turn-to-turn.
-            //   Routes to RuntimeVolatile (None scope) as an
-            //   `extra_dynamic_sections` entry → correctly post-marker.
+            // * memoria prefetch entries (VOLATILE) — typed MemoryEntry items
+            //   produced by `prefetch_memories`. The retrieval query uses the
+            //   latest user message, so results drift turn-to-turn. They route
+            //   through the pipeline's Memory section (None scope) where rank,
+            //   dedup, and budget trimming are applied.
             //
             // Previously both were concatenated into one `profile_desc`
             // string and routed to volatile, dragging ~3-4 kB of stable
@@ -1134,6 +1134,7 @@ impl InProcessChatTurnBridge {
 
             // Memoria prefetch lives on its own. `section` is the
             // "## User Memories\n..." block — the piece that actually drifts.
+            let mut memoria_prefetch_entries = Vec::new();
             let memoria_prefetch_section = if let (Some(mem_url), Some(mem_key)) = (
                 edge_profile.get("memoria_url").and_then(Value::as_str),
                 edge_profile.get("memoria_key").and_then(Value::as_str),
@@ -1152,6 +1153,7 @@ impl InProcessChatTurnBridge {
                 memory_fetch_ms = result.fetch_ms;
                 memory_items = result.items;
                 memory_preview = result.preview;
+                memoria_prefetch_entries = result.entries;
                 result.section
             } else {
                 None
@@ -1368,8 +1370,8 @@ impl InProcessChatTurnBridge {
             //   self_awareness_hint
             //
             // VOLATILE (change each turn by design):
-            //   memoria_prefetch_section (per-turn retrieval — was baked
-            //     into profile_desc, now split out),
+            //   typed memory_entries (per-turn retrieval — was baked into
+            //     profile_desc, now routed through the Memory section),
             //   implicit_feedback_hint (per-turn correction signal based on
             //     user message content),
             //   memoria_insights_hint (per-turn retrieval),
@@ -1384,7 +1386,9 @@ impl InProcessChatTurnBridge {
                     prompts::PromptTokenBucket::Environment,
                 ));
             }
-            if let Some(ref section) = memoria_prefetch_section {
+            if let Some(ref section) = memoria_prefetch_section
+                && memoria_prefetch_entries.is_empty()
+            {
                 dynamic_sections.push(prompts::PromptSection::dynamic(
                     section.clone(),
                     prompts::PromptTokenBucket::Environment,
@@ -1526,6 +1530,9 @@ impl InProcessChatTurnBridge {
             // through ExternalSources.extra_dynamic_sections so the binder
             // appends them after runtime identity — keeping them in the
             // None-scoped post-cache segment where churn is expected.
+            // Memoria prefetch results are passed separately as typed
+            // MemoryEntry values so the Memory binder can rank/dedup/budget
+            // them instead of treating the whole recall block as one string.
             // project_context comes from cross-session history summaries;
             // byte-stable within a session, so routing it into the pipeline's
             // ProjectContext section (Session scope) puts it behind the
@@ -1539,6 +1546,7 @@ impl InProcessChatTurnBridge {
                 &edge_tools,
                 &stable_sections,
                 &dynamic_sections,
+                &memoria_prefetch_entries,
                 selection_confidence,
                 task_type,
                 &cache_cfg,

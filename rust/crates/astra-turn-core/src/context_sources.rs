@@ -22,6 +22,70 @@ use crate::session_latches::SessionLatches;
 use crate::token_accounting::TokenAccounting;
 use crate::working_memory::WorkingMemoryState;
 
+/// A structured memory item retrieved before entering the pure core pipeline.
+///
+/// Core still performs no Memoria I/O; this metadata gives Plan/Bind enough
+/// catalog information to rank, deduplicate, and budget memory content instead
+/// of treating recall as one opaque text blob.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryEntry {
+    pub content: String,
+    pub relevance_score: f64,
+    pub source: Option<String>,
+    pub token_estimate: u32,
+    pub freshness_turn: Option<u32>,
+    pub content_hash: u64,
+}
+
+impl MemoryEntry {
+    #[must_use]
+    pub fn new(content: impl Into<String>) -> Self {
+        Self::scored(content, 0.0)
+    }
+
+    #[must_use]
+    pub fn scored(content: impl Into<String>, relevance_score: f64) -> Self {
+        let content = content.into();
+        let token_estimate = crate::section_types::estimate_text_tokens(&content);
+        let content_hash = stable_content_hash(&content);
+        Self {
+            content,
+            relevance_score,
+            source: None,
+            token_estimate,
+            freshness_turn: None,
+            content_hash,
+        }
+    }
+
+    #[must_use]
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_freshness_turn(mut self, turn: u32) -> Self {
+        self.freshness_turn = Some(turn);
+        self
+    }
+
+    #[must_use]
+    pub fn with_token_estimate(mut self, token_estimate: u32) -> Self {
+        self.token_estimate = token_estimate;
+        self
+    }
+}
+
+fn stable_content_hash(content: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001b3;
+
+    content.as_bytes().iter().fold(FNV_OFFSET, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+    })
+}
+
 /// The catalog that the pipeline queries during Plan and Bind.
 ///
 /// All references are immutable — the pipeline never mutates its sources.
@@ -112,9 +176,9 @@ pub struct TurnState {
 /// owns structure, ordering, and cache optimization.
 #[derive(Default)]
 pub struct ExternalSources {
-    /// Memory text already retrieved by the runtime before entering the pure
-    /// core pipeline. Core does not perform Memoria I/O.
-    pub memory_snippets: Vec<String>,
+    /// Memory entries already retrieved by the runtime before entering the
+    /// pure core pipeline. Core does not perform Memoria I/O.
+    pub memory_entries: Vec<MemoryEntry>,
     pub spill_dir: Option<PathBuf>,
     /// Optional spill backend for offloading oversized sections to disk.
     /// When set, the optimizer will persist section content and replace it

@@ -579,7 +579,7 @@ mod tests {
 
     fn test_external() -> ExternalSources {
         ExternalSources {
-            memory_snippets: vec![],
+            memory_entries: vec![],
             spill_dir: None,
             ..Default::default()
         }

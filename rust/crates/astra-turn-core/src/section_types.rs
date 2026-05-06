@@ -353,11 +353,13 @@ impl BoundSection {
     }
 }
 
+pub const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
+
 /// Estimate token count from raw text length (≈4 bytes/token).
 /// Saturates at `u32::MAX` instead of truncating on extremely large inputs.
 #[must_use]
 pub fn estimate_text_tokens(text: &str) -> u32 {
-    (text.len() / 4).min(u32::MAX as usize) as u32
+    (text.len() / BYTES_PER_TOKEN_ESTIMATE).min(u32::MAX as usize) as u32
 }
 
 #[cfg(test)]
@@ -466,8 +468,8 @@ mod tests {
         // Simulate a length that would overflow u32 if cast directly.
         // We can't allocate 16GB in a test, but we can verify the arithmetic
         // path by checking that for any len the result is <= u32::MAX.
-        let big_len: usize = (u32::MAX as usize) * 4 + 100;
-        let estimated = (big_len / 4).min(u32::MAX as usize) as u32;
+        let big_len: usize = (u32::MAX as usize) * BYTES_PER_TOKEN_ESTIMATE + 100;
+        let estimated = (big_len / BYTES_PER_TOKEN_ESTIMATE).min(u32::MAX as usize) as u32;
         assert_eq!(estimated, u32::MAX);
 
         // Also verify normal path still works

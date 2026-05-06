@@ -62,7 +62,7 @@ fn build_sources() -> (
             last_user_message: "hello".into(),
         },
         ExternalSources {
-            memory_snippets: vec!["contract memory".into()],
+            memory_entries: vec![MemoryEntry::new("contract memory")],
             spill_dir: None,
             ..Default::default()
         },
@@ -184,7 +184,7 @@ fn bind_outputs_typed_artifacts_not_raw_string_only() {
         latches: &latches,
         stats: &stats,
         provider_policy: &session.provider_policy,
-        has_memory: !ext.memory_snippets.is_empty(),
+        has_memory: !ext.memory_entries.is_empty(),
         model_id: &session.model_id,
         query_source: "harness",
     };

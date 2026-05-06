@@ -68,7 +68,9 @@ fn build_sources() -> (
             last_user_message: "Fix the bug in main.rs".into(),
         },
         ExternalSources {
-            memory_snippets: vec!["Relevant memory: main.rs has flaky parsing.".into()],
+            memory_entries: vec![MemoryEntry::new(
+                "Relevant memory: main.rs has flaky parsing.",
+            )],
             spill_dir: None,
             ..Default::default()
         },
@@ -100,7 +102,7 @@ fn pipeline_single_turn_produces_valid_output() {
         latches: &latches,
         stats: &stats,
         provider_policy: &session.provider_policy,
-        has_memory: !ext.memory_snippets.is_empty(),
+        has_memory: !ext.memory_entries.is_empty(),
         model_id: &session.model_id,
         query_source: "repl",
     };
@@ -176,7 +178,7 @@ fn pipeline_compaction_under_pressure() {
         latches: &latches,
         stats: &stats,
         provider_policy: &session.provider_policy,
-        has_memory: !ext.memory_snippets.is_empty(),
+        has_memory: !ext.memory_entries.is_empty(),
         model_id: &session.model_id,
         query_source: "repl",
     };
@@ -216,7 +218,7 @@ fn pipeline_ptl_recovery_escalates() {
         latches: &latches,
         stats: &stats,
         provider_policy: &session.provider_policy,
-        has_memory: !ext.memory_snippets.is_empty(),
+        has_memory: !ext.memory_entries.is_empty(),
         model_id: &session.model_id,
         query_source: "repl",
     };
@@ -264,7 +266,7 @@ fn pipeline_emergent_context_flows() {
         latches: &latches,
         stats: &stats,
         provider_policy: &session.provider_policy,
-        has_memory: !ext.memory_snippets.is_empty(),
+        has_memory: !ext.memory_entries.is_empty(),
         model_id: &session.model_id,
         query_source: "repl",
     };
@@ -311,7 +313,7 @@ fn pipeline_shadow_diff_identical() {
         latches: &latches,
         stats: &stats,
         provider_policy: &session.provider_policy,
-        has_memory: !ext.memory_snippets.is_empty(),
+        has_memory: !ext.memory_entries.is_empty(),
         model_id: &session.model_id,
         query_source: "repl",
     };
@@ -387,7 +389,7 @@ fn pipeline_shadow_diff_detects_recovery_divergence() {
         latches: &latches,
         stats: &stats,
         provider_policy: &session.provider_policy,
-        has_memory: !ext.memory_snippets.is_empty(),
+        has_memory: !ext.memory_entries.is_empty(),
         model_id: &session.model_id,
         query_source: "repl",
     };
@@ -424,7 +426,7 @@ fn pipeline_shadow_diff_detects_recovery_divergence() {
         latches: &latches,
         stats: &stats,
         provider_policy: &session.provider_policy,
-        has_memory: !ext.memory_snippets.is_empty(),
+        has_memory: !ext.memory_entries.is_empty(),
         model_id: &session.model_id,
         query_source: "repl",
     };

@@ -578,7 +578,7 @@ mod tests {
             last_user_message: "test".into(),
         };
         let external = ExternalSources {
-            memory_snippets: Vec::new(),
+            memory_entries: Vec::new(),
             spill_dir: None,
             ..Default::default()
         };

@@ -28,7 +28,7 @@ struct MockLoopState {
     project_context: String,
     cwd: Option<String>,
     git_branch: Option<String>,
-    memory_snippets: Vec<String>,
+    memory_entries: Vec<MemoryEntry>,
     turn_index: u32,
 }
 
@@ -49,7 +49,7 @@ impl MockLoopState {
             project_context: "Rust project with cargo".into(),
             cwd: Some("/home/user/project".into()),
             git_branch: Some("main".into()),
-            memory_snippets: vec!["User prefers concise answers.".into()],
+            memory_entries: vec![MemoryEntry::new("User prefers concise answers.")],
             turn_index: 3,
         }
     }
@@ -100,7 +100,7 @@ impl MockLoopState {
 
     fn build_external(&self) -> ExternalSources {
         ExternalSources {
-            memory_snippets: self.memory_snippets.clone(),
+            memory_entries: self.memory_entries.clone(),
             spill_dir: None,
             ..Default::default()
         }
@@ -117,7 +117,7 @@ fn adapter_produces_valid_turn_input() {
     assert_eq!(turn.messages.len(), 2);
     assert_eq!(turn.turn_index, 3);
     assert_eq!(session.model_limit, 200_000);
-    assert_eq!(external.memory_snippets.len(), 1);
+    assert_eq!(external.memory_entries.len(), 1);
 }
 
 #[test]

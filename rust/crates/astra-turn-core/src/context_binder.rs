@@ -4,6 +4,8 @@
 //! and returns a `BoundSection`. The runtime pre-fetches external data before
 //! entering core, so binding is a pure in-memory transform.
 
+use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::time::Instant;
 
 use serde_json::Value;
@@ -11,9 +13,12 @@ use serde_json::Value;
 use crate::context_planner::ContextPlan;
 use crate::context_sources::ContextSources;
 use crate::section_types::{
-    BoundSection, PlannedSection, SectionArtifact, SectionKind, estimate_text_tokens,
+    BYTES_PER_TOKEN_ESTIMATE, BoundSection, PlannedSection, SectionArtifact, SectionKind,
+    estimate_text_tokens,
 };
 use crate::working_memory::WorkingMemoryState;
+
+const MEMORY_SECTION_HEADER: &str = "## User Memories\n";
 
 /// Result of the Bind phase.
 #[derive(Debug)]
@@ -54,7 +59,7 @@ fn bind_section(planned: &PlannedSection, sources: &ContextSources<'_>) -> Bound
         SectionKind::SelfModel => bind_self_model(sources),
         SectionKind::ProjectContext => bind_project_context(sources),
         SectionKind::Skills => bind_skills(sources),
-        SectionKind::Memory => bind_memory(sources),
+        SectionKind::Memory => bind_memory(planned, sources),
         SectionKind::WorkingMemory => bind_working_memory(sources),
         // Conversation history is serialized as provider messages, not as a
         // separate text section.
@@ -129,9 +134,74 @@ fn bind_skills(sources: &ContextSources<'_>) -> String {
     format!("Active skills: {}", sources.turn.active_skills.join(", "))
 }
 
-/// Bind memory snippets that the runtime retrieved before entering core.
-fn bind_memory(sources: &ContextSources<'_>) -> String {
-    sources.external.memory_snippets.join("\n\n")
+/// Bind memory entries that the runtime retrieved before entering core.
+fn bind_memory(planned: &PlannedSection, sources: &ContextSources<'_>) -> String {
+    let header_tokens = estimate_text_tokens(MEMORY_SECTION_HEADER).max(1);
+    let budget = planned.estimated_tokens.saturating_sub(header_tokens);
+    if budget == 0 || sources.external.memory_entries.is_empty() {
+        return String::new();
+    }
+
+    let mut entries = sources.external.memory_entries.clone();
+    entries.sort_by(|a, b| {
+        compare_score_desc(a.relevance_score, b.relevance_score)
+            .then_with(|| b.freshness_turn.cmp(&a.freshness_turn))
+            .then_with(|| a.content_hash.cmp(&b.content_hash))
+    });
+
+    let mut seen = HashSet::new();
+    let mut selected = Vec::new();
+    let mut used = 0_u32;
+    for entry in entries {
+        if used == budget {
+            break;
+        }
+        if entry.content.trim().is_empty() || !seen.insert(entry.content_hash) {
+            continue;
+        }
+        let estimate = entry
+            .token_estimate
+            .max(estimate_text_tokens(&entry.content))
+            .max(1);
+        let remaining = budget.saturating_sub(used);
+        if remaining == 0 {
+            break;
+        }
+        if estimate <= remaining {
+            used = used.saturating_add(estimate);
+            selected.push(entry.content);
+        } else if selected.is_empty() {
+            selected.push(truncate_memory_to_budget(&entry.content, remaining));
+            break;
+        }
+    }
+
+    if selected.is_empty() {
+        String::new()
+    } else {
+        format!("{MEMORY_SECTION_HEADER}{}", selected.join("\n\n"))
+    }
+}
+
+fn compare_score_desc(a: f64, b: f64) -> Ordering {
+    let a = if a.is_finite() { a } else { f64::NEG_INFINITY };
+    let b = if b.is_finite() { b } else { f64::NEG_INFINITY };
+    b.partial_cmp(&a).unwrap_or(Ordering::Equal)
+}
+
+fn truncate_memory_to_budget(content: &str, budget_tokens: u32) -> String {
+    if budget_tokens == 0 {
+        return String::new();
+    }
+    let char_budget = (budget_tokens as usize).saturating_mul(BYTES_PER_TOKEN_ESTIMATE);
+    if content.len() <= char_budget {
+        return content.to_string();
+    }
+    let mut end = char_budget.min(content.len());
+    while !content.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    content[..end].to_string()
 }
 
 /// Bind first-class working memory: goal, decisions, blockers, next action.
@@ -356,7 +426,7 @@ mod tests {
                 last_user_message: "hello".into(),
             },
             external: ExternalSources {
-                memory_snippets: vec!["Remember: prefer pipeline-first design.".into()],
+                memory_entries: vec![MemoryEntry::new("Remember: prefer pipeline-first design.")],
                 spill_dir: None,
                 ..Default::default()
             },
@@ -514,11 +584,139 @@ mod tests {
     }
 
     #[test]
-    fn bind_memory_uses_retrieved_snippets() {
+    fn bind_memory_uses_retrieved_entries() {
         let fixture = test_sources();
         let sources = fixture.context();
-        let content = bind_memory(&sources);
+        let planned = planned_memory(1024);
+        let content = bind_memory(&planned, &sources);
         assert!(content.contains("pipeline-first"));
+    }
+
+    #[test]
+    fn bind_memory_ranks_deduplicates_and_respects_budget() {
+        let mut fixture = test_sources();
+        fixture.external.memory_entries = vec![
+            MemoryEntry::scored("low relevance memory that should be dropped", 0.1),
+            MemoryEntry::scored("high relevance memory", 0.9).with_freshness_turn(1),
+            MemoryEntry::scored("high relevance memory", 0.9).with_freshness_turn(9),
+            MemoryEntry::scored("medium relevance memory", 0.5),
+        ];
+        let planned = planned_memory(12);
+        let sources = fixture.context();
+
+        let content = bind_memory(&planned, &sources);
+
+        assert!(
+            content.starts_with("## User Memories\nhigh relevance memory"),
+            "highest-scored memory should lead: {content}"
+        );
+        assert_eq!(
+            content.matches("high relevance memory").count(),
+            1,
+            "duplicate memory content must be hash-deduped: {content}"
+        );
+        assert!(
+            !content.contains("low relevance"),
+            "low-score memory should be dropped first under budget: {content}"
+        );
+    }
+
+    #[test]
+    fn bind_memory_treats_nan_relevance_as_lowest() {
+        let mut fixture = test_sources();
+        fixture.external.memory_entries = vec![
+            MemoryEntry::scored("nan relevance memory", f64::NAN),
+            MemoryEntry::scored("finite relevance memory", 0.1),
+        ];
+        let planned = planned_memory(32);
+        let sources = fixture.context();
+
+        let content = bind_memory(&planned, &sources);
+
+        assert!(
+            content.starts_with("## User Memories\nfinite relevance memory"),
+            "finite relevance should outrank NaN: {content}"
+        );
+    }
+
+    #[test]
+    fn bind_memory_zero_budget_is_empty_by_contract() {
+        let fixture = test_sources();
+        let sources = fixture.context();
+        let content = bind_memory(&planned_memory(0), &sources);
+        assert!(
+            content.is_empty(),
+            "planner must allocate non-zero memory budget when has_memory=true"
+        );
+    }
+
+    #[test]
+    fn bind_memory_truncates_single_oversized_entry_on_utf8_boundary() {
+        let mut fixture = test_sources();
+        fixture.external.memory_entries =
+            vec![MemoryEntry::scored("ééé", 1.0).with_token_estimate(100)];
+        let sources = fixture.context();
+
+        let budget = estimate_text_tokens(MEMORY_SECTION_HEADER).max(1) + 1;
+        let content = bind_memory(&planned_memory(budget), &sources);
+
+        assert_eq!(content, "## User Memories\néé");
+    }
+
+    #[test]
+    fn bind_memory_skips_empty_entries_before_budgeting() {
+        let mut fixture = test_sources();
+        fixture.external.memory_entries = vec![
+            MemoryEntry::scored("   ", 10.0),
+            MemoryEntry::scored("usable memory", 1.0),
+        ];
+        let sources = fixture.context();
+
+        let content = bind_memory(&planned_memory(32), &sources);
+
+        assert_eq!(content, "## User Memories\nusable memory");
+    }
+
+    #[test]
+    fn bind_memory_uses_freshness_then_hash_tiebreaks() {
+        let older = MemoryEntry::scored("older memory", 1.0).with_freshness_turn(1);
+        let newer = MemoryEntry::scored("newer memory", 1.0).with_freshness_turn(9);
+        assert_ne!(older.content_hash, newer.content_hash);
+
+        let mut fixture = test_sources();
+        fixture.external.memory_entries = vec![older, newer];
+        let sources = fixture.context();
+        let content = bind_memory(&planned_memory(64), &sources);
+
+        assert!(
+            content.starts_with("## User Memories\nnewer memory"),
+            "freshness must sort descending before hash tiebreak: {content}"
+        );
+
+        let alpha = MemoryEntry::scored("alpha", 1.0);
+        let beta = MemoryEntry::scored("beta", 1.0);
+        let expected_first = if alpha.content_hash < beta.content_hash {
+            "alpha"
+        } else {
+            "beta"
+        };
+        fixture.external.memory_entries = vec![beta, alpha];
+        let sources = fixture.context();
+        let content = bind_memory(&planned_memory(64), &sources);
+        assert!(
+            content.starts_with(&format!("## User Memories\n{expected_first}")),
+            "content_hash tiebreak should be deterministic ascending: {content}"
+        );
+    }
+
+    fn planned_memory(estimated_tokens: u32) -> PlannedSection {
+        PlannedSection {
+            kind: SectionKind::Memory,
+            scope: crate::section_types::CacheScope::None,
+            estimated_tokens,
+            priority: crate::section_types::CompressionPriority::Normal,
+            source: crate::section_types::SectionSource::Memory,
+        }
     }
 
     #[test]
@@ -565,7 +763,7 @@ mod tests {
             latches: sources.latches,
             stats: sources.stats,
             provider_policy: &sources.session.provider_policy,
-            has_memory: !sources.external.memory_snippets.is_empty(),
+            has_memory: !sources.external.memory_entries.is_empty(),
             model_id: &sources.session.model_id,
             query_source: "repl",
         };
