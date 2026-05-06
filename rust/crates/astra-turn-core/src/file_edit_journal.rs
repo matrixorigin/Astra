@@ -110,9 +110,20 @@ impl FileEditJournal {
 
     /// Turn on auto-persistence to `dir`. Each subsequent `push` writes
     /// the new entry atomically to `<dir>/<seq:06>.json`; each eviction
-    /// removes the stale file. Existing in-memory entries are flushed
-    /// now. Errors are logged at `warn` and do not propagate — the
-    /// in-memory journal keeps working even if disk I/O fails.
+    /// removes the stale file.
+    ///
+    /// **Initial sync**: existing in-memory entries are flushed to `dir`
+    /// right now via [`Self::save_to_dir`]. Because `save_to_dir` also
+    /// prunes on-disk entries whose sequences are not in-memory, calling
+    /// `enable_persistence` on a dir that another process has written to
+    /// will destructively reconcile it to match our in-memory state.
+    /// Callers relying on crash-recovery should load from `dir` FIRST
+    /// (via [`Self::load_from_dir`]) and then `enable_persistence` on the
+    /// loaded journal — the in-memory state then matches disk and the
+    /// flush is a no-op write of identical bytes.
+    ///
+    /// Errors are logged at `warn` and do not propagate — the in-memory
+    /// journal keeps working even if disk I/O fails.
     pub fn enable_persistence(&mut self, dir: PathBuf) {
         self.persist_dir = Some(dir);
         // Flush current entries so the on-disk state matches in-memory.
@@ -295,10 +306,13 @@ impl FileEditJournal {
     /// entry. The directory is created if missing. Writes are atomic
     /// (tmp + rename) to survive partial crashes.
     ///
-    /// Entries evicted from the in-memory ring (when len > max_entries)
-    /// are cleaned up from disk too: any stale `*.json` whose sequence
-    /// number isn't in the current ring is deleted. This keeps the disk
-    /// footprint bounded by `max_entries` without separate GC.
+    /// **Destructive pruning**: any `<seq:06>.json` on disk whose
+    /// sequence number is NOT in the current in-memory ring is deleted.
+    /// This keeps the disk footprint bounded by `max_entries` without a
+    /// separate GC pass, but it also means `save_to_dir` is NOT a safe
+    /// operation on a dir shared with another process — it will delete
+    /// the other process's entries. Callers must ensure exclusive
+    /// ownership of `dir` for the lifetime of this journal.
     pub fn save_to_dir(&self, dir: &Path) -> io::Result<()> {
         std::fs::create_dir_all(dir)?;
 
@@ -415,8 +429,18 @@ impl FileEditJournal {
         Ok(journal)
     }
 
-    /// Test-only accessor. The ring buffer is kept internal so callers
-    /// can't violate the FIFO invariants; tests need read access.
+    /// Read-only iterator over all journaled entries in insertion order.
+    ///
+    /// Exposed for diagnostics and test assertions. Callers must not
+    /// rely on this for mutation — modifying the ring buffer outside the
+    /// `record_*` / `undo_*` / `enable_persistence` methods would break
+    /// the FIFO + persistence invariants.
+    pub fn entries(&self) -> impl Iterator<Item = &FileEditEntry> {
+        self.entries.iter()
+    }
+
+    /// Test-only convenience: collect all entries into a Vec for
+    /// assertion helpers. Prefer [`Self::entries`] in production code.
     #[cfg(test)]
     pub fn entries_for_test(&self) -> Vec<FileEditEntry> {
         self.entries.iter().cloned().collect()
