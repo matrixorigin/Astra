@@ -1292,11 +1292,16 @@ impl ServerToolExecutor {
                 let op = args.get("action").and_then(|v| v.as_str()).unwrap_or("retrieve");
                 let mut isolated_args = args.clone();
                 if let Some(obj) = isolated_args.as_object_mut() {
+                    obj.remove("action"); // Memoria API doesn't expect this field
                     obj.insert("session_id".to_string(), Value::String(self.user_id.clone()));
                     obj.insert("user_id".to_string(), Value::String(self.user_id.clone()));
                 }
                 let output = self.memoria_client.call(op, &isolated_args).await;
-                if output.starts_with("Error") { astra_tools::ToolResult::error(output) } else { astra_tools::ToolResult::text(output) }
+                if output.starts_with("Error") {
+                    astra_tools::ToolResult::error(output)
+                } else {
+                    astra_tools::ToolResult::text(output)
+                }
             }
             // Legacy aliases
             "memory_retrieve" | "memory_store" | "memory_search" | "memory_purge"
