@@ -625,6 +625,20 @@ impl ToolRegistry {
         TOOL_CATALOG.iter().map(|t| t.name).collect()
     }
 
+    /// Return all tool names from THIS registry instance (includes
+    /// dynamically injected schemas like spawn_agent, skill, etc.).
+    pub fn all_schema_names(&self) -> Vec<String> {
+        self.all_schemas
+            .iter()
+            .filter_map(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(String::from)
+            })
+            .collect()
+    }
+
     /// Return names of currently selected tools.
     pub fn selected_names(schemas: &[Value]) -> Vec<String> {
         schemas

@@ -634,7 +634,7 @@ impl ToolSelector for TfIdfSelector {
         // scoring/ranking pipeline and return all schemas directly.
         if ToolRegistry::dynamic_count() == 0 {
             return SelectionResult {
-                tool_names: ToolRegistry::all_tool_names().into_iter().map(|s| s.to_string()).collect(),
+                tool_names: self.registry.all_schema_names(),
                 strategy: "all_pinned",
                 budget_used: 0,
                 failed: false,
