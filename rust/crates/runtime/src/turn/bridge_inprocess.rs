@@ -1091,6 +1091,22 @@ impl InProcessChatTurnBridge {
             let tool_names: Vec<&str> = edge_tools.iter()
                 .filter_map(|t| t.get("function").and_then(|f| f.get("name")).and_then(Value::as_str))
                 .collect();
+            // Split `profile_desc` into two cache-aligned parts:
+            //
+            // * `profile_desc` (STABLE) — cwd + git_branch + env_section.
+            //   Derived from edge_profile only; byte-stable within a session.
+            //   Routes to RuntimeIdentity (Session scope) via the pipeline's
+            //   typed `profile_desc` field → cached behind the 2nd marker.
+            //
+            // * `memoria_prefetch_section` (VOLATILE) — the "## User Memories"
+            //   block produced by `prefetch_memories`. The retrieval query
+            //   uses the latest user message, so results drift turn-to-turn.
+            //   Routes to RuntimeVolatile (None scope) as an
+            //   `extra_dynamic_sections` entry → correctly post-marker.
+            //
+            // Previously both were concatenated into one `profile_desc`
+            // string and routed to volatile, dragging ~3-4 kB of stable
+            // cwd/branch/env content out of the cached prefix every turn.
             let profile_desc = {
                 let mut parts = Vec::new();
                 if let Some(cwd) = edge_profile.get("cwd").and_then(Value::as_str) {
@@ -1099,39 +1115,11 @@ impl InProcessChatTurnBridge {
                 if let Some(branch) = edge_profile.get("git_branch").and_then(Value::as_str) {
                     parts.push(format!("git_branch: {branch}"));
                 }
-                // Inject rich environment context (OS, shell, git status, etc.)
                 let env_section = edge_profile
                     .get("environment_context")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                // Prefetch memories relevant to the current user message.
-                // Injected every turn — cost is bounded by top_k and relevance
-                // (typically 1-3 matches, ~100 tokens). This ensures LLM always
-                // has user context (repo mappings, preferences) without needing
-                // an extra round-trip to call memory_retrieve itself.
-                if let (Some(mem_url), Some(mem_key)) = (
-                    edge_profile.get("memoria_url").and_then(Value::as_str),
-                    edge_profile.get("memoria_key").and_then(Value::as_str),
-                ) {
-                    let user_msg = messages
-                        .iter()
-                        .rev()
-                        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-                        .and_then(|m| m.get("content").and_then(Value::as_str))
-                        .unwrap_or("");
-                    let top_k = edge_profile
-                        .get("retrieval_top_k")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(5) as u32;
-                    let result = prefetch_memories(mem_url, mem_key, user_msg, &user_id, top_k).await;
-                    memory_fetch_ms = result.fetch_ms;
-                    memory_items = result.items;
-                    memory_preview = result.preview;
-                    if let Some(section) = result.section {
-                        parts.push(section);
-                    }
-                }
                 if parts.is_empty() && env_section.is_empty() {
                     String::new()
                 } else {
@@ -1142,6 +1130,31 @@ impl InProcessChatTurnBridge {
                     };
                     format!("{base}{env_section}")
                 }
+            };
+
+            // Memoria prefetch lives on its own. `section` is the
+            // "## User Memories\n..." block — the piece that actually drifts.
+            let memoria_prefetch_section = if let (Some(mem_url), Some(mem_key)) = (
+                edge_profile.get("memoria_url").and_then(Value::as_str),
+                edge_profile.get("memoria_key").and_then(Value::as_str),
+            ) {
+                let user_msg = messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+                    .and_then(|m| m.get("content").and_then(Value::as_str))
+                    .unwrap_or("");
+                let top_k = edge_profile
+                    .get("retrieval_top_k")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(5) as u32;
+                let result = prefetch_memories(mem_url, mem_key, user_msg, &user_id, top_k).await;
+                memory_fetch_ms = result.fetch_ms;
+                memory_items = result.items;
+                memory_preview = result.preview;
+                result.section
+            } else {
+                None
             };
             // Read active skill hints from edge_profile (injected by CLI)
             let active_skill_names: Vec<&str> = edge_profile
@@ -1350,29 +1363,30 @@ impl InProcessChatTurnBridge {
             // (RuntimeVolatile scope → re-sent per turn).
             //
             // STABLE (change only when session state changes, if at all):
+            //   profile_desc (cwd/branch/env — Memoria split out),
             //   skill_hint, learned_context_hint, feedback_rules_hint,
             //   self_awareness_hint
             //
             // VOLATILE (change each turn by design):
-            //   profile_desc (per-turn! includes Memoria prefetch snippets
-            //     under "## User Memories" header),
+            //   memoria_prefetch_section (per-turn retrieval — was baked
+            //     into profile_desc, now split out),
             //   implicit_feedback_hint (per-turn correction signal based on
             //     user message content),
             //   memoria_insights_hint (per-turn retrieval),
             //   recent_arg_hints_hint (per-turn tool args),
             //   session_anchor (per-turn state),
             //   tool_round_guidance (per-turn messages count)
-            //
-            // NOTE: the bridge's `profile_desc` is NOT the same as the
-            // pipeline's typed `ExternalSources.profile_desc` (which is
-            // pure cwd/branch). The bridge version is a superset that
-            // includes prefetched Memoria context, so it belongs in the
-            // volatile lane even though the name suggests stability.
             let mut stable_sections = Vec::new();
             let mut dynamic_sections = Vec::new();
             if !profile_desc.is_empty() {
-                dynamic_sections.push(prompts::PromptSection::dynamic(
+                stable_sections.push(prompts::PromptSection::dynamic(
                     profile_desc.clone(),
+                    prompts::PromptTokenBucket::Environment,
+                ));
+            }
+            if let Some(ref section) = memoria_prefetch_section {
+                dynamic_sections.push(prompts::PromptSection::dynamic(
+                    section.clone(),
                     prompts::PromptTokenBucket::Environment,
                 ));
             }
