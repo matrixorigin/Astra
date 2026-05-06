@@ -2059,8 +2059,14 @@ mod tests {
         let desc = rs["function"]["description"].as_str().unwrap();
         // At least read_file and web_fetch should be mentioned — they're
         // the staple tools for multi-step pipelines.
-        assert!(desc.contains("read_file"), "default schema should list read_file");
-        assert!(desc.contains("web_fetch"), "default schema should list web_fetch");
+        assert!(
+            desc.contains("read_file"),
+            "default schema should list read_file"
+        );
+        assert!(
+            desc.contains("web_fetch"),
+            "default schema should list web_fetch"
+        );
     }
 
     #[cfg(not(unix))]

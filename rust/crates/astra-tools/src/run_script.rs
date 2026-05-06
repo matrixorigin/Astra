@@ -246,7 +246,7 @@ pub enum RunScriptError {
     #[error(
         "Script exited with code {code}:\nstderr: {}\nstdout: {}",
         preview_stream(stderr),
-        preview_stream(stdout),
+        preview_stream(stdout)
     )]
     ScriptFailed {
         code: i32,
@@ -396,14 +396,38 @@ struct ToolDocLine {
 }
 
 const TOOL_DOC_LINES: &[ToolDocLine] = &[
-    ToolDocLine { name: "read_file", doc: "  read_file(path, offset=None, limit=None) — read file contents" },
-    ToolDocLine { name: "write_file", doc: "  write_file(path, content) — write/overwrite a file" },
-    ToolDocLine { name: "list_dir", doc: "  list_dir(path='.') — list directory" },
-    ToolDocLine { name: "grep", doc: "  grep(pattern, path=None, include=None) — search files" },
-    ToolDocLine { name: "web_fetch", doc: "  web_fetch(url, format='markdown') — fetch URL content" },
-    ToolDocLine { name: "search_files", doc: "  search_files(pattern, target='content', path='.', file_glob=None, limit=50) — search/find files" },
-    ToolDocLine { name: "patch", doc: "  patch(path, old_string, new_string, replace_all=False) — find-and-replace" },
-    ToolDocLine { name: "bash", doc: "  bash(command, timeout=None) — shell command (hardened)" },
+    ToolDocLine {
+        name: "read_file",
+        doc: "  read_file(path, offset=None, limit=None) — read file contents",
+    },
+    ToolDocLine {
+        name: "write_file",
+        doc: "  write_file(path, content) — write/overwrite a file",
+    },
+    ToolDocLine {
+        name: "list_dir",
+        doc: "  list_dir(path='.') — list directory",
+    },
+    ToolDocLine {
+        name: "grep",
+        doc: "  grep(pattern, path=None, include=None) — search files",
+    },
+    ToolDocLine {
+        name: "web_fetch",
+        doc: "  web_fetch(url, format='markdown') — fetch URL content",
+    },
+    ToolDocLine {
+        name: "search_files",
+        doc: "  search_files(pattern, target='content', path='.', file_glob=None, limit=50) — search/find files",
+    },
+    ToolDocLine {
+        name: "patch",
+        doc: "  patch(path, old_string, new_string, replace_all=False) — find-and-replace",
+    },
+    ToolDocLine {
+        name: "bash",
+        doc: "  bash(command, timeout=None) — shell command (hardened)",
+    },
 ];
 
 const BUILTIN_HELPERS: &str = r#"
@@ -545,21 +569,25 @@ pub fn build_run_script_schema(
         .join("\n");
 
     let mode_note = match mode {
-        ExecutionMode::Project =>
+        ExecutionMode::Project => {
             "Scripts run in the session's working directory with the active venv's python, \
-             so project deps and relative paths work naturally.",
-        ExecutionMode::Strict =>
+             so project deps and relative paths work naturally."
+        }
+        ExecutionMode::Strict => {
             "Scripts run in an isolated temp directory — use absolute paths or tool calls \
-             for file access.",
+             for file access."
+        }
     };
 
     let priority_note = match priority {
-        PriorityHint::Pinned =>
+        PriorityHint::Pinned => {
             "\n\n**PREFERRED**: This tool is pinned as the preferred approach for multi-step tasks \
-             in this session. Use it when you need 3+ tool calls with processing logic between them.",
-        PriorityHint::Deprioritized =>
+             in this session. Use it when you need 3+ tool calls with processing logic between them."
+        }
+        PriorityHint::Deprioritized => {
             "\n\n**DEPRIORITIZED**: Prefer individual tool calls unless you specifically need \
-             batch processing with conditional logic.",
+             batch processing with conditional logic."
+        }
         PriorityHint::Neutral => "",
     };
 
@@ -572,7 +600,8 @@ pub fn build_run_script_schema(
     // Empty enabled_tools → degrade gracefully rather than emitting broken Python hints.
     let available_block = if tool_lines.is_empty() {
         "No sandbox tools are enabled for this session. run_script can only \
-         execute pure Python (stdlib) without calling any agent tool.".to_string()
+         execute pure Python (stdlib) without calling any agent tool."
+            .to_string()
     } else {
         let example = if import_examples.is_empty() {
             let mut names: Vec<_> = enabled_tools.iter().take(2).cloned().collect();
@@ -581,9 +610,7 @@ pub fn build_run_script_schema(
         } else {
             import_examples.join(", ")
         };
-        format!(
-            "Available via `from astra_tools import {example}, ...`:\n\n{tool_lines}"
-        )
+        format!("Available via `from astra_tools import {example}, ...`:\n\n{tool_lines}")
     };
 
     let script_param_desc = if tool_lines.is_empty() {
@@ -682,7 +709,11 @@ pub(crate) fn resolve_python(mode: ExecutionMode) -> String {
 /// The caller is responsible for ensuring `fallback` actually exists
 /// before spawning. The public `run_script` entry point always passes
 /// its freshly-created tmpdir, so the guarantee holds in practice.
-pub(crate) fn resolve_cwd(mode: ExecutionMode, session_cwd: Option<&Path>, fallback: &Path) -> PathBuf {
+pub(crate) fn resolve_cwd(
+    mode: ExecutionMode,
+    session_cwd: Option<&Path>,
+    fallback: &Path,
+) -> PathBuf {
     if mode == ExecutionMode::Strict {
         return fallback.to_path_buf();
     }
@@ -861,9 +892,7 @@ pub async fn run_script(
     );
 
     let mut cmd = Command::new(&python);
-    cmd.arg(&script_path)
-        .current_dir(&cwd)
-        .env_clear();
+    cmd.arg(&script_path).current_dir(&cwd).env_clear();
     for (k, v) in &env_pairs {
         cmd.env(k, v);
     }
@@ -884,11 +913,8 @@ pub async fn run_script(
     // until the child has exited and been waited on — otherwise Drop
     // tries to remove a non-empty cgroup directory. Silent fallback when
     // cgroup v2 is unavailable: the guard is inactive and does nothing.
-    let _cgroup_guard = astra_sandbox::apply_cgroup(
-        &mut cmd,
-        config.memory_limit_bytes,
-        config.cpu_quota,
-    );
+    let _cgroup_guard =
+        astra_sandbox::apply_cgroup(&mut cmd, config.memory_limit_bytes, config.cpu_quota);
 
     let mut child = cmd
         .spawn()
@@ -896,7 +922,8 @@ pub async fn run_script(
 
     let stdout = child.stdout.take().expect("stdout piped");
     let max_stdout = config.max_stdout_bytes;
-    let stdout_handle = tokio::spawn(async move { collect_stdout_head_tail(stdout, max_stdout).await });
+    let stdout_handle =
+        tokio::spawn(async move { collect_stdout_head_tail(stdout, max_stdout).await });
 
     let stderr = child.stderr.take().expect("stderr piped");
     let stderr_handle = tokio::spawn(async move { collect_stderr_with_notice(stderr).await });
@@ -938,8 +965,7 @@ pub async fn run_script(
             // Await both IO tasks concurrently so one panicking doesn't leak
             // the other. try_join! short-circuits on first Err; the
             // #[from] JoinError impl does the structured wrap.
-            let (stdout_content, stderr_content) =
-                tokio::try_join!(stdout_handle, stderr_handle)?;
+            let (stdout_content, stderr_content) = tokio::try_join!(stdout_handle, stderr_handle)?;
 
             if !status.success() {
                 let code = status.code().unwrap_or(-1);
@@ -989,9 +1015,7 @@ fn build_child_env(
 ) -> Vec<(String, String)> {
     let path = match mode {
         ExecutionMode::Strict => STRICT_PATH.to_string(),
-        ExecutionMode::Project => {
-            std::env::var("PATH").unwrap_or_else(|_| STRICT_PATH.to_string())
-        }
+        ExecutionMode::Project => std::env::var("PATH").unwrap_or_else(|_| STRICT_PATH.to_string()),
     };
     let home = if isolate_home {
         tmp_path.display().to_string()
@@ -1005,8 +1029,14 @@ fn build_child_env(
     };
 
     let mut out: Vec<(String, String)> = vec![
-        ("ASTRA_RPC_SOCKET".to_string(), socket_path.display().to_string()),
-        ("ASTRA_RPC_AUTH_TOKEN".to_string(), auth_token.as_str().to_string()),
+        (
+            "ASTRA_RPC_SOCKET".to_string(),
+            socket_path.display().to_string(),
+        ),
+        (
+            "ASTRA_RPC_AUTH_TOKEN".to_string(),
+            auth_token.as_str().to_string(),
+        ),
         ("HOME".to_string(), home),
         ("LANG".to_string(), "C.UTF-8".to_string()),
         ("PATH".to_string(), path),
@@ -1215,7 +1245,10 @@ mod tests {
     #[async_trait]
     impl ToolExecutor for MockToolExecutor {
         async fn execute(&self, name: &str, args: &Value) -> ToolResult {
-            self.call_log.lock().unwrap().push((name.to_string(), args.clone()));
+            self.call_log
+                .lock()
+                .unwrap()
+                .push((name.to_string(), args.clone()));
             match name {
                 "read_file" => {
                     let path = args.get("path").and_then(Value::as_str).unwrap_or("");
@@ -1230,8 +1263,12 @@ mod tests {
                 _ => ToolResult::error(format!("Unknown tool: {name}")),
             }
         }
-        fn tool_schemas(&self) -> Vec<Value> { vec![] }
-        fn project_root(&self) -> &Path { &self.project_root }
+        fn tool_schemas(&self) -> Vec<Value> {
+            vec![]
+        }
+        fn project_root(&self) -> &Path {
+            &self.project_root
+        }
     }
 
     // ── Config defaults (A3.3: pin secure-by-default choices) ────────────
@@ -1534,8 +1571,12 @@ mod tests {
 
     #[test]
     fn schema_lists_only_enabled_tools() {
-        let enabled: HashSet<String> = ["read_file", "write_file"].iter().map(|s| s.to_string()).collect();
-        let schema = build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
+        let enabled: HashSet<String> = ["read_file", "write_file"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let schema =
+            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
         let desc = schema["function"]["description"].as_str().unwrap();
         assert!(desc.contains("read_file"));
         assert!(desc.contains("write_file"));
@@ -1548,7 +1589,8 @@ mod tests {
     #[test]
     fn schema_timeout_description_reflects_constants() {
         let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
-        let schema = build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
+        let schema =
+            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
         let timeout_desc = schema["function"]["parameters"]["properties"]["timeout"]["description"]
             .as_str()
             .unwrap();
@@ -1582,7 +1624,8 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let schema = build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
+        let schema =
+            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
         let desc = schema["function"]["description"].as_str().unwrap();
         // Known tool appears; unknown one is omitted (no panic, no raw name leak).
         assert!(desc.contains("read_file"));
@@ -1598,22 +1641,36 @@ mod tests {
     // allowlist layer but produce a noisy error.
     #[test]
     fn schema_omits_bash_when_disabled() {
-        let enabled: HashSet<String> = ["read_file", "grep"].iter().map(|s| s.to_string()).collect();
-        let schema = build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
+        let enabled: HashSet<String> = ["read_file", "grep"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let schema =
+            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
         let desc = schema["function"]["description"].as_str().unwrap();
         let script_desc = schema["function"]["parameters"]["properties"]["script"]["description"]
             .as_str()
             .unwrap();
         // No `bash(` call suggestion, no `bash,` import example token.
-        assert!(!desc.contains("bash("), "desc leaks bash when disabled: {desc}");
-        assert!(!desc.contains(" bash,"), "desc lists bash in imports when disabled: {desc}");
-        assert!(!script_desc.contains("bash("), "script desc leaks bash: {script_desc}");
+        assert!(
+            !desc.contains("bash("),
+            "desc leaks bash when disabled: {desc}"
+        );
+        assert!(
+            !desc.contains(" bash,"),
+            "desc lists bash in imports when disabled: {desc}"
+        );
+        assert!(
+            !script_desc.contains("bash("),
+            "script desc leaks bash: {script_desc}"
+        );
     }
 
     #[test]
     fn schema_pinned_hint_present() {
         let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
-        let schema = build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Pinned);
+        let schema =
+            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Pinned);
         let desc = schema["function"]["description"].as_str().unwrap();
         assert!(desc.contains("PREFERRED"));
         assert!(desc.contains("pinned"));
@@ -1622,8 +1679,11 @@ mod tests {
     #[test]
     fn schema_deprioritized_hint_present() {
         let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
-        let schema =
-            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Deprioritized);
+        let schema = build_run_script_schema(
+            &enabled,
+            ExecutionMode::Project,
+            PriorityHint::Deprioritized,
+        );
         let desc = schema["function"]["description"].as_str().unwrap();
         assert!(desc.contains("DEPRIORITIZED"));
         // T48: Deprioritized is exclusive of Pinned — no PREFERRED marker leak.
@@ -1637,7 +1697,8 @@ mod tests {
     #[test]
     fn schema_pinned_hint_excludes_deprioritized_marker() {
         let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
-        let schema = build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Pinned);
+        let schema =
+            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Pinned);
         let desc = schema["function"]["description"].as_str().unwrap();
         assert!(desc.contains("PREFERRED"));
         assert!(
@@ -1649,7 +1710,8 @@ mod tests {
     #[test]
     fn schema_neutral_has_no_priority_hint() {
         let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
-        let schema = build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
+        let schema =
+            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
         let desc = schema["function"]["description"].as_str().unwrap();
         assert!(!desc.contains("PREFERRED"));
         assert!(!desc.contains("DEPRIORITIZED"));
@@ -1659,7 +1721,8 @@ mod tests {
     #[test]
     fn schema_empty_enabled_tools_graceful() {
         let enabled: HashSet<String> = HashSet::new();
-        let schema = build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
+        let schema =
+            build_run_script_schema(&enabled, ExecutionMode::Project, PriorityHint::Neutral);
         let desc = schema["function"]["description"].as_str().unwrap();
         let script_desc = schema["function"]["parameters"]["properties"]["script"]["description"]
             .as_str()
@@ -1667,11 +1730,7 @@ mod tests {
 
         // ── Negative: no broken import hint leaks through.
         // Catches `from astra_tools import , ...` and its moral equivalents.
-        let broken_patterns = [
-            "import , ",
-            "import , `",
-            "import , .",
-        ];
+        let broken_patterns = ["import , ", "import , `", "import , ."];
         for bad in broken_patterns {
             assert!(
                 !desc.contains(bad),
@@ -1704,7 +1763,10 @@ mod tests {
 
     #[test]
     fn stub_contains_only_enabled_tools() {
-        let enabled: HashSet<String> = ["read_file", "grep"].iter().map(|s| s.to_string()).collect();
+        let enabled: HashSet<String> = ["read_file", "grep"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let stub = generate_python_stub(&enabled);
         assert!(stub.contains("def read_file("));
         assert!(stub.contains("def grep("));
@@ -1725,8 +1787,14 @@ mod tests {
     fn stub_has_try_finally_for_fd_safety() {
         let enabled: HashSet<String> = ["read_file"].iter().map(|s| s.to_string()).collect();
         let stub = generate_python_stub(&enabled);
-        assert!(stub.contains("try:"), "stub must wrap socket in try/finally");
-        assert!(stub.contains("finally:"), "stub must close socket in finally");
+        assert!(
+            stub.contains("try:"),
+            "stub must wrap socket in try/finally"
+        );
+        assert!(
+            stub.contains("finally:"),
+            "stub must close socket in finally"
+        );
         assert!(stub.contains("sock.close()"));
     }
 
@@ -1856,7 +1924,10 @@ mod tests {
             std::fs::set_permissions(tmp.path(), perms).unwrap();
         }
         let path = tmp.path().to_str().unwrap();
-        assert!(!is_usable_python(path), "non-executable file must probe false");
+        assert!(
+            !is_usable_python(path),
+            "non-executable file must probe false"
+        );
     }
 
     // R6: repeated is_usable_python calls hit the cache (same result +
@@ -2110,7 +2181,10 @@ mod tests {
         let _guard = EnvGuard::set("PATH", "/opt/suspicious:/usr/bin:/bin");
         let env = test_env_bundle(ExecutionMode::Strict, true);
         let path = env_get(&env, "PATH").unwrap();
-        assert_eq!(path, STRICT_PATH, "Strict mode must not inherit parent PATH");
+        assert_eq!(
+            path, STRICT_PATH,
+            "Strict mode must not inherit parent PATH"
+        );
         assert!(!path.contains("/opt/suspicious"));
     }
 
@@ -2155,12 +2229,17 @@ mod tests {
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_happy_path_multiple_rpc_calls() {
-        if !python3_available() { return; }
+        if !python3_available() {
+            return;
+        }
         let exec = MockToolExecutor::new();
         let config = RunScriptConfig {
             timeout: Duration::from_secs(10),
             mode: ExecutionMode::Strict,
-            allowed_tools: ["read_file", "grep"].iter().map(|s| s.to_string()).collect(),
+            allowed_tools: ["read_file", "grep"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             ..Default::default()
         };
         let script = r#"
@@ -2179,7 +2258,9 @@ print(f"{r1}|{r2}")
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_script_partial_stdout_preserved_on_error() {
-        if !python3_available() { return; }
+        if !python3_available() {
+            return;
+        }
         let exec = MockToolExecutor::new();
         let config = RunScriptConfig {
             timeout: Duration::from_secs(10),
@@ -2192,7 +2273,11 @@ raise ValueError("boom")
 "#;
         let err = run_script(script, &config, &exec).await.unwrap_err();
         match err {
-            RunScriptError::ScriptFailed { code, stdout, stderr } => {
+            RunScriptError::ScriptFailed {
+                code,
+                stdout,
+                stderr,
+            } => {
                 assert_ne!(code, 0);
                 // Partial stdout lives in its OWN field — cleanly separable.
                 assert!(
@@ -2216,7 +2301,9 @@ raise ValueError("boom")
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_scripts_run_concurrently_without_cross_talk() {
-        if !python3_available() { return; }
+        if !python3_available() {
+            return;
+        }
 
         async fn run_one(label: &'static str) -> String {
             let exec = MockToolExecutor::new();
@@ -2230,8 +2317,14 @@ raise ValueError("boom")
         }
 
         let (a, b) = tokio::join!(run_one("alpha-marker"), run_one("bravo-marker"));
-        assert!(a.contains("alpha-marker") && !a.contains("bravo"), "A tainted: {a}");
-        assert!(b.contains("bravo-marker") && !b.contains("alpha"), "B tainted: {b}");
+        assert!(
+            a.contains("alpha-marker") && !a.contains("bravo"),
+            "A tainted: {a}"
+        );
+        assert!(
+            b.contains("bravo-marker") && !b.contains("alpha"),
+            "B tainted: {b}"
+        );
     }
 
     // R5.8 / T31 (inner layer): the raw API returns an empty string for
@@ -2241,7 +2334,9 @@ raise ValueError("boom")
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_run_script_empty_source_returns_empty_ok() {
-        if !python3_available() { return; }
+        if !python3_available() {
+            return;
+        }
         let exec = MockToolExecutor::new();
         let config = RunScriptConfig {
             timeout: Duration::from_secs(5),
@@ -2258,20 +2353,21 @@ raise ValueError("boom")
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn handle_run_script_empty_source_returns_notice() {
-        if !python3_available() { return; }
+        if !python3_available() {
+            return;
+        }
         let exec = MockToolExecutor::new();
         let config = RunScriptConfig {
             timeout: Duration::from_secs(5),
             mode: ExecutionMode::Strict,
             ..Default::default()
         };
-        let result = handle_run_script(
-            &serde_json::json!({"script": ""}),
-            &exec,
-            config,
-        )
-        .await;
-        assert!(!result.is_error, "empty script must exit cleanly: {}", result.output);
+        let result = handle_run_script(&serde_json::json!({"script": ""}), &exec, config).await;
+        assert!(
+            !result.is_error,
+            "empty script must exit cleanly: {}",
+            result.output
+        );
         assert!(
             result.output.contains("completed with no output"),
             "expected empty-output notice, got: {}",
@@ -2284,7 +2380,9 @@ raise ValueError("boom")
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_script_stderr_only_nonzero_exit() {
-        if !python3_available() { return; }
+        if !python3_available() {
+            return;
+        }
         let exec = MockToolExecutor::new();
         let config = RunScriptConfig {
             timeout: Duration::from_secs(10),
@@ -2297,10 +2395,17 @@ sys.stderr.write("only-on-stderr\n")
 sys.exit(7)
 "#;
         match run_script(script, &config, &exec).await {
-            Err(RunScriptError::ScriptFailed { code, stdout, stderr }) => {
+            Err(RunScriptError::ScriptFailed {
+                code,
+                stdout,
+                stderr,
+            }) => {
                 assert_eq!(code, 7);
                 assert!(stdout.is_empty(), "stdout should be empty, got: {stdout:?}");
-                assert!(stderr.contains("only-on-stderr"), "stderr missing content: {stderr}");
+                assert!(
+                    stderr.contains("only-on-stderr"),
+                    "stderr missing content: {stderr}"
+                );
             }
             other => panic!("expected ScriptFailed, got {other:?}"),
         }
@@ -2311,7 +2416,9 @@ sys.exit(7)
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_script_failed_exit_still_caps_stdout() {
-        if !python3_available() { return; }
+        if !python3_available() {
+            return;
+        }
         let exec = MockToolExecutor::new();
         let config = RunScriptConfig {
             timeout: Duration::from_secs(10),
@@ -2327,7 +2434,10 @@ raise RuntimeError("after noise")
         match run_script(script, &config, &exec).await {
             Err(RunScriptError::ScriptFailed { stdout, stderr, .. }) => {
                 // stdout got truncated — notice present + first line retained.
-                assert!(stdout.contains("OUTPUT TRUNCATED"), "stdout cap not applied: {stdout}");
+                assert!(
+                    stdout.contains("OUTPUT TRUNCATED"),
+                    "stdout cap not applied: {stdout}"
+                );
                 assert!(stdout.contains("line_000"), "head lost: {stdout}");
                 assert!(stderr.contains("RuntimeError"), "stderr missing: {stderr}");
             }
@@ -2339,7 +2449,9 @@ raise RuntimeError("after noise")
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_script_stderr_truncation_notice_present() {
-        if !python3_available() { return; }
+        if !python3_available() {
+            return;
+        }
         let exec = MockToolExecutor::new();
         let config = RunScriptConfig {
             timeout: Duration::from_secs(10),
@@ -2384,7 +2496,9 @@ sys.exit(2)
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_script_exceeded_call_limit_kills_child_fast() {
-        if !python3_available() { return; }
+        if !python3_available() {
+            return;
+        }
         let exec = MockToolExecutor::new();
         let config = RunScriptConfig {
             timeout: Duration::from_secs(60),
@@ -2424,7 +2538,9 @@ print("LEAK: should not have reached here")
     #[serial]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_script_secret_env_not_visible_to_child() {
-        if !python3_available() { return; }
+        if !python3_available() {
+            return;
+        }
         let _guard = EnvGuard::set("MY_SUPER_SECRET", "should-not-leak");
         let exec = MockToolExecutor::new();
         let config = RunScriptConfig {
@@ -2450,7 +2566,9 @@ print(os.environ.get("MY_SUPER_SECRET", "UNSET"))
     #[serial]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_script_home_is_isolated_by_default() {
-        if !python3_available() { return; }
+        if !python3_available() {
+            return;
+        }
         let _guard = EnvGuard::set("HOME", "/tmp/sentinel-parent-home");
         let exec = MockToolExecutor::new();
         let config = RunScriptConfig {
@@ -2487,7 +2605,9 @@ print(os.environ["HOME"])
     #[tokio::test]
     #[cfg_attr(not(feature = "cgroup_tests"), ignore)]
     async fn live_script_cgroup_memory_limit_kills_runaway() {
-        if !python3_available() { return; }
+        if !python3_available() {
+            return;
+        }
         let exec = MockToolExecutor::new();
         let config = RunScriptConfig {
             timeout: Duration::from_secs(10),
@@ -2504,9 +2624,7 @@ print(f"allocated {len(data)} bytes — cgroup did not enforce limit")
         let result = run_script(script, &config, &exec).await;
         match result {
             Ok(out) => {
-                panic!(
-                    "script completed despite memory cap; cgroup not enforced: {out}"
-                );
+                panic!("script completed despite memory cap; cgroup not enforced: {out}");
             }
             Err(RunScriptError::ScriptFailed { code, .. }) => {
                 // SIGKILL → exit code 137 (128 + 9) on typical shells,
@@ -2515,9 +2633,7 @@ print(f"allocated {len(data)} bytes — cgroup did not enforce limit")
                 assert_ne!(code, 0, "cgroup-killed child must exit nonzero");
             }
             Err(other) => {
-                panic!(
-                    "expected ScriptFailed from cgroup OOM-kill, got: {other:?}"
-                );
+                panic!("expected ScriptFailed from cgroup OOM-kill, got: {other:?}");
             }
         }
     }

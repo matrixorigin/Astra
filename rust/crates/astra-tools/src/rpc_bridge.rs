@@ -120,10 +120,16 @@ pub(crate) struct RpcResponse {
 
 impl RpcResponse {
     pub fn success(output: String) -> Self {
-        Self { output: Some(output), error: None }
+        Self {
+            output: Some(output),
+            error: None,
+        }
     }
     pub fn error(msg: String) -> Self {
-        Self { output: None, error: Some(msg) }
+        Self {
+            output: None,
+            error: Some(msg),
+        }
     }
 }
 
@@ -518,7 +524,10 @@ mod tests {
             }
         }
         fn with_payload(size: usize) -> Self {
-            Self { payload_size: size, ..Self::new() }
+            Self {
+                payload_size: size,
+                ..Self::new()
+            }
         }
         fn call_count(&self) -> usize {
             self.call_log.lock().unwrap().len()
@@ -527,20 +536,30 @@ mod tests {
     #[async_trait]
     impl ToolExecutor for MockExecutor {
         async fn execute(&self, name: &str, args: &Value) -> ToolResult {
-            self.call_log.lock().unwrap().push((name.to_string(), args.clone()));
+            self.call_log
+                .lock()
+                .unwrap()
+                .push((name.to_string(), args.clone()));
             if self.payload_size > 0 {
                 ToolResult::text("A".repeat(self.payload_size))
             } else {
                 ToolResult::text(format!("ok: {name}"))
             }
         }
-        fn tool_schemas(&self) -> Vec<Value> { vec![] }
-        fn project_root(&self) -> &Path { &self.root }
+        fn tool_schemas(&self) -> Vec<Value> {
+            vec![]
+        }
+        fn project_root(&self) -> &Path {
+            &self.root
+        }
     }
 
     fn default_policy() -> RpcPolicy {
         RpcPolicy {
-            allowed_tools: ["read_file", "grep"].iter().map(|s| s.to_string()).collect(),
+            allowed_tools: ["read_file", "grep"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             max_tool_calls: 50,
             max_response_bytes: 256 * 1024,
         }
@@ -607,7 +626,10 @@ mod tests {
         // No auth_token field → deserialize error before allowlist/executor run.
         let req = r#"{"tool":"read_file","args":{"path":"x"}}"#;
         let (resp, _) = rpc_roundtrip(req, &policy, &token, &exec, &counter).await;
-        assert!(resp.contains("Invalid JSON") || resp.contains("auth"), "resp: {resp}");
+        assert!(
+            resp.contains("Invalid JSON") || resp.contains("auth"),
+            "resp: {resp}"
+        );
         assert_eq!(exec.call_count(), 0);
     }
 
@@ -659,15 +681,25 @@ mod tests {
         let counter = AtomicUsize::new(0);
         let req = r#"{"tool":"read_file","args":{},"auth_token":"tok"}"#;
         let (resp, _) = rpc_roundtrip(req, &policy, &token, &exec, &counter).await;
-        assert!(resp.len() < 3_000, "response not capped: {} bytes", resp.len());
-        assert!(resp.contains("OUTPUT TRUNCATED"), "resp: {}", &resp[..resp.len().min(200)]);
+        assert!(
+            resp.len() < 3_000,
+            "response not capped: {} bytes",
+            resp.len()
+        );
+        assert!(
+            resp.contains("OUTPUT TRUNCATED"),
+            "resp: {}",
+            &resp[..resp.len().min(200)]
+        );
     }
 
     // R2: write_response never hangs — even with a pathological writer.
     #[tokio::test]
     async fn write_response_writes_newline_terminator() {
         let mut buf = Vec::<u8>::new();
-        write_response(&mut buf, &RpcResponse::success("hi".into())).await.unwrap();
+        write_response(&mut buf, &RpcResponse::success("hi".into()))
+            .await
+            .unwrap();
         assert!(buf.ends_with(b"\n"));
         assert!(String::from_utf8_lossy(&buf).contains("\"output\":\"hi\""));
     }
@@ -707,7 +739,10 @@ mod tests {
     async fn reply_and_shutdown_survives_shutdown_failure() {
         let mut w = FailOnShutdown { buf: Vec::new() };
         let result = reply_and_shutdown(&mut w, &RpcResponse::success("payload".into())).await;
-        assert!(result.is_ok(), "write succeeded; shutdown failure shouldn't propagate");
+        assert!(
+            result.is_ok(),
+            "write succeeded; shutdown failure shouldn't propagate"
+        );
         assert!(w.buf.ends_with(b"\n"));
         assert!(String::from_utf8_lossy(&w.buf).contains("payload"));
     }

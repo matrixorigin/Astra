@@ -17,10 +17,6 @@ pub mod build_test;
 // It uses Unix domain sockets for the script↔host RPC channel. Windows
 // would need named pipes — deferred. Gate the modules so the crate still
 // builds cross-platform.
-#[cfg(unix)]
-pub mod rpc_bridge;
-#[cfg(unix)]
-pub mod run_script;
 pub mod code_intel;
 pub mod config_tool;
 pub mod env_tools;
@@ -32,6 +28,10 @@ pub mod git_ops;
 pub mod github;
 pub mod passive_cargo_check;
 pub mod passive_tsc_check;
+#[cfg(unix)]
+pub mod rpc_bridge;
+#[cfg(unix)]
+pub mod run_script;
 pub mod shell_ops;
 pub mod task_mgmt;
 pub mod tool_search;

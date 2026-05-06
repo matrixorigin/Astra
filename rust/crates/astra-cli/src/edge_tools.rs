@@ -655,7 +655,9 @@ impl ToolExecutor {
                     // initial flush. Then load sid2's own disk state.
                     *journal = astra_turn_core::file_edit_journal::FileEditJournal::new(500);
                     if let Ok(disk_journal) =
-                        astra_turn_core::file_edit_journal::FileEditJournal::load_from_dir(&dir, 500)
+                        astra_turn_core::file_edit_journal::FileEditJournal::load_from_dir(
+                            &dir, 500,
+                        )
                     {
                         journal.merge_older_entries(disk_journal);
                     }
@@ -664,7 +666,9 @@ impl ToolExecutor {
                 None => {
                     // Case (c): first binding — R9.1 merge policy.
                     if let Ok(disk_journal) =
-                        astra_turn_core::file_edit_journal::FileEditJournal::load_from_dir(&dir, 500)
+                        astra_turn_core::file_edit_journal::FileEditJournal::load_from_dir(
+                            &dir, 500,
+                        )
                     {
                         journal.merge_older_entries(disk_journal);
                     }
@@ -1914,10 +1918,11 @@ mod tests {
         let _guard = CheckpointRootGuard::set(tmp.path());
 
         // Simulate ReplState: a shared in-memory journal with no persistence.
-        let shared: std::sync::Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>> =
-            std::sync::Arc::new(std::sync::Mutex::new(
-                astra_turn_core::file_edit_journal::FileEditJournal::new(500),
-            ));
+        let shared: std::sync::Arc<
+            std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(
+            astra_turn_core::file_edit_journal::FileEditJournal::new(500),
+        ));
         assert!(
             shared.lock().unwrap().persist_dir().is_none(),
             "fresh shared journal starts in-memory"
@@ -1956,10 +1961,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = CheckpointRootGuard::set(tmp.path());
 
-        let shared: std::sync::Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>> =
-            std::sync::Arc::new(std::sync::Mutex::new(
-                astra_turn_core::file_edit_journal::FileEditJournal::new(500),
-            ));
+        let shared: std::sync::Arc<
+            std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(
+            astra_turn_core::file_edit_journal::FileEditJournal::new(500),
+        ));
 
         // Record something into the shared journal BEFORE either builder
         // call. This validates R8.7: the reverse order must preserve
@@ -1981,12 +1987,19 @@ mod tests {
         let j = shared.lock().unwrap();
         assert_eq!(j.persist_dir(), Some(expected.as_path()));
         assert!(std::sync::Arc::ptr_eq(&executor.file_journal, &shared));
-        assert_eq!(j.len(), 1, "pre-session entry must survive late session binding");
+        assert_eq!(
+            j.len(),
+            1,
+            "pre-session entry must survive late session binding"
+        );
         // Entry was also flushed to disk via enable_persistence's initial save.
         let on_disk = std::fs::read_dir(&expected)
             .map(|r| r.flatten().count())
             .unwrap_or(0);
-        assert!(on_disk >= 1, "pre-session entry should have been flushed to disk");
+        assert!(
+            on_disk >= 1,
+            "pre-session entry should have been flushed to disk"
+        );
     }
 
     /// R8.2 regression: if the shared journal already has in-memory entries
@@ -2007,10 +2020,11 @@ mod tests {
         let file = work.path().join("pre-session.txt");
         std::fs::write(&file, b"before").unwrap();
 
-        let shared: std::sync::Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>> =
-            std::sync::Arc::new(std::sync::Mutex::new(
-                astra_turn_core::file_edit_journal::FileEditJournal::new(500),
-            ));
+        let shared: std::sync::Arc<
+            std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(
+            astra_turn_core::file_edit_journal::FileEditJournal::new(500),
+        ));
         {
             let mut j = shared.lock().unwrap();
             j.record_before(&file, "early-call", 0);
@@ -2025,11 +2039,7 @@ mod tests {
 
         // The pre-session entry MUST survive the binding.
         let j = shared.lock().unwrap();
-        assert_eq!(
-            j.len(),
-            1,
-            "pre-session in-memory entry must not be lost"
-        );
+        assert_eq!(j.len(), 1, "pre-session in-memory entry must not be lost");
         let entries: Vec<_> = j.entries().collect();
         assert_eq!(entries[0].path, file);
         assert_eq!(entries[0].after_content, b"after");
@@ -2057,17 +2067,14 @@ mod tests {
             tool_call_id: "prior".into(),
             edit_type: astra_turn_core::file_edit_journal::EditType::Overwrite,
         };
-        std::fs::write(
-            dir.join("000000.json"),
-            serde_json::to_vec(&prior).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(dir.join("000000.json"), serde_json::to_vec(&prior).unwrap()).unwrap();
 
         // Empty shared journal + set session-id → should load the disk entry.
-        let shared: std::sync::Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>> =
-            std::sync::Arc::new(std::sync::Mutex::new(
-                astra_turn_core::file_edit_journal::FileEditJournal::new(500),
-            ));
+        let shared: std::sync::Arc<
+            std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(
+            astra_turn_core::file_edit_journal::FileEditJournal::new(500),
+        ));
 
         let _executor = test_executor()
             .with_shared_file_journal(shared.clone())
@@ -2116,10 +2123,11 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let pre_file = work.path().join("pre.txt");
         std::fs::write(&pre_file, b"v0").unwrap();
-        let shared: std::sync::Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>> =
-            std::sync::Arc::new(std::sync::Mutex::new(
-                astra_turn_core::file_edit_journal::FileEditJournal::new(500),
-            ));
+        let shared: std::sync::Arc<
+            std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(
+            astra_turn_core::file_edit_journal::FileEditJournal::new(500),
+        ));
         {
             let mut j = shared.lock().unwrap();
             j.record_before(&pre_file, "pre-session", 0);
@@ -2138,10 +2146,7 @@ mod tests {
             3,
             "both disk (2) and pre-session (1) entries must survive"
         );
-        let tags: Vec<String> = j
-            .entries()
-            .map(|e| e.tool_call_id.clone())
-            .collect();
+        let tags: Vec<String> = j.entries().map(|e| e.tool_call_id.clone()).collect();
         assert_eq!(tags, vec!["prior-0", "prior-1", "pre-session"]);
 
         // All 3 entries should now be on disk.

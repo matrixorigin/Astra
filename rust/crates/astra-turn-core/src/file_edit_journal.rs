@@ -542,8 +542,8 @@ impl FileEditJournal {
         let tmp = dir.join(format!(".{:06}.tmp", entry.sequence));
         match serde_json::to_vec(entry) {
             Ok(bytes) => {
-                if let Err(e) = std::fs::write(&tmp, &bytes)
-                    .and_then(|_| std::fs::rename(&tmp, &dest))
+                if let Err(e) =
+                    std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &dest))
                 {
                     astra_core::agent_warn!(
                         "file_edit_journal",
@@ -581,8 +581,8 @@ impl FileEditJournal {
         let tmp = dir.join(format!(".{:06}.tmp", seq));
         match serde_json::to_vec(entry) {
             Ok(bytes) => {
-                if let Err(e) = std::fs::write(&tmp, &bytes)
-                    .and_then(|_| std::fs::rename(&tmp, &dest))
+                if let Err(e) =
+                    std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &dest))
                 {
                     astra_core::agent_warn!(
                         "file_edit_journal",
@@ -687,7 +687,10 @@ mod tests {
         std::fs::write(&file_x, b"x1").unwrap();
         j.record_before(&file_x, "Y", 2);
         let new_seq = j.entries_for_test().last().unwrap().sequence;
-        assert!(new_seq > max_existing, "next_sequence must advance past max");
+        assert!(
+            new_seq > max_existing,
+            "next_sequence must advance past max"
+        );
     }
 
     /// When combined length exceeds max_entries, oldest entries are evicted
@@ -933,9 +936,7 @@ mod tests {
         let files: Vec<_> = std::fs::read_dir(&persist)
             .unwrap()
             .flatten()
-            .filter(|e| {
-                e.path().extension().and_then(|x| x.to_str()) == Some("json")
-            })
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
             .collect();
         assert_eq!(files.len(), 2, "evicted entries must be removed from disk");
     }
