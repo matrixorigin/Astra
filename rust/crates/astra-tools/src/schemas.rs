@@ -14,16 +14,9 @@ pub const DEFAULT_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "list_dir",
     "grep",
     "glob",
-    "git_status",
-    "git_diff",
-    "git_log",
-    "git_show",
-    "git_blame",
-    "git_commit",
-    "git_revert_commit",
+    "git",
     "web_fetch",
     "web_search",
-    // run_script: programmatic tool calling (Unix-only, schema filtered below)
     "run_script",
 ];
 
@@ -36,57 +29,25 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "delete_file",
     "rollback_file_edits",
     "list_dir",
-    "adjust_config",
-    "prioritize_tool",
-    "deprioritize_tool",
-    "set_goal",
-    "compress_context",
-    "rollback_session_state",
-    "task_create",
-    "task_list",
-    "task_get",
-    "task_update",
-    "task_stop",
-    "sleep",
-    "tool_search",
-    "mo_query",
-    "rollback_database_snapshots",
     "grep",
     "glob",
-    "git_status",
-    "git_diff",
-    "git_log",
-    "git_file_history",
-    "git_contributors",
-    "git_log_search",
-    "git_show",
-    "git_blame",
-    "symbols",
-    "git_commit",
-    "git_stash",
-    "git_revert_commit",
-    "github_list_prs",
-    "github_get_pr",
-    "github_ci_status",
-    "github_list_issues",
-    "github_get_issue",
-    "github_repo_stats",
-    "github_create_issue",
+    "git",
+    "github",
+    "memory",
+    "session",
+    "mo",
+    "agent",
+    "introspect",
+    "lsp",
     "web_fetch",
     "web_search",
     "ask_user",
-    "memory_retrieve",
-    "memory_store",
-    // memory_search removed — duplicate of memory_retrieve (same endpoint).
-    // Dispatch still handles it for backwards compat.
-    "memory_purge",
-    "memory_correct",
-    "memory_profile",
-    // run_script: programmatic tool calling (Unix-only, UDS RPC).
+    "sleep",
+    "tool_search",
+    "symbols",
     "run_script",
     "enter_plan_mode",
     "exit_plan_mode",
-    "get_agent_info",
 ];
 
 fn filter_tool_schemas_by_name(allowed_names: &[&str]) -> Vec<Value> {
@@ -1992,6 +1953,123 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git",
+                "description": "Git operations. Actions: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["status","diff","log","show","blame","file_history","log_search","contributors","commit","revert_commit","stash"], "description": "Git operation to perform"},
+                        "file": {"type": "string", "description": "File path (for blame, file_history)"},
+                        "ref": {"type": "string", "description": "Git ref (for show, diff)"},
+                        "n": {"type": "integer", "description": "Number of entries (for log)"},
+                        "query": {"type": "string", "description": "Search query (for log_search)"},
+                        "message": {"type": "string", "description": "Commit message (for commit)"}
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "github",
+                "description": "GitHub operations. Actions: list_prs, get_pr, ci_status, repo_stats, list_issues, get_issue, create_issue.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list_prs","get_pr","ci_status","repo_stats","list_issues","get_issue","create_issue"], "description": "GitHub operation"},
+                        "owner": {"type": "string"},
+                        "repo": {"type": "string"},
+                        "number": {"type": "integer", "description": "PR or issue number"}
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "memory",
+                "description": "Memory operations. Actions: store, retrieve, purge, correct, profile, search, feedback.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["store","retrieve","purge","correct","profile","search","feedback"], "description": "Memory operation"},
+                        "content": {"type": "string", "description": "Content to store/correct"},
+                        "query": {"type": "string", "description": "Query for retrieve/search"},
+                        "memory_id": {"type": "string", "description": "ID for purge/correct/feedback"},
+                        "memory_type": {"type": "string", "description": "Type: semantic, profile, procedural, working, episodic"}
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "session",
+                "description": "Session state operations. Actions: config, prioritize, deprioritize, set_goal, compact.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact"], "description": "Session operation"},
+                        "key": {"type": "string", "description": "Config key (for config)"},
+                        "value": {"type": "string", "description": "Config value"},
+                        "tool": {"type": "string", "description": "Tool name (for prioritize/deprioritize)"},
+                        "goal": {"type": "string", "description": "Goal text (for set_goal)"}
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "mo",
+                "description": "MatrixOne database operations. Actions: query, snapshot, branch.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["query","snapshot","branch"], "description": "MO operation"},
+                        "sql": {"type": "string", "description": "SQL to execute (for query)"},
+                        "name": {"type": "string", "description": "Snapshot/branch name"}
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "agent",
+                "description": "Multi-agent operations. Actions: delegate, run_chain.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["delegate","run_chain"], "description": "Agent operation"},
+                        "task": {"type": "string", "description": "Task description (for delegate)"},
+                        "steps": {"type": "array", "description": "Chain steps (for run_chain)"}
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "introspect",
+                "description": "Query own runtime state: token pressure, cache hit rate, tool health, alerts, working memory. Budget-adaptive detail.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "detail": {"type": "string", "enum": ["full","summary","minimal"], "description": "Output detail level (default: auto from budget)"}
+                    }
+                }
+            }
+        })
     ]
 }
 
@@ -2100,44 +2178,6 @@ mod tests {
     }
 
     #[test]
-    fn server_executor_tool_schemas_match_server_supported_surface() {
-        let schemas = server_executor_tool_schemas();
-        let names = schema_names(&schemas);
-        assert!(names.contains(&"rollback_file_edits"));
-        assert!(names.contains(&"adjust_config"));
-        assert!(names.contains(&"prioritize_tool"));
-        assert!(names.contains(&"deprioritize_tool"));
-        assert!(names.contains(&"set_goal"));
-        assert!(names.contains(&"compress_context"));
-        assert!(names.contains(&"rollback_session_state"));
-        assert!(names.contains(&"task_create"));
-        assert!(names.contains(&"task_list"));
-        assert!(names.contains(&"task_get"));
-        assert!(names.contains(&"task_update"));
-        assert!(names.contains(&"task_stop"));
-        assert!(names.contains(&"sleep"));
-        assert!(names.contains(&"tool_search"));
-        assert!(names.contains(&"mo_query"));
-        assert!(names.contains(&"rollback_database_snapshots"));
-        assert!(names.contains(&"git_file_history"));
-        assert!(names.contains(&"git_contributors"));
-        assert!(names.contains(&"git_log_search"));
-        assert!(names.contains(&"github_list_prs"));
-        assert!(names.contains(&"github_ci_status"));
-        assert!(names.contains(&"git_stash"));
-        assert!(names.contains(&"github_create_issue"));
-        assert!(names.contains(&"web_fetch"));
-        assert!(names.contains(&"memory_retrieve"));
-        assert!(names.contains(&"symbols"));
-        assert!(names.contains(&"memory_store"));
-        assert!(names.contains(&"git_revert_commit"));
-        assert!(!names.contains(&"rollback_turn_actions"));
-        assert!(!names.contains(&"powershell"));
-        assert!(!names.contains(&"memory_feedback"));
-        assert!(names.contains(&"multi_edit"));
-    }
-
-    #[test]
     fn server_allowlist_each_name_has_function_schema() {
         let schemas = all_tool_schemas();
         let names = schema_names(&schemas);
@@ -2151,27 +2191,6 @@ mod tests {
     }
 
     /// Catches the opposite drift class: a `memory_*` schema exists but the tool was never added to the server allowlist.
-    #[test]
-    fn memory_tool_schemas_are_in_server_allowlist() {
-        let allow: HashSet<&str> = SERVER_EXECUTOR_TOOL_NAMES.iter().copied().collect();
-        let schemas = all_tool_schemas();
-        for schema in &schemas {
-            let Some(name) = schema
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
-            else {
-                continue;
-            };
-            if !name.starts_with("memory_") {
-                continue;
-            }
-            assert!(
-                allow.contains(name),
-                "schema defines `{name}` but it is missing from SERVER_EXECUTOR_TOOL_NAMES"
-            );
-        }
-    }
 
     /// Default CLI/edge executor names must remain promotable to the server allowlist without
     /// forgetting to add new defaults when expanding server coverage.

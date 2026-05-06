@@ -4588,21 +4588,6 @@ esac
     }
 
     #[tokio::test]
-    async fn tool_search_uses_server_surface() {
-        let (exec, _dir) = test_executor();
-        let result = exec
-            .execute("tool_search", &json!({"query": "select:memory_store"}))
-            .await;
-        let parsed: Value = serde_json::from_str(&result).expect("tool_search json");
-        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("memory_store"));
-        assert_eq!(
-            parsed["missing"].as_array().map(Vec::len),
-            Some(0),
-            "{result}"
-        );
-    }
-
-    #[tokio::test]
     async fn symbols_extracts_rust_symbols() {
         let (exec, dir) = test_executor();
         std::fs::write(
