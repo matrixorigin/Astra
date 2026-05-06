@@ -16,8 +16,8 @@ pub use astra_prompts::skills::{
 };
 pub use context::{
     CacheAwareEstimate, CompactConfig, CompactionTier, ContextBudget, DEFAULT_SYSTEM_PROMPT_TOKENS,
-    budget_for_model, capped_output_tokens, compaction_tier_calibrated, estimate_str_tokens,
-    estimate_tokens, estimate_tokens_cache_aware, estimate_tokens_precise,
+    budget_for_model, capped_output_tokens, estimate_str_tokens, estimate_tokens,
+    estimate_tokens_cache_aware, estimate_tokens_precise,
 };
 pub use system::{
     AgentRuntimeContext, CacheScope, LOW_CONFIDENCE_THRESHOLD, PARALLEL_BATCHING_NUDGE_THRESHOLD,

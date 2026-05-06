@@ -1043,26 +1043,6 @@ pub async fn compact_with_memoria(
     result
 }
 
-/// Synchronous wrapper that checks for Memoria availability.
-///
-/// If Memoria is not configured, falls back to pure truncation.
-pub fn compact_with_memoria_sync(
-    messages: &[Value],
-    _session_id: Option<&str>,
-    _config: &MemoriaCompactConfig,
-    params: &MemoriaCompactParams,
-) -> CompactResult {
-    // For sync contexts, we can't use Memoria (requires async HTTP).
-    // Fall back to pure truncation.
-    compact_tiered_with_result(
-        messages,
-        params.budget_chars,
-        params.keep_chars,
-        params.tier,
-        params.keep_recent_turns,
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1612,24 +1592,6 @@ mod tests {
             has_facts,
             "facts-only injection should work without narrative"
         );
-    }
-
-    #[test]
-    fn sync_wrapper_falls_back() {
-        let msgs = vec![user("hello"), assistant("hi")];
-        let config = MemoriaCompactConfig::default();
-        let params = MemoriaCompactParams {
-            budget_chars: 10000,
-            keep_chars: 2000,
-            tier: CompactionTier::Normal,
-            keep_recent_turns: 4,
-            current_tokens: 1000,
-            session_memory_file: None,
-            session_memory_combine: SessionMemoryFileCombine::None,
-            session_facts: None,
-        };
-        let result = compact_with_memoria_sync(&msgs, Some("sess1"), &config, &params);
-        assert_eq!(result.messages.len(), 2);
     }
 
     // ── Summary integration tests ────────────────────────────────────────────
