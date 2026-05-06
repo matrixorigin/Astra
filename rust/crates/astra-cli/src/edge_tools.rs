@@ -91,6 +91,25 @@ pub(crate) use file_state::ReadDedupKey;
 
 /// Shared file-state cache handle for cross-turn read-before-write tracking.
 pub(crate) type SharedFileState = std::sync::Arc<std::sync::Mutex<HashMap<PathBuf, FileState>>>;
+
+/// Per-session directory for persisted file-edit checkpoints.
+/// Location: `~/.astra/sessions/<session_id>/file_checkpoints/`.
+///
+/// Returns `None` when `HOME` is unavailable or the session_id is empty —
+/// in those cases persistence is silently disabled and the journal runs
+/// in-memory only (original behavior before F-series).
+fn file_checkpoint_dir_for(session_id: &str) -> Option<PathBuf> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let home = dirs::home_dir()?;
+    Some(
+        home.join(".astra")
+            .join("sessions")
+            .join(session_id)
+            .join("file_checkpoints"),
+    )
+}
 #[path = "edge_tools/worktree.rs"]
 mod worktree;
 pub(crate) use worktree::GitWorktreeRollbackJournal;
@@ -570,6 +589,22 @@ impl ToolExecutor {
             }
             if let Ok(mut deprioritized) = self.self_mod_deprioritized_tools.lock() {
                 *deprioritized = ws.deprioritized_tools.clone();
+            }
+        }
+        // File-edit checkpoint persistence: on session-id set, rebind the
+        // journal to an auto-persist directory keyed by session, and
+        // preload entries from a prior run if the CLI was restarted.
+        if let Some(dir) = file_checkpoint_dir_for(&session_id) {
+            if let Ok(mut journal) = self.file_journal.lock() {
+                // Preload any entries left over from a previous session.
+                if let Ok(loaded) =
+                    astra_turn_core::file_edit_journal::FileEditJournal::load_from_dir(
+                        &dir, 500,
+                    )
+                {
+                    *journal = loaded;
+                }
+                journal.enable_persistence(dir);
             }
         }
         if let Ok(mut guard) = self.active_session_id.lock() {
