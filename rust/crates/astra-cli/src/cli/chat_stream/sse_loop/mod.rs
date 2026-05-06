@@ -34,7 +34,6 @@ use astra_runtime::{
     turn::skill_tool::SkillResolver,
     turn::stop_hooks_yaml::detect_turn_hook_sets,
     turn::tool_health::ToolHealthTracker,
-    turn::tool_schema_prune::openai_tool_names_from_schemas,
     turn::turn_guard::TurnGuard,
 };
 
