@@ -1310,10 +1310,9 @@ impl ServerToolExecutor {
             "memory_retrieve" | "memory_store" | "memory_search" | "memory_purge"
             | "memory_correct" | "memory_profile" => {
                 let op = name.strip_prefix("memory_").unwrap_or(name);
-                // Force-inject user_id and session_id for per-user isolation,
-                // mirroring the server's /memory/* proxy in auth_handlers.rs.
                 let mut isolated_args = args.clone();
                 if let Some(obj) = isolated_args.as_object_mut() {
+                    obj.remove("action"); // defensive: strip if present
                     obj.insert(
                         "session_id".to_string(),
                         Value::String(self.user_id.clone()),

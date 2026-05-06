@@ -59,10 +59,9 @@ fn create_tool_selector_with_quality_internal(
     };
 
     let mut all_schemas = edge_tools::all_tool_schemas();
-    // Inject edge-protocol tools that the CLI always provides (spawn_agent,
-    // get_agent_result, send_message, skill). These used to be injected later
-    // in sse_loop, but the selector's fast path needs them visible at
-    // construction time.
+    // Inject edge-protocol tools that the CLI always provides. The `skill`
+    // tool is NOT here — it's dynamically injected by the agentic loop
+    // (skill_tool::skill_tool_schema) based on discovered skills each turn.
     all_schemas.push(astra_runtime::orchestration::spawn_agent_schema());
     all_schemas.push(crate::edge_tools::agent_spawning::get_agent_result_schema());
     all_schemas.push(crate::edge_tools::agent_messaging::send_message_schema());

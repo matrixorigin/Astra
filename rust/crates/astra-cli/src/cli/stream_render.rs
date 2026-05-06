@@ -5805,6 +5805,8 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "list_dir" => format!("Listing: {preview}"),
         "grep" => format!("Grep: {preview}"),
         "glob" => format!("Glob: {preview}"),
+        "git" => format!("Git {preview}"),
+        // Legacy individual names (kept for old sessions/journal replay)
         "git_status" => "Git status".to_string(),
         "git_log" => format!("Git log {preview}"),
         "git_show" => format!("Git show {preview}"),
@@ -5837,6 +5839,13 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "lsp" => format!("LSP: {preview}"),
         "web_fetch" => format!("Fetching: {preview}"),
         "web_search" => format!("Searching web: \"{preview}\""),
+        "github" => format!("GitHub: {preview}"),
+        "memory" => format!("Memory: {preview}"),
+        "session" => format!("Session: {preview}"),
+        "mo" => format!("MO: {preview}"),
+        "agent" => format!("Agent: {preview}"),
+        "introspect" => "Introspecting…".to_string(),
+        // Legacy individual names
         "github_get_pr" => format!("Getting PR: {preview}"),
         "github_list_prs" => format!("Listing PRs: {preview}"),
         "github_get_issue" => format!("Getting issue: {preview}"),
