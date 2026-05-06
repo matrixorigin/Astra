@@ -315,10 +315,20 @@ fn last_pinned_tool_index(
     })
 }
 
-/// Place a single `cache_control` marker on the last non-system message,
-/// so the conversation prefix up to that point is cached across turns.
+/// Place a `cache_control` marker that maximizes prefix cache hits across
+/// turns in a growing conversation.
 ///
-/// If the last message's `content` is a string, it is upgraded to a
+/// **Strategy (Claude Code pattern):** mark the **second-to-last user message**
+/// — i.e. the user message from the *previous* turn. This makes the entire
+/// prefix (system + tools + history up to and including that user turn) stable
+/// across turns: turn N+1 appends new messages *after* the marker, so
+/// Anthropic's prefix-based cache still hits the full prefix from turn N.
+///
+/// **Fallback:** if there is only one user message (turn 1), the marker goes
+/// on the last non-system message (same as the legacy behaviour), because
+/// there is no "previous turn" yet.
+///
+/// If the target message's `content` is a string, it is upgraded to a
 /// content-block array with one `{type: "text", cache_control: …}` entry.
 /// If already an array, the marker is attached to the last block.
 ///
@@ -327,22 +337,83 @@ pub fn annotate_last_message_cache_breakpoint(messages: &mut [Value]) {
     if messages.is_empty() {
         return;
     }
-    let Some(last) = messages.iter_mut().rev().find(|m| {
-        m.get("role")
-            .and_then(Value::as_str)
-            .is_some_and(|r| r != "system")
-    }) else {
+
+    // Find the target: second-to-last user message, or last non-system
+    // message if there's only one user message.
+    let target_idx = find_cache_breakpoint_target(messages);
+    let Some(idx) = target_idx else {
         return;
     };
 
-    if last.get("content").is_some_and(Value::is_string) {
-        let text = last["content"].as_str().unwrap_or_default().to_string();
-        last["content"] = json!([{
+    apply_cache_control_to_message(&mut messages[idx]);
+}
+
+/// Determine which message index should receive the cache breakpoint.
+///
+/// Returns `None` if there are no non-system messages at all.
+fn find_cache_breakpoint_target(messages: &[Value]) -> Option<usize> {
+    // Collect indices of all user messages (non-system).
+    let user_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.get("role").and_then(Value::as_str) == Some("user"))
+        .map(|(i, _)| i)
+        .collect();
+
+    if user_indices.len() >= 2 {
+        // Mark the second-to-last user message. The entire prefix through
+        // this message (inclusive) is the "stable history" from previous
+        // turns. New messages appended after it won't break the cache.
+        let penultimate_user_idx = user_indices[user_indices.len() - 2];
+        // Actually place the marker on the last message BEFORE the current
+        // turn's user message. That's the assistant response (or tool result)
+        // that sits between the two user messages — the last thing from the
+        // previous turn.
+        let last_user_idx = *user_indices.last().unwrap();
+        // Walk backwards from last_user_idx to find the message just before it
+        // that isn't system.
+        let target = if last_user_idx > 0 {
+            last_user_idx - 1
+        } else {
+            penultimate_user_idx
+        };
+        Some(target)
+    } else {
+        // Only 1 user message (or none): fallback to last non-system message.
+        messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, m)| {
+                m.get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|r| r != "system")
+            })
+            .map(|(i, _)| i)
+    }
+}
+
+/// Apply `cache_control: ephemeral` to a single message.
+///
+/// For `user`/`assistant` messages with string content: upgrades to a
+/// content-block array with one `{type: "text", cache_control: …}` entry.
+/// For messages with array content: attaches to the last block.
+/// For `tool` messages (which must keep string content for downstream
+/// compatibility): places `cache_control` at the **message level** instead
+/// of inside content — Anthropic's API supports both forms.
+fn apply_cache_control_to_message(msg: &mut Value) {
+    let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
+    if role == "tool" {
+        // Tool messages: top-level cache_control (keeps content as string).
+        msg["cache_control"] = anthropic_ephemeral_cache_control();
+    } else if msg.get("content").is_some_and(Value::is_string) {
+        let text = msg["content"].as_str().unwrap_or_default().to_string();
+        msg["content"] = json!([{
             "type": "text",
             "text": text,
             "cache_control": anthropic_ephemeral_cache_control(),
         }]);
-    } else if let Some(arr) = last.get_mut("content").and_then(Value::as_array_mut) {
+    } else if let Some(arr) = msg.get_mut("content").and_then(Value::as_array_mut) {
         if let Some(last_block) = arr.last_mut() {
             last_block["cache_control"] = anthropic_ephemeral_cache_control();
         }
@@ -350,9 +421,9 @@ pub fn annotate_last_message_cache_breakpoint(messages: &mut [Value]) {
 }
 
 /// Attach `cache_reference: <tool_call_id>` to every `role: "tool"` message
-/// that sits **before** the last message carrying a `cache_control` marker.
-/// The Anthropic API uses this to short-circuit replaying tool results whose
-/// content hasn't changed since the cached snapshot.
+/// at or before the last message carrying a `cache_control` marker. These
+/// tool results are part of the cached prefix — the `cache_reference` tells
+/// Anthropic's API to skip re-processing their content on cache hits.
 ///
 /// No-op if no message carries `cache_control` (nothing to reference against).
 pub fn annotate_tool_result_cache_references(messages: &mut [Value]) {
@@ -366,7 +437,9 @@ pub fn annotate_tool_result_cache_references(messages: &mut [Value]) {
         return;
     };
 
-    for msg in messages.iter_mut().take(last_cc_idx) {
+    // Include the marker-bearing message itself (it may be a tool message
+    // when the marker sits on the last message of the previous turn).
+    for msg in messages.iter_mut().take(last_cc_idx + 1) {
         if msg.get("role").and_then(Value::as_str) != Some("tool") {
             continue;
         }
@@ -425,7 +498,7 @@ fn ensure_content_array(msg: &mut Value) {
     msg["content"] = json!([{ "type": "text", "text": text }]);
 }
 
-fn message_has_cache_control(msg: &Value) -> bool {
+pub fn message_has_cache_control(msg: &Value) -> bool {
     // Top-level cache_control is preserved for forward compatibility: the
     // legacy runtime helper checked it before block-level, and any future
     // caller that places markers at the message level must still be
@@ -621,15 +694,15 @@ mod tests {
     }
 
     #[test]
-    fn annotate_last_message_cache_breakpoint_upgrades_string_content() {
+    fn cache_breakpoint_single_user_message_marks_it_directly() {
+        // Turn 1: only one user message → fallback to marking the last
+        // non-system message (same as legacy behaviour).
         let mut msgs = vec![
             json!({"role": "system", "content": "sys"}),
             json!({"role": "user", "content": "hi"}),
         ];
         annotate_last_message_cache_breakpoint(&mut msgs);
-        // system untouched
         assert_eq!(msgs[0]["content"], "sys");
-        // user content upgraded to block array with cache_control
         let arr = msgs[1]["content"].as_array().expect("content is array");
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["type"], "text");
@@ -638,7 +711,133 @@ mod tests {
     }
 
     #[test]
-    fn annotate_last_message_cache_breakpoint_marks_last_block_of_array() {
+    fn cache_breakpoint_multi_turn_marks_before_last_user() {
+        // Multi-turn: [user1, assistant1, user2] → marker on assistant1
+        // (the last message from the previous turn). This makes prefix
+        // [system + user1 + assistant1] stable across future turns.
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "turn 1 question"}),
+            json!({"role": "assistant", "content": "turn 1 answer"}),
+            json!({"role": "user", "content": "turn 2 question"}),
+        ];
+        annotate_last_message_cache_breakpoint(&mut msgs);
+        // system untouched
+        assert_eq!(msgs[0]["content"], "sys");
+        // user1 untouched
+        assert_eq!(msgs[1]["content"], "turn 1 question");
+        // assistant1 gets the marker (it's the message just before the last user)
+        let arr = msgs[2]["content"].as_array().expect("assistant content upgraded");
+        assert_eq!(arr[0]["cache_control"], json!({"type": "ephemeral"}));
+        // user2 (current turn) has NO marker
+        assert_eq!(msgs[3]["content"], "turn 2 question");
+    }
+
+    #[test]
+    fn cache_breakpoint_multi_turn_with_tool_results() {
+        // Real pattern: [user1, assistant(tool_call), tool_result, user2, assistant2, user3]
+        // Marker should go on assistant2 (message before user3 = last user).
+        let mut msgs = vec![
+            json!({"role": "user", "content": "turn 1"}),
+            json!({"role": "assistant", "tool_calls": [{"id":"c1"}]}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "result"}),
+            json!({"role": "user", "content": "turn 2"}),
+            json!({"role": "assistant", "content": "answer 2"}),
+            json!({"role": "user", "content": "turn 3"}),
+        ];
+        annotate_last_message_cache_breakpoint(&mut msgs);
+        // Marker on msgs[4] (assistant "answer 2" — just before last user)
+        let arr = msgs[4]["content"].as_array().expect("assistant2 upgraded");
+        assert_eq!(arr[0]["cache_control"], json!({"type": "ephemeral"}));
+        // msgs[5] (current user) has no marker
+        assert_eq!(msgs[5]["content"], "turn 3");
+        // msgs[0..4] have no marker
+        assert!(msgs[0]["content"].is_string());
+        assert!(msgs[3]["content"].is_string());
+    }
+
+    #[test]
+    fn cache_breakpoint_prefix_grows_monotonically_across_turns() {
+        // Simulate 3 turns of a conversation. Each turn should produce a
+        // longer cacheable prefix than the previous — never shrink.
+        let mut turn1 = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "q1"}),
+        ];
+        annotate_last_message_cache_breakpoint(&mut turn1);
+        let marker1_idx = turn1
+            .iter()
+            .position(|m| message_has_cache_control(m))
+            .expect("turn 1 must have marker");
+
+        let mut turn2 = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": "a1"}),
+            json!({"role": "user", "content": "q2"}),
+        ];
+        annotate_last_message_cache_breakpoint(&mut turn2);
+        let marker2_idx = turn2
+            .iter()
+            .position(|m| message_has_cache_control(m))
+            .expect("turn 2 must have marker");
+
+        let mut turn3 = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": "a1"}),
+            json!({"role": "user", "content": "q2"}),
+            json!({"role": "assistant", "content": "a2"}),
+            json!({"role": "user", "content": "q3"}),
+        ];
+        annotate_last_message_cache_breakpoint(&mut turn3);
+        let marker3_idx = turn3
+            .iter()
+            .position(|m| message_has_cache_control(m))
+            .expect("turn 3 must have marker");
+
+        // Prefix grows: marker position advances each turn
+        assert!(
+            marker2_idx > marker1_idx,
+            "turn 2 prefix must be larger than turn 1"
+        );
+        assert!(
+            marker3_idx > marker2_idx,
+            "turn 3 prefix must be larger than turn 2"
+        );
+    }
+
+    #[test]
+    fn cache_breakpoint_turn2_prefix_includes_turn1_entirely() {
+        // The critical invariant: everything in turn 1's payload that was
+        // BEFORE the marker in turn 1 must be IDENTICAL AND BEFORE the
+        // marker in turn 2. This is what makes prefix caching work.
+        let system = json!({"role": "system", "content": "sys"});
+        let user1 = json!({"role": "user", "content": "q1"});
+        let asst1 = json!({"role": "assistant", "content": "a1"});
+        let user2 = json!({"role": "user", "content": "q2"});
+
+        let mut turn1_msgs = vec![system.clone(), user1.clone()];
+        annotate_last_message_cache_breakpoint(&mut turn1_msgs);
+
+        let mut turn2_msgs = vec![system.clone(), user1.clone(), asst1.clone(), user2.clone()];
+        annotate_last_message_cache_breakpoint(&mut turn2_msgs);
+
+        // Turn 2's cacheable prefix: everything up to and including the marker.
+        let marker2_idx = turn2_msgs
+            .iter()
+            .position(|m| message_has_cache_control(m))
+            .unwrap();
+        // The prefix [0..=marker2_idx] must contain the exact same system + user1
+        // that turn 1 had. The marker in turn 2 is on asst1 (index 2).
+        assert_eq!(marker2_idx, 2, "marker on assistant = msg[2]");
+        // system + user1 are byte-identical (they have no marker on them in turn 2)
+        assert_eq!(turn2_msgs[0], system);
+        assert_eq!(turn2_msgs[1], user1);
+    }
+
+    #[test]
+    fn cache_breakpoint_marks_last_block_of_array_content() {
         let mut msgs = vec![json!({
             "role": "assistant",
             "content": [
@@ -653,10 +852,10 @@ mod tests {
     }
 
     #[test]
-    fn annotate_last_message_cache_breakpoint_noop_on_system_only() {
+    fn cache_breakpoint_noop_on_system_only() {
         let mut msgs = vec![json!({"role": "system", "content": "sys"})];
         annotate_last_message_cache_breakpoint(&mut msgs);
-        assert_eq!(msgs[0]["content"], "sys"); // unchanged
+        assert_eq!(msgs[0]["content"], "sys");
     }
 
     #[test]

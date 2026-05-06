@@ -1297,27 +1297,31 @@ mod tests {
             messages[1]["content"], original_tool_content,
             "request annotation must not rewrite full local tool content"
         );
+        // Both tool messages get cache_reference (they're at or before the marker).
         assert_eq!(messages[1]["cache_reference"], "tool-1");
         assert_eq!(messages[2]["cache_reference"], "tool-2");
 
+        // The cache_control marker is on messages[2] (last msg before the
+        // current-turn user message) — this is the "prefix boundary" that
+        // Anthropic's cache keys on.
+        let marker_msg = &messages[2];
+        assert!(
+            astra_turn_core::context_serializer::message_has_cache_control(marker_msg),
+            "cache_control marker must be on the last message before the current user turn"
+        );
+
+        // cache_edits go on the last user message (API directive, separate
+        // from the prefix marker).
         let user_blocks = messages[3]["content"]
             .as_array()
-            .expect("user content blocks");
+            .expect("user content upgraded to blocks for cache_edits");
         let cache_edits = user_blocks
             .iter()
             .find(|block| block.get("type").and_then(Value::as_str) == Some("cache_edits"))
-            .expect("cache_edits block");
+            .expect("cache_edits block on last user");
         assert_eq!(
             cache_edits["edits"],
             json!([{ "type": "delete", "cache_reference": "tool-2" }])
-        );
-        let cache_control_blocks = user_blocks
-            .iter()
-            .filter(|block| block.get("cache_control").is_some())
-            .count();
-        assert_eq!(
-            cache_control_blocks, 1,
-            "there must be exactly one message-level cache_control marker"
         );
     }
 
