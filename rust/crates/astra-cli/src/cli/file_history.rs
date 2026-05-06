@@ -1,0 +1,1260 @@
+//! Transparent filesystem checkpoint system.
+//!
+//! Before every file-mutating tool call, this module snapshots affected files
+//! so users can undo changes via `/undo`. Works without git — pure filesystem.
+
+use std::collections::VecDeque;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+/// Maximum number of snapshots retained before evicting the oldest.
+const DEFAULT_MAX_SNAPSHOTS: usize = 100;
+
+/// Maximum per-file size captured in a checkpoint. Larger files are
+/// skipped: 100 snapshots × gigabyte-sized artifacts would blow out
+/// `~/.astra/file-history/` quickly. Undo for skipped files is a no-op —
+/// the tool reports the skip rather than silently losing the state.
+pub const MAX_CHECKPOINT_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
+
+/// What we know about a file at the moment a checkpoint was taken.
+///
+/// A checkpointed file is in exactly one of three states; encoding them
+/// as an ADT (rather than two correlated `Option<String>` + `PathBuf`
+/// fields) makes it impossible for a consumer to miss a case.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum FileBackupState {
+    /// File existed pre-checkpoint and its bytes were copied to `backup_path`.
+    /// Undo restores from this path.
+    Captured { backup_path: PathBuf },
+    /// File did NOT exist pre-checkpoint. No bytes to keep. Undo means
+    /// "delete the version we wrote on top of nothing".
+    AbsentBefore,
+    /// File existed but was not captured (typically oversize). Undo is
+    /// a no-op; the reason is surfaced to the user so they know undo
+    /// didn't fully restore them to the checkpoint state.
+    Skipped { reason: String },
+}
+
+/// A single file backup within a snapshot.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct FileBackup {
+    /// The original file path that was backed up.
+    pub original_path: PathBuf,
+    /// What happened when we tried to capture this file — see FileBackupState.
+    pub state: FileBackupState,
+}
+
+/// A point-in-time snapshot of one or more files.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    /// Monotonically increasing snapshot identifier.
+    pub id: usize,
+    /// When the snapshot was taken.
+    pub timestamp: Instant,
+    /// The files captured in this snapshot.
+    pub files: Vec<FileBackup>,
+}
+
+/// Summary of differences since a snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiffStats {
+    pub files_changed: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+}
+
+/// Outcome of a revert/undo operation, for surfacing to the user.
+///
+/// `reverted` is the list of paths that were successfully restored (or
+/// deleted, if they didn't exist pre-checkpoint). `skipped` is the list
+/// of paths that were in the snapshot but whose pre-state was never
+/// captured (typically because the file exceeded `MAX_CHECKPOINT_FILE_BYTES`);
+/// the CURRENT file state was left alone. The user needs to see this so
+/// they don't assume undo fully restored everything.
+///
+/// `#[non_exhaustive]` so we can add fields (e.g. `errors_per_path`) later.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct RevertReport {
+    pub reverted: Vec<PathBuf>,
+    pub skipped: Vec<SkippedEntry>,
+}
+
+/// A file that was intentionally not restored by a revert, with the
+/// reason so the user knows why (typically an oversize file whose
+/// pre-state was never captured to `~/.astra/file-history/`).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct SkippedEntry {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+impl RevertReport {
+    pub fn has_skips(&self) -> bool {
+        !self.skipped.is_empty()
+    }
+}
+
+/// Manages per-session file history with bounded snapshot storage.
+#[derive(Debug)]
+pub struct FileHistory {
+    backup_dir: PathBuf,
+    snapshots: VecDeque<Snapshot>,
+    max_snapshots: usize,
+    next_id: usize,
+}
+
+impl FileHistory {
+    /// Create a new `FileHistory` backed by `~/.astra/file-history/<session_id>/`.
+    pub fn new(session_id: &str) -> Self {
+        let base = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".astra")
+            .join("file-history")
+            .join(session_id);
+        Self {
+            backup_dir: base,
+            snapshots: VecDeque::new(),
+            max_snapshots: DEFAULT_MAX_SNAPSHOTS,
+            next_id: 0,
+        }
+    }
+
+    /// Create with a custom backup directory (useful for testing).
+    pub fn with_backup_dir(backup_dir: PathBuf, max_snapshots: usize) -> Self {
+        Self {
+            backup_dir,
+            snapshots: VecDeque::new(),
+            max_snapshots,
+            next_id: 0,
+        }
+    }
+
+    /// Take a checkpoint of the given file paths before mutation.
+    ///
+    /// Returns the snapshot ID on success.
+    ///
+    /// On failure, snap_id and snap_dir are rolled back so the next
+    /// checkpoint reuses the id (no gaps) and no orphan directory is
+    /// left on disk. This keeps the snapshot numbering dense and
+    /// `~/.astra/file-history/` tidy even under repeated failures.
+    pub fn checkpoint(&mut self, paths: &[&Path]) -> io::Result<usize> {
+        let snap_id = self.next_id;
+        let snap_dir = self.backup_dir.join(format!("snap_{snap_id}"));
+
+        // Wrap the fallible work in a closure so both error and success
+        // paths share the id/dir bookkeeping cleanup.
+        let result: io::Result<Vec<FileBackup>> = Self::build_file_backups(&snap_dir, paths);
+
+        let file_backups = match result {
+            Ok(v) => v,
+            Err(e) => {
+                // Best-effort cleanup of whatever was created under snap_dir.
+                // If it fails, the leftover will be picked up on next process
+                // start if there's ever a sweep; we don't fail louder here.
+                let _ = fs::remove_dir_all(&snap_dir);
+                return Err(e);
+            }
+        };
+
+        // Commit: only now do we advance next_id and retain the snap_dir.
+        self.next_id += 1;
+
+        let snapshot = Snapshot {
+            id: snap_id,
+            timestamp: Instant::now(),
+            files: file_backups,
+        };
+
+        self.snapshots.push_back(snapshot);
+
+        // Evict oldest if over capacity.
+        while self.snapshots.len() > self.max_snapshots {
+            if let Some(old) = self.snapshots.pop_front() {
+                let old_dir = self.backup_dir.join(format!("snap_{}", old.id));
+                let _ = fs::remove_dir_all(&old_dir);
+            }
+        }
+
+        Ok(snap_id)
+    }
+
+    /// Do all the fallible work of a checkpoint inside a snap_dir:
+    /// create the directory, iterate paths, stat/copy/skip each file.
+    /// Returns on first error so the caller can clean snap_dir and roll
+    /// back snap_id.
+    fn build_file_backups(snap_dir: &Path, paths: &[&Path]) -> io::Result<Vec<FileBackup>> {
+        fs::create_dir_all(snap_dir)?;
+
+        let mut file_backups = Vec::with_capacity(paths.len());
+        for &path in paths {
+            let relative = sanitize_path_for_backup(path);
+            let backup_path = snap_dir.join(&relative);
+
+            let state = if !path.exists() {
+                FileBackupState::AbsentBefore
+            } else {
+                // Size-guard: refuse to capture oversize files. 100 snapshots
+                // of a 500MB binary would blow out ~/.astra/file-history/.
+                //
+                // fs::metadata can race with path.exists() above. If it fails,
+                // propagate — do NOT silently claim size=0, which would pass
+                // the limit check and then fail in fs::copy with a misleading
+                // error. (Review-critical #3: fail-closed over fail-open.)
+                let size = fs::metadata(path)
+                    .map_err(|e| {
+                        io::Error::new(e.kind(), format!("stat {}: {}", path.display(), e))
+                    })?
+                    .len();
+                if size > MAX_CHECKPOINT_FILE_BYTES {
+                    let reason = format!(
+                        "size {size} bytes exceeds checkpoint limit {MAX_CHECKPOINT_FILE_BYTES}"
+                    );
+                    tracing::warn!(
+                        target: "astra_cli::file_history",
+                        path = %path.display(),
+                        size_bytes = size,
+                        limit_bytes = MAX_CHECKPOINT_FILE_BYTES,
+                        "file too large to checkpoint — undo for this file will be a no-op"
+                    );
+                    FileBackupState::Skipped { reason }
+                } else {
+                    if let Some(parent) = backup_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::copy(path, &backup_path)?;
+                    FileBackupState::Captured { backup_path }
+                }
+            };
+
+            file_backups.push(FileBackup {
+                original_path: path.to_path_buf(),
+                state,
+            });
+        }
+        Ok(file_backups)
+    }
+
+    /// Apply a snapshot's backups to the filesystem, building a report of
+    /// what was restored vs what was intentionally skipped (oversize files
+    /// that were never captured).
+    fn apply_snapshot(snapshot: &Snapshot) -> io::Result<RevertReport> {
+        let mut report = RevertReport::default();
+        for backup in &snapshot.files {
+            match &backup.state {
+                FileBackupState::Skipped { reason } => {
+                    // Pre-state was never captured (typically oversize).
+                    // Leave the current file alone; tell the user.
+                    report.skipped.push(SkippedEntry {
+                        path: backup.original_path.clone(),
+                        reason: reason.clone(),
+                    });
+                }
+                FileBackupState::Captured { backup_path } => {
+                    if let Some(parent) = backup.original_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::copy(backup_path, &backup.original_path)?;
+                    report.reverted.push(backup.original_path.clone());
+                }
+                FileBackupState::AbsentBefore => {
+                    // File was created after the checkpoint — undo means delete.
+                    if backup.original_path.exists() {
+                        fs::remove_file(&backup.original_path)?;
+                    }
+                    report.reverted.push(backup.original_path.clone());
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Revert all files in a specific snapshot to their backed-up state.
+    pub fn revert_to(&self, snapshot_id: usize) -> io::Result<RevertReport> {
+        let snapshot = self
+            .snapshots
+            .iter()
+            .find(|s| s.id == snapshot_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("snapshot {snapshot_id} not found"),
+                )
+            })?;
+        Self::apply_snapshot(snapshot)
+    }
+
+    /// Revert the most recent snapshot and remove it from history.
+    ///
+    /// Returns `None` if no snapshots exist, else `Some(report)`.
+    pub fn undo_last(&mut self) -> io::Result<Option<RevertReport>> {
+        let snapshot = match self.snapshots.pop_back() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let snap_id = snapshot.id;
+        let report = Self::apply_snapshot(&snapshot)?;
+
+        // Clean up the snapshot directory.
+        let snap_dir = self.backup_dir.join(format!("snap_{snap_id}"));
+        let _ = fs::remove_dir_all(&snap_dir);
+
+        Ok(Some(report))
+    }
+
+    /// Compute diff statistics between a snapshot and the current file state.
+    pub fn diff_since(&self, snapshot_id: usize) -> io::Result<DiffStats> {
+        let snapshot = self
+            .snapshots
+            .iter()
+            .find(|s| s.id == snapshot_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("snapshot {snapshot_id} not found"),
+                )
+            })?;
+
+        let mut stats = DiffStats::default();
+
+        for backup in &snapshot.files {
+            let (backup_content, was_captured) = match &backup.state {
+                FileBackupState::Skipped { .. } => {
+                    // We never captured this file's prior state — can't diff.
+                    continue;
+                }
+                FileBackupState::Captured { backup_path } => {
+                    (fs::read_to_string(backup_path).ok(), true)
+                }
+                FileBackupState::AbsentBefore => (None, false),
+            };
+            let _ = was_captured; // reserved for future: distinguish "empty pre" from "absent pre"
+            let current_content = if backup.original_path.exists() {
+                fs::read_to_string(&backup.original_path).ok()
+            } else {
+                None
+            };
+
+            match (&backup_content, &current_content) {
+                (Some(old), Some(new)) => {
+                    if old != new {
+                        stats.files_changed += 1;
+                        let (ins, del) = line_diff_counts(old, new);
+                        stats.insertions += ins;
+                        stats.deletions += del;
+                    }
+                }
+                (None, Some(new)) => {
+                    // File was newly created.
+                    stats.files_changed += 1;
+                    stats.insertions += new.lines().count();
+                }
+                (Some(old), None) => {
+                    // File was deleted.
+                    stats.files_changed += 1;
+                    stats.deletions += old.lines().count();
+                }
+                (None, None) => {
+                    // Both non-existent — no change.
+                }
+            }
+        }
+
+        Ok(stats)
+    }
+
+    /// List all snapshots currently tracked.
+    pub fn list_snapshots(&self) -> &VecDeque<Snapshot> {
+        &self.snapshots
+    }
+
+    /// Return number of snapshots stored.
+    pub fn snapshot_count(&self) -> usize {
+        self.snapshots.len()
+    }
+}
+
+/// Compute a simple line-based diff: (insertions, deletions).
+fn line_diff_counts(old: &str, new: &str) -> (usize, usize) {
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+
+    // Simple diff approximation: count lines present only in new (insertions)
+    // and lines present only in old (deletions).
+    let mut insertions = 0;
+    let mut deletions = 0;
+
+    // Use a basic LCS-approximation via matching.
+    let mut old_used = vec![false; old_lines.len()];
+    let mut new_used = vec![false; new_lines.len()];
+
+    // First pass: mark exact matches in order (greedy).
+    let mut oi = 0;
+    let mut ni = 0;
+    while oi < old_lines.len() && ni < new_lines.len() {
+        if old_lines[oi] == new_lines[ni] {
+            old_used[oi] = true;
+            new_used[ni] = true;
+            oi += 1;
+            ni += 1;
+        } else {
+            // Try to find old_lines[oi] in new_lines ahead.
+            let found_in_new = new_lines[ni..]
+                .iter()
+                .position(|l| *l == old_lines[oi])
+                .map(|p| p + ni);
+            let found_in_old = old_lines[oi..]
+                .iter()
+                .position(|l| *l == new_lines[ni])
+                .map(|p| p + oi);
+
+            match (found_in_new, found_in_old) {
+                (Some(npos), Some(opos)) => {
+                    // Pick the closer match.
+                    if (npos - ni) <= (opos - oi) {
+                        // Lines ni..npos are insertions.
+                        ni = npos;
+                    } else {
+                        // Lines oi..opos are deletions.
+                        oi = opos;
+                    }
+                }
+                (Some(npos), None) => {
+                    ni = npos;
+                }
+                (None, Some(opos)) => {
+                    oi = opos;
+                }
+                (None, None) => {
+                    oi += 1;
+                    ni += 1;
+                }
+            }
+        }
+    }
+
+    for (i, used) in old_used.iter().enumerate() {
+        if !*used {
+            // Check if this line appears in any unused new line (unmatched).
+            let _ = i; // suppress unused warning
+            deletions += 1;
+        }
+    }
+    for used in &new_used {
+        if !*used {
+            insertions += 1;
+        }
+    }
+
+    (insertions, deletions)
+}
+
+/// Convert an absolute path to a sanitized relative path for the backup tree.
+///
+/// Cross-platform:
+/// - Unix roots (`/`) are stripped.
+/// - Windows drive prefixes (`C:`, `\\?\UNC`) are encoded as a leading
+///   pseudo-component (`_drive_c`, `_unc_<server>_<share>`) so files on
+///   different drives don't collide under the same backup tree.
+/// - `..` and `.` components are dropped; `Normal` components are kept.
+/// - Components are joined using the platform-native separator via
+///   `PathBuf::push`, not a hardcoded `/`.
+fn sanitize_path_for_backup(path: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(p) => match p.kind() {
+                Prefix::Disk(b) | Prefix::VerbatimDisk(b) => {
+                    out.push(format!("_drive_{}", (b as char).to_ascii_lowercase()));
+                }
+                Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                    out.push(format!(
+                        "_unc_{}_{}",
+                        server.to_string_lossy(),
+                        share.to_string_lossy()
+                    ));
+                }
+                Prefix::DeviceNS(name) | Prefix::Verbatim(name) => {
+                    out.push(format!("_dev_{}", name.to_string_lossy()));
+                }
+            },
+            Component::RootDir | Component::CurDir | Component::ParentDir => {}
+            Component::Normal(s) => out.push(s),
+        }
+    }
+    out
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn make_history(tmp: &TempDir) -> FileHistory {
+        FileHistory::with_backup_dir(tmp.path().join("backups"), DEFAULT_MAX_SNAPSHOTS)
+    }
+
+    // ── P0-2: size guard ──────────────────────────────────────────────────
+    //
+    // Without a size cap, checkpointing a large binary can blow out disk.
+    // 100 snapshots × 500MB = 50GB in ~/.astra. Skip oversize files
+    // deliberately and record why, so undo clearly says "not captured".
+
+    #[test]
+    fn oversize_file_is_skipped_and_reason_recorded() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = FileHistory::with_backup_dir(tmp.path().join("backups"), 10);
+
+        let big = tmp.path().join("big.bin");
+        // Write more than MAX_CHECKPOINT_FILE_BYTES so the guard fires.
+        let oversize = (MAX_CHECKPOINT_FILE_BYTES + 1) as usize;
+        fs::write(&big, vec![0u8; oversize]).unwrap();
+
+        let snap_id = history.checkpoint(&[big.as_path()]).unwrap();
+        let snap = &history.list_snapshots()[0];
+        assert_eq!(snap.id, snap_id);
+        assert_eq!(snap.files.len(), 1);
+        let backup = &snap.files[0];
+        match &backup.state {
+            FileBackupState::Skipped { reason } => {
+                assert!(
+                    reason.contains("size") || reason.contains("bytes"),
+                    "skip reason should mention size: {reason}"
+                );
+            }
+            other => panic!("oversize file must be Skipped, got {other:?}"),
+        }
+        // No backup file on disk for the skipped entry.
+    }
+
+    #[test]
+    fn under_limit_file_is_captured_normally() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let small = tmp.path().join("small.txt");
+        fs::write(&small, b"hello").unwrap();
+
+        history.checkpoint(&[small.as_path()]).unwrap();
+        let backup = &history.list_snapshots()[0].files[0];
+        match &backup.state {
+            FileBackupState::Captured { backup_path } => assert!(backup_path.exists()),
+            other => panic!("small file should be Captured, got {other:?}"),
+        }
+    }
+
+    // ── P3-1: symlink + permission unhappy paths ──────────────────────────
+    //
+    // The review noted file_history had zero coverage for symlinks and
+    // permission-denied. Neither is fixed by this commit — we just prove
+    // current behavior so a future refactor that breaks it is caught.
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_is_followed_and_captures_target_content() {
+        // Checkpoint of a symlink captures the TARGET file's bytes via
+        // fs::copy — which follows symlinks on Unix. Regression guard:
+        // if the implementation is later changed to preserve the link
+        // itself (e.g. using fs::hard_link or explicit symlink_metadata),
+        // restore semantics change and callers must be updated.
+        use std::os::unix::fs as unix_fs;
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let target = tmp.path().join("real.txt");
+        fs::write(&target, "target content").unwrap();
+        let link = tmp.path().join("link.txt");
+        unix_fs::symlink(&target, &link).unwrap();
+
+        history.checkpoint(&[link.as_path()]).unwrap();
+        let snap = &history.list_snapshots()[0];
+        assert_eq!(snap.files.len(), 1);
+        let backup = &snap.files[0];
+        let backup_path = match &backup.state {
+            FileBackupState::Captured { backup_path } => backup_path,
+            other => panic!("symlink to small file should be Captured, got {other:?}"),
+        };
+        let captured = fs::read(backup_path).unwrap();
+        assert_eq!(
+            captured, b"target content",
+            "fs::copy follows symlink, so backup holds the target's bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_symlink_surfaces_error_not_silent_success() {
+        use std::os::unix::fs as unix_fs;
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let missing = tmp.path().join("does_not_exist");
+        let link = tmp.path().join("dangling");
+        unix_fs::symlink(&missing, &link).unwrap();
+
+        // path.exists() returns false for dangling symlinks — we treat
+        // them as "did not exist" rather than erroring. Regression guard
+        // that we don't silently treat them as existing-and-capturable.
+        let snap_id = history.checkpoint(&[link.as_path()]).unwrap();
+        let snap = &history.list_snapshots()[0];
+        assert_eq!(snap.id, snap_id);
+        let backup = &snap.files[0];
+        assert!(
+            matches!(backup.state, FileBackupState::AbsentBefore),
+            "dangling symlink must map to AbsentBefore, not a bogus Captured"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readable_but_unreadable_mode_surfaces_error() {
+        // File exists but we can't read it (mode 0000). Capture must
+        // not silently succeed with empty bytes.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let p = tmp.path().join("locked.txt");
+        fs::write(&p, "secret").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = history.checkpoint(&[p.as_path()]);
+        // Restore perms first so TempDir::drop can clean up.
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "fs::copy of unreadable file must bubble up the io::Error, \
+             not swallow it and record a bogus backup"
+        );
+    }
+
+    // ── review-critical #3: metadata error must propagate, not become size=0 ──
+    //
+    // The P0-2 fix used `fs::metadata(path).map(|m| m.len()).unwrap_or(0)`.
+    // If metadata fails (EACCES on a racy TOCTOU), size=0 passes the
+    // limit check, then fs::copy fails with a different error — operator
+    // sees "copy failed" when the real cause is unreadable metadata.
+    //
+    // We can't easily produce a metadata-fails-but-copy-succeeds case
+    // in a portable test (they share the same underlying stat). Instead:
+    // assert that the checkpoint function returns io::Error (not Ok with
+    // a bogus silent-skipped entry) when we deliberately feed it a
+    // path-in-unreadable-parent-dir on Unix — the `existed` check fails
+    // too, which is the correct fail-closed behavior, verified below.
+
+    // ── R2-#2: snap_id / snap_dir must not leak on mid-checkpoint error ──
+    //
+    // Previous impl allocated snap_id + created snap_dir BEFORE iterating
+    // files. If metadata/copy failed on file N, the `?` aborted — leaving
+    // snap_dir on disk AND leaving next_id advanced past a never-used id.
+    // After fix: on error, snap_id is rolled back and snap_dir cleaned up.
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_failure_rolls_back_snap_id_and_cleans_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let backup_root = tmp.path().join("backups");
+        let mut history = FileHistory::with_backup_dir(backup_root.clone(), 10);
+
+        // First: a successful checkpoint to establish next_id = 1.
+        let ok = tmp.path().join("ok.txt");
+        fs::write(&ok, "fine").unwrap();
+        let id0 = history.checkpoint(&[ok.as_path()]).unwrap();
+        assert_eq!(id0, 0);
+
+        // Now set up a file whose fs::copy will fail: make backup_root
+        // read-only so create_dir_all of the per-snap subdir fails.
+        fs::set_permissions(&backup_root, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let ok2 = tmp.path().join("ok2.txt");
+        fs::write(&ok2, "also fine").unwrap();
+        let result = history.checkpoint(&[ok2.as_path()]);
+        // Restore perms so TempDir cleanup works regardless of outcome.
+        fs::set_permissions(&backup_root, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "checkpoint that can't create snap_dir must return Err"
+        );
+
+        // Next snap_id must NOT have been burned. Successful checkpoint
+        // after recovery should get id=1, not id=2.
+        let id1 = history.checkpoint(&[ok.as_path()]).unwrap();
+        assert_eq!(
+            id1, 1,
+            "next_id must not advance when checkpoint failed — no wasted ids"
+        );
+
+        // There must be no leaked `snap_1` directory from the failed call.
+        let leaked = backup_root.join("snap_1");
+        // The current successful id=1 is allowed to exist (it's ours);
+        // what we care about is that no PREVIOUS snap_1 was left dangling.
+        // After id1==1 is used, the dir now legitimately exists for THIS
+        // snapshot. So really we check that history.list_snapshots() has
+        // exactly 2 entries (ids 0 and 1), not 3.
+        let _ = leaked; // used above to build path; kept for doc clarity
+        assert_eq!(
+            history.list_snapshots().len(),
+            2,
+            "failed checkpoint must not leave a phantom snapshot entry"
+        );
+    }
+
+    // Tautological test removed (R2 review): the old
+    // `metadata_err_is_wrapped_with_path_context` just applied `format!()`
+    // to a synthetic io::Error and read the result back — it never called
+    // production `checkpoint()` and would have passed even if the `?`
+    // propagation were deleted. The `path_in_unreadable_parent_...` test
+    // below and the `partial_failure_rolls_back_...` test above are the
+    // real regression guards for stat-failure handling.
+
+    #[cfg(unix)]
+    #[test]
+    fn path_in_unreadable_parent_is_treated_as_nonexistent_not_silently_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let restricted = tmp.path().join("locked_dir");
+        fs::create_dir(&restricted).unwrap();
+        let child = restricted.join("target.txt");
+        fs::write(&child, "some content").unwrap();
+        // Remove read+exec on the parent dir so metadata(child) fails.
+        fs::set_permissions(&restricted, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Checkpoint: path.exists() returns false (can't stat),
+        // branch records existed=false, not size=0 bogus skip.
+        let snap_id = history.checkpoint(&[child.as_path()]).unwrap();
+        // Restore perms first so TempDir drop can clean up.
+        fs::set_permissions(&restricted, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let snap = &history.list_snapshots()[0];
+        assert_eq!(snap.id, snap_id);
+        let backup = &snap.files[0];
+        // Invariant: we did NOT silently claim to have captured a file
+        // whose metadata we couldn't even read. The only valid states
+        // here are AbsentBefore (correct fail-closed) or Skipped with a
+        // reason that's NOT the "size 0 bytes" lie.
+        match &backup.state {
+            FileBackupState::AbsentBefore => {}
+            FileBackupState::Skipped { reason } => {
+                assert!(
+                    !reason.starts_with("size 0 bytes exceeds"),
+                    "stat failure must not masquerade as \"size 0 bytes exceeds limit\": {reason}"
+                );
+            }
+            FileBackupState::Captured { .. } => {
+                panic!("never pretend we captured a file whose metadata failed")
+            }
+        }
+    }
+
+    // ── R3-P1-#3: undo surfaces skipped files to the caller ───────────────
+    //
+    // Previously revert_to/undo_last returned io::Result<()> — no way for
+    // a caller (CLI or UI layer) to tell the user "we couldn't restore
+    // big.bin because it was too large to checkpoint". Now both return
+    // a RevertReport listing reverted + skipped paths with reasons.
+
+    #[test]
+    fn undo_report_lists_reverted_paths() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+        let p1 = tmp.path().join("a.txt");
+        let p2 = tmp.path().join("b.txt");
+        fs::write(&p1, "one").unwrap();
+        fs::write(&p2, "two").unwrap();
+        history.checkpoint(&[p1.as_path(), p2.as_path()]).unwrap();
+        fs::write(&p1, "ONE").unwrap();
+        fs::write(&p2, "TWO").unwrap();
+
+        let report = history.undo_last().unwrap().unwrap();
+        assert!(!report.has_skips());
+        assert_eq!(report.reverted.len(), 2);
+        assert!(report.reverted.contains(&p1));
+        assert!(report.reverted.contains(&p2));
+    }
+
+    #[test]
+    fn undo_report_lists_skipped_with_reason() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = FileHistory::with_backup_dir(tmp.path().join("backups"), 10);
+        let normal = tmp.path().join("small.txt");
+        let big = tmp.path().join("big.bin");
+        fs::write(&normal, "ok").unwrap();
+        fs::write(&big, vec![0u8; (MAX_CHECKPOINT_FILE_BYTES + 1) as usize]).unwrap();
+        history
+            .checkpoint(&[normal.as_path(), big.as_path()])
+            .unwrap();
+
+        let report = history.undo_last().unwrap().unwrap();
+        assert_eq!(report.reverted, vec![normal.clone()]);
+        assert!(report.has_skips(), "big file must appear in skipped list");
+        assert_eq!(report.skipped.len(), 1);
+        let entry = &report.skipped[0];
+        assert_eq!(entry.path, big);
+        assert!(
+            entry.reason.contains("size") || entry.reason.contains("bytes"),
+            "reason should describe why (size): {}",
+            entry.reason
+        );
+    }
+
+    #[test]
+    fn revert_to_returns_same_report_shape() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+        let p = tmp.path().join("x.txt");
+        fs::write(&p, "v1").unwrap();
+        let snap_id = history.checkpoint(&[p.as_path()]).unwrap();
+        fs::write(&p, "v2").unwrap();
+
+        let report = history.revert_to(snap_id).unwrap();
+        assert_eq!(report.reverted, vec![p]);
+        assert!(report.skipped.is_empty());
+    }
+
+    #[test]
+    fn revert_of_skipped_file_is_noop_not_error() {
+        // Undo must NOT try to restore a skipped file (its backup_path
+        // doesn't exist) — should leave the current file untouched.
+        let tmp = TempDir::new().unwrap();
+        let mut history = FileHistory::with_backup_dir(tmp.path().join("backups"), 10);
+
+        let big = tmp.path().join("big.bin");
+        let oversize = (MAX_CHECKPOINT_FILE_BYTES + 1) as usize;
+        fs::write(&big, vec![0u8; oversize]).unwrap();
+
+        history.checkpoint(&[big.as_path()]).unwrap();
+        // User modifies the big file post-checkpoint.
+        fs::write(&big, b"modified").unwrap();
+
+        // Revert must not error and must not touch the (skipped) file.
+        history.undo_last().unwrap();
+        let content = fs::read(&big).unwrap();
+        assert_eq!(
+            content, b"modified",
+            "skipped files must be left alone on undo (we never had their state)"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_creates_backup_for_existing_file() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        // Create a file to checkpoint.
+        let file_path = tmp.path().join("hello.txt");
+        fs::write(&file_path, "original content").unwrap();
+
+        let snap_id = history.checkpoint(&[file_path.as_path()]).unwrap();
+        assert_eq!(snap_id, 0);
+
+        // Verify backup exists and has correct content.
+        let snapshots = history.list_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].files.len(), 1);
+        let backup_path = match &snapshots[0].files[0].state {
+            FileBackupState::Captured { backup_path } => backup_path.clone(),
+            other => panic!("expected Captured state, got {other:?}"),
+        };
+        let backup_content = fs::read_to_string(&backup_path).unwrap();
+        assert_eq!(backup_content, "original content");
+    }
+
+    #[test]
+    fn test_checkpoint_for_new_file_records_non_existence() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        // Path that does NOT exist.
+        let file_path = tmp.path().join("nonexistent.txt");
+        let snap_id = history.checkpoint(&[file_path.as_path()]).unwrap();
+        assert_eq!(snap_id, 0);
+
+        let snapshots = history.list_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert!(
+            matches!(snapshots[0].files[0].state, FileBackupState::AbsentBefore),
+            "non-existent file must be AbsentBefore, not a bogus capture"
+        );
+    }
+
+    #[test]
+    fn test_revert_restores_file_content() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let file_path = tmp.path().join("data.txt");
+        fs::write(&file_path, "version 1").unwrap();
+
+        let snap_id = history.checkpoint(&[file_path.as_path()]).unwrap();
+
+        // Mutate the file.
+        fs::write(&file_path, "version 2").unwrap();
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "version 2");
+
+        // Revert.
+        history.revert_to(snap_id).unwrap();
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "version 1");
+    }
+
+    #[test]
+    fn test_revert_of_new_file_deletes_it() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let file_path = tmp.path().join("new_file.txt");
+        // File doesn't exist — take a checkpoint.
+        let snap_id = history.checkpoint(&[file_path.as_path()]).unwrap();
+
+        // Now "create" the file (simulating the tool creating it).
+        fs::write(&file_path, "new content").unwrap();
+        assert!(file_path.exists());
+
+        // Revert should delete it.
+        history.revert_to(snap_id).unwrap();
+        assert!(!file_path.exists());
+    }
+
+    #[test]
+    fn test_multiple_snapshots_tracked_correctly() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let file_path = tmp.path().join("multi.txt");
+        fs::write(&file_path, "v1").unwrap();
+        let id0 = history.checkpoint(&[file_path.as_path()]).unwrap();
+
+        fs::write(&file_path, "v2").unwrap();
+        let id1 = history.checkpoint(&[file_path.as_path()]).unwrap();
+
+        fs::write(&file_path, "v3").unwrap();
+        let id2 = history.checkpoint(&[file_path.as_path()]).unwrap();
+
+        assert_eq!(id0, 0);
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        assert_eq!(history.snapshot_count(), 3);
+
+        // Revert to v1 (snapshot 0).
+        history.revert_to(id0).unwrap();
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "v1");
+
+        // Revert to v2 (snapshot 1).
+        history.revert_to(id1).unwrap();
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "v2");
+
+        // Revert to v3 (snapshot 2).
+        history.revert_to(id2).unwrap();
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "v3");
+    }
+
+    #[test]
+    fn test_max_snapshot_eviction() {
+        let tmp = TempDir::new().unwrap();
+        let max = 5;
+        let mut history = FileHistory::with_backup_dir(tmp.path().join("backups"), max);
+
+        let file_path = tmp.path().join("evict.txt");
+        fs::write(&file_path, "content").unwrap();
+
+        // Create max + 3 snapshots.
+        for _ in 0..(max + 3) {
+            history.checkpoint(&[file_path.as_path()]).unwrap();
+        }
+
+        // Should only have `max` snapshots retained.
+        assert_eq!(history.snapshot_count(), max);
+
+        // The oldest snapshot IDs (0, 1, 2) should have been evicted.
+        let remaining_ids: Vec<usize> = history.list_snapshots().iter().map(|s| s.id).collect();
+        assert_eq!(remaining_ids, vec![3, 4, 5, 6, 7]);
+
+        // Evicted snapshot directories should be cleaned up.
+        assert!(!tmp.path().join("backups/snap_0").exists());
+        assert!(!tmp.path().join("backups/snap_1").exists());
+        assert!(!tmp.path().join("backups/snap_2").exists());
+    }
+
+    #[test]
+    fn test_undo_last_returns_most_recent_and_removes() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let file_path = tmp.path().join("undo.txt");
+        fs::write(&file_path, "original").unwrap();
+        history.checkpoint(&[file_path.as_path()]).unwrap();
+
+        fs::write(&file_path, "modified").unwrap();
+        history.checkpoint(&[file_path.as_path()]).unwrap();
+
+        fs::write(&file_path, "latest").unwrap();
+
+        // Undo last should revert to "modified" state.
+        let report = history.undo_last().unwrap().expect("snap present");
+        assert!(report.reverted.contains(&file_path));
+        assert!(report.skipped.is_empty());
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "modified");
+        assert_eq!(history.snapshot_count(), 1);
+
+        // Undo again should revert to "original".
+        let report = history.undo_last().unwrap().expect("snap present");
+        assert!(report.reverted.contains(&file_path));
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "original");
+        assert_eq!(history.snapshot_count(), 0);
+
+        // Undo with nothing left should return None.
+        let undone = history.undo_last().unwrap();
+        assert!(undone.is_none());
+    }
+
+    #[test]
+    fn test_diff_stats_computation() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let file_path = tmp.path().join("diff.txt");
+        fs::write(&file_path, "line1\nline2\nline3\n").unwrap();
+
+        let snap_id = history.checkpoint(&[file_path.as_path()]).unwrap();
+
+        // Modify the file.
+        fs::write(&file_path, "line1\nmodified\nline3\nnew_line\n").unwrap();
+
+        let stats = history.diff_since(snap_id).unwrap();
+        assert_eq!(stats.files_changed, 1);
+        // "line2" deleted, "modified" and "new_line" inserted.
+        assert!(stats.insertions > 0);
+        assert!(stats.deletions > 0);
+    }
+
+    #[test]
+    fn test_diff_stats_new_file_created() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let file_path = tmp.path().join("brand_new.txt");
+        let snap_id = history.checkpoint(&[file_path.as_path()]).unwrap();
+
+        // Create the file after checkpoint.
+        fs::write(&file_path, "hello\nworld\n").unwrap();
+
+        let stats = history.diff_since(snap_id).unwrap();
+        assert_eq!(stats.files_changed, 1);
+        assert_eq!(stats.insertions, 2);
+        assert_eq!(stats.deletions, 0);
+    }
+
+    #[test]
+    fn test_diff_stats_file_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let file_path = tmp.path().join("to_delete.txt");
+        fs::write(&file_path, "a\nb\nc\n").unwrap();
+
+        let snap_id = history.checkpoint(&[file_path.as_path()]).unwrap();
+
+        // Delete the file.
+        fs::remove_file(&file_path).unwrap();
+
+        let stats = history.diff_since(snap_id).unwrap();
+        assert_eq!(stats.files_changed, 1);
+        assert_eq!(stats.insertions, 0);
+        assert_eq!(stats.deletions, 3);
+    }
+
+    #[test]
+    fn test_diff_stats_no_change() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let file_path = tmp.path().join("stable.txt");
+        fs::write(&file_path, "unchanged").unwrap();
+
+        let snap_id = history.checkpoint(&[file_path.as_path()]).unwrap();
+
+        let stats = history.diff_since(snap_id).unwrap();
+        assert_eq!(stats.files_changed, 0);
+        assert_eq!(stats.insertions, 0);
+        assert_eq!(stats.deletions, 0);
+    }
+
+    #[test]
+    fn test_revert_nonexistent_snapshot_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let history = make_history(&tmp);
+
+        let result = history.revert_to(999);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_diff_nonexistent_snapshot_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let history = make_history(&tmp);
+
+        let result = history.diff_since(42);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_checkpoint_missing_file_gracefully_handled() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        // The path doesn't exist — should record AbsentBefore without error.
+        let missing = tmp.path().join("ghost.txt");
+        let snap_id = history.checkpoint(&[missing.as_path()]).unwrap();
+        assert_eq!(snap_id, 0);
+
+        let snapshots = history.list_snapshots();
+        assert!(matches!(
+            snapshots[0].files[0].state,
+            FileBackupState::AbsentBefore
+        ));
+    }
+
+    #[test]
+    fn test_multiple_files_in_single_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let file_a = tmp.path().join("a.txt");
+        let file_b = tmp.path().join("b.txt");
+        fs::write(&file_a, "aaa").unwrap();
+        fs::write(&file_b, "bbb").unwrap();
+
+        let snap_id = history
+            .checkpoint(&[file_a.as_path(), file_b.as_path()])
+            .unwrap();
+
+        // Modify both.
+        fs::write(&file_a, "AAA").unwrap();
+        fs::write(&file_b, "BBB").unwrap();
+
+        // Revert should restore both.
+        history.revert_to(snap_id).unwrap();
+        assert_eq!(fs::read_to_string(&file_a).unwrap(), "aaa");
+        assert_eq!(fs::read_to_string(&file_b).unwrap(), "bbb");
+    }
+
+    #[test]
+    fn test_undo_last_for_new_file_deletes_it() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let file_path = tmp.path().join("created_by_tool.txt");
+        history.checkpoint(&[file_path.as_path()]).unwrap();
+
+        // Simulate tool creating the file.
+        fs::write(&file_path, "tool output").unwrap();
+        assert!(file_path.exists());
+
+        // Undo should delete the file.
+        history.undo_last().unwrap();
+        assert!(!file_path.exists());
+    }
+
+    #[test]
+    fn test_snapshot_ids_monotonically_increase() {
+        let tmp = TempDir::new().unwrap();
+        let mut history = make_history(&tmp);
+
+        let file_path = tmp.path().join("seq.txt");
+        fs::write(&file_path, "x").unwrap();
+
+        let id0 = history.checkpoint(&[file_path.as_path()]).unwrap();
+        let id1 = history.checkpoint(&[file_path.as_path()]).unwrap();
+        let id2 = history.checkpoint(&[file_path.as_path()]).unwrap();
+
+        assert_eq!(id0, 0);
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+    }
+
+    #[test]
+    fn test_sanitize_path_for_backup() {
+        let path = Path::new("/home/user/project/src/main.rs");
+        let sanitized = sanitize_path_for_backup(path);
+        assert_eq!(
+            sanitized,
+            PathBuf::from("home")
+                .join("user")
+                .join("project")
+                .join("src")
+                .join("main.rs")
+        );
+    }
+
+    // ── R3-P1-#2: cross-platform path sanitization ────────────────────────
+    //
+    // `components.join("/")` was hardcoded. On Windows, `C:\Users\Alice\x.txt`
+    // has a Prefix(C:) + RootDir + Normal(Users)...; the Prefix is dropped
+    // by our Normal-only filter, so files on C:\ and D:\ would collide in
+    // the backup tree. Use MAIN_SEPARATOR (platform-native) and encode the
+    // Prefix explicitly so drive letters don't get silently stripped.
+
+    #[test]
+    fn sanitize_uses_platform_native_separator() {
+        // The sanitized path should be a valid native PathBuf (accepts
+        // both `/` and `\` on Windows; `/` on Unix). What matters is that
+        // iterating its components yields each piece separately.
+        let path = Path::new("/a/b/c.txt");
+        let sanitized = sanitize_path_for_backup(path);
+        let pieces: Vec<&std::ffi::OsStr> = sanitized
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pieces,
+            vec![
+                std::ffi::OsStr::new("a"),
+                std::ffi::OsStr::new("b"),
+                std::ffi::OsStr::new("c.txt"),
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sanitize_preserves_windows_drive_letter() {
+        // C:\x.txt and D:\x.txt must not collide in the backup tree.
+        let p_c = Path::new(r"C:\Users\Alice\file.txt");
+        let p_d = Path::new(r"D:\Users\Alice\file.txt");
+        let s_c = sanitize_path_for_backup(p_c);
+        let s_d = sanitize_path_for_backup(p_d);
+        assert_ne!(
+            s_c, s_d,
+            "C-drive and D-drive files with the same relative path MUST \
+             produce distinct backup paths: both collapsed to {:?}",
+            s_c
+        );
+    }
+
+    #[test]
+    fn sanitize_is_idempotent_for_relative_input() {
+        // A relative input shouldn't grow extra components.
+        let p = Path::new("src/main.rs");
+        let s = sanitize_path_for_backup(p);
+        assert_eq!(s, PathBuf::from("src").join("main.rs"));
+    }
+}

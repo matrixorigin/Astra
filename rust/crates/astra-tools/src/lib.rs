@@ -9,9 +9,15 @@
 
 pub mod memoria;
 pub mod schemas;
+pub mod web_fetch;
 pub mod web_search;
 
 pub mod build_test;
+// code_exec uses Unix domain sockets for the script↔host RPC bridge.
+// On Windows it would need named pipes; that integration is deferred.
+// Gate the module itself so the crate still builds cross-platform.
+#[cfg(unix)]
+pub mod code_exec;
 pub mod code_intel;
 pub mod config_tool;
 pub mod env_tools;
@@ -868,6 +874,61 @@ mod tests {
             "memory_search removed — use memory_retrieve"
         );
         assert!(names.contains(&"memory_profile".into()));
+    }
+
+    #[test]
+    fn spawn_agent_and_get_agent_result_registered_together() {
+        // Regression guard: if spawn_agent is in the catalog but
+        // get_agent_result is not, the LLM can launch background
+        // agents but never retrieve their results — silent data loss.
+        // See session dc285027 for the production failure.
+        let schemas = schemas::all_tool_schemas();
+        let names: Vec<String> = schemas
+            .iter()
+            .filter_map(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(String::from)
+            })
+            .collect();
+        let has_spawn = names.contains(&"spawn_agent".into());
+        let has_result = names.contains(&"get_agent_result".into());
+        assert_eq!(
+            has_spawn, has_result,
+            "spawn_agent and get_agent_result must be registered together \
+             (spawn={has_spawn}, get_result={has_result}) — otherwise the LLM \
+             can launch background agents whose results are unreachable"
+        );
+    }
+
+    #[test]
+    fn spawn_agent_default_is_sync() {
+        // Default background=false: sync execution is safer. LLM opts in
+        // to background only when it understands it MUST call
+        // get_agent_result(agent_id) later. See session dc285027.
+        let schemas = schemas::all_tool_schemas();
+        let spawn = schemas
+            .iter()
+            .find(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    == Some("spawn_agent")
+            })
+            .expect("spawn_agent schema present");
+        let default = spawn
+            .get("function")
+            .and_then(|f| f.get("parameters"))
+            .and_then(|p| p.get("properties"))
+            .and_then(|p| p.get("background"))
+            .and_then(|b| b.get("default"))
+            .and_then(|v| v.as_bool());
+        assert_eq!(
+            default,
+            Some(false),
+            "spawn_agent.background must default to false — see session dc285027"
+        );
     }
 
     #[test]

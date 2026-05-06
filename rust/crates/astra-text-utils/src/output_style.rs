@@ -268,9 +268,11 @@ pub fn get_output_style(name: &str) -> Option<&'static OutputStyle> {
     })
 }
 
-/// Get the current output style. Always returns None (no env-controlled style).
+/// Get the current output style from `ASTRA_OUTPUT_STYLE`.
 pub fn current_output_style() -> Option<&'static OutputStyle> {
-    None
+    std::env::var("ASTRA_OUTPUT_STYLE")
+        .ok()
+        .and_then(|name| get_output_style(name.trim()))
 }
 
 /// List all available output styles.

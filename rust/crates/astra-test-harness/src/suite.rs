@@ -665,6 +665,8 @@ mod tests {
             tools_used: tools.iter().map(|s| s.to_string()).collect(),
             completion_tokens: 0,
             prompt_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_tokens: 0,
             duration_ms: 12,
             turn_rounds: 1,
             cache_hits: 0,

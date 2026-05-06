@@ -42,12 +42,12 @@ impl ToolExecutor {
                     encoded_query, num_results
                 ),
                 "Google",
-                "Use web_fetch with this URL to get search results. Parse the HTML for links.",
+                "Fetch this URL with web_fetch. The response includes extracted content in Markdown and navigation links.",
             ),
             "duckduckgo" => (
                 format!("https://html.duckduckgo.com/html/?q={}", encoded_query),
                 "DuckDuckGo",
-                "Use web_fetch with this URL. Results are in HTML format with class='result'.",
+                "Fetch this URL with web_fetch. The response includes extracted content in Markdown and navigation links.",
             ),
             "bing" => (
                 format!(
@@ -55,7 +55,7 @@ impl ToolExecutor {
                     encoded_query, num_results
                 ),
                 "Bing",
-                "Use web_fetch with this URL to get search results.",
+                "Fetch this URL with web_fetch. The response includes extracted content in Markdown and navigation links.",
             ),
             "wikipedia" => (
                 format!(
@@ -64,7 +64,7 @@ impl ToolExecutor {
                     num_results.min(20)
                 ),
                 "Wikipedia",
-                "This returns JSON directly. Format: [query, [titles], [descriptions], [urls]]",
+                "Fetch this URL with web_fetch. Returns JSON directly: [query, [titles], [descriptions], [urls]]",
             ),
             "github" => (
                 format!(
@@ -72,7 +72,7 @@ impl ToolExecutor {
                     encoded_query
                 ),
                 "GitHub",
-                "Use web_fetch with this URL. Consider using gh CLI for better structured results.",
+                "Fetch this URL with web_fetch. The response includes extracted content in Markdown and navigation links. Consider gh CLI for structured results.",
             ),
             other => {
                 return serde_json::json!({
@@ -110,7 +110,7 @@ impl ToolExecutor {
             "search_url": search_url,
             "tip": result_tip,
             "alternatives": alternatives,
-            "usage": "Call web_fetch with the search_url to retrieve results. For Wikipedia, results are JSON. For others, parse the HTML response."
+            "usage": "Call web_fetch with the search_url. The response is structured JSON with a content field (Markdown) and links array."
         }).to_string()
     }
 }

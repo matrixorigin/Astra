@@ -47,6 +47,8 @@ pub(super) async fn try_connect_matrixone() -> Option<sqlx::Pool<sqlx::MySql>> {
     sqlx::mysql::MySqlPoolOptions::new()
         .max_connections(2)
         .acquire_timeout(std::time::Duration::from_secs(3))
+        .idle_timeout(std::time::Duration::from_secs(60))
+        .test_before_acquire(true)
         .connect(&url)
         .await
         .ok()

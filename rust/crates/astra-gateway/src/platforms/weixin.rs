@@ -17,6 +17,7 @@ use super::{
     PlatformAdapter, emit_adapter_health,
 };
 use crate::dedup::MessageDeduplicator;
+use crate::store::GatewayStore;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -92,7 +93,7 @@ const TYPING_TICKET_TTL_SECS: u64 = 600; // 10 minutes
 
 pub struct WeixinAdapter {
     config: WeixinConfig,
-    pool: Option<sqlx::MySqlPool>,
+    store: Option<Arc<dyn GatewayStore>>,
     msg_tx: mpsc::Sender<InboundMessage>,
     msg_rx: Mutex<mpsc::Receiver<InboundMessage>>,
     context_tokens: ContextTokens,
@@ -105,7 +106,7 @@ impl WeixinAdapter {
         let (tx, rx) = mpsc::channel(256);
         Self {
             config: config.resolve(),
-            pool: None,
+            store: None,
             msg_tx: tx,
             msg_rx: Mutex::new(rx),
             context_tokens: Arc::new(Mutex::new(HashMap::new())),
@@ -114,8 +115,8 @@ impl WeixinAdapter {
         }
     }
 
-    pub fn with_pool(mut self, pool: sqlx::MySqlPool) -> Self {
-        self.pool = Some(pool);
+    pub fn with_store(mut self, store: Arc<dyn GatewayStore>) -> Self {
+        self.store = Some(store);
         self
     }
 
@@ -126,9 +127,8 @@ impl WeixinAdapter {
             validate_weixin_credentials(&self.config.token, &self.config.account_id)?;
             return Ok(());
         }
-        if let Some(ref pool) = self.pool
-            && let Ok(Some(cred)) =
-                crate::storage::get_credential(pool, "weixin", "default", "bot_token").await
+        if let Some(ref store) = self.store
+            && let Ok(Some(cred)) = store.get_credential("weixin", "default", "bot_token").await
         {
             if let Some(token) = cred.credentials["token"].as_str() {
                 if validate_restored_token(token) {
@@ -342,12 +342,13 @@ impl PlatformAdapter for WeixinAdapter {
         let config = self.config.clone();
         let msg_tx = self.msg_tx.clone();
         let tokens = self.context_tokens.clone();
-        let pool = self.pool.clone();
+        let store = self.store.clone();
 
         // Restore persisted context_tokens from DB
-        if let Some(ref pool) = pool
-            && let Ok(Some(cred)) =
-                crate::storage::get_credential(pool, "weixin", "default", "context_tokens").await
+        if let Some(ref store) = store
+            && let Ok(Some(cred)) = store
+                .get_credential("weixin", "default", "context_tokens")
+                .await
         {
             let restored = restore_context_tokens_value(&cred.credentials);
             let mut t = tokens.lock().await;
@@ -363,9 +364,8 @@ impl PlatformAdapter for WeixinAdapter {
             let mut dedup = MessageDeduplicator::new();
             let mut shutdown_rx = shutdown_tx.subscribe();
             // Restore sync cursor from DB
-            let mut sync_buf = if let Some(ref pool) = pool
-                && let Ok(Some(cred)) =
-                    crate::storage::get_credential(pool, "weixin", "default", "sync_buf").await
+            let mut sync_buf = if let Some(ref store) = store
+                && let Ok(Some(cred)) = store.get_credential("weixin", "default", "sync_buf").await
                 && let Some(s) = restore_sync_buf_value(&cred.credentials)
             {
                 tracing::info!("restored sync cursor from DB");
@@ -377,7 +377,7 @@ impl PlatformAdapter for WeixinAdapter {
 
             loop {
                 tokio::select! {
-                    result = poll_updates(&client, &config, &mut sync_buf, &msg_tx, &mut dedup, &tokens, &pool) => {
+                    result = poll_updates(&client, &config, &mut sync_buf, &msg_tx, &mut dedup, &tokens, &store) => {
                         match result {
                             Ok(()) => { consecutive_errors = 0; }
                             Err(e) => {
@@ -454,7 +454,31 @@ impl PlatformAdapter for WeixinAdapter {
             tokens.get(chat_id).cloned().unwrap_or_default()
         };
 
-        send_text_with_retry(&self.config.token, chat_id, &text, &context_token).await
+        match send_text_with_retry(&self.config.token, chat_id, &text, &context_token).await {
+            Ok(new_ct) => {
+                if let Some(ct) = new_ct {
+                    let mut tokens = self.context_tokens.lock().await;
+                    tokens.insert(chat_id.to_string(), ct);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if e.starts_with(FATAL_SEND_ERROR_PREFIX) {
+                    // Fatal send (stale session even after tokenless retry) —
+                    // evict the dead token so the NEXT inbound message's
+                    // context_token takes over. Without this the cache
+                    // keeps serving the dead value forever.
+                    let mut tokens = self.context_tokens.lock().await;
+                    if tokens.remove(chat_id).is_some() {
+                        tracing::warn!(
+                            chat_id = %crate::runner::truncate_chars(chat_id, 12),
+                            "evicted dead context_token after fatal send"
+                        );
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
     async fn send_typing(&self, chat_id: &str) -> Result<(), String> {
@@ -559,7 +583,7 @@ async fn poll_updates(
     msg_tx: &mpsc::Sender<InboundMessage>,
     dedup: &mut MessageDeduplicator,
     context_tokens: &ContextTokens,
-    pool: &Option<sqlx::MySqlPool>,
+    store: &Option<Arc<dyn GatewayStore>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{ILINK_BASE_URL}/ilink/bot/getupdates");
 
@@ -606,16 +630,16 @@ async fn poll_updates(
     // Update sync cursor and persist to DB
     if let Some(buf) = data["get_updates_buf"].as_str() {
         *sync_buf = buf.to_string();
-        if let Some(pool) = pool {
-            let _ = crate::storage::save_credential(
-                pool,
-                "weixin",
-                "default",
-                "sync_buf",
-                &serde_json::Value::String(buf.to_string()),
-                None,
-            )
-            .await;
+        if let Some(store) = store {
+            let _ = store
+                .save_credential(
+                    "weixin",
+                    "default",
+                    "sync_buf",
+                    &serde_json::Value::String(buf.to_string()),
+                    None,
+                )
+                .await;
         }
     }
 
@@ -656,20 +680,14 @@ async fn poll_updates(
                 let mut tokens = context_tokens.lock().await;
                 tokens.insert(from_id.clone(), ct.to_string());
                 // Persist to DB for crash recovery
-                if let Some(pool) = pool {
+                if let Some(store) = store {
                     let map: serde_json::Value = tokens
                         .iter()
                         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                         .collect();
-                    let _ = crate::storage::save_credential(
-                        pool,
-                        "weixin",
-                        "default",
-                        "context_tokens",
-                        &map,
-                        None,
-                    )
-                    .await;
+                    let _ = store
+                        .save_credential("weixin", "default", "context_tokens", &map, None)
+                        .await;
                 }
             }
 
@@ -700,6 +718,7 @@ async fn poll_updates(
                 msg_id,
                 chat_type,
                 reply_token: None,
+                route_override: None,
             };
 
             match deliver_weixin_inbound(msg_tx, inbound) {
@@ -773,16 +792,105 @@ fn extract_text(msg: &Value) -> String {
 const SEND_MAX_RETRIES: usize = 3;
 const SEND_RETRY_DELAY_MS: u64 = 1500;
 
+/// What to do when iLink returns a non-zero error code.
+///
+/// Semantics (observed from production traffic):
+/// - iLink returns bare `{"ret":-2}` with NO `errmsg` field for stale
+///   sessions (same condition as `errcode=-14`, despite the different code).
+/// - iLink returns `-2` with an explicit `freq` errmsg for rate limiting.
+/// - Any other `-2` with a specific errmsg is genuinely "something else
+///   went wrong, give up for this call" — retrying won't change the
+///   outcome and clogs the outbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendRetryAction {
+    /// Retry the same request without context_token (session expired).
+    DropContextToken,
+    /// Back off longer — server indicated rate limiting.
+    RateLimitBackoff,
+    /// Normal retry with delay (keep context_token).
+    NormalRetry,
+    /// Do NOT retry — the error is terminal for this message. Caller
+    /// should give up and surface the failure immediately instead of
+    /// blocking the outbox on repeated attempts that will all fail.
+    /// Triggered when we've already tried tokenless and still hit
+    /// stale-session-shape errors — the problem is outside our control
+    /// (e.g. peer logged out, token revoked).
+    Fatal,
+}
+
+/// Return true when the errmsg "looks like" iLink's stale-session signal:
+/// missing, empty, or the default "unknown" / "unknown error" we see when
+/// the response body is just `{"ret":-2}`. Same semantic as errcode=-14.
+fn is_stale_session_errmsg(errmsg: &str) -> bool {
+    let trimmed = errmsg.trim().to_lowercase();
+    trimmed.is_empty() || trimmed == "unknown" || trimmed == "unknown error"
+}
+
+/// Decide how to handle an iLink send error. Pure function — no I/O.
+fn classify_send_error(
+    errcode: i64,
+    errmsg: &str,
+    already_tried_tokenless: bool,
+) -> SendRetryAction {
+    // -14 = explicit session expiry.
+    if errcode == -14 {
+        return if already_tried_tokenless {
+            // Tokenless retry still session-expired → nothing left to try.
+            // The peer's session is gone; our outbound is blocked until
+            // they send us something new.
+            SendRetryAction::Fatal
+        } else {
+            SendRetryAction::DropContextToken
+        };
+    }
+    // -2 + explicit rate-limit errmsg (`freq`) → backoff.
+    if errcode == -2 && errmsg.contains("freq") {
+        return SendRetryAction::RateLimitBackoff;
+    }
+    // -2 with no/empty/"unknown" errmsg = stale session.
+    // iLink returns bare `{"ret":-2}` in this case; we parse errmsg as
+    // the default placeholder "unknown". Treat as session-expired.
+    if errcode == -2 && is_stale_session_errmsg(errmsg) {
+        return if already_tried_tokenless {
+            // We already tried without context_token and still got -2 stale.
+            // The peer's session is dead. Do NOT NormalRetry — that would
+            // waste retry budget on the same hopeless attempt.
+            SendRetryAction::Fatal
+        } else {
+            SendRetryAction::DropContextToken
+        };
+    }
+    // -2 with some other specific errmsg: genuinely an iLink error we
+    // don't understand. Retry once in case it's transient — but only
+    // while we still have a token. Tokenless + unknown -2 = give up.
+    if errcode == -2 && already_tried_tokenless {
+        return SendRetryAction::Fatal;
+    }
+    // Everything else: normal retry with original context_token
+    SendRetryAction::NormalRetry
+}
+
+/// Send a text message via iLink API with retries.
+/// Returns the updated context_token from the response (if any).
 async fn send_text_with_retry(
     token: &str,
     chat_id: &str,
     text: &str,
     context_token: &str,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let client = reqwest::Client::new();
     let url = format!("{ILINK_BASE_URL}/ilink/bot/sendmessage");
     let mut last_error = String::new();
     let mut tried_tokenless = false;
+
+    if text.is_empty() {
+        return Err("empty message text".into());
+    }
+    tracing::debug!(
+        text_len = text.len(),
+        has_context_token = !context_token.is_empty(),
+        "iLink send attempt"
+    );
 
     for attempt in 0..=SEND_MAX_RETRIES {
         let ct = if tried_tokenless { "" } else { context_token };
@@ -834,24 +942,41 @@ async fn send_text_with_retry(
             .or_else(|| data["ret"].as_i64())
             .unwrap_or(0);
         if errcode == 0 {
-            return Ok(());
+            let new_ct = data["context_token"]
+                .as_str()
+                .or_else(|| data["data"]["context_token"].as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            return Ok(new_ct);
         }
 
         let errmsg = data["errmsg"].as_str().unwrap_or("unknown");
+        tracing::debug!(errcode, errmsg, body = %data, "iLink send response (non-zero)");
         last_error = format!("{errcode}: {errmsg}");
 
-        // Session expired — retry without context_token
-        if errcode == -14 && !tried_tokenless {
-            tracing::debug!("send got -14, retrying without context_token");
-            tried_tokenless = true;
-            continue;
-        }
-
-        // Rate limit — backoff
-        if errcode == -2 && errmsg.contains("freq") {
-            tracing::warn!("send rate limited, backing off");
-            tokio::time::sleep(std::time::Duration::from_millis(SEND_RETRY_DELAY_MS * 3)).await;
-            continue;
+        match classify_send_error(errcode, errmsg, tried_tokenless) {
+            SendRetryAction::DropContextToken => {
+                tracing::debug!(errcode, "retrying without context_token");
+                tried_tokenless = true;
+                continue;
+            }
+            SendRetryAction::RateLimitBackoff => {
+                tracing::warn!("send rate limited, backing off");
+                tokio::time::sleep(std::time::Duration::from_millis(SEND_RETRY_DELAY_MS * 3)).await;
+                continue;
+            }
+            SendRetryAction::Fatal => {
+                // Tokenless retry still stale (or some other unrecoverable
+                // -14/-2). Do NOT keep hammering the same failing request.
+                tracing::warn!(
+                    errcode,
+                    tried_tokenless,
+                    "iLink send unrecoverable — giving up this attempt \
+                     so the outbox isn't blocked on a dead session"
+                );
+                return Err(FATAL_SEND_ERROR_PREFIX.to_string() + &format!("{errcode}: {errmsg}"));
+            }
+            SendRetryAction::NormalRetry => {}
         }
 
         // Other error — retry with delay
@@ -862,6 +987,13 @@ async fn send_text_with_retry(
 
     Err(format!("weixin send failed after retries: {last_error}"))
 }
+
+/// Prefix on Err(...) from send_text_with_retry that tells the caller this
+/// is a fatal/unrecoverable send failure (stale session that even tokenless
+/// retry couldn't resolve). The PlatformAdapter impl recognizes this prefix
+/// and evicts the cached context_token so the next inbound message
+/// refreshes it rather than reusing the dead one.
+const FATAL_SEND_ERROR_PREFIX: &str = "weixin fatal send: ";
 
 async fn fetch_typing_ticket(
     token: &str,
@@ -1237,6 +1369,7 @@ mod tests {
             msg_id: "msg-1".into(),
             chat_type: ChatType::DirectMessage,
             reply_token: None,
+            route_override: None,
         };
         tx.send(first).await.unwrap();
 
@@ -1248,6 +1381,7 @@ mod tests {
             msg_id: "msg-2".into(),
             chat_type: ChatType::DirectMessage,
             reply_token: None,
+            route_override: None,
         };
 
         assert_eq!(
@@ -1264,10 +1398,153 @@ mod tests {
         const { assert!(SEND_RETRY_DELAY_MS >= 1000) };
     }
 
+    // ── classify_send_error regression tests ───────────────────────
+
+    // Stale-session semantics:
+    //   ret=-2 with errmsg missing / empty / "unknown"/"unknown error"
+    //   = stale session (same bucket as errcode=-14).
+    // Our iLink responses are literally `{"ret":-2}` with no errmsg field,
+    // which we parse via .unwrap_or("unknown"). Both forms must map to
+    // DropContextToken (first try) or Fatal (second try) — never
+    // NormalRetry, which would waste the retry budget on a dead session.
+
+    #[test]
+    fn error_minus2_unknown_drops_context_token_once() {
+        // First attempt with "unknown" → drop token, retry once.
+        assert_eq!(
+            classify_send_error(-2, "unknown", false),
+            SendRetryAction::DropContextToken,
+        );
+    }
+
+    #[test]
+    fn error_minus2_empty_errmsg_treated_as_stale_session() {
+        // iLink returns `{"ret":-2}` with no errmsg field → parser default
+        // can be empty too. Same behavior as "unknown".
+        assert_eq!(
+            classify_send_error(-2, "", false),
+            SendRetryAction::DropContextToken,
+        );
+    }
+
+    #[test]
+    fn error_minus2_unknown_error_with_space_treated_as_stale_session() {
+        // Normalize: "unknown" (our default placeholder) and "unknown error"
+        // (with space, the form some iLink responses carry) both mean stale.
+        assert_eq!(
+            classify_send_error(-2, "unknown error", false),
+            SendRetryAction::DropContextToken,
+        );
+    }
+
+    #[test]
+    fn error_minus2_unknown_after_tokenless_is_fatal() {
+        // BUG FIX: we used to loop on NormalRetry here, burning the entire
+        // retry budget on doomed requests and blocking the outbox for
+        // seconds. Tokenless retry still getting -2 means the session is
+        // really dead — give up this call, let the next inbound refresh it.
+        assert_eq!(
+            classify_send_error(-2, "unknown", true),
+            SendRetryAction::Fatal,
+        );
+    }
+
+    #[test]
+    fn error_minus2_empty_after_tokenless_is_fatal() {
+        assert_eq!(classify_send_error(-2, "", true), SendRetryAction::Fatal,);
+    }
+
+    #[test]
+    fn error_minus2_freq_triggers_rate_limit_backoff() {
+        assert_eq!(
+            classify_send_error(-2, "freq limit exceeded", false),
+            SendRetryAction::RateLimitBackoff,
+        );
+    }
+
+    #[test]
+    fn error_minus2_freq_still_backoff_after_tokenless() {
+        // Rate-limit is a server-load signal, not a session signal.
+        // Whether or not we tried tokenless, backoff is the right response.
+        assert_eq!(
+            classify_send_error(-2, "freq exceeded", true),
+            SendRetryAction::RateLimitBackoff,
+        );
+    }
+
+    #[test]
+    fn error_minus14_drops_context_token_once() {
+        assert_eq!(
+            classify_send_error(-14, "session expired", false),
+            SendRetryAction::DropContextToken,
+        );
+    }
+
+    #[test]
+    fn error_minus14_is_fatal_after_tokenless() {
+        // BUG FIX: was NormalRetry, which is hopeless for -14.
+        assert_eq!(
+            classify_send_error(-14, "session expired", true),
+            SendRetryAction::Fatal,
+        );
+    }
+
+    #[test]
+    fn error_other_codes_normal_retry() {
+        // Unknown negative codes without context_token-affinity: maybe
+        // transient server blip, worth one more try.
+        assert_eq!(
+            classify_send_error(-1, "", false),
+            SendRetryAction::NormalRetry,
+        );
+        assert_eq!(
+            classify_send_error(-99, "server error", false),
+            SendRetryAction::NormalRetry,
+        );
+    }
+
+    #[test]
+    fn error_zero_would_not_reach_classify() {
+        // errcode 0 is success — classify is never called.
+        // But if it were, it should be normal retry (harmless).
+        assert_eq!(
+            classify_send_error(0, "", false),
+            SendRetryAction::NormalRetry,
+        );
+    }
+
+    #[test]
+    fn is_stale_session_errmsg_matches_known_shapes() {
+        assert!(is_stale_session_errmsg(""));
+        assert!(is_stale_session_errmsg("   "));
+        assert!(is_stale_session_errmsg("unknown"));
+        assert!(is_stale_session_errmsg("Unknown"));
+        assert!(is_stale_session_errmsg("unknown error"));
+        assert!(is_stale_session_errmsg("UNKNOWN ERROR"));
+    }
+
+    #[test]
+    fn is_stale_session_errmsg_rejects_specific_errors() {
+        assert!(!is_stale_session_errmsg("freq"));
+        assert!(!is_stale_session_errmsg("freq limit"));
+        assert!(!is_stale_session_errmsg("invalid token"));
+        assert!(!is_stale_session_errmsg("peer offline"));
+    }
+
     #[test]
     fn typing_ticket_ttl_reasonable() {
         const { assert!(TYPING_TICKET_TTL_SECS >= 300) };
         const { assert!(TYPING_TICKET_TTL_SECS <= 1800) };
+    }
+
+    #[test]
+    fn send_diagnostics_do_not_log_message_preview() {
+        let source = include_str!("weixin.rs");
+        let needle = concat!("text_", "preview");
+        assert!(
+            !source.contains(needle),
+            "send diagnostics must not log outbound message content previews"
+        );
     }
 
     #[test]

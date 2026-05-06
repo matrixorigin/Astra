@@ -80,6 +80,7 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "memory_purge",
     "memory_correct",
     "memory_profile",
+    // execute_code gated behind ASTRA_CODE_EXEC_UNSAFE=1 — opt-in only.
     "enter_plan_mode",
     "exit_plan_mode",
     "get_agent_info",
@@ -107,6 +108,26 @@ pub fn server_executor_tool_schemas() -> Vec<Value> {
 }
 
 pub fn all_tool_schemas() -> Vec<Value> {
+    all_tool_schemas_with_env(|k| std::env::var(k).ok())
+}
+
+/// Like `all_tool_schemas()` but reads env via a caller-supplied closure.
+/// Used for deterministic testing — set `ASTRA_CODE_EXEC_UNSAFE=1` to
+/// expose the `execute_code` tool, which runs Python scripts unsandboxed.
+pub fn all_tool_schemas_with_env<F: Fn(&str) -> Option<String>>(env: F) -> Vec<Value> {
+    let mut schemas = all_tool_schemas_core();
+    // execute_code is Unix-only (UDS RPC transport). On Windows the
+    // schema is hidden from the LLM — even if the env var is set.
+    #[cfg(unix)]
+    if env("ASTRA_CODE_EXEC_UNSAFE").as_deref() == Some("1") {
+        schemas.push(execute_code_schema());
+    }
+    #[cfg(not(unix))]
+    let _ = env; // suppress unused-param warning on non-unix builds
+    schemas
+}
+
+fn all_tool_schemas_core() -> Vec<Value> {
     vec![
         json!({
             "type": "function",
@@ -1145,13 +1166,15 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "web_fetch",
-                "description": "Fetch a URL and return its content (truncated to ~10KB by default). Use for reading web pages, APIs, documentation, or any HTTP resource. Safer and simpler than bash+curl. Set max_bytes to fetch more content.",
+                "description": "Fetch a URL and return structured JSON with metadata, extracted content (Markdown by default), and navigation links. Handles HTML-to-Markdown conversion, link discovery, and content truncation automatically.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "url": {"type": "string", "description": "URL to fetch (http:// or https://)"},
-                        "max_bytes": {"type": "integer", "description": "Max response size in bytes (default 10000)"},
-                        "timeout": {"type": "integer", "description": "Timeout in seconds (default 10)"}
+                        "format": {"type": "string", "enum": ["markdown", "text"], "description": "Output format for extracted content (default: markdown)"},
+                        "max_content": {"type": "integer", "description": "Max extracted content characters (default 80000)"},
+                        "timeout": {"type": "integer", "description": "Timeout in seconds (default 30)"},
+                        "max_links": {"type": "integer", "description": "Max navigation links to extract (default 25)"}
                     },
                     "required": ["url"]
                 }
@@ -1539,7 +1562,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "spawn_agent",
-                "description": "Launch a sub-agent for independent work. Types: explore, code-review, task, general-purpose.",
+                "description": "Launch a sub-agent for independent work. Types: explore, code-review, task, general-purpose. Returns the agent's result synchronously by default. Set background=true only when you have genuinely independent work to do in parallel — and you MUST then call get_agent_result(agent_id) to retrieve the result, or it will be lost.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1563,8 +1586,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         },
                         "background": {
                             "type": "boolean",
-                            "description": "Run in background (async). If true, returns immediately with agent_id. Default: true.",
-                            "default": true
+                            "description": "Run in background (async). If true, returns immediately with agent_id and you MUST call get_agent_result(agent_id) to collect the output. Default: false (sync — result returned directly).",
+                            "default": false
                         },
                         "name": {
                             "type": "string",
@@ -1588,6 +1611,24 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         }
                     },
                     "required": ["description", "prompt"]
+                }
+            }
+        }),
+        // ── get_agent_result: Retrieve result of background-spawned agent ──────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "get_agent_result",
+                "description": "Retrieve the result of a background-spawned agent. Call this after spawn_agent with background=true to collect the child's output once it finishes. Waits up to 120s for completion; returns status=timeout if the agent is still running.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent_id": {
+                            "type": "string",
+                            "description": "The agent_id returned by spawn_agent."
+                        }
+                    },
+                    "required": ["agent_id"]
                 }
             }
         }),
@@ -1932,6 +1973,34 @@ pub fn all_tool_schemas() -> Vec<Value> {
     ]
 }
 
+/// Schema for the `execute_code` tool. Returned by `all_tool_schemas_with_env`
+/// only when `ASTRA_CODE_EXEC_UNSAFE=1` — the tool runs Python scripts
+/// unsandboxed as the current user. Keep the description pointed at what
+/// the model needs to know for correct usage AND for understanding the risk.
+fn execute_code_schema() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "execute_code",
+            "description": "⚠️ UNSAFE: executes a Python script unsandboxed as the current user — no cgroup, no seccomp, no chroot. Use only when absolutely necessary for multi-step read/search operations that would otherwise require dozens of tool calls. Only stdout is returned. Script-callable functions: read_file, write_file, list_dir, grep, web_fetch.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "script": {
+                        "type": "string",
+                        "description": "Python script to execute. Module `astra_tools` is auto-imported with: read_file(path), write_file(path, content), list_dir(path), grep(pattern, path), web_fetch(url). Do NOT rely on shell access — write Python, not shell-outs."
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Max execution time in seconds (default 300, capped at 600)"
+                    }
+                },
+                "required": ["script"]
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -1948,6 +2017,111 @@ mod tests {
                     .and_then(Value::as_str)
             })
             .collect()
+    }
+
+    // ── P0-1: execute_code gate tests ─────────────────────────────────────
+    //
+    // execute_code spawns `python3 script.py` directly without sandboxing.
+    // In practice this is RCE-as-current-user: LLM can read any file, spawn
+    // shell via allowlisted `bash`, open network. Gate the schema behind
+    // an explicit opt-in env var so the tool isn't silently available.
+    // See plans review 2026-05-05.
+
+    #[test]
+    fn execute_code_hidden_by_default() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let names = schema_names(&schemas);
+        assert!(
+            !names.contains(&"execute_code"),
+            "execute_code must NOT appear in the default schema list — it runs unsandboxed"
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn execute_code_hidden_on_non_unix_even_with_env_set() {
+        // The RPC transport is a Unix domain socket; on Windows the
+        // tool is unavailable regardless of ASTRA_CODE_EXEC_UNSAFE.
+        let schemas = all_tool_schemas_with_env(|_| Some("1".into()));
+        let names = schema_names(&schemas);
+        assert!(
+            !names.contains(&"execute_code"),
+            "execute_code must stay hidden on non-unix even if env says enable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_code_visible_when_unsafe_env_set() {
+        let schemas = all_tool_schemas_with_env(|k| {
+            if k == "ASTRA_CODE_EXEC_UNSAFE" {
+                Some("1".into())
+            } else {
+                None
+            }
+        });
+        let names = schema_names(&schemas);
+        assert!(
+            names.contains(&"execute_code"),
+            "execute_code must appear when ASTRA_CODE_EXEC_UNSAFE=1"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_code_description_warns_unsandboxed() {
+        let schemas = all_tool_schemas_with_env(|_| Some("1".into()));
+        let desc = schemas
+            .iter()
+            .find(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    == Some("execute_code")
+            })
+            .and_then(|s| s.get("function"))
+            .and_then(|f| f.get("description"))
+            .and_then(Value::as_str)
+            .expect("execute_code schema present");
+        assert!(
+            desc.to_lowercase().contains("unsandboxed") || desc.contains("UNSAFE"),
+            "description must warn the model the tool is unsandboxed: got {desc:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_code_description_omits_bash_from_allowlist() {
+        // Script-callable `bash` is a bypass for the allowlist concept.
+        // The schema must not advertise bash as available to the script.
+        let schemas = all_tool_schemas_with_env(|_| Some("1".into()));
+        let func = schemas
+            .iter()
+            .find(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    == Some("execute_code")
+            })
+            .and_then(|s| s.get("function"))
+            .expect("execute_code schema present");
+        let outer_desc = func
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let script_desc = func
+            .get("parameters")
+            .and_then(|p| p.get("properties"))
+            .and_then(|p| p.get("script"))
+            .and_then(|p| p.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let combined = format!("{outer_desc} {script_desc}");
+        // Token boundaries to avoid matching 'bashrc' etc.
+        assert!(
+            !combined.contains("bash("),
+            "schema still advertises bash() to the script — remove it"
+        );
     }
 
     #[test]

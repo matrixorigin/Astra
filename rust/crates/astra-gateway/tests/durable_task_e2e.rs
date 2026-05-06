@@ -5,6 +5,7 @@
 
 use astra_core::durable_task_store::*;
 use astra_gateway::durable_task_store::MysqlDurableTaskStore;
+use astra_gateway::store::{GatewayStore, mysql::MysqlGatewayStore};
 
 async fn setup() -> MysqlDurableTaskStore {
     let url = "mysql://root:111@127.0.0.1:6001/astra_gateway";
@@ -13,9 +14,8 @@ async fn setup() -> MysqlDurableTaskStore {
         .connect(url)
         .await
         .expect("DB connection failed — is MatrixOne running?");
-    astra_gateway::storage::ensure_schema(&pool)
-        .await
-        .expect("schema setup failed");
+    let store = MysqlGatewayStore::new(pool.clone());
+    store.ensure_schema().await.expect("schema setup failed");
     MysqlDurableTaskStore::new(pool)
 }
 
@@ -343,26 +343,22 @@ async fn context_token_persist_and_restore() {
         .connect(url)
         .await
         .unwrap();
-    astra_gateway::storage::ensure_schema(&pool).await.unwrap();
+    let store = MysqlGatewayStore::new(pool);
+    store.ensure_schema().await.unwrap();
 
     // Save context tokens
     let tokens = serde_json::json!({
         "user_a": "token_aaa",
         "user_b": "token_bbb",
     });
-    astra_gateway::storage::save_credential(
-        &pool,
-        "weixin",
-        "default",
-        "context_tokens",
-        &tokens,
-        None,
-    )
-    .await
-    .unwrap();
+    store
+        .save_credential("weixin", "default", "context_tokens", &tokens, None)
+        .await
+        .unwrap();
 
     // Restore
-    let cred = astra_gateway::storage::get_credential(&pool, "weixin", "default", "context_tokens")
+    let cred = store
+        .get_credential("weixin", "default", "context_tokens")
         .await
         .unwrap()
         .unwrap();
@@ -375,22 +371,16 @@ async fn context_token_persist_and_restore() {
         "user_a": "token_aaa_updated",
         "user_c": "token_ccc",
     });
-    astra_gateway::storage::save_credential(
-        &pool,
-        "weixin",
-        "default",
-        "context_tokens",
-        &tokens2,
-        None,
-    )
-    .await
-    .unwrap();
+    store
+        .save_credential("weixin", "default", "context_tokens", &tokens2, None)
+        .await
+        .unwrap();
 
-    let cred2 =
-        astra_gateway::storage::get_credential(&pool, "weixin", "default", "context_tokens")
-            .await
-            .unwrap()
-            .unwrap();
+    let cred2 = store
+        .get_credential("weixin", "default", "context_tokens")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(cred2.credentials["user_a"], "token_aaa_updated");
     assert_eq!(cred2.credentials["user_c"], "token_ccc");
     // user_b gone (full replacement)

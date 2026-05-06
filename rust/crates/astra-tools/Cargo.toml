@@ -23,6 +23,7 @@ thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 url = "2.5"
+scraper = "0.22"
 
 # Git operations (gix)
 gix = { version = "0.81.0", features = ["status", "blame", "mailmap", "revision"] }
@@ -40,10 +41,11 @@ tree-sitter-ruby = "0.23"
 # System (process control, file ops). `signal` gives us killpg(2) so we can
 # SIGKILL an entire process group without fork-execing `/usr/bin/kill`.
 nix.workspace = true
+libc.workspace = true
 dirs = "6.0.0"
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 serde_json.workspace = true
 serial_test = "3"
 
@@ -51,3 +53,5 @@ serial_test = "3"
 default = []
 # Enable CLI-specific tool features (MCP dispatch, passive LSP, colored output)
 cli = []
+# Enable integration tests that require python3 on the system
+python_tests = []

@@ -375,6 +375,7 @@ async fn handle_wecom_message(
         msg_id,
         chat_type,
         reply_token,
+        route_override: None,
     };
 
     if msg_tx.send(msg).await.is_err() {

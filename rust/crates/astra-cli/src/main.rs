@@ -77,6 +77,8 @@ mod command_registry;
 mod command_router;
 #[path = "cli/command_usage.rs"]
 mod command_usage;
+#[path = "cli/context_references.rs"]
+mod context_references;
 
 #[path = "cli/delegate_subrun.rs"]
 mod delegate_subrun;
@@ -92,6 +94,8 @@ mod dynamic_completions;
 mod edge_lifecycle;
 #[path = "cli/effects/mod.rs"]
 mod effects;
+#[path = "cli/file_history.rs"]
+mod file_history;
 #[path = "cli/followup_suggestion.rs"]
 mod followup_suggestion;
 #[path = "cli/idle_agent_messages.rs"]
@@ -106,6 +110,8 @@ mod journal_tree;
 mod memory_extraction;
 #[path = "cli/mock_llm.rs"]
 mod mock_llm;
+#[path = "cli/notifications.rs"]
+mod notifications;
 #[path = "cli/permission_manager.rs"]
 mod permission_manager;
 #[path = "cli/picker_echo.rs"]

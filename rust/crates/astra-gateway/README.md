@@ -49,7 +49,8 @@ cp gateway.example.yaml gateway.yaml
 astra:
   base_url: "http://127.0.0.1:8000"      # astra server
 
-database:
+storage:
+  backend: mysql                         # required for durable gateway mode
   url: "mysql://root:111@127.0.0.1:6001/astra_gateway"
 
 cli:                                       # default CLI
@@ -166,7 +167,18 @@ Slash commands respond instantly while regular chat requests are serialized per 
 Different conversations run concurrently up to `max_concurrent_runs`; final responses are written
 to the durable outbox before platform delivery is acknowledged.
 
-## Database
+## Storage
+
+Durable gateway mode requires MySQL / MatrixOne storage. The gateway uses the
+same MySQL pool for user/session state, durable tasks, trace events, and the
+delivery outbox. Configure it explicitly with `storage.backend: mysql` or set a
+non-empty `GATEWAY_DATABASE_URL`.
+
+`database:` is no longer promoted automatically; use `storage:` instead. If no
+storage is configured, the gateway starts in explicit no-persistence mode and
+storage-dependent commands are disabled. SQLite and file stores remain local
+store implementations for tests/tools, but they are rejected by the gateway
+runner because they do not provide durable tasks, trace, or outbox recovery.
 
 Auto-created on first run. Tables:
 

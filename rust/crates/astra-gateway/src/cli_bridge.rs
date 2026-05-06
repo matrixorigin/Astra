@@ -10,6 +10,47 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
+/// Kill guard: sends SIGKILL to a child process on drop. Defuse with
+/// `.defuse()` when the process exits normally. Without this, an async
+/// cancellation (outer task abort) would orphan the child process since
+/// tokio's `Child::drop` does NOT kill the process.
+pub(crate) struct ChildKillGuard {
+    pid: Option<u32>,
+}
+
+impl ChildKillGuard {
+    pub(crate) fn new(child: &tokio::process::Child) -> Self {
+        Self { pid: child.id() }
+    }
+
+    pub(crate) fn defuse(&mut self) {
+        self.pid = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_pid(pid: u32) -> Self {
+        Self { pid: Some(pid) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_defused(&self) -> bool {
+        self.pid.is_none()
+    }
+}
+
+impl Drop for ChildKillGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid
+            && let Ok(pid_i32) = i32::try_from(pid)
+            && pid_i32 > 1
+        {
+            unsafe {
+                libc::kill(pid_i32, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum CliProgress {
     Status(String),
@@ -577,7 +618,16 @@ pub async fn run_cli(
     working_dir: Option<&std::path::Path>,
     progress_tx: Option<mpsc::Sender<CliProgress>>,
 ) -> Result<CliResult, String> {
-    run_cli_with_context(profile, message, session_id, working_dir, progress_tx, None).await
+    run_cli_with_context(
+        profile,
+        message,
+        session_id,
+        working_dir,
+        progress_tx,
+        None,
+        None,
+    )
+    .await
 }
 
 pub async fn run_cli_with_context(
@@ -587,6 +637,7 @@ pub async fn run_cli_with_context(
     working_dir: Option<&std::path::Path>,
     progress_tx: Option<mpsc::Sender<CliProgress>>,
     system_prompt: Option<&str>,
+    access_token: Option<&str>,
 ) -> Result<CliResult, String> {
     run_cli_with_context_and_timeout(
         profile,
@@ -596,10 +647,12 @@ pub async fn run_cli_with_context(
         progress_tx,
         system_prompt,
         None,
+        access_token,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_cli_with_context_and_timeout(
     profile: &CliProfile,
     message: &str,
@@ -608,6 +661,7 @@ pub async fn run_cli_with_context_and_timeout(
     progress_tx: Option<mpsc::Sender<CliProgress>>,
     system_prompt: Option<&str>,
     timeout: Option<Duration>,
+    access_token: Option<&str>,
 ) -> Result<CliResult, String> {
     run_cli_with_context_trace_and_timeout(
         profile,
@@ -619,6 +673,7 @@ pub async fn run_cli_with_context_and_timeout(
         None,
         None,
         timeout,
+        access_token,
     )
     .await
 }
@@ -634,6 +689,39 @@ pub async fn run_cli_with_context_trace_and_timeout(
     trace_id: Option<&str>,
     request_id: Option<&str>,
     timeout: Option<Duration>,
+    access_token: Option<&str>,
+) -> Result<CliResult, String> {
+    run_cli_with_cancel(
+        profile,
+        message,
+        session_id,
+        working_dir,
+        progress_tx,
+        system_prompt,
+        trace_id,
+        request_id,
+        timeout,
+        access_token,
+        None,
+    )
+    .await
+}
+
+/// Full CLI spawn with cancellation token support. When `cancel` fires,
+/// the child process is killed (SIGKILL) immediately — no zombie.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_cli_with_cancel(
+    profile: &CliProfile,
+    message: &str,
+    session_id: Option<&str>,
+    working_dir: Option<&std::path::Path>,
+    progress_tx: Option<mpsc::Sender<CliProgress>>,
+    system_prompt: Option<&str>,
+    trace_id: Option<&str>,
+    request_id: Option<&str>,
+    timeout: Option<Duration>,
+    access_token: Option<&str>,
+    cancel: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<CliResult, String> {
     let mut cmd =
         profile.build_command_with_context(message, session_id, working_dir, system_prompt);
@@ -643,16 +731,55 @@ pub async fn run_cli_with_context_trace_and_timeout(
     if let Some(request_id) = request_id {
         cmd.env("ASTRA_GATEWAY_REQUEST_ID", request_id);
     }
+    if let Some(token) = access_token {
+        cmd.env("ASTRA_ACCESS_TOKEN", token);
+    }
+    let name = profile.name().to_string();
+    let (stdout_text, stderr_text, exit_code) =
+        run_child_with_cancel(cmd, progress_tx, timeout, cancel, &name).await?;
+
+    let mut result = profile.parse_output(&stdout_text, exit_code);
+    result.stdout = stdout_text;
+    result.stderr = stderr_text;
+    Ok(result)
+}
+
+/// Core subprocess lifecycle: spawn, stream output, handle timeout/cancel.
+/// Separated from `run_cli_with_cancel` for testability — tests can pass
+/// any `Command` directly without going through `build_command_with_context`.
+/// Kill a child process and abort its I/O tasks. Used by cancel paths.
+async fn abort_child(
+    kill_guard: ChildKillGuard,
+    mut child: tokio::process::Child,
+    stderr_task: tokio::task::JoinHandle<String>,
+    stdout_task: tokio::task::JoinHandle<String>,
+) {
+    // Defuse so drop doesn't redundantly SIGKILL after we explicitly kill.
+    let mut guard = kill_guard;
+    guard.defuse();
+    let _ = child.kill().await;
+    stderr_task.abort();
+    stdout_task.abort();
+}
+
+pub(crate) async fn run_child_with_cancel(
+    mut cmd: Command,
+    progress_tx: Option<mpsc::Sender<CliProgress>>,
+    timeout: Option<Duration>,
+    cancel: Option<tokio_util::sync::CancellationToken>,
+    name: &str,
+) -> Result<(String, String, i32), String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("failed to spawn {}: {e}", profile.name()))?;
+        .map_err(|e| format!("failed to spawn {name}: {e}"))?;
+
+    let mut kill_guard = ChildKillGuard::new(&child);
 
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let stderr = child.stderr.take().ok_or("no stderr")?;
 
-    let progress_tx_clone = progress_tx;
     let stderr_task = tokio::spawn(async move {
         let reader = BufReader::new(stderr);
         let mut lines = reader.lines();
@@ -667,7 +794,7 @@ pub async fn run_cli_with_context_trace_and_timeout(
             }
             collected.push_str(&line);
             let event = parse_stderr_line(&line);
-            if let Some(ref tx) = progress_tx_clone {
+            if let Some(ref tx) = progress_tx {
                 let _ = tx.send(event).await;
             }
         }
@@ -687,36 +814,50 @@ pub async fn run_cli_with_context_trace_and_timeout(
         output
     });
 
+    let cancel_future = async {
+        match cancel.as_ref() {
+            Some(t) => t.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+
     let status = if let Some(timeout) = timeout {
         tokio::select! {
             status = child.wait() => status.map_err(|e| format!("wait failed: {e}"))?,
             _ = tokio::time::sleep(timeout) => {
+                // Timeout — kill and collect stderr for diagnostics.
+                kill_guard.defuse();
                 let _ = child.kill().await;
                 let stderr_text = stderr_task.await.unwrap_or_default();
                 let _stdout_text = stdout_task.await.unwrap_or_default();
                 return Err(format!(
-                    "{} timed out after {}s\n{}{}",
-                    profile.name(),
+                    "{name} timed out after {}s\n{}{}",
                     timeout.as_secs(),
                     if stderr_text.is_empty() { "" } else { "stderr: " },
                     stderr_text.lines().take(10).collect::<Vec<_>>().join("\n")
                 ).trim().to_string());
             }
+            _ = cancel_future => {
+                abort_child(kill_guard, child, stderr_task, stdout_task).await;
+                return Err(format!("{name} killed by user"));
+            }
         }
     } else {
-        child
-            .wait()
-            .await
-            .map_err(|e| format!("wait failed: {e}"))?
+        tokio::select! {
+            status = child.wait() => status.map_err(|e| format!("wait failed: {e}"))?,
+            _ = cancel_future => {
+                abort_child(kill_guard, child, stderr_task, stdout_task).await;
+                return Err(format!("{name} killed by user"));
+            }
+        }
     };
+    // Normal exit — defuse so Drop doesn't send SIGKILL.
+    kill_guard.defuse();
+
     let stderr_text = stderr_task.await.unwrap_or_default();
     let stdout_text = stdout_task.await.unwrap_or_default();
     let exit_code = status.code().unwrap_or(-1);
-
-    let mut result = profile.parse_output(&stdout_text, exit_code);
-    result.stdout = stdout_text;
-    result.stderr = stderr_text;
-    Ok(result)
+    Ok((stdout_text, stderr_text, exit_code))
 }
 
 // ─── CLI Availability ──────────────────────────────────────────────────────
@@ -815,19 +956,37 @@ pub fn onboarding_message(profile: &CliProfile, availability: &CliAvailability) 
     }
 }
 
+/// Check whether stderr output indicates an authentication / credentials failure.
+pub fn is_auth_error(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("could not validate credentials")
+        || lower.contains("invalid_api_key")
+        || lower.contains("invalid api key")
+        || lower.contains("401 unauthorized")
+        || lower.contains("authentication failed")
+        || lower.contains("token expired")
+        || lower.contains("token has expired")
+        // Match bare "401" only when it looks like an HTTP status, not a random number.
+        // We check for "401" preceded by a space, start-of-line, or common prefix.
+        || lower.contains("status: 401")
+        || lower.contains("http 401")
+        || lower.contains("error 401")
+}
+
+/// Invalidate the CLI probe cache so the next `probe_cli` call re-checks.
+pub fn invalidate_probe_cache() {
+    CLI_PROBE_CACHE.clear();
+}
+
 pub fn translate_cli_error(profile: &CliProfile, exit_code: i32, stderr: &str) -> String {
     let name = profile.name();
-    if stderr.contains("could not validate credentials")
-        || stderr.contains("Could not validate credentials")
-        || stderr.contains("invalid_api_key")
-        || stderr.contains("401")
-    {
+    if is_auth_error(stderr) {
         return format!(
-            "🔑 `{name}` API 密钥无效或过期\n\n\
-             请检查对应的环境变量或配置:\n\
-             - **astra**: ASTRA_API_KEY\n\
-             - **claude**: ANTHROPIC_API_KEY\n\
-             - **codex**: OPENAI_API_KEY"
+            "🔑 `{name}` 认证失败\n\n\
+             请尝试:\n\
+             1. 发送 `/auth` 重置认证\n\
+             2. 运行 `astra /login` 重新登录\n\
+             3. 或 `/cli claude` 切换到其他 CLI"
         );
     }
     if stderr.contains("rate limit") || stderr.contains("429") {
@@ -1115,9 +1274,10 @@ model: claude-sonnet-4-6"#;
 
     #[tokio::test]
     async fn run_kills_cli_on_timeout() {
+        // Use `sleep 30` directly (not via sh -c) so kill is immediate.
         let p = CliProfile::Custom {
-            bin: "sh".into(),
-            args_template: vec!["-c".into(), "sleep 5".into()],
+            bin: "sleep".into(),
+            args_template: vec!["30".into()],
             json_output: false,
             text_field: None,
             session_id_field: None,
@@ -1130,6 +1290,7 @@ model: claude-sonnet-4-6"#;
             None,
             None,
             Some(Duration::from_millis(50)),
+            None,
         )
         .await
         .unwrap_err();
@@ -1158,10 +1319,57 @@ model: claude-sonnet-4-6"#;
             Some("trace-1"),
             Some("req-1"),
             None,
+            None,
         )
         .await
         .unwrap();
         assert_eq!(r.text.as_deref(), Some("trace-1/req-1"));
+    }
+
+    #[tokio::test]
+    async fn run_injects_access_token_env() {
+        let p = CliProfile::Custom {
+            bin: "sh".into(),
+            args_template: vec!["-c".into(), "printf '%s' \"$ASTRA_ACCESS_TOKEN\"".into()],
+            json_output: false,
+            text_field: None,
+            session_id_field: None,
+        };
+        let r = run_cli_with_context_trace_and_timeout(
+            &p,
+            "ignored",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("test-token-xyz"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.text.as_deref(), Some("test-token-xyz"));
+    }
+
+    #[tokio::test]
+    async fn run_no_access_token_when_none() {
+        let p = CliProfile::Custom {
+            bin: "sh".into(),
+            args_template: vec![
+                "-c".into(),
+                "printf '%s' \"${ASTRA_ACCESS_TOKEN:-unset}\"".into(),
+            ],
+            json_output: false,
+            text_field: None,
+            session_id_field: None,
+        };
+        let r = run_cli_with_context_trace_and_timeout(
+            &p, "ignored", None, None, None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.text.as_deref(), Some("unset"));
     }
 
     #[tokio::test]
@@ -1229,7 +1437,43 @@ model: claude-sonnet-4-6"#;
     fn translate_auth_error() {
         let p = CliProfile::default();
         let msg = translate_cli_error(&p, 1, "Error: Could not validate credentials");
-        assert!(msg.contains("API 密钥"));
+        assert!(msg.contains("认证失败"));
+        assert!(msg.contains("/auth"));
+    }
+
+    // ── is_auth_error tests ──────────────────────────────────────
+
+    #[test]
+    fn is_auth_error_validates_credentials() {
+        assert!(is_auth_error("Could not validate credentials"));
+        assert!(is_auth_error("could not validate credentials"));
+    }
+
+    #[test]
+    fn is_auth_error_invalid_api_key() {
+        assert!(is_auth_error("Error: invalid_api_key"));
+        assert!(is_auth_error("invalid api key provided"));
+    }
+
+    #[test]
+    fn is_auth_error_401_status() {
+        assert!(is_auth_error("status: 401"));
+        assert!(is_auth_error("HTTP 401 response"));
+        assert!(is_auth_error("error 401"));
+    }
+
+    #[test]
+    fn is_auth_error_token_expired() {
+        assert!(is_auth_error("token expired"));
+        assert!(is_auth_error("Token has expired"));
+    }
+
+    #[test]
+    fn is_auth_error_false_positives_avoided() {
+        assert!(!is_auth_error("port 4010 is in use"));
+        assert!(!is_auth_error("some random error"));
+        assert!(!is_auth_error("timeout after 30s"));
+        assert!(!is_auth_error("rate limit exceeded"));
     }
 
     #[test]
@@ -1358,5 +1602,114 @@ model: claude-sonnet-4-6"#;
     fn parse_status_event() {
         let line = r#"{"type":"status","text":"compiling..."}"#;
         assert!(matches!(parse_stderr_line(line), CliProgress::Status(t) if t == "compiling..."));
+    }
+
+    // ── Cancellation tests ─────────────────────────────────────────────
+    //
+    // Test `run_child_with_cancel` DIRECTLY — bypasses build_command_with_context
+    // so we can pass a real blocking command (plain `cat` with no args = blocks
+    // forever on stdin). This avoids the false-positive bug where `cat` received
+    // `-m msg --json` args and exited immediately.
+
+    #[tokio::test]
+    async fn cancel_pre_fired_kills_immediately() {
+        use tokio_util::sync::CancellationToken;
+
+        // Pre-cancelled token: function must return Err without blocking.
+        let token = CancellationToken::new();
+        token.cancel();
+
+        // `sleep 30` would block 30s, but pre-fired cancel kills immediately.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let result = run_child_with_cancel(
+            cmd,
+            None,
+            Some(Duration::from_secs(30)),
+            Some(token),
+            "test",
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("killed by user"),
+            "pre-fired token must produce killed error"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_kills_blocking_process() {
+        use tokio_util::sync::CancellationToken;
+
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+
+        // `sleep 30` blocks for 30s — guaranteed to still be running when cancel fires.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let handle = tokio::spawn(async move {
+            run_child_with_cancel(
+                cmd,
+                None,
+                Some(Duration::from_secs(60)),
+                Some(token_clone),
+                "test",
+            )
+            .await
+        });
+
+        // Cancel fires. The select! picks it up and kills the child.
+        token.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("task must complete promptly after cancel")
+            .expect("join");
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("killed by user"),
+            "expected 'killed by user', got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_cancel_completes_normally() {
+        // `true` exits 0 immediately; no cancel token.
+        let cmd = Command::new("true");
+        let result =
+            run_child_with_cancel(cmd, None, Some(Duration::from_secs(5)), None, "test").await;
+        assert!(result.is_ok(), "true must exit 0: {:?}", result);
+        let (stdout, _stderr, code) = result.unwrap();
+        assert_eq!(code, 0);
+        assert!(stdout.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_blocking_process() {
+        use tokio_util::sync::CancellationToken;
+
+        // `sleep 30` blocks for 30s; token NOT cancelled; 100ms timeout fires.
+        let token = CancellationToken::new();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let result = run_child_with_cancel(
+            cmd,
+            None,
+            Some(Duration::from_millis(100)),
+            Some(token.clone()),
+            "test",
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("timed out"), "expected timeout, got: {err}");
+        assert!(
+            !token.is_cancelled(),
+            "token must NOT be cancelled by timeout"
+        );
     }
 }

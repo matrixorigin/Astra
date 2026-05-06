@@ -634,6 +634,8 @@ mod tests {
             tools_used: vec!["Read".into()],
             completion_tokens: 0,
             prompt_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_tokens: 0,
             duration_ms: 42,
             turn_rounds: 0,
             cache_hits: 0,

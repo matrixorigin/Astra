@@ -168,6 +168,11 @@ pub struct InboundMessage {
     pub chat_type: ChatType,
     /// WeCom: the inbound req_id, needed for group responds.
     pub reply_token: Option<String>,
+    /// When the router wants to enqueue this message under a
+    /// non-default cli_profile (e.g. `/manage` routes through the
+    /// `_manage` virtual profile so it does NOT queue behind the user's
+    /// stuck tasks). None = use resolve_cli_profile's normal result.
+    pub route_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

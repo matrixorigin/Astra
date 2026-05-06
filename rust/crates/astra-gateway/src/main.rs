@@ -53,36 +53,32 @@ async fn main() {
     if let Some(Command::LoginWeixin) = cli.command {
         match astra_gateway::platforms::weixin::qr_login().await {
             Ok((token, account_id)) => {
-                // Save to database if config is loadable
+                // Save to store if config is loadable
                 let db_saved = if cli.config.exists() {
                     if let Ok(cfg) = astra_gateway::config::GatewayConfig::load(&cli.config) {
-                        match astra_gateway::storage::try_connect_db(&cfg.database.url).await {
-                            Ok(pool) => {
+                        let storage_config = cfg.resolve_storage();
+                        match astra_gateway::store::open_store_bundle(&storage_config).await {
+                            Ok(Some(bundle)) => {
                                 let creds = serde_json::json!({
                                     "token": token,
                                     "account_id": account_id,
                                 });
-                                match astra_gateway::storage::save_credential(
-                                    &pool,
-                                    "weixin",
-                                    "default",
-                                    "bot_token",
-                                    &creds,
-                                    None,
-                                )
-                                .await
+                                match bundle
+                                    .store
+                                    .save_credential("weixin", "default", "bot_token", &creds, None)
+                                    .await
                                 {
                                     Ok(()) => {
-                                        println!("✅ 凭证已保存到数据库 (换机器无需重新扫码)");
+                                        println!("✅ 凭证已保存到存储 (换机器无需重新扫码)");
                                         true
                                     }
                                     Err(e) => {
-                                        tracing::warn!(error = %e, "DB save failed, falling back to config file");
+                                        tracing::warn!(error = %e, "store save failed, falling back to config file");
                                         false
                                     }
                                 }
                             }
-                            Err(_) => false,
+                            _ => false,
                         }
                     } else {
                         false
@@ -141,7 +137,9 @@ async fn main() {
 
     // CLI flag overrides config file
     if let Some(ref db_url) = cli.database_url {
-        config.database.url = db_url.clone();
+        config.storage = astra_gateway::store::StorageConfig::Mysql {
+            url: db_url.clone(),
+        };
     }
 
     let mut runner = match astra_gateway::runner::GatewayRunner::new(config.clone()).await {
@@ -167,8 +165,8 @@ async fn main() {
         && weixin_cfg.enabled
     {
         let mut adapter = astra_gateway::platforms::weixin::WeixinAdapter::new(weixin_cfg);
-        if let Some(pool) = runner.pool() {
-            adapter = adapter.with_pool(pool.clone());
+        if let Some(store) = runner.store() {
+            adapter = adapter.with_store(store);
         }
         adapters.push(Box::new(adapter));
     }
@@ -182,13 +180,17 @@ async fn main() {
     let (cron_tx, cron_rx) = tokio::sync::mpsc::channel(64);
     runner.set_outbound_tx(cron_tx.clone());
 
-    // Start cron scheduler (only if DB available)
-    if let Some(pool) = runner.pool() {
-        let scheduler =
-            astra_gateway::scheduler::CronScheduler::new(pool.clone(), scheduler_config, cron_tx);
+    // Start cron scheduler (only if store + trace_repo available)
+    if let (Some(store), Some(trace_repo)) = (runner.store(), runner.trace_repo()) {
+        let scheduler = astra_gateway::scheduler::CronScheduler::new(
+            store,
+            scheduler_config,
+            trace_repo,
+            cron_tx,
+        );
         let _scheduler_handle = scheduler.spawn(shutdown_tx.subscribe());
     } else {
-        tracing::info!("cron scheduler disabled (no DB)");
+        tracing::info!("cron scheduler disabled (no store or trace_repo)");
     }
 
     // Ctrl+C

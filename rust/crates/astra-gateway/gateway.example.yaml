@@ -10,15 +10,16 @@
 # 环境变量覆盖:
 #   WECOM_BOT_ID, WECOM_SECRET — 企微凭证
 #   WEIXIN_TOKEN, WEIXIN_ACCOUNT_ID — 微信凭证
-#   GATEWAY_DATABASE_URL — 数据库连接
+#   GATEWAY_DATABASE_URL — MySQL / MatrixOne storage URL
 
 astra:
   base_url: "http://localhost:8080"    # Astra server 地址
   api_key: ""                          # Astra API key (如开启认证)
   default_model: "MiniMax-M2.7"       # 默认模型
 
-database:
-  url: "mysql://root:111@127.0.0.1:6001/astra_gateway"  # Gateway 独立数据库
+storage:
+  backend: mysql
+  url: "mysql://root:111@127.0.0.1:6001/astra_gateway"  # Gateway durable storage
 
 # 全局并发上限；同一会话仍会按顺序串行执行，避免 session race
 max_concurrent_runs: 4

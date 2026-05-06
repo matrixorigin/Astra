@@ -32,7 +32,7 @@ use crate::turn::agentic_loop_host::{
 use crate::turn::agentic_loop_tool_support::edge_tool_status_exit_code;
 use crate::turn::bridge_llm_stream::rate_limit_cooldown;
 use crate::turn::llm_client::{
-    LlmCallResult, LlmCancel, cached_system_prompt, call_llm_and_collect_with_request_overrides,
+    LlmCallResult, LlmCancel, call_llm_and_collect_with_request_overrides,
     call_llm_nonstream_fallback_with_request_overrides, llm_connect_timeout, llm_fallback_timeout,
     sleep_ms_or_llm_cancel,
 };
@@ -1838,8 +1838,6 @@ impl ServerAgenticLoopHost {
             crate::prompts::PromptTokenBucket::Environment,
         ));
 
-        let full_dynamic = crate::prompts::sections_to_string(&dynamic_sections);
-
         // Build structured system messages with Anthropic cache annotations.
         // Stable sections (Global/Session) get cache_control; dynamic content does not.
         let (sys_msg, dynamic_msg, sections) = build_system_message_with_dynamic_sections(
@@ -1892,12 +1890,7 @@ impl ServerAgenticLoopHost {
         }
 
         // Plain text for token estimation (no cache annotations)
-        let plain = cached_system_prompt(
-            &tool_names,
-            &full_dynamic,
-            self.selection_confidence,
-            task_type,
-        );
+        let plain = crate::prompts::sections_to_string(&sections);
 
         (system_messages, plain, breakdown)
     }
@@ -2061,7 +2054,7 @@ impl ServerAgenticLoopHost {
             "{profile_desc}{skill_hint}{learned_context_hint}{memory_signal_hint}{round_budget_hint}{plan_resume}{runtime_identity}"
         );
 
-        cached_system_prompt(
+        crate::turn::llm_client::cached_system_prompt(
             &tool_names,
             &full_dynamic,
             self.selection_confidence,

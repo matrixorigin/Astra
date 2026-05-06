@@ -10,7 +10,9 @@ path = "src/main.rs"
 [dependencies]
 astra-thin-client.workspace = true
 tokio.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
 tokio-tungstenite.workspace = true
+libc.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -22,8 +24,9 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 clap.workspace = true
 chrono.workspace = true
-sqlx.workspace = true
+sqlx = { workspace = true, features = ["sqlite"] }
 astra-core.workspace = true
+thiserror.workspace = true
 base64.workspace = true
 regex.workspace = true
 aes = "0.8"

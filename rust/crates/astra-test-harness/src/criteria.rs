@@ -158,6 +158,12 @@ pub enum Criterion {
         #[serde(default = "default_cache_min_calls")]
         min_calls: u32,
     },
+
+    /// Passes when provider prompt-cache accounting reports both the
+    /// cache-read and cache-creation buckets at or above the expected
+    /// minimums. This is distinct from `cache_rate_above`, which checks
+    /// the local idempotent tool-result cache.
+    PromptCacheTokens { min_read: u64, min_creation: u64 },
 }
 
 fn default_cache_min_calls() -> u32 {
@@ -227,6 +233,7 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
         | Criterion::DurationBetween { .. }
         | Criterion::TurnRoundsBetween { .. }
         | Criterion::CacheRateAbove { .. }
+        | Criterion::PromptCacheTokens { .. }
         | Criterion::StderrMatches { .. } => CriterionSeverity::Soft,
 
         Criterion::Judger { .. }
@@ -476,6 +483,8 @@ fn evaluate_one(
         Criterion::TokensBetween { min, max } => {
             let total = outcome
                 .prompt_tokens
+                .saturating_add(outcome.cached_input_tokens)
+                .saturating_add(outcome.cache_creation_tokens)
                 .saturating_add(outcome.completion_tokens);
             let passed = total >= *min && total <= *max;
             CriterionResult {
@@ -607,6 +616,27 @@ fn evaluate_one(
                     full_detail: None,
                     score: None,
                 }
+            }
+        }
+        Criterion::PromptCacheTokens {
+            min_read,
+            min_creation,
+        } => {
+            let passed = outcome.cached_input_tokens >= *min_read
+                && outcome.cache_creation_tokens >= *min_creation;
+            CriterionResult {
+                criterion: c.clone(),
+                severity: criterion_severity(c),
+                passed,
+                detail: format!(
+                    "prompt_cache read={} creation={}, expected read>={} creation>={}",
+                    outcome.cached_input_tokens,
+                    outcome.cache_creation_tokens,
+                    min_read,
+                    min_creation
+                ),
+                full_detail: None,
+                score: None,
             }
         }
     }
@@ -752,6 +782,18 @@ pub fn validate_criterion(c: &Criterion) -> Result<(), String> {
             }
             Ok(())
         }
+        Criterion::PromptCacheTokens {
+            min_read,
+            min_creation,
+        } => {
+            if *min_read == 0 && *min_creation == 0 {
+                return Err(
+                    "PromptCacheTokens requires min_read or min_creation to be greater than 0"
+                        .into(),
+                );
+            }
+            Ok(())
+        }
     }
 }
 
@@ -781,6 +823,8 @@ mod tests {
             tools_used: tools.iter().map(|s| s.to_string()).collect(),
             completion_tokens: 0,
             prompt_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_tokens: 0,
             duration_ms: 0,
             turn_rounds: 0,
             cache_hits: 0,
@@ -1391,5 +1435,22 @@ mod tests {
         );
         assert!(!r[0].passed);
         assert!(r[0].detail.contains("step_events missing"));
+    }
+
+    #[test]
+    fn prompt_cache_tokens_requires_read_and_creation_buckets() {
+        let c = Criterion::PromptCacheTokens {
+            min_read: 10,
+            min_creation: 5,
+        };
+        let mut out = RunOutcome::new("m");
+        out.cached_input_tokens = 12;
+        out.cache_creation_tokens = 5;
+        let r = evaluate_one(&c, &out, None);
+        assert!(r.passed, "{r:?}");
+
+        out.cached_input_tokens = 9;
+        let r = evaluate_one(&c, &out, None);
+        assert!(!r.passed, "{r:?}");
     }
 }

@@ -34,9 +34,112 @@ impl From<ExitCode> for i32 {
 /// the checkpoint is unreadable.
 fn load_session_messages_for_continuation(session_id: &str) -> Option<Vec<serde_json::Value>> {
     match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(session_id) {
-        Ok(Some(cp)) if !cp.messages.is_empty() => Some(cp.messages),
+        Ok(Some(cp)) if !cp.messages.is_empty() => {
+            Some(sanitize_continuation_messages(cp.messages))
+        }
         _ => None,
     }
+}
+
+/// Strip runtime-injected scaffolding messages that must not persist across
+/// turn boundaries. Without this, harness nudges (injected as "user" role)
+/// bias the model toward tool usage on the next turn even when the user's
+/// new message is purely conversational.
+fn sanitize_continuation_messages(mut msgs: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    msgs.retain(|m| {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let content_text = extract_text_content(m);
+        let content = content_text.as_deref().unwrap_or("");
+        match role {
+            "user" => !is_runtime_injected_user_msg(content),
+            "system" => !is_runtime_injected_system_msg(content),
+            _ => true,
+        }
+    });
+    trim_trailing_incomplete_tool_round(&mut msgs);
+    msgs
+}
+
+/// Extract text content from a message regardless of format.
+/// Handles both string content and array-format content blocks.
+fn extract_text_content(msg: &serde_json::Value) -> Option<String> {
+    if let Some(s) = msg.get("content").and_then(|c| c.as_str()) {
+        return Some(s.to_string());
+    }
+    if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+        let texts: Vec<&str> = arr
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect();
+        if !texts.is_empty() {
+            return Some(texts.join("\n"));
+        }
+    }
+    None
+}
+
+fn is_runtime_injected_user_msg(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with("## ⚠ Sequential Tool Calls Detected")
+        || trimmed.starts_with("✓ Previous round:")
+        || trimmed.starts_with("[attention:")
+        || trimmed.starts_with("[working-set:")
+        || trimmed.starts_with("[session-anchor]")
+}
+
+fn is_runtime_injected_system_msg(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with("[working-set:")
+        || trimmed.starts_with("[attention:")
+        || trimmed.starts_with("[session-anchor]")
+        || trimmed.starts_with("## Already Fetched")
+        || trimmed.starts_with("## Cross-Session Project Context")
+        || trimmed.starts_with("✓ ")
+}
+
+/// If the conversation ends with an incomplete tool round (assistant tool_use
+/// → tool results, but no final assistant text), trim back to the last
+/// complete exchange. This prevents the model from continuing a stale tool
+/// loop from the previous turn.
+fn trim_trailing_incomplete_tool_round(msgs: &mut Vec<serde_json::Value>) {
+    // Walk backwards: if the tail is tool/assistant-tool_use pattern without
+    // a final assistant-text, find the cut point.
+    let mut cut_at = None;
+    for i in (0..msgs.len()).rev() {
+        let role = msgs[i].get("role").and_then(|r| r.as_str()).unwrap_or("");
+        match role {
+            "tool" => continue,
+            "assistant" => {
+                if has_tool_use_content(&msgs[i]) {
+                    cut_at = Some(i);
+                    continue;
+                }
+                // Assistant with text content — this is a valid end point.
+                break;
+            }
+            _ => break,
+        }
+    }
+    if let Some(cut) = cut_at {
+        msgs.truncate(cut);
+    }
+}
+
+fn has_tool_use_content(msg: &serde_json::Value) -> bool {
+    if msg
+        .get("tool_calls")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty())
+    {
+        return true;
+    }
+    if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
+        return content
+            .iter()
+            .any(|c| c.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
+    }
+    false
 }
 
 /// Prepend system prompt to user message when `--system-prompt` is set.
@@ -1508,13 +1611,20 @@ fn final_json_output_with_context(
     trace_id: Option<String>,
     request_id: Option<String>,
 ) -> serde_json::Value {
+    let total_prompt_tokens = sr.prompt_tokens + sr.cache_read_tokens + sr.cache_creation_tokens;
     serde_json::json!({
         "trace_id": trace_id,
         "request_id": request_id,
         "run_id": sr.run_id,
         "session_id": sr.session_id,
         "text": sr.full_text,
-        "prompt_tokens": sr.prompt_tokens + sr.cache_read_tokens + sr.cache_creation_tokens,
+        "prompt_tokens": total_prompt_tokens,
+        "fresh_prompt_tokens": sr.prompt_tokens,
+        "cache": {
+            "hit": sr.cache_read_tokens > 0,
+            "read_tokens": sr.cache_read_tokens,
+            "creation_tokens": sr.cache_creation_tokens,
+        },
         "completion_tokens": sr.completion_tokens,
         "tool_calls_count": sr.tool_calls_count,
         "tools_used": sr.tools_used,
@@ -3184,6 +3294,12 @@ mod final_json_output_tests {
         assert_eq!(output["session_id"], "session-1");
         assert_eq!(output["text"], "hello");
         assert_eq!(output["prompt_tokens"], 13);
+        assert_eq!(output["fresh_prompt_tokens"], 10);
+        assert!(output.get("cached_input_tokens").is_none());
+        assert!(output.get("cache_creation_tokens").is_none());
+        assert_eq!(output["cache"]["hit"], true);
+        assert_eq!(output["cache"]["read_tokens"], 2);
+        assert_eq!(output["cache"]["creation_tokens"], 1);
         assert_eq!(output["completion_tokens"], 3);
         assert_eq!(output["tool_calls_count"], 2);
         assert_eq!(
@@ -3201,6 +3317,8 @@ mod final_json_output_tests {
             "session_id",
             "text",
             "prompt_tokens",
+            "fresh_prompt_tokens",
+            "cache",
             "completion_tokens",
             "tool_calls_count",
             "tools_used",
@@ -3670,5 +3788,58 @@ mod session_continuation_tests {
     fn load_session_messages_returns_none_for_missing_session() {
         let messages = super::load_session_messages_for_continuation("nonexistent-session-xyz-42");
         assert!(messages.is_none());
+    }
+
+    #[test]
+    fn sanitize_strips_runtime_injected_messages() {
+        let msgs = vec![
+            json!({"role": "user", "content": "review code"}),
+            json!({"role": "assistant", "content": "Here is the review..."}),
+            json!({"role": "system", "content": "[working-set:v1]\ngoal: review code\npending_work: none"}),
+            json!({"role": "user", "content": "\n\n## ⚠ Sequential Tool Calls Detected\nYour last 4 rounds..."}),
+            json!({"role": "system", "content": "## Already Fetched (do NOT re-read)\nContext already fetched:\nGit: status"}),
+            json!({"role": "system", "content": "## Cross-Session Project Context\nBelow are summaries..."}),
+            json!({"role": "user", "content": "\n\n✓ Previous round: 2 tools executed in parallel — excellent."}),
+            json!({"role": "user", "content": "[attention:v1]\ngoal: stale goal\ncurrent_todo: none"}),
+            json!({"role": "user", "content": "[working-set:v1]\ngoal: stale\npending_work: none"}),
+            json!({"role": "user", "content": "[session-anchor] Goal: stale. State: t1."}),
+            json!({"role": "system", "content": "[attention:v1]\ngoal: stale system-role manifest"}),
+            json!({"role": "system", "content": "[session-anchor] Goal: stale. State: t1."}),
+            json!({"role": "user", "content": "你好"}),
+        ];
+        let result = super::sanitize_continuation_messages(msgs);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0]["content"], "review code");
+        assert_eq!(result[1]["content"], "Here is the review...");
+        assert_eq!(result[2]["content"], "你好");
+    }
+
+    #[test]
+    fn sanitize_trims_trailing_tool_round() {
+        let msgs = vec![
+            json!({"role": "user", "content": "check status"}),
+            json!({"role": "assistant", "content": "Here is the status."}),
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "git_status", "arguments": "{}"}}]}),
+            json!({"role": "tool", "content": "M file.rs", "tool_call_id": "1"}),
+            json!({"role": "assistant", "tool_calls": [{"id": "2", "type": "function", "function": {"name": "git_diff", "arguments": "{}"}}]}),
+            json!({"role": "tool", "content": "+line", "tool_call_id": "2"}),
+        ];
+        let result = super::sanitize_continuation_messages(msgs);
+        // Should trim back to the last complete exchange
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[2]["content"], "hi");
+    }
+
+    #[test]
+    fn sanitize_preserves_complete_conversation() {
+        let msgs = vec![
+            json!({"role": "user", "content": "hello"}),
+            json!({"role": "assistant", "content": "Hi! How can I help?"}),
+            json!({"role": "user", "content": "thanks"}),
+            json!({"role": "assistant", "content": "You're welcome!"}),
+        ];
+        let result = super::sanitize_continuation_messages(msgs.clone());
+        assert_eq!(result.len(), 4);
     }
 }

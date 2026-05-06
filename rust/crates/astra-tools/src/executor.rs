@@ -301,7 +301,16 @@ impl DefaultToolExecutor {
             }
 
             // ── Web fetch (HTTP GET) ─────────────────────────────────
-            "web_fetch" => self.dispatch_web_fetch(args).await,
+            "web_fetch" => {
+                let cache_scope = format!("{}:{}", self.ctx.user_id, self.ctx.session_id);
+                let output = crate::web_fetch::fetch_with_cache_scope(
+                    self.ctx.http_client.as_ref(),
+                    args,
+                    &cache_scope,
+                )
+                .await;
+                string_to_result(output)
+            }
 
             // ── Memory tools (require configured endpoint) ───────────
             "memory_retrieve" | "memory_store" | "memory_search" | "memory_purge"
@@ -310,6 +319,29 @@ impl DefaultToolExecutor {
                     "Error: Memory tool '{name}' requires a configured memoria endpoint. \
                      Use ServerToolExecutor or CliToolExecutor instead of DefaultToolExecutor."
                 ))
+            }
+
+            // ── Code execution (Python RPC bridge) ──────────────────
+            // Fail-closed: runtime env-var gate regardless of schema visibility.
+            "execute_code" => {
+                if std::env::var("ASTRA_CODE_EXEC_UNSAFE").as_deref() != Ok("1") {
+                    return ToolResult::error(
+                        "execute_code is disabled. Set ASTRA_CODE_EXEC_UNSAFE=1 to enable.".into(),
+                    );
+                }
+                #[cfg(unix)]
+                {
+                    crate::code_exec::handle_execute_code(args, self).await
+                }
+                #[cfg(not(unix))]
+                {
+                    ToolResult::error(
+                        "execute_code is not available on this platform \
+                         (requires Unix domain sockets; Windows named-pipe \
+                         support is a future work)"
+                            .into(),
+                    )
+                }
             }
 
             // ── Delegation placeholder ───────────────────────────────
@@ -346,94 +378,6 @@ impl DefaultToolExecutor {
             _ => return ToolResult::error(format!("Error: Unknown GitHub tool '{name}'")),
         };
         string_to_result(output)
-    }
-
-    /// Dispatch web_fetch: simple HTTP GET using the context's HTTP client or curl fallback.
-    async fn dispatch_web_fetch(&self, args: &Value) -> ToolResult {
-        let url = match args.get("url").and_then(|v| v.as_str()) {
-            Some(u) => u,
-            None => return ToolResult::error("Error: Missing 'url' parameter".into()),
-        };
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            return ToolResult::error("Error: URL must start with http:// or https://".into());
-        }
-        let max_bytes = args
-            .get("max_bytes")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(10_000) as usize;
-        let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(10);
-
-        if let Some(client) = &self.ctx.http_client {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                client.get(url).header("User-Agent", "astra/0.1").send(),
-            )
-            .await
-            {
-                Ok(Ok(resp)) => {
-                    let status = resp.status();
-                    match resp.text().await {
-                        Ok(body) => {
-                            let truncated = if body.len() > max_bytes {
-                                format!(
-                                    "{}\n... [truncated at {} of {} bytes]",
-                                    &body[..max_bytes],
-                                    max_bytes,
-                                    body.len()
-                                )
-                            } else {
-                                body
-                            };
-                            ToolResult::text(format!("HTTP {status}\n{truncated}"))
-                        }
-                        Err(e) => ToolResult::error(format!("Error reading response: {e}")),
-                    }
-                }
-                Ok(Err(e)) => ToolResult::error(format!("Error: HTTP request failed: {e}")),
-                Err(_) => {
-                    ToolResult::error(format!("Error: Request timed out after {timeout_secs}s"))
-                }
-            }
-        } else {
-            // Fallback: use curl subprocess
-            let output = tokio::process::Command::new("curl")
-                .args([
-                    "-sS",
-                    "-L",
-                    "--max-redirs",
-                    "5",
-                    "--max-time",
-                    &timeout_secs.to_string(),
-                    "--max-filesize",
-                    &(max_bytes * 2).to_string(),
-                    "-H",
-                    "User-Agent: astra/0.1",
-                    url,
-                ])
-                .output()
-                .await;
-            match output {
-                Ok(out) => {
-                    let body = String::from_utf8_lossy(&out.stdout);
-                    if body.is_empty() {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        return ToolResult::error(format!("Error: {stderr}"));
-                    }
-                    let truncated = if body.len() > max_bytes {
-                        format!(
-                            "{}\n... [truncated at {} of {} bytes]",
-                            &body[..max_bytes],
-                            max_bytes,
-                            body.len()
-                        )
-                    } else {
-                        body.to_string()
-                    };
-                    ToolResult::text(truncated)
-                }
-                Err(e) => ToolResult::error(format!("Error: curl failed: {e}")),
-            }
-        }
     }
 
     /// Dispatch the `symbols` tool: read a file, detect language, extract symbols.
@@ -835,7 +779,7 @@ mod tests {
             )
             .await;
         assert!(result.is_error);
-        assert!(result.output.contains("http"));
+        assert!(result.output.contains("Unsupported scheme"));
     }
 
     #[tokio::test]
