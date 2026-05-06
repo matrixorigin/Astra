@@ -1206,7 +1206,10 @@ impl ToolExecutor {
                     astra_tools::web_fetch::fetch_with_cache_scope(None, args, &cache_scope).await
                 }
                 "memory" => {
-                    let op = args.get("action").and_then(|v| v.as_str()).unwrap_or("retrieve");
+                    let op = match args.get("action").and_then(|v| v.as_str()) {
+                        Some(a) => a,
+                        None => return "Error: missing required parameter 'action'. Use one of: store, retrieve, purge, correct, profile, search, feedback".to_string(),
+                    };
                     let mut clean_args = args.clone();
                     if let Some(obj) = clean_args.as_object_mut() { obj.remove("action"); }
                     self.memoria_call(op, &clean_args).await

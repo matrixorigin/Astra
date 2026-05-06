@@ -1289,7 +1289,10 @@ impl ServerToolExecutor {
         let mut result = match name {
             // ── Memory tools (HTTP proxy) ──────────────────────────────
             "memory" => {
-                let op = args.get("action").and_then(|v| v.as_str()).unwrap_or("retrieve");
+                let op = match args.get("action").and_then(|v| v.as_str()) {
+                    Some(a) => a,
+                    None => return tool_result_from_output("Error: missing required parameter 'action'. Use: store, retrieve, purge, correct, profile, search, feedback".to_string()),
+                };
                 let mut isolated_args = args.clone();
                 if let Some(obj) = isolated_args.as_object_mut() {
                     obj.remove("action"); // Memoria API doesn't expect this field
