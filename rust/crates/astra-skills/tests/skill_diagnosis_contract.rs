@@ -1,6 +1,6 @@
 //! Contract: a `SkillDiagnosis` must be recoverable from the free-form
 //! markdown response of an auto-invoked diagnostic skill
-//! (`analyze_session`, `evaluate_session`, `optimize_prompt`).
+//! (`analyze_session`, `analyze_session`, `optimize_prompt`).
 //!
 //! The skills themselves are LLM-authored and produce human-readable
 //! markdown. The auto-invoke pipeline only needs the structured slice of
@@ -74,7 +74,7 @@ fn parses_block_with_no_recommended_action() {
 ```skill-diagnosis
 {
   "schema_version": 2,
-  "skill": "evaluate_session",
+  "skill": "analyze_session",
   "cause": "repeated_corrections",
   "headline": "user re-scoped 5× in 8 turns",
   "findings": ["scope drift"],
@@ -93,7 +93,7 @@ fn parses_block_with_no_recommended_action() {
 "#;
     let diag = SkillDiagnosis::parse_from_skill_output(output).expect("parse");
     assert!(diag.recommended_action.is_none());
-    assert_eq!(diag.skill, "evaluate_session");
+    assert_eq!(diag.skill, "analyze_session");
 }
 
 // ─── Missing / unparseable inputs ─────────────────────────────────────────
@@ -268,7 +268,7 @@ fn skill_md_example_blocks_are_parseable() {
         .nth(3)
         .expect("walk up to repo root");
 
-    for skill_name in ["analyze_session", "evaluate_session", "optimize_prompt"] {
+    for skill_name in ["analyze_session", "analyze_session", "optimize_prompt"] {
         let path = repo_root.join("skills").join(skill_name).join("SKILL.md");
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
