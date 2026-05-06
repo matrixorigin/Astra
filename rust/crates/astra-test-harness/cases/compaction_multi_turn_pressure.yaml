@@ -1,0 +1,70 @@
+name: compaction_multi_turn_pressure
+description: |
+  **What**: Multi-turn session that accumulates context pressure across turns, then
+  verifies that compaction fired and the agent retained recent state.
+  **Tests**: Cross-turn compaction lifecycle — turn 1 fills context with large tool
+  results, turn 2 adds more, turn 3 asks a question about recent content.
+  If compaction fires correctly between turns, old results are cleared but recent
+  ones survive. The stderr "♻ Compacted" line confirms it fired.
+  **Why**: Production sessions hit compaction after 5-10 turns of tool use. If
+  compaction breaks cross-turn state (e.g., clears ALL results instead of old ones),
+  the agent becomes amnesiac.
+  **Pass means**: Agent recalls turn-2 content in turn 3 after compaction fired.
+  **Fail means**: Compaction was too aggressive (cleared recent results) or never fired.
+prompt: |
+  Read these 5 files using read_file, one at a time:
+  1. rust/crates/runtime/Cargo.toml
+  2. rust/crates/astra-cli/Cargo.toml
+  3. rust/crates/services/Cargo.toml
+  4. rust/crates/astra-tools/Cargo.toml
+  5. Makefile
+  After reading, say "batch-1-done" and nothing else.
+capability: tool_use
+difficulty: 3
+weight: 2.0
+timeout_seconds: 300
+steps:
+  - prompt: |
+      Now read these 4 more files:
+      1. rust/crates/astra-turn-core/Cargo.toml
+      2. rust/crates/astra-test-harness/Cargo.toml
+      3. scripts/dev/start-api.sh
+      4. rust/crates/core/Cargo.toml
+      After reading all 4, say "batch-2-done" and nothing else.
+    criteria:
+      - type: text_contains
+        needle: batch-2-done
+      - type: tool_called
+        name: read_file
+  - prompt: |
+      Without reading any more files, answer these two questions:
+      1. What build tool does the start-api.sh script use? (cargo or make?)
+      2. What is the package name in rust/crates/core/Cargo.toml?
+      Answer in exactly this format:
+      BUILD_TOOL: <answer>
+      PACKAGE: <answer>
+    criteria:
+      - type: text_contains
+        needle: "BUILD_TOOL:"
+      - type: judger
+        question: |
+          The agent was asked about start-api.sh (which uses cargo to build)
+          and the package name in rust/crates/core/Cargo.toml (which is "astra-core").
+          Did the agent correctly answer:
+          1. BUILD_TOOL: cargo (the script runs cargo build)
+          2. PACKAGE: astra-core
+          Score 1.0 if both correct, 0.5 if one correct, 0.0 if neither.
+        threshold: 0.5
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: read_file
+  - type: text_contains
+    needle: batch-1-done
+  - type: tools_count_between
+    min: 8
+    max: 25
+  - type: turn_rounds_between
+    min: 3
+    max: 40
