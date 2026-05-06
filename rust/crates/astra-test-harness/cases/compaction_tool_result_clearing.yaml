@@ -43,6 +43,9 @@ criteria:
   - type: turn_rounds_between
     min: 2
     max: 20
+  - type: session_event_count
+    event_type: CompactionFired
+    min: 1
   - type: judger
     question: |
       The agent was asked to read 8 files and then recall the package name

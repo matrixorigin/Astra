@@ -922,17 +922,23 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 session_dir.as_deref(),
             )
         };
-        if mc.results_compacted > 0 && !quiet {
-            host.emit_headless_line(
-                HeadlessStderrStyle::Dim,
-                format!(
-                    "  ♻ Compacted {} old tool result(s), ~{} tokens saved (pressure {:.0}%)",
-                    mc.results_compacted,
-                    mc.tokens_saved,
-                    pressure * 100.0,
-                ),
+        if mc.results_compacted > 0 {
+            if !quiet {
+                host.emit_headless_line(
+                    HeadlessStderrStyle::Dim,
+                    format!(
+                        "  ♻ Compacted {} old tool result(s), ~{} tokens saved (pressure {:.0}%)",
+                        mc.results_compacted,
+                        mc.tokens_saved,
+                        pressure * 100.0,
+                    ),
+                );
+            }
+            state.step_recorder.record_compaction(
+                mc.results_compacted as u32,
+                mc.tokens_saved as u64,
+                pressure,
             );
-            // Record compaction audit for pipeline journal
             if let Some(ref mut sess) = state.pipeline_session {
                 sess.record_compaction_audit(
                     "tool_result_clearing",

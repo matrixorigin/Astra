@@ -70,3 +70,6 @@ criteria:
   - type: turn_rounds_between
     min: 3
     max: 40
+  - type: session_event_count
+    event_type: CompactionFired
+    min: 1

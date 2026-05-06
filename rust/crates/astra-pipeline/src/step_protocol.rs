@@ -1591,6 +1591,8 @@ pub enum StepEventType {
     MemoryRecorded,
     MemoryGovernanceApplied,
 
+    CompactionFired,
+
     StallDetected,
     DivergenceDetected,
     RetryScheduled,

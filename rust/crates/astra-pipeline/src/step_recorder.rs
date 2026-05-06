@@ -599,6 +599,18 @@ impl StepRecorder {
         self.checkpoint_count += 1;
     }
 
+    /// Record that microcompact or compression fired this turn.
+    pub fn record_compaction(&mut self, results_compacted: u32, tokens_saved: u64, pressure: f64) {
+        self.emit_with_payload(
+            StepEventType::CompactionFired,
+            serde_json::json!({
+                "results_compacted": results_compacted,
+                "tokens_saved": tokens_saved,
+                "pressure": (pressure * 1000.0).round() / 1000.0,
+            }),
+        );
+    }
+
     /// Record tool-level retry.
     pub fn record_retry(&mut self, tool_name: &str, attempt: u32, succeeded: bool) {
         self.emit_with_payload(
