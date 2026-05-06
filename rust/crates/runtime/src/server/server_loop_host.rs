@@ -48,9 +48,7 @@ use astra_turn_core::bridge_rate_limit_cooldown::{
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use astra_turn_core::compaction_types::CompactionTier;
 use astra_turn_core::thinking_config::ThinkingConfig;
-use astra_turn_core::tool_schema_prune::{
-    filter_tool_schemas_by_excluded_names, prune_tool_schemas,
-};
+use astra_turn_core::tool_schema_prune::filter_tool_schemas_by_excluded_names;
 use astra_turn_core::turn_guard::merge_deprioritized_tools_into_restricted;
 
 fn request_aware_summary_http_client() -> Result<reqwest::Client, String> {
@@ -242,6 +240,25 @@ struct ResolvedTurnLlmConfig {
     header_overrides: HashMap<String, String>,
     completions_url_override: Option<String>,
     request_timeout: Option<Duration>,
+}
+
+/// Full output of [`ServerAgenticLoopHost::run_turn_pipeline`] — everything the
+/// wire-payload path needs from a pipeline turn in one place.
+struct PipelineTurnOutcome {
+    /// Rendered system message(s), ready to prepend to the LLM request.
+    system_messages: Vec<Value>,
+    /// Flattened plain-text system prompt, for trace + cache-estimate consumers.
+    system_plain: String,
+    /// Per-section token breakdown for observability.
+    breakdown: astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
+    /// Compaction tier the planner selected this turn. The runtime must honour
+    /// this rather than re-deriving a tier from raw prompt-token estimates —
+    /// double derivation used to be the primary source of pipeline/runtime drift.
+    tier: CompactionTier,
+    /// Tool schemas already pruned to `tier` by the pipeline's Optimize phase.
+    /// Runtime still needs to layer `cache_control` annotations (Phase 2), but
+    /// the pruning decision is authoritative from here down.
+    tool_schemas: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -1081,19 +1098,20 @@ impl ServerAgenticLoopHost {
             Some((p, m)) => (p.clone(), m.clone()),
             None => ("openai".to_string(), "server-loop-mock".to_string()),
         };
-        let (system_msgs, _system_plain, system_prompt_breakdown) = self
-            .build_pipeline_system_messages(
-                state,
-                &edge_tools_snapshot,
-                &provider_name,
-                &model_name_for_pipeline,
-                &state.message,
-            );
-        self.emit_context_meta(&system_prompt_breakdown);
+        let mock_pipeline = self.run_turn_pipeline(
+            state,
+            &edge_tools_snapshot,
+            &provider_name,
+            &model_name_for_pipeline,
+            &state.message,
+        );
+        let system_msgs = mock_pipeline.system_messages;
+        self.emit_context_meta(&mock_pipeline.breakdown);
 
         // Replicate the real-path tool + message annotations so captured
-        // payloads reflect what a real provider would see.
-        let mut annotated_tools = edge_tools_snapshot.clone();
+        // payloads reflect what a real provider would see. Start from the
+        // pipeline-pruned tool schemas so mock replay mirrors the real wire.
+        let mut annotated_tools = mock_pipeline.tool_schemas;
         annotate_tool_schemas_for_caching(&mut annotated_tools, &cache_cfg);
         let mut annotated_messages = state.messages.clone();
         apply_anthropic_cache_metadata(&mut annotated_messages, &cache_cfg, &self.session_id);
@@ -1685,18 +1703,19 @@ impl ServerAgenticLoopHost {
     /// deleted in the same change that introduced this helper.
     ///
     /// Returns `(structured_system_messages, plain_text_for_estimates, breakdown)`.
-    fn build_pipeline_system_messages(
+    /// Run the full context pipeline for this turn and return everything the
+    /// wire payload needs: rendered system message(s), the plain-text form for
+    /// tracing, the breakdown, the selected compaction tier, and the tier-pruned
+    /// tool schemas. Callers that only want the system text can discard the
+    /// extra fields.
+    fn run_turn_pipeline(
         &mut self,
         state: &mut AgenticLoopState,
         visible_tools: &[Value],
         provider: &str,
         model_name: &str,
         user_content: &str,
-    ) -> (
-        Vec<Value>,
-        String,
-        astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
-    ) {
+    ) -> PipelineTurnOutcome {
         use crate::turn::context_pipeline_adapter::{
             build_external_sources, build_session_context, build_turn_state,
         };
@@ -1799,14 +1818,18 @@ impl ServerAgenticLoopHost {
                     total_tokens: (emergency.len() / 4) as u32,
                     ..Default::default()
                 };
-                return (
-                    vec![json!({
+                // Emergency fallback: keep the original visible tools so the
+                // turn can still function; tier defaults to Normal.
+                return PipelineTurnOutcome {
+                    system_messages: vec![json!({
                         "role": "system",
                         "content": [{"type": "text", "text": emergency}],
                     })],
-                    emergency.to_string(),
+                    system_plain: emergency.to_string(),
                     breakdown,
-                );
+                    tier: CompactionTier::Normal,
+                    tool_schemas: visible_tools.to_vec(),
+                };
             }
         };
 
@@ -1818,11 +1841,13 @@ impl ServerAgenticLoopHost {
             total_tokens: pipeline_output.metrics.sections,
             ..Default::default()
         };
-        (
-            vec![json!({"role": "system", "content": content})],
-            plain,
+        PipelineTurnOutcome {
+            system_messages: vec![json!({"role": "system", "content": content})],
+            system_plain: plain,
             breakdown,
-        )
+            tier: pipeline_output.plan.compact_tier,
+            tool_schemas: pipeline_output.optimized.tool_schemas,
+        }
     }
 
     /// Test-only: returns the plain-text system prompt (no cache annotations).
@@ -1920,11 +1945,18 @@ impl ServerAgenticLoopHost {
     }
 
     /// Build the LLM message array from loop state.
+    ///
+    /// `tier` is the compaction tier selected by the context pipeline's planner.
+    /// This function must NOT re-derive a tier — using a different tier than the
+    /// pipeline caused silent drift between planner decisions and Memoria
+    /// compaction decisions (two independent tier calculations that disagreed).
+    #[allow(clippy::too_many_arguments)]
     async fn build_llm_messages(
         &self,
         system_messages: Vec<Value>,
         state: &AgenticLoopState,
         visible_tools: &[Value],
+        tier: CompactionTier,
         model_name: &str,
         api_key: &str,
         base_url: &str,
@@ -1936,8 +1968,12 @@ impl ServerAgenticLoopHost {
     ) -> Vec<Value> {
         let mut llm_messages = system_messages;
 
-        // Compute compaction tier
         let budget = crate::prompts::budget_for_model(Some(model_name));
+        let budget_chars = budget.effective_input_limit() * 4;
+
+        // For Memoria's `current_tokens` signal — memoria uses this as the
+        // "budget pressure" knob for retrieval. We still need an estimate here;
+        // Phase 3 will move this into the pipeline and this can disappear.
         let tool_schema_tokens: usize = visible_tools
             .iter()
             .map(|t| {
@@ -1949,13 +1985,6 @@ impl ServerAgenticLoopHost {
         let mut all_msgs = llm_messages.clone();
         all_msgs.extend(state.messages.iter().cloned());
         let cache_est = crate::prompts::estimate_tokens_cache_aware(&all_msgs, tool_schema_tokens);
-        let tier = crate::prompts::compaction_tier_calibrated(
-            &budget,
-            cache_est.total_tokens,
-            state.last_measured_prompt_tokens,
-            state.consecutive_context_window_errors,
-        );
-        let budget_chars = budget.effective_input_limit() * 4;
 
         // Tool result compaction is handled by compact_tool_results_adaptive
         // in agentic_loop_lifecycle.rs. No separate analytics pass needed.
@@ -2280,15 +2309,26 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             max_output_tokens: 4096,
         });
 
-        // ── 2b. Build system prompt via context pipeline ─────────────────
-        let (system_messages, system_prompt_plain, system_prompt_breakdown) = self
-            .build_pipeline_system_messages(
-                state,
-                &visible_tools,
-                &llm_cfg.provider,
-                &llm_cfg.model_name,
-                &user_content,
-            );
+        // ── 2b. Run the context pipeline ─────────────────────────────────
+        // Pipeline is the single source of truth for:
+        //   * system prompt content
+        //   * compaction tier selection
+        //   * tier-pruned tool schemas
+        // Runtime no longer re-derives any of these.
+        let turn_pipeline = self.run_turn_pipeline(
+            state,
+            &visible_tools,
+            &llm_cfg.provider,
+            &llm_cfg.model_name,
+            &user_content,
+        );
+        let PipelineTurnOutcome {
+            system_messages,
+            system_plain: system_prompt_plain,
+            breakdown: system_prompt_breakdown,
+            tier,
+            tool_schemas: pipeline_tool_schemas,
+        } = turn_pipeline;
 
         // Debug: dump system prompt for cache analysis (env-gated, zero cost when off).
         if std::env::var("ASTRA_PIPELINE_DUMP_SYSTEM_PROMPT").is_ok() {
@@ -2305,6 +2345,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 system_messages,
                 state,
                 &visible_tools,
+                tier,
                 &llm_cfg.model_name,
                 &llm_cfg.api_key,
                 &llm_cfg.base_url,
@@ -2320,24 +2361,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let budget = crate::prompts::budget_for_model(Some(&llm_cfg.model_name));
         let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
 
-        let tool_schema_tokens: usize = visible_tools
-            .iter()
-            .map(|t| {
-                serde_json::to_string(t)
-                    .map(|s| crate::prompts::estimate_str_tokens(&s))
-                    .unwrap_or(50)
-            })
-            .sum();
-        let mut est_msgs = vec![json!({"role": "system", "content": system_prompt_plain})];
-        est_msgs.extend(state.messages.iter().cloned());
-        let cache_est = crate::prompts::estimate_tokens_cache_aware(&est_msgs, tool_schema_tokens);
-        let tier = crate::prompts::compaction_tier_calibrated(
-            &budget,
-            cache_est.total_tokens,
-            state.last_measured_prompt_tokens,
-            state.consecutive_context_window_errors,
-        );
-        let mut final_tools = prune_tool_schemas(&visible_tools, tier);
+        let mut final_tools = pipeline_tool_schemas;
         // Annotate tool schemas with cache_control for Anthropic.
         annotate_tool_schemas_for_caching(&mut final_tools, &cache_cfg);
         state.last_turn_policy =
@@ -2919,13 +2943,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             effective_restricted.remove(boosted);
         }
         let visible_tools = self.filtered_turn_tools(&effective_restricted);
-        let (system_messages, _, _) = self.build_pipeline_system_messages(
-            state,
-            &visible_tools,
-            &params.provider,
-            &params.model_name,
-            &user_content,
-        );
+        // We only need the system messages here — the inline summary call
+        // reuses the main turn's system prefix, not its tools.
+        let system_messages = self
+            .run_turn_pipeline(
+                state,
+                &visible_tools,
+                &params.provider,
+                &params.model_name,
+                &user_content,
+            )
+            .system_messages;
         // Use the trait's summary_client() so gateway overrides and forwarded
         // auth headers are respected, rather than constructing a plain client inline.
         let Some(client) = self.summary_client() else {
@@ -3723,13 +3751,11 @@ mod tests {
         state.pipeline_session = Some(pipeline_session);
         let tools = host.edge_tools.clone();
 
-        let (messages, plain, breakdown) = host.build_pipeline_system_messages(
-            &mut state,
-            &tools,
-            "anthropic",
-            "claude-sonnet",
-            "continue",
-        );
+        let outcome =
+            host.run_turn_pipeline(&mut state, &tools, "anthropic", "claude-sonnet", "continue");
+        let messages = outcome.system_messages;
+        let plain = outcome.system_plain;
+        let breakdown = outcome.breakdown;
 
         assert!(
             !messages.is_empty(),
@@ -3907,6 +3933,7 @@ mod tests {
                 vec![json!({"role": "system", "content": "system prompt text"})],
                 &state,
                 &host.edge_tools,
+                CompactionTier::Normal,
                 "gpt-4",
                 "sk-test",
                 "https://api.test.com",
@@ -3920,6 +3947,116 @@ mod tests {
         assert!(msgs.len() >= 2, "should have system + user messages");
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[0]["content"], "system prompt text");
+    }
+
+    #[tokio::test]
+    async fn run_turn_pipeline_returns_tier_and_pruned_tool_schemas() {
+        // Phase 1 contract: the pipeline is the sole authority for
+        // (a) compaction tier selection and
+        // (b) tier-appropriate tool-schema pruning.
+        // Runtime no longer re-derives either — both must come back from
+        // `run_turn_pipeline` via the PipelineTurnOutcome struct.
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-turn-pipeline".to_string(),
+            "s-turn-pipeline".to_string(),
+        )
+        .with_edge_tools(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Execute a shell command. Runs inside the sandbox with a 2-minute default timeout and deletes temp dirs on exit.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "Command to run. Use absolute paths."}
+                    }
+                }
+            }
+        })])
+        .build();
+
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-turn-pipeline".into());
+        state.max_turn_input_tokens = 200_000;
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        let tools = host.edge_tools.clone();
+
+        let outcome = host.run_turn_pipeline(&mut state, &tools, "openai", "gpt-4", "just do it");
+
+        // Tier comes from the planner, not from runtime's estimate.
+        // For this low-pressure state planner should select Normal.
+        assert_eq!(
+            outcome.tier,
+            CompactionTier::Normal,
+            "low-pressure turn should plan at CompactionTier::Normal"
+        );
+        // Tool schemas are the pipeline's Optimize output, not the raw input.
+        assert_eq!(
+            outcome.tool_schemas.len(),
+            tools.len(),
+            "Normal tier preserves tool schema count"
+        );
+        // System messages are rendered from pipeline's serialized system blocks.
+        assert!(!outcome.system_messages.is_empty());
+        assert_eq!(outcome.system_messages[0]["role"], "system");
+    }
+
+    #[tokio::test]
+    async fn run_turn_pipeline_prunes_tool_schemas_under_pressure() {
+        // Forces the planner into TrimSchemas+ tier by driving up recovery
+        // state (PTL errors), then verifies the returned tool_schemas reflect
+        // tier-appropriate pruning — tool descriptions should be truncated.
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-prune".to_string(),
+            "s-prune".to_string(),
+        )
+        .with_edge_tools(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Execute a shell command. Runs inside the sandbox with a 2-minute default timeout and deletes temp dirs on exit.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "Command to run. Use absolute paths."}
+                    }
+                }
+            }
+        })])
+        .build();
+
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-prune".into());
+        state.max_turn_input_tokens = 200_000;
+        let mut ps = astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        );
+        // Force the planner to escalate beyond Normal via recovery state.
+        ps.recovery.consecutive_ptl_errors = 1;
+        state.pipeline_session = Some(ps);
+        let tools = host.edge_tools.clone();
+
+        let outcome = host.run_turn_pipeline(&mut state, &tools, "openai", "gpt-4", "continue");
+
+        assert!(
+            outcome.tier >= CompactionTier::TrimSchemas,
+            "recovery PTL=1 must escalate tier above Normal, got {:?}",
+            outcome.tier
+        );
+        // Description must have been touched by TrimSchemas (first-sentence truncation).
+        let pruned_desc = outcome.tool_schemas[0]["function"]["description"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            !pruned_desc.contains("deletes temp dirs"),
+            "trailing sentence should be stripped under TrimSchemas, got: {pruned_desc:?}"
+        );
     }
 
     #[tokio::test]
@@ -4486,8 +4623,10 @@ mod tests {
             TurnInteractionMode::Headless,
         ));
         let visible_tools = host.filtered_turn_tools(&effective_restricted);
-        let final_tools =
-            prune_tool_schemas(&visible_tools, crate::prompts::CompactionTier::Normal);
+        let final_tools = astra_turn_core::tool_schema_prune::prune_tool_schemas(
+            &visible_tools,
+            crate::prompts::CompactionTier::Normal,
+        );
         let policy =
             TurnInteractionPolicy::from_tool_schemas(TurnInteractionMode::Headless, &final_tools);
 
@@ -4518,8 +4657,10 @@ mod tests {
             host.turn_interaction_mode(),
         ));
         let visible_tools = host.filtered_turn_tools(&effective_restricted);
-        let final_tools =
-            prune_tool_schemas(&visible_tools, crate::prompts::CompactionTier::Normal);
+        let final_tools = astra_turn_core::tool_schema_prune::prune_tool_schemas(
+            &visible_tools,
+            crate::prompts::CompactionTier::Normal,
+        );
         let policy =
             TurnInteractionPolicy::from_tool_schemas(host.turn_interaction_mode(), &final_tools);
 
