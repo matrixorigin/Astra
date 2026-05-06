@@ -6,7 +6,7 @@ description: |
   **Pass means**: The agent retains specific file content (target names, variables) after compaction pressure, proving state re-injection works.
   **Fail means**: Compaction dropped recent_file_reads — the agent either re-read the file (wasted a tool call) or fabricated generic content.
 prompt: |
-  First, use read_file to look at ./Cargo.toml (top 30 lines is fine).
+  First, use read_file to look at rust/Cargo.toml (top 30 lines is fine).
   Then in your final answer, do two things:
     1. Describe what's in the Cargo.toml based on what you just read.
     2. Reference a SPECIFIC workspace member or profile name from the file.
@@ -20,7 +20,7 @@ criteria:
     name: read_file
   - type: tools_count_between
     min: 1
-    max: 2
+    max: 3
   - type: judger
     question: |
       Does the final answer quote a specific Cargo.toml workspace
