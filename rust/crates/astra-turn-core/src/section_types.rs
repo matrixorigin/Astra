@@ -122,8 +122,19 @@ pub enum SectionKind {
     Constraints,
     /// Dynamic — active skill instructions.
     Skills,
-    /// Dynamic — model, date, cwd, git.
+    /// Dynamic — **session-stable** runtime identity fragments:
+    /// model, cwd, git branch, session id, self-model (tool set), tool-conditional
+    /// guidance, project profile, learned context, system override. These
+    /// change at session boundaries but are byte-stable within a session, so
+    /// they belong in `CacheScope::Session` behind a cache marker.
     RuntimeIdentity,
+    /// Dynamic — **turn-volatile** runtime fragments:
+    /// tool-round guidance (depends on conversation length), effort hint
+    /// (depends on active skill), plan-resume context, per-turn bridge
+    /// escape-hatch extras (session anchor, feedback rules, memoria insights).
+    /// These change every turn so they must live in `CacheScope::None`, AFTER
+    /// the cache marker, otherwise they would invalidate the cached prefix.
+    RuntimeVolatile,
     /// Emergent — discovered skills from previous turn.
     EmergentSkills,
     /// Emergent — prefetched memory from previous turn.
@@ -141,10 +152,11 @@ impl SectionKind {
             Self::SelfModel => 1,
             Self::ProjectContext => 2,
             Self::Skills => 3,
-            Self::Memory | Self::EmergentMemory => 4,
-            Self::WorkingMemory | Self::EmergentSkills | Self::EmergentSummary => 5,
-            Self::History => 6,
-            Self::RuntimeIdentity => 7,
+            Self::RuntimeIdentity => 4, // session-stable; sits with Session blocks
+            Self::Memory | Self::EmergentMemory => 5,
+            Self::WorkingMemory | Self::EmergentSkills | Self::EmergentSummary => 6,
+            Self::History => 7,
+            Self::RuntimeVolatile => 8, // turn-volatile; latest in the prompt
         }
     }
 }
@@ -220,6 +232,7 @@ impl SectionArtifact {
             | SectionKind::WorkingMemory
             | SectionKind::Skills
             | SectionKind::RuntimeIdentity
+            | SectionKind::RuntimeVolatile
             | SectionKind::EmergentSkills
             | SectionKind::EmergentSummary => Self::RuntimeText(text),
         }
@@ -369,7 +382,11 @@ mod tests {
         assert_eq!(SectionKind::Identity.volatility(), 0);
         assert_eq!(SectionKind::Constraints.volatility(), 0);
         assert!(SectionKind::Identity.volatility() < SectionKind::History.volatility());
-        assert!(SectionKind::History.volatility() < SectionKind::RuntimeIdentity.volatility());
+        // Post-split: RuntimeIdentity carries session-stable fragments and sits
+        // BEFORE History; RuntimeVolatile is the turn-volatile section and
+        // ranks highest (most-drifting, emitted last in the prompt).
+        assert!(SectionKind::RuntimeIdentity.volatility() < SectionKind::History.volatility());
+        assert!(SectionKind::History.volatility() < SectionKind::RuntimeVolatile.volatility());
     }
 
     #[test]

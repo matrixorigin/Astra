@@ -59,6 +59,7 @@ fn bind_section(planned: &PlannedSection, sources: &ContextSources<'_>) -> Bound
         // separate text section.
         SectionKind::History => String::new(),
         SectionKind::RuntimeIdentity => bind_runtime_identity(sources),
+        SectionKind::RuntimeVolatile => bind_runtime_volatile(sources),
         SectionKind::EmergentSkills => bind_emergent_skills(sources),
         SectionKind::EmergentMemory => bind_emergent_memory(sources),
         SectionKind::EmergentSummary => bind_emergent_summary(sources),
@@ -121,11 +122,13 @@ fn bind_memory(sources: &ContextSources<'_>) -> String {
     sources.external.memory_snippets.join("\n\n")
 }
 
-/// Bind runtime identity — the per-turn dynamic section.
+/// Bind the **session-stable** runtime identity fragments.
 ///
-/// Includes: model/env identity + all pre-computed dynamic fragments from
-/// ExternalSources (profile, self-model, tool guidance, plan context, etc.).
-/// The runtime computes these; the pipeline just includes them in order.
+/// Includes model/cwd/branch/session header + fragments that only change at
+/// session boundaries: `self_model_text` (tools-dependent), `tool_conditional`
+/// guidance, `profile_desc`, `learned_context`, `system_override`. These
+/// sit in `CacheScope::Session` so Anthropic's per-session cache captures
+/// them behind the 2nd cache marker.
 fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
     let ep = &sources.session.edge_profile;
     let ext = &sources.external;
@@ -143,7 +146,9 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
         parts.push(format!("Session: {}", sources.session.session_id));
     }
 
-    // Dynamic fragments from runtime (order matches legacy for cache stability)
+    // Session-stable dynamic fragments. Order matches the legacy
+    // `bind_runtime_identity` emission order for byte stability across
+    // refactors.
     if let Some(ref text) = ext.self_model_text {
         parts.push(text.clone());
     }
@@ -153,13 +158,29 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
     if let Some(ref text) = ext.profile_desc {
         parts.push(text.clone());
     }
-    if let Some(ref text) = ext.effort_hint {
-        parts.push(text.clone());
-    }
     if let Some(ref text) = ext.learned_context {
         parts.push(text.clone());
     }
     if let Some(ref text) = ext.system_override {
+        parts.push(text.clone());
+    }
+
+    parts.join("\n")
+}
+
+/// Bind the **turn-volatile** runtime identity fragments.
+///
+/// Includes pieces that can change every turn: `effort_hint` (depends on
+/// the active skill), `plan_context` (resume hint), `tool_guidance` (uses
+/// current conversation length), and `extra_dynamic_sections` (bridge
+/// escape hatch — session anchor, feedback rules, memoria insights that
+/// update each turn). These sit in `CacheScope::None` so turn-to-turn
+/// drift does not invalidate the cached session prefix.
+fn bind_runtime_volatile(sources: &ContextSources<'_>) -> String {
+    let ext = &sources.external;
+    let mut parts = Vec::new();
+
+    if let Some(ref text) = ext.effort_hint {
         parts.push(text.clone());
     }
     if let Some(ref text) = ext.plan_context {
@@ -169,9 +190,9 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
         parts.push(text.clone());
     }
 
-    // Bridge escape hatch: pre-built dynamic sections (session anchor,
-    // feedback rules, memoria insights, etc.). Appended verbatim in
-    // caller order so the bridge's legacy composition can be replicated
+    // Bridge escape hatch: pre-built per-turn dynamic sections (session
+    // anchor, feedback rules, memoria insights, etc.). Appended verbatim
+    // in caller order so the bridge's legacy composition can be replicated
     // without adding 10 more typed fields.
     for section in &ext.extra_dynamic_sections {
         if !section.text.is_empty() {
@@ -342,10 +363,12 @@ mod tests {
     /// HTTP bridge escape hatch: `extra_dynamic_sections` gives callers a
     /// way to feed pre-built sections (session anchor, feedback rules,
     /// memoria insights, etc.) through the pipeline without each one
-    /// needing a dedicated typed field. Binder appends them verbatim
-    /// after the standard runtime fragments.
+    /// needing a dedicated typed field. Post-split these land in the
+    /// volatile section (they can vary turn-to-turn — session anchors
+    /// update, feedback rules grow, memoria insights rotate) and stay
+    /// OUT of the session-cached prefix.
     #[test]
-    fn bind_runtime_identity_includes_extra_dynamic_sections() {
+    fn bind_runtime_volatile_includes_extra_dynamic_sections() {
         use crate::section_types::PromptSection;
         use crate::section_types::PromptTokenBucket;
 
@@ -362,11 +385,11 @@ mod tests {
         ];
 
         let sources = fixture.context();
-        let content = bind_runtime_identity(&sources);
+        let content = bind_runtime_volatile(&sources);
 
         assert!(
             content.contains("Session Anchor"),
-            "first extra section must appear in runtime identity: {content}"
+            "first extra section must appear in runtime volatile: {content}"
         );
         assert!(
             content.contains("Learned Feedback Rules"),
@@ -379,12 +402,21 @@ mod tests {
             anchor_pos < rules_pos,
             "extra_dynamic_sections must append in caller-specified order"
         );
+
+        // The session-stable RuntimeIdentity must NOT leak the extras —
+        // otherwise the cached prefix would drift with bridge escape-hatch
+        // churn.
+        let stable = bind_runtime_identity(&sources);
+        assert!(
+            !stable.contains("Session Anchor"),
+            "extras must stay out of session-stable identity — would break cache"
+        );
     }
 
     #[test]
     fn bind_runtime_identity_empty_extras_behaves_like_before() {
         // Backward-compat: empty `extra_dynamic_sections` (the default)
-        // must not change the output versus the pre-refactor behaviour.
+        // must not change the session-stable output versus pre-refactor.
         let fixture = test_sources();
         let sources = fixture.context();
         let content = bind_runtime_identity(&sources);

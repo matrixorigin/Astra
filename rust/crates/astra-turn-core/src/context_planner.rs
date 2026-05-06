@@ -158,10 +158,28 @@ fn plan_section_manifest(budget: &TokenBudget, has_memory: bool) -> Vec<PlannedS
             priority: CompressionPriority::Normal,
             source: SectionSource::Skill,
         },
+        // Session-stable runtime identity: model / cwd / branch / session +
+        // fragments that only change at session boundaries (self_model_text,
+        // tool_conditional, profile_desc, learned_context, system_override).
+        // Placing these in `Session` scope is the cache optimization that
+        // gives a 2nd marker its target — everything up through here sits in
+        // the cached prefix, only truly per-turn content is re-sent.
         PlannedSection {
             kind: SectionKind::RuntimeIdentity,
-            scope: CacheScope::None,
+            scope: CacheScope::Session,
             estimated_tokens: budget.budget_for(SectionKind::RuntimeIdentity),
+            priority: CompressionPriority::Normal,
+            source: SectionSource::Environment,
+        },
+        // Turn-volatile runtime fragments: tool-round guidance (uses current
+        // messages), effort hint (depends on active skill), plan_context,
+        // and `extra_dynamic_sections` (bridge escape hatch — session anchor,
+        // feedback, memoria insights). These drift every turn so they must
+        // sit AFTER the marker.
+        PlannedSection {
+            kind: SectionKind::RuntimeVolatile,
+            scope: CacheScope::None,
+            estimated_tokens: budget.budget_for(SectionKind::RuntimeVolatile),
             priority: CompressionPriority::Normal,
             source: SectionSource::Environment,
         },
@@ -444,11 +462,14 @@ mod tests {
                 SectionKind::ProjectContext,
                 SectionKind::Skills,
                 SectionKind::RuntimeIdentity,
+                SectionKind::RuntimeVolatile,
                 SectionKind::EmergentSkills,
                 SectionKind::EmergentMemory,
                 SectionKind::EmergentSummary,
             ],
-            "canonical section order drifted — this breaks Anthropic prompt-cache prefix"
+            "canonical section order drifted — this breaks Anthropic prompt-cache prefix. \
+             RuntimeIdentity (Session) must precede RuntimeVolatile (None) so the 2nd cache \
+             marker falls at the Session→None boundary."
         );
     }
 
@@ -468,18 +489,106 @@ mod tests {
                 SectionKind::ProjectContext,
                 SectionKind::Skills,
                 SectionKind::RuntimeIdentity,
+                SectionKind::RuntimeVolatile,
                 SectionKind::Memory,
                 SectionKind::EmergentSkills,
                 SectionKind::EmergentMemory,
                 SectionKind::EmergentSummary,
             ],
-            "canonical section order (with memory) drifted — Memory must sit between RuntimeIdentity and Emergent*"
+            "canonical section order (with memory) drifted — Memory must sit between RuntimeVolatile and Emergent*"
         );
     }
 
     /// Global-scope anchors (Identity, Constraints) MUST appear before any
     /// Session-scope section. This is what lets Global-scope content survive
     /// across sessions in provider-level caches.
+    /// Session-scope sections MUST appear before any None-scope section.
+    /// This is the second half of the "ascending-volatility prefix" rule —
+    /// the 2nd cache marker (placed at the Session→None boundary) only works
+    /// if there's a clean boundary, i.e. no None-scope block sneaks in
+    /// between Session-scope blocks.
+    ///
+    /// Concrete test: `RuntimeIdentity (Session)` must strictly precede
+    /// `RuntimeVolatile (None)`. Otherwise turn-volatile content leaks into
+    /// the cached region and defeats the whole split.
+    #[test]
+    fn session_scope_sections_precede_none_scope_sections() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+
+        let first_none_pos = plan
+            .sections
+            .iter()
+            .position(|s| s.scope == CacheScope::None);
+        let last_session_pos = plan
+            .sections
+            .iter()
+            .rposition(|s| s.scope == CacheScope::Session);
+
+        if let (Some(first_none), Some(last_session)) = (first_none_pos, last_session_pos) {
+            assert!(
+                last_session < first_none,
+                "Session-scope sections must precede all None-scope sections so the \
+                 2nd cache marker falls at a clean Session→None boundary. \
+                 RuntimeVolatile (None) appearing between Session blocks would leak \
+                 per-turn drift into the cached prefix."
+            );
+        }
+
+        // Specifically assert RuntimeIdentity(Session) precedes RuntimeVolatile(None)
+        let identity_pos = plan
+            .sections
+            .iter()
+            .position(|s| s.kind == SectionKind::RuntimeIdentity);
+        let volatile_pos = plan
+            .sections
+            .iter()
+            .position(|s| s.kind == SectionKind::RuntimeVolatile);
+        assert!(
+            identity_pos.is_some() && volatile_pos.is_some(),
+            "both RuntimeIdentity and RuntimeVolatile must be emitted"
+        );
+        assert!(
+            identity_pos.unwrap() < volatile_pos.unwrap(),
+            "RuntimeIdentity (stable, Session-scoped) must precede RuntimeVolatile (None-scoped)"
+        );
+    }
+
+    /// The split itself: `RuntimeIdentity` is Session, `RuntimeVolatile` is None.
+    /// If either scope changes we lose the cache strengthening this split was
+    /// designed for.
+    #[test]
+    fn runtime_identity_split_has_correct_scopes() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+
+        let identity = plan
+            .sections
+            .iter()
+            .find(|s| s.kind == SectionKind::RuntimeIdentity)
+            .expect("RuntimeIdentity section must be planned");
+        assert_eq!(
+            identity.scope,
+            CacheScope::Session,
+            "RuntimeIdentity (session-stable: model/cwd/branch/session + self-model + profile) \
+             must be Session-scoped so the 2nd cache marker captures it"
+        );
+
+        let volatile = plan
+            .sections
+            .iter()
+            .find(|s| s.kind == SectionKind::RuntimeVolatile)
+            .expect("RuntimeVolatile section must be planned");
+        assert_eq!(
+            volatile.scope,
+            CacheScope::None,
+            "RuntimeVolatile (tool_guidance/effort/plan_context/extras) must be None-scoped \
+             so turn-to-turn drift doesn't invalidate the cached prefix"
+        );
+    }
+
     #[test]
     fn global_scope_sections_precede_session_scope_sections() {
         let (tokens, recovery, latches, stats, policy) = default_input();

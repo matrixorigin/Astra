@@ -91,10 +91,20 @@ impl TokenBudget {
 
         let allocated: u32 = allocations.values().sum();
         let remaining = effective_limit.saturating_sub(allocated);
-        allocations.insert(SectionKind::SelfModel, remaining / 4);
-        allocations.insert(SectionKind::Skills, remaining / 4);
-        allocations.insert(SectionKind::ProjectContext, remaining / 4);
-        allocations.insert(SectionKind::RuntimeIdentity, remaining / 4);
+        let remainder_kinds = [
+            SectionKind::SelfModel,
+            SectionKind::Skills,
+            SectionKind::ProjectContext,
+            SectionKind::RuntimeIdentity,
+            SectionKind::RuntimeVolatile,
+        ];
+        let base = remaining / remainder_kinds.len() as u32;
+        let mut extra = remaining % remainder_kinds.len() as u32;
+        for kind in remainder_kinds {
+            let budget = base + u32::from(extra > 0);
+            extra = extra.saturating_sub(1);
+            allocations.insert(kind, budget);
+        }
 
         Self {
             effective_limit,
@@ -206,6 +216,17 @@ mod tests {
                 budget.effective_limit,
             );
         }
+    }
+
+    #[test]
+    fn budget_distributes_integer_remainder() {
+        let budget = TokenBudget::allocate(100_003, CompactionTier::Normal, &HashMap::new());
+
+        assert_eq!(
+            budget.total_allocated(),
+            budget.effective_limit,
+            "section allocation should not discard integer-division remainders"
+        );
     }
 
     proptest! {
