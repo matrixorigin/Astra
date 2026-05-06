@@ -10,11 +10,12 @@ endif
 
 CARGO ?= cargo
 RELEASE_BIN = ../../target/release/astra-gateway
+DEBUG_BIN = ../../target/debug/astra-gateway
 CONFIG ?= gateway.yaml
 PID_FILE = /tmp/astra-gateway.pid
 LOG_FILE = /tmp/astra-gateway.log
 
-.PHONY: help build run start stop restart status logs login-weixin setup test test-live test-offline lint clean docker
+.PHONY: help build build-debug run start start-debug stop restart restart-debug status logs login-weixin setup test test-live test-offline lint clean docker
 
 help:
 	@echo "Astra Gateway"
@@ -46,6 +47,11 @@ build:
 	@echo "Building astra-gateway + astra CLI (release)..."
 	@$(CARGO) build --manifest-path ../../Cargo.toml -p astra-gateway -p astra-cli --release
 	@echo "Binary: $(RELEASE_BIN)"
+
+build-debug:
+	@echo "Building astra-gateway + astra CLI (debug)..."
+	@$(CARGO) build --manifest-path ../../Cargo.toml -p astra-gateway -p astra-cli
+	@echo "Binary: $(DEBUG_BIN)"
 
 # ── Foreground (dev) ──
 
@@ -103,7 +109,42 @@ stop:
 		rm -f $(PID_FILE); \
 	fi
 
+start-debug: build-debug _ensure_config _ensure_astra_auth
+	@if [ -f $(PID_FILE) ]; then \
+		PID=$$(cat $(PID_FILE)); \
+		if kill -0 $$PID 2>/dev/null && ps -p $$PID -o command= 2>/dev/null | grep -q 'astra-gateway'; then \
+			echo "✅ Gateway already running (PID $$PID)"; \
+		else \
+			rm -f $(PID_FILE); \
+			echo "Starting gateway (debug) in background..."; \
+			nohup $(DEBUG_BIN) --config $(CONFIG) </dev/null > $(LOG_FILE) 2>&1 & \
+			sleep 1; \
+			if [ -f $(PID_FILE) ] && kill -0 $$(cat $(PID_FILE)) 2>/dev/null && ps -p $$(cat $(PID_FILE)) -o command= 2>/dev/null | grep -q 'astra-gateway'; then \
+				echo "✅ Gateway started (PID $$(cat $(PID_FILE)))"; \
+				echo "   Logs: $(LOG_FILE)"; \
+			else \
+				echo "❌ Gateway failed to start. Check $(LOG_FILE)"; \
+				tail -10 $(LOG_FILE); \
+				exit 1; \
+			fi; \
+		fi; \
+	else \
+		echo "Starting gateway (debug) in background..."; \
+		nohup $(DEBUG_BIN) --config $(CONFIG) </dev/null > $(LOG_FILE) 2>&1 & \
+		sleep 1; \
+		if [ -f $(PID_FILE) ] && kill -0 $$(cat $(PID_FILE)) 2>/dev/null && ps -p $$(cat $(PID_FILE)) -o command= 2>/dev/null | grep -q 'astra-gateway'; then \
+			echo "✅ Gateway started (PID $$(cat $(PID_FILE)))"; \
+			echo "   Logs: $(LOG_FILE)"; \
+		else \
+			echo "❌ Gateway failed to start. Check $(LOG_FILE)"; \
+			tail -10 $(LOG_FILE); \
+			exit 1; \
+		fi; \
+	fi
+
 restart: stop start
+
+restart-debug: stop start-debug
 
 status:
 	@if [ -f $(PID_FILE) ] && kill -0 $$(cat $(PID_FILE)) 2>/dev/null && ps -p $$(cat $(PID_FILE)) -o command= 2>/dev/null | grep -q 'astra-gateway'; then \
@@ -142,16 +183,17 @@ _ensure_config:
 		echo "Created $(CONFIG). Edit it or run: make login-weixin"; \
 	fi
 
-ASTRA_BIN = ../../target/release/astra
-
 _ensure_astra_auth:
-	@if [ -f $(ASTRA_BIN) ]; then \
-		no_proxy=127.0.0.1,localhost $(ASTRA_BIN) whoami >/dev/null 2>&1 || { \
+	@ASTRA_BIN=""; \
+	if [ -f ../../target/release/astra ]; then ASTRA_BIN=../../target/release/astra; \
+	elif [ -f ../../target/debug/astra ]; then ASTRA_BIN=../../target/debug/astra; fi; \
+	if [ -n "$$ASTRA_BIN" ]; then \
+		no_proxy=127.0.0.1,localhost $$ASTRA_BIN whoami >/dev/null 2>&1 || { \
 			echo "Astra CLI auth expired — refreshing..."; \
 			USER=$${ASTRA_USERNAME:-gateway}; \
 			PASS=$${ASTRA_PASSWORD:-gateway123}; \
-			no_proxy=127.0.0.1,localhost $(ASTRA_BIN) login --username $$USER --password $$PASS >/dev/null 2>&1 || \
-			no_proxy=127.0.0.1,localhost $(ASTRA_BIN) register --username $$USER --email $$USER@gateway.local --password $$PASS >/dev/null 2>&1 || \
+			no_proxy=127.0.0.1,localhost $$ASTRA_BIN login --username $$USER --password $$PASS >/dev/null 2>&1 || \
+			no_proxy=127.0.0.1,localhost $$ASTRA_BIN register --username $$USER --email $$USER@gateway.local --password $$PASS >/dev/null 2>&1 || \
 			echo "⚠️  Astra auth failed — astra CLI may not work. Set ASTRA_USERNAME/ASTRA_PASSWORD or run: astra login"; \
 		}; \
 	fi

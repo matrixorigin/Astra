@@ -20,9 +20,11 @@ help:
 	@echo "  make dev-db-connect     - Connect to MatrixOne CLI"
 	@echo ""
 	@echo "API Server:"
-	@echo "  make dev-api-start      - Start API server"
+	@echo "  make dev-api-start      - Start API server (release build)"
+	@echo "  make dev-api-start-debug - Start API server (debug build, fast)"
 	@echo "  make dev-api-stop       - Stop API server"
-	@echo "  make dev-api-restart    - Restart API server"
+	@echo "  make dev-api-restart    - Restart API server (release)"
+	@echo "  make dev-api-restart-debug - Restart API server (debug, fast)"
 	@echo "  make dev-api-logs       - Show API server logs"
 	@echo "  make dev-api-status     - Show API server status"
 	@echo ""
@@ -35,9 +37,11 @@ help:
 	@echo "  (also: test-sdk-offline, test-sdk-online — @astra/sdk; offline in test-offline; remote E2E opt-in on test-online)"
 	@echo ""
 	@echo "Gateway (Chat Platform Bridge):"
-	@echo "  make gateway            - Build + start gateway (background)"
+	@echo "  make gateway            - Build + start gateway (release)"
+	@echo "  make gateway-debug      - Build + start gateway (debug, fast)"
 	@echo "  make gateway-stop       - Stop gateway"
-	@echo "  make gateway-restart    - Restart gateway"
+	@echo "  make gateway-restart    - Restart gateway (release)"
+	@echo "  make gateway-restart-debug - Restart gateway (debug, fast)"
 	@echo "  make gateway-status     - Show gateway status"
 	@echo "  make gateway-logs       - Tail gateway logs"
 	@echo "  make gateway-login      - WeChat QR login"
@@ -53,14 +57,17 @@ help:
 	@echo ""
 	@echo "Build:"
 	@echo "  make build              - Build entire Rust workspace (release)"
-	@echo "  make build-release      - Build entire Rust workspace (release)"
+	@echo "  make build-debug        - Build entire Rust workspace (debug, fast)"
 	@echo "  make build-server       - Build astra-server (release)"
-	@echo "  make build-server-release - Build astra-server (release)"
+	@echo "  make build-server-debug - Build astra-server (debug, fast)"
 	@echo "  make build-cli          - Build astra + astra-admin (release)"
-	@echo "  make build-cli-release  - Build astra + astra-admin (release)"
+	@echo "  make build-cli-debug    - Build astra + astra-admin (debug, fast)"
 	@echo ""
 	@echo "Cleanup:"
-	@echo "  make clean              - Remove Rust build artifacts (target/)"
+	@echo "  make clean              - Remove ALL Rust build artifacts (target/)"
+	@echo "  make clean-stale        - Remove artifacts not accessed in 12h (override: STALE_HOURS=N)"
+	@echo "  make clean-debug        - Remove debug/ directory only"
+	@echo "  make sweep              - Remove artifacts older than 4h (runs auto before release builds)"
 	@echo ""
 	@echo "Memoria (Memory Service):"
 	@echo "  make memoria-start      - Start Memoria service"
@@ -257,10 +264,19 @@ dev-api-stop:
 	@echo "Stopping API server..."
 	@./scripts/dev/stop-api.sh
 
+.PHONY: dev-api-start-debug
+dev-api-start-debug:
+	@BUILD_MODE=debug ./scripts/dev/start-api.sh
+
 .PHONY: dev-api-restart
 dev-api-restart: dev-api-stop
 	@sleep 1
 	@$(MAKE) dev-api-start
+
+.PHONY: dev-api-restart-debug
+dev-api-restart-debug: dev-api-stop
+	@sleep 1
+	@$(MAKE) dev-api-start-debug
 
 .PHONY: dev-api-logs
 dev-api-logs:
@@ -440,24 +456,51 @@ build-server-release: sweep
 	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --release --bin $(API_SERVER_BIN)
 	@echo "Binary: $(RUST_RELEASE_BIN_DIR)/$(API_SERVER_BIN)"
 
+# --- Debug builds (no sweep, no --release => fast incremental) ---
+
+.PHONY: build-debug
+build-debug:
+	@echo "Building Rust workspace (debug)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG)
+	@echo "✅ Debug artifacts: $(RUST_DEBUG_BIN_DIR)/"
+
+.PHONY: build-cli-debug
+build-cli-debug:
+	@echo "Building astra + astra-admin (debug)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli -p astra-admin-cli
+	@echo "Binaries:"
+	@for bin in $(CLI_BINS); do echo "  $(RUST_DEBUG_BIN_DIR)/$$bin"; done
+
+.PHONY: build-server-debug
+build-server-debug:
+	@echo "Building astra-server (debug)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --bin $(API_SERVER_BIN)
+	@echo "Binary: $(RUST_DEBUG_BIN_DIR)/$(API_SERVER_BIN)"
+
 # ============================================================================
 # Gateway
 # ============================================================================
 
 # Gateway targets delegate to the gateway crate's own Makefile.
 # For full gateway dev workflow: cd rust/crates/astra-gateway && make help
-.PHONY: gateway gateway-stop gateway-restart gateway-status gateway-logs gateway-build gateway-login gateway-setup gateway-test gateway-lint gateway-docker
+.PHONY: gateway gateway-debug gateway-stop gateway-restart gateway-restart-debug gateway-status gateway-logs gateway-build gateway-login gateway-setup gateway-test gateway-lint gateway-docker
 
 GATEWAY_DIR = rust/crates/astra-gateway
 
 gateway:
 	@cd $(GATEWAY_DIR) && make start
 
+gateway-debug:
+	@cd $(GATEWAY_DIR) && make start-debug
+
 gateway-stop:
 	@cd $(GATEWAY_DIR) && make stop
 
 gateway-restart:
 	@cd $(GATEWAY_DIR) && make restart
+
+gateway-restart-debug:
+	@cd $(GATEWAY_DIR) && make restart-debug
 
 gateway-status:
 	@cd $(GATEWAY_DIR) && make status
@@ -504,6 +547,31 @@ clean-incremental:
 	@echo "Cleaning incremental compilation cache..."
 	@rm -rf $(RUST_TARGET_DIR)/debug/incremental
 	@echo "✅ Incremental cache removed"
+
+# Deep cleanup: removes artifacts not accessed in STALE_HOURS hours.
+# Unlike `sweep` (time-based on mtime, runs automatically), this is manual
+# and aggressive — good for reclaiming disk when target/ has ballooned.
+# Override: make clean-stale STALE_HOURS=6
+STALE_HOURS ?= 12
+
+.PHONY: clean-stale
+clean-stale:
+	@echo "Current target/ size:"; du -sh $(RUST_TARGET_DIR) 2>/dev/null || true
+	@echo ""
+	@echo "Removing artifacts not accessed in $(STALE_HOURS)h..."
+	@STALE_MIN=$$(( $(STALE_HOURS) * 60 )); \
+	for PROFILE in debug release; do \
+		DIR=$(RUST_TARGET_DIR)/$$PROFILE; \
+		[ -d "$$DIR" ] || continue; \
+		find $$DIR/incremental -mindepth 1 -maxdepth 1 -type d -amin +$$STALE_MIN -exec rm -rf {} + 2>/dev/null || true; \
+		find $$DIR/deps -type f -amin +$$STALE_MIN -delete 2>/dev/null || true; \
+		find $$DIR/.fingerprint -mindepth 1 -maxdepth 1 -type d -amin +$$STALE_MIN -exec rm -rf {} + 2>/dev/null || true; \
+		find $$DIR/build -mindepth 1 -maxdepth 1 -type d -amin +$$STALE_MIN -exec rm -rf {} + 2>/dev/null || true; \
+		find $$DIR/examples -type f -amin +$$STALE_MIN -delete 2>/dev/null || true; \
+	done
+	@echo ""
+	@echo "After cleanup:"; du -sh $(RUST_TARGET_DIR) 2>/dev/null || true
+	@echo "✅ Stale artifacts (>$(STALE_HOURS)h) removed"
 
 # Maximum age (in hours) for build artifacts before sweep removes them.
 # Override: make sweep SWEEP_MAX_AGE_H=2
