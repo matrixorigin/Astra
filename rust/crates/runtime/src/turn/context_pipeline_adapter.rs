@@ -91,12 +91,19 @@ pub(crate) fn build_external_sources(
         if hint.is_empty() { None } else { Some(hint) }
     };
 
-    // 5. Learned context
-    let learned_context = edge_profile
+    // 5. Learned context — routed to volatile lane because the quality
+    //    tracker's EMA updates every turn, producing byte-level drift that
+    //    would break the Session-scope cached prefix if placed in stable.
+    let learned_context_section = edge_profile
         .get("learned_context_hint")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .map(|s| format!("\n\n## Learned Runtime Context\n{s}"));
+        .map(|s| {
+            crate::prompts::PromptSection::dynamic(
+                format!("\n\n## Learned Runtime Context\n{s}"),
+                crate::prompts::PromptTokenBucket::Environment,
+            )
+        });
 
     // 6. System override (delegation)
     let system_override = edge_profile
@@ -189,7 +196,7 @@ pub(crate) fn build_external_sources(
 
         profile_desc,
         effort_hint,
-        learned_context,
+        learned_context: None,
         system_override,
         plan_context,
         tool_guidance,
@@ -202,6 +209,7 @@ pub(crate) fn build_external_sources(
         // None scope via RuntimeVolatile so it doesn't invalidate the
         // cached prefix.
         extra_dynamic_sections: {
+            extra_dynamic_sections.extend(learned_context_section);
             extra_dynamic_sections.extend(skill_listing_extra);
             extra_dynamic_sections
         },
