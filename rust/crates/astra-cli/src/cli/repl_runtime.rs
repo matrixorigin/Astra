@@ -58,7 +58,14 @@ fn create_tool_selector_with_quality_internal(
         calibration::ProgressiveCalibrator, entity::EntityGraph, pattern::PatternLibrary,
     };
 
-    let all_schemas = edge_tools::all_tool_schemas();
+    let mut all_schemas = edge_tools::all_tool_schemas();
+    // Inject edge-protocol tools that the CLI always provides (spawn_agent,
+    // get_agent_result, send_message, skill). These used to be injected later
+    // in sse_loop, but the selector's fast path needs them visible at
+    // construction time.
+    all_schemas.push(astra_runtime::orchestration::spawn_agent_schema());
+    all_schemas.push(crate::edge_tools::agent_spawning::get_agent_result_schema());
+    all_schemas.push(crate::edge_tools::agent_messaging::send_message_schema());
     let mut registry = tool_registry::ToolRegistry::new(all_schemas);
 
     // Load skill manifests from skills/ directory and register plugin tools
