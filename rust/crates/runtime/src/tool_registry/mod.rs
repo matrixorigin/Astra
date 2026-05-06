@@ -68,19 +68,19 @@ mod tests {
     // ── Catalog invariants ──
 
     #[test]
-    fn catalog_has_44_tools() {
-        assert_eq!(TOOL_CATALOG.len(), 44);
+    fn catalog_has_37_tools() {
+        assert_eq!(TOOL_CATALOG.len(), 37);
     }
 
     #[test]
-    fn catalog_has_14_pinned() {
-        // +1 for introspect (budget-adaptive runtime self-check).
-        assert_eq!(ToolRegistry::pinned_count(), 14);
+    fn catalog_has_13_pinned() {
+        // 14 - 2 old pinned git_* + 1 consolidated git = 13
+        assert_eq!(ToolRegistry::pinned_count(), 13);
     }
 
     #[test]
-    fn catalog_has_30_dynamic() {
-        assert_eq!(ToolRegistry::dynamic_count(), 30);
+    fn catalog_has_24_dynamic() {
+        assert_eq!(ToolRegistry::dynamic_count(), 24);
     }
 
     #[test]

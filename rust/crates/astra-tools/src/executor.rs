@@ -237,6 +237,9 @@ impl DefaultToolExecutor {
             "glob" => crate::shell_ops::glob(&self.ctx, args).await,
 
             // ── Git operations (gix-based) ───────────────────────────
+            // Consolidated git tool — single entry point for all git operations.
+            "git" => string_to_result(crate::git_gix::git_dispatch(pr, args)),
+            // Legacy aliases (backward compat during transition, will be removed).
             "git_status" => string_to_result(crate::git_gix::git_status(pr)),
             "git_diff" => string_to_result(crate::git_gix::git_diff(pr, args, 0.0, 0)),
             "git_log" => string_to_result(crate::git_gix::git_log(pr, args)),

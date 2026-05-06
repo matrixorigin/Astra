@@ -2392,6 +2392,40 @@ pub fn git_stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecuti
     }
 }
 
+/// Consolidated `git` tool dispatcher. Routes `args.action` to the
+/// appropriate git sub-operation. Replaces 11 separate git_* tools with
+/// a single `git { action: "...", ...params }` interface.
+pub fn git_dispatch(project_root: &Path, args: &Value) -> String {
+    let action = match args.get("action").and_then(Value::as_str) {
+        Some(a) => a,
+        None => {
+            return "Missing required parameter: action. \
+                    Use one of: status, diff, log, show, blame, \
+                    file_history, log_search, contributors, commit, \
+                    revert_commit, stash"
+                .to_string();
+        }
+    };
+    match action {
+        "status" => git_status(project_root),
+        "diff" => git_diff(project_root, args, 0.0, 0),
+        "log" => git_log(project_root, args),
+        "show" => git_show(project_root, args, 0.0, 0),
+        "blame" => git_blame(project_root, args),
+        "file_history" => git_file_history(project_root, args),
+        "log_search" => git_log_search(project_root, args),
+        "contributors" => git_contributors(project_root, args),
+        "commit" => git_commit_with_metadata(project_root, args).output,
+        "revert_commit" => git_revert_commit_with_metadata(project_root, args).output,
+        "stash" => git_stash_with_metadata(project_root, args).output,
+        other => format!(
+            "Unknown git action: '{other}'. Valid actions: status, diff, log, \
+             show, blame, file_history, log_search, contributors, commit, \
+             revert_commit, stash"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3696,4 +3730,52 @@ mod tests {
     }
 
     // ── Git Worktree Tests ──────────────────────────────────────────────
+
+    // ── Consolidated `git` tool tests ──────────────────────────────────
+    #[test]
+    fn consolidated_git_dispatches_status() {
+        let root = repo_root();
+        let result = super::git_dispatch(&root, &json!({"action": "status"}));
+        assert!(
+            result.contains("##") || result.contains("nothing to commit") || result.contains("On branch"),
+            "git status action should return valid status: {result}"
+        );
+    }
+
+    #[test]
+    fn consolidated_git_dispatches_log() {
+        let root = repo_root();
+        let result = super::git_dispatch(&root, &json!({"action": "log", "n": 3}));
+        assert!(!result.is_empty(), "git log should return commits");
+    }
+
+    #[test]
+    fn consolidated_git_dispatches_diff() {
+        let root = repo_root();
+        let result = super::git_dispatch(&root, &json!({"action": "diff"}));
+        assert!(
+            !result.starts_with("Unknown git action") && !result.starts_with("Missing required"),
+            "diff must be recognized as valid action"
+        );
+    }
+
+    #[test]
+    fn consolidated_git_unknown_action_returns_error() {
+        let root = repo_root();
+        let result = super::git_dispatch(&root, &json!({"action": "nonexistent"}));
+        assert!(
+            result.contains("Unknown git action"),
+            "unknown action must produce error: {result}"
+        );
+    }
+
+    #[test]
+    fn consolidated_git_missing_action_returns_error() {
+        let root = repo_root();
+        let result = super::git_dispatch(&root, &json!({"file": "foo.rs"}));
+        assert!(
+            result.contains("Missing required parameter"),
+            "missing action must produce helpful error: {result}"
+        );
+    }
 }

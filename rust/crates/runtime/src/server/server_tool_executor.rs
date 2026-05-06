@@ -1365,6 +1365,7 @@ impl ServerToolExecutor {
             "glob" => self.default_executor.execute("glob", args).await,
             // ── Git operations ─────────────────────────────────────────
             // All git ops delegate to DefaultToolExecutor.
+            "git" => self.default_executor.execute("git", args).await,
             "git_status" => self.default_executor.execute("git_status", args).await,
             "git_diff" => self.default_executor.execute("git_diff", args).await,
             "git_log" => self.default_executor.execute("git_log", args).await,
