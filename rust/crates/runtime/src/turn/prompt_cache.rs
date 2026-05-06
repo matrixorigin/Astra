@@ -708,7 +708,7 @@ mod tests {
             json!({"type": "function", "function": {"name": "read_file"}}), // pinned
             json!({"type": "function", "function": {"name": "git"}}), // pinned (new)
             json!({"type": "function", "function": {"name": "git_log"}}), // dynamic
-            json!({"type": "function", "function": {"name": "mo_branch"}}), // dynamic
+            json!({"type": "function", "function": {"name": "mo"}}), // dynamic
         ];
         annotate_tool_schemas_for_caching(
             &mut tools,
@@ -1446,7 +1446,7 @@ mod cache_stability_regression {
         let mut a = pinned_prefix_fixture();
         a.extend([
             schema("git_log"),
-            schema("mo_branch"),
+            schema("mo"),
             schema("github_list_prs"),
         ]);
         annotate_tool_schemas_for_caching(&mut a, &cfg_anthropic());
@@ -1457,7 +1457,7 @@ mod cache_stability_regression {
             schema("git_show"),
             schema("github_get_pr"),
             schema("web_fetch"),
-            schema("mo_query"),
+            schema("mo"),
         ]);
         annotate_tool_schemas_for_caching(&mut b, &cfg_anthropic());
 
@@ -1520,7 +1520,7 @@ mod cache_stability_regression {
             schema("bash"),         // pinned
             schema("git_log"),      // dynamic (interleaved — shouldn't happen in production)
             schema("read_file"),    // pinned
-            schema("mo_branch"),    // dynamic
+            schema("mo"),    // dynamic
             schema("memory"), // pinned
             schema("web_fetch"),    // dynamic
         ];
@@ -1589,7 +1589,7 @@ mod cache_stability_regression {
     #[test]
     fn bedrock_request_body_places_cachepoint_at_pinned_boundary() {
         let mut tools = pinned_prefix_fixture();
-        tools.extend([schema("git_log"), schema("mo_branch")]);
+        tools.extend([schema("git_log"), schema("mo")]);
         annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
 
         let body = build_provider_request_body(
@@ -1643,7 +1643,7 @@ mod cache_stability_regression {
     #[test]
     fn anthropic_direct_request_preserves_cache_control_on_last_pinned() {
         let mut tools = pinned_prefix_fixture();
-        tools.extend([schema("git_log"), schema("mo_branch")]);
+        tools.extend([schema("git_log"), schema("mo")]);
         annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
 
         let body = build_provider_request_body(
@@ -1701,7 +1701,7 @@ mod cache_stability_regression {
             let mut tools = pinned_prefix_fixture();
             // Deliberately DIFFERENT dynamic tools each call — the test
             // asserts the pinned portion is unaffected.
-            tools.extend([schema("git_log"), schema("mo_branch")]);
+            tools.extend([schema("git_log"), schema("mo")]);
             annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
             build_provider_request_body(
                 &[json!({"role": "user", "content": "hi"})],
@@ -1720,7 +1720,7 @@ mod cache_stability_regression {
             tools.extend([
                 schema("web_fetch"),
                 schema("github_list_prs"),
-                schema("mo_query"),
+                schema("mo"),
             ]);
             annotate_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
             build_provider_request_body(
@@ -1769,7 +1769,7 @@ mod cache_stability_regression {
                 &ThinkingConfig::Off,
             )
         };
-        let a = build(vec![schema("git_log"), schema("mo_branch")]);
+        let a = build(vec![schema("git_log"), schema("mo")]);
         let b = build(vec![schema("web_fetch")]);
 
         let a_tools = a["toolConfig"]["tools"].as_array().unwrap();
@@ -1810,7 +1810,7 @@ mod cache_stability_regression {
                 &ThinkingConfig::Off,
             )
         };
-        let a = build(vec![schema("git_log"), schema("mo_branch")]);
+        let a = build(vec![schema("git_log"), schema("mo")]);
         let b = build(vec![schema("web_fetch")]);
 
         let a_tools = a["tools"].as_array().unwrap();
@@ -1845,7 +1845,7 @@ mod cache_stability_regression {
         pinned.insert("my_custom_db_tool".into());
         // Add a dynamic tail.
         tools.push(schema("git_log"));
-        tools.push(schema("mo_branch"));
+        tools.push(schema("mo"));
         annotate_tool_schemas_for_caching_with_pinned(&mut tools, &cfg_anthropic(), &pinned);
 
         let last_pinned_idx = pinned_prefix_fixture().len(); // == 14 (my_custom_db_tool at idx 14)
@@ -1932,7 +1932,7 @@ mod cache_stability_regression {
             )
         };
 
-        let a = build(vec![schema("git_log"), schema("mo_branch")]);
+        let a = build(vec![schema("git_log"), schema("mo")]);
         let b = build(vec![schema("web_fetch")]);
         (a, b, pinned_prefix_fixture().len())
     }
@@ -2014,7 +2014,7 @@ mod cache_stability_regression {
                 &astra_turn_core::thinking_config::ThinkingConfig::Off,
             )
         };
-        let a = build(vec![schema("git_log"), schema("mo_branch")]);
+        let a = build(vec![schema("git_log"), schema("mo")]);
         let b = build(vec![schema("web_fetch")]);
 
         // Static system + user message identical
@@ -2057,7 +2057,7 @@ mod cache_stability_regression {
                 &astra_turn_core::thinking_config::ThinkingConfig::Off,
             )
         };
-        let a = build(vec![schema("git_log"), schema("mo_branch")]);
+        let a = build(vec![schema("git_log"), schema("mo")]);
         let b = build(vec![schema("web_fetch")]);
 
         assert_eq!(a["messages"], b["messages"]);

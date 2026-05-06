@@ -842,7 +842,7 @@ fn is_plan_mode_blocked_tool(tool: &str) -> bool {
             | "multi_edit"
             | "delete_file"
             | "rollback_file_edits"
-            | "mo_query"
+            | "mo"
             | "rollback_database_snapshots"
             | "git_commit"
             | "git_stash"
@@ -1334,13 +1334,26 @@ impl ServerToolExecutor {
             "delete_file" => tool_result_from_output(self.server_delete_file(args)),
             "rollback_file_edits" => tool_result_from_output(self.rollback_file_edits(args)),
             "list_dir" => self.default_executor.execute("list_dir", args).await,
-            // ── Session-state tools ─────────────────────────────────────
-            "adjust_config" => tool_result_from_output(self.adjust_config(args)),
-            "prioritize_tool" => tool_result_from_output(self.prioritize_tool(args)),
-            "deprioritize_tool" => tool_result_from_output(self.deprioritize_tool(args)),
+            // ── Consolidated session tool ──────────────────────────────
+            "session" => {
+                let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                match action {
+                    "config" => tool_result_from_output(self.adjust_config(args)),
+                    "prioritize" => tool_result_from_output(self.prioritize_tool(args)),
+                    "deprioritize" => tool_result_from_output(self.deprioritize_tool(args)),
+                    "session" => tool_result_from_output(self.set_goal(args)),
+                    "compact" => tool_result_from_output(self.compress_context(args)),
+                    "" => tool_result_from_output("Missing required parameter: action. Use: config, prioritize, deprioritize, set_goal, compact".to_string()),
+                    other => tool_result_from_output(format!("Unknown session action: '{other}'")),
+                }
+            }
+            // Legacy aliases
+            "session" => tool_result_from_output(self.adjust_config(args)),
+            "session" => tool_result_from_output(self.prioritize_tool(args)),
+            "session" => tool_result_from_output(self.deprioritize_tool(args)),
             "introspect" => tool_result_from_output(self.handle_introspect(args)),
-            "set_goal" => tool_result_from_output(self.set_goal(args)),
-            "compress_context" => tool_result_from_output(self.compress_context(args)),
+            "session" => tool_result_from_output(self.set_goal(args)),
+            "session" => tool_result_from_output(self.compress_context(args)),
             "rollback_session_state" => tool_result_from_output(self.rollback_session_state(args)),
             "task_create" => tool_result_from_output(self.task_create(args)),
             "task_list" => tool_result_from_output(self.task_list(args)),
@@ -1352,8 +1365,17 @@ impl ServerToolExecutor {
                 &astra_tools::schemas::server_executor_tool_schemas(),
                 args,
             )),
-            // ── MatrixOne operations ────────────────────────────────────
-            "mo_query" => self.server_mo_query(args),
+            // ── Consolidated mo tool ───────────────────────────────────
+            "mo" => {
+                let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("query");
+                match action {
+                    "query" => self.server_mo_query(args),
+                    "snapshot" | "branch" => self.default_executor.execute(&format!("mo_{action}"), args).await,
+                    other => tool_result_from_output(format!("Unknown mo action: '{other}'. Use: query, snapshot, branch")),
+                }
+            }
+            // Legacy alias
+            "mo" => self.server_mo_query(args),
             "rollback_database_snapshots" => {
                 tool_result_from_output(self.rollback_database_snapshots(args))
             }
@@ -1420,8 +1442,20 @@ impl ServerToolExecutor {
                     .await
             }
             // ── Agent introspection ────────────────────────────────────
-            "get_agent_info" => tool_result_from_output(self.server_get_agent_info(args)),
-            // ── Delegation placeholder ─────────────────────────────────
+            "introspect" => tool_result_from_output(self.server_get_agent_info(args)),
+            // ── Consolidated agent tool ────────────────────────────────
+            "agent" => {
+                let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("delegate");
+                match action {
+                    "delegate" => astra_tools::ToolResult::text(
+                        "Delegation request acknowledged. The delegation engine will execute \
+                         this request and provide results in the next round.".to_string(),
+                    ),
+                    "run_chain" => self.default_executor.execute("run_chain", args).await,
+                    other => tool_result_from_output(format!("Unknown agent action: '{other}'. Use: delegate, run_chain")),
+                }
+            }
+            // Legacy alias
             "delegate" => astra_tools::ToolResult::text(
                 "Delegation request acknowledged. The delegation engine will execute \
                  this request and provide results in the next round."
@@ -1915,7 +1949,7 @@ impl ServerToolExecutor {
         snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
     ) {
         self.record_session_state_rollback(
-            "set_goal".to_string(),
+            "session".to_string(),
             SessionStateRollbackAction::GoalOverride {
                 previous_goal,
                 snapshot,
@@ -4738,7 +4772,7 @@ esac
         exec.set_turn_index(11);
 
         let result = exec
-            .execute_with_metadata("mo_query", &json!({"sql": "UPDATE metrics SET value = 1"}))
+            .execute_with_metadata("mo", &json!({"sql": "UPDATE metrics SET value = 1"}))
             .await;
         assert!(!result.is_error, "got: {}", result.output);
         let fields = result.metadata.as_ref().expect("mo_query metadata");
@@ -4782,7 +4816,7 @@ esac
         let adjust: Value = serde_json::from_str(
             &exec
                 .execute(
-                    "adjust_config",
+                    "session",
                     &json!({"path": "memory.retrieval_top_k", "value": new_top_k}),
                 )
                 .await,
@@ -4792,7 +4826,7 @@ esac
 
         let prioritize: Value = serde_json::from_str(
             &exec
-                .execute("prioritize_tool", &json!({"tool": "bash"}))
+                .execute("session", &json!({"tool": "bash"}))
                 .await,
         )
         .unwrap();
@@ -4800,7 +4834,7 @@ esac
 
         let goal: Value = serde_json::from_str(
             &exec
-                .execute("set_goal", &json!({"goal": "ship parity"}))
+                .execute("session", &json!({"goal": "ship parity"}))
                 .await,
         )
         .unwrap();
@@ -4808,7 +4842,7 @@ esac
 
         let compress: Value = serde_json::from_str(
             &exec
-                .execute("compress_context", &json!({"reason": "manual"}))
+                .execute("session", &json!({"reason": "manual"}))
                 .await,
         )
         .unwrap();

@@ -1202,7 +1202,7 @@ mod inprocess_hook_contract_tests {
         let messages = vec![json!({"role": "user", "content": "update the database"})];
         let tool_results: Vec<Value> = vec![json!({
             "tool_call_id": "call-1",
-            "name": "mo_query",
+            "name": "mo",
             "result": "OK (no results)",
             "pre_state_snapshot_id": "moq_snap_123",
             "pre_state_snapshot_database": "analytics"
@@ -1210,7 +1210,7 @@ mod inprocess_hook_contract_tests {
         let tool_calls = vec![json!({
             "id": "call-1",
             "function": {
-                "name": "mo_query",
+                "name": "mo",
                 "arguments": "{\"sql\": \"UPDATE metrics SET value = 1\", \"database\": \"analytics\"}"
             }
         })];
@@ -1623,7 +1623,7 @@ mod inprocess_hook_contract_tests {
             .expect("decision_audit missing");
         assert_eq!(
             audit.decision_output["action_profiles"][0]["tool_name"],
-            "mo_query"
+            "mo"
         );
         assert_eq!(
             audit.decision_output["action_profiles"][0]["pre_state_snapshot_id"],

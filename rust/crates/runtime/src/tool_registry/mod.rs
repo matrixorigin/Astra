@@ -68,18 +68,18 @@ mod tests {
     // ── Catalog invariants ──
 
     #[test]
-    fn catalog_has_27_tools() {
-        assert_eq!(TOOL_CATALOG.len(), 27);
+    fn catalog_has_16_tools() {
+        assert_eq!(TOOL_CATALOG.len(), 16);
     }
 
     #[test]
-    fn catalog_has_10_pinned() {
-        assert_eq!(ToolRegistry::pinned_count(), 10);
+    fn all_tools_are_pinned() {
+        assert_eq!(ToolRegistry::pinned_count(), 16);
     }
 
     #[test]
-    fn catalog_has_17_dynamic() {
-        assert_eq!(ToolRegistry::dynamic_count(), 17);
+    fn catalog_dynamic_count_is_zero() {
+        assert_eq!(ToolRegistry::dynamic_count(), 0);
     }
 
     #[test]
@@ -513,7 +513,7 @@ mod tests {
         let selected = registry.select("为什么上次选错了工具?", 1);
         let names = ToolRegistry::selected_names(&selected);
         assert!(
-            names.contains(&"reflect".to_string()),
+            names.contains(&"introspect".to_string()),
             "reflect query should include reflect, got: {:?}",
             names
         );

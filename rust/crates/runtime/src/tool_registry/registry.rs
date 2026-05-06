@@ -1200,7 +1200,7 @@ mod pinned_budget_tests {
             json!({"function": {"name": "read_file", "description": "Read file contents", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}),
             json!({"function": {"name": "str_replace", "description": "Replace text in files", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"}}, "required": ["path", "old_str", "new_str"]}}}),
             json!({"function": {"name": "git_log", "description": "Show git log", "parameters": {"type": "object", "properties": {}}}}),
-            json!({"function": {"name": "mo_branch", "description": "Matrixone branch ops", "parameters": {"type": "object", "properties": {}}}}),
+            json!({"function": {"name": "mo", "description": "Matrixone branch ops", "parameters": {"type": "object", "properties": {}}}}),
         ];
 
         let registry = ToolRegistry::new(schemas);
@@ -1230,7 +1230,7 @@ mod pinned_budget_tests {
             .expect("lsp must exist in TOOL_CATALOG");
         let mo_branch_idx = TOOL_CATALOG
             .iter()
-            .position(|t| t.name == "mo_branch")
+            .position(|t| t.name == "mo")
             .expect("mo_branch must exist in TOOL_CATALOG");
 
         let ranked = vec![(lsp_idx, 0.8), (mo_branch_idx, 0.5)];
@@ -1267,7 +1267,7 @@ mod pinned_budget_tests {
             "git_log should be excluded at zero budget"
         );
         assert!(
-            !result_names.contains(&"mo_branch"),
+            !result_names.contains(&"mo"),
             "mo_branch should be excluded at zero budget"
         );
         assert_eq!(

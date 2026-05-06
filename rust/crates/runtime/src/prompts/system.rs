@@ -1154,7 +1154,7 @@ const TASK_TYPE_KEYWORDS: &[(&str, &[&str])] = &[
             "analysis",
             "research",
             "investigate",
-            "diagnose",
+            "introspect",
             "root cause",
             "why does",
             "why is",
@@ -2211,7 +2211,7 @@ mod tests {
     #[test]
     fn session_state_rollback_guidance_omits_turn_rollback_when_unavailable() {
         let p = build_main_system_prompt(
-            &["rollback_session_state", "adjust_config"],
+            &["rollback_session_state", "session"],
             "",
             0.5,
             Some("implementation"),
@@ -2232,7 +2232,7 @@ mod tests {
             &[
                 "rollback_session_state",
                 "rollback_turn_actions",
-                "adjust_config",
+                "session",
             ],
             "",
             0.5,

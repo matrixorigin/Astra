@@ -3569,18 +3569,18 @@ mod tests {
         assert!(host.server_side_tools);
         assert!(!host.valid_tool_names().is_empty());
         assert!(host.valid_tool_names().contains("rollback_file_edits"));
-        assert!(host.valid_tool_names().contains("adjust_config"));
-        assert!(host.valid_tool_names().contains("prioritize_tool"));
-        assert!(host.valid_tool_names().contains("deprioritize_tool"));
-        assert!(host.valid_tool_names().contains("set_goal"));
-        assert!(host.valid_tool_names().contains("compress_context"));
+        assert!(host.valid_tool_names().contains("session"));
+        assert!(host.valid_tool_names().contains("session"));
+        assert!(host.valid_tool_names().contains("session"));
+        assert!(host.valid_tool_names().contains("session"));
+        assert!(host.valid_tool_names().contains("session"));
         assert!(host.valid_tool_names().contains("rollback_session_state"));
         assert!(host.valid_tool_names().contains("task_create"));
         assert!(host.valid_tool_names().contains("task_list"));
         assert!(host.valid_tool_names().contains("task_get"));
         assert!(host.valid_tool_names().contains("task_update"));
         assert!(host.valid_tool_names().contains("task_stop"));
-        assert!(host.valid_tool_names().contains("mo_query"));
+        assert!(host.valid_tool_names().contains("mo"));
         assert!(
             host.valid_tool_names()
                 .contains("rollback_database_snapshots")
