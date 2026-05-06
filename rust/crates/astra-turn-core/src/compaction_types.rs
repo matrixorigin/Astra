@@ -3,6 +3,11 @@
 //! Extracted from `prompts::context` for cross-crate use.
 
 /// Token-budget compaction tier based on context window usage.
+///
+/// Variants are declared in ascending order of aggressiveness. `PartialOrd`/`Ord`
+/// derive ordinal comparison from this order, so guards like
+/// `tier < CompactionTier::CompactHistory` and escalation via `tier.max(other)`
+/// rely on keeping new variants inserted at the correct position.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -16,6 +21,13 @@ pub enum CompactionTier {
     CompactHistory,
     /// > 85% — aggressive pruning, summarize entire history.
     AggressivePrune,
+}
+
+impl Default for CompactionTier {
+    /// `Normal` — no compaction has been applied yet.
+    fn default() -> Self {
+        Self::Normal
+    }
 }
 
 impl CompactionTier {

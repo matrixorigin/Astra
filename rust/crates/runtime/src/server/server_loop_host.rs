@@ -46,6 +46,7 @@ use astra_turn_core::bridge_rate_limit_cooldown::{
     FallbackOutcome, RateLimitAction, try_resolve_fallback,
 };
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
+use astra_turn_core::compaction_types::CompactionTier;
 use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_core::tool_schema_prune::{
     filter_tool_schemas_by_excluded_names, prune_tool_schemas,
@@ -2887,12 +2888,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         state: &mut crate::turn::agentic_loop_host::AgenticLoopState,
         pressure: f64,
         quiet: bool,
-    ) -> Result<(), astra_core::ClassifiedError> {
-        if pressure < 0.80 || state.pre_turn_compact_applied || state.messages.len() <= 10 {
-            return Ok(());
+    ) {
+        if pressure < 0.80
+            || state.compact_tier_applied >= CompactionTier::CompactHistory
+            || state.messages.len() <= 10
+        {
+            return;
         }
         let Some(params) = self.resolved_llm_params.clone() else {
-            return Ok(());
+            return;
         };
 
         let user_content = state
@@ -2925,7 +2929,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // Use the trait's summary_client() so gateway overrides and forwarded
         // auth headers are respected, rather than constructing a plain client inline.
         let Some(client) = self.summary_client() else {
-            return Ok(());
+            return;
         };
         if let Some(summary_text) = astra_turn_core::cloud_summary::generate_inline_summary(
             &system_messages,
@@ -2961,7 +2965,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     )
                 }),
             );
-            state.pre_turn_compact_applied = true;
+            state.compact_tier_applied = CompactionTier::CompactHistory;
 
             if let Some(ref mut sess) = state.pipeline_session {
                 sess.recovery.record_reactive_compact();
@@ -2986,8 +2990,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 ),
             );
         }
-
-        Ok(())
     }
 
     fn summary_client(&self) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
@@ -4270,7 +4272,7 @@ mod tests {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
-            pre_turn_compact_applied: false,
+            compact_tier_applied: CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
@@ -5321,8 +5323,12 @@ mod tests {
             0.95,
             true,
         )
-        .await
-        .expect("pre-turn compact should succeed");
+        .await;
+        assert_eq!(
+            state.compact_tier_applied,
+            CompactionTier::CompactHistory,
+            "pre-turn compact should bump tier to CompactHistory",
+        );
 
         let body = capture
             .body

@@ -65,6 +65,7 @@ use astra_text_utils::semantic_dedup::SemanticDedup;
 use astra_turn_core::agentic_verdict_audit::AgenticVerdictAuditEvent;
 use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
+use astra_turn_core::compaction_types::CompactionTier;
 use astra_turn_core::headless_types::HeadlessStderrStyle;
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use astra_turn_core::turn_guard::TurnGuard;
@@ -189,14 +190,17 @@ pub trait AgenticLoopHost: Send {
     ///
     /// Hosts that can build the exact next-turn system prompt may override
     /// this to run cache-friendly inline summarization before the next LLM
-    /// round. Default is a no-op so non-server hosts preserve legacy behavior.
+    /// round. On success the implementation must bump
+    /// [`AgenticLoopState::compact_tier_applied`] to at least
+    /// [`CompactionTier::CompactHistory`] so the downstream budget guard
+    /// skips redundant mechanical compression. Default is a no-op so
+    /// non-server hosts preserve legacy behavior.
     async fn maybe_pre_turn_compact(
         &mut self,
         _state: &mut AgenticLoopState,
         _pressure: f64,
         _quiet: bool,
-    ) -> Result<(), astra_core::ClassifiedError> {
-        Ok(())
+    ) {
     }
 
     /// Valid tool names from the host's tool schemas.
@@ -754,11 +758,14 @@ pub struct AgenticLoopState {
     /// The loop allows exactly one more LLM iteration after injection.
     pub budget_wrapup_injected: bool,
 
-    /// Set to `true` when a pre-turn LLM summarization compact was applied
-    /// this turn. Reset to `false` at the start of each turn. Prevents
-    /// double-compaction: `handle_token_budget` skips tier-1 LLM compact
-    /// when the pre-turn pass already ran.
-    pub pre_turn_compact_applied: bool,
+    /// Highest [`CompactionTier`] applied to this turn so far.
+    ///
+    /// `Normal` = no compaction; `CompactHistory` = pre-turn LLM summary or
+    /// tier-1 mechanical compression already ran; `AggressivePrune` = reserved
+    /// for future tiered escalation. Paths that would otherwise re-compact
+    /// check this and stay their hand when the current tier already covers
+    /// them. Not persisted — starts `Normal` every time the loop runs.
+    pub compact_tier_applied: CompactionTier,
 
     /// Set to `true` when a skill produced substantial output in the current
     /// turn. The CLI host reads this to suppress intermediate text rendering
@@ -1423,7 +1430,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         pinned_tool_schema_tokens: 0,
         max_turn_input_tokens: 0,
         budget_wrapup_injected: false,
-        pre_turn_compact_applied: false,
+        compact_tier_applied: CompactionTier::Normal,
         skill_produced_output: false,
         max_cumulative_tokens: 0,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
@@ -1791,7 +1798,7 @@ pub(crate) mod tests {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
-            pre_turn_compact_applied: false,
+            compact_tier_applied: CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
@@ -4622,7 +4629,7 @@ pub(crate) mod tests {
         let mut state = make_state();
         state.max_turn_input_tokens = 80_000;
         state.current_session_id = Some(session_id.clone());
-        state.pre_turn_compact_applied = true;
+        state.compact_tier_applied = CompactionTier::CompactHistory;
         state
             .messages
             .push(json!({"role": "user", "content": "keep debugging"}));
@@ -4656,6 +4663,75 @@ pub(crate) mod tests {
         assert!(
             !has_budget_wrapup_msg,
             "spill recovery should avoid injecting the hard wrap-up message"
+        );
+
+        let _ = std::fs::remove_dir_all(spill_dir);
+    }
+
+    #[tokio::test]
+    async fn compact_tier_gate_skips_mechanical_compression() {
+        // When compact_tier_applied >= CompactHistory (e.g. after a pre-turn LLM
+        // summary), handle_token_budget must NOT run the tier-1 mechanical
+        // CompressionPipeline again. We verify this by populating the history
+        // with otherwise-compressible tool_result payloads: if the guard is
+        // broken, CompressionPipeline would rewrite them to `[Cleared]` and the
+        // original text would disappear. With the guard honoured the messages
+        // stay intact and spill-to-disk (an independent tier-2 recovery) runs.
+        let session_id = format!(
+            "tier-gate-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        );
+        let spill_dir = astra_services::session_journal::local_sessions_dir().join(&session_id);
+
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool("bash", "large output")],
+                90_000,
+                2_000,
+                Some(100),
+            ),
+            text_result("Compacted result.", 40_000, 500, None),
+        ]);
+        let mut state = make_state();
+        state.max_turn_input_tokens = 80_000;
+        state.current_session_id = Some(session_id.clone());
+        // Simulate a pre-turn LLM compact having already run.
+        state.compact_tier_applied = CompactionTier::CompactHistory;
+        let distinctive_tool_payload = "SENTINEL_RESULT_PAYLOAD_DO_NOT_CLEAR_".repeat(200);
+        state
+            .messages
+            .push(json!({"role": "user", "content": "kick off"}));
+        state.messages.push(json!({
+            "role": "assistant",
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+            ],
+        }));
+        state.messages.push(json!({
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": distinctive_tool_payload.clone(),
+        }));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert_eq!(state.final_text, "Compacted result.");
+
+        // Either the payload still appears verbatim in live messages, OR it was
+        // moved to disk via tier-2 spill (whose system marker shows up instead).
+        // What must NOT happen: the mechanical pipeline rewriting it to
+        // `[Cleared]` in place — that would mean the tier guard failed.
+        let has_cleared_tombstone = state.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| s.contains("[Cleared") && !s.contains("[Context compressed"))
+        });
+        assert!(
+            !has_cleared_tombstone,
+            "tier-1 mechanical compression must be skipped when compact_tier_applied >= CompactHistory",
         );
 
         let _ = std::fs::remove_dir_all(spill_dir);

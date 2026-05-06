@@ -9,6 +9,8 @@ use super::agentic_loop_lifecycle::{
     TurnIterationPrep, current_agentic_step, interruption_state_summary, session_turn_number,
     tool_record_is_workspace_mutation,
 };
+use astra_turn_core::compaction_types::CompactionTier;
+
 use astra_turn_core::agentic_turn_ingest::{
     AgenticIngestIterationControl, AgenticTurnIngestMut, AgenticTurnIngestOutcome,
     agentic_turn_stream_snapshot_with_kind, ingest_agentic_turn_stream,
@@ -2140,7 +2142,7 @@ async fn handle_token_budget<H: AgenticLoopHost>(
             current_round_index: Some(state.current_round_index),
         };
         let mut total_freed = 0;
-        if !state.pre_turn_compact_applied {
+        if state.compact_tier_applied < CompactionTier::CompactHistory {
             let pipeline = super::context_compression::CompressionPipeline::aggressive_pipeline();
             let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
             total_freed = outcome.total_tokens_freed;
@@ -2152,8 +2154,7 @@ async fn handle_token_budget<H: AgenticLoopHost>(
         // can read_file it if needed. This is the SpillBackend pattern
         // applied to conversation history — content isn't lost, just
         // moved out of the live context window.
-        if measured.saturating_sub(total_freed) > state.max_turn_input_tokens
-        {
+        if measured.saturating_sub(total_freed) > state.max_turn_input_tokens {
             if let Some(sid) = state.current_session_id.as_deref() {
                 let spill_freed = spill_old_messages_to_disk(
                     &mut state.messages,

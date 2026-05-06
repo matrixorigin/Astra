@@ -12,6 +12,7 @@ use super::agentic_loop_host::{
 };
 use crate::orchestration::permission_sync::PermissionResponseMessaging;
 use astra_services::SessionArtifactStore;
+use astra_turn_core::compaction_types::CompactionTier;
 use astra_turn_core::interruption::{
     InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
 };
@@ -879,11 +880,14 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         // Pre-turn LLM compact: if pressure exceeds 80%, let the host run an
         // optional cache-friendly inline-summary pass before the next LLM call.
         // Server hosts can build the exact system prompt + history prefix;
-        // generic hosts keep the default no-op behavior.
-        if pressure >= 0.80 && !state.pre_turn_compact_applied && state.messages.len() > 10 {
-            host.maybe_pre_turn_compact(state, pressure, quiet)
-                .await
-                .map_err(|e| e.to_string())?;
+        // generic hosts keep the default no-op behavior. When it succeeds the
+        // host bumps `state.compact_tier_applied` so the later budget guard
+        // won't re-run mechanical compression.
+        if pressure >= 0.80
+            && state.compact_tier_applied < CompactionTier::CompactHistory
+            && state.messages.len() > 10
+        {
+            host.maybe_pre_turn_compact(state, pressure, quiet).await;
         }
 
         // Adaptive microcompact: scale aggressiveness with context pressure.
