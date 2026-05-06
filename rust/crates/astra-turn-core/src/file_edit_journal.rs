@@ -283,6 +283,51 @@ impl FileEditJournal {
         self.entries.is_empty()
     }
 
+    /// Absorb another journal's entries as PRECEDING this journal's.
+    ///
+    /// Sequence numbers are reassigned contiguously starting from 0 —
+    /// older entries first, then self's entries. `next_sequence` is
+    /// updated so subsequent `push` calls can't collide with any
+    /// existing entry's sequence.
+    ///
+    /// Ring-buffer semantics apply: if `older.len() + self.len() > max_entries`,
+    /// the oldest entries (starting from `older`) are evicted.
+    ///
+    /// **No on-disk side effects**. This is purely an in-memory merge —
+    /// callers that want to sync the merged state to disk should call
+    /// [`Self::save_to_dir`] afterward.
+    ///
+    /// Use case: a `ToolExecutor` is wiring a shared journal that
+    /// already holds pre-session entries. The session's on-disk dir may
+    /// also hold entries from a prior run. Without this operation the
+    /// caller has to choose which side to keep; with it, both are
+    /// preserved and re-sequenced cleanly.
+    pub fn merge_older_entries(&mut self, older: FileEditJournal) {
+        if older.entries.is_empty() {
+            return;
+        }
+        // Build the combined entry list: older first, self's after.
+        // Drop each entry's original sequence by overwriting below.
+        let mut combined: Vec<FileEditEntry> = older
+            .entries
+            .into_iter()
+            .chain(std::mem::take(&mut self.entries))
+            .collect();
+
+        // Apply ring-buffer cap: drop oldest if over.
+        if combined.len() > self.max_entries {
+            let drop_n = combined.len() - self.max_entries;
+            combined.drain(..drop_n);
+        }
+
+        // Reassign contiguous sequences 0..combined.len().
+        for (i, entry) in combined.iter_mut().enumerate() {
+            entry.sequence = i as u64;
+        }
+        self.next_sequence = combined.len() as u64;
+        self.entries = combined.into_iter().collect();
+    }
+
     /// List files edited in a specific turn.
     pub fn files_in_turn(&self, turn_index: u32) -> Vec<&Path> {
         self.entries
@@ -574,6 +619,117 @@ mod tests {
     /// We persist with raw bytes serialized via serde-bytes-compatible
     /// `Vec<u8>` serialization (base64'd by serde_json as number arrays).
     /// Test covers all four edit types and the None-before-content case.
+    // R9.1: merge_older_entries lets a journal that already holds
+    // in-memory entries absorb an older (prior-run) set from disk
+    // without either side being lost. After merge, the older side's
+    // entries precede self's, and self's entries keep relative order
+    // but are re-sequenced past the older set's max so future saves
+    // don't collide on disk.
+    #[test]
+    fn merge_older_entries_preserves_both_sides_and_re_sequences() {
+        let tmp = TempDir::new().unwrap();
+        let file_a = tmp.path().join("a");
+        let file_b = tmp.path().join("b");
+        let file_x = tmp.path().join("x");
+
+        // Older journal: two entries with sequences 0 and 1.
+        let mut older = FileEditJournal::new(100);
+        std::fs::write(&file_a, b"a0").unwrap();
+        older.record_before(&file_a, "A", 0);
+        older.record_after(&file_a, "A", b"a1");
+        std::fs::write(&file_b, b"b0").unwrap();
+        older.record_before(&file_b, "B", 0);
+        older.record_after(&file_b, "B", b"b1");
+        assert_eq!(older.len(), 2);
+
+        // Self: one entry at sequence 0.
+        let mut j = FileEditJournal::new(100);
+        std::fs::write(&file_x, b"x0").unwrap();
+        j.record_before(&file_x, "X", 1);
+        j.record_after(&file_x, "X", b"x1");
+        assert_eq!(j.len(), 1);
+
+        j.merge_older_entries(older);
+
+        // All 3 entries present.
+        assert_eq!(j.len(), 3);
+        let entries = j.entries_for_test();
+
+        // Older entries come first (chronologically earlier).
+        assert_eq!(entries[0].tool_call_id, "A");
+        assert_eq!(entries[1].tool_call_id, "B");
+        assert_eq!(entries[2].tool_call_id, "X");
+
+        // All sequences unique and monotonic so save_to_dir doesn't overwrite.
+        let seqs: Vec<u64> = entries.iter().map(|e| e.sequence).collect();
+        let mut sorted = seqs.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 3, "sequences must be unique after merge");
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "sequences monotonic");
+
+        // Subsequent record gets a sequence past all three.
+        let max_existing = *seqs.iter().max().unwrap();
+        std::fs::write(&file_x, b"x1").unwrap();
+        j.record_before(&file_x, "Y", 2);
+        let new_seq = j.entries_for_test().last().unwrap().sequence;
+        assert!(new_seq > max_existing, "next_sequence must advance past max");
+    }
+
+    /// When combined length exceeds max_entries, oldest entries are evicted
+    /// (ring-buffer semantics preserved across merges).
+    #[test]
+    fn merge_older_entries_respects_max_entries_cap() {
+        let tmp = TempDir::new().unwrap();
+        let mk_entry = |j: &mut FileEditJournal, tag: &str| {
+            let f = tmp.path().join(tag);
+            std::fs::write(&f, b"x").unwrap();
+            j.record_before(&f, tag, 0);
+            j.record_after(&f, tag, b"y");
+        };
+
+        // Self with cap=3 and 2 entries.
+        let mut j = FileEditJournal::new(3);
+        mk_entry(&mut j, "self-0");
+        mk_entry(&mut j, "self-1");
+
+        // Older with 3 entries.
+        let mut older = FileEditJournal::new(10);
+        mk_entry(&mut older, "old-0");
+        mk_entry(&mut older, "old-1");
+        mk_entry(&mut older, "old-2");
+
+        j.merge_older_entries(older);
+
+        // 2 + 3 = 5 total, cap=3 → keep newest 3.
+        assert_eq!(j.len(), 3);
+        // Oldest (old-0, old-1) evicted; old-2 + both self-* survive.
+        let tags: Vec<String> = j
+            .entries_for_test()
+            .iter()
+            .map(|e| e.tool_call_id.clone())
+            .collect();
+        assert_eq!(tags, vec!["old-2", "self-0", "self-1"]);
+    }
+
+    /// Merging an empty older journal is a no-op.
+    #[test]
+    fn merge_older_entries_empty_older_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("a");
+        std::fs::write(&file, b"a").unwrap();
+
+        let mut j = FileEditJournal::new(100);
+        j.record_before(&file, "A", 0);
+        j.record_after(&file, "A", b"b");
+
+        let before_len = j.len();
+        let before_seq = j.checkpoint();
+        j.merge_older_entries(FileEditJournal::new(100));
+        assert_eq!(j.len(), before_len);
+        assert_eq!(j.checkpoint(), before_seq);
+    }
+
     #[test]
     fn entry_serde_roundtrip_preserves_fields() {
         let original = FileEditEntry {
