@@ -2345,6 +2345,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &final_tools,
                 Some(effective_max_output),
             );
+            state.step_recorder.begin_llm_round(&llm_cfg.model_name);
+            let llm_round_start = std::time::Instant::now();
             let llm_cancel = llm_cancel_for_state(state);
             let r = call_llm_and_collect_with_request_overrides(
                 &llm_messages,
@@ -2511,6 +2513,18 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     return Err(e);
                 }
             };
+
+            {
+                let u = crate::turn::token_usage::TokenUsage::from_json_map(&r.usage);
+                state.step_recorder.end_llm_round(
+                    &llm_cfg.model_name,
+                    u.input_tokens,
+                    u.output_tokens,
+                    u.cached_input_tokens,
+                    u.cache_creation_tokens,
+                    llm_round_start.elapsed().as_millis() as u64,
+                );
+            }
 
             record_full_llm_response_event(
                 state,

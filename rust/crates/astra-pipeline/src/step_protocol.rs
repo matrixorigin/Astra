@@ -1573,6 +1573,9 @@ pub enum StepEventType {
     StepFailed,
     StepRetried,
 
+    LlmRoundStarted,
+    LlmRoundCompleted,
+
     ToolCallStarted,
     ToolCallCompleted,
     ToolCallFailed,

@@ -220,6 +220,37 @@ impl StepRecorder {
     }
 
     /// Transition to ACT phase (before LLM call).
+    /// Record the start of an LLM API call. Pairs with [`Self::end_llm_round`].
+    pub fn begin_llm_round(&mut self, model: &str) {
+        self.emit_with_payload(
+            StepEventType::LlmRoundStarted,
+            serde_json::json!({ "model": model }),
+        );
+    }
+
+    /// Record the completion of an LLM API call with usage metrics.
+    pub fn end_llm_round(
+        &mut self,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read: u64,
+        cache_creation: u64,
+        latency_ms: u64,
+    ) {
+        self.emit_with_payload(
+            StepEventType::LlmRoundCompleted,
+            serde_json::json!({
+                "model": model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_read_tokens": cache_read,
+                "cache_creation_tokens": cache_creation,
+                "latency_ms": latency_ms,
+            }),
+        );
+    }
+
     pub fn begin_act(&mut self, tool_count: usize) {
         self.transition_phase(StepAction::Act);
         if let Some(ref mut step) = self.current_step {
