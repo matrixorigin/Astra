@@ -93,14 +93,28 @@ pub(crate) use file_state::ReadDedupKey;
 pub(crate) type SharedFileState = std::sync::Arc<std::sync::Mutex<HashMap<PathBuf, FileState>>>;
 
 /// Per-session directory for persisted file-edit checkpoints.
-/// Location: `~/.astra/sessions/<session_id>/file_checkpoints/`.
+/// Default location: `~/.astra/sessions/<session_id>/file_checkpoints/`.
 ///
-/// Returns `None` when `HOME` is unavailable or the session_id is empty —
-/// in those cases persistence is silently disabled and the journal runs
-/// in-memory only (original behavior before F-series).
+/// Override via `ASTRA_FILE_CHECKPOINT_ROOT` — when set, checkpoints live
+/// at `$ASTRA_FILE_CHECKPOINT_ROOT/<session_id>/file_checkpoints/`.
+/// Used by tests to redirect writes away from the user's real HOME.
+///
+/// Returns `None` when neither override nor `HOME` is available, or the
+/// session_id is empty — in those cases persistence is silently disabled
+/// and the journal runs in-memory only.
 fn file_checkpoint_dir_for(session_id: &str) -> Option<PathBuf> {
     if session_id.trim().is_empty() {
         return None;
+    }
+    // Env override takes precedence so tests don't pollute the real HOME.
+    if let Ok(root) = std::env::var("ASTRA_FILE_CHECKPOINT_ROOT") {
+        if !root.is_empty() {
+            return Some(
+                PathBuf::from(root)
+                    .join(session_id)
+                    .join("file_checkpoints"),
+            );
+        }
     }
     let home = dirs::home_dir()?;
     Some(
@@ -638,6 +652,13 @@ impl ToolExecutor {
     }
 
     /// Use a shared file edit journal (session-scoped) instead of the default.
+    ///
+    /// If an `active_session_id` is already set when this is called, the
+    /// persistence binding is re-applied to the incoming journal so the
+    /// `ToolExecutor::new(..).with_active_session_id(sid).with_shared_file_journal(arc)`
+    /// order (as used by `sse_loop/mod.rs`) preserves crash-recovery
+    /// semantics. Without this, the prior call to `with_active_session_id`
+    /// would be silently discarded by the journal swap.
     pub fn with_shared_file_journal(
         mut self,
         journal: std::sync::Arc<
@@ -645,6 +666,22 @@ impl ToolExecutor {
         >,
     ) -> Self {
         self.file_journal = journal;
+        // Re-apply persistence to the new journal if a session is already active.
+        // Guarded by session_id presence so pure in-memory callers (no session
+        // set) keep the original zero-side-effect behavior.
+        if let Some(sid) = self.active_session_id()
+            && let Some(dir) = file_checkpoint_dir_for(&sid)
+            && let Ok(mut j) = self.file_journal.lock()
+            && j.persist_dir().is_none()
+        {
+            // Preload entries a prior run persisted under the same session.
+            if let Ok(loaded) =
+                astra_turn_core::file_edit_journal::FileEditJournal::load_from_dir(&dir, 500)
+            {
+                *j = loaded;
+            }
+            j.enable_persistence(dir);
+        }
         self
     }
 
@@ -1744,6 +1781,127 @@ mod tests {
 
         executor.set_cloud_token("new-token");
         assert_eq!(executor.cloud_token().as_deref(), Some("new-token"));
+    }
+
+    // ── File-journal persistence wiring (regression guard) ──────────────
+
+    /// RAII guard that scrubs `ASTRA_FILE_CHECKPOINT_ROOT` on drop so the
+    /// test's override doesn't bleed into other tests running in the same
+    /// process. Also restores any prior value so running under a hostile
+    /// parent env stays idempotent.
+    struct CheckpointRootGuard {
+        prior: Option<String>,
+    }
+    impl CheckpointRootGuard {
+        fn set(dir: &std::path::Path) -> Self {
+            let prior = std::env::var("ASTRA_FILE_CHECKPOINT_ROOT").ok();
+            // SAFETY: test-only; callers are `#[serial]` so no parallel
+            // reads race this write.
+            unsafe { std::env::set_var("ASTRA_FILE_CHECKPOINT_ROOT", dir) };
+            Self { prior }
+        }
+    }
+    impl Drop for CheckpointRootGuard {
+        fn drop(&mut self) {
+            // SAFETY: see set().
+            match &self.prior {
+                Some(v) => unsafe { std::env::set_var("ASTRA_FILE_CHECKPOINT_ROOT", v) },
+                None => unsafe { std::env::remove_var("ASTRA_FILE_CHECKPOINT_ROOT") },
+            }
+        }
+    }
+
+    /// Baseline: setting the active session-id binds persistence on the
+    /// executor's journal. Without the shared-journal override, this is the
+    /// simple path that already worked before the regression fix.
+    #[serial_test::serial]
+    #[test]
+    fn active_session_id_enables_persistence_on_default_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CheckpointRootGuard::set(tmp.path());
+
+        let executor = test_executor().with_active_session_id("session-a");
+
+        let journal = executor.file_journal.lock().unwrap();
+        assert!(
+            journal.persist_dir().is_some(),
+            "persistence must be enabled after session-id is set"
+        );
+        let expected = tmp.path().join("session-a").join("file_checkpoints");
+        assert_eq!(journal.persist_dir(), Some(expected.as_path()));
+    }
+
+    /// REGRESSION: the production wiring order is
+    /// `ToolExecutor::new(..).with_active_session_id(sid).with_shared_file_journal(arc)`
+    /// (see sse_loop/mod.rs:192-201). Before this fix, `with_shared_file_journal`
+    /// replaced the executor's journal wholesale, discarding the
+    /// persistence binding that `with_active_session_id` had just installed.
+    ///
+    /// Invariant: after both builder calls, the FINAL journal on the
+    /// executor must have `persist_dir == Some(dir for sid)`.
+    #[serial_test::serial]
+    #[test]
+    fn shared_journal_inherits_persistence_from_active_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CheckpointRootGuard::set(tmp.path());
+
+        // Simulate ReplState: a shared in-memory journal with no persistence.
+        let shared: std::sync::Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>> =
+            std::sync::Arc::new(std::sync::Mutex::new(
+                astra_turn_core::file_edit_journal::FileEditJournal::new(500),
+            ));
+        assert!(
+            shared.lock().unwrap().persist_dir().is_none(),
+            "fresh shared journal starts in-memory"
+        );
+
+        // Production wiring order from sse_loop/mod.rs.
+        let executor = test_executor()
+            .with_active_session_id("session-b")
+            .with_shared_file_journal(shared.clone());
+
+        let expected = tmp.path().join("session-b").join("file_checkpoints");
+
+        // The executor must see the shared journal as its own (Arc ptr eq).
+        assert!(
+            std::sync::Arc::ptr_eq(&executor.file_journal, &shared),
+            "executor should hold the shared journal Arc"
+        );
+
+        // AND that shared journal must now carry the persistence binding.
+        let journal = shared.lock().unwrap();
+        assert_eq!(
+            journal.persist_dir(),
+            Some(expected.as_path()),
+            "with_shared_file_journal after with_active_session_id must re-apply persistence"
+        );
+    }
+
+    /// Reverse order: `with_shared_file_journal(arc).with_active_session_id(sid)`
+    /// — legacy builder call sequence. Persistence must still end up on
+    /// the shared journal (because set_active_session_id operates on
+    /// whatever journal is currently bound).
+    #[serial_test::serial]
+    #[test]
+    fn shared_journal_gets_persistence_when_session_id_set_last() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CheckpointRootGuard::set(tmp.path());
+
+        let shared: std::sync::Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>> =
+            std::sync::Arc::new(std::sync::Mutex::new(
+                astra_turn_core::file_edit_journal::FileEditJournal::new(500),
+            ));
+
+        let executor = test_executor()
+            .with_shared_file_journal(shared.clone())
+            .with_active_session_id("session-c");
+
+        let expected = tmp.path().join("session-c").join("file_checkpoints");
+        assert_eq!(
+            shared.lock().unwrap().persist_dir(),
+            Some(expected.as_path())
+        );
+        assert!(std::sync::Arc::ptr_eq(&executor.file_journal, &shared));
     }
 
     mod aggregate_tests;

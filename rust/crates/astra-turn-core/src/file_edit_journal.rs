@@ -127,6 +127,13 @@ impl FileEditJournal {
         }
     }
 
+    /// Current auto-persistence directory, if enabled. Exposed so a caller
+    /// wiring a shared journal into a session-scoped executor can verify
+    /// the journal is already configured (and avoid double-binding).
+    pub fn persist_dir(&self) -> Option<&Path> {
+        self.persist_dir.as_deref()
+    }
+
     /// Record the before-state of a file that is about to be written.
     ///
     /// Call this BEFORE `fs::write` / `str_replace`. If the file does not
