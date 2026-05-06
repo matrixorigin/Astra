@@ -802,7 +802,6 @@ mod tests {
                 false,
                 true,
             ),
-            ("git_checkout_file", json!({ "path": "a.txt" }), false, true),
             (
                 "bash",
                 json!({ "command": "printf new > a.txt" }),

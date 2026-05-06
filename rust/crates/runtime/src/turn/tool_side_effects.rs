@@ -10,7 +10,7 @@ use serde_json::Value;
 const NON_CLOUD_MUTATION_TOOLS: &[&str] = &[
     "apply_patch",
     // Conservative: even a no-op checkout can refresh file contents.
-    "git_checkout_file",
+    
     "rollback_git_worktrees",
 ];
 
