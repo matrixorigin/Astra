@@ -121,7 +121,7 @@ pub fn optimize_with_spill(
         }
         CompactionTier::TrimSchemas => {
             if limits.allow_schema_pruning {
-                stats.schemas_pruned = prune_tool_schemas(&mut tool_schemas);
+                stats.schemas_pruned = prune_tool_schemas(&mut tool_schemas, plan.compact_tier);
             } else {
                 stats.skipped.push(SkippedOptimization {
                     step: "schema_pruning".into(),
@@ -131,7 +131,7 @@ pub fn optimize_with_spill(
         }
         CompactionTier::CompactHistory | CompactionTier::AggressivePrune => {
             if limits.allow_schema_pruning {
-                stats.schemas_pruned = prune_tool_schemas(&mut tool_schemas);
+                stats.schemas_pruned = prune_tool_schemas(&mut tool_schemas, plan.compact_tier);
             }
 
             if limits.allow_tool_result_clearing {
@@ -204,34 +204,28 @@ struct ClearResult {
     skipped_over_budget: bool,
 }
 
-/// Gated tool result clearing with circuit breaker.
-/// Prune tool schemas: remove `description` fields to save tokens.
-/// Returns the number of schemas pruned.
-fn prune_tool_schemas(schemas: &mut [Value]) -> u32 {
-    let mut pruned = 0u32;
-    for schema in schemas.iter_mut() {
-        if let Some(func) = schema.get_mut("function") {
-            if let Some(func_obj) = func.as_object_mut() {
-                if func_obj.remove("description").is_some() {
-                    pruned += 1;
-                }
-                // Also strip parameter descriptions.
-                if let Some(params) = func_obj.get_mut("parameters")
-                    && let Some(props) = params.get_mut("properties")
-                    && let Some(obj) = props.as_object_mut()
-                {
-                    for (_key, prop) in obj.iter_mut() {
-                        if let Some(p) = prop.as_object_mut()
-                            && p.remove("description").is_some()
-                        {
-                            pruned += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    pruned
+/// Prune tool schemas in-place using the shared 4-tier pruning strategy.
+///
+/// Delegates to [`crate::tool_schema_prune::prune_tool_schemas`] so the
+/// pipeline and runtime share exactly one pruning implementation.
+/// Returns the number of schemas whose JSON representation changed —
+/// observational only (for stats traces); the canonical proof is the
+/// mutated `schemas` slice itself.
+fn prune_tool_schemas(schemas: &mut Vec<Value>, tier: CompactionTier) -> u32 {
+    let originals: Vec<String> = schemas
+        .iter()
+        .map(|s| serde_json::to_string(s).unwrap_or_default())
+        .collect();
+    let pruned = crate::tool_schema_prune::prune_tool_schemas(schemas, tier);
+    let touched = pruned
+        .iter()
+        .zip(originals.iter())
+        .filter(|(after, before)| {
+            serde_json::to_string(*after).map(|s| s != **before).unwrap_or(false)
+        })
+        .count();
+    *schemas = pruned;
+    u32::try_from(touched).unwrap_or(u32::MAX)
 }
 
 /// Drop the oldest assistant/user round pairs under extreme pressure.
@@ -791,31 +785,32 @@ mod tests {
         };
         let policy = ProviderCachePolicy::default();
 
-        // Inject some tool schemas with descriptions to be pruned
+        // Inject tool schemas with multi-sentence descriptions so TrimSchemas
+        // (which truncates to the first sentence) actually mutates them.
         let mut bound = bound;
         bound.tool_schemas = vec![
-            serde_json::json!({"type": "function", "function": {"name": "read_file", "description": "Read a file from disk", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "File path"}}}}}),
-            serde_json::json!({"type": "function", "function": {"name": "bash", "description": "Execute a shell command", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "Command to run"}}}}}),
-            serde_json::json!({"type": "function", "function": {"name": "grep", "description": "Search file contents", "parameters": {"type": "object", "properties": {"pattern": {"type": "string", "description": "Regex pattern"}, "path": {"type": "string", "description": "Search path"}}}}}),
-            serde_json::json!({"type": "function", "function": {"name": "list_dir", "description": "List directory", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "depth": {"type": "integer"}}}}}),
+            serde_json::json!({"type": "function", "function": {"name": "read_file", "description": "Read a file from disk. Supports optional line ranges and binary-safe decoding.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "File path. Accepts absolute or workspace-relative paths."}}}}}),
+            serde_json::json!({"type": "function", "function": {"name": "bash", "description": "Execute a shell command. Runs inside the sandbox with a 2-minute default timeout.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "Command to run. Must be idempotent when possible to allow retries."}}}}}),
         ];
 
         let original_count = bound.tool_schemas.len();
         let result = optimize(&plan, bound, &latches, &policy, &limits, 1);
 
-        // Under TrimSchemas tier, schemas should be pruned (descriptions removed or schemas dropped)
+        // Under TrimSchemas tier, descriptions should be truncated to the first sentence.
         assert!(
             result.stats.schemas_pruned > 0,
-            "TrimSchemas tier should prune schemas"
+            "TrimSchemas tier should touch schemas with multi-sentence descriptions"
         );
-        // Should not remove ALL schemas
+        let first_desc = result.tool_schemas[0]["function"]["description"]
+            .as_str()
+            .expect("description should still be present after TrimSchemas");
         assert!(
-            !result.tool_schemas.is_empty(),
-            "should keep at least some schemas"
+            !first_desc.contains("Supports optional line ranges"),
+            "trailing sentences should be removed under TrimSchemas"
         );
         assert!(
-            result.tool_schemas.len() <= original_count,
-            "should not add schemas"
+            result.tool_schemas.len() == original_count,
+            "TrimSchemas keeps schema count stable"
         );
     }
 
@@ -846,7 +841,7 @@ mod tests {
             "function": "not-an-object"
         })];
 
-        let pruned = prune_tool_schemas(&mut schemas);
+        let pruned = prune_tool_schemas(&mut schemas, CompactionTier::TrimSchemas);
 
         assert_eq!(pruned, 0);
         assert_eq!(schemas[0]["function"], "not-an-object");
