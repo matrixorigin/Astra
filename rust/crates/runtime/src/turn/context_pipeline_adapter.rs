@@ -159,6 +159,27 @@ pub(crate) fn build_external_sources(
                     as std::sync::Arc<dyn astra_turn_core::spill_backend::SpillBackend>
             });
 
+    // Skill listing — per-turn ranked shortlist of available skills, based
+    // on the current user message. Previously injected post-pipeline as a
+    // `role: system` message and folded into `body.system[]` via
+    // `consolidate_system_messages`. Routing it through the pipeline's
+    // volatile lane keeps the same cache behaviour (it lands in
+    // RuntimeVolatile / None scope) but makes the pipeline the single
+    // owner of system-block content — simpler to reason about where each
+    // byte of the system prompt comes from.
+    let skill_listing_extra = state.skills.listing_message.as_ref().and_then(|listing| {
+        listing
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                crate::prompts::PromptSection::dynamic(
+                    s.to_string(),
+                    crate::prompts::PromptTokenBucket::Environment,
+                )
+            })
+    });
+
     ExternalSources {
         memory_snippets,
         spill_dir: None,
@@ -171,10 +192,15 @@ pub(crate) fn build_external_sources(
         system_override,
         plan_context,
         tool_guidance,
-        // Adapter path (ServerAgenticLoopHost) doesn't use the bridge
-        // escape hatches — all its signals have typed fields above.
+        // Adapter path (ServerAgenticLoopHost) doesn't use the bridge's
+        // stable-lane escape hatch — session-stable signals have typed
+        // fields above.
         extra_stable_sections: Vec::new(),
-        extra_dynamic_sections: Vec::new(),
+        // Volatile lane: the per-turn skill-listing shortlist. Turn-varying
+        // by design (content depends on current user message). Kept in
+        // None scope via RuntimeVolatile so it doesn't invalidate the
+        // cached prefix.
+        extra_dynamic_sections: skill_listing_extra.into_iter().collect(),
     }
 }
 

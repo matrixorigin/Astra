@@ -2085,10 +2085,10 @@ impl ServerAgenticLoopHost {
             llm_messages.extend(file_messages);
         }
 
-        // Ephemeral per-turn skill listing (not stored in state.messages).
-        if let Some(ref listing) = state.skills.listing_message {
-            llm_messages.push(listing.clone());
-        }
+        // Per-turn skill listing (ranked shortlist) now flows through the
+        // pipeline as an `extra_dynamic_sections` entry (RuntimeVolatile
+        // section, None scope). See `context_pipeline_adapter` —
+        // runtime-side post-injection here would double up the content.
 
         // Protocol-level Anthropic cache metadata (last-message breakpoint,
         // cache_edits block, tool-result cache_references).
