@@ -449,6 +449,40 @@ impl StepRecorder {
     ) {
         let slot_idx = self.slot_counter.saturating_sub(1);
 
+        // Guarantee the event stream is always a valid span:
+        // ToolCallStarted → ToolCallCompleted/Failed/Skipped.
+        // If begin_tool was never called (fast-path dispatch where the CLI
+        // only sees the result), inject a ToolCallStarted event now. This
+        // does NOT increment slot_counter (the slot was already allocated
+        // by begin_act) — it only emits the event and marks the slot Running.
+        let needs_started = self
+            .current_step
+            .as_ref()
+            .and_then(|step| step.execution.cursor.slots.get(slot_idx as usize))
+            .is_some_and(|slot| slot.state == crate::step_protocol::SlotState::Pending);
+        if needs_started {
+            let call_id = fallback_call_id.unwrap_or("");
+            let args_preview = fallback_args_preview;
+            // Mark slot as Running (same as begin_tool does).
+            if let Some(ref mut step) = self.current_step
+                && let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize)
+            {
+                slot.tool_name = tool_name.to_string();
+                slot.call_id = call_id.to_string();
+                slot.state = crate::step_protocol::SlotState::Running;
+                slot.args_preview = args_preview.map(|a| a.to_string());
+            }
+            let mut started_payload = serde_json::json!({
+                "tool_name": tool_name,
+                "slot_index": slot_idx,
+                "call_id": call_id,
+            });
+            if let Some(ap) = args_preview {
+                started_payload["args_preview"] = serde_json::json!(ap);
+            }
+            self.emit_with_payload(StepEventType::ToolCallStarted, started_payload);
+        }
+
         // Extract trace metadata from slot before mutation.
         let slot_meta = self.current_step.as_ref().and_then(|step| {
             step.execution.cursor.slots.get(slot_idx as usize).map(|s| {
@@ -1603,5 +1637,82 @@ mod tests {
                 "StepRetried must not represent normal cross-round progression"
             );
         }
+    }
+
+    #[test]
+    fn complete_without_begin_auto_injects_started_event() {
+        // When a tool is completed WITHOUT a preceding begin_tool call
+        // (e.g., fast-path tools dispatched through bridge where CLI
+        // only sees the result), the recorder must auto-inject a
+        // ToolCallStarted event so the event stream is always a
+        // valid span: Started → Completed/Failed/Skipped.
+        let mut rec = StepRecorder::new("sess-started-fix", "task-1");
+        rec.begin_turn(0);
+        rec.begin_act(1);
+        // Skip begin_tool — go straight to complete (simulates fast-path)
+        rec.complete_tool_with_result_and_metadata(
+            "read_file",
+            "call-fast-1",
+            Some("src/lib.rs"),
+            false,
+            5,
+            false,
+            "file contents here",
+        );
+
+        let events = rec.events();
+        let tool_events: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.event_type,
+                    StepEventType::ToolCallStarted
+                        | StepEventType::ToolCallCompleted
+                        | StepEventType::ToolCallFailed
+                        | StepEventType::ToolCallSkipped
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            tool_events.len(),
+            2,
+            "must have exactly Started + Completed: {:?}",
+            tool_events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+        );
+        assert_eq!(tool_events[0].event_type, StepEventType::ToolCallStarted);
+        assert_eq!(tool_events[1].event_type, StepEventType::ToolCallCompleted);
+
+        // The auto-injected Started must carry the tool_name and call_id
+        let started_payload = tool_events[0].payload.as_ref().unwrap();
+        assert_eq!(
+            started_payload.get("tool_name").and_then(|v| v.as_str()),
+            Some("read_file")
+        );
+        assert_eq!(
+            started_payload.get("call_id").and_then(|v| v.as_str()),
+            Some("call-fast-1")
+        );
+    }
+
+    #[test]
+    fn begin_then_complete_does_not_double_emit_started() {
+        // Normal path: begin_tool → complete_tool. Must emit exactly one
+        // ToolCallStarted (from begin_tool), not a second from complete.
+        let mut rec = StepRecorder::new("sess-no-double", "task-1");
+        rec.begin_turn(0);
+        rec.begin_act(1);
+        rec.begin_tool_with_key_and_args_preview("bash", "call-1", None, Some("ls"));
+        rec.complete_tool_with_result_and_metadata("bash", "call-1", Some("ls"), false, 10, false, "output");
+
+        let started_count = rec
+            .events()
+            .iter()
+            .filter(|e| e.event_type == StepEventType::ToolCallStarted)
+            .count();
+        assert_eq!(
+            started_count, 1,
+            "begin_tool + complete_tool must produce exactly 1 Started, not 2"
+        );
     }
 }
